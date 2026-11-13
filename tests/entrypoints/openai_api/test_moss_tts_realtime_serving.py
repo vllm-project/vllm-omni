@@ -112,6 +112,23 @@ def test_realtime_components_use_the_realtime_model_and_codec(
     assert processor_calls == [tokenizer]
 
 
+def test_realtime_components_reject_unsupported_device_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine_client = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="OpenMOSS-Team/MOSS-TTS-Realtime",
+            hf_config=SimpleNamespace(),
+        )
+    )
+    server = MossTTSAdapter(SpeechServingContext(server=object(), engine_client=engine_client))
+    monkeypatch.setenv(adapter_module._MOSS_REALTIME_REF_ENCODER_DEVICE_ENV, "gpu")
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{adapter_module._MOSS_REALTIME_REF_ENCODER_DEVICE_ENV} only supports 'cpu'",
+    ):
+        server._get_moss_realtime_components()
+
+
 def test_realtime_serving_builds_the_talker_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     server = MossTTSAdapter(SpeechServingContext(server=SimpleNamespace(uploaded_speakers={})))
     server._moss_variant = "realtime"

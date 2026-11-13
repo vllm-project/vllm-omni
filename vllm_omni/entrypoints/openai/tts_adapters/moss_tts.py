@@ -342,6 +342,15 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             return torch.device("cpu")
         return platform.get_torch_device(index)
 
+    def _resolve_realtime_ref_encoder_device(self):
+        """Resolve the Realtime codec device, allowing only the CI CPU fallback."""
+        override = os.getenv(_MOSS_REALTIME_REF_ENCODER_DEVICE_ENV, "").strip().lower()
+        if not override:
+            return self._resolve_ref_encoder_device()
+        if override != "cpu":
+            raise ValueError(f"{_MOSS_REALTIME_REF_ENCODER_DEVICE_ENV} only supports 'cpu'; got {override!r}")
+        return "cpu"
+
     def _get_moss_processor(self):
         """Lazily load the upstream MOSS-TTS processor once per server.
 
@@ -391,6 +400,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             if cached is not None:
                 return cached
 
+            device = self._resolve_realtime_ref_encoder_device()
             model_id = self.engine_client.model_config.model
             processor_cls = get_class_from_dynamic_module(
                 "processing_mossttsrealtime.MossTTSRealtimeProcessor",
@@ -414,8 +424,6 @@ class _MossTTSAdapterBase(ARTTSAdapter):
                 codec_path,
                 trust_remote_code=True,
             )
-            device = os.getenv(_MOSS_REALTIME_REF_ENCODER_DEVICE_ENV, "").strip()
-            device = device or self._resolve_ref_encoder_device()
             # Production follows the codec stage accelerator. Memory-constrained
             # qualification lanes can opt into CPU without weakening the
             # default cold-reference latency for user deployments.
