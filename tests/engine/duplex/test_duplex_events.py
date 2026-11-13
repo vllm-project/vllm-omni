@@ -769,12 +769,12 @@ def test_flat_format_does_not_borrow_a_different_nested_rate():
     assert defaults.input_sample_rate_hz == 16000
 
 
-def test_flat_format_switch_keeps_a_previously_accepted_rate():
-    """A later flat switch that omits a rate keeps the rate already accepted.
+def test_flat_format_switch_resets_to_the_new_format_default():
+    """A later flat switch that omits a rate falls back to the new format's default.
 
-    Format and rate are partial updates. The leftover nested ``audio/pcm`` rate
-    is a different encoding, so it is not borrowed, but the connection does not
-    fall back to 16000 either.
+    Format and rate are partial updates, but a rate belongs to one encoding:
+    once the client moves from ``audio/pcm`` to ``pcm_f32le`` without a rate,
+    keeping the accepted 24000 would apply it to a different encoding.
     """
     accepted = RealtimeInputDefaults().with_session_payload(
         {"audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}}}
@@ -787,7 +787,8 @@ def test_flat_format_switch_keeps_a_previously_accepted_rate():
         }
     )
     assert switched.input_audio_format == "pcm_f32le"
-    assert switched.input_sample_rate_hz == 24000
+    assert switched.input_sample_rate_hz == 16000
+    assert switched.input_sample_rate_declared is False
 
 
 def test_discard_pending_commit_item_clears_aborted_head():

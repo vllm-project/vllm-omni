@@ -178,3 +178,48 @@ def test_explicit_g711_rate_survives_the_session_round_trip(event_format, _sessi
 
     assert defaults.input_sample_rate_hz == DECLARED_RATE_HZ
     _assert_16khz_tone(decode_audio_append(_append_event(encode, DECLARED_RATE_HZ), defaults=defaults))
+
+
+class _Connection:
+    """One live connection: the projection state and the accepted session evolve together."""
+
+    def __init__(self) -> None:
+        self.state = RealtimeProjectionState(session_id="sess-live")
+        self.envelope = RealtimeEnvelope()
+
+    def update(self, session_payload: dict[str, object]) -> RealtimeInputDefaults:
+        self.state.defaults = self.envelope.defaults
+        self.state.apply_session_defaults(session_payload)
+        self.envelope.apply_accepted_session(realtime_session_payload(self.state, session_payload))
+        return self.envelope.defaults
+
+
+@pytest.mark.parametrize(("event_format", "_session_format", "encode"), _CODECS)
+def test_nested_rate_less_g711_on_a_model_connection(event_format, _session_format, encode):
+    connection = _Connection()
+    defaults = connection.update({"model": "demo", "audio": {"input": {"format": {"type": event_format}}}})
+
+    assert defaults.input_sample_rate_hz == NATIVE_RATE_HZ
+    _assert_16khz_tone(decode_audio_append(_append_event(encode, NATIVE_RATE_HZ), defaults=defaults))
+
+
+@pytest.mark.parametrize(("event_format", "_session_format", "encode"), _CODECS)
+def test_switch_to_rate_less_pcm_drops_the_g711_rate(event_format, _session_format, encode):
+    connection = _Connection()
+    connection.update({"input_audio_format": event_format})
+    defaults = connection.update({"audio": {"input": {"format": {"type": "audio/pcm"}}}})
+
+    assert defaults.input_audio_format == "pcm16"
+    assert defaults.input_sample_rate_hz == DECLARED_RATE_HZ
+    pcm = {"audio": base64.b64encode(_tone_pcm16(DECLARED_RATE_HZ)).decode("ascii")}
+    _assert_16khz_tone(decode_audio_append(pcm, defaults=defaults))
+
+
+@pytest.mark.parametrize(("event_format", "_session_format", "encode"), _CODECS)
+def test_repeated_same_format_update_keeps_the_accepted_rate(event_format, _session_format, encode):
+    connection = _Connection()
+    connection.update({"audio": {"input": {"format": {"type": event_format, "rate": DECLARED_RATE_HZ}}}})
+    defaults = connection.update({"input_audio_format": event_format})
+
+    assert defaults.input_sample_rate_hz == DECLARED_RATE_HZ
+    _assert_16khz_tone(decode_audio_append(_append_event(encode, DECLARED_RATE_HZ), defaults=defaults))

@@ -62,6 +62,11 @@ class RealtimeInputDefaults:
         return values
 
 
+def _native_input_rate(input_format: str) -> int:
+    """Sample rate an input encoding uses when the session does not declare one."""
+    return 8_000 if input_format.lower().startswith("g711") else 16_000
+
+
 def apply_realtime_session_defaults(
     defaults: RealtimeInputDefaults,
     session_payload: Mapping[str, object],
@@ -91,6 +96,12 @@ def apply_realtime_session_defaults(
     updates: dict[str, Any] = {}
     if isinstance(input_format, str) and input_format.lower() in REALTIME_INPUT_AUDIO_FORMATS:
         updates["input_audio_format"] = input_format
+        # A rate only carries over while the encoding stays the same. Switching
+        # format without a rate must fall back to that format's own default
+        # instead of inheriting the previous encoding's rate.
+        if input_rate is None and input_format.lower() != defaults.input_audio_format:
+            updates["input_sample_rate_hz"] = _native_input_rate(input_format)
+            updates["input_sample_rate_declared"] = False
     output_format: object = session_payload.get("output_audio_format") or session_payload.get("response_format")
     output_rate_raw: object | None = None
     if output_format is None and isinstance(audio_config, dict):

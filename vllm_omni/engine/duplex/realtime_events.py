@@ -808,19 +808,14 @@ def realtime_session_payload(state: RealtimeProjectionState, session: object) ->
     payload.setdefault("output_audio_format", state.output_audio_format)
     payload.setdefault("modalities", payload.get("modalities") or ["text", "audio"])
     payload.setdefault("output_modalities", payload.get("output_modalities") or payload.get("modalities"))
-    input_sample_rate_hz = state.input_sample_rate_hz
-    if state.input_audio_format in {"g711_ulaw", "g711_alaw"} and not state.defaults.input_sample_rate_declared:
-        # G.711 is 8 kHz unless the session declared a rate. Project the rate
-        # that actually applies, so replaying this accepted session (delivery
-        # cache -> envelope) cannot turn the server default into a client
-        # declaration and skip the 8k -> 16k resample.
-        input_sample_rate_hz = 8_000
     payload.setdefault(
         "audio",
         {
             "input": {
-                "format": realtime_audio_format_object(state.input_audio_format, sample_rate_hz=input_sample_rate_hz),
-                "sample_rate_hz": input_sample_rate_hz,
+                "format": realtime_audio_format_object(
+                    state.input_audio_format, sample_rate_hz=state.input_sample_rate_hz
+                ),
+                "sample_rate_hz": state.input_sample_rate_hz,
             },
             "output": {
                 "format": realtime_audio_format_object(
