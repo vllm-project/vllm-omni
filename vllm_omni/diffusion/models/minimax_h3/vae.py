@@ -36,6 +36,7 @@ from vllm_omni.platforms import current_omni_platform
 from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .vae_reshape import install_cross_chunk_tiling
 from .vae_temporal import install_temporal_stream_patches
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
@@ -466,6 +467,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 "[H3_VAE_FP16_WEIGHTS] %d decoder-block linears persisted as fp16 device=%s", len(_linears), device
             )
         self.model = self.remote.model
+        if not self.encode_only:
+            install_cross_chunk_tiling(self)
         self._stager = None
         self._encoder_stager = None
         self._decoder_stager = None

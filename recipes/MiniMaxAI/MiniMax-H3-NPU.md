@@ -663,3 +663,17 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - [Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
+
+## Independent VAE optimization validation
+
+Cross-chunk scheduling uses up to four native spatial tiles per rank/wave. The FFN expansion `w1` keeps the released checkpoint's per-tile sample batch size to preserve its NPU FP16 results. Other tile operations remain packed. Native `stack_tiling=true` keeps the original path. Set controls before constructing the VAE:
+
+```bash
+export H3_VIDEO_DECODER_CROSS_CHUNK=1
+export H3_VIDEO_DECODER_TILE_BATCHING=1
+export H3_VIDEO_DECODER_TILE_BATCH_SIZE=4
+```
+
+Full original Ref2VA VAE on eight 910B4-1 NPUs, main `b7bbfbd`, nightly software/CANN 9.2.1, identical captured latents: two independent launches per arm, each three warmups and five formal samples. Video decode 4.066660 → 3.554920 s (12.584% reduction, 1.143953x). The complete 294-frame Float32 video, canonical/plain RGB and PCM match main with zero differing bytes in both precision launches. This replaces the previous non-bit-exact packed-w1 measurement. It measures resident VAE decode and excludes conditioning, DiT and media encoding.
+
+Compare the complete saved pre-codec outputs with `benchmarks/diffusion/minimax_h3_vae_precision.py --baseline-dir baseline-results --candidate-dir candidate-results`. This checks raw float bytes, including signed zero; any difference fails the gate.
