@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Render PR 1994's weekly comparisons or explicitly selected SGLang diagnostics."""
 
+from __future__ import annotations
+
 import argparse
 import json
 import subprocess
@@ -61,7 +63,7 @@ def qwen_image_performance_job(benchmark: dict) -> dict:
     return job
 
 
-def video_performance_job(benchmark: dict, case: str) -> dict:
+def video_performance_job(benchmark: dict, case: str, *, weekly: bool = False) -> dict:
     filenames = {
         "wan22-i2v": ("test_wan22_i2v_sglang.json", "wan", "wan22_i2v"),
         "hunyuanvideo15": ("test_hunyuanvideo15_sglang.json", "hunyuanvideo", "hunyuanvideo15"),
@@ -93,7 +95,7 @@ def video_performance_job(benchmark: dict, case: str) -> dict:
     if case == "hunyuanvideo15":
         patches.extend(["sglang-diffusion-config-only-guider.patch", "sglang-diffusers-revision.patch"])
         checks.extend(["test_sglang_diffusion_loader.py", "test_sglang_diffusers_revision.py"])
-    for patch in patches:
+    for patch in [] if weekly else patches:
         commands.extend(
             [
                 'git -C /tmp apply --unsafe-paths --directory="$${sglang_source_root}" --check '
@@ -223,7 +225,43 @@ def cosmos_performance_job(benchmark: dict) -> dict:
     return job
 
 
-def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
+def weekly_job(job: dict, environment: dict) -> None:
+    """Attach every weekly job to the same immutable build and recorded versions."""
+    container = next(iter(job["plugins"][0].values()))["podSpec"]["containers"][0]
+    container["image"] = environment["image_reference"]
+    job.update(
+        depends_on="image-build-sglang-omni",
+        concurrency=2,
+        concurrency_group="vllm-omni/pr1994/sglang-smoke",
+    )
+    job["env"].update(
+        COMPARISON_IMAGE_DIGEST=environment["image_digest"],
+        COMPARISON_SGLANG_OMNI_REVISION=environment["sglang_omni_revision"],
+        COMPARISON_SGLANG_REVISION=environment["installed_packages"]["sglang"]["sglang"],
+        COMPARISON_ENVIRONMENT_LOCK="tests/dfx/perf/results/comparison-environment.json",
+    )
+    # Some helpers inherit the YAML command list; Buildkite accepts one command
+    # representation, so normalize it before prepending the artifact download.
+    commands = job.pop("command", None)
+    inherited = job.pop("commands", [])
+    if commands is None:
+        commands = "\n".join(inherited)
+    commands = commands.replace(
+        '.experiment_metadata.server_revision == "0.5.22"',
+        ".experiment_metadata.server_revision == " + json.dumps(environment["installed_packages"]["sglang"]["sglang"]),
+    )
+    job["command"] = "\n".join(
+        [
+            "set -eu",
+            'test "$$(git rev-parse HEAD)" = "$${BACKEND_COMPARISON_COMMIT}"',
+            'buildkite-agent artifact download "tests/dfx/perf/results/comparison-environment.json" . '
+            "--step image-build-sglang-omni",
+            commands,
+        ]
+    )
+
+
+def smoke_pipeline(cases: list[str], *, weekly: bool = False, environment: dict | None = None) -> dict:
     qwen_performance = cases == ["qwen-image-21-perf"]
     video_cases = {"wan22-i2v-perf", "hunyuanvideo15-perf", "minimax-h3-perf"}
     video_performance = len(cases) == 1 and cases[0] in video_cases
@@ -241,6 +279,20 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
     weekly_steps = {step["key"]: step for step in pipeline["steps"]}
     image = weekly_steps["image-build-sglang-omni"]
     benchmark = weekly_steps["nightly-sglang-omni-qwen3-omni"]
+    if weekly and environment is None:
+        image["commands"] = [
+            'test "$$(git rev-parse HEAD)" = "$${BACKEND_COMPARISON_COMMIT}"',
+            "aws ecr-public get-login-password --region us-east-1 | "
+            "docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7",
+            "python3 -c 'import importlib.util, sys; "
+            """sys.exit(not (importlib.util.find_spec("tomllib") or importlib.util.find_spec("tomli")))' """
+            "|| python3 -m pip install tomli==2.4.1",
+            "python3 .buildkite/cuda/scripts/build_weekly_comparison.py",
+        ]
+        pipeline["steps"] = [image]
+        return pipeline
+    if environment is not None and not weekly:
+        raise ValueError("An environment lock is only supported for weekly jobs")
     if qwen_performance:
         pipeline["steps"] = [qwen_image_performance_job(benchmark)]
         return pipeline
@@ -251,7 +303,7 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
         pipeline["steps"] = [cosmos_performance_job(benchmark)]
         return pipeline
     pinned_diagnostics = not weekly and set(cases) <= {"hunyuanvideo15", "minimax-h3"}
-    pipeline["steps"] = [] if pinned_diagnostics else [image]
+    pipeline["steps"] = [] if pinned_diagnostics or weekly else [image]
     if weekly:
         pipeline["steps"].extend(
             [
@@ -259,9 +311,9 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
                 weekly_steps["nightly-sglang-omni-qwen3-tts"],
                 qwen_image_performance_job(benchmark),
                 cosmos_performance_job(benchmark),
-                video_performance_job(benchmark, "hunyuanvideo15"),
-                video_performance_job(benchmark, "minimax-h3"),
-                video_performance_job(benchmark, "wan22-i2v"),
+                video_performance_job(benchmark, "hunyuanvideo15", weekly=True),
+                video_performance_job(benchmark, "minimax-h3", weekly=True),
+                video_performance_job(benchmark, "wan22-i2v", weekly=True),
             ]
         )
     for case in cases:
@@ -284,6 +336,7 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
         commands = [
             'test "$$(git rev-parse HEAD)" = "$${BACKEND_COMPARISON_COMMIT}"',
             'export HF_TOKEN="$${VLLM_CI_HF_TOKEN}"',
+            'export PYTHONPATH="$$PWD$${PYTHONPATH:+:$$PYTHONPATH}"',
         ]
         if pinned_diagnostics:
             commands.insert(0, "set -eu")
@@ -343,8 +396,7 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
         pipeline["steps"].append(job)
     if weekly:
         for job in pipeline["steps"]:
-            if job["key"] != "image-build-sglang-omni":
-                job.update(concurrency=2, concurrency_group="vllm-omni/pr1994/sglang-smoke")
+            weekly_job(job, environment)
     return pipeline
 
 
@@ -353,9 +405,11 @@ if __name__ == "__main__":
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("cases", nargs="?", help="Comma-separated model keys")
     selection.add_argument("--weekly", action="store_true", help="Run the validated comparison workloads")
+    parser.add_argument("--environment-lock", type=Path, help="Built weekly image and exact package versions")
     args = parser.parse_args()
     try:
         cases = ["minicpm-o-perf"] if args.weekly else args.cases.split(",")
-        print(json.dumps(smoke_pipeline(cases, weekly=args.weekly)))
+        environment = json.loads(args.environment_lock.read_text()) if args.environment_lock else None
+        print(json.dumps(smoke_pipeline(cases, weekly=args.weekly, environment=environment)))
     except ValueError as exc:
         parser.error(str(exc))

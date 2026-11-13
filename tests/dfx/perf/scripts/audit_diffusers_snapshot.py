@@ -11,6 +11,8 @@ import subprocess
 from importlib.metadata import version
 from pathlib import Path
 
+from tests.dfx.perf.scripts.experiment_metadata import comparison_environment
+
 
 def audit_snapshot(snapshot: Path, config_path: Path) -> dict:
     (config,) = json.loads(config_path.read_text())
@@ -48,6 +50,38 @@ def audit_snapshot(snapshot: Path, config_path: Path) -> dict:
     }
 
 
+def audit_runtime(runner_commit: str) -> dict:
+    environment = comparison_environment(runner_commit)
+    lock = environment.get("environment_lock")
+    versions = {name: version(name) for name in ("sglang", "diffusers")}
+    expected_versions = (
+        {name: lock["installed_packages"]["sglang"][name] for name in versions}
+        if lock
+        else {"sglang": "0.5.22", "diffusers": "0.37.0"}
+    )
+    if versions != expected_versions:
+        raise ValueError(f"Unexpected runtime versions: {versions}")
+    sources = {
+        "sglang": "multimodal_gen/runtime/pipelines/diffusers_pipeline.py",
+        "diffusers": "pipelines/hunyuan_video1_5/pipeline_hunyuan_video1_5.py",
+    }
+    source_files = []
+    for package, relative in sources.items():
+        spec = importlib.util.find_spec(package)
+        assert spec is not None and spec.origin is not None
+        source = Path(spec.origin).parent / relative
+        source_files.append(
+            {"package": package, "path": relative, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+        )
+    result = {"versions": versions, "source_files": source_files}
+    if lock:
+        expected_sources = {(item["package"], item["path"]): item["sha256"] for item in lock["runtime_source_files"]}
+        if any(expected_sources.get((item["package"], item["path"])) != item["sha256"] for item in source_files):
+            raise ValueError("Runtime source differs from the frozen comparison image")
+        result["environment_lock_sha256"] = environment["environment_lock_sha256"]
+    return result
+
+
 def main() -> None:
     from huggingface_hub import snapshot_download
 
@@ -61,21 +95,7 @@ def main() -> None:
         repo_id=server["model"], revision=server["serve_args"]["revision"], local_files_only=True
     )
     result = audit_snapshot(Path(snapshot), args.config)
-    result["versions"] = {name: version(name) for name in ("sglang", "diffusers")}
-    if result["versions"] != {"sglang": "0.5.22", "diffusers": "0.37.0"}:
-        raise ValueError(f"Unexpected runtime versions: {result['versions']}")
-    sources = {
-        "sglang": "multimodal_gen/runtime/pipelines/diffusers_pipeline.py",
-        "diffusers": "pipelines/hunyuan_video1_5/pipeline_hunyuan_video1_5.py",
-    }
-    result["source_files"] = []
-    for package, relative in sources.items():
-        spec = importlib.util.find_spec(package)
-        assert spec is not None and spec.origin is not None
-        source = Path(spec.origin).parent / relative
-        result["source_files"].append(
-            {"package": package, "path": relative, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
-        )
+    result.update(audit_runtime(result["runner_commit"]))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(f"Audited cached {server['model']} snapshot {result['revision']} with {len(result['configs'])} config files")

@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from importlib.metadata import version
 from pathlib import Path
 
+from tests.dfx.perf.scripts.experiment_metadata import comparison_environment
+
 ROOT = Path(__file__).resolve().parents[4]
 PROMPT = "A red ceramic teapot sits on a wooden table beside a sunlit window."
 
@@ -178,8 +180,15 @@ def main() -> None:
         "runner_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
     }
     try:
+        record.update(comparison_environment(record["runner_commit"]))
         record["versions"] = {name: version(name) for name in ("sglang", "diffusers", "torch", "transformers")}
-        if record["versions"]["sglang"] != "0.5.22" or record["versions"]["diffusers"] != "0.37.0":
+        lock = record.get("environment_lock")
+        expected = (
+            {name: lock["installed_packages"]["sglang"][name] for name in record["versions"]}
+            if lock
+            else {"sglang": "0.5.22", "diffusers": "0.37.0"}
+        )
+        if any(record["versions"][name] != value for name, value in expected.items()):
             raise RuntimeError(f"Expected the pinned comparison environment, found {record['versions']}")
         import torch
 

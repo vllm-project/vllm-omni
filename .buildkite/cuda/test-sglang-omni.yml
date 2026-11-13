@@ -11,7 +11,14 @@ steps:
     commands:
       - 'test "$$(git rev-parse HEAD)" = "$${BACKEND_COMPARISON_COMMIT}"'
       - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
-      - "docker build --progress=plain --file docker/Dockerfile.other -t vllm-omni-ci-sglang ."
+      # Explicit historical inputs for manually selected diagnostics. Weekly
+      # builds replace this command with the snapshot resolver/image producer.
+      - >-
+        docker build --progress=plain --file docker/Dockerfile.other
+        --build-arg SGLANG_OMNI_COMMIT=137eaa97b7ba426b13aa8837d37c5ba4e0a0daba
+        --build-arg SGLANG_BASE_IMAGE=lmsysorg/sglang@sha256:5fc09edb6a0bb1d5b6992b543723c66d08f86d7a507e951e87e0d05db4ac766e
+        --build-arg UCX_COMMIT=d8e50df6651b9ea5b76f23aee0aefbf053a4137a
+        -t vllm-omni-ci-sglang .
       - "docker tag vllm-omni-ci-sglang public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:${BUILDKITE_COMMIT}-sglang-omni"
       - "docker push public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:${BUILDKITE_COMMIT}-sglang-omni"
     agents:

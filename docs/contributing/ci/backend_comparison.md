@@ -1,19 +1,19 @@
 # Scheduled backend comparison
 
 PR #1994 provides weekly comparisons for Qwen3-Omni, Qwen3-TTS,
-Qwen-Image-2.1, MiniCPM-o 4.5, Cosmos3 T2I, HunyuanVideo-1.5, MiniMax-H3 and Wan2.2 I2V on H100 GPUs. Audio jobs use
-a separate SGLang-Omni image; native SGLang diffusion jobs use a fixed image
-digest. Reuse the existing daily vLLM-Omni H100 artifacts for the other side
+Qwen-Image-2.1, MiniCPM-o 4.5, Cosmos3 T2I, HunyuanVideo-1.5, MiniMax-H3 and
+Wan2.2 I2V on H100 GPUs. Each weekly build resolves SGLang-Omni main once,
+uses its declared compatible SGLang dependency, and builds one immutable
+image for all eight models. Reuse the existing daily vLLM-Omni H100 artifacts for the other side
 of the comparison.
 
 ```mermaid
 flowchart LR
     S[Buildkite native schedule: weekly] --> P[Existing pipeline: comparison-only entry]
-    P --> I[Build SGLang comparison image]
-    I --> B[Qwen3-Omni, Qwen3-TTS, MiniCPM-o]
-    P --> D[Fixed image: Qwen-Image-2.1, Cosmos3, HunyuanVideo, MiniMax, Wan]
-    B --> A[JSON artifacts]
-    D --> A
+    P --> R[Freeze upstream main SHA and declared dependencies]
+    R --> I[Build and verify image; record immutable digest]
+    I --> B[Eight SGLang model benchmarks share this image]
+    B --> A[Metrics, environment lock and media audits]
     N[Existing daily vLLM-Omni H100 job] --> V[Existing JSON artifacts]
     A --> C[Consumer verifies source and workload]
     V --> C
@@ -51,7 +51,8 @@ fork's PR head. Do not use `ci/separate-image`, which belongs to the fork,
 or the webhook display name `congw729:ci/separate-image` as its branch.
 Buildkite resolves `HEAD` after checkout. The uploader embeds that immutable
 SHA in `BACKEND_COMPARISON_COMMIT`; both image and benchmark jobs verify their
-checkout against it before executing work. Image tags use the same SHA.
+checkout against it before executing work. Weekly image tags contain the
+Buildkite build ID, runner SHA and upstream SHA; benchmark jobs pull by digest.
 
 The weekly YAML contains `image-build-sglang-omni` and these benchmark jobs:
 
@@ -151,6 +152,9 @@ Buildkite. From the repository root:
 ```bash
 python -m pytest --noconftest -o addopts='' \
   tests/buildkite/test_backend_comparison_schedule.py \
+  tests/buildkite/test_weekly_comparison_environment.py \
+  tests/buildkite/test_diffusers_snapshot_audit.py \
+  tests/dfx/perf/tests/test_experiment_metadata.py \
   tests/buildkite/test_upload_pipeline.py -m 'core_model and cpu' -q
 ```
 
@@ -164,31 +168,40 @@ configured Talker sampling controls. `sgl_qwen3_omni.yaml` places Thinker on
 GPU 0 and Talker/Code2Wav on GPU 1, with first/steady/context codec windows
 4/25/25. Read those files for the full configuration and memory budgets.
 
-`docker/Dockerfile.other` pins SGLang-Omni to
-`137eaa97b7ba426b13aa8837d37c5ba4e0a0daba` (2026-11-03 main) and applies
-`docker/patches/sglang-omni-ignore-eos.patch`. A schedule repeats this fixed
-backend version. Updating its pin or patch requires a reviewed code change.
+The weekly image step runs `build_weekly_comparison.py`. It resolves
+SGLang-Omni main to a full SHA, stores it in build-scoped metadata, then reads
+`pyproject.toml` and `docker/Dockerfile` at that SHA. Retries reuse the same
+snapshot. The source lock records declared dependencies, UV overrides, the
+base-image digest, UCX commit and source-file hashes. The bottom-level SGLang
+version follows this declaration; it does not independently track SGLang main.
 
-Native SGLang diffusion jobs instead use SGLang 0.5.22 from the immutable
-image digest
-`sha256:125988c0f4ec5f9e9f0e19d94b92b7e3855dbf6aaf063c3025af4ca8c3b990b7`.
-Qwen-Image and Cosmos jobs do not depend on the audio image build. Selected
-video jobs apply their checked-in API compatibility patches to this image;
-HunyuanVideo-1.5 uses its explicitly configured Diffusers fallback and pinned
-snapshot. The common vLLM benchmark client measures the online requests.
+`docker/Dockerfile.other` receives these immutable inputs. It derives the
+FlashInfer pin and dependency overrides from the same checkout, preserves
+the SGLang-Omni Git installation record, and runs the compatibility patches'
+CPU semantic tests. A patch already covered by upstream must pass the same
+tests; a skipped or failed test stops the image build. Patches are applied
+once inside the image. HunyuanVideo keeps its configured Diffusers fallback
+and pinned model snapshot. No model weights or GPU inference are needed for
+the image's compatibility checks.
 
-The audio image builds the benchmark runner from the resolved comparison
-checkout with the vLLM 0.32.0 wheel pin. The SGLang-Omni server's separate
-environment uses SGLang 0.5.22, Torch 2.14.1
-and Transformers 5.19.0 as required by the pinned SGLang-Omni revision.
-Its image follows that revision's base-image digest, UCX commit and protobuf
-override, and preserves the matching FlashInfer 0.7.1 AOT packages. The image
-build runs CPU checks for ignore-EOS propagation and the two-GPU deployment
-configuration; it does not load model weights or run inference.
+After pushing the image, the producer records its digest, installed package
+inventories, upstream installation identity, patch status and runtime source
+hashes in `comparison-environment.json`. Only then are the eight GPU jobs
+uploaded. They download this artifact from the image job and use the same
+image digest. A failed update stops this build without silently substituting
+an older backend. Retries after a completed image reuse its environment lock.
 
-Using `HEAD` in the schedule follows the comparison branch. Refresh the
-runner baseline, backend pins and fixed image through reviewed changes when
-current-version measurements are needed.
+The common benchmark client stays in its separate environment, built from
+the comparison checkout with the vLLM 0.32.0 wheel pin. That client sends
+requests to SGLang and does not run a vLLM inference comparison. The vLLM
+comparison data continues to come from existing nightly artifacts.
+
+Manual diagnostic selections retain explicit historical inputs for replay
+(SGLang-Omni `137eaa97b`, SGLang `0.5.22`, or the previously validated native
+image digest). These fixed diagnostics do not control the weekly image.
+Using `HEAD` in the schedule follows PR #1994's runner; the weekly resolver
+independently refreshes SGLang-Omni main. Changes to workloads, compatibility
+patches or the runner baseline still require code review.
 
 For vLLM-Omni, select the existing
 `nightly-omni-performance-async-chunk` H100 job's **audio** result from
@@ -216,7 +229,9 @@ and filename pattern. SGLang runs add an `experiment_metadata` object:
 | `runner_files` | Runner source paths and SHA-256 hashes of their actual bytes |
 | `server_type` | `sglang-omni` or `sglang-diffusion` |
 | `server_revision` | SGLang-Omni VCS commit, or native SGLang distribution version; `null` when unavailable |
-| `image_digest` | Fixed image digest for `sglang-diffusion` runs |
+| `image_digest` | Immutable image digest for every weekly job; also present on historical native diffusion runs |
+| `environment_lock` | Weekly source/build identity, dependencies, installed packages, image reference, patch results and runtime source hashes |
+| `environment_lock_sha256` | SHA-256 of the exact environment artifact bytes from the image job |
 | `num_gpus`, `num_gpus_source` | Declared CUDA card count from `test_config.hardware_marks.num_cards`, or `null`; source records that origin |
 | `test_config` | Test JSON path and SHA-256 |
 | `server_config` | Selected deployment YAML path and SHA-256, or `null` |
@@ -230,6 +245,13 @@ which is separate from the vLLM benchmark client environment. A runner
 checkout's HEAD and the Buildkite commit are recorded separately. Patch
 fingerprints describe the recipe and do not independently prove that a local
 installation applied it.
+
+Weekly consumers also fetch `comparison-environment.json` from the same
+build's passed image job. Verify it against the embedded lock and hash,
+upstream declarations at the recorded SHA, actual server identity and
+reviewed patch/workload evidence. Preserve the lock artifact with each
+observation. A version update alone does not establish configuration
+equivalence; missing or changed workload evidence remains unverified.
 
 Video jobs also upload `validated_*_media.json` after benchmark timing.
 The audit decodes every saved MP4, including warmups, verifies count,

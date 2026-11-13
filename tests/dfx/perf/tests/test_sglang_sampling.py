@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU contract checks for the comparison image's patched SGLang environment."""
 
+import inspect
 from pathlib import Path
 
 import pytest
@@ -60,8 +61,11 @@ def test_chat_ignore_eos_reaches_thinker_sampler(ignore_eos: bool | None) -> Non
             "attention_mask": torch.ones(3),
         }
     )
+    # Newer upstream separates spoken/text request budgets; historical manual
+    # comparison images still expose the earlier request-builder signature.
+    speech_args = {"speaks": True} if "speaks" in inspect.signature(build_sglang_thinker_request).parameters else {}
     thinker = build_sglang_thinker_request(
-        state, params=params, tokenizer=None, vocab_size=256, capture_prompt_hidden_states=False
+        state, params=params, tokenizer=None, vocab_size=256, capture_prompt_hidden_states=False, **speech_args
     )
     assert thinker.req.sampling_params.ignore_eos is (ignore_eos is True)
     assert thinker.req.sampling_params.max_new_tokens == 100

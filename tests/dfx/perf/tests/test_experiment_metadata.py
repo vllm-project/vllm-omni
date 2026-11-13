@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU checks for comparison provenance, independent of server/GPU dependencies."""
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -68,6 +69,69 @@ def test_diffusers_provenance_records_applied_patches_and_audit(monkeypatch):
         "docker/patches/sglang-diffusers-revision.patch",
     ]
     assert "tests/dfx/perf/scripts/audit_diffusers_snapshot.py" in {item["path"] for item in runners}
+
+
+@pytest.fixture
+def weekly_environment(tmp_path, monkeypatch):
+    lock = {
+        "schema_version": 1,
+        "runner_commit": "a" * 40,
+        "build_id": "build-id",
+        "source_identity": {"pipeline_slug": "vllm-omni", "build_number": "20000"},
+        "image_digest": "sha256:" + "d" * 64,
+        "sglang_omni_revision": "c" * 40,
+        "installed_packages": {"sglang": {"sglang": "0.5.23"}},
+    }
+    path = tmp_path / "comparison-environment.json"
+    path.write_text(json.dumps(lock) + "\n")
+    monkeypatch.setenv("COMPARISON_ENVIRONMENT_LOCK", str(path))
+    for key, value in {
+        "BUILDKITE_BUILD_ID": "build-id",
+        "BUILDKITE_PIPELINE_SLUG": "vllm-omni",
+        "BUILDKITE_BUILD_NUMBER": "20000",
+        "COMPARISON_IMAGE_DIGEST": lock["image_digest"],
+        "COMPARISON_SGLANG_OMNI_REVISION": lock["sglang_omni_revision"],
+        "COMPARISON_SGLANG_REVISION": "0.5.23",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(experiment_metadata.subprocess, "check_output", lambda *args, **kwargs: "a" * 40 + "\n")
+    return path
+
+
+@pytest.mark.parametrize("server_type,revision", [("sglang-omni", "c" * 40), ("sglang-diffusion", "0.5.23")])
+def test_weekly_result_carries_exact_environment_artifact(weekly_environment, server_type, revision):
+    metadata = experiment_metadata.comparison_provenance(
+        test_config="tests/dfx/perf/tests/test_qwen3_omni_sglang.json",
+        server_config=None,
+        server_revision=revision,
+        server_type=server_type,
+    )
+    assert metadata["environment_lock"] == json.loads(weekly_environment.read_bytes())
+    assert metadata["environment_lock_sha256"] == hashlib.sha256(weekly_environment.read_bytes()).hexdigest()
+    assert metadata["image_digest"] == "sha256:" + "d" * 64
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("build_id", "other-build"), ("runner_commit", "b" * 40), ("image_digest", "sha256:" + "f" * 64)],
+)
+def test_weekly_rejects_environment_from_another_execution(weekly_environment, field, value):
+    lock = json.loads(weekly_environment.read_bytes())
+    lock[field] = value
+    weekly_environment.write_text(json.dumps(lock))
+    with pytest.raises(ValueError, match="does not belong"):
+        experiment_metadata.comparison_environment("a" * 40)
+
+
+@pytest.mark.parametrize("server_type,revision", [("sglang-omni", "e" * 40), ("sglang-diffusion", "0.5.22")])
+def test_weekly_rejects_server_different_from_environment_lock(weekly_environment, server_type, revision):
+    with pytest.raises(ValueError, match="Running server revision"):
+        experiment_metadata.comparison_provenance(
+            test_config="tests/dfx/perf/tests/test_qwen3_omni_sglang.json",
+            server_config=None,
+            server_revision=revision,
+            server_type=server_type,
+        )
 
 
 @pytest.mark.parametrize("direct_url", [{"vcs_info": {"commit_id": "c" * 40}}, {}])

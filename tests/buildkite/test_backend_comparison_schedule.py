@@ -64,24 +64,83 @@ def comparison_runner(tmp_path: Path):
         "BUILDKITE_COMMIT": COMMIT,
     }
 
-    def run(overrides: dict[str, str]):
+    def run(overrides: dict[str, str], environment: dict | None = None):
+        selected_command = command
+        if environment is not None:
+            lock = tmp_path / "environment.json"
+            lock.write_text(json.dumps(environment))
+            selected_command = (
+                "set -euo pipefail; python3 .buildkite/cuda/scripts/comparison_smoke_pipeline.py --weekly "
+                f"--environment-lock {lock} | buildkite-agent pipeline upload"
+            )
         result = subprocess.run(
-            ["/bin/bash", "-c", command], cwd=tmp_path, env={**env, **overrides}, capture_output=True, text=True
+            ["/bin/bash", "-c", selected_command],
+            cwd=tmp_path,
+            env={**env, **overrides},
+            capture_output=True,
+            text=True,
         )
         return result, calls.read_text().splitlines() if calls.exists() else []
 
     return run
 
 
-def test_schedule_uploads_only_validated_sglang_workloads(comparison_runner, tmp_path):
+def test_schedule_first_uploads_only_cpu_image_builder(comparison_runner, tmp_path):
     result, calls = comparison_runner({})
+    assert result.returncode == 0, result.stderr
+    assert calls == ["buildkite-agent pipeline upload"]
+    (job,) = json.loads((tmp_path / "calls.json").read_text())["steps"]
+    assert job["key"] == "image-build-sglang-omni"
+    assert job["agents"] == {"queue": "medium_cpu_queue_premerge"}
+    assert job["commands"][-1] == "python3 .buildkite/cuda/scripts/build_weekly_comparison.py"
+
+
+@pytest.mark.parametrize("toml_available", [False, True])
+def test_weekly_cpu_installs_tomli_only_when_no_toml_parser_exists(comparison_runner, tmp_path, toml_available):
+    result, _ = comparison_runner({})
+    assert result.returncode == 0, result.stderr
+    (job,) = json.loads((tmp_path / "calls.json").read_text())["steps"]
+    bootstrap = job["commands"][-2]
+    bindir = tmp_path / "bootstrap-bin"
+    bindir.mkdir()
+    stub = bindir / "python3"
+    stub.write_text(
+        '#!/bin/bash\nif [[ "$1" == "-c" ]]; then exit "$TEST_IMPORT_EXIT"; fi\n'
+        'printf "%s\\n" "$*" > "$TEST_PIP_CALL"\n'
+    )
+    stub.chmod(0o755)
+    pip_call = tmp_path / "pip-call"
+    result = subprocess.run(
+        ["/bin/bash", "-c", bootstrap],
+        env={
+            "PATH": f"{bindir}:/usr/bin:/bin",
+            "TEST_IMPORT_EXIT": "0" if toml_available else "1",
+            "TEST_PIP_CALL": str(pip_call),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert pip_call.exists() is not toml_available
+    if not toml_available:
+        assert pip_call.read_text().strip() == "-m pip install tomli==2.4.1"
+
+
+def test_built_weekly_image_uploads_only_validated_sglang_workloads(comparison_runner, tmp_path):
+    digest = "sha256:" + "c" * 64
+    environment = {
+        "image_reference": "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo@" + digest,
+        "image_digest": digest,
+        "sglang_omni_revision": "b" * 40,
+        "installed_packages": {"sglang": {"sglang": "0.5.23"}},
+    }
+    result, calls = comparison_runner({}, environment)
     assert result.returncode == 0, result.stderr
     assert calls == ["buildkite-agent pipeline upload"]
     pipeline = json.loads((tmp_path / "calls.json").read_text())
     assert pipeline["env"] == {"BACKEND_COMPARISON_COMMIT": "${BUILDKITE_COMMIT}"}
     jobs = {step["key"]: step for step in pipeline["steps"]}
     assert set(jobs) == {
-        "image-build-sglang-omni",
         "nightly-sglang-omni-qwen3-omni",
         "nightly-sglang-omni-qwen3-tts",
         "perf-sglang-qwen-image-21",
@@ -114,12 +173,16 @@ def test_schedule_uploads_only_validated_sglang_workloads(comparison_runner, tmp
             "perf-sglang-minimax-h3",
             "perf-sglang-wan22-i2v",
         }:
-            assert "depends_on" not in job
-            assert container["image"].endswith("@" + job["env"]["COMPARISON_IMAGE_DIGEST"])
+            assert '.server_revision == "0.5.23"' in job["command"]
+            assert "git -C /tmp apply" not in job["command"]
             prompts = 3 if key in {"perf-sglang-cosmos3-t2i", "perf-sglang-minimax-h3"} else 10
             assert f".completed == {prompts}" in job["command"]
-        else:
-            assert job["depends_on"] == "image-build-sglang-omni"
+        assert container["image"] == environment["image_reference"]
+        assert job["depends_on"] == "image-build-sglang-omni"
+        assert "commands" not in job
+        assert "artifact download" in job["command"]
+        assert job["env"]["COMPARISON_SGLANG_OMNI_REVISION"] == "b" * 40
+        assert job["env"]["COMPARISON_SGLANG_REVISION"] == "0.5.23"
     assert ".completed == 32" in jobs["perf-sglang-minicpm-o"]["command"]
 
 
@@ -169,6 +232,8 @@ def test_manual_smokes_require_explicit_models_and_api_source(
     assert calls == (["buildkite-agent pipeline upload"] if success else [])
     if success:
         jobs = json.loads((tmp_path / "calls.json").read_text())["steps"]
+        for job in jobs[1:]:
+            assert 'export PYTHONPATH="$$PWD$${PYTHONPATH:+:$$PYTHONPATH}"' in job["command"]
         assert [job["key"] for job in jobs] == [
             "image-build-sglang-omni",
             "smoke-sglang-qwen-image",

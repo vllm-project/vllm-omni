@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Reject drift in effective model configuration before comparison inference."""
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -61,3 +62,53 @@ def test_wrong_snapshot_is_rejected(cached_snapshot):
     cached_snapshot.rename(moved)
     with pytest.raises(ValueError, match="Unexpected resolved snapshot"):
         module.audit_snapshot(moved, CONFIG)
+
+
+@pytest.fixture
+def runtime_environment(tmp_path, monkeypatch):
+    source_files = []
+    for package, relative in (
+        ("sglang", "multimodal_gen/runtime/pipelines/diffusers_pipeline.py"),
+        ("diffusers", "pipelines/hunyuan_video1_5/pipeline_hunyuan_video1_5.py"),
+    ):
+        source = tmp_path / package / relative
+        source.parent.mkdir(parents=True)
+        source.write_text(f"# {package} runtime\n")
+        source_files.append(
+            {"package": package, "path": relative, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+        )
+    versions = {"sglang": "0.5.23", "diffusers": "0.37.0"}
+    environment = {
+        "environment_lock": {"installed_packages": {"sglang": versions.copy()}, "runtime_source_files": source_files},
+        "environment_lock_sha256": "f" * 64,
+    }
+    monkeypatch.setattr(module, "version", versions.__getitem__)
+    monkeypatch.setattr(module, "comparison_environment", lambda _: environment)
+    monkeypatch.setattr(
+        module.importlib.util,
+        "find_spec",
+        lambda name: importlib.util.spec_from_file_location(name, tmp_path / name / "__init__.py"),
+    )
+    return environment, versions, tmp_path
+
+
+def test_runtime_uses_this_weeks_environment(runtime_environment):
+    environment, versions, _ = runtime_environment
+    result = module.audit_runtime("a" * 40)
+    assert result["versions"] == versions
+    assert result["source_files"] == environment["environment_lock"]["runtime_source_files"]
+    assert result["environment_lock_sha256"] == environment["environment_lock_sha256"]
+
+
+def test_runtime_rejects_package_drift(runtime_environment):
+    _, versions, _ = runtime_environment
+    versions["sglang"] = "0.5.24"
+    with pytest.raises(ValueError, match="Unexpected runtime versions"):
+        module.audit_runtime("a" * 40)
+
+
+def test_runtime_rejects_source_modified_after_image_build(runtime_environment):
+    _, _, directory = runtime_environment
+    (directory / "sglang/multimodal_gen/runtime/pipelines/diffusers_pipeline.py").write_text("# changed\n")
+    with pytest.raises(ValueError, match="Runtime source differs"):
+        module.audit_runtime("a" * 40)

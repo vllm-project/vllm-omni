@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -54,6 +55,38 @@ def file_fingerprint(path: str | Path) -> dict[str, str]:
     }
 
 
+def comparison_environment(runner_commit: str) -> dict:
+    """Bind a weekly result to the image job's immutable environment artifact."""
+    lock_path = os.environ.get("COMPARISON_ENVIRONMENT_LOCK")
+    if not lock_path:
+        return {}
+    raw = Path(lock_path).read_bytes()
+    lock = json.loads(raw)
+    if lock.get("schema_version") != 1:
+        raise ValueError("Unsupported comparison environment lock")
+    expected = {
+        "runner_commit": runner_commit,
+        "build_id": os.environ["BUILDKITE_BUILD_ID"],
+        "image_digest": os.environ["COMPARISON_IMAGE_DIGEST"],
+        "sglang_omni_revision": os.environ["COMPARISON_SGLANG_OMNI_REVISION"],
+    }
+    if any(lock.get(key) != value for key, value in expected.items()):
+        raise ValueError("Comparison environment does not belong to this build/image")
+    identity = lock["source_identity"]
+    if (
+        identity["pipeline_slug"] != os.environ["BUILDKITE_PIPELINE_SLUG"]
+        or str(identity["build_number"]) != os.environ["BUILDKITE_BUILD_NUMBER"]
+    ):
+        raise ValueError("Comparison environment has a different Buildkite source")
+    if lock["installed_packages"]["sglang"]["sglang"] != os.environ["COMPARISON_SGLANG_REVISION"]:
+        raise ValueError("Comparison SGLang version differs from the environment lock")
+    return {
+        "environment_lock": lock,
+        "environment_lock_sha256": hashlib.sha256(raw).hexdigest(),
+        "image_digest": lock["image_digest"],
+    }
+
+
 def comparison_provenance(
     *, test_config: str, server_config: str | None, server_revision: str | None, server_type: str = "sglang-omni"
 ) -> dict[str, object]:
@@ -86,9 +119,20 @@ def comparison_provenance(
                     file_fingerprint("docker/patches/sglang-diffusers-revision.patch"),
                 ]
             )
+    runner_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=_REPO_ROOT, text=True).strip()
+    environment = comparison_environment(runner_commit)
+    if environment:
+        lock = environment["environment_lock"]
+        expected_revision = (
+            lock["sglang_omni_revision"]
+            if server_type == "sglang-omni"
+            else lock["installed_packages"]["sglang"]["sglang"]
+        )
+        if server_revision != expected_revision:
+            raise ValueError("Running server revision differs from the environment lock")
     return {
         "schema_version": 1,
-        "runner_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=_REPO_ROOT, text=True).strip(),
+        "runner_commit": runner_commit,
         "server_type": server_type,
         "server_revision": server_revision,
         "runner_files": [file_fingerprint(path) for path in runner_paths],
@@ -96,6 +140,7 @@ def comparison_provenance(
         "server_config": file_fingerprint(server_config) if server_config else None,
         "server_patches": server_patches,
         **({"image_digest": os.environ.get("COMPARISON_IMAGE_DIGEST")} if server_type == "sglang-diffusion" else {}),
+        **environment,
         "buildkite": {
             field: os.environ.get(f"BUILDKITE_{field.upper()}")
             for field in ("build_id", "job_id", "step_key", "pipeline_slug", "branch", "source", "commit")
