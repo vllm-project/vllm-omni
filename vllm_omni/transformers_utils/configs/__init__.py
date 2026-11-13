@@ -23,6 +23,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "FishSpeechSlowARConfig": "vllm_omni.transformers_utils.configs.fish_speech",
     "FishSpeechFastARConfig": "vllm_omni.transformers_utils.configs.fish_speech",
     "GLMTTSConfig": "vllm_omni.transformers_utils.configs.glm_tts",
+    "HaruConfig": "vllm_omni.transformers_utils.configs.haru",
     "VibeVoiceConfig": "vllm_omni.transformers_utils.configs.vibevoice",
     "VibeVoiceDiffusionHeadConfig": "vllm_omni.transformers_utils.configs.vibevoice",
     "VoxCPM2Config": "vllm_omni.transformers_utils.configs.voxcpm2",
@@ -60,6 +61,7 @@ __all__ = [
     "FishSpeechSlowARConfig",
     "FishSpeechFastARConfig",
     "GLMTTSConfig",
+    "HaruConfig",
     "VibeVoiceConfig",
     "VibeVoiceDiffusionHeadConfig",
     "VoxCPM2Config",
@@ -103,6 +105,7 @@ from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # no
 from vllm_omni.transformers_utils.configs import fish_omni as _fish_omni  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import glm_tts as _glm_tts  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import haru as _haru  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import higgs_audio_v3 as _higgs_audio_v3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import ming3_audio as _ming3_audio  # noqa: F401, E402
