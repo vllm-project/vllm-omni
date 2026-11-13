@@ -2376,9 +2376,9 @@ class DuplexSessionRunner:
         commit has its own prefixes, or when that retained payload is a VISION
         unit the model replays separately. Merging either of those into the
         terminal would reorder or collapse separate units. A single-terminal
-        model leaves a retained camera observation in place, so the newer
-        commit replaces it and a promotion queued for the old payload no
-        longer matches. A vision-only terminal still merges into retained
+        model coalesces retained camera frames into the newer terminal, so a
+        promotion queued for the old payload no longer matches. A vision-only
+        terminal still merges into retained
         speech, which keeps that speech's transcript owner and accumulates
         the frames. Returns False if the model state cannot hold prefixes;
         the caller then rolls the commit back.

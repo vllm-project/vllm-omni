@@ -173,6 +173,8 @@ def test_merging_two_appends_keeps_speech_if_either_half_was_speech(speech_first
     }
     first, second = (speech, silence) if speech_first else (silence, speech)
     merged = overlap_policy.merge_audio_payloads(first, second)
+    assert isinstance(first["audio"], str)
+    assert isinstance(second["audio"], str)
     assert base64.b64decode(merged["audio"]) == base64.b64decode(first["audio"]) + base64.b64decode(second["audio"])
     assert merged["sample_rate_hz"] == 16000
     assert merged["is_speech"] is True
@@ -211,6 +213,18 @@ def test_mergeable_payloads_are_concatenated_in_order() -> None:
     merged = overlap_policy.merge_audio_payloads(first, second)
     assert base64.b64decode(merged["audio"]) == head + tail
     assert merged["sample_rate_hz"] == 16000
+
+
+@pytest.mark.parametrize("with_speech", [False, True])
+def test_committed_camera_frames_survive_coalescing(with_speech: bool) -> None:
+    first = {"video_frames": ["frame-a"], "is_speech": False, "realtime_item_id": "old"}
+    second = {"video_frames": ["frame-b"], "is_speech": False, "realtime_item_id": "new"}
+    if with_speech:
+        second.update(format="pcm_f32le", sample_rate_hz=16000, audio="AAAAAA==", is_speech=True)
+    merged = overlap_policy.merge_audio_payloads(first, second)
+    assert merged == {**second, "video_frames": ["frame-a", "frame-b"]}
+    assert first["video_frames"] == ["frame-a"]
+    assert second["video_frames"] == ["frame-b"]
 
 
 # --------------------------------------------------------------------------- #

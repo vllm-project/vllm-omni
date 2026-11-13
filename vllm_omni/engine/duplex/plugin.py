@@ -144,8 +144,8 @@ class PcmAppendBuffer(ABC):
         """Whether an already-committed camera unit must stay ahead of the next commit.
 
         Streaming models replay each frame group as its own listen-only prefix.
-        A single-terminal model replaces that observation: replaying it as a
-        non-final prefix is not a legal append.
+        A single-terminal model combines its frames with the next terminal:
+        replaying it as a non-final prefix is not a legal append.
         """
         return False
 
