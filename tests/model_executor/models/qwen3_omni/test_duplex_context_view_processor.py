@@ -4,21 +4,15 @@
 """Exercise final session prompts with the supported, real Qwen processor.
 
 Only processor/tokenizer assets are needed; no model weights or forward pass
-are loaded. Populate the pinned checkpoint's HF cache before running, or set
-QWEN3_OMNI_PROCESSOR_PATH to its ``snapshots/<revision>`` directory. Missing
-optional cached assets skip; an explicit path must load successfully. All HF
-loads are local-only, and an explicit path must name the pinned revision.
-The ready pipeline's Model Executor CPU job prefetches these assets and sets
-QWEN3_OMNI_PROCESSOR_REQUIRED=1, making cache failures errors instead of skips.
+are loaded. The pinned revision is loaded through Hugging Face, which uses
+the local cache when that snapshot is present and downloads it otherwise.
 """
 
 from __future__ import annotations
 
 import io
 import json
-import os
 from itertools import groupby
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -52,33 +46,17 @@ def qwen_processor(record_testsuite_property) -> Qwen3OmniMoeProcessor:
     import transformers
     from transformers import AutoProcessor, Qwen3OmniMoeProcessor
 
-    override = os.environ.get("QWEN3_OMNI_PROCESSOR_PATH")
-    source = PROCESSOR_MODEL
-    if override is not None:
-        checkpoint = Path(override).expanduser().resolve()
-        if not checkpoint.is_dir() or checkpoint.name != PROCESSOR_REVISION:
-            pytest.fail("QWEN3_OMNI_PROCESSOR_PATH must be the pinned snapshots/" + PROCESSOR_REVISION)
-        source = str(checkpoint)
-    try:
-        processor = AutoProcessor.from_pretrained(
-            source,
-            revision=PROCESSOR_REVISION,
-            local_files_only=True,
-            trust_remote_code=False,
-        )
-    except OSError:
-        if override is not None or os.environ.get("QWEN3_OMNI_PROCESSOR_REQUIRED") == "1":
-            raise
-        pytest.skip(
-            f"Optional processor assets for {PROCESSOR_MODEL}@{PROCESSOR_REVISION} are not cached; "
-            "set QWEN3_OMNI_PROCESSOR_PATH to the pinned snapshot to require this integration test"
-        )
+    processor = AutoProcessor.from_pretrained(
+        PROCESSOR_MODEL,
+        revision=PROCESSOR_REVISION,
+        trust_remote_code=False,
+    )
     assert isinstance(processor, Qwen3OmniMoeProcessor)
     assert processor.audio_token == "<|audio_pad|>"
     assert processor.image_token == "<|image_pad|>"
     record_testsuite_property("qwen3_omni_processor_model", PROCESSOR_MODEL)
     record_testsuite_property("qwen3_omni_processor_revision", PROCESSOR_REVISION)
-    record_testsuite_property("qwen3_omni_processor_source", source)
+    record_testsuite_property("qwen3_omni_processor_source", PROCESSOR_MODEL)
     record_testsuite_property("qwen3_omni_transformers_version", transformers.__version__)
     return processor
 
