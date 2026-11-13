@@ -1,0 +1,61 @@
+# MiniCPM-o 4.5 Thinker-only full-duplex deploy on one GPU.
+#
+# Only Stage 0 runs and replies are text. Stage 0 settings mirror
+# minicpmo_4_5.yaml, which this file does not inherit (its connectors and
+# Stage 1/2 overrides do not apply).
+pipeline: minicpmo_4_5_thinker_only
+# V1 first; MRv2 needs its own validation and stays a separate overlay.
+model_runner: v1
+async_chunk: false
+session_mode: duplex
+duplex_session:
+  # Matches Stage 0 max_num_seqs below.
+  max_sessions: 16
+
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.85
+    enforce_eager: false
+    # The duplex KV window (duplex/window_kv.py) refuses the prefix cache.
+    enable_prefix_caching: false
+    tensor_parallel_size: 1
+    max_num_batched_tokens: 16384
+    devices: "0"
+    interleave_mm_strings: true
+    media_io_kwargs:
+      video:
+        fps: 1
+        num_frames: 128
+    limit_mm_per_prompt:
+      image: 64
+      audio: 64
+      video: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        # Same CUDA Thinker kernels and attention backend as minicpmo_4_5.yaml.
+        kernel_config:
+          ir_op_priority:
+            rms_norm: [vllm_c, native]
+            fused_add_rms_norm: [vllm_c, native]
+        compilation_config:
+          custom_ops: [none, +silu_and_mul, +rotary_embedding]
+          pass_config:
+            fuse_norm_quant: false
+            fuse_act_quant: false
+            enable_qk_norm_rope_fusion: true
+        attention_backend: TRITON_ATTN

@@ -31,6 +31,8 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import (
     _CODEC_EOS_TOKEN_ID,
+    MINICPMO_4_5_PIPELINE,
+    MINICPMO_4_5_THINKER_ONLY_PIPELINE,
 )
 from vllm_omni.model_executor.models.registry import _OMNI_MODELS
 from vllm_omni.platforms import current_omni_platform
@@ -158,8 +160,8 @@ class TestDeployTopology:
         deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / filename), platform=platform)
         stages = {stage.stage_id: stage for stage in deploy.stages}
         assert stages[0].attention_backend == ("TRITON_ATTN" if platform == "cuda" else None)
-        assert stages[1].attention_backend is None
-        assert stages[2].attention_backend is None
+        # The Thinker-only profile has no downstream stages to check.
+        assert all(stage.attention_backend is None for stage_id, stage in stages.items() if stage_id != 0)
 
     @pytest.mark.parametrize(("filename", "devices"), _DEPLOY_LAYOUTS.items())
     def test_deploy_resolves_three_stage_pipeline(self, filename: str, devices: list[str]) -> None:
@@ -280,6 +282,47 @@ class TestDeployTopology:
 
         assert stages[1].yaml_engine_args["async_chunk"] is False
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(".tts2code2wav_full_payload")
+
+
+_THINKER_ONLY_KEY = "minicpmo_4_5_thinker_only"
+_THINKER_ONLY_DEPLOY = "minicpmo_4_5_duplex_thinker_only.yaml"
+
+
+def _merge_on_cuda(filename: str, monkeypatch: pytest.MonkeyPatch):
+    # Resolve the CUDA overlay independently of the host.
+    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+    deploy = load_deploy_config(_DEPLOY_DIR / filename)
+    return deploy, merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
+
+
+class TestThinkerOnlyPipeline:
+    def test_registers_a_single_text_stage(self) -> None:
+        pipeline = OMNI_PIPELINES[_THINKER_ONLY_KEY]
+        assert pipeline is MINICPMO_4_5_THINKER_ONLY_PIPELINE
+        assert pipeline.model_type == _THINKER_ONLY_KEY
+        assert len(pipeline.stages) == 1
+        assert pipeline.model_arch == MINICPMO_4_5_PIPELINE.model_arch
+        assert pipeline.duplex_plugin == MINICPMO_4_5_PIPELINE.duplex_plugin
+        # A single final text stage is what makes the deployment text-only.
+        assert pipeline.stages[0].final_output is True
+        assert pipeline.stages[0].final_output_type == "text"
+
+    def test_deploy_resolves_only_stage_0(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        deploy, stages = _merge_on_cuda(_THINKER_ONLY_DEPLOY, monkeypatch)
+
+        assert deploy.pipeline == _THINKER_ONLY_KEY
+        assert deploy.session_mode == "duplex"
+        assert deploy.async_chunk is False
+        assert deploy.connectors is None
+        assert [stage.stage_id for stage in stages] == [0]
+        thinker = stages[0]
+        assert thinker.final_output_type == "text"
+        assert thinker.yaml_runtime["devices"] == "0"
+        assert "input_connectors" not in thinker.yaml_extras
+        assert "output_connectors" not in thinker.yaml_extras
+        assert not thinker.yaml_engine_args.get("custom_process_next_stage_input_func")
+        assert thinker.yaml_engine_args["use_v2_model_runner"] is False
+        assert deploy.duplex_session.max_sessions == thinker.yaml_engine_args["max_num_seqs"]
 
 
 def test_code2wav_model_is_lazily_registered() -> None:

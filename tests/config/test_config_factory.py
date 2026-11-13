@@ -1779,6 +1779,30 @@ stages:
         assert thinker.yaml_engine_args["async_chunk"] is False
         assert thinker.yaml_extras["default_sampling_params"]["detokenize"] is True
 
+    @pytest.mark.parametrize(
+        ("deploy_name", "expected_pipeline", "expected_stage_ids"),
+        [
+            (None, "minicpmo_4_5", [0, 1, 2]),
+            ("minicpmo_4_5_duplex_thinker_only.yaml", "minicpmo_4_5_thinker_only", [0]),
+        ],
+        ids=["auto_detect", "thinker_only_deploy"],
+    )
+    def test_minicpmo_thinker_only_is_selected_only_by_deploy_config(
+        self, deploy_name, expected_pipeline, expected_stage_ids
+    ):
+        hf_config = PretrainedConfig(model_type="minicpmo", architectures=["MiniCPMO"], version="4.5")
+        deploy_path = str(Path(get_deploy_config_path(deploy_name))) if deploy_name else None
+        with patch("vllm_omni.config.config_factory.get_config", return_value=hf_config):
+            pipeline = StageConfigFactory.get_pipeline_config(
+                "openbmb/MiniCPM-o-4_5",
+                trust_remote_code=True,
+                deploy_config_path=deploy_path,
+            )
+
+        assert pipeline is not None
+        assert pipeline.model_type == expected_pipeline
+        assert [stage.stage_id for stage in pipeline.stages] == expected_stage_ids
+
     def test_load_voxtral_tts_deploy_config_schema_fields(self):
         deploy_path = Path(get_deploy_config_path("voxtral_tts.yaml"))
         deploy = load_deploy_config(deploy_path)

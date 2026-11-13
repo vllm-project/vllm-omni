@@ -8,6 +8,9 @@ Stage 2: Code2Wav — codec tokens to the final audio waveform.
 
 The thinker -> talker bridge uses ``llm2tts``. The talker -> Code2Wav bridge
 streams request-routed codec chunks.
+
+``minicpmo_4_5_thinker_only`` keeps only Stage 0. A deploy config selects it
+through its ``pipeline`` key; checkpoint auto-detection keeps the full pipeline.
 """
 
 from vllm_omni.config.stage_config import (
@@ -112,6 +115,32 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             async_chunk_prewarm_payload_func=f"{_PROC}.code2wav_prewarm_payload",
             sampling_constraints={"detokenize": True},
             requires_full_payload_input=True,
+        ),
+    ),
+)
+
+MINICPMO_4_5_THINKER_ONLY_PIPELINE = PipelineConfig(
+    model_type="minicpmo_4_5_thinker_only",
+    default_deploy_config_name="minicpmo_4_5_duplex_thinker_only.yaml",
+    model_arch="MiniCPMO45OmniForConditionalGeneration",
+    duplex_plugin="vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin.MiniCPMO45DuplexPlugin",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="llm",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            engine_output_type="latent",
+            supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
+            sampling_constraints={
+                "detokenize": True,
+                "stop_token_ids": [151704, 151645],
+            },
         ),
     ),
 )
