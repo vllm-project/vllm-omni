@@ -17,8 +17,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize(
     "profile,capacities,kv_gib",
     [
-        ("minicpmo_4_5_turn.yaml", [16, 16, 16], 4),
-        ("minicpmo_4_5_turn_mrv2.yaml", [16, 8, 8], 2),
+        ("minicpmo_4_5_turn.yaml", [16, 8, 8], 2),
         ("minicpmo_4_5_turn_mrv2_h200.yaml", [16, 16, 8], 4),
     ],
 )

@@ -27,7 +27,7 @@ prompt state. The previous experimental block compilation, tiled attention,
 channels-last and merged-CFM implementations are removed.
 
 `minicpmo_4_5_turn_mrv2_h200.yaml` selects Talker capacity 16 and 4 GiB KV;
-the generic MRv2 profile selects capacity 8 and 2 GiB KV. These configurations
+the standard turn profile selects capacity 8 and 2 GiB KV. These configurations
 require new end-to-end performance measurements after the mainline integration.
 Previously reported numbers do not describe this revised codec backend.
 
@@ -62,7 +62,7 @@ on the target workload, or disable stage-0 prefix caching in the CUDA overlay.
 
 ## Runner and codec behavior
 
-The generic MRv2 profile and the opt-in native V1 duplex H200 profile enable
+The CUDA turn profile and the opt-in duplex H200 profile enable
 ordinary TF32 for CFM DiT GEMMs within Code2Wav forward/capture only
 (`torch.backends.cuda.matmul.allow_tf32` on dense QKV/MLP, Triton
 `input_precision="tf32"` on tiled attention). This is not compensated TF32x3.
@@ -146,7 +146,7 @@ accepted tokens reach `llm2tts`, so the Talker still receives one Thinker row
 per committed token. Example overlay:
 
 ```yaml
-base_config: minicpmo_4_5_turn_mrv2.yaml
+base_config: minicpmo_4_5_turn.yaml
 stages:
   - stage_id: 0
     speculative_config:
@@ -191,7 +191,7 @@ block selects the draft method. Set the DSpark config there and clear the
 inherited K-step control stop ID. The pipeline supplies the codec EOS.
 
 ```yaml
-base_config: minicpmo_4_5_turn_mrv2.yaml
+base_config: minicpmo_4_5_turn.yaml
 platforms:
   cuda:
     stages:
@@ -224,7 +224,7 @@ Use `minicpmo_4_5_turn.yaml` for CUDA turn serving. It inherits FlashAttention,
 synchronous scheduling, seven continuation drafts and the control stop ID from
 `minicpmo_4_5.yaml`. The MRv2 Talker uses one FlashAttention query per codec
 frame, advances the position and KV slot, and re-embeds the confirmed codec.
-`minicpmo_4_5_turn_mrv2.yaml` adds shared-GPU capacity and Code2Wav tuning.
+The turn profile sets the shared-GPU capacity and Code2Wav tuning.
 For a single-frame control, override CUDA stage 1 with
 `speculative_config: null` and `default_sampling_params.stop_token_ids: []`.
 

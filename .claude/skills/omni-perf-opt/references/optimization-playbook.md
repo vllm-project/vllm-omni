@@ -100,8 +100,8 @@ Validate smoothness with `audio_continuity_ok_rate`, not mean RTF.
 
 Knob: `model_runner: v2` (top-level or per stage). Ready-made overlays:
 `qwen3_omni_moe_mrv2.yaml`, `qwen3_omni_moe_mrv2_h200.yaml`,
-`minicpmo_4_5_turn_mrv2.yaml` (+ `_h200`). MiniCPM-o duplex runs llm and code2wav on MRv2
-on CUDA through the default `minicpmo_4_5.yaml`; tts keeps v1 for multi-frame decode.
+and `minicpmo_4_5_turn_mrv2_h200.yaml`. On CUDA, MiniCPM-o uses MRv2 for all
+three stages in the default duplex profile and in `minicpmo_4_5_turn.yaml`.
 
 - CUDA only; overlays fall back to V1 on NPU, XPU, ROCm, and MUSA.
 - Gains come from keeping sampler and EOS state on device (no per-step D2H

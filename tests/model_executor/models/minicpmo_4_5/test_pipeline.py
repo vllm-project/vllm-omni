@@ -164,7 +164,7 @@ class TestDeployTopology:
             "minicpmo_4_5_4gpu_stage1_replicas.yaml",
             "minicpmo_4_5_stage2_replicas.yaml",
             "minicpmo_4_5_turn.yaml",
-            "minicpmo_4_5_turn_mrv2.yaml",
+            "minicpmo_4_5_duplex_h200.yaml",
             "minicpmo_4_5_turn_mrv2_h200.yaml",
         }
         talker_backend = "FLASH_ATTN" if platform == "cuda" and filename in cuda_flash_talker_profiles else None
