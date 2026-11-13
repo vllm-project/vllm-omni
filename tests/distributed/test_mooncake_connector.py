@@ -10,12 +10,14 @@ from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 import transformers.configuration_utils
 from transformers import Qwen3OmniMoeConfig
 from vllm import SamplingParams
 from vllm.config import CacheConfig, DeviceConfig, KVTransferConfig, SchedulerConfig, VllmConfig
+from vllm.config.multimodal import MultiModalConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
@@ -30,12 +32,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     ReqMeta,
     TailKeyBoundary,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import MooncakeStoreConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import MooncakeStoreScheduler
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
     KVCacheStoreSendingThread,
     LookupKeyClient,
     MooncakeStoreWorker,
 )
+from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
+from vllm.renderers.base import BaseRenderer
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import CrossAttentionSpec, FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
@@ -103,6 +108,19 @@ class TokenDatabase:
 class WorkerSeam:
     store: MemoryStore
     token_dbs: list[TokenDatabase] = field(default_factory=lambda: [TokenDatabase()])
+    kv_connector_stats: MooncakeStoreConnectorStats = field(default_factory=MooncakeStoreConnectorStats)
+
+    def _record_kv_connector_operation(self, operation, duration_seconds, num_keys, **fields):
+        # The pinned stats class checks the adapter's argument names.
+        self.kv_connector_stats.record_operation(operation, duration_seconds, num_keys, **fields)
+
+
+def recorded(owner, operation):
+    """One operation's telemetry records, without their wall-clock durations."""
+    return [
+        (record["num_keys"], record["num_bytes"], record["status"], record["num_failed_keys"])
+        for record in owner.kv_connector_stats.data.get(operation, [])
+    ]
 
 
 @dataclass
@@ -141,6 +159,7 @@ class ModelConfigSeam:
     hf_text_config: object | None = None
     dtype: torch.dtype = torch.bfloat16
     quantization: str | None = None
+    multimodal_config: MultiModalConfig = field(default_factory=MultiModalConfig)
 
 
 @dataclass
@@ -211,6 +230,7 @@ def connector(monkeypatch):
     connector._reserved_bytes = 0
     connector._scheduler_attempts = {}
     connector._lookup_started = {}
+    connector._lookup_stats = MooncakeStoreConnectorStats()
     connector._lookup_probe = None
     connector._bypass = set()
     connector._retired = set()
@@ -303,10 +323,17 @@ def capture_meta(attempt):
     )
 
 
-def test_lookup_stops_at_missing_hs_pair_and_clamps_native_boundary(monkeypatch):
+def joint_worker(max_hs_tokens):
     worker = JointStoreWorker.__new__(JointStoreWorker)
-    worker.hs_namespace, worker.block_size, worker.max_hs_tokens = "ns", 4, 20
+    worker.hs_namespace, worker.block_size, worker.max_hs_tokens = "ns", 4, max_hs_tokens
     worker.store = MemoryStore()
+    worker._kv_connector_stats_lock = threading.Lock()
+    worker.kv_connector_stats = MooncakeStoreConnectorStats()
+    return worker
+
+
+def test_lookup_stops_at_missing_hs_pair_and_clamps_native_boundary(monkeypatch):
+    worker = joint_worker(max_hs_tokens=20)
     hashes = [b"a", b"b", b"c"]
     for block_hash in hashes:
         worker.store.objects[hs_key("ns", block_hash)] = b"hs"
@@ -319,9 +346,7 @@ def test_lookup_stops_at_missing_hs_pair_and_clamps_native_boundary(monkeypatch)
 
 
 def test_lookup_caps_read_memory_at_complete_block(monkeypatch):
-    worker = JointStoreWorker.__new__(JointStoreWorker)
-    worker.hs_namespace, worker.block_size, worker.max_hs_tokens = "ns", 4, 7
-    worker.store = MemoryStore()
+    worker = joint_worker(max_hs_tokens=7)
     for block_hash in (b"a", b"b"):
         worker.store.objects[hs_key("ns", block_hash)] = b"hs"
         worker.store.objects[hs_key("ns", block_hash) + ":ready"] = b"ready"
@@ -330,9 +355,7 @@ def test_lookup_caps_read_memory_at_complete_block(monkeypatch):
 
 
 def test_lookup_rpc_hash_views_match_scheduler_byte_keys(monkeypatch):
-    worker = JointStoreWorker.__new__(JointStoreWorker)
-    worker.hs_namespace, worker.block_size, worker.max_hs_tokens = "ns", 4, 8
-    worker.store = MemoryStore()
+    worker = joint_worker(max_hs_tokens=8)
     for block_hash in (b"aaaa", b"bbbb"):
         worker.store.objects[hs_key("ns", block_hash)] = b"hs"
         worker.store.objects[hs_key("ns", block_hash) + ":ready"] = b"ready"
@@ -635,7 +658,8 @@ def test_slow_hs_write_preserves_kv_readiness_budget(connector, monkeypatch, kv_
         now += seconds
 
     monkeypatch.setattr(store, "put", slow_put)
-    monkeypatch.setattr(connector_module, "time", SimpleNamespace(monotonic=lambda: now, sleep=sleep))
+    clock = SimpleNamespace(monotonic=lambda: now, perf_counter=lambda: now, sleep=sleep)
+    monkeypatch.setattr(connector_module, "time", clock)
     monkeypatch.setattr(connector_module, "_KV_POLL_SECONDS", 1)
     saved = connector._save_hs(PendingSave(attempt, [(0, 4, captures(0, 4))], 0))
 
@@ -985,6 +1009,13 @@ def test_quantization_rejected_for_an_otherwise_identical_checkpoint(supported_c
         OmniMooncakeStoreConnector._validate_supported(config, kv_config)
 
 
+def test_duplex_sessions_pass_startup_guard(supported_config):
+    # Qwen3-Omni duplex commits each utterance as an ordinary Thinker request.
+    config, kv_config = supported_config
+    config.model_config.session_mode = "duplex"
+    OmniMooncakeStoreConnector._validate_supported(config, kv_config)
+
+
 @pytest.mark.parametrize(
     ("owner", "field", "value", "message"),
     [
@@ -995,7 +1026,7 @@ def test_quantization_rejected_for_an_otherwise_identical_checkpoint(supported_c
         ("parallel_config", "decode_context_parallel_size", 2, "single TP=1"),
         ("parallel_config", "prefill_context_parallel_size", 2, "single TP=1"),
         ("model_config", "model_stage", "talker", "Thinker only"),
-        ("model_config", "session_mode", "duplex", "duplex"),
+        ("model_config", "multimodal_config", MultiModalConfig(mm_processor_cache_gb=0), "content-hashed"),
         ("model_config", "engine_output_type", "text", "capture outputs"),
         ("cache_config", "enable_prefix_caching", True, "local prefix caching"),
         (None, "speculative_config", object(), "speculation"),
@@ -1428,3 +1459,143 @@ def test_rejected_connector_reset_fails_the_scheduler_reset(lookup_connector):
     # failure, which AsyncOmni and the HTTP endpoint report unchanged.
     assert scheduler.reset_prefix_cache() is True
     assert scheduler.reset_prefix_cache(reset_connector=True) is False
+
+
+@dataclass
+class RendererSeam:
+    """The renderer state that BaseRenderer._process_mm_uuids reads."""
+
+    model_config: ModelConfigSeam
+    config: ServingConfigSeam
+
+    def _validate_mm_uuids(self, *_args: object) -> None:
+        """These tests check only the generated names."""
+
+
+def media_names(*, mm_processor_cache_gb):
+    """Names the pinned renderer gives one audio clip that has no explicit UUID."""
+    model_config = ModelConfigSeam(multimodal_config=MultiModalConfig(mm_processor_cache_gb=mm_processor_cache_gb))
+    renderer = RendererSeam(model_config, ServingConfigSeam(KVTransferConfig(), model_config=model_config))
+    audio = [np.zeros(16000, dtype=np.float32)]
+    items = MultiModalDataItems({"audio": AudioProcessorItems(audio)})
+    return BaseRenderer._process_mm_uuids(renderer, {"audio": audio}, items, {}, "renderer0-mm-1").get("audio")
+
+
+def test_pinned_renderer_names_media_per_request_only_without_its_processor_cache():
+    # The premise of the startup guard. Unnamed media are hashed by content
+    # later, in the multimodal processor.
+    assert media_names(mm_processor_cache_gb=4) is None
+    # With local prefix caching off as well, the name is a process-local
+    # counter. A restarted server issues it again for different media, so a
+    # stored prefix must never be keyed by it.
+    assert media_names(mm_processor_cache_gb=0) == ["renderer0-mm-1-audio-0"]
+
+
+def test_lookup_reports_blocks_with_kv_and_those_without_hs(monkeypatch):
+    worker = joint_worker(max_hs_tokens=20)
+    hashes = [b"a", b"b", b"c"]
+    for block_hash in hashes[:2]:
+        worker.store.objects[hs_key("ns", block_hash)] = b"hs"
+        worker.store.objects[hs_key("ns", block_hash) + ":ready"] = b"ready"
+    native = [MooncakeLookupResult(12, (TailKeyBoundary(0, 12),)), MooncakeLookupResult(0), MooncakeLookupResult(12)]
+    monkeypatch.setattr(MooncakeStoreWorker, "lookup", lambda *_: native.pop(0))
+    assert worker.lookup(12, hashes).hit_length == 8
+    assert worker.lookup(12, hashes).hit_length == 0
+    worker.store.batch_is_exist = Mock(side_effect=RuntimeError("store unavailable"))
+    assert worker.lookup(12, hashes).hit_length == 0
+    # Three blocks had KV and one of them no HS; a miss; a failed HS query.
+    assert recorded(worker, "joint_lookup") == [(3, 0, "partial_failure", 1), (0, 0, "ok", 0), (3, 0, "error", 3)]
+
+
+@pytest.mark.parametrize("outcome", ["ok", "hs_error", "kv_error", "timeout", "rejected", "cancelled"])
+def test_load_outcome_is_reported_once_with_its_reason(connector, monkeypatch, outcome):
+    attempt = install_attempt(connector)
+    save_prefix(connector, attempt, 2)
+    if outcome == "hs_error":
+        del connector.connector_worker.store.objects[hs_key(connector.namespace, attempt.hashes[0])]
+    elif outcome == "rejected":
+        connector.settings = replace(connector.settings, max_hs_bytes=1)
+    pending = begin_read(connector, attempt)
+    if outcome == "timeout":
+        pending.deadline = time.monotonic() - 1
+    elif outcome == "kv_error":
+        monkeypatch.setattr(MooncakeStoreConnector, "get_block_ids_with_load_errors", lambda _self: {11})
+    elif outcome == "cancelled":
+        connector.bind_connector_metadata(
+            joint_metadata(
+                omni_retired={attempt.req_id},
+                omni_cancelled={attempt.req_id},
+                omni_finished={attempt.req_id},
+                omni_attempts={},
+                requests=[],
+            )
+        )
+    if pending.future is not None:
+        connector._read_executor.run()
+    connector.native_result = KVConnectorTransferResults(finished_recving={attempt.token})
+    connector.get_transfer_results(set())
+    # A later poll must not report the same attempt again.
+    connector.get_transfer_results(set())
+    assert not connector._reads
+    # Two blocks of four rows, 24 bytes per row. Only a completed load restores
+    # them, and only a failed load leaves them to be recomputed.
+    restored = 192 if outcome == "ok" else 0
+    recomputed = 0 if outcome in ("ok", "cancelled") else 2
+    assert recorded(connector.connector_worker, "joint_load") == [(2, restored, outcome, recomputed)]
+    # The read itself is reported separately: a load can fail after a good read.
+    reads = {"rejected": [], "hs_error": [(4, 0, "error", 4)], "cancelled": [(4, 0, "cancelled", 0)]}
+    assert recorded(connector.connector_worker, "hs_get") == reads.get(outcome, [(4, 192, "ok", 0)])
+
+
+def test_save_reports_writes_and_blocks_left_without_completion_records(connector):
+    attempt = install_attempt(connector)
+    connector.settings = replace(connector.settings, load_timeout_seconds=0.05)
+    worker = connector.connector_worker
+    # Only the first block's KV object ever appears.
+    worker.store.objects["kv:" + attempt.hashes[0].hex()] = b"kv"
+    connector._save_hs(PendingSave(attempt, [(0, 4, captures(0, 4)), (4, 8, captures(4, 8))], 0))
+    assert recorded(worker, "hs_put") == [(2, 192, "ok", 0)]
+    assert recorded(worker, "hs_commit") == [(2, 0, "partial_failure", 1)]
+    assert hs_key(connector.namespace, attempt.hashes[1]) + ":ready" not in worker.store.objects
+
+
+def test_failed_and_dropped_saves_are_reported(connector):
+    attempt = install_attempt(connector, prompt_len=13)
+    worker = connector.connector_worker
+    worker.store.fail_put.add(hs_key(connector.namespace, attempt.hashes[0]))
+    for start in (0, 4):
+        connector.capture_step(attempt.req_id, attempt.token, start, 13, captures(start, start + 4))
+    assert connector._save_executor.run(0).result() is False
+    # The failed save wrote nothing, so it has no completion records to wait
+    # for, and its queued successor never runs.
+    assert recorded(worker, "hs_put") == [(1, 0, "partial_failure", 1), (1, 0, "skipped", 1)]
+    assert recorded(worker, "hs_commit") == []
+    connector.get_transfer_results(set())
+    # A full save queue skips another request's blocks before they are queued.
+    other = install_attempt(connector, req_id="other", token="other")
+    connector.settings = replace(connector.settings, max_pending_transfers=1)
+    connector._saves[Future()] = PendingSave(attempt, [], 0)
+    connector.capture_step(other.req_id, other.token, 0, 9, captures(0, 4))
+    assert recorded(worker, "hs_put")[2:] == [(1, 0, "skipped", 1)]
+
+
+def test_scheduler_reports_how_long_requests_waited_for_lookup(lookup_connector):
+    connector, gate = lookup_connector
+    slow = Request("slow", list(range(32)), SamplingParams(max_tokens=1), None)
+    arriving = Request("arriving", list(range(32)), SamplingParams(max_tokens=1), None)
+    answered = Request("answered", list(range(32)), SamplingParams(max_tokens=1), None)
+    assert connector.get_num_new_matched_tokens(slow, 0) == (None, False)
+    assert connector.get_kv_connector_stats() is None
+    connector._lookup_started[slow.request_id] -= connector.settings.load_timeout_seconds
+    assert connector.get_num_new_matched_tokens(slow, 0) == (0, False)
+    # A request that arrives during the stall is a miss without a lookup.
+    assert connector.get_num_new_matched_tokens(arriving, 0) == (0, False)
+    gate.release.set()
+    connector._lookup_probe.result(timeout=5)
+    assert wait_for_lookup(connector, answered) == (0, False)
+    stats = connector.get_kv_connector_stats()
+    waits = stats.data["lookup_wait"]
+    assert [(wait["status"], wait["num_failed_keys"]) for wait in waits] == [("timeout", 1), ("skipped", 1), ("ok", 0)]
+    assert waits[0]["duration_seconds"] >= connector.settings.load_timeout_seconds
+    # Handing the records over leaves nothing to report twice.
+    assert connector.get_kv_connector_stats() is None

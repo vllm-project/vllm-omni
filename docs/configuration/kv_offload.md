@@ -6,8 +6,8 @@ recipe covers the second option: spilling KV (and hidden states) to a CPU
 cache so a request can resume without recomputing prefill.
 
 The established backend is **LMCache** via vLLM's `LMCacheConnectorV1`.
-An opt-in Mooncake KV/HS backend for Qwen3-Omni MRv2 turn serving is described
-below. Hidden states are
+An opt-in Mooncake KV/HS backend for Qwen3-Omni MRv2 turn and duplex serving
+is described below. Hidden states are
 stored alongside KV because downstream stages (talker, code2wav) read the
 full thinker HS sequence — restoring KV alone would leave a hole for the
 cached prefix.
@@ -121,10 +121,10 @@ It wraps vLLM's Mooncake Store **KV connector**. It is independent of Omni's
 similarly named inter-stage `MooncakeStoreConnector`, which transports stage
 outputs and does not add prefix reuse.
 
-This is the M1 implementation of [RFC #9908](https://github.com/vllm-project/vllm-omni/issues/9908).
-Duplex serving is unsupported.
-M1 is a Mooncake-only external cache: local Thinker prefix caching is disabled,
-so the two caches do not cooperate. The
+This implements milestone M1 (turn serving) of
+[RFC #9908](https://github.com/vllm-project/vllm-omni/issues/9908) and adds
+duplex sessions from milestone M2. It is a Mooncake-only external cache: local
+Thinker prefix caching is disabled, so the two caches do not cooperate. The
 [design document](../design/feature/mooncake_kv_hs_cache.md) describes the
 request lifecycle and the deferred two-level mode.
 
@@ -136,11 +136,13 @@ GPU transfers or the complete serving pipeline.
 
 ### Configuration
 
-Use an explicit Qwen3-Omni MRv2 turn deployment with CUDA and an unquantized
-Thinker at TP=1. Runtime quantization is rejected to prevent incompatible
-effective models from sharing cached KV and hidden states.
-Keep the deployment's normal async-chunk handoff and downstream stage settings.
-Set this on the Thinker stage:
+Use an explicit Qwen3-Omni MRv2 deployment with CUDA and an unquantized
+Thinker at TP=1: `qwen3_omni_moe_mrv2.yaml` for turn serving or
+`qwen3_omni_duplex_mrv2.yaml` for duplex sessions. The V1 duplex profile,
+`qwen3_omni_duplex.yaml`, is not supported. Runtime quantization is rejected
+to prevent incompatible effective models from sharing cached KV and hidden
+states. Keep the deployment's normal async-chunk handoff and downstream stage
+settings. Set this on the Thinker stage:
 
 ```yaml
 stages:
@@ -157,6 +159,12 @@ stages:
           max_pending_transfers: 16
           load_timeout_seconds: 30.0
 ```
+
+Keep the multimodal processor cache enabled (vLLM's default,
+`mm_processor_cache_gb: 4`); startup rejects `mm_processor_cache_gb: 0`. With
+that cache and local prefix caching both off, vLLM names audio and images by a
+per-process counter instead of their content. The names repeat after a
+restart, so stored prefixes could be matched to different media.
 
 `config_file` selects the upstream Mooncake Store JSON connection configuration.
 Use a reachable Mooncake master and install the Mooncake package matching the
@@ -199,6 +207,32 @@ reset removes every object in the Store, including other namespaces, and does
 not wait for HS writes. Entries written under earlier weights remain, so after
 changing weights, restart with a new namespace or `model_revision`.
 
+### Monitoring
+
+The connector adds its operations to the native Mooncake telemetry, exported
+as the `vllm:mooncake_store_operation_*` Prometheus families, labelled by
+`operation` and `status`. At this revision Omni servers export only the
+records of steps that also emit scheduler statistics, at most one step per
+second, so these counts are lower bounds (see the design document).
+
+- `joint_load`: one record per load attempt. `ok` restored its blocks (keys);
+  `hs_error`, `kv_error`, `timeout`, and `rejected` recomputed them (failed
+  keys). Restored tokens are keys times the block size.
+- `joint_lookup` and `lookup_wait`: lookups, the blocks found without usable
+  HS, and how long requests waited; a `timeout` or `skipped` wait was a miss
+  without the cache.
+- `hs_get`, `hs_put`, and `hs_commit`: HS reads, writes, and completion
+  records. `hs_put` with status `skipped` means the save queue or staging
+  budget was full, or an earlier save of the same request failed; `hs_commit`
+  failed keys are blocks left unpublished.
+- Native `load_get`, `save_put`, `lookup_exists`, and `save_exists` cover KV.
+
+vLLM's `vllm:external_prefix_cache_hits` counts lookup hits when requests are
+admitted, including loads that later fail, so it can exceed the restored
+tokens that `joint_load` reports. The
+[design document](../design/feature/mooncake_kv_hs_cache.md#telemetry) lists
+every field.
+
 ### Correctness contract
 
 - A lookup identifies a candidate prefix; it is not proof that loading worked.
@@ -220,8 +254,14 @@ and chunked-prefill cases, corrupted/missing objects, failure recovery, and
 request cleanup. Confirm the restored row positions and resulting Talker inputs
 as well as text/audio output; matching text alone cannot validate HS restoration.
 
-The opt-in full-pipeline acceptance test requires two H100-class GPUs and a
-running Store. It runs two cache-off baselines before the cached arm, records
+The opt-in full-pipeline acceptance tests require two H100-class GPUs and a
+running Store. `tests/engine/test_mooncake_duplex_consistency_qwen3.py` runs
+scripted duplex sessions, including a cancelled reply, an injected HS read
+failure, a history window shift, and changed audio, against a cache-off
+server; see the design document for its assertions.
+
+The turn test, `tests/engine/test_mooncake_turn_consistency_qwen3.py`, runs
+two cache-off baselines before the cached arm, records
 the actual restore count, and compares the prompt tensors before/after Talker
 conversion, generated token IDs, and audio. It uses a fresh cache namespace
 and includes chunked prefill, a complete hit, and a shared-prefix partial hit.

@@ -33,7 +33,8 @@ The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
 
 The experimental Mooncake KV/HS backend uses the existing MRv2 external-load
-state transitions for Qwen3-Omni turn requests. Its connector must withhold
+state transitions for Qwen3-Omni turn requests and duplex utterances, which
+are also ordinary requests. Its connector must withhold
 successful receive completion until both GPU KV and request-local CPU captures
 are ready. For a cancelled or failed load, it reports completion once the
 native KV copy drains, so a CPU-only HS read never holds destination GPU

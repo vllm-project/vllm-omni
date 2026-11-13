@@ -1,25 +1,44 @@
 # Mooncake KV and Hidden-State Cache
 
 This page is the implementation contract for the experimental Mooncake KV/HS
-backend, milestone M1 of
-[RFC #9908](https://github.com/vllm-project/vllm-omni/issues/9908).
+backend, milestones M1 (turn serving) and M2 (duplex sessions and evaluation)
+of [RFC #9908](https://github.com/vllm-project/vllm-omni/issues/9908).
 Configuration, supported deployments, and validation commands are in the
 [KV offload guide](../../configuration/kv_offload.md#mooncake-kv-and-hidden-state-caching-experimental).
 
 ## Scope
 
-M1 serves ordinary Qwen3-Omni turn requests on CUDA with Model Runner V2: an
-unquantized Thinker with tensor parallel size 1, one full-attention KV group,
-and equal KV and hash block sizes. The connector rejects other deployments at
-startup, including runtime quantization, whose effective model values are not
+The backend serves Qwen3-Omni turn requests and duplex sessions on CUDA with
+Model Runner V2: an unquantized Thinker with tensor parallel size 1, one
+full-attention KV group, equal KV and hash block sizes, and content-hashed
+multimodal inputs. The connector rejects other deployments at startup,
+including runtime quantization, whose effective model values are not
 represented by the checkpoint configuration alone.
 
-**Cache mode.** M1 is a Mooncake-only external cache. Selecting this backend
+**Duplex sessions.** Qwen3-Omni duplex commits each user utterance as a fresh
+Thinker request whose prompt is rebuilt from the selected conversation
+history (`Qwen3OmniDuplexPlugin.plan_append`). The connector therefore needs no
+duplex-specific state: a follow-up turn reuses the stored blocks of earlier
+prompts in the session, an interruption aborts the reply's request, and a
+history change that alters earlier tokens or media shortens the hit at the
+first changed block. Each committed audio item is re-encoded from the same
+PCM, so its content hash, and the block hashes that include it, repeat across
+turns.
+
+**Multimodal identity.** Block hashes include each media item's identifier.
+vLLM derives that identifier from the item's content unless both the
+multimodal processor cache (`mm_processor_cache_gb: 0`) and local prefix
+caching are disabled; it then uses a per-process request counter. This
+backend always disables local prefix caching, and a counter repeats after a
+restart while the Store keeps its objects, so a restarted server could reuse
+another request's audio or image prefix. The connector rejects
+`mm_processor_cache_gb: 0`.
+
+**Cache mode.** The backend is a Mooncake-only external cache. Selecting it
 rejects local Thinker prefix caching, so every reused prefix is restored from
 Mooncake. It is not a two-level cache; the
 [deferred two-level design](#deferred-two-level-cache-cooperation) records what
-that mode requires. Duplex sessions remain M2 work.
-Online connector reset is unsupported.
+that mode requires. Online connector reset is unsupported.
 
 In this page, **HS** means the two Thinker captures that Talker reads for
 prompt positions: the input embeddings and the hidden states of
@@ -140,6 +159,48 @@ written under earlier weights stay in the Store, so a weight change requires a
 new namespace or `model_revision`. Shutdown cancels attempts and pending saves
 and waits for the HS workers before closing the native Store handle.
 
+## Telemetry
+
+The connector adds its records to the native Mooncake per-operation
+telemetry (`MooncakeStoreConnectorStats`), which vLLM aggregates into
+`SchedulerStats.kv_connector_stats` and exports as the
+`vllm:mooncake_store_operation_*` Prometheus families, labelled by
+`operation` and `status`. Each record has a duration, a key count, bytes, and
+a failed-key count.
+
+| Operation | Role | One record per | Keys / failed keys | Statuses |
+| --- | --- | --- | --- | --- |
+| `lookup_wait` | Scheduler | Prefix lookup, as the request waited for it | 1 / 1 if not answered | `ok`, `timeout`, `skipped` (stall guard) |
+| `joint_lookup` | Worker rank 0 | Joint lookup | Blocks with KV / those without usable HS | `ok`, `partial_failure`, `error` |
+| `joint_load` | Worker | Load attempt, from submission to outcome | Blocks / blocks left to recompute | `ok`, `hs_error`, `kv_error`, `timeout`, `rejected`, `cancelled` |
+| `hs_get` | Worker | HS prefix read and validation | HS objects and records | `ok`, `error`, `cancelled` |
+| `hs_put` | Worker | Save job's HS object writes | Blocks / blocks not written | `ok`, `partial_failure`, `cancelled`, `skipped` |
+| `hs_commit` | Worker | Save job's completion records | Blocks / blocks never published | `ok`, `partial_failure`, `cancelled` |
+
+An `hs_put` record is `skipped` when a full save queue or staging budget turns
+blocks away, or when an earlier save of the same request attempt failed and
+its queued successors are dropped.
+
+Bytes count HS rows, not encoded objects. `joint_load` bytes are the restored
+rows only. Native records cover the KV side: `lookup_exists`, `load_get`,
+`save_exists`, and `save_put`. The `hs_commit` duration includes the wait for
+the blocks' native KV objects, so it measures how long new blocks take to
+become reusable.
+
+The restored token count of a load is its `joint_load` keys times the block
+size. vLLM's external prefix-cache counters
+(`vllm:external_prefix_cache_queries`, `vllm:external_prefix_cache_hits`) count
+lookup hits when the scheduler admits them, before the load succeeds or
+fails, so they overstate reuse when loads fail.
+
+**Known gap.** Omni schedulers emit `SchedulerStats` at most once per second
+(`OmniSchedulerMixin.make_stats`). A step that emits none discards the
+connector records passed to it, so `/metrics` undercounts every Mooncake
+operation: native and Omni, worker and scheduler role alike. In a
+three-request diagnostic run, all 26 records reached the scheduler and 4 were
+exported. Until records from skipped steps are carried into the next emission,
+treat these counts as lower bounds.
+
 ## Concurrency and resource limits
 
 | Resource | Bound |
@@ -249,8 +310,20 @@ reaching the scheduler's caller.
 
 Opt-in tests need a running Mooncake master and `MOONCAKE_CONFIG_PATH`:
 `tests/distributed/test_mooncake_hs_store.py` exercises the native Store with KV
-sentinels, and `tests/engine/test_mooncake_turn_consistency_qwen3.py` runs the
-cold, full-hit, and partial-hit pipeline on GPUs. The acceptance test compares
-embeddings, hidden states, packed Talker inputs, generated tokens, and audio
-against independent cache-off runs. Image and audio cases also check that
-changing media prevents reuse. Neither test runs in CI.
+sentinels, `tests/engine/test_mooncake_turn_consistency_qwen3.py` runs the
+cold, full-hit, and partial-hit pipeline on GPUs, and
+`tests/engine/test_mooncake_duplex_consistency_qwen3.py` runs scripted duplex
+sessions on GPUs. The turn acceptance test compares embeddings, hidden states,
+packed Talker inputs, generated tokens, and audio against independent cache-off
+runs. Image and audio cases also check that changing media prevents reuse.
+None of these tests runs in CI.
+
+The duplex test runs the same script on a cache-off server and a Mooncake
+server, with audio input and explicit commits: a cold turn, a follow-up that
+reuses the session prefix, a reply cancelled while it is generating, a turn
+whose HS read is made to fail after the native KV load starts, a turn whose
+history leaves the four-audio prompt window, and a second session whose audio
+differs only in content. It requires identical prompts, Talker inputs, reply
+text, and audio in both servers, and restored row counts equal to the longest
+stored block-aligned prefix: zero for the failed read, and ending before the
+first audio block for the changed media.
