@@ -1372,7 +1372,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         is_finished_fn = getattr(request, "is_finished", None)
         if callable(is_finished_fn):
             try:
-                if supports_is_finished is not False:
+                if supports_is_finished is not False and "is_finished" not in kwargs:
                     kwargs["is_finished"] = bool(is_finished_fn())
             except Exception:
                 logger.debug("request.is_finished() failed for %s", request_id, exc_info=True)

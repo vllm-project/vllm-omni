@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 
 _CLASS_TO_MODULE: dict[str, str] = {
+    "Zonos3Config": "vllm_omni.transformers_utils.configs.zonos3",
     "Audio8TTSConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "Audio8TTSSlowARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "Audio8TTSFastARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
@@ -46,6 +47,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
 }
 
 __all__ = [
+    "Zonos3Config",
     "Audio8TTSConfig",
     "AuKConfig",
     "Audio8TTSFastARConfig",
@@ -114,3 +116,4 @@ from vllm_omni.transformers_utils.configs import vibevoice as _vibevoice  # noqa
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxtral_tts as _voxtral_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import yue2 as _yue2  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import zonos3 as _zonos3  # noqa: F401, E402

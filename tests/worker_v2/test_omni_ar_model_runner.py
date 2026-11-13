@@ -632,6 +632,30 @@ def test_async_output_slices_request_payloads_with_graph_padding(
                 assert "hidden" not in payload
 
 
+@pytest.mark.cpu
+def test_async_output_preserves_request_scoped_codec_validity_mask(monkeypatch, mocker):
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = mocker.Mock(spec=InputBatch)
+    batch.query_start_loc_np = np.array([0, 1, 2])
+    batch.num_scheduled_tokens = np.array([1, 1])
+    batch.num_reqs = 2
+    batch.num_tokens_after_padding = 2
+    validity = torch.tensor([True, False])
+    output = _async_output(
+        req_ids=["a", "b"],
+        multimodal_outputs={
+            "codes": {"audio": torch.arange(20).reshape(2, 1, 10)},
+            "meta": {"codec_frame_valid": validity},
+        },
+        input_batch=batch,
+        async_chunk=True,
+    ).get_output()
+    assert [payload["meta.codec_frame_valid"].tolist() for payload in output.inter_stage_outputs] == [[True], [False]]
+    assert output.inter_stage_outputs[0]["codes.audio"].shape == (1, 1, 10)
+
+
 @pytest.mark.parametrize("async_chunk", [False, True])
 @pytest.mark.cpu
 def test_async_output_drops_rejected_draft_rows(monkeypatch, mocker, async_chunk):

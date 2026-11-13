@@ -52,6 +52,15 @@ rounded initial weighted value and the same FMA accumulation order. This
 preserves bitwise parity when the compiler inlines attention into sampling,
 including SM89 code generation affected by LLVM SLP reduction reordering.
 
+## Custom sampling-head warmup
+
+Custom head samplers may implement `OmniSampler.warmup(hidden_states)` and
+return `True` after exercising their own `sample_step` pipeline. The MRV2 AR
+runner then skips upstream's text-logits dummy sampling pass. The default
+returns `False` and preserves the existing upstream path. Zonos3 uses this
+hook because its ten-codebook head belongs in sampling rather than Backbone
+forward; its serving constraints remain separate from internal warmup inputs.
+
 ## Qwen3-Omni Talker sampling
 
 The MRv2 Talker adapter follows the selected vLLM sampler's dispatch contract,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Runner-side adapters for payload metadata that affects scheduling."""
 
 from __future__ import annotations
@@ -69,6 +69,21 @@ class DefaultSchedulingMetadataAdapter:
 
     @classmethod
     def _extract_prompt_token_ids(cls, payload: OmniPayload) -> tuple[int, ...] | None:
+        meta = payload.get("meta") if isinstance(payload, dict) else None
+        if isinstance(meta, dict) and "next_stage_prompt_ids" in meta:
+            declared = meta["next_stage_prompt_ids"]
+            if (
+                not isinstance(declared, list)
+                or not declared
+                or any(not isinstance(token, int) or isinstance(token, bool) or token < 0 for token in declared)
+            ):
+                raise ValueError("next_stage_prompt_ids must be a non-empty list of nonnegative integer token IDs")
+            length = meta.get("next_stage_prompt_len")
+            if length is not None and (
+                not isinstance(length, int) or isinstance(length, bool) or length != len(declared)
+            ):
+                raise ValueError("next_stage_prompt_len must match next_stage_prompt_ids")
+            return tuple(declared)
         codes = payload.get("codes") if isinstance(payload, dict) else None
         value = codes.get("audio") if isinstance(codes, dict) else None
         if value is None:

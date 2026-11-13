@@ -65,3 +65,21 @@ def test_adapter_preserves_stock_sampler_staged_write_fast_path():
     assert OmniSampler(object.__new__(Sampler)).omni_static_staged_writes
     assert not OmniSampler(SimpleNamespace()).omni_static_staged_writes
     assert OmniSampler(SimpleNamespace(omni_static_staged_writes=True)).omni_static_staged_writes
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_ar_runner_custom_warmup_preserves_default_sampler_path(monkeypatch, custom):
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    class HeadSampler(OmniSampler):
+        def warmup(self, hidden_states):
+            assert hidden_states.shape == (2, 8)
+            return True
+
+    runner = object.__new__(OmniARModelRunner)
+    runner.sampler = HeadSampler(Mock()) if custom else OmniSampler(Mock())
+    upstream = Mock()
+    monkeypatch.setattr(OmniGPUModelRunner, "_dummy_sampler_run", upstream)
+    runner._dummy_sampler_run(torch.zeros(2, 8))
+    assert upstream.call_count == (0 if custom else 1)
