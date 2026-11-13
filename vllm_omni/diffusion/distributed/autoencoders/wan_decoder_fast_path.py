@@ -14,11 +14,11 @@ touches a value that reaches the convolution, so it can go without changing a si
   own dtype, so the normalisation arithmetic and its fp32 promotion are untouched.
 - ``WanUpsample`` runs its nearest-exact gather on the activation dtype directly instead of via
   ``x.float()`` and ``type_as``: a gather moves values, so the result is identical.
-- The spatially sharded conv wrappers keep one input buffer per conv across calls
-  (``reuse_input_buffer``), writing only the activation interior and the halo slots into it.
+- Spatial convolution input assembly is provided by the shared wrappers. Conv2d
+  reuses its input buffer; Conv3d uses transient storage to bound retained memory.
 
 Numerics: bit-identical to the plain path (``tests/diffusion/distributed/test_wan_decoder_fast_path.py``).
-Memory: one persistent input buffer per sharded conv (about the size of that conv's input).
+Memory: one persistent input buffer per sharded Conv2d.
 
 Level ``"fused"`` adds the rest of what the ledger showed, at the cost of exactness (it is gated with the bf16
 decode option, whose quality gate it shares): the decoder runs channels_last_3d end to end so cuDNN uses its
@@ -182,8 +182,7 @@ def install_wan_decoder_fast_path(vae: Any, *, conv_dtype: torch.dtype | None, l
                 module.forward = MethodType(_upsample_forward, module)
                 module._vllm_omni_fast_path_upsample = True
                 counts["upsamples"] += 1
-            if isinstance(module, (WanDistCausalConv3d, WanDistConv2d)):
-                module.reuse_input_buffer = True
+            if isinstance(module, WanDistConv2d):
                 counts["persistent_input_buffers"] += 1
     if level == "fused":
         _install_fused(decoder, post_quant_conv if isinstance(post_quant_conv, nn.Module) else None, counts)
