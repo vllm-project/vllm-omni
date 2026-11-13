@@ -392,3 +392,56 @@ def test_runner_encodes_a_group_beyond_one_replay_in_one_eager_call(monkeypatch)
     for output, reference in zip(cached, model.encoder_eager_forward(images).split([2, 3])):
         torch.testing.assert_close(output, reference)
     assert manager.graph_hits == 0 and manager.graph_misses == 2
+
+
+def test_eager_vision_chunks_follow_frame_boundaries():
+    """A 60x22x40 video is 52800 patches; chunks stay on frame edges and cover it."""
+    grid = torch.tensor([[60, 22, 40]], dtype=torch.int32)
+    chunks = Qwen3Omni_VisionTransformer._eager_vision_chunks(grid, max_tokens=8192)
+    frame = 22 * 40
+    assert all(count % frame == 0 for _, count, _, _, _ in chunks)
+    assert sum(count for _, count, _, _, _ in chunks) == 60 * frame
+    assert all(count <= 8192 or frames == 1 for _, count, frames, _, _ in chunks)
+    assert chunks[0][0] == 0
+    assert [offset for offset, _, _, _, _ in chunks] == list(
+        torch.cumsum(torch.tensor([0, *[count for _, count, _, _, _ in chunks[:-1]]]), dim=0).tolist()
+    )
+
+
+class _FrameMixingBlock(nn.Module):
+    """Mixes rows only inside each ``cu_seqlens`` span, as frame attention does."""
+
+    def forward(self, x, *, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin, max_seqlen, sequence_lengths):
+        bounds = cu_seqlens.tolist()
+        mixed = torch.empty_like(x)
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            span = x[start:end]
+            mixed[start:end] = span + span.mean(dim=0, keepdim=True)
+        return mixed + rotary_pos_emb_cos[:, None, :] + rotary_pos_emb_sin[:, None, :]
+
+
+class _Rotary:
+    def get_cos_sin(self, size):
+        angles = torch.arange(int(size)).float()[:, None] * torch.tensor([1.0, 0.5])
+        return angles.cos(), angles.sin()
+
+
+def test_chunked_eager_video_matches_one_forward(monkeypatch):
+    """The real positional helpers repeat per frame, so time chunks reproduce one pass."""
+    model = _vision()
+    del model.fast_pos_embed_interpolate
+    del model.rot_pos_emb
+    torch.manual_seed(0)
+    model.num_grid_per_side = 4
+    model.pos_embed = nn.Embedding(16, 4)
+    model.rotary_pos_emb = _Rotary()
+    model.blocks = nn.ModuleList([_FrameMixingBlock(), _FrameMixingBlock()])
+    grid = torch.tensor([[5, 4, 4], [3, 4, 6]], dtype=torch.int32)
+    x = torch.randn(5 * 16 + 3 * 24, 4)
+    monkeypatch.setattr(thinker_module, "_MAX_EAGER_VISION_TOKENS", 48)
+
+    assert len(Qwen3Omni_VisionTransformer._eager_vision_chunks(grid, 48)) > len(grid)
+    with torch.no_grad():
+        chunked = model(x, grid)
+        whole = model.forward_with_encoder_metadata(x, model.prepare_encoder_metadata(grid))
+    torch.testing.assert_close(chunked, whole)

@@ -531,17 +531,17 @@ def test_history_snapshot_aligns_item_identity_across_late_playback_materializat
     session.append_history_message(second)
     session.register_history_item("q2", second)
     session.append_history_message({"role": "user", "content": "anonymous"})
-    messages, item_ids = session.history_snapshot()
-    assert messages == session.history
-    assert item_ids == ("q1", "q2", None)
+    snapshot = session.history_snapshot()
+    assert snapshot.messages == session.history
+    assert snapshot.item_ids == ("q1", "q2", None)
 
     apply_playback_ack(session, {"response_id": response_id, "played_ms": 1_000})
-    messages, item_ids = session.history_snapshot()
-    assert messages == session.history
-    assert item_ids == ("q1", item_id, "q2", None)
-    assert messages[1]["content"] == "played answer"
+    snapshot = session.history_snapshot()
+    assert snapshot.messages == session.history
+    assert snapshot.item_ids == ("q1", item_id, "q2", None)
+    assert snapshot.messages[1]["content"] == "played answer"
     assert session.delete_history_item(item_id)
-    assert session.history_snapshot()[1] == ("q1", "q2", None)
+    assert session.history_snapshot().item_ids == ("q1", "q2", None)
 
 
 @pytest.mark.parametrize("response_ended", [False, True])
