@@ -267,7 +267,38 @@ def test_p0_precomputed_adarms_matches_nonzero_live_projections(dtype):
                 torch.testing.assert_close(lhs, rhs, rtol=0, atol=0)
     assert model.runtime_step_table(num_steps=1, batch_size=1) is None
     assert model.runtime_step_table(num_steps=4, batch_size=1) is None
-    assert model.runtime_step_table(num_steps=10, batch_size=2) is None
+    assert model.runtime_step_table(num_steps=10, batch_size=0) is None
+    # A batch shares the rows, its timestep expanded to the batch.
+    batched = model.runtime_step_table(num_steps=10, batch_size=3)
+    assert batched is not None and len(batched) == 10
+    for row, alone in zip(batched, table):
+        assert row.timestep.shape == (3,) and torch.equal(row.timestep, alone.timestep.expand(3))
+        assert row.time_cond is alone.time_cond and row.modulations is alone.modulations
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_p0_precomputed_adarms_serves_a_batch(dtype):
+    """A batch of requests denoises on the one-request schedule rows: the eager
+    norms take the row's modulations for every request, and the chunks are
+    the ones the batch gets with the schedule computed live."""
+    import copy
+
+    model = _p0_runtime_model(dtype)
+    optimized = copy.deepcopy(model)
+    optimized.configure_runtime(Pi05RuntimeOptions(precompute_adarms=True))
+    optimized.prepare_runtime_caches()
+    generator = torch.Generator().manual_seed(0)
+    inputs = dict(
+        images=[torch.randn(3, 3, 8, 8, generator=generator) for _ in range(3)],
+        image_masks=[torch.tensor([True, False, True]), torch.tensor([False, True, True]), torch.tensor([True] * 3)],
+        lang_tokens=torch.tensor([[1, 2, 3, 4], [5, 6, 0, 0], [7, 0, 0, 0]]),
+        lang_masks=torch.tensor([[True] * 4, [True, True, False, False], [True, False, False, False]]),
+        noise=torch.randn(3, 4, 4, generator=generator),
+    )
+    expected = model.sample_actions(**inputs)
+    actual = optimized.sample_actions(**inputs)
+    assert actual.shape == (3, 4, 4)
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("mutation", ["inplace", "replace", "dtype"])

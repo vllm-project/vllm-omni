@@ -89,11 +89,13 @@ class Pi05DenoiseContext:
 
 @dataclass(frozen=True)
 class Pi05DenoiseStepData:
-    """Weight/schedule-derived data for one BS=1 denoising step.
+    """Weight/schedule-derived data for one denoising step.
 
     ``modulations`` is contiguous ``(2 * layers + 1, 1, 3 * expert_width)``
     in input-norm, post-attention-norm order, followed by the final norm.
     Unlike prefix KV, these tensors contain no observation-dependent data.
+    The requests of a batch share the step's timestep, so one row serves a
+    batch of any size: ``timestep`` is ``(batch,)``, the rest one request's.
     """
 
     timestep: torch.Tensor
@@ -426,8 +428,10 @@ def _compute_layer_suffix_only(
     """
     layer = gemma_expert.model.layers[layer_idx]
 
+    batch = hidden_states.shape[0]
     residual = hidden_states
-    modulation = None if adarms_modulations is None else adarms_modulations[2 * layer_idx]
+    # One request's modulations serve the batch: its requests share the timestep.
+    modulation = None if adarms_modulations is None else adarms_modulations[2 * layer_idx].expand(batch, -1)
     x, gate = layer.input_layernorm(hidden_states, adarms_cond, modulation=modulation)
     x = _match(x, layer.self_attn.q_proj)
 
@@ -457,7 +461,7 @@ def _compute_layer_suffix_only(
     hidden_states = _gated_residual(residual, layer.self_attn.o_proj(_match(att, layer.self_attn.o_proj)), gate)
 
     residual = hidden_states
-    modulation = None if adarms_modulations is None else adarms_modulations[2 * layer_idx + 1]
+    modulation = None if adarms_modulations is None else adarms_modulations[2 * layer_idx + 1].expand(batch, -1)
     x, gate = layer.post_attention_layernorm(hidden_states, adarms_cond, modulation=modulation)
     return _gated_residual(residual, layer.mlp(_match(x, layer.mlp.up_proj)), gate)
 
@@ -1706,7 +1710,9 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
                 rotary_emb=rotary_emb,
                 adarms_modulations=adarms_modulations,
             )
-        final_modulation = None if adarms_modulations is None else adarms_modulations[-1]
+        final_modulation = (
+            None if adarms_modulations is None else adarms_modulations[-1].expand(hidden_states.shape[0], -1)
+        )
         hidden_states, _ = expert_lm.norm(hidden_states, adarms_cond, modulation=final_modulation)
         return [None, hidden_states], None
 
@@ -1827,12 +1833,14 @@ class Pi05ForActionPrediction(nn.Module):
     @torch.inference_mode(False)
     @torch.no_grad()
     def prepare_runtime_caches(self) -> None:
-        """Build only the deployed BS=1 schedule from the final inference weights.
+        """Build only the deployed schedule from the final inference weights.
 
         Each step uses the original scalar timestep expression and each norm's
-        original dense operation. Batching steps/projections together could
-        select a different GEMM and change BF16 rounding. This bounded table
-        removes the time MLP and all AdaRMS dense calls from request execution.
+        original dense operation, for one request: the requests of a batch
+        share the timestep, and the fused step takes one request's modulations
+        as well. Batching steps/projections together could select a different
+        GEMM and change BF16 rounding. This bounded table removes the time MLP
+        and all AdaRMS dense calls from request execution.
         """
         if self.cuda_graphs is not None:
             raise RuntimeError("Prepare Pi0.5 runtime caches before CUDA Graph capture.")
@@ -1862,14 +1870,16 @@ class Pi05ForActionPrediction(nn.Module):
     def runtime_step_table(self, num_steps: int, batch_size: int) -> tuple[Pi05DenoiseStepData, ...] | None:
         """Select the initialized table, or preserve the ordinary path unchanged.
 
-        Alternate schedules and batches are intentionally not cached online.
-        A weight update invalidates the whole table, never a subset of norms.
+        A batch gets the same rows with the timestep expanded to its size (a
+        view: no device work). Alternate schedules are intentionally not cached
+        online. A weight update invalidates the whole table, never a subset of
+        norms.
         """
         rows = getattr(self, "_runtime_steps", None)
         if (
             rows is None
             or self.training
-            or batch_size != 1
+            or batch_size < 1
             or num_steps != self.num_inference_steps
             or not getattr(self, "runtime_options", Pi05RuntimeOptions()).precompute_adarms
         ):
@@ -1878,7 +1888,11 @@ class Pi05ForActionPrediction(nn.Module):
             self._runtime_steps = None
             self._runtime_signature = None
             return None
-        return rows
+        if batch_size == 1:
+            return rows
+        return tuple(
+            Pi05DenoiseStepData(row.timestep.expand(batch_size), row.time_cond, row.modulations) for row in rows
+        )
 
     def _apply(self, fn, recurse=True):
         if getattr(self, "cuda_graphs", None) is not None:

@@ -150,9 +150,10 @@ def _rotary_matches(src, static: tuple[torch.Tensor, torch.Tensor] | None) -> bo
 def _step_data_matches(src: Pi05DenoiseStepData | None, static: Pi05DenoiseStepData | None) -> bool:
     if static is None:
         return src is None
+    # The timestep is the batch's; the conditioning and modulations are one request's.
     return (
         isinstance(src, Pi05DenoiseStepData)
-        and _matches(src.timestep, static.timestep)
+        and _matches_rows(src.timestep, static.timestep)
         and _matches(src.time_cond, static.time_cond)
         and _matches(src.modulations, static.modulations)
     )
@@ -273,8 +274,9 @@ class Pi05CUDAGraphs:
         (a new one of the batch's size when None), captured into ``pool`` in
         replay order.
 
-        The AdaRMS schedule table serves batch 1 only; a formed batch embeds
-        its timestep inside its denoising graph.
+        With schedule precomputation on, the denoising graph of every size
+        loads the schedule's row for its step: the batch's requests share the
+        timestep.
         """
         model = self._model
         options = self._runtime_options
@@ -328,10 +330,10 @@ class Pi05CUDAGraphs:
         if options.hoist_denoise_invariants:
             context = model.prepare_denoise_context(prefix_pad_masks)
             denoise_kwargs["context"] = context
-        if options.precompute_adarms and batch == 1:
-            table = model.runtime_step_table(model.num_inference_steps, 1)
+        if options.precompute_adarms:
+            table = model.runtime_step_table(model.num_inference_steps, batch)
             if table is None:
-                raise ValueError("Prepare the default BS=1 AdaRMS schedule after loading weights, before capture.")
+                raise ValueError("Prepare the default AdaRMS schedule after loading weights, before capture.")
             row = table[0]
             # All rows use these same static addresses. A replay loads the
             # selected row in bulk; it never keeps using capture's row 0.
