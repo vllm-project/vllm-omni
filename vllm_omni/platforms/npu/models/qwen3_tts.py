@@ -93,7 +93,10 @@ def _patched_load_weights(self, weights):
 
     connector = getattr(self.vllm_config.model_config, "stage_connector_config", None)
     extra = connector.get("extra", connector) if isinstance(connector, dict) else {}
-    fused_snake = extra.get("npu_fused_snake", False)
+    additional = getattr(self.vllm_config, "additional_config", None)
+    if isinstance(additional, dict):
+        extra = {**additional, **extra}
+    fused_snake = extra.get("npu_fused_snake", True)
     if not isinstance(fused_snake, bool):
         raise ValueError("npu_fused_snake must be a boolean")
     for module in self.decoder.modules():
@@ -101,14 +104,15 @@ def _patched_load_weights(self, weights):
             module.precompute_embedding()
         elif isinstance(module, SnakeBeta):
             module.npu_fused = fused_snake and HAS_TRITON
-    incremental = extra.get("npu_incremental_codec", False)
+    incremental = extra.get("npu_incremental_codec", True)
     if not isinstance(incremental, bool):
         raise ValueError("npu_incremental_codec must be a boolean")
-    streams = extra.get("npu_codec_streams", 1)
+    streams = extra.get("npu_codec_streams", 2 if incremental and HAS_TRITON else 1)
     if type(streams) is not int or streams not in (1, 2):
         raise ValueError("npu_codec_streams must be 1 or 2")
     if streams == 2 and (not incremental or not HAS_TRITON):
-        raise ValueError("npu_codec_streams=2 requires npu_incremental_codec and Triton")
+        logger.warning("Using one codec stream: two streams require incremental codec and Triton")
+        streams = 1
     if incremental:
         # The conv-tail graphs replay work this path no longer performs.
         from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec
@@ -124,7 +128,11 @@ def _patched_load_weights(self, weights):
                 chunk_frames=chunk_frames,
                 streams=streams,
             )
-    shapes = [] if incremental else extra.get("npu_conv_graph_shapes", [])
+    shapes = (
+        []
+        if incremental
+        else extra.get("npu_conv_graph_shapes", [[batch, frames] for batch in (1, 2, 4) for frames in (1, 26, 37, 73)])
+    )
     if shapes:
         if not isinstance(shapes, list) or any(
             not isinstance(pair, (list, tuple))

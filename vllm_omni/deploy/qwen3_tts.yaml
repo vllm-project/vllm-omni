@@ -73,33 +73,8 @@ connectors:
       # decode_cudagraph_batch_sizes: [1, 2, 4]
       # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.
       decode_batch_max_size: 4
-      # NPU codec options are ignored on CUDA. The code_predictor_* options
-      # below are shared with the CUDA predictor.
-      # Opt-in kernels/graphs require workload-specific quality and performance checks.
-      npu_fused_snake: false
-      # Exact [batch, hidden_frames] pairs; empty disables capture.
-      # Example for a measured workload: [[1, 1], [1, 26], [1, 37], [1, 73]].
-      # Stage 1 enforce_eager=true skips these captures.
-      npu_conv_graph_shapes: []
-      # Eager incremental KV skips the predictor NPU graphs. Re-prefill
-      # replay is the fast path; the flag stays off.
-      code_predictor_kv_cache: false
-      code_predictor_fused_sampling: false
-      # One graph for all 15 residual codebooks. The NPU runner already
-      # captures the whole MTP call, and a concurrency-1 run stayed at
-      # RTF 0.45, so leave this off.
-      code_predictor_frame_graph: false
-      # Incremental decode reduces repeated codec work, but this alone does
-      # not establish an end-to-end gain. Leave this off: the earlier
-      # concurrency 1/16/32 experiments did not consistently beat baseline.
-      npu_incremental_codec: false
-      # Opt-in migrations from the independent Ascend engine. Qualify audio
-      # and service performance on the deployment before enabling them.
-      # Two streams require npu_incremental_codec=true and Triton Ascend;
-      # this doubles incremental codec graph storage, not the batch limit.
-      npu_codec_streams: 1
-      code_predictor_npu_native_gqa: false
-      code_predictor_npu_fused_swiglu: false
+      # Qwen3-TTS NPU optimizations are configured in platforms.npu below.
+      # Shared predictor options remain unset here so CUDA keeps its defaults.
 
 stages:
   - stage_id: 0
@@ -192,9 +167,37 @@ platforms:
         enforce_eager: false
         compilation_config:
           cudagraph_mode: PIECEWISE
+        additional_config:
+          code_predictor_fused_sampling: true
+          code_predictor_frame_graph: true
+          code_predictor_npu_native_gqa: true
+          code_predictor_npu_fused_swiglu: true
+          # NPU has no routed frame-local KV implementation; keep re-prefill.
+          code_predictor_kv_cache: false
       - stage_id: 1
         compilation_config:
           cudagraph_mode: PIECEWISE
+        additional_config:
+          npu_fused_snake: true
+          npu_incremental_codec: true
+          # Falls back to one stream without incremental decode or Triton.
+          npu_codec_streams: 2
+          # Incremental decode supersedes these stateless convolution graphs.
+          # These defaults apply when npu_incremental_codec is disabled;
+          # enforce_eager=true skips capture, [] disables it explicitly.
+          npu_conv_graph_shapes:
+            - [1, 1]
+            - [1, 26]
+            - [1, 37]
+            - [1, 73]
+            - [2, 1]
+            - [2, 26]
+            - [2, 37]
+            - [2, 73]
+            - [4, 1]
+            - [4, 26]
+            - [4, 37]
+            - [4, 73]
   xpu:
     model_runner: v1
     stages:

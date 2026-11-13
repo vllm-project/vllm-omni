@@ -12,6 +12,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.vllm import set_current_vllm_config
 from vllm.logger import init_logger
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
     CodePredictorBaseModel,
@@ -33,6 +34,21 @@ Qwen3TTSTalkerCodePredictorModelVLLM = CodePredictorBaseModel
 
 class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapper):
     """Qwen3-TTS code predictor (per-call sampling, projection)."""
+
+    @staticmethod
+    def _stage_connector_extra_config(vllm_config: VllmConfig) -> dict:
+        extra = CodePredictorWrapper._stage_connector_extra_config(vllm_config)
+        if not current_omni_platform.is_npu():
+            return extra
+        # Model-local NPU defaults: do not change Qwen3-Omni or CUDA defaults.
+        # Explicit connector/stage options, including false, remain authoritative.
+        return {
+            "code_predictor_fused_sampling": True,
+            "code_predictor_frame_graph": True,
+            "code_predictor_npu_native_gqa": True,
+            "code_predictor_npu_fused_swiglu": True,
+            **extra,
+        }
 
     def __init__(
         self,
@@ -284,6 +300,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         if (
             self._fused_sampling
             and current_omni_platform.is_npu()
+            and HAS_TRITON
             and logits.device.type == "npu"
             and uniforms is not None
             and uniforms.dtype == torch.float32

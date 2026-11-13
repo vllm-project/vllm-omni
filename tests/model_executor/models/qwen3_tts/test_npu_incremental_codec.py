@@ -205,7 +205,7 @@ def test_eager_loader_skips_requested_conv_capture(monkeypatch):
             model_config=SimpleNamespace(
                 enforce_eager=True,
                 stage_connector_config={
-                    "extra": {"npu_conv_graph_shapes": [[1, 1], [2, 37]]},
+                    "extra": {"npu_conv_graph_shapes": [[1, 1], [2, 37]], "npu_incremental_codec": False},
                 },
             ),
             device_config=SimpleNamespace(device="cpu"),
@@ -243,3 +243,50 @@ def test_incremental_attention_does_not_change_stateless_backend():
         assert decoder.pre_transformer.config._attn_implementation == "sdpa"
     finally:
         arena.close()
+
+
+@pytest.mark.parametrize("has_triton", [False, True])
+@pytest.mark.parametrize("disabled", [False, True])
+@pytest.mark.parametrize("stage_defaults", [False, True])
+def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, disabled, stage_defaults):
+    pytest.importorskip("torch_npu")
+    import vllm.triton_utils
+
+    from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
+    from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
+    from vllm_omni.platforms.npu.layers import codec_graph, incremental_codec
+    from vllm_omni.platforms.npu.models import qwen3_tts
+
+    decoder = _make_decoder()
+    explicit = {"npu_fused_snake": False, "npu_incremental_codec": False, "npu_conv_graph_shapes": []}
+    model = SimpleNamespace(
+        decoder=decoder,
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                enforce_eager=False, stage_connector_config={"extra": explicit if disabled else {}}
+            ),
+            # Explicit connector opt-outs must override stage defaults too.
+            additional_config=(
+                {"npu_fused_snake": True, "npu_incremental_codec": True, "npu_codec_streams": 2}
+                if stage_defaults
+                else {}
+            ),
+            device_config=SimpleNamespace(device="cpu"),
+            scheduler_config=SimpleNamespace(max_num_seqs=4),
+        ),
+    )
+    monkeypatch.setattr(vllm.triton_utils, "HAS_TRITON", has_triton)
+    monkeypatch.setattr(qwen3_tts, "_original_load_weights", lambda *_: {"loaded"})
+    monkeypatch.setattr(qwen3_tts, "_prepare_npu_decoder_weights", lambda _: None)
+    incremental = Mock()
+    conv = Mock(side_effect=AssertionError("incremental or explicit [] must skip stateless capture"))
+    monkeypatch.setattr(incremental_codec, "NPUIncrementalCodec", incremental)
+    monkeypatch.setattr(codec_graph, "NPUCodecGraphs", conv)
+    qwen3_tts._patched_load_weights(model, [])
+    if disabled:
+        incremental.assert_not_called()
+    else:
+        assert incremental.call_args.kwargs["streams"] == (2 if has_triton else 1)
+        assert decoder._npu_incremental is incremental.return_value
+    conv.assert_not_called()
+    assert all(m.npu_fused is (has_triton and not disabled) for m in decoder.modules() if isinstance(m, SnakeBeta))
