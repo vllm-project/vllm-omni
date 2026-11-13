@@ -107,15 +107,20 @@ def _activation_edges(
                 if src != dst:
                     edges.append((src, dst, ((item.req, task),)))
         return edges
+    schedules = {item.req: item.plan.schedule for item in inflight}
     last_rank = topology.world - 1
     if topology.step_replicas == 1:
-        peer_tasks = rank_work(inflight, slot, last_rank)
-        if _tasks_need_activation_send(peer_tasks, schedule):
+        peer_tasks = tuple(
+            (req, cell) for req, cell in rank_work(inflight, slot, last_rank) if is_group_boundary(cell, schedules[req])
+        )
+        if peer_tasks:
             edges.append((last_rank, 0, peer_tasks))
     for src in range(last_rank):
         dst = src + 1
-        src_tasks = rank_work(inflight, slot, src)
-        if _tasks_need_activation_send(src_tasks, schedule):
+        src_tasks = tuple(
+            (req, cell) for req, cell in rank_work(inflight, slot, src) if is_group_boundary(cell, schedules[req])
+        )
+        if src_tasks:
             edges.append((src, dst, src_tasks))
     return edges
 
@@ -181,7 +186,9 @@ def _post_activations_ws(
             if packed_output is not None and len(src_tasks) == len(tasks)
             else _pack_outs_for_tasks(task_outs, tasks, src_tasks)
         )
-        if rank == src and edge_out is not None:
+        if rank == src:
+            if edge_out is None:
+                raise RuntimeError(f"Missing activation output for edge {src}->{dst}: {src_tasks}")
             packed = send_adapter.pack_activation(edge_out)
             peer = _pp_global_rank(pp_group, dst)
             for key in keys:
@@ -433,42 +440,6 @@ def _assert_i8(tasks: tuple[tuple[str, Cell], ...]) -> None:
         raise RuntimeError(f"I8 violated: same request appears twice in one microbatch: {tasks}")
 
 
-def _tasks_need_activation_send(
-    tasks: tuple[tuple[str, Cell], ...],
-    schedule: Any | None,
-) -> bool:
-    """Activation P2P only after the last local block of a layer group."""
-    if not tasks or schedule is None:
-        return bool(tasks)
-    return any(is_group_boundary(cell, schedule) for _req, cell in tasks)
-
-
-class _UniformMembers(Mapping[str, CellAdapter]):
-    """Resolve every request id to the same adapter (test / single-backend helpers)."""
-
-    def __init__(self, adapter: CellAdapter) -> None:
-        self._adapter = adapter
-
-    def __getitem__(self, key: str) -> CellAdapter:
-        del key
-        return self._adapter
-
-    def __iter__(self):
-        return iter(())
-
-    def __len__(self) -> int:
-        return 1
-
-    def values(self):
-        return (self._adapter,)
-
-
-def _as_member_map(members: Mapping[str, CellAdapter] | CellAdapter) -> Mapping[str, CellAdapter]:
-    if isinstance(members, CellAdapter):
-        return _UniformMembers(members)
-    return members
-
-
 def _tensor_dicts_concatable(typed: Sequence[Mapping[str, torch.Tensor]]) -> bool:
     """True when every dict shares keys and trailing tensor shapes (dim 1+)."""
     if len(typed) <= 1:
@@ -604,21 +575,17 @@ def _run_slot_batches(
 def run_cell_pipeline(
     *,
     ctx: ARDiffusionCellContext,
-    members: Mapping[str, CellAdapter] | CellAdapter | None = None,
-    adapter: CellAdapter | None = None,
+    members: Mapping[str, CellAdapter],
     max_slots: int | None = None,
 ) -> None:
     """Run inflight plans on this rank (one cell per tick).
 
     Per tick: prepare → organize Batches → compute → publish → post act/KV.
-    ``members`` maps request/kv id → model adapter. A single ``CellAdapter`` (or
-    legacy ``adapter=``) is treated as the backend for every request.
+    ``members`` maps request/kv id to the adapter that owns its state.
     """
-    if members is None:
-        members = adapter
-    if members is None:
-        raise ValueError("run_cell_pipeline requires members= or adapter=")
-    member_map = _as_member_map(members)
+    member_map = members
+    if not member_map:
+        raise ValueError("run_cell_pipeline requires a non-empty members mapping")
     primary = next(iter(member_map.values()))
     spec = ctx.spec
     kv = ctx.kv
@@ -683,21 +650,19 @@ def run_cell_pipeline(
                 kv.publish(tasks)
                 # A local clean successor consumes the chunk-0 final latent here.
                 # The executor owns this handoff; adapters need no latent cache.
-                keep_clean_input = (
-                    schedule is not None
-                    and schedule.ordering is Ordering.SAME_STEP
-                    and schedule.chunks > 1
-                    and rank_of_block(schedule.num_denoise_steps, 0, schedule) == spec.rank
-                    and any(
-                        cell == (0, schedule.num_denoise_steps - 1, schedule.num_blocks - 1) for _req, cell in tasks
+                schedules = {item.req: item.plan.schedule for item in ctx.inflight}
+                for (req, cell), part in zip(tasks, task_outs, strict=True):
+                    member_schedule = schedules[req]
+                    keep_clean_input = (
+                        member_schedule.ordering is Ordering.SAME_STEP
+                        and member_schedule.chunks > 1
+                        and rank_of_block(member_schedule.num_denoise_steps, 0, member_schedule) == spec.rank
+                        and cell == (0, member_schedule.num_denoise_steps - 1, member_schedule.num_blocks - 1)
                     )
-                )
-                if schedule is not None and (keep_clean_input or not _tasks_need_activation_send(tasks, schedule)):
-                    pending_hidden = {
-                        req: part for (req, _cell), part in zip(tasks, task_outs, strict=True) if part is not None
-                    }
-                else:
-                    pending_hidden = {}
+                    if part is not None and (keep_clean_input or not is_group_boundary(cell, member_schedule)):
+                        pending_hidden[req] = part
+                    else:
+                        pending_hidden.pop(req, None)
             if kv_stream and prev_slot_for_evict is not None:
                 kv.wait_sends()
                 kv.evict(prev_slot_for_evict)
@@ -723,7 +688,9 @@ def run_cell_pipeline(
                             if output is not None and len(src_tasks) == len(tasks)
                             else _pack_outs_for_tasks(task_outs, tasks, src_tasks)
                         )
-                        if spec.rank == src and edge_out is not None:
+                        if spec.rank == src:
+                            if edge_out is None:
+                                raise RuntimeError(f"Missing activation output for edge {src}->{dst}: {src_tasks}")
                             send_adapter = member_map.get(src_tasks[0][0], primary)
                             handles = pp.isend_tensor_dict(send_adapter.pack_activation(edge_out), dst=dst)
                             comm_handles.extend(handles)

@@ -35,6 +35,8 @@ class WanCell(CellAdapter):
         self.transformer = transformer
         self.sampler = sampler
         self.prompt_embeds = prompt_embeds
+        if len(latent_shape) != 5 or latent_shape[0] != 1:
+            raise ValueError("WanCell requires latent_shape B=1 per member")
         self.latent_shape = latent_shape
         self.seed = seed
         self.device = device
@@ -94,8 +96,7 @@ class WanCell(CellAdapter):
             raise ValueError(f"member_inputs length {len(member_inputs)} != batch size {batch.size}")
         block = batch.block
         tf = typed_members[0].transformer
-        text = torch.cat([m.prompt_embeds for m in typed_members], dim=0)
-        tf.prepare_cell(text)
+        tf.prepare_cell(tuple(m.prompt_embeds for m in typed_members))
 
         latents: list[torch.Tensor] = []
         tokens_list: list[torch.Tensor | None] = []

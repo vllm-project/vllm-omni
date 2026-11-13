@@ -234,8 +234,26 @@ class StageWanTransformer(nn.Module):
             raise ValueError(f"latent {latent_shape} not aligned to patch {self.patch_size}")
         return (t // pt) * (h // ph) * (w // pw)
 
-    def prepare_cell(self, encoder_hidden_states: torch.Tensor, **_kwargs) -> None:
-        """Bind text; clear per-step embedding / per-chunk RoPE caches."""
+    def prepare_cell(self, encoder_hidden_states: torch.Tensor | Sequence[torch.Tensor], **_kwargs) -> None:
+        """Reuse conditioning for the same ordered, immutable prompt tensors.
+
+        Keep only the current pack: identity changes invalidate embeddings and
+        RoPE, so another request composition cannot reuse its text projection.
+        Tensor callers explicitly start a new invocation (the Physis path).
+        """
+        if not isinstance(encoder_hidden_states, torch.Tensor):
+            texts = tuple(encoder_hidden_states)
+            if not texts or any(t.ndim != 3 or t.shape[0] != 1 for t in texts):
+                raise ValueError("Cell conditioning requires one text row per member")
+            if any(t.shape[1:] != texts[0].shape[1:] for t in texts):
+                raise ValueError("Cell conditioning requires equal text shapes")
+            previous = getattr(self, "_prepared_texts", ())
+            if len(texts) == len(previous) and all(a is b for a, b in zip(texts, previous, strict=True)):
+                return
+            encoder_hidden_states = torch.cat(texts, dim=0)
+            self._prepared_texts = texts
+        else:
+            self._prepared_texts = ()
         self._text = encoder_hidden_states
         self._embeddings = {}
         self._rotary = {}
@@ -307,7 +325,7 @@ class StageWanTransformer(nn.Module):
         """RoPE for one latent row (batch dim may be 1)."""
         assert self._wan is not None
         frames = int(latent.shape[2])
-        cache_key = (int(chunk), frames)
+        cache_key = (int(chunk), tuple(latent.shape[2:]), latent.dtype, latent.device)
         hit = self._rotary.get(cache_key)
         if hit is not None:
             return hit
@@ -317,6 +335,11 @@ class StageWanTransformer(nn.Module):
         freqs_cos, freqs_sin = self._rope_with_temporal_offset(latent, start_frame=start_frame)
         rotary = (freqs_cos[..., 0::2].to(latent.dtype), freqs_sin[..., 1::2].to(latent.dtype))
         self._rotary[cache_key] = rotary
+        # Retain only one position per member, not an entire long video timeline.
+        text = getattr(self, "_text", None)
+        capacity = max(1, int(text.shape[0])) if text is not None else 1
+        while len(self._rotary) > capacity:
+            self._rotary.pop(next(iter(self._rotary)))
         return rotary
 
     def _rotary_emb_for_batch(self, chunks: Sequence[int], latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

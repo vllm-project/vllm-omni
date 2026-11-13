@@ -143,6 +143,9 @@ def test_rotary_emb_applies_chunk_temporal_offset():
     cos1, _ = tf._rotary_emb(1, latent)
     assert cos0.shape == cos1.shape
     assert not torch.equal(cos0, cos1)
+    swapped, _ = tf._rotary_emb(1, torch.zeros(1, 4, 3, 4, 1))
+    assert not torch.equal(swapped, cos1)
+    assert len(tf._rotary) == 1
     # After even-dim slice (Wan rotary packs cos[..., 0::2]), temporal axis still differs.
     assert cos1.mean().item() > cos0.mean().item()
 
@@ -523,3 +526,43 @@ def test_pipeline_forward_cancels_stream_jobs_on_failure(monkeypatch, failure_st
     with pytest.raises(ValueError, match="decode wave failed"):
         pipeline.forward(batch)
     assert cancelled == (["A"] if failure_stage == "admit" else ["A", "B"])
+
+
+def test_conditioning_cache_reuses_blocks_and_invalidates_member_order():
+    """Exercise real StageWanTransformer caching, not the WanCell test double."""
+    tf = StageWanTransformer.__new__(StageWanTransformer)
+    torch.nn.Module.__init__(tf)
+    calls = []
+
+    def condition(timestep, text, *_args, **_kwargs):
+        calls.append((timestep.clone(), text.clone()))
+        value = text.mean(dim=1) + timestep[:, None]
+        return value, value, text, None
+
+    tf._wan = SimpleNamespace(condition_embedder=condition, timestep_proj_prepare=lambda value, _: value)
+    a, b = torch.ones(1, 3, 4), torch.full((1, 3, 4), 7.0)
+    timestep = torch.tensor([800.0, 500.0])
+    tf.prepare_cell((a, b))
+    first = tf._embedding((0, 1), timestep, batch_size=2, device=a.device, dtype=a.dtype)
+    tf._rotary[0] = (a, b)
+    tf.prepare_cell((a, b))
+    second = tf._embedding((0, 1), timestep, batch_size=2, device=a.device, dtype=a.dtype)
+    assert second is first
+    assert len(calls) == 1
+    assert 0 in tf._rotary
+    tf.prepare_cell((b, a))
+    assert not tf._rotary
+    third = tf._embedding((0, 1), timestep, batch_size=2, device=a.device, dtype=a.dtype)
+    assert len(calls) == 2
+    torch.testing.assert_close(third[2], torch.cat([b, a]))
+    assert not torch.equal(third[2], first[2])
+    tf._embedding((0, 1), timestep + 1, batch_size=2, device=a.device, dtype=a.dtype)
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("texts", [(torch.zeros(2, 3, 4),), (torch.zeros(1, 3, 4), torch.zeros(1, 5, 4))])
+def test_conditioning_rejects_invalid_member_shapes(texts):
+    tf = StageWanTransformer.__new__(StageWanTransformer)
+    torch.nn.Module.__init__(tf)
+    with pytest.raises(ValueError, match="conditioning requires"):
+        tf.prepare_cell(texts)

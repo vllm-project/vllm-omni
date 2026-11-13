@@ -69,6 +69,9 @@ class ComputeBatch:
 
     def split_outputs(self, packed: Mapping[str, torch.Tensor]) -> list[dict[str, torch.Tensor]]:
         """Split packed model outputs into per-member dicts (batch dim 0)."""
+        for key, tensor in packed.items():
+            if tensor.ndim < 1 or tensor.shape[0] != self.size:
+                raise ValueError(f"Output {key!r} must have one row per member ({self.size})")
         outs: list[dict[str, torch.Tensor]] = []
         for i in range(self.size):
             sl = self.row_slice(i)
@@ -127,7 +130,9 @@ def organize_batches(
 
 def _single_kv_view(ctx_list: Any) -> Any:
     if isinstance(ctx_list, list):
-        return ctx_list[0] if ctx_list else None
+        if len(ctx_list) != 1:
+            raise ValueError(f"Cell requires exactly one KV view, got {len(ctx_list)}")
+        return ctx_list[0]
     return ctx_list
 
 
@@ -140,10 +145,11 @@ def slice_activation_for_task(
     """Map a slot-packed activation payload to one member's tensors."""
     if src is None:
         return None
+    if not 0 <= task_index < task_count:
+        raise ValueError("Activation task index is out of range")
     out: dict[str, torch.Tensor] = {}
     for key, tensor in src.items():
-        if isinstance(tensor, torch.Tensor) and tensor.ndim >= 1 and tensor.shape[0] == task_count:
-            out[key] = tensor[task_index : task_index + 1]
-        else:
-            out[key] = tensor
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim < 1 or tensor.shape[0] != task_count:
+            raise ValueError(f"Activation {key!r} must have one row per member ({task_count})")
+        out[key] = tensor[task_index : task_index + 1]
     return out

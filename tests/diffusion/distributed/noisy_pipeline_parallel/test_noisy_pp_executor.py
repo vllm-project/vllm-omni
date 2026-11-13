@@ -98,7 +98,7 @@ def test_executor_runs_all_slots_r1():
     )
     assert ctx.admit("A", plan, chunk_tokens=4, slot=0)
     adapter = CountingAdapter()
-    run_cell_pipeline(ctx=ctx, adapter=adapter)
+    run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
     assert adapter.calls
     assert not ctx.inflight
     assert kv.resident_versions == 0
@@ -169,7 +169,7 @@ def test_continuous_batch_two_requests_same_tokens():
     ctx.enqueue("A", plan, chunk_tokens=4)
     ctx.enqueue("B", plan, chunk_tokens=4)
     adapter = CountingAdapter()
-    run_cell_pipeline(ctx=ctx, adapter=adapter)
+    run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
     reqs_seen = {req for call in adapter.calls for req, _task in call}
     assert reqs_seen == {"A", "B"}
     assert not ctx.inflight
@@ -214,7 +214,8 @@ def test_executor_releases_versions_when_forward_raises():
             raise RuntimeError("boom")
 
     with pytest.raises(RuntimeError, match="boom"):
-        run_cell_pipeline(ctx=ctx, adapter=BoomAdapter())
+        adapter = BoomAdapter()
+        run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
     assert not ctx.inflight
     assert not ctx.pending
     assert len(cache.pool.keys) == 0
@@ -333,7 +334,8 @@ def test_same_rank_clean_receives_final_latent_without_adapter_cache():
             return {"latent": torch.tensor([7.0]).expand(batch.size).clone()}
 
     assert ctx.admit("A", plan, chunk_tokens=1, slot=0)
-    run_cell_pipeline(ctx=ctx, adapter=StatelessAdapter())
+    adapter = StatelessAdapter()
+    run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
     assert not ctx.inflight
     assert ctx.kv.resident_versions == 0
 
@@ -486,7 +488,7 @@ def test_expand_activation_edges_agrees_without_local_outs():
 
         def activation_spec(self, *, batch: int, include_hidden: bool):
             _b, c, t, h, w = self._shape
-            spec = [("latent", (batch, c, t, h, w), self._dtype)]
+            spec: list[tuple[str, tuple[int, ...], torch.dtype]] = [("latent", (batch, c, t, h, w), self._dtype)]
             if include_hidden:
                 spec.append(("hidden_states", (batch, t * h * w, 8), self._dtype))
             return spec
@@ -527,3 +529,34 @@ def test_expand_activation_edges_agrees_without_local_outs():
         (0, 1, (("A", (1, 0, 0)),)),
         (0, 1, (("B", (1, 0, 0)),)),
     ]
+
+
+def test_activation_edges_only_send_boundary_members():
+    """A boundary member must not drag a mid-group member into PP transport."""
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import _activation_edges
+
+    schedule = CellSchedule(
+        chunks=2,
+        num_denoise_steps=1,
+        step_replicas=1,
+        layer_groups=2,
+        blocks=4,
+        kv_history_chunks=1,
+        ordering=Ordering.SELF_FORCING,
+    )
+
+    def item(req, cell):
+        return SimpleNamespace(
+            req=req,
+            t0=0,
+            plan=SimpleNamespace(
+                schedule=schedule,
+                task=lambda _slot, rank: cell if rank == 0 else None,
+            ),
+        )
+
+    inflight = (item("boundary", (0, 0, 1)), item("local", (0, 0, 0)))
+    edges = _activation_edges(topology=CellTopology(1, 2), inflight=inflight, slot=0, schedule=schedule)
+    assert edges == [(0, 1, (("boundary", (0, 0, 1)),))]

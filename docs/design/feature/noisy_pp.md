@@ -311,6 +311,18 @@ keys on ``(block, latent_shape, dtype)``; chunk / step / timestep are member
 inputs. ``forward`` packs per-member noise levels and chunk RoPE (e.g.
 ``timesteps=[800, 500]``, ``chunks=[0, 3]``) into embed / block / unembed.
 
+Each member contributes exactly one tensor row and one KV view. Activation
+payloads and model outputs validate that row count rather than broadcasting a
+mismatched tensor. Local activation retention and PP boundary sends are decided
+per member, independently of other requests in the slot. A missing send payload
+is an execution error.
+
+CausVid reuses conditioning and RoPE across blocks while the ordered prompt
+tensors stay unchanged. Changing the member composition invalidates the caches;
+noise levels remain part of the embedding key. Only the current pack is cached.
+Prompt tensors must remain immutable during execution. Physis continues to run
+one member at a time through the same explicit member-map runtime entry.
+
 Async VAE decode retains a separate temporal state per member. Each request in
 an execution wave receives a deterministic Gloo tag from its input position;
 sender and VAE owner use the same tag, so interleaved member chunks cannot match

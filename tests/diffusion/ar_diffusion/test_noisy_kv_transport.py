@@ -298,7 +298,7 @@ def _sink_pipeline_worker(
             spec=CellRunSpec(topology=CellTopology(steps, groups), rank=rank, pp_group=pp), kv=state
         )
         ctx.enqueue("A", plan, chunk_tokens=1)
-        run_cell_pipeline(ctx=ctx, adapter=adapter)
+        run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
         assert state.resident_versions == 0
         assert bool(fixed_calls) == fixed_shape
         expected_clean = sum(

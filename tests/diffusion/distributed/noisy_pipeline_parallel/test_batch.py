@@ -81,11 +81,27 @@ def test_slice_activation_maps_packed_rows_by_task_index():
                 torch.full((4,), 30.0),
             ]
         ),
-        "scalar": torch.tensor(7.0),
     }
     part = slice_activation_for_task(packed, task_index=2, task_count=3)
     assert part is not None
     assert torch.allclose(part["latent"], torch.full((1, 2), 3.0))
     assert torch.allclose(part["hidden_states"], torch.full((1, 4), 30.0))
-    assert part["scalar"].item() == 7.0
     assert slice_activation_for_task(None, task_index=0, task_count=1) is None
+
+
+@pytest.mark.parametrize("shape", [(), (1, 4), (3, 4)])
+def test_activation_rejects_missing_or_extra_member_rows(shape):
+    with pytest.raises(ValueError, match="one row per member"):
+        slice_activation_for_task({"latent": torch.zeros(shape)}, task_index=0, task_count=2)
+    batch = ComputeBatch(
+        members=(MemberRef("A", 0, 0, 0, 0), MemberRef("B", 0, 0, 0, 1)),
+        kv_views=(None, None),
+    )
+    with pytest.raises(ValueError, match="one row per member"):
+        batch.split_outputs({"latent": torch.zeros(shape)})
+
+
+@pytest.mark.parametrize("contexts", [[], ["a", "b"]])
+def test_organize_rejects_ambiguous_kv_views(contexts):
+    with pytest.raises(ValueError, match="exactly one KV view"):
+        organize_batches([("A", (0, 0, 0))], [contexts], compatibility_of=lambda *_: 0, max_batch_size=1)

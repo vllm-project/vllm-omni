@@ -41,6 +41,8 @@ class _FakeTransformer:
         self._text: torch.Tensor | None = None
 
     def prepare_cell(self, text: torch.Tensor, **_kwargs) -> None:
+        if not isinstance(text, torch.Tensor):
+            text = torch.cat(tuple(text), dim=0)
         self.prepare_calls.append(tuple(text.shape))
         self._text = text.detach().clone()
 
