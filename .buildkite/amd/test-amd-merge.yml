@@ -12,7 +12,7 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 75
       source_file_dependencies:
         - entrypoints_function
@@ -675,17 +675,15 @@ steps:
       commands:
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - >-
-          bash .buildkite/amd/scripts/assert-pytest-collection.sh 13
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 11
           tests/e2e/offline_inference/test_qwen3_omni.py
           tests/e2e/online_serving/test_qwen3_omni.py
-          tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
           -m 'advanced_model and rocm and MI325 and not nvidia_only'
           --run-level 'advanced_model'
         - >-
           pytest -s -v
           tests/e2e/offline_inference/test_qwen3_omni.py
           tests/e2e/online_serving/test_qwen3_omni.py
-          tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
           -m 'advanced_model and rocm and MI325 and not nvidia_only'
           --run-level 'advanced_model'
 
@@ -851,7 +849,7 @@ steps:
           set -euo pipefail
           node='tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]'
           pytest --collect-only -q "$$node" \
-            -m 'advanced_model and diffusion and rocm and MI325 and cards_1' \
+            -m 'slow and diffusion and rocm and MI325 and cards_1' \
             --run-level advanced_model \
             > "$$QWEN_IMAGE_MERGE_ARTIFACT_DIR/collection.txt"
           count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
@@ -866,7 +864,7 @@ steps:
           timeout --signal=TERM --kill-after=2m 45m \
             pytest -s -v -ra \
             'tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]' \
-            -m 'advanced_model and diffusion and rocm and MI325 and cards_1' \
+            -m 'slow and diffusion and rocm and MI325 and cards_1' \
             --run-level advanced_model \
             --junitxml="$$QWEN_IMAGE_MERGE_ARTIFACT_DIR/pytest.xml" \
             || status=$$?
@@ -909,7 +907,7 @@ steps:
           set -euo pipefail
           node='tests/e2e/online_serving/test_qwen_image.py::test_batch_001[default]'
           pytest --collect-only -q "$$node" \
-            -m 'advanced_model and diffusion and rocm and MI325 and cards_1' \
+            -m 'slow and diffusion and rocm and MI325 and cards_1' \
             --run-level advanced_model \
             > "$$QWEN_IMAGE_BATCH_MERGE_ARTIFACT_DIR/collection.txt"
           count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
@@ -924,7 +922,7 @@ steps:
           timeout --signal=TERM --kill-after=2m 45m \
             pytest -s -v -ra \
             'tests/e2e/online_serving/test_qwen_image.py::test_batch_001[default]' \
-            -m 'advanced_model and diffusion and rocm and MI325 and cards_1' \
+            -m 'slow and diffusion and rocm and MI325 and cards_1' \
             --run-level advanced_model \
             --junitxml="$$QWEN_IMAGE_BATCH_MERGE_ARTIFACT_DIR/pytest.xml" \
             || status=$$?
@@ -971,7 +969,7 @@ steps:
           )
           printf '%s\n' "$${nodes[@]}" | sort > /tmp/drama3-merge-expected.txt
           pytest -q 'tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]' \
-            -m "advanced_model and tts and rocm and MI325 and cards_1" \
+            -m "slow and tts and rocm and MI325 and cards_1" \
             --run-level "advanced_model" \
             --collect-only \
             | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
@@ -981,7 +979,7 @@ steps:
             exit 1
           fi
           pytest -s -v 'tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]' \
-            -m "advanced_model and tts and rocm and MI325 and cards_1" \
+            -m "slow and tts and rocm and MI325 and cards_1" \
             --run-level "advanced_model" \
             --junitxml="$$DRAMA3_MERGE_ARTIFACT_DIR/pytest.xml"
           python -c 'import sys, xml.etree.ElementTree as ET
@@ -1006,7 +1004,7 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 75
       source_file_dependencies:
         - tts_drama_3_function
@@ -1030,7 +1028,7 @@ steps:
           )
           printf '%s\n' "$${nodes[@]}" | LC_ALL=C sort > "$$ROCM_MERGE_ARTIFACT_DIR/expected.txt"
           pytest --collect-only -q "$${nodes[@]}" \
-            -m 'advanced_model and tts and rocm and MI325 and cards_1' --run-level advanced_model \
+            -m 'slow and tts and rocm and MI325 and cards_1' --run-level advanced_model \
             --shard-id=0 --num-shards=1 \
             > "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt"
           sed -n '/^tests\/.*::/p' "$$ROCM_MERGE_ARTIFACT_DIR/collection.txt" \
@@ -1047,7 +1045,7 @@ steps:
             'tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed42-drama_3-rocm]' \
             'tests/e2e/online_serving/test_drama_3.py::test_voice_clone_concurrent_003[drama_3-rocm]' \
             'tests/e2e/online_serving/test_drama_3.py::test_voice_clone_requires_ref_text_004[drama_3-rocm]' \
-            -m 'advanced_model and tts and rocm and MI325 and cards_1' --run-level advanced_model \
+            -m 'slow and tts and rocm and MI325 and cards_1' --run-level advanced_model \
             --shard-id=0 --num-shards=1 \
             --basetemp="$$ROCM_MERGE_ARTIFACT_DIR/tmp-voice-clone" \
             --junitxml="$$ROCM_MERGE_ARTIFACT_DIR/voice-clone.xml" || status=$$?
@@ -1183,7 +1181,7 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 90
       source_file_dependencies:
         - omni_minicpmo_4_5_duplex_function

@@ -25,15 +25,32 @@ from tests.dfx.stability.helpers import (
 )
 from tests.helpers.runtime import OmniServer
 
-DEFAULT_STABILITY_SERVER_TIMEOUT_ARGS = ["--stage-init-timeout", "600", "--init-timeout", "900"]
+DEFAULT_STABILITY_SERVER_TIMEOUT_ARGS = (("--stage-init-timeout", "600"), ("--init-timeout", "900"))
 
 _omni_server_lock = threading.Lock()
 
 
+def _merge_timeout_args(extra_cli_args: tuple[str, ...], *, use_omni: bool) -> list[str]:
+    """Append default stage/init timeouts for flags not set by the JSON CLI args.
+
+    JSON ``serve_args`` / ``extra_cli_args`` win (e.g. MiniMax-H3 sets
+    ``--stage-init-timeout 1800 --init-timeout 1800`` in its config); only the
+    missing flags are filled with the default, mirroring
+    ``tests/dfx/perf/scripts/run_benchmark.py::_merge_omni_default_server_args``.
+    """
+    if not use_omni:
+        return []
+    present = {token.split("=", 1)[0] for token in extra_cli_args if str(token).startswith("--")}
+    args: list[str] = []
+    for flag, value in DEFAULT_STABILITY_SERVER_TIMEOUT_ARGS:
+        if flag not in present:
+            args += [flag, value]
+    return args
+
+
 @pytest.fixture(scope="module")
 def omni_server(request: pytest.FixtureRequest):
-    """Start OmniServer for stability tests, with per-module timeout override."""
-    timeout_args = getattr(request.module, "STABILITY_SERVER_TIMEOUT_ARGS", DEFAULT_STABILITY_SERVER_TIMEOUT_ARGS)
+    """Start OmniServer for stability tests."""
     with _omni_server_lock:
         # Same tuple and CLI composition as ``tests/dfx/perf/scripts/run_benchmark.py``;
         # ``serve_args`` from JSON are folded into ``extra_cli_args`` inside
@@ -41,9 +58,7 @@ def omni_server(request: pytest.FixtureRequest):
         test_name, model, deploy_path, stage_overrides, extra_cli_args, use_omni = request.param
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
-        server_args: list[str] = []
-        if use_omni:
-            server_args += list(timeout_args)
+        server_args: list[str] = _merge_timeout_args(tuple(extra_cli_args), use_omni=use_omni)
         if deploy_path:
             server_args = ["--deploy-config", deploy_path] + server_args
         if stage_overrides:
@@ -59,10 +74,8 @@ def omni_server(request: pytest.FixtureRequest):
 
 
 @pytest.fixture
-def stability_benchmark_params(request: pytest.FixtureRequest, omni_server):
+def stability_benchmark_params(request: pytest.FixtureRequest):
     test_name, param_index = request.param
-    if test_name != omni_server.test_name:
-        pytest.skip(f"Skipping parameter for {test_name} - current server is {omni_server.test_name}")
 
     server_to_benchmark_mapping = getattr(request.module, "server_to_benchmark_mapping", None)
     if server_to_benchmark_mapping is None:
