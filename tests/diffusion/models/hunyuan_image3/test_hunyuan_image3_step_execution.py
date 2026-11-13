@@ -1510,3 +1510,36 @@ def test_scheduled_generate_path_keeps_paged_row_keys_for_split_groups(monkeypat
         [("short", 0), ("long", 0)],
         [("short", 0), ("long", 0)],
     ]
+
+
+def test_later_forward_does_not_slice_cached_prefix_again(monkeypatch):
+    import vllm.forward_context as native_context
+
+    pipeline = _pipeline()
+    pipeline.config = SimpleNamespace(use_return_dict=True, hidden_size=2)
+    pipeline.vllm_config = None
+    pipeline.get_pos_emb = lambda *args: None
+    pipeline.time_embed = lambda timestep: timestep
+    pipeline.patch_embed = lambda images, timestep: (torch.zeros(1, 2, 2), 1, 2)
+    pipeline.timestep_emb = lambda timestep: torch.zeros(1, 2)
+
+    class StopAtModel:
+        def __call__(self, **kwargs):
+            assert kwargs["inputs_embeds"].shape[1] == 3
+            assert kwargs["query_lens"] == [3]
+            assert kwargs["seq_lens"] == [7]
+            raise RuntimeError("reached model with intact image-only query")
+
+    pipeline.model = StopAtModel()
+    monkeypatch.setattr(native_context, "set_forward_context", lambda *args, **kwargs: nullcontext())
+    with pytest.raises(RuntimeError, match="reached model with intact image-only query"):
+        pipeline.forward_call(
+            mode="gen_image",
+            images=torch.zeros(1, 1, 1, 1),
+            timestep=torch.ones(1),
+            gen_timestep_scatter_index=torch.zeros(1, 1, dtype=torch.long),
+            query_lens=[3],
+            seq_lens=[7],
+            first_step=False,
+            hunyuan_paged_prefix_cut=4,
+        )

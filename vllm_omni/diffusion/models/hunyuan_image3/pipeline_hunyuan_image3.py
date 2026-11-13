@@ -2076,7 +2076,7 @@ class HunyuanImage3Pipeline(
             paged_kv_cached_prefix_len = int(context.paged_kv_cached_prefix_len)
             if prefix_cut is None:
                 prefix_cut = paged_kv_cached_prefix_len if paged_kv_cached_prefix_len else None
-        if prefix_cut:
+        if first_step and prefix_cut:
             if ar_kv_reuse_len:
                 raise ValueError("Hunyuan cannot combine imported AR KV and Scheduler prefix-cache hits")
             (
