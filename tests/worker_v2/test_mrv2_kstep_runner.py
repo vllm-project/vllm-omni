@@ -10,6 +10,7 @@ import torch
 
 from vllm_omni.platforms.npu.worker import talker_multiframe
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -23,6 +24,21 @@ def _cuda_runner_platform(monkeypatch):
 
 def _runner():
     return OmniARModelRunner.__new__(OmniARModelRunner)
+
+
+@pytest.mark.parametrize("frames", [0, 8])
+def test_model_load_skips_rejection_sampler_only_for_talker_kstep(monkeypatch, frames):
+    runner = _runner()
+    runner.num_speculative_steps = 7
+    runner.is_last_pp_rank = True
+    runner.rejection_sampler = None
+    monkeypatch.setattr(OmniGPUModelRunner, "load_model", lambda self: None)
+    monkeypatch.setattr(runner, "_talker_kstep_frames", lambda: frames)
+    if frames:
+        runner.load_model()
+    else:
+        with pytest.raises(ValueError, match="requires a rejection sampler"):
+            runner.load_model()
 
 
 def test_kstep_spans_from_schedule():
