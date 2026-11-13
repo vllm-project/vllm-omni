@@ -43,6 +43,21 @@ if HAS_FLASHINFER:
     _LOG2_E = math.log2(math.e)
 
 
+def _ring_op_type(op_type: str, device: torch.device, dtype: torch.dtype) -> str:
+    """Return the aten SDPA op that yields a usable LSE for ``device``.
+
+    Ring accumulation merges blocks with ``update_out_and_lse``, which needs a
+    real log-sum-exp. On XPU, ``aten::_scaled_dot_product_efficient_attention``
+    returns a correct output but a zero log-sum-exp, so every block is merged
+    with the same weight and the ring result diverges from unsharded attention.
+    The flash aten op returns a real LSE there. fp32 keeps the requested op,
+    since the flash path does not support it.
+    """
+    if op_type == "efficient" and device.type == "xpu" and dtype != torch.float32:
+        return "flash"
+    return op_type
+
+
 def pytorch_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -57,6 +72,7 @@ def pytorch_attn_forward(
     op_type="efficient",
 ):
     assert op_type in ["flash", "efficient"], f"Invalid op_type: {op_type}"
+    op_type = _ring_op_type(op_type, q.device, q.dtype)
     """
     q shape (bs, seqlen, nhead, hs)
     k shape (bs, seqlen, nhead, hs)
