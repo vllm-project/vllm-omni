@@ -114,16 +114,27 @@ def has_audio(message: Message) -> bool:
     )
 
 
+def has_unanswered_user_input(history: Sequence[Message]) -> bool:
+    """Find pending user input across system updates, until an assistant reply."""
+    for message in reversed(history):
+        role = message.get("role")
+        if role in {"user", "assistant"}:
+            return role == "user"
+    return False
+
+
 def turn_ranges(history: Sequence[Message]) -> list[tuple[int, int]]:
-    """Return ordered half-open turns, keeping consecutive user items together."""
+    """Keep unanswered user items and intervening system updates in one turn."""
     starts = []
+    unanswered = False
     for i, message in enumerate(history):
-        if (
-            not starts
-            or message.get("role") == "system"
-            or (message.get("role") == "user" and history[i - 1].get("role") != "user")
-        ):
+        role = message.get("role")
+        if not starts or (role in {"user", "system"} and not unanswered):
             starts.append(i)
+        if role == "user":
+            unanswered = True
+        elif role == "assistant":
+            unanswered = False
     return list(zip(starts, [*starts[1:], len(history)]))
 
 
@@ -465,7 +476,7 @@ class IncrementalHistoryPolicy(QwenHistoryPolicy):
             if start >= cutoff:
                 break
             # Do not consolidate an unanswered user input.
-            if stop == len(history) and history[-1].get("role") == "user":
+            if stop == len(history) and has_unanswered_user_input(history):
                 break
             if end > state.processed and stop - state.processed > limits.chunk_messages:
                 break

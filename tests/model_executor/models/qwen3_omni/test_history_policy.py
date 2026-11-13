@@ -125,23 +125,31 @@ class IdleHistoryPolicy(IncrementalHistoryPolicy):
         return super().next_batch(state, limits, max_audio=max_audio)
 
 
-def test_unavailable_current_audio_cannot_silently_fall_back_to_old_question():
+@pytest.mark.parametrize("system_update", [False, True])
+def test_unavailable_current_audio_cannot_silently_fall_back_to_old_question(system_update):
     owner = runtime("bounded_recent")
     state = owner.create_state()
     missing, _ = audio_message(0)
-    sync_history(state, [*text_history(2), missing, {"role": "user", "content": "current budget is 5000"}])
+    history = [*text_history(2), missing, {"role": "user", "content": "current budget is 5000"}]
+    if system_update:
+        history.append({"role": "system", "content": "answer briefly"})
+    sync_history(state, history)
     with pytest.raises(DuplexRuntimeConfigError, match="Current.*audio"):
         owner.foreground(state, {"type": "conversation"})
 
 
-def test_current_mixed_input_survives_too_small_history_media_pool():
+@pytest.mark.parametrize("system_update", [False, True])
+def test_current_mixed_input_survives_too_small_history_media_pool(system_update):
     plugin = Qwen3OmniDuplexPlugin(lambda *args: "")
     plugin._history_runtime = runtime("bounded_recent", max_audio_bytes=100)
     message, payload = audio_message(0)
     message["content"].append({"type": "text", "text": "current budget is 5000"})
     state = plugin.create_session_state()
-    bind_history(state.history_policy_state, [message])
-    config = plugin.prepare_prompt_config({"conversation": [message]}, state=state, payload=payload)
+    history = [message]
+    if system_update:
+        history.append({"role": "system", "content": "answer briefly"})
+    bind_history(state.history_policy_state, history)
+    config = plugin.prepare_prompt_config({"conversation": history}, state=state, payload=payload)
     prompt = plugin._history_runtime.build_foreground(config[HISTORY_PROMPT], {}, 128)
     assert "current budget is 5000" in prompt["prompt"]
     assert len(prompt["multi_modal_data"]["audio"]) == 1
@@ -571,7 +579,8 @@ def test_byte_trigger_is_independent_of_legacy_cache(trigger_bytes, pool_bytes, 
 
 
 @pytest.mark.asyncio
-async def test_consecutive_commits_share_one_source_in_foreground_and_summary():
+@pytest.mark.parametrize("commits", [5, 8, 10])
+async def test_consecutive_commits_share_one_source_in_foreground_and_summary(commits):
     from tests.engine.duplex.test_session_runner import append_audio, tts_output
     from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
     from vllm_omni.engine.duplex.commands import AckPlayback, Commit, CreateResponse
@@ -581,16 +590,16 @@ async def test_consecutive_commits_share_one_source_in_foreground_and_summary():
         owner = runtime(recent_messages=1)
         h.runner.plugin._history_runtime = owner
         # Keep automatic scheduling off to inspect the prepared request directly.
-        for _ in range(5):
+        for _ in range(commits):
             await h.run(append_audio(value=0.1))
             await h.run(Commit(final=True, create_response=False))
         await h.run(CreateResponse())
         submission = h.port.submissions[-1]
         assert len(submission.prompt["multi_modal_data"]["audio"]) == 1
-        assert sum(m["role"] == "user" for m in h.session.history) == 5
+        assert sum(m["role"] == "user" for m in h.session.history) == commits
         response_id = h.session.active_response_id
         await h.deliver_and_settle(
-            tts_output(submission.context.request_id, samples=0, text="heard all five", finished=True), stage_id=0
+            tts_output(submission.context.request_id, samples=0, text="heard all commits", finished=True), stage_id=0
         )
         await h.deliver_and_settle(tts_output(submission.context.request_id, finished=True), stage_id=2)
         await h.run(AckPlayback(response_id=response_id, played_ms=1000, committed_ms=1000))
@@ -600,8 +609,40 @@ async def test_consecutive_commits_share_one_source_in_foreground_and_summary():
         assert request is not None
         assert len(request.prompt["multi_modal_data"]["audio"]) == 1
         assert not memory.omissions
+        assert owner.apply(memory, request, completion("heard every committed source"))
+        assert memory.processed == commits + 1
+        assert len(memory.ledger.get(memory.summary_node_id).sources) == commits + 1
     finally:
         await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["text", "audio", "image"])
+async def test_unanswered_input_is_not_compressed_across_system_updates(kind):
+    from tests.model_executor.models.qwen3_omni.test_history_multimodal import image_message
+
+    owner = runtime(recent_messages=1)
+    state = owner.create_state()
+    message = {"role": "user", "content": "first pending question"}
+    if kind == "image":
+        message = image_message()
+    elif kind == "audio":
+        message, payload = audio_message(0)
+        state.retain([((message["content"],), payload)], owner.limits)
+    sync_history(
+        state,
+        [
+            message,
+            {"role": "system", "content": "answer briefly"},
+            {"role": "user", "content": "second pending question"},
+            {"role": "system", "content": "answer both questions"},
+        ],
+    )
+    assert await owner.prepare(state) is None
+    assert state.processed == 0 and not state.omissions and not state.ledger.nodes()
+    assert state.visual.admitted == state.visual.covered == 0
+    sync_history(state, [*state.history, {"role": "assistant", "content": "answered both questions"}])
+    assert await owner.prepare(state) is not None
 
 
 @pytest.mark.asyncio

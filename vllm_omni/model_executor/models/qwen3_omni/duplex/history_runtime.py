@@ -31,6 +31,7 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
     QwenHistoryState,
     RetainedAudio,
     has_audio,
+    has_unanswered_user_input,
     load_history_policy,
     turn_ranges,
 )
@@ -223,29 +224,31 @@ class QwenHistoryRuntime:
         groups = []
         last = 0
         encoded = payload.get("audio")
+        turns = turn_ranges(state.history)
+        unanswered = has_unanswered_user_input(state.history)
         current_contents = []
-        for message in reversed(state.history):
-            if message.get("role") != "user":
-                break
+        current_start = turns[-1][0] if unanswered else len(state.history)
+        for message in state.history[current_start:]:
             if has_audio(message):
                 current_contents.append(message.get("content"))
         submitted = isinstance(encoded, str) and bool(encoded)
         sources = list(available_audio)
         if submitted and current_contents:
             sources.append((tuple(current_contents), payload))
-        valid = set(turn_ranges(state.history))
+        valid = set(turns)
         for start, end in self.policy.select(state, self.limits):
             if (start, end) not in valid or start < last:
                 raise ValueError("History policy selected invalid or unordered turn ranges")
             last = end
+            is_current = end == len(state.history) and unanswered
             group = self.group(
                 state,
                 start,
                 end,
                 sources,
-                preserve_images=end == len(state.history) and state.history[-1].get("role") == "user",
+                preserve_images=is_current,
             )
-            if group is None and end == len(state.history) and state.history[-1].get("role") == "user":
+            if group is None and is_current:
                 raise DuplexRuntimeConfigError("Current input contains unavailable audio without a transcript")
             if group is not None:
                 groups.append(group)
@@ -253,7 +256,7 @@ class QwenHistoryRuntime:
             raise ValueError("History policy must preserve the current turn")
         if submitted and not current_contents:
             audio_message = {"role": "user", "content": [{"type": "audio"}]}
-            if groups and state.history and state.history[-1].get("role") == "user":
+            if groups and unanswered:
                 current = groups.pop()
                 groups.append(
                     PromptGroup((*current.messages, audio_message), (*current.audio, encoded), current.images)
@@ -474,7 +477,7 @@ class QwenHistoryRuntime:
         if not self.policy.compress_visual_history or self.max_images <= 0:
             return None
         completed_end = len(state.history)
-        if state.history and state.history[-1].get("role") == "user":
+        if has_unanswered_user_input(state.history):
             completed_end = turn_ranges(state.history)[-1][0]
         return state.visual.plan(
             required_end=work.end if work else max(0, len(state.history) - self.limits.recent_messages),
@@ -708,9 +711,6 @@ class QwenHistoryRuntime:
                         f"audio payloads exceeding request limit {self.max_audio}; "
                         "history remains pending until the turn fits"
                     )
-                if group.audio and candidate.end - candidate.start > self.limits.chunk_messages:
-                    state.advance(candidate, omission="summary_capacity")
-                    break
                 unique_audio = {id(value): value for value in group.audio}
                 if (
                     len(unique_audio) > self.limits.max_audio_items

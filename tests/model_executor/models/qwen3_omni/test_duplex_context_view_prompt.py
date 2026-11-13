@@ -161,19 +161,38 @@ async def test_keep_zero_preserves_current_image_during_tool_followup():
 
 
 @pytest.mark.parametrize("keep", [None, 0])
-async def test_current_image_survives_system_item_before_response(keep):
+@pytest.mark.parametrize(
+    ("policy", "kind", "fits"),
+    [
+        ("recent", "image", True),
+        *[
+            (policy, kind, fits)
+            for policy in ("bounded_recent", "incremental")
+            for kind in ("text", "image")
+            for fits in (True, False)
+        ],
+    ],
+)
+async def test_current_input_survives_system_item_before_response(keep, policy, kind, fits):
     h = await _open(keep)
     try:
+        if policy != "recent":
+            from tests.model_executor.models.qwen3_omni.test_history_policy import runtime
+
+            h.runner.plugin._history_runtime = runtime(policy, summary_tokens=64, max_context_tokens=512)
+            h.session.register_history_item("old-user", {"role": "user", "content": "old question " * 500})
+            h.session.register_history_item("old-reply", {"role": "assistant", "content": "old answer"})
+        question = "describe this input" if fits else "describe this oversized input " * 200
+        content = [{"type": "input_text", "text": question}]
+        if kind == "image":
+            content.append({"type": "input_image", "image_url": _image()["image_url"]["url"]})
         await h.run(
             CreateItem(
                 item=normalize_conversation_item(
                     {
                         "type": "message",
                         "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": "describe this picture"},
-                            {"type": "input_image", "image_url": _image()["image_url"]["url"]},
-                        ],
+                        "content": content,
                     }
                 )
             )
@@ -190,12 +209,24 @@ async def test_current_image_survives_system_item_before_response(keep):
             )
         )
 
-        await h.run(CreateResponse())
+        before = h.session.history_snapshot()
+        events = await h.run(CreateResponse())
+
+        assert h.session.history_snapshot().messages == before.messages
+        if not fits:
+            assert not h.port.submissions
+            assert any(
+                event.type == "error" and event.code == "invalid_duplex_runtime_config" and "capacity" in event.message
+                for event in events
+            )
+            return
 
         assert len(h.port.submissions) == 1
         prompt = h.port.submissions[-1].prompt
-        assert "describe this picture" in prompt["prompt"]
+        assert question in prompt["prompt"]
         assert "answer briefly" in prompt["prompt"]
-        assert len(prompt["multi_modal_data"].get("image", [])) == 1
+        assert len(prompt["multi_modal_data"].get("image", [])) == int(kind == "image")
+        if policy != "recent":
+            assert "old question" not in prompt["prompt"]
     finally:
         await close_harness(h)

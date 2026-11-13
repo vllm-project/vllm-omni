@@ -120,6 +120,13 @@ metadata; its published text is also read from ledger nodes. Original Session
 records and source dependencies remain retained, so the bounded prompt and media
 limits do not bound total Session storage.
 
+Unanswered user items and intervening system messages form one protected turn.
+Foreground fitting preserves that complete turn, including original media, or
+returns an explicit capacity error. Background dialogue and visual compression
+wait until the turn has an assistant reply. `chunk_messages` is a batch target:
+an indivisible audio turn can exceed it when its actual audio count, retained
+bytes and processor-expanded input plus reserved output fit the hard limits.
+
 The summary lifecycle is:
 
 1. The Session owner supplies a current snapshot and refreshed ledger through
