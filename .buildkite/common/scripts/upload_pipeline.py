@@ -23,7 +23,14 @@ Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
     matches a job-key prefix; unrelated files must not reduce fallback coverage.
     List used shared helpers in job dependencies so mixed diffs retain their consumers.
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
-    for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
+    for NPU) + ``plugins`` + ``retry`` (see ci_mirror_hardwares.yml).
+  - ``automatic_shard: true`` is uploader-only. Before planning, the uploader
+    tries to build a per-step profile from recent passed ``timings/jobs``
+    artifacts (or ``VLLM_OMNI_SHARD_TIMINGS``). Ready excludes ``main`` and uses
+    pull-request builds; merge stays on ``main``. That profile packs measured
+    files into bins that fit ``timeout_in_minutes``. Each bin is uploaded as a
+    file list and the shard runs only that list. With no profile the step stays
+    one job and still records ``timings/jobs/*.json``.
   - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
     markers plus ``cards_n`` (max of several positives; ``not cards_1`` with no
     positive ``cards_*`` uses that chip's highest existing preset). An explicit
@@ -599,7 +606,8 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
             merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK]
         else:
             merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK, commands]
-    # Preset retry (K8S_RETRY on l4_*) must not clobber a step that opted out.
+    # A step-level retry fully replaces the preset retry. It is not merged, so a
+    # step that sets only automatic drops manual.permit_on_passed.
     if "retry" in step:
         merged["retry"] = step["retry"]
     return merged
@@ -618,6 +626,67 @@ def _get_step_label(step: dict[str, Any]) -> str:
     return str(step.get("group") or step.get("label") or "<step>")
 
 
+_shard_timings_prepared = False
+_shard_timings_pipeline: Path | None = None
+
+
+def _history_selection(pipeline_path: Path | None) -> tuple[str, frozenset[str]]:
+    """Ready uses non-main PR builds; merge keeps main."""
+    if pipeline_path is not None and pipeline_path.name == "test-ready.yml":
+        return "", frozenset({"main"})
+    return "main", frozenset()
+
+
+def _ensure_shard_timings_env() -> None:
+    """Populate ``VLLM_OMNI_SHARD_TIMINGS`` from recent Buildkite artifacts when unset."""
+    global _shard_timings_prepared
+    if _shard_timings_prepared:
+        return
+    _shard_timings_prepared = True
+    if os.environ.get("VLLM_OMNI_SHARD_TIMINGS", "").strip():
+        return
+    if os.environ.get("VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD", "").strip() in {"1", "true", "yes"}:
+        return
+    # Local import: AMD source filtering loads this module and must not require
+    # the shard planner. Only the CUDA uploader reaches a download.
+    from merge_shard_timings import prepare_profile_from_history
+
+    output = ROOT / "timings" / "upload-profile.json"
+    branch, exclude_branches = _history_selection(_shard_timings_pipeline)
+    try:
+        path = prepare_profile_from_history(
+            output,
+            branch=branch,
+            exclude_branches=exclude_branches,
+        )
+    except Exception as exc:  # noqa: BLE001 - planning must not fail the upload
+        _log(f"automatic-shard: timing download skipped ({exc})")
+        return
+    if path is None:
+        _log("automatic-shard: no historical timings; enrolled steps use the no-profile fallback")
+        return
+    os.environ["VLLM_OMNI_SHARD_TIMINGS"] = str(path)
+    _log(f"automatic-shard: using timing profile {path}")
+
+
+def _shard_timings() -> dict[str, float] | None:
+    from runtime_shard import load_shard_timings
+
+    _ensure_shard_timings_env()
+    raw = os.environ.get("VLLM_OMNI_SHARD_TIMINGS", "").strip()
+    timings = load_shard_timings()
+    if raw and timings is None and not Path(raw).is_file() and getattr(_shard_timings, "warned", None) != raw:
+        _shard_timings.warned = raw  # type: ignore[attr-defined]
+        _log(f"automatic-shard: {raw!r} is not a file; steps use the no-profile fallback")
+    return timings
+
+
+def _plan_automatic_shard(step: dict[str, Any]) -> dict[str, Any]:
+    from runtime_shard import apply_automatic_shard
+
+    return apply_automatic_shard(step, timings=_shard_timings(), root=ROOT, log=_log)
+
+
 def _process_test_steps(
     steps: list[Any],
     changed_files: list[str] | None,
@@ -628,6 +697,9 @@ def _process_test_steps(
     processed: list[Any] = []
     for step in steps:
         if not isinstance(step, dict):
+            processed.append(step)
+            continue
+        if "wait" in step:
             processed.append(step)
             continue
 
@@ -652,13 +724,15 @@ def _process_test_steps(
             continue
 
         leaf = {key: value for key, value in step.items() if key != "source_file_dependencies"}
+        # AMD nightly filtering uses this mode. It must not plan CUDA shards or
+        # download timing artifacts; the CUDA uploader does that while rendering.
         if not expand_mirror_hardwares:
             processed.append(leaf)
             continue
         expanded = _expand_mirror_hardwares(leaf)
         if expanded is None:
             continue
-        processed.append(expanded)
+        processed.append(_plan_automatic_shard(expanded))
 
     return processed
 
@@ -702,6 +776,8 @@ def _render_test_pipeline(
     # Validate MIRROR_HW once up front. Per-step skip must not run for typos
     # (e.g. b20o), or a pipeline can shrink to leftover CPU-only steps and
     # still upload successfully.
+    global _shard_timings_pipeline
+    _shard_timings_pipeline = pipeline_path
     _get_mirror_hw_selector()
     steps = doc.get("steps")
     if not isinstance(steps, list):
@@ -917,10 +993,24 @@ def main() -> int:
 
     rendered = _render_pipeline(path, force_all=args.all, e2e_only=args.e2e)
     if args.upload:
+        _upload_shard_file_lists()
         _upload_to_buildkite(rendered)
     else:
         sys.stdout.write(rendered)
     return 0
+
+
+def _upload_shard_file_lists() -> None:
+    """Publish packed file lists before shard jobs start."""
+    root = ROOT / "timings" / "file-shards"
+    if not root.is_dir() or not any(root.rglob("*.txt")):
+        return
+    _log(f"automatic-shard: uploading file lists from {root}")
+    subprocess.run(
+        ["buildkite-agent", "artifact", "upload", "timings/file-shards/**/*.txt"],
+        cwd=ROOT,
+        check=True,
+    )
 
 
 if __name__ == "__main__":

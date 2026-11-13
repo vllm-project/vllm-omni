@@ -53,6 +53,8 @@ higher-priority strategy is selected.
 | LingBotVideoPipeline | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | `LingBotVideoTransformer3DModel` | yes | yes | — | `blocks`; text encoder `model.visual.blocks`, `model.language_model.layers` |
 | BagelPipeline | `ByteDance-Seed/BAGEL-7B-MoT` | `Qwen2MoTModel` | — | yes | — | `layers`, customized modules |
 | Cosmos3OmniDiffusersPipeline | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | `Cosmos3VFMTransformer`, `Cosmos3LanguageModel` | yes | yes | yes | `layers`, `gen_layers` |
+| HyNomasModularPipeline | `tencent/Hy-Nomas-Diffusers` | reference `CPTHYNomasDiffusionTransformer` | yes | — | — | — |
+| PAN2ModularPipeline | `IFM/PAN2` | `PAN2Transformer3DModel` | yes | yes | yes | `context_refiner`, `transformer_blocks` |
 
 Model-level support requires discoverable DiT and encoder components.
 Layerwise support requires transformer block topology. Distributed support
