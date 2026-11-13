@@ -709,6 +709,16 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--enable-cfg-batching",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Run the positive and negative classifier-free-guidance branches as one batched "
+                "denoiser call when CFG is not split across ranks, on pipelines that support it. "
+                "Off by default. Not used with cfg-parallel or a cache backend."
+            ),
+        )
+        omni_config_group.add_argument(
             "--fa-deterministic",
             dest="fa_deterministic",
             action="store_true",
@@ -775,8 +785,8 @@ class OmniServeCommand(CLISubcommand):
             action=argparse.BooleanOptionalAction,
             default=None,
             help=(
-                "Enable fused permute-free Ulysses all-to-all using platform-specific symmetric memory "
-                "(NCCL on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
+                "Enable Ulysses all-to-all over platform symmetric memory "
+                "(CUDA copy engines on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
                 "NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
                 "TorchNPU NPUSHMEM and Triton-Ascend, "
                 "with libshmem.so on LD_LIBRARY_PATH. Defaults to disabled."
@@ -1197,13 +1207,13 @@ class OmniServeCommand(CLISubcommand):
             help="Maximum length for TTS voice style instructions (overrides the pipeline default, default: 500).",
         )
 
-        # Disable safety guardrails for this server (currently only applicable for Cosmos3)
+        # Disable safety guardrails for this server (currently only applicable for Cosmos3 and PAN2)
         # TODO: drop once --model-config-override lands (3/N config refactor)
         omni_config_group.add_argument(
             "--no-guardrails",
             dest="no_guardrails",
             action="store_true",
-            help="Disable Cosmos3 text/video safety guardrails for this server.",
+            help="Disable Cosmos3 and PAN2 text/video safety guardrails for this server.",
         )
         omni_config_group.add_argument(
             "--robot-openpi-idle-timeout",
@@ -1269,6 +1279,9 @@ def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int
 
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
+
+    if resolved.weight_sharing is not None:
+        raise ValueError("weight sharing requires one API server with local stage ownership")
 
     sleep_stages = [
         int(getattr(stage_config, "stage_id", stage_index))
@@ -1522,6 +1535,9 @@ def run_headless(args: TrackingNamespace) -> None:
     )
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
+
+    if resolved.weight_sharing is not None:
+        raise ValueError("weight sharing does not support headless stages; launch both stages in one local server")
 
     try:
         stage_cfg = resolved.stage_by_id(stage_id)

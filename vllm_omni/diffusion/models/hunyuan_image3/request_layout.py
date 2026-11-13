@@ -16,6 +16,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .hunyuan_image3_tokenizer import TokenizerEncodeOutput
 from .hunyuan_image3_transformer import ImageInfo, JointImageInfo
+from .prompt_utils import HUNYUAN_AR_GENERATED_TOKEN_IDS_KEY, HUNYUAN_AR_PROMPT_TOKEN_IDS_KEY
 from .system_prompt import get_system_prompt
 
 if TYPE_CHECKING:
@@ -131,6 +132,21 @@ def normalize_hunyuan_cot_text(cot: str | None) -> str | None:
     if "</recaption>" in cot and not cot.startswith("<recaption>"):
         return "<recaption>" + cot
     return cot
+
+
+def extract_hunyuan_ar_token_ids(
+    prompts: list[Any],
+) -> list[tuple[list[int], list[int]] | None] | None:
+    """Read the original AR sequence without a lossy text round trip."""
+    result = []
+    for prompt in prompts:
+        extra = prompt.get("extra", {}) if isinstance(prompt, dict) else {}
+        prompt_ids = extra.get(HUNYUAN_AR_PROMPT_TOKEN_IDS_KEY)
+        generated_ids = extra.get(HUNYUAN_AR_GENERATED_TOKEN_IDS_KEY)
+        if (prompt_ids is None) != (generated_ids is None):
+            raise ValueError("Hunyuan AR token metadata requires both prompt and generated token IDs.")
+        result.append(None if prompt_ids is None else (list(prompt_ids), list(generated_ids)))
+    return result if any(item is not None for item in result) else None
 
 
 def extract_hunyuan_prompt_inputs(
@@ -294,6 +310,8 @@ def prepare_hunyuan_layout(
         batch_cond_image_info=batch_cond_image_info,
         batch_system_prompt=[system_prompt],
         batch_cot_text=cot_text,
+        batch_ar_token_ids=extract_hunyuan_ar_token_ids([request.prompt]),
+        validate_ar_kv_prefix=request.kv_transfer_params is not None,
         max_length=None,
         bot_task=tokenizer_bot_task,
         image_base_size=image_base_size,
