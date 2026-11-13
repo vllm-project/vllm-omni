@@ -727,6 +727,7 @@ def test_registry_hook_installs_on_supported_platform(mocker, device_type: str, 
     platform = mocker.Mock()
     platform.is_cuda.return_value = device_type == "cuda"
     platform.is_xpu.return_value = device_type == "xpu"
+    platform.is_npu.return_value = False
     mocker.patch.object(registry_module, "current_omni_platform", platform)
 
     registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path=level))
@@ -735,12 +736,25 @@ def test_registry_hook_installs_on_supported_platform(mocker, device_type: str, 
         assert getattr(vae, REPORT_ATTR).level == level
 
 
-def test_registry_hook_skips_unsupported_platform_and_non_wan_vaes(mocker) -> None:
+def test_registry_hook_supports_npu_and_skips_other_platforms_and_non_wan_vaes(mocker) -> None:
     _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
     platform = mocker.Mock()
     platform.is_cuda.return_value = False
     platform.is_xpu.return_value = False
+    platform.is_npu.return_value = True
     mocker.patch.object(registry_module, "current_omni_platform", platform)
+    registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path="lossless"))
+    assert is_installed(vae)
+    assert set(getattr(vae, REPORT_ATTR).patched) == {"WanCausalConv3d"}
+    assert not is_encoder_installed(vae)
+
+    uninstall_wan_vae_fastpath(vae)
+    registry_module._apply_wan_vae_fastpath_if_enabled(
+        _StubPipeline(vae), SimpleNamespace(vae_fast_path="channels_last")
+    )
+    assert not is_installed(vae)
+
+    platform.is_npu.return_value = False
     registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path="lossless"))
     assert not is_installed(vae)
 
@@ -758,6 +772,8 @@ def test_registry_encoder_decoder_settings_are_independent(mocker, decode_level,
     vae = AutoencoderKLWan(**CONFIG).eval()
     platform = mocker.Mock()
     platform.is_cuda.return_value = True
+    platform.is_xpu.return_value = False
+    platform.is_npu.return_value = False
     mocker.patch.object(registry_module, "current_omni_platform", platform)
     registry_module._apply_wan_vae_fastpath_if_enabled(
         _StubPipeline(vae), SimpleNamespace(vae_fast_path=decode_level, vae_encode_fast_path=encode_level)
@@ -774,6 +790,8 @@ def test_registry_component_failure_does_not_disable_other_component(mocker, fai
     vae = AutoencoderKLWan(**CONFIG).eval()
     platform = mocker.Mock()
     platform.is_cuda.return_value = True
+    platform.is_xpu.return_value = False
+    platform.is_npu.return_value = False
     mocker.patch.object(registry_module, "current_omni_platform", platform)
     install_name = "install_wan_vae_encoder_fastpath" if failed_component == "encoder" else "install_wan_vae_fastpath"
     mocker.patch.object(wan_vae_fastpath, install_name, side_effect=RuntimeError("injected failure"))

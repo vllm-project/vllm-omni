@@ -212,6 +212,20 @@ def causal_conv_forward(self: WanCausalConv3d, x: torch.Tensor, cache_x: torch.T
         assembled = dm.cat_pad_5d(x, history, padding)
         if assembled is not None:
             return nn.Conv3d.forward(self, assembled)
+    if x.device.type == "npu" and not torch.is_grad_enabled() and not torch.compiler.is_compiling():
+        history = cache_x if padding[4] > 0 else None
+        cache_frames = 0 if history is None else history.shape[2]
+        key = _conv_verdict_key(self, x, cache_frames)
+        verdicts = _SPATIAL_PAD_VERDICTS.setdefault(self, {})
+        if verdicts.get(key, True):
+            temporal_padding = list(padding)
+            if history is not None:
+                x = torch.cat([history.to(x.device), x], dim=2)
+                temporal_padding[4] -= cache_frames
+            temporal_left, temporal_right = temporal_padding[4], temporal_padding[5]
+            if temporal_left != 0 or temporal_right != 0:
+                x = F.pad(x, (0, 0, 0, 0, temporal_left, temporal_right))
+            return _conv_with_spatial_padding(self, x, self.bias, verdicts, key)
     return WanCausalConv3d.forward(self, x, cache_x)
 
 
@@ -248,7 +262,7 @@ def _deferred_conv_bias(conv: nn.Module, output: torch.Tensor) -> torch.Tensor |
 
 # Each cache retains at most this many verdicts per live convolution module.
 _MAX_VERDICTS_PER_CONV = 128
-# Per conv module: {(x.shape, cache_frames, dtype, layout): cuDNN padding is bitwise
+# Per conv module: {(shape, cache frames, dtype, layout, device/backend settings): internal padding is bitwise
 # identical to a pre-padded input}. ``False`` routes that shape to the padded path.
 _SPATIAL_PAD_VERDICTS: WeakKeyDictionary[nn.Module, dict[tuple, bool]] = WeakKeyDictionary()
 # Per conv module: {(x.shape, cache_frames, dtype): the convolution of the channels-last
@@ -298,9 +312,9 @@ def _equal_on_random_operands(
     """Compare two convolution formulations on several seeded stand-ins for ``x`` and ``weight``.
 
     Agreement on the real operands proves little: all-zero activations or
-    weights give the same bytes under any kernel. cuDNN picks the kernel from
-    the verdict key's metadata, but two deterministic low-precision kernels
-    can still disagree by an ulp on some inputs, so every one of
+    weights give the same bytes under any kernel. The backend picks the kernel
+    from the verdict key's metadata, but two deterministic low-precision
+    kernels can still disagree by an ulp on some inputs, so every one of
     ``_PROBE_TRIALS`` probes has to match before the verdict is reused for a
     later input or weight update. A private generator leaves the global RNG
     streams untouched.
@@ -331,16 +345,15 @@ def _conv_with_spatial_padding(
     verdicts: dict[tuple, bool],
     key: tuple,
 ) -> torch.Tensor:
-    """Convolve the time-assembled input, letting cuDNN apply the spatial zero padding.
+    """Convolve the time-assembled input with operator-provided spatial padding.
 
     Upstream pads the input tensor explicitly and convolves with ``padding=0``.
-    Handing the spatial padding to cuDNN avoids materializing the padded copy,
-    but is only bit-identical when the two formulations agree on every probe in
-    :func:`_equal_on_random_operands`. The first call for each (conv, shape)
-    compares both before running the real convolution once with the selected
-    formulation; later calls reuse the verdict until it is evicted.
-    Internal channels-last decoder convolutions skip this bitwise check under
-    their tolerance-based contract.
+    Handing the spatial padding to the device convolution avoids materializing
+    the padded copy, but is only bit-identical when the two formulations agree
+    on every probe in :func:`_equal_on_random_operands`. Exact paths compare
+    both for each (conv, shape) before running the selected formulation; later
+    calls reuse the verdict until it is evicted. Internal channels-last decoder
+    convolutions skip this bitwise check under their tolerance-based contract.
     """
     pad_height, pad_width = conv._padding[2], conv._padding[0]
     pads = (pad_width, pad_width, pad_height, pad_height, 0, 0)
@@ -367,7 +380,7 @@ def _conv_with_spatial_padding(
         _record_verdict(verdicts, key, verdict)
         if not verdict:
             logger.info(
-                "cuDNN spatial padding is not bitwise identical to pre-padded input for %s %s; "
+                "Internal spatial padding is not bitwise identical to pre-padded input for %s %s; "
                 "using the pre-padded path for this shape",
                 type(conv).__name__,
                 tuple(assembled.shape),
