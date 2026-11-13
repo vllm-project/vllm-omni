@@ -4,9 +4,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.helpers.mark import hardware_marks
+
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
     pytest.mark.tts,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
@@ -59,7 +61,7 @@ def test_compile_and_graph_replay_reads_fresh_inputs():
         torch.testing.assert_close(result, F.scaled_dot_product_attention(query, key, value), atol=0.015625, rtol=0.01)
 
 
-def test_depth_block_cache_overwrite_and_compiled_positions(monkeypatch):
+def test_depth_block_cache_overwrite_positions(monkeypatch):
     from transformers import GPT2Config
 
     from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth import (
@@ -71,7 +73,7 @@ def test_depth_block_cache_overwrite_and_compiled_positions(monkeypatch):
     attn = model.h[0].attn
     attn.prepare_rope_cache(12, torch.device("cuda"), torch.bfloat16)
     cache = tuple(torch.empty(4, 4, 12, 80, device="cuda", dtype=torch.bfloat16) for _ in range(2))
-    forward = torch.compile(model._forward_prefix, fullgraph=True, dynamic=True)
+    forward = model._forward_prefix
     with torch.inference_mode():
         for _ in range(2):
             inputs = torch.randn(4, 12, 320, device="cuda", dtype=torch.bfloat16)

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import importlib.util
 import json
 import sys
@@ -13,6 +16,7 @@ def _load_excel_module():
     repo_root = Path(__file__).resolve().parents[2]
     module_path = repo_root / "tools" / "nightly" / "generate_nightly_perf_excel.py"
     spec = importlib.util.spec_from_file_location("generate_nightly_perf_excel", module_path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -34,7 +38,9 @@ def test_generate_excel_report_with_perf_templates(tmp_path: Path):
     diffusion_template_path = perf_scripts_dir / "diffusion_result_template.json"
 
     omni_record = json.loads(omni_template_path.read_text(encoding="utf-8"))
+    omni_record["branch"] = "release/v0.30.0"
     diffusion_records = json.loads(diffusion_template_path.read_text(encoding="utf-8"))
+    diffusion_records[0]["branch"] = "release/v0.30.0"
     diffusion_records[0]["endpoint"] = "/v1/videos"
     diffusion_records[0]["result"]["endpoint"] = "/v1/videos"
 
@@ -69,6 +75,10 @@ def test_generate_excel_report_with_perf_templates(tmp_path: Path):
     assert baseline_cell == json.dumps(omni_record["baseline"], ensure_ascii=False, sort_keys=True)
 
     ws_omni_summary = wb["omni_summary"]
+    assert "branch" not in [c.value for c in ws_omni_summary[1]]
+    assert "branch" not in [c.value for c in ws_omni_raw[1]]
+    assert "branch" not in [c.value for c in wb["diffusion_summary"][1]]
+    assert "branch" not in [c.value for c in wb["diffusion_raw"][1]]
     assert _cell_value_by_header(ws_omni_summary, "commit_sha") == "test_commit_sha"
     assert _cell_value_by_header(ws_omni_summary, "build_id") == "test_build_id"
 

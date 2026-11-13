@@ -12,8 +12,7 @@ from vllm_omni.diffusion.layers.norm import RMSNorm
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.diffusion,
-    pytest.mark.cuda,
-    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
 ]
 
 # MammothModa2-Preview at 1024x1024: 77 text + 4096 image tokens, hidden 2520, 21 heads of 120.

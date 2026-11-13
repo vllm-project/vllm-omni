@@ -42,6 +42,11 @@ lists `path:line` findings, but keeps the same confidence and severity bar.
 
 ## Reference guide
 
+Before reviewing, read the relevant entries in
+[Review and issue lessons](../../../docs/contributing/ci/lessons.md). Verify their
+linked evidence against the current diff and revision; historical examples are
+not proof of a new defect.
+
 Load references in review order: process, one primary module contract, matching
 feature designs, evidence checks, then delivery. Every file is linked directly
 below; do not load unrelated module references.
@@ -225,9 +230,11 @@ and restart from the new snapshot.
 
 Return findings first. Use
 [maintainer-style-study.md](references/delivery/maintainer-style-study.md) to keep them
-direct and brief. Each finding must include an exact `path:line`, trigger or
-call path, current behavior, impact, and smallest fix direction. If there are
-no findings, say so briefly and name material validation gaps.
+direct and brief. For consolidated replies with multiple actions, use its short
+contributor-owned checklist; omit routine process and maintainer CI narration.
+Each finding must include an exact `path:line`, trigger or call path, current
+behavior, impact, and smallest fix direction. If there are no findings, say so
+briefly and name material validation gaps.
 
 Keep the review read-only unless the user explicitly authorizes posting. Do not
 submit `APPROVE`, `COMMENT`, or `REQUEST_CHANGES`, add labels, edit code, or push

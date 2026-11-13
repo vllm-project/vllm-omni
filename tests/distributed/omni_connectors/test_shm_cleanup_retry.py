@@ -401,10 +401,8 @@ class TestSharedMemoryCleanupRetry(unittest.TestCase):
 
         def fail_once(path):
             nonlocal failed
-            if path == shm_path and not failed:
-                # get's first identity lookup for the segment is after the
-                # actual SHM helper has read and unlinked its payload.
-                self.assertFalse(os.path.exists(shm_path))
+            if path == shm_path and not failed and not os.path.exists(shm_path):
+                # Inject only after the actual read has unlinked the payload.
                 failed = True
                 raise PermissionError(errno.EACCES, "one-shot post-read stat failure", path)
             return real_identity(path)

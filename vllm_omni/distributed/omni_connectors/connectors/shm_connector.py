@@ -18,6 +18,7 @@ from typing import Any
 from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
 
 from ..utils.logging import get_connector_logger
+from ..utils.serialization import OmniSerde
 from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
@@ -27,14 +28,9 @@ def _wakeup_enabled() -> bool:
     return os.environ.get("VLLM_OMNI_SHM_WAKEUP", "1") == "1"
 
 
-def _wakeup_directory() -> str:
-    # Stage engine processes of one deployment share their launching parent.
-    return f"/dev/shm/omni_shm_wake_{os.getuid()}_{os.getppid()}"
-
-
 @dataclass
 class _PendingSegment:
-    identity: tuple[int, int]
+    identity: tuple[int, int] | None
     lock_identity: tuple[int, int]
     cleanup_attempts: int = 0
     retry_at: float | None = None
@@ -69,6 +65,44 @@ class SharedMemoryConnector(OmniConnectorBase):
     deployment layout, or ``VLLM_OMNI_SHM_WAKEUP=0``) keeps the timed poll.
     """
 
+    shm_directory = "/dev/shm"
+
+    def _shm_name(self, key: str) -> str:
+        """Map a logical key to an OS segment name."""
+        return key
+
+    def _shm_exists(self, key: str) -> bool:
+        """Return True while a published payload remains unread.
+
+        Override when segments are not files under ``shm_directory``.
+        """
+        return os.path.exists(f"{self.shm_directory}/{self._shm_name(key)}")
+
+    def _segment_identity(self, name: str) -> tuple[int, int] | None:
+        # Some storage hooks use named SHM with no file in this directory.
+        return _identity(f"{self.shm_directory}/{name}")
+
+    def _wakeup_directory(self) -> str:
+        # Stage engine processes of one deployment share their launching parent.
+        return f"{self.shm_directory}/omni_shm_wake_{os.getuid()}_{os.getppid()}"
+
+    def _lock_file(self, name: str) -> str:
+        return f"{self.shm_directory}/shm_{name}_lockfile.lock"
+
+    def _write_bytes(self, payload: bytes | bytearray | memoryview, name: str) -> dict[str, Any]:
+        """Publish payload bytes while the caller holds the segment lock."""
+        return shm_write_bytes(payload, name=name)
+
+    def _read_bytes(self, metadata: dict[str, Any]) -> bytes:
+        """Read logical payload bytes and unlink under the segment lock."""
+        return shm_read_bytes(metadata)
+
+    def _unlink_segment(self, name: str) -> None:
+        """Unlink a segment by its OS name; raise FileNotFoundError if absent."""
+        seg = shm_pkg.SharedMemory(name=name)
+        seg.close()
+        seg.unlink()
+
     def get_with_deadline(self, from_stage, to_stage, get_key, metadata=None, *, deadline):
         if time.monotonic() >= deadline:
             return None
@@ -77,14 +111,18 @@ class SharedMemoryConnector(OmniConnectorBase):
     def __init__(self, config: dict[str, Any]):
         self.config = config
         self.stage_id = config.get("stage_id", -1)
-        scope = config.get("extra", {}).get("wakeup_scope")
+        # load_omni_transfer_config puts the scope in the edge's extra, which
+        # the factory passes as this config.
+        scope = config.get("wakeup_scope")
         self._wake_directory = (
-            f"/dev/shm/omni_shm_wake_{os.getuid()}_{hashlib.sha256(str(scope).encode()).hexdigest()[:24]}"
+            f"{self.shm_directory}/omni_shm_wake_{os.getuid()}_{hashlib.sha256(str(scope).encode()).hexdigest()[:24]}"
             if scope is not None
-            else _wakeup_directory()
+            else self._wakeup_directory()
         )
         self._pending_keys: OrderedDict[str, _PendingSegment] = OrderedDict()
         self._pending_keys_lock = threading.Lock()
+        self._serde = OmniSerde()
+        self._encode_buffer = threading.local()
         self._metrics = {
             "puts": 0,
             "gets": 0,
@@ -99,6 +137,14 @@ class SharedMemoryConnector(OmniConnectorBase):
         self._wake_path: str | None = None
         self._wake_generation = 0
         self._wake_closed = False
+
+    def _thread_encode_buffer(self) -> bytearray:
+        """Return this thread's reusable encode buffer."""
+        buffer = getattr(self._encode_buffer, "value", None)
+        if buffer is None:
+            buffer = bytearray()
+            self._encode_buffer.value = buffer
+        return buffer
 
     def _open_wakeup_receiver(self) -> bool:
         if self._wake_closed:
@@ -225,10 +271,12 @@ class SharedMemoryConnector(OmniConnectorBase):
             # Keep per-send housekeeping small when unread chunks accumulate.
             # Explicit sweeps retain a larger budget to drain stale records.
             self.reap_consumed(max_keys=4)
-            payload = self.serialize_obj(data)
-            size = len(payload)
+            buffer = self._thread_encode_buffer()
+            size = self._serde.serialize_into(data, buffer)
+            payload = memoryview(buffer)[:size]
 
-            lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
+            name = self._shm_name(put_key)
+            lock_file = self._lock_file(name)
             for _ in range(3):
                 with open(lock_file, "wb+") as lockf:
                     fcntl.flock(lockf, fcntl.LOCK_EX)
@@ -237,9 +285,9 @@ class SharedMemoryConnector(OmniConnectorBase):
                     # Reopen its current pathname before writing a new generation.
                     if _identity(lock_file) != lock_identity:
                         continue
-                    meta = shm_write_bytes(payload, name=put_key)
-                    identity = _identity(f"/dev/shm/{put_key}")
-                    if identity is None:
+                    meta = self._write_bytes(payload, name)
+                    identity = self._segment_identity(name)
+                    if identity is None and not self._shm_exists(put_key):
                         raise FileNotFoundError(put_key)
                     with self._pending_keys_lock:
                         self._pending_keys[put_key] = _PendingSegment(identity, lock_identity)
@@ -260,33 +308,38 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
             return False, 0, None
 
-    def _get_data_with_lock(self, lock_file: str, shm_handle: dict[str, Any]) -> tuple[Any, int] | None:
+    def _get_data_with_lock(self, key: str, shm_handle: dict[str, Any]) -> tuple[Any, int] | None:
+        name = shm_handle["name"]
+        lock_file = self._lock_file(name)
         try:
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                if _identity(lock_file) != _lock_identity(lockf):
+                lock_identity = _lock_identity(lockf)
+                if _identity(lock_file) != lock_identity:
                     return None
-                key = shm_handle["name"]
-                stat = os.stat(f"/dev/shm/{key}")
-                identity = (stat.st_dev, stat.st_ino)
-                data_bytes = shm_read_bytes({"name": key, "size": stat.st_size})
+                identity = self._segment_identity(name)
+                data_bytes = self._read_bytes(shm_handle)
                 try:
-                    if _identity(f"/dev/shm/{key}") is None:
+                    if self._segment_identity(name) is None:
                         # Remove the lock before releasing it. Waiters must reject
                         # this old fd rather than write through a detached lock.
                         os.remove(lock_file)
                         with self._pending_keys_lock:
                             owner = self._pending_keys.get(key)
-                            if owner is not None and owner.identity == identity:
+                            if (
+                                owner is not None
+                                and owner.lock_identity == lock_identity
+                                and owner.identity == identity
+                                and name == self._shm_name(key)
+                            ):
                                 self._pending_keys.pop(key)
                 except OSError as e:
                     # Reading succeeded. An uncertain observation or failed lock
                     # removal must retain ownership without discarding the payload.
                     logger.debug("get: failed to finalize consumed SHM %s: %s", key, e)
-            obj = self.deserialize_obj(data_bytes)
-            result = (obj, stat.st_size)
-            return result
-        except BlockingIOError:
+            obj = self._serde.deserialize(data_bytes)
+            return obj, len(data_bytes)
+        except (BlockingIOError, FileNotFoundError):
             return None
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
@@ -294,31 +347,8 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
         """Read a SHM segment addressed purely by *get_key*."""
-        shm = None
-        try:
-            shm = shm_pkg.SharedMemory(name=get_key)
-            if shm is None or shm.size == 0:
-                return None
-            lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
-            shm_handle = {"name": get_key, "size": shm.size}
-            result = self._get_data_with_lock(lock_file, shm_handle)
-            return result
-        except FileNotFoundError:
-            return None
-        except ValueError as e:
-            # A receiver can observe a newly-created POSIX SHM object before
-            # the writer has finished sizing it. Treat that as "not ready yet"
-            # so async polling can retry without a traceback.
-            if "empty file" in str(e):
-                return None
-            logger.debug("_get_by_key: unexpected error reading SHM segment %s", get_key, exc_info=True)
-            return None
-        except Exception:
-            logger.debug("_get_by_key: unexpected error reading SHM segment %s", get_key, exc_info=True)
-            return None
-        finally:
-            if shm:
-                shm.close()
+        # Take the publication lock before opening a possibly unsized segment.
+        return self._get_data_with_lock(get_key, {"name": self._shm_name(get_key)})
 
     def get(
         self,
@@ -333,8 +363,7 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             if isinstance(metadata, dict) and "shm" in metadata:
                 shm_handle = metadata["shm"]
-                lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
-                result = self._get_data_with_lock(lock_file, shm_handle)
+                result = self._get_data_with_lock(get_key, shm_handle)
             else:
                 # Missing or non-SHM metadata falls back to key-based lookup.
                 result = self._get_by_key(get_key)
@@ -361,44 +390,59 @@ class SharedMemoryConnector(OmniConnectorBase):
         if not force and owner.retry_at is not None:
             if owner.cleanup_attempts >= 3 or time.monotonic() < owner.retry_at:
                 return False
-        lock_file = f"/dev/shm/shm_{key}_lockfile.lock"
+        name = self._shm_name(key)
+        lock_file = self._lock_file(name)
+        has_identity = owner.identity is not None
+        if not has_identity:
+            # A lock can cover several generations. Without a segment identity
+            # preserve one-shot cleanup, never schedule a delayed unlink.
+            self._pending_keys.pop(key)
+
         try:
-            identity = _identity(f"/dev/shm/{key}")
-            if identity is not None and identity != owner.identity:
-                self._pending_keys.pop(key)
-                return False
-            if identity is None and _identity(lock_file) is None:
-                self._pending_keys.pop(key)
-                return False
+            if has_identity:
+                identity = self._segment_identity(name)
+                if identity is not None and identity != owner.identity:
+                    self._pending_keys.pop(key)
+                    return False
+                if identity is None and _identity(lock_file) is None:
+                    self._pending_keys.pop(key)
+                    return False
             with open(lock_file, "rb+") as lockf:
                 try:
                     fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     # A busy transfer has not attempted cleanup. Retry on the
                     # next maintenance pass without spending its error budget.
-                    owner.retry_at = time.monotonic() + 0.1
+                    if has_identity:
+                        owner.retry_at = time.monotonic() + 0.1
                     return False
                 if _lock_identity(lockf) != owner.lock_identity or _identity(lock_file) != owner.lock_identity:
-                    owner.retry_at = time.monotonic() + 0.1
+                    if has_identity:
+                        owner.retry_at = time.monotonic() + 0.1
                     return False
                 # Identity check AND unlink share the writer/consumer lock.
                 # A stat check alone would allow deleting a replacement segment.
-                identity = _identity(f"/dev/shm/{key}")
+                identity = self._segment_identity(name) if has_identity else None
                 if identity is not None and identity != owner.identity:
                     self._pending_keys.pop(key)
                     return False
-                unlinked = identity is not None
-                if identity is not None:
-                    seg = shm_pkg.SharedMemory(name=key)
-                    seg.close()
-                    seg.unlink()
+                unlinked = False
+                if identity is not None or not has_identity:
+                    try:
+                        self._unlink_segment(name)
+                        unlinked = True
+                    except FileNotFoundError:
+                        unlinked = False
                 try:
                     os.remove(lock_file)
                 except FileNotFoundError:
                     pass
-                self._pending_keys.pop(key)
+                self._pending_keys.pop(key, None)
                 return unlinked
         except OSError as e:
+            if not has_identity:
+                logger.debug("cleanup: failed to unlink SHM segment %s: %s", key, e)
+                return False
             # Reuse the adapter's periodic reap_consumed maintenance. Duplicate
             # cleanup calls share this budget; failed ownership is never dropped.
             owner.cleanup_attempts += 1
@@ -438,6 +482,24 @@ class SharedMemoryConnector(OmniConnectorBase):
         if error is not None:
             raise error
 
+    def _opaque_segment_may_remain(self, key: str, owner: _PendingSegment) -> bool:
+        lock_file = self._lock_file(self._shm_name(key))
+        try:
+            with open(lock_file, "rb+") as lockf:
+                fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # A storage hook may open the segment to check it. Don't
+                # observe an in-progress publication without the lock.
+                return (
+                    _lock_identity(lockf) == owner.lock_identity
+                    and _identity(lock_file) == owner.lock_identity
+                    and self._shm_exists(key)
+                )
+        except FileNotFoundError:
+            return False
+        except OSError:
+            # Contention or a failed observation cannot prove it was consumed.
+            return True
+
     def reap_consumed(self, *, max_keys: int = 64) -> None:
         """Bounded sweep of consumed keys and due cleanup retries.
 
@@ -448,12 +510,14 @@ class SharedMemoryConnector(OmniConnectorBase):
             for _ in range(min(max_keys, len(self._pending_keys))):
                 key, owner = self._pending_keys.popitem(last=False)
                 try:
-                    identity = _identity(f"/dev/shm/{key}")
+                    if owner.identity is None:
+                        if self._opaque_segment_may_remain(key, owner):
+                            self._pending_keys[key] = owner
+                        continue
+                    name = self._shm_name(key)
+                    identity = self._segment_identity(name)
                     if identity != owner.identity:
-                        if (
-                            identity is not None
-                            or _identity(f"/dev/shm/shm_{key}_lockfile.lock") != owner.lock_identity
-                        ):
+                        if identity is not None or _identity(self._lock_file(name)) != owner.lock_identity:
                             continue
                         if owner.retry_at is None:
                             # SHM was consumed, but its own lock remains. Only

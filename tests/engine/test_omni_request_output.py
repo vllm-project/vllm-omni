@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for OmniRequestOutput class."""
+
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -8,8 +10,30 @@ from PIL import Image
 from vllm.outputs import CompletionOutput, RequestOutput
 
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("payload_location", ["request", "completion", "missing"])
+def test_multimodal_output_audio_accessor(payload_location):
+    audio = {"audio": [0.1, -0.1], "sr": 24000}
+    output = OmniRequestOutput(request_id="audio-accessor")
+    if payload_location == "request":
+        output = OmniRequestOutput.from_diffusion(request_id="audio-accessor", images=[], multimodal_output=audio)
+    elif payload_location == "completion":
+        output.outputs = [
+            MultimodalCompletionOutput(
+                index=0,
+                text="",
+                token_ids=[],
+                cumulative_logprob=None,
+                logprobs=None,
+                multimodal_output=audio,
+            )
+        ]
+
+    assert output.multimodal_output == ({} if payload_location == "missing" else audio)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -132,6 +156,21 @@ class TestFromStageOutput:
         assert len(out.outputs) == 1
         assert out.outputs[0].text == "hello"
         assert out.outputs[0].token_ids == [1, 2, 3]
+
+    def test_scalar_pooling_output_is_normalized_to_list(self):
+        """PoolingRequestOutput's scalar output remains safe for serving."""
+        multimodal_output = {"metadata": {"stream": {"output_chunk_index": 2}}}
+        pooling_output = SimpleNamespace(data=object(), multimodal_output=multimodal_output)
+        source = SimpleNamespace(
+            request_id="pooling-1",
+            outputs=pooling_output,
+            finished=True,
+        )
+
+        out = OmniRequestOutput.from_stage_output(source, stage_id=2, final_output_type="audio")
+
+        assert out.outputs == [pooling_output]
+        assert out.multimodal_output == multimodal_output
 
 
 # ── dataclass safety ────────────────────────────────────────────────────────

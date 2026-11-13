@@ -84,10 +84,12 @@ class TestParallelConfigPropagation:
             tensor_parallel_size=2,
             ulysses_degree=2,
             ring_degree=1,
+            ulysses_a2a_permute=True,
         )
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.parallel_config.ulysses_degree == 2
         assert od.parallel_config.ring_degree == 1
+        assert od.parallel_config.ulysses_a2a_permute is True
 
     def test_mask_sp_padding_roundtrip(self):
         pc = DiffusionParallelConfig(ulysses_degree=2, mask_sp_padding=True)
@@ -239,6 +241,18 @@ def test_vae_fast_path_roundtrip():
 def test_invalid_vae_fast_path_is_rejected():
     with pytest.raises(ValueError, match="vae_fast_path"):
         OmniDiffusionConfig(model="x", vae_fast_path="fast")
+
+
+def test_vae_encode_fast_path_roundtrip():
+    assert _roundtrip_diffusion_config(model="x").vae_encode_fast_path == "lossless"
+    od = _roundtrip_diffusion_config(model="x", vae_fast_path="off", vae_encode_fast_path="channels_last")
+    assert od.vae_fast_path == "off"
+    assert od.vae_encode_fast_path == "channels_last"
+
+
+def test_invalid_vae_encode_fast_path_is_rejected():
+    with pytest.raises(ValueError, match="vae_encode_fast_path"):
+        OmniDiffusionConfig(model="x", vae_encode_fast_path="fast")
 
 
 def test_flux2_klein_sets_generic_multimodal_limit():

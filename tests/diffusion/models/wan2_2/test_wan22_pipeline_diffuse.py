@@ -2,17 +2,42 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from torch import nn
 
+import vllm_omni.diffusion.attention.layer as layer_mod
+import vllm_omni.diffusion.cache.cachedit.model_specific as cd_model_specific
+from tests.diffusion.attention.test_attention_schedule_candidates import _fake_resolve, _FakeImpl, _make_config
+from vllm_omni.config.stage_config import DiffusionStageRole
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    AttentionSpec,
+    DiffusionCacheConfig,
+    OmniDiffusionConfig,
+)
+from vllm_omni.diffusion.forward_context import (
+    bind_attention_schedule,
+    get_attention_schedule_profile,
+    get_forward_context,
+    is_forward_context_available,
+    override_forward_context,
+    set_forward_context,
+)
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -96,6 +121,7 @@ def _stub_encode_prompt(
 def _make_pipeline() -> Wan22Pipeline:
     pipeline = object.__new__(Wan22Pipeline)
     nn.Module.__init__(pipeline)
+    pipeline.stage_role = DiffusionStageRole.FULL
     pipeline.device = torch.device("cpu")
     pipeline.transformer = _StubTransformer()
     pipeline.transformer_2 = None
@@ -479,6 +505,101 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
     assert torch.equal(result, torch.full_like(latents, 10.0))
 
 
+@pytest.mark.parametrize("fail", [False, True], ids=["exit", "exception"])
+def test_diffuse_clears_the_scheduled_step_on_any_exit(fail) -> None:
+    pipeline = _make_pipeline()
+    latents = torch.zeros((1, 1, 1, 2, 2), dtype=torch.float32)
+    seen: list[tuple[int | None, float | None, int | None]] = []
+
+    def _fake_predict_noise_maybe_with_cfg(**kwargs):
+        context = get_forward_context()
+        seen.append((context.denoise_step_idx, context.denoise_timestep, context.total_denoise_steps))
+        if fail and context.denoise_step_idx == 1:
+            raise RuntimeError("forward failed")
+        return torch.zeros_like(latents)
+
+    pipeline.predict_noise_maybe_with_cfg = _fake_predict_noise_maybe_with_cfg  # type: ignore[method-assign]
+    pipeline.scheduler_step_maybe_with_cfg = lambda noise_pred, t, current, cfg: current  # type: ignore[method-assign]
+    schedule = (AttentionScheduleRange(start=1, end=2, profile="candidate"),)
+
+    with set_forward_context(), bind_attention_schedule(schedule, from_request=True):
+        raises = pytest.raises(RuntimeError, match="forward failed") if fail else nullcontext()
+        with raises:
+            pipeline.diffuse(
+                latents=latents,
+                timesteps=torch.tensor([7, 3, 1], dtype=torch.int64),
+                prompt_embeds=torch.randn(1, 8),
+                negative_prompt_embeds=None,
+                guidance_low=1.0,
+                guidance_high=1.0,
+                boundary_timestep=None,
+                dtype=torch.float32,
+                attention_kwargs={},
+            )
+        context = get_forward_context()
+        after = (context.denoise_step_idx, context.denoise_timestep, context.total_denoise_steps)
+
+    # _StubScheduler normalizes by num_train_timesteps=1000.
+    published = [(0, pytest.approx(0.007), 3), (1, pytest.approx(0.003), 3), (2, pytest.approx(0.001), 3)]
+    assert seen == (published[:2] if fail else published)
+    assert after == (None, None, None)
+
+
+def test_cache_dit_expert_budgets_follow_each_request_schedule(monkeypatch) -> None:
+    """Each expert's refreshed Cache-DiT budget must equal the steps diffuse() routes to it.
+
+    Consecutive requests on one server with no pinned boundary omit
+    num_inference_steps and change the boundary, sample solver and flow shift;
+    the budgets must follow each request's own schedule, not the previous one.
+    """
+    pipeline = _make_pipeline()
+    pipeline.transformer_2 = _StubTransformer()
+    for expert in (pipeline.transformer, pipeline.transformer_2):
+        expert.blocks = nn.ModuleList()
+    pipeline.boundary_ratio = None
+    pipeline.scheduler = build_wan_scheduler("unipc", 5.0)
+
+    refreshed: dict[str, list[int]] = {"transformer": [], "transformer_2": []}
+
+    def _fake_build_refresh(cache_config, get_pipeline_transformer=None):
+        name = "transformer" if get_pipeline_transformer is None else "transformer_2"
+        return lambda pipeline, num_inference_steps, verbose=True: refreshed[name].append(num_inference_steps)
+
+    monkeypatch.setattr(cd_model_specific, "_build_cache_context_refresh", _fake_build_refresh)
+    monkeypatch.setattr(cd_model_specific, "cache_dit", Mock())
+    monkeypatch.setattr(cd_model_specific, "BlockAdapter", Mock())
+    cd_model_specific.enable_cache_for_wan22(pipeline, DiffusionCacheConfig())
+
+    routed: list[str] = []
+
+    def _fake_predict_noise_maybe_with_cfg(**kwargs):
+        current_model = kwargs["positive_kwargs"]["current_model"]
+        routed.append("transformer_2" if current_model is pipeline.transformer_2 else "transformer")
+        return torch.zeros_like(kwargs["positive_kwargs"]["hidden_states"])
+
+    pipeline.predict_noise_maybe_with_cfg = _fake_predict_noise_maybe_with_cfg  # type: ignore[method-assign]
+    pipeline.scheduler_step_maybe_with_cfg = lambda noise_pred, t, latents, do_true_cfg: latents  # type: ignore[method-assign]
+
+    for overrides in (
+        {},
+        {"boundary_ratio": 0.9},
+        {"extra_args": {"sample_solver": "euler", "flow_shift": 12.0}},
+        {"boundary_ratio": 0.5, "extra_args": {"sample_solver": "unipc", "flow_shift": 3.0}},
+    ):
+        routed.clear()
+        for counts in refreshed.values():
+            counts.clear()
+        sampling = _make_sampling(num_inference_steps=None, **overrides)
+        request = OmniDiffusionRequest(prompt="prompt", request_id="schedule", sampling_params=sampling)
+
+        pipeline.forward(DiffusionRequestBatch(requests=[request]))
+
+        assert len(routed) == pipeline.default_num_inference_steps
+        for name in ("transformer", "transformer_2"):
+            expected = routed.count(name)
+            assert refreshed[name] == ([expected] if expected else []), (overrides, name)
+
+
 @pytest.mark.parametrize("fail_first_request", [False, True])
 def test_runner_publishes_wan_step_context_across_requests(fail_first_request, monkeypatch):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -573,6 +694,146 @@ def test_runner_publishes_wan_step_context_across_requests(fail_first_request, m
     assert events == expected
 
 
+@pytest.fixture
+def fake_attention_backends(monkeypatch):
+    # Attention layers resolve fake backends from the supplied config, as in tests/diffusion/attention.
+    monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeImpl))
+    monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
+    monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", lambda **kwargs: _fake_resolve(**kwargs))
+
+
+def _candidate_from_step_2() -> AttentionScheduleConfig:
+    return AttentionScheduleConfig(
+        profiles={"candidate": AttentionConfig(default=AttentionSpec(backend="SDPA"))},
+        default=[{"start": 2, "end": None, "profile": "candidate"}],
+    )
+
+
+def _make_scheduled_runner(pipeline, monkeypatch, schedule_config):
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = pipeline
+    runner.od_config = OmniDiffusionConfig(model="", dtype=torch.float32)
+    # Set after construction so the config does not look up calibration for a model.
+    runner.od_config.diffusion_attention_schedule = schedule_config
+    runner.vllm_config = None
+    runner.cache_backend = None
+    monkeypatch.setattr(runner, "_prepare_request_for_forward", lambda *args, **kwargs: None)
+    return runner
+
+
+def _execute_wan_request(runner, request):
+    return runner._execute_request_list(
+        [request],
+        od_config=runner.od_config,
+        allow_single_output=True,
+        require_request_batch_support=False,
+        record_name="test_wan_attention_schedule",
+        record_output_peak_memory=False,
+    )
+
+
+@pytest.mark.parametrize("scheduled", [True, False], ids=["inherited-default", "disabled"])
+def test_runner_selects_wan_attention_by_actual_denoise_step(scheduled, monkeypatch, fake_attention_backends):
+    schedule_config = _candidate_from_step_2()
+    with set_current_diffusion_config(_make_config(schedule=schedule_config)):
+        layer = Attention(num_heads=4, head_size=64, causal=False, softmax_scale=1.0)
+    names = {id(layer.attention): "base", id(layer._schedule_candidates["candidate"].impl): "candidate"}
+
+    def selection():
+        context = get_forward_context()
+        return context.denoise_step_idx, context.total_denoise_steps, names[id(layer.effective_attention()[0])]
+
+    events = []
+
+    class RecordingTransformer(_StubTransformer):
+        def __init__(self, expert):
+            super().__init__()
+            self.expert = expert
+
+        def forward(self, hidden_states, encoder_hidden_states, **kwargs):
+            positive = bool(encoder_hidden_states[0, 0, 0] > 0)
+            events.append((*selection(), self.expert, positive))
+            return (torch.zeros_like(hidden_states),)
+
+    def encode_prompt(**kwargs):
+        embeds = torch.ones(1, 8, 8)
+        return embeds, -embeds
+
+    pipeline = _make_pipeline()
+    pipeline.transformer = RecordingTransformer("high")
+    pipeline.transformer_2 = RecordingTransformer("low")
+    # The request asks for 4 steps, but the scheduler builds 3; the schedule must follow the 3.
+    pipeline.scheduler = _StubScheduler([900, 500, 100])
+    monkeypatch.setattr(pipeline, "encode_prompt", encode_prompt)
+    monkeypatch.setattr(pipeline, "scheduler_step_maybe_with_cfg", lambda pred, t, latents, cfg: latents)
+    after_loop = []
+    diffuse = pipeline.diffuse
+
+    def diffuse_then_record(**kwargs):
+        latents = diffuse(**kwargs)
+        after_loop.append(selection())
+        return latents
+
+    monkeypatch.setattr(pipeline, "diffuse", diffuse_then_record)
+    runner = _make_scheduled_runner(pipeline, monkeypatch, schedule_config)
+    request = OmniDiffusionRequest(
+        prompt="a fox walks",
+        request_id="request-0",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_frames=1,
+            num_inference_steps=4,
+            guidance_scale=2.0,
+            output_type="latent",
+            attention_schedule=None if scheduled else [],
+        ),
+    )
+
+    with override_forward_context(None):
+        _execute_wan_request(runner, request)
+
+    total = 3 if scheduled else None
+    last = "candidate" if scheduled else "base"
+    # Both CFG passes of a step see the same step and selection. The expert changes at the numeric
+    # boundary (875) between steps 0 and 1; the step index does not, so step 1 still uses the baseline.
+    assert events == [
+        (0, total, "base", "high", True),
+        (0, total, "base", "high", False),
+        (1, total, "base", "low", True),
+        (1, total, "base", "low", False),
+        (2, total, last, "low", True),
+        (2, total, last, "low", False),
+    ]
+    # A scheduled run clears the step after the loop, so VAE decode uses the baseline. An unscheduled
+    # run leaves the last step in place.
+    assert after_loop == [(None, None, "base") if scheduled else (2, None, "base")]
+
+
+def test_runner_rejects_wan_schedule_past_actual_total_before_denoise(monkeypatch):
+    calls = []
+    pipeline = _make_pipeline()
+    pipeline.scheduler = _StubScheduler([900, 500, 100])
+    monkeypatch.setattr(pipeline, "predict_noise_maybe_with_cfg", lambda **kwargs: calls.append(kwargs))
+    runner = _make_scheduled_runner(pipeline, monkeypatch, _candidate_from_step_2())
+    # Steps 3 to 4 fit the 4 requested steps but not the 3 the scheduler builds.
+    request = OmniDiffusionRequest(
+        prompt="a fox walks",
+        request_id="request-0",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_frames=1,
+            num_inference_steps=4,
+            output_type="latent",
+            attention_schedule=[{"start": 3, "end": 4, "profile": "candidate"}],
+        ),
+    )
+
+    with override_forward_context(None):
+        with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=3"):
+            _execute_wan_request(runner, request)
+        assert not is_forward_context_available()
+
+    assert calls == []
+
+
 class _StubDMDScheduler:
     def __init__(self) -> None:
         self.predict_clean_calls: list[tuple[float, float, float]] = []
@@ -625,9 +886,66 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> N
     torch.testing.assert_close(result, torch.tensor([[[[[17.0]]]]]))
 
 
+def _denoise_progress():
+    context = get_forward_context()
+    return context.denoise_step_idx, context.total_denoise_steps, get_attention_schedule_profile()
+
+
+@pytest.mark.parametrize(
+    ("schedule", "from_request", "last_profile"),
+    [
+        ((AttentionScheduleRange(start=2, end=3, profile="candidate"),), True, "candidate"),
+        ((AttentionScheduleRange(start=3, end=4, profile="candidate"),), True, None),
+        # An inherited default is not checked against the sequence; [3, 4) selects nothing in 3 steps.
+        ((AttentionScheduleRange(start=3, end=4, profile="candidate"),), False, None),
+    ],
+    ids=["fits-three-steps", "past-three-steps", "inherited-past-three-steps"],
+)
+def test_dmd_forward_checks_and_publishes_the_fixed_three_step_total(
+    schedule, from_request, last_profile, monkeypatch
+) -> None:
+    fits = not from_request or schedule[0].end <= 3
+    pipeline = _make_pipeline()
+    pipeline.is_dmd = True
+    pipeline.scheduler = _StubDMDScheduler()
+    # forward reads num_train_timesteps for the expert boundary.
+    monkeypatch.setattr(pipeline.scheduler, "config", SimpleNamespace(num_train_timesteps=1000), raising=False)
+    calls: list[tuple[int | None, int | None, str | None]] = []
+
+    def fake_predict_noise_maybe_with_cfg(**kwargs):
+        calls.append(_denoise_progress())
+        return torch.zeros_like(kwargs["positive_kwargs"]["hidden_states"])
+
+    monkeypatch.setattr(pipeline, "predict_noise_maybe_with_cfg", fake_predict_noise_maybe_with_cfg)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.randn_tensor",
+        lambda *args, **kwargs: torch.zeros(args[0], dtype=kwargs["dtype"]),
+    )
+    # DMD ignores the 40 requested steps and runs its 3 fixed timesteps.
+    request = OmniDiffusionRequest(
+        prompt="prompt",
+        request_id="dmd",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_frames=1, num_inference_steps=40, max_sequence_length=32, output_type="latent"
+        ),
+    )
+
+    with set_forward_context(), bind_attention_schedule(schedule, from_request=from_request):
+        if fits:
+            pipeline.forward(DiffusionRequestBatch(requests=[request]))
+        else:
+            with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=3"):
+                pipeline.forward(DiffusionRequestBatch(requests=[request]))
+        after = _denoise_progress()
+
+    assert calls == ([(0, 3, None), (1, 3, None), (2, 3, last_profile)] if fits else [])
+    assert after == (None, None, None)
+
+
 def _make_gate_loading_pipeline():
     pipeline = Wan22Pipeline.__new__(Wan22Pipeline)
     nn.Module.__init__(pipeline)
+    pipeline.encode_only = False
     gate = WanSelfAttention.__new__(WanSelfAttention)
     nn.Module.__init__(gate)
     gate.to_gate_compress = nn.Linear(1, 1)
@@ -648,6 +966,8 @@ def test_wan_pipeline_loaders_share_optional_gate_cleanup(monkeypatch, module_na
     module = importlib.import_module(f"vllm_omni.diffusion.models.wan2_2.{module_name}")
     pipeline_cls = getattr(module, class_name)
     pipeline = pipeline_cls.__new__(pipeline_cls)
+    if class_name == "Wan22Pipeline":
+        pipeline.encode_only = False
     expected = {"loaded"}
 
     def fake_loader(model, weights):
@@ -693,3 +1013,128 @@ def test_load_weights_keeps_trained_vsa_gate(monkeypatch) -> None:
 
     assert pipeline.has_gate_compress_weights is True
     assert gate.to_gate_compress is original_gate
+
+
+class _StubParallelLinear(nn.Module):
+    """Stands in for vLLM parallel linear layers, which need a tensor-parallel group."""
+
+    def __init__(self, *args, total_num_heads=None, **kwargs):
+        del args, kwargs
+        super().__init__()
+        self.num_heads = total_num_heads
+        self.num_kv_heads = total_num_heads
+        self.weight = nn.Parameter(torch.zeros(1))
+        self.bias = nn.Parameter(torch.zeros(1))
+
+
+@pytest.mark.parametrize(
+    ("baseline", "candidate", "has_gate", "rejected"),
+    [
+        (None, "FASTVIDEO_VSA", False, True),
+        (None, "SDPA", False, False),
+        ("FASTVIDEO_VSA", "SDPA", True, False),
+        ("FASTVIDEO_VSA", "FASTVIDEO_VSA", True, False),
+    ],
+    ids=["default-baseline-vsa", "default-baseline-sdpa", "vsa-baseline-sdpa", "vsa-baseline-vsa"],
+)
+def test_startup_validation_rejects_vsa_candidate_on_self_attention_without_gate(
+    baseline, candidate, has_gate, rejected, monkeypatch, fake_attention_backends
+) -> None:
+    module = importlib.import_module("vllm_omni.diffusion.models.wan2_2.wan2_2_transformer")
+    for name in ("QKVParallelLinear", "ColumnParallelLinear", "RowParallelLinear"):
+        monkeypatch.setattr(module, name, _StubParallelLinear)
+    monkeypatch.setattr(module, "RMSNorm", nn.Identity)
+    monkeypatch.setattr(module, "RotaryEmbeddingWan", nn.Identity)
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+    schedule = AttentionScheduleConfig(
+        profiles={"candidate": AttentionConfig(default=AttentionSpec(backend=candidate))},
+        default=[{"start": 0, "end": None, "profile": "candidate"}],
+    )
+    baseline_config = None if baseline is None else AttentionConfig(default=AttentionSpec(backend=baseline))
+    config = _make_config(baseline=baseline_config, schedule=schedule)
+    with set_current_diffusion_config(config):
+        attention = WanSelfAttention(dim=256, num_heads=4, head_dim=64, prefix="blocks.0.attn1")
+
+    # The gate is built from the baseline backend only, so a FASTVIDEO_VSA candidate on a layer without
+    # it is rejected at startup. A candidate on a layer with the gate, or a dense candidate, is accepted.
+    assert (attention.to_gate_compress is not None) is has_gate
+    if rejected:
+        with pytest.raises(ValueError, match="profile 'candidate' selects backend FASTVIDEO_VSA.*to_gate_compress"):
+            layer_mod.validate_attention_schedule_candidates(attention, config)
+    else:
+        assert layer_mod.validate_attention_schedule_candidates(attention, config) == 1
+
+
+class _StubGraphedForward:
+    """Stands in for the platform graph class: always on, records the step calls."""
+
+    def __init__(self, module: nn.Module, *, name: str, **kwargs) -> None:
+        self.module, self.name, self.enabled = module, name, True
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs) -> torch.Tensor:
+        self.calls.append(kwargs)
+        return self.module(**kwargs)
+
+
+@pytest.fixture
+def graph_platform(monkeypatch):
+    import vllm_omni.diffusion.distributed.utils as dist_utils
+    import vllm_omni.diffusion.graph as graph_mod
+
+    monkeypatch.setattr(graph_mod.current_omni_platform, "get_graphed_forward_cls", lambda: _StubGraphedForward)
+    monkeypatch.setattr(dist_utils, "get_local_device", lambda: torch.device("cpu"))
+
+
+def _graph_od_config(**overrides) -> SimpleNamespace:
+    od_config = SimpleNamespace(
+        diffusion_use_graph=True,
+        enforce_eager=False,
+        cache_backend="none",
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        diffusion_kv_cache_skip_step_indices=None,
+    )
+    vars(od_config).update(overrides)
+    return od_config
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expect_runner"),
+    [
+        ({}, True),
+        ({"diffusion_kv_cache_skip_step_indices": (1,)}, True),
+        ({"diffusion_kv_cache_dtype": "fp8", "diffusion_kv_cache_skip_step_indices": (1,)}, False),
+    ],
+    ids=["on", "skip-steps-without-kv-quant", "fp8-kv-skip-steps"],
+)
+def test_denoise_graph_runner_refuses_step_dependent_kv_quant(graph_platform, overrides, expect_runner):
+    # Wan publishes denoise_step_idx every step, so skip_steps would switch the
+    # KV dtype per step; a replay would keep the capture step's choice.
+    od_config = _graph_od_config(**overrides)
+
+    assert (_make_pipeline()._build_denoise_graph_runner(od_config) is not None) == expect_runner
+
+
+def test_denoise_graph_runner_gets_the_expert_by_name(graph_platform):
+    # The graph class rejects module arguments, and the name keys one graph per expert.
+    class _Expert(nn.Module):
+        def __init__(self, scale: float) -> None:
+            super().__init__()
+            self.scale = scale
+
+        def forward(self, *, hidden_states: torch.Tensor, return_dict: bool) -> tuple[torch.Tensor]:
+            return (hidden_states * self.scale,)
+
+    pipeline = _make_pipeline()
+    pipeline.transformer, pipeline.transformer_2 = _Expert(2.0), _Expert(3.0)
+    pipeline._denoise_graph_runner = pipeline._build_denoise_graph_runner(_graph_od_config())
+    x = torch.ones(2)
+
+    high = pipeline.predict_noise(current_model=pipeline.transformer, hidden_states=x, return_dict=False)
+    low = pipeline.predict_noise(current_model=pipeline.transformer_2, hidden_states=x, return_dict=False)
+
+    torch.testing.assert_close(high, x * 2)
+    torch.testing.assert_close(low, x * 3)
+    assert [call["component"] for call in pipeline._denoise_graph_runner.calls] == ["transformer", "transformer_2"]

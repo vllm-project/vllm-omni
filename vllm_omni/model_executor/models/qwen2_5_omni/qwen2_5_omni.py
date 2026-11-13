@@ -54,8 +54,27 @@ get_llm_pos_ids_for_vision = OmniMRotaryEmbedding._get_llm_pos_ids_for_vision
 TALKER_CODEC_EOS_TOKEN_ID = 8294
 TALKER_CODEC_BOS_TOKEN_ID = 8293
 
+# Built-in voices in the checkpoint's spk_dict.pt. Chelsie is the default of
+# the reference Transformers implementation.
+SPEAKERS = ("Chelsie", "Ethan")
+DEFAULT_SPEAKER = "Chelsie"
+
 
 logger = init_logger(__name__)
+
+
+def resolve_speaker(requested: object) -> str:
+    """Map a request's ``speaker`` (any case, or a one-item list) to a built-in voice.
+
+    Missing or unrecognized names select the default voice.
+    """
+    if isinstance(requested, (list, tuple)):
+        requested = requested[0] if requested else None
+    if isinstance(requested, str):
+        for speaker in SPEAKERS:
+            if speaker.lower() == requested.strip().lower():
+                return speaker
+    return DEFAULT_SPEAKER
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -245,7 +264,6 @@ class Qwen2_5OmniForConditionalGeneration(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         generate_audio: bool = True,
-        voice_type: str = "Chelsie",
         codec: torch.Tensor | None = None,
         sampling_metadata: SamplingMetadata | None = None,
         logits_index: int | None = None,
@@ -341,11 +359,6 @@ class Qwen2_5OmniForConditionalGeneration(
             # mock data for profile
             if input_ids is None:
                 input_ids = torch.zeros(inputs_embeds.shape[0], dtype=torch.long, device=inputs_embeds.device)
-                self.thinker_reply_part = torch.zeros_like(inputs_embeds)
-
-            # TODO(Peiqi): temporal hack here to support voice_type.
-            if not hasattr(self, "voice_type"):
-                self.voice_type = voice_type
 
             # For MRoPE, positions shape is [3, num_tokens] (T/H/W), don't slice it
             if positions.ndim == 2 and positions.shape[0] == 3:
@@ -386,7 +399,11 @@ class Qwen2_5OmniForConditionalGeneration(
             if code.numel() and code[0] == TALKER_CODEC_BOS_TOKEN_ID:
                 code = code[1:]
 
-            audio_tensor = self.generate_audio(code, voice_type) if code.numel() else torch.zeros(0, device=code.device)
+            # Code2Wav decodes one request per forward (its deploy uses max_num_seqs=1).
+            buffers = kwargs.get("model_intermediate_buffer") or ()
+            info = buffers[0] if buffers else None
+            speaker = resolve_speaker(info.get("speaker") if isinstance(info, dict) else None)
+            audio_tensor = self.generate_audio(code, speaker) if code.numel() else torch.zeros(0, device=code.device)
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": audio_tensor})
 
         return OmniOutput(
@@ -575,7 +592,7 @@ class Qwen2_5OmniForConditionalGeneration(
 
         return llm_positions, mrope_position_delta
 
-    def generate_audio(self, code, voice_type):
+    def generate_audio(self, code, speaker):
         token2wav_dev = self._module_device(self.token2wav)
         if isinstance(code, torch.Tensor):
             code_tensor = code.to(dtype=torch.long, device=token2wav_dev)
@@ -584,7 +601,7 @@ class Qwen2_5OmniForConditionalGeneration(
         if code_tensor.ndim == 2 and code_tensor.shape[0] == 1:
             code_tensor = code_tensor.squeeze(0)
 
-        audio_tensor = self._codec_to_audio(code_tensor, voice_type)
+        audio_tensor = self._codec_to_audio(code_tensor, speaker)
 
         return audio_tensor
 
@@ -683,35 +700,91 @@ class Qwen2_5OmniForConditionalGeneration(
             return talker_hf_config.tts_text_start_token_id
         return self.tts_text_spk_token_ids[voice_type]
 
+    def _condition_thinker_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        token_ids: list[int] | torch.Tensor,
+        *,
+        mask_multimodal_tokens: bool,
+    ) -> torch.Tensor:
+        """Match the reference thinker-to-talker text conditioning.
+
+        The talker consumes the sum of the thinker's last hidden state and the
+        corresponding text-token embedding. Prompt-side multimodal placeholder
+        embeddings are zeroed because their modality features are already
+        represented in the thinker hidden state.
+        """
+        embedding_device = self.thinker_embedding.weight.device
+        token_ids_tensor = torch.as_tensor(token_ids, dtype=torch.long, device=embedding_device).reshape(-1)
+        if hidden_states.ndim != 2 or hidden_states.shape[0] != token_ids_tensor.numel():
+            raise ValueError(
+                "Thinker hidden states and token ids must have matching rows: "
+                f"hidden_shape={tuple(hidden_states.shape)}, token_count={token_ids_tensor.numel()}"
+            )
+
+        token_embeds = self.thinker_embedding(token_ids_tensor).to(dtype=hidden_states.dtype)
+        if mask_multimodal_tokens and token_ids_tensor.numel() > 0:
+            multimodal_mask = torch.zeros_like(token_ids_tensor, dtype=torch.bool)
+            for token_attr in ("audio_token_index", "image_token_index", "video_token_index"):
+                token_id = getattr(self.thinker_config, token_attr, None)
+                if isinstance(token_id, int):
+                    multimodal_mask |= token_ids_tensor == token_id
+            token_embeds = token_embeds.masked_fill(multimodal_mask.unsqueeze(-1), 0)
+
+        return hidden_states.to(embedding_device) + token_embeds
+
     def talker_preprocess(
         self,
         input_ids: torch.Tensor,
         input_embeds: torch.Tensor,
         **info_dict: object,
     ):
-        # Mixed-mode support: In a single step, both Prefill*n and Decode*n are supported.
-        # Rules:
-        # - Prefill segments are wrapped with special tokens: [BOS][PAD...][EOS]
-        # - Decode segments consist of a single non-special token.
-        # - If additional_information is provided (can be a list split by request or a
-        #   concatenated tensor plus a list of shapes), then for each request, reconstruct
-        #   the thinker→talker input embeddings for the Prefill segments;
-        # - For Decode segments, if per-request auxiliary decode embeddings are provided (optional),
-        #   add them; otherwise, keep the original embedding.
-
+        # The runner reports, for every scheduled span, the request's prompt length
+        # and the absolute position of the span's first token (#3662). The span is
+        # assembled from these positions, never from its length: a chunked-prefill
+        # chunk, a speculative-decoding verify step and a preemption replay all
+        # schedule spans whose length does not identify their phase.
+        # - Prompt positions take rows of the reconstructed Talker prompt.
+        # - Generated positions add the request's ``thinker_reply`` row for their
+        #   generation offset, repeating its final text-PAD row after text ends.
         payload: OmniPayload = info_dict
+        try:
+            start = int(payload["_omni_num_computed_tokens"])
+            prompt_len = int(payload["_omni_prompt_len"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "Qwen2.5-Omni talker preprocessing requires the runner metadata "
+                "_omni_num_computed_tokens and _omni_prompt_len."
+            ) from exc
+
+        if start >= prompt_len:
+            thinker_reply = payload.get("embed", {}).get("thinker_reply")
+            return self.thinker_to_talker_decode(input_ids, input_embeds, thinker_reply, start - prompt_len)
 
         # Ensure we have base embeddings when only ids are provided
         if input_embeds is None and input_ids is not None:
             input_embeds = self.talker.embed_input_ids(input_ids)
-
-        span_len = input_ids.shape[0]
-        if span_len > 1:
-            # prefill
-            return self.thinker_to_talker_process(input_ids, input_embeds, payload)
-        else:
-            # decode
-            return self.thinker_to_talker_decode_one_step(input_ids, input_embeds, payload)
+        req_input_ids, req_embeds, update_dict = self.thinker_to_talker_process(input_ids, input_embeds, payload)
+        if req_embeds.shape[0] != prompt_len:
+            raise ValueError(
+                f"Reconstructed Talker prompt has {req_embeds.shape[0]} rows, but the "
+                f"scheduled prompt has {prompt_len} tokens."
+            )
+        num_prompt = min(int(input_ids.shape[0]), prompt_len - start)
+        out_ids = req_input_ids[start : start + num_prompt]
+        out_embeds = req_embeds[start : start + num_prompt]
+        if num_prompt < input_ids.shape[0]:
+            # After preemption the scheduler resets num_computed_tokens to 0 while
+            # keeping the generated tokens, and may schedule the prompt and those
+            # tokens in one span. The generated suffix uses the thinker_reply
+            # reconstructed above, so it matches the original decode steps.
+            thinker_reply = update_dict.get("embed", {}).get("thinker_reply")
+            suffix_ids, suffix_embeds, _ = self.thinker_to_talker_decode(
+                input_ids[num_prompt:], input_embeds[num_prompt:], thinker_reply, 0
+            )
+            out_ids = torch.cat([out_ids, suffix_ids.to(device=out_ids.device, dtype=out_ids.dtype)])
+            out_embeds = torch.cat([out_embeds, suffix_embeds.to(device=out_embeds.device, dtype=out_embeds.dtype)])
+        return out_ids, out_embeds, update_dict
 
     def thinker_to_talker_process(
         self,
@@ -725,17 +798,17 @@ class Qwen2_5OmniForConditionalGeneration(
 
         update_dict = {}
 
-        prompt_embeds = embed.get("prefill")  # Tensor [P,H]
-        thinker_result = hs.get("output")  # Tensor [K,H]
+        prompt_hidden_states = embed.get("prefill")  # Tensor [P,H]
+        thinker_hidden_states = hs.get("output")  # Tensor [K,H]
         prompt_token_ids = ids.get("prompt")  # list[int]
         thinker_output_token_ids = ids.get("output")  # list[int]
 
-        if not isinstance(prompt_embeds, torch.Tensor):
-            prompt_embeds = torch.zeros(
+        if not isinstance(prompt_hidden_states, torch.Tensor):
+            prompt_hidden_states = torch.zeros(
                 0, self.talker.config.hidden_size, dtype=input_embeds.dtype, device=self._module_device(self.model)
             )
-        if not isinstance(thinker_result, torch.Tensor):
-            thinker_result = torch.zeros(
+        if not isinstance(thinker_hidden_states, torch.Tensor):
+            thinker_hidden_states = torch.zeros(
                 0, self.talker.config.hidden_size, dtype=input_embeds.dtype, device=self._module_device(self.model)
             )
         if not isinstance(prompt_token_ids, (list, torch.Tensor)):
@@ -743,17 +816,36 @@ class Qwen2_5OmniForConditionalGeneration(
         if not isinstance(thinker_output_token_ids, (list, torch.Tensor)):
             thinker_output_token_ids = []
 
-        # TODO(Peiqi): add voice_type support
+        prompt_conditioning = self._condition_thinker_hidden_states(
+            prompt_hidden_states.to(input_embeds.dtype),
+            prompt_token_ids,
+            mask_multimodal_tokens=True,
+        )
+        reply_conditioning = self._condition_thinker_hidden_states(
+            thinker_hidden_states.to(input_embeds.dtype),
+            thinker_output_token_ids,
+            mask_multimodal_tokens=False,
+        )
+
         req_input_ids, req_embeds = self._thinker_to_talker_prefill(
-            speaker=self.voice_type,
-            output_prompt_embeds=thinker_result.to(input_embeds.dtype).to(self._module_device(self.model)),
+            speaker=resolve_speaker(payload.get("speaker")),
+            output_prompt_embeds=reply_conditioning,
             output_token_ids=thinker_output_token_ids,
-            thinker_prompt_embeds=prompt_embeds.to(input_embeds.dtype).to(self._module_device(self.model)),
+            thinker_prompt_embeds=prompt_conditioning,
             prompt_token_ids=prompt_token_ids,
         )
 
-        if thinker_result.ndim == 2 and thinker_result.shape[0] > 0:
-            update_dict.setdefault("embed", {})["thinker_reply"] = thinker_result[1:].detach().to("cpu").contiguous()
+        if reply_conditioning.shape[0] > 0:
+            terminal_conditioning = torch.cat(
+                [
+                    self.embed_text_eos_token.to(dtype=input_embeds.dtype, device=reply_conditioning.device),
+                    self.embed_text_pad_token.to(dtype=input_embeds.dtype, device=reply_conditioning.device),
+                ],
+                dim=0,
+            )
+            update_dict.setdefault("embed", {})["thinker_reply"] = (
+                torch.cat([reply_conditioning[1:], terminal_conditioning], dim=0).detach().to("cpu").contiguous()
+            )
 
         return req_input_ids, req_embeds, update_dict
 
@@ -802,49 +894,34 @@ class Qwen2_5OmniForConditionalGeneration(
             )
         return prompt_token_ids_processed, prompt_embeds
 
-    def thinker_to_talker_decode_one_step(self, input_ids, input_embeds, payload: OmniPayload):
-        embed = payload.get("embed", {})
+    def thinker_to_talker_decode(self, input_ids, input_embeds, thinker_reply, offset: int):
+        """Assemble embeddings for generated positions starting at generation ``offset``.
 
-        update_dict = {}
-        # choose step vector in priority order
-        step_vec = None
-        q = embed.get("thinker_reply", None)
-        if isinstance(q, torch.Tensor) and q.numel() > 0:
-            step_vec = q[0:1]
-            new_q = q[1:].detach().to("cpu").contiguous()
-            update_dict.setdefault("embed", {})["thinker_reply"] = new_q
-        else:
-            # B) per-request provided decode vector (optional)
-            dv = embed.get("decode")
-            if isinstance(dv, torch.Tensor) and dv.numel() > 0:
-                step_vec = dv[0:1] if dv.ndim == 2 else dv.view(1, -1)
-            elif (
-                hasattr(self, "thinker_reply_part")
-                and isinstance(self.thinker_reply_part, torch.Tensor)
-                and self.thinker_reply_part.numel() > 0
-            ):
-                # C) fallback shared pool
-                step_vec = self.thinker_reply_part[0:1]
-                self.thinker_reply_part = self.thinker_reply_part[1:]
+        Each position needs ``thinker_reply[offset + i] + codec_embedding``. The
+        rows are selected by position and ``thinker_reply`` is never consumed, so
+        a single decode step, a speculative-decoding verify span and a
+        preemption replay of the same positions all receive the same rows.
+        Prefill appends text EOS and PAD; the final PAD conditions every
+        remaining audio position, matching the reference decoder.
+        """
+        span_len = int(input_ids.shape[0])
+        # Build the span embeddings from the codec ids rather than trusting the
+        # incoming buffer: in a mixed batch the runner hands decode requests a
+        # slice of a ``torch.empty`` scratch tensor (uninitialized memory).
+        out_dtype = input_embeds.dtype if input_embeds is not None else None
+        input_embeds = self.talker.embed_input_ids(input_ids)
+        if out_dtype is not None and input_embeds.dtype != out_dtype:
+            input_embeds = input_embeds.to(out_dtype)
 
-        if isinstance(step_vec, torch.Tensor) and step_vec.numel() > 0:
-            one_id = input_ids[0:1]
-            _, one_embed = self._thinker_to_talker_decode_one_step(
-                output_prompt_embeds=step_vec.to(input_embeds.dtype).to(self._module_device(self.model)),
-                output_token_ids=one_id,
-            )
-            input_embeds[0] = one_embed[0]
-        return input_ids[0:1], input_embeds[0:1], update_dict
-
-    def _thinker_to_talker_decode_one_step(
-        self,
-        output_prompt_embeds,
-        output_token_ids,
-    ):
-        processed_output_token_embeds = output_prompt_embeds + self.talker.embed_input_ids(
-            output_token_ids
-        )  # for decode
-        return output_token_ids, processed_output_token_embeds
+        if isinstance(thinker_reply, torch.Tensor) and thinker_reply.numel() > 0:
+            rows = thinker_reply[offset : offset + span_len]
+            n = int(rows.shape[0])
+            if n > 0:
+                input_embeds[:n] = input_embeds[:n] + rows.to(dtype=input_embeds.dtype, device=input_embeds.device)
+            if n < span_len:
+                pad = thinker_reply[-1:].to(dtype=input_embeds.dtype, device=input_embeds.device)
+                input_embeds[n:] = input_embeds[n:] + pad
+        return input_ids, input_embeds, {}
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, **kwargs: object) -> torch.Tensor | None:
         # Handle OmniOutput type
@@ -892,11 +969,11 @@ class Qwen2_5OmniForConditionalGeneration(
                     key = os.path.basename(f).split("_")[0].lower()
                     self._token2wav_ref_mels[key] = torch.as_tensor(np.load(f), device=device)
 
-    def _codec_to_audio(self, codec_tokens: torch.Tensor, voice_type: str = "default") -> torch.Tensor | None:
+    def _codec_to_audio(self, codec_tokens: torch.Tensor, speaker: str = DEFAULT_SPEAKER) -> torch.Tensor | None:
         if self.token2wav is None:
             return None
-        # Normalize voice type
-        voice = voice_type or "default"
+        # spk_dict.pt keys keep the voice's casing; legacy npy inputs are lowercase.
+        voice = next((key for key in self._token2wav_conds if key.lower() == speaker.lower()), speaker)
         # Resolve cond / ref_mel if provided
         cond = None
         ref_mel = None

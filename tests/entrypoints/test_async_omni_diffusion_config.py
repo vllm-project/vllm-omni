@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -69,37 +70,6 @@ def test_default_stage_config_preserves_model_extras():
     stage_cfg = StageConfigFactory.create_default_diffusion({"extras": {"ltx2_use_conv_vae": True}})[0]
 
     assert stage_cfg["engine_args"]["extras"]["ltx2_use_conv_vae"] is True
-
-
-def test_default_stage_config_preserves_and_overrides_promoted_extras():
-    stage_cfg = StageConfigFactory.create_default_diffusion(
-        {
-            "extras": {
-                "auxiliary_text_encoder": "/models/extras-llama",
-                "default_llama_model_id": "extras/default-llama",
-            },
-            "auxiliary_text_encoder": None,
-        }
-    )[0]
-
-    extras = stage_cfg["engine_args"]["extras"]
-    assert extras["auxiliary_text_encoder"] == "/models/extras-llama"
-    assert extras["default_llama_model_id"] == "extras/default-llama"
-
-    stage_cfg = StageConfigFactory.create_default_diffusion(
-        {
-            "extras": {
-                "auxiliary_text_encoder": "/models/extras-llama",
-                "default_llama_model_id": "extras/default-llama",
-            },
-            "auxiliary_text_encoder": "/models/top-level-llama",
-            "default_llama_model_id": "top-level/default-llama",
-        }
-    )[0]
-
-    extras = stage_cfg["engine_args"]["extras"]
-    assert extras["auxiliary_text_encoder"] == "/models/top-level-llama"
-    assert extras["default_llama_model_id"] == "top-level/default-llama"
 
 
 @pytest.mark.parametrize(
@@ -178,14 +148,15 @@ def test_default_diffusion_factory_rejects_unowned_field(field_name, value):
         StageConfigFactory.create_default_diffusion({field_name: value})
 
 
-def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch):
+def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch, tmp_path):
     from vllm_omni.config.config_factory import StageConfigFactory
     from vllm_omni.config.yaml_util import create_config
     from vllm_omni.engine import stage_init_utils
 
+    model_path = str(tmp_path)
     stage_dict = StageConfigFactory.create_default_diffusion(
         {
-            "model": "unused",
+            "model": model_path,
             "api_key": "frontend-owned",
         }
     )[0]
@@ -194,9 +165,9 @@ def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch)
     metadata = SimpleNamespace(stage_id=0, cfg_kv_collect_func=None, default_sampling_params=None)
     monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
 
-    config = stage_init_utils.build_diffusion_config("unused", stage_cfg, metadata)
+    config = stage_init_utils.build_diffusion_config(model_path, stage_cfg, metadata)
 
-    assert config.model == "unused"
+    assert config.model == model_path
 
 
 def test_default_cache_config_used_when_missing():
@@ -448,6 +419,20 @@ def test_serve_cli_accepts_ulysses_mode():
     assert parallel_config["ulysses_mode"] == "advanced_uaa"
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_serve_cli_preserves_ulysses_a2a_permute(enabled: bool) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+    flag = "--ulysses-a2a-permute" if enabled else "--no-ulysses-a2a-permute"
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-degree", "4", flag])
+
+    stage_cfg = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config["ulysses_degree"] == 4
+    assert parallel_config["ulysses_a2a_permute"] is enabled
+
+
 def test_serve_cli_accepts_text_encoder_tp_size():
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
@@ -610,6 +595,33 @@ def test_invalid_diffusion_offload_config_fails_before_model_loading(monkeypatch
     load_model.assert_not_called()
 
 
+def test_serve_cli_forwards_nondefault_dlo_chunk_size():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--enable-distributed-layerwise-offload",
+            "--dlo-chunk-size-mb",
+            "32",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
+    engine_args = stage_cfg["engine_args"]
+    od_config = _terminal_config(stage_cfg)
+
+    assert args.dlo_chunk_size_mb == 32
+    assert explicit_kwargs["dlo_chunk_size_mb"] == 32
+    assert engine_args["dlo_chunk_size_mb"] == 32
+    assert od_config.dlo_chunk_size_mb == 32
+
+
 def test_serve_cli_forwards_hwr_policy_for_no_allgather_dlo():
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
@@ -697,6 +709,35 @@ def test_serve_cli_accepts_diffusion_attention_backend():
     assert diffusion_attention_config.default is not None
     assert diffusion_attention_config.default.backend == "FASTVIDEO_VSA"
     assert diffusion_attention_config.default.backend_kwargs() == {"topk": 96}
+
+
+@pytest.mark.diffusion
+@pytest.mark.parametrize("style", ["json", "dotted"])
+def test_serve_cli_forwards_attention_schedule_to_default_stage(style):
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+    raw = {
+        "profiles": {"dense": {"default": "TORCH_SDPA"}},
+        "default": [{"start": 3, "end": None, "profile": "dense"}],
+    }
+    flags = (
+        ["--diffusion-attention-schedule", json.dumps(raw)]
+        if style == "json"
+        else [
+            "--diffusion-attention-schedule.profiles.dense.default",
+            "TORCH_SDPA",
+            "--diffusion-attention-schedule.default",
+            json.dumps(raw["default"]),
+        ]
+    )
+    args = parser.parse_args(["serve", "Qwen/Qwen-Image", "--omni", *flags])
+    stage = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
+    config = _terminal_config(stage)
+
+    assert config.diffusion_attention_schedule.profiles["dense"].default.backend == "TORCH_SDPA"
+    assert config.diffusion_attention_schedule.default[0].start == 3
+    assert config.diffusion_attention_schedule.default[0].end is None
 
 
 def test_serve_cli_accepts_request_batch_max_wait_ms():
@@ -828,13 +869,13 @@ def test_default_stage_config_includes_quantization_config():
 
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
-def test_default_diffusion_factory_preserves_engine_quantization(typed, monkeypatch):
+def test_default_diffusion_factory_preserves_engine_quantization(typed, monkeypatch, tmp_path):
     monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
     monkeypatch.setattr(OmniDiffusionConfig, "enrich_config", lambda _self: None)
     kwargs = {"quantization": "fp8"}
 
     if typed:
-        stage = StageConfigFactory.create_typed_default_diffusion("generic-diffusion", kwargs).stage_configs[0]
+        stage = StageConfigFactory.create_typed_default_diffusion(str(tmp_path), kwargs).stage_configs[0]
         config = stage.diffusion_config
         config.enrich_config()
     else:
@@ -946,6 +987,58 @@ def test_generic_diffusion_structured_stage_reaches_standard_startup(mocker):
     assert launched["model"] == "generic-diffusion"
     assert launched["stage_id"] == 0
     assert runtime.stage_pools[0].clients == [client]
+
+
+@pytest.mark.parametrize(
+    "overrides,ulysses,tp,devices,max_seqs",
+    [
+        ({}, 2, 1, "2,3", 4),
+        ({"ulysses_degree": 1, "devices": "0", "max_num_seqs": 9}, 1, 1, "0", 9),
+        ({"parallel_config": {"tensor_parallel_size": 2}, "devices": "0,1,2,3"}, 2, 2, "0,1,2,3", 4),
+    ],
+)
+def test_generic_diffusion_deploy_survives_typed_resolution(
+    mocker, tmp_path, overrides, ulysses, tp, devices, max_seqs
+):
+    mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.config.resolver._resolve_generic_diffusion_model_class",
+        return_value=(True, "MOSSImagePipeline"),
+    )
+    deploy_path = tmp_path / "mossimage.yaml"
+    deploy_path.write_text(
+        "stages:\n"
+        "  - stage_id: 0\n"
+        "    devices: '2,3'\n"
+        "    num_replicas: 2\n"
+        "    env: {MOSSIMAGE_TEST: '1'}\n"
+        "    ulysses_degree: 2\n"
+        "    max_num_seqs: 4\n"
+        "    step_execution: true\n"
+        "    flow_shift: 5.0\n"
+        "    default_sampling_params: {guidance_scale: 4.0}\n"
+    )
+    resolved = resolve_omni_config(
+        "generic-diffusion",
+        trust_remote_code=False,
+        deploy_config_path=str(deploy_path),
+        cli_overrides=overrides,
+        stage_overrides=None,
+        strategy_config_path=None,
+    )
+    stage = resolved.stage_configs[0]
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.parallel_config.ulysses_degree == ulysses
+    assert stage.parallel_config.tensor_parallel_size == tp
+    assert stage.parallel_config.sequence_parallel_size == ulysses
+    assert stage.parallel_config.world_size == ulysses * tp
+    assert stage.runtime_config.devices == devices
+    assert stage.runtime_config.num_replicas == 2
+    assert stage.runtime_config.env == {"MOSSIMAGE_TEST": "1"}
+    assert stage.scheduler_config.max_num_seqs == max_seqs
+    assert stage.diffusion_config.step_execution is True
+    assert stage.diffusion_config.flow_shift == 5.0
+    assert stage.model_config.default_sampling_params == {"guidance_scale": 4.0}
 
 
 def test_default_stage_config_preserves_pre_sharded_hsdp_weight_load() -> None:

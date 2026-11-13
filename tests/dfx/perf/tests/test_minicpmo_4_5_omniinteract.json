@@ -19,7 +19,11 @@
         "--deploy-config",
         "vllm_omni/deploy/minicpmo_4_5.yaml",
         "--trust-remote-code"
-      ]
+      ],
+      "update": {
+        "duplex_session.max_sessions": 8,
+        "duplex_session.collect_stats": true
+      }
     },
     "judge_server_params": {
       "model": "Qwen/Qwen2.5-7B-Instruct",
@@ -38,21 +42,35 @@
         "backend": "openai-realtime-duplex",
         "endpoint": "/v1/realtime",
         "num_prompts": [
-          4
+          8
         ],
         "max_concurrency": [
-          2
+          8
         ],
         "num_warmups": 0,
         "disable_shuffle": true,
         "trust_remote_code": true,
         "omniinteract_subsets": "1q1a",
         "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
-        "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract/1q1a",
+        "omniinteract_persist_artifacts": false,
         "omniinteract_max_video_duration_s": 600,
         "omniinteract_evaluate": true,
         "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
-        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "extra_body": {
+          "sliding_window_mode": "basic",
+          "basic_window_high_tokens": 7000,
+          "basic_window_low_tokens": 5000
+        },
+        "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
+        "metric-percentiles": "50,95",
+        "duplex_metric_aggregation": "response",
+        "required_duplex_metrics": [
+          "duplex_client_rtf",
+          "duplex_client_ttfp_ms",
+          "duplex_client_ttft_ms",
+          "duplex_busy_rtf",
+          "duplex_stall_ratio"
+        ]
       },
       {
         "dataset_name": "omniinteract",
@@ -60,21 +78,35 @@
         "backend": "openai-realtime-duplex",
         "endpoint": "/v1/realtime",
         "num_prompts": [
-          4
+          8
         ],
         "max_concurrency": [
-          2
+          8
         ],
         "num_warmups": 0,
         "disable_shuffle": true,
         "trust_remote_code": true,
         "omniinteract_subsets": "1q1a_math",
         "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
-        "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract/1q1a_math",
+        "omniinteract_persist_artifacts": false,
         "omniinteract_max_video_duration_s": 600,
         "omniinteract_evaluate": true,
         "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
-        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "extra_body": {
+          "sliding_window_mode": "basic",
+          "basic_window_high_tokens": 7000,
+          "basic_window_low_tokens": 5000
+        },
+        "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
+        "metric-percentiles": "50,95",
+        "duplex_metric_aggregation": "response",
+        "required_duplex_metrics": [
+          "duplex_client_rtf",
+          "duplex_client_ttfp_ms",
+          "duplex_client_ttft_ms",
+          "duplex_busy_rtf",
+          "duplex_stall_ratio"
+        ]
       },
       {
         "dataset_name": "omniinteract",
@@ -82,21 +114,35 @@
         "backend": "openai-realtime-duplex",
         "endpoint": "/v1/realtime",
         "num_prompts": [
-          4
+          8
         ],
         "max_concurrency": [
-          2
+          8
         ],
         "num_warmups": 0,
         "disable_shuffle": true,
         "trust_remote_code": true,
         "omniinteract_subsets": "1qna",
         "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
-        "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract/1qna",
+        "omniinteract_persist_artifacts": false,
         "omniinteract_max_video_duration_s": 600,
         "omniinteract_evaluate": true,
         "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
-        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "extra_body": {
+          "sliding_window_mode": "basic",
+          "basic_window_high_tokens": 7000,
+          "basic_window_low_tokens": 5000
+        },
+        "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
+        "metric-percentiles": "50,95",
+        "duplex_metric_aggregation": "response",
+        "required_duplex_metrics": [
+          "duplex_client_rtf",
+          "duplex_client_ttfp_ms",
+          "duplex_client_ttft_ms",
+          "duplex_busy_rtf",
+          "duplex_stall_ratio"
+        ]
       }
     ]
   }

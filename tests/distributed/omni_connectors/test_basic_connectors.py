@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 from pytest_mock import MockerFixture
@@ -33,6 +33,44 @@ def test_tensor_serialization():
     assert torch.equal(tensor, deserialized)
 
 
+def test_serialize_into_matches_serialize():
+    """The caller-owned buffer path produces the same wire bytes."""
+    data = {"key": "value", "nested": [1, 2, {"x": True}]}
+    expected = OmniSerializer.serialize(data)
+
+    buffer = bytearray(b"stale" * 8)
+    size = OmniSerializer.serialize_into(data, buffer)
+
+    assert size == len(expected)
+    assert bytes(buffer) == expected
+    assert OmniSerializer.deserialize(buffer) == data
+
+
+def test_tensor_serialize_into_round_trip():
+    """The tensor fast path preserves dtype, shape, and values."""
+    import torch
+
+    tensor = torch.tensor([[1.0, -2.5], [3.25, 4.5]], dtype=torch.bfloat16)
+    expected = OmniSerializer.serialize({"embeds": tensor})
+    buffer = bytearray()
+
+    size = OmniSerializer.serialize_into({"embeds": tensor}, buffer)
+    deserialized = OmniSerializer.deserialize(buffer[:size])
+
+    assert bytes(buffer) == expected
+    assert deserialized["embeds"].dtype == torch.bfloat16
+    assert torch.equal(deserialized["embeds"], tensor)
+
+
+def test_shared_memory_connector_owns_serde():
+    """The connector must not share the module-level encoder/decoder state."""
+    connector = SharedMemoryConnector({})
+    try:
+        assert connector._serde is not OmniSerializer
+    finally:
+        connector.close()
+
+
 def test_bfloat16_tensor_serialization():
     """The raw tensor serializer preserves the Mammoth BF16 wire dtype."""
     import torch
@@ -55,6 +93,18 @@ def test_noncontiguous_tensor_serialization():
 
     serialized = OmniSerializer.serialize({"codes": tensor})
     deserialized = OmniSerializer.deserialize(serialized)
+
+    assert torch.equal(tensor, deserialized["codes"])
+
+
+def test_contiguous_tensor_with_unit_dim_stride_serialization():
+    """A single-frame [codebooks, frames] transpose is contiguous yet has a non-unit last stride."""
+    import torch
+
+    tensor = torch.arange(12, dtype=torch.long).reshape(1, 12).transpose(0, 1).contiguous()
+    assert tensor.is_contiguous() and tensor.stride(-1) != 1
+
+    deserialized = OmniSerializer.deserialize(OmniSerializer.serialize({"codes": tensor}))
 
     assert torch.equal(tensor, deserialized["codes"])
 
@@ -107,37 +157,24 @@ def test_put_get_small_payload_uses_shm(shm_connector):
     assert size == ret_size
 
 
-def test_put_get_shm(mocker: MockerFixture, shm_connector, monkeypatch: pytest.MonkeyPatch):
-    """Test SHM transfer logic for large data (Mocked)."""
-    # Create data larger than 100 bytes
+def test_put_get_shm(mocker: MockerFixture, shm_connector):
+    """Verify that the real SHM handle is passed unchanged to the reader."""
     data = {"large": "x" * 200}
-
-    # Mock SHM return values
-    mock_handle = {"name": "req_2", "size": 200}
-    mock_write = mocker.MagicMock(return_value=mock_handle)
-    monkeypatch.setattr("vllm_omni.distributed.omni_connectors.connectors.shm_connector.shm_write_bytes", mock_write)
-
-    # When reading, return the serialized bytes of the data
-    serialized_data = shm_connector.serialize_obj(data)
-    mock_read = mocker.MagicMock(return_value=serialized_data)
-    monkeypatch.setattr("vllm_omni.distributed.omni_connectors.connectors.shm_connector.shm_read_bytes", mock_read)
-
-    # Put
+    write = mocker.spy(shm_connector, "_write_bytes")
+    read = mocker.spy(shm_connector, "_read_bytes")
     success, size, metadata = shm_connector.put("stage_0", "stage_1", "req_2", data)
 
     assert success is True
-    # Should use SHM because data > threshold
-    assert "shm" in metadata
-    assert metadata["shm"] == mock_handle
+    assert metadata["shm"] == write.spy_return
     assert "inline_bytes" not in metadata
+    assert isinstance(write.call_args.args[0], memoryview)
+    write.assert_called_once()
 
-    mock_write.assert_called_once()
-
-    # Get
     retrieved_data, ret_size = shm_connector.get("stage_0", "stage_1", "req_2", metadata)
 
     assert data == retrieved_data
-    mock_read.assert_called_once_with(mock_handle)
+    assert ret_size == size
+    read.assert_called_once_with(metadata["shm"])
 
 
 def test_get_invalid_metadata(shm_connector):
@@ -244,3 +281,23 @@ def test_mooncake_get_counts_cuda_sync_failure_as_error(mocker: MockerFixture):
     assert connector._metrics == {"errors": 1, "timeouts": 0}
     recv_buffer.release.assert_called_once()
     connector._closed = True
+
+
+def test_tensor_serialize_into_edge_shapes():
+    """0-dim, empty, and non-contiguous tensors keep their wire bytes and shape."""
+    import torch
+
+    cases = [
+        torch.tensor(1.5, dtype=torch.bfloat16),
+        torch.empty((0, 3), dtype=torch.bfloat16),
+        torch.arange(12, dtype=torch.bfloat16).reshape(3, 4).t(),
+    ]
+    for tensor in cases:
+        expected = OmniSerializer.serialize(tensor)
+        buffer = bytearray()
+        size = OmniSerializer.serialize_into(tensor, buffer)
+        assert bytes(buffer) == expected
+        decoded = OmniSerializer.deserialize(buffer[:size])
+        assert decoded.dtype == tensor.dtype
+        assert decoded.shape == tensor.shape
+        assert torch.equal(decoded, tensor)

@@ -43,6 +43,13 @@
           "fps": 24,
           "num_inference_steps": 2,
           "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        },
+        "baseline": {
+          "H100": {
+            "request_throughput": 0.4985,
+            "mean_e2el_ms": 2005.6932,
+            "mean_peak_memory_mb": 20744.0
+          }
         }
       }
     ]

@@ -67,6 +67,23 @@ class SuccessRateGate:
     concurrency: int | None = None
 
 
+def assert_duplex_artifact_publication(result: dict, params: dict, num_prompt: int) -> None:
+    if params.get("dataset_name") == "omni-duplex-eval":
+        summary = result.get("omni_duplex_eval")
+        assert isinstance(summary, dict), "Omni-DuplexEval summary is missing"
+        assert summary.get("published") == num_prompt, "Omni-DuplexEval artifacts are incomplete"
+        assert summary.get("artifact_errors") == [], "Omni-DuplexEval artifact publication failed"
+    elif params.get("dataset_name") == "omniinteract":
+        summary = result.get("omniinteract")
+        assert isinstance(summary, dict), "OmniInteract summary is missing"
+        assert (summary.get("total"), summary.get("success"), summary.get("failed")) == (
+            num_prompt,
+            num_prompt,
+            0,
+        ), "OmniInteract requests did not all succeed"
+        assert summary.get("artifacts_complete") is True, "OmniInteract artifacts are incomplete"
+
+
 def is_quality_failure(exc: BaseException) -> bool:
     """True when ``exc`` is one of the sampled quality assertions above.
 
@@ -388,6 +405,23 @@ def assert_video_first_frames_differ(
     )
 
 
+def video_mean_absolute_error(video: bytes, reference: bytes) -> float:
+    """Mean per-pixel absolute error over every decoded frame, normalized to [0, 1]."""
+    absolute_error = 0.0
+    pixel_count = 0
+    with av.open(BytesIO(video)) as actual, av.open(BytesIO(reference)) as expected:
+        for frame, reference_frame in zip(actual.decode(video=0), expected.decode(video=0), strict=True):
+            pixels = frame.to_ndarray(format="rgb24")
+            reference_pixels = reference_frame.to_ndarray(format="rgb24")
+            assert pixels.shape == reference_pixels.shape
+            absolute_error += np.abs(pixels.astype(np.float32) - reference_pixels.astype(np.float32)).sum(
+                dtype=np.float64
+            )
+            pixel_count += pixels.size
+    assert pixel_count > 0
+    return absolute_error / pixel_count / 255.0
+
+
 def assert_audio_diffusion_response(
     response: "DiffusionResponse",
     request_config: dict[str, Any],
@@ -535,6 +569,13 @@ def assert_video_audio_valid(
         actual_channels = int(audio_stream.channels or 0)
         assert actual_sample_rate == sample_rate, f"Expected audio sample rate={sample_rate}, got {actual_sample_rate}"
         assert actual_channels == channels, f"Expected audio channels={channels}, got {actual_channels}"
+
+
+def assert_wav_sample_rate(audio_bytes: bytes | None, sample_rate: int) -> None:
+    """Assert a WAV body's native rate when the request did not ask the server for one."""
+    assert audio_bytes, "Expected WAV bytes"
+    info = sf.info(io.BytesIO(audio_bytes))
+    assert info.samplerate == sample_rate, f"Expected a {sample_rate} Hz WAV, got {info.samplerate} Hz"
 
 
 def assert_audio_valid(
@@ -718,6 +759,7 @@ def _assert_pcm_int16_speech_hnr(
     audio_bytes: bytes,
     min_hnr_db: float = _MIN_PCM_SPEECH_HNR_DB,
     sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ,
+    channels: int = 1,
 ) -> None:
     """Validate harmonic-to-noise ratio on raw int16 PCM from /v1/audio/speech.
 
@@ -733,8 +775,11 @@ def _assert_pcm_int16_speech_hnr(
     understates HNR for models that do not decode at 24 kHz.
     """
     assert audio_bytes is not None and len(audio_bytes) >= 2, "missing PCM bytes"
-    assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
+    assert len(audio_bytes) % (2 * channels) == 0, "PCM byte length must be aligned to int16 frames"
     pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        # Interleaved multi-channel PCM: downmix so the pitch search sees one waveform.
+        pcm_samples = pcm_samples.reshape(-1, channels).mean(axis=1)
     hnr = _compute_pcm_hnr_db(pcm_samples, sr=sr)
     print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {min_hnr_db} dB, sr={sr})")
     assert hnr >= min_hnr_db, f"PCM speech HNR={hnr:.2f} dB is below the configured floor of {min_hnr_db} dB."
@@ -791,15 +836,22 @@ def _speech_pcm_sample_rate(request_config: dict[str, Any]) -> int:
     return int(expected or _PCM_SPEECH_SAMPLE_RATE_HZ)
 
 
+def _speech_pcm_channels(request_config: dict[str, Any]) -> int:
+    channels = request_config.get("transcript_pcm_channels", 1)
+    assert type(channels) is int and channels > 0, "transcript_pcm_channels must be a positive integer"
+    return channels
+
+
 def _speech_audio_for_transcription(audio_bytes: bytes | None, request_config: dict[str, Any]) -> bytes | None:
     """Give ASR a WAV container when a speech test opts into raw PCM transcription."""
     if not audio_bytes or request_config.get("response_format") != "pcm":
         return audio_bytes
     sample_rate = _speech_pcm_sample_rate(request_config)
-    assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
+    channels = _speech_pcm_channels(request_config)
+    assert len(audio_bytes) % (2 * channels) == 0, "PCM byte length must be aligned to int16 frames"
     with io.BytesIO() as buffer:
         with wave.open(buffer, "wb") as wav_file:
-            wav_file.setnchannels(1)
+            wav_file.setnchannels(channels)
             wav_file.setsampwidth(2)
             wav_file.setframerate(sample_rate)
             wav_file.writeframes(audio_bytes)
@@ -1002,9 +1054,15 @@ def _assert_transcript_matches(
 
 
 def _retain_failed_speech_audio(
-    audio_bytes: bytes | None, transcript: str, expected_text: Any, error: AssertionError
+    audio_bytes: bytes | None,
+    transcript: str,
+    expected_text: Any,
+    error: AssertionError,
+    *,
+    audio_format: Literal["wav", "pcm"] = "wav",
+    sample_rate: int | None = None,
 ) -> None:
-    """Retain the exact ASR input when a CI speech-content assertion fails."""
+    """Retain exact ASR input or raw PCM when a CI speech-quality assertion fails."""
     directory = os.environ.get("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR")
     if not directory or not audio_bytes:
         return
@@ -1012,18 +1070,24 @@ def _retain_failed_speech_audio(
     root = Path(directory)
     try:
         root.mkdir(parents=True, exist_ok=True)
-        (root / f"{stem}.wav").write_bytes(audio_bytes)
+        (root / f"{stem}.{audio_format}").write_bytes(audio_bytes)
         (root / f"{stem}.json").write_text(
             json.dumps(
-                {"transcript": transcript, "expected_text": str(expected_text), "assertion": str(error)},
+                {
+                    "transcript": transcript,
+                    "expected_text": str(expected_text),
+                    "assertion": str(error),
+                    "audio_format": audio_format,
+                    "sample_rate": sample_rate,
+                },
                 ensure_ascii=False,
                 indent=2,
             )
         )
-        print(f"Retained failed speech ASR input: {root / f'{stem}.wav'}")
+        print(f"Retained failed speech audio: {root / f'{stem}.{audio_format}'}")
     except OSError as exc:
         # Diagnostic I/O must never replace or suppress the content failure.
-        print(f"Could not retain failed speech ASR input: {exc}")
+        print(f"Could not retain failed speech audio: {exc}")
 
 
 def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str | None = None) -> None:
@@ -1078,11 +1142,25 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
             # the rate. Defaulting to 24 kHz for a 44.1 kHz model shifts the
             # search window to 147-735 Hz and misses the fundamental entirely,
             # scoring clean speech ~1.9 dB lower than it is.
-            _assert_pcm_int16_speech_hnr(
-                response.audio_bytes,
-                min_hnr_db=min_hnr_db,
-                sr=_speech_pcm_sample_rate(request_config),
-            )
+            sample_rate = _speech_pcm_sample_rate(request_config)
+            channels = _speech_pcm_channels(request_config)
+            try:
+                _assert_pcm_int16_speech_hnr(
+                    response.audio_bytes,
+                    min_hnr_db=min_hnr_db,
+                    sr=sample_rate,
+                    channels=channels,
+                )
+            except AssertionError as exc:
+                _retain_failed_speech_audio(
+                    response.audio_bytes,
+                    "",
+                    request_config.get("input", ""),
+                    exc,
+                    audio_format="pcm",
+                    sample_rate=sample_rate,
+                )
+                raise
 
         transcript = _resolve_audio_transcript(response, request_config, run_level, speech_api=True)
         if transcript is not None:
@@ -1147,6 +1225,29 @@ def _http_response_body_materialize(resp: Any) -> tuple[bytes, dict[str, Any] | 
     return raw, parsed if isinstance(parsed, dict) else None
 
 
+def _response_error_code(payload: dict[str, Any] | None) -> int | str | None:
+    """Return OpenAI-style ``error.code`` when the body carries one.
+
+    Numeric strings are returned as ``int``. ``bool`` is ignored because it is a subclass of ``int``.
+    """
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    if isinstance(code, bool) or code is None:
+        return None
+    if isinstance(code, int):
+        return code
+    if isinstance(code, str):
+        stripped = code.strip()
+        if stripped.isdigit():
+            return int(stripped)
+        return stripped or None
+    return None
+
+
 def assert_err_message_in_text(
     haystack: str,
     err_message: str | tuple[str, ...] | list[str] | set[str] | frozenset[str],
@@ -1189,6 +1290,8 @@ def assert_http_error(
     Tuple/list ``err_message`` then uses **any** substring match; HTTP mode still requires **all** pieces.
 
     - ``err_code``: exact HTTP ``int``, or membership if a non-string sequence (e.g. ``(400, 422)``).
+      When the HTTP status is 200 and the JSON body has ``error.code``, that value is checked instead of
+      the status. Sync errors still match on the HTTP status, which is set from the same code.
       When ``err_code`` is set and the actual status is a client error in ``400..499`` other than ``404``,
       the JSON body must include FastAPI ``detail`` and/or OpenAI-style ``error`` (2xx skips this).
     - ``err_message``: substring match (case-insensitive) against serialized ``json_body`` and ``error_message``.
@@ -1215,14 +1318,19 @@ def assert_http_error(
     actual = getattr(resp, "status_code", None)
     assert actual is not None, "response missing status_code"
 
+    body_bytes, payload = _http_response_body_materialize(resp)
+
     if err_code is not None:
+        code_to_check: int | str = actual
+        if actual == 200:
+            body_code = _response_error_code(payload)
+            if body_code is not None:
+                code_to_check = body_code
         if isinstance(err_code, int):
-            assert actual == err_code, (resp, err_code)
+            assert code_to_check == err_code, (resp, err_code)
         else:
             allowed = tuple(err_code)
-            assert actual in allowed, (resp, allowed)
-
-    body_bytes, payload = _http_response_body_materialize(resp)
+            assert code_to_check in allowed, (resp, allowed)
 
     if err_code is not None and actual is not None and 400 <= actual < 500 and actual != 404:
         assert payload is not None, getattr(resp, "error_message", resp)

@@ -22,6 +22,7 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
+from vllm.multimodal.image import open_image
 
 from vllm_omni.errors import OmniClientError
 
@@ -45,7 +46,7 @@ MINIMAX_H3_SUPPORTED_ASPECT_RATIOS = {
     "9:16": 9.0 / 16.0,
 }
 MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
-MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
+MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp"})
 
 
 def _align_multiple(value: float, multiple: int = 32) -> int:
@@ -67,11 +68,11 @@ def load_minimax_h3_images(value: Any) -> list[Image.Image]:
     if isinstance(value, (str, os.PathLike)):
         if os.path.getsize(value) > MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES:
             raise OmniClientError("MiniMax H3 reference image exceeds the 30 MiB size limit")
-        with Image.open(value) as image:
+        with open_image(value) as image:
             image_format = str(image.format or "").lower()
             if image_format and image_format not in MINIMAX_H3_REFERENCE_IMAGE_FORMATS:
                 raise OmniClientError(
-                    f"MiniMax H3 reference image must use JPG, JPEG, PNG, WEBP, HEIC, or HEIF, got {image.format}"
+                    f"MiniMax H3 reference image must use JPG, JPEG, PNG, or WEBP, got {image.format}"
                 )
             return [image.convert("RGB")]
     if isinstance(value, Image.Image):
@@ -134,17 +135,27 @@ def resolve_minimax_h3_aspect_ratio(
     return numeric_value
 
 
-def resolve_minimax_h3_reference_image_shape(image: Image.Image) -> tuple[int, int]:
-    """Preserve reference resolution, rounding each axis to the 32-pixel grid."""
+def resolve_minimax_h3_reference_image_shape(
+    image: Image.Image,
+    *,
+    max_area: int | None = None,
+) -> tuple[int, int]:
+    """Preserve reference resolution, rounding each axis to the 32-pixel grid.
+
+    ``max_area`` scales the reference down, keeping its aspect ratio, so its
+    pixel area does not exceed the output canvas. Timeline-guided requests use
+    it because their references ride through every step next to the guides.
+    """
     width, height = image.size
     ratio = width / height
     if not 0.4 <= ratio <= 2.5:
         raise OmniClientError(f"reference image aspect ratio must be in [0.4, 2.5], got {width}x{height}")
     if min(width, height) < 256 or max(width, height) > 5760:
         raise OmniClientError(f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}")
+    scale = 1.0 if max_area is None else min(1.0, math.sqrt(max_area / (width * height)))
     return (
-        _align_multiple(width, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
-        _align_multiple(height, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+        _align_multiple(width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+        _align_multiple(height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
     )
 
 

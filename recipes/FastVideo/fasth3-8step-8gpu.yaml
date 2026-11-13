@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# Shared BF16 deployment for FastH3 V2 and FastH3 Omni on eight GPUs.
+trust-remote-code: true
+enforce-eager: true
+usp: 8
+use-hsdp: true
+text-encoder-tp-size: 8
+vae-patch-parallel-size: 8
+vae-use-tiling: true
+diffusion-attention-config:
+  default:
+    backend: FASTVIDEO_VSA
+    fastvideo_vsa_provider: cudnn
+default-sampling-params:
+  "0":
+    num_inference_steps: 8
+    guidance_scale: 1
+# Allow checkpoint loading from shared storage.
+init-timeout: 1800
+stage-init-timeout: 1800

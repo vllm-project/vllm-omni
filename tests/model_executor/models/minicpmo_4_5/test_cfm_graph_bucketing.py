@@ -344,3 +344,108 @@ def test_precapture_covers_final_chunk_without_displacing_steady_graphs(monkeypa
     if max_graphs == 32:
         assert (1, 100, 350) in captured
         assert captured[15:] == [(b, 100, o) for b in [16, 8, 4, 2, 1] for o in [400, 350, 300]]
+
+
+@pytest.mark.parametrize("width,valid", [(0, 0), (3, 2), (8, 8)])
+def test_uniform_capture_mask_cache_reuses_only_key_storage(width, valid):
+    cache = {}
+    args = dict(
+        attn_mask=None,
+        query_cap=8,
+        offset=2,
+        mel_width=width,
+        mel_frames=valid,
+        device=torch.device("cpu"),
+        offset_cap=4,
+        key_masks=cache,
+    )
+    first = _build_capture_mask(batch_size=1, **args)
+    larger = _build_capture_mask(batch_size=4, **args)
+    expected = torch.zeros(8, 8, 12, dtype=torch.bool)
+    expected[:, :width, :valid] = True
+    expected[:, :width, 8:10] = True
+    if width < 8:
+        expected[:, width:] = expected[:, :1]
+    torch.testing.assert_close(larger, expected)
+    assert first.data_ptr() == larger.data_ptr()
+    assert larger.untyped_storage().nbytes() == 12
+    # The CFG split used when filling graph inputs must preserve broadcasting.
+    target = torch.empty_like(larger)
+    target.unflatten(0, (2, 4)).copy_(larger.unflatten(0, (2, 4)))
+    torch.testing.assert_close(target, expected)
+
+
+def test_capture_key_mask_cache_is_bounded_and_excludes_dynamic_masks():
+    cache = {}
+    args = dict(batch_size=1, query_cap=4, mel_width=3, mel_frames=2, device=torch.device("cpu"), key_masks=cache)
+    first = _build_capture_mask(attn_mask=None, offset=0, **args)
+    retained = first.clone()
+    for offset in range(70):
+        _build_capture_mask(attn_mask=None, offset=offset, **args)
+    assert len(cache) == 64
+    torch.testing.assert_close(first, retained)
+    caller = torch.ones(2, 3, 3, dtype=torch.bool)
+    a = _build_capture_mask(attn_mask=caller, offset=0, **args)
+    caller[0, :, 1] = False
+    b = _build_capture_mask(attn_mask=caller, offset=0, **args)
+    assert a[0, :, 1].all() and not b[0, :, 1].any()
+    assert len(cache) == 64
+
+
+@pytest.mark.parametrize("device_type", ["cuda", "npu", "cpu"])
+def test_graph_memory_telemetry_uses_device_allocator(monkeypatch, mocker, device_type):
+    from vllm_omni.model_executor.models.minicpmo_4_5 import cuda_graph_wrapper as graph_module
+
+    device = SimpleNamespace(type=device_type)
+    api = mocker.Mock()
+    api.memory_allocated.return_value = 10
+    api.memory_reserved.return_value = 20
+    api.max_memory_allocated.return_value = 30
+    api.max_memory_reserved.return_value = 40
+    monkeypatch.setattr(torch, "npu", api if device_type == "npu" else mocker.Mock(), raising=False)
+    monkeypatch.setattr(torch, "accelerator", api if device_type == "cuda" else mocker.Mock())
+    if device_type == "cpu":
+        assert graph_module._memory_snapshot(device) is None
+        assert graph_module._memory_peak(device) is None
+        assert not api.mock_calls
+    else:
+        assert graph_module._memory_snapshot(device) == (10, 20)
+        assert graph_module._memory_peak(device) == (30, 40)
+        for name in ("memory_allocated", "memory_reserved", "max_memory_allocated", "max_memory_reserved"):
+            getattr(api, name).assert_called_once_with(device)
+
+
+def test_npu_precapture_stops_after_graph_exceeds_memory_budget(monkeypatch, mocker):
+    from vllm_omni.model_executor.models.minicpmo_4_5 import cuda_graph_wrapper as graph_module
+
+    api = mocker.Mock()
+    api.memory_allocated.return_value = 0
+    api.memory_reserved.side_effect = [0, 2048]
+    monkeypatch.setattr(torch, "npu", api, raising=False)
+    # Keep tensor allocation on CPU; exercise the real NPU telemetry and
+    # precapture stop policy without requiring a device or graph capture.
+    empty = torch.empty
+    monkeypatch.setattr(graph_module.torch, "empty", lambda shape, **kwargs: empty(shape))
+    wrapper = WholeEulerCFMGraphWrapper.__new__(WholeEulerCFMGraphWrapper)
+    wrapper.enabled = True
+    wrapper.att_slots = 0
+    wrapper._att_capacity = 0
+    wrapper.offset_bucket_frames = 50
+    wrapper.query_widths = (50,)
+    wrapper._graph_batches = lambda: [1]
+    wrapper.max_graphs = 10
+    wrapper._cache = {}
+    wrapper._slot_graphs = {}
+    wrapper.device = SimpleNamespace(type="npu")
+    wrapper.dtype = torch.float32
+    wrapper._stats = {"captures": 0}
+    wrapper.arena = mocker.Mock()
+    wrapper.arena.att_bytes.return_value = 0
+
+    def entry(**kwargs):
+        wrapper._stats["captures"] += 1
+        return ()
+
+    wrapper._entry = entry
+    assert wrapper.precapture(offsets=[50, 100, 150], steady=150, channels=4, spk_dim=4, max_graph_bytes=1024) == 1
+    assert api.memory_reserved.call_count == 2

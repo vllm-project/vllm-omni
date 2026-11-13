@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 import torch
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import contiguous_kv_gather_enabled
-from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping, visible_window_blocks
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
+    chunk_window_skipped_tokens,
+    compute_slot_mapping,
+    visible_window_blocks,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import MultipleOf
@@ -35,7 +39,7 @@ def _to_device_async(t: torch.Tensor, device: torch.device) -> torch.Tensor:
     keeps the CPU running ahead (the caching host allocator keeps the pinned
     source alive until the copy's stream event completes).
     """
-    if torch.device(device).type != "cuda" or t.device.type != "cpu":
+    if torch.device(device).type not in ("cuda", "npu") or t.device.type != "cpu":
         return t.to(device=device)
     return t.pin_memory().to(device=device, non_blocking=True)
 
@@ -75,6 +79,7 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     # Index of the current chunk's first block within the staged window: right after the visible history,
     # which is not the end of the padded block table (that carries at least one action-capacity block).
     stage_first_block: int = 0
+    private_slots: torch.Tensor | None = None
 
 
 @dataclass
@@ -119,6 +124,8 @@ class ARDiffusionPagedForwardContext:
     max_query_len: int = 0
     max_seq_len: int = 0
     _prepared: bool = False
+    private_slots: torch.Tensor | None = None
+    superpage_fragment_tokens: int = 0
 
     @property
     def block_size(self) -> int:
@@ -326,6 +333,9 @@ class ARDiffusionPagedForwardContext:
         for index, block in enumerate(self.current_video_block_ids):
             first_position.setdefault(int(block), current_start + index * block_size)
 
+        if self.kv_cache.superpage_size:
+            return self._superpage_video_blocks(first_position, device)
+
         visible_video_blocks: list[int] = []
         video_len = 0
         for block, first in sorted(first_position.items(), key=lambda item: item[1]):
@@ -339,6 +349,57 @@ class ARDiffusionPagedForwardContext:
             visible_video_blocks.append(block)
             video_len += min(block_size, end - first)
         return visible_video_blocks, video_len
+
+    def _superpage_video_blocks(self, first_position: dict[int, int], device: torch.device) -> tuple[list[int], int]:
+        """Pack baseline-visible boundary rows of manager-owned superpages."""
+        cache = self.kv_cache
+        page, unit = self.block_size, cache.visibility_block_size
+        history = self.adapter.absolute_num_computed_tokens
+        end = history + self.seq_len
+        sink_end = -(-self.sink_tokens // unit) * unit
+        skipped = chunk_window_skipped_tokens(
+            history,
+            chunk_size=self.chunk_size,
+            sliding_window=cache.spec.sliding_window,
+            sink_chunks=cache.spec.sink_chunks,
+            reset_at_boundary=cache.spec.reset_at_boundary,
+        )
+        recent = max(
+            sink_end, max(0, end - self.window_tokens) // unit * unit, (self.sink_tokens + skipped) // unit * unit
+        )
+        ranges = ((0, min(sink_end, end)), (recent, end))
+        signature = (tuple(first_position.items()), ranges, self.adapter.compacted_tokens)
+        previous = cache.superpage_plan
+        if previous is not None and previous[0] == signature:
+            _, pages, length, self.private_slots, self.superpage_fragment_tokens = previous
+            return pages, length
+
+        pages, fragments = [], []
+        sink_page_end = -(-self.sink_tokens // page) * page
+        length = 0
+        for block, first in sorted(first_position.items(), key=lambda item: item[1]):
+            absolute = first + (self.adapter.compacted_tokens if first >= sink_page_end else 0)
+            spans = [(max(lo, absolute), min(hi, absolute + page)) for lo, hi in ranges]
+            spans = [(lo, hi) for lo, hi in spans if hi > lo]
+            count = sum(hi - lo for lo, hi in spans)
+            length += count
+            if count == page:
+                pages.append(block)
+            else:
+                for lo, hi in spans:
+                    fragments.extend(range(block * page + lo - absolute, block * page + hi - absolute))
+        capacity = cache.superpage_private_pages * page
+        if len(fragments) > capacity:
+            raise RuntimeError(f"superpage boundary bound violated: {len(fragments)} > {capacity}")
+        private_base = cache.num_blocks_total - cache.superpage_private_pages
+        pages += list(range(private_base, private_base + -(-len(fragments) // page)))
+        self.private_slots = _to_device_async(
+            torch.tensor(fragments + [cache.null_block_id * page] * (capacity - len(fragments)), dtype=torch.long),
+            device,
+        )
+        self.superpage_fragment_tokens = len(fragments)
+        cache.superpage_plan = (signature, pages, length, self.private_slots, len(fragments))
+        return pages, length
 
     def build_block_table(
         self,
@@ -355,6 +416,8 @@ class ARDiffusionPagedForwardContext:
         (and, later, CUDA-graph capture). The kernel only dereferences the first
         ``ceil(seq_lens/block_size)`` entries, so padding is never read.
         """
+        if self.kv_cache.superpage_size and action_len:
+            raise ValueError("superpage_tokens does not support action/state KV tokens")
         video_blocks, video_len = self.video_block_table(device)
         # Action K/V is listed after the video blocks and the kernel reads the
         # table as one run, so the video run has to end on a block edge. If it
@@ -385,7 +448,7 @@ class ARDiffusionPagedForwardContext:
         # and start tracking how full the window is -- the exact shape churn
         # the fixed width exists to prevent -- and max_seq_len could come out
         # below the kv_len actually being passed, by up to block_size - 1.
-        capacity_blocks = self.max_video_blocks + action_capacity_blocks
+        capacity_blocks = self.max_video_blocks + action_capacity_blocks + self.kv_cache.superpage_private_pages
         width = max(capacity_blocks, len(block_ids))
         padded = block_ids + [0] * (width - len(block_ids))
 
@@ -395,9 +458,15 @@ class ARDiffusionPagedForwardContext:
         # Built on the host once per AR block; the copies go through the same
         # pinned, non-blocking path as the slot mappings above so the CPU does
         # not wait for the stream to drain three times before the first layer.
+        signature = (tuple(padded), self.kv_len, self.query_len)
+        previous = self.kv_cache.superpage_metadata
+        if previous is not None and previous[0] == signature:
+            return (*previous[1:], self.query_len, max_seq_len)
         block_table = _to_device_async(torch.tensor([padded], dtype=torch.int32), device)
         query_start_loc = _to_device_async(torch.tensor([0, self.query_len], dtype=torch.int32), device)
         seq_lens = _to_device_async(torch.tensor([self.kv_len], dtype=torch.int32), device)
+        if self.kv_cache.superpage_size:
+            self.kv_cache.superpage_metadata = (signature, block_table, query_start_loc, seq_lens)
         return block_table, query_start_loc, seq_lens, self.query_len, max_seq_len
 
     def prepare(self, device: torch.device, action_len: int, query_len: int) -> None:
@@ -480,6 +549,18 @@ class ARDiffusionPagedForwardContext:
         window inside the attention custom op instead of at the compiled boundary.
         """
         if not self.staging_enabled:
+            # NPU eager dispatch of the fused write+attend custom op rejects
+            # None for a tensor argument declared mutable, so hand back
+            # zero-size buffers there; the op treats an empty stage buffer
+            # like None (fresh allocation). Other devices keep the upstream
+            # None contract.
+            k_pool = self.kv_cache._k_pools[layer_idx]
+            if k_pool.device.type == "npu":
+                v_pool = self.kv_cache._v_pools[layer_idx]
+                return (
+                    torch.empty(0, device=k_pool.device, dtype=k_pool.dtype),
+                    torch.empty(0, device=v_pool.device, dtype=v_pool.dtype),
+                )
             return None, None
         return self.kv_cache.history_staging[layer_idx]
 
@@ -506,6 +587,7 @@ class ARDiffusionPagedForwardContext:
             stage_value=stage_value,
             reuse_history=self.reuse_history,
             stage_first_block=int(self.stage_first_block),
+            private_slots=self.private_slots,
         )
 
     def mark_committed(self) -> None:
@@ -719,6 +801,45 @@ def ar_diffusion_paged_attention(
     else:
         query_flat = query
 
+    if query_flat.device.type == "npu":
+        # NPU: gather the visible blocks on device, then run the fused
+        # npu_fusion_attention kernel over the packed (contiguous) window.
+        # Mirrors the ROCm gather path; the reference implementation below is
+        # the correctness oracle but pays per-block gathers and fp32 einsum.
+        import torch_npu
+
+        # Gather whole blocks in one index_select instead of per-token
+        # advanced indexing: the block-major flatten + truncate is byte-identical
+        # (same block_table row mapping) and measurably faster on NPU
+        # (-4.1% full 40-chunk request at SP4, -7.3% steady chunk interval at
+        # SP8 on 910C; 477-frame precodec output bit-identical).
+        block_size = key_cache.shape[1]
+        num_blocks = (int(max_seq_len) + block_size - 1) // block_size
+        block_ids = block_table[0, :num_blocks].long()
+        gathered_k = key_cache.index_select(0, block_ids).flatten(0, 1)[: int(max_seq_len)]
+        gathered_v = value_cache.index_select(0, block_ids).flatten(0, 1)[: int(max_seq_len)]
+        kv_len = int(seq_lens[0].item())
+        packed_k = gathered_k[:kv_len]
+        packed_v = gathered_v[:kv_len]
+        # TND layout: per-sequence lengths and their cu_seqlens prefixes.
+        q_lens_per_seq = query_start_loc[1:] - query_start_loc[:-1]
+        actual_seq_q = q_lens_per_seq.to(torch.int32).cpu().tolist()
+        actual_seq_kv = seq_lens.to(torch.int32).cpu().tolist()
+        out = torch_npu.npu_fusion_attention(
+            query_flat.contiguous(),
+            packed_k.contiguous(),
+            packed_v.contiguous(),
+            head_num=query_flat.shape[1],
+            input_layout="TND",
+            actual_seq_qlen=actual_seq_q,
+            actual_seq_kvlen=actual_seq_kv,
+            scale=float(softmax_scale),
+            keep_prob=1.0,
+        )[0]
+        if batched:
+            return out.reshape(query.shape)
+        return out
+
     if not query_flat.is_cuda:
         out = _reference_paged_attention(
             query_flat,
@@ -772,7 +893,7 @@ def ar_diffusion_paged_attention(
         if n_blocks * block_size != int(max_seq_len):
             raise ValueError("the contiguous K/V gather path requires max_seq_len to be block-aligned")
         block_ids = block_table[0, :n_blocks].to(torch.long)
-        if stage_key is None or stage_value is None:
+        if stage_key is None or stage_value is None or stage_key.numel() == 0:
             # Fresh allocations on purpose: a module-level cached buffer that is first
             # allocated inside a CUDA-graph-trees warm-up run lives in the graph pool
             # untracked ("tensor(s) in the cudagraph pool not tracked as outputs").
@@ -891,12 +1012,17 @@ def _paged_write_attn_impl(
     stage_value: torch.Tensor | None = None,
     reuse_history: bool = False,
     stage_first_block: int = 0,
+    private_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
     key_pool[video_slots] = k_curr.to(key_pool.dtype)
     value_pool[video_slots] = v_curr.to(value_pool.dtype)
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:
         key_pool[action_slots] = k_act.to(key_pool.dtype)
         value_pool[action_slots] = v_act.to(value_pool.dtype)
+    if private_slots is not None:
+        count = private_slots.shape[0]
+        torch.index_select(key_pool[:-count], 0, private_slots, out=key_pool[-count:])
+        torch.index_select(value_pool[:-count], 0, private_slots, out=value_pool[-count:])
     key_cache = key_pool.unflatten(0, (-1, block_size))
     value_cache = value_pool.unflatten(0, (-1, block_size))
     return ar_diffusion_paged_attention(
@@ -949,6 +1075,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         stage_value: torch.Tensor | None,
         reuse_history: bool,
         stage_first_block: int,
+        private_slots: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return _paged_write_attn_impl(
             query,
@@ -971,6 +1098,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
             stage_value,
             reuse_history,
             stage_first_block,
+            private_slots,
         )
 
     @_paged_write_attn_op.register_fake
@@ -995,6 +1123,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         stage_value=None,
         reuse_history=False,
         stage_first_block=0,
+        private_slots=None,
     ):
         return torch.empty_like(query)
 
@@ -1024,4 +1153,5 @@ def paged_write_attn(
         inputs.stage_value,
         inputs.reuse_history,
         inputs.stage_first_block,
+        inputs.private_slots,
     )
