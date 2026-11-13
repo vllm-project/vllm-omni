@@ -49,7 +49,7 @@ from vllm_omni.errors import client_error_metadata
 from vllm_omni.quantization import build_quant_config
 
 if TYPE_CHECKING:
-    from vllm.config import KVTransferConfig, ProfilerConfig
+    from vllm.config import CompilationConfig, KVTransferConfig, ProfilerConfig
 
 # Import after TYPE_CHECKING to avoid circular imports at runtime
 # The actual import is deferred to __post_init__ to avoid import order issues
@@ -1148,6 +1148,11 @@ class OmniDiffusionConfig:
 
     profiler_config: "ProfilerConfig | dict[str, Any] | None" = None
 
+    # The stage's vLLM ``--compilation-config``. The model runner's torch.compile
+    # uses its ``backend`` when set (stock torch.compile semantics: the backend
+    # receives each compiled region whole); ``None`` keeps torch.compile's default.
+    compilation_config: "CompilationConfig | dict[str, Any] | None" = None
+
     # Model-specific function for collecting CFG KV caches (set at runtime)
     cfg_kv_collect_func: Any | None = None
 
@@ -1404,6 +1409,11 @@ class OmniDiffusionConfig:
             from vllm.config import ProfilerConfig
 
             self.profiler_config = ProfilerConfig(**self.profiler_config)
+
+        if isinstance(self.compilation_config, dict):
+            from vllm.config import CompilationConfig
+
+            self.compilation_config = CompilationConfig(**self.compilation_config)
 
         if self.additional_config is None:
             self.additional_config = {}

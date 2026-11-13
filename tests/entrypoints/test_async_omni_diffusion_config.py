@@ -681,6 +681,30 @@ def test_serve_cli_accepts_diffusion_compile_controls():
     assert stage_cfg["engine_args"]["diffusion_compile_dynamic"] is False
 
 
+def test_serve_cli_compilation_config_reaches_diffusion_stage():
+    """``--compilation-config`` reaches the diffusion stage config instead of being dropped."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Lightricks/LTX-Video-0.9.8-13B-distilled",
+            "--omni",
+            "--compilation-config",
+            '{"backend": "eager"}',
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
+    terminal_config = _terminal_config(stage_cfg)
+
+    assert terminal_config.compilation_config is not None
+    assert terminal_config.compilation_config.backend == "eager"
+
+
 def test_serve_cli_accepts_diffusion_attention_backend():
     """Ensure diffusion serve CLI exposes the shorthand backend flag."""
     parser = TrackingArgumentParser()

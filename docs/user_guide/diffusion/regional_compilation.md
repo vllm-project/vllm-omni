@@ -30,6 +30,32 @@ HSDP, sequence parallelism, CPU offload, or layerwise offload is enabled, or
 attention schedule profiles are configured. Use regional scope with those
 features.
 
+### Compilation backend
+
+The model runner compiles with torch.compile's default backend (Inductor). A
+stage can name another backend with vLLM's compilation config:
+
+```bash
+vllm serve <model> --omni --compilation-config '{"backend": "eager"}'
+```
+
+or, per stage in the deploy configuration:
+
+```yaml
+stages:
+  - stage_id: 0
+    compilation_config:
+      backend: eager
+```
+
+The value is either a backend registered with `torch._dynamo` (for example
+`eager`, `aot_eager`, or one an out-of-tree platform registers) or the qualified
+name of a backend callable, as for vLLM's stock torch.compile mode. Diffusion
+applies only `backend`: the backend receives each compiled region whole, and
+vLLM's `mode`, piecewise splitting and CUDA graph settings do not apply here.
+With a non-Inductor backend, the Inductor-only options used for graph capture
+are not passed.
+
 These settings control the generic model-runner compilation path. Pipelines
 that provide their own `setup_compile()` implementation manage their compilation
 policy independently. Compilation is lazy, so backend or graph errors can first

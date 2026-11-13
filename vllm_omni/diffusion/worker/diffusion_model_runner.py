@@ -267,6 +267,27 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 f"Diffusion KV metadata request mismatch: expected={request_id!r}, got={metadata.request_id!r}"
             )
 
+    def _configured_compile_backend(self) -> str | Callable[..., Any] | None:
+        """The torch.compile backend set by the stage's ``compilation_config``.
+
+        Only a backend the user configured is applied, so platforms keep
+        torch.compile's default (inductor) unless ``--compilation-config`` names
+        another one. A registered Dynamo backend is passed by name; any other
+        value is imported as a qualified name, as vLLM's ``CompilationConfig``
+        resolves its backend for stock torch.compile.
+        """
+        compilation_config = getattr(self.od_config, "compilation_config", None)
+        backend = getattr(compilation_config, "backend", "") if compilation_config is not None else ""
+        if not backend or backend == "inductor":
+            return None
+        from torch._dynamo.backends.registry import list_backends
+
+        if backend in list_backends(exclude_tags=()):
+            return backend
+        from vllm.utils.import_utils import resolve_obj_by_qualname
+
+        return resolve_obj_by_qualname(backend)
+
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
         model = getattr(self.pipeline, attr_name, None)
@@ -274,12 +295,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             return
 
         compile_kwargs: dict[str, Any] = {"dynamic": self.od_config.diffusion_compile_dynamic}
+        backend = self._configured_compile_backend()
+        if backend is not None:
+            compile_kwargs["backend"] = backend
         graph_layer = None
         if getattr(model, "enable_cuda_graph_decode", False):
             graph_layer = "CUDA graph decode"
         elif getattr(self.od_config, "diffusion_use_graph", False):
             graph_layer = "denoise graphs"
-        if graph_layer is not None:
+        if graph_layer is not None and backend is None:
             # Graph capture records the compiled (fused) kernels. Scope inductor
             # cudagraphs to this compile so the two graph layers never stack,
             # without changing torch.compile for every other model in the process.
@@ -309,11 +333,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             return
 
         logger.info(
-            "Model runner: %s configured for lazy %s torch.compile with dynamic=%s; "
+            "Model runner: %s configured for lazy %s torch.compile with dynamic=%s, backend=%s; "
             "compilation errors may surface on the first request.",
             attr_name,
             compile_granularity,
             compile_kwargs["dynamic"],
+            compile_kwargs.get("backend", "inductor"),
         )
 
     def load_model(

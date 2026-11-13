@@ -61,6 +61,25 @@ def test_direct_config_preserves_explicit_extras():
     assert config.extras["prefix_kv_cache_dtype"] == "fp8"
 
 
+class TestCompilationConfigPropagation:
+    """``--compilation-config`` must reach the diffusion stage config.
+
+    Before the field existed, the generic diffusion path kept only
+    ``OmniDiffusionConfig`` fields and dropped it without a warning.
+    """
+
+    def test_compilation_config_roundtrip(self):
+        from vllm.config import CompilationConfig
+
+        od = _roundtrip_diffusion_config(model="x", compilation_config={"backend": "eager"})
+        assert isinstance(od.compilation_config, CompilationConfig)
+        assert od.compilation_config.backend == "eager"
+
+    def test_compilation_config_defaults_to_none(self):
+        od = _roundtrip_diffusion_config(model="x")
+        assert od.compilation_config is None
+
+
 class TestParallelConfigPropagation:
     """Core regression tests: parallel_config must survive serialization."""
 

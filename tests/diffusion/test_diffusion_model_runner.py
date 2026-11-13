@@ -370,6 +370,7 @@ def _make_compile_runner(
     compile_granularity: str = "regional",
     compile_dynamic: bool = True,
     use_hsdp: bool = False,
+    compile_backend: str | None = None,
 ):
     runner = object.__new__(DiffusionModelRunner)
     runner.pipeline = SimpleNamespace(transformer=model or SimpleNamespace())
@@ -377,8 +378,14 @@ def _make_compile_runner(
         diffusion_compile_granularity=compile_granularity,
         diffusion_compile_dynamic=compile_dynamic,
         parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
+        compilation_config=None if compile_backend is None else SimpleNamespace(backend=compile_backend),
     )
     return runner
+
+
+def _qualname_compile_backend(gm, example_inputs):
+    """A torch.compile backend reached by qualified name in the tests below."""
+    return gm.forward
 
 
 class _EnabledCacheBackend:
@@ -747,6 +754,66 @@ def test_compile_transformer_scopes_inductor_cudagraphs_to_graph_layers(monkeypa
             },
         }
     ]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("compile_backend", [None, "", "inductor"], ids=["unset", "empty", "inductor"])
+def test_compile_transformer_keeps_default_backend_unless_configured(compile_backend):
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(
+        model, compile_granularity="full", compile_dynamic=False, compile_backend=compile_backend
+    )
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert model.compile_calls == [((), {"dynamic": False})]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_uses_configured_registered_backend():
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(model, compile_granularity="full", compile_dynamic=False, compile_backend="eager")
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert model.compile_calls == [((), {"dynamic": False, "backend": "eager"})]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_resolves_configured_backend_qualname():
+    model = _CompileTrackingModel()
+    runner = _make_compile_runner(
+        model,
+        compile_granularity="full",
+        compile_dynamic=False,
+        compile_backend=f"{__name__}._qualname_compile_backend",
+    )
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert model.compile_calls == [((), {"dynamic": False, "backend": _qualname_compile_backend})]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_gives_configured_backend_no_inductor_options(monkeypatch):
+    model = SimpleNamespace(enable_cuda_graph_decode=False)
+    runner = _make_compile_runner(model, compile_backend="eager")
+    runner.od_config.diffusion_use_graph = True
+    compile_calls = []
+
+    def _regionally_compile(target, *args, **kwargs):
+        compile_calls.append(kwargs)
+        return target
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert compile_calls == [{"dynamic": True, "backend": "eager"}]
 
 
 @pytest.mark.core_model
