@@ -1054,19 +1054,21 @@ class Zonos3CodecModel(nn.Module):
 
     def _codec_manager(self) -> CodecManager:
         if self._manager is None:
-            extra = self.vllm_config.additional_config or {}
-            enabled = extra.get("zonos3_codec_cuda_graph", False)
-            if not isinstance(enabled, bool):
-                raise ValueError("zonos3_codec_cuda_graph must be boolean")
             capacity = self.vllm_config.scheduler_config.max_num_seqs
-            batches = tuple(extra.get("zonos3_codec_graph_batch_sizes", (1, 2, 4, 8, 16, 32))) if enabled else ()
-            frames = tuple(extra.get("zonos3_codec_graph_frame_sizes", (1, 2, 4, 8, 15))) if enabled else ()
-            if enabled:
-                if any(type(size) is not int or size < 1 for size in (*batches, *frames)):
-                    raise ValueError("Zonos3 Codec graph bucket sizes must be positive integers")
-                batches = tuple(size for size in batches if size <= capacity)
-                if not batches or max(batches) != capacity:
-                    batches = (*batches, capacity)
+            batches: tuple[int, ...] = ()
+            frames: tuple[int, ...] = ()
+            if not self.vllm_config.model_config.enforce_eager:
+                connector = self.vllm_config.model_config.stage_connector_config
+                extra = connector.get("extra", connector) if isinstance(connector, dict) else connector.extra
+                chunk_size = extra.get("codec_chunk_frames", 15)
+                ramp = extra.get("codec_chunk_ramp", (1, 2, 4, 8, 15))
+                # Empty final inputs use the one-frame bucket with length zero;
+                # short tails round up. Per-request overrides beyond these
+                # shared connector buckets use the wrapper's eager path.
+                frames = tuple(sorted({1, chunk_size, *ramp}))
+                if any(type(size) is not int or size < 1 for size in frames):
+                    raise ValueError("Zonos3 Codec chunk sizes must be positive integers")
+                batches = tuple(1 << i for i in range((capacity - 1).bit_length())) + (capacity,)
             self._manager = CodecManager(self.network, capacity, graph_batch_sizes=batches, graph_frame_sizes=frames)
         return self._manager
 

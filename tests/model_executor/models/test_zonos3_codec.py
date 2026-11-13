@@ -742,6 +742,10 @@ def checkpoint(tmp_path, monkeypatch):
     config.model_config.model = str(tmp_path)
     config.model_config.revision = None
     config.model_config.hf_config = PretrainedConfig(zonos3_decoder="keep2_plain")
+    config.model_config.enforce_eager = True
+    config.model_config.stage_connector_config = {
+        "extra": {"codec_chunk_frames": 15, "codec_chunk_ramp": [1, 2, 4, 8, 15]}
+    }
     config.load_config = LoadConfig()
     config.additional_config = {}
     config.scheduler_config = SchedulerConfig(
@@ -760,6 +764,29 @@ def payload(external_id, codes, seq, offset, finished=False):
             "finished": torch.tensor(finished),
         },
     }
+
+
+@pytest.mark.parametrize("capacity, expected_batches", [(1, [1]), (3, [1, 2, 3]), (8, [1, 2, 4, 8])])
+@pytest.mark.parametrize("chunk_size, ramp", [(7, [1, 3, 7]), (5, [])])
+@pytest.mark.parametrize("enforce_eager", [True, False])
+def test_codec_graph_policy_uses_scheduler_and_connector(
+    checkpoint, capacity, expected_batches, chunk_size, ramp, enforce_eager
+):
+    config, _ = checkpoint
+    config.scheduler_config.max_num_seqs = capacity
+    config.model_config.enforce_eager = enforce_eager
+    config.model_config.stage_connector_config = {"extra": {"codec_chunk_frames": chunk_size, "codec_chunk_ramp": ramp}}
+    model = Zonos3CodecModel(vllm_config=config)
+    manager = model._codec_manager()
+    if enforce_eager:
+        assert manager.graph is None
+        assert manager.state.frames.shape[0] == capacity
+    else:
+        assert manager.graph.batch_sizes == expected_batches
+        assert manager.graph.frame_sizes == sorted({1, chunk_size, *ramp})
+        assert manager.state.frames.shape[0] == 2 * capacity
+        assert manager.graph.frame_bucket(0) == 1
+        assert manager.graph.frame_bucket(chunk_size - 1) == chunk_size
 
 
 @pytest.mark.parametrize("termination", ["eos", "length", "length_before_frame", "cancel", "cancel_before_output"])
@@ -787,7 +814,7 @@ def test_native_finalizer_transport_codec_lifecycle(checkpoint, termination, com
     from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 
     config, oracle = checkpoint
-    config.additional_config = {"zonos3_codec_cuda_graph": complete_codec}
+    config.model_config.enforce_eager = not complete_codec
     model = Zonos3CodecModel(vllm_config=config)
     model.load_weights(iter(()))
     frames = torch.arange(200).reshape(20, 10)

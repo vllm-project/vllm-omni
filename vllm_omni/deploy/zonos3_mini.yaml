@@ -1,4 +1,4 @@
-# Native MRV2 two-stage streaming profile. GPU acceptance is pending.
+# Native MRV2 two-stage streaming profile.
 # Launch with FLA_TILELANG=0 and the zonos3 optional dependency installed.
 pipeline: zonos3
 model_runner: v2
@@ -24,7 +24,12 @@ stages:
     max_num_seqs: 32
     max_num_batched_tokens: 4096
     max_model_len: 2048
-    gpu_memory_utilization: 0.60
+    gpu_memory_utilization: 0.25
+    # Two global-attention layers, four KV heads, head_dim=32, BF16:
+    # 32 * 2048 * 2 layers * 2 (K/V) * 4 * 32 * 2 bytes = 64 MiB.
+    # Reserve 128 MiB for block rounding and the null block, rather than filling
+    # the GPU with KV for thousands of requests the scheduler cannot admit.
+    kv_cache_memory_bytes: 134217728
     skip_tokenizer_init: true
     enable_prefix_caching: false
     enforce_eager: false
@@ -53,13 +58,12 @@ stages:
     gpu_memory_utilization: 0.25
     skip_tokenizer_init: true
     enable_prefix_caching: false
-    enforce_eager: true
-    # The native Generation runner stays eager; the model captures the complete
-    # stateful Codec separately, including synthesis, resampling and final flush.
-    additional_config:
-      zonos3_codec_cuda_graph: true
-      zonos3_codec_graph_batch_sizes: [1, 2, 4, 8, 16, 32]
-      zonos3_codec_graph_frame_sizes: [1, 2, 4, 8, 15]
+    # The Generation runner dispatches eagerly; this flag controls the model's
+    # complete Codec graphs. Buckets derive from max_num_seqs and shm.extra.
+    enforce_eager: false
+    compilation_config:
+      mode: 0
+      cudagraph_mode: NONE
     async_scheduling: true
     input_connectors:
       from_stage_0: shm
