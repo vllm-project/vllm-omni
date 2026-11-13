@@ -20,8 +20,9 @@ migration can be handled separately without weakening the current contract.
 
 ## Current boundary
 
-The VAE installer validates the official model structure before making any
-change. It then binds the selected operator set, reuses Omni's existing
+For the existing bit-exact operator sets, the VAE installer validates the
+official model structure before making any change. It then binds the selected
+operator set, reuses Omni's existing
 `SiluAndMul`, and materializes only the decoder-block Linear weights in the FP16
 dtype already selected by decode autocast. Unsupported model contracts, tensor
 inputs, execution modes, and devices retain the original implementation.
@@ -31,6 +32,19 @@ other capabilities fall back to the reference path. Bit-exact full-decode and
 operator evidence has been collected on SM90, with independent full-decode and
 stress validation on SM103. Enabling a target and claiming it as validated are
 kept separate so the evidence remains clear.
+
+Eligible native Ascend A5 decoders use the reference operators by default.
+To opt into fused RMSNorm, RoPE and SwiGLU, set
+`--additional-config '{"video_vae_fused_ops": true}'`. For
+`minimax_h3_disaggregated_decode`, set the same key in the decoder stage's
+`additional_config`. The A5 installer reads this boolean from the stage's
+diffusion configuration. Fusion is independent of MXFP8 selection. Unsupported
+decoder structures and RMSNorm or RoPE inputs retain the reference operations.
+Set `MINIMAX_H3_VAE_DECODER_VIT_ROPE_TORCH_COMPILE=1` at startup to let the
+checkpoint manage RoPE compilation while allowing the other A5 fusions.
+The A5 kernels can differ from the reference in floating-point rounding.
+Before enabling them by default, validate the full decoded output and agree
+with maintainers on the quality criteria.
 
 ## Extending platform support
 
