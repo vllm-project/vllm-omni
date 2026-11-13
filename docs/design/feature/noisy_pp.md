@@ -314,12 +314,15 @@ inputs. ``forward`` packs per-member noise levels and chunk RoPE (e.g.
 Each member contributes exactly one tensor row and one KV view. Activation
 payloads and model outputs validate that row count rather than broadcasting a
 mismatched tensor. Local activation retention and PP boundary sends are decided
-per member, independently of other requests in the slot. A missing send payload
+per member, independently of other requests in the slot. Local handoffs record
+the expected consumer Cell and reject a different consumer. A missing send payload
 is an execution error.
 
 CausVid reuses conditioning and RoPE across blocks while the ordered prompt
 tensors stay unchanged. Changing the member composition invalidates the caches;
-noise levels remain part of the embedding key. Only the current pack is cached.
+noise levels remain part of the embedding key. Only the current noise-level embedding is cached; CPU noise levels form the
+key before any device transfer, so cache hits need no GPU readback. RoPE
+retention is bounded by the current pack size and refreshed on access.
 Prompt tensors must remain immutable during execution. Physis continues to run
 one member at a time through the same explicit member-map runtime entry.
 

@@ -540,7 +540,7 @@ def _run_slot_batches(
     contexts: list[Any],
     members: Mapping[str, CellAdapter],
     max_batch_size: int,
-    pending_hidden: dict[str, Any],
+    pending_hidden: dict[str, tuple[Cell, Any]],
     act_stash: dict[tuple[str, int, int], dict[str, torch.Tensor]],
 ) -> list[dict[str, torch.Tensor] | None]:
     """Organize compatible Batches, map per-member activations, run model forward."""
@@ -556,10 +556,14 @@ def _run_slot_batches(
         member_inputs: list[Any | None] = []
         for member_ref in batch.members:
             req = member_ref.request_id
-            # Local mid-group / clean handoff is request-keyed; PP rows use the
-            # consumer (req, chunk, step) written at send time.
+            # A local handoff has one explicit next consumer, even across idle
+            # ticks. Never let request identity alone select its activation.
             if req in pending_hidden:
-                member_inputs.append(pending_hidden.pop(req))
+                consumer, payload = pending_hidden.pop(req)
+                cell = (member_ref.chunk, member_ref.step, member_ref.block)
+                if cell != consumer:
+                    raise RuntimeError(f"Local activation for {req!r} expects {consumer}, got {cell}")
+                member_inputs.append(payload)
             else:
                 member_inputs.append(act_stash.pop((req, int(member_ref.chunk), int(member_ref.step)), None))
         packed = member_adapters[0].forward(
@@ -602,7 +606,7 @@ def run_cell_pipeline(
     slot = 0
     limit = max_slots if max_slots is not None else 10**9
     # Request-keyed local handoff (mid-group / same-rank clean). PP rows live in act_stash.
-    pending_hidden: dict[str, Any] = {}
+    pending_hidden: dict[str, tuple[Cell, Any]] = {}
     act_stash: dict[tuple[str, int, int], dict[str, torch.Tensor]] = {}
     try:
         kv_stream = kv.uses_comm_stream
@@ -660,7 +664,11 @@ def run_cell_pipeline(
                         and cell == (0, member_schedule.num_denoise_steps - 1, member_schedule.num_blocks - 1)
                     )
                     if part is not None and (keep_clean_input or not is_group_boundary(cell, member_schedule)):
-                        pending_hidden[req] = part
+                        chunk, step, block = cell
+                        consumer = (
+                            (0, member_schedule.num_denoise_steps, 0) if keep_clean_input else (chunk, step, block + 1)
+                        )
+                        pending_hidden[req] = (consumer, part)
                     else:
                         pending_hidden.pop(req, None)
             if kv_stream and prev_slot_for_evict is not None:
@@ -730,6 +738,7 @@ def run_cell_pipeline(
                     still.append(item)
                 else:
                     kv.end_request(item.req)
+                    pending_hidden.pop(item.req, None)
             ctx.inflight = still
             kv.set_inflight(tuple(ctx.inflight))
             # End-of-slot wait for remotes first consumed at slot+1 (plan wait_ready).

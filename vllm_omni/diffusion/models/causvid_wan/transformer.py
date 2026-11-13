@@ -273,18 +273,24 @@ class StageWanTransformer(nn.Module):
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self._wan is not None and self._text is not None
+        # WanCell and Physis supply CPU noise levels. Build the key before
+        # any H2D copy, and do not read CUDA tensors back just to cache them.
+        cache_key = None
+        if timestep.device.type == "cpu":
+            levels = tuple(float(x) for x in timestep.detach().reshape(-1).tolist())
+            cache_key = (step, levels, device, dtype)
+            hit = self._embeddings.get(cache_key)
+            if hit is not None:
+                return hit
         ts = timestep.to(device=device, dtype=torch.float32)
         if ts.ndim == 0 or (ts.ndim == 1 and ts.shape[0] == 1 and batch_size > 1):
             ts = ts.expand(batch_size)
-        # Key by per-member noise levels so mixed-shift packs do not reuse a scalar cache.
-        cache_key = (step, tuple(float(x) for x in ts.detach().reshape(-1).tolist()))
-        hit = self._embeddings.get(cache_key)
-        if hit is not None:
-            return hit
         temb, timestep_proj, enc, _ = self._wan.condition_embedder(ts, self._text, None, timestep_seq_len=None)
         timestep_proj = self._wan.timestep_proj_prepare(timestep_proj, None)
         out = (temb.to(dtype=dtype), timestep_proj.to(dtype=dtype), enc.to(dtype=dtype))
-        self._embeddings[cache_key] = out
+        # A single current noise-level pack is enough to reuse all local blocks
+        # and unembed; do not retain duplicate full text projections per step.
+        self._embeddings = {cache_key: out} if cache_key is not None else {}
         return out
 
     def _rope_with_temporal_offset(
@@ -326,8 +332,9 @@ class StageWanTransformer(nn.Module):
         assert self._wan is not None
         frames = int(latent.shape[2])
         cache_key = (int(chunk), tuple(latent.shape[2:]), latent.dtype, latent.device)
-        hit = self._rotary.get(cache_key)
+        hit = self._rotary.pop(cache_key, None)
         if hit is not None:
+            self._rotary[cache_key] = hit  # refresh LRU order
             return hit
         # Absolute temporal offset so history KV and the current chunk do not share
         # the same frame indices (official CausVid ``current_start``).

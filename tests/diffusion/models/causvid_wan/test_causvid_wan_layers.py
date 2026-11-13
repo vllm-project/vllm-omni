@@ -528,7 +528,7 @@ def test_pipeline_forward_cancels_stream_jobs_on_failure(monkeypatch, failure_st
     assert cancelled == (["A"] if failure_stage == "admit" else ["A", "B"])
 
 
-def test_conditioning_cache_reuses_blocks_and_invalidates_member_order():
+def test_conditioning_cache_reuses_blocks_and_invalidates_member_order(monkeypatch):
     """Exercise real StageWanTransformer caching, not the WanCell test double."""
     tf = StageWanTransformer.__new__(StageWanTransformer)
     torch.nn.Module.__init__(tf)
@@ -548,6 +548,13 @@ def test_conditioning_cache_reuses_blocks_and_invalidates_member_order():
     tf.prepare_cell((a, b))
     second = tf._embedding((0, 1), timestep, batch_size=2, device=a.device, dtype=a.dtype)
     assert second is first
+    with monkeypatch.context() as patch:
+
+        def no_transfer(*_args, **_kwargs):
+            raise AssertionError("cache hit must not copy timestep to the device")
+
+        patch.setattr(torch.Tensor, "to", no_transfer)
+        assert tf._embedding((0, 1), timestep, batch_size=2, device=a.device, dtype=a.dtype) is first
     assert len(calls) == 1
     assert 0 in tf._rotary
     tf.prepare_cell((b, a))
@@ -558,6 +565,9 @@ def test_conditioning_cache_reuses_blocks_and_invalidates_member_order():
     assert not torch.equal(third[2], first[2])
     tf._embedding((0, 1), timestep + 1, batch_size=2, device=a.device, dtype=a.dtype)
     assert len(calls) == 3
+    for offset in range(2, 12):
+        tf._embedding((0, 1), timestep + offset, batch_size=2, device=a.device, dtype=a.dtype)
+        assert len(tf._embeddings) == 1
 
 
 @pytest.mark.parametrize("texts", [(torch.zeros(2, 3, 4),), (torch.zeros(1, 3, 4), torch.zeros(1, 5, 4))])
@@ -566,3 +576,26 @@ def test_conditioning_rejects_invalid_member_shapes(texts):
     torch.nn.Module.__init__(tf)
     with pytest.raises(ValueError, match="conditioning requires"):
         tf.prepare_cell(texts)
+
+
+def test_rotary_cache_refreshes_hot_member_before_eviction():
+    tf = StageWanTransformer.__new__(StageWanTransformer)
+    torch.nn.Module.__init__(tf)
+    tf._wan = SimpleNamespace()
+    tf._text = torch.zeros(2, 3, 4)
+    tf._rotary = {}
+    calls = []
+
+    def rope(latent, *, start_frame):
+        calls.append(start_frame)
+        return torch.zeros(1, 4, 1, 8), torch.zeros(1, 4, 1, 8)
+
+    tf._rope_with_temporal_offset = rope
+    latent = torch.zeros(1, 4, 1, 2, 2)
+    first = tf._rotary_emb(0, latent)
+    tf._rotary_emb(1, latent)
+    assert tf._rotary_emb(0, latent) is first
+    tf._rotary_emb(2, latent)
+    assert {key[0] for key in tf._rotary} == {0, 2}
+    assert tf._rotary_emb(0, latent) is first
+    assert calls == [0, 1, 2]

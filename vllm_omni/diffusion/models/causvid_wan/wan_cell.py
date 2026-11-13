@@ -126,7 +126,7 @@ class WanCell(CellAdapter):
 
         latent_b = torch.cat(latents, dim=0)
         # One noise-level condition per member (shift / plan step may differ).
-        t = torch.tensor(timesteps, dtype=torch.float32, device=latent_b.device)
+        t = torch.tensor(timesteps, dtype=torch.float32)
 
         if block == tf.start_layer and tf.is_layer_group_first:
             tokens_b = tf.embed(latent_b)

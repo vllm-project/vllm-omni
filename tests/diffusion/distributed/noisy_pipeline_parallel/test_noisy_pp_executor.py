@@ -560,3 +560,67 @@ def test_activation_edges_only_send_boundary_members():
     inflight = (item("boundary", (0, 0, 1)), item("local", (0, 0, 0)))
     edges = _activation_edges(topology=CellTopology(1, 2), inflight=inflight, slot=0, schedule=schedule)
     assert edges == [(0, 1, (("boundary", (0, 0, 1)),))]
+
+
+def test_executor_preserves_mid_group_hidden_beside_boundary_member():
+    """Run the actual loop: A leaves the group while B must keep its next-block input."""
+    from types import SimpleNamespace
+    from typing import Any
+    from unittest.mock import MagicMock
+
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Inflight
+
+    schedule = CellSchedule(
+        chunks=1,
+        num_denoise_steps=1,
+        step_replicas=1,
+        layer_groups=2,
+        ordering=Ordering.SELF_FORCING,
+        kv_history_chunks=0,
+        blocks=4,
+    )
+
+    def plan(cells) -> Any:
+        return SimpleNamespace(schedule=schedule, num_slots=2, task=lambda slot, _rank: cells[slot])
+
+    kv = MagicMock()
+    kv.uses_comm_stream = False
+    kv.prepare.side_effect = lambda tasks: [[None] for _ in tasks]
+    ctx = ARDiffusionCellContext(spec=CellRunSpec(CellTopology(1, 2), rank=0, max_batch_size=2), kv=kv)
+    ctx.inflight = [
+        Inflight("A", 0, plan([(0, 0, 1), None])),
+        Inflight("B", 0, plan([(0, 0, 0), (0, 0, 1)])),
+    ]
+    seen = []
+
+    class Adapter(CellAdapter):
+        def compatibility_key(self, cell):
+            return cell[2]
+
+        def forward(self, batch, members, *, member_inputs):
+            member = batch.members[0]
+            seen.append((member.request_id, member.block))
+            if member.request_id == "B" and member.block == 1:
+                assert member_inputs[0] is not None
+                torch.testing.assert_close(member_inputs[0]["hidden_states"], torch.tensor([[42.0]]))
+            else:
+                assert member_inputs == [None]
+            return {"hidden_states": torch.tensor([[42.0]])}
+
+    run_cell_pipeline(ctx=ctx, members={"A": Adapter(), "B": Adapter()})
+    assert seen == [("A", 1), ("B", 0), ("B", 1)]
+    assert not ctx.inflight
+
+
+def test_local_activation_rejects_wrong_consumer_cell():
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import _run_slot_batches
+
+    with pytest.raises(RuntimeError, match="Local activation.*expects"):
+        _run_slot_batches(
+            tasks=(("A", (0, 0, 0)),),
+            contexts=[[None]],
+            members={"A": CountingAdapter()},
+            max_batch_size=1,
+            pending_hidden={"A": ((1, 0, 0), {"hidden_states": torch.zeros(1, 4, 8)})},
+            act_stash={},
+        )
