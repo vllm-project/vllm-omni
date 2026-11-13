@@ -14,6 +14,7 @@ import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import (
+    in_piecewise_cudagraph,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -543,6 +544,10 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             def _capture_forward(*args: Any, **kwargs: Any) -> Any:
                 output = original_forward(*args, **kwargs)
                 if aux_outputs:
+                    # PIECEWISE replays this payload directly; only native
+                    # FULL buffers (including NONE warmup) consume leaves.
+                    if in_piecewise_cudagraph():
+                        return output
                     return self._flatten_capture_aux_output(output)
                 return self._prepare_cudagraph_capture_output(output)
 
