@@ -259,7 +259,8 @@ def _analyze(trial: dict, events: list[dict]) -> None:
         request["scheduled_during_stall"] = sum(begin <= e["time_ns"] < end for e in scheduled)
         request["restored_rows"] = sum(e["restored_rows"] for e in own if e["event"] == "capture")
         queued = {e["save_id"]: e for e in own if e["event"] == "save_queued"}
-        started = {e["save_id"] for e in own if e["event"] == "save_started"}
+        started = {e["save_id"]: e["time_ns"] for e in own if e["event"] == "save_started"}
+        request["first_hs_save_start_ms"] = (min(started.values()) - request["started_ns"]) / 1e6 if started else None
         finished = {e["save_id"]: e["success"] for e in own if e["event"] == "save_finished"}
         request["save_dropped_blocks"] = max(
             0,
@@ -437,6 +438,19 @@ async def _run(args) -> None:
                         },
                     }
                 )
+                if kind == "kv_put":
+                    peers = [t["requests"][3] for t in trials]
+                    report["summary"][-1]["peer_hs_save_started_requests"] = sum(
+                        r["first_hs_save_start_ms"] is not None for r in peers
+                    )
+                    for name, field in (
+                        ("ttft", "ttft_ms"),
+                        ("e2e", "e2e_ms"),
+                        ("hs_save_start", "first_hs_save_start_ms"),
+                    ):
+                        samples = [r[field] for r in peers if r[field] is not None]
+                        for stat, calculate in (("mean", statistics.mean), ("min", min), ("max", max)):
+                            report["summary"][-1][f"peer_{name}_{stat}_ms"] = calculate(samples) if samples else None
         report["passed"] = True
     finally:
         engine.shutdown()
