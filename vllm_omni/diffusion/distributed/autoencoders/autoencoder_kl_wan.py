@@ -800,7 +800,13 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
 
     def _encode(self, x: torch.Tensor):
         """Run the spatially sharded encode before the native-tiling check, like ``_decode``."""
-        if getattr(self, "distributed_executor", None) is not None and self._spatial_shard_decode_split_dim():
+        # ``patchify`` assumes the 5D video layout, so the rank check comes before it; a 4D
+        # input takes the regular encode path, as ``_spatial_shard_encode_enabled`` would decide.
+        if (
+            getattr(self, "distributed_executor", None) is not None
+            and x.ndim == 5
+            and self._spatial_shard_decode_split_dim()
+        ):
             patched = x if self.config.patch_size is None else patchify(x, patch_size=self.config.patch_size)
             if self._spatial_shard_encode_enabled(patched):
                 split_dim = self._spatial_shard_decode_split_dim()

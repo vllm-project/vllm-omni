@@ -648,6 +648,57 @@ def _tiny_wan_vae(kind: str):
     return vae.double().eval()
 
 
+def _halo_path_equivalence_worker(rank, world_size, split_dim, halo_size, port, return_dict):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        shape = (1, 2, 3, 8, 6) if split_dim == "height" else (1, 2, 3, 6, 8)
+        # Distinct data per rank, so a halo that came from the wrong neighbour cannot match.
+        x = torch.randn(shape, generator=torch.Generator().manual_seed(100 + rank), dtype=torch.float64)
+        outs = {}
+        for name, uses_all_gather in (("p2p", False), ("all_gather", True)):
+            wan_spatial_shard._halo_exchange_uses_all_gather = lambda value=uses_all_gather: value
+            out, _, _ = wan_spatial_shard.halo_exchange(
+                x, group=dist.group.WORLD, halo_size=halo_size, split_dim=split_dim
+            )
+            outs[name] = out.clone()
+        return_dict[rank] = {
+            "equal": torch.equal(outs["p2p"], outs["all_gather"]),
+            "grew_by": outs["p2p"].shape[-2 if split_dim == "height" else -1]
+            - shape[-2 if split_dim == "height" else -1],
+        }
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("split_dim", ["height", "width"])
+def test_all_gather_halo_matches_point_to_point_on_every_rank(world_size, split_dim):
+    """The XPU all-gather halo must deliver exactly what the point-to-point halo does.
+
+    ``_halo_exchange_uses_all_gather`` is ``is_xpu()`` in production, so this forces the
+    collective branch under gloo. The collective is entered once per halo exchange on every
+    rank -- a rank-conditional exchange would hang here instead of reaching the assert.
+    """
+    halo_size = 2
+    return_dict = mp.get_context("spawn").Manager().dict()
+    port = str(get_open_port())
+    mp.spawn(
+        _halo_path_equivalence_worker,
+        args=(world_size, split_dim, halo_size, port, return_dict),
+        nprocs=world_size,
+        join=True,
+    )
+
+    assert len(return_dict) == world_size
+    for rank in range(world_size):
+        assert return_dict[rank]["equal"], f"rank {rank}: all-gather halo differs from P2P"
+        assert return_dict[rank]["grew_by"] == 2 * halo_size
+
+
 def _spatial_shard_encode_cpu_worker(rank, world_size, kind, split_dim, shape, all_gather_halo, port, return_dict):
     from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
 
@@ -740,8 +791,10 @@ def _encode_gate_vae(monkeypatch: pytest.MonkeyPatch, *, mode: str, parallel_siz
     vae = DistributedAutoencoderKLWan.__new__(DistributedAutoencoderKLWan)
     vae.distributed_executor = SimpleNamespace(group=object(), parallel_size=parallel_size, parallel_mode=mode)
     vae.is_distributed_enabled = lambda: True
+    tiny = _tiny_wan_vae("wan2.1")
     # Bypass nn.Module.__setattr__: the gate tests skip Module.__init__.
-    object.__setattr__(vae, "encoder", _tiny_wan_vae("wan2.1").encoder)
+    object.__setattr__(vae, "encoder", tiny.encoder)
+    object.__setattr__(vae, "quant_conv", tiny.quant_conv)
     return vae
 
 
@@ -753,11 +806,12 @@ def test_encode_dispatches_to_spatial_shard_without_tiling(monkeypatch: pytest.M
     object.__setattr__(vae, "_internal_dict", SimpleNamespace(patch_size=None))
     vae.use_tiling = False
     calls = []
-    monkeypatch.setattr(
-        wan_spatial_shard,
-        "spatial_shard_encode",
-        lambda vae, x, *, group, split_dim: calls.append(split_dim) or x,
-    )
+
+    def record(vae, x, *, group, split_dim):
+        calls.append(split_dim)
+        return x
+
+    monkeypatch.setattr(wan_spatial_shard, "spatial_shard_encode", record)
 
     x = torch.zeros((1, 3, 5, 16, 32))
     assert DistributedAutoencoderKLWan._encode(vae, x) is x
@@ -778,6 +832,43 @@ def test_spatial_shard_encode_gate_falls_back(monkeypatch: pytest.MonkeyPatch, m
     vae = _encode_gate_vae(monkeypatch, mode=mode, parallel_size=parallel_size)
 
     assert vae._spatial_shard_encode_enabled(torch.zeros(shape)) is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_can_spatial_shard_encode_requires_a_pointwise_quant_conv():
+    """A k>1 quant_conv would read across a strip boundary; the gate has to decline it."""
+    vae = _tiny_wan_vae("wan2.1")
+    x = torch.zeros((1, 3, 5, 48, 128))
+    assert wan_spatial_shard.can_spatial_shard_encode(vae, x, split_dim="width", world_size=8) is True
+
+    object.__setattr__(vae.quant_conv, "kernel_size", (1, 3, 3))
+    assert wan_spatial_shard.can_spatial_shard_encode(vae, x, split_dim="width", world_size=8) is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_encode_keeps_the_regular_path_for_a_4d_input(monkeypatch: pytest.MonkeyPatch):
+    """A 4D input must not reach ``patchify``, which assumes the 5D video layout."""
+    vae = _encode_gate_vae(monkeypatch, mode="spatial_shard_width")
+    object.__setattr__(vae, "_internal_dict", SimpleNamespace(patch_size=2))
+    vae.use_tiling = False
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan.patchify",
+        lambda x, patch_size: pytest.fail("patchify ran on a 4D input"),
+    )
+    monkeypatch.setattr(
+        wan_spatial_shard,
+        "spatial_shard_encode",
+        lambda vae, x, *, group, split_dim: pytest.fail("sharded encode took a 4D input"),
+    )
+    sentinel = object()
+    monkeypatch.setattr(
+        "diffusers.models.autoencoders.autoencoder_kl_wan.AutoencoderKLWan._encode",
+        lambda self, x: sentinel,
+    )
+
+    assert DistributedAutoencoderKLWan._encode(vae, torch.zeros((1, 3, 16, 32))) is sentinel
 
 
 @pytest.mark.core_model

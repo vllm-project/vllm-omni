@@ -1081,10 +1081,27 @@ def _encoder_downsample_count(encoder: nn.Module) -> int:
     )
 
 
+def _quant_conv_is_pointwise(vae: Any) -> bool:
+    """Whether ``quant_conv`` is 1x1 spatially, so running it per strip is exact.
+
+    ``spatial_shard_encode`` applies it to the local strip, before the all-gather.
+    Every Wan-family VAE uses a 1x1x1 ``quant_conv``; a wider spatial kernel would
+    read across a strip boundary and would need a halo of its own.
+    """
+    kernel_size = getattr(getattr(vae, "quant_conv", None), "kernel_size", None)
+    if kernel_size is None:
+        return False
+    if isinstance(kernel_size, int):
+        return kernel_size == 1
+    return tuple(kernel_size)[-2:] == (1, 1)
+
+
 def can_spatial_shard_encode(vae: Any, x: torch.Tensor, *, split_dim: str, world_size: int) -> bool:
     """Whether ``x`` (already patchified) splits into exact, stride-aligned encoder shards."""
     encoder = getattr(vae, "encoder", None)
     if encoder is None or x.ndim != 5 or world_size <= 1:
+        return False
+    if not _quant_conv_is_pointwise(vae):
         return False
     divisor = world_size * 2 ** _encoder_downsample_count(encoder)
     return x.shape[_spatial_dim(split_dim)] % divisor == 0
@@ -1138,8 +1155,10 @@ def spatial_shard_encode(
     """Encode patchified ``x`` sharded along ``split_dim``; every rank returns the full moments.
 
     Mirrors the untiled Diffusers ``_encode`` temporal loop, including
-    ``quant_conv``. Callers must check :func:`can_spatial_shard_encode` first;
-    every rank of ``group`` must call this with the same ``x``.
+    ``quant_conv``, which runs on the local strip and so has to be pointwise
+    (:func:`_quant_conv_is_pointwise` gates on that). Callers must check
+    :func:`can_spatial_shard_encode` first; every rank of ``group`` must call
+    this with the same ``x``.
     """
     encoder = install_wan_spatial_shard_encode(vae, group, split_dim=split_dim)
     rank, world_size = _rank_world(group)
