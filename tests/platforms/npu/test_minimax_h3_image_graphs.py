@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Default routing, opt-outs and weight lifetime for H3 image graphs."""
 
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -150,7 +151,7 @@ def test_deterministic_execution_restores_caller_settings(initial, warn_only, fa
 def test_failed_graph_setup_does_not_change_determinism(monkeypatch):
     initial = torch.are_deterministic_algorithms_enabled()
     monkeypatch.setattr(adapter.NPUExactGraphRunner, "is_supported", staticmethod(lambda: False))
-    with pytest.raises(RuntimeError, match="NPUGraph support"):
+    with pytest.raises(ValueError, match="NPUGraph support"):
         adapter.apply_minimax_h3_image_graphs(_model(), _config(npu_deterministic=True, npu_vae_tile_graph=True))
     assert torch.are_deterministic_algorithms_enabled() == initial
 
@@ -161,7 +162,7 @@ def test_graph_off_control_can_match_internal_format(monkeypatch):
     model = _model()
     original = model.vae._decode_tile
     adapter.apply_minimax_h3_image_graphs(model, _config(npu_vae_tile_graph=False, npu_disable_internal_format=True))
-    assert not config.allow_internal_format
+    assert config.allow_internal_format
     assert model.vae._decode_tile == original
 
 
@@ -177,7 +178,7 @@ def test_graph_off_control_can_match_jit_mode(mocker, monkeypatch):
     model = _model()
     original = model.vae._decode_tile
     adapter.apply_minimax_h3_image_graphs(model, _config(npu_vae_tile_graph=False, npu_disable_jit_compile=True))
-    set_compile_mode.assert_called_once_with(jit_compile=False)
+    set_compile_mode.assert_not_called()
     assert model.vae._decode_tile == original
 
 
@@ -214,10 +215,12 @@ def graph_runtime(monkeypatch, mocker):
     return npu, autocast
 
 
-def test_default_graphs_batch_decoder_and_fp16_encoder(graph_runtime):
+def test_explicit_graphs_batch_decoder_and_fp16_encoder(graph_runtime):
     npu, autocast = graph_runtime
     model = _model()
-    adapter.apply_minimax_h3_image_graphs(model, _config())
+    adapter.apply_minimax_h3_image_graphs(
+        model, _config(npu_vae_tile_batch=32, npu_vae_encoder_precision="fp16", npu_vae_encoder_batch=8)
+    )
     tiles = [torch.full((1, 2, 2), float(i)).as_subclass(_NpuTensor) for i in range(35)]
     decoded = model.vae._decode_tile.map(tiles)
     encoded = model.vae._encode_moments.map(tiles[:11])
@@ -228,8 +231,8 @@ def test_default_graphs_batch_decoder_and_fp16_encoder(graph_runtime):
     assert all(torch.equal(result, tile * 3) for result, tile in zip(encoded, tiles))
     assert autocast.call_count == 2
     autocast.assert_called_with(device_type="npu", dtype=torch.float16, cache_enabled=False)
-    npu.set_compile_mode.assert_called_once_with(jit_compile=False)
-    assert not npu.config.allow_internal_format
+    npu.set_compile_mode.assert_not_called()
+    assert npu.config.allow_internal_format
 
 
 def test_explicit_streams_replace_default_decoder_batch(graph_runtime, monkeypatch):
@@ -259,7 +262,9 @@ def test_explicit_streams_replace_default_decoder_batch(graph_runtime, monkeypat
 
 def test_explicit_single_tile_batches_disable_default_batching(graph_runtime):
     model = _model()
-    adapter.apply_minimax_h3_image_graphs(model, _config(npu_vae_tile_batch=1, npu_vae_encoder_batch=1))
+    adapter.apply_minimax_h3_image_graphs(
+        model, _config(npu_vae_tile_batch=1, npu_vae_encoder_precision="fp16", npu_vae_encoder_batch=1)
+    )
     assert not hasattr(model.vae._decode_tile, "map")
     assert not hasattr(model.vae._encode_moments, "map")
 
@@ -281,3 +286,155 @@ def test_determinism_can_be_disabled():
     original = model.forward
     adapter.apply_minimax_h3_image_graphs(model, _config(npu_vae_tile_graph=False, npu_deterministic=False))
     assert model.forward == original
+
+
+@pytest.fixture(autouse=True)
+def compatible_graph_environment(monkeypatch):
+    """Host debug settings must not affect the unit test's graph admission."""
+    monkeypatch.delenv("TASK_QUEUE_ENABLE", raising=False)
+    monkeypatch.delenv("ASCEND_LAUNCH_BLOCKING", raising=False)
+
+
+def test_defaults_preserve_native_encoder_and_single_tile_decoder(graph_runtime):
+    model = _model()
+    original_encoder = model.vae._encode_moments
+    original_decoder = model.vae._decode_tile
+    adapter.apply_minimax_h3_image_graphs(model, _config())
+    assert model.vae._encode_moments == original_encoder
+    assert model.vae._decode_tile != original_decoder
+    assert not hasattr(model.vae._decode_tile, "map")
+
+
+@pytest.mark.parametrize("name,value", [("TASK_QUEUE_ENABLE", "2"), ("ASCEND_LAUNCH_BLOCKING", "1")])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_incompatible_environment_is_rejected_before_capture(graph_runtime, monkeypatch, name, value, explicit):
+    monkeypatch.setenv(name, value)
+    model = _model()
+    original_forward = model.forward
+    original_encoder = model.vae._encode_moments
+    original_decoder = model.vae._decode_tile
+    config = _config(**({"npu_vae_tile_graph": True} if explicit else {}))
+    if explicit:
+        with pytest.raises(ValueError, match=name):
+            adapter.apply_minimax_h3_image_graphs(model, config)
+        assert model.forward == original_forward
+    else:
+        adapter.apply_minimax_h3_image_graphs(model, config)
+    assert model.vae._encode_moments == original_encoder
+    assert model.vae._decode_tile == original_decoder
+    graph_runtime[0].set_compile_mode.assert_not_called()
+
+
+def test_unavailable_graph_api_preserves_implicit_eager_default(monkeypatch):
+    monkeypatch.setattr(adapter.NPUExactGraphRunner, "is_supported", staticmethod(lambda: False))
+    model = _model()
+    original_decoder = model.vae._decode_tile
+    adapter.apply_minimax_h3_image_graphs(model, _config())
+    assert model.vae._decode_tile == original_decoder
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"npu_vae_encoder_precision": "invalid"},
+        {"npu_vae_tile_streams": 4, "npu_vae_tile_batch": 32},
+    ],
+)
+def test_invalid_configuration_does_not_mutate_model_or_runtime(graph_runtime, settings):
+    npu, _ = graph_runtime
+    model = _model()
+    original_forward = model.forward
+    original_encoder = model.vae._encode_moments
+    original_decoder = model.vae._decode_tile
+    with pytest.raises(ValueError):
+        adapter.apply_minimax_h3_image_graphs(model, _config(**settings))
+    assert model.forward == original_forward
+    assert model.vae._encode_moments == original_encoder
+    assert model.vae._decode_tile == original_decoder
+    npu.set_compile_mode.assert_not_called()
+    assert npu.config.allow_internal_format
+
+
+@pytest.mark.parametrize("internal_format", [False, True])
+@pytest.mark.parametrize("jit_compile", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("graphs", [False, True])
+def test_forward_restores_npu_runtime_settings(graph_runtime, monkeypatch, internal_format, jit_compile, fail, graphs):
+    """Exercise the actual forward boundary, including graph-off matching controls."""
+    npu, _ = graph_runtime
+    npu.config.allow_internal_format = internal_format
+    jit = [jit_compile]
+    npu.set_compile_mode.side_effect = lambda *, jit_compile: jit.__setitem__(0, jit_compile)
+    npu.is_jit_compile_false = lambda: not jit[0]
+    # TorchNPU exposes allow_internal_format as write-only; its getter is in _C.
+    native = SimpleNamespace(_npu_getOption=lambda name: b"enable" if npu.config.allow_internal_format else b"disable")
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(_C=native))
+    model = _model()
+
+    def forward(request):
+        assert not npu.config.allow_internal_format
+        assert not jit[0]
+        if fail:
+            raise RuntimeError("request failure")
+        return request
+
+    model.forward = forward
+    adapter.apply_minimax_h3_image_graphs(
+        model,
+        _config(
+            npu_vae_tile_graph=graphs,
+            npu_disable_internal_format=not graphs,
+            npu_disable_jit_compile=not graphs,
+            npu_deterministic=False,
+        ),
+    )
+    assert npu.config.allow_internal_format == internal_format
+    assert jit[0] == jit_compile
+    for _ in range(2):
+        if fail:
+            with pytest.raises(RuntimeError, match="request failure"):
+                model(torch.tensor([1]))
+        else:
+            assert model(torch.tensor([1])).item() == 1
+        assert npu.config.allow_internal_format == internal_format
+        assert jit[0] == jit_compile
+    if not jit_compile:
+        npu.set_compile_mode.assert_not_called()
+
+
+@pytest.mark.parametrize("eager", [False, True])
+def test_eager_override_precedes_environment_rejection(graph_runtime, monkeypatch, eager):
+    monkeypatch.setenv("TASK_QUEUE_ENABLE", "2")
+    model = _model()
+    original_decoder = model.vae._decode_tile
+    config = _config(npu_vae_tile_graph=True)
+    config.enforce_eager = eager
+    config.enable_cuda_graph_decode = eager
+    adapter.apply_minimax_h3_image_graphs(model, config)
+    assert model.vae._decode_tile == original_decoder
+
+
+def test_runtime_entry_failure_restores_preceding_settings(graph_runtime, monkeypatch):
+    """A setter can fail after changing state, before the model is called."""
+    npu, _ = graph_runtime
+    jit = [True]
+    npu.is_jit_compile_false = lambda: not jit[0]
+    native = SimpleNamespace(_npu_getOption=lambda name: b"")
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(_C=native))
+
+    def set_compile_mode(*, jit_compile):
+        jit[0] = jit_compile
+        if not jit_compile:
+            raise RuntimeError("JIT setter failed")
+
+    npu.set_compile_mode.side_effect = set_compile_mode
+    model = _model()
+    initial = torch.are_deterministic_algorithms_enabled()
+    initial_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+    adapter.apply_minimax_h3_image_graphs(model, _config())
+    with pytest.raises(RuntimeError, match="JIT setter failed"):
+        model(torch.tensor([1]))
+    assert jit[0]
+    assert npu.config.allow_internal_format
+    assert torch.are_deterministic_algorithms_enabled() == initial
+    assert torch.is_deterministic_algorithms_warn_only_enabled() == initial_warn

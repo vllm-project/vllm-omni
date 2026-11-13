@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Default NPU VAE tile graphs and approximate batching for H3 image."""
+"""NPU H3 image VAE graphs with scoped runtime settings and opt-in batching."""
 
 from __future__ import annotations
 
+import os
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from types import MethodType
 from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
+from vllm.logger import init_logger
 
 from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 
@@ -17,62 +21,114 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 
+logger = init_logger(__name__)
+
+
+@contextmanager
+def _npu_runtime_settings(*, disable_internal_format: bool, disable_jit_compile: bool) -> Iterator[None]:
+    """Restore effective process settings after forward, including setup failures.
+
+    TorchNPU's internal-format property is write-only. Its native option getter
+    returns an empty value for the default (enabled). JIT's public getter resolves
+    the effective device-dependent default. Avoid redundant JIT writes, which
+    synchronize the device even when the mode is unchanged.
+    """
+    with ExitStack() as restore:
+        if disable_internal_format:
+            import torch_npu
+
+            previous = torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT") != b"disable"
+            if previous:
+                restore.callback(setattr, torch.npu.config, "allow_internal_format", previous)
+                torch.npu.config.allow_internal_format = False
+        if disable_jit_compile and not torch.npu.is_jit_compile_false():
+            restore.callback(torch.npu.set_compile_mode, jit_compile=True)
+            torch.npu.set_compile_mode(jit_compile=False)
+        yield
+
+
 def apply_minimax_h3_image_graphs(model: nn.Module, od_config: OmniDiffusionConfig) -> None:
+    """Validate H3 graph admission and install forward-scoped runtime controls.
+
+    Implicit graphs fall back to the native VAE when the runtime is incompatible;
+    explicit graph enablement fails before model or process state is modified.
+    Approximate precision and batching are opt-in. Other pipelines are unchanged.
+    """
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_image import MiniMaxH3ImagePipeline
 
     if not isinstance(model, MiniMaxH3ImagePipeline):
         return
-    deterministic = (od_config.additional_config or {}).get("npu_deterministic", True)
+    additional = od_config.additional_config or {}
+    deterministic = additional.get("npu_deterministic", True)
     if type(deterministic) is not bool:
         raise ValueError("npu_deterministic must be a bool")
-    if deterministic:
-        original_forward = model.forward
-
-        def deterministic_forward(module: nn.Module, request: DiffusionRequestBatch) -> DiffusionOutput:
-            # Inline engines share the caller's process. Scope this setting to
-            # execution, including failures, instead of leaking it at setup.
-            previous = torch.are_deterministic_algorithms_enabled()
-            warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
-            try:
-                torch.use_deterministic_algorithms(True)
-                return original_forward(request)
-            finally:
-                torch.use_deterministic_algorithms(previous, warn_only=warn_only)
-
-        model.forward = MethodType(deterministic_forward, model)
-    enabled = (od_config.additional_config or {}).get("npu_vae_tile_graph", True)
+    enabled = additional.get("npu_vae_tile_graph", True)
     if type(enabled) is not bool:
         raise ValueError("npu_vae_tile_graph must be a bool")
-    disable_internal_format = (od_config.additional_config or {}).get("npu_disable_internal_format", False)
+    disable_internal_format = additional.get("npu_disable_internal_format", False)
     if type(disable_internal_format) is not bool:
         raise ValueError("npu_disable_internal_format must be a bool")
-    if disable_internal_format:
-        # Expose the same worker setting to graph-off integration controls.
-        torch.npu.config.allow_internal_format = False
-    disable_jit_compile = (od_config.additional_config or {}).get("npu_disable_jit_compile", False)
+    disable_jit_compile = additional.get("npu_disable_jit_compile", False)
     if type(disable_jit_compile) is not bool:
         raise ValueError("npu_disable_jit_compile must be a bool")
-    if disable_jit_compile:
-        torch.npu.set_compile_mode(jit_compile=False)
-    if not enabled or od_config.enforce_eager or not od_config.enable_cuda_graph_decode:
+    enabled = enabled and not od_config.enforce_eager and od_config.enable_cuda_graph_decode
+    if enabled:
+        reason = None
+        if os.environ.get("TASK_QUEUE_ENABLE") == "2":
+            reason = "TASK_QUEUE_ENABLE=2; set TASK_QUEUE_ENABLE=1 or 0 before starting the worker"
+        elif os.environ.get("ASCEND_LAUNCH_BLOCKING") == "1":
+            reason = "ASCEND_LAUNCH_BLOCKING=1; unset it or set it to 0 before starting the worker"
+        elif not NPUExactGraphRunner.is_supported():
+            reason = "missing NPUGraph support"
+        if reason is not None:
+            if additional.get("npu_vae_tile_graph") is True:
+                raise ValueError(f"npu_vae_tile_graph cannot be enabled: {reason}; or set npu_vae_tile_graph=false")
+            logger.warning("MiniMax H3 image VAE graphs disabled: %s. Using native VAE execution.", reason)
+            enabled = False
+
+    # Finish validation before installing any wrapper or changing runtime state.
+    encoder_precision = additional.get("npu_vae_encoder_precision", "fp32")
+    encoder_batch = additional.get("npu_vae_encoder_batch", 1)
+    stream_count = additional.get("npu_vae_tile_streams", 1)
+    batch_size = additional.get("npu_vae_tile_batch", 1)
+    if enabled:
+        if encoder_precision not in {"fp32", "fp16", "bf16"}:
+            raise ValueError("npu_vae_encoder_precision must be fp32, fp16, or bf16")
+        if type(encoder_batch) is not int or encoder_batch not in (1, 2, 4, 8, 16):
+            raise ValueError("npu_vae_encoder_batch must be 1, 2, 4, 8, or 16")
+        if encoder_batch > 1 and encoder_precision == "fp32":
+            raise ValueError("Batched VAE encoder currently requires reduced precision")
+        if type(stream_count) is not int or not 1 <= stream_count <= 8:
+            raise ValueError("npu_vae_tile_streams must be an integer in [1, 8]")
+        if type(batch_size) is not int or batch_size not in (1, 2, 4, 8, 16, 32):
+            raise ValueError("npu_vae_tile_batch must be 1, 2, 4, 8, 16, or 32")
+        if batch_size > 1 and stream_count > 1:
+            raise ValueError("VAE tile batching and multiple streams must be evaluated independently")
+
+    if deterministic or enabled or disable_internal_format or disable_jit_compile:
+        original_forward = model.forward
+
+        def runtime_forward(module: nn.Module, request: DiffusionRequestBatch) -> DiffusionOutput:
+            # Inline engines share the caller's process. Setup never changes
+            # global settings, and forward restores them even on exceptions.
+            with ExitStack() as restore:
+                if deterministic:
+                    previous = torch.are_deterministic_algorithms_enabled()
+                    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+                    restore.callback(torch.use_deterministic_algorithms, previous, warn_only=warn_only)
+                    torch.use_deterministic_algorithms(True)
+                with _npu_runtime_settings(
+                    disable_internal_format=enabled or disable_internal_format,
+                    disable_jit_compile=enabled or disable_jit_compile,
+                ):
+                    return original_forward(request)
+
+        model.forward = MethodType(runtime_forward, model)
+    if not enabled:
         return
-    if not NPUExactGraphRunner.is_supported():
-        raise RuntimeError("npu_vae_tile_graph requires NPUGraph support")
-    torch.npu.set_compile_mode(jit_compile=False)
-    torch.npu.config.allow_internal_format = False
     vae = model.vae
     if getattr(vae, "_h3_npu_tile_graph_installed", False):
         return
-    encoder_precision = (od_config.additional_config or {}).get("npu_vae_encoder_precision", "fp16")
-    if encoder_precision not in {"fp32", "fp16", "bf16"}:
-        raise ValueError("npu_vae_encoder_precision must be fp32, fp16, or bf16")
-    encoder_batch = (od_config.additional_config or {}).get(
-        "npu_vae_encoder_batch", 1 if encoder_precision == "fp32" else 8
-    )
-    if type(encoder_batch) is not int or encoder_batch not in (1, 2, 4, 8, 16):
-        raise ValueError("npu_vae_encoder_batch must be 1, 2, 4, 8, or 16")
-    if encoder_batch > 1 and encoder_precision == "fp32":
-        raise ValueError("Batched VAE encoder currently requires reduced precision")
     if encoder_precision != "fp32":
         encoder_dtype = torch.float16 if encoder_precision == "fp16" else torch.bfloat16
         encoder_runner = None
@@ -115,15 +171,6 @@ def apply_minimax_h3_image_graphs(model: nn.Module, od_config: OmniDiffusionConf
     original_prepare = vae.prepare_decoder_weights
     runner = None
     streams_runner = None
-    stream_count = (od_config.additional_config or {}).get("npu_vae_tile_streams", 1)
-    if type(stream_count) is not int or not 1 <= stream_count <= 8:
-        raise ValueError("npu_vae_tile_streams must be an integer in [1, 8]")
-    # An explicit multi-stream choice replaces the default batched decoder.
-    batch_size = (od_config.additional_config or {}).get("npu_vae_tile_batch", 1 if stream_count > 1 else 32)
-    if type(batch_size) is not int or batch_size not in (1, 2, 4, 8, 16, 32):
-        raise ValueError("npu_vae_tile_batch must be 1, 2, 4, 8, 16, or 32")
-    if batch_size > 1 and stream_count > 1:
-        raise ValueError("VAE tile batching and multiple streams must be evaluated independently")
     weight_signature = None
 
     def prepare(module, dtype=torch.bfloat16):
