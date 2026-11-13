@@ -11,6 +11,12 @@ steps:
           # Buildkite will automatically replace this with the actual commit hash
           VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
           VLLM_VERSION: "v0.33.0"
+          # The CI image is local-only and the run's trap deletes it, so
+          # compressing its ~37GB of layers only costs test time.
+          EXPORT_COMPRESSION: "uncompressed"
+          # Container test budget; leaves the rest of timeout_in_minutes for
+          # the image build.
+          XPU_TEST_BUDGET: "60m"
         priority: 100
-        timeout_in_minutes: 60
+        timeout_in_minutes: 80
         soft_fail: false
