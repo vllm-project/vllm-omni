@@ -19,7 +19,11 @@ from typing import Any, NoReturn
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import GrammarOutput
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, register_top_k_top_p_warmups
+from vllm.v1.sample.ops.topk_topp_sampler import (
+    apply_top_k_top_p,
+    apply_top_k_top_p_pytorch,
+    register_top_k_top_p_warmups,
+)
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -256,7 +260,7 @@ class Zonos3Sampler(OmniSampler):
         positions = self.state.position.index_select(0, slots)
         ids = torch.arange(c.audio_vocab, device=logits.device)
         invalid = (ids >= c.codebook_size) & (ids != c.eoa_id)
-        minimum = self.settings.min_frames.gpu.index_select(0, slots)
+        minimum = self._setting("min_frames", slots)
         stop_blocked = (minimum[:, None] > 0) & (positions[:, None] < minimum[:, None] + self.state.columns)
         logits = logits.masked_fill(
             invalid[None, None, :] | (stop_blocked[:, :, None] & (ids == c.eoa_id)), float("-inf")
@@ -265,29 +269,44 @@ class Zonos3Sampler(OmniSampler):
             offsets = torch.arange(width, device=logits.device)
             indices = (positions[:, None] - 1 - offsets) % self.history_capacity
             history = self.history[slots[:, None, None], self.state.columns[None, :, None], indices[:, None, :]]
-            window = self.settings.repetition_window.gpu.index_select(0, slots)
-            books = self.settings.repetition_codebooks.gpu.index_select(0, slots)
+            window = self._setting("repetition_window", slots)
+            books = self._setting("repetition_codebooks", slots)
             valid = (history >= 0) & (history < c.codebook_size)
             valid = valid & (offsets[None, None, :] < torch.minimum(positions, window)[:, None, None])
             valid = valid & (self.state.columns[None, :, None] < books[:, None, None])
             repeated = torch.zeros_like(logits, dtype=torch.int32)
             repeated.scatter_add_(-1, history.clamp(min=0, max=c.audio_vocab - 1), valid.to(torch.int32))
-            penalty = self.settings.repetition_penalty.gpu.index_select(0, slots)[:, None, None]
+            penalty = self._setting("repetition_penalty", slots)[:, None, None]
             adjusted = torch.where(logits > 0, logits / penalty, logits * penalty)
             logits = torch.where(repeated > 0, adjusted, logits)
-        temperature = self.settings.temperature.gpu.index_select(0, slots)[:, None, None]
+        temperature = self._setting("temperature", slots)[:, None, None]
         logits = logits / torch.where(temperature > 0, temperature, 1.0)
-        k = self.settings.top_k.gpu.index_select(0, slots)[:, None].expand(-1, 10).reshape(-1)
-        p = self.settings.top_p.gpu.index_select(0, slots)[:, None].expand(-1, 10).reshape(-1)
-        logits = apply_top_k_top_p(logits.reshape(-1, c.audio_vocab), k, p, has_topp_only_rows=True).view(
-            -1, 10, c.audio_vocab
-        )
+        k = self._setting("top_k", slots)[:, None].expand(-1, 10).reshape(-1)
+        p = self._setting("top_p", slots)[:, None].expand(-1, 10).reshape(-1)
+        flat = logits.reshape(-1, c.audio_vocab)
+        if flat.is_cuda:
+            logits = apply_top_k_top_p(flat, k, p, has_topp_only_rows=True)
+        else:
+            # The Triton kernel cannot read CPU pointers; CPU numerical checks
+            # use the equivalent PyTorch fallback with per-row k/p.
+            logits = apply_top_k_top_p_pytorch(flat, k.to(flat.device), p.to(flat.device))
+        logits = logits.view(-1, 10, c.audio_vocab)
         probs = logits.softmax(-1)
-        min_p = self.settings.min_p.gpu.index_select(0, slots)[:, None, None]
+        min_p = self._setting("min_p", slots)[:, None, None]
         probs = probs.masked_fill(probs < min_p * probs.amax(-1, keepdim=True), 0)
         total = probs.sum(-1, keepdim=True)
         fallback = torch.zeros_like(probs).scatter_(-1, logits.argmax(-1, keepdim=True), 1.0)
         return torch.where(total > 0, probs / total.clamp(min=1e-8), fallback)
+
+    def _setting(self, name: str, slots: torch.Tensor) -> torch.Tensor:
+        """Index one per-request setting on its host device, aligning to the
+        sampling device for CPU numerical checks that run beside CUDA UVA
+        buffers."""
+        backed: UvaBackedTensor = getattr(self.settings, name)
+        if backed.gpu.device != slots.device:
+            values = backed.np[slots.detach().cpu().numpy()]
+            return torch.from_numpy(values.copy()).to(slots.device)
+        return backed.gpu.index_select(0, slots)
 
     def _draw_cpu(self, probs: torch.Tensor, indices: list[int], active: torch.Tensor) -> torch.Tensor:
         # Explicit CPU numerical path; the CUDA path below never reads a GPU
@@ -334,7 +353,14 @@ class Zonos3Sampler(OmniSampler):
                 req_states.prefill_len.gpu,
             )
         else:
-            sampled = (input_batch.seq_lens >= req_states.prefill_len.gpu.index_select(0, slots)).to(torch.int32)
+            # UVA-backed request state may still be materialized on CUDA even
+            # when the numerical sampler is running on CPU. Keep the CPU
+            # reference path fully on the hidden-state device before indexing.
+            sampling_device = hidden_states.device
+            prefill_len = req_states.prefill_len.gpu.to(device=sampling_device)
+            sampling_slots = slots.to(device=sampling_device)
+            seq_lens = input_batch.seq_lens.to(device=sampling_device)
+            sampled = (seq_lens >= prefill_len.index_select(0, sampling_slots)).to(torch.int32)
             rejected = torch.zeros_like(sampled)
         active = (sampled > 0) & ~(
             (self.state.eoa_frame.index_select(0, slots) >= 0)
