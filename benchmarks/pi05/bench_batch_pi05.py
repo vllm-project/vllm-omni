@@ -252,6 +252,32 @@ def report(root: Path, out_md: Path | None) -> None:
             cells.append(f"{total['p50_ms']:.1f} ({total['p95_ms']:.1f}), {total['p50_ms'] / b:.1f}/req{memory}")
         lines.append(f"| {b} | " + " | ".join(cells) + " |")
 
+    lines += ["", "### Formed batches against sequential batch 1", ""]
+    lines.append(
+        "A batch of B against the same B requests one at a time (B times the chain's batch-1 p50). "
+        "Scaling efficiency is that speedup over B. Spread is the round-to-round p95 over p50 of the run."
+    )
+    lines += ["", "| chain | B | p50 ms | req/s | sequential B=1 ms | speedup | efficiency | spread | peak GB |"]
+    lines.append("|---|---|---|---|---|---|---|---|---|")
+    for key in runs:
+        alone = rows[key].get(1)
+        alone_ms = percentiles(alone["total"])["p50_ms"] if alone and "error" not in alone else None
+        for b, row in sorted(rows[key].items()):
+            if "error" in row:
+                lines.append(f"| {key} | {b} | {row['error'][:70]} | | | | | | |")
+                continue
+            total = percentiles(row["total"])
+            ms = total["p50_ms"]
+            peak = row.get("peak_mem_gb", float("nan"))
+            cells = [key, b, f"{ms:.1f}", f"{1000 * b / ms:.1f}"]
+            if alone_ms is None:
+                cells += ["-", "-", "-"]
+            else:
+                sequential = alone_ms * b
+                cells += [f"{sequential:.1f}", f"{sequential / ms:.2f}x", f"{100 * sequential / ms / b:.0f}%"]
+            cells += [f"{100 * (total['p95_ms'] / ms - 1):.1f}%", f"{peak:.1f}" if peak == peak else "-"]
+            lines.append("| " + " | ".join(str(cell) for cell in cells) + " |")
+
     lines += ["", "### Stages: p50 ms in the staged rounds, GPU activity of the stage looped alone", ""]
     lines.append(
         "| chain | B | stage | p50 ms | ms/req | share | SM act | SM occ | tensor | FP32 | DRAM act | engine act | W |"

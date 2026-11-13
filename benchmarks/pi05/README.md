@@ -93,10 +93,15 @@ python benchmarks/pi05/bench_batch_pi05.py --mode graph --vision-precision selec
 python benchmarks/pi05/bench_batch_pi05.py --report pi05_stages/ --out-md pi05_stages/report.md
 ```
 
-`--all4` turns on the four opt-in runtime switches above. The optimized path captures the denoising step for
+`--all4` turns on the four opt-in runtime switches above. The optimized path captures the three regions for
 batch sizes 1, the powers of two below the largest `--batches` value, and that value; a batch size between two
-of them runs the denoising step on the next larger graph. A batch size the optimized path has no CUDA graph
-for is reported as such rather than timed on its eager fallback.
+of them runs its prefix regions without a graph and its denoising step on the next larger graph. A batch size
+the optimized path has no CUDA graph for is reported as such rather than timed on its eager fallback.
+
+The report also sets every batch against the same requests run one at a time (B times the chain's batch-1
+p50): req/s, speedup, scaling efficiency, the run's round-to-round spread and peak memory, per chain and
+batch size. The matching correctness check is `tests/diffusion/models/pi05/test_pi05_batch_parity.py`: each
+row of a formed batch against its request alone, and no cross-request contamination.
 
 ## Reference results
 
