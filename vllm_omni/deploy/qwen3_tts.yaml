@@ -2,9 +2,9 @@
 # Verified on 1x H100.
 #
 # Runner selection:
-#   Model Runner V2 (MRV2) is EXPERIMENTAL and is the default runner on CUDA
+#   Model Runner V2 (MRV2) is EXPERIMENTAL and is the default runner on CUDA and NPU
 #   for this model. Set `model_runner: v1` to opt out. The `platforms:`
-#   sections at the end of this file keep V1 on NPU, XPU, ROCm and MUSA.
+#   sections at the end of this file keep V1 on XPU, ROCm and MUSA.
 #   See docs/configuration/stage_configs.md ("Qwen3-TTS with Model Runner V2").
 #
 # Fields omitted from a stage fall back to StageDeployConfig defaults (see
@@ -73,6 +73,7 @@ connectors:
       # decode_cudagraph_batch_sizes: [1, 2, 4]
       # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.
       decode_batch_max_size: 4
+      npu_fused_snake: false
       # Qwen3-TTS NPU optimization defaults are owned by the model and loader.
       # Set explicit overrides here or in stage additional_config; CUDA keeps
       # its existing defaults when these options are omitted.
@@ -162,7 +163,7 @@ platforms:
         # Stage 1 eager on ROCm so decoder convolutions execute normally.
         enforce_eager: true
   npu:
-    model_runner: v1
+    model_runner: v2
     stages:
       - stage_id: 0
         enforce_eager: false
