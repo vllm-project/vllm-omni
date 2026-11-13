@@ -53,7 +53,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     codec_sample_result,
     make_device_state,
 )
-from vllm_omni.platforms.npu.worker import talker_multiframe
+from vllm_omni.worker import talker_multiframe
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -644,7 +644,6 @@ def test_talker_stop_token_ids_match_the_multi_frame_head():
     NPU worker, and the codec EOS on every platform without that worker.
     """
     from vllm_omni.model_executor.models.minicpmo_4_5 import pipeline as mcp_pipeline
-    from vllm_omni.platforms.npu.worker import talker_multiframe
 
     assert talker_multiframe.STOP_TOKEN_ID == 1
     # The pipeline default cannot depend on the platform: the block that
@@ -654,8 +653,6 @@ def test_talker_stop_token_ids_match_the_multi_frame_head():
 
 
 def test_multiframe_gate_matrix():
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     model = _contract_stub(armed=True)
     state = {"step": 5}
 
@@ -707,8 +704,6 @@ def test_constant_drafts_fold_when_a_stop_truncates_a_row():
     way of saying the short row belongs to a request that has never
     multi-framed and must re-arm the K-step.
     """
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     # Five staggered codecs, K=6: one stopped at frame 3 (4 tokens), three
     # at frame 4 (5 tokens), one ran the step out (6 tokens). Every request
     # ran on a drafted step (5 drafts each), so the short rows are real
@@ -736,8 +731,6 @@ def test_constant_drafts_cold_start_short_row_still_drafts():
     emitted": the step after a fold schedules one token per request again,
     so every row looks short, and folding those too would starve the loop
     forever (the three-tier bench stall, 31/32 requests)."""
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     # Both rows sat on a draftless step (scheduled=0): one produced one
     # token, the other a full-width row. Neither is a stop truncation.
     sampled = [[5], [1, 2, 3, 4, 5, 6]]
@@ -749,8 +742,6 @@ def test_constant_drafts_cold_start_short_row_still_drafts():
 
 
 def test_constant_drafts_fold_when_a_row_samples_nothing():
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     sampled = [[1, 2, 3, 4, 5, 6], [], [1, 2, 3, 4, 5, 6]]
     scheduled = [5, 5, 5]
     assert talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=3, scheduled_draft_counts=scheduled) == [
@@ -761,8 +752,6 @@ def test_constant_drafts_fold_when_a_row_samples_nothing():
 def test_constant_drafts_keep_drafts_when_every_row_is_full():
     """No stop anywhere: every request accepted the step's K tokens and the
     drafts arm the next K-frame step exactly as before the fold rule."""
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     sampled = [[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]]
     scheduled = [5, 5]
     drafts = talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=2, scheduled_draft_counts=scheduled)
@@ -778,8 +767,6 @@ def test_constant_drafts_start_kstep_after_a_draftless_step():
     and no drafts ever appear). Regression for the three-tier bench stall
     where 31/32 requests hung on this exact shape.
     """
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     # Prefill just completed for both requests: one token each, zero drafts.
     sampled = [[42], [43]]
     scheduled = [0, 0]
@@ -828,8 +815,6 @@ def test_stop_vocab_gate_reports_the_two_wide_stop_row_not_the_hidden_width():
     EOS (the 910C scene where stage 1 reported ``finished_reason=length`` for
     all 34 requests).
     """
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     assert talker_multiframe.STOP_ROW_WIDTH == 2
 
     runner = _vocab_runner(supports_multi_frame=True, vocab_size=0)
@@ -843,8 +828,6 @@ def test_stop_vocab_gate_reports_the_two_wide_stop_row_not_the_hidden_width():
 
 
 def test_stop_vocab_gate_stays_off_without_multi_frame_or_rows():
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     # Single-frame models (K=1, stage 0/2) never take the branch that reads
     # vocab_size; the gate must leave them exactly as they were.
     single = _vocab_runner(supports_multi_frame=False, vocab_size=0)
@@ -874,8 +857,6 @@ def test_kstep_min_tokens_neutralization_clears_the_censor_list():
     guard already holds the codec EOS back with ``state.step < min_tokens``, so
     this layer is redundant.
     """
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     censor = _MinTokensLogitsProcessor({0: (50, [0, 0, 0], {1})})
     untouched = _MinTokensLogitsProcessor({0: (50, [0], {1})})
     untouched.__class__ = type("SomeOtherProcessor", (object,), {})  # not the target processor
@@ -1955,7 +1936,7 @@ def test_kstep_eos_does_not_consume_later_frame_rng():
     assert model._request_audio_states["r1"]["step"] == 1
 
 
-_TALKER_LOGGER = "vllm_omni.platforms.npu.worker.talker_multiframe"
+_TALKER_LOGGER = talker_multiframe.__name__
 
 
 def test_kstep_log_reasons_are_deduped_by_reason_set(caplog, monkeypatch):
@@ -1970,13 +1951,18 @@ def test_kstep_log_reasons_are_deduped_by_reason_set(caplog, monkeypatch):
     """
     monkeypatch.setattr(talker_multiframe, "_LOGGED_BLOCKS", set())
     monkeypatch.setattr(talker_multiframe, "_LOGGED_FOLDS", set())
-    monkeypatch.setattr(talker_multiframe, "_LOGGED_NARROW_BLOCKS", set())
+    from vllm_omni.platforms.npu.worker import talker_narrow_replay
+
+    monkeypatch.setattr(talker_narrow_replay, "_LOGGED_NARROW_BLOCKS", set())
 
     stopped_mid_step = "a request stopped mid-step, short of its drafts; no drafts this step"
     mixed_batch = "a batch mixed drafted and undrafted requests; no drafts this step"
     never_engaged = "request token spans are not uniform"
 
-    with caplog.at_level(logging.INFO, logger=_TALKER_LOGGER):
+    with (
+        caplog.at_level(logging.INFO, logger=_TALKER_LOGGER),
+        caplog.at_level(logging.INFO, logger=talker_narrow_replay.__name__),
+    ):
         talker_multiframe._log_fold_once(stopped_mid_step)
         talker_multiframe._log_fold_once(mixed_batch)
         talker_multiframe._log_fold_once(stopped_mid_step)
@@ -1988,9 +1974,9 @@ def test_kstep_log_reasons_are_deduped_by_reason_set(caplog, monkeypatch):
         blocks = [r.getMessage() for r in caplog.records if "not engaged" in r.getMessage()]
 
         caplog.clear()
-        talker_multiframe._decline("no one-query graph captured for 3 rows")
-        talker_multiframe._decline("no one-query graph captured for 5 rows")
-        talker_multiframe._decline("no one-query graph captured for 3 rows")
+        talker_narrow_replay._decline("no one-query graph captured for 3 rows")
+        talker_narrow_replay._decline("no one-query graph captured for 5 rows")
+        talker_narrow_replay._decline("no one-query graph captured for 3 rows")
         declines = [r.getMessage() for r in caplog.records if "one-query Talker replay" in r.getMessage()]
 
     assert folds == [

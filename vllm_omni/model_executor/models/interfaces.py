@@ -13,6 +13,7 @@ make the miss loud in the unit tests instead, and the Protocol gives the
 supported surface one name.
 """
 
+from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
@@ -42,6 +43,31 @@ class SupportsMultiFrameDecode(Protocol):
     def set_batch_stop_logits(self, logits: Any) -> None: ...
 
     def merge_frame_outputs(self, frame_outputs: list[Any], frame_stop_logits: list[Any]) -> Any: ...
+
+
+class SupportsMRv2MultiFrameDecode(SupportsMultiFrameDecode, Protocol):
+    """Model-owned codec state and inputs for the MRv2 frame loop."""
+
+    kstep_continue_token_id: int
+
+    def kstep_rows_ready(self, request_ids: Sequence[str]) -> bool: ...
+
+    def prepare_kstep_inputs(
+        self,
+        extra: dict[str, Any],
+        *,
+        num_reqs: int,
+        prefilling: Any,
+        seed_ids: Any,
+        ib_ids: Any,
+        logits_idx: Any,
+    ) -> None: ...
+
+    def rewrite_kstep_initial_embeds(
+        self, inputs_embeds: Any, extra: dict[str, Any], spans: list[tuple[int, int]], input_ids: Any = None
+    ) -> None: ...
+
+    def flush_cuda_kstep_feedback(self) -> None: ...
 
 
 # The members a runner actually calls, spelled out instead of read off the

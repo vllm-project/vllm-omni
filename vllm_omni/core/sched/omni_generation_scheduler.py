@@ -24,7 +24,6 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
-from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.engine.serialization import deserialize_additional_information
@@ -53,10 +52,6 @@ def _has_async_chunk_payload_to_run(request: Request) -> bool:
 
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     waiting: RequestQueue
-
-    # Both schedulers enforce the same Talker span contract before booking.
-    _talker_kstep_armed = OmniARScheduler._talker_kstep_armed
-    _enforce_kstep_span_uniformity = OmniARScheduler._enforce_kstep_span_uniformity
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

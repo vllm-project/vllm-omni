@@ -8,6 +8,9 @@ from typing import Any
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+    MiniCPMO45OmniTTSForConditionalGeneration,
+)
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
@@ -22,7 +25,14 @@ def _cuda_runner_platform(monkeypatch):
 
 
 def _runner():
-    return OmniARModelRunner.__new__(OmniARModelRunner)
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model._request_audio_states = {}
+    model._request_codec_history = {}
+    model._codec_eos_id = 0
+    runner.model = model
+    return runner
 
 
 @pytest.mark.parametrize("frames", [0, 8])
@@ -106,15 +116,13 @@ def test_existing_state_is_not_reseeded():
 def test_initial_embedding_uses_confirmed_history_only():
     runner = _runner()
     embedding = torch.nn.Embedding(64, 3)
-    runner.model = SimpleNamespace(
-        talker=SimpleNamespace(emb_code=[embedding]),
-        _request_codec_history={"embedding-test": [17, 23]},
-    )
+    runner.model.emb_code = [embedding]
+    runner.model._request_codec_history = {"embedding-test": [17, 23]}
     state = {"step": 2, "last_code": 11, "codes": torch.tensor([61, 62])}
     info = {"req_id": "embedding-test", "audio_state": state}
     embeds = torch.zeros(8, 3)
     ids = torch.zeros(8, dtype=torch.long)
-    runner._rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
+    runner.model.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
     torch.testing.assert_close(embeds[0], embedding.weight[23])
     assert torch.count_nonzero(embeds[1:]) == 0
     assert ids.tolist() == [23, 0, 0, 0, 0, 0, 0, 0]
@@ -125,17 +133,13 @@ def test_initial_embedding_resolves_history_by_request_id():
     """Find the committed codec under the request ID used by the model."""
     runner = _runner()
     embedding = torch.nn.Embedding(64, 3)
-    runner.model = SimpleNamespace(
-        talker=SimpleNamespace(
-            emb_code=[embedding],
-            _request_codec_history={"req-abc-1": [17, 23]},
-        ),
-    )
+    runner.model.emb_code = [embedding]
+    runner.model._request_codec_history = {"req-abc-1": [17, 23]}
     state = {"step": 10, "last_code": 11}
     info = {"req_id": "sched-internal-9", "request_id": "req-abc-1", "audio_state": state}
     embeds = torch.zeros(8, 3)
     ids = torch.zeros(8, dtype=torch.long)
-    runner._rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
+    runner.model.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
     torch.testing.assert_close(embeds[0], embedding.weight[23])
     assert torch.count_nonzero(embeds[1:]) == 0
     assert ids.tolist() == [23, 0, 0, 0, 0, 0, 0, 0]
@@ -146,12 +150,12 @@ def test_initial_embedding_resolves_history_by_request_id():
 def test_initial_embedding_falls_back_to_row_token_on_first_kstep(dtype):
     runner = _runner()
     embedding = torch.nn.Embedding(64, 3)
-    runner.model = SimpleNamespace(talker=SimpleNamespace(emb_code=[embedding]))
+    runner.model.emb_code = [embedding]
     state = {"step": 1}
     info = {"req_id": "first-kstep", "audio_state": state}
     embeds = torch.zeros(8, 3)
     ids = torch.tensor([23, 0, 0, 0, 0, 0, 0, 0], dtype=dtype)
-    runner._rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
+    runner.model.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
     torch.testing.assert_close(embeds[0], embedding.weight[23])
     assert torch.count_nonzero(embeds[1:]) == 0
     assert ids.tolist() == [23, 0, 0, 0, 0, 0, 0, 0]
@@ -168,12 +172,12 @@ def test_initial_embedding_declines_control_row_token_after_first_step():
     """
     runner = _runner()
     embedding = torch.nn.Embedding(64, 3)
-    runner.model = SimpleNamespace(talker=SimpleNamespace(emb_code=[embedding]))
+    runner.model.emb_code = [embedding]
     state = {"step": 9}
     info = {"req_id": "later-kstep", "audio_state": state}
     embeds = torch.zeros(8, 3)
     ids = torch.tensor([1, 0, 0, 0, 0, 0, 0, 0], dtype=torch.long)
-    runner._rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
+    runner.model.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
     assert torch.count_nonzero(embeds) == 0
     assert "last_code" not in state
 
@@ -184,7 +188,6 @@ def test_propose_kstep_drafts_records_booked_width(dtype, width):
     runner = _runner()
     runner._talker_kstep_frames = lambda: 8
     runner.num_speculative_steps = width
-    runner.model = torch.nn.Module()
     runner.model._request_audio_states = {"request-a": {"step": 1}}
     buffer = torch.full((3, width), -1, dtype=dtype)
     runner.req_states = SimpleNamespace(draft_tokens=buffer)
@@ -205,7 +208,6 @@ def test_propose_drafts_unready_request_emits_empty_drafts():
     runner = _runner()
     runner._talker_kstep_frames = lambda: 8
     runner.num_speculative_steps = 7
-    runner.model = torch.nn.Module()
     runner.model._request_audio_states = {"request-a": {"step": 0}}
     runner.req_states = SimpleNamespace(draft_tokens=torch.full((3, 7), -1, dtype=torch.int32))
     captured = []
@@ -234,7 +236,6 @@ def test_propose_drafts_nonkstep_model_keeps_generic_buffer_slice():
     runner = _runner()
     runner._talker_kstep_frames = lambda: 0
     runner.num_speculative_steps = 7
-    runner.model = torch.nn.Module()
     runner.model._request_audio_states = {"request-a": {"step": 1}}
     runner.req_states = SimpleNamespace(draft_tokens=torch.tensor([[5, 5, 5, 5, 5, 5, 5]] * 3, dtype=torch.int32))
     captured = []

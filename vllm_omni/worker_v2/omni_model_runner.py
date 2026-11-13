@@ -38,6 +38,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
+from vllm_omni.model_executor.models.interfaces import SupportsMRv2MultiFrameDecode, supports_multi_frame_decode
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
@@ -694,7 +695,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         return scheduler_output.num_spec_tokens_to_schedule
 
     def _talker_kstep_frames(self) -> int:
-        if not current_omni_platform.is_cuda() or not getattr(self.model, "supports_multi_frame_decode", False):
+        if not current_omni_platform.is_cuda() or not supports_multi_frame_decode(self.model):
             return 0
         from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
 
@@ -730,234 +731,15 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     marked.append(info)
             extra["model_intermediate_buffer"] = marked
             extra["runtime_additional_information"] = marked
-        model = getattr(self, "model", None)
-        talker = getattr(model, "talker", model)
-        states = getattr(talker, "_request_audio_states", {})
-        for info in extra.get("model_intermediate_buffer") or []:
-            if isinstance(info, dict) and info.get("req_id") in states:
-                info["request_id"] = info["req_id"]
-                info["audio_state"] = states[info["req_id"]]
-        # Only a confirmed codec can seed the first decode frame.
-        extra["request_sample_eligible"] = [True] * num_reqs
-        seed_ids = model_inputs.get("input_ids")
-        for index, info in enumerate(buffers or []):
-            if not isinstance(info, dict) or index >= len(extra["request_sample_eligible"]):
-                continue
-            if is_warmup_request(str(info.get("req_id") or info.get("request_id", index))):
-                extra["request_sample_eligible"][index] = False
-                continue
-            if prefilling is not None and index < len(prefilling) and bool(prefilling[index]):
-                # The single-frame path samples the final prefill frame.
-                continue
-            state = info.get("audio_state")
-            if not isinstance(state, dict):
-                state = {}
-                info["audio_state"] = state
-            if state.get("finished") or int(state.get("step", 0)) > 0:
-                continue
-            row = int(spans[index][0]) if index < len(spans) else -1
-            seeded = None
-            handoff = info.get("audio_codes")
-            if not isinstance(handoff, dict):
-                handoff = info.get("codes")
-            candidates = []
-            if isinstance(handoff, dict):
-                for key in ("accumulated", "current", "audio"):
-                    handoff_value = handoff.get(key)
-                    if handoff_value is not None:
-                        candidates.append(handoff_value)
-            elif handoff is not None:
-                candidates.append(handoff)
-            for handoff_value in candidates:
-                if isinstance(handoff_value, torch.Tensor):
-                    if handoff_value.numel():
-                        candidate = int(handoff_value.reshape(-1)[-1].item())
-                    else:
-                        continue
-                elif isinstance(handoff_value, (list, tuple)) and handoff_value:
-                    candidate = int(handoff_value[-1])
-                else:
-                    continue
-                if candidate > 0:
-                    seeded = candidate
-                    break
-            if seeded is None and seed_ids is not None and row >= 0:
-                try:
-                    tok = seed_ids[row] if getattr(seed_ids, "ndim", 1) == 1 else seed_ids[row, 0]
-                    candidate = int(tok.item())
-                    if candidate > 0:
-                        seeded = candidate
-                except (IndexError, RuntimeError, TypeError, ValueError):
-                    pass
-            if seeded is None:
-                # A fresh runtime buffer can lack the model's confirmed codec.
-                _talker = getattr(self, "model", None)
-                if _talker is not None:
-                    # Accept either request identifier used by the handoff.
-                    _rids = [
-                        str(info.get("request_id") or ""),
-                        str(info.get("req_id") or ""),
-                        str(index),
-                    ]
-                    for _rid in dict.fromkeys(r for r in _rids if r):
-                        _hist = getattr(_talker, "_request_codec_history", {}).get(_rid) or []
-                        if _hist:
-                            try:
-                                _candidate = int(_hist[-1])
-                                if _candidate > 0:
-                                    seeded = _candidate
-                            except (TypeError, ValueError):
-                                pass
-                        if seeded is None:
-                            _st = getattr(_talker, "_request_audio_states", {}).get(_rid) or {}
-                            _lc = _st.get("last_code") if isinstance(_st, dict) else None
-                            if isinstance(_lc, int) and _lc > 0:
-                                seeded = _lc
-                        if seeded is not None:
-                            break
-            if seeded is None:
-                extra["request_sample_eligible"][index] = False
-                continue
-            state["last_code"] = seeded
-            state["_kstep_last_code"] = (
-                seed_ids.new_tensor([seeded])
-                if isinstance(seed_ids, torch.Tensor)
-                else torch.tensor([seeded], dtype=torch.long)
-            )
-            state["step"] = 1
-        # The frame loop needs the request's sampling limits and identity.
-        active_buffers = extra.get("model_intermediate_buffer") or []
-        for info in active_buffers:
-            if isinstance(info, dict) and "request_id" not in info and info.get("req_id") is not None:
-                info["request_id"] = str(info["req_id"])
-        extra["request_sampling_params"] = [
-            info.get("sampling_params") if isinstance(info, dict) else None for info in active_buffers
-        ]
-        # A codec EOS may be in the first (bonus) row of a drafted span.
-        codec_eos = getattr(talker, "_codec_eos_id", None)
-        ib_ids = getattr(input_batch, "input_ids", None)
-        logits_idx = getattr(input_batch, "logits_indices", None)
-        if codec_eos is not None and int(codec_eos) > 0 and ib_ids is not None and logits_idx is not None:
-            try:
-                last_ids = ib_ids.index_select(0, logits_idx[:num_reqs].long())
-                bonus_rows = torch.tensor(
-                    [int(span[0]) for span in spans[:num_reqs]],
-                    device=ib_ids.device,
-                    dtype=torch.long,
-                )
-                bonus_ids = ib_ids.index_select(0, bonus_rows)
-                eos_rows = (
-                    ((last_ids == int(codec_eos)) | (bonus_ids == int(codec_eos)))
-                    .nonzero(as_tuple=False)
-                    .flatten()
-                    .tolist()
-                )
-            except (RuntimeError, IndexError, AttributeError, TypeError):
-                eos_rows = []
-            for index in eos_rows:
-                if index >= len(active_buffers):
-                    continue
-                info = active_buffers[index]
-                if not isinstance(info, dict):
-                    continue
-                state = info.get("audio_state")
-                if isinstance(state, dict):
-                    state["finished"] = True
+        cast(SupportsMRv2MultiFrameDecode, self.model).prepare_kstep_inputs(
+            extra,
+            num_reqs=num_reqs,
+            prefilling=prefilling,
+            seed_ids=model_inputs.get("input_ids"),
+            ib_ids=getattr(input_batch, "input_ids", None),
+            logits_idx=getattr(input_batch, "logits_indices", None),
+        )
         return extra
-
-    def _rewrite_kstep_initial_embeds(
-        self,
-        inputs_embeds: Any,
-        extra: dict[str, Any],
-        spans: list[tuple[int, int]],
-        input_ids: Any = None,
-    ) -> None:
-        """Condition the first row on the last committed codec; later frames feed back their own codes."""
-        infos = extra.get("model_intermediate_buffer") or []
-        emb = getattr(self.model, "emb_code", None)
-        if emb is None:
-            talker_module = getattr(self.model, "talker", None)
-            if talker_module is not None:
-                emb = getattr(talker_module, "emb_code", None)
-        if not infos or not spans or inputs_embeds is None or emb is None:
-            return
-        try:
-            emb_rows = int(emb[0].weight.shape[0])
-        except (AttributeError, IndexError, TypeError, RuntimeError):
-            emb_rows = None
-        rows: list[int] = []
-        codes: list[int] = []
-        row_infos: list[dict[str, Any]] = []
-        for index, span in enumerate(spans):
-            try:
-                start, end = int(span[0]), int(span[1])
-            except (TypeError, ValueError, IndexError):
-                continue
-            if end <= start or index >= len(infos):
-                continue
-            info = infos[index]
-            state = info.get("audio_state") if isinstance(info, dict) else None
-            if not isinstance(state, dict):
-                continue
-            code = None
-            # Use the last emitted codec, which can differ from the last packed frame.
-            confirmed = None
-            if isinstance(info, dict):
-                host = getattr(self.model, "talker", None)
-                if host is None or not hasattr(host, "_request_codec_history"):
-                    host = self.model
-                history = getattr(host, "_request_codec_history", {})
-                for _rid_key in (info.get("request_id"), info.get("req_id")):
-                    if _rid_key is None:
-                        continue
-                    confirmed = history.get(str(_rid_key))
-                    if confirmed:
-                        break
-            if confirmed:
-                code = int(confirmed[-1])
-            # The full-width codes mirror can contain frames the request never emitted.
-            if code is None:
-                device_last = state.get("_kstep_last_code")
-                if isinstance(device_last, torch.Tensor) and device_last.numel():
-                    candidate = int(device_last.reshape(-1)[-1].item())
-                    if candidate > 0:
-                        code = candidate
-            if code is None:
-                last_code = state.get("last_code")
-                if isinstance(last_code, int) and last_code > 0:
-                    code = last_code
-            if code is None and int(state.get("step", 0)) <= 1:
-                # The first decode may still carry the committed prompt-tail codec.
-                _ptids = info.get("prompt_token_ids") if isinstance(info, dict) else None
-                candidate = 0
-                if _ptids:
-                    try:
-                        candidate = int(_ptids[-1])
-                    except (TypeError, ValueError, IndexError):
-                        candidate = 0
-                if not candidate and input_ids is not None and int(input_ids.numel()) > start:
-                    try:
-                        candidate = int(input_ids[start].item())
-                    except (RuntimeError, IndexError, ValueError):
-                        candidate = 0
-                if candidate > 0 and (emb_rows is None or candidate < emb_rows):
-                    code = candidate
-            if code is None or code <= 0:
-                continue
-            rows.append(start)
-            codes.append(code)
-            row_infos.append(info)
-        if not rows:
-            return
-        tokens = torch.tensor(codes, device=inputs_embeds.device, dtype=torch.long).unsqueeze(1)
-        vectors = emb[0](tokens).to(inputs_embeds.dtype).reshape(len(rows), -1)
-        inputs_embeds[rows] = vectors
-        for code, info in zip(codes, row_infos, strict=True):
-            state = info["audio_state"]
-            state["_kstep_last_code"] = code
-            state["last_code"] = code
-        if input_ids is not None:
-            input_ids[rows] = tokens.view(-1).to(input_ids.dtype)
 
     def _run_kstep_model_forward(
         self,
@@ -968,11 +750,11 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         """Execute each codec frame against its own one-query attention view."""
         from vllm.forward_context import get_forward_context
 
-        from vllm_omni.platforms.npu.worker import talker_multiframe
+        from vllm_omni.worker import talker_multiframe
 
         spans = extra.get("request_token_spans") or []
         # Replace the first placeholder with the confirmed previous codec.
-        self._rewrite_kstep_initial_embeds(
+        cast(SupportsMRv2MultiFrameDecode, self.model).rewrite_kstep_initial_embeds(
             model_inputs.get("inputs_embeds"), extra, spans, model_inputs.get("input_ids")
         )
         from vllm_omni.worker.talker_cuda_graph import begin_cuda_narrow_step
@@ -1236,11 +1018,11 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         kstep_frames = 0
         kstep_extra: dict[str, Any] = {}
         if not dummy_run and not is_profile:
-            from vllm_omni.platforms.npu.worker import talker_multiframe
+            from vllm_omni.worker import talker_multiframe
 
             expected_frames = self._talker_kstep_frames()
             if expected_frames and not any(is_warmup_request(req_id) for req_id in input_batch.req_ids):
-                self.model.flush_cuda_kstep_feedback()
+                cast(SupportsMRv2MultiFrameDecode, self.model).flush_cuda_kstep_feedback()
                 kstep_extra = self._build_kstep_model_kwargs_extra(model_inputs, input_batch)
             if kstep_extra and scheduler_output.scheduled_spec_decode_tokens:
                 kstep_frames = talker_multiframe.applies(self.model, kstep_extra)

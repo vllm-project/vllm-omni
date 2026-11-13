@@ -407,7 +407,8 @@ def test_model_binding_commit_and_batch_compaction():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize("eos_frame", [0, 1, 2])
-def test_native_model_graph_eos_restores_request_rng(eos_frame):
+@pytest.mark.parametrize("use_v2", [False, True], ids=["multinomial", "batched_noise"])
+def test_native_model_graph_eos_restores_request_rng(eos_frame, use_v2):
     from types import MethodType, SimpleNamespace
 
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
@@ -421,6 +422,7 @@ def test_native_model_graph_eos_restores_request_rng(eos_frame):
     generators = {name: torch.Generator(device="cuda").manual_seed(seed) for name, seed in (("a", 123), ("b", 456))}
     references = {name: torch.Generator(device="cuda").manual_seed(seed) for name, seed in (("a", 123), ("b", 456))}
     model = SimpleNamespace(
+        _use_v2_model_runner=use_v2,
         _request_audio_states={},
         _request_codec_history={},
         _codec_temperature=0.8,
@@ -469,7 +471,8 @@ def test_native_model_graph_eos_restores_request_rng(eos_frame):
         )
         assert state is not None
 
-        graph_generators = model._cuda_kstep_generators
+        assert bool(model._cuda_kstep_rng_increment) is use_v2
+        graph_generators = tuple(g for g in model._cuda_kstep_generators if g is not None)
 
         def snapshot():
             return state.snapshot(), tuple(g.get_state() for g in graph_generators)
@@ -511,14 +514,24 @@ def test_native_model_graph_eos_restores_request_rng(eos_frame):
         _flush_cuda_kstep_host_pending(model)
         for row, name in enumerate(order):
             draws = eos_frame + 1 if row == 0 else 3
-            for frame in range(draws):
-                torch.multinomial(scores[frame, row].softmax(-1), 1, generator=references[name])
+            if use_v2:
+                base = references[name].get_offset()
+                reference_noise = torch.empty(VOCAB_SIZE, device="cuda")
+                for _ in range(draws):
+                    reference_noise.exponential_(generator=references[name])
+                assert generators[name].get_offset() == base + draws * model._cuda_kstep_rng_increment
+                continuation = torch.empty_like(reference_noise).exponential_(generator=generators[name])
+                reference_noise.exponential_(generator=references[name])
+                torch.testing.assert_close(continuation, reference_noise, rtol=0, atol=0)
+            else:
+                for frame in range(draws):
+                    torch.multinomial(scores[frame, row].softmax(-1), 1, generator=references[name])
+                continuation = torch.ones(VOCAB_SIZE, device="cuda")
+                assert torch.equal(
+                    torch.multinomial(continuation, 1, generator=generators[name]),
+                    torch.multinomial(continuation, 1, generator=references[name]),
+                )
             assert torch.equal(generators[name].get_state(), references[name].get_state())
-            continuation = torch.ones(VOCAB_SIZE, device="cuda")
-            assert torch.equal(
-                torch.multinomial(continuation, 1, generator=generators[name]),
-                torch.multinomial(continuation, 1, generator=references[name]),
-            )
         assert narrow.captures == 1
         assert narrow.replays == iteration + 1
 

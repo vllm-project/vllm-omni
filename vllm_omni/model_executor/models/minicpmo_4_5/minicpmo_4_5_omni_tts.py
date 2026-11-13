@@ -63,6 +63,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     VOCAB_SIZE as _CODEC_VOCAB_SIZE,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
+    CONTINUE_TOKEN_ID,
     talker_kstep_frames,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_mrv2_sampling import draw_v1_codec_ids
@@ -71,6 +72,7 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 from vllm_omni.utils.seeded_exponential import fill_exponential_rows, fill_exponential_steps
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
+from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
 
@@ -2517,6 +2519,214 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     list(range(rows)),
                 )
 
+    kstep_continue_token_id = CONTINUE_TOKEN_ID
+
+    def kstep_rows_ready(self, request_ids: Sequence[str]) -> bool:
+        """Return whether every request has sampled its first codec frame."""
+        return all(self._request_audio_states.get(req_id, {}).get("step", 0) > 0 for req_id in request_ids)
+
+    def prepare_kstep_inputs(
+        self,
+        extra: dict[str, Any],
+        *,
+        num_reqs: int,
+        prefilling: Any,
+        seed_ids: torch.Tensor | None,
+        ib_ids: torch.Tensor | None,
+        logits_idx: torch.Tensor | None,
+    ) -> None:
+        """Bind the Talker's codec state and sampling metadata to the scheduled rows."""
+        spans = extra["request_token_spans"]
+        buffers = extra.get("model_intermediate_buffer")
+        states = self._request_audio_states
+        for info in extra.get("model_intermediate_buffer") or []:
+            if isinstance(info, dict) and info.get("req_id") in states:
+                info["request_id"] = info["req_id"]
+                info["audio_state"] = states[info["req_id"]]
+        # Only a confirmed codec can seed the first decode frame.
+        extra["request_sample_eligible"] = [True] * num_reqs
+        for index, info in enumerate(buffers or []):
+            if not isinstance(info, dict) or index >= len(extra["request_sample_eligible"]):
+                continue
+            if is_warmup_request(str(info.get("req_id") or info.get("request_id", index))):
+                extra["request_sample_eligible"][index] = False
+                continue
+            if prefilling is not None and index < len(prefilling) and bool(prefilling[index]):
+                # The single-frame path samples the final prefill frame.
+                continue
+            state = info.get("audio_state")
+            if not isinstance(state, dict):
+                state = {}
+                info["audio_state"] = state
+            if state.get("finished") or int(state.get("step", 0)) > 0:
+                continue
+            row = int(spans[index][0]) if index < len(spans) else -1
+            seeded = None
+            handoff = info.get("audio_codes")
+            if not isinstance(handoff, dict):
+                handoff = info.get("codes")
+            candidates = []
+            if isinstance(handoff, dict):
+                for key in ("accumulated", "current", "audio"):
+                    handoff_value = handoff.get(key)
+                    if handoff_value is not None:
+                        candidates.append(handoff_value)
+            elif handoff is not None:
+                candidates.append(handoff)
+            for handoff_value in candidates:
+                if isinstance(handoff_value, torch.Tensor):
+                    if handoff_value.numel():
+                        candidate = int(handoff_value.reshape(-1)[-1].item())
+                    else:
+                        continue
+                elif isinstance(handoff_value, (list, tuple)) and handoff_value:
+                    candidate = int(handoff_value[-1])
+                else:
+                    continue
+                if candidate > 0:
+                    seeded = candidate
+                    break
+            if seeded is None and seed_ids is not None and row >= 0:
+                try:
+                    tok = seed_ids[row] if getattr(seed_ids, "ndim", 1) == 1 else seed_ids[row, 0]
+                    candidate = int(tok.item())
+                    if candidate > 0:
+                        seeded = candidate
+                except (IndexError, RuntimeError, TypeError, ValueError):
+                    pass
+            if seeded is None:
+                # A fresh runtime buffer can lack the model's confirmed codec.
+                for request_id in (info.get("request_id"), info.get("req_id"), str(index)):
+                    history = self._request_codec_history.get(str(request_id))
+                    last_code = history[-1] if history else states.get(str(request_id), {}).get("last_code")
+                    if isinstance(last_code, int) and last_code > 0:
+                        seeded = last_code
+                        break
+            if seeded is None:
+                extra["request_sample_eligible"][index] = False
+                continue
+            state["last_code"] = seeded
+            state["_kstep_last_code"] = (
+                seed_ids.new_tensor([seeded])
+                if isinstance(seed_ids, torch.Tensor)
+                else torch.tensor([seeded], dtype=torch.long)
+            )
+            state["step"] = 1
+        # The frame loop needs the request's sampling limits and identity.
+        active_buffers = extra.get("model_intermediate_buffer") or []
+        for info in active_buffers:
+            if isinstance(info, dict) and "request_id" not in info and info.get("req_id") is not None:
+                info["request_id"] = str(info["req_id"])
+        extra["request_sampling_params"] = [
+            info.get("sampling_params") if isinstance(info, dict) else None for info in active_buffers
+        ]
+        # A codec EOS may be in the first (bonus) row of a drafted span.
+        codec_eos = self._codec_eos_id
+        if codec_eos is not None and int(codec_eos) > 0 and ib_ids is not None and logits_idx is not None:
+            try:
+                last_ids = ib_ids.index_select(0, logits_idx[:num_reqs].long())
+                bonus_rows = torch.tensor(
+                    [int(span[0]) for span in spans[:num_reqs]],
+                    device=ib_ids.device,
+                    dtype=torch.long,
+                )
+                bonus_ids = ib_ids.index_select(0, bonus_rows)
+                eos_rows = (
+                    ((last_ids == int(codec_eos)) | (bonus_ids == int(codec_eos)))
+                    .nonzero(as_tuple=False)
+                    .flatten()
+                    .tolist()
+                )
+            except (RuntimeError, IndexError, AttributeError, TypeError):
+                eos_rows = []
+            for index in eos_rows:
+                if index >= len(active_buffers):
+                    continue
+                info = active_buffers[index]
+                if not isinstance(info, dict):
+                    continue
+                state = info.get("audio_state")
+                if isinstance(state, dict):
+                    state["finished"] = True
+
+    def rewrite_kstep_initial_embeds(
+        self,
+        inputs_embeds: Any,
+        extra: dict[str, Any],
+        spans: list[tuple[int, int]],
+        input_ids: Any = None,
+    ) -> None:
+        """Condition the first row on the last committed codec; later frames feed back their own codes."""
+        infos = extra.get("model_intermediate_buffer") or []
+        if not infos or not spans or inputs_embeds is None:
+            return
+        embedding = self.emb_code[0]
+        emb_rows = embedding.weight.shape[0]
+        rows: list[int] = []
+        codes: list[int] = []
+        row_infos: list[dict[str, Any]] = []
+        for index, span in enumerate(spans):
+            try:
+                start, end = int(span[0]), int(span[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if end <= start or index >= len(infos):
+                continue
+            info = infos[index]
+            state = info.get("audio_state") if isinstance(info, dict) else None
+            if not isinstance(state, dict):
+                continue
+            code = None
+            # Use the last emitted codec, which can differ from the last packed frame.
+            for request_id in (info.get("request_id"), info.get("req_id")):
+                history = self._request_codec_history.get(str(request_id))
+                if history:
+                    code = int(history[-1])
+                    break
+            # The full-width codes mirror can contain frames the request never emitted.
+            if code is None:
+                device_last = state.get("_kstep_last_code")
+                if isinstance(device_last, torch.Tensor) and device_last.numel():
+                    candidate = int(device_last.reshape(-1)[-1].item())
+                    if candidate > 0:
+                        code = candidate
+            if code is None:
+                last_code = state.get("last_code")
+                if isinstance(last_code, int) and last_code > 0:
+                    code = last_code
+            if code is None and int(state.get("step", 0)) <= 1:
+                # The first decode may still carry the committed prompt-tail codec.
+                _ptids = info.get("prompt_token_ids") if isinstance(info, dict) else None
+                candidate = 0
+                if _ptids:
+                    try:
+                        candidate = int(_ptids[-1])
+                    except (TypeError, ValueError, IndexError):
+                        candidate = 0
+                if not candidate and input_ids is not None and int(input_ids.numel()) > start:
+                    try:
+                        candidate = int(input_ids[start].item())
+                    except (RuntimeError, IndexError, ValueError):
+                        candidate = 0
+                if 0 < candidate < emb_rows:
+                    code = candidate
+            if code is None or code <= 0:
+                continue
+            rows.append(start)
+            codes.append(code)
+            row_infos.append(info)
+        if not rows:
+            return
+        tokens = torch.tensor(codes, device=inputs_embeds.device, dtype=torch.long).unsqueeze(1)
+        vectors = embedding(tokens).to(inputs_embeds.dtype).reshape(len(rows), -1)
+        inputs_embeds[rows] = vectors
+        for code, info in zip(codes, row_infos, strict=True):
+            state = info["audio_state"]
+            state["_kstep_last_code"] = code
+            state["last_code"] = code
+        if input_ids is not None:
+            input_ids[rows] = tokens.view(-1).to(input_ids.dtype)
+
     def flush_cuda_kstep_feedback(self) -> None:
         """Make the latest confirmed codec available to the next forward."""
         _flush_cuda_kstep_host_pending(self)
@@ -3472,9 +3682,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # The K-frame path projects all of the step's rows in one call and
         # hands each row its slice; the single-frame path still projects
         # here, so the default keeps that behaviour.
-        _raw_in = self.head_code[0](hidden_state).float() if logits is None else logits
         logits = prepare_codec_logits(
-            _raw_in,
+            self.head_code[0](hidden_state).float() if logits is None else logits,
             device_state,
             min_tokens_tensor,
             temperature_tensor,
