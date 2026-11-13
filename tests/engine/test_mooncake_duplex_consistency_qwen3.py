@@ -193,7 +193,10 @@ def _run_arm(model: str, directory: Path, mooncake: dict | None) -> dict:
     (directory / "case.txt").write_text("startup")
     deploy = _deploy(directory / "deploy.yaml", mooncake=mooncake)
     env = {AUDIT_ENV: str(directory), "VLLM_BATCH_INVARIANT": os.environ.get("VLLM_BATCH_INVARIANT", "1")}
-    args = ["--deploy-config", str(deploy), "--init-timeout", "1800", "--stage-init-timeout", "1800"]
+    # The CLI revision reaches every stage's model loading, not only the
+    # tokenizer and the cache identity.
+    args = ["--revision", REVISION, "--deploy-config", str(deploy)]
+    args += ["--init-timeout", "1800", "--stage-init-timeout", "1800"]
     with OmniServer(model, args, env_dict=env) as server:
         results = asyncio.run(_run_session(server, directory, SESSION_1, _clip()))
         results |= asyncio.run(_run_session(server, directory, SESSION_2, _clip(scale=0.5)))
