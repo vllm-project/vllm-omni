@@ -62,9 +62,8 @@ or derive a calibration/CV limit. Each workload has a distinct excluded
 eight-chunk warmup; six attention-window chunks and the terminal chunk are
 excluded from steady cadence. Readiness does not inject an unrecorded full
 rollout. The 12 FPS playback target is a measurement basis, not an absolute
-acceptance gate. The H100 baseline comes from a recorded CI run (latency x 1.10,
-throughput and FPS x 0.90). A2 has no measured baseline yet, so the NPU
-performance job is labeled as recording with a baseline pending.
+acceptance gate. The H100 and A2 baselines come from recorded CI runs (latency
+x 1.10, throughput and FPS x 0.90).
 
 `tests/e2e/accuracy/lingbot_world` contains three independent numerical, WBench
 and VBench tests. Each CI run captures one candidate server
