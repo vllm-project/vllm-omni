@@ -579,20 +579,31 @@ def test_byte_trigger_is_independent_of_legacy_cache(trigger_bytes, pool_bytes, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("commits", [5, 8, 10])
-async def test_consecutive_commits_share_one_source_in_foreground_and_summary(commits):
+@pytest.mark.parametrize(("commits", "system_update"), [(5, False), (8, False), (10, False), (2, True)])
+async def test_consecutive_commits_share_one_source_in_foreground_and_summary(commits, system_update):
     from tests.engine.duplex.test_session_runner import append_audio, tts_output
     from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
-    from vllm_omni.engine.duplex.commands import AckPlayback, Commit, CreateResponse
+    from vllm_omni.engine.duplex.commands import AckPlayback, Commit, CreateItem, CreateResponse
 
     h = await open_qwen()
     try:
         owner = runtime(recent_messages=1)
         h.runner.plugin._history_runtime = owner
         # Keep automatic scheduling off to inspect the prepared request directly.
-        for _ in range(commits):
+        for index in range(commits):
             await h.run(append_audio(value=0.1))
             await h.run(Commit(final=True, create_response=False))
+            if system_update:
+                await h.run(
+                    CreateItem(
+                        item={
+                            "id": f"system-{index}",
+                            "type": "message",
+                            "role": "system",
+                            "content": [{"type": "input_text", "text": "answer briefly"}],
+                        }
+                    )
+                )
         await h.run(CreateResponse())
         submission = h.port.submissions[-1]
         assert len(submission.prompt["multi_modal_data"]["audio"]) == 1
@@ -603,6 +614,16 @@ async def test_consecutive_commits_share_one_source_in_foreground_and_summary(co
         )
         await h.deliver_and_settle(tts_output(submission.context.request_id, finished=True), stage_id=2)
         await h.run(AckPlayback(response_id=response_id, played_ms=1000, committed_ms=1000))
+        completed_length = len(h.session.history)
+        # A later request must still have the old audio after its committed
+        # payload is released, without rebinding it to the new utterance.
+        assert h.runner.model_state.committed_audio_payload is None
+        await h.run(append_audio(value=0.2))
+        await h.run(Commit(final=True, create_response=True))
+        audios = h.port.submissions[-1].prompt["multi_modal_data"]["audio"]
+        assert len(audios) == 2
+        np.testing.assert_allclose(audios[0][0], np.full(commits * 16000, 0.1, dtype="<f4"))
+        np.testing.assert_allclose(audios[1][0], np.full(16000, 0.2, dtype="<f4"))
         memory = h.runner.model_state.history_policy_state
         sync_history(memory, h.session.history, session=h.session)
         request = await owner.prepare(memory)
@@ -610,8 +631,8 @@ async def test_consecutive_commits_share_one_source_in_foreground_and_summary(co
         assert len(request.prompt["multi_modal_data"]["audio"]) == 1
         assert not memory.omissions
         assert owner.apply(memory, request, completion("heard every committed source"))
-        assert memory.processed == commits + 1
-        assert len(memory.ledger.get(memory.summary_node_id).sources) == commits + 1
+        assert memory.processed == completed_length
+        assert len(memory.ledger.get(memory.summary_node_id).sources) == completed_length
     finally:
         await h.manager.shutdown()
 

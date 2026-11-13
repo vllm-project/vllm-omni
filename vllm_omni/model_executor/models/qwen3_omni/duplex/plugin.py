@@ -1003,11 +1003,13 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         # payload can never overwrite an earlier, already answered utterance.
         current_contents = []
         if has_audio:
-            # Keep payload binding on its existing trailing-user boundary;
-            # prompt formatting protects current media separately.
+            # System updates do not answer pending user input. Keep the same
+            # unanswered-turn boundary as foreground selection and compression.
             for index, message in reversed(list(enumerate(history))):
-                if index < bind_from or message.get("role") != "user":
+                if index < bind_from or message.get("role") == "assistant":
                     break
+                if message.get("role") != "user":
+                    continue
                 content = message.get("content")
                 if isinstance(content, list) and any(part.get("type") == "audio_url" for part in content):
                     current_contents.append(content)
