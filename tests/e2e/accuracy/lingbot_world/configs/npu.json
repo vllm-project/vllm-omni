@@ -8,7 +8,7 @@
   "warmup_chunks": 6,
   "mux_fps": 16,
   "target_fps": 12,
-  "startup_timeout_s": 1200,
+  "startup_timeout_s": 2400,
   "precision_timeout_s": 600,
   "first_chunk_timeout_s": 900,
   "chunk_timeout_s": 120,

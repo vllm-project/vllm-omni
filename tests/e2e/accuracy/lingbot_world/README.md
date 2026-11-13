@@ -79,8 +79,10 @@ auto-promoted to a baseline.
 Partial capture preserves its manifest and available artifacts. The three
 tests inspect their own required inputs even after a producer failure. A local
 run without `--lingbot-profile` is opt-in; selected CI tests cannot skip.
-Each accuracy job has a 120-minute timeout budget; actual native duration and
-two-GPU capacity still need matching CI evidence.
+The NPU profile allows 2400 s for server startup: serial shard loading on a
+contended A2 host took 57-126 s per shard (vllm-omni-npu-ci build 11393), versus
+~22 s on earlier runs. Each accuracy job has a 120-minute timeout budget;
+actual native duration and two-GPU capacity still need matching CI evidence.
 
 For a CPU-only check of capture/recording contracts:
 
