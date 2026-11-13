@@ -269,6 +269,51 @@ def test_disabled_stage_metrics_preserve_speech_completion_without_full_merge(mo
     assert all(call.kwargs == {"collect_stage_metrics": False} for call in merge.call_args_list)
 
 
+def test_process_single_result_accepts_scalar_pooling_output(mocker):
+    base = _make_base()
+    base.collect_stage_metrics = False
+    base._enable_ar_profiler = False
+    base.engine.get_stage_metadata.return_value = StageRuntimeInfo(
+        stage_type="llm",
+        final_output=True,
+        final_output_type="latent",
+        model_stage="pooler",
+    )
+    base.prom_metrics = mocker.Mock()
+    base.mod_metrics = mocker.Mock()
+    base._publish_request_gauges = mocker.Mock()
+    mocker.patch("vllm_omni.entrypoints.omni_base.observe_modality_at_finalize")
+
+    metrics = mocker.Mock()
+    metrics.stage_events = {}
+    metrics.stage_first_ts = [None]
+    metrics.stage_last_ts = [None]
+    metrics.e2e_done = set()
+    pooling_output = SimpleNamespace(data=object())
+    result = SimpleNamespace(
+        request_id="req-pooling",
+        stage_id=0,
+        replica_id=0,
+        stage_submit_ts=1.0,
+        metrics=None,
+        engine_outputs=SimpleNamespace(
+            request_id="req-pooling",
+            outputs=pooling_output,
+            finished=True,
+            final_output_type="latent",
+            stage_durations={},
+            peak_memory_mb=0.0,
+        ),
+    )
+
+    output = base._process_single_result(result, 0, metrics, {}, 0.0, 0)
+
+    base.prom_metrics.request_succeeded.assert_called_once()
+    assert base.prom_metrics.request_succeeded.call_args.kwargs["finished_reason"] == "stop"
+    assert output is not None
+    assert output.outputs == [pooling_output]
+
+
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
 def test_resolve_sampling_params_list_preserves_stage_constraints(typed):
     from vllm_omni.config.omni_config import VllmOmniARStageConfig

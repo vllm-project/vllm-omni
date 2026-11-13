@@ -83,6 +83,7 @@ def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
     # `__init__` is bypassed here: `_codec_sample_setup` still reads the
     # fused-prelude switch, so set it explicitly (eager chain, no kernels).
     model._codec_fused_prelude = False
+    model._codec_fused_tail = False
     emb = nn.Embedding(_NUM_AUDIO_TOKENS, 4)
     with torch.no_grad():
         emb.weight.zero_()
@@ -299,18 +300,16 @@ def test_decode_batch_reembeds_live_rows_from_last_code():
     assert torch.equal(scalar_embeds[0], embeds[0])
 
 
-def test_multi_frame_decode_is_rejected_under_v2_model_runner():
+def test_multi_frame_decode_arms_under_both_model_runners():
     def _config(*, use_v2_model_runner: bool):
         return SimpleNamespace(
             model_config=SimpleNamespace(model_stage="tts", use_v2_model_runner=use_v2_model_runner),
             speculative_config={"method": "ngram", "num_speculative_tokens": 7},
         )
 
-    # The same config arms eight frames on V1 and is refused on Model Runner
-    # V2, whose decode preprocess cannot re-embed the real previous frame.
+    # Both runners arm K=8; MRv2 replays one forward per frame.
     assert MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=False)) == 8
-    with pytest.raises(ValueError, match="Model Runner V2"):
-        MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=True))
+    assert MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=True)) == 8
 
 
 def _make_scheduler(*, num_spec: int, waiting=(), running=(), stage: str = "tts"):
@@ -1376,6 +1375,7 @@ def _cuda_prepare_stub():
         _codec_seed=42,
         _codec_eos_id=_EOS_ID,
         _codec_fused_prelude=False,
+        _codec_fused_tail=False,
         _merge_request_codec_params=lambda *args, **kwargs: None,
         _request_generator=lambda request_id, device: None,
     )
@@ -1965,3 +1965,49 @@ def test_kstep_log_reasons_are_deduped_by_reason_set(caplog, monkeypatch):
         "[minicpmo] one-query Talker replay not engaged: no one-query graph captured for 3 rows",
         "[minicpmo] one-query Talker replay not engaged: no one-query graph captured for 5 rows",
     ]
+
+
+@pytest.mark.parametrize("graph_first", [False, True])
+def test_kstep_mixed_outputs_preserve_codec_validity(graph_first):
+    """Eager frames and graph padding must share one full-payload row mask."""
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin,
+    )
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _extract_codec_delta
+
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    model._request_audio_states["r1"] = {"step": 0}
+    eager = _frame_call(model, torch.zeros(1, 8)).multimodal_outputs
+    eager_payload = {"codes.audio": eager["codes"]["audio"][0]}
+    if "codec_frame_valid" in eager["meta"]:
+        eager_payload["meta.codec_frame_valid"] = eager["meta"]["codec_frame_valid"][0]
+    # CUDA commit retains all eight rows, including padding after EOS.
+    graph_payload = {
+        "codes.audio": torch.tensor([[70], [71], [0], [0], [0], [0], [0], [0]]),
+        "meta.codec_frame_valid": torch.tensor([True, True, False, False, False, False, False, False]),
+    }
+    transport = _OmniConnectorPayloadTransportMixin()
+    transport._pending_full_payload_send = {}
+    transport._full_payload_replace_keys_cached = frozenset()
+    outputs = [graph_payload, eager_payload] if graph_first else [eager_payload, graph_payload]
+    for output in outputs:
+        transport.accumulate_full_payload_output("r1", output, None)
+    full, _ = transport._materialize_full_payload_entry(transport._pending_full_payload_send["r1"])
+    assert _extract_codec_delta(full, "r1") == ([70, 71, 42] if graph_first else [42, 70, 71])
+
+
+@pytest.mark.parametrize("samples", [[42, 43, _EOS_ID], [_EOS_ID]])
+def test_kstep_merged_frames_preserve_codec_validity(samples):
+    """Validity follows codec rows, including empty frames after a stop."""
+    model = _make_talker(k_step_frames=8, scripted_samples=samples)
+    model._request_audio_states["r1"] = {"step": 0}
+    frames, stops = [], []
+    for _ in range(8):
+        frames.append(_frame_call(model, torch.zeros(1, 8)))
+        stops.append(model.take_batch_stop_logits())
+    merged = model.merge_frame_outputs(frames, stops).multimodal_outputs
+    audio = merged["codes"]["audio"][0].reshape(-1)
+    valid = merged["meta"]["codec_frame_valid"][0]
+    assert valid.dtype == torch.bool
+    assert valid.tolist() == [True] * (len(samples) - 1)
+    assert audio[valid].tolist() == samples[:-1]
