@@ -82,8 +82,7 @@ case "$QUERY_TYPE" in
   audio_to_audio)
     system_content='[{"type": "text", "text": "You are an audio processing assistant. Listen and repeat the audio content."}]'
     user_content='[
-      {"type": "audio_url", "audio_url": {"url": "'"$MARY_HAD_LAMB_URL"'"}},
-      {"type": "text", "text": "Please listen to this audio and repeat its content."}
+      {"type": "audio_url", "audio_url": {"url": "'"$MARY_HAD_LAMB_URL"'"}}
     ]'
     thinker_sampling_params='{
       "temperature": 0.7,

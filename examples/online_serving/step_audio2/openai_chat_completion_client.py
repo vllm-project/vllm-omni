@@ -9,7 +9,9 @@ Step-Audio2 is a two-stage model:
 
 Usage examples:
   # Start server first:
-  vllm serve stepfun-ai/Step-Audio-2-mini --omni --port 8092
+  vllm serve stepfun-ai/Step-Audio-2-mini --omni --port 8092 \
+      --chat-template vllm_omni/transformers_utils/chat_templates/step_audio2.jinja \
+      --trust-remote-code --enforce-eager
 
   # Audio to text (ASR)
   python openai_chat_completion_client.py --query-type audio_to_text
@@ -107,7 +109,7 @@ def get_text_to_audio_query(
 
     Returns a list of messages: user message + assistant message with <tts_start>.
     The assistant message triggers TTS mode and must be used with
-    continue_final_message=True so the chat template does not append <|im_end|>.
+    continue_final_message=True so the chat template does not append <|EOT|>.
     """
     text_to_speak = text or "Hello, this is a test of Step Audio 2 text to speech."
 
@@ -132,7 +134,6 @@ def get_audio_to_audio_query(
     Returns a list of messages: user message (with audio) + assistant message
     with <tts_start>. Must be used with continue_final_message=True.
     """
-    question = custom_prompt or "Please listen to this audio and repeat its content."
     audio_url = get_audio_url(audio_path)
 
     return [
@@ -140,7 +141,6 @@ def get_audio_to_audio_query(
             "role": "user",
             "content": [
                 {"type": "audio_url", "audio_url": {"url": audio_url}},
-                {"type": "text", "text": question},
             ],
         },
         {
@@ -157,7 +157,7 @@ def get_system_prompt(query_type: str, custom_prompt: str | None = None) -> dict
     elif query_type == "text_to_audio":
         system_text = "以自然的语速读出下面的文字。"
     else:  # audio_to_audio
-        system_text = "You are an audio processing assistant. Listen and repeat the audio content."
+        system_text = custom_prompt or "You are an audio processing assistant. Listen and repeat the audio content."
 
     return {
         "role": "system",
@@ -232,7 +232,7 @@ def run_step_audio2(args) -> None:
         messages = [system_message, user_message]
 
     # For TTS/S2ST, use continue_final_message so <tts_start> in the
-    # assistant turn is not followed by <|im_end|>.
+    # assistant turn is not followed by <|EOT|>.
     extra_body: dict = {"sampling_params_list": sampling_params_list}
     if args.query_type == "audio_to_text":
         extra_body["modalities"] = ["text"]
