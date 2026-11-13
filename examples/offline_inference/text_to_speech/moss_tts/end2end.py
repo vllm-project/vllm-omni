@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Offline inference example for MOSS-TTS variants.
 
 Covers six models:
@@ -60,9 +63,13 @@ def _build_unified_codes(
     ``audio_codes_LxNQ`` is the matching delay-pattern audio code grid
     (``audio_pad_code`` everywhere except inside the reference-audio block).
     """
-    from transformers import AutoProcessor
+    from vllm_omni.model_executor.models.moss_tts.processor_loading import (
+        MOSS_DELAY_PROCESSOR,
+        MOSS_LOCAL_PROCESSOR,
+        load_moss_processor,
+    )
 
-    proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    proc = load_moss_processor(model_id, MOSS_LOCAL_PROCESSOR if "Local" in model_id else MOSS_DELAY_PROCESSOR)
 
     reference: list[torch.Tensor] | None = None
     if ref_audio is not None:

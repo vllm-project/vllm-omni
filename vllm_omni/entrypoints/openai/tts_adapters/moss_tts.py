@@ -27,6 +27,11 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     apply_max_new_tokens,
     conditioning_cache_salt,
 )
+from vllm_omni.model_executor.models.moss_tts.processor_loading import (
+    MOSS_DELAY_PROCESSOR,
+    MOSS_LOCAL_PROCESSOR,
+    load_moss_processor,
+)
 from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realtime_prompt
 
 if TYPE_CHECKING:
@@ -369,17 +374,10 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         cached = getattr(self, "_moss_processor_cache", None)
         if cached is not None:
             return cached
-        from transformers import AutoProcessor
-
-        model_id = self.engine_client.model_config.model
-        if self._moss_variant == "local":
-            # AutoProcessor injects loader-only kwargs (e.g. revision) that
-            # Local's custom from_pretrained forwards to ProcessorMixin.__init__.
-            # Invoke the checkpoint's loader directly, as for Realtime below.
-            processor_cls = get_class_from_dynamic_module("processing_moss_tts.MossTTSLocalProcessor", model_id)
-            proc = processor_cls.from_pretrained(model_id, trust_remote_code=True)
-        else:
-            proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        proc = load_moss_processor(
+            self.engine_client.model_config.model,
+            MOSS_LOCAL_PROCESSOR if self._moss_variant == "local" else MOSS_DELAY_PROCESSOR,
+        )
         if hasattr(proc, "audio_tokenizer"):
             device = self._resolve_ref_encoder_device()
             proc._vllm_omni_ref_encoder_device = device

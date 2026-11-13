@@ -67,6 +67,7 @@ from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_TOKENIZER_FILE,
 )
 from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import unpack_reference_audio
+from vllm_omni.model_executor.models.moss_tts import processor_loading as moss_processor_loading
 from vllm_omni.model_executor.stage_input_processors.auk import encoder2dit
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -649,9 +650,9 @@ def test_moss_salt_shares_reference_across_texts(mocker):
     assert salt(voice + 1, input="Hello.") != hello
 
 
-def _moss_adapter_with_stage_configs(stage_configs, mocker):
+def _moss_adapter_with_stage_configs(stage_configs, mocker, model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"):
     engine_client = SimpleNamespace(
-        model_config=SimpleNamespace(model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"),
+        model_config=SimpleNamespace(model=model),
         stage_configs=stage_configs,
     )
     server = mocker.Mock(api_server_shared_dir=None)  # one API process
@@ -751,7 +752,7 @@ def test_moss_get_processor_places_audio_tokenizer_on_codec_stage_device(mocker)
     audio_tokenizer = mocker.Mock()
     audio_tokenizer.to.return_value = audio_tokenizer
     processor = SimpleNamespace(audio_tokenizer=audio_tokenizer)
-    native_loader = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.moss_tts.get_class_from_dynamic_module")
+    native_loader = mocker.patch.object(moss_processor_loading, "get_class_from_dynamic_module")
     from_pretrained = native_loader.return_value.from_pretrained
     from_pretrained.return_value = processor
 
@@ -762,6 +763,38 @@ def test_moss_get_processor_places_audio_tokenizer_on_codec_stage_device(mocker)
     assert adapter._get_moss_processor() is processor
     from_pretrained.assert_called_once()
     audio_tokenizer.to.assert_called_once()
+
+
+class _StrictMossProcessor:
+    """Like the checkpoint processors, rejects any loader kwarg but ``trust_remote_code``."""
+
+    @classmethod
+    def from_pretrained(cls, model: str, *, trust_remote_code: bool) -> "_StrictMossProcessor":
+        return cls()
+
+
+@pytest.mark.parametrize(
+    ("model", "class_reference"),
+    [
+        ("OpenMOSS-Team/MOSS-TTS", moss_processor_loading.MOSS_DELAY_PROCESSOR),
+        ("OpenMOSS-Team/MOSS-TTS-v1.5", moss_processor_loading.MOSS_DELAY_PROCESSOR),
+        ("OpenMOSS-Team/MOSS-TTSD-v1.0", moss_processor_loading.MOSS_DELAY_PROCESSOR),
+        ("OpenMOSS-Team/MOSS-SoundEffect", moss_processor_loading.MOSS_DELAY_PROCESSOR),
+        ("OpenMOSS-Team/MOSS-VoiceGenerator", moss_processor_loading.MOSS_DELAY_PROCESSOR),
+        ("OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5", moss_processor_loading.MOSS_LOCAL_PROCESSOR),
+    ],
+)
+def test_moss_get_processor_loads_checkpoint_class_not_auto_processor(mocker, model, class_reference):
+    # AutoProcessor hands the checkpoint loaders a ``revision`` kwarg they reject (#9717).
+    adapter = _moss_adapter_with_stage_configs([], mocker, model=model)
+    auto_processor = mocker.patch("transformers.AutoProcessor.from_pretrained")
+    class_lookup = mocker.patch.object(
+        moss_processor_loading, "get_class_from_dynamic_module", return_value=_StrictMossProcessor
+    )
+
+    assert isinstance(adapter._get_moss_processor(), _StrictMossProcessor)
+    class_lookup.assert_called_once_with(class_reference, model)
+    auto_processor.assert_not_called()
 
 
 @pytest.mark.parametrize(

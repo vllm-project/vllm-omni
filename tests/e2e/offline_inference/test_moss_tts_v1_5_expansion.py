@@ -15,12 +15,12 @@ import urllib.request
 
 import pytest
 import torch
-from transformers import AutoProcessor
 from vllm import SamplingParams
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.model_executor.models.moss_tts.processor_loading import MOSS_DELAY_PROCESSOR, load_moss_processor
 
 MODEL = "OpenMOSS-Team/MOSS-TTS-v1.5"
 DEPLOY_CONFIG = get_deploy_config_path("moss_tts.yaml")
@@ -67,7 +67,7 @@ def ref_audio_path(tmp_path_factory) -> str:
 
 
 def _build_request(text: str, ref_audio_path: str) -> dict:
-    processor = AutoProcessor.from_pretrained(MODEL, trust_remote_code=True)
+    processor = load_moss_processor(MODEL, MOSS_DELAY_PROCESSOR)
     message = processor.build_user_message(
         text=text,
         reference=[ref_audio_path],
