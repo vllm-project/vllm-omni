@@ -281,8 +281,10 @@ class Zonos3Sampler(OmniSampler):
             logits = torch.where(repeated > 0, adjusted, logits)
         temperature = self._setting("temperature", slots)[:, None, None]
         logits = logits / torch.where(temperature > 0, temperature, 1.0)
-        k = self._setting("top_k", slots)[:, None].expand(-1, 10).reshape(-1)
-        p = self._setting("top_p", slots)[:, None].expand(-1, 10).reshape(-1)
+        # With one request, expand/reshape keeps stride zero. The Triton
+        # filter reads per-row k/p as contiguous arrays, so materialize them.
+        k = self._setting("top_k", slots).repeat_interleave(10)
+        p = self._setting("top_p", slots).repeat_interleave(10)
         flat = logits.reshape(-1, c.audio_vocab)
         if flat.is_cuda:
             logits = apply_top_k_top_p(flat, k, p, has_topp_only_rows=True)
