@@ -1773,6 +1773,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "min_tokens": min_tokens,
                 "turn_end_drain": drain_kind,
             }
+            if native_duplex:
+                state["host_condition_seq"] = condition_seq
             if isinstance(retained_codes, torch.Tensor) or retained_codes:
                 state["recent_codes"] = retained_codes
             request_states = getattr(self, "_request_audio_states", None)
@@ -1794,6 +1796,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codec_inputs = getattr(self, "_request_codec_device_inputs", None)
                 if isinstance(codec_inputs, dict):
                     codec_inputs.pop(request_id, None)
+                host_states = getattr(self, "_request_host_codec_states", None)
+                host_state = host_states.get(request_id) if isinstance(host_states, dict) else None
+                if (
+                    host_state is not None
+                    and isinstance(condition_seq, int)
+                    and not isinstance(condition_seq, bool)
+                    and host_state.get("condition_seq") != condition_seq
+                ):
+                    # Finishing one segment must not stop the next; retries of
+                    # the same segment must preserve its finished state.
+                    host_state["finished"] = False
+                    host_state["condition_seq"] = condition_seq
             empty_codes = torch.empty(0, dtype=torch.long, device="cpu")
             return (
                 input_ids,
@@ -3505,6 +3519,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "finished": False,
                 "bins": bins,
                 "generator": generator,
+                "condition_seq": request_state.get("host_condition_seq"),
             }
             states[request_id] = hstate
         # Resolve knobs once per request, same sources as the device
