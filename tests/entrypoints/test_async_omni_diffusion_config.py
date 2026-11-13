@@ -437,7 +437,7 @@ def test_serve_cli_accepts_hsdp_data_parallel():
     )
 
     explicit_kwargs = args.get_explicit_kwargs_dict()
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
 
     assert args.hsdp_data_parallel is True
@@ -446,6 +446,20 @@ def test_serve_cli_accepts_hsdp_data_parallel():
     # Unset, so OmniDiffusionConfig can apply the HSDP data-parallel default.
     assert args.request_batch_max_wait_ms is None
     assert stage_cfg["engine_args"].get("request_batch_max_wait_ms") is None
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_serve_cli_preserves_ulysses_a2a_permute(enabled: bool) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+    flag = "--ulysses-a2a-permute" if enabled else "--no-ulysses-a2a-permute"
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-degree", "4", flag])
+
+    stage_cfg = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config["ulysses_degree"] == 4
+    assert parallel_config["ulysses_a2a_permute"] is enabled
 
 
 def test_serve_cli_accepts_text_encoder_tp_size():

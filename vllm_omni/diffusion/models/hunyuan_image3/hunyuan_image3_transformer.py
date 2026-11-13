@@ -4,7 +4,7 @@
 import inspect
 import logging
 from collections.abc import Callable, Iterable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
@@ -60,7 +60,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_allgather_parallel_world_size,
@@ -77,6 +77,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
+    begin_scheduled_denoise,
     get_forward_context,
     get_paged_kv_computed_tokens,
     is_forward_context_available,
@@ -891,6 +892,28 @@ class HunYuanRotary2DEmbedder:
         return q, k
 
 
+def _require_attention_mask_support(record: ScheduleCandidate) -> str | None:
+    """Schedule candidate check for ImageKVCacheManager.attn (see Attention.add_schedule_candidate_check).
+
+    The dense path sends a 4D attention mask with ``full_attn_spans`` on every forward. A backend that honors
+    the spans or declares dense 4D mask support runs it only if it also takes the mask. Any other backend
+    raises at the first dense forward that selects the profile if the profile names it; if the role uses the
+    platform default, that forward falls back to SDPA as outside a schedule, so the check accepts it. The
+    paged path sends no mask; there, startup validation already requires every candidate to match the
+    baseline paged backend.
+    """
+    backend_cls = record.backend_cls
+    if backend_cls.supports_piecewise_spans or backend_cls.supports_dense_4d_mask(record.spec):
+        if backend_cls.supports_attention_mask(record.spec):
+            return None
+    elif record.spec is None:
+        return None
+    return (
+        "HunyuanImage3 image attention sends a 4D attention mask with full_attn_spans on every dense "
+        "forward, so the backend must take the mask and either honor full_attn_spans or consume a dense 4D mask"
+    )
+
+
 class ImageKVCacheManager(nn.Module):
     """
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
@@ -937,6 +960,9 @@ class ImageKVCacheManager(nn.Module):
             # bfloat16 autocast, independent of the weight-loading dtype.
             paged_kv_cache_dtype=torch.bfloat16,
         )
+        # The dense image attention path always sends a 4D mask together with full_attn_spans.
+        # Startup validation runs this check only with a schedule.
+        self.attn.add_schedule_candidate_check(_require_attention_mask_support)
 
     @staticmethod
     def _get_current_starts(
@@ -2695,6 +2721,23 @@ class HunyuanImage3Text2ImagePipelineOutput(BaseOutput):
     samples: list[Any] | np.ndarray
 
 
+@contextmanager
+def _clear_denoise_progress_on_exit():
+    """Clear the published denoise step on any exit and restore the timestep and total seen on entry.
+
+    The denoise loop publishes a timestep and total only when a schedule is bound; without one, the
+    restore assigns the values those fields already hold.
+    """
+    ctx = get_forward_context() if is_forward_context_available() else None
+    previous = (ctx.denoise_timestep, ctx.total_denoise_steps) if ctx is not None else (None, None)
+    try:
+        yield
+    finally:
+        set_forward_context_denoise_step_idx(None)
+        if ctx is not None:
+            ctx.denoise_timestep, ctx.total_denoise_steps = previous
+
+
 class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
     r"""
     Pipeline for condition-to-sample generation using Stable Diffusion.
@@ -3101,12 +3144,35 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         # 1. positive prefix len
         positive_reuse_len, negative_reuse_len = self._get_kv_reuse_len(model_kwargs, batch_size)
+        if positive_reuse_len <= 0:
+            return input_ids, 0
+
+        # Sampled tokens can extend beyond the prefix actually computed by
+        # AR. Every decoder layer must have KV for the prefix we remove.
+        for layer in self.model.model.layers:
+            layer_kv = ar_kv_data.get(layer.layer_idx)
+            if layer_kv is None or layer_kv.get("key") is None or layer_kv.get("value") is None:
+                raise ValueError(f"AR KV cache is missing key/value tensors for layer {layer.layer_idx}")
+            positive_reuse_len = min(positive_reuse_len, layer_kv["key"].shape[0], layer_kv["value"].shape[0])
+        if positive_reuse_len <= 0:
+            raise ValueError("AR KV cache does not contain a computed prefix")
+        if any(
+            image_slice.stop > positive_reuse_len
+            for image_slices in model_kwargs["tokenizer_output"].joint_image_slices or []
+            for image_slice in image_slices
+        ):
+            raise ValueError("AR KV cache does not cover the conditional images")
+        if (
+            self.do_classifier_free_guidance
+            and not getattr(self.model.config, "cfg_distilled", False)
+            and negative_reuse_len is not None
+            and positive_reuse_len <= negative_reuse_len
+        ):
+            raise ValueError("AR KV cache does not cover the negative CFG prefill boundary")
         logger.info(
             f"Handling AR KV reuse with positive_reuse_len={positive_reuse_len}, "
             f"negative_reuse_len={negative_reuse_len}"
         )
-        if positive_reuse_len <= 0:
-            return input_ids, 0
 
         # 2. inject positive kv
         self.model.inject_ar_kv_into_layers(ar_kv_data, positive_reuse_len)
@@ -3239,6 +3305,9 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             timesteps,
             sigmas,
         )
+        # Check a bound schedule against the sequence this call runs, before any forward below, including
+        # the AR-reuse prefill. None when no schedule is bound, which keeps the step-only publish.
+        scheduled_total = begin_scheduled_denoise(len(timesteps))
 
         # Prepare latent variables
         latents = self.prepare_latents(
@@ -3315,9 +3384,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             tc_prev_pred = None
             tc_cnt = 0
 
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
+        with self.progress_bar(total=num_inference_steps) as progress_bar, _clear_denoise_progress_on_exit():
             for i, t in enumerate(timesteps):
-                set_forward_context_denoise_step_idx(i)
+                if scheduled_total is None:
+                    set_forward_context_denoise_step_idx(i)
+                else:
+                    self.model.record_denoise_step(i, t, scheduler=self.scheduler, total_steps=scheduled_total)
                 if cfg_parallel_ready:
                     # CFG parallel: each rank forwards its own branch (no batch doubling)
                     latent_model_input = latents
@@ -3367,6 +3439,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                         **model_kwargs,
                     )
 
+                    # Later steps reuse the prompt K/V computed at step 0 under whatever profile step 0 selected.
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
                         model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
                         pred = model_output["diffusion_prediction"]
@@ -3420,8 +3493,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
-
-        set_forward_context_denoise_step_idx(None)
 
         if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor:
             latents = latents / self.vae.config.scaling_factor

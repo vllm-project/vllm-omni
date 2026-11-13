@@ -180,6 +180,16 @@ for distributed layerwise offload with AllGather DP concurrency.
 Async requests share one engine busy loop. Worker calls and control RPCs pass
 through that loop, so they cannot race on the executor transport.
 
+After each execution, the engine updates scheduler progress before draining
+queued control RPCs. A queued interaction belongs to the scheduler request
+instance present at submission. If that instance finishes, is removed, or is
+replaced before delivery, the interaction expires without a worker call or a
+scheduler wakeup. Its RPC completes without an error; this is not an
+acknowledgment that the control was applied. Unknown request IDs are rejected
+at submission. This preserves terminal output and worker cleanup when a
+control arrives during the final step or cancellation, and prevents queued
+controls from crossing request-ID reuse.
+
 ```mermaid
 sequenceDiagram
     participant Caller
@@ -417,6 +427,11 @@ output-stream consumer removes that consumer's queue. It does not take
 ownership of scheduler cleanup.
 
 ### Shutdown and worker failure
+
+For shared-weight consumers, the worker closes and drops its LoRA manager
+before detaching the runner and closing imported weights. The default manager
+retains the pipeline even when no adapter is loaded. A cleanup failure poisons
+the consumer session; it does not authorize the provider to release its weights.
 
 `DiffusionEngine.close()` is idempotent. It stops the busy loop, wakes pending
 streams with an error, closes scheduler state, and shuts down the executor.

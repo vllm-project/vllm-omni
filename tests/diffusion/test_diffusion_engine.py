@@ -690,6 +690,54 @@ class TestRequestBatchCapability:
         warmup.assert_called_once_with()
 
 
+class _MixfusionCapablePipeline:
+    supports_mixfusion = True
+
+
+class TestMixFusionCapability:
+    pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    @staticmethod
+    def _resolve(monkeypatch: pytest.MonkeyPatch, pipeline_cls: type, **config: object):
+        od_config = SimpleNamespace(
+            model_class_name="StubPipeline",
+            custom_pipeline_args=None,
+            streaming_output=False,
+            max_num_seqs=1,
+            **config,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: pipeline_cls,
+        )
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        return engine, od_config, engine._resolve_execution_mode(od_config)
+
+    def test_engine_rejects_server_level_mixfusion_on_unsupported_pipeline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(ValueError, match="does not support MixFusion"):
+            self._resolve(monkeypatch, _SingleRequestPipeline, enable_mixfusion=True)
+
+    @pytest.mark.parametrize("step_execution", [False, True])
+    def test_server_level_mixfusion_runs_step_execution(
+        self, monkeypatch: pytest.MonkeyPatch, step_execution: bool
+    ) -> None:
+        # Request-mode batching keys on height/width, so MixFusion without step
+        # execution would silently never fuse.
+        engine, od_config, mode = self._resolve(
+            monkeypatch, _MixfusionCapablePipeline, enable_mixfusion=True, step_execution=step_execution
+        )
+        assert mode is DiffusionExecutionMode.STEP_BATCH
+        assert od_config.step_execution is True
+        assert engine.step_execution is True
+
+    def test_engine_ignores_mixfusion_check_when_flag_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _, _, mode = self._resolve(monkeypatch, _SingleRequestPipeline)
+        assert mode is DiffusionExecutionMode.REQUEST_BATCH
+
+
 class TestDiffusionCompileConfig:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 

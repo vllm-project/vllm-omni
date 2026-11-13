@@ -25,8 +25,9 @@ ALPAMAYO2_SUPER_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             requires_multimodal_data=True,
             engine_output_type="text",
-            # Sent when the request finishes, after <|traj_future_start|>'s KV is written.
-            omni_kv_config={"need_send_cache": True},
+            # Sent when the request finishes, after <|traj_future_start|>'s KV is written. With n > 1,
+            # each reasoning sample sends its own KV and the expert returns one trajectory per sample.
+            omni_kv_config={"need_send_cache": True, "per_sample_kv": True},
         ),
         StagePipelineConfig(
             stage_id=1,
