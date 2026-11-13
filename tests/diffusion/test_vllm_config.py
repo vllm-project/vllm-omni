@@ -18,15 +18,19 @@ def test_native_cudagraph_pool_selection_accepts_diffusion_config():
     assert config.use_cumem_cudagraph_pool is False
 
 
-def test_stage_compilation_config_reaches_the_native_config():
-    od_config = OmniDiffusionConfig(model="test", compilation_config={"backend": "eager", "cache_dir": "/tmp/omni-cc"})
+def test_native_config_keeps_vllm_compilation_defaults():
+    """Only the stage's ``backend`` applies to diffusion, in the model runner.
+
+    A global ``--compilation-config`` also reaches diffusion stages of a mixed
+    pipeline; its other settings (custom ops, IR wrapping, mode) must not change
+    which kernels the diffusion stage's native layers use.
+    """
+    od_config = OmniDiffusionConfig(model="test", compilation_config={"backend": "eager", "custom_ops": ["all"]})
 
     config = create_diffusion_vllm_config(torch.device("cpu"), od_config)
+    default = create_diffusion_vllm_config(torch.device("cpu"), OmniDiffusionConfig(model="test"))
 
     assert isinstance(od_config.compilation_config, CompilationConfig)
-    assert config.compilation_config.cache_dir == "/tmp/omni-cc"
-    # The native config gets its own copy: vLLM's platform hooks may rewrite its
-    # mode and backend (the CPU platform does), and the stage's value, which the
-    # model runner compiles with, must keep the user's backend.
-    assert config.compilation_config is not od_config.compilation_config
     assert od_config.compilation_config.backend == "eager"
+    assert config.compilation_config.custom_ops == default.compilation_config.custom_ops
+    assert config.compilation_config.ir_enable_torch_wrap == default.compilation_config.ir_enable_torch_wrap

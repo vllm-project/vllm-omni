@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from vllm.config import CompilationConfig
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
@@ -378,7 +379,7 @@ def _make_compile_runner(
         diffusion_compile_granularity=compile_granularity,
         diffusion_compile_dynamic=compile_dynamic,
         parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
-        compilation_config=None if compile_backend is None else SimpleNamespace(backend=compile_backend),
+        compilation_config=None if compile_backend is None else CompilationConfig(backend=compile_backend),
     )
     return runner
 

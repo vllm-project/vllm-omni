@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -270,9 +269,8 @@ def create_base_diffusion_vllm_config(
 ) -> VllmConfig:
     """Create the native vLLM 0.27 config used by diffusion."""
 
-    compilation_config = getattr(od_config, "compilation_config", None)
     return VllmConfig(
-        compilation_config=copy.deepcopy(compilation_config) if compilation_config is not None else CompilationConfig(),
+        compilation_config=CompilationConfig(),
         device_config=DeviceConfig(device=device),
         additional_config=od_config.additional_config,
         kernel_config=KernelConfig(moe_backend=od_config.moe_backend, linear_backend=od_config.linear_backend),

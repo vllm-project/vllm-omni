@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch.profiler import record_function
-from vllm.config import LoadConfig, VllmConfig
+from vllm.config import CompilationConfig, LoadConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes, format_gib
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -276,8 +276,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         value is imported as a qualified name, as vLLM's ``CompilationConfig``
         resolves its backend for stock torch.compile.
         """
-        compilation_config = getattr(self.od_config, "compilation_config", None)
-        backend = getattr(compilation_config, "backend", "") if compilation_config is not None else ""
+        # OmniDiffusionConfig coerces a dict to CompilationConfig on construction.
+        compilation_config = self.od_config.compilation_config
+        backend = compilation_config.backend if isinstance(compilation_config, CompilationConfig) else ""
         if not backend or backend == "inductor":
             return None
         from torch._dynamo.backends.registry import list_backends

@@ -1148,9 +1148,10 @@ class OmniDiffusionConfig:
 
     profiler_config: "ProfilerConfig | dict[str, Any] | None" = None
 
-    # The stage's vLLM ``--compilation-config``. The model runner's torch.compile
-    # uses its ``backend`` when set (stock torch.compile semantics: the backend
-    # receives each compiled region whole); ``None`` keeps torch.compile's default.
+    # The stage's vLLM ``--compilation-config``. Only its ``backend`` applies: the
+    # model runner's torch.compile uses it when set (stock torch.compile semantics:
+    # the backend receives each compiled region whole). The native diffusion
+    # VllmConfig keeps vLLM's defaults. ``None`` keeps torch.compile's default.
     compilation_config: "CompilationConfig | dict[str, Any] | None" = None
 
     # Model-specific function for collecting CFG KV caches (set at runtime)

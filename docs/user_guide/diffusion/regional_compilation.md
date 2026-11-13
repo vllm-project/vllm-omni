@@ -51,10 +51,14 @@ stages:
 The value is either a backend registered with `torch._dynamo` (for example
 `eager`, `aot_eager`, or one an out-of-tree platform registers) or the qualified
 name of a backend callable, as for vLLM's stock torch.compile mode. Diffusion
-applies only `backend`: the backend receives each compiled region whole, and
-vLLM's `mode`, piecewise splitting and CUDA graph settings do not apply here.
-With a non-Inductor backend, the Inductor-only options used for graph capture
-are not passed.
+applies only `backend`, in the model runner: the backend receives each compiled
+region whole. The other compilation settings (`mode`, piecewise splitting,
+custom ops, CUDA graphs) do not affect a diffusion stage. With a non-Inductor
+backend, the Inductor-only options used for graph capture are not passed.
+
+A top-level `--compilation-config` applies to every stage of a multi-stage
+pipeline, so its `backend` also reaches the diffusion stage. Set it per stage in
+the deploy configuration to scope it to one stage.
 
 These settings control the generic model-runner compilation path. Pipelines
 that provide their own `setup_compile()` implementation manage their compilation
