@@ -1454,14 +1454,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # read back from the injected stage-1 speculative_config.
         self._k_step_frames = self._parse_k_step_frames(vllm_config)
         self.supports_multi_frame_decode = self._k_step_frames > 0
-        if self._k_step_frames > 0 and bool(
-            getattr(getattr(vllm_config, "model_config", None), "use_v2_model_runner", False)
-        ):
-            # K-step on MRv2: the runner's decode preprocess hook must run on
-            # single-frame steps too, so the per-request Talker state (step,
-            # last_code, codec history) the multi-frame loop reads stays
-            # current before the loop can engage.
-            self.mrv2_decode_preprocess_is_identity = False
         # Last frame's stop/continue rows and the flattened per-token stop
         # sequence the merged step presents to compute_logits.
         self._k_last_stop_rows: list[bool] | None = None
