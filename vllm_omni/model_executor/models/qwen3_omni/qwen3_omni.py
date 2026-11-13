@@ -1795,12 +1795,24 @@ class Qwen3OmniMoeForConditionalGeneration(
 
     def _plan_npu_code2wav_graph_shapes(self, streaming: bool) -> list[tuple[int, int]]:
         """Exact decode windows the Code2Wav stage sees, matching the talker chunker."""
-        from vllm_omni.platforms.npu.models.code2wav_graph import plan_code2wav_graph_shapes
+        from vllm_omni.platforms.npu.models.code2wav_graph import (
+            MAX_CODE2WAV_GRAPHS,
+            plan_code2wav_graph_shapes,
+        )
 
         max_batch_size = int(self.vllm_config.scheduler_config.max_num_seqs)
         if not streaming:
             # Non-streaming chunked_decode: first chunk, then chunk + left context.
-            return plan_code2wav_graph_shapes(steady_window=325, start_windows=[300], max_batch_size=max_batch_size)
+            # Capture both windows at the same bounded batch sizes used at runtime.
+            max_rows = self.code2wav._max_decode_rows
+            if max_rows is not None:
+                max_batch_size = min(max_batch_size, max_rows)
+            # Reserve a pair of windows per row count within the graph budget.
+            return [
+                (rows, frames)
+                for rows in range(1, min(max_batch_size, MAX_CODE2WAV_GRAPHS // 2) + 1)
+                for frames in (300, 325)
+            ]
         extra = self._get_codec_connector_extra()
         chunk = int(extra.get("codec_chunk_frames", 25) or 25)
         left = int(extra.get("codec_left_context_frames", 25) or 0)
