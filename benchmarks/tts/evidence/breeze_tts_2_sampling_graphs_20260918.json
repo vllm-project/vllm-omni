@@ -1,0 +1,2735 @@
+{
+  "schema_version": 1,
+  "performance_audit_status": "complete",
+  "quality_audit_status": "targeted_checks_complete_with_severe_ASR_mismatches_in_baseline_and_final",
+  "code": {
+    "baseline_commit": "ec6f20e7ce82eb5aade6c0ea4c9a616b5e80bf16",
+    "candidate_commit": "ca22df8b3a6459154271873006caaebc829ec5a9",
+    "all_seven_changed_runtime_and_test_files_match_tested_candidate": true,
+    "candidate_gpu_tests": {
+      "passed": 50,
+      "skipped": 0
+    }
+  },
+  "hardware": {
+    "gpu_count": 1,
+    "gpu_model": "NVIDIA H100 80GB HBM3",
+    "driver_version": "580.159.04"
+  },
+  "runtime": {
+    "python": "3.12.3",
+    "packages": {
+      "torch": "2.13.0+cu132",
+      "vllm": "0.29.0",
+      "transformers": "5.14.1",
+      "triton": "3.7.1",
+      "numpy": "2.3.5",
+      "flashinfer-python": "0.6.18"
+    },
+    "vllm_omni_distribution_metadata_version": "0.29.0rc1",
+    "vllm_omni_runtime_source": "Code commits above; distribution metadata does not replace the source revision."
+  },
+  "model": {
+    "id": "BreezeBlue/Breeze-TTS-2",
+    "revision": "3e28c5151381a722f1d8661b4118c298caa77aa4",
+    "config_sha256": "57849eb756ca1602efe89afcc5c70379dd127f8deeb9f655204d4340190ea929"
+  },
+  "deployment": {
+    "repository_path": "vllm_omni/deploy/breeze_tts_2_throughput.yaml",
+    "rendered_sha256": "add2dd15fda6a8049b5fc940e94cb61e6dd87b8e8c7c6a84cc899d641b8fcef3",
+    "rendered_yaml": "async_chunk: true\nconnectors:\n  shm:\n    name: SharedMemoryConnector\n    extra:\n      codec_streaming: true\n      codec_chunk_frames: 16\n      initial_codec_chunk_frames: 16\n      codec_chunk_ramp:\n      - 16\n      codec_left_context_frames: 0\n      decode_cudagraph_batch_sizes:\n      - 1\n      - 2\n      - 4\n      - 8\n      - 16\n      - 32\n      connector_get_sleep_s: 0.001\n      connector_get_max_wait_first_chunk: 1000\n      connector_get_max_wait: 300\nstages:\n- stage_id: 0\n  devices: '0'\n  max_num_seqs: 32\n  max_model_len: 2048\n  max_num_batched_tokens: 4096\n  gpu_memory_utilization: 0.65\n  kv_cache_memory_bytes: 8589934592\n  enforce_eager: false\n  compilation_config:\n    mode: 3\n    cudagraph_mode: FULL_AND_PIECEWISE\n    cudagraph_capture_sizes:\n    - 1\n    - 2\n    - 4\n    - 8\n    - 32\n    - 64\n    - 128\n    - 256\n  enable_prefix_caching: false\n  enable_chunked_prefill: false\n  async_scheduling: false\n  engine_extras:\n    additional_config:\n      cfg_prefill_delay_tokens: 0\n  output_connectors:\n    to_stage_1: shm\n  default_sampling_params:\n    temperature: 0.9\n    top_p: 1.0\n    top_k: 50\n    repetition_penalty: 1.1\n    max_tokens: 1500\n    seed: 42\n- stage_id: 1\n  devices: '0'\n  max_num_seqs: 32\n  max_model_len: 32768\n  max_num_batched_tokens: 32768\n  gpu_memory_utilization: 0.15\n  enforce_eager: false\n  enable_prefix_caching: false\n  async_scheduling: true\n  input_connectors:\n    from_stage_0: shm\n  default_sampling_params:\n    temperature: 0.0\n    top_p: 1.0\n    top_k: -1\n    repetition_penalty: 1.0\n    max_tokens: 32768\n"
+  },
+  "dataset": {
+    "repository_path": "benchmarks/build_dataset/seed_tts_smoke/en/meta.lst",
+    "sha256": "17e5a91c6889ffef16957f7a5367897494a1b9f989cce195d2681c8e9c537bb3",
+    "texts": 30,
+    "language": "English",
+    "kind": "Checked-in synthetic smoke texts; not original Seed test-en recordings."
+  },
+  "protocol": {
+    "api": "POST /v1/audio/speech",
+    "stream": false,
+    "response_format": "pcm",
+    "audio_sample_rate_hz": 24000,
+    "channels": 1,
+    "sample_width_bytes": 2,
+    "server_slots_per_stage": 32,
+    "client_concurrencies": [
+      32,
+      64
+    ],
+    "closed_loop": true,
+    "rounds_per_arm": 3,
+    "requests_per_cohort": 300,
+    "measured_cohorts": 24,
+    "measured_requests_per_arm": 3600,
+    "request_order": "30 texts cyclically repeated ten times; complete request bodies match across arms, repeated rounds and client concurrency.",
+    "seed": "42 + zero-based request index; resets for each cohort.",
+    "natural_sampled": {
+      "temperature": 0.9,
+      "top_k": 50,
+      "top_p": 1.0,
+      "max_new_tokens": 384
+    },
+    "capped_greedy": {
+      "temperature": 0.0,
+      "top_k": 0,
+      "top_p": 1.0,
+      "max_new_tokens": 48,
+      "minimum_tokens": null,
+      "fixed_work_valid": false
+    },
+    "shared_sampling": {
+      "repetition_penalty": 1.1,
+      "guidance_scale": 1.0
+    },
+    "warmup": "Fresh server per arm. Before timing: 150 requests each in sampled C32, capped-greedy C32, sampled C64, capped-greedy C64 order; 600 excluded warmup requests per arm.",
+    "cohort_order": "Round 0: sampled C32, greedy C32, sampled C64, greedy C64. Rotate left one position in round 1 and two in round 2.",
+    "arms_order": "All baseline rounds and C1 control precede candidate validation, final rounds and final C1 control; arms are sequential, not interleaved.",
+    "timing": "Request start through complete PCM receipt. Cohort wall is latest response end minus earliest request start. PCM joining, analysis, hashing and writes follow completion of all cohort requests.",
+    "profiling": "Both timing arms uninjected; separate profiles excluded.",
+    "asr": "No ASR during timing arms; quality work follows both servers stopping.",
+    "memory_polling": "Identical 1 Hz management polling in both arms; whole-run scope stated separately.",
+    "source_guards": "Six identical execution helpers and full source/config/model/runtime/GPU checks; final timing bound to the exact successful 50-test candidate.",
+    "workload_scope": {
+      "reference_audio": false,
+      "guidance_scales": [
+        1.0
+      ],
+      "texts": "30 synthetic English smoke texts; not original Seed-TTS or a published blog benchmark.",
+      "untested_performance_scopes": [
+        "voice cloning",
+        "guidance scale greater than one",
+        "long prompts",
+        "multiple GPUs"
+      ],
+      "startup_and_warmup": "Server startup and all four warmup waves are excluded from measured makespans."
+    }
+  },
+  "metric_definitions": {
+    "rps": "Successful responses / cohort makespan.",
+    "rtf": "Cohort makespan / total full returned PCM duration, including quiet tails.",
+    "p95_response_s": "Per-cohort statistics.quantiles(request wall seconds,n=20,method=\"inclusive\")[18]. Summary is median/minimum/maximum of three cohort p95s.",
+    "summary": "Three per-cohort observations per arm/family: median and observed full min/max ranges, no confidence intervals.",
+    "total_audio_percent_change": "Change in SUMMED audio duration across all three rounds: 900 responses per arm/family.",
+    "near_cap": "PCM-derived frames >= max_new_tokens-1; exact-cap counts reported separately.",
+    "frames": "PCM byte length /3840 (1920 mono int16 samples/frame). No RVQ token sequence recorded.",
+    "interior": "Last initial request start through last request start; counts completions and their full delivered clips. This is not GPU work isolated to the window."
+  },
+  "individual_measured_cohorts": [
+    {
+      "arm": "baseline",
+      "round": 0,
+      "mode": "greedy48",
+      "client_concurrency": 32,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 12.409082953352481,
+      "audio_s": 1138.1599999999999,
+      "rps": 24.175839675481495,
+      "rtf": 0.010902757919231464,
+      "p95_response_s": 1.3660403012065216,
+      "mean_duration_s": 3.7938666666666663,
+      "median_duration_s": 3.84,
+      "min_duration_s": 2.96,
+      "max_duration_s": 3.84,
+      "caps": 276,
+      "at_max_frames": 274,
+      "exact48": 274,
+      "pcm_derived_frames": 14227.0,
+      "peak_inflight": 32,
+      "interior_rps": 23.55702600182998,
+      "interior_rtf": 0.011197488491907423,
+      "interior_mean_inflight": 31.999404196554725,
+      "fixed48_valid": false,
+      "max_response_s": 1.3778274049982429
+    },
+    {
+      "arm": "baseline",
+      "round": 0,
+      "mode": "greedy48",
+      "client_concurrency": 64,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 11.4890843112953,
+      "audio_s": 1137.6,
+      "rps": 26.11174153409772,
+      "rtf": 0.010099406040168162,
+      "p95_response_s": 2.568560073385015,
+      "mean_duration_s": 3.792,
+      "median_duration_s": 3.84,
+      "min_duration_s": 2.96,
+      "max_duration_s": 3.84,
+      "caps": 275,
+      "at_max_frames": 269,
+      "exact48": 269,
+      "pcm_derived_frames": 14220.0,
+      "peak_inflight": 64,
+      "interior_rps": 25.370435925769396,
+      "interior_rtf": 0.010412561279692619,
+      "interior_mean_inflight": 63.99934963725613,
+      "fixed48_valid": false,
+      "max_response_s": 2.6073009888641536
+    },
+    {
+      "arm": "baseline",
+      "round": 0,
+      "mode": "sampled",
+      "client_concurrency": 32,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 19.73926813295111,
+      "audio_s": 1372.48,
+      "rps": 15.19813186483873,
+      "rtf": 0.014382190001275873,
+      "p95_response_s": 2.6196906621102243,
+      "mean_duration_s": 4.574933333333333,
+      "median_duration_s": 4.56,
+      "min_duration_s": 2.64,
+      "max_duration_s": 7.76,
+      "caps": 0,
+      "at_max_frames": 0,
+      "exact48": 11,
+      "pcm_derived_frames": 17156.0,
+      "peak_inflight": 32,
+      "interior_rps": 14.769683037456982,
+      "interior_rtf": 0.014883914366667608,
+      "interior_mean_inflight": 31.99964170182187,
+      "fixed48_valid": false,
+      "max_response_s": 3.423801572062075
+    },
+    {
+      "arm": "baseline",
+      "round": 0,
+      "mode": "sampled",
+      "client_concurrency": 64,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 19.836500237695873,
+      "audio_s": 1368.8,
+      "rps": 15.123635540804791,
+      "rtf": 0.01449189088084152,
+      "p95_response_s": 4.799736037221737,
+      "mean_duration_s": 4.562666666666667,
+      "median_duration_s": 4.48,
+      "min_duration_s": 2.88,
+      "max_duration_s": 8.72,
+      "caps": 0,
+      "at_max_frames": 0,
+      "exact48": 5,
+      "pcm_derived_frames": 17110.0,
+      "peak_inflight": 64,
+      "interior_rps": 14.826302139784737,
+      "interior_rtf": 0.014957955135430911,
+      "interior_mean_inflight": 63.99961896669195,
+      "fixed48_valid": false,
+      "max_response_s": 5.861642682924867
+    },
+    {
+      "arm": "baseline",
+      "round": 1,
+      "mode": "greedy48",
+      "client_concurrency": 32,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 12.368925544898957,
+      "audio_s": 1140.8799999999999,
+      "rps": 24.25432984546684,
+      "rtf": 0.010841565760552344,
+      "p95_response_s": 1.3458482225192712,
+      "mean_duration_s": 3.802933333333333,
+      "median_duration_s": 3.84,
+      "min_duration_s": 2.96,
+      "max_duration_s": 3.84,
+      "caps": 278,
+      "at_max_frames": 276,
+      "exact48": 276,
+      "pcm_derived_frames": 14261.0,
+      "peak_inflight": 32,
+      "interior_rps": 23.594010932160216,
+      "interior_rtf": 0.011157971292675595,
+      "interior_mean_inflight": 31.99941429464469,
+      "fixed48_valid": false,
+      "max_response_s": 1.3915124712511897
+    },
+    {
+      "arm": "baseline",
+      "round": 1,
+      "mode": "greedy48",
+      "client_concurrency": 64,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 11.264604894910008,
+      "audio_s": 1140.8,
+      "rps": 26.632092541084788,
+      "rtf": 0.009874303028497552,
+      "p95_response_s": 2.4218830559635536,
+      "mean_duration_s": 3.8026666666666666,
+      "median_duration_s": 3.84,
+      "min_duration_s": 2.8,
+      "max_duration_s": 3.84,
+      "caps": 282,
+      "at_max_frames": 282,
+      "exact48": 282,
+      "pcm_derived_frames": 14260.0,
+      "peak_inflight": 64,
+      "interior_rps": 25.794812158986286,
+      "interior_rtf": 0.010210167083200961,
+      "interior_mean_inflight": 63.999343316676544,
+      "fixed48_valid": false,
+      "max_response_s": 2.4386735460720956
+    },
+    {
+      "arm": "baseline",
+      "round": 1,
+      "mode": "sampled",
+      "client_concurrency": 32,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 20.184422803111374,
+      "audio_s": 1385.04,
+      "rps": 14.862946685488366,
+      "rtf": 0.01457316958579635,
+      "p95_response_s": 2.753425784688443,
+      "mean_duration_s": 4.6168,
+      "median_duration_s": 4.52,
+      "min_duration_s": 2.4,
+      "max_duration_s": 8.0,
+      "caps": 0,
+      "at_max_frames": 0,
+      "exact48": 11,
+      "pcm_derived_frames": 17313.0,
+      "peak_inflight": 32,
+      "interior_rps": 14.506207588669962,
+      "interior_rtf": 0.01503976665662243,
+      "interior_mean_inflight": 31.99963270833469,
+      "fixed48_valid": false,
+      "max_response_s": 3.552142067812383
+    },
+    {
+      "arm": "baseline",
+      "round": 1,
+      "mode": "sampled",
+      "client_concurrency": 64,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 19.947364503052086,
+      "audio_s": 1378.88,
+      "rps": 15.039580790439654,
+      "rtf": 0.014466352766775995,
+      "p95_response_s": 4.897944782185368,
+      "mean_duration_s": 4.596266666666667,
+      "median_duration_s": 4.48,
+      "min_duration_s": 2.88,
+      "max_duration_s": 10.24,
+      "caps": 0,
+      "at_max_frames": 0,
+      "exact48": 9,
+      "pcm_derived_frames": 17236.0,
+      "peak_inflight": 64,
+      "interior_rps": 14.772988235869104,
+      "interior_rtf": 0.014789570445164352,
+      "interior_mean_inflight": 63.99964299078361,
+      "fixed48_valid": false,
+      "max_response_s": 6.380287105217576
+    },
+    {
+      "arm": "baseline",
+      "round": 2,
+      "mode": "greedy48",
+      "client_concurrency": 32,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 12.094073274172843,
+      "audio_s": 1140.24,
+      "rps": 24.805538481452444,
+      "rtf": 0.010606603236312392,
+      "p95_response_s": 1.3324332737131044,
+      "mean_duration_s": 3.8008,
+      "median_duration_s": 3.84,
+      "min_duration_s": 2.96,
+      "max_duration_s": 3.84,
+      "caps": 276,
+      "at_max_frames": 273,
+      "exact48": 273,
+      "pcm_derived_frames": 14253.0,
+      "peak_inflight": 32,
+      "interior_rps": 24.0738475426106,
+      "interior_rtf": 0.010936431591609813,
+      "interior_mean_inflight": 31.999390705533155,
+      "fixed48_valid": false,
+      "max_response_s": 1.3492237930186093
+    },
+    {
+      "arm": "baseline",
+      "round": 2,
+      "mode": "greedy48",
+      "client_concurrency": 64,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 11.363486644811928,
+      "audio_s": 1142.32,
+      "rps": 26.400347831355695,
+      "rtf": 0.009947726245545845,
+      "p95_response_s": 2.411577110388316,
+      "mean_duration_s": 3.807733333333333,
+      "median_duration_s": 3.84,
+      "min_duration_s": 2.8,
+      "max_duration_s": 3.84,
+      "caps": 283,
+      "at_max_frames": 283,
+      "exact48": 283,
+      "pcm_derived_frames": 14279.0,
+      "peak_inflight": 64,
+      "interior_rps": 25.24913933766535,
+      "interior_rtf": 0.010414089097638338,
+      "interior_mean_inflight": 63.99934789676571,
+      "fixed48_valid": false,
+      "max_response_s": 2.4508438971824944
+    },
+    {
+      "arm": "baseline",
+      "round": 2,
+      "mode": "sampled",
+      "client_concurrency": 32,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 19.982479984872043,
+      "audio_s": 1371.52,
+      "rps": 15.013151532098034,
+      "rtf": 0.014569587016501432,
+      "p95_response_s": 2.6867772510275243,
+      "mean_duration_s": 4.571733333333333,
+      "median_duration_s": 4.48,
+      "min_duration_s": 2.72,
+      "max_duration_s": 10.0,
+      "caps": 0,
+      "at_max_frames": 0,
+      "exact48": 7,
+      "pcm_derived_frames": 17144.0,
+      "peak_inflight": 32,
+      "interior_rps": 14.688290200283893,
+      "interior_rtf": 0.014979169569545266,
+      "interior_mean_inflight": 31.99963069200315,
+      "fixed48_valid": false,
+      "max_response_s": 4.393639067653567
+    },
+    {
+      "arm": "baseline",
+      "round": 2,
+      "mode": "sampled",
+      "client_concurrency": 64,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 19.736425609793514,
+      "audio_s": 1363.84,
+      "rps": 15.200320763813254,
+      "rtf": 0.014471217745331942,
+      "p95_response_s": 4.845615285425447,
+      "mean_duration_s": 4.546133333333333,
+      "median_duration_s": 4.4,
+      "min_duration_s": 2.72,
+      "max_duration_s": 11.68,
+      "caps": 0,
+      "at_max_frames": 0,
+      "exact48": 11,
+      "pcm_derived_frames": 17048.0,
+      "peak_inflight": 64,
+      "interior_rps": 14.76624455355767,
+      "interior_rtf": 0.015027830388430046,
+      "interior_mean_inflight": 63.9996463755415,
+      "fixed48_valid": false,
+      "max_response_s": 7.120478071272373
+    },
+    {
+      "arm": "final",
+      "round": 0,
+      "mode": "greedy48",
+      "client_concurrency": 32,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 12.865571803878993,
+      "audio_s": 1141.92,
+      "rps": 23.31804637781816,
+      "rtf": 0.011266613951834622,
+      "p95_response_s": 1.4281870554899796,
+      "mean_duration_s": 3.8064000000000004,
+      "median_duration_s": 3.84,
+      "min_duration_s": 2.96,
+      "max_duration_s": 3.84,
+      "caps": 280,
+      "at_max_frames": 276,
+      "exact48": 276,
+      "pcm_derived_frames": 14274.0,
+      "peak_inflight": 32,
+      "interior_rps": 22.500397275173285,
+      "interior_rtf": 0.011688354533888935,
+      "interior_mean_inflight": 31.999437066682333,
+      "fixed48_valid": false,
+      "max_response_s": 1.464728930965066
+    },
+    {
+      "arm": "final",
+      "round": 0,
+      "mode": "greedy48",
+      "client_concurrency": 64,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 11.269619753584266,
+      "audio_s": 1141.6,
+      "rps": 26.620241548485783,
+      "rtf": 0.009871776238248307,
+      "p95_response_s": 2.4245060281828046,
+      "mean_duration_s": 3.805333333333333,
+      "median_duration_s": 3.84,
+      "min_duration_s": 2.88,
+      "max_duration_s": 3.84,
+      "caps": 283,
+      "at_max_frames": 279,
+      "exact48": 279,
+      "pcm_derived_frames": 14270.0,
+      "peak_inflight": 64,
+      "interior_rps": 25.810591381249292,
+      "interior_rtf": 0.010193914144174995,
+      "interior_mean_inflight": 63.99934948513199,
+      "fixed48_valid": false,
+      "max_response_s": 2.4315964658744633
+    },
+    {
+      "arm": "final",
+      "round": 0,
+      "mode": "sampled",
+      "client_concurrency": 32,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 18.745703546330333,
+      "audio_s": 1377.92,
+      "rps": 16.003667147437,
+      "rtf": 0.013604348254129654,
+      "p95_response_s": 2.5659151571802794,
+      "mean_duration_s": 4.593066666666667,
+      "median_duration_s": 4.48,
+      "min_duration_s": 2.64,
+      "max_duration_s": 9.76,
+      "caps": 0,
+      "at_max_frames": 0,
+      "exact48": 9,
+      "pcm_derived_frames": 17224.0,
+      "peak_inflight": 32,
+      "interior_rps": 15.772488640297134,
+      "interior_rtf": 0.013955919853733439,
+      "interior_mean_inflight": 31.999625586638548,
+      "fixed48_valid": false,
+      "max_response_s": 4.05552648473531
+    },
+    {
+      "arm": "final",
+      "round": 0,
+      "mode": "sampled",
+      "client_concurrency": 64,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 18.54867773130536,
+      "audio_s": 1379.92,
+      "rps": 16.173659618533225,
+      "rtf": 0.013441850057470985,
+      "p95_response_s": 4.537079988559708,
+      "mean_duration_s": 4.599733333333334,
+      "median_duration_s": 4.56,
+      "min_duration_s": 2.8,
+      "max_duration_s": 8.48,
+      "caps": 0,
+      "at_max_frames": 0,
+      "exact48": 6,
+      "pcm_derived_frames": 17249.0,
+      "peak_inflight": 64,
+      "interior_rps": 15.8409283531812,
+      "interior_rtf": 0.013839659582945052,
+      "interior_mean_inflight": 63.99963034685142,
+      "fixed48_valid": false,
+      "max_response_s": 5.520832907408476
+    },
+    {
+      "arm": "final",
+      "round": 1,
+      "mode": "greedy48",
+      "client_concurrency": 32,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 12.254824021831155,
+      "audio_s": 1139.68,
+      "rps": 24.48015568934894,
+      "rtf": 0.010752863980969354,
+      "p95_response_s": 1.3326363097177818,
+      "mean_duration_s": 3.7989333333333337,
+      "median_duration_s": 3.84,
+      "min_duration_s": 2.96,
+      "max_duration_s": 3.84,
+      "caps": 277,
+      "at_max_frames": 274,
+      "exact48": 274,
+      "pcm_derived_frames": 14246.0,
+      "peak_inflight": 32,
+      "interior_rps": 23.823985180226373,
+      "interior_rtf": 0.011062433628333746,
+      "interior_mean_inflight": 31.999409786066966,
+      "fixed48_valid": false,
+      "max_response_s": 1.361410547979176
+    },
+    {
+      "arm": "final",
+      "round": 1,
+      "mode": "greedy48",
+      "client_concurrency": 64,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 11.139470681082457,
+      "audio_s": 1141.12,
+      "rps": 26.931261689971794,
+      "rtf": 0.00976187489578875,
+      "p95_response_s": 2.3560594292357564,
+      "mean_duration_s": 3.803733333333333,
+      "median_duration_s": 3.84,
+      "min_duration_s": 2.8,
+      "max_duration_s": 3.84,
+      "caps": 282,
+      "at_max_frames": 282,
+      "exact48": 282,
+      "pcm_derived_frames": 14264.0,
+      "peak_inflight": 64,
+      "interior_rps": 26.111513201255992,
+      "interior_rtf": 0.010082729464473302,
+      "interior_mean_inflight": 63.99933949378279,
+      "fixed48_valid": false,
+      "max_response_s": 2.371493713930249
+    },
+    {
+      "arm": "final",
+      "round": 1,
+      "mode": "sampled",
+      "client_concurrency": 32,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 18.653851190116256,
+      "audio_s": 1373.1200000000001,
+      "rps": 16.08246988476862,
+      "rtf": 0.013585011645097482,
+      "p95_response_s": 2.5459276892710476,
+      "mean_duration_s": 4.577066666666667,
+      "median_duration_s": 4.48,
+      "min_duration_s": 2.8,
+      "max_duration_s": 8.88,
+      "caps": 0,
+      "at_max_frames": 0,
+      "exact48": 4,
+      "pcm_derived_frames": 17164.0,
+      "peak_inflight": 32,
+      "interior_rps": 15.806562888397778,
+      "interior_rtf": 0.01389570439926151,
+      "interior_mean_inflight": 31.999616261200515,
+      "fixed48_valid": false,
+      "max_response_s": 3.6991110420785844
+    },
+    {
+      "arm": "final",
+      "round": 1,
+      "mode": "sampled",
+      "client_concurrency": 64,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 18.535222947131842,
+      "audio_s": 1369.76,
+      "rps": 16.18540013549836,
+      "rtf": 0.013531730337527628,
+      "p95_response_s": 4.556147839757614,
+      "mean_duration_s": 4.5658666666666665,
+      "median_duration_s": 4.4,
+      "min_duration_s": 2.64,
+      "max_duration_s": 8.8,
+      "caps": 0,
+      "at_max_frames": 0,
+      "exact48": 11,
+      "pcm_derived_frames": 17122.0,
+      "peak_inflight": 64,
+      "interior_rps": 15.81525110648647,
+      "interior_rtf": 0.014033163705711225,
+      "interior_mean_inflight": 63.99962328469041,
+      "fixed48_valid": false,
+      "max_response_s": 5.544348424300551
+    },
+    {
+      "arm": "final",
+      "round": 2,
+      "mode": "greedy48",
+      "client_concurrency": 32,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 12.365936156827956,
+      "audio_s": 1142.1599999999999,
+      "rps": 24.260193178690514,
+      "rtf": 0.010826798484299887,
+      "p95_response_s": 1.423822610313073,
+      "mean_duration_s": 3.8071999999999995,
+      "median_duration_s": 3.84,
+      "min_duration_s": 2.96,
+      "max_duration_s": 3.84,
+      "caps": 282,
+      "at_max_frames": 280,
+      "exact48": 280,
+      "pcm_derived_frames": 14277.0,
+      "peak_inflight": 32,
+      "interior_rps": 23.562173703329602,
+      "interior_rtf": 0.01115026548503734,
+      "interior_mean_inflight": 31.99942383477762,
+      "fixed48_valid": false,
+      "max_response_s": 1.47030667681247
+    },
+    {
+      "arm": "final",
+      "round": 2,
+      "mode": "greedy48",
+      "client_concurrency": 64,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 11.290032208897173,
+      "audio_s": 1141.68,
+      "rps": 26.57211197002461,
+      "rtf": 0.009888963815515007,
+      "p95_response_s": 2.424221107456833,
+      "mean_duration_s": 3.8056,
+      "median_duration_s": 3.84,
+      "min_duration_s": 2.96,
+      "max_duration_s": 3.84,
+      "caps": 282,
+      "at_max_frames": 280,
+      "exact48": 280,
+      "pcm_derived_frames": 14271.0,
+      "peak_inflight": 64,
+      "interior_rps": 25.776552207561373,
+      "interior_rtf": 0.010202825738838942,
+      "interior_mean_inflight": 63.99933511364126,
+      "fixed48_valid": false,
+      "max_response_s": 2.4331844090484083
+    },
+    {
+      "arm": "final",
+      "round": 2,
+      "mode": "sampled",
+      "client_concurrency": 32,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 18.93886736407876,
+      "audio_s": 1395.04,
+      "rps": 15.840440414562925,
+      "rtf": 0.013575859734544357,
+      "p95_response_s": 2.6509435122599827,
+      "mean_duration_s": 4.650133333333333,
+      "median_duration_s": 4.48,
+      "min_duration_s": 2.56,
+      "max_duration_s": 25.84,
+      "caps": 0,
+      "at_max_frames": 0,
+      "exact48": 11,
+      "pcm_derived_frames": 17438.0,
+      "peak_inflight": 32,
+      "interior_rps": 15.46414657722741,
+      "interior_rtf": 0.013988772091516137,
+      "interior_mean_inflight": 31.999631729721422,
+      "fixed48_valid": false,
+      "max_response_s": 10.408001323696226
+    },
+    {
+      "arm": "final",
+      "round": 2,
+      "mode": "sampled",
+      "client_concurrency": 64,
+      "requests": 300,
+      "failures": 0,
+      "makespan_s": 18.556426780298352,
+      "audio_s": 1373.84,
+      "rps": 16.166905598362,
+      "rtf": 0.013506978090824516,
+      "p95_response_s": 4.500672037573532,
+      "mean_duration_s": 4.579466666666667,
+      "median_duration_s": 4.44,
+      "min_duration_s": 2.72,
+      "max_duration_s": 14.0,
+      "caps": 0,
+      "at_max_frames": 0,
+      "exact48": 5,
+      "pcm_derived_frames": 17173.0,
+      "peak_inflight": 64,
+      "interior_rps": 15.927726434800704,
+      "interior_rtf": 0.013815576532996239,
+      "interior_mean_inflight": 63.999623723744996,
+      "fixed48_valid": false,
+      "max_response_s": 7.473742607049644
+    }
+  ],
+  "summaries": {
+    "sampled-c32": {
+      "baseline": {
+        "requests": {
+          "median": 300,
+          "min": 300,
+          "max": 300
+        },
+        "failures": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "makespan_s": {
+          "median": 19.982479984872043,
+          "min": 19.73926813295111,
+          "max": 20.184422803111374
+        },
+        "audio_s": {
+          "median": 1372.48,
+          "min": 1371.52,
+          "max": 1385.04
+        },
+        "rps": {
+          "median": 15.013151532098034,
+          "min": 14.862946685488366,
+          "max": 15.19813186483873
+        },
+        "rtf": {
+          "median": 0.014569587016501432,
+          "min": 0.014382190001275873,
+          "max": 0.01457316958579635
+        },
+        "p95_response_s": {
+          "median": 2.6867772510275243,
+          "min": 2.6196906621102243,
+          "max": 2.753425784688443
+        },
+        "mean_duration_s": {
+          "median": 4.574933333333333,
+          "min": 4.571733333333333,
+          "max": 4.6168
+        },
+        "median_duration_s": {
+          "median": 4.52,
+          "min": 4.48,
+          "max": 4.56
+        },
+        "min_duration_s": {
+          "median": 2.64,
+          "min": 2.4,
+          "max": 2.72
+        },
+        "max_duration_s": {
+          "median": 8.0,
+          "min": 7.76,
+          "max": 10.0
+        },
+        "caps": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "at_max_frames": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "exact48": {
+          "median": 11,
+          "min": 7,
+          "max": 11
+        },
+        "pcm_derived_frames": {
+          "median": 17156.0,
+          "min": 17144.0,
+          "max": 17313.0
+        },
+        "peak_inflight": {
+          "median": 32,
+          "min": 32,
+          "max": 32
+        },
+        "interior_rps": {
+          "median": 14.688290200283893,
+          "min": 14.506207588669962,
+          "max": 14.769683037456982
+        },
+        "interior_rtf": {
+          "median": 0.014979169569545266,
+          "min": 0.014883914366667608,
+          "max": 0.01503976665662243
+        },
+        "interior_mean_inflight": {
+          "median": 31.99963270833469,
+          "min": 31.99963069200315,
+          "max": 31.99964170182187
+        },
+        "total_requests": 900,
+        "total_audio_s": 4129.04,
+        "total_caps": 0,
+        "total_at_max_frames": 0,
+        "total_exact48": 29,
+        "all_fixed48_valid": false
+      },
+      "final": {
+        "requests": {
+          "median": 300,
+          "min": 300,
+          "max": 300
+        },
+        "failures": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "makespan_s": {
+          "median": 18.745703546330333,
+          "min": 18.653851190116256,
+          "max": 18.93886736407876
+        },
+        "audio_s": {
+          "median": 1377.92,
+          "min": 1373.1200000000001,
+          "max": 1395.04
+        },
+        "rps": {
+          "median": 16.003667147437,
+          "min": 15.840440414562925,
+          "max": 16.08246988476862
+        },
+        "rtf": {
+          "median": 0.013585011645097482,
+          "min": 0.013575859734544357,
+          "max": 0.013604348254129654
+        },
+        "p95_response_s": {
+          "median": 2.5659151571802794,
+          "min": 2.5459276892710476,
+          "max": 2.6509435122599827
+        },
+        "mean_duration_s": {
+          "median": 4.593066666666667,
+          "min": 4.577066666666667,
+          "max": 4.650133333333333
+        },
+        "median_duration_s": {
+          "median": 4.48,
+          "min": 4.48,
+          "max": 4.48
+        },
+        "min_duration_s": {
+          "median": 2.64,
+          "min": 2.56,
+          "max": 2.8
+        },
+        "max_duration_s": {
+          "median": 9.76,
+          "min": 8.88,
+          "max": 25.84
+        },
+        "caps": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "at_max_frames": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "exact48": {
+          "median": 9,
+          "min": 4,
+          "max": 11
+        },
+        "pcm_derived_frames": {
+          "median": 17224.0,
+          "min": 17164.0,
+          "max": 17438.0
+        },
+        "peak_inflight": {
+          "median": 32,
+          "min": 32,
+          "max": 32
+        },
+        "interior_rps": {
+          "median": 15.772488640297134,
+          "min": 15.46414657722741,
+          "max": 15.806562888397778
+        },
+        "interior_rtf": {
+          "median": 0.013955919853733439,
+          "min": 0.01389570439926151,
+          "max": 0.013988772091516137
+        },
+        "interior_mean_inflight": {
+          "median": 31.999625586638548,
+          "min": 31.999616261200515,
+          "max": 31.999631729721422
+        },
+        "total_requests": 900,
+        "total_audio_s": 4146.08,
+        "total_caps": 0,
+        "total_at_max_frames": 0,
+        "total_exact48": 24,
+        "all_fixed48_valid": false
+      },
+      "median_percent_change": {
+        "rps": 6.597652819404698,
+        "rtf": -6.75774385566884,
+        "p95_response_s": -4.49840394476404,
+        "audio_s": 0.39636278852879236,
+        "mean_duration_s": 0.39636278852881457,
+        "interior_rps": 7.381379488214934
+      },
+      "total_audio_percent_change": 0.41268672621239677,
+      "matched_pcm_hashes": 14,
+      "matched_durations": 112
+    },
+    "greedy48-c32": {
+      "baseline": {
+        "requests": {
+          "median": 300,
+          "min": 300,
+          "max": 300
+        },
+        "failures": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "makespan_s": {
+          "median": 12.368925544898957,
+          "min": 12.094073274172843,
+          "max": 12.409082953352481
+        },
+        "audio_s": {
+          "median": 1140.24,
+          "min": 1138.1599999999999,
+          "max": 1140.8799999999999
+        },
+        "rps": {
+          "median": 24.25432984546684,
+          "min": 24.175839675481495,
+          "max": 24.805538481452444
+        },
+        "rtf": {
+          "median": 0.010841565760552344,
+          "min": 0.010606603236312392,
+          "max": 0.010902757919231464
+        },
+        "p95_response_s": {
+          "median": 1.3458482225192712,
+          "min": 1.3324332737131044,
+          "max": 1.3660403012065216
+        },
+        "mean_duration_s": {
+          "median": 3.8008,
+          "min": 3.7938666666666663,
+          "max": 3.802933333333333
+        },
+        "median_duration_s": {
+          "median": 3.84,
+          "min": 3.84,
+          "max": 3.84
+        },
+        "min_duration_s": {
+          "median": 2.96,
+          "min": 2.96,
+          "max": 2.96
+        },
+        "max_duration_s": {
+          "median": 3.84,
+          "min": 3.84,
+          "max": 3.84
+        },
+        "caps": {
+          "median": 276,
+          "min": 276,
+          "max": 278
+        },
+        "at_max_frames": {
+          "median": 274,
+          "min": 273,
+          "max": 276
+        },
+        "exact48": {
+          "median": 274,
+          "min": 273,
+          "max": 276
+        },
+        "pcm_derived_frames": {
+          "median": 14253.0,
+          "min": 14227.0,
+          "max": 14261.0
+        },
+        "peak_inflight": {
+          "median": 32,
+          "min": 32,
+          "max": 32
+        },
+        "interior_rps": {
+          "median": 23.594010932160216,
+          "min": 23.55702600182998,
+          "max": 24.0738475426106
+        },
+        "interior_rtf": {
+          "median": 0.011157971292675595,
+          "min": 0.010936431591609813,
+          "max": 0.011197488491907423
+        },
+        "interior_mean_inflight": {
+          "median": 31.999404196554725,
+          "min": 31.999390705533155,
+          "max": 31.99941429464469
+        },
+        "total_requests": 900,
+        "total_audio_s": 3419.2799999999997,
+        "total_caps": 830,
+        "total_at_max_frames": 823,
+        "total_exact48": 823,
+        "all_fixed48_valid": false
+      },
+      "final": {
+        "requests": {
+          "median": 300,
+          "min": 300,
+          "max": 300
+        },
+        "failures": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "makespan_s": {
+          "median": 12.365936156827956,
+          "min": 12.254824021831155,
+          "max": 12.865571803878993
+        },
+        "audio_s": {
+          "median": 1141.92,
+          "min": 1139.68,
+          "max": 1142.1599999999999
+        },
+        "rps": {
+          "median": 24.260193178690514,
+          "min": 23.31804637781816,
+          "max": 24.48015568934894
+        },
+        "rtf": {
+          "median": 0.010826798484299887,
+          "min": 0.010752863980969354,
+          "max": 0.011266613951834622
+        },
+        "p95_response_s": {
+          "median": 1.423822610313073,
+          "min": 1.3326363097177818,
+          "max": 1.4281870554899796
+        },
+        "mean_duration_s": {
+          "median": 3.8064000000000004,
+          "min": 3.7989333333333337,
+          "max": 3.8071999999999995
+        },
+        "median_duration_s": {
+          "median": 3.84,
+          "min": 3.84,
+          "max": 3.84
+        },
+        "min_duration_s": {
+          "median": 2.96,
+          "min": 2.96,
+          "max": 2.96
+        },
+        "max_duration_s": {
+          "median": 3.84,
+          "min": 3.84,
+          "max": 3.84
+        },
+        "caps": {
+          "median": 280,
+          "min": 277,
+          "max": 282
+        },
+        "at_max_frames": {
+          "median": 276,
+          "min": 274,
+          "max": 280
+        },
+        "exact48": {
+          "median": 276,
+          "min": 274,
+          "max": 280
+        },
+        "pcm_derived_frames": {
+          "median": 14274.0,
+          "min": 14246.0,
+          "max": 14277.0
+        },
+        "peak_inflight": {
+          "median": 32,
+          "min": 32,
+          "max": 32
+        },
+        "interior_rps": {
+          "median": 23.562173703329602,
+          "min": 22.500397275173285,
+          "max": 23.823985180226373
+        },
+        "interior_rtf": {
+          "median": 0.01115026548503734,
+          "min": 0.011062433628333746,
+          "max": 0.011688354533888935
+        },
+        "interior_mean_inflight": {
+          "median": 31.99942383477762,
+          "min": 31.999409786066966,
+          "max": 31.999437066682333
+        },
+        "total_requests": 900,
+        "total_audio_s": 3423.76,
+        "total_caps": 839,
+        "total_at_max_frames": 830,
+        "total_exact48": 830,
+        "all_fixed48_valid": false
+      },
+      "median_percent_change": {
+        "rps": 0.024174377362840005,
+        "rtf": -0.13620981118971365,
+        "p95_response_s": 5.793698463846297,
+        "audio_s": 0.14733740265207018,
+        "mean_duration_s": 0.14733740265207018,
+        "interior_rps": -0.13493775569637378
+      },
+      "total_audio_percent_change": 0.13102173557006935,
+      "matched_pcm_hashes": 1,
+      "matched_durations": 804
+    },
+    "sampled-c64": {
+      "baseline": {
+        "requests": {
+          "median": 300,
+          "min": 300,
+          "max": 300
+        },
+        "failures": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "makespan_s": {
+          "median": 19.836500237695873,
+          "min": 19.736425609793514,
+          "max": 19.947364503052086
+        },
+        "audio_s": {
+          "median": 1368.8,
+          "min": 1363.84,
+          "max": 1378.88
+        },
+        "rps": {
+          "median": 15.123635540804791,
+          "min": 15.039580790439654,
+          "max": 15.200320763813254
+        },
+        "rtf": {
+          "median": 0.014471217745331942,
+          "min": 0.014466352766775995,
+          "max": 0.01449189088084152
+        },
+        "p95_response_s": {
+          "median": 4.845615285425447,
+          "min": 4.799736037221737,
+          "max": 4.897944782185368
+        },
+        "mean_duration_s": {
+          "median": 4.562666666666667,
+          "min": 4.546133333333333,
+          "max": 4.596266666666667
+        },
+        "median_duration_s": {
+          "median": 4.48,
+          "min": 4.4,
+          "max": 4.48
+        },
+        "min_duration_s": {
+          "median": 2.88,
+          "min": 2.72,
+          "max": 2.88
+        },
+        "max_duration_s": {
+          "median": 10.24,
+          "min": 8.72,
+          "max": 11.68
+        },
+        "caps": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "at_max_frames": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "exact48": {
+          "median": 9,
+          "min": 5,
+          "max": 11
+        },
+        "pcm_derived_frames": {
+          "median": 17110.0,
+          "min": 17048.0,
+          "max": 17236.0
+        },
+        "peak_inflight": {
+          "median": 64,
+          "min": 64,
+          "max": 64
+        },
+        "interior_rps": {
+          "median": 14.772988235869104,
+          "min": 14.76624455355767,
+          "max": 14.826302139784737
+        },
+        "interior_rtf": {
+          "median": 0.014957955135430911,
+          "min": 0.014789570445164352,
+          "max": 0.015027830388430046
+        },
+        "interior_mean_inflight": {
+          "median": 63.99964299078361,
+          "min": 63.99961896669195,
+          "max": 63.9996463755415
+        },
+        "total_requests": 900,
+        "total_audio_s": 4111.52,
+        "total_caps": 0,
+        "total_at_max_frames": 0,
+        "total_exact48": 25,
+        "all_fixed48_valid": false
+      },
+      "final": {
+        "requests": {
+          "median": 300,
+          "min": 300,
+          "max": 300
+        },
+        "failures": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "makespan_s": {
+          "median": 18.54867773130536,
+          "min": 18.535222947131842,
+          "max": 18.556426780298352
+        },
+        "audio_s": {
+          "median": 1373.84,
+          "min": 1369.76,
+          "max": 1379.92
+        },
+        "rps": {
+          "median": 16.173659618533225,
+          "min": 16.166905598362,
+          "max": 16.18540013549836
+        },
+        "rtf": {
+          "median": 0.013506978090824516,
+          "min": 0.013441850057470985,
+          "max": 0.013531730337527628
+        },
+        "p95_response_s": {
+          "median": 4.537079988559708,
+          "min": 4.500672037573532,
+          "max": 4.556147839757614
+        },
+        "mean_duration_s": {
+          "median": 4.579466666666667,
+          "min": 4.5658666666666665,
+          "max": 4.599733333333334
+        },
+        "median_duration_s": {
+          "median": 4.44,
+          "min": 4.4,
+          "max": 4.56
+        },
+        "min_duration_s": {
+          "median": 2.72,
+          "min": 2.64,
+          "max": 2.8
+        },
+        "max_duration_s": {
+          "median": 8.8,
+          "min": 8.48,
+          "max": 14.0
+        },
+        "caps": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "at_max_frames": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "exact48": {
+          "median": 6,
+          "min": 5,
+          "max": 11
+        },
+        "pcm_derived_frames": {
+          "median": 17173.0,
+          "min": 17122.0,
+          "max": 17249.0
+        },
+        "peak_inflight": {
+          "median": 64,
+          "min": 64,
+          "max": 64
+        },
+        "interior_rps": {
+          "median": 15.8409283531812,
+          "min": 15.81525110648647,
+          "max": 15.927726434800704
+        },
+        "interior_rtf": {
+          "median": 0.013839659582945052,
+          "min": 0.013815576532996239,
+          "max": 0.014033163705711225
+        },
+        "interior_mean_inflight": {
+          "median": 63.999623723744996,
+          "min": 63.99962328469041,
+          "max": 63.99963034685142
+        },
+        "total_requests": 900,
+        "total_audio_s": 4123.52,
+        "total_caps": 0,
+        "total_at_max_frames": 0,
+        "total_exact48": 22,
+        "all_fixed48_valid": false
+      },
+      "median_percent_change": {
+        "rps": 6.942934289148828,
+        "rtf": -6.663154901517987,
+        "p95_response_s": -6.367308972995566,
+        "audio_s": 0.36820572764464377,
+        "mean_duration_s": 0.36820572764464377,
+        "interior_rps": 7.229005399998334
+      },
+      "total_audio_percent_change": 0.29186286336926326,
+      "matched_pcm_hashes": 7,
+      "matched_durations": 112
+    },
+    "greedy48-c64": {
+      "baseline": {
+        "requests": {
+          "median": 300,
+          "min": 300,
+          "max": 300
+        },
+        "failures": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "makespan_s": {
+          "median": 11.363486644811928,
+          "min": 11.264604894910008,
+          "max": 11.4890843112953
+        },
+        "audio_s": {
+          "median": 1140.8,
+          "min": 1137.6,
+          "max": 1142.32
+        },
+        "rps": {
+          "median": 26.400347831355695,
+          "min": 26.11174153409772,
+          "max": 26.632092541084788
+        },
+        "rtf": {
+          "median": 0.009947726245545845,
+          "min": 0.009874303028497552,
+          "max": 0.010099406040168162
+        },
+        "p95_response_s": {
+          "median": 2.4218830559635536,
+          "min": 2.411577110388316,
+          "max": 2.568560073385015
+        },
+        "mean_duration_s": {
+          "median": 3.8026666666666666,
+          "min": 3.792,
+          "max": 3.807733333333333
+        },
+        "median_duration_s": {
+          "median": 3.84,
+          "min": 3.84,
+          "max": 3.84
+        },
+        "min_duration_s": {
+          "median": 2.8,
+          "min": 2.8,
+          "max": 2.96
+        },
+        "max_duration_s": {
+          "median": 3.84,
+          "min": 3.84,
+          "max": 3.84
+        },
+        "caps": {
+          "median": 282,
+          "min": 275,
+          "max": 283
+        },
+        "at_max_frames": {
+          "median": 282,
+          "min": 269,
+          "max": 283
+        },
+        "exact48": {
+          "median": 282,
+          "min": 269,
+          "max": 283
+        },
+        "pcm_derived_frames": {
+          "median": 14260.0,
+          "min": 14220.0,
+          "max": 14279.0
+        },
+        "peak_inflight": {
+          "median": 64,
+          "min": 64,
+          "max": 64
+        },
+        "interior_rps": {
+          "median": 25.370435925769396,
+          "min": 25.24913933766535,
+          "max": 25.794812158986286
+        },
+        "interior_rtf": {
+          "median": 0.010412561279692619,
+          "min": 0.010210167083200961,
+          "max": 0.010414089097638338
+        },
+        "interior_mean_inflight": {
+          "median": 63.99934789676571,
+          "min": 63.999343316676544,
+          "max": 63.99934963725613
+        },
+        "total_requests": 900,
+        "total_audio_s": 3420.72,
+        "total_caps": 840,
+        "total_at_max_frames": 834,
+        "total_exact48": 834,
+        "all_fixed48_valid": false
+      },
+      "final": {
+        "requests": {
+          "median": 300,
+          "min": 300,
+          "max": 300
+        },
+        "failures": {
+          "median": 0,
+          "min": 0,
+          "max": 0
+        },
+        "makespan_s": {
+          "median": 11.269619753584266,
+          "min": 11.139470681082457,
+          "max": 11.290032208897173
+        },
+        "audio_s": {
+          "median": 1141.6,
+          "min": 1141.12,
+          "max": 1141.68
+        },
+        "rps": {
+          "median": 26.620241548485783,
+          "min": 26.57211197002461,
+          "max": 26.931261689971794
+        },
+        "rtf": {
+          "median": 0.009871776238248307,
+          "min": 0.00976187489578875,
+          "max": 0.009888963815515007
+        },
+        "p95_response_s": {
+          "median": 2.424221107456833,
+          "min": 2.3560594292357564,
+          "max": 2.4245060281828046
+        },
+        "mean_duration_s": {
+          "median": 3.805333333333333,
+          "min": 3.803733333333333,
+          "max": 3.8056
+        },
+        "median_duration_s": {
+          "median": 3.84,
+          "min": 3.84,
+          "max": 3.84
+        },
+        "min_duration_s": {
+          "median": 2.88,
+          "min": 2.8,
+          "max": 2.96
+        },
+        "max_duration_s": {
+          "median": 3.84,
+          "min": 3.84,
+          "max": 3.84
+        },
+        "caps": {
+          "median": 282,
+          "min": 282,
+          "max": 283
+        },
+        "at_max_frames": {
+          "median": 280,
+          "min": 279,
+          "max": 282
+        },
+        "exact48": {
+          "median": 280,
+          "min": 279,
+          "max": 282
+        },
+        "pcm_derived_frames": {
+          "median": 14270.0,
+          "min": 14264.0,
+          "max": 14271.0
+        },
+        "peak_inflight": {
+          "median": 64,
+          "min": 64,
+          "max": 64
+        },
+        "interior_rps": {
+          "median": 25.810591381249292,
+          "min": 25.776552207561373,
+          "max": 26.111513201255992
+        },
+        "interior_rtf": {
+          "median": 0.010193914144174995,
+          "min": 0.010082729464473302,
+          "max": 0.010202825738838942
+        },
+        "interior_mean_inflight": {
+          "median": 63.99933949378279,
+          "min": 63.99933511364126,
+          "max": 63.99934948513199
+        },
+        "total_requests": 900,
+        "total_audio_s": 3424.3999999999996,
+        "total_caps": 847,
+        "total_at_max_frames": 841,
+        "total_exact48": 841,
+        "all_fixed48_valid": false
+      },
+      "median_percent_change": {
+        "rps": 0.8329197726286042,
+        "rtf": -0.7634911277493606,
+        "p95_response_s": 0.09653857924816212,
+        "audio_s": 0.07012622720896644,
+        "mean_duration_s": 0.07012622720896644,
+        "interior_rps": 1.7349148306624818
+      },
+      "total_audio_percent_change": 0.10757969082531016,
+      "matched_pcm_hashes": 164,
+      "matched_durations": 844
+    }
+  },
+  "memory": {
+    "scope": "1 Hz whole-GPU resident memory across startup, four warmups, all measured rounds, post-timing C1 control, and shutdown; not peak allocated memory and not a measured-window-only peak.",
+    "arms": {
+      "baseline": {
+        "samples": 499,
+        "observed_duration_s": 498.07,
+        "max_sampled_resident_MiB": 30081,
+        "max_sampled_resident_GiB": 29.3759765625,
+        "max_poll_gap_s": 1.001,
+        "median_poll_gap_s": 1.0,
+        "last_sample_MiB": 4,
+        "csv_sha256": "17134f74aa2854bd5d792da1a451879dea086f145eea971bd5fe5e153c14ebb1"
+      },
+      "final": {
+        "samples": 479,
+        "observed_duration_s": 478.068,
+        "max_sampled_resident_MiB": 29245,
+        "max_sampled_resident_GiB": 28.5595703125,
+        "max_poll_gap_s": 1.001,
+        "median_poll_gap_s": 1.0,
+        "last_sample_MiB": 4,
+        "csv_sha256": "51d8ce22b6632a07725285379e4d1fd23b8b972ea0329bd65e161751a6baf320"
+      }
+    },
+    "max_sampled_resident_change_MiB": -836,
+    "max_sampled_resident_change_pct": -2.7791629267644002,
+    "interpretation": "These are observed whole-run sampled resident maxima, including startup and warmup. The difference is not attributed to memory savings from the optimization."
+  },
+  "c1_control": {
+    "requests": 60,
+    "request_bodies_match": true,
+    "matching_counts": {
+      "pcm_bytes": 60,
+      "generated_frame_estimate": 60,
+      "pcm_sha256": 60
+    },
+    "wav_payloads_independently_verified": {
+      "baseline": 60,
+      "final": 60
+    },
+    "note": "Frame counts are derived from PCM length; no RVQ token sequence was recorded. Recorded hashes are distinguished from downloaded WAV verification. Excluded from throughput.",
+    "position": "60 sampled requests at concurrency one after measured rounds per arm; excluded from throughput.",
+    "waveform_verification_status": "All 120 saved C1 WAV payloads were independently decoded and checked locally against their recorded PCM hashes; all 60 cross-arm request bodies, PCM-derived frame counts and PCM hashes match.",
+    "saved_wav_payloads_validated_post_timing": 120,
+    "quality_caveat": "Byte-identical output is not necessarily correct speech: one matched control pair has a severe ASR mismatch in the targeted follow-up."
+  },
+  "quality_observations": {
+    "status": "Endpoint, C1 and selected ASR checks completed; severe ASR mismatches confirmed in baseline and final outputs.",
+    "natural_c32_max_audio_s": {
+      "baseline": 10.0,
+      "final": 25.84
+    },
+    "natural_c64_max_audio_s": {
+      "baseline": 11.68,
+      "final": 14.0
+    },
+    "final_c32_longest_response_s": 10.408001323696226,
+    "final_c32_longest_pcm_derived_frames": 323,
+    "outlier_reached_384_frame_cap": false,
+    "caveat": "The final C64 14.0-second output has 27 normalized word edits against 13 reference words. Same-input/seed checks also find severe baseline mismatches and a mismatched byte-identical C1 pair. The final C32 25.84-second output transcribes expected words, but its excess duration remains unexplained. These selected checks establish neither quality equivalence nor a change in failure rates.",
+    "outlier_endpoint_metrics": [
+      {
+        "arm": "final",
+        "client_concurrency": 32,
+        "duration_s": 25.84,
+        "leading_quiet_s": 0.02,
+        "trailing_quiet_s": 0.4,
+        "endpoint_trimmed_duration_s": 25.42,
+        "generated_frame_estimate": 323.0,
+        "wall_s": 10.408001323696226
+      },
+      {
+        "arm": "final",
+        "client_concurrency": 64,
+        "duration_s": 14.0,
+        "leading_quiet_s": 0.04,
+        "trailing_quiet_s": 0.04,
+        "endpoint_trimmed_duration_s": 13.92,
+        "generated_frame_estimate": 175.0,
+        "wall_s": 7.473742607049644
+      },
+      {
+        "arm": "baseline",
+        "client_concurrency": 32,
+        "duration_s": 5.44,
+        "leading_quiet_s": 0.02,
+        "trailing_quiet_s": 0.82,
+        "endpoint_trimmed_duration_s": 4.6,
+        "generated_frame_estimate": 68.0,
+        "wall_s": 2.19121035002172
+      }
+    ],
+    "current_outlier_ASR": [
+      {
+        "arm": "baseline",
+        "client_concurrency": 32,
+        "audio_duration_s": 5.44,
+        "endpoint_trimmed_audio_s": 4.6,
+        "word_edits": 0,
+        "reference_words": 12,
+        "normalized_word_error_rate": 0.0,
+        "exact_normalized_match": true,
+        "finding": "Paired baseline transcribed expected words."
+      },
+      {
+        "arm": "final",
+        "client_concurrency": 32,
+        "audio_duration_s": 25.84,
+        "endpoint_trimmed_audio_s": 25.42,
+        "word_edits": 0,
+        "reference_words": 12,
+        "normalized_word_error_rate": 0.0,
+        "exact_normalized_match": true,
+        "finding": "Expected words transcribed; large duration anomaly remains unresolved."
+      },
+      {
+        "arm": "final",
+        "client_concurrency": 64,
+        "audio_duration_s": 14.0,
+        "endpoint_trimmed_audio_s": 13.92,
+        "word_edits": 27,
+        "reference_words": 13,
+        "normalized_word_error_rate": 2.076923076923077,
+        "exact_normalized_match": false,
+        "finding": "ASR transcribed unrelated content; serious content mismatch."
+      }
+    ],
+    "controlled_same_input_seed_followup": "Complete 13-membership diagnostic: severe baseline mismatches and a mismatched byte-identical C1 pair confirm the issue predates the candidate relative to this baseline. Failure-rate changes and quality equivalence remain unproven."
+  },
+  "limitations": [
+    "Three observed rounds per arm; medians and full min/max ranges, no confidence intervals or statistical significance claim.",
+    "Arms ran sequentially in one allocation, each with a fresh server and identical four-wave warmup; temporal effects remain possible.",
+    "Greedy48 is a capped greedy workload; early EOS prevents a fixed-work claim whenever all_fixed48_valid is false.",
+    "Natural output duration and caps affect wall/audio RTF. ASR and quiet-tail validation are separate evidence; no quality equivalence inferred here.",
+    "Interior completion rates omit ramp-up/drain but include whole delivered clips crossing window boundaries; not a GPU-work measure.",
+    "Greedy median throughput changes only +0.02% at C32 and +0.83% at C64; ranges overlap. C32 median per-cohort p95 response increases. The 48-token cap permits early EOS and is not a fixed-work control.",
+    "Gains are incremental versus the stated baseline only; no multiplication by historical gains.",
+    "C1 recorded hash equality does not establish bitwise concurrent trajectory equality or perceptual quality.",
+    "Whole-run sampled resident memory maxima are not peak allocator usage or measured-window-only peaks.",
+    "Performance evidence covers guidance scale 1, no reference audio, and 30 synthetic English smoke texts only. It establishes no new voice-cloning, higher-guidance, long-prompt or multi-GPU performance claim.",
+    "Startup and warmup are excluded from throughput timing; no cold-start improvement is claimed.",
+    "Severe ASR mismatches occur in both baseline and final outputs, including one byte-identical C1 pair. This confirms a pre-existing baseline problem but establishes neither failure-rate changes, quality equivalence nor causal attribution. The final C32 duration anomaly remains unexplained."
+  ],
+  "endpoint_quality": {
+    "waveforms_validated_by_post_timing_scan": 7200,
+    "group_count": 24,
+    "method": "20ms endpoint RMS windows <= -40dBFS; internal pauses retained; WAVs unchanged; trimmed RTF is a diagnostic sensitivity check, not speech detection or a replacement timing metric.",
+    "families": {
+      "sampled-c32": {
+        "baseline": {
+          "raw_audio_s": 4129.04,
+          "endpoint_trimmed_audio_s": 3846.56,
+          "endpoint_quiet_fraction": 0.06841299672563114,
+          "endpoint_trimmed_rtf": {
+            "median": 0.015680875390857187,
+            "min": 0.015360102819197814,
+            "max": 0.01568163481932419
+          },
+          "max_trailing_quiet_s": 1.54,
+          "all_quiet_count": 0,
+          "trailing_quiet_at_least_3s": 0
+        },
+        "final": {
+          "raw_audio_s": 4146.08,
+          "endpoint_trimmed_audio_s": 3880.1400000000003,
+          "endpoint_quiet_fraction": 0.06414251533979075,
+          "endpoint_trimmed_rtf": {
+            "median": 0.014528399685595633,
+            "min": 0.014491443388230744,
+            "max": 0.014539698190213456
+          },
+          "max_trailing_quiet_s": 1.34,
+          "all_quiet_count": 0,
+          "trailing_quiet_at_least_3s": 0
+        }
+      },
+      "sampled-c64": {
+        "baseline": {
+          "raw_audio_s": 4111.52,
+          "endpoint_trimmed_audio_s": 3836.66,
+          "endpoint_quiet_fraction": 0.06685118885473026,
+          "endpoint_trimmed_rtf": {
+            "median": 0.015514306549576187,
+            "min": 0.015510448744788451,
+            "max": 0.015515933418093543
+          },
+          "max_trailing_quiet_s": 2.04,
+          "all_quiet_count": 0,
+          "trailing_quiet_at_least_3s": 0
+        },
+        "final": {
+          "raw_audio_s": 4123.52,
+          "endpoint_trimmed_audio_s": 3841.3,
+          "endpoint_quiet_fraction": 0.06844152568679192,
+          "endpoint_trimmed_rtf": {
+            "median": 0.01450060700187415,
+            "min": 0.014416817761002147,
+            "max": 0.014537429762456347
+          },
+          "max_trailing_quiet_s": 1.46,
+          "all_quiet_count": 0,
+          "trailing_quiet_at_least_3s": 0
+        }
+      },
+      "greedy48-c32": {
+        "baseline": {
+          "raw_audio_s": 3419.2799999999997,
+          "endpoint_trimmed_audio_s": 3314.56,
+          "endpoint_quiet_fraction": 0.030626330689501827,
+          "endpoint_trimmed_rtf": {
+            "median": 0.01117902963097769,
+            "min": 0.010945258900026102,
+            "max": 0.011248670141550168
+          },
+          "max_trailing_quiet_s": 1.78,
+          "all_quiet_count": 0,
+          "trailing_quiet_at_least_3s": 0
+        },
+        "final": {
+          "raw_audio_s": 3423.76,
+          "endpoint_trimmed_audio_s": 3315.88,
+          "endpoint_quiet_fraction": 0.03150921793583666,
+          "endpoint_trimmed_rtf": {
+            "median": 0.011153931029244703,
+            "min": 0.011152539823979037,
+            "max": 0.011607545971489015
+          },
+          "max_trailing_quiet_s": 3.08,
+          "all_quiet_count": 0,
+          "trailing_quiet_at_least_3s": 1
+        }
+      },
+      "greedy48-c64": {
+        "baseline": {
+          "raw_audio_s": 3420.72,
+          "endpoint_trimmed_audio_s": 3317.9799999999996,
+          "endpoint_quiet_fraction": 0.030034612596178654,
+          "endpoint_trimmed_rtf": {
+            "median": 0.010294318704194309,
+            "min": 0.01015213404613458,
+            "max": 0.01040169148359978
+          },
+          "max_trailing_quiet_s": 1.5,
+          "all_quiet_count": 0,
+          "trailing_quiet_at_least_3s": 0
+        },
+        "final": {
+          "raw_audio_s": 3424.3999999999996,
+          "endpoint_trimmed_audio_s": 3326.52,
+          "endpoint_quiet_fraction": 0.02858310944983053,
+          "endpoint_trimmed_rtf": {
+            "median": 0.010161415751703484,
+            "min": 0.010035378354518348,
+            "max": 0.01019471231750449
+          },
+          "max_trailing_quiet_s": 1.18,
+          "all_quiet_count": 0,
+          "trailing_quiet_at_least_3s": 0
+        }
+      }
+    },
+    "individual_groups": [
+      {
+        "arm": "baseline",
+        "round": 0,
+        "mode": "sampled",
+        "client_concurrency": 32,
+        "count": 300,
+        "raw_audio_s": 1372.48,
+        "endpoint_trimmed_audio_s": 1285.1,
+        "raw_aggregate_rtf": 0.014382190001275873,
+        "endpoint_trimmed_aggregate_rtf": 0.015360102819197814,
+        "endpoint_quiet_fraction": 0.0636657729074377,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.28
+      },
+      {
+        "arm": "baseline",
+        "round": 0,
+        "mode": "sampled",
+        "client_concurrency": 64,
+        "count": 300,
+        "raw_audio_s": 1368.8,
+        "endpoint_trimmed_audio_s": 1278.46,
+        "raw_aggregate_rtf": 0.01449189088084152,
+        "endpoint_trimmed_aggregate_rtf": 0.015515933418093543,
+        "endpoint_quiet_fraction": 0.065999415546464,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.26
+      },
+      {
+        "arm": "baseline",
+        "round": 0,
+        "mode": "greedy48",
+        "client_concurrency": 32,
+        "count": 300,
+        "raw_audio_s": 1138.1599999999999,
+        "endpoint_trimmed_audio_s": 1103.1599999999999,
+        "raw_aggregate_rtf": 0.010902757919231464,
+        "endpoint_trimmed_aggregate_rtf": 0.011248670141550168,
+        "endpoint_quiet_fraction": 0.03075138820552471,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.78
+      },
+      {
+        "arm": "baseline",
+        "round": 0,
+        "mode": "greedy48",
+        "client_concurrency": 64,
+        "count": 300,
+        "raw_audio_s": 1137.6,
+        "endpoint_trimmed_audio_s": 1104.54,
+        "raw_aggregate_rtf": 0.010099406040168162,
+        "endpoint_trimmed_aggregate_rtf": 0.01040169148359978,
+        "endpoint_quiet_fraction": 0.029061181434599112,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.5
+      },
+      {
+        "arm": "baseline",
+        "round": 1,
+        "mode": "sampled",
+        "client_concurrency": 32,
+        "count": 300,
+        "raw_audio_s": 1385.04,
+        "endpoint_trimmed_audio_s": 1287.2,
+        "raw_aggregate_rtf": 0.01457316958579635,
+        "endpoint_trimmed_aggregate_rtf": 0.015680875390857187,
+        "endpoint_quiet_fraction": 0.07064055911742616,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.32
+      },
+      {
+        "arm": "baseline",
+        "round": 1,
+        "mode": "sampled",
+        "client_concurrency": 64,
+        "count": 300,
+        "raw_audio_s": 1378.88,
+        "endpoint_trimmed_audio_s": 1285.74,
+        "raw_aggregate_rtf": 0.014466352766775995,
+        "endpoint_trimmed_aggregate_rtf": 0.015514306549576187,
+        "endpoint_quiet_fraction": 0.0675475748433512,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.8
+      },
+      {
+        "arm": "baseline",
+        "round": 1,
+        "mode": "greedy48",
+        "client_concurrency": 32,
+        "count": 300,
+        "raw_audio_s": 1140.8799999999999,
+        "endpoint_trimmed_audio_s": 1106.44,
+        "raw_aggregate_rtf": 0.010841565760552344,
+        "endpoint_trimmed_aggregate_rtf": 0.01117902963097769,
+        "endpoint_quiet_fraction": 0.030187223897342255,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.4
+      },
+      {
+        "arm": "baseline",
+        "round": 1,
+        "mode": "greedy48",
+        "client_concurrency": 64,
+        "count": 300,
+        "raw_audio_s": 1140.8,
+        "endpoint_trimmed_audio_s": 1109.58,
+        "raw_aggregate_rtf": 0.009874303028497552,
+        "endpoint_trimmed_aggregate_rtf": 0.01015213404613458,
+        "endpoint_quiet_fraction": 0.02736676016830297,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.16
+      },
+      {
+        "arm": "baseline",
+        "round": 2,
+        "mode": "sampled",
+        "client_concurrency": 32,
+        "count": 300,
+        "raw_audio_s": 1371.52,
+        "endpoint_trimmed_audio_s": 1274.26,
+        "raw_aggregate_rtf": 0.014569587016501432,
+        "endpoint_trimmed_aggregate_rtf": 0.01568163481932419,
+        "endpoint_quiet_fraction": 0.07091402239850676,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.54
+      },
+      {
+        "arm": "baseline",
+        "round": 2,
+        "mode": "sampled",
+        "client_concurrency": 64,
+        "count": 300,
+        "raw_audio_s": 1363.84,
+        "endpoint_trimmed_audio_s": 1272.46,
+        "raw_aggregate_rtf": 0.014471217745331942,
+        "endpoint_trimmed_aggregate_rtf": 0.015510448744788451,
+        "endpoint_quiet_fraction": 0.06700199436884084,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 2.04
+      },
+      {
+        "arm": "baseline",
+        "round": 2,
+        "mode": "greedy48",
+        "client_concurrency": 32,
+        "count": 300,
+        "raw_audio_s": 1140.24,
+        "endpoint_trimmed_audio_s": 1104.96,
+        "raw_aggregate_rtf": 0.010606603236312392,
+        "endpoint_trimmed_aggregate_rtf": 0.010945258900026102,
+        "endpoint_quiet_fraction": 0.03094085455693536,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.68
+      },
+      {
+        "arm": "baseline",
+        "round": 2,
+        "mode": "greedy48",
+        "client_concurrency": 64,
+        "count": 300,
+        "raw_audio_s": 1142.32,
+        "endpoint_trimmed_audio_s": 1103.86,
+        "raw_aggregate_rtf": 0.009947726245545845,
+        "endpoint_trimmed_aggregate_rtf": 0.010294318704194309,
+        "endpoint_quiet_fraction": 0.03366832411233283,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.5
+      },
+      {
+        "arm": "final",
+        "round": 0,
+        "mode": "sampled",
+        "client_concurrency": 32,
+        "count": 300,
+        "raw_audio_s": 1377.92,
+        "endpoint_trimmed_audio_s": 1290.28,
+        "raw_aggregate_rtf": 0.013604348254129654,
+        "endpoint_trimmed_aggregate_rtf": 0.014528399685595633,
+        "endpoint_quiet_fraction": 0.0636031119368324,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.34
+      },
+      {
+        "arm": "final",
+        "round": 0,
+        "mode": "sampled",
+        "client_concurrency": 64,
+        "count": 300,
+        "raw_audio_s": 1379.92,
+        "endpoint_trimmed_audio_s": 1286.6,
+        "raw_aggregate_rtf": 0.013441850057470985,
+        "endpoint_trimmed_aggregate_rtf": 0.014416817761002147,
+        "endpoint_quiet_fraction": 0.0676271088179026,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.28
+      },
+      {
+        "arm": "final",
+        "round": 0,
+        "mode": "greedy48",
+        "client_concurrency": 32,
+        "count": 300,
+        "raw_audio_s": 1141.92,
+        "endpoint_trimmed_audio_s": 1108.3799999999999,
+        "raw_aggregate_rtf": 0.011266613951834622,
+        "endpoint_trimmed_aggregate_rtf": 0.011607545971489015,
+        "endpoint_quiet_fraction": 0.029371584699453716,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.32
+      },
+      {
+        "arm": "final",
+        "round": 0,
+        "mode": "greedy48",
+        "client_concurrency": 64,
+        "count": 300,
+        "raw_audio_s": 1141.6,
+        "endpoint_trimmed_audio_s": 1109.06,
+        "raw_aggregate_rtf": 0.009871776238248307,
+        "endpoint_trimmed_aggregate_rtf": 0.010161415751703484,
+        "endpoint_quiet_fraction": 0.0285038542396636,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.16
+      },
+      {
+        "arm": "final",
+        "round": 1,
+        "mode": "sampled",
+        "client_concurrency": 32,
+        "count": 300,
+        "raw_audio_s": 1373.1200000000001,
+        "endpoint_trimmed_audio_s": 1282.96,
+        "raw_aggregate_rtf": 0.013585011645097482,
+        "endpoint_trimmed_aggregate_rtf": 0.014539698190213456,
+        "endpoint_quiet_fraction": 0.06566068515497558,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.3
+      },
+      {
+        "arm": "final",
+        "round": 1,
+        "mode": "sampled",
+        "client_concurrency": 64,
+        "count": 300,
+        "raw_audio_s": 1369.76,
+        "endpoint_trimmed_audio_s": 1275.0,
+        "raw_aggregate_rtf": 0.013531730337527628,
+        "endpoint_trimmed_aggregate_rtf": 0.014537429762456347,
+        "endpoint_quiet_fraction": 0.06918000233617567,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.46
+      },
+      {
+        "arm": "final",
+        "round": 1,
+        "mode": "greedy48",
+        "client_concurrency": 32,
+        "count": 300,
+        "raw_audio_s": 1139.68,
+        "endpoint_trimmed_audio_s": 1098.7,
+        "raw_aggregate_rtf": 0.010752863980969354,
+        "endpoint_trimmed_aggregate_rtf": 0.011153931029244703,
+        "endpoint_quiet_fraction": 0.035957461743647355,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 1,
+        "max_trailing_quiet_s": 3.08
+      },
+      {
+        "arm": "final",
+        "round": 1,
+        "mode": "greedy48",
+        "client_concurrency": 64,
+        "count": 300,
+        "raw_audio_s": 1141.12,
+        "endpoint_trimmed_audio_s": 1110.02,
+        "raw_aggregate_rtf": 0.00976187489578875,
+        "endpoint_trimmed_aggregate_rtf": 0.010035378354518348,
+        "endpoint_quiet_fraction": 0.027253925967470477,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.16
+      },
+      {
+        "arm": "final",
+        "round": 2,
+        "mode": "sampled",
+        "client_concurrency": 32,
+        "count": 300,
+        "raw_audio_s": 1395.04,
+        "endpoint_trimmed_audio_s": 1306.9,
+        "raw_aggregate_rtf": 0.013575859734544357,
+        "endpoint_trimmed_aggregate_rtf": 0.014491443388230744,
+        "endpoint_quiet_fraction": 0.0631809840578047,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.32
+      },
+      {
+        "arm": "final",
+        "round": 2,
+        "mode": "sampled",
+        "client_concurrency": 64,
+        "count": 300,
+        "raw_audio_s": 1373.84,
+        "endpoint_trimmed_audio_s": 1279.7,
+        "raw_aggregate_rtf": 0.013506978090824516,
+        "endpoint_trimmed_aggregate_rtf": 0.01450060700187415,
+        "endpoint_quiet_fraction": 0.06852326326209739,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.28
+      },
+      {
+        "arm": "final",
+        "round": 2,
+        "mode": "greedy48",
+        "client_concurrency": 32,
+        "count": 300,
+        "raw_audio_s": 1142.1599999999999,
+        "endpoint_trimmed_audio_s": 1108.8,
+        "raw_aggregate_rtf": 0.010826798484299887,
+        "endpoint_trimmed_aggregate_rtf": 0.011152539823979037,
+        "endpoint_quiet_fraction": 0.029207816768228534,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.5
+      },
+      {
+        "arm": "final",
+        "round": 2,
+        "mode": "greedy48",
+        "client_concurrency": 64,
+        "count": 300,
+        "raw_audio_s": 1141.68,
+        "endpoint_trimmed_audio_s": 1107.44,
+        "raw_aggregate_rtf": 0.009888963815515007,
+        "endpoint_trimmed_aggregate_rtf": 0.01019471231750449,
+        "endpoint_quiet_fraction": 0.029990890617335862,
+        "all_quiet_count": 0,
+        "trailing_quiet_at_least_3s": 0,
+        "max_trailing_quiet_s": 1.18
+      }
+    ],
+    "current_outliers": [
+      {
+        "arm": "final",
+        "client_concurrency": 32,
+        "duration_s": 25.84,
+        "leading_quiet_s": 0.02,
+        "trailing_quiet_s": 0.4,
+        "endpoint_trimmed_duration_s": 25.42,
+        "generated_frame_estimate": 323.0,
+        "wall_s": 10.408001323696226
+      },
+      {
+        "arm": "final",
+        "client_concurrency": 64,
+        "duration_s": 14.0,
+        "leading_quiet_s": 0.04,
+        "trailing_quiet_s": 0.04,
+        "endpoint_trimmed_duration_s": 13.92,
+        "generated_frame_estimate": 175.0,
+        "wall_s": 7.473742607049644
+      },
+      {
+        "arm": "baseline",
+        "client_concurrency": 32,
+        "duration_s": 5.44,
+        "leading_quiet_s": 0.02,
+        "trailing_quiet_s": 0.82,
+        "endpoint_trimmed_duration_s": 4.6,
+        "generated_frame_estimate": 68.0,
+        "wall_s": 2.19121035002172
+      }
+    ],
+    "independent_local_outlier_waveform_checks": [
+      {
+        "arm": "final",
+        "client_concurrency": 32,
+        "duration_s": 25.84,
+        "leading_quiet_s": 0.02,
+        "trailing_quiet_s": 0.4,
+        "endpoint_trimmed_duration_s": 25.42,
+        "pcm_sha256_verified": true
+      },
+      {
+        "arm": "final",
+        "client_concurrency": 64,
+        "duration_s": 14.0,
+        "leading_quiet_s": 0.04,
+        "trailing_quiet_s": 0.04,
+        "endpoint_trimmed_duration_s": 13.920000000000002,
+        "pcm_sha256_verified": true
+      },
+      {
+        "arm": "baseline",
+        "client_concurrency": 32,
+        "duration_s": 5.44,
+        "leading_quiet_s": 0.02,
+        "trailing_quiet_s": 0.8200000000000001,
+        "endpoint_trimmed_duration_s": 4.6000000000000005,
+        "pcm_sha256_verified": true
+      }
+    ]
+  },
+  "asr_validation": {
+    "status": "selected_checks_complete_with_baseline_and_final_quality_limitations",
+    "model_id": "deepdml/faster-whisper-large-v3-turbo-ct2",
+    "model_revision": "4df90f75321148c3a29a9e2351b7ddf8f5b115a8",
+    "device": "cpu",
+    "compute_type": "int8",
+    "cpu_threads": 8,
+    "versions": {
+      "faster-whisper": "1.2.1",
+      "ctranslate2": "4.8.2"
+    },
+    "primary_selection": "One upper-duration-median clip per each of 30 prompts in round 0 sampled C32, each arm.",
+    "normalization": "NFKC, case folding, non-letter/non-number separators; no numeric word expansion.",
+    "primary": {
+      "baseline": {
+        "clips": 30,
+        "word_edits": 25,
+        "reference_words": 384,
+        "exact_normalized_matches": 18,
+        "normalized_word_error_rate": 0.06510416666666667
+      },
+      "final": {
+        "clips": 30,
+        "word_edits": 20,
+        "reference_words": 384,
+        "exact_normalized_matches": 21,
+        "normalized_word_error_rate": 0.052083333333333336
+      }
+    },
+    "primary_audio_memberships": 60,
+    "supplemental_current_outliers_required": 3,
+    "evidence_sha256": "abae4040710aef2e489996375e0e30b03159a4ddf5fbacccbdb0e40c18b9c4e5",
+    "limitations": [
+      "A targeted transcription sanity check of selected clips, not a full-corpus ASR score, perceptual-quality evaluation or MOS.",
+      "Numeric spelling and recognition differences contribute to normalized word edits.",
+      "No quality-improvement or concurrent-output equivalence claim."
+    ],
+    "supplemental_current_outliers": [
+      {
+        "arm": "baseline",
+        "client_concurrency": 32,
+        "audio_duration_s": 5.44,
+        "endpoint_trimmed_audio_s": 4.6,
+        "word_edits": 0,
+        "reference_words": 12,
+        "normalized_word_error_rate": 0.0,
+        "exact_normalized_match": true,
+        "finding": "Paired baseline transcribed expected words."
+      },
+      {
+        "arm": "final",
+        "client_concurrency": 32,
+        "audio_duration_s": 25.84,
+        "endpoint_trimmed_audio_s": 25.42,
+        "word_edits": 0,
+        "reference_words": 12,
+        "normalized_word_error_rate": 0.0,
+        "exact_normalized_match": true,
+        "finding": "Expected words transcribed; large duration anomaly remains unresolved."
+      },
+      {
+        "arm": "final",
+        "client_concurrency": 64,
+        "audio_duration_s": 14.0,
+        "endpoint_trimmed_audio_s": 13.92,
+        "word_edits": 27,
+        "reference_words": 13,
+        "normalized_word_error_rate": 2.076923076923077,
+        "exact_normalized_match": false,
+        "finding": "ASR transcribed unrelated content; serious content mismatch."
+      }
+    ],
+    "supplemental_memberships": 3,
+    "same_input_seed_followup_status": "Complete; severe baseline and final ASR mismatches confirmed. Failure rates and quality equivalence remain unproven.",
+    "retry_kept_serving_versions_unchanged": true,
+    "same_input_seed_followup": {
+      "status": "complete_targeted_diagnostic",
+      "scope": "Only the 12 sampled cohorts and C1 controls of this matched comparison; final means candidate commit ca22df8b3a6459154271873006caaebc829ec5a9.",
+      "input_text": "Our quarterly engineering review begins promptly at two in the afternoon on Thursday.",
+      "sampling_seed": 94,
+      "selection": "Post-hoc follow-up of a problematic input/seed across both arms, all rounds and both client concurrency levels, plus one representative of its byte-identical C1 pair.",
+      "asr_memberships": 13,
+      "new_transcriptions": 12,
+      "reused_current_outlier_transcriptions": 1,
+      "local_waveforms_independently_hashed": 13,
+      "c1_counterpart_payload_bytes_also_compared": true,
+      "model_id": "deepdml/faster-whisper-large-v3-turbo-ct2",
+      "model_revision": "4df90f75321148c3a29a9e2351b7ddf8f5b115a8",
+      "versions": {
+        "faster-whisper": "1.2.1",
+        "ctranslate2": "4.8.2"
+      },
+      "rows": [
+        {
+          "arm": "baseline",
+          "round": 0,
+          "client_concurrency": 32,
+          "audio_duration_s": 7.76,
+          "word_edits": 1,
+          "reference_words": 13,
+          "normalized_word_error_rate": 0.07692307692307693,
+          "transcript": "Our quarterly engineering review begins promptly at 2 in the afternoon on Thursday."
+        },
+        {
+          "arm": "baseline",
+          "round": 0,
+          "client_concurrency": 64,
+          "audio_duration_s": 7.36,
+          "word_edits": 1,
+          "reference_words": 13,
+          "normalized_word_error_rate": 0.07692307692307693,
+          "transcript": "Our quarterly engineering review begins promptly at 2 in the afternoon on Thursday."
+        },
+        {
+          "arm": "baseline",
+          "round": 1,
+          "client_concurrency": 32,
+          "audio_duration_s": 5.76,
+          "word_edits": 1,
+          "reference_words": 13,
+          "normalized_word_error_rate": 0.07692307692307693,
+          "transcript": "Uh, quarterly engineering review begins promptly at two in the afternoon on Thursday."
+        },
+        {
+          "arm": "baseline",
+          "round": 1,
+          "client_concurrency": 64,
+          "audio_duration_s": 10.24,
+          "word_edits": 16,
+          "reference_words": 13,
+          "normalized_word_error_rate": 1.2307692307692308,
+          "transcript": "I come to the engineering review, it begins from the S2 and I have to do it on those days."
+        },
+        {
+          "arm": "baseline",
+          "round": 2,
+          "client_concurrency": 32,
+          "audio_duration_s": 10.0,
+          "word_edits": 149,
+          "reference_words": 13,
+          "normalized_word_error_rate": 11.461538461538462,
+          "transcript": "Thanks, I'll take you with 4.4th and 5.5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th and 5th"
+        },
+        {
+          "arm": "baseline",
+          "round": 2,
+          "client_concurrency": 64,
+          "audio_duration_s": 5.04,
+          "word_edits": 1,
+          "reference_words": 13,
+          "normalized_word_error_rate": 0.07692307692307693,
+          "transcript": "Our quarterly engineering review begins promptly at 2 in the afternoon on Thursday."
+        },
+        {
+          "arm": "final",
+          "round": 0,
+          "client_concurrency": 32,
+          "audio_duration_s": 6.72,
+          "word_edits": 1,
+          "reference_words": 13,
+          "normalized_word_error_rate": 0.07692307692307693,
+          "transcript": "Our quarterly engineering review begins promptly at 2 in the afternoon on Thursday."
+        },
+        {
+          "arm": "final",
+          "round": 0,
+          "client_concurrency": 64,
+          "audio_duration_s": 5.76,
+          "word_edits": 13,
+          "reference_words": 13,
+          "normalized_word_error_rate": 1.0,
+          "transcript": "They come here while they can't get me, walk back up here."
+        },
+        {
+          "arm": "final",
+          "round": 1,
+          "client_concurrency": 32,
+          "audio_duration_s": 6.96,
+          "word_edits": 1,
+          "reference_words": 13,
+          "normalized_word_error_rate": 0.07692307692307693,
+          "transcript": "Our quarterly engineering review begins promptly at 2 in the afternoon on Thursday."
+        },
+        {
+          "arm": "final",
+          "round": 1,
+          "client_concurrency": 64,
+          "audio_duration_s": 7.04,
+          "word_edits": 5,
+          "reference_words": 13,
+          "normalized_word_error_rate": 0.38461538461538464,
+          "transcript": "Thank you, Jeff Boyden. Our quarterly engineering review begins promptly at 2 in the afternoon on Thursday."
+        },
+        {
+          "arm": "final",
+          "round": 2,
+          "client_concurrency": 32,
+          "audio_duration_s": 8.0,
+          "word_edits": 2,
+          "reference_words": 13,
+          "normalized_word_error_rate": 0.15384615384615385,
+          "transcript": "A quarterly engineering review begins promptly at 2 in the afternoon on Thursday."
+        },
+        {
+          "arm": "final",
+          "round": 2,
+          "client_concurrency": 64,
+          "audio_duration_s": 14.0,
+          "word_edits": 27,
+          "reference_words": 13,
+          "normalized_word_error_rate": 2.076923076923077,
+          "transcript": "I can't get more than we're working them. Don't care, I'll say. Don't look like. Don't know. Just, just. Don't."
+        },
+        {
+          "arm": "baseline_and_final_identical_C1_pair",
+          "round": null,
+          "client_concurrency": 1,
+          "audio_duration_s": 10.16,
+          "word_edits": 26,
+          "reference_words": 13,
+          "normalized_word_error_rate": 2.0,
+          "transcript": "I can't just walk in there so much, and I'm always going to be fighting a deal, being young, roughly, men, death, with men."
+        }
+      ],
+      "findings": [
+        "Severe ASR mismatches occur in baseline outputs, including 16 and 149 word edits over 13 reference words. The issue predates this candidate relative to the stated baseline.",
+        "The byte-identical baseline/final C1 representative has 26 word edits over 13 reference words: bitwise agreement does not establish correct speech content.",
+        "Final concurrent outputs also show serious ASR mismatches; the previously observed C32 duration anomaly remains unexplained."
+      ],
+      "limitations": [
+        "This selected diagnostic cannot estimate failure rates, establish quality equivalence, or attribute changes causally to batching or the optimization.",
+        "ASR can introduce recognition errors and repetitions; these are transcription sanity findings, not perceptual-quality scores or MOS.",
+        "The frozen 60-clip primary sample and this targeted diagnostic remain separate."
+      ]
+    }
+  },
+  "profiling": {
+    "method": {
+      "tool": "Nsight Systems 2026.5.1",
+      "graph_trace": "graph:host-only",
+      "trace": "cuda,nvtx",
+      "sampling": "sampled generation, temperature 0.9/top-k 50/top-p 1",
+      "cpu_context_switches": "disabled",
+      "client_concurrency": 32,
+      "capture_target_seconds": 15,
+      "capture_begins_after_completions": 128,
+      "request_cap": 2400,
+      "configuration": "Same model, deployment and workload as the uninjected comparison; four matched warmups and a 300-request collection-disabled control precede each capture.",
+      "timings_excluded_from_throughput": true,
+      "cpu_sampling": "disabled"
+    },
+    "arms": {
+      "baseline": {
+        "capture_duration_s": 15.051548019,
+        "both_stages_verified": true,
+        "sustained_window_valid": true,
+        "gpu_activity_envelope_s": 15.01934332,
+        "recorded_activity_upper_bound_s": 10.267107808,
+        "recorded_idle_lower_bound_s": 4.752235512,
+        "recorded_activity_upper_fraction": 0.6835923241949036,
+        "fully_contained_32_request_scopes": [
+          {
+            "scope": "breeze.first_code rows=32",
+            "fully_contained_ranges": 183,
+            "cpu_span_total_ms": 2206.124574,
+            "cpu_span_mean_ms": 12.055325540983606,
+            "external_kernel_records": 157530,
+            "external_kernels_per_range_distribution": {
+              "852": 10,
+              "864": 106,
+              "858": 63,
+              "840": 2,
+              "846": 2
+            },
+            "graph_envelope_records": 0,
+            "graph_envelopes_per_range_distribution": {
+              "0": 183
+            }
+          },
+          {
+            "scope": "breeze.depth rows=32 sampled=1",
+            "fully_contained_ranges": 106,
+            "cpu_span_total_ms": 847.075044,
+            "cpu_span_mean_ms": 7.991274000000001,
+            "external_kernel_records": 50880,
+            "external_kernels_per_range_distribution": {
+              "480": 106
+            },
+            "graph_envelope_records": 106,
+            "graph_envelopes_per_range_distribution": {
+              "1": 106
+            }
+          },
+          {
+            "scope": "breeze.depth.rng rows=32 draws=480",
+            "fully_contained_ranges": 106,
+            "cpu_span_total_ms": 689.3856850000001,
+            "cpu_span_mean_ms": 6.50363853773585,
+            "external_kernel_records": 50880,
+            "external_kernels_per_range_distribution": {
+              "480": 106
+            },
+            "graph_envelope_records": 0,
+            "graph_envelopes_per_range_distribution": {
+              "0": 106
+            }
+          },
+          {
+            "scope": "breeze.first_code.eos_readback rows=32",
+            "fully_contained_ranges": 183,
+            "cpu_span_total_ms": 84.379238,
+            "cpu_span_mean_ms": 0.46108873224043717,
+            "external_kernel_records": 183,
+            "external_kernels_per_range_distribution": {
+              "1": 183
+            },
+            "graph_envelope_records": 0,
+            "graph_envelopes_per_range_distribution": {
+              "0": 183
+            }
+          }
+        ]
+      },
+      "final": {
+        "capture_duration_s": 15.089370444,
+        "both_stages_verified": true,
+        "sustained_window_valid": true,
+        "gpu_activity_envelope_s": 15.028040847,
+        "recorded_activity_upper_bound_s": 11.987511476,
+        "recorded_idle_lower_bound_s": 3.040529371,
+        "recorded_activity_upper_fraction": 0.7976762638619677,
+        "fully_contained_32_request_scopes": [
+          {
+            "scope": "breeze.first_code rows=32",
+            "fully_contained_ranges": 191,
+            "cpu_span_total_ms": 978.859137,
+            "cpu_span_mean_ms": 5.124916947643979,
+            "external_kernel_records": 66937,
+            "external_kernels_per_range_distribution": {
+              "347": 51,
+              "353": 126,
+              "335": 2,
+              "341": 12
+            },
+            "graph_envelope_records": 191,
+            "graph_envelopes_per_range_distribution": {
+              "1": 191
+            }
+          },
+          {
+            "scope": "breeze.first_code.eos_readback rows=32",
+            "fully_contained_ranges": 191,
+            "cpu_span_total_ms": 662.0009520000001,
+            "cpu_span_mean_ms": 3.465973570680629,
+            "external_kernel_records": 191,
+            "external_kernels_per_range_distribution": {
+              "1": 191
+            },
+            "graph_envelope_records": 0,
+            "graph_envelopes_per_range_distribution": {
+              "0": 191
+            }
+          },
+          {
+            "scope": "breeze.depth rows=32 sampled=1",
+            "fully_contained_ranges": 126,
+            "cpu_span_total_ms": 288.402938,
+            "cpu_span_mean_ms": 2.2889122063492064,
+            "external_kernel_records": 8064,
+            "external_kernels_per_range_distribution": {
+              "64": 126
+            },
+            "graph_envelope_records": 126,
+            "graph_envelopes_per_range_distribution": {
+              "1": 126
+            }
+          },
+          {
+            "scope": "breeze.depth.rng rows=32 draws=480",
+            "fully_contained_ranges": 126,
+            "cpu_span_total_ms": 22.377353,
+            "cpu_span_mean_ms": 0.17759803968253968,
+            "external_kernel_records": 0,
+            "external_kernels_per_range_distribution": {
+              "0": 126
+            },
+            "graph_envelope_records": 0,
+            "graph_envelopes_per_range_distribution": {
+              "0": 126
+            }
+          }
+        ]
+      }
+    },
+    "limits": [
+      "One separately instrumented capture per arm; profiler overhead changes host timing.",
+      "CPU annotation spans include waiting and overlap for nested scopes; do not sum them or equate their differences with serving speedup.",
+      "External kernel records exclude graph-internal nodes. Captured sampling kernels still execute on the GPU. Replay seed/offset prologue kernels remain external.",
+      "Both stages covered on one GPU before drain. Different iteration counts are normalized by fully contained 32-request ranges.",
+      "Graph envelopes hide internal gaps. Recorded activity is an upper bound and recorded idle is a lower bound, not SM utilization. Capturing more work changes those bounds.",
+      "Faster submission moves some waiting into EOS readback; it does not remove the dependency on completed sampling."
+    ]
+  }
+}

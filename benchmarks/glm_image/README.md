@@ -5,7 +5,7 @@ Benchmark GLM-Image T2I (text-to-image) and I2I (image-to-image) performance acr
 ## Benchmarks
 
 | Benchmark | Script | Description |
-|-----------|--------|-------------|
+| ----------- | -------- | ------------- |
 | HuggingFace Baseline | `huggingface/inference.py` | Single-GPU transformers + diffusers pipeline |
 | vLLM-Omni Offline | `vllm-omni/inference.py` | Offline inference with continuous batching |
 | vLLM-Omni Online | `benchmark_glm_image.py` | Online serving via `/v1/chat/completions` |
@@ -27,7 +27,7 @@ CUDA_VISIBLE_DEVICES=0 python benchmarks/glm_image/huggingface/inference.py \
 ### Options
 
 | Flag | Default | Description |
-|------|---------|-------------|
+| ------ | --------- | ------------- |
 | `--model-path` | `zai-org/GLM-Image` | Model path |
 | `--mode` | `t2i` | `t2i` or `i2i` |
 | `--dataset-path` | `prompt/prompt.json` | Path to prompt.json |
@@ -54,7 +54,7 @@ CUDA_VISIBLE_DEVICES=0,1 python benchmarks/glm_image/vllm-omni/inference.py \
 ### Options
 
 | Flag | Default | Description |
-|------|---------|-------------|
+| ------ | --------- | ------------- |
 | `--model-path` | `zai-org/GLM-Image` | Model path |
 | `--deploy-config` | - | Deploy config YAML |
 | `--mode` | `t2i` | `t2i` or `i2i` |
@@ -100,7 +100,7 @@ python benchmarks/glm_image/benchmark_glm_image.py \
 ### Options
 
 | Flag | Default | Description |
-|------|---------|-------------|
+| ------ | --------- | ------------- |
 | `--mode` | `t2i` | `t2i` or `i2i` |
 | `--dataset` | `prompt` | `prompt`, `random`, or `custom` |
 | `--dataset-path` | - | JSON file path (required for `custom`) |
@@ -134,7 +134,7 @@ Custom datasets use the same JSON format and can be provided via `--dataset-path
 All three benchmarks report per-stage pipeline timings (in milliseconds):
 
 | Key | Description |
-|-----|-------------|
+| ----- | ------------- |
 | `preprocess_ms` | Input preprocessing (tokenization, multimodal encoding) |
 | `stage_0_gen_ms` | AR (autoregressive) model generation time |
 | `ar2diffusion_ms` | AR output to diffusion input conversion |
@@ -148,7 +148,7 @@ The stages are ordered by execution: `preprocess → stage_0 (AR) → ar2diffusi
 Tested on 2x GPU with 10 prompts, 1024x1024, 50 denoising steps:
 
 | Backend | Mode | Latency Mean (s) | Throughput (img/s) |
-|---------|------|-------------------|--------------------|
+| --------- | ------ | ------------------- | -------------------- |
 | HuggingFace | T2I | 72.6 | 0.014 |
 | HuggingFace | I2I | 70.9 | 0.014 |
 | vLLM-Omni Offline | T2I | 35.0 | 0.044 |

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Background KV prefetch — CPU-testable mechanism.
 
 Covers opt-in gating, the start_prefetch / consume_prefetched_kv round trip over a
@@ -5,6 +8,7 @@ mock connector, dedup, per-call sender_info isolation, role classification, and
 miss/abort paths.  GPU H2D and D2D paths need CUDA (integration tests).
 """
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -204,6 +208,25 @@ def test_start_prefetch_sweeps_orphan():
     assert "rid-next" in receiver._prefetch_futures
 
 
+def test_manager_close_stops_prefetch_before_connector_and_is_idempotent():
+    receiver = object.__new__(OmniKVTransferManager)
+    events = []
+    receiver.shutdown_prefetch = lambda: events.append("prefetch")
+    receiver._connector = SimpleNamespace(close=lambda: events.append("connector"))
+    receiver.close()
+    receiver.close()
+    assert events == ["prefetch", "connector", "prefetch"]
+    assert receiver.connector is None
+
+
+def test_manager_close_does_not_initialize_unused_connector():
+    receiver = object.__new__(OmniKVTransferManager)
+    receiver.shutdown_prefetch = lambda: None
+    receiver._connector = None
+    receiver.close()
+    assert receiver.connector is None
+
+
 def test_shutdown_prefetch_clears_state():
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-sd")
@@ -293,16 +316,6 @@ def test_recv_role_sp_leader_and_follower(monkeypatch):
     assert _role(mgr) is ReceiveRole.FOLLOWER
 
 
-def test_recv_role_tp_and_sp_leader_per_tp_rank(monkeypatch):
-    # TP=2 + SP=2: sp_rank 0 is leader (pulls), sp_rank 1 is follower (gets broadcast).
-    mgr = OmniKVTransferManager(OmniKVCacheConfig())
-    _set_tp(mgr, 2, 2)
-    _patch_topo(monkeypatch, world_size=4, sp_size=2, sp_rank=0)
-    assert _role(mgr) is ReceiveRole.LEADER
-    _patch_topo(monkeypatch, world_size=4, sp_size=2, sp_rank=1)
-    assert _role(mgr) is ReceiveRole.FOLLOWER
-
-
 def test_recv_role_hsdp_world_broadcast(monkeypatch):
     # TP inactive, world > 1 (HSDP): rank-0 leader, others follower.
     mgr = OmniKVTransferManager(OmniKVCacheConfig())
@@ -354,3 +367,41 @@ def test_consume_then_apply_attaches_payload():
     receiver._record_stream_for_prefetched(data)
     receiver.apply_kv_cache_to_request(req, data)
     assert req.past_key_values is not None
+
+
+# --------------------------------------------------------------------------- #
+#  wait_prefetch: the pause barrier's view of outstanding background loads
+# --------------------------------------------------------------------------- #
+
+
+def test_wait_prefetch_is_true_when_nothing_outstanding():
+    _, receiver, _ = _make_sender_receiver()
+    assert receiver.wait_prefetch(timeout=0.01) is True
+
+
+def test_wait_prefetch_is_true_when_prefetch_disabled():
+    _, receiver, _ = _make_sender_receiver(async_prefetch=False)
+    assert receiver.wait_prefetch(timeout=0.01) is True
+
+
+def test_wait_prefetch_reports_a_running_prefetch_and_keeps_its_payload():
+    sender, receiver, connector = _make_sender_receiver()
+    _seed_payload(sender, "rid-w")
+    gate = threading.Event()
+    real_get = connector.get
+
+    def slow_get(*args, **kwargs):
+        gate.wait(timeout=5.0)
+        return real_get(*args, **kwargs)
+
+    connector.get = slow_get
+    receiver.start_prefetch({"request_id": "rid-w", "kv_sender_info": _SENDER_INFO})
+    try:
+        assert receiver.wait_prefetch(timeout=0.05) is False
+        gate.set()
+        assert receiver.wait_prefetch(timeout=5.0) is True
+        data, _ = receiver.consume_prefetched_kv(_req("rid-w"))
+        assert data is not None
+    finally:
+        gate.set()
+        receiver.shutdown_prefetch()

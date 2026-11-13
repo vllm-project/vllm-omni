@@ -9,7 +9,9 @@ Three caching strategies:
 - **TaylorSeer**: Calibration-based prediction using Taylor expansion to estimate block outputs
 - **SCM** (Step Computation Masking): Dynamic step skipping based on configurable policies
 
-**Typical speedup**: 1.5-2.5x depending on model and configuration.
+Speedup is model-, step-, and policy-dependent. Treat a cache-enabled run as
+integration evidence until logs or a focused test show real hits and repeated
+timings show an improvement over the uncached baseline.
 
 **Official docs**: https://docs.vllm.ai/projects/vllm-omni/en/latest/design/feature/cache_dit
 
@@ -29,8 +31,13 @@ vLLM-Omni integrates cache-dit through `CacheDiTBackend`:
 | `cache_dit.refresh_context()` | Updates cache context when `num_inference_steps` changes |
 
 **Source files**:
-- `vllm_omni/diffusion/cache/cache_dit_backend.py` — `CacheDiTBackend`, enablers, `CUSTOM_DIT_ENABLERS`
-- `vllm_omni/diffusion/cache/` — cache backend implementations
+- `vllm_omni/diffusion/cache/cachedit/__init__.py` — public package API
+- `vllm_omni/diffusion/cache/cachedit/backend.py` — generic backend lifecycle and integration
+- `vllm_omni/diffusion/cache/cachedit/config.py` — Cache-DiT configuration types
+- `vllm_omni/diffusion/cache/cachedit/model_specific.py` — model-specific adapters, enablers, and registry
+
+Outside `vllm_omni/diffusion/cache`, import Cache-DiT symbols only from
+`vllm_omni.diffusion.cache.cachedit`.
 
 ## Standard Models: Automatic Support
 
@@ -175,7 +182,8 @@ Inspect your block's `forward()` return type and residual connection pattern to 
 
 ## Registering Custom Enablers
 
-Add your enabler to `CUSTOM_DIT_ENABLERS` in `vllm_omni/diffusion/cache/cache_dit_backend.py`:
+Add your enabler to `CUSTOM_DIT_ENABLERS` in
+`vllm_omni/diffusion/cache/cachedit/model_specific.py`:
 
 ```python
 CUSTOM_DIT_ENABLERS = {
@@ -237,8 +245,10 @@ vllm serve your-model --omni --port 8098 \
 
 **Verification checklist**:
 1. Logs show "Cache-dit enabled successfully on xxx"
-2. Performance: 1.5-2x speedup vs no cache
-3. Quality: compare output with `cache_backend=None`
+2. A focused test or summary confirms at least one real cache hit
+3. Quality is compared with `cache_backend=None`
+4. Performance uses a realistic step count, repeated timings, and a policy
+   whose warmup does not consume the whole run
 
 ## Excluded Models
 
@@ -248,7 +258,7 @@ Models listed in `_NO_CACHE_ACCELERATION` in `vllm_omni/diffusion/registry.py` d
 
 | Model | Path | Notes |
 |-------|------|-------|
-| Standard DiT | `cache_dit_backend.py::enable_cache_for_dit` | Default enabler, automatic |
-| Wan2.2 | `cache_dit_backend.py::enable_cache_for_wan22` | Dual-transformer, auto-detects mode |
-| LongCat | `cache_dit_backend.py::enable_cache_for_longcat_image` | Multi-block-list |
-| BAGEL | `cache_dit_backend.py::enable_cache_for_bagel` | Complex omni model |
+| Standard DiT | `cachedit.backend::enable_cache_for_dit` | Default enabler, automatic |
+| Wan2.2 | `cachedit.model_specific::enable_cache_for_wan22` | Dual-transformer, auto-detects mode |
+| LongCat | `cachedit.config::CacheDiTAdapterConfig` | Declarative multi-block-list adapter |
+| BAGEL | `cachedit.model_specific::BagelCachedAdapter` | Custom cached adapter |

@@ -2,7 +2,7 @@
 
 Use this reference to map testing goals to levels, markers, and runnable commands.
 
-**Repo paths** (`.buildkite/`, `docs/contributing/…`): link with repo-relative paths from this file (e.g. `../../../../.buildkite/cuda/test-ready.yml`, `../../../../docs/contributing/ci/CI_5levels.md`).
+**Repo paths** (`.buildkite/`, `docs/contributing/…`): link with repo-relative paths from this file (e.g. `../../../../.buildkite/cuda/test-ready.yml`, `../../../../docs/contributing/ci/test_system_overview.md`).
 
 ## Model-centric e2e filename convention (L2–L4)
 
@@ -37,7 +37,7 @@ Every model-centric e2e test must declare **exactly one** type marker:
 | **Diffusion X2I(&A&T) Model Test** | x2**i** / x2**a** / x2**t** — image, audio, text (non-video) | Qwen-Image*, BAGEL, FLUX, SD3, Z-Image, LongCat, DreamZero |
 | **Diffusion X2V Model Test** | x2**v** — video only | Wan2.2, HunyuanVideo 1.5, Wan VACE |
 
-PR labels for selective nightly runs: `diffusion-x2iat-test`, `diffusion-x2v-test` (plus `nightly-test` / `NIGHTLY=1`).
+PR label for L4 on a branch: `nightly-test` (jobs then filtered by `source_file_dependencies`). Scheduled `main` uses `NIGHTLY=1` and runs every nightly job, including **Simple · CPU Coverage Test** (`NIGHTLY=1` only, no `source_file_dependencies`). L5 Reliability / Perf use `weekly-test` with the same path filter; the weekly E2E group is env-only (`NON_CRITICAL=1`) and is not source-filtered.
 
 ## Level and Marker Mapping
 
@@ -47,7 +47,7 @@ PR labels for selective nightly runs: `diffusion-x2iat-test`, `diffusion-x2v-tes
 
 ### L1 unit tests — mocking (`mocker`, not `unittest.mock`)
 
-L1 modules run in **Simple Test** (`test-ready.yml` / `test-merge.yml`: `-m 'core_model and cpu'`). When isolation requires doubles:
+L1 modules run in **Simple Test** (`test-ready.yml`: `-m 'core_model and cpu'`). When isolation requires doubles:
 
 - **Use** the **`mocker`** fixture (`pytest-mock`): `mocker.patch`, `mocker.spy`, `mocker.Mock`, `mocker.MagicMock`, `mocker.AsyncMock`.
 - **Use** **`monkeypatch`** for env vars and simple `setattr` / `delattr` without mock objects.
@@ -79,7 +79,7 @@ E2E (L2+) should not rely on mocks unless documenting a rare exception; prefer r
    - `full_model` — L4 nightly (`test-nightly.yml`); some expansion tests still carry both `advanced_model` and `full_model` during migration
 2. **Model type** (pick one): `omni`, `tts`, or `diffusion`
 3. **Cross-cutting** when relevant: `parallel`, `cache`, `example`, `benchmark`
-4. **Hardware**: `cpu`, `cuda`, `rocm`, `npu`, `L4`, `H100`, `distributed_cuda`, …
+4. **Hardware**: `cpu`, `cuda`, `rocm`, `npu`, `L4`, `H100`, `cards_1`, …
 5. Multi-card: `@hardware_test(...)` in `tests/helpers/mark.py`
 
 ## Command Templates
@@ -129,7 +129,7 @@ export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
 export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
 # CI-like: single JSON file (nightly Perf Test steps)
 pytest -s -v dfx/perf/scripts/run_diffusion_benchmark.py \
-  --test-config-file dfx/perf/tests/test_qwen_image_vllm_omni.json
+  --test-config-file dfx/perf/tests/test_bagel_vllm_omni.json
 # Local bulk load: all *.json under tests/dfx/perf/tests/, filter by JSON mark
 pytest -sv dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"
 pytest -sv dfx/perf/scripts/run_benchmark.py -m "full_model and omni and H100"
@@ -165,7 +165,7 @@ Nightly **L4** for a model is often **multiple jobs** in `test-nightly.yml`, not
 | `server_params` | Yes | `model`, `serve_args`, … |
 | `benchmark_params[]` | Yes | Each row: **`name`** (pytest id suffix), workload fields, **`baseline`** |
 
-Copy structure from `test_qwen_image_vllm_omni.json` or `test_cosmos3_vllm_omni.json` (2-GPU mark example).
+Copy structure from `test_bagel_vllm_omni.json` or `test_cosmos3_vllm_omni.json` (2-GPU mark example).
 
 **Omni perf JSON**: `test_qwen3_omni_*.json` — same `mark` shape with `"marks": ["full_model", "omni"]`; run via `run_benchmark.py`.
 
@@ -200,7 +200,7 @@ Copy structure from `test_qwen_image_vllm_omni.json` or `test_cosmos3_vllm_omni.
 
 | Model type | Perf runner | Config example |
 |------------|-------------|----------------|
-| Diffusion X2I/X2V | `dfx/perf/scripts/run_diffusion_benchmark.py` | `test_qwen_image_vllm_omni.json`, `test_cosmos3_vllm_omni.json` |
+| Diffusion X2I/X2V | `dfx/perf/scripts/run_diffusion_benchmark.py` | `test_bagel_vllm_omni.json`, `test_cosmos3_vllm_omni.json` |
 | TTS | `dfx/perf/scripts/run_benchmark.py` | `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json` |
 | Omni | `dfx/perf/scripts/run_benchmark.py` | `test_qwen3_omni_async_chunk.json`, `test_qwen3_omni_no_async_chunk.json`, … |
 
@@ -238,13 +238,13 @@ pytest -s -v dfx/reliability/invalid_param_test/ -m "slow and L4"
 pytest -s -v dfx/reliability/invalid_param_test/test_invalid_image_generation.py::test_images_generations_invalid_requests -m "slow and H100"
 ```
 
-**Trigger:** `WEEKLY=1` or PR label `weekly-test`. Appending cases to existing scripts usually needs **no YAML edit** (directory sweep). No `source_file_dependencies` on weekly steps.
+**Trigger:** `WEEKLY=1` (all jobs) or PR label `weekly-test` (Reliability / Perf, filtered by `source_file_dependencies`). Appending cases to existing scripts usually needs **no YAML edit** (directory sweep).
 
 ### Platform-targeted examples
 
 ```bash
 cd tests
-pytest -s -v -m "core_model and distributed_cuda and L4" --run-level=core_model
+pytest -s -v -m "core_model and L4 and not cards_1" --run-level=core_model
 ```
 
 ### Concrete e2e paths (common in-tree)
@@ -263,7 +263,7 @@ Paths are relative to `tests/` after `cd tests`.
 | **Diffusion X2I** L2 online smoke | `pytest -s -v e2e/online_serving/test_qwen_image.py e2e/online_serving/test_bagel.py -m "core_model and diffusion" --run-level=core_model` |
 | **Diffusion X2V** L2 online smoke | `pytest -s -v e2e/online_serving/test_wan22_t2v.py -m "core_model and diffusion" --run-level=core_model` |
 | **Diffusion X2I** L4 online expansion (H100) | `pytest -s -v e2e/online_serving/test_qwen_image_expansion.py -m "full_model and diffusion and H100" --run-level=full_model` |
-| **Diffusion X2I** L4 perf (nightly) | `pytest -s -v dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file dfx/perf/tests/test_qwen_image_vllm_omni.json` |
+| **Diffusion X2I** L4 perf (nightly) | `pytest -s -v dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file dfx/perf/tests/test_bagel_vllm_omni.json` |
 | **Diffusion X2I** L4 online expansion (Edit) | `pytest -s -v e2e/online_serving/test_qwen_image_edit_expansion.py -m "full_model and diffusion and H100" --run-level=full_model` |
 | **Diffusion X2V** L4 nightly | `pytest -s -v e2e/online_serving/test_wan22_expansion.py -m "full_model and cuda" --run-level=full_model` |
 | **Invalid param** weekly H100 | `pytest -s -v dfx/reliability/invalid_param_test/ -m "slow and H100"` |
@@ -279,7 +279,7 @@ When adding or modifying tests, do not stop at “where the file lives” — al
 4. **API client + assert placement**: **General** validation → implement in `assertions.py`, call **inside** `send_*_request` in `runtime.py`; tests call **`send_*_request` only**. **Special** case validation → `assert_*` in `assertions.py`, called **in the test** after `send_*_request`. Low-level `send_*_http_request` is for negative/dfx tests (`err_code`), not ordinary L2+ success e2e.
 5. **Shared assertions**: logic in **`tests/helpers/assertions.py`**; general checks inside `send_*_request`; special checks only in the test. No `_assert_*` in `test_*.py`.
 6. **One case → one `test_*`**: function name reflects what is validated; no `if case_id == ...` mega-test merging multiple scenarios.
-7. **Fixture scope**: default **`omni_server` + `openai_client`** / **`omni_runner` + `omni_runner_handler`** (module). Use **`omni_server_function` + `openai_client_function`** / **`omni_runner_function` + `omni_runner_handler_function`** only when each `test_*` must spawn a fresh instance. Parametrize name must match fixture (`omni_server` vs `omni_server_function`).
+7. **Fixture scope**: default **`omni_server` + `online_client`** / **`omni_runner` + `offline_client`** (module). Use **`omni_server_function` + `online_client_function`** / **`omni_runner_function` + `offline_client_function`** only when each `test_*` must spawn a fresh instance. Parametrize name must match fixture (`omni_server` vs `omni_server_function`).
 8. **Type marker**: `omni`, `tts`, or `diffusion` on every model e2e module.
 9. **Diffusion L4 Function**: wire `*_expansion.py` into **X2I(&A&T)** or **X2V** **Function Test** in **`test-nightly.yml` only** — do not add `test-merge.yml` unless the user also requested L3.
 10. **Diffusion L4 Perf** (only when requested): add `tests/dfx/perf/tests/test_<slug>_vllm_omni.json` + **Perf Test · &lt;Model&gt;** step (artifact upload); not part of “L4 functional cases” by default.

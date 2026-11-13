@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Dynamic import utilities for the native VoxCPM2 package.
 
 Supports three discovery modes (first match wins):
-1. ``VLLM_OMNI_VOXCPM_CODE_PATH`` env var (explicit source tree)
+1. ``VLLM_OMNI_VOXCPM_CODE_PATH`` env var (explicit source tree; deprecated)
 2. Sibling ``../VoxCPM/src`` relative to the vllm-omni repo root
 3. pip-installed ``voxcpm`` package (>= 2.0)
 """
@@ -26,6 +26,10 @@ def _iter_voxcpm2_src_candidates() -> list[Path]:
     candidates: list[Path] = []
     env_path = os.environ.get("VLLM_OMNI_VOXCPM_CODE_PATH")
     if env_path:
+        logger.warning_once(
+            "VLLM_OMNI_VOXCPM_CODE_PATH is deprecated and will be removed in a future release. "
+            "Install voxcpm>=2.0 instead (pip install voxcpm, or pip install -e <path> for a source checkout)."
+        )
         candidates.append(Path(env_path).expanduser())
 
     repo_root = Path(__file__).resolve().parents[4]
@@ -71,7 +75,6 @@ def _import_voxcpm2_attrs(module_name: str, *attr_names: str) -> tuple[Any, ...]
     raise ImportError(
         f"Could not import {attr_names} from {module_name}. "
         f"Install voxcpm>=2.0: pip install voxcpm. "
-        f"Or set VLLM_OMNI_VOXCPM_CODE_PATH to the VoxCPM source tree. "
         f"Last error: {last_exc}"
     )
 

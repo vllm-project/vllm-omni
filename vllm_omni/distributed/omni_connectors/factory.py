@@ -70,14 +70,16 @@ def _create_mooncake_store_connector(config: dict[str, Any]) -> OmniConnectorBas
 
 def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
-        from .connectors.shm_connector import SharedMemoryConnector
+        from vllm_omni.platforms import current_omni_platform
     except ImportError:
         # Fallback import
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
         from omni_connectors.connectors.shm_connector import SharedMemoryConnector
-    return SharedMemoryConnector(config)
+
+        return SharedMemoryConnector(config)
+    return current_omni_platform.get_shared_memory_connector_cls()(config)
 
 
 def _create_yuanrong_connector(config: dict[str, Any]) -> OmniConnectorBase:
@@ -125,6 +127,17 @@ def _create_mori_transfer_engine_connector(config: dict[str, Any]) -> OmniConnec
     return MoriTransferEngineConnector(config)
 
 
+def _create_nixl_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    try:
+        from .connectors.nixl_connector import NixlConnector
+    except ImportError:
+        import sys
+
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from omni_connectors.connectors.nixl_connector import NixlConnector
+    return NixlConnector(config)
+
+
 # Register connectors
 OmniConnectorFactory.register_connector("MooncakeStoreConnector", _create_mooncake_store_connector)
 OmniConnectorFactory.register_connector("MooncakeTransferEngineConnector", _create_mooncake_transfer_engine_connector)
@@ -132,5 +145,6 @@ OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_con
 OmniConnectorFactory.register_connector("YuanrongConnector", _create_yuanrong_connector)
 OmniConnectorFactory.register_connector("YuanrongTransferEngineConnector", _create_yuanrong_transfer_engine_connector)
 OmniConnectorFactory.register_connector("MoriTransferEngineConnector", _create_mori_transfer_engine_connector)
+OmniConnectorFactory.register_connector("NixlConnector", _create_nixl_connector)
 # Backward-compatible aliases – will be removed in the future
 OmniConnectorFactory.register_connector("MooncakeConnector", _create_mooncake_store_connector)

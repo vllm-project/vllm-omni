@@ -96,13 +96,7 @@
   #   key: upload-nightly-pipeline
   #   if: >-
   #     (build.branch == "main" && build.env("NIGHTLY") == "1") ||
-  #     (build.branch != "main" && (
-  #       build.pull_request.labels includes "nightly-test" ||
-  #       build.pull_request.labels includes "omni-test" ||
-  #       build.pull_request.labels includes "tts-test" ||
-  #       build.pull_request.labels includes "diffusion-x2iat-test" ||
-  #       build.pull_request.labels includes "diffusion-x2v-test"
-  #     ))
+  #     (build.branch != "main" && build.pull_request.labels includes "nightly-test")
   #   commands:
   #     - buildkite-agent pipeline upload .buildkite/npu/test-npu-nightly.yml
   #   agents:

@@ -5,7 +5,6 @@
 # Stage 1: replicas on GPU 1, 2, and 3
 base_config: minicpmo_4_5.yaml
 pipeline: minicpmo_4_5
-session_mode: duplex
 
 stages:
   - stage_id: 0
@@ -15,3 +14,10 @@ stages:
     devices: "1,2,3"
     num_replicas: 3
     async_scheduling: false
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        # Stage 1 has dedicated GPUs in this profile; retain automatic sizing.
+        kv_cache_memory_bytes: null

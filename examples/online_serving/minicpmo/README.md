@@ -4,19 +4,18 @@ This directory contains MiniCPM-o 4.5 online serving demos for vLLM-Omni.
 Inputs can include text, image, audio, or video; outputs are text and optional
 24 kHz speech.
 
-For the experimental native duplex runtime architecture, lifecycle invariants,
+For the native duplex runtime architecture, lifecycle invariants,
 capability boundary, and validation scope, see
-[`vllm_omni/experimental/fullduplex/DESIGN.md`](../../../vllm_omni/experimental/fullduplex/DESIGN.md).
+[`docs/design/fullduplex.md`](../../../docs/design/fullduplex.md); for the
+`DuplexClient` API and the `/v1/realtime?duplex=1` wire protocol, see
+[`docs/serving/realtime_duplex_api.md`](../../../docs/serving/realtime_duplex_api.md).
 
 ## Installation
 
 Install vLLM-Omni with the MiniCPM-o talker dependencies:
 
 ```bash
-pip install 'vllm-omni[minicpmo]'
-
-# From a source checkout:
-pip install -e '.[minicpmo]'
+pip install stepaudio2-minicpmo
 ```
 
 The `minicpmo` extra installs `stepaudio2-minicpmo` and its audio dependencies,
@@ -24,21 +23,35 @@ including `librosa`.
 
 ## Start the backend server
 
-Pick a deploy config that matches your GPU layout:
+The deploy config auto-loads via `--omni`.
+The default `vllm_omni/deploy/minicpmo_4_5.yaml` keeps all three stages on
+logical device 0 with memory budgets of 55%, 15%, and 18%, leaving headroom
+for runtime kernels such as the HiFi-GAN vocoder's cuDNN workspace. The
+profile admits at most four sequences per stage and bounds Talker context
+to 4096 tokens. For throughput,
+`minicpmo_4_5_2gpu.yaml` gives the Thinker
+GPU 0 (90%) and colocates the Talker (55%) and Code2Wav (35%) on GPU 1. That
+profile admits at most four concurrent sequences per stage.
 
-| config | GPUs | TP | Notes |
-|---|---|---|---|
-| `minicpmo_4_5.yaml` | 1 | 1 | Thinker and talker+t2w co-located on GPU0. |
-| `minicpmo_4_5_2gpu.yaml` | 2 | 1 | Thinker on GPU0, talker+t2w on GPU1. |
-| `minicpmo_4_5_3gpu.yaml` | 3 | 2 | Thinker 2-way TP on GPU0/1, talker+t2w share GPU2. |
-| `minicpmo_4_5_8x4090.yaml` | 8 | 4 | Thinker 4-way TP on GPU0-3, talker+t2w on GPU4. |
-| `minicpmo_4_5_3gpu_stage1_replicas.yaml` | 3 | 1 | Experimental validation profile: Thinker on GPU0, two talker+Token2wav replicas on GPU1/2. |
-| `minicpmo_4_5_4gpu_stage1_replicas.yaml` | 4 | 1 | Experimental validation profile: Thinker on GPU0, three talker+Token2wav replicas on GPU1/2/3. |
-| `minicpmo_4_5_8x4090_stage1_replicas.yaml` | 8 | 4 | Experimental validation profile: Thinker 4-way TP on GPU0-3, four talker+Token2wav replicas on GPU4-7. |
-| `minicpmo_4_5_duplex.yaml` | 2 | 1 | Experimental native duplex profile. |
+| deploy config | GPUs | Notes |
+| --- | --- | --- |
+| `minicpmo_4_5.yaml` (default) | 1 | Memory-constrained compatibility layout. |
+| `minicpmo_4_5_2gpu.yaml` | 2 | Recommended continuous-batching layout; Talker and Code2Wav share GPU 1. |
+| `minicpmo_4_5_3gpu.yaml` | 3 | One GPU per stage. |
+| `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
+
+Every profile sets `session_mode: duplex`, so native full-duplex is served
+from the same process as `/v1/chat/completions`.
+
+The split pipeline preserves native-duplex epoch/turn identity, segment text,
+turn completion, reference voice, and terminal-audio metadata through
+Code2Wav. Focused CPU regressions cover this envelope; run the Realtime
+scenario below for live barge-in validation on the target GPU.
+
+Default:
 
 ```bash
-vllm-omni serve openbmb/MiniCPM-o-4_5 \
+vllm serve openbmb/MiniCPM-o-4_5 \
     --omni \
     --deploy-config vllm_omni/deploy/minicpmo_4_5.yaml \
     --trust-remote-code \
@@ -46,16 +59,23 @@ vllm-omni serve openbmb/MiniCPM-o-4_5 \
 ```
 
 For local ModelScope checkpoints, replace `openbmb/MiniCPM-o-4_5` with the
-checkpoint path. To start the experimental native duplex backend, use
-`vllm_omni/deploy/minicpmo_4_5_duplex.yaml`.
+checkpoint path. For native full-duplex, connect `/v1/realtime?duplex=1` on
+this same server.
 
-The `*_stage1_replicas.yaml` files exercise composite Stage1 replica routing
-and failure recovery. They are validation profiles, not recommended production
-entrypoints.
+### Per-stage overrides
 
-## Send chat requests
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code --port 8099 \
+    --stage-overrides '{"0": {"gpu_memory_utilization": 0.55}}'
+```
 
-From this directory, run the MiniCPM-specific curl or Python clients:
+## Send multimodal requests
+
+```bash
+cd examples/online_serving/minicpmo
+```
+
+### curl
 
 ```bash
 bash run_curl_multimodal_generation.sh text
@@ -64,13 +84,41 @@ bash run_curl_multimodal_generation.sh use_audio '["text"]'
 
 python openai_chat_completion_client_for_multimodal_generation.py \
     --query-type use_image \
-    --host localhost \
+    --port 8099 \
+    --host localhost
+
+# Text-only (faster; no <|tts_bos|>)
+python openai_chat_completion_client_for_multimodal_generation.py \
+    --query-type text \
+    --modalities text \
+    --prompt "Briefly introduce yourself."
+```
+
+Streaming text + audio (use `--stream`):
+
+```bash
+python openai_chat_completion_client_for_multimodal_generation.py \
+    --query-type text \
+    --prompt "Briefly introduce yourself." \
+    --port 8099 \
+    --stream
+```
+
+The client prints text deltas as they arrive and saves streamed audio chunks
+to WAV files.
+
+Shared helpers also work if you pass MiniCPM defaults yourself:
+
+```bash
+python ../openai_chat_completion_client_for_multimodal_generation.py \
+    --model openbmb/MiniCPM-o-4_5 \
+    --query-type text \
     --port 8099
 ```
 
-Speech output requires `chat_template_kwargs.use_tts_template=true`. Put that
-field at the request root for curl; the OpenAI Python SDK can merge it from
-`extra_body`.
+Speech output no longer depends on a MiniCPM-specific default in the generic
+serving layer. `chat_template_kwargs.use_tts_template=true` remains an
+explicitly supported model option.
 
 ## Launch the Gradio demo
 
@@ -86,9 +134,22 @@ python examples/online_serving/minicpmo/gradio_demo.py \
 
 Open `http://<host>:7862` in a browser.
 
+## Daily-Omni accuracy
+
+Daily-Omni requires one A–D letter. Set
+`chat_template_kwargs.enable_thinking=false` explicitly in `--extra-body`;
+the generic benchmark CLI does not inject a MiniCPM-specific default.
+Leaving reasoning enabled can exhaust the 256-token answer budget inside
+`<think>` and make first-letter extraction score reasoning text.
+
+For the established text benchmark, send
+`--extra_body '{"modalities":["text"],"chat_template_kwargs":{"enable_thinking":false}}'`.
+Requesting audio also benchmarks Talker and Code2Wav and changes the
+assistant template, so it is not an apples-to-apples accuracy run.
+
 ## Run the Realtime duplex CLI demo
 
-After the duplex backend is running, stream one WAV through the Realtime
+After the server is running, stream one WAV through the Realtime
 WebSocket endpoint:
 
 ```bash
@@ -99,6 +160,77 @@ python examples/online_serving/minicpmo/realtime_duplex_demo.py \
     --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav \
     --output-dir /tmp/minicpmo_realtime_duplex_demo
 ```
+
+Video input uses the same session. PyAV demuxes JPEG frames at `--video-fps`
+(default 1.0) and vLLM `load_audio` extracts a 16 kHz mono WAV unless
+`--input-wav` overrides the soundtrack. If the file has no audio track and no
+external WAV is provided, the demo sends frame-only input units at the configured
+video rate. These use the model's VISION path without synthetic silence; each
+unit can produce a listen/speak decision before the final input commit.
+Frames keep their capture size
+(`--frame-max-side 0`); the server `process_image` normalizes at 448.
+
+`--stack-frames N` raises the visual refresh rate the way official duplex does:
+each 1 s unit also samples the `N-1` sub-frames captured inside it and tiles
+them into a single composite image sent next to that unit's base frame. The
+audio cadence never changes — a unit is always one second — and the wire always
+carries 2 images per unit however large `N` is, because the sub-frames share one
+composite. Official uses 5 for high refresh rate mode:
+
+```bash
+python examples/online_serving/minicpmo/realtime_duplex_demo.py \
+    --url ws://localhost:8099/v1/realtime?duplex=1 \
+    --model openbmb/MiniCPM-o-4_5 \
+    --input-video /path/to/clip.mp4 \
+    --stack-frames 5 \
+    --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav \
+    --output-dir /tmp/minicpmo_realtime_duplex_video_demo
+```
+
+Stage 0 processes a stacked unit the way official HD mode does
+(`max_slice_nums=[2, 1]`): the base frame keeps its own 66-token block plus the
+patches `get_sliced_grid` cuts for its size at `scale_resolution=448`, and the
+composite adds one block. The wire still rejects a caller-supplied
+`max_slice_nums`, so slicing is Stage 0's decision, not the client's.
+
+For a video's own soundtrack, the demo trims decoder padding or adds silence
+to match the video's whole-second units, as in the official
+`adjust_audio_length=True` flow. An explicit `--input-wav` keeps its own
+timeline. This avoids submitting AAC padding as another audio-only unit after
+the final video frame.
+
+Use `--instructions '...'` to set the session system prompt. When evaluating a
+video containing UI overlays, identify the intended object in this prompt;
+otherwise a question about a "shape" can also refer to an audio meter or
+progress bar. The default remains `Streaming Omni Conversation.`.
+
+That detail costs context. One 960x540 frame is 66 vision tokens per unit and a
+stacked pair is 264, on top of the unit's audio, so the Stage 0 prompt grows by
+277 tokens per second stacked against 79 with a single frame. Against the
+40960-token context this model ships with, a listen-heavy call reaches the limit
+after about 2.5 minutes stacked and about 8.5 minutes unstacked (measured on a
+264 s 960x540 clip). For long sessions, enable the existing retention policy
+with `--sliding-window-mode basic`; `--basic-window-high-tokens` (8000) and
+`--basic-window-low-tokens` (6000) control its watermarks. The CLI default is
+`off` to preserve existing runs. Sliding bounds retained history; it does not
+guarantee answer accuracy.
+
+For comparison, `--sliding-window-mode context` rebuilds retained units with
+previous generated text. `--context-max-units` (24) bounds the retained units;
+`--context-previous-max-tokens` (500) bounds that text. Rebuilding dense video
+history can lag behind real time; a smaller window reduces retained history
+but does not necessarily improve answers. Compare both content and response
+timing before choosing this mode.
+
+Use `--tail-silence-s 8` when a clip ends immediately after a question. This
+streams additional silent input while holding the last frame, giving native
+duplex model time to finish its answer before commit/close. It defaults to 0.
+The result records the input start clock, window settings, and tail frame count
+for comparison against a timestamped reference. `input_timeline.json` records
+each audio append's media position and actual send clock, without audio payloads.
+Real-time PCM pacing accounts for send overhead rather than accumulating it
+after each chunk. `ok` checks transport and
+lifecycle only; semantic correctness must be assessed separately.
 
 ## Open the experimental browser client
 
@@ -133,7 +265,103 @@ stronger `response-required` mode is diagnostic: it requires a purpose-built
 two-response WAV, its `--input-sha256`, and an
 `--expect-second-response-substring` value.
 
+## Run Omni-DuplexEval
+
+Omni-DuplexEval generation uses the vLLM-Omni native MiniCPM-o duplex
+endpoint. Evaluation uses a separate OpenAI-compatible multimodal judge
+served from the same vLLM-Omni environment. This validates the vLLM-Omni
+duplex client and local judge integration; it does not reproduce the paper's
+original MiniCPM-o inference implementation.
+
+Start the duplex generation server:
+
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code \
+    --deploy-config vllm_omni/deploy/minicpmo_4_5.yaml \
+    --served-model-name openbmb/MiniCPM-o-4_5 \
+    --host 0.0.0.0 --port 8099
+```
+
+Start a separate multimodal judge. The allowed path must contain any local
+videos passed with `--judge-video-mode video_url`:
+
+```bash
+vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
+    --served-model-name Qwen/Qwen2.5-VL-7B-Instruct \
+    --allowed-local-media-path /data/omni-duplex-eval \
+    --host 0.0.0.0 --port 8000
+```
+
+Generate, evaluate, and summarize:
+
+`omni-duplex-eval generate` requires `--ref-audio` to pin the assistant voice
+across benchmark samples. Pass the model-bundled `assets/HT_ref_audio.wav` when
+you want to score that default voice; regular duplex clients may omit the
+reference and let the server load it.
+
+```bash
+vllm bench omni-duplex-eval --omni generate \
+    --url ws://127.0.0.1:8099/v1/realtime?duplex=1 \
+    --model openbmb/MiniCPM-o-4_5 \
+    --ref-audio /data/ref.wav \
+    --dataset Hothan/Omni-DuplexEval \
+    --concurrency 2 \
+    --response-root /data/omni-duplex-eval/responses
+
+vllm bench omni-duplex-eval --omni evaluate \
+    --dataset Hothan/Omni-DuplexEval \
+    --response-root /data/omni-duplex-eval/responses \
+    --score-root /data/omni-duplex-eval/scores \
+    --judge-base-url http://127.0.0.1:8000 \
+    --judge-model Qwen/Qwen2.5-VL-7B-Instruct \
+    --judge-video-mode video_url \
+    --eval-workers 4
+
+vllm bench omni-duplex-eval --omni summarize \
+    --score-root /data/omni-duplex-eval/scores
+```
+
+The dataset names such as `RTD_OCR` and `PR_correction` are Hugging Face
+splits, not dataset configurations. Pass one with `--split`, or omit it to
+run all nine splits. `--limit 1` is useful for a smoke test. Realtime
+generation records `clock=media`; artifacts generated with
+`--pace as-fast-as-possible` record `clock=invalid` and evaluation rejects
+them unless `--allow-invalid-clock` is explicit.
+
 ## Related examples
 
 - [Offline MiniCPM-o inference](../../offline_inference/minicpmo/)
 - [MiniCPM-o 4.5 recipe](../../../recipes/OpenBMB/MiniCPM-o-4_5.md)
+
+## Pipeline notes
+
+- Stage 1 performs request-owned AR continuous batching. Stage 2 keeps
+  request-owned Flow/HiFT caches and batches exact-shape-compatible chunks.
+- Reference audio travels with the first codec chunk; Stage 2 owns its
+  temporary prompt WAV and evicts prompt features when the request finishes.
+- Codec sampling reads the checkpoint `tts_config` (default deterministic
+  seed 42). Stage-1 YAML sampling parameters govern only the binary
+  continue/stop token exposed to vLLM.
+- `StageRequestStats.batch_size` is request-scoped and does not report the
+  scheduler's execution batch.
+- Stage 0 and Stage 1 use vLLM CUDA Graph capture. Stage 2 remains eager until
+  a dedicated exact-shape graph wrapper owns static I/O buffers and copies
+  request cache state outside capture.
+- Co-locating all three stages minimizes hardware requirements but makes their
+  CUDA contexts contend for one GPU. Use the 8x4090 layout or a custom
+  multi-GPU deploy config when throughput is the primary goal.
+- Output audio is base64 WAV in `message.audio.data` (24 kHz mono).
+- Offline counterpart:
+  [`examples/offline_inference/minicpmo/`](../../offline_inference/minicpmo/)
+- Recipe:
+  [`recipes/OpenBMB/MiniCPM-o-4_5.md`](../../../recipes/OpenBMB/MiniCPM-o-4_5.md)
+
+### Shared realtime UI implementation
+
+The `python -m examples.online_serving.minicpmo.realtime_web` command remains
+available with the same MiniCPM defaults. `--ref-audio` is optional: when it is
+omitted, the server uses the model-bundled `assets/HT_ref_audio.wav`. Its assets
+now live in [the shared realtime UI](../realtime_web/README.md), with a dedicated
+`minicpm-native` profile preserving native duplex input, playback ACKs and camera
+frames. Qwen3 uses a separate profile in the same shell, supporting manual STT
+turns or Server VAD turns with speech interruption.

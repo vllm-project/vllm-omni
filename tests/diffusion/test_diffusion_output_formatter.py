@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -19,6 +19,13 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_coalesced_events_keep_their_reporting_chunk():
+    output = DiffusionOutput(chunk_index=4, coalesced_event_ids=["superseded"])
+    metadata = output_formatter._stream_metadata_from_diffusion_output(output)
+    assert metadata["coalesced_event_ids"] == ["superseded"]
+    assert metadata["generation_chunk_index"] == 4
 
 
 def _request(
@@ -76,7 +83,7 @@ def test_formatter_preserves_single_video_audio_actions_and_metadata(
     result = results[0]
     assert result.images == ["frame-0"]
     assert result.prompt == "prompt-0"
-    assert result.final_output_type == "image"
+    assert result.final_output_type == "video"
     assert result.multimodal_output == {
         "metadata": {
             "audio": {"sample_rate": 48000},
@@ -95,6 +102,7 @@ def test_formatter_preserves_single_video_audio_actions_and_metadata(
         "resolution": 512,
         "width": None,
         "height": None,
+        "num_inference_steps": 1,
     }
 
 
@@ -314,7 +322,7 @@ def test_formatter_preserves_audio_model_video_audio_and_actions(
 
     assert result.images == ["frame-0"]
     assert result.prompt == "watch and listen"
-    assert result.final_output_type == "image"
+    assert result.final_output_type == "video"
     assert result.multimodal_output == {
         "metadata": {
             "audio": {"sample_rate": 16000},
@@ -325,6 +333,25 @@ def test_formatter_preserves_audio_model_video_audio_and_actions(
         "fps": 30.0,
         "actions": "action-0",
     }
+
+
+def test_formatter_uses_native_model_identity_for_diffusers_video_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    frames = [["frame-0", "frame-1"]]
+    postprocess_output = normalize_diffusion_postprocess_output(frames)
+
+    [result] = format_diffusion_outputs(
+        request=_request("make a video"),
+        od_config=_config("WanImageToVideoPipeline"),
+        diffusion_output=DiffusionOutput(output=frames),
+        output_data=frames,
+        postprocess_output=postprocess_output,
+    )
+
+    assert result.images == frames
+    assert result.final_output_type == "video"
 
 
 def test_formatter_preserves_audio_only_postprocess_dict(
@@ -423,3 +450,36 @@ def test_format_empty_diffusion_outputs_preserves_empty_response_shape() -> None
     assert [result.prompt for result in results] == ["prompt-0"]
     assert [result.images for result in results] == [[]]
     assert [result.metrics for result in results] == [{}]
+
+
+def test_format_empty_diffusion_outputs_preserves_custom_output() -> None:
+    [result] = format_empty_diffusion_outputs(
+        _request("prompt-0"),
+        finished=False,
+        custom_output={"lifecycle": "started"},
+    )
+
+    assert result.custom_output == {"lifecycle": "started"}
+    assert result.finished is False
+
+
+@pytest.mark.parametrize("key", ["segmentation", "video_segmentation", "video_depth"])
+def test_formatter_routes_segmentation_payload_to_multimodal_output(
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+) -> None:
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    segmentation = {"masks": torch.zeros(1, 4, dtype=torch.uint8), "scores": torch.tensor([0.9])}
+    postprocess_output = normalize_diffusion_postprocess_output({key: segmentation})
+
+    [result] = format_diffusion_outputs(
+        request=_request("prompt-0"),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None),
+        output_data={key: segmentation},
+        postprocess_output=postprocess_output,
+    )
+
+    # Structured payloads are not images: they travel under their own key.
+    assert result.images == []
+    assert result.multimodal_output[key] is segmentation

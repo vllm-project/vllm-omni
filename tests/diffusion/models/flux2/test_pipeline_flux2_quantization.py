@@ -7,17 +7,17 @@ from vllm_omni.diffusion.models.flux2.pipeline_flux2 import (
     Flux2Pipeline,
     _resolve_component_quant_config,
 )
+from vllm_omni.quantization import ComponentQuantizationConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_resolve_component_quant_config_routes_components():
     text_encoder_config = object()
-    component_config = Mock()
-    component_config.resolve.side_effect = {
-        "text_encoder": text_encoder_config,
-        "transformer": None,
-    }.get
+    component_config = ComponentQuantizationConfig(
+        component_configs={"text_encoder": text_encoder_config},
+        default_config=None,
+    )
 
     assert _resolve_component_quant_config(component_config, "text_encoder") is text_encoder_config
     assert _resolve_component_quant_config(component_config, "transformer") is None

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Papercraft Explainers"
+  short_description: "Explain ideas with layered paper mechanisms"
+  default_prompt: "Use $papercraft-stop-motion-explainer to prepare the requested H3 prompts or video with the available tools."

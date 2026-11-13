@@ -189,5 +189,5 @@ Async chunk reduces TTFP by **67%** by streaming audio token chunks from Thinker
 - Check server logs for errors
 
 ### Out of memory
-- Reduce `gpu_memory_utilization` in stage configs
+- Reduce `gpu_memory_utilization` in the deploy config
 - Use a smaller batch size

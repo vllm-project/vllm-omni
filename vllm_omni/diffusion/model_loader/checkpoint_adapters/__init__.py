@@ -9,6 +9,13 @@ from .modelopt import (
 )
 
 
+def get_direct_mmap_adapter(model: nn.Module):
+    """Resolve direct-mmap adapters lazily to avoid model-loader cycles."""
+    from .direct_mmap import get_direct_mmap_adapter as _get_direct_mmap_adapter
+
+    return _get_direct_mmap_adapter(model)
+
+
 def get_checkpoint_adapter(
     model: nn.Module,
     source: object,
@@ -29,4 +36,5 @@ __all__ = [
     "ModelOptMixedPrecisionCheckpointAdapter",
     "ModelOptNvFp4CheckpointAdapter",
     "get_checkpoint_adapter",
+    "get_direct_mmap_adapter",
 ]

@@ -3,6 +3,19 @@
 import torch
 
 
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Expand GQA KV from num_kv_heads to num_heads.
+
+    Input:  (batch, seqlen, num_key_value_heads, head_dim)
+    Output: (batch, seqlen, num_key_value_heads * n_rep, head_dim)
+    """
+    if n_rep == 1:
+        return hidden_states
+    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, :, None, :].expand(batch, slen, num_key_value_heads, n_rep, head_dim)
+    return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
+
+
 def left_pad_stack(
     tensors: list[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor | None]:

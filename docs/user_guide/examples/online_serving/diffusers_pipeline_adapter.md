@@ -16,6 +16,7 @@ implemented with clear Diffusers or vLLM-Omni behavior.
 - Sequence parallel execution
 - TeaCache / Cache-DiT acceleration
 - Step-wise execution (continuous batching)
+- Component-selective `diffusion_offload_config` (the legacy whole-pipeline CPU-offload options remain supported)
 
 For these features, it is recommended to use natively supported pipelines instead.
 

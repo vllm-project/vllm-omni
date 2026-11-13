@@ -5,6 +5,7 @@
 import asyncio
 import base64
 import os
+import tempfile
 
 import httpx
 import pytest
@@ -101,7 +102,7 @@ class TestDecodeAudioUrlSuffixSanitization:
         try:
             # ".." contains non-alnum dots, so falls back to .wav
             assert path.endswith(".wav")
-            assert os.path.dirname(path) == "/tmp"
+            assert os.path.dirname(path) == tempfile.gettempdir()
         finally:
             _cleanup(path)
 

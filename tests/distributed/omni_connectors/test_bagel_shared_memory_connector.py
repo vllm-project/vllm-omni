@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 End-to-end tests for Bagel with shared memory connector: img2img and text2img.
 
-- img2img: validates output vs reference pixels within a ±10 tolerance.
+- img2img: validates output vs reference pixels within a ±10 tolerance on
+  CUDA and a ±25 tolerance on ROCm.
 - text2img: validates output vs reference pixels within a ±5 tolerance
   (equivalent to `examples/offline_inference/bagel/end2end.py` with
   text2img modality and 14 steps).
@@ -13,7 +14,6 @@ End-to-end tests for Bagel with shared memory connector: img2img and text2img.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-import socket
 from typing import Any
 
 import pytest
@@ -24,6 +24,8 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.usefixtures("clean_gpu_memory_between_tests")]
 
@@ -33,16 +35,19 @@ BAGEL_CI_DEPLOY = get_deploy_config_path("ci/bagel.yaml")
 # Generated with seed=52, num_inference_steps=15,
 # prompt='Change the grass color to red',
 # input image: 2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg
+# Re-goldened from the vLLM-0.27-aligned output (nightly builds 2953/2954
+# produced bit-identical pixels across two different torch/base images; only
+# (512, 336) moved beyond tolerance vs the main-branch goldens from #5898).
 REFERENCE_PIXELS = [
-    {"position": (100, 100), "rgb": (156, 172, 217)},
+    {"position": (100, 100), "rgb": (157, 172, 217)},
     {"position": (400, 50), "rgb": (105, 144, 217)},
     {"position": (700, 100), "rgb": (118, 159, 232)},
-    {"position": (150, 400), "rgb": (180, 22, 52)},
-    {"position": (512, 336), "rgb": (221, 211, 194)},
-    {"position": (700, 400), "rgb": (192, 10, 46)},
-    {"position": (100, 600), "rgb": (102, 12, 22)},
-    {"position": (400, 600), "rgb": (161, 28, 47)},
-    {"position": (700, 600), "rgb": (100, 87, 94)},
+    {"position": (150, 400), "rgb": (185, 21, 55)},
+    {"position": (512, 336), "rgb": (205, 215, 191)},
+    {"position": (700, 400), "rgb": (193, 11, 48)},
+    {"position": (100, 600), "rgb": (103, 14, 25)},
+    {"position": (400, 600), "rgb": (159, 28, 48)},
+    {"position": (700, 600), "rgb": (101, 87, 94)},
     {"position": (256, 256), "rgb": (181, 201, 221)},
 ]
 
@@ -64,6 +69,10 @@ TEXT2IMG_REFERENCE_PIXELS = [
 
 
 PIXEL_TOLERANCE = 10
+# Three independent MI300X MERGE runs reproduced a maximum channel delta of
+# 21 at one img2img probe while the other nine probes and text2img remained
+# within their existing bounds. Retain four levels of headroom for ROCm drift.
+ROCM_PIXEL_TOLERANCE = 25
 TEXT2IMG_PIXEL_TOLERANCE = 5
 
 DEFAULT_PROMPT = "<|fim_middle|><|im_start|>Change the grass color to red<|im_end|>"
@@ -76,15 +85,6 @@ EXPECTED_OUTPUT_SIZE = (1024, 672)
 def _load_input_image() -> Image.Image:
     """Load the test input image via vllm's ImageAsset."""
     return ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
-
-
-def _find_free_port() -> int:
-    """Find and return a free ephemeral port by binding to port 0."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        s.listen(1)
-        port = s.getsockname()[1]
-    return port
 
 
 def _configure_sampling_params(omni: Omni, num_inference_steps: int = 15) -> list:
@@ -119,8 +119,8 @@ def _extract_generated_image(omni_outputs: list) -> Image.Image | None:
     for req_output in omni_outputs:
         if images := getattr(req_output, "images", None):
             return images[0]
-        if hasattr(req_output, "request_output") and req_output.request_output:
-            stage_out = req_output.request_output
+        if isinstance(req_output, OmniRequestOutput) and req_output:
+            stage_out = req_output
             if hasattr(stage_out, "images") and stage_out.images:
                 return stage_out.images[0]
     return None
@@ -141,13 +141,31 @@ def _validate_pixels(
     Raises:
         AssertionError: If any pixel differs beyond tolerance.
     """
+    mismatches = []
+    probes = []
     for ref in reference_pixels:
         x, y = ref["position"]
         expected = ref["rgb"]
         actual = image.getpixel((x, y))[:3]
-        assert all(abs(a - e) <= tolerance for a, e in zip(actual, expected)), (
-            f"Pixel mismatch at ({x}, {y}): expected {expected}, got {actual}"
-        )
+        probes.append(f'    {{"position": ({x}, {y}), "rgb": {actual}}},')
+        if not all(abs(a - e) <= tolerance for a, e in zip(actual, expected)):
+            mismatches.append(f"({x}, {y}): expected {expected}, got {actual}")
+    # Report every probe, not just the first mismatch: CI does not upload the
+    # generated image, so this failure message is the only place the full
+    # actual-value table exists when the goldens need to be regenerated.
+    assert not mismatches, (
+        f"Pixel mismatch at {len(mismatches)} probe(s) (tolerance ±{tolerance}):\n  "
+        + "\n  ".join(mismatches)
+        + "\nActual values at all probes (paste as the new reference table if re-goldening):\n"
+        + "\n".join(probes)
+    )
+
+
+def _img2img_pixel_tolerance() -> int:
+    """Keep CUDA's golden strict while allowing observed ROCm variance."""
+    if current_omni_platform.is_rocm():
+        return ROCM_PIXEL_TOLERANCE
+    return PIXEL_TOLERANCE
 
 
 def _generate_bagel_img2img(
@@ -236,11 +254,11 @@ def test_bagel_img2img_shared_memory_connector(run_level):
     config_path = _resolve_deploy_config(BAGEL_CI_DEPLOY, run_level)
     with OmniRunner(
         "ByteDance-Seed/BAGEL-7B-MoT",
-        stage_configs_path=config_path,
+        deploy_config=config_path,
     ) as runner:
         generated_image = _generate_bagel_img2img(runner.omni, input_image)
         if run_level == "advanced_model":
-            _validate_pixels(generated_image)
+            _validate_pixels(generated_image, tolerance=_img2img_pixel_tolerance())
 
 
 @pytest.mark.advanced_model
@@ -251,7 +269,7 @@ def test_bagel_text2img_shared_memory_connector(run_level):
     config_path = _resolve_deploy_config(BAGEL_CI_DEPLOY, run_level)
     with OmniRunner(
         "ByteDance-Seed/BAGEL-7B-MoT",
-        stage_configs_path=config_path,
+        deploy_config=config_path,
     ) as runner:
         generated_image = _generate_bagel_text2img(runner.omni)
         if run_level == "advanced_model":

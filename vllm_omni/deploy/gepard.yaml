@@ -1,0 +1,40 @@
+# Gepard-1.0: single-stage native-AR FSQ/NanoCodec TTS (~0.5B).
+# Target 1x L4 24GB. Zero-shot only; enforce_eager until the perf PR.
+#
+# The pipeline pin is required, not cosmetic: the checkpoint's config.json
+# self-identifies as qwen3_5_text, so model_type inference cannot reach the
+# gepard registry entry, and the architectures fallback would match
+# Qwen3_5ForCausalLM against the diffusion pipeline.
+pipeline: gepard
+async_chunk: false
+dtype: bfloat16
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.3      # AR LM + NanoCodec fit in ~2 GiB
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    # Override architectures so vLLM resolves our talker rather than the native
+    # Qwen3.5 text model. Do NOT override model_type: the backbone's own
+    # model_type check needs it to stay qwen3_5_text.
+    hf_overrides:
+      architectures: ["GepardTalkerForConditionalGeneration"]
+    default_sampling_params:
+      # All 32 heads are sampled in-model, so vLLM's sampler is pinned
+      # deterministic and just argmaxes what forward chose.
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      # One output token is one frame, so this is the frame budget: 1000 frames
+      # is ~46 s at 21.5 fps. A backstop, not a target -- normal utterances are
+      # 40-420 frames -- but a load-bearing one, because this checkpoint's stop
+      # head does not fire on every batched trajectory.
+      max_tokens: 1000
+      seed: 42
+      detokenize: false

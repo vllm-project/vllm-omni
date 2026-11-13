@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Base interaction handler interface."""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import ClassVar
+
+from typing_extensions import Self
+
+from vllm_omni.diffusion.interaction.types import (
+    InteractionChunkMetadata,
+    InteractionPayload,
+)
+from vllm_omni.diffusion.worker.utils import StepRequestState
+
+
+class InteractionHandler(ABC):
+    """Strategy object for one interaction modality.
+
+    Handler instances are pipeline/runner-owned and request-agnostic. Per-request
+    session state lives on ``StepRequestState.interaction_sessions``.
+    Each concrete modality handler decides how to handle timing from ``received_at``.
+    """
+
+    modality: ClassVar[str]
+    # When True, chunk-boundary apply needs ``ChunkMediaSpec`` (frame count & fps)
+    # Those information are useful when interaction handler needs interpolation/integration on a frame-by-frame basis
+    needs_chunk_media: ClassVar[bool] = False
+    # When True, the coordinator skips ``apply_at_chunk_boundary`` until a session
+    # exists (normally created on the first enqueue). When False, every chunk
+    # boundary runs apply even with no prior enqueue so the handler can create
+    # its session and materialize default chunk data (e.g. identity camera hold).
+    lazy_initialize_session: ClassVar[bool] = True
+
+    @classmethod
+    def from_pipeline(cls, pipeline: object) -> Self:
+        """Bind a request-agnostic handler to ``pipeline`` when construction needs it.
+
+        Default construction ignores the pipeline. Prompt handlers override this to
+        capture ``encode_prompt`` / device / dtype.
+        """
+        del pipeline
+        return cls()
+
+    @abstractmethod
+    def validate_payload(
+        self,
+        state: StepRequestState,
+        *,
+        event_id: str,
+        payload: InteractionPayload,
+        transition_chunks: int | None,
+    ) -> None:
+        """Validate a modality payload without mutating request state.
+
+        Used by ``InteractionCoordinator.enqueue_parts`` so composite events
+        fail before any track is queued.
+        """
+
+    @abstractmethod
+    def enqueue(
+        self,
+        state: StepRequestState,
+        *,
+        event_id: str,
+        received_at: float,
+        payload: InteractionPayload,
+        transition_chunks: int | None,
+    ) -> None:
+        """Validate and queue this track on request-local state."""
+
+    @abstractmethod
+    def apply_at_chunk_boundary(
+        self,
+        state: StepRequestState,
+        *,
+        boundary_at: float,
+        chunk_index: int | None = None,  # defaults to state.chunk_index when omitted
+        # Optional chunk media information. Only present when at least one initialized interaction handler needs it
+        num_media_frames: int | None = None,
+        fps: float | None = None,
+        num_latent_frames: int | None = None,
+    ) -> InteractionChunkMetadata | None:
+        """Advance request-local state and materialize this chunk's effects."""

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Integration tests for the post-finish defensive purge of
 ``self.running`` placed in
 ``OmniARScheduler.finish_requests`` /
@@ -23,6 +26,7 @@ import vllm_omni.core.sched.omni_ar_scheduler as ar_sched_mod
 import vllm_omni.core.sched.omni_generation_scheduler as gen_sched_mod
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.engine import OmniEngineCoreOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -52,6 +56,9 @@ def _make_scheduler(scheduler_cls, *, requests, running, waiting):
     scheduler.requests = requests
     scheduler.running = running
     scheduler.waiting = waiting
+    scheduler.kv_holding_waiting = []
+    scheduler.deferred_waiting = set()
+    scheduler._outputs_awaiting_stage_payload = {}
     return scheduler
 
 
@@ -76,8 +83,9 @@ def test_finish_requests_purges_finished_request_from_running(
     )
 
     def fake_finish_requests(self, request_ids, finished_status):
-        # super() returning the abort tuple but leaving self.running untouched
-        return [(finished.request_id, 0)]
+        # vLLM 0.26 super() returns the finished Request objects but here
+        # leaves self.running untouched to simulate the missed removal.
+        return [finished]
 
     monkeypatch.setattr(scheduler_mod.VLLMScheduler, "finish_requests", fake_finish_requests)
 
@@ -88,7 +96,7 @@ def test_finish_requests_purges_finished_request_from_running(
     )
 
     assert scheduler.running == []
-    assert result == [(finished.request_id, 0)]
+    assert result == [finished]
 
 
 @pytest.mark.parametrize(("scheduler_cls", "scheduler_mod"), _SCHEDULER_PARAMS)
@@ -111,7 +119,7 @@ def test_finish_requests_purges_untracked_request_from_running(
     )
 
     def fake_finish_requests(self, request_ids, finished_status):
-        return [(untracked.request_id, 0)]
+        return [untracked]
 
     monkeypatch.setattr(scheduler_mod.VLLMScheduler, "finish_requests", fake_finish_requests)
 
@@ -122,7 +130,7 @@ def test_finish_requests_purges_untracked_request_from_running(
     )
 
     assert scheduler.running == []
-    assert result == [(untracked.request_id, 0)]
+    assert result == [untracked]
 
 
 @pytest.mark.parametrize(("scheduler_cls", "scheduler_mod"), _SCHEDULER_PARAMS)
@@ -136,7 +144,7 @@ def test_finish_requests_leaves_healthy_running_intact(
     is conservative and won't aggressively drop healthy entries.
     """
     alive = _StubRequest("req-alive", RequestStatus.RUNNING)
-    leaving_id = "req-leaving"
+    leaving = _StubRequest("req-leaving", RequestStatus.FINISHED_STOPPED)
     scheduler = _make_scheduler(
         scheduler_cls,
         requests={alive.request_id: alive},
@@ -145,14 +153,102 @@ def test_finish_requests_leaves_healthy_running_intact(
     )
 
     def fake_finish_requests(self, request_ids, finished_status):
-        return [(leaving_id, 0)]
+        return [leaving]
 
     monkeypatch.setattr(scheduler_mod.VLLMScheduler, "finish_requests", fake_finish_requests)
 
     scheduler_cls.finish_requests(
         scheduler,
-        [leaving_id],
+        [leaving.request_id],
         RequestStatus.FINISHED_STOPPED,
     )
 
     assert scheduler.running == [alive]
+
+
+@pytest.mark.parametrize(("scheduler_cls", "scheduler_mod"), _SCHEDULER_PARAMS)
+def test_finish_requests_preserves_unrelated_resumable_segment(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler_cls,
+    scheduler_mod,
+) -> None:
+    paused = _StubRequest("req-paused", RequestStatus.FINISHED_STOPPED)
+    paused.resumable = True
+    leaving = _StubRequest("req-leaving", RequestStatus.FINISHED_STOPPED)
+    scheduler = _make_scheduler(
+        scheduler_cls,
+        requests={paused.request_id: paused},
+        running=[paused],
+        waiting=[],
+    )
+
+    def fake_finish_requests(self, request_ids, finished_status):
+        return [leaving]
+
+    monkeypatch.setattr(scheduler_mod.VLLMScheduler, "finish_requests", fake_finish_requests)
+
+    scheduler_cls.finish_requests(scheduler, [leaving.request_id], RequestStatus.FINISHED_ABORTED)
+
+    assert scheduler.running == [paused]
+    assert scheduler.requests == {paused.request_id: paused}
+
+
+@pytest.mark.parametrize(("scheduler_cls", "scheduler_mod"), _SCHEDULER_PARAMS)
+def test_finish_requests_materializes_single_pass_request_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler_cls,
+    scheduler_mod,
+) -> None:
+    request = _StubRequest("req-generator", RequestStatus.RUNNING)
+    scheduler = _make_scheduler(
+        scheduler_cls,
+        requests={request.request_id: request},
+        running=[request],
+        waiting=[],
+    )
+
+    def fake_finish_requests(self, request_ids, finished_status):
+        assert tuple(request_ids) == (request.request_id,)
+        return [request]
+
+    monkeypatch.setattr(scheduler_mod.VLLMScheduler, "finish_requests", fake_finish_requests)
+
+    result = scheduler_cls.finish_requests(
+        scheduler,
+        (request_id for request_id in [request.request_id]),
+        RequestStatus.FINISHED_ABORTED,
+    )
+
+    assert result == [request]
+
+
+@pytest.mark.parametrize("scheduler_cls", [OmniARScheduler, OmniGenerationScheduler])
+def test_finish_requests_does_not_reopen_off_queue_deferred_free_terminal(scheduler_cls) -> None:
+    terminal = _StubRequest("req-deferred-free", RequestStatus.FINISHED_STOPPED)
+    terminal.resumable = True
+    scheduler = _make_scheduler(scheduler_cls, requests={terminal.request_id: terminal}, running=[], waiting=[])
+    scheduler._free_request = lambda *args, **kwargs: pytest.fail("off-queue request was freed")
+
+    assert scheduler_cls.finish_requests(scheduler, [terminal.request_id], RequestStatus.FINISHED_ABORTED) == []
+    assert scheduler.requests == {terminal.request_id: terminal}
+    assert terminal.status == RequestStatus.FINISHED_STOPPED
+
+
+# None finishes every request (abort-all pause, fault recovery).
+@pytest.mark.parametrize("request_ids", [["run"], None])
+@pytest.mark.parametrize(("scheduler_cls", "scheduler_mod"), _SCHEDULER_PARAMS)
+def test_finish_requests_drops_the_held_output_of_a_run_request(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler_cls,
+    scheduler_mod,
+    request_ids: list[str] | None,
+) -> None:
+    """Ensure aborting a run request whose finished output waits for its stage payload drops that output."""
+    # The run request already finished and was freed; only its output is held.
+    scheduler = _make_scheduler(scheduler_cls, requests={}, running=[], waiting=[])
+    scheduler._outputs_awaiting_stage_payload = {"run": (0, OmniEngineCoreOutput(request_id="run", new_token_ids=[]))}
+    monkeypatch.setattr(scheduler_mod.VLLMScheduler, "finish_requests", lambda self, request_ids, finished_status: [])
+
+    scheduler_cls.finish_requests(scheduler, request_ids, RequestStatus.FINISHED_ABORTED)
+
+    assert scheduler._outputs_awaiting_stage_payload == {}

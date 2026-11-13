@@ -1,0 +1,10 @@
+# MammothModa2 AR→DiT text-to-image with opt-in FP8 KV cache for the AR stage.
+
+base_config: mammoth_moda2.yaml
+
+stages:
+  - stage_id: 0
+    kv_cache_dtype: fp8_e4m3
+    # Layer 0 stays BF16: with every layer in FP8, most text-to-image samples
+    # lose the prompt (A800 results in recipes/MammothModa2/MammothModa2.md).
+    kv_cache_dtype_skip_layers: ["0"]

@@ -1,0 +1,197 @@
+[
+  {
+    "test_name": "test_minicpmo_4_5",
+    "description": "Chat C1/C4/C8 baselines incorporate non-regressing equal-weight nightly means for 2026-10-08 through 2026-10-14 (H100: 7 days; A3: 6 days; no added margin); A3 C4 mean_ttft_ms uses the window mean with an explicitly approved regression; other regressing A3 values are retained. C16/C32 references use H100 Buildkite build 17017 (commit c5e0bd7c2c3dd297adfbf36a40f3b7a19bf94d24) and A3 vllm-omni-npu-ci build 8873 (commit 26237d470651a841534abbddfb70301580a0227d): request_throughput is measured x 0.90, latency and audio RTF are measured x 1.10, rounded to 4 decimals. These historical runs are reference measurements, not validation of the current revision. A3 C8 mean_ttft_ms supersedes the window reference with 624.6985 ms: issue #9095 reports 567.9077 ms on 2026-10-18 at commit 72a665bbe8b4fb035baf56516d643b7fd1f6b039, multiplied by 1.10 and rounded to 4 decimals. B200 remains without a baseline pending measurements.",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": ["H100", "B200"],
+            "npu": "A3",
+            "rocm": "MI325"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5.yaml",
+        "--trust-remote-code"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [
+          32,
+          64,
+          128,
+          256,
+          512
+        ],
+        "max_concurrency": [
+          1,
+          4,
+          8,
+          16,
+          32
+        ],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "modalities": [
+            "text",
+            "audio"
+          ],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {
+          "H100": {
+            "request_throughput": [
+              1.525,
+              3.1855,
+              4.036,
+              3.609,
+              3.8121
+            ],
+            "mean_ttft_ms": [
+              121.6802,
+              255.7893,
+              256.2622,
+              348.5606,
+              398.8221
+            ],
+            "mean_e2el_ms": [
+              660.8259,
+              1238.4447,
+              1965.672,
+              4364.1781,
+              8260.9541
+            ],
+            "mean_audio_ttfp_ms": [
+              362.9356,
+              795.4822,
+              1115.6453,
+              1832.5383,
+              3193.5749
+            ],
+            "mean_audio_rtf": [
+              0.159,
+              0.2941,
+              0.4743,
+              0.9997,
+              1.8129
+            ]
+          },
+          "A3": {
+            "request_throughput": [
+              0.4813,
+              0.6969,
+              0.8728,
+              0.8563,
+              0.9032
+            ],
+            "mean_ttft_ms": [
+              324.7352,
+              623.6599,
+              624.6985,
+              644.0404,
+              719.7749
+            ],
+            "mean_e2el_ms": [
+              2086.7028,
+              5760.4772,
+              9103.7395,
+              18362.9433,
+              34760.4601
+            ],
+            "mean_audio_ttfp_ms": [
+              1023.3301,
+              2734.1486,
+              3151.402,
+              6572.2464,
+              13222.2413
+            ],
+            "mean_audio_rtf": [
+              0.4659,
+              1.3127,
+              2.1758,
+              4.181,
+              7.7519
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_minicpmo_4_5_a2",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A2"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5.yaml",
+        "--trust-remote-code"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [
+          32,
+          64,
+          128
+        ],
+        "max_concurrency": [
+          1,
+          4,
+          8
+        ],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "modalities": [
+            "text",
+            "audio"
+          ],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+      }
+    ]
+  }
+]

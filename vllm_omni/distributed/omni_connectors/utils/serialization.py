@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, fields, is_dataclass
 from typing import Any
 
 import msgspec
@@ -45,6 +45,11 @@ class OmniMsgpackEncoder:
         """Encode an object to bytes."""
         return self.encoder.encode(obj)
 
+    def encode_into(self, obj: Any, buffer: bytearray) -> int:
+        """Encode into a caller-owned bytearray and return the written length."""
+        self.encoder.encode_into(obj, buffer)
+        return len(buffer)
+
     def _enc_hook(self, obj: Any) -> Any:
         """Custom encoding hook for non-standard types."""
         # torch.Tensor
@@ -59,7 +64,10 @@ class OmniMsgpackEncoder:
         if isinstance(obj, Image.Image):
             return self._encode_pil_image(obj)
 
-        # RequestOutput (not a dataclass, needs special handling)
+        # RequestOutput (not a dataclass, needs special handling).
+        # Note: OmniRequestOutput subclasses RequestOutput but is a dataclass,
+        # so msgspec encodes it natively (field map) and it never reaches
+        # this hook.
         if isinstance(obj, RequestOutput):
             return self._encode_request_output(obj)
 
@@ -83,18 +91,15 @@ class OmniMsgpackEncoder:
 
     def _encode_tensor(self, tensor: torch.Tensor) -> dict[str, Any]:
         """Encode torch.Tensor to dict."""
-        t = tensor.detach().cpu()
-        # Handle 0-dimensional (scalar) tensors by reshaping to 1D first
-        if t.dim() == 0:
-            t = t.reshape(1)
-        if not t.is_contiguous():
-            t = t.contiguous()
-        t = t.view(torch.uint8)
+        # Flatten: a contiguous tensor can still have a non-unit last stride
+        # beside a size-1 dimension, which view(uint8) rejects. This also
+        # covers 0-d tensors; decode restores the shape.
+        t = tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
         return {
             _TENSOR_MARKER: True,
             "dtype": str(tensor.dtype).removeprefix("torch."),
             "shape": list(tensor.shape),
-            "data": t.numpy().tobytes(),
+            "data": memoryview(t.numpy()),
         }
 
     def _encode_ndarray(self, arr: np.ndarray) -> dict[str, Any]:
@@ -148,7 +153,6 @@ class OmniMsgpackEncoder:
             "encoder_prompt": obj.encoder_prompt,
             "encoder_prompt_token_ids": obj.encoder_prompt_token_ids,
             "num_cached_tokens": obj.num_cached_tokens,
-            "multi_modal_placeholders": getattr(obj, "multi_modal_placeholders", None),
             "kv_transfer_params": obj.kv_transfer_params,
         }
         # Handle multimodal_output attribute (MultimodalPayload or dict)
@@ -252,23 +256,27 @@ class OmniMsgpackDecoder:
     def _decode_omni_request_output(self, obj: dict[str, Any]) -> Any:
         """Decode dict to OmniRequestOutput.
 
-        OmniRequestOutput is a dataclass, so we can use msgspec.convert
-        or construct it directly.
+        By the time this runs, ``_post_process`` has already reconstructed
+        nested values bottom-up (CompletionOutput, tensors, images, ...), so
+        the object is built directly from the known dataclass fields.
         """
         from vllm_omni.outputs import OmniRequestOutput
 
+        data = dict(obj)
+        # Legacy wire format (pre-inheritance): the stage output was nested
+        # under "request_output". Merge its content into the new object.
+        legacy_inner = data.pop("request_output", None)
+        field_names = {f.name for f in fields(OmniRequestOutput)}
+        known = {k: v for k, v in data.items() if k in field_names}
         try:
-            # Use msgspec.convert for dataclass reconstruction
-            return msgspec.convert(obj, OmniRequestOutput)
+            out = OmniRequestOutput(**known)
         except Exception:
-            try:
-                # Fallback: construct directly if msgspec.convert fails
-                # (e.g., if some fields are missing or have wrong types)
-                return OmniRequestOutput(**obj)
-            except Exception:
-                # If both attempts fail, return dict as-is (defensive fallback)
-                # This should rarely happen if _is_omni_request_output is correct
-                return obj
+            # Defensive fallback; should rarely happen if
+            # _is_omni_request_output is correct.
+            return obj
+        if legacy_inner is not None and not isinstance(legacy_inner, dict):
+            out._copy_content_from(legacy_inner)
+        return out
 
     def _decode_tensor(self, obj: dict[str, Any]) -> torch.Tensor:
         """Decode dict to torch.Tensor."""
@@ -314,19 +322,16 @@ class OmniMsgpackDecoder:
         We construct it manually using only the known __init__ parameters to
         avoid triggering the "Ignoring extra arguments" warning in vllm.
         Fields that are not part of RequestOutput.__init__ (e.g.
-        multi_modal_placeholders, multimodal_output) are extracted first and
+        multimodal_output) are extracted first and
         then restored as dynamic attributes after construction.
         """
         # Extract dynamically-added / non-init fields before constructing so
         # they are not passed as unknown **kwargs to RequestOutput.__init__.
         mm_output = obj.pop("multimodal_output", None)
-        multi_modal_placeholders = obj.pop("multi_modal_placeholders", None)
 
         ro = RequestOutput(**obj)
 
         # Restore dynamic attributes that are not part of __init__.
-        if multi_modal_placeholders is not None:
-            setattr(ro, "multi_modal_placeholders", multi_modal_placeholders)
         if mm_output is not None:
             setattr(ro, "multimodal_output", mm_output)
         return ro
@@ -342,6 +347,10 @@ class OmniSerde:
     def serialize(self, obj: Any) -> bytes:
         """Serialize an object to bytes."""
         return self.encoder.encode(obj)
+
+    def serialize_into(self, obj: Any, buffer: bytearray) -> int:
+        """Serialize into a caller-owned bytearray and return the written length."""
+        return self.encoder.encode_into(obj, buffer)
 
     def deserialize(self, data: bytes | bytearray | memoryview) -> Any:
         """Deserialize bytes to an object."""

@@ -1,6 +1,5 @@
 # CFG-Parallel Guide
 
-
 ## Table of Content
 
 - [Overview](#overview)
@@ -18,6 +17,12 @@
 CFG-Parallel accelerates diffusion models by distributing positive and negative classifier-free guidance (CFG) passes across different GPUs, providing ~1.8x speedup when CFG is enabled. It's ideal for image editing tasks that require guidance scales greater than 1.0.
 
 See supported models list in [Supported Models](../../diffusion_features.md#supported-models).
+
+Distilled Cosmos3 checkpoints, including `nvidia/Cosmos3-Super-Image2Video-4Step`,
+run without CFG and reject `--cfg-parallel-size` greater than 1 at startup.
+Use `--ulysses-degree 2` for two-GPU inference. These checkpoints always use
+`guidance_scale=1.0`; other explicitly requested values produce a warning, and
+`negative_prompt` does not affect generation.
 
 ---
 
@@ -88,14 +93,26 @@ vllm serve Qwen/Qwen-Image-Edit --omni --port 8091 --cfg-parallel-size 2
 
 In `DiffusionParallelConfig`
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `cfg_parallel_size` | int | 1 | Number of GPUs for CFG parallelism. Set to 2 to enable CFG-Parallel (rank 0 for positive, rank 1 for negative branch) |
-
+| Parameter           | Type | Default | Description                                                                                                           |
+| ------------------- | ---- | ------- | --------------------------------------------------------------------------------------------------------------------- |
+| `cfg_parallel_size` | int  | 1       | Number of GPUs for CFG parallelism. Set to 2 to enable CFG-Parallel (rank 0 for positive, rank 1 for negative branch) |
 
 !!! info
-    Most models support `cfg_parallel_size=2` (positive branch on rank 0, negative branch on rank 1). **Bagel** is an exception: it supports `cfg_parallel_size=3`, which adds a third branch on rank 2 for full three-way CFG parallelism.
+    Most models support `cfg_parallel_size=2` (positive branch on rank 0, negative branch on rank 1). **Bagel** and **Boogu-Image-Edit double guidance** also support `cfg_parallel_size=3` for full three-way branch execution. Boogu double guidance additionally supports size 2 via round-robin assignment of its three branches.
 
+### CFG batching on one CFG rank
+
+Without CFG-Parallel (`cfg_parallel_size=1`), some pipelines run the positive and negative branch as one denoiser
+call on the two branches concatenated along the batch dimension, instead of two calls. This halves the denoiser
+calls per step, which helps most where a step is launch-bound (small resolutions, eager mode). It is off by default;
+enable it with `--enable-cfg-batching` or `Omni(..., enable_cfg_batching=True)`.
+
+- Pipelines opt in with `supports_cfg_batching = True`: SDXL, SD3, FLUX.1 (true CFG) and FLUX.1-Kontext,
+  FLUX.2 and FLUX.2-Klein, Wan2.2 T2V/TI2V/I2V/VACE.
+- It is not used with CFG-Parallel, pipeline parallelism, or any `cache_backend` (TeaCache and friends keep one state
+  per branch). If the branch arguments differ in shape (for example different prompt lengths), that step runs the
+  branches sequentially and a warning is logged once.
+- Batched and sequential outputs are not bit-identical in bf16, since GEMMs run at twice the batch size.
 
 ---
 
@@ -118,8 +135,8 @@ In `DiffusionParallelConfig`
 
 ### Expected Performance
 
-| Configuration | Speedup | Quality | Use Case |
-|--------------|---------|---------|----------|
+| Configuration         | Speedup  | Quality        | Use Case                  |
+| --------------------- | -------- | -------------- | ------------------------- |
 | CFG-Parallel (2 GPUs) | 1.5~1.8x | No degradation | Large model, VRAM limited |
 
 ---
@@ -133,6 +150,7 @@ In `DiffusionParallelConfig`
 **Solutions**:
 
 1. **Ensure CFG scale is set correctly:**
+
 ```python
 # Bad: No CFG effect
 sampling_params = OmniDiffusionSamplingParams(num_inference_steps=50)
@@ -144,7 +162,8 @@ sampling_params = OmniDiffusionSamplingParams(
 )
 ```
 
-2. **Add negative prompt:**
+1. **Add negative prompt:**
+
 ```python
 outputs = omni.generate(
     {
@@ -156,7 +175,7 @@ outputs = omni.generate(
 )
 ```
 
-3. **Check model support:**
+1. **Check model support:**
    - Verify your model in [supported models](../../diffusion_features.md#supported-models)
    - Some models don't support CFG-Parallel
 

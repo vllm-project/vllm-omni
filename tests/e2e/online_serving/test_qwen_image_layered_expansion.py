@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Comprehensive tests of diffusion features that are available in online serving mode
 and are supported by Qwen-Image-Layered model.
@@ -12,13 +12,18 @@ Kept cases (maximum feature coverage, no cpu-offload):
 Total distinct features covered: cache_dit, Ulysses-SP, CFG-Parallel, layerwise-offload.
 """
 
+import base64
+import io
+from typing import Any
+
 import pytest
+from PIL import Image
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.media import decode_b64_image, generate_synthetic_image
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.media import generate_synthetic_image
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = "Qwen/Qwen-Image-Layered"
 EDIT_PROMPT = "Decompose this image into layers."
@@ -82,7 +87,7 @@ FEATURE_CASES = [
 
 
 @pytest.mark.parametrize("omni_server", FEATURE_CASES, indirect=True)
-def test_feature(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_feature(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Test feature combinations with Qwen-Image-Layered."""
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
 
@@ -99,7 +104,7 @@ def test_feature(omni_server: OmniServer, openai_client: OpenAIClientHandler):
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 # ── Guard: Issue #1969 – layered output must return `layers` images ─────────
@@ -123,19 +128,19 @@ LAYERS_GUARD_CASES = [
 ]
 
 
-def _collect_image_url_items(openai_client: OpenAIClientHandler, request_config: dict):
+def _collect_image_url_items(online_client: OnlineOmniClient, request_config: dict):
     """Send a request and return all image_url content items from the API response.
 
     Handles both object-style (Pydantic) and dict-style (raw JSON) content items,
     because the OpenAI SDK may return either depending on how the server serializes
     the multimodal content list.
     """
-    chat_completion = openai_client.client.chat.completions.create(
+    chat_completion = online_client.client.chat.completions.create(
         model=request_config["model"],
         messages=request_config["messages"],
         extra_body=request_config.get("extra_body"),
     )
-    image_items = []
+    image_items: list[Any] = []
     for choice in chat_completion.choices:
         content = getattr(choice.message, "content", None)
         assert content is not None, "API response content is None"
@@ -164,7 +169,7 @@ def _collect_image_url_items(openai_client: OpenAIClientHandler, request_config:
 )
 def test_layered_output_image_count(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     expected_layers: int,
 ):
     """Guard for https://github.com/vllm-project/vllm-omni/issues/1969
@@ -189,7 +194,7 @@ def test_layered_output_image_count(
         },
     }
 
-    image_items = _collect_image_url_items(openai_client, request_config)
+    image_items = _collect_image_url_items(online_client, request_config)
 
     # Core assertion: the API must NOT collapse multiple layers into 1 image
     assert len(image_items) != 1 or expected_layers == 1, (
@@ -209,7 +214,8 @@ def test_layered_output_image_count(
             url = item.image_url.url
         assert url.startswith("data:image"), f"image_url item {i} is not a data URI: {url[:80]}"
         b64 = url.split(",", 1)[1]
-        img = decode_b64_image(b64)
+        img = Image.open(io.BytesIO(base64.b64decode(b64)))
+        img.load()
         assert img is not None, f"Failed to decode image at index {i}"
 
 
@@ -231,7 +237,7 @@ PROMPT_CASES = [
 
 
 @pytest.mark.parametrize("omni_server", PROMPT_CASES, indirect=True)
-def test_empty_prompt(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_empty_prompt(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Test feature combinations with Qwen-Image-Layered."""
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
 
@@ -248,4 +254,4 @@ def test_empty_prompt(omni_server: OmniServer, openai_client: OpenAIClientHandle
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

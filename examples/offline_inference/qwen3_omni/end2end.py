@@ -367,7 +367,7 @@ def main(args):
     print(f"query type: {args.query_type}")
 
     for stage_outputs in omni_generator:
-        output = stage_outputs.request_output
+        output = stage_outputs
         if stage_outputs.final_output_type == "text":
             request_id = output.request_id
             text_output = output.outputs[0].text
@@ -461,12 +461,6 @@ def parse_args():
         help="Timeout for initializing stages in seconds (default: 300)",
     )
     parser.add_argument(
-        "--shm-threshold-bytes",
-        type=int,
-        default=65536,
-        help="Threshold for using shared memory in bytes (default: 65536)",
-    )
-    parser.add_argument(
         "--output-wav",
         default="output_audio",
         help="[Deprecated] Output wav directory (use --output-dir).",
@@ -484,10 +478,10 @@ def parse_args():
         help="Path to a .txt file with one prompt per line (preferred).",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
         default=None,
-        help="Path to a stage configs file.",
+        help="Path to a deploy config YAML.",
     )
     parser.add_argument(
         "--video-path",

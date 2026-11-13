@@ -12,6 +12,8 @@ from tests.entrypoints.openai_api.conftest_video import (
 )
 from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilter
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class TestFrameSimilarityFilter:
     def test_first_frame_always_retained(self):

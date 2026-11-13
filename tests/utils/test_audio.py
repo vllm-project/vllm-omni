@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for vllm_omni.utils.audio."""
 
@@ -9,11 +9,14 @@ import torch
 
 from vllm_omni.utils.audio import mel_filter_bank, peak_normalize
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 # Parameter combinations used across the codebase.
 _PARAM_SETS = [
     # Qwen3-TTS talker / speaker encoder (sr=24000)
     dict(sr=24000, n_fft=1024, n_mels=128, fmin=0, fmax=12000),
-    # CosyVoice3 whisper encoder, Qwen3-TTS 25Hz tokenizer (sr=16000, 80 mels)
+    # CosyVoice3 whisper encoder (sr=16000, 80 mels)
     dict(sr=16000, n_fft=400, n_mels=80),
     # CosyVoice3 whisper encoder (sr=16000, 128 mels)
     dict(sr=16000, n_fft=400, n_mels=128),

@@ -1,13 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
+import ast
 import inspect
-import os
-import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+
+from tests.model_executor.models.minicpmo_4_5.helpers import stage0_vision_runtime as _stage0_vision_runtime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -16,12 +21,12 @@ def _minicpmo_duplex_policy_case(
     state: SimpleNamespace,
     payload: dict[str, object],
 ):
-    from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRow
+    from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
 
-    session_key = ("sid-policy", 1)
+    session_key = "sid-policy"
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.model_stage = "llm"
     model._minicpmo45_native_duplex_token_ids_cache = {
@@ -33,8 +38,7 @@ def _minicpmo_duplex_policy_case(
     row = DuplexSamplingRow(
         row_idx=0,
         request_id="req-policy",
-        session_id=session_key[0],
-        incarnation=session_key[1],
+        session_id=session_key,
         seq=3,
         payload=payload,
         max_tokens=20,
@@ -43,7 +47,7 @@ def _minicpmo_duplex_policy_case(
 
 
 def test_minicpmo_model_hook_owns_duplex_sampling_rows_and_force_listen():
-    from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRow
+    from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
@@ -61,13 +65,12 @@ def test_minicpmo_model_hook_owns_duplex_sampling_rows_and_force_listen():
         "tts_bos_token_id": 8,
         "turn_eos_token_id": 9,
     }
-    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={("sid-hook", 2): state})
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={"sid-hook": state})
     logits = torch.zeros((1, 16), dtype=torch.float32)
     row = DuplexSamplingRow(
         row_idx=0,
         request_id="req-hook",
         session_id="sid-hook",
-        incarnation=2,
         seq=3,
         payload={"force_listen": True, "is_speech": True},
         max_tokens=20,
@@ -76,7 +79,7 @@ def test_minicpmo_model_hook_owns_duplex_sampling_rows_and_force_listen():
     model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
 
     assert model._minicpmo45_active_duplex_rows == [0]
-    assert model._minicpmo45_duplex_row_sessions == {0: ("sid-hook", 2)}
+    assert model._minicpmo45_duplex_row_sessions == {0: "sid-hook"}
     assert model._minicpmo45_duplex_row_payloads == {0: row.payload}
     assert model._minicpmo45_duplex_row_max_tokens == {0: 20}
     assert logits[0, listen_id].item() == 0.0
@@ -150,7 +153,7 @@ def test_minicpmo_model_hook_old_response_output_does_not_clear_pending_speech_c
         pending_speech_context=True,
     )
     model, row = _minicpmo_duplex_policy_case(state, {"is_speech": True})
-    model._minicpmo45_duplex_row_sessions = {0: (row.session_id, row.incarnation)}
+    model._minicpmo45_duplex_row_sessions = {0: row.session_id}
     model._minicpmo45_duplex_row_payloads = {0: row.payload}
 
     model._record_minicpmo45_duplex_terminator(
@@ -171,7 +174,7 @@ def test_minicpmo_model_hook_new_response_output_clears_pending_speech_context()
         pending_speech_context=True,
     )
     model, row = _minicpmo_duplex_policy_case(state, {"is_speech": False})
-    model._minicpmo45_duplex_row_sessions = {0: (row.session_id, row.incarnation)}
+    model._minicpmo45_duplex_row_sessions = {0: row.session_id}
     model._minicpmo45_duplex_row_payloads = {0: row.payload}
 
     model._record_minicpmo45_duplex_terminator(
@@ -193,7 +196,7 @@ def test_minicpmo_model_hook_empty_speak_envelope_preserves_pending_speech_conte
         pending_speech_response_open=False,
     )
     model, row = _minicpmo_duplex_policy_case(state, {"is_speech": False})
-    model._minicpmo45_duplex_row_sessions = {0: (row.session_id, row.incarnation)}
+    model._minicpmo45_duplex_row_sessions = {0: row.session_id}
     model._minicpmo45_duplex_row_payloads = {0: row.payload}
     token_ids = {
         "listen_token_id": 7,
@@ -234,7 +237,7 @@ def test_minicpmo_model_hook_second_new_response_step_is_not_forced_to_listen():
     original_logits = logits.clone()
 
     model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
-    model._minicpmo45_duplex_row_sessions = {0: (row.session_id, row.incarnation)}
+    model._minicpmo45_duplex_row_sessions = {0: row.session_id}
     model._minicpmo45_duplex_row_payloads = {0: row.payload}
     model._record_minicpmo45_duplex_terminator(
         0,
@@ -267,7 +270,7 @@ def test_minicpmo_model_hook_same_speech_row_second_step_does_not_rearm_pending_
     logits[0, 10] = 20.0
 
     model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
-    model._minicpmo45_duplex_row_sessions = {0: (row.session_id, row.incarnation)}
+    model._minicpmo45_duplex_row_sessions = {0: row.session_id}
     model._minicpmo45_duplex_row_payloads = {0: row.payload}
     model._record_minicpmo45_duplex_terminator(
         0,
@@ -278,16 +281,16 @@ def test_minicpmo_model_hook_same_speech_row_second_step_does_not_rearm_pending_
     next_logits[0, 7] = 30.0
     next_logits[0, 8] = -2.0
     next_logits[0, 10] = 20.0
+    original_next_logits = next_logits.clone()
 
     model.prepare_duplex_sampling(next_logits, SimpleNamespace(), (row,))
 
     assert state.pending_speech_context is False
     assert state.current_turn_ended is False
-    assert torch.isneginf(next_logits[0, 7])
-    assert next_logits[0, 8].item() == 30.0
+    assert torch.equal(next_logits, original_next_logits)
 
 
-def test_minicpmo_model_hook_mid_turn_speech_redirects_listen_to_tts_bos():
+def test_minicpmo_model_hook_mid_turn_speech_preserves_logits_for_post_sample_redirect():
     state = SimpleNamespace(
         current_turn_ended=False,
         last_terminator_token=None,
@@ -298,12 +301,11 @@ def test_minicpmo_model_hook_mid_turn_speech_redirects_listen_to_tts_bos():
     logits[0, 7] = 30.0
     logits[0, 8] = -2.0
     logits[0, 10] = 20.0
+    original_logits = logits.clone()
 
     model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
 
-    assert torch.isneginf(logits[0, 7])
-    assert logits[0, 8].item() == 30.0
-    assert logits[0, 10].item() == 20.0
+    assert torch.equal(logits, original_logits)
 
 
 def test_minicpmo_model_hook_ignores_serving_new_user_turn_marker():
@@ -319,16 +321,16 @@ def test_minicpmo_model_hook_ignores_serving_new_user_turn_marker():
     logits = torch.zeros((1, 16), dtype=torch.float32)
     logits[0, 7] = 5.0
     logits[0, 10] = 20.0
+    original_logits = logits.clone()
     model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
 
     assert state.current_turn_ended is False
     assert state.last_terminator_token is None
-    assert torch.isneginf(logits[0, 7])
-    assert logits[0, 8].item() == 5.0
+    assert torch.equal(logits, original_logits)
 
 
 def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
-    from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingHelper
+    from vllm_omni.model_executor.duplex_sampling import DuplexSamplingHelper
     from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
     runner = GPUARModelRunner.__new__(GPUARModelRunner)
@@ -338,7 +340,6 @@ def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
             "duplex": {
                 "data_plane": True,
                 "session_id": "sid-runner-hook",
-                "incarnation": 4,
                 "seq": 4,
                 "payload": {"is_speech": True},
             }
@@ -358,7 +359,6 @@ def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
     assert rows[0].row_idx == 0
     assert rows[0].request_id == "req-duplex"
     assert rows[0].session_id == "sid-runner-hook"
-    assert rows[0].incarnation == 4
     assert rows[0].seq == 4
     assert rows[0].payload == {"is_speech": True}
     assert rows[0].max_tokens == 32
@@ -399,6 +399,7 @@ def test_minicpmo_non_duplex_sample_skips_duplex_row_scan():
 
     calls = []
     runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.requests = {}
     runner.input_batch = SimpleNamespace(
         sampling_metadata=SimpleNamespace(output_token_ids=[]),
         update_async_output_token_ids=lambda: None,
@@ -417,7 +418,8 @@ def test_minicpmo_non_duplex_sample_skips_duplex_row_scan():
     )
 
     assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
-    assert calls == []
+    # The empty row set is still published: the model then skips its per-row prompt scan.
+    assert calls == ["prepare"]
 
 
 def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
@@ -425,6 +427,7 @@ def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
 
     calls = []
     runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.requests = {}
     runner.input_batch = SimpleNamespace(
         sampling_metadata=SimpleNamespace(output_token_ids=[]),
         update_async_output_token_ids=lambda: None,
@@ -444,7 +447,7 @@ def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
 
     assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
     assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
-    assert calls == [()]
+    assert calls == [(), ()]
 
 
 def test_generic_ar_runner_has_no_minicpmo_sampler_state_or_typeerror_probe():
@@ -457,13 +460,13 @@ def test_generic_ar_runner_has_no_minicpmo_sampler_state_or_typeerror_probe():
     assert 'if "duplex_rows" not in str(exc)' not in source
 
 
-def test_minicpmo_model_cleans_incarnation_state_when_request_finishes():
+def test_minicpmo_model_cleans_session_state_when_request_finishes():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
 
     request_id = "duplex-sid-cleanup-i3-e0-stage0"
-    session_key = ("sid-cleanup", 3)
+    session_key = "sid-cleanup"
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.model = SimpleNamespace()
     model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: object()})
@@ -531,7 +534,7 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
 
 
 def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -544,222 +547,8 @@ def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():
         )
 
 
-def test_minicpmo_tts_native_duplex_exports_segment_text_not_accumulated_condition_text():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
-        MiniCPMO45OmniForConditionalGeneration,
-    )
-
-    class _Talker:
-        _ar_last_chunk_flags = [False]
-        _ar_last_emitted_text = "你好，你有什莫想聊的吗？"
-
-        def __call__(self, **kwargs):
-            del kwargs
-            return None, torch.zeros(8, dtype=torch.float32)
-
-    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
-    model.model_stage = "tts"
-    model.config = SimpleNamespace(hidden_size=4)
-    model.talker = _Talker()
-
-    output = model.forward(
-        input_ids=torch.zeros(1, dtype=torch.long),
-        positions=torch.zeros(1, dtype=torch.long),
-        runtime_additional_information=[
-            {
-                "native_duplex": True,
-                "llm_output_text": ["你好，你有什莫想聊的吗？你好，你有什莫想聊的吗？"],
-                "meta": {
-                    "native_duplex_segment_text": "你好，你有什莫想聊的吗？",
-                },
-            }
-        ],
-    )
-
-    text_bytes = output.multimodal_outputs["meta.llm_output_text_utf8"].detach().cpu().tolist()
-    assert bytes(text_bytes).decode("utf-8") == "你好，你有什莫想聊的吗？"
-    assert int(output.multimodal_outputs["meta.audio_text_total_chars"].item()) == len("你好，你有什莫想聊的吗？")
-
-
-def test_minicpmo_tts_native_duplex_exports_model_turn_end_metadata():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
-        MiniCPMO45OmniForConditionalGeneration,
-    )
-
-    class _Talker:
-        _ar_last_chunk_flags = [True]
-        _ar_turn_end_flags = [True]
-
-        def __call__(self, **kwargs):
-            del kwargs
-            return None, torch.zeros(0, dtype=torch.float32)
-
-    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
-    model.model_stage = "tts"
-    model.config = SimpleNamespace(hidden_size=4)
-    model.talker = _Talker()
-
-    output = model.forward(
-        input_ids=torch.zeros(1, dtype=torch.long),
-        positions=torch.zeros(1, dtype=torch.long),
-        runtime_additional_information=[
-            {
-                "native_duplex": True,
-                "meta": {"native_duplex_segment_text": ""},
-            }
-        ],
-    )
-
-    assert int(output.multimodal_outputs["meta.turn_end"].item()) == 1
-
-
-def test_minicpmo_tts_routes_batched_requests_and_terminal_flags_independently():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
-        MiniCPMO45OmniForConditionalGeneration,
-    )
-
-    class _Talker:
-        def __init__(self):
-            self.calls = []
-            self._ar_last_chunk_flags = [True]
-            self._ar_turn_end_flags = [False]
-            self._ar_last_emitted_text = ""
-
-        def __call__(self, **kwargs):
-            info = kwargs["additional_information"]
-            request_id = info["global_request_id"][0]
-            self.calls.append(request_id)
-            is_last = request_id == "req-b"
-            self._ar_last_chunk_flags = [is_last]
-            self._ar_turn_end_flags = [is_last]
-            self._ar_last_emitted_text = request_id
-            value = 1.0 if request_id == "req-a" else 2.0
-            return None, torch.full((2,), value, dtype=torch.float32)
-
-    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
-    model.model_stage = "tts"
-    model.config = SimpleNamespace(hidden_size=4)
-    model.talker = _Talker()
-
-    output = model.forward(
-        input_ids=torch.zeros(3, dtype=torch.long),
-        positions=torch.zeros(3, dtype=torch.long),
-        runtime_additional_information=[
-            {
-                "global_request_id": ["req-a"],
-                "native_duplex": True,
-                "duplex": {"epoch": 3, "turn_id": 7},
-                "meta": {"native_duplex_segment_text": "first"},
-            },
-            {
-                "global_request_id": ["req-idle"],
-                "native_duplex": True,
-                "duplex": {"epoch": 3, "turn_id": 9},
-                "meta": {"native_duplex_segment_text": "idle"},
-            },
-            {
-                "global_request_id": ["req-b"],
-                "native_duplex": True,
-                "duplex": {"epoch": 4, "turn_id": 8},
-                "meta": {"native_duplex_segment_text": "second"},
-            },
-        ],
-        request_token_spans=[(0, 2), (2, 2), (2, 3)],
-    )
-
-    assert model.talker.calls == ["req-a", "req-b"]
-    assert model.talker._ar_last_chunk_flags == [False, False, True]
-    assert model.talker._ar_turn_end_flags == [False, False, True]
-    assert output.multimodal_outputs["meta.req_id"] == ["req-a", "req-b"]
-    assert output.multimodal_outputs["meta.sparse_audio"] == ["1"]
-    assert [waveform.tolist() for waveform in output.multimodal_outputs["model_outputs"]] == [
-        [1.0, 1.0],
-        [2.0, 2.0],
-    ]
-    assert [int(value.item()) for value in output.multimodal_outputs["meta.tts_is_last_chunk"]] == [0, 1]
-    assert [int(value.item()) for value in output.multimodal_outputs["meta.turn_end"]] == [0, 1]
-    assert [int(value.item()) for value in output.multimodal_outputs["meta.duplex_epoch"]] == [3, 4]
-    assert [int(value.item()) for value in output.multimodal_outputs["meta.duplex_turn_id"]] == [7, 8]
-
-
-@pytest.mark.parametrize(
-    ("runtime_info", "request_token_spans", "expected_rows", "expected_ids"),
-    [
-        (
-            [
-                {
-                    "global_request_id": ["req-a"],
-                    "native_duplex": True,
-                    "duplex": {"epoch": 3, "turn_id": 7},
-                    "meta": {"native_duplex_segment_text": "first"},
-                }
-            ],
-            [(0, 3)],
-            [3],
-            ["req-a"],
-        ),
-        (
-            [
-                {
-                    "global_request_id": ["req-a"],
-                    "native_duplex": True,
-                    "duplex": {"epoch": 3, "turn_id": 7},
-                    "meta": {"native_duplex_segment_text": "first"},
-                },
-                {
-                    "global_request_id": ["req-b"],
-                    "native_duplex": True,
-                    "duplex": {"epoch": 4, "turn_id": 8},
-                    "meta": {"native_duplex_segment_text": "second"},
-                },
-            ],
-            [(0, 2), (2, 3)],
-            [2, 1],
-            ["req-a", "req-b"],
-        ),
-    ],
-    ids=["single-request", "batched-requests"],
-)
-def test_minicpmo_tts_ignores_cuda_graph_padding_after_request_spans(
-    runtime_info,
-    request_token_spans,
-    expected_rows,
-    expected_ids,
-):
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
-        MiniCPMO45OmniForConditionalGeneration,
-    )
-
-    class _Talker:
-        def __init__(self):
-            self.input_rows = []
-            self._ar_last_chunk_flags = [True]
-            self._ar_turn_end_flags = [False]
-            self._ar_last_emitted_text = ""
-
-        def __call__(self, **kwargs):
-            self.input_rows.append(int(kwargs["input_ids"].shape[0]))
-            return None, torch.ones(2, dtype=torch.float32)
-
-    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
-    model.model_stage = "tts"
-    model.config = SimpleNamespace(hidden_size=4)
-    model.talker = _Talker()
-
-    output = model.forward(
-        input_ids=torch.zeros(4, dtype=torch.long),
-        positions=torch.zeros(4, dtype=torch.long),
-        runtime_additional_information=runtime_info,
-        request_token_spans=request_token_spans,
-    )
-
-    assert model.talker.input_rows == expected_rows
-    assert output.text_hidden_states.shape == (4, 4)
-    assert output.multimodal_outputs["meta.req_id"] == expected_ids
-
-
 def test_minicpmo_stage0_special_token_ids_are_tokenizer_derived():
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -796,7 +585,7 @@ def test_minicpmo_stage0_special_token_ids_are_tokenizer_derived():
 
 
 def test_minicpmo_stage0_rejects_unknown_special_token_fallbacks():
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -829,10 +618,184 @@ def test_minicpmo_stage0_rejects_unknown_special_token_fallbacks():
         runtime._require_special_token_ids()
 
 
+def _minicpmo45_tokenizer_stub():
+    token_ids = {
+        token: index
+        for index, token in enumerate(
+            (
+                "<unit>",
+                "</unit>",
+                "<|listen|>",
+                "<|speak|>",
+                "<|tts_bos|>",
+                "<|tts_eos|>",
+                "<|tts_pad|>",
+                "<|chunk_eos|>",
+                "<|chunk_tts_eos|>",
+                "<|turn_eos|>",
+            ),
+            start=101,
+        )
+    }
+    return SimpleNamespace(
+        unk_token_id=0,
+        convert_tokens_to_ids=lambda token: token_ids.get(token, 0),
+        encode=lambda token, add_special_tokens=False: (
+            [token_ids[token]] if not add_special_tokens and token in token_ids else [0]
+        ),
+    )
+
+
+def _transformers_processor_stub(auto_processor):
+    class _AutoImageProcessor:
+        @staticmethod
+        def register(*_args, **_kwargs):
+            return None
+
+    return SimpleNamespace(
+        AutoImageProcessor=_AutoImageProcessor,
+        AutoProcessor=auto_processor,
+    )
+
+
+def test_minicpmo_stage0_loads_processor_from_hf_id(monkeypatch):
+    import sys
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    model_id = "openbmb/MiniCPM-o-4_5"
+    processor = SimpleNamespace(tokenizer=_minicpmo45_tokenizer_stub())
+    load_calls = []
+
+    class _AutoImageProcessor:
+        @staticmethod
+        def register(config_class, image_processor_class):
+            del image_processor_class
+            if isinstance(config_class, str):
+                raise AttributeError("'str' object has no attribute '__module__'")
+
+    class _AutoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_path, *, trust_remote_code):
+            load_calls.append((model_path, trust_remote_code))
+            _AutoImageProcessor.register("MiniCPMVImageProcessor", object)
+            return processor
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoImageProcessor=_AutoImageProcessor,
+            AutoProcessor=_AutoProcessor,
+        ),
+    )
+
+    loaded = MiniCPMO45Stage0DuplexRuntime._load_processor_from_path(model_id)
+
+    assert loaded is processor
+    assert load_calls == [(model_id, True)]
+    with pytest.raises(AttributeError, match="__module__"):
+        _AutoImageProcessor.register("MiniCPMVImageProcessor", object)
+
+
+def test_minicpmo_stage0_processor_load_preserves_original_exception(monkeypatch):
+    import sys
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    original = ValueError("invalid processor config")
+
+    class _AutoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_path, *, trust_remote_code):
+            del cls, model_path, trust_remote_code
+            raise original
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        _transformers_processor_stub(_AutoProcessor),
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to load MiniCPM-o duplex processor") as exc_info:
+        MiniCPMO45Stage0DuplexRuntime._load_processor_from_path("openbmb/MiniCPM-o-4_5")
+
+    assert exc_info.value.__cause__ is original
+
+
+def test_minicpmo_stage0_processor_requires_tokenizer(monkeypatch):
+    import sys
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    class _AutoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_path, *, trust_remote_code):
+            del cls, model_path, trust_remote_code
+            return object()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        _transformers_processor_stub(_AutoProcessor),
+    )
+
+    with pytest.raises(RuntimeError, match="does not expose a tokenizer"):
+        MiniCPMO45Stage0DuplexRuntime._load_processor_from_path("openbmb/MiniCPM-o-4_5")
+
+
+def test_minicpmo_stage0_loaded_processor_validates_special_tokens(monkeypatch):
+    import sys
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    processor = SimpleNamespace(tokenizer=_minicpmo45_tokenizer_stub())
+
+    class _AutoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_path, *, trust_remote_code):
+            del cls, model_path, trust_remote_code
+            return processor
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        _transformers_processor_stub(_AutoProcessor),
+    )
+
+    runtime = MiniCPMO45Stage0DuplexRuntime(
+        SimpleNamespace(),
+        model_path="openbmb/MiniCPM-o-4_5",
+        device="cpu",
+    )
+
+    assert runtime.processor is processor
+    assert set(runtime._special_token_ids()) == {
+        "unit_token_id",
+        "unit_end_token_id",
+        "listen_token_id",
+        "speak_token_id",
+        "tts_bos_token_id",
+        "tts_eos_token_id",
+        "tts_pad_token_id",
+        "chunk_eos_token_id",
+        "chunk_tts_eos_token_id",
+        "turn_eos_token_id",
+    }
+
+
 def test_minicpmo_stage0_data_plane_prefill_matches_official_unit_format():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -891,10 +854,458 @@ def test_minicpmo_stage0_data_plane_prefill_matches_official_unit_format():
     assert result["prompt_suffix_len"] == 0
 
 
+@pytest.mark.parametrize("mode", [None, "off", "basic", "context"])
+def test_minicpmo_stage0_history_collection_starts_with_session_config(mode):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="history-lifecycle")
+    config = {} if mode is None else {"duplex_window_config": {"sliding_window_mode": mode}}
+    runtime._prepare_session_context(state, {}, runtime_config=config)
+    for seq in range(1, 101):
+        runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=seq)
+    enabled = mode in {"basic", "context"}
+    assert state.window_enabled is enabled
+    assert len(state.window_units) == (99 if enabled else 0)
+    assert (state.pending_window_unit is not None) is enabled
+    assert state.pending_window_generated_tokens == []
+
+
+@pytest.mark.parametrize("mode", ["basic", "context"])
+@pytest.mark.parametrize("buffered", [False, True])
+def test_minicpmo_stage0_multi_chunk_append_matches_scheduler_window(mode, buffered):
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="multi-chunk-window", window_enabled=True)
+    if buffered:
+        # Keep the tiny fake processor's initial chunk unpadded to model carry.
+        runtime._pad_first_audio_chunk_if_needed = lambda *args: None
+        assert runtime._stage_prefill_embeddings_only(state, np.zeros(2, dtype=np.float32), seq=0)["success"] is False
+    first = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(6 if buffered else 8, dtype=np.float32), seq=1, final=buffered
+    )
+    assert first["input_token_ids"] == [1, 11, 2, 1, 11]
+    assert state.window_units == []
+    assert state.pending_window_unit.token_ids == first["input_token_ids"]
+    session = SimpleNamespace(num_prompt_tokens=5)
+    replaced = False
+    for seq in (2, 3):
+        info = {
+            "duplex": {
+                "data_plane": True,
+                "seq": seq,
+                "runtime_config": {
+                    "duplex_window_config": {
+                        "sliding_window_mode": mode,
+                        "basic_window_high_tokens": 1,
+                        "basic_window_low_tokens": 2,
+                        "context_max_units": 1,
+                        "context_previous_max_tokens": 16,
+                    },
+                    "duplex_window_previous_marker_token_ids": [201, 5],
+                },
+            }
+        }
+        update = SimpleNamespace(prompt_token_ids=[3, 2, 1, 11], model_intermediate_buffer=info)
+        planned = OmniARScheduler._prepare_minicpmo45_stage0_window(
+            session, update, segment_output_ids=[44], completed_terminator=3
+        )
+        result = runtime._stage_prefill_embeddings_only(
+            state, np.zeros(4, dtype=np.float32), seq=seq, stage0_window=info["duplex"]["stage0_window"]
+        )
+        assert result["stage0_window_replaced"] is planned
+        if planned:
+            assert result["num_input_tokens"] == len(update.prompt_token_ids)
+            replaced = True
+            break
+        session.num_prompt_tokens += 1 + len(update.prompt_token_ids)
+    assert replaced
+
+
+def test_minicpmo_stage0_basic_window_rebuilds_from_retained_units():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-stage0-basic-window", window_enabled=True)
+    first = runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=1)
+    assert first["input_token_ids"] == [1, 11]
+    state.pending_window_generated_tokens.append(5)
+    state.pending_terminator_token = 3
+
+    rebuilt = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        seq=2,
+        stage0_window={
+            "replace": True,
+            "mode": "basic",
+            "drop_units": 1,
+            "replacement_prompt_len": 2,
+        },
+    )
+
+    assert rebuilt["stage0_window_replaced"] is True
+    assert rebuilt["input_token_ids"] == [1, 11]
+    assert state.window_units == []
+
+
+def test_minicpmo_stage0_context_window_inserts_previous_before_suffix():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-stage0-context-window", window_enabled=True)
+    prefix = runtime._embed_token(200)
+    suffix = runtime._embed_token(202)
+    state.context_embeds = [prefix, suffix]
+    state.context_token_ids = [200, 202]
+    state.context_prefix_embeds = [prefix]
+    state.context_prefix_token_ids = [200]
+    state.context_suffix_embeds = [suffix]
+    state.context_suffix_token_ids = [202]
+    first = runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=1)
+    assert first["input_token_ids"] == [200, 202, 1, 11]
+    state.pending_window_generated_tokens.append(42)
+    state.pending_terminator_token = 3
+
+    rebuilt = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        seq=2,
+        stage0_window={
+            "replace": True,
+            "mode": "context",
+            "drop_units": 1,
+            "previous_token_ids": [42],
+            "previous_marker_token_ids": [201, 5],
+            "replacement_prompt_len": 7,
+        },
+    )
+
+    assert rebuilt["input_token_ids"] == [200, 201, 5, 42, 202, 1, 11]
+    assert rebuilt["num_input_tokens"] == 7
+
+
+@pytest.mark.parametrize("pending_terminator", [None, 3, 99])
+def test_minicpmo_stage0_window_uses_accepted_output_not_async_sampler_history(pending_terminator):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    runtime._stage_audio_embeddings = lambda *args, **kwargs: torch.zeros((10, 2))
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-accepted-window", window_enabled=True)
+    state.context_prefix_token_ids = [200] * 7
+    state.context_suffix_token_ids = [202]
+    state.context_token_ids = [*state.context_prefix_token_ids, 202]
+    state.context_prefix_embeds = [runtime._embed_token(token_id) for token_id in state.context_prefix_token_ids]
+    state.context_suffix_embeds = [runtime._embed_token(202)]
+    state.context_embeds = [*state.context_prefix_embeds, *state.context_suffix_embeds]
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=1)
+    for seq in (2, 3):
+        state.pending_window_generated_tokens = [3, 40, 41]
+        state.pending_terminator_token = pending_terminator
+        plan = {"completed_token_ids": [], "completed_terminator_token_id": 3}
+        if seq == 3:
+            plan.update(replace=True, mode="context", drop_units=1, replacement_prompt_len=32)
+        result = runtime._stage_prefill_embeddings_only(
+            state, np.zeros(4, dtype=np.float32), seq=seq, stage0_window=plan
+        )
+
+    assert result["num_input_tokens"] == 32
+    assert [len(unit.token_ids) for unit in state.window_units] == [13]
+    assert len(state.pending_window_unit.token_ids) == 11
+    assert 40 not in result["input_token_ids"]
+    assert 41 not in result["input_token_ids"]
+
+
+@pytest.mark.parametrize("pending_terminator", [None, 3, 99])
+def test_minicpmo_stage0_without_window_reconciles_accepted_terminator(pending_terminator):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-no-window", window_enabled=False)
+    runtime._stage_prefill_embeddings_only(state, None, video_frames=[object()], seq=1)
+    # Emulate a late async sample overwriting the accepted listen boundary.
+    state.pending_terminator_token = pending_terminator
+    result = runtime._stage_prefill_embeddings_only(
+        state,
+        None,
+        video_frames=[object()],
+        seq=2,
+        stage0_window={"completed_token_ids": [], "completed_terminator_token_id": 3},
+    )
+    assert result["input_token_ids"][:3] == [3, 2, 1]  # listen, </unit>, <unit>
+    assert result["stage0_window_replaced"] is False
+    assert state.pending_terminator_token is None
+    assert not state.window_units
+
+
+def _minicpmo_seeded_silence_sampling_case(initial_user_text: str | None, *, force_listen_count: int = 0):
+    from vllm_omni.engine.duplex.contracts import DuplexFence
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import build_duplex_data_plane_prompt
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-seeded-text")
+    runtime_config = {"initial_user_text": initial_user_text}
+    runtime._prepare_session_context(state, {"instructions": "Speak exactly."}, runtime_config=runtime_config)
+    prefill = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(4, dtype=np.float32), epoch=0, seq=1, is_speech=False
+    )
+    assert prefill["success"] is True
+    prompt = build_duplex_data_plane_prompt(
+        request_id="req-seeded-text",
+        fence=DuplexFence(state.session_id),
+        session_config={"extra_body": {"force_listen_count": force_listen_count}},
+        runtime_config=runtime_config,
+        seq=1,
+        turn_seq=1,
+        payload={"type": "audio", "is_speech": False},
+        final=False,
+    )
+    payload = prompt["model_intermediate_buffer"]["duplex"]["payload"]
+    model, row = _minicpmo_duplex_policy_case(state, payload)
+    model._minicpmo45_native_duplex_token_ids_cache = runtime._special_token_ids()
+    return runtime, state, model, row
+
+
+@pytest.mark.parametrize("initial_user_text", [None, "", "Get the trust fund to the bank early."])
+@pytest.mark.parametrize("force_listen_count", [0, 1])
+def test_minicpmo_seeded_text_reaches_sampling_on_silence(initial_user_text, force_listen_count):
+    """A seeded user turn must reach the model despite its silent audio clock."""
+    runtime, state, model, row = _minicpmo_seeded_silence_sampling_case(
+        initial_user_text, force_listen_count=force_listen_count
+    )
+    logits = torch.zeros((1, 32), dtype=torch.float32)
+    logits[0, 20] = 10.0
+    original_logits = logits.clone()
+
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+
+    if initial_user_text and not force_listen_count:
+        assert torch.equal(logits, original_logits)
+        assert state.pending_speech_context is True
+    else:
+        assert logits[0, runtime.listen_token_id] == 0
+        assert torch.isfinite(logits).sum() == 1
+
+
+def test_minicpmo_seeded_text_is_consumed_before_post_turn_silence():
+    """The opening text allows one answer; silence after its end stays quiet."""
+    from dataclasses import replace
+
+    runtime, state, model, row = _minicpmo_seeded_silence_sampling_case("Read this sentence.")
+    token_ids = runtime._special_token_ids()
+    logits = torch.zeros((1, 32), dtype=torch.float32)
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+    assert torch.isfinite(logits).all()
+
+    model._record_minicpmo45_duplex_terminator(0, runtime.tts_bos_token_id, token_ids)
+    assert state.pending_speech_context is True
+    model._record_minicpmo45_duplex_terminator(0, 20, token_ids)
+    assert state.pending_speech_context is False
+    model._record_minicpmo45_duplex_terminator(0, runtime.turn_eos_token_id, token_ids)
+    assert state.current_turn_ended is True
+
+    prefill = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(4, dtype=np.float32), epoch=0, seq=2, is_speech=False
+    )
+    assert prefill["success"] is True
+    next_logits = torch.zeros((1, 32), dtype=torch.float32)
+    model.prepare_duplex_sampling(next_logits, SimpleNamespace(), (replace(row, seq=row.seq + 1),))
+    assert next_logits[0, runtime.listen_token_id] == 0
+    assert torch.isfinite(next_logits).sum() == 1
+
+
+def test_minicpmo_seeded_text_survives_explicit_initial_listen():
+    """The force-listen prefix delays the seed without losing its answer."""
+    from dataclasses import replace
+
+    runtime, state, model, row = _minicpmo_seeded_silence_sampling_case("Read this sentence.", force_listen_count=1)
+    token_ids = runtime._special_token_ids()
+    logits = torch.zeros((1, 32), dtype=torch.float32)
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+    assert torch.isfinite(logits).sum() == 1
+    model._record_minicpmo45_duplex_terminator(0, runtime.listen_token_id, token_ids)
+
+    prefill = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(4, dtype=np.float32), epoch=0, seq=2, is_speech=False
+    )
+    assert prefill["success"] is True
+    next_logits = torch.zeros((1, 32), dtype=torch.float32)
+    next_row = replace(row, seq=row.seq + 1, payload={"is_speech": False, "force_listen": False})
+    model.prepare_duplex_sampling(next_logits, SimpleNamespace(), (next_row,))
+    assert torch.isfinite(next_logits).all()
+    assert state.pending_speech_context is True
+
+
+@pytest.mark.parametrize("initial_text", [None, "", "Please say hello.", "请说你好。"])
+@pytest.mark.parametrize("speech_envelope", [False, True])
+def test_minicpmo_seeded_context_keeps_assistant_turn_open_until_eos(initial_text, speech_envelope, mocker):
+    from vllm.v1.sample.metadata import SamplingMetadata
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="seeded-context")
+    runtime._prepare_session_context(state, {}, runtime_config={"initial_user_text": initial_text})
+    result = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(4, dtype=np.float32), epoch=0, seq=1, is_speech=False
+    )
+    assert result["success"] is True
+    model, row = _minicpmo_duplex_policy_case(state, {"is_speech": False})
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    logits[0, 10] = 20.0
+    original_logits = logits.clone()
+    sampling_metadata = mocker.Mock(spec=SamplingMetadata)
+    model.prepare_duplex_sampling(logits, sampling_metadata, (row,))
+    token_ids = model._minicpmo45_native_duplex_token_ids_cache
+    sampled = model._finalize_minicpmo45_native_duplex_sample(0, 7, token_ids)
+
+    if not initial_text:
+        assert sampled == 7
+        assert logits[0, 7].item() == 0.0
+        assert torch.isneginf(logits[0, :7]).all()
+        assert torch.isneginf(logits[0, 8:]).all()
+        return
+
+    assert torch.equal(logits, original_logits)
+    assert sampled == 8
+    if speech_envelope:
+        model._record_minicpmo45_duplex_terminator(0, 8, token_ids)
+        assert state.current_turn_ended is False
+        assert state.pending_speech_context is True
+    model._record_minicpmo45_duplex_terminator(0, 10, token_ids)
+    assert state.pending_speech_context is False
+    model._record_minicpmo45_duplex_terminator(0, 9, token_ids)
+
+    # A later silent unit must not re-admit the seed after the turn ended.
+    result = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(4, dtype=np.float32), epoch=0, seq=2, is_speech=False
+    )
+    assert result["success"] is True
+    logits = original_logits.clone()
+    model.prepare_duplex_sampling(logits, sampling_metadata, (replace(row, seq=4),))
+    assert logits[0, 7].item() == 0.0
+    assert torch.isneginf(logits[0, :7]).all()
+    assert torch.isneginf(logits[0, 8:]).all()
+    assert model._finalize_minicpmo45_native_duplex_sample(0, 7, token_ids) == 7
+
+
+def test_minicpmo_stage0_puts_every_frame_of_an_append_in_one_unit():
+    """Official streaming_prefill feeds the whole frame_list into one unit.
+
+    Stacked pairs used to be spread one frame per unit, so a two-frame append
+    that closed a single unit left a frame over, failed the prefill, and still
+    advanced the session state.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-stage0-stacked-frames")
+
+    result = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        video_frames=["frame-prev", "frame-cur"],
+        seq=1,
+    )
+
+    assert result["success"] is True
+    # <unit>, then each frame as <image> + embeds + </image>, then the audio.
+    assert result["input_token_ids"] == [1, 12, 0, 0, 13, 12, 0, 0, 13, 11]
+    assert state.audio_chunk_idx == 1
+
+
+def test_minicpmo_stage0_wraps_hd_slices_after_the_source_image():
+    """Official stacked pair is max_slice_nums=[2, 1]: source + slices, then audio."""
+    import torch
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-stage0-hd-slices")
+    runtime._stage_vision_embeddings = lambda frames: [
+        [torch.ones((2, 2)), torch.full((2, 2), 2.0), torch.full((2, 2), 3.0)],
+        [torch.full((2, 2), 4.0)],
+    ]
+
+    result = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        video_frames=["base", "stack"],
+        seq=1,
+    )
+
+    assert result["success"] is True
+    # <unit> <image> src </image> <slice> p0 </slice> <slice> p1 </slice>
+    # <image> stack </image> audio
+    assert result["input_token_ids"] == [
+        1,
+        12,
+        0,
+        0,
+        13,
+        14,
+        0,
+        0,
+        15,
+        14,
+        0,
+        0,
+        15,
+        12,
+        0,
+        0,
+        13,
+        11,
+    ]
+
+
+def test_minicpmo_stage0_reports_frames_that_close_no_unit_instead_of_dropping_them():
+    """A frame only binds to the unit its append closes.
+
+    Frames are not carried across appends, so one arriving early used to vanish
+    under a generic "audio not enough" buffering result.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-stage0-early-frame")
+
+    assert runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=1)["success"] is True
+
+    early = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(2, dtype=np.float32),
+        video_frames=["frame-cur"],
+        seq=2,
+    )
+
+    assert early["success"] is False
+    assert "closes no model unit" in early["reason"]
+    # The half-filled append must not advance the unit counter.
+    assert state.audio_chunk_idx == 1
+
+
 def test_minicpmo_stage0_speech_append_sets_pending_context_once():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1002,7 +1413,7 @@ def test_minicpmo_stage0_speech_append_sets_pending_context_once():
 def test_minicpmo_stage0_failed_append_does_not_set_pending_speech_context():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1057,7 +1468,7 @@ def test_minicpmo_stage0_failed_append_does_not_set_pending_speech_context():
 
 
 def test_minicpmo_stage0_streaming_processor_is_isolated_per_session():
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1101,10 +1512,75 @@ def test_minicpmo_stage0_streaming_processor_is_isolated_per_session():
     assert runtime.processor._streaming_mel_processor.counter == 0
 
 
+def test_minicpmo_stage0_feature_extractor_is_isolated_per_session():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    class _FeatureExtractor:
+        # Like MiniCPMAAudioProcessor: the log-mel floor mode lives on the extractor.
+        def __init__(self):
+            self.dynamic_log_norm = True
+            self.dynamic_range_db = 8.0
+            self.log_floor_db = -10.0
+
+        def set_spac_log_norm(self, dynamic_range_db=None, log_floor_db=None):
+            if dynamic_range_db is not None:
+                self.dynamic_log_norm, self.dynamic_range_db = True, dynamic_range_db
+            if log_floor_db is not None:
+                self.dynamic_log_norm, self.log_floor_db = False, log_floor_db
+
+    class _Mel:
+        # Like StreamingMelProcessorExact._extract_full below 5 s of buffer.
+        def __init__(self, feature_extractor: _FeatureExtractor):
+            self.feature_extractor = feature_extractor
+
+        def process(self) -> bool:
+            self.feature_extractor.set_spac_log_norm(log_floor_db=-10)
+            return self.feature_extractor.dynamic_log_norm
+
+    class _Processor:
+        # Like the remote MiniCPMOProcessor: set_streaming_mode() rebuilds the streaming
+        # mel processor on self.audio_processor, and process_audio() (the reference
+        # voice) reads whatever floor mode that extractor is in.
+        def __init__(self):
+            self.audio_processor = _FeatureExtractor()
+            self._streaming_mel_processor = _Mel(self.audio_processor)
+
+        def set_streaming_mode(self, **_kwargs):
+            self._streaming_mel_processor = _Mel(self.audio_processor)
+
+        def reset_streaming(self):
+            return None
+
+        def process_audio_streaming(self, _audio, **_kwargs):
+            return self._streaming_mel_processor.process()
+
+        def process_audio(self, _audios):
+            return self.audio_processor.dynamic_log_norm
+
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime.processor = _Processor()
+    runtime.stage_model = SimpleNamespace()
+    runtime.thinker = runtime.stage_model
+    processor_a = runtime._configure_streaming_processor(_MiniCPMO45Stage0SessionState(session_id="a"))
+    processor_b = runtime._configure_streaming_processor(_MiniCPMO45Stage0SessionState(session_id="b"))
+
+    assert runtime._process_streaming_audio([], 0, processor=processor_a) is False
+
+    # Session a's stream changed neither the processor that encodes reference voices
+    # nor session b.
+    assert runtime.processor.process_audio([]) is True
+    assert processor_b.audio_processor.dynamic_log_norm is True
+    assert processor_a._streaming_mel_processor.feature_extractor is processor_a.audio_processor
+    assert processor_a.audio_processor is not processor_b.audio_processor
+
+
 def test_minicpmo_stage0_data_plane_next_append_reinjects_previous_listen():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1167,7 +1643,7 @@ def test_minicpmo_stage0_data_plane_next_append_reinjects_previous_listen():
 def test_minicpmo_stage0_data_plane_turn_eos_closes_previous_unit():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1230,7 +1706,7 @@ def test_minicpmo_stage0_data_plane_turn_eos_closes_previous_unit():
 def test_minicpmo_stage0_data_plane_model_owned_turn_boundary_preserves_audio_cache():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1295,7 +1771,7 @@ def test_minicpmo_stage0_data_plane_model_owned_turn_boundary_preserves_audio_ca
 def test_minicpmo_stage0_data_plane_final_first_chunk_does_not_add_silence_unit():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1366,10 +1842,92 @@ def test_minicpmo_stage0_data_plane_final_first_chunk_does_not_add_silence_unit(
     )
 
 
+def test_minicpmo_stage0_final_does_not_promote_first_chunk_alignment_tail_to_unit():
+    import torch
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    class _StageModel(torch.nn.Module):
+        first_chunk_ms = 10
+        chunk_ms = 8
+        sample_rate = 1000
+
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(256, 2)
+
+        def get_input_embeddings(self):
+            return self.embed
+
+        def get_audio_hidden_states(self, _data):
+            return [torch.tensor([[0.5, 0.5]], dtype=torch.float32)]
+
+    class _MelProcessor:
+        sample_rate = 1000
+        is_first = True
+
+        def get_config(self):
+            return {"effective_first_chunk_ms": 9}
+
+    class _Processor:
+        def __init__(self):
+            self._streaming_mel_processor = _MelProcessor()
+
+        def get_streaming_chunk_size(self):
+            return 9 if self._streaming_mel_processor.is_first else 8
+
+        def process_audio_streaming(self, audio, **_kwargs):
+            self._streaming_mel_processor.is_first = False
+            return {"audio_features": audio, "audio_feature_lens": [[len(audio)]]}
+
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime.stage_model = _StageModel()
+    runtime.thinker = runtime.stage_model
+    runtime.tokenizer = SimpleNamespace(
+        unk_token_id=0,
+        convert_tokens_to_ids=lambda token: {
+            "<unit>": 1,
+            "</unit>": 2,
+            "<|listen|>": 3,
+            "<|speak|>": 4,
+            "<|tts_bos|>": 5,
+            "<|tts_eos|>": 6,
+            "<|tts_pad|>": 7,
+            "<|chunk_eos|>": 8,
+            "<|chunk_tts_eos|>": 9,
+            "<|turn_eos|>": 10,
+            "<|audio|>": 11,
+        }.get(token, 0),
+        encode=lambda text, add_special_tokens=False: [],
+    )
+    runtime.processor = _Processor()
+    runtime.device = "cpu"
+    runtime._init_token_ids()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-first-chunk-alignment-tail")
+
+    first = runtime._stage_prefill_embeddings_only(state, np.zeros(8, dtype=np.float32), seq=1)
+    second = runtime._stage_prefill_embeddings_only(state, np.zeros(8, dtype=np.float32), seq=2)
+    final = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(8, dtype=np.float32),
+        seq=3,
+        final=True,
+    )
+
+    assert first["input_token_ids"].count(1) == 1
+    assert second["input_token_ids"].count(1) == 1
+    assert final["input_token_ids"].count(1) == 1
+    assert state.audio_chunk_idx == 3
+    assert len(state.audio_buffer) == 1
+
+
 def test_minicpmo_stage0_runtime_uses_loaded_vllm_embed_tokens_when_get_input_embeddings_is_broken():
     import torch
 
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
     )
 
@@ -1405,7 +1963,7 @@ def test_minicpmo_stage0_runtime_uses_loaded_vllm_embed_tokens_when_get_input_em
 
 
 def test_minicpmo_remote_config_patch_handles_nested_and_dict_configs():
-    from vllm_omni.experimental.fullduplex.minicpmo45.compat import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat import (
         patch_minicpmo_remote_config,
     )
 
@@ -1427,7 +1985,7 @@ def test_minicpmo_remote_config_patch_handles_nested_and_dict_configs():
 
 
 def test_minicpmo_stage0_short_audio_buffers_without_context_mutation():
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -1503,7 +2061,7 @@ def test_minicpmo_stage0_native_sampler_penalizes_repeated_text_token():
 
 
 def test_minicpmo_stage0_native_sampler_penalizes_text_from_prior_chunk():
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         _MiniCPMO45Stage0SessionState,
     )
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
@@ -1533,9 +2091,9 @@ def test_minicpmo_stage0_native_sampler_penalizes_text_from_prior_chunk():
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.model_stage = "llm"
     model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
-    session_key = ("sid-cross-chunk-repetition", 0)
-    state = _MiniCPMO45Stage0SessionState(session_id=session_key[0])
-    state.generated_text_tokens = [198] * 8
+    session_key = "sid-cross-chunk-repetition"
+    state = _MiniCPMO45Stage0SessionState(session_id=session_key)
+    state.generated_tokens = [198] * 8
     model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
     model._minicpmo45_duplex_row_sessions = {0: session_key}
 
@@ -1563,7 +2121,7 @@ def test_minicpmo_stage0_native_sampler_penalizes_text_from_prior_chunk():
 
 
 def test_minicpmo_stage0_native_sampler_matches_official_negative_logit_penalty():
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         _MiniCPMO45Stage0SessionState,
     )
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
@@ -1593,11 +2151,11 @@ def test_minicpmo_stage0_native_sampler_matches_official_negative_logit_penalty(
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.model_stage = "llm"
     model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
-    session_key = ("sid-negative-logit-repetition", 0)
-    state = _MiniCPMO45Stage0SessionState(session_id=session_key[0])
+    session_key = "sid-negative-logit-repetition"
+    state = _MiniCPMO45Stage0SessionState(session_id=session_key)
     repeated = 198
     alternative = 1234
-    state.generated_text_tokens = [repeated]
+    state.generated_tokens = [repeated]
     model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
     model._minicpmo45_duplex_row_sessions = {0: session_key}
 
@@ -1621,16 +2179,16 @@ def test_minicpmo_stage0_native_sampler_matches_official_negative_logit_penalty(
     assert sampled.sampled_token_ids.tolist() == [[repeated]]
 
 
-def test_minicpmo_stage0_records_only_bounded_text_repetition_history():
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+def test_minicpmo_stage0_records_bounded_model_policy_history():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         _MiniCPMO45Stage0SessionState,
     )
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
 
-    session_key = ("sid-text-history", 0)
-    state = _MiniCPMO45Stage0SessionState(session_id=session_key[0])
+    session_key = "sid-text-history"
+    state = _MiniCPMO45Stage0SessionState(session_id=session_key)
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
     model._minicpmo45_duplex_row_sessions = {0: session_key}
@@ -1648,15 +2206,15 @@ def test_minicpmo_stage0_records_only_bounded_text_repetition_history():
     }
 
     for sampled in range(1000, 1520):
-        model._record_minicpmo45_duplex_terminator(0, sampled, token_ids)
+        model._record_minicpmo45_duplex_generation_token(0, sampled)
 
     expected_history = list(range(1008, 1520))
-    assert state.generated_text_tokens == expected_history
+    assert state.generated_tokens == expected_history
 
     for sampled in token_ids.values():
-        model._record_minicpmo45_duplex_terminator(0, sampled, token_ids)
+        model._record_minicpmo45_duplex_generation_token(0, sampled)
 
-    assert state.generated_text_tokens == expected_history
+    assert state.generated_tokens == [*expected_history[len(token_ids) :], *token_ids.values()]
 
 
 def test_minicpmo_stage0_native_sampler_does_not_override_model_at_punctuation():
@@ -2050,7 +2608,7 @@ def test_minicpmo_stage0_native_sampler_preserves_model_chunk_eos():
 
 
 def test_minicpmo_stage0_native_sampler_keeps_hard_chunk_cap():
-    from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
         MiniCPMO45DuplexPolicy,
     )
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
@@ -2162,7 +2720,7 @@ def test_minicpmo_stage0_native_sampler_cuts_before_request_length_cap():
 
 
 def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
-    from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
         MiniCPMO45DuplexPolicy,
     )
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
@@ -2200,6 +2758,7 @@ def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
 
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.model_stage = "llm"
+    model.max_speak_chars_per_chunk = 28
     model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
     vocab_size = 151723
     candidate = 202
@@ -2218,8 +2777,13 @@ def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
 
     sampled = model.sample(logits, sampling_metadata)
 
-    assert MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK == 28
+    assert MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK == 0
+    assert model.max_speak_chars_per_chunk == 28
     assert sampled is not None
+    # Keep the complete token that reaches the soft character target.
+    assert sampled.sampled_token_ids.tolist() == [[candidate]]
+    sampling_metadata.output_token_ids[0].append(candidate)
+    sampled = model.sample(logits, sampling_metadata)
     assert sampled.sampled_token_ids.tolist() == [[151718]]
 
 
@@ -2373,6 +2937,7 @@ def test_minicpmo_stage0_native_sampler_forced_listen_yields_floor():
     )
 
     sampled = model.sample(logits, sampling_metadata)
+    model._commit_minicpmo45_duplex_pending_samples()  # the runner commits before the next step
 
     assert sampled is not None
     assert sampled.sampled_token_ids.tolist() == [[151705]]
@@ -2400,7 +2965,7 @@ def test_minicpmo_stage0_native_sampler_uses_runner_duplex_rows():
 
 
 def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
-    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,
         _MiniCPMO45Stage0SessionState,
     )
@@ -2429,148 +2994,318 @@ def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
     assert len(state.context_embeds) == 6
 
 
-def test_minicpmo_tts_ref_audio_lru_evicts_matching_vocoder_base_cache(tmp_path):
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        MiniCPMO45OmniTTSForConditionalGeneration,
-        MiniCPMO45TTSRuntimeConfig,
+# ---------------------------------------------------------------------------
+# Cross-platform wiring: every AR model runner must reach the duplex hook.
+#
+# GPUARModelRunner and NPUARModelRunner are siblings -- neither inherits the
+# other's _sample -- so the NPU runner once copied GPU _sample without the
+# prepare_duplex_sampling call. Parse source instead of importing NPUARModelRunner:
+# that class needs vllm_ascend, which CPU test images do not have.
+# ---------------------------------------------------------------------------
+
+_REQUIRED_DUPLEX_CALLS = {
+    "__init__": "_init_duplex_sampling_state",
+    "load_model": "_resolve_duplex_sampling_hook",
+    "_update_states": "_update_duplex_sampling_states",
+    "_sample": "_apply_duplex_sampling",
+}
+
+_MODEL_SAMPLER_CALL = "call_model_sampler"
+
+
+def _repo_root():
+    from pathlib import Path
+
+    return Path(__file__).parents[2]
+
+
+def _ar_runner_sources():
+    root = _repo_root()
+    paths = [root / "vllm_omni/worker/gpu_ar_model_runner.py"]
+    paths.extend(sorted(root.glob("vllm_omni/platforms/*/worker/*_ar_model_runner.py")))
+    return paths
+
+
+def _ar_runner_classdefs():
+    root = _repo_root()
+    found = {}
+    for path in _ar_runner_sources():
+        module = ast.parse(path.read_text())
+        for node in module.body:
+            if isinstance(node, ast.ClassDef) and node.name.endswith("ARModelRunner"):
+                found[node.name] = (node, str(path.relative_to(root)))
+    assert found, "no AR model runners discovered; the glob in _ar_runner_sources() is stale"
+    return found
+
+
+def _method_calls(method):
+    calls: dict[str, int] = {}
+    for node in ast.walk(method):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            calls.setdefault(node.func.attr, node.lineno)
+    return calls
+
+
+def _wires_duplex_sampling_directly(classdef) -> bool:
+    bases = {base.id for base in classdef.bases if isinstance(base, ast.Name)}
+    if "DuplexSamplingRunnerMixin" not in bases:
+        return False
+    methods = {node.name: node for node in classdef.body if isinstance(node, ast.FunctionDef)}
+    return all(
+        method_name in methods and required_call in _method_calls(methods[method_name])
+        for method_name, required_call in _REQUIRED_DUPLEX_CALLS.items()
     )
 
-    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
-    model._runtime_config = MiniCPMO45TTSRuntimeConfig(ref_audio_file_cache_size=1)
-    model._t2w_base_caches = {}
-    model._token2wav_state_lock = threading.RLock()
-    first_path = model._write_ref_audio_prompt_wav(np.array([0.1, -0.1], dtype=np.float32), 16_000)
-    assert first_path is not None
-    model._t2w_base_caches[first_path] = (torch.tensor([1]), {"cache": torch.tensor([2])})
 
-    second_path = model._write_ref_audio_prompt_wav(np.array([0.2, -0.2], dtype=np.float32), 16_000)
+def test_every_ar_runner_reaches_the_duplex_sampling_hook():
+    classdefs = _ar_runner_classdefs()
+    wired = {name for name, (classdef, _path) in classdefs.items() if _wires_duplex_sampling_directly(classdef)}
 
-    assert second_path is not None
-    assert second_path != first_path
-    assert first_path not in model._t2w_base_caches
-    assert not os.path.exists(first_path)
-
-
-def test_minicpmo_tts_prompt_wav_path_does_not_default_to_model_asset(tmp_path):
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        MiniCPMO45OmniTTSForConditionalGeneration,
-    )
-
-    model_dir = tmp_path / "MiniCPM-o-4_5"
-    assets_dir = model_dir / "assets"
-    assets_dir.mkdir(parents=True)
-    (assets_dir / "HT_ref_audio.wav").write_bytes(b"placeholder")
-
-    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
-    model.vllm_config = SimpleNamespace(model_config=SimpleNamespace(model=str(model_dir)))
-    model._write_ref_audio_prompt_wav = lambda ref_audio, ref_audio_sr: None
-
-    assert model._resolve_prompt_wav_path(None, None) == (None, None)
-
-
-def test_minicpmo_tts_stream_turn_id_prefers_duplex_identity():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        MiniCPMO45OmniTTSForConditionalGeneration,
-    )
-
-    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
-
-    assert (
-        model._stream_turn_id(
-            {
-                "duplex": {"turn_id": 0, "model_turn_id": 4},
-                "meta": {"turn_id": 3},
-            }
+    for class_name, (classdef, path) in sorted(classdefs.items()):
+        if class_name in wired:
+            continue
+        base_names = {base.id for base in classdef.bases if isinstance(base, ast.Name)}
+        assert base_names & wired, (
+            f"{path}::{class_name} neither wires the duplex sampling hook nor derives from a "
+            f"runner that does (wired runners: {sorted(wired)}).  Inherit DuplexSamplingRunnerMixin "
+            f"and call {sorted(_REQUIRED_DUPLEX_CALLS.values())} from "
+            f"{sorted(_REQUIRED_DUPLEX_CALLS)} respectively."
         )
-        == 4
+
+
+@pytest.mark.parametrize("class_name", ["GPUARModelRunner", "NPUARModelRunner"])
+def test_ar_runner_calls_every_duplex_sampling_hook_site(class_name: str):
+    classdefs = _ar_runner_classdefs()
+    assert class_name in classdefs, f"{class_name} not found by _ar_runner_sources()"
+    classdef, path = classdefs[class_name]
+
+    bases = {base.id for base in classdef.bases if isinstance(base, ast.Name)}
+    assert "DuplexSamplingRunnerMixin" in bases, (
+        f"{path}::{class_name} must inherit DuplexSamplingRunnerMixin so the duplex "
+        f"sampling hook is wired the same way on every platform"
     )
-    assert (
-        model._stream_turn_id(
-            {
-                "duplex": {"turn_id": 0},
-                "meta": {"turn_id": 3},
-            }
+
+    methods = {node.name: node for node in classdef.body if isinstance(node, ast.FunctionDef)}
+    for method_name, required_call in _REQUIRED_DUPLEX_CALLS.items():
+        method = methods.get(method_name)
+        assert method is not None, f"{path}::{class_name}.{method_name} is missing; it must call {required_call}"
+        calls = _method_calls(method)
+        assert required_call in calls, f"{path}::{class_name}.{method_name} must call self.{required_call}"
+
+
+@pytest.mark.parametrize("class_name", ["GPUARModelRunner", "NPUARModelRunner"])
+def test_ar_runner_applies_duplex_sampling_before_the_model_sampler(class_name: str):
+    classdef, path = _ar_runner_classdefs()[class_name]
+    sample = next(node for node in classdef.body if isinstance(node, ast.FunctionDef) and node.name == "_sample")
+
+    apply_lineno = _method_calls(sample).get("_apply_duplex_sampling")
+    sampler_lineno = next(
+        (
+            node.lineno
+            for node in ast.walk(sample)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == _MODEL_SAMPLER_CALL
+        ),
+        None,
+    )
+    assert apply_lineno is not None, f"{path}::{class_name}._sample must call self._apply_duplex_sampling"
+    assert sampler_lineno is not None, (
+        f"{path}::{class_name}._sample no longer calls {_MODEL_SAMPLER_CALL}(); update _MODEL_SAMPLER_CALL "
+        f"so the ordering check keeps testing something"
+    )
+    assert apply_lineno < sampler_lineno, (
+        f"{path}::{class_name}._sample calls self._apply_duplex_sampling at line {apply_lineno}, after "
+        f"{_MODEL_SAMPLER_CALL}() at line {sampler_lineno}.  The hook masks the logits and publishes the "
+        f"row -> session map the sampler reads, so running it afterwards is a silent no-op."
+    )
+
+
+class _NativeDuplexTokenizer:
+    eos_token_id = 151705
+    unk_token_id = -1
+    bad_token_ids: list[int] = []
+    all_special_ids: list[int] = []
+
+    def convert_tokens_to_ids(self, token):
+        return {
+            "<unit>": 151683,
+            "</unit>": 151684,
+            "<|listen|>": 151705,
+            "<|speak|>": 151706,
+            "<|tts_bos|>": 151703,
+            "<|tts_eos|>": 151704,
+            "<|tts_pad|>": 151722,
+            "<|chunk_eos|>": 151718,
+            "<|chunk_tts_eos|>": 151721,
+            "<|turn_eos|>": 151717,
+        }.get(token, -1)
+
+
+def _native_duplex_model_with_state():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    session_key = "sid-lookahead"
+    state = _MiniCPMO45Stage0SessionState(session_id=session_key, current_turn_ended=False)
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model.model_stage = "llm"
+    model.thinker = SimpleNamespace(get_tokenizer=lambda: _NativeDuplexTokenizer())
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
+    model._minicpmo45_duplex_row_sessions = {0: session_key}
+    model._minicpmo45_duplex_row_payloads = {0: {"is_speech": True}}
+    model._minicpmo45_active_duplex_rows = [0]
+    return model, state
+
+
+def _native_duplex_sampling_metadata(output_token_ids: list[int]):
+    return SimpleNamespace(
+        all_greedy=True,
+        all_random=False,
+        temperature=torch.tensor([0.0]),
+        top_k=torch.tensor([1]),
+        top_p=torch.tensor([1.0]),
+        generators={},
+        prompt_token_ids=torch.tensor([[151683] * 16]),
+        output_token_ids=[output_token_ids],
+    )
+
+
+@pytest.mark.parametrize("terminator", [151718, 151721, 151705])
+def test_minicpmo_stage0_async_lookahead_frame_after_chunk_terminator_is_frozen(terminator):
+    """The frame async scheduling runs after a sampled chunk terminator is
+    discarded by the scheduler; it must neither decide anything nor touch the
+    session state that the next append re-injects."""
+    model, state = _native_duplex_model_with_state()
+    state.pending_terminator_token = terminator
+    state.last_terminator_token = terminator
+    state.generated_tokens = [200, 201]
+    logits = torch.full((1, 151723), -100.0)
+    logits[0, 1234] = 30.0  # what the stale frame would otherwise pick
+
+    sampled = model.sample(logits, _native_duplex_sampling_metadata([151706, 200, 201, terminator, -1]))
+
+    assert sampled is not None
+    assert sampled.sampled_token_ids.tolist() == [[terminator]]
+    assert state.pending_terminator_token == terminator
+    assert state.last_terminator_token == terminator
+    assert state.generated_tokens == [200, 201]
+    assert state.current_turn_ended is False
+
+
+def test_minicpmo_stage0_turn_eos_is_forwarded_not_pending():
+    """<|turn_eos|> is fed like text in the official unit loop; only the
+    chunk terminator sampled afterwards is re-injected on the next append."""
+    model, state = _native_duplex_model_with_state()
+    logits = torch.full((1, 151723), -100.0)
+    logits[0, 151717] = 30.0
+
+    sampled = model.sample(logits, _native_duplex_sampling_metadata([151706, 200, 201]))
+    model._commit_minicpmo45_duplex_pending_samples()  # the runner commits before the next step
+
+    assert sampled.sampled_token_ids.tolist() == [[151717]]
+    assert state.pending_terminator_token is None
+    assert state.last_terminator_token == 151717
+    assert state.current_turn_ended is True
+
+    # The frame that consumes <|turn_eos|> keeps sampling; the chunk
+    # terminator it picks becomes the pending token for the next append.
+    logits = torch.full((1, 151723), -100.0)
+    logits[0, 151718] = 30.0
+    sampled = model.sample(logits, _native_duplex_sampling_metadata([151706, 200, 201, 151717]))
+    model._commit_minicpmo45_duplex_pending_samples()
+
+    assert sampled.sampled_token_ids.tolist() == [[151718]]
+    assert state.pending_terminator_token == 151718
+    assert state.current_turn_ended is True
+
+
+def test_minicpmo_stage0_stop_tokens_exclude_turn_eos():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import _stage0_stop_token_ids
+
+    stop_ids = _stage0_stop_token_ids(_NativeDuplexTokenizer())
+
+    assert stop_ids == [151718, 151721, 151705]
+
+
+@pytest.mark.parametrize("is_speech", [False, True])
+def test_minicpmo_camera_frames_preserve_audio_speech_gate(is_speech):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="silent-camera")
+    result = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        video_frames=["frame"],
+        is_speech=is_speech,
+        epoch=0,
+        seq=1,
+    )
+    assert result["success"]
+    assert state.pending_speech_context is is_speech
+
+
+def test_minicpmo_vision_only_units_skip_audio_encoder_and_keep_boundaries():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="vision-only")
+
+    def unexpected_audio(*args, **kwargs):
+        raise AssertionError("VISION must not encode synthetic audio")
+
+    runtime._process_streaming_audio = unexpected_audio
+    for seq in (1, 2):
+        result = runtime._stage_prefill_embeddings_only(
+            state,
+            None,
+            encoded_frames=[[torch.zeros(2, 2)]],
+            epoch=0,
+            seq=seq,
         )
-        == 0
+        assert result["success"]
+        assert state.audio_chunk_idx == seq
+        assert state.audio_buffer.size == 0
+        assert state.pending_speech_context
+        ids = result["input_token_ids"]
+        assert ids.count(runtime.unit_token_id) == 1
+        assert ids.count(runtime.unit_end_token_id) == (seq - 1)
+
+
+def test_minicpmo_audio_after_vision_unit_starts_audio_encoder_at_first_chunk():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    # 4 Hz keeps the 1250 ms first window at 5 samples against a 4-sample chunk.
+    runtime.stage_model.first_chunk_ms = 1250
+    runtime.processor._streaming_mel_processor = SimpleNamespace(
+        sample_rate=4, get_config=lambda: {"effective_first_chunk_ms": 1250}
     )
-    assert model._stream_turn_id({"meta": {"turn_id": 3}, "turn_id": 2}) == 3
-    assert model._stream_turn_id({"turn_id": 2}) == 2
+    original_process = runtime._process_streaming_audio
+    encoded = []
 
+    def process(chunk, chunk_idx, *, processor=None):
+        encoded.append((chunk.copy(), chunk_idx))
+        return original_process(chunk, chunk_idx, processor=processor)
 
-def test_minicpmo_tts_no_ref_audio_initializes_empty_vocoder_cache():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        MiniCPMO45OmniTTSForConditionalGeneration,
-        _TalkerTurnState,
-    )
+    runtime._process_streaming_audio = process
+    state = _MiniCPMO45Stage0SessionState(session_id="vision-then-audio")
+    vision = runtime._stage_prefill_embeddings_only(state, None, encoded_frames=[[torch.zeros(2, 2)]], epoch=0, seq=1)
+    assert vision["success"]
+    assert state.audio_chunk_idx == 1
+    assert state.audio_encoder_chunk_idx == 0
 
-    class AudioTokenizer:
-        def set_stream_cache(self, prompt_wav_path):
-            raise AssertionError(f"unexpected reference-audio cache load: {prompt_wav_path!r}")
+    audio = runtime._stage_prefill_embeddings_only(state, np.ones(4, dtype=np.float32), epoch=0, seq=2)
 
-    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
-    model._t2w_base_caches = {}
-    model._token2wav_state_lock = threading.RLock()
-    model.audio_tokenizer = AudioTokenizer()
-    state = _TalkerTurnState(None, None)
-
-    model._begin_turn_vocoder_cache(None, state=state)
-
-    assert state.stream_cache is None
-    assert state.hift_cache_dict == {}
-    assert state.vocoder_initialized is True
-    assert model._t2w_base_caches[""] == (None, {})
-
-
-def test_minicpmo_tts_native_duplex_merges_and_left_pads_nonfinal_unit_audio():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        _native_duplex_unit_waveform,
-    )
-
-    waveform = _native_duplex_unit_waveform(
-        [torch.tensor([1.0, 2.0]), torch.tensor([3.0])],
-        turn_end=False,
-        target_samples=6,
-    )
-
-    assert waveform is not None
-    assert waveform.tolist() == [0.0, 0.0, 0.0, 1.0, 2.0, 3.0]
-
-
-def test_minicpmo_tts_native_duplex_does_not_pad_final_unit_audio():
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        _native_duplex_unit_waveform,
-    )
-
-    waveform = _native_duplex_unit_waveform(
-        [torch.tensor([1.0, 2.0]), torch.tensor([3.0])],
-        turn_end=True,
-        target_samples=6,
-    )
-
-    assert waveform is not None
-    assert waveform.tolist() == [1.0, 2.0, 3.0]
-
-
-def test_minicpmo_tts_turn_cleanup_removes_deleted_ref_audio_vocoder_cache(tmp_path):
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        MiniCPMO45OmniTTSForConditionalGeneration,
-        _TalkerTurnState,
-    )
-
-    prompt_path = tmp_path / "session-ref.wav"
-    prompt_path.write_bytes(b"wav")
-    model = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
-    model._talker_turn_states = {
-        "request": _TalkerTurnState(str(prompt_path), str(prompt_path)),
-    }
-    model._talker_consumed_tokens = {"request": 1}
-    model._talker_request_keys = {}
-    model._t2w_base_caches = {
-        str(prompt_path): (torch.tensor([1]), {"cache": torch.tensor([2])}),
-    }
-    model._token2wav_state_lock = threading.RLock()
-    model.audio_tokenizer = None
-
-    assert model._close_turn_state("request") is True
-    assert str(prompt_path) not in model._t2w_base_caches
-    assert not prompt_path.exists()
+    assert audio["success"]
+    [(chunk, chunk_idx)] = encoded
+    assert chunk_idx == 0
+    # The mel processor's first window is front-padded, as for an audio-first session.
+    assert chunk.tolist() == [0.0, 1.0, 1.0, 1.0]
+    assert state.audio_buffer.size == 0
+    assert state.audio_encoder_chunk_idx == 1
+    assert state.audio_chunk_idx == 2
+    assert audio["input_token_ids"][:2] == [runtime.unit_end_token_id, runtime.unit_token_id]

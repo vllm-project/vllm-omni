@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # This implementation is heavily inspired by the diffusers project.
 # Original implementation: https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/flux/pipeline_flux_kontext.py
@@ -85,6 +85,12 @@ class FluxKontextPipeline(
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
+    # Both CFG branches share latents and timestep; T5 prompts are padded to a
+    # fixed length. Text and image position ids are unbatched [L, 3] tensors,
+    # so they are shared rather than concatenated (their length can coincide
+    # with the branch batch size, e.g. one image token at batch 1).
+    supports_cfg_batching = True
+    cfg_batching_shared_kwargs = frozenset({"txt_ids", "img_ids"})
     support_image_input = True
 
     def __init__(
@@ -515,7 +521,6 @@ class FluxKontextPipeline(
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
     ) -> torch.Tensor:
         self.scheduler.set_begin_index(0)
-        self.transformer.do_true_cfg = do_true_cfg
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -640,7 +645,9 @@ class FluxKontextPipeline(
         width = req.sampling_params.width or width
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
         sigmas = req.sampling_params.sigmas or sigmas
-        guidance_scale = req.sampling_params.guidance_scale or guidance_scale
+        guidance_scale = (
+            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale_provided else guidance_scale
+        )
         num_images_per_prompt = (
             req.sampling_params.num_outputs_per_prompt
             if req.sampling_params.num_outputs_per_prompt > 0

@@ -67,8 +67,8 @@ omniArgs:
   enableCpuOffload: false
   # -- Number of GPUs for diffusion inference (empty = auto)
   numGpus:
-  # -- Path to stage configs file (empty = auto-detected from model)
-  stageConfigsPath:
+  # -- Path to deploy config file (empty = auto-detected from model)
+  deployConfigPath:
   # -- Cache backend: none, tea_cache, or cache_dit
   cacheBackend: "none"
   # -- Default sampling params as a JSON string

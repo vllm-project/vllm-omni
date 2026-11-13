@@ -20,12 +20,12 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.progress_bar import _is_rank_zero
+from vllm_omni.diffusion.utils.guardrail_utils import is_guardrails_enabled
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 logger = init_logger(__name__)
 
@@ -65,11 +65,10 @@ except ImportError:
         # ``model_config["guardrails"]`` is False.
         def __init__(self, *args, **kwargs):
             raise ValueError(
-                f"You have disabled the safety checker for {self.__class__}. This is in violation of the "
+                f"The guardrails are enabled but not functional for {self.__class__}. This is most likely due to a"
+                f"missing cosmos-guardrail package. Please install cosmos-guardrail to be compliant with the "
                 "[NVIDIA Open Model License Agreement]"
-                "(https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license). "
-                f"Please ensure that you are compliant with the license agreement."
-                f"Please install cosmos-guardrail package to enable safety checks."
+                "(https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license)."
             )
 
 
@@ -182,28 +181,3 @@ def check_video_safety(video_tensor: torch.Tensor) -> torch.Tensor:
     if video_tensor.dim() == 5:
         result = result.unsqueeze(0)
     return result.to(video_tensor.device)
-
-
-def is_guardrails_enabled(
-    od_config: OmniDiffusionConfig,
-    sampling_params: OmniDiffusionSamplingParams | None = None,
-) -> bool:
-    """Resolve the active guardrail gate.
-
-    Server-level ``od_config.model_config["guardrails"]`` decides whether the
-    guardrail models are loaded at all (eager load at pipeline build time).
-    When that is False, no per-request override can turn checks back on,
-    because the singletons in this module are never populated.
-
-    When the server gate is on, ``sampling_params.extra_args["guardrails"]``
-    may override on a per-request basis: ``False`` skips the check for that
-    request, anything else (or missing) keeps the default behavior.
-    """
-    model_config = od_config.model_config or {}
-    if not bool(model_config.get("guardrails", True)):
-        return False
-    if sampling_params is not None:
-        per_request = (sampling_params.extra_args or {}).get("guardrails")
-        if per_request is not None:
-            return bool(per_request)
-    return True

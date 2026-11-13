@@ -28,8 +28,11 @@ If image.command is set, uses that as a full override.
 - {{ .Values.omniArgs.numGpus | quote }}
 {{- end }}
 {{- if .Values.omniArgs.stageConfigsPath }}
-- "--stage-configs-path"
-- {{ .Values.omniArgs.stageConfigsPath | quote }}
+{{- fail "omniArgs.stageConfigsPath has been removed; use omniArgs.deployConfigPath" }}
+{{- end }}
+{{- if .Values.omniArgs.deployConfigPath }}
+- "--deploy-config"
+- {{ .Values.omniArgs.deployConfigPath | quote }}
 {{- end }}
 {{- if and .Values.omniArgs.cacheBackend (ne .Values.omniArgs.cacheBackend "none") }}
 - "--cache-backend"

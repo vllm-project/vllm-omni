@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from typing import TYPE_CHECKING
 
 import torch
+import torch.nn as nn
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.kernel import IrOpPriorityConfig
@@ -11,6 +14,9 @@ from vllm.platforms.rocm import RocmPlatform
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 from vllm_omni.platforms.rocm.patch import apply_patches
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
 
@@ -30,7 +36,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     when the selected_backend is not specified.
 
     So the behaviour of the attention backend overriding logic currently lives in
-    extract_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
+    extract_legacy_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
 
     ```
     if current_omni_platform.is_rocm():
@@ -71,11 +77,31 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         return is_flash_attn_installed()
 
     @classmethod
+    def apply_diffusion_model_patches(cls, model: nn.Module, od_config: "OmniDiffusionConfig") -> None:
+        from vllm_omni.platforms.rocm.patch.worker.patch_groupnorm import apply_aiter_groupnorm
+
+        apply_aiter_groupnorm(model, od_config.model_class_name)
+
+    @classmethod
     def get_diffusion_attn_backend_cls(
         cls,
         selected_backend: str | None,
         head_size: int,
+        allow_trtllm_default: bool = False,
     ) -> str:
+        """Get the diffusion attention backend class path for ROCm platform.
+
+        ROCm supports FLASH_ATTN via the aiter library, and SDPA as fallback.
+
+        Args:
+            selected_backend: User-selected backend name (e.g., "FLASH_ATTN",
+                "TORCH_SDPA"). If None, uses platform default.
+            head_size: Attention head size.
+            allow_trtllm_default: Does not support TRTLLM backend;
+                arg accepted for signature parity but unused.
+        Returns:
+            Fully qualified class path of the selected backend.
+        """
         from vllm._aiter_ops import is_aiter_found_and_supported
 
         # Check if aiter is available for Flash Attention support
@@ -88,6 +114,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            cls.validate_diffusion_attn_backend(backend_upper)
             if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
                 logger.warning(
                     "HuggingFace kernels-backed FlashAttention is "
@@ -146,6 +173,16 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         torch.accelerator.synchronize()
 
     @classmethod
+    def record_device_event(cls) -> torch.Event | None:
+        try:
+            event = torch.Event()
+            event.record()
+            return event
+        except Exception:
+            logger.warning("Failed to record device event for cross-stream sync")
+            return None
+
+    @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
         free, _ = torch.cuda.mem_get_info(device)
         return free
@@ -156,11 +193,16 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         return free, total
 
     @classmethod
+    def memory_reserved(cls, device: torch.device | int | None = None) -> int:
+        return int(torch.cuda.memory_reserved(device))
+
+    @classmethod
     def set_device_control_env_var(cls, devices: str | int | None) -> None:
         import os
 
-        os.environ["HIP_VISIBLE_DEVICES"] = devices
-        os.environ["CUDA_VISIBLE_DEVICES"] = devices
+        visible = "" if devices is None else str(devices)
+        os.environ["HIP_VISIBLE_DEVICES"] = visible
+        os.environ["CUDA_VISIBLE_DEVICES"] = visible
 
     @classmethod
     def unset_device_control_env_var(cls) -> None:
@@ -178,6 +220,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         Preserves omni-specific is_custom_op_enabled('rms_norm') check.
         """
         from vllm.config.compilation import CompilationMode
+        from vllm.platforms.rocm import on_gfx90a
 
         # TODO(luka/TJ) use aiter, vllm_c, native by default on ROCm
         cc = vllm_config.compilation_config
@@ -188,9 +231,24 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         # Necessary on ROCm because it's common that users
         # enable rms_norm to use the aiter kernel.
         # TODO(luka/TJ) remove env vars completely
-        if cc.is_custom_op_enabled("rms_norm") and envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_RMSNORM:
+        # AITER rmsnorm is not built for gfx90a and segfaults (upstream 2622ee21aa).
+        # Keep the Omni custom-op gate; do not switch to cudagraph_mode / on_rdna4.
+        if (
+            cc.is_custom_op_enabled("rms_norm")
+            and envs.VLLM_ROCM_USE_AITER
+            and envs.VLLM_ROCM_USE_AITER_RMSNORM
+            and not on_gfx90a()
+        ):
             rms_norm = ["aiter"] + default
         else:
             rms_norm = default
 
-        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm, fused_add_rms_norm=rms_norm)
+        # Mirrors upstream RocmPlatform defaults: `gelu_and_mul_sparse` has no
+        # ROCm-specific provider, so it must not fall back to `default` (which
+        # contains `vllm_c`) via IrOpPriorityConfig.with_default.
+        return IrOpPriorityConfig.with_default(
+            default,
+            rms_norm=rms_norm,
+            fused_add_rms_norm=rms_norm,
+            gelu_and_mul_sparse=["native"],
+        )

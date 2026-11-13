@@ -32,6 +32,7 @@ from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 from .configuration_fish_speech import FishSpeechConfig, FishSpeechFastARConfig, FishSpeechSlowARConfig
@@ -195,7 +196,11 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         self.mtp_hidden_size = int(self.text_config.hidden_size)
         self.talker_mtp_output_key = ("codes", "audio")
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("hidden_states", "last")}
-        self.talker_mtp_graph_safe = True
+        # NPU (Ascend) ACL graphs cannot capture the Fast-AR random-sampling ops
+        # (torch.nonzero / torch.multinomial used for top-p), so keep the talker
+        # MTP eager on NPU to fall back to native (non-graph) execution. Mirrors
+        # the 310P patch for Qwen3-TTS (talker_mtp_graph_safe=False).
+        self.talker_mtp_graph_safe = not current_omni_platform.is_npu()
 
         # Qwen3 transformer backbone.
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))

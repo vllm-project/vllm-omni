@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Concurrent MiniCPM-o Realtime duplex and resumable-session E2E driver."""
 
 from __future__ import annotations
@@ -8,18 +11,109 @@ import hashlib
 import json
 import sys
 import uuid
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import websockets
+from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+REPO_ROOT = SCRIPT_DIR.parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from minicpmo_realtime_duplex_scenarios import _url_with_model, run_demo  # noqa: E402
+
+@lru_cache(maxsize=1)
+def _scenario_module():
+    """Delay heavyweight vLLM imports so ``--help`` remains directly executable."""
+    from tests.e2e.online_serving.helpers import minicpmo_realtime_duplex_scenarios
+
+    return minicpmo_realtime_duplex_scenarios
+
+
+def _ref_audio_data_url(path: str) -> str:
+    return _scenario_module()._ref_audio_data_url(path)
+
+
+def _url_with_model(*args, **kwargs) -> str:
+    return _scenario_module()._url_with_model(*args, **kwargs)
+
+
+def _created_session_id(created: dict[str, object]) -> str:
+    """The server-allocated session id announced by ``session.created``."""
+    session = created.get("session")
+    session_id = session.get("id") if isinstance(session, dict) else None
+    if not isinstance(session_id, str) or not session_id:
+        raise RuntimeError("session.created omitted the server-allocated session id")
+    return session_id
+
+
+async def run_demo(args):
+    return await _scenario_module().run_demo(args)
+
+
+class _SynchronizedStartGate:
+    """One-shot, failure-propagating start gate for Python 3.10+."""
+
+    def __init__(self, parties: int, *, timeout_s: float):
+        if parties < 1:
+            raise ValueError("synchronized start parties must be positive")
+        if timeout_s <= 0:
+            raise ValueError("synchronized start timeout must be positive")
+        self._parties = parties
+        self._timeout_s = timeout_s
+        self._arrived = 0
+        self._released = False
+        self._failure: BaseException | None = None
+        self._event = asyncio.Event()
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            if self._failure is not None:
+                raise RuntimeError(f"synchronized start aborted: {self._failure!r}") from self._failure
+            if self._released:
+                return
+            self._arrived += 1
+            if self._arrived == self._parties:
+                self._released = True
+                self._event.set()
+                return
+
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=self._timeout_s)
+        except asyncio.TimeoutError as exc:
+            failure = TimeoutError(
+                f"synchronized start timed out after {self._timeout_s:.1f}s "
+                f"({self._arrived}/{self._parties} sessions ready)"
+            )
+            await self.abort(failure)
+            if self._released and self._failure is None:
+                return
+            raise failure from exc
+
+        if self._failure is not None:
+            raise RuntimeError(f"synchronized start aborted: {self._failure!r}") from self._failure
+
+    async def abort(self, failure: BaseException) -> None:
+        async with self._lock:
+            if self._released or self._failure is not None:
+                return
+            self._failure = failure
+            self._event.set()
+
+
+async def _run_demo_with_start_gate(args: SimpleNamespace):
+    start_gate = getattr(args, "start_barrier", None)
+    try:
+        return await run_demo(args)
+    except BaseException as exc:
+        if start_gate is not None:
+            await start_gate.abort(exc)
+        raise
 
 
 def _with_resume_mode(url: str) -> str:
@@ -81,14 +175,24 @@ def _validate_semantic_isolation(
         return True
     if len(expected_tokens) != len(results):
         return False
-    for result, expected_token in zip(results, expected_tokens, strict=True):
+    normalized_expected_tokens = [token.strip().casefold() for token in expected_tokens]
+    if any(not token for token in normalized_expected_tokens):
+        return False
+    for result_index, (result, expected_token) in enumerate(zip(results, normalized_expected_tokens, strict=True)):
         details = result.get("transcript_integrity")
         transcripts = (
             [str(item.get("transcript", "")) for item in details if isinstance(item, dict)]
             if isinstance(details, list)
             else []
         )
-        if expected_token not in "".join(transcripts):
+        joined_transcripts = "".join(transcripts).casefold()
+        if expected_token not in joined_transcripts:
+            return False
+        if any(
+            other_token in joined_transcripts
+            for other_index, other_token in enumerate(normalized_expected_tokens)
+            if other_index != result_index
+        ):
             return False
     return True
 
@@ -110,21 +214,28 @@ async def _receive_until(ws, event_type: str, *, timeout_s: float) -> tuple[dict
     return await asyncio.wait_for(receive(), timeout=timeout_s)
 
 
+def _server_event_sequences(events: list[dict[str, object]]) -> list[int]:
+    return [sequence for event in events if isinstance(sequence := event.get("server_event_seq"), int)]
+
+
 async def _open_admission_session(
     args: argparse.Namespace,
     session_id: str,
-) -> tuple[object, dict[str, object]]:
-    url = _url_with_model(args.url, args.model, session_id=session_id)
+) -> tuple[ClientConnection, dict[str, object]]:
+    url = _url_with_model(
+        args.url,
+        args.model,
+        autostart=False if getattr(args, "ref_audio", None) else None,
+    )
     ws = await websockets.connect(url, max_size=64 * 1024 * 1024)
     await ws.send(
         json.dumps(
             {
                 "type": "session.update",
                 "session": {
-                    "session_id": session_id,
                     "model": args.model,
                     "modalities": ["audio", "text"],
-                    "extra_body": {"minicpmo45_native_duplex": True},
+                    **({"ref_audio": _ref_audio_data_url(args.ref_audio)} if getattr(args, "ref_audio", None) else {}),
                 },
             }
         )
@@ -133,7 +244,7 @@ async def _open_admission_session(
     return ws, created
 
 
-async def _close_admission_session(ws, *, timeout_s: float) -> None:
+async def _close_admission_session(ws: ClientConnection, *, timeout_s: float) -> None:
     await ws.send(json.dumps({"type": "session.close"}))
     await _receive_until(ws, "session.closed", timeout_s=timeout_s)
     await ws.close()
@@ -143,25 +254,31 @@ async def _admission_probe(args: argparse.Namespace, *, limit: int) -> dict[str,
     if limit < 1:
         raise ValueError("admission limit must be positive")
     prefix = f"admission-{uuid.uuid4().hex}"
-    accepted: list[tuple[object, dict[str, object]]] = []
-    replacement: tuple[object, dict[str, object]] | None = None
+    accepted: list[tuple[ClientConnection, dict[str, object]]] = []
+    replacement: tuple[ClientConnection, dict[str, object]] | None = None
     overflow_code = None
     try:
         for index in range(limit):
             accepted.append(await _open_admission_session(args, f"{prefix}-accepted-{index}"))
 
-        overflow_id = f"{prefix}-overflow"
-        overflow_url = _url_with_model(args.url, args.model, session_id=overflow_id)
+        overflow_url = _url_with_model(
+            args.url,
+            args.model,
+            autostart=False if getattr(args, "ref_audio", None) else None,
+        )
         async with websockets.connect(overflow_url, max_size=64 * 1024 * 1024) as overflow:
             await overflow.send(
                 json.dumps(
                     {
                         "type": "session.update",
                         "session": {
-                            "session_id": overflow_id,
                             "model": args.model,
                             "modalities": ["audio", "text"],
-                            "extra_body": {"minicpmo45_native_duplex": True},
+                            **(
+                                {"ref_audio": _ref_audio_data_url(args.ref_audio)}
+                                if getattr(args, "ref_audio", None)
+                                else {}
+                            ),
                         },
                     }
                 )
@@ -207,7 +324,11 @@ async def _resume_probe(
     session_id: str,
     expect_expired: bool = False,
 ) -> dict[str, object]:
-    url = _url_with_model(args.url, args.model, session_id=session_id)
+    url = _url_with_model(
+        args.url,
+        args.model,
+        autostart=False if getattr(args, "ref_audio", None) else None,
+    )
     async with websockets.connect(url, max_size=64 * 1024 * 1024) as first:
         await first.send(
             json.dumps(
@@ -216,25 +337,22 @@ async def _resume_probe(
                     "session": {
                         "model": args.model,
                         "modalities": ["audio", "text"],
-                        "extra_body": {"minicpmo45_native_duplex": True},
+                        **(
+                            {"ref_audio": _ref_audio_data_url(args.ref_audio)}
+                            if getattr(args, "ref_audio", None)
+                            else {}
+                        ),
                     },
                 }
             )
         )
         created, first_events = await _receive_until(first, "session.created", timeout_s=args.timeout_s)
+        session_id = _created_session_id(created)
         token = created.get("resume_token")
-        incarnation = created.get("incarnation")
         generation = created.get("attachment_generation")
-        if not isinstance(token, str) or not isinstance(incarnation, int):
+        if not isinstance(token, str):
             raise RuntimeError("session.created omitted resumable credentials")
-        last_seq = max(
-            (
-                event.get("server_event_seq", 0)
-                for event in first_events
-                if isinstance(event.get("server_event_seq"), int)
-            ),
-            default=0,
-        )
+        last_seq = max(_server_event_sequences(first_events), default=0)
 
     delay_s = args.expire_after_s if expect_expired else args.resume_after_ms / 1000
     if delay_s > 0:
@@ -247,7 +365,6 @@ async def _resume_probe(
                 {
                     "type": "session.resume",
                     "session_id": session_id,
-                    "incarnation": incarnation,
                     "resume_token": token,
                     "last_received_server_event_seq": last_seq,
                 }
@@ -277,7 +394,7 @@ async def _resume_probe(
         await second.send(json.dumps({"type": "session.close"}))
         closed, close_events = await _receive_until(second, "session.closed", timeout_s=args.timeout_s)
 
-    replay_sequences = [event["server_event_seq"] for event in replay if isinstance(event.get("server_event_seq"), int)]
+    replay_sequences = _server_event_sequences(replay)
     return {
         "ok": (
             resumed.get("session_id") == session_id
@@ -306,7 +423,11 @@ async def _takeover_probe(
     *,
     session_id: str,
 ) -> dict[str, object]:
-    url = _url_with_model(args.url, args.model, session_id=session_id)
+    url = _url_with_model(
+        args.url,
+        args.model,
+        autostart=False if getattr(args, "ref_audio", None) else None,
+    )
     first = await websockets.connect(url, max_size=64 * 1024 * 1024)
     second = None
     try:
@@ -317,25 +438,22 @@ async def _takeover_probe(
                     "session": {
                         "model": args.model,
                         "modalities": ["audio", "text"],
-                        "extra_body": {"minicpmo45_native_duplex": True},
+                        **(
+                            {"ref_audio": _ref_audio_data_url(args.ref_audio)}
+                            if getattr(args, "ref_audio", None)
+                            else {}
+                        ),
                     },
                 }
             )
         )
         created, first_events = await _receive_until(first, "session.created", timeout_s=args.timeout_s)
+        session_id = _created_session_id(created)
         token = created.get("resume_token")
-        incarnation = created.get("incarnation")
         generation = created.get("attachment_generation")
-        if not isinstance(token, str) or not isinstance(incarnation, int) or not isinstance(generation, int):
+        if not isinstance(token, str) or not isinstance(generation, int):
             raise RuntimeError("session.created omitted takeover credentials")
-        last_seq = max(
-            (
-                event.get("server_event_seq", 0)
-                for event in first_events
-                if isinstance(event.get("server_event_seq"), int)
-            ),
-            default=0,
-        )
+        last_seq = max(_server_event_sequences(first_events), default=0)
 
         second = await websockets.connect(_with_resume_mode(url), max_size=64 * 1024 * 1024)
         await second.send(
@@ -343,7 +461,6 @@ async def _takeover_probe(
                 {
                     "type": "session.resume",
                     "session_id": session_id,
-                    "incarnation": incarnation,
                     "resume_token": token,
                     "last_received_server_event_seq": last_seq,
                 }
@@ -399,7 +516,9 @@ async def _takeover_probe(
         await first.close()
 
 
-def _demo_args(args: argparse.Namespace, index: int) -> SimpleNamespace:
+def _demo_args(
+    args: argparse.Namespace, index: int, start_barrier: _SynchronizedStartGate | None = None
+) -> SimpleNamespace:
     validation_mode = "response-required" if args.response_required else "model-policy"
     input_wav = args.session_input_wav[index] if args.session_input_wav else args.input_wav
     return SimpleNamespace(
@@ -419,14 +538,17 @@ def _demo_args(args: argparse.Namespace, index: int) -> SimpleNamespace:
         omit_transcript_hints=True,
         validation_mode=validation_mode,
         temperature=args.temperature,
-        scenario="sequential",
+        scenario=getattr(args, "scenario", "sequential"),
+        silence_ms=getattr(args, "silence_ms", 500),
         require_audio=args.response_required,
+        allow_extra_responses=getattr(args, "allow_extra_responses", False),
         require_distinct_inputs=False,
-        expect_empty_turn=[],
+        expect_empty_turn=list(getattr(args, "expect_empty_turn", []) or []),
         short_ack_ms=350,
         turns=args.turns,
         timeout_s=args.timeout_s,
         model_policy_settle_ms=args.model_policy_settle_ms,
+        start_barrier=start_barrier,
     )
 
 
@@ -451,23 +573,18 @@ async def run_multi_session(args: argparse.Namespace) -> dict[str, object]:
             args,
             session_id=f"takeover-{args.takeover_session_index}-{uuid.uuid4().hex}",
         )
-    expiry_result = None
-    if args.expire_session_index is not None:
-        if not 0 <= args.expire_session_index < args.sessions:
-            raise ValueError("--expire-session-index is outside the session range")
-        expiry_result = await _resume_probe(
-            args,
-            session_id=f"expire-{args.expire_session_index}-{uuid.uuid4().hex}",
-            expect_expired=True,
+    lifecycle_result = await run_lifecycle_probes(args)
+
+    start_barrier = (
+        _SynchronizedStartGate(
+            args.sessions,
+            timeout_s=min(float(args.timeout_s), 30.0),
         )
-    admission_result = (
-        await _admission_probe(args, limit=args.verify_admission_limit)
-        if args.verify_admission_limit is not None
+        if getattr(args, "synchronized_start", False)
         else None
     )
-
     session_results = await asyncio.gather(
-        *(run_demo(_demo_args(args, index)) for index in range(args.sessions)),
+        *(_run_demo_with_start_gate(_demo_args(args, index, start_barrier)) for index in range(args.sessions)),
         return_exceptions=True,
     )
     failures = [repr(result) for result in session_results if isinstance(result, BaseException)]
@@ -487,16 +604,15 @@ async def run_multi_session(args: argparse.Namespace) -> dict[str, object]:
             and semantic_isolation_ok
             and (resume_result is None or resume_result.get("ok") is True)
             and (takeover_result is None or takeover_result.get("ok") is True)
-            and (expiry_result is None or expiry_result.get("ok") is True)
-            and (admission_result is None or admission_result.get("ok") is True)
+            and lifecycle_result["ok"] is True
         ),
         "session_count": args.sessions,
         "identity_isolation_ok": identity_isolation_ok,
         "semantic_isolation_ok": semantic_isolation_ok,
         "resume": resume_result,
         "takeover": takeover_result,
-        "expiry": expiry_result,
-        "admission": admission_result,
+        "expiry": lifecycle_result["expiry"],
+        "admission": lifecycle_result["admission"],
         "failures": failures,
         "sessions": completed,
     }
@@ -505,6 +621,34 @@ async def run_multi_session(args: argparse.Namespace) -> dict[str, object]:
         encoding="utf-8",
     )
     return result
+
+
+async def run_lifecycle_probes(args: argparse.Namespace) -> dict[str, object]:
+    """Run expiry and admission probes without requiring model output."""
+    if args.sessions < 1:
+        raise ValueError("--sessions must be positive")
+    expiry_result = None
+    if args.expire_session_index is not None:
+        if not 0 <= args.expire_session_index < args.sessions:
+            raise ValueError("--expire-session-index is outside the session range")
+        expiry_result = await _resume_probe(
+            args,
+            session_id=f"expire-{args.expire_session_index}-{uuid.uuid4().hex}",
+            expect_expired=True,
+        )
+    admission_result = (
+        await _admission_probe(args, limit=args.verify_admission_limit)
+        if args.verify_admission_limit is not None
+        else None
+    )
+    return {
+        "ok": (
+            (expiry_result is None or expiry_result.get("ok") is True)
+            and (admission_result is None or admission_result.get("ok") is True)
+        ),
+        "expiry": expiry_result,
+        "admission": admission_result,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -524,7 +668,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turns", type=int, default=1)
     parser.add_argument("--first-turn-ms", type=int, default=1400)
     parser.add_argument("--turn-duration-ms", type=int, action="append", default=[])
+    parser.add_argument("--expect-empty-turn", type=int, action="append", default=[])
     parser.add_argument("--response-required", action="store_true")
+    parser.add_argument(
+        "--scenario",
+        choices=["sequential", "listen-only-overlap"],
+        default="sequential",
+    )
+    parser.add_argument("--silence-ms", type=int, default=500)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--disconnect-session-index", type=int)
     parser.add_argument("--takeover-session-index", type=int)
@@ -532,6 +683,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expire-session-index", type=int)
     parser.add_argument("--expire-after-s", type=float, default=6.0)
     parser.add_argument("--verify-admission-limit", type=int)
+    parser.add_argument(
+        "--synchronized-start",
+        action="store_true",
+        help="Wait until every session is created before starting input.",
+    )
     parser.add_argument("--model-policy-settle-ms", type=int, default=600)
     parser.add_argument("--timeout-s", type=float, default=120.0)
     args = parser.parse_args()
@@ -543,6 +699,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("provide exactly one --session-expected-token per session")
     if args.session_expected_token and not args.session_input_wav:
         parser.error("--session-expected-token requires --session-input-wav")
+    normalized_expected_tokens = [token.strip().casefold() for token in args.session_expected_token]
+    for token_index, token in enumerate(normalized_expected_tokens):
+        if any(
+            token in other_token or other_token in token
+            for other_token in normalized_expected_tokens[token_index + 1 :]
+        ):
+            parser.error("--session-expected-token values must not overlap after normalization")
     return args
 
 

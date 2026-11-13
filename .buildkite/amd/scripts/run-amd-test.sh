@@ -1,153 +1,103 @@
 #!/bin/bash
-# vllm-omni customized version
-# Based on: vllm/.buildkite/scripts/hardware_ci/run-amd-test.sh
-# Last synced: 2025-12-15
-# Modifications: docker image name for vllm-omni
 
-# This script runs test inside the corresponding ROCm docker container.
-set -o pipefail
+# Run vLLM-Omni ROCm tests directly in the MI300 Kubernetes pod. The pod's
+# container image is selected by test-template-amd-omni.j2; MI300 has no DinD.
+set -euo pipefail
 
-# Export Python path
-export PYTHONPATH=".."
+: "${PYTHONFAULTHANDLER:=1}"
+: "${HF_HOME:=/home/buildkite-agent/huggingface}"
+: "${HF_HUB_DOWNLOAD_TIMEOUT:=300}"
+: "${HF_HUB_ETAG_TIMEOUT:=60}"
+: "${MIOPEN_DEBUG_CONV_DIRECT:=0}"
+: "${MIOPEN_DEBUG_CONV_GEMM:=0}"
+: "${VLLM_ROCM_USE_AITER:=0}"
+export PYTHONFAULTHANDLER HF_HOME HF_HUB_DOWNLOAD_TIMEOUT HF_HUB_ETAG_TIMEOUT
+export MIOPEN_DEBUG_CONV_DIRECT MIOPEN_DEBUG_CONV_GEMM VLLM_ROCM_USE_AITER
+export PYTORCH_ROCM_ARCH=""
+export PYTHONPATH="${PYTHONPATH:-..}"
 
-# Print ROCm version
-echo "--- ROCm info"
+if [[ "${VLLM_CI_DOCKER_DISABLED:-0}" != "1" ]]; then
+    echo "Error: MI300 CI must run natively with Docker disabled." >&2
+    exit 1
+fi
+
+if [[ -n "${TEST_COMMANDS:-}" ]]; then
+    commands="${TEST_COMMANDS}"
+else
+    commands="$*"
+fi
+if [[ -z "${commands}" ]]; then
+    echo "Error: No test commands provided." >&2
+    exit 1
+fi
+
+echo "--- Native in-pod ROCm CI"
+
+job_id="${BUILDKITE_JOB_ID:-${BUILDKITE_PARALLEL_JOB:-local}}"
+job_id="${job_id//[^A-Za-z0-9_.-]/_}"
+native_cache_root="/tmp/vllm-omni-native-${job_id}"
+TMPDIR="${native_cache_root}/tmp"
+TORCHINDUCTOR_CACHE_DIR="${native_cache_root}/torchinductor"
+TRITON_CACHE_DIR="${native_cache_root}/triton"
+VLLM_CACHE_ROOT="${native_cache_root}/vllm"
+XDG_CACHE_HOME="${native_cache_root}/xdg"
+HF_DATASETS_CACHE="${native_cache_root}/huggingface/datasets"
+export TMPDIR TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR VLLM_CACHE_ROOT
+export XDG_CACHE_HOME HF_DATASETS_CACHE
+mkdir -p "${TMPDIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}" \
+    "${VLLM_CACHE_ROOT}" "${XDG_CACHE_HOME}" "${HF_HOME}" \
+    "${HF_DATASETS_CACHE}"
+
+if [[ "${VLLM_CI_REQUIRE_PERSISTENT_HF_CACHE:-0}" == "1" ]]; then
+    if ! command -v findmnt >/dev/null 2>&1; then
+        echo "Error: findmnt is required to verify the Hugging Face cache mount." >&2
+        exit 1
+    fi
+    hf_mount=$(findmnt -n -T "${HF_HOME}" -o TARGET 2>/dev/null || true)
+    if [[ -z "${hf_mount}" || "${hf_mount}" == "/" ]]; then
+        echo "Error: MI300 CI requires a persistent volume at or above ${HF_HOME}." >&2
+        exit 1
+    fi
+fi
+
 rocminfo
 
-# cleanup older docker images
-cleanup_docker() {
-  # Get Docker's root directory
-  docker_root=$(docker info -f '{{.DockerRootDir}}')
-  if [ -z "$docker_root" ]; then
-    echo "Failed to determine Docker root directory."
-    exit 1
-  fi
-  echo "Docker root directory: $docker_root"
-  # Check disk usage of the filesystem where Docker's root directory is located
-  disk_usage=$(df "$docker_root" | tail -1 | awk '{print $5}' | sed 's/%//')
-  # Define the threshold
-  threshold=70
-  if [ "$disk_usage" -gt "$threshold" ]; then
-    echo "Disk usage is above $threshold%. Cleaning up Docker images and volumes..."
-    # Remove dangling images (those that are not tagged and not used by any container)
-    docker image prune -f
-    # Remove unused volumes / force the system prune for old images as well.
-    docker volume prune -f && docker system prune --force --filter "until=72h" --all
-    echo "Docker images and volumes cleanup completed."
-  else
-    echo "Disk usage is below $threshold%. No cleanup needed."
-  fi
-}
+expected_gpus="${VLLM_CI_EXPECTED_GPU_COUNT:-1}"
+python3 - <<'PY'
+import os
 
-# Call the cleanup docker function
-cleanup_docker
+import torch
 
-echo "--- Pulling container"
-## Temporary change to use AMD Docker Hub to store the vllm-omni image
-# to bypass the rate limit issue with ECR Public Gallery.
-# Images are now stored in a separate repository for vllm-omni, instead of vllm-ci.
-# TODO: @tjtanaa point back to ECR Public Gallery
-# once the amd agents are configured to use ECR Public Gallery.
-# image_name="public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:${BUILDKITE_COMMIT}-rocm-omni"
-image_name="rocm/vllm-omni:${BUILDKITE_COMMIT}"
-container_name="rocm_${BUILDKITE_COMMIT}_$(tr -dc A-Za-z0-9 < /dev/urandom | head -c 10; echo)"
+expected = int(os.environ.get("VLLM_CI_EXPECTED_GPU_COUNT", "1"))
+assert torch.version.hip, "PyTorch is not a ROCm build"
+assert torch.cuda.is_available(), "ROCm GPU is not available to PyTorch"
+actual = torch.cuda.device_count()
+assert actual == expected, f"Expected {expected} ROCm GPU(s), found {actual}"
+PY
 
-# TODO: @tjtanaa uncomment this once the amd agents are configured to use ECR Public Gallery.
-# # Install AWS CLI to authenticate to ECR Public Gallery to get higher rate limit for pulling images
-# sudo apt-get update && sudo apt-get install -y awscli
-##  Use safe docker login helper to prevent race conditions
-# source "$(dirname "${BASH_SOURCE[0]}")/../../common/scripts/docker_login_ecr_public.sh"
-# safe_docker_login_ecr_public
-
-## Pull the container from AMD Docker Hub
-
-docker pull "${image_name}"
-
-remove_docker_container() {
-   docker ps -aq --filter "name=${container_name}" | xargs -r docker rm -f || true
-   docker image rm -f "${image_name}" || true
-}
-trap remove_docker_container EXIT
-
-echo "--- Running container"
-
-HF_CACHE="$(realpath ~)/huggingface"
-mkdir -p "${HF_CACHE}"
-HF_MOUNT="/root/.cache/huggingface"
-
-if [[ -n "${TEST_COMMAND:-}" ]]; then
-    commands="$TEST_COMMAND"
-else
-    commands="$@"
-fi
-echo "Commands:$commands"
-
-PARALLEL_JOB_COUNT=8
-MYPYTHONPATH=".."
-
-# Test that we're launching on the machine that has
-# proper access to GPUs
-render_gid=$(getent group render | cut -d: -f3)
-if [[ -z "$render_gid" ]]; then
-  echo "Error: 'render' group not found. This is required for GPU access." >&2
-  exit 1
-fi
-
-# check if the command contains shard flag, we will run all shards in parallel because the host have 8 GPUs.
-# TODO: @tjtanaa reenable to run VLLM_ROCM_USE_AITER=1 when AITER is shipped with prebuilt kernels.
-if [[ $commands == *"--shard-id="* ]]; then
-  # assign job count as the number of shards used
-  commands=$(echo "$commands" | sed -E "s/--num-shards[[:blank:]]*=[[:blank:]]*[0-9]*/--num-shards=${PARALLEL_JOB_COUNT} /g" | sed 's/ \\ / /g')
-  for GPU in $(seq 0 $(($PARALLEL_JOB_COUNT-1))); do
-    # assign shard-id for each shard
-    commands_gpu=$(echo "$commands" | sed -E "s/--shard-id[[:blank:]]*=[[:blank:]]*[0-9]*/--shard-id=${GPU} /g" | sed 's/ \\ / /g')
-    echo "Shard ${GPU} commands:$commands_gpu"
-    echo "Render devices: $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES"
-    docker run \
-        --device /dev/kfd $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES \
-        --network=host \
-        --shm-size=16gb \
-        --group-add "$render_gid" \
-        -e MIOPEN_DEBUG_CONV_DIRECT=0 \
-        -e MIOPEN_DEBUG_CONV_GEMM=0 \
-        -e VLLM_ROCM_USE_AITER=0 \
-        -e HIP_VISIBLE_DEVICES="${GPU}" \
-        -e HF_TOKEN \
-        -v "${HF_CACHE}:${HF_MOUNT}" \
-        -e "HF_HOME=${HF_MOUNT}" \
-        -e "PYTHONPATH=${MYPYTHONPATH}" \
-        --name "${container_name}_${GPU}" \
-        "${image_name}" \
-        /bin/bash -c "${commands_gpu}" \
-        |& while read -r line; do echo ">>Shard $GPU: $line"; done &
-    PIDS+=($!)
-  done
-  #wait for all processes to finish and collect exit codes
-  for pid in "${PIDS[@]}"; do
-    wait "${pid}"
-    STATUS+=($?)
-  done
-  for st in "${STATUS[@]}"; do
-    if [[ ${st} -ne 0 ]]; then
-      echo "One of the processes failed with $st"
-      exit "${st}"
+echo "Commands:${commands}"
+if /bin/bash -o pipefail -c '
+set -E
+test_status=0
+trap '\''
+    command_status=$?
+    # Keep running subsequent commands, but retain a failure for the final exit.
+    # Prefer a test failure over pytest "no tests collected" when both occur.
+    if (( test_status == 0 || (test_status == 5 && command_status != 5) )); then
+        test_status=${command_status}
     fi
-  done
+'\'' ERR
+eval "$1"
+exit "${test_status}"
+' _ "${commands}"; then
+    exit 0
 else
-  echo "Render devices: $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES"
-  docker run \
-          --device /dev/kfd $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES \
-          --network=host \
-          --shm-size=16gb \
-          --group-add "$render_gid" \
-          -e MIOPEN_DEBUG_CONV_DIRECT=0 \
-          -e MIOPEN_DEBUG_CONV_GEMM=0 \
-          -e VLLM_ROCM_USE_AITER=0 \
-          -e HF_TOKEN \
-          -v "${HF_CACHE}:${HF_MOUNT}" \
-          -e "HF_HOME=${HF_MOUNT}" \
-          -e "PYTHONPATH=${MYPYTHONPATH}" \
-          --name "${container_name}" \
-          "${image_name}" \
-          /bin/bash -c "${commands}"
+    exit_code=$?
 fi
+
+if [[ ${exit_code} -eq 5 && "${VLLM_CI_ALLOW_NO_TESTS:-0}" == "1" ]]; then
+    echo "Pytest collected no tests; VLLM_CI_ALLOW_NO_TESTS=1, treating exit code 5 as success."
+    exit 0
+fi
+
+exit "${exit_code}"

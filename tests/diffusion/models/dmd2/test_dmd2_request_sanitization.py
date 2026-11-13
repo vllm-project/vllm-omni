@@ -8,7 +8,6 @@ import torch
 from vllm_omni.diffusion.models.flux.pipeline_flux import FluxDMD2Pipeline, FluxPipeline
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
     LTX2I2VDMD2Pipeline,
-    LTX2ImageToVideoPipeline,
     LTX2Pipeline,
     LTX2T2VDMD2Pipeline,
 )
@@ -25,7 +24,7 @@ _DMD2_BASE = {
     WanT2VDMD2Pipeline: Wan22Pipeline,
     WanI2VDMD2Pipeline: Wan22I2VPipeline,
     LTX2T2VDMD2Pipeline: LTX2Pipeline,
-    LTX2I2VDMD2Pipeline: LTX2ImageToVideoPipeline,
+    LTX2I2VDMD2Pipeline: LTX2Pipeline,
     FluxDMD2Pipeline: FluxPipeline,
     QwenImageDMD2Pipeline: QwenImagePipeline,
 }

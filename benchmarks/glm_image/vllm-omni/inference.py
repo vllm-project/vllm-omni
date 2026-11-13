@@ -300,7 +300,7 @@ def benchmark(args: argparse.Namespace) -> None:
         output_idx = 0
         for stage_outputs in omni.generate(all_prompts, sampling_params_list, py_generator=True):
             if stage_outputs.final_output_type == "image":
-                request_output = stage_outputs.request_output
+                request_output = stage_outputs
                 request_id = getattr(request_output, "request_id", "")
 
                 images = getattr(request_output, "images", [])

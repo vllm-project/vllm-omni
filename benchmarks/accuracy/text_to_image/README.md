@@ -12,14 +12,14 @@ Upstream mapping:
 What changed:
 
 - Generation calls the local OpenAI-compatible `vllm-omni` endpoints:
-  - `/v1/images/generations` for text-only frame generation
-  - `/v1/images/edits` for image-conditioned GUI transition generation
+    - `/v1/images/generations` for text-only frame generation
+    - `/v1/images/edits` for image-conditioned GUI transition generation
 - Evaluation still keeps the GEBench scoring dimensions:
-  - `goal`
-  - `logic`
-  - `cons`
-  - `ui`
-  - `qual`
+    - `goal`
+    - `logic`
+    - `cons`
+    - `ui`
+    - `qual`
 - Judge calls are also routed to a local OpenAI-compatible model served by
   `vllm-omni` instead of a remote service.
 

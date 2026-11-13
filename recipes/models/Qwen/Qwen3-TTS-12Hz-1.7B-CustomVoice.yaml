@@ -1,0 +1,200 @@
+meta:
+  title: "Qwen3-TTS-12Hz-1.7B-CustomVoice"
+  slug: "qwen3-tts-12hz-1.7b-customvoice"
+  provider: "Qwen"
+  description: "Text-to-speech served via vLLM-Omni with predefined speaker voices and optional style/emotion control, exposed through the OpenAI /v1/audio/speech API. Sibling VoiceDesign and Base (voice-clone) checkpoints share the same serving path."
+  date_added: 2026-06-17
+  date_updated: 2026-06-15
+  tasks:
+    - omni
+  related_recipes:
+    - mistralai/Voxtral-4B-TTS-2603
+    - fishaudio/s2-pro
+    - stabilityai/stable-audio-open-1.0
+
+model:
+  model_id: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+  min_vllm_version: "0.20.0"
+  architecture: dense
+  parameter_count: "1.7B"
+  active_parameters: "1.7B"
+  context_length: 0
+  base_args:
+    - "--omni"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: t2a
+      label: "Text → Speech"
+      endpoint: "/v1/audio/speech"
+      description: "CustomVoice TTS via the OpenAI /v1/audio/speech API"
+      curl: |
+        curl -X POST http://localhost:8000/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            "input": "Hello, how are you?",
+            "voice": "vivian",
+            "language": "English",
+            "response_format": "wav"
+          }' --output output.wav
+
+dependencies:
+  - note: "vLLM-Omni provides the TTS serving backend and the `--omni` serve path. See the installation guide for pre-built wheels or building from source."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+
+features: {}
+
+opt_in_features: []
+
+# The Qwen3-TTS family ships separate checkpoints per task type and size. Each
+# variant swaps the served model_id; pick the one matching your task. (There is
+# no 0.6B VoiceDesign checkpoint.)
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 16
+    description: "CustomVoice 1.7B — predefined speaker voices + optional style/emotion control"
+  voicedesign-1.7b:
+    model_id: "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    precision: bf16
+    vram_minimum_gb: 16
+    description: "VoiceDesign 1.7B — generate a voice from a natural-language description"
+  base-1.7b:
+    model_id: "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    precision: bf16
+    vram_minimum_gb: 16
+    description: "Base 1.7B — voice cloning from reference audio + transcript"
+  customvoice-0.6b:
+    model_id: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+    precision: bf16
+    vram_minimum_gb: 8
+    description: "CustomVoice 0.6B — smaller, lower-VRAM predefined voices"
+  base-0.6b:
+    model_id: "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    precision: bf16
+    vram_minimum_gb: 8
+    description: "Base 0.6B — smaller voice-clone checkpoint"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) is a
+  text-to-speech family served through **vLLM-Omni** with the OpenAI-compatible
+  `/v1/audio/speech` API. Three task types are each backed by a dedicated
+  checkpoint:
+
+  | Task type   | Model                                       | Use case                                          |
+  |-------------|---------------------------------------------|---------------------------------------------------|
+  | CustomVoice | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`      | Predefined speaker voices + optional style/emotion |
+  | VoiceDesign | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`      | Speech from a natural-language voice description   |
+  | Base        | `Qwen/Qwen3-TTS-12Hz-1.7B-Base`             | Voice cloning from reference audio + transcript    |
+
+  Smaller 0.6B variants are also published for CustomVoice and Base. The server
+  serves **one** checkpoint at a time — switch task type by restarting with the
+  matching model.
+
+  ## Prerequisites
+
+  - **Hardware**: a single CUDA GPU (the 1.7B talker + codec decoder share one
+    device; the bundled deploy config requests `gpu_memory_utilization: 0.3` per
+    stage).
+  - **vLLM-Omni** targeting vLLM >= 0.20. See the
+    [installation guide](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/gpu/).
+
+  Use the **Variant** selector above to switch checkpoint (CustomVoice /
+  VoiceDesign / Base, 1.7B or 0.6B); the served `model_id` updates accordingly.
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  ```
+
+  ## Launch the server
+
+  The two-stage deploy config (`vllm_omni/deploy/qwen3_tts.yaml`, async chunking
+  on for low first-audio latency) is auto-discovered from `model_type=qwen3_tts`:
+
+  ```bash
+  # CustomVoice (predefined speakers)
+  vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8000
+
+  # VoiceDesign (natural-language voice description)
+  vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign --omni --port 8000
+
+  # Base (voice cloning from reference audio)
+  vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --port 8000
+  ```
+
+  > `--omni` is what selects the Omni pipeline, so it is required. The
+  > `vllm-omni serve` console-script is equivalent only when `--omni` is passed
+  > to it as well; without the flag it falls through to stock `vllm serve`.
+
+  ## Client usage
+
+  ### Predefined voice (curl)
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "input": "Hello, how are you?", "voice": "vivian", "language": "English"}' \
+    --output output.wav
+  ```
+
+  ### Emotion / style instruction
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "input": "I am so excited!", "voice": "vivian", "instructions": "Speak with great enthusiasm"}' \
+    --output excited.wav
+  ```
+
+  ### List available voices
+
+  ```bash
+  curl http://localhost:8000/v1/audio/voices
+  ```
+
+  ### Streaming PCM (low latency)
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "input": "Hello, how are you?", "voice": "vivian", "language": "English", "stream": true, "response_format": "pcm"}' \
+    --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
+  ```
+
+  Streaming requires `stream: true` with `response_format: "pcm"` (24 kHz mono).
+
+  ### Python client and offline inference
+
+  ```bash
+  # Online client (CustomVoice / VoiceDesign / Base)
+  python examples/online_serving/text_to_speech/qwen3_tts/openai_speech_client.py \
+    --text "Hello, how are you?" --speaker vivian --language English
+
+  # Offline (no server)
+  python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
+    --query-type CustomVoice [--streaming]
+  ```
+
+  ## Known limitations
+
+  - Each task type requires its matching checkpoint — a CustomVoice model cannot
+    serve a Base (voice-clone) request.
+  - One model variant is served per process; switching task type means restarting.
+
+  ## References
+
+  - [Model card](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)
+  - [vLLM-Omni Qwen3-TTS online example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_speech/qwen3_tts)
+  - [vLLM-Omni Qwen3-TTS offline example](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/qwen3_tts)

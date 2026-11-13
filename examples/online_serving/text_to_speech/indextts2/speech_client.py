@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""OpenAI-compatible client for IndexTTS2 TTS via /v1/audio/speech endpoint.
+"""OpenAI-compatible client for IndexTTS 2.0/2.5 via /v1/audio/speech.
 
 Examples:
     # With reference audio for voice cloning
@@ -54,13 +54,44 @@ def main() -> None:
     parser.add_argument("--emo-alpha", type=float, default=None, help="Emotion weight in [0, 1]")
     parser.add_argument("--use-emo-text", action="store_true", help="Infer emotion vector from emo-text or text")
     parser.add_argument("--use-random", action="store_true", help="Use random emotion prototypes")
-    parser.add_argument("--model", type=str, default="IndexTeam/IndexTTS-2")
+    parser.add_argument(
+        "--model-version",
+        choices=("2.0", "2.5"),
+        default="2.0",
+    )
+    parser.add_argument("--model", type=str, default=None)
+    parser.add_argument(
+        "--lang",
+        default="zh",
+        help=(
+            "IndexTTS 2.5 language code, for example zh/en/zhen/ja/yue; "
+            "zhen is mixed Chinese/English and Mandarin is a vLLM-Omni alias for zh"
+        ),
+    )
+    parser.add_argument(
+        "--no-text-normalization",
+        action="store_false",
+        dest="text_normalization",
+        help="Disable IndexTTS 2.5 text normalization",
+    )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="IndexTTS 2.5 native synthesis speed in [0.5, 2.0]; 2.0 is faster",
+    )
     parser.add_argument("--voice", type=str, default=None, help="Uploaded voice name to use instead of --ref-audio")
     parser.add_argument("--output", type=str, default="output.wav")
     parser.add_argument("--api-base", type=str, default=DEFAULT_API_BASE)
     parser.add_argument("--api-key", type=str, default=DEFAULT_API_KEY)
     parser.add_argument("--response-format", type=str, default="wav")
     args = parser.parse_args()
+    if args.model is None:
+        if args.model_version == "2.5":
+            parser.error("--model is required for IndexTTS 2.5")
+        args.model = "IndexTeam/IndexTTS-2"
+    if args.model_version == "2.5" and not 0.5 <= args.speed <= 2.0:
+        parser.error("IndexTTS 2.5 --speed must be between 0.5 and 2.0")
 
     if not args.ref_audio and not args.voice:
         parser.error("IndexTTS2 requires --ref-audio or --voice for voice cloning")
@@ -97,6 +128,10 @@ def main() -> None:
         extra_params["use_emo_text"] = True
     if args.use_random:
         extra_params["use_random"] = True
+    if args.model_version == "2.5":
+        payload["speed"] = args.speed
+        extra_params["lang"] = args.lang
+        extra_params["text_normalization"] = args.text_normalization
     if extra_params:
         payload["extra_params"] = extra_params
 

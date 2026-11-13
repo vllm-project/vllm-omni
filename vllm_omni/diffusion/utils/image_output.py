@@ -51,8 +51,13 @@ def _iter_multimodal_image_payloads(output: OmniRequestOutput | RequestOutput) -
     if isinstance(output, OmniRequestOutput):
         if output.multimodal_output is not None:
             yield from _image_values_from_mapping_like(output.multimodal_output)
-        if output.request_output is not None:
-            yield from _iter_request_output_payloads(output.request_output)
+        # OmniRequestOutput IS the RequestOutput now; iterate completion
+        # outputs directly for multimodal payloads that the property
+        # (which returns only the first match) may have missed.
+        for completion in getattr(output, "outputs", []):
+            mm = getattr(completion, "multimodal_output", None)
+            if mm is not None:
+                yield from _image_values_from_mapping_like(mm)
     else:
         yield from _iter_request_output_payloads(output)
 

@@ -92,4 +92,4 @@ For HunyuanImage-3.0, use the Hunyuan-specific adaptation linked above.
 2. The `ascend` quantization method expects weights produced by the Ascend
    tooling; it is not a load-time CUDA quantizer.
 3. Keep the quantized checkpoint aligned with the same model architecture and
-   stage config used for BF16 inference.
+   pipeline and deploy config used for BF16 inference.

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import random
 import warnings
@@ -22,6 +22,7 @@ class TokenizerEncodeOutput(BaseOutput):
     tokens: torch.Tensor | None = None
     timestep_scatter_index: torch.Tensor | None = None
     guidance_scatter_index: torch.Tensor | None = None
+    timesteps_r_scatter_index: torch.Tensor | None = None  # For MeanFlow distilled models
     text_slices: list[slice] | None = None
     gen_image_slices: list[slice] | None = None
     joint_image_slices: list[slice] | None = None
@@ -45,9 +46,9 @@ class Conversation:
 
 
 class TokenizerWrapper:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, *, revision: str | None = None):
         if isinstance(tokenizer, str):
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer, revision=revision)
         else:
             self.tokenizer = tokenizer
 
@@ -196,6 +197,7 @@ class TokenizerWrapper:
         extra_token_pos,
         add_timestep_token=False,
         add_image_shape_token=False,
+        add_timestep_r_token=False,
         base_size=None,
         ratio_idx=None,
         image_type=None,
@@ -221,6 +223,10 @@ class TokenizerWrapper:
             token_seq.extend([self.special_token_map["<guidance>"]])
             extra_token_pos["guidance"].append(token_count)
             token_count += 1
+        if add_timestep_r_token:
+            token_seq.extend([self.special_token_map["<timestep_r>"]])
+            extra_token_pos["gen_timestep_r"].append(token_count)
+            token_count += 1
         return token_count
 
     def encode_sequence(
@@ -230,6 +236,7 @@ class TokenizerWrapper:
         total_length=None,
         add_timestep_token=False,
         add_guidance_token=False,
+        add_timestep_r_token=False,
         last_key_only_prefix=False,
         add_eos=True,
         use_front_boi_token=True,
@@ -329,6 +336,7 @@ class TokenizerWrapper:
                     2
                     + (1 if source.get("timestep", add_timestep_token) else 0)
                     + (1 if source.get("guidance", add_guidance_token) else 0)
+                    + (1 if source.get("timestep_r", add_timestep_r_token) else 0)
                     + (2 if source.get("image_shape", add_image_shape_token) else 0)
                 )
                 if drop_last is True and token_count + extra_count + source["length"] > total_length:
@@ -344,6 +352,7 @@ class TokenizerWrapper:
                     extra_token_pos=extra_token_pos,
                     add_timestep_token=source.get("timestep", add_timestep_token),
                     add_guidance_token=source.get("guidance", add_guidance_token),
+                    add_timestep_r_token=source.get("timestep_r", add_timestep_r_token),
                     add_image_shape_token=source.get("image_shape", add_image_shape_token),
                     base_size=source.get("base_size"),
                     ratio_idx=source.get("ratio_idx"),
@@ -384,7 +393,7 @@ class TokenizerWrapper:
                     drop_last_break = True
                     break
                 if source.get("front_boi", use_front_boi_token):
-                    token_seq.append(self.boi_token_id)  # Use patched boi for Janus, otherwise useing default <boi>
+                    token_seq.append(self.boi_token_id)  # Use patched boi for Janus, otherwise using default <boi>
                     extra_token_pos["boi"].append(token_count)
                     token_count += 1
                 token_count = self._add_image_meta_info_token(
@@ -739,6 +748,7 @@ class TokenizerWrapper:
                         length=section["token_length"],
                         timestep=section.get("add_timestep_token", False),
                         guidance=section.get("add_guidance_token", False),
+                        timestep_r=section.get("add_timestep_r_token", False),
                         front_boi=section.get("use_front_boi_token", False),
                         image_shape=section.get("add_image_shape_token", False),
                         base_size=section.get("base_size"),
@@ -776,6 +786,11 @@ class TokenizerWrapper:
         )
         guidance_scatter_index = (
             torch.tensor(extra_token_pos["guidance"], dtype=torch.long) if "guidance" in extra_token_pos else None
+        )
+        timesteps_r_scatter_index = (
+            torch.tensor(extra_token_pos["gen_timestep_r"], dtype=torch.long)
+            if "gen_timestep_r" in extra_token_pos
+            else None
         )
         cond_timestep_scatter_index = (
             torch.tensor(extra_token_pos["cond_timestep"], dtype=torch.long)
@@ -847,6 +862,7 @@ class TokenizerWrapper:
             tokens=full_seq_token_tensor,
             timestep_scatter_index=timestep_scatter_index,
             guidance_scatter_index=guidance_scatter_index,
+            timesteps_r_scatter_index=timesteps_r_scatter_index,
             text_slices=text_slices,
             gen_image_slices=gen_image_slices,
             joint_image_slices=joint_image_slices,
@@ -867,41 +883,32 @@ class TokenizerWrapper:
     def get_cot_sections(self, cot_text, uncond_kwargs, cot_max_length=None, drop_think=False):
         if not cot_text:  # None or empty
             return []
-        if "<think>" in cot_text and "</think>" in cot_text:
-            before_think_sec = cot_text.split("<think>")[0]
-            after_think_sec = cot_text.split("</think>")[1]
-            think_sec = cot_text.split("<think>")[1].split("</think>")[0]
-            return (
-                self.get_cot_sections(before_think_sec, uncond_kwargs, drop_think=drop_think)
-                + (
-                    [
-                        dict(type="text", text="<think>"),
-                        dict(type="text", text=think_sec, max_length=cot_max_length, **uncond_kwargs),
-                        dict(type="text", text="</think>"),
-                    ]
-                    if not drop_think
-                    else []
-                )
-                + self.get_cot_sections(after_think_sec, uncond_kwargs, drop_think=drop_think)
-            )
-
-        if "<recaption>" in cot_text and "</recaption>" in cot_text:
-            before_recaption_sec = cot_text.split("<recaption>")[0]
-            after_recaption_sec = cot_text.split("</recaption>")[1]
-            recaption_sec = cot_text.split("<recaption>")[1].split("</recaption>")[0]
-            return (
-                self.get_cot_sections(before_recaption_sec, uncond_kwargs, drop_think=drop_think)
-                + [
-                    dict(type="text", text="<recaption>"),
-                    dict(type="text", text=recaption_sec, max_length=cot_max_length, **uncond_kwargs),
-                    dict(type="text", text="</recaption>"),
+        is_text = isinstance(cot_text, str)
+        content_key = "text" if is_text else "tokens"
+        for tag in ("think", "recaption"):
+            opening, closing = f"<{tag}>", f"</{tag}>"
+            start = opening if is_text else self.special_token_map[opening]
+            end = closing if is_text else self.special_token_map[closing]
+            if start not in cot_text or end not in cot_text:
+                continue
+            start_pos = cot_text.index(start)
+            body_pos = start_pos + (len(start) if is_text else 1)
+            end_pos = cot_text.index(end, body_pos)
+            after_pos = end_pos + (len(end) if is_text else 1)
+            body = cot_text[body_pos:end_pos]
+            sections = []
+            if tag != "think" or not drop_think:
+                sections = [
+                    dict(type="text", text=opening),
+                    dict(type="text", **{content_key: body}, max_length=cot_max_length, **uncond_kwargs),
+                    dict(type="text", text=closing),
                 ]
-                + self.get_cot_sections(after_recaption_sec, uncond_kwargs, drop_think=drop_think)
+            return (
+                self.get_cot_sections(cot_text[:start_pos], uncond_kwargs, drop_think=drop_think)
+                + sections
+                + self.get_cot_sections(cot_text[after_pos:], uncond_kwargs, drop_think=drop_think)
             )
-
-        return [
-            dict(type="text", text=cot_text, **uncond_kwargs),
-        ]
+        return [dict(type="text", **{content_key: cot_text}, **uncond_kwargs)]
 
     def apply_general_template(
         self,
@@ -957,8 +964,10 @@ class TokenizerWrapper:
                     if role == "system":
                         _sub_sections.append(dict(type="text", text=text))
                     elif role == "assistant":
-                        if ("<recaption>" in text and "</recaption>" in text) or (
-                            "<think>" in text and "</think>" in text
+                        if (
+                            not isinstance(text, str)
+                            or ("<recaption>" in text and "</recaption>" in text)
+                            or ("<think>" in text and "</think>" in text)
                         ):
                             _sub_sections.extend(self.get_cot_sections(text, uncond_kwargs, drop_think=drop_think))
                         else:
@@ -1087,7 +1096,8 @@ class TokenizerWrapper:
         batch_gen_image_info: list[ImageInfo] | None = None,
         batch_cond_image_info: list[JointImageInfo] | list[list[JointImageInfo]] | None = None,
         batch_system_prompt: list[str] | None = None,
-        batch_cot_text: list[str] | None = None,
+        # Raw AR token rows replace text entries when batch_ar_token_ids is set.
+        batch_cot_text: list[str | list[int] | None] | None = None,
         max_length: int | None = None,
         bot_task: str = "auto",  # auto/image/think/recaption/img_ratio
         image_base_size: int = 1024,
@@ -1095,10 +1105,15 @@ class TokenizerWrapper:
         cfg_factor: int = 1,
         add_assistant_prefix: bool | None = None,
         drop_think: bool = False,
+        batch_ar_token_ids: list[tuple[list[int], list[int]] | None] | None = None,
+        validate_ar_kv_prefix: bool = False,
     ) -> dict[str, Any]:
         assert bot_task in ["image", "auto", "think", "recaption", "img_ratio"], (
             f"bot_task should be one of ['image', 'auto', 'think', 'recaption', 'img_ratio'], but got {bot_task}."
         )
+        if batch_message_list is not None and batch_ar_token_ids is not None:
+            # Message lists carry text CoT; raw AR IDs only replace prompt-path CoT.
+            raise ValueError("Hunyuan AR token metadata requires prompt inputs, not message lists.")
 
         if batch_message_list is None:
             # Simple text-to-image or text-cot-to-image task
@@ -1116,6 +1131,29 @@ class TokenizerWrapper:
                 )
             else:
                 batch_cot_text = [None] * batch_size
+            if batch_ar_token_ids is not None:
+                if len(batch_ar_token_ids) != batch_size:
+                    raise ValueError("Hunyuan AR token metadata must have one entry per prompt.")
+                batch_cot_text = list(batch_cot_text)
+                for i, ar_tokens in enumerate(batch_ar_token_ids):
+                    if ar_tokens is None:
+                        continue
+                    prompt_ids, generated_ids = ar_tokens
+                    cot_ids = list(generated_ids)
+                    # Match the text path's recaption-first boundary, and let
+                    # the template rebuild answer/image metadata exactly once.
+                    for closing in (self.end_recaption_token_id, self.end_think_token_id):
+                        if closing in cot_ids:
+                            cot_ids = cot_ids[: cot_ids.index(closing) + 1]
+                            break
+                    else:
+                        # Vanilla/img_ratio and unfinished thoughts do not
+                        # supply a completed CoT prefix for KV reuse.
+                        continue
+                    trigger_ids = (self.special_token_map["<think>"], self.special_token_map["<recaption>"])
+                    if prompt_ids and prompt_ids[-1] in trigger_ids:
+                        cot_ids.insert(0, prompt_ids[-1])
+                    batch_cot_text[i] = cot_ids or None
             if batch_cond_image_info is not None:
                 assert len(batch_cond_image_info) == batch_size, (
                     f"batch_cond_image_info should have the same length as batch_size ({batch_size}), "
@@ -1172,4 +1210,29 @@ class TokenizerWrapper:
             image_base_size=image_base_size,
             drop_think=drop_think,
         )
+        if validate_ar_kv_prefix and batch_ar_token_ids is not None:
+            # Conditional rows precede CFG rows. Check identity, not just
+            # length, before either dense KV injection or native KV admission.
+            for i, ar_tokens in enumerate(batch_ar_token_ids):
+                if ar_tokens is None:
+                    continue
+                boundary = output.think_recaption_end_pos[i][0]
+                if boundary is None:
+                    continue
+                source_ids = ar_tokens[0] + ar_tokens[1]
+                # Dense and native reuse both stop before the closing CoT
+                # token. AR tokens past it, such as an unfinished
+                # <recaption>, are rebuilt by the template and never reused.
+                prefix_len = boundary
+                layout_ids = output.tokens[i, :prefix_len].tolist()
+                if layout_ids != source_ids[:prefix_len]:
+                    mismatch = next(
+                        (pos for pos, (a, b) in enumerate(zip(layout_ids, source_ids)) if a != b),
+                        min(len(layout_ids), len(source_ids)),
+                    )
+                    raise ValueError(
+                        "Hunyuan AR KV prefix token IDs do not match the DiT layout: "
+                        f"first mismatch at {mismatch}, checked prefix {prefix_len}, "
+                        f"AR sequence length {len(source_ids)}."
+                    )
         return dict(output=output, sections=sections)

@@ -1,0 +1,19 @@
+# Opt-in single-Hopper C64 throughput profile: one AR and two codec replicas.
+# Inherit sampling, connector, and runtime settings from the full-response profile.
+# Each stage has aggregate capacity 64; this is not a streaming TTFP profile.
+# One Model Runner V2 talker serves all 64 requests: a decode step costs about
+# the same at 32 and 64 rows, so a second talker only adds processes. The
+# codec is the throughput limit; two replicas overlap its launch-bound steps.
+base_config: cosyvoice3_full_response.yaml
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    num_replicas: 1
+    gpu_memory_utilization: 0.35
+    max_num_seqs: 64
+  - stage_id: 1
+    devices: "0,0"
+    num_replicas: 2
+    gpu_memory_utilization: 0.2
+    max_num_seqs: 32

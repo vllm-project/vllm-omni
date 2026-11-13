@@ -50,7 +50,7 @@ async def generate(
         output_modalities=["text"],
     ):
         stage_id = omni_output.stage_id
-        out = omni_output.request_output
+        out = omni_output
         if stage_id == 0:
             num_tokens = sum(len(output.token_ids) for output in out.outputs)
             count = num_tokens
@@ -68,7 +68,7 @@ async def test_abort():
     with ExitStack() as after:
         engine = AsyncOmni(
             model=model,
-            stage_configs_path=stage_config,
+            deploy_config=stage_config,
         )
         after.callback(engine.shutdown)
 

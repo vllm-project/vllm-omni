@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 E2E tests for Qwen2.5-Omni model with mixed modality inputs, audio and text output.
 """
@@ -10,8 +13,7 @@ from tests.helpers.media import (
     generate_synthetic_image,
     generate_synthetic_video,
 )
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
-from vllm_omni.platforms import current_omni_platform
+from tests.helpers.stage_config import get_deploy_config_path
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
 
@@ -21,22 +23,10 @@ models = ["Qwen/Qwen2.5-Omni-7B"]
 _CI_DEPLOY = get_deploy_config_path("ci/qwen2_5_omni.yaml")
 
 
-def get_cuda_graph_config():
-    return modify_stage_config(
-        _CI_DEPLOY,
-        updates={
-            "stages": {
-                0: {"enforce_eager": True},
-                1: {"enforce_eager": True},
-            },
-        },
-    )
-
-
-if current_omni_platform.is_rocm() or current_omni_platform.is_xpu() or current_omni_platform.is_npu():
-    stage_config = _CI_DEPLOY
-else:
-    stage_config = get_cuda_graph_config()
+# The bundled deploy YAML runs the talker with CUDA graphs on CUDA and keeps
+# eager on ROCm, on the NPU talker and on XPU through its ``platforms:``
+# section, so every platform runs this test on the same resolved config.
+stage_config = _CI_DEPLOY
 
 # Create parameter combinations for model and stage config
 # Qwen2.5-Omni with TP=3 needs longer init timeout
@@ -55,7 +45,7 @@ def get_question(prompt_type="mix"):
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 4, "rocm": 2, "xpu": 3})
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
-def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
+def test_mix_to_audio(omni_runner, offline_client) -> None:
     """
     Test multi-modal input processing and text/audio output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -79,14 +69,14 @@ def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
     }
 
     # Test single completion
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)
 
 
 @pytest.mark.slow
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 4, "rocm": 2, "xpu": 3})
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
-def test_text_to_text(omni_runner, omni_runner_handler) -> None:
+def test_text_to_text(omni_runner, offline_client) -> None:
     """
     Test text input processing and text output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -99,4 +89,4 @@ def test_text_to_text(omni_runner, omni_runner_handler) -> None:
     request_config = {"prompts": get_question("text_only"), "modalities": ["text"]}
 
     # Test single completion
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)

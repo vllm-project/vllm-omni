@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
@@ -74,6 +74,9 @@ KEY_LAST_STOP_PROB = "ming_last_stop_prob"
 KEY_NEXT_EMBEDS = "ming_next_embeds"
 KEY_PROMPT_LATENTS = "ming_prompt_latents"
 KEY_SPEAKER_EMBEDDING = "ming_speaker_embedding"
+KEY_SPEAKER_WAVEFORM = "ming_speaker_waveform"
+KEY_SPEAKER_WAVEFORM_LENGTHS = "ming_speaker_waveform_lengths"
+KEY_SPEAKER_SAMPLE_RATES = "ming_speaker_sample_rates"
 KEY_REQUEST_ID = "ming_request_id"
 KEY_CHUNK_ID = "ming_chunk_id"
 KEY_CFG = "ming_cfg"
@@ -81,4 +84,5 @@ KEY_SIGMA = "ming_sigma"
 KEY_TEMPERATURE = "ming_temperature"
 KEY_MAX_DECODE_STEPS = "ming_max_decode_steps"
 KEY_MIN_DECODE_STEPS = "ming_min_decode_steps"
+KEY_STOP_REASON = "ming_stop_reason"
 KEY_TEXT_MODE = "ming_text_mode"

@@ -1,3 +1,11 @@
+"""Shared interface for vLLM-Omni benchmark CLI subcommands.
+
+``OmniBenchmarkSubcommandBase`` defines the argument-registration and command
+execution hooks required by benchmark implementations. The ``bench`` command
+discovers its concrete subclasses and uses these hooks to build and dispatch
+nested benchmark subcommands.
+"""
+
 import argparse
 
 from vllm.entrypoints.cli.types import CLISubcommand

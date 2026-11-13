@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Tests for Stable Diffusion XL Base 1.0 model.
 
@@ -10,7 +13,7 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import (
     OmniServer,
     OmniServerParams,
-    OpenAIClientHandler,
+    OnlineOmniClient,
     dummy_messages_from_mix_data,
 )
 
@@ -41,7 +44,7 @@ def _get_diffusion_feature_cases(model: str):
     ),
     indirect=True,
 )
-def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_text_to_image_001(omni_server: OmniServer, online_client: OnlineOmniClient):
     messages = dummy_messages_from_mix_data(content_text=POSITIVE_PROMPT)
     request_config = {
         "model": omni_server.model,
@@ -56,4 +59,4 @@ def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientH
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

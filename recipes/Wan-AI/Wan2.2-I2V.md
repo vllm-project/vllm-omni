@@ -80,9 +80,13 @@ parallelism at `--usp 4` so the two CFG branches cover all 8 GPUs.
 - `--use-hsdp` is recommended for memory efficiency on the 14B DiT backbone.
 - `--vae-patch-parallel-size 8` is recommended for the standard 8-card setup;
   disabling VAE patch parallelism can significantly increase VAE latency.
-- The CUDA Triton fused AdaLayerNorm path is not available in the current
-  release. The `VLLM_OMNI_ENABLE_TRITON_ADALN` toggle is reserved for that
-  future implementation and should not be used until the kernel lands.
+- CUDA eager execution uses the fused Triton AdaLayerNorm path for supported
+  contiguous 3D inputs with shared `(C,)`, `(1, C)`, or `(1, 1, C)` modulation,
+  or per-sample `(B, 1, C)` modulation, including supported strided chunk views.
+  Unsupported inputs use the native path; per-token `(B, L, C)` modulation
+  used by TI2V remains native.
+- During `torch.compile`, AdaLayerNorm uses the native operation chain, which
+  Inductor can fuse. The eager Triton path remains available after compilation.
 - In an 8x NVIDIA H20 test with the official model, `num_inference_steps=4`,
   `flow_shift=12.0`, `--use-hsdp`, `--cfg-parallel-size 2`, `--usp 4`, and
   `--vae-patch-parallel-size 8`, an internal Triton AdaLayerNorm prototype
@@ -181,20 +185,20 @@ for complete client examples and request formats.
 #### Notes
 
 - **Key flags:**
-  - `--omni` — enables vLLM-Omni diffusion serving.
-  - `--use-hsdp` — enables Hybrid Sharded Data Parallelism for the DiT model
+    - `--omni` — enables vLLM-Omni diffusion serving.
+    - `--use-hsdp` — enables Hybrid Sharded Data Parallelism for the DiT model
     weights.
-  - `--usp <N>` — Unified Sequence Parallelism degree.
-  - `--cfg <N>` — Classifier-Free Guidance parallelism; set to 2 for models
+    - `--usp <N>` — Unified Sequence Parallelism degree.
+    - `--cfg <N>` — Classifier-Free Guidance parallelism; set to 2 for models
     that require negative-prompt computation, omit for distilled models.
-  - `--vae-patch-parallel-size 8` — parallelizes VAE decoding across all 8
+    - `--vae-patch-parallel-size 8` — parallelizes VAE decoding across all 8
     cards.
-  - `--vae-use-tiling` — enables tiled VAE decoding to reduce peak memory.
+    - `--vae-use-tiling` — enables tiled VAE decoding to reduce peak memory.
 - **Performance tips:**
-  - Installing mindie-sd and enabling Laser Attention
+    - Installing mindie-sd and enabling Laser Attention
     (`MINDIE_SD_FA_TYPE=ascend_laser_attention`) provides up to ~40%
     performance improvement at 720p resolution due to long-sequence attention
     optimization.
 - **Known limitations:**
-  - `MULTI_STREAM_MEMORY_REUSE=2` is required on NPU when using HSDP/FSDP2
+    - `MULTI_STREAM_MEMORY_REUSE=2` is required on NPU when using HSDP/FSDP2
     due to a multi-stream memory reuse bug. This is not needed on CUDA.

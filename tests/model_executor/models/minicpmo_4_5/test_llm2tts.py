@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the MiniCPM-o 4.5 stage 0 -> stage 1 bridge.
 
 Covers ``vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.llm2tts``:
@@ -9,8 +9,8 @@ Covers ``vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.llm2t
   - both inputs missing -> raises
   - structured model_intermediate_buffer carries the thinker ids and text
   - scheduler prompt tokens follow the selected TTS region or output tokens
-  - MiniCPM-o 4.5 TTS region detection on 151703 / 151704 tokens
-  - No TTS markers present -> no ``tts_token_ids`` / ``tts_hidden_states`` keys
+  - MiniCPM-o 4.5 TTS region detection on 151703 / 151704 / 151645 tokens
+  - plain chat without TTS markers conditions on the generated assistant span
   - prompt arg is normalized to a list and ``multi_modal_data`` is gated by
     ``requires_multimodal_data``
 """
@@ -22,9 +22,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import unpack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import llm2tts
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -33,6 +35,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _HIDDEN_DIM = 4
 
 
+@pytest.mark.skip(reason="Legacy fused Talker metadata is replaced by separate Talker and Code2Wav stage payloads.")
 def test_native_duplex_talker_emits_empty_text_metadata_to_clear_previous_segment() -> None:
     class _Talker:
         _ar_last_chunk_flags = [True]
@@ -91,13 +94,15 @@ def _make_thinker_output(
     latent: torch.Tensor | None = None,
     hidden_states: torch.Tensor | None = None,
     multimodal_output: dict[str, object] | None = None,
+    request_multimodal_output: dict[str, object] | None = None,
 ):
     """Construct a minimal mock of a thinker engine output entry.
 
     The real ``llm2tts`` only reads a tight slice of fields:
-      - top-level: ``request_id``, ``prompt_token_ids``, ``outputs[0]``
-      - per-output: ``multimodal_output`` (dict), ``hidden_states`` (opt),
-        ``text``, ``token_ids``
+      - top-level: ``request_id``, ``prompt_token_ids``, optional
+        ``multimodal_output``, and ``outputs[0]``
+      - per-output: fallback ``multimodal_output``, ``hidden_states`` (opt),
+        ``text``, and ``token_ids``
     """
     mm_output = dict(multimodal_output or {})
     if latent is not None:
@@ -109,11 +114,14 @@ def _make_thinker_output(
     )
     if hidden_states is not None:
         output.hidden_states = hidden_states
-    return SimpleNamespace(
+    request_output = SimpleNamespace(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
         outputs=[output],
     )
+    if request_multimodal_output is not None:
+        request_output.multimodal_output = request_multimodal_output
+    return request_output
 
 
 class TestInputValidation:
@@ -131,6 +139,22 @@ class TestInputValidation:
 
 
 class TestBasicShape:
+    def test_request_level_multimodal_output_feeds_orchestrator_bridge(self) -> None:
+        hidden = torch.zeros((2, _HIDDEN_DIM))
+        thinker_output = _make_thinker_output(
+            prompt_token_ids=[10],
+            output_token_ids=[20],
+            request_multimodal_output={"latent": hidden},
+        )
+
+        out = llm2tts([thinker_output], prompt=None)
+
+        assert out[0]["prompt_token_ids"] == [0, 0, 0]
+        assert torch.equal(
+            torch.as_tensor(unpack_handoff_tensor(out[0]["model_intermediate_buffer"]["hidden_states"]["tts"])),
+            hidden[1:],
+        )
+
     def test_returns_one_entry_per_input(self) -> None:
         hidden = torch.zeros((3, _HIDDEN_DIM))
         out = llm2tts(
@@ -144,13 +168,13 @@ class TestBasicShape:
         )
         assert len(out) == 2
 
-    def test_talker_scheduler_prompt_uses_output_tokens(self) -> None:
+    def test_talker_scheduler_prompt_matches_condition_length(self) -> None:
         hidden = torch.zeros((2, _HIDDEN_DIM))
         out = llm2tts(
             [_make_thinker_output(prompt_token_ids=[10], output_token_ids=[20], hidden_states=hidden)],
             prompt=None,
         )
-        assert out[0]["prompt_token_ids"] == [20]
+        assert out[0]["prompt_token_ids"] == [0, 0, 0]
         assert "stream_output" not in out[0]["model_intermediate_buffer"]
 
     def test_model_intermediate_buffer_carries_thinker_outputs(self) -> None:
@@ -174,6 +198,24 @@ class TestBasicShape:
         assert buffer["ids"]["output"] == out_ids
         assert buffer["llm_output_text"] == ["hello"]
 
+    def test_strict_talker_receives_canonical_nested_handoff(self) -> None:
+        hidden = torch.arange(5 * _HIDDEN_DIM, dtype=torch.float32).reshape(5, _HIDDEN_DIM)
+        result = llm2tts(
+            [
+                _make_thinker_output(
+                    prompt_token_ids=[10],
+                    output_token_ids=[151703, 20, 21, 151704],
+                    hidden_states=hidden,
+                )
+            ],
+            prompt=None,
+        )[0]
+
+        buffer = result["model_intermediate_buffer"]
+        assert result["prompt_token_ids"] == [0, 0, 0, 0]
+        assert buffer["ids"]["tts"] == [20, 21]
+        assert torch.equal(torch.as_tensor(unpack_handoff_tensor(buffer["hidden_states"]["tts"])), hidden[2:4])
+
     def test_latent_in_multimodal_output_takes_precedence(self) -> None:
         # When both ``multimodal_output["latent"]`` and ``hidden_states`` are
         # present, the latent payload must win (this is the steady-state path
@@ -196,7 +238,9 @@ class TestBasicShape:
         )
         buffer = result[0]["model_intermediate_buffer"]
         # latent (ones) won over hidden_states (zeros)
-        assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), latent[3:4].to(torch.float32))
+        assert torch.equal(
+            torch.as_tensor(unpack_handoff_tensor(buffer["hidden_states"]["tts"])), latent[3:4].to(torch.float32)
+        )
 
 
 class TestTtsRegionDetection:
@@ -222,15 +266,16 @@ class TestTtsRegionDetection:
         )
         return result[0]["model_intermediate_buffer"], hidden
 
-    def test_4_5_markers_detected(self) -> None:
+    @pytest.mark.parametrize("tts_end_id", [151704, 151645])
+    def test_4_5_markers_detected(self, tts_end_id: int) -> None:
         # prompt:        [10, 11]
-        # output:        [151703, 30, 31, 151704, 40]
-        # full sequence: [10, 11, 151703, 30, 31, 151704, 40]
+        # output:        [151703, 30, 31, end, 40]
+        # full sequence: [10, 11, 151703, 30, 31, end, 40]
         #                  0   1     2    3   4     5     6
-        # 4.5 BOS at idx 2 -> slice starts at 3; EOS at idx 5 -> slice ends at 5.
-        buffer, hidden = self._run([10, 11], [151703, 30, 31, 151704, 40])
+        # 4.5 BOS at idx 2 -> slice starts at 3; end at idx 5 -> slice ends at 5.
+        buffer, hidden = self._run([10, 11], [151703, 30, 31, tts_end_id, 40])
         assert buffer["ids"]["tts"] == [30, 31]
-        assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[3:5])
+        assert torch.equal(torch.as_tensor(unpack_handoff_tensor(buffer["hidden_states"]["tts"])), hidden[3:5])
 
     def test_bos_without_eos_runs_to_end(self) -> None:
         # When BOS is found but EOS is missing (typical for an in-flight or
@@ -239,15 +284,12 @@ class TestTtsRegionDetection:
         # sequence: [10, 11, 151703, 30, 31]
         buffer, hidden = self._run([10, 11], [151703, 30, 31])
         assert buffer["ids"]["tts"] == [30, 31]
-        assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[3:5])
+        assert torch.equal(torch.as_tensor(unpack_handoff_tensor(buffer["hidden_states"]["tts"])), hidden[3:5])
 
-    def test_no_tts_markers_omits_slice_keys(self) -> None:
-        # If neither marker pair is present, the bridge should NOT populate
-        # ``tts_token_ids`` / ``tts_hidden_states`` — the talker should fall
-        # through to the dummy path.
-        buffer, _ = self._run([10, 11], [20, 21, 22])
-        assert "tts" not in buffer["ids"]
-        assert "tts" not in buffer.get("hidden_states", {})
+    def test_plain_chat_without_tts_markers_uses_assistant_span(self) -> None:
+        buffer, hidden = self._run([10, 11], [20, 21, 22])
+        assert buffer["ids"]["tts"] == [20, 21, 22]
+        assert torch.equal(torch.as_tensor(unpack_handoff_tensor(buffer["hidden_states"]["tts"])), hidden[2:5])
 
 
 class TestPromptAndMultiModal:
@@ -278,6 +320,44 @@ class TestPromptAndMultiModal:
             requires_multimodal_data=True,
         )
         assert out[0]["multi_modal_data"] == mm
+
+    def test_reference_audio_is_added_to_stage_handoff(self) -> None:
+        hidden_states = torch.zeros((2, _HIDDEN_DIM))
+        waveform = torch.tensor([0.25, -0.5], dtype=torch.float32)
+
+        stage_outputs = llm2tts(
+            [_make_thinker_output(prompt_token_ids=[10], output_token_ids=[20], hidden_states=hidden_states)],
+            prompt={"multi_modal_data": {"audio": (waveform, 16000)}},
+        )
+
+        intermediate_buffer = stage_outputs[0]["model_intermediate_buffer"]
+        assert torch.equal(unpack_handoff_tensor(intermediate_buffer["codes"]["ref"]), torch.tensor([0.25, -0.5]))
+        assert intermediate_buffer["meta"]["ref_audio_sr"] == 16000
+
+    def test_serving_reference_audio_is_added_to_stage_handoff(self) -> None:
+        hidden_states = torch.zeros((2, _HIDDEN_DIM))
+        waveform = torch.tensor([0.125, -0.25], dtype=torch.float32)
+
+        stage_outputs = llm2tts(
+            [_make_thinker_output(prompt_token_ids=[10], output_token_ids=[20], hidden_states=hidden_states)],
+            prompt={MINICPMO45_REFERENCE_AUDIO_KEY: (waveform, 24000)},
+        )
+
+        intermediate_buffer = stage_outputs[0]["model_intermediate_buffer"]
+        assert torch.equal(unpack_handoff_tensor(intermediate_buffer["codes"]["ref"]), torch.tensor([0.125, -0.25]))
+        assert intermediate_buffer["meta"]["ref_audio_sr"] == 24000
+
+    def test_missing_reference_audio_does_not_add_stage_handoff_fields(self) -> None:
+        hidden_states = torch.zeros((2, _HIDDEN_DIM))
+
+        stage_outputs = llm2tts(
+            [_make_thinker_output(prompt_token_ids=[10], output_token_ids=[20], hidden_states=hidden_states)],
+            prompt={"multi_modal_data": {}},
+        )
+
+        intermediate_buffer = stage_outputs[0]["model_intermediate_buffer"]
+        assert "codes" not in intermediate_buffer
+        assert "ref_audio_sr" not in intermediate_buffer.get("meta", {})
 
     def test_internal_streaming_context_is_accepted(self) -> None:
         hidden = torch.zeros((2, _HIDDEN_DIM))

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 TeaCache backend implementation.
@@ -8,16 +8,22 @@ This module provides the TeaCache backend that implements the CacheBackend
 interface using the hooks-based TeaCache system.
 """
 
-from typing import Any
+from typing import Any, Protocol
 
+import torch.nn as nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.base import CacheBackend
-from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
+from vllm_omni.diffusion.cache.teacache.config import _MODEL_COEFFICIENTS, TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook, apply_teacache_hook
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 logger = init_logger(__name__)
+
+
+class _MammothModa2TeaCachePipeline(Protocol):
+    gen_transformer: nn.Module
+    transformer: nn.Module
 
 
 def enable_hunyuan_image3_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
@@ -57,6 +63,23 @@ def enable_bagel_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
     )
 
 
+def enable_mammoth_moda2_teacache(pipeline: _MammothModa2TeaCachePipeline, config: DiffusionCacheConfig) -> None:
+    """Enable TeaCache for MammothModa2's DiT stage."""
+    teacache_config = TeaCacheConfig(
+        transformer_type="MammothModa2Transformer2DModel",
+        rel_l1_thresh=config.rel_l1_thresh,
+        coefficients=config.coefficients,
+    )
+    transformer = pipeline.gen_transformer
+    apply_teacache_hook(transformer, teacache_config)
+    pipeline.transformer = transformer
+
+    logger.info(
+        f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
+        f"transformer_class={teacache_config.transformer_type}"
+    )
+
+
 def enable_sensenova_u1_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
     """Enable TeaCache for SenseNova-U1 denoising forwards."""
     teacache_config = TeaCacheConfig(
@@ -70,6 +93,53 @@ def enable_sensenova_u1_teacache(pipeline: Any, config: DiffusionCacheConfig) ->
     logger.info(
         f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
         f"transformer_class={teacache_config.transformer_type}"
+    )
+
+
+def enable_minimax_h3_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    """Enable TeaCache for the calibrated MiniMax-H3 FL2VA partition."""
+    partition = getattr(pipeline, "partition", None)
+    if partition == "ref2va":
+        raise ValueError(
+            "TeaCache only supports the MiniMax-H3 FL2VA partition; Ref2VA TeaCache has not been calibrated"
+        )
+    if partition not in {"fl2va", "combined"}:
+        raise ValueError(f"Unsupported MiniMax-H3 partition for TeaCache: {partition!r}")
+
+    teacache_config = TeaCacheConfig(
+        transformer_type="MiniMaxH3DiTModel",
+        rel_l1_thresh=config.rel_l1_thresh,
+        coefficients=config.coefficients,
+    )
+    apply_teacache_hook(pipeline.transformer, teacache_config)
+
+    if partition == "combined":
+        logger.warning(
+            "TeaCache is enabled only for MiniMax-H3 FL2VA; "
+            "Ref2VA requests on this combined pipeline will run without TeaCache"
+        )
+    logger.info(
+        f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
+        "transformer_class=MiniMaxH3DiTModel, partition=FL2VA"
+    )
+
+
+def enable_ming_image_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    """Use the Design or Design-Layer calibration for the shared Ming transformer."""
+    threshold = 0.13 if config.rel_l1_thresh is None and pipeline.is_layer_decomposition else config.rel_l1_thresh
+    coefficients = config.coefficients
+    if coefficients is None and pipeline.is_layer_decomposition:
+        coefficients = _MODEL_COEFFICIENTS["MingImageTransformer2DModel:Design-Layer"]
+    teacache_config = TeaCacheConfig(
+        transformer_type="MingImageTransformer2DModel",
+        rel_l1_thresh=threshold,
+        coefficients=coefficients,
+    )
+    apply_teacache_hook(pipeline.transformer, teacache_config)
+    logger.info(
+        "TeaCache applied to Ming-Image variant=%s with rel_l1_thresh=%s",
+        "Design-Layer" if pipeline.is_layer_decomposition else "Design",
+        teacache_config.rel_l1_thresh,
     )
 
 
@@ -92,10 +162,32 @@ def enable_flux2_klein_teacache(pipeline: Any, config: DiffusionCacheConfig) -> 
     )
 
 
+def enable_kandinsky6_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    """TeaCache for Kandinsky 6 via the denoise-loop step cache.
+
+    Coefficients are uncalibrated (see ``K6_TEACACHE_COEFFICIENTS``).
+    """
+    from vllm_omni.diffusion.models.kandinsky6.cache_accel import attach_tea_cache
+
+    attach_tea_cache(
+        pipeline.transformer,
+        rel_l1_thresh=config.rel_l1_thresh if config.rel_l1_thresh is not None else 0.2,
+        coefficients=tuple(config.coefficients) if config.coefficients is not None else None,
+    )
+    logger.info(
+        "TeaCache: Kandinsky 6 step-cache attached (uncalibrated coefficients, thresh=%s)",
+        config.rel_l1_thresh,
+    )
+
+
 CUSTOM_TEACACHE_ENABLERS = {
     "BagelPipeline": enable_bagel_teacache,
     "Flux2KleinPipeline": enable_flux2_klein_teacache,
     "HunyuanImage3Pipeline": enable_hunyuan_image3_teacache,
+    "MingImageDiffusionPipeline": enable_ming_image_teacache,
+    "MammothModa2DiTPipeline": enable_mammoth_moda2_teacache,
+    "Kandinsky6TI2VAPipeline": enable_kandinsky6_teacache,
+    "MiniMaxH3Pipeline": enable_minimax_h3_teacache,
     "SenseNovaU1Pipeline": enable_sensenova_u1_teacache,
 }
 
@@ -145,7 +237,6 @@ class TeaCacheBackend(CacheBackend):
 
             # Create TeaCacheConfig from DiffusionCacheConfig with transformer_type
             # Access parameters via attribute access: config.rel_l1_thresh
-            # rel_l1_thresh already has a default value of 0.2 in DiffusionCacheConfig
             try:
                 teacache_config = TeaCacheConfig(
                     transformer_type=transformer_type,
