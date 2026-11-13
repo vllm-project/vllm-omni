@@ -853,7 +853,6 @@ class HunYuanRotary2DEmbedder:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.custom_pos_emb: tuple[torch.Tensor, torch.Tensor] | None = None
         self.rope = RotaryEmbedding(is_neox_style=True)
 
     def _prepare_cos_sin(
@@ -862,21 +861,13 @@ class HunYuanRotary2DEmbedder:
         first_step: bool,
         device: torch.device,
     ):
-        """Returns cos/sin on the target device based on first_step and caching strategy."""
-        if first_step:
-            cos_input, sin_input = custom_pos_emb
-            cos = cos_input.to(device)
-            sin = sin_input.to(device)
-            self.custom_pos_emb = None
-        else:
-            if self.custom_pos_emb is None:
-                cos_input, sin_input = custom_pos_emb
-                cos = cos_input.to(device)
-                sin = sin_input.to(device)
-                self.custom_pos_emb = (cos, sin)
-            else:
-                cos, sin = self.custom_pos_emb
-        return cos, sin
+        """Return this forward's cos/sin on the target device."""
+        # Active request groups can change their rows, order and positions
+        # between denoise steps. Layer-global caching can reuse another
+        # group's RoPE; the caller already supplies this forward's tensors.
+        del first_step
+        cos, sin = custom_pos_emb
+        return cos.to(device), sin.to(device)
 
     def __call__(
         self,

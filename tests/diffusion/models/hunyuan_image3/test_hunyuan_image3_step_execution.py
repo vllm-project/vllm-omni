@@ -1543,3 +1543,17 @@ def test_later_forward_does_not_slice_cached_prefix_again(monkeypatch):
             first_step=False,
             hunyuan_paged_prefix_cut=4,
         )
+
+
+@pytest.mark.parametrize("second_batch", [2, 4])
+def test_rotary_uses_current_group_on_later_steps(second_batch):
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunYuanRotary2DEmbedder
+
+    rope = object.__new__(HunYuanRotary2DEmbedder)
+    rope.custom_pos_emb = None
+    old = (torch.zeros(2, 3, 4), torch.ones(2, 3, 4))
+    new = (torch.full((second_batch, 3, 4), 2.0), torch.full((second_batch, 3, 4), 3.0))
+    rope._prepare_cos_sin(old, False, torch.device("cpu"))
+    actual = rope._prepare_cos_sin(new, False, torch.device("cpu"))
+    torch.testing.assert_close(actual[0], new[0])
+    torch.testing.assert_close(actual[1], new[1])
