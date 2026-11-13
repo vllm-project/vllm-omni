@@ -55,9 +55,11 @@ def looks_like_hyperflow_h3_flash(model: str | None) -> bool:
     path = Path(normalized)
     if not path.is_dir():
         return False
-    return any((path / subfolder / "config.json").is_file() for subfolder in PARTITIONS.values()) or (
-        path / "config.json"
-    ).is_file() and _config_looks_hyperflow(path / "config.json")
+    return (
+        any((path / subfolder / "config.json").is_file() for subfolder in PARTITIONS.values())
+        or (path / "config.json").is_file()
+        and _config_looks_hyperflow(path / "config.json")
+    )
 
 
 def _config_looks_hyperflow(config_path: Path) -> bool:
@@ -78,8 +80,7 @@ def resolve_hyperflow_partition(task_type: str | None) -> str:
     if task == "ref2va":
         return "ref2va"
     raise ValueError(
-        "HyperFlow H3 Flash --task-type must be one of auto/combined/t2va/fl2va/ref2va, "
-        f"got {task_type!r}"
+        f"HyperFlow H3 Flash --task-type must be one of auto/combined/t2va/fl2va/ref2va, got {task_type!r}"
     )
 
 

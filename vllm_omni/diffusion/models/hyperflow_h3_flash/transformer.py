@@ -94,10 +94,10 @@ class HyperFlowH3FlashDiTModel(MiniMaxH3DiTModel):
         self._hyperflow_gate = float(config_mapping.get("hyperflow_gate", extras.get("hyperflow_gate", 0.25)))
         quant = config_mapping.get("quantization") or extras.get("hyperflow_quantization") or {}
         self._hyperflow_int8_group = int(quant.get("group", 64)) if isinstance(quant, Mapping) else 64
-        self._hyperflow_int8_linears = frozenset(quant.get("linears", ())) if isinstance(quant, Mapping) else frozenset()
-        self._hyperflow_lowrank_ranks = {
-            str(k): int(v) for k, v in (config_mapping.get("lowrank_ranks") or {}).items()
-        }
+        self._hyperflow_int8_linears = (
+            frozenset(quant.get("linears", ())) if isinstance(quant, Mapping) else frozenset()
+        )
+        self._hyperflow_lowrank_ranks = {str(k): int(v) for k, v in (config_mapping.get("lowrank_ranks") or {}).items()}
 
         for index in self._hyperflow_dropped_blocks:
             if 0 <= index < len(self.blocks):

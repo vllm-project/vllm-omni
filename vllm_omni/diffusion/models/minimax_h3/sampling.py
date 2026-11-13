@@ -182,11 +182,7 @@ class MiniMaxH3ModelBatch:
                     # Official: r_i = 1 - sigma_{i+1} on the same t = 1 - sigma axis.
                     step = evaluations[0].state.step_index
                     sigmas_v = evaluations[0].state.sigmas[0]
-                    sigmas_a = (
-                        evaluations[0].state.sigmas[1]
-                        if len(evaluations[0].state.sigmas) > 1
-                        else sigmas_v
-                    )
+                    sigmas_a = evaluations[0].state.sigmas[1] if len(evaluations[0].state.sigmas) > 1 else sigmas_v
                     kwargs = models[0].branch.forward_kwargs_hyperflow(
                         video_rows=rows[0][0],
                         audio_rows=rows[1][0],

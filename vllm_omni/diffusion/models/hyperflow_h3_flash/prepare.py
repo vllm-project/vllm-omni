@@ -30,9 +30,7 @@ from vllm_omni.errors import OmniClientError
 logger = init_logger(__name__)
 
 # Official README t2va example prompt (Video-Rebirth/hyperflow-h3-flash).
-OFFICIAL_T2VA_PROMPT = (
-    "A chef slides a steaming bowl of ramen across a wooden counter; rain taps on the window."
-)
+OFFICIAL_T2VA_PROMPT = "A chef slides a steaming bowl of ramen across a wooden counter; rain taps on the window."
 
 
 def _symlink_tree(src: Path, dest: Path) -> None:
