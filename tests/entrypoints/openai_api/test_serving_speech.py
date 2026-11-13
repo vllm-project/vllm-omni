@@ -1549,7 +1549,8 @@ class TestTTSMethods:
     """Unit tests for TTS validation and parameter building."""
 
     @pytest.mark.asyncio
-    async def test_segmented_request_encodes_all_audio_once(self, speech_server, mocker):
+    @pytest.mark.parametrize("failure", [None, "empty", "nan", "rate"])
+    async def test_segmented_request_encodes_all_audio_once(self, speech_server, mocker, failure):
         from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import IndexTTS25Adapter
 
         server = speech_server
@@ -1578,8 +1579,17 @@ class TestTTSMethods:
             part = kwargs["prompt"]["part"]
             assert kwargs["prompt"]["cache_salt"] == f"tenant:segment-{part}"
             assert kwargs["watermarking"] is False
+            wave = torch.full((4,), float(part))
+            sr = 22050
+            if part == 1:
+                if failure == "empty":
+                    wave = torch.empty(0)
+                elif failure == "nan":
+                    wave.fill_(float("nan"))
+                elif failure == "rate":
+                    sr = 24000
             yield OmniRequestOutput(
-                _multimodal_output={"audio": torch.full((4,), float(kwargs["prompt"]["part"])), "sr": 22050},
+                _multimodal_output={"audio": wave, "sr": sr},
                 metrics={"stage_metrics": {"0": {"num_tokens_out": 3}}},
             )
 
@@ -1592,6 +1602,17 @@ class TestTTSMethods:
                 media_type="audio/wav",
             ),
         )
+        if failure is not None:
+            mocker.patch.object(server, "_check_model", new=mocker.AsyncMock(return_value=None))
+            response = await server.create_speech(
+                OpenAICreateSpeechRequest(input="full text", seed=42, cache_salt="tenant", watermarking=False)
+            )
+            assert response.status_code == 500
+            assert len(calls) == 2
+            server.engine_client.abort.assert_awaited_once_with(calls[1])
+            create_audio.assert_not_called()
+            return
+
         result = await server._generate_audio_bytes(
             OpenAICreateSpeechRequest(input="full text", seed=42, cache_salt="tenant", watermarking=False)
         )

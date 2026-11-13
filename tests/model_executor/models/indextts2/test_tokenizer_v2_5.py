@@ -41,6 +41,13 @@ def test_split_text_preserves_content_and_respects_budget(text, budget, expected
     assert all(len(segment) <= budget for segment in segments)
 
 
+@pytest.mark.parametrize("text", ["甲。 ", "甲。\n", "甲。\n\n乙。", "   甲。", "甲。   乙。"])
+def test_split_text_never_emits_whitespace_only_segments(text):
+    segments = split_indextts25_text(text, token_length=len, lang_prefix="", capacity=100, max_tokens=2)
+    assert all(segment.strip() and len(segment) <= 2 for segment in segments)
+    assert "".join("".join(segments).split()) == "".join(text.split())
+
+
 def test_split_text_reserves_language_prefix_and_start_stop_positions():
     segments = split_indextts25_text("甲乙丙丁戊", token_length=len, lang_prefix="zh ", capacity=8, max_tokens=120)
     assert segments == ["甲乙丙", "丁戊"]

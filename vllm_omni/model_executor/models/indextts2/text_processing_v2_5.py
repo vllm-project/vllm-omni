@@ -303,7 +303,7 @@ def split_indextts25_text(
     capacity: int,
     max_tokens: int = 120,
 ) -> list[str]:
-    """Split normalized text without changing its contents.
+    """Split normalized text, dropping only standalone boundary whitespace.
 
     ``token_length`` must use the same tokenizer as model prefill, including
     special-token handling. ``max_tokens`` includes the language prefix but
@@ -348,6 +348,10 @@ def split_indextts25_text(
         if current and not fits(current + unit):
             segments.append(current)
             current = ""
+        # A standalone whitespace segment is rejected by model preprocessing.
+        # Keep whitespace within a segment, but do not start one with it alone.
+        if not current and not unit.strip():
+            return
         if not fits(current + unit):
             raise ValueError("IndexTTS 2.5 token budget cannot fit an indivisible text unit with its language prefix")
         current += unit

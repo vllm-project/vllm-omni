@@ -12,6 +12,7 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.speech_segments import generate_speech_segments
 from vllm_omni.entrypoints.openai.speech_usage import SpeechOutputTokenCounter
+from vllm_omni.entrypoints.openai.tts_adapters.base import TTSGenerationError
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -28,7 +29,7 @@ def output(audio, *, sr=1000, tokens=3, finished=True, reason="stop"):
 def generate(engine, **kwargs):
     return generate_speech_segments(
         engine,
-        prompts=[{"part": 0}, {"part": 1}],
+        prompts=kwargs.pop("prompts", [{"part": 0}, {"part": 1}]),
         request_id="speech-test",
         sampling_params_list=[SamplingParams(seed=42, max_tokens=1500)],
         silence_ms=2,
@@ -70,12 +71,17 @@ async def test_segments_emit_one_complete_waveform_and_sum_usage():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fail_at", [0, 1])
 @pytest.mark.parametrize("failure", ["exception", "empty", "length", "unfinished", "nan", "rate"])
-async def test_segment_failure_does_not_return_partial_audio(failure):
+async def test_segment_failure_does_not_return_partial_audio(failure, fail_at):
     calls = []
 
     async def engine_generate(**kwargs):
-        calls.append(kwargs["prompt"]["part"])
+        part = kwargs["prompt"]["part"]
+        calls.append(part)
+        if part != fail_at:
+            yield output(torch.ones(2))
+            return
         if failure == "exception":
             raise RuntimeError("engine failed")
         yield output(
@@ -86,11 +92,11 @@ async def test_segment_failure_does_not_return_partial_audio(failure):
         )
 
     engine = Mock(spec=AsyncOmni, generate=engine_generate, abort=AsyncMock())
-    with pytest.raises((ValueError, RuntimeError)):
-        async for _ in generate(engine):
+    with pytest.raises(RuntimeError if failure == "exception" else TTSGenerationError):
+        async for _ in generate(engine, prompts=[{"part": i} for i in range(3)]):
             pytest.fail("A failed request must not return a partial waveform")
-    assert calls == [0]
-    engine.abort.assert_awaited_once_with("speech-test-segment-0")
+    assert calls == list(range(fail_at + 1))
+    engine.abort.assert_awaited_once_with(f"speech-test-segment-{fail_at}")
 
 
 @pytest.mark.asyncio
@@ -104,7 +110,13 @@ async def test_cancellation_aborts_current_segment_and_stops_scheduling():
         await asyncio.Event().wait()
         yield output(torch.ones(2))
 
-    engine = Mock(spec=AsyncOmni, generate=engine_generate, abort=AsyncMock())
+    completed_aborts = []
+
+    async def abort(request_id):
+        await asyncio.sleep(0)
+        completed_aborts.append(request_id)
+
+    engine = Mock(spec=AsyncOmni, generate=engine_generate, abort=AsyncMock(side_effect=abort))
 
     async def consume():
         return [result async for result in generate(engine)]
@@ -115,6 +127,7 @@ async def test_cancellation_aborts_current_segment_and_stops_scheduling():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert calls == [0]
+    assert completed_aborts == ["speech-test-segment-0"]
     engine.abort.assert_awaited_once_with("speech-test-segment-0")
 
 
@@ -124,5 +137,7 @@ async def test_segments_reject_mismatched_sample_rates():
         yield output(torch.ones(2), sr=1000 + kwargs["prompt"]["part"])
 
     engine = Mock(spec=AsyncOmni, generate=engine_generate, abort=AsyncMock())
-    with pytest.raises(ValueError, match="inconsistent sample rates"):
+    with pytest.raises(TTSGenerationError, match="inconsistent sample rates"):
         _ = [result async for result in generate(engine)]
+
+    engine.abort.assert_awaited_once_with("speech-test-segment-1")

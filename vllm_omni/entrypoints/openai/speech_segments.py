@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm_omni.entrypoints.openai.speech_usage import SpeechOutputTokenCounter
+from vllm_omni.entrypoints.openai.tts_adapters.base import TTSGenerationError
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -61,16 +62,16 @@ async def generate_speech_segments(
             finished = False
             async for result in generator:
                 if result.error:
-                    raise ValueError(f"Speech segment {index + 1} failed: {result.error}")
+                    raise TTSGenerationError(f"Speech segment {index + 1} failed: {result.error}")
                 counter.observe(result)
                 finished = result.finished
                 candidate, key = extract_audio(result)
                 if key is not None:
                     audio_output, audio_key = candidate, key
             if not finished or audio_output is None or audio_key is None:
-                raise ValueError(f"Speech segment {index + 1} did not produce complete audio")
+                raise TTSGenerationError(f"Speech segment {index + 1} did not produce complete audio")
             if counter.stage0_finish_reason == "length":
-                raise ValueError(f"Speech segment {index + 1} reached its generation token limit")
+                raise TTSGenerationError(f"Speech segment {index + 1} reached its generation token limit")
             audio = audio_output[audio_key]
             # Non-streaming history lists contain cumulative waveforms. Retain
             # only the latest nonempty snapshot, as the regular serving path does.
@@ -80,14 +81,14 @@ async def generate_speech_segments(
             if wave.ndim == 0:
                 wave = wave.reshape(1)
             if wave.ndim != 1 or not wave.numel() or not bool(torch.isfinite(wave).all()):
-                raise ValueError(f"Speech segment {index + 1} did not produce finite nonempty mono audio")
+                raise TTSGenerationError(f"Speech segment {index + 1} did not produce finite nonempty mono audio")
             sr = audio_output.get("sr")
             if isinstance(sr, list):
                 sr = sr[-1] if sr else None
             if sr is None or int(sr) <= 0:
-                raise ValueError(f"Speech segment {index + 1} has no valid sample rate")
+                raise TTSGenerationError(f"Speech segment {index + 1} has no valid sample rate")
             if sample_rate is not None and int(sr) != sample_rate:
-                raise ValueError("Speech segments have inconsistent sample rates")
+                raise TTSGenerationError("Speech segments have inconsistent sample rates")
             sample_rate = int(sr)
             waves.append(wave)
             output_tokens += counter.total()
