@@ -33,6 +33,10 @@ For the full list of supported architectures across all modalities, see
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
 
+For ZONOS3-Mini, use the [RTX 3090 startup recipe](../../../recipes/Zyphra/ZONOS3-Mini-RTX3090.md).
+It covers the minimal cached checkpoint download and the Speech API request
+without a preset `voice`.
+
 ## Common Quick Start
 
 Launch the server (defaults shown — adjust `--port`, `--gpu-memory-utilization`, etc. as needed):

@@ -160,6 +160,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`zai-org/GLM-TTS.md`](./zai-org/GLM-TTS.md) | Online serving for Chinese/English zero-shot voice-cloned TTS | 1x A40 48GB / 2x non-standard RTX 4090 48GB (49,140 MiB each) |
 | [`GLM/GLM-Image.md`](./GLM/GLM-Image.md) | Online serving for image generation | 1x A800 80GB / 2x A800 80GB |
 | [`JD/JoyAI-VL-Interaction.md`](./JD/JoyAI-VL-Interaction.md) | Real-time streaming video-language interaction (proactive speak/silence/delegate) | 1x GPU 24GB+ |
+| [`Zyphra/ZONOS3-Mini-RTX3090.md`](./Zyphra/ZONOS3-Mini-RTX3090.md) | Speech API TTS; minimal checkpoint download and cached startup | 1x RTX 3090 24GB |
 
 Keep one accelerator model or platform per recipe file. Add a separately
 suffixed recipe and table row for another GPU, ROCm accelerator, or NPU.

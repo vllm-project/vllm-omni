@@ -1,4 +1,10 @@
-# ZONOS3-Mini implementation report
+# ZONOS3-Mini
+
+For installation, the seven required checkpoint files, HF cache setup, server
+startup and a Speech API request, see the
+[RTX 3090 quickstart](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Zyphra/ZONOS3-Mini-RTX3090.md).
+
+## Implementation report
 
 The two-stage Speech API has passed a single-GPU online smoke on RTX 3090,
 including complete Codec graph capture and an ASR content check. Reference-prefix
@@ -216,23 +222,9 @@ comparison. These are not official release-weight, CUDA or audio-quality results
 
 ### Server validation commands
 
-Install the `zonos3` optional dependencies in the server environment first.
-Keep the required LM, speaker encoder and selected autoencoder decoder files
-when using a local model path.
-
-```bash
-FLA_TILELANG=0 vllm serve Zyphra/ZONOS3-Mini --omni \
-  --deploy-config vllm_omni/deploy/zonos3_mini.yaml --port 8000
-```
-
-After startup, request unconditioned speech through the standard Speech API:
-
-```bash
-curl --fail-with-body http://localhost:8000/v1/audio/speech \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"Zyphra/ZONOS3-Mini","input":"Hello from Zonos3.","response_format":"wav"}' \
-  --output zonos3.wav
-```
+Follow the [startup recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Zyphra/ZONOS3-Mini-RTX3090.md)
+for dependency installation, minimal checkpoint downloads, cached serving,
+decoder variants and a Speech API request.
 
 The single online e2e case starts the default deploy with real release weights
 and checks the returned WAV and spoken content through the shared ASR assertions:
