@@ -1370,7 +1370,7 @@ def test_realtime_video_json_uses_standard_candidate_runner_without_a_numeric_ba
         return _realtime_video_perf_record()
 
     monkeypatch.setattr(runner, "run_benchmark", benchmark)
-    expected = [("cuda", "H100", 2, "usp2_compiled.yaml"), ("npu", "A2", 4, "npu_usp4_eager.yaml")]
+    expected = [("cuda", "H100", 2, "usp2_compiled.yaml"), ("npu", "A2", 4, "npu_usp4_offload.yaml")]
     for config, (platform, resource, cards, deploy) in zip(configs, expected, strict=True):
         assert config["mark"][0]["hardware_marks"] == {"res": {platform: resource}, "num_cards": cards}
         assert config["server_params"]["serve_args"]["deploy-config"].endswith(deploy)
@@ -1665,3 +1665,24 @@ def test_inline_deploy_modifications_require_a_deploy_path(tmp_path, field):
     config = {"test_name": "missing-deploy", "server_params": {"model": "mock", field: {"async_chunk": True}}}
     with pytest.raises(ValueError, match="requires stage_config_name or --deploy-config"):
         _create_unique_server_params([config], tmp_path)
+
+
+@pytest.mark.parametrize("extra", [("--revision", "a" * 40), (f"--revision={'a' * 40}",), ()])
+def test_offline_model_resolution_uses_the_pinned_revision(monkeypatch, extra):
+    import huggingface_hub
+
+    from tests.dfx.perf.scripts import run_benchmark as runner
+    from vllm_omni.transformers_utils import repo_utils
+
+    calls = []
+
+    class Api:
+        def snapshot_download(self, repo_id, **kwargs):
+            calls.append((repo_id, kwargs))
+            return "/cache/snapshot"
+
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
+    monkeypatch.setattr(repo_utils, "hf_api", Api)
+    revision = runner._cli_flag_value(extra, "--revision")
+    assert runner._resolve_offline_model("org/model", revision=revision) == "/cache/snapshot"
+    assert calls == [("org/model", {"revision": "a" * 40 if extra else None, "local_files_only": True})]

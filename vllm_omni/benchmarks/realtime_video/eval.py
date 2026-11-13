@@ -132,6 +132,9 @@ def verify_evaluator_source(repository: Path, revision: str) -> None:
     if actual != revision:
         raise RegressionError("Wrong evaluator revision")
     # CI may add agent metadata here; evaluator scoring imports no .claude code.
+    # Importing a locked checkout writes bytecode caches (torch.hub's local
+    # DINO checkout has no .gitignore); Python revalidates them against the
+    # tracked sources, so they are not source changes.
     status = subprocess.run(
         [
             "git",
@@ -143,6 +146,7 @@ def verify_evaluator_source(repository: Path, revision: str) -> None:
             "--",
             ".",
             ":(exclude).claude",
+            ":(exclude,glob)**/__pycache__/**",
         ],
         check=True,
         capture_output=True,

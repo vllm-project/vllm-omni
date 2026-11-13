@@ -310,3 +310,29 @@ def test_accuracy_cli_requires_explicit_record_only_inputs(mode_args):
 
     with pytest.raises(ValueError, match="currently requires"):
         build_serve_args(["--realtime-video-evaluate", "precision", *mode_args])
+
+
+def test_evaluator_checkout_guard_ignores_bytecode_caches_only(tmp_path):
+    import subprocess
+
+    repository = tmp_path / "dino"
+    repository.mkdir()
+    git = ["git", "-c", "user.name=CPU fixture", "-c", "user.email=cpu@fixture", "-C", str(repository)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    (repository / "hubconf.py").write_text("dependencies = []\n")
+    subprocess.run([*git, "add", "hubconf.py"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "fixture"], check=True)
+    revision = subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
+    # torch.hub imports a local checkout and leaves bytecode next to its sources.
+    for cache in (repository / "__pycache__", repository / "utils/__pycache__"):
+        cache.mkdir(parents=True)
+        (cache / "hubconf.cpython-312.pyc").write_bytes(b"bytecode")
+    evaluation.verify_evaluator_source(repository, revision)
+
+    (repository / "patched.py").write_text("scores = 1\n")
+    with pytest.raises(evaluation.RegressionError, match="tracked or untracked"):
+        evaluation.verify_evaluator_source(repository, revision)
+    (repository / "patched.py").unlink()
+    (repository / "hubconf.py").write_text("dependencies = ['changed']\n")
+    with pytest.raises(evaluation.RegressionError, match="tracked or untracked"):
+        evaluation.verify_evaluator_source(repository, revision)

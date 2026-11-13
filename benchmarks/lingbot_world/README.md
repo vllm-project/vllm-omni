@@ -45,7 +45,8 @@ finished; retain its observed records.
 
 NPU uses the same `realtime-video` backend against a server started with
 `benchmarks/lingbot_world/configs/npu_usp4_eager.yaml` in the supported NPU
-runtime. Its CI measurement count is `--num-prompts 7`, with one excluded
+runtime; CI on 64GB A2 runners uses `npu_usp4_offload.yaml`, which offloads the
+text encoder and keeps the KV budget at one session to leave activation headroom. Its CI measurement count is `--num-prompts 7`, with one excluded
 eight-chunk warmup per case. The client does not choose CUDA/NPU device APIs;
 the server deployment and outer CI job own that allocation.
 
