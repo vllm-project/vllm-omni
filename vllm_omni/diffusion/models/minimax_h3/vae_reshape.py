@@ -21,6 +21,46 @@ logger = init_logger(__name__)
 _MISSING = object()
 
 
+@contextmanager
+def _reference_ffn_projection_batches(model, reference_batch_size):
+    """Keep the FFN expansion Linear's original NPU GEMM batch shape.
+
+    The released unstacked decoder invokes w1 with one sample batch per
+    spatial tile. Combining tiles changes that Linear's floating-point
+    result on Ascend even when each sample's input is identical. Only this
+    projection uses the reference batch; the remaining network work stays
+    packed. No dtype, weight, input value or output coordinate changes.
+    """
+    previous = []
+
+    def wrap(original):
+        @wraps(original)
+        def forward(value):
+            if value.ndim != 3 or value.shape[0] <= reference_batch_size:
+                return original(value)
+            if value.shape[0] % reference_batch_size:
+                raise RuntimeError("Packed FFN input disagrees with the native tile batch")
+            return torch.cat([original(part) for part in value.split(reference_batch_size, dim=0)], dim=0)
+
+        return forward
+
+    try:
+        for block in getattr(model.decoder, "transformer_blocks", ()):
+            projection = getattr(getattr(block, "ff", None), "w1", None)
+            if not isinstance(projection, torch.nn.Linear):
+                continue
+            saved = projection.__dict__.get("forward", _MISSING)
+            previous.append((projection, saved))
+            projection.forward = wrap(projection.forward)
+        yield len(previous)
+    finally:
+        for projection, saved in reversed(previous):
+            if saved is _MISSING:
+                del projection.forward
+            else:
+                projection.forward = saved
+
+
 class _TilePool:
     def __init__(self, adapter, latent, *, all_outputs):
         self.adapter, self.model = adapter, adapter.model
@@ -50,6 +90,7 @@ class _TilePool:
             "tiles": self.tiles,
             "total_items": self.total,
             "max_tile_batch": self.batch,
+            "reference_ffn_batch_size": int(latent.shape[0]),
             "wave_items": [],
             "local_batch_sizes": [],
         }
@@ -155,6 +196,9 @@ def _supported(model, latent):
         and getattr(model, "use_3d_conv", False)
         and getattr(model, "use_vit_decoder", False)
         and getattr(model, "decoder_tiling", False)
+        # Native stacking groups tiles by spatial rank within each chunk.
+        # Retain that path until those exact batch groups can be scheduled.
+        and not getattr(model, "stack_tiling", False)
         and not getattr(getattr(model, "decoder", None), "spatial_parallel", False)
         and not getattr(model, "isolated_first_frame", False)
         and not getattr(model, "isolated_last_frame", False)
@@ -180,14 +224,16 @@ def _cross_chunk_tiling(adapter, latent, *, all_outputs):
     previous = model.__dict__.get("tiled_decode", _MISSING)
     model.tiled_decode = pool.decode_chunk
     try:
-        yield
-        if pool.next_chunk == 0:
-            pool.stats.update(active=False, status="native-rank-skip")
-            return
-        if pool.next_chunk != pool.chunks or pool.next_item != pool.total or pool.pending:
-            raise RuntimeError("H3 cross-chunk decode did not consume its complete native plan")
-        pool.stats["status"] = "complete"
-        pool.stats["idle_item_slots"] = (-pool.total) % pool.size
+        with _reference_ffn_projection_batches(model, int(latent.shape[0])) as projections:
+            pool.stats["reference_ffn_projections"] = projections
+            yield
+            if pool.next_chunk == 0:
+                pool.stats.update(active=False, status="native-rank-skip")
+                return
+            if pool.next_chunk != pool.chunks or pool.next_item != pool.total or pool.pending:
+                raise RuntimeError("H3 cross-chunk decode did not consume its complete native plan")
+            pool.stats["status"] = "complete"
+            pool.stats["idle_item_slots"] = (-pool.total) % pool.size
     finally:
         if previous is _MISSING:
             del model.tiled_decode
