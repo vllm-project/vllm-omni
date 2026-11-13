@@ -708,7 +708,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "Diffusion · Model Test",
         AMD_READY_PIPELINE,
         "Blocking",
-        117,
+        120,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
