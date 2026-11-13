@@ -30,9 +30,18 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.fixture
 def owner(monkeypatch):
     monkeypatch.setattr("vllm.v1.worker.gpu.buffer_utils.is_uva_available", lambda: False)
+    return make_owner()
+
+
+def make_owner(capacity=4, device="cpu", dtype=torch.float32):
+    device = torch.device(device)
     torch.manual_seed(31)
     architecture = small_ar_config()
-    model = Zonos3Backbone(architecture, lambda config, index: CPUAttentionOracle(config)).eval()
+    model = (
+        Zonos3Backbone(architecture, lambda config, index: CPUAttentionOracle(config))
+        .eval()
+        .to(device=device, dtype=dtype)
+    )
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.normal_(std=0.1)
@@ -42,25 +51,36 @@ def owner(monkeypatch):
     config.model_config.uses_mrope = False
     config.model_config.get_inputs_embeds_size.return_value = architecture.dim
     config.model_config.max_model_len = 128
-    config.model_config.dtype = torch.float32
+    config.model_config.dtype = dtype
     config.speculative_config = None
     config.scheduler_config = SchedulerConfig(
-        max_model_len=128, is_encoder_decoder=False, max_num_seqs=4, max_num_batched_tokens=32
+        max_model_len=128, is_encoder_decoder=False, max_num_seqs=capacity, max_num_batched_tokens=max(32, capacity)
     )
     config.compilation_config.cudagraph_capture_sizes = [1, 2, 4]
-    state = Zonos3ARModelState(config, model, None, torch.device("cpu"))
+    state = Zonos3ARModelState(config, model, None, device)
     native = Mock(spec=Sampler)
-    native.sampling_states = SamplingStates(4, 3)
+    native.sampling_states = SamplingStates(capacity, 3)
     native.add_request.side_effect = native.sampling_states.add_request
     native.apply_staged_writes.side_effect = native.sampling_states.apply_staged_writes
     native.req_states = MagicMock(spec=RequestState)
     native.req_states.index_to_req_id = {}
     from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 
-    native.req_states.prefill_len = UvaBackedTensor(4, dtype=torch.int32)
-    sampler, rejection = state.custom_sampler(native)
-    assert rejection is None
-    return state, sampler, native.req_states
+    native.req_states.prefill_len = UvaBackedTensor(capacity, dtype=torch.int32)
+    return state, native, native.req_states
+
+
+def materialize_codes(snapshot):
+    """Use the runner's real generic D2H/partition contract for model snapshots."""
+    from vllm_omni.data_entry_keys import unflatten_payload
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+
+    cpu = snapshot.copy_to_cpu(lambda tensor: tensor.clone())
+    n = len(cpu["codes"]["audio"])
+    outputs, _ = OmniARModelRunner._build_async_chunk_outputs_from_mm(
+        cpu, np.arange(n + 1, dtype=np.int32), np.ones(n, dtype=np.int32), n, n
+    )
+    return [unflatten_payload(payload) for payload in outputs]
 
 
 def add(owner, req_id, slot, length):
@@ -94,6 +114,7 @@ def add(owner, req_id, slot, length):
     requests.prefill_len.copy_to_uva()
     sampler.add_request(slot, params)
     sampler.apply_staged_writes()
+    state.apply_staged_writes()
     return request
 
 
@@ -131,7 +152,8 @@ def step(owner, data):
     inputs = state.prepare_inputs(data, requests)
     state.run_preprocess(data, inputs, requests)
     hidden = state.model(inputs["inputs_embeds"], data.positions, inputs["zonos3_batch"])
-    return sampler.sample_step(hidden, data, requests, None, lambda *args: pytest.fail("text sampler called")), inputs
+    state.postprocess_model_output(hidden, data, requests)
+    return state.sample_determined_tokens(data, sampler), inputs
 
 
 @torch.inference_mode()
@@ -162,7 +184,7 @@ def test_conditioning_once_chunked_mixed_prefill_feedback_and_static_bucket(owne
     assert inputs["zonos3_batch"] is capture_inputs["zonos3_batch"]
     assert inputs["zonos3_batch"].decode_slots.data_ptr() == slot_pointer
     assert inputs["zonos3_batch"].decode_slots.tolist() == [1, 0, 4, 5]
-    assert sampler.state.position[:2].tolist() == [2, 3]
+    assert state.sampling_state.position[:2].tolist() == [2, 3]
     state.on_requests_finished({"a"})
     state.remove_request(0)
     add(owner, "replacement", 0, 5)
@@ -240,10 +262,36 @@ def test_prompt_conditioning_survives_engine_core_metadata_serialization(owner):
     state.add_request(0, request)
     sampler.add_request(0, request.sampling_params)
     sampler.apply_staged_writes()
+    state.apply_staged_writes()
     output, _ = step(owner, batch(owner, [("serialized", 0, 6, 0, True)]))
     assert output.num_sampled.tolist() == [1]
     assert state._prompts["serialized"].embeddings.shape == (6, state.model.config.dim)
     assert bool(state.sampling_state.has_audio_prefix[0])
+
+
+@torch.inference_mode()
+def test_request_owned_codes_survive_mixed_prefill_partition_and_later_steps(owner):
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+
+    state, native, requests = owner
+    add(owner, "partial", 0, 6)
+    add(owner, "complete", 1, 5)
+    data = batch(owner, [("partial", 0, 2, 0, True), ("complete", 1, 5, 0, True)])
+    inputs = state.prepare_inputs(data, requests)
+    state.run_preprocess(data, inputs, requests)
+    hidden = state.model(inputs["inputs_embeds"], data.positions, inputs["zonos3_batch"])
+    _, snapshot = state.postprocess_model_output(hidden, data, requests)
+    tokens = state.sample_determined_tokens(data, native)
+    assert tokens.num_sampled.tolist() == [0, 1]
+    cpu = snapshot.copy_to_cpu(lambda tensor: tensor.clone())
+    outputs, _ = OmniARModelRunner._build_async_chunk_outputs_from_mm(
+        cpu, data.query_start_loc_np, data.num_scheduled_tokens, 2, 7
+    )
+    assert [p["codes.audio"].shape for p in outputs] == [(1, 10), (1, 10)]
+    assert [p["meta.codec_frame_valid"].item() for p in outputs] == [0, 1]
+    saved = outputs[1]["codes.audio"].clone()
+    step(owner, batch(owner, [("partial", 0, 4, 2, True), ("complete", 1, 1, 5, False)]))
+    assert torch.equal(materialize_codes(snapshot)[1]["codes"]["audio"], saved)
 
 
 def test_native_startup_decode_warmup_can_run_before_full_graph_capture(owner, monkeypatch):

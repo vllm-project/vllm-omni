@@ -736,8 +736,8 @@ class Zonos3ForCausalLM(Zonos3Backbone):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # The upstream startup/prompt-logprob plumbing sees the logical control
-        # vocabulary only. Real request logprobs are rejected by Zonos3Sampler.
-        # MultiOutputHead is invoked exclusively by its sample_step().
+        # vocabulary only. Real request logprobs are rejected by ModelState.
+        # MultiOutputHead runs in ModelState.postprocess_model_output().
         return torch.zeros((hidden_states.shape[0], 3), dtype=hidden_states.dtype, device=hidden_states.device)
 
     def forward(

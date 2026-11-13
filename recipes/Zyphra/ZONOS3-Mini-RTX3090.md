@@ -18,7 +18,7 @@
 | Precision | AR BF16; speaker encoder and Codec weights FP32 |
 | Execution | Eager AR prefill, graph AR decode, model-owned Codec graphs |
 | Qualified scope | Single-GPU startup and one online WAV case with ASR content validation |
-| Voice cloning / other topologies | Implemented paths and remaining qualification are described in the [model report](../../docs/models/zonos3.md) |
+| Voice cloning / other topologies | Not qualified by this recipe |
 
 For generic API fields, see the [Speech API](../../docs/serving/speech_api.md).
 Model-specific requests should follow this recipe rather than supplying a preset
@@ -93,7 +93,7 @@ The deploy sets Stage 0 KV cache to **128 MiB**. GDN recurrent/conv/window state
 is separately preallocated. Stage 1 `enforce_eager: false` enables complete Codec
 graphs; set it to `true` for eager Codec execution. Graph buckets derive from
 `max_num_seqs` and connector chunk sizes; no separate graph-bucket configuration
-is needed. See the [memory and graph details](../../docs/models/zonos3.md#memory-budgets).
+is needed.
 
 ## Decoder variants and launch adjustments
 
@@ -216,5 +216,5 @@ supported by the strict Zonos3 companion loaders.
 
 These are bounded startup/smoke observations, not peak-memory or throughput
 benchmarks. They include runtime state and graph pools, not only weights.
-See the [implementation report](../../docs/models/zonos3.md) for reference tests
-and the [upstream source](https://github.com/Zyphra/ZONOS3-Mini) for model details.
+The verification command above covers the online case. See the
+[upstream source](https://github.com/Zyphra/ZONOS3-Mini) for model details.

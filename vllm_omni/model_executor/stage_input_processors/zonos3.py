@@ -297,8 +297,12 @@ def zonos3_rvq_async_chunk(
         value = namespace.get("audio")
         if value is not None and not isinstance(value, torch.Tensor):
             raise ValueError("Expected a materialized audio-code tensor")
-        codes = cast(torch.Tensor | None, value)
         meta = pooling_output.get("meta", {})
+        valid = meta.get("codec_frame_valid") if isinstance(meta, Mapping) else None
+        # Partial prefills and post-EOS in-flight steps carry no new RVQ row.
+        # These flags share the runner's existing D2H boundary with the codes.
+        if valid is None or bool(torch.as_tensor(valid).any()):
+            codes = cast(torch.Tensor | None, value)
         eos = meta.get("codec_eos_valid") if isinstance(meta, Mapping) else None
         if isinstance(eos, torch.Tensor):
             eos_complete = bool(eos.any())

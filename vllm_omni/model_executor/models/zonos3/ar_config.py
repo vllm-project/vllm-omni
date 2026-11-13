@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 ZONOS3_PROMPT_KEY = "zonos3_prompt"
+ZONOS3_SAMPLING_KEY = "zonos3_sampling"
 
 
 @dataclass(frozen=True)

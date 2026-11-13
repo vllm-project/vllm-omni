@@ -245,3 +245,21 @@ def test_native_hook_independent_requests_terminal_cancel_and_identity_reuse(fla
     assert torch.equal(p.codes.audio, frames)
     assert p.meta.finished and p.meta.request_id == b.external_req_id
     assert b.external_req_id not in manager.request_payload
+
+
+def test_native_hook_ignores_inactive_prefill_and_post_eos_rows():
+    manager = Manager()
+    request = Request("inactive")
+    invalid = {
+        "codes": {"audio": torch.full((1, 10), -999)},
+        "meta": {"codec_frame_valid": torch.tensor([False])},
+    }
+    assert zonos3_rvq_async_chunk(manager, invalid, request) is None
+    assert manager.request_payload[request.external_req_id]["_zonos3_rvq_state"].received == 0
+    frames = torch.arange(100).reshape(10, 10)
+    rows = delayed(frames)
+    zonos3_rvq_async_chunk(manager, {"codes": {"audio": rows}}, request)
+    state = manager.request_payload[request.external_req_id]["_zonos3_rvq_state"]
+    before = state.received, state.emitted
+    assert zonos3_rvq_async_chunk(manager, invalid, request) is None
+    assert (state.received, state.emitted) == before

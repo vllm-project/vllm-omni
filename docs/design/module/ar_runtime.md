@@ -52,14 +52,26 @@ rounded initial weighted value and the same FMA accumulation order. This
 preserves bitwise parity when the compiler inlines attention into sampling,
 including SM89 code generation affected by LLVM SLP reduction reordering.
 
-## Custom sampling-head warmup
+## Model-state sampling and determined tokens
 
-Custom head samplers may implement `OmniSampler.warmup(hidden_states)` and
-return `True` after exercising their own `sample_step` pipeline. The MRV2 AR
-runner then skips upstream's text-logits dummy sampling pass. The default
-returns `False` and preserves the existing upstream path. Zonos3 uses this
-hook because its ten-codebook head belongs in sampling rather than Backbone
-forward; its serving constraints remain separate from internal warmup inputs.
+Models whose physical outputs differ from scheduler tokens can perform sampling
+and state transitions in `ModelState.postprocess_model_output`. The returned
+multimodal snapshot owns its tensors until asynchronous D2H finishes. Request-owned
+rows must remain independent of token-span slicing, including mixed prefills.
+
+`ModelState.sample_determined_tokens` returns the already decided scheduler tokens
+and effective sampled/rejected counts. The runner uses this hook when grammar,
+speculative decoding and distributed execution do not require the standard path.
+An incomplete prefill must not advance physical generation; terminal in-flight
+steps must not emit another frame or mutate completed request state. Model-owned
+validity flags are consumed after the existing D2H boundary.
+
+During startup profiling, the AR runner calls the optional
+`ModelState.warmup_sampling(hidden_states, req_states)` instead of text sampler
+warmup. It should exercise the serving head/filter/draw path and configured batch
+shapes, then reset dummy history, RNG and feedback state before requests arrive.
+States without this hook retain upstream dummy sampling. Decoder graph capture
+warms its own captured path separately.
 
 ## Qwen3-Omni Talker sampling
 

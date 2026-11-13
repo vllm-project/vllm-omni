@@ -684,8 +684,7 @@ def test_release_checkpoint_native_factory_and_parallel_codebook_sampling(tmp_pa
     base.req_states = MagicMock(spec=RequestState)
     base.req_states.index_to_req_id = {}
     base.req_states.prefill_len = UvaBackedTensor(4, dtype=torch.int32)
-    sampler, _ = state.custom_sampler(base)
-    owner = state, sampler, base.req_states
+    owner = state, base, base.req_states
     from tests.model_executor.models.test_zonos3_model_state import add, batch
 
     add(owner, "request", 0, 5)
@@ -697,12 +696,10 @@ def test_release_checkpoint_native_factory_and_parallel_codebook_sampling(tmp_pa
     try:
         hidden = model(input_ids=data.input_ids, positions=data.positions, **inputs)
         assert hidden.shape == (5, 16) and not calls
-        result = sampler.sample_step(
-            hidden, data, base.req_states, None, lambda *args: pytest.fail("text sampling called")
-        )
+        _, snapshot = state.postprocess_model_output(hidden, data, base.req_states)
+        result = state.sample_determined_tokens(data, base)
         assert calls == [1]
     finally:
         hook.remove()
     assert result.num_sampled.tolist() == [1]
-    snapshot = result.finalize_multimodal(result.multimodal_outputs, [1])
-    assert snapshot.inter_stage[0]["codes"]["audio"].shape == (1, 10)
+    assert snapshot.copy_to_cpu(lambda tensor: tensor.clone())["codes"]["audio"][0].shape == (1, 10)

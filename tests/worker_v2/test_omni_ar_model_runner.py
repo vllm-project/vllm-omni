@@ -646,14 +646,14 @@ def test_async_output_preserves_request_scoped_codec_validity_mask(monkeypatch, 
     output = _async_output(
         req_ids=["a", "b"],
         multimodal_outputs={
-            "codes": {"audio": torch.arange(20).reshape(2, 1, 10)},
-            "meta": {"codec_frame_valid": validity},
+            "codes": {"audio": list(torch.arange(20).reshape(2, 1, 10).unbind(0))},
+            "meta": {"codec_frame_valid": list(validity.split(1))},
         },
         input_batch=batch,
         async_chunk=True,
     ).get_output()
     assert [payload["meta.codec_frame_valid"].tolist() for payload in output.inter_stage_outputs] == [[True], [False]]
-    assert output.inter_stage_outputs[0]["codes.audio"].shape == (1, 1, 10)
+    assert output.inter_stage_outputs[0]["codes.audio"].shape == (1, 10)
 
 
 @pytest.mark.parametrize("async_chunk", [False, True])
