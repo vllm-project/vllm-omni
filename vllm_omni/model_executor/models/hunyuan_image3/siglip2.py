@@ -57,6 +57,8 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from vllm_omni.platforms import current_omni_platform
+
 logger = init_logger(__name__)
 
 
@@ -180,14 +182,19 @@ class Siglip2Attention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        # head_dim 72 (1152 / 16) is not 64-byte aligned, which the XPU flash kernel
-        # rejects. MMEncoderAttention takes no backend argument here, so retarget it.
-        if self.head_dim % 32 != 0 and self.attn.attn_backend in (
-            AttentionBackendEnum.FLASH_ATTN,
-            AttentionBackendEnum.ROCM_AITER_FA,
+        # The XPU flash kernel needs a 64-byte-aligned head_size, i.e. a multiple of 32
+        # in bf16/fp16; SigLIP2's head_dim is 72 (1152 / 16). XPUPlatform.get_vit_attn_backend
+        # returns FLASH_ATTN without consulting head_size, and MMEncoderAttention takes no
+        # backend argument, so retarget the instance. XPU only: CUDA and ROCm pick the ViT
+        # backend through backend_class.supports_head_size(), which keeps head_dim 72 on FA.
+        if (
+            current_omni_platform.is_xpu()
+            and self.head_dim % 32 != 0
+            and self.attn.attn_backend == AttentionBackendEnum.FLASH_ATTN
         ):
             logger.info_once(
-                "SigLIP2 head_dim=%d is not 32-element aligned; using TORCH_SDPA instead of %s for the vision tower.",
+                "SigLIP2 head_dim=%d is not 32-element aligned for the XPU flash kernel; "
+                "using TORCH_SDPA instead of %s for the vision tower.",
                 self.head_dim,
                 self.attn.attn_backend,
             )
