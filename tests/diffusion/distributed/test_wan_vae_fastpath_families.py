@@ -373,13 +373,18 @@ def test_family_lookup_never_imports_a_model_package() -> None:
     import subprocess
     import sys
 
+    # Only the delta matters: importing ``vllm_omni`` itself pulls in some of ``diffusion.models`` (e.g.
+    # ``models.interface`` via the attention schedule), which is not the fast path's doing.
     code = """
 import sys
+import vllm_omni  # its own eager imports settle first
 from diffusers.models.autoencoders import AutoencoderKLWan
+models = lambda: {m for m in sys.modules if m.startswith("vllm_omni.diffusion.models.")}
+before = models()
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import families as fam
 names = lambda: sorted(f.name for f in fam.families())
 assert names() == ["qwen_image", "wan"], names()
-assert not any(m.startswith("vllm_omni.diffusion.models.") for m in sys.modules), "a model package was imported"
+assert models() == before, f"the fast path imported {sorted(models() - before)}"
 import vllm_omni.diffusion.models.qwen_image_21.autoencoder_kl_qwenimage21  # what owning such a VAE implies
 assert names() == ["qwen_image", "qwen_image_21", "wan"], names()
 """
