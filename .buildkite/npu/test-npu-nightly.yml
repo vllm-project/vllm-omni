@@ -436,7 +436,7 @@ steps:
         key: lingbot-npu-nightly-performance
         if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
         source_file_dependencies: lingbot_world_perf
-        timeout_in_minutes: 180
+        timeout_in_minutes: 60
         mirror_hardwares: a2b3_npu_4
         artifact_paths:
           - "tests/dfx/perf/results/*.json"
@@ -458,7 +458,7 @@ steps:
         key: lingbot-npu-nightly-accuracy-data
         if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
         source_file_dependencies: lingbot_world_accuracy
-        timeout_in_minutes: 120
+        timeout_in_minutes: 90
         mirror_hardwares: a2b3_npu_4
         artifact_paths:
           - "lingbot-artifacts/npu-accuracy/**/*"
@@ -472,7 +472,7 @@ steps:
           - step: lingbot-npu-nightly-accuracy-data
             allow_failure: true
           - lingbot-npu-accuracy-ci-image
-        timeout_in_minutes: 120
+        timeout_in_minutes: 45
         mirror_hardwares: h100_2
         artifact_paths:
           - "lingbot-artifacts/npu-accuracy-results/**/*"

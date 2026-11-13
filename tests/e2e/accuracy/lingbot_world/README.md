@@ -86,8 +86,11 @@ tests inspect their own required inputs even after a producer failure. A local
 run without `--lingbot-profile` is opt-in; selected CI tests cannot skip.
 The NPU profile allows 2400 s for server startup: serial shard loading on a
 contended A2 host took 57-126 s per shard (vllm-omni-npu-ci build 11393), versus
-~22 s on earlier runs. Each accuracy job has a 120-minute timeout budget;
-actual native duration and two-GPU capacity still need matching CI evidence.
+~22 s on earlier runs. Job timeouts follow measured nightly durations:
+CUDA accuracy 60 min (21.7-25.2 min, builds 19532-19586), NPU Data 90 min
+(22.2-22.9 min; the 2400 s startup bound plus ~15 min of capture fits), NPU
+Outputs 45 min (12.3-15.0 min). Perf jobs: CUDA 45 min (6.9-8.1 min), A2
+60 min (15.9-19.2 min; server init is bounded at 900 s).
 
 For a CPU-only check of capture and scoring contracts:
 

@@ -1287,7 +1287,16 @@ def test_lingbot_nightly_uses_independent_perf_and_accuracy_frameworks(monkeypat
     for job in jobs.values():
         assert "Recording" not in job["label"] and "Baseline Pending" not in job["label"]
         assert "record-only" not in " ".join(job.get("commands", []))
-    assert accuracy["timeout_in_minutes"] == 120
+    # Budgets from measured nightly durations (CUDA 19532-19586, NPU 11393-11432).
+    timeouts = {
+        "cuda": {"performance": 45, "accuracy": 60},
+        "npu": {"performance": 60, "accuracy-data": 90, "accuracy": 45},
+    }[platform]
+    assert {
+        key.removeprefix(f"lingbot-{platform}-nightly-"): job["timeout_in_minutes"]
+        for key, job in jobs.items()
+        if "nightly" in key
+    } == timeouts
     for name in ("precision", "wbench", "vbench"):
         assert f"tests/e2e/accuracy/lingbot_world/test_{name}.py" in " ".join(accuracy["commands"])
     retry = _load_mirror_hardwares()["h100_2"]["retry"]
@@ -1296,8 +1305,6 @@ def test_lingbot_nightly_uses_independent_perf_and_accuracy_frameworks(monkeypat
         assert "run_ci.sh" not in " ".join(job.get("commands", []))
         if "plugins" in job:
             assert job["retry"] == retry
-        if "accuracy" in job["key"]:
-            assert job["timeout_in_minutes"] <= 120
     if platform == "cuda":
         assert len(jobs) == 2
         assert _gpu_limit(perf) == 2
