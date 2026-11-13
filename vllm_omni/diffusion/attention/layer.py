@@ -859,7 +859,8 @@ class Attention(nn.Module):
         global_dtype = getattr(config, "diffusion_kv_cache_dtype", None)
         if global_dtype == "auto":
             global_dtype = None
-        dtype = self._spec_quant_precision(self.attn_spec) or global_dtype
+        spec_precision = self._spec_quant_precision(self.attn_spec)
+        dtype = spec_precision or global_dtype
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
         if dtype and dtype != "float":
@@ -881,7 +882,7 @@ class Attention(nn.Module):
         self._kv_cache_skip_layers = getattr(config, "diffusion_kv_cache_skip_layer_indices", None)
         if self._kv_cache_skip_layers and self.layer_idx is None and not self._disable_kv_quant:
             raise ValueError("Attention quantization skip_layers requires a parseable transformer block index.")
-        self._has_spec_quantization = self._spec_quant_precision(self.attn_spec) is not None or any(
+        self._has_spec_quantization = spec_precision is not None or any(
             self._spec_quant_precision(candidate.spec) is not None for candidate in self._schedule_candidates.values()
         )
 
