@@ -253,21 +253,30 @@ def test_reported_deterministic_failing_case_for_regression(pipeline):
     )
 
 
-@pytest.mark.parametrize("num_views", NUM_VIEWS, ids=lambda views: f"views={views}")
-def test_prefix_forward_is_bit_exact(pipeline, num_views):
+# A batch of three requests with different cameras, for the prefix pass alone.
+PREFIX_BATCH_VIEWS = (3, 1, 2)
+
+
+@pytest.mark.parametrize(
+    "views", [*((v,) for v in NUM_VIEWS), PREFIX_BATCH_VIEWS], ids=lambda views: "views=" + ",".join(map(str, views))
+)
+def test_prefix_forward_is_bit_exact(pipeline, views):
     """Every denoising step attends over the prefix K/V and amplifies any
     rounding difference in it into the whole chunk, so the fused prefix pass
-    equals the eager one bit for bit: its K/V cache slots and its output."""
+    equals the eager one bit for bit: its K/V cache slots and its output, for
+    one request and for a batch (the eager pass runs the batch as one)."""
     model = pipeline.model
-    images, image_masks, lang_tokens, lang_masks = pipeline.processor.build_model_inputs(
-        _robot_obs(pipeline.config, num_views, seed=0)
-    )
+    parts = [pipeline.processor.build_model_inputs(_robot_obs(pipeline.config, v, seed=i)) for i, v in enumerate(views)]
+    images = [torch.cat([part[0][cam] for part in parts]) for cam in range(len(parts[0][0]))]
+    image_masks = [torch.cat([part[1][cam] for part in parts]) for cam in range(len(parts[0][1]))]
+    lang_tokens = torch.cat([part[2] for part in parts])
+    lang_masks = torch.cat([part[3] for part in parts])
     results = []
     with torch.inference_mode():
         embs, pad_masks, att_masks = model.embed_prefix(images, image_masks, lang_tokens, lang_masks)
         prefix_len = embs.shape[1]
         for fused_kernels in (False, True):
-            kv_cache = model.new_kv_cache(1, prefix_len)
+            kv_cache = model.new_kv_cache(len(views), prefix_len)
             with _path(model, graphs=None, fused_kernels=fused_kernels):
                 (out, _), _ = model.paligemma_with_expert.forward(
                     attention_mask=prepare_attention_masks_4d(make_att_2d_masks(pad_masks, att_masks)),
@@ -423,11 +432,12 @@ def _assert_rows_as_alone(pipeline, outputs, actual: torch.Tensor, rows, label: 
 
 
 @pytest.mark.parametrize("batch", sorted(BATCH_ROWS), ids=lambda batch: f"batch={batch}")
-def test_formed_batch_replays_its_denoise_graph(outputs, pipeline, batch):
-    """A batch of a declared size replays the denoising graph captured for it
-    (its prefix regions run eagerly), equals its kernels run eagerly on the
-    batch bit for bit, and gives each request the chunk it gets alone within
-    ``TOLERANCE``: the vision tower and prefix run batched."""
+def test_formed_batch_replays_its_prefix_and_denoise_graphs(outputs, pipeline, batch):
+    """A batch of a declared size replays the prefix forward and denoising
+    graphs captured for it (its prefix embedding runs eagerly), equals its
+    kernels run eagerly on the batch bit for bit, and gives each request the
+    chunk it gets alone within ``TOLERANCE``: the vision tower and prefix run
+    batched."""
     model = pipeline.model
     graphs = model.cuda_graphs
     rows = BATCH_ROWS[batch]
@@ -435,7 +445,8 @@ def test_formed_batch_replays_its_denoise_graph(outputs, pipeline, batch):
 
     replays_before = graphs.num_replays.copy()
     actual = _sample_batch(model, inputs)
-    assert graphs.num_replays - replays_before == {"denoise_step": pipeline.config.num_inference_steps}
+    expected_replays = {"prefix_forward": 1, "denoise_step": pipeline.config.num_inference_steps}
+    assert graphs.num_replays - replays_before == expected_replays
     assert actual.shape == (batch, pipeline.config.chunk_size, pipeline.config.max_action_dim)
     assert torch.isfinite(actual).all()
 
@@ -446,12 +457,13 @@ def test_formed_batch_replays_its_denoise_graph(outputs, pipeline, batch):
 
 
 def test_batch_between_captured_sizes_pads_to_the_next_graph(outputs, pipeline):
-    """A batch of 3 runs over the first rows of the batch-4 cache and replays
-    the batch-4 graph; the stale fourth row changes nothing. In bfloat16 every
-    GEMM of the step runs in Triton, so the chunks are the ones its kernels
-    give the batch of 3 eagerly, bit for bit; in float32 the expert GEMMs stay
-    on cuBLAS, which rounds a row of 200 differently than a row of 150, so the
-    rows are checked against the requests alone."""
+    """A batch of 3 runs over the first rows of the batch-4 cache: its prefix
+    forward runs on the fused kernels without a graph, at its own size, and its
+    steps replay the batch-4 graph; the stale fourth row changes nothing. In
+    bfloat16 every GEMM of the step runs in Triton, so the chunks are the ones
+    its kernels give the batch of 3 eagerly, bit for bit; in float32 the expert
+    GEMMs stay on cuBLAS, which rounds a row of 200 differently than a row of
+    150, so the rows are checked against the requests alone."""
     model = pipeline.model
     graphs = model.cuda_graphs
     rows = ((1, None), (2, None), (3, None))

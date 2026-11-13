@@ -17,15 +17,20 @@ count only changes how often region 3 replays. With it on, the default schedule
 supplies a new conditioning/modulation row on every replay; unsupported
 schedules use eager denoising. No captured control flow depends on tensor data.
 
-Region 3 is also captured for every other size in ``batch_sizes`` (the
-pipeline declares them from ``max_num_seqs``): a formed batch of such a size
-replays its own denoising graph over its own KV cache, which ``kv_cache_for``
-hands ``sample_actions``. Its prefix embedding and prefix forward are not
-captured yet; they run eagerly, batched, into that cache. A batch between two
-captured sizes runs over the first rows of the next larger size's cache and
-replays that graph: the rows behind it carry stale data and are dropped from
-the output (every row is computed on its own). A batch above the largest
-captured size runs its steps without a graph.
+Regions 2 and 3 are also captured for every other size in ``batch_sizes`` (the
+pipeline declares them from ``max_num_seqs``), over a KV cache and a memory
+pool of that size, which ``kv_cache_for`` hands ``sample_actions``. A formed
+batch of such a size replays its prefix forward and its denoising graphs; its
+prefix embedding is not captured yet and runs eagerly, batched, its output
+copied into the prefix graph's static input. A batch between two captured
+sizes runs over the first rows of the next larger size's cache. Its prefix
+forward runs on the fused kernels without a graph, at its own size: the prefix
+pass is compute-bound, so the rows a padded replay would add cost their full
+time, and its cuBLAS GEMMs may round a row differently among more rows. Its
+denoising steps replay the larger graph, which is launch-bound: the rows
+behind the batch carry stale data and are dropped from the output (every row
+is computed on its own). A batch above the largest captured size runs without
+a graph.
 
 Optional request-invariant masks, positions and RoPE tables are copied into
 stable buffers once per request, before its denoising loop. Optional KV-only
@@ -206,18 +211,20 @@ class Pi05CUDAGraphs:
         self._prefix_forward: _PrefixForwardGraph | None = None
         self._denoise_step: _DenoiseStepGraph | None = None
         # Batch 1 is always captured, all three regions; ``batch_sizes`` adds
-        # the formed-batch sizes the denoising step is also captured for.
+        # the formed-batch sizes regions 2 and 3 are also captured for.
         sizes = tuple(sorted(set(batch_sizes)))
         if any(not isinstance(size, int) or size < 1 for size in sizes):
             raise ValueError(f"batch_sizes must be positive integers, got {sizes}.")
         self._batch_sizes = sizes
+        self._prefix_batches: dict[int, _PrefixForwardGraph] = {}
         self._denoise_batches: dict[int, _DenoiseStepGraph] = {}
         self.num_replays: Counter[str] = Counter()
 
     # ── Capture ──────────────────────────────────────────────────────
     def capture(self) -> None:
         """Capture all three regions at the deployed shapes, batch size 1, and
-        the denoising step at every other declared batch size.
+        the prefix forward and the denoising step at every other declared
+        batch size.
 
         Needs ``model.kv_cache``. Raises on failure: ``enforce_eager=False`` asks
         for the graph path, so a silent eager fallback would hide a slowdown.
@@ -226,6 +233,7 @@ class Pi05CUDAGraphs:
             self._capture()
         except Exception as exc:
             self._embed_prefix = self._prefix_forward = self._denoise_step = None
+            self._prefix_batches = {}
             self._denoise_batches = {}
             raise RuntimeError(
                 "π0.5 CUDA Graph capture failed. Set `enforce_eager: true` in the deploy "
@@ -342,62 +350,115 @@ class Pi05CUDAGraphs:
                     **denoise_kwargs,
                 )
             denoise_step = _DenoiseStepGraph(graph, prefix_pad_masks, kv_cache, x_t, timestep, v_t, context, step_data)
-            denoise_batches = {
-                batch: self._capture_denoise_batch(batch, kv_cache.prefix_len, device)
-                for batch in self._batch_sizes
-                if batch > 1
-            }
+            prefix_batches, denoise_batches = {}, {}
+            for batch in self._batch_sizes:
+                if batch > 1:
+                    prefix_batches[batch], denoise_batches[batch] = self._capture_batch(batch, prefix_embs, device)
 
         self._embed_prefix, self._prefix_forward, self._denoise_step = embed_prefix, prefix_forward, denoise_step
-        self._denoise_batches = denoise_batches
+        self._prefix_batches, self._denoise_batches = prefix_batches, denoise_batches
 
-    def _capture_denoise_batch(self, batch: int, prefix_len: int, device: torch.device) -> _DenoiseStepGraph:
-        """Region 3 for a formed batch of ``batch`` requests, over its own KV cache.
+    def _capture_batch(
+        self, batch: int, prefix_embs: torch.Tensor, device: torch.device
+    ) -> tuple[_PrefixForwardGraph, _DenoiseStepGraph]:
+        """Regions 2 and 3 for a formed batch of ``batch`` requests, over their own KV cache.
 
-        The batch's prefix embedding and prefix forward run eagerly into that
-        cache before its steps replay. The graph gets its own memory pool:
-        batches of different sizes replay in any order, so none may share the
-        pool of another. The AdaRMS schedule table serves batch 1 only; a batch
-        embeds its timestep inside the graph.
+        The batch's prefix embedding runs eagerly, and ``prefix_forward`` copies
+        its output into the static input captured here, ``batch`` rows of the
+        shape and dtype of batch 1's ``prefix_embs``. The two graphs share a
+        memory pool of their own, captured and replayed in that order: batches
+        of different sizes replay in any order, so none may share the pool of
+        another. The AdaRMS schedule table serves batch 1 only; a batch embeds
+        its timestep inside its denoising graph.
         """
         model = self._model
+        _, prefix_len, width = prefix_embs.shape
         kv_cache = model.new_kv_cache(batch, prefix_len)
-        # Dummy prefix K/V; only shapes and addresses are captured.
+        # Dummy inputs and prefix K/V; only shapes, dtypes and addresses are captured.
         kv_cache.key.zero_()
         kv_cache.value.zero_()
+        inputs_embeds = torch.zeros(batch, prefix_len, width, dtype=prefix_embs.dtype, device=device)
         prefix_pad_masks = torch.ones(batch, prefix_len, dtype=torch.bool, device=device)
+        prefix_att_masks = torch.zeros(batch, prefix_len, dtype=torch.bool, device=device)
+        attention_mask = prepare_attention_masks_4d(make_att_2d_masks(prefix_pad_masks, prefix_att_masks))
+        position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_kwargs = {}
+        rotary_emb = None
+        if self._runtime_options.prefix_kv_only:
+            prefix_kwargs["prefix_kv_only"] = True
+        if self._runtime_options.hoist_denoise_invariants:
+            rotary_emb = model.prepare_prefix_rotary(inputs_embeds, position_ids)
+            prefix_kwargs["rotary_emb"] = rotary_emb
+
+        def prefix():
+            return model.paligemma_with_expert.forward(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=kv_cache,
+                inputs_embeds=[inputs_embeds, None],
+                use_cache=True,
+                **prefix_kwargs,
+            )
+
         x_t = torch.zeros(batch, model.action_horizon, model.action_dim, dtype=torch.float32, device=device)
         timestep = torch.ones(batch, dtype=torch.float32, device=device)
         context = None
-        kwargs = {}
+        denoise_kwargs = {}
         if self._runtime_options.hoist_denoise_invariants:
             context = model.prepare_denoise_context(prefix_pad_masks)
-            kwargs["context"] = context
+            denoise_kwargs["context"] = context
 
         def step():
             return model.denoise_step(
-                prefix_pad_masks=prefix_pad_masks, past_key_values=kv_cache, x_t=x_t, timestep=timestep, **kwargs
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=kv_cache,
+                x_t=x_t,
+                timestep=timestep,
+                **denoise_kwargs,
             )
 
-        step()  # eager warmup, outside capture
+        # Eager warmup, outside capture.
+        prefix()
+        step()
         torch.accelerator.synchronize(device)
+
+        pool = torch.cuda.graph_pool_handle()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=torch.cuda.graph_pool_handle()):
+        with torch.cuda.graph(graph, pool=pool):
+            outputs = prefix()
+        prefix_forward = _PrefixForwardGraph(
+            graph,
+            attention_mask,
+            position_ids,
+            inputs_embeds,
+            kv_cache,
+            outputs,
+            self._runtime_options.prefix_kv_only,
+            rotary_emb,
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
             v_t = step()
-        return _DenoiseStepGraph(graph, prefix_pad_masks, kv_cache, x_t, timestep, v_t, context)
+        denoise_step = _DenoiseStepGraph(graph, prefix_pad_masks, kv_cache, x_t, timestep, v_t, context)
+        return prefix_forward, denoise_step
 
     def kv_cache_for(self, batch_size: int, prefix_len: int) -> Pi05KVCache | None:
         """The KV cache a formed batch of ``batch_size`` requests runs over: the
-        cache of the denoising graph that serves the size (the first rows of it
-        when the batch is smaller), or None when no graph does. Batch 1 runs
-        over ``model.kv_cache``."""
+        cache of the graphs that serve the size (the first rows of it when the
+        batch is smaller), or None when no graph does. Batch 1 runs over
+        ``model.kv_cache``."""
         g = None if batch_size == 1 else self._denoise_graph(batch_size)
         if g is None or not g.kv_cache.fits(g.kv_cache.batch_size, prefix_len):
             return None
         return g.kv_cache if g.kv_cache.batch_size == batch_size else g.kv_cache.rows(batch_size)
 
+    def _prefix_graph(self, batch_size: int) -> _PrefixForwardGraph | None:
+        """The prefix forward graph of exactly ``batch_size``; a batch between
+        captured sizes runs its prefix forward without a graph."""
+        return self._prefix_forward if batch_size == 1 else self._prefix_batches.get(batch_size)
+
     def _denoise_graph(self, batch_size: int) -> _DenoiseStepGraph | None:
-        """The graph that serves ``batch_size``: its own, else the smallest larger one."""
+        """The denoising graph that serves ``batch_size``: its own, else the smallest larger one."""
         if batch_size == 1:
             return self._denoise_step
         g = self._denoise_batches.get(batch_size)
@@ -453,7 +514,9 @@ class Pi05CUDAGraphs:
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         adarms_modulations: torch.Tensor | None = None,
     ):
-        g = self._prefix_forward
+        g = None
+        if inputs_embeds is not None and len(inputs_embeds) == 2 and isinstance(inputs_embeds[0], torch.Tensor):
+            g = self._prefix_graph(inputs_embeds[0].shape[0])
         if g is not None and not (
             torch.get_default_dtype() == _CAPTURE_DEFAULT_DTYPE
             and past_key_values is g.kv_cache
@@ -462,8 +525,6 @@ class Pi05CUDAGraphs:
             and adarms_modulations is None
             and prefix_kv_only == g.prefix_kv_only
             and _rotary_matches(rotary_emb, g.rotary_emb)
-            and inputs_embeds is not None
-            and len(inputs_embeds) == 2
             and inputs_embeds[1] is None
             and _matches(inputs_embeds[0], g.inputs_embeds)
             and _matches(attention_mask, g.attention_mask)

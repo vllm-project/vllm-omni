@@ -14,7 +14,8 @@ The model is built by ``Pi05Pipeline`` as the server builds it, from the deploy
 config's ``model_config``: ``--dtype`` sets the serving dtype (bfloat16 is the
 mixed layout serving runs), and the optimized path (CUDA graphs over the fused
 Triton kernels) runs unless ``--enforce-eager`` is passed. The optimized path
-serves batch 1; other batch sizes run eagerly.
+serves batch 1 (``build_model`` declares ``max_num_seqs=1``); other batch sizes
+run on the fused kernels without a graph.
 
     python bench_pi05.py --out results/            # full sweep
     python bench_pi05.py --bs 1 --views 3 --iters 5
@@ -66,8 +67,9 @@ def build_model(
     max_num_seqs: int = 1,
 ):
     """The model ``Pi05Pipeline`` serves: its dtype layout, KV cache, and with
-    ``enforce_eager`` unset its fused kernels and CUDA graphs (the denoising
-    step's for the batch sizes ``max_num_seqs`` declares)."""
+    ``enforce_eager`` unset its fused kernels and CUDA graphs (the prefix
+    forward's and the denoising step's for the batch sizes ``max_num_seqs``
+    declares)."""
     import yaml
     from vllm.utils.torch_utils import set_default_torch_dtype
 

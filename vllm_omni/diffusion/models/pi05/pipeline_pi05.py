@@ -123,10 +123,11 @@ def _set_inference_dtype(model: Pi05ForActionPrediction, dtype: torch.dtype) -> 
 
 
 def graph_batch_sizes(max_num_seqs: int) -> tuple[int, ...]:
-    """The batch sizes the denoising step is captured for: 1, every power of
-    two below ``max_num_seqs``, and ``max_num_seqs`` itself. Each size holds a
-    KV cache of its own, so every size up to a large ``max_num_seqs`` would not
-    fit; a batch of an undeclared size runs its steps without a graph."""
+    """The batch sizes the prefix forward and the denoising step are captured
+    for: 1, every power of two below ``max_num_seqs``, and ``max_num_seqs``
+    itself. Each size holds a KV cache of its own, so every size up to a large
+    ``max_num_seqs`` would not fit; a batch of an undeclared size runs its
+    prefix forward without a graph and its steps on the next larger size's."""
     max_num_seqs = max(1, int(max_num_seqs))
     sizes = {1, max_num_seqs}
     size = 2
@@ -335,7 +336,7 @@ class Pi05Pipeline(nn.Module):
         self.model.cuda_graphs = graphs
         logger.info(
             "Pi05Pipeline: captured the sample_actions CUDA graphs over the fused kernels in %.2f s "
-            "(denoising step at batch sizes %s, %.2f GB); sample_actions runs its optimized path.",
+            "(prefix forward and denoising step at batch sizes %s, %.2f GB); sample_actions runs its optimized path.",
             time.perf_counter() - start,
             list(batch_sizes),
             (torch.accelerator.memory_allocated() - allocated) / 2**30,

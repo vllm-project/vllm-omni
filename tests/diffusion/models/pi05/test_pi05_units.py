@@ -671,6 +671,51 @@ def test_batched_denoise_graph_serves_its_size_and_pads_smaller_batches():
     assert graphs.num_replays["denoise_step"] == 2
 
 
+def test_batched_prefix_graph_serves_exactly_its_size():
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.pi05 import cuda_graph_pi05 as adapter
+
+    model = _P0GraphAdapterModel(Pi05RuntimeOptions())
+    graphs = Pi05CUDAGraphs(model, batch_sizes=(1, 4))
+    cache = _tiny_kv_cache(4)
+    mask = torch.zeros(4, 1, 3, 3)
+    positions = torch.zeros(4, 3, dtype=torch.long)
+    embeddings = torch.zeros(4, 3, 4)
+    output = torch.zeros(4)
+    static = adapter._PrefixForwardGraph(
+        SimpleNamespace(replay=lambda: output.copy_(static.inputs_embeds.sum(dim=(1, 2)))),
+        mask,
+        positions,
+        embeddings,
+        cache,
+        ([output, None], cache),
+    )
+    graphs._prefix_batches[4] = static
+
+    def run(batch, kv_cache):
+        return graphs.prefix_forward(
+            attention_mask=torch.zeros(batch, 1, 3, 3),
+            position_ids=torch.zeros(batch, 3, dtype=torch.long),
+            past_key_values=kv_cache,
+            inputs_embeds=[torch.ones(batch, 3, 4), None],
+            use_cache=True,
+        )
+
+    # The batch of the graph's size replays it over its own cache.
+    (hidden, _), returned = run(4, cache)
+    assert hidden is output and returned is cache and hidden.tolist() == [12.0] * 4
+    assert graphs.num_replays["prefix_forward"] == 1
+    # A batch between captured sizes, over the first rows of that cache, and a
+    # batch above the largest size run the model's forward; so does batch 1
+    # without its graph.
+    for batch, kv_cache in ((3, cache.rows(3)), (5, _tiny_kv_cache(5)), (1, _tiny_kv_cache(1))):
+        (hidden, _), returned = run(batch, kv_cache)
+        assert hidden.item() == 123 and returned is kv_cache
+    assert [call[0] for call in model.calls] == ["prefix"] * 3
+    assert graphs.num_replays["prefix_forward"] == 1
+
+
 # ----------------------------------------------------------------------------
 # Pi05Config dataclass + checkpoint resolver
 # ----------------------------------------------------------------------------

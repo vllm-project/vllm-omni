@@ -1291,7 +1291,7 @@ def _fused_prefix_forward(
     prefix_kv_only: bool = False,
     rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor | None:
-    """``PaliGemmaWithActionExpertPi05.forward``'s prefix pass, batch 1, with fused kernels.
+    """``PaliGemmaWithActionExpertPi05.forward``'s prefix pass with fused kernels.
 
     Bit-exact with the eager pass: every denoising step attends over the
     prefix K/V and amplifies any rounding difference in it, so the norms,
@@ -1299,21 +1299,30 @@ def _fused_prefix_forward(
     only RoPE, which writes the layer's K/V straight into ``kv_cache``, and the
     GELU. ``prefix_kv_only`` explicitly discards the unused final hidden
     state and skips the last layer's Q/attention/MLP plus final norm.
+
+    A batch runs as eager runs it: the norms and GEMMs over every request's
+    rows back to back, the attention as one batched matmul under the batch's
+    ``(requests, 1, prefix, prefix)`` mask, and RoPE as one launch that writes
+    each request's K/V into its own cache row. Batch 1 launches what it
+    launched alone.
     """
     lm = paligemma.model.language_model
-    x_in = inputs_embeds[0]
-    seq_len, width = x_in.shape
+    batch, seq_len, width = inputs_embeds.shape
+    n_rows = batch * seq_len
+    x_in = inputs_embeds.reshape(n_rows, width)
     first_attn = lm.layers[0].self_attn
     proj_dtype = first_attn.q_proj.weight.dtype
     num_heads = first_attn.config.num_attention_heads
     head_dim = first_attn.head_dim
     device = x_in.device
 
-    hidden_states = torch.empty(seq_len, width, dtype=torch.promote_types(x_in.dtype, proj_dtype), device=device)
-    x_normed = torch.empty(seq_len, width, dtype=proj_dtype, device=device)
-    q = torch.empty(num_heads, seq_len, head_dim, dtype=proj_dtype, device=device)
-    # Every eager layer builds this same table, in its V projection's dtype.
+    hidden_states = torch.empty(n_rows, width, dtype=torch.promote_types(x_in.dtype, proj_dtype), device=device)
+    x_normed = torch.empty(n_rows, width, dtype=proj_dtype, device=device)
+    q = torch.empty(batch, num_heads, seq_len, head_dim, dtype=proj_dtype, device=device)
+    # Every eager layer builds this same table, in its V projection's dtype:
+    # ``(requests, prefix, head_dim)``, and the requests' rows back to back.
     cos, sin = lm.rotary_emb(x_normed, position_ids) if rotary_emb is None else rotary_emb
+    cos_rows, sin_rows = cos.reshape(n_rows, -1), sin.reshape(n_rows, -1)
 
     residual, mlp_out = x_in, None
     for layer_idx, layer in enumerate(lm.layers):
@@ -1324,27 +1333,28 @@ def _fused_prefix_forward(
             torch.add(mlp_out, residual, out=hidden_states)
             x_normed.copy_(layer.input_layernorm(hidden_states))
             residual = hidden_states
-        key, value = kv_cache.key[layer_idx, 0, 0], kv_cache.value[layer_idx, 0, 0]
+        # ``(requests, prefix + suffix, head_dim)``: each request's K/V row of the cache.
+        key, value = kv_cache.key[layer_idx, :, 0], kv_cache.value[layer_idx, :, 0]
         if prefix_kv_only and layer_idx == len(lm.layers) - 1:
             # Keep the separate cuBLAS K/V projections and the exact eager
             # RoPE arithmetic; concatenating the weights changes BF16 GEMM
             # accumulation. No Q projection or decoder output is needed.
-            shape = (1, seq_len, -1, head_dim)
+            shape = (batch, seq_len, -1, head_dim)
             k = attn.k_proj(x_normed[None]).view(shape).transpose(1, 2)
             v = attn.v_proj(x_normed[None]).view(shape).transpose(1, 2)
             k = k * cos.unsqueeze(1) + rotate_half(k) * sin.unsqueeze(1)
             kv_cache.write_prefix(layer_idx, k, v)
             return None
-        _fused_qkv_rope(x_normed, attn, cos[0], sin[0], q, key[:seq_len], value[:seq_len], triton_gemm=False)
+        _fused_qkv_rope(x_normed, attn, cos_rows, sin_rows, q, key[:, :seq_len], value[:, :seq_len], triton_gemm=False)
         att = _attend(
-            q[None],
-            key[None, None, :seq_len],
-            value[None, None, :seq_len],
+            q,
+            key[:, None, :seq_len],
+            value[:, None, :seq_len],
             attention_mask,
             num_kv_groups=attn.num_key_value_groups,
             scaling=1.0 / math.sqrt(head_dim),
         )
-        attn_out = attn.o_proj(att.transpose(1, 2).reshape(1, seq_len, num_heads * head_dim))[0]
+        attn_out = attn.o_proj(att.transpose(1, 2).reshape(batch, seq_len, num_heads * head_dim)).view(n_rows, width)
         torch.add(attn_out, residual, out=hidden_states)
         x_normed.copy_(layer.post_attention_layernorm(hidden_states))
         residual = hidden_states
@@ -1353,7 +1363,7 @@ def _fused_prefix_forward(
         mlp_out = layer.mlp.down_proj(gate)[0]
 
     torch.add(mlp_out, residual, out=hidden_states)
-    return lm.norm(hidden_states[None])
+    return lm.norm(hidden_states.view(batch, seq_len, width))
 
 
 def _fused_denoise_forward(
@@ -1445,7 +1455,7 @@ def _fused_kernels_serve(backbone: PaliGemmaWithActionExpertPi05, kv_cache, batc
     """Whether a call runs the fused kernels: they are enabled, and its batch has
     a single-KV-head ``Pi05KVCache`` of its size in the action expert's K/V
     dtype. Any other call runs eagerly, which also keeps eager's errors for bad
-    caches. The prefix pass serves batch 1 only, which its caller checks."""
+    caches."""
     return (
         backbone.fused_kernels
         and isinstance(kv_cache, Pi05KVCache)
@@ -1627,7 +1637,7 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         ``past_key_values`` is a :class:`Pi05KVCache` in both modes: prefix_only
         with ``use_cache`` writes the prefix K/V into it and returns it, and
         suffix_only reads it. With the fused kernels enabled, prefix_only runs
-        on them (``_fused_prefix_forward``) when it is batch 1.
+        on them (``_fused_prefix_forward``).
         """
         num_layers = self.paligemma.config.text_config.num_hidden_layers
         pali_lm = self.paligemma.model.language_model
@@ -1647,7 +1657,7 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
             if (
                 use_cache
                 and attention_mask is not None
-                and attention_mask.shape[:3] == (1, 1, hidden_states.shape[1])
+                and attention_mask.shape[:3] == (hidden_states.shape[0], 1, hidden_states.shape[1])
                 and attention_mask.stride(-1) == 1
                 and _fused_kernels_serve(self, past_key_values, hidden_states.shape[0])
                 and past_key_values.prefix_len == hidden_states.shape[1]
@@ -1931,9 +1941,9 @@ class Pi05ForActionPrediction(nn.Module):
         """Run the prefix forward and each denoising step through the fused Triton kernels.
 
         The optimized path's kernels (``Pi05Pipeline`` enables them together
-        with its CUDA graphs). A call still runs eagerly when it is not batch 1
-        on a single-KV-head ``Pi05KVCache``. Raises if the kernels cannot
-        serve this model at all.
+        with its CUDA graphs). A call still runs eagerly when its batch has no
+        single-KV-head ``Pi05KVCache`` of its size. Raises if the kernels
+        cannot serve this model at all.
         """
         problems = []
         if not HAS_TRITON:
