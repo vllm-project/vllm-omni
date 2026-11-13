@@ -380,7 +380,8 @@ class Qwen3TTSAdapter(ARTTSAdapter):
 
     def _validate_text_lead(self, request: "OpenAICreateSpeechRequest", task_type: str) -> str | None:
         """A text lead lays out the streaming CustomVoice prompt and cannot pass the text's END."""
-        if not request.text_lead:
+        text_lead = getattr(request, "text_lead", None)
+        if not text_lead:
             return None
         if task_type != "CustomVoice":
             return "'text_lead' is only valid for CustomVoice task"
@@ -391,8 +392,8 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         self._load_text_tokenizer()
         # The assistant template wraps the text in 3 + 5 tokens.
         num_text_ids = len(self.ctx.server._tts_tokenizer(build_assistant_text(request.input))["input_ids"]) - 8
-        if request.text_lead > num_text_ids + 1:
-            return f"'text_lead' {request.text_lead} exceeds the text's {num_text_ids} tokens plus its end"
+        if text_lead > num_text_ids + 1:
+            return f"'text_lead' {text_lead} exceeds the text's {num_text_ids} tokens plus its end"
         return None
 
     def _build_tts_params(self, request: "OpenAICreateSpeechRequest") -> dict[str, Any]:
@@ -524,8 +525,10 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         elif params["task_type"][0] == "VoiceDesign":
             params["non_streaming_mode"] = [True]
 
-        if request.text_lead:
-            params["text_lead"] = [request.text_lead]
+        # Batch items and other request forms have no text_lead field.
+        text_lead = getattr(request, "text_lead", None)
+        if text_lead:
+            params["text_lead"] = [text_lead]
 
         # Do not set ``full_utterance_decode`` here. That flag is an explicit
         # Code2Wav emit opt-in (offline / advanced callers via

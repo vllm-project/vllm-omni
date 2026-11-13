@@ -947,7 +947,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             await asyncio.shield(task)
         except asyncio.CancelledError:
             caller = asyncio.current_task()
-            if caller is not None and caller.cancelling() > 0:
+            if caller is not None and caller.cancelling() > 0:  # type: ignore[attr-defined]
                 raise
             # The submit was revoked (pause, sleep or abort) before admission.
             raise ValueError(f"Request {internal_id} was not admitted") from None

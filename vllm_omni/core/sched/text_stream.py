@@ -78,7 +78,9 @@ def first_value(value: Any) -> Any:
 
 def declares_text_stream(info: Mapping[str, Any] | None) -> bool:
     """Whether a request's additional information declares a text stream."""
-    return bool(info) and bool(first_value(info.get(TEXT_STREAM_KEY)))
+    if not info:
+        return False
+    return bool(first_value(info.get(TEXT_STREAM_KEY)))
 
 
 def text_row(prompt_ids: int, frame: int) -> int:

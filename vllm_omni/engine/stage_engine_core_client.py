@@ -12,7 +12,7 @@ from __future__ import annotations
 import inspect
 import os
 import socket
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
 import vllm.v1.engine as _vllm_engine_module
@@ -282,9 +282,11 @@ class StageEngineCoreClientBase(StageClientBase):
         with the request's ADD and ABORT. Returns why the engine refused the
         append, or ``None``.
         """
+        # The concrete client puts an upstream AsyncMPClient after this mixin in its MRO.
+        client = cast(AsyncMPClient, self)
         # A data-parallel client routes per request; send to the engine holding it.
-        engine = getattr(self, "reqs_in_flight", {}).get(request_id) or self.core_engine
-        return await self._call_utility_async("omni_append_text", request_id, token_ids, final, engine=engine)
+        engine = getattr(client, "reqs_in_flight", {}).get(request_id) or client.core_engine
+        return await client._call_utility_async("omni_append_text", request_id, token_ids, final, engine=engine)
 
     # ==================== Stage Methods ====================
 

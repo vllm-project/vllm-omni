@@ -909,12 +909,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             # Subsequent chunks slice the buffer stored by the first round.
             is_first_prefill = not isinstance(prompt_embeds_buffer, torch.Tensor) or prompt_embeds_buffer.ndim != 2
             if is_first_prefill:
+                streamed_text = self._streamed_texts.prompt_text(req_id, input_ids.device)
+                # Only a streamed request passes its text; others keep the plain call.
+                build_kwargs = {"streamed_text": streamed_text} if streamed_text is not None else {}
                 full_prompt_embeds, tailing_text_hidden, ref_code_len, ref_code = (
-                    self._prompt_builder.build_prompt_embeds(
-                        task_type=task_type,
-                        info_dict=info_dict,
-                        streamed_text=self._streamed_texts.prompt_text(req_id, input_ids.device),
-                    )
+                    self._prompt_builder.build_prompt_embeds(task_type=task_type, info_dict=info_dict, **build_kwargs)
                 )
                 prompt_embeds_buffer = full_prompt_embeds.detach()
                 if not bool(getattr(self, "_use_v2_model_runner", False)):

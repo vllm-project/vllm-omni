@@ -157,7 +157,7 @@ def test_the_stage_client_sends_a_utility_call_to_the_engine_that_holds_the_requ
 
         client.reqs_in_flight = {"r": b"engine-1"}
         await client.append_text_async("r", [3], True)
-        assert client._call_utility_async.await_args.kwargs["engine"] == b"engine-1"
+        client._call_utility_async.assert_awaited_with("omni_append_text", "r", [3], True, engine=b"engine-1")
 
     asyncio.run(run())
 
