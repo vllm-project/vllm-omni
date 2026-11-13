@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from tests.e2e.accuracy.omni_duplex_eval.validation import assert_accuracy_result, load_accuracy_config
+from tests.e2e.accuracy.omni_duplex_eval.validation import (
+    assert_accuracy_result,
+    load_accuracy_config,
+    select_duplex_eval_baseline,
+)
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import summarize_scores
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_metrics import PROTOCOL_PIN
 
@@ -19,10 +23,8 @@ _CONFIG_PATH = Path(__file__).with_name("omni_duplex_eval_ci_config.json")
 
 @pytest.fixture
 def config():
-    from tests.dfx.perf.scripts.run_benchmark import _duplex_eval_selected_baseline
-
     raw = json.loads(_CONFIG_PATH.read_text())
-    selected = _duplex_eval_selected_baseline(raw, "H100")
+    selected = select_duplex_eval_baseline(raw, "H100")
     return {**raw, "baseline": selected} if selected else raw
 
 
@@ -231,6 +233,35 @@ def test_zero_threshold_is_rejected(result, config):
         assert_accuracy_result(result, config)
 
 
+_CALIBRATED_FLOORS = {
+    "min_rtd_mean_content_score": 1.8,
+    "min_rtd_mean_temporal_score": 1.4,
+    "min_pr_mean_all_success": 0.28,
+}
+
+
+def test_select_duplex_eval_baseline_nested_contract():
+    nested = {
+        "baseline": {
+            "H100": dict(_CALIBRATED_FLOORS),
+            "B200": dict(_CALIBRATED_FLOORS),
+            "A3": dict(_CALIBRATED_FLOORS),
+            "MI325": {},
+        }
+    }
+    assert select_duplex_eval_baseline(nested, "H100") == _CALIBRATED_FLOORS
+    assert select_duplex_eval_baseline(nested, "MI325") == {}
+    assert select_duplex_eval_baseline(nested, "MI300") == {}
+    with pytest.raises(ValueError, match="requires a runtime hardware label"):
+        select_duplex_eval_baseline(nested, "")
+    with pytest.raises(ValueError, match="requires a runtime hardware label"):
+        select_duplex_eval_baseline(nested, None)
+    mixed = {"baseline": {"H100": dict(_CALIBRATED_FLOORS), "min_rtd_mean_content_score": 1.8}}
+    with pytest.raises(ValueError, match="mixes hardware maps and flat metrics"):
+        select_duplex_eval_baseline(mixed, "H100")
+    assert select_duplex_eval_baseline({"baseline": dict(_CALIBRATED_FLOORS)}, "MI325") == _CALIBRATED_FLOORS
+
+
 def test_dfx_invokes_full_accuracy_contract(result):
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
@@ -331,7 +362,7 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
     test_root = Path(__file__).resolve().parents[3]
     dfx_config = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
     dfx_config["benchmark_params"][0]["duplex_eval_accuracy_config"] = str(_CONFIG_PATH.resolve())
-    selected_baseline = runner._duplex_eval_selected_baseline(json.loads(_CONFIG_PATH.read_text()), resource_label)
+    selected_baseline = select_duplex_eval_baseline(json.loads(_CONFIG_PATH.read_text()), resource_label)
     enforce_score_floors = bool(selected_baseline)
     if benchmark_params_name is not None:
         dfx_config["benchmark_params"][0]["name"] = benchmark_params_name

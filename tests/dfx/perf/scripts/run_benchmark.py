@@ -627,36 +627,22 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
     return accuracy_path
 
 
-def _duplex_eval_selected_baseline(accuracy_config: dict, hardware: object) -> dict:
-    """Return this hardware's score floors, or ``{}`` to record scores without gating.
-
-    Nested accuracy-config baselines (``{"H100": {...}, "A3": {...}}``) enforce only
-    when the runtime label has an entry. A flat metric dict still applies to every
-    hardware label, matching jobs that share one calibrated floor.
-    """
-    baseline = accuracy_config.get("baseline") or {}
-    if not isinstance(baseline, dict) or not baseline:
-        return {}
-    if all(isinstance(value, dict) and value for value in baseline.values()):
-        if not isinstance(hardware, str) or not hardware:
-            return {}
-        selected = baseline.get(hardware)
-        return dict(selected) if isinstance(selected, dict) else {}
-    return {str(key): value for key, value in baseline.items() if value is not None}
-
-
 def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> None:
     summary = result["omni_duplex_eval"]
     sessions = result.get("duplex_session_metrics")
     assert isinstance(sessions, list) and len(sessions) == num_prompt, "Omni-DuplexEval session metrics are missing"
     if path := params.get("duplex_eval_accuracy_config"):
-        from tests.e2e.accuracy.omni_duplex_eval.validation import assert_accuracy_result, load_accuracy_config
+        from tests.e2e.accuracy.omni_duplex_eval.validation import (
+            assert_accuracy_result,
+            load_accuracy_config,
+            select_duplex_eval_baseline,
+        )
 
         # The accuracy suite scores collected output, including silence and
         # close-boundary responses. Preserve its eligibility policy; missing
         # client measurements and unfinished counts remain visible in artifacts.
         config = load_accuracy_config(path, params)
-        selected = _duplex_eval_selected_baseline(config, result.get("Hardware"))
+        selected = select_duplex_eval_baseline(config, result.get("Hardware"))
         assert_accuracy_result(
             result,
             {**config, "baseline": selected},
@@ -789,10 +775,10 @@ def test_performance_benchmark(omni_server, benchmark_params):
     resource_label = get_runtime_resource_label()
     accuracy_baseline = None
     if path := params.get("duplex_eval_accuracy_config"):
-        from tests.e2e.accuracy.omni_duplex_eval.validation import load_accuracy_config
+        from tests.e2e.accuracy.omni_duplex_eval.validation import load_accuracy_config, select_duplex_eval_baseline
 
         accuracy_config = load_accuracy_config(path, params)
-        accuracy_baseline = _duplex_eval_selected_baseline(accuracy_config, resource_label)
+        accuracy_baseline = select_duplex_eval_baseline(accuracy_config, resource_label)
     elif params.get("omniinteract_evaluate"):
         accuracy_baseline = _omniinteract_accuracy_baseline(params, test_name)
     for dataset_prefix in ("omniinteract", "duplex_eval"):
