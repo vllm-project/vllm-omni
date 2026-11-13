@@ -254,7 +254,12 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
     pipeline["steps"] = [] if pinned_diagnostics else [image]
     if weekly:
         pipeline["steps"].extend(
-            [benchmark, weekly_steps["nightly-sglang-omni-qwen3-tts"], qwen_image_performance_job(benchmark)]
+            [
+                benchmark,
+                weekly_steps["nightly-sglang-omni-qwen3-tts"],
+                qwen_image_performance_job(benchmark),
+                cosmos_performance_job(benchmark),
+            ]
         )
     for case in cases:
         job = deepcopy(benchmark)
@@ -333,6 +338,10 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
             )
         job["command"] = "\n".join(commands)
         pipeline["steps"].append(job)
+    if weekly:
+        for job in pipeline["steps"]:
+            if job["key"] != "image-build-sglang-omni":
+                job.update(concurrency=2, concurrency_group="vllm-omni/pr1994/sglang-smoke")
     return pipeline
 
 
@@ -340,7 +349,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("cases", nargs="?", help="Comma-separated model keys")
-    selection.add_argument("--weekly", action="store_true", help="Run the four validated comparison workloads")
+    selection.add_argument("--weekly", action="store_true", help="Run the validated comparison workloads")
     args = parser.parse_args()
     try:
         cases = ["minicpm-o-perf"] if args.weekly else args.cases.split(",")

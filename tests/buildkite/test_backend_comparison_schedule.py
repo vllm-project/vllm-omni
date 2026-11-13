@@ -86,21 +86,26 @@ def test_schedule_uploads_only_validated_sglang_workloads(comparison_runner, tmp
         "nightly-sglang-omni-qwen3-tts",
         "perf-sglang-qwen-image-21",
         "perf-sglang-minicpm-o",
+        "perf-sglang-cosmos3-t2i",
     }
     for key, cards in (
         ("nightly-sglang-omni-qwen3-omni", 2),
         ("nightly-sglang-omni-qwen3-tts", 2),
         ("perf-sglang-qwen-image-21", 1),
         ("perf-sglang-minicpm-o", 1),
+        ("perf-sglang-cosmos3-t2i", 2),
     ):
         job = jobs[key]
         assert job["agents"] == {"queue": "mithril-h100-pool"}
+        assert job["concurrency"] == 2
+        assert job["concurrency_group"] == "vllm-omni/pr1994/sglang-smoke"
         container = next(iter(job["plugins"][0].values()))["podSpec"]["containers"][0]
         assert container["resources"]["limits"]["nvidia.com/gpu"] == cards
-        if key == "perf-sglang-qwen-image-21":
+        if key in {"perf-sglang-qwen-image-21", "perf-sglang-cosmos3-t2i"}:
             assert "depends_on" not in job
             assert container["image"].endswith("@" + job["env"]["COMPARISON_IMAGE_DIGEST"])
-            assert ".completed == 10" in job["command"]
+            prompts = 10 if key == "perf-sglang-qwen-image-21" else 3
+            assert f".completed == {prompts}" in job["command"]
         else:
             assert job["depends_on"] == "image-build-sglang-omni"
     assert ".completed == 32" in jobs["perf-sglang-minicpm-o"]["command"]
