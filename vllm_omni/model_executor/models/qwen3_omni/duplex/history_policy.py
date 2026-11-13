@@ -530,6 +530,7 @@ class IncrementalHistoryPolicy(QwenHistoryPolicy):
             "END_NEW_DIALOGUE",
             "END_SOURCE_MESSAGE",
             "END_MEMORY",
+            "Return the complete updated memory.",
         }
         if not memory or all(line.strip() in markers for line in memory.splitlines() if line.strip()):
             return None

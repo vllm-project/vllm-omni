@@ -77,24 +77,36 @@ async def test_invalid_visual_completion_does_not_publish_a_ledger_node():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("visual", [False, True])
 @pytest.mark.parametrize(
-    "text", ["END_MEMORY", "END_PREVIOUS_MEMORY\nEND_NEW_DIALOGUE", "\n NEW_DIALOGUE \n END_MEMORY \n"]
+    "text",
+    [
+        "END_MEMORY",
+        "END_PREVIOUS_MEMORY\nEND_NEW_DIALOGUE",
+        "\n NEW_DIALOGUE \n END_MEMORY \n",
+        "PREVIOUS_MEMORY\nEND_PREVIOUS_MEMORY\nNEW_DIALOGUE\nEND_NEW_DIALOGUE\nReturn the complete updated memory.",
+    ],
 )
-async def test_marker_only_visual_summary_keeps_evidence_pending_for_retry(text):
+async def test_marker_only_summary_keeps_evidence_pending_for_retry(visual, text):
     owner = runtime(recent_messages=2)
     state = state_for(owner)
-    sync_history(state, [image_message(), {"role": "assistant", "content": "red"}, *text_history(4)])
+    history = [image_message(), {"role": "assistant", "content": "red"}] if visual else []
+    sync_history(state, [*history, *text_history(4)])
     request = await owner.prepare(state)
-    before = visual_snapshot(state)
+    before = (state.processed, state.summary, visual_snapshot(state))
     assert not owner.apply(state, request, completion(text))
-    assert visual_snapshot(state) == before
+    assert (state.processed, state.summary, visual_snapshot(state)) == before
     assert state.counts["rejected_summaries"] == 1
     retry = await owner.prepare(state)
     assert retry.model_source == request.model_source
     # A marker mentioned as a real fact must remain usable memory text.
     assert owner.apply(state, retry, completion("A red square with reference code END_MEMORY."))
-    assert state.visual.covered == 1
-    assert "reference code END_MEMORY" in state.visual.summaries()[0]
+    if visual:
+        assert state.visual.covered == 1
+        assert "reference code END_MEMORY" in state.visual.summaries()[0]
+    else:
+        assert state.processed > 0
+        assert "reference code END_MEMORY" in state.summary
 
 
 @pytest.mark.asyncio
