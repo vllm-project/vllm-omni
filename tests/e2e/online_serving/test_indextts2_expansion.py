@@ -49,11 +49,13 @@ def test_basic_english(omni_server, online_client) -> None:
     """
     request_config = {
         "model": omni_server.model,
-        "input": "Hello, this is a voice cloning demo.",
+        "input": "Please read this sentence clearly and naturally.",
         "stream": False,
         "response_format": "wav",
         "ref_audio": REF_AUDIO_URL,
         "min_audio_bytes": 1024,
+        "transcript_language": "en",
+        "transcript_escalation_model": "large-v3",
     }
     online_client.send_audio_speech_request(request_config)
 
@@ -73,11 +75,13 @@ def test_streaming(omni_server, online_client) -> None:
     """
     request_config = {
         "model": omni_server.model,
-        "input": "Hello, this is a voice cloning demo.",
+        "input": "Please read this sentence clearly and naturally.",
         "stream": True,
         "stream_format": "audio",
         "response_format": "pcm",
         "ref_audio": REF_AUDIO_URL,
         "min_audio_bytes": 1024,
+        "transcript_language": "en",
+        "transcript_escalation_model": "large-v3",
     }
     online_client.send_audio_speech_request(request_config)
