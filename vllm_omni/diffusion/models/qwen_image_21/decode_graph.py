@@ -44,7 +44,6 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 
 from vllm_omni.platforms import current_omni_platform
 
@@ -141,28 +140,32 @@ class QwenImage21DecodeGraphEntry:
         nothing to the cache (prefix K/V are read-only), so warm-up is
         idempotent.
         """
+        caller_stream = torch.cuda.current_stream()
         side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
+        side.wait_stream(caller_stream)
         try:
             with torch.cuda.stream(side), torch.inference_mode(False), torch.no_grad():
                 for _ in range(2):
                     body()
         finally:
-            torch.cuda.current_stream().wait_stream(side)
+            caller_stream.wait_stream(side)
 
         graph = torch.cuda.CUDAGraph()
-        # The platform-wide pool is shared with every other captured path in
-        # the tree; entries only keep their *output* alive, whose tiny size
-        # makes reuse safe because the caller clones it before any other graph
-        # on the pool replays.
+        # Let this graph own a private pool. Idle cleanup can destroy the last
+        # graph while pool allocations remain live; reusing a global pool
+        # handle in that state hits the allocator's use_count assertion.
         # Pooled streams recycle, so warm-up may run on the capture stream and
         # leave its cuBLAS workspace outside the graph pool, where evicting
         # another graph frees it under survivors. Clear around capture, as
         # torch cudagraph trees do, so captured workspaces live in the pool.
         torch._C._cuda_clearCublasWorkspaces()
         try:
-            with torch.inference_mode(False), torch.no_grad():
-                with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+            # torch.cuda.graph switches streams before capture_begin. Its
+            # __exit__ cannot restore the caller's stream if __enter__ raises;
+            # capture_end can also raise before restoration. Keep an outer
+            # stream context so the eager fallback runs on the caller's stream.
+            with torch.cuda.stream(caller_stream), torch.inference_mode(False), torch.no_grad():
+                with torch.cuda.graph(graph):
                     self.output = body()
         finally:
             torch._C._cuda_clearCublasWorkspaces()
@@ -455,8 +458,7 @@ class QwenImage21DecodeGraphManager:
             logger.info("Captured Qwen-Image-2.1 decode graph for key=%s", key)
         entry.graph.replay()
         assert entry.output is not None
-        # Clone before returning: the output lives in the shared graph pool and
-        # the next replay (of this or another graph on the pool) overwrites it.
+        # Clone before returning: the next replay of this graph overwrites its output.
         return entry.output.clone()
 
     def release_idle_entries(self) -> None:

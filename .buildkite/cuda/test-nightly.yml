@@ -81,7 +81,7 @@ steps:
           - export SEED_TTS_UTMOS_DEVICE=cuda:1
           - pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and H100 and B200 and cuda and (cards_1 or cards_2)" --run-level full_model
 
-      - label: ":full_moon: Omni · Omni-DuplexEval CI Guard"
+      - label: ":full_moon: Omni · Minicpm-o 4.5 · Duplex Omni-DuplexEval Accuracy and Perf Test"
         source_file_dependencies: omni_duplex_eval_ci
         timeout_in_minutes: 240
         artifact_paths:
