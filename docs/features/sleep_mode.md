@@ -90,6 +90,43 @@ Behavior notes:
 
 ## 2. Usage Examples
 
+### Automatic idle sleep for consumer profiles
+
+Consumer deploy profiles can opt in to automatic level-1 sleep:
+
+```yaml
+idle_sleep:
+  timeout_s: 300
+
+stages:
+  - stage_id: 0
+    enable_sleep_mode: true
+```
+
+MOSS-TTS-Nano provides the shipped opt-in example
+`vllm_omni/deploy/moss_tts_nano_idle_sleep.yaml`. Its base
+`moss_tts_nano.yaml` remains unchanged and does not enable automatic sleep.
+The opt-in profile's 300-second timeout is a qualification candidate, not a
+consumer-GPU support claim.
+
+The policy is disabled when `idle_sleep` is omitted or `timeout_s` is `null`.
+Every resolved stage must enable sleep mode, and the API server must use one
+worker.
+
+Only inference traffic resets the deadline. Active HTTP responses, streaming
+responses, and WebSocket sessions keep the deployment awake for their complete
+transport lifetime. Health, metrics, model-list, documentation, lifecycle
+control, and result-retrieval requests do not reset the deadline.
+
+Automatic sleep always targets every stage with level 1 and waits for active
+engine work. The next inference request transparently runs `wake_up()` followed
+by `resume_generation()` before entering the serving handler. Level 2 is not
+used because discarded weights cannot currently be restored by the automatic
+serving path.
+
+Level 1 moves weights to host memory. A profile that enables automatic idle
+sleep must document enough host RAM and its measured wake latency.
+
 ### Python API Example
 
 You can programmatically control the lifecycle of stages using the `AsyncOmni` engine.
@@ -124,7 +161,7 @@ Start the server with sleep mode enabled:
 
 The first method
 
-```
+```bash
 
 vllm serve ByteDance-Seed/BAGEL-7B-MoT \
 --omni \
@@ -136,7 +173,7 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT \
 
 The second method
 
-```
+```bash
 
 python3 -m vllm_omni.entrypoints.openai.api_server \
     --model ByteDance-Seed/BAGEL-7B-MoT \
@@ -155,7 +192,7 @@ Objective: Verify VRAM reclamation for Stage 0 (Thinker).
 
 Trigger sleep (Level 1 or Level 2) via client:
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/sleep \
      -H "Content-Type: application/json" \
@@ -171,7 +208,7 @@ Objective: Verify VRAM reclamation for Stage 1 (Diffusion).
 
 Trigger sleep (Level 1 or Level 2) via client:
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/sleep \
      -H "Content-Type: application/json" \
@@ -185,7 +222,7 @@ Objective: Test concurrent sleep and rapid wake-up across multiple stages.
 
 Concurrent Sleep (Stage 0 & 1):
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/sleep \
      -H "Content-Type: application/json" \
@@ -195,7 +232,7 @@ curl -X POST http://localhost:8000/v1/omni/sleep \
 
 Rapid Wake-up:
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/wakeup \
      -H "Content-Type: application/json" \
@@ -211,7 +248,7 @@ Check Initial State: Observe baseline VRAM usage.
 
 Trigger Deep Sleep (Level 2):
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/sleep \
      -H "Content-Type: application/json" \
@@ -221,7 +258,7 @@ curl -X POST http://localhost:8000/v1/omni/sleep \
 
 Wake-up Model:
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/wakeup \
      -H "Content-Type: application/json" \
@@ -232,7 +269,7 @@ curl -X POST http://localhost:8000/v1/omni/wakeup \
 Verify Functional Integrity (Inference):
 Ensure the model still generates valid output after reloading weights.
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/images/generations \
      -H "Content-Type: application/json" \
@@ -270,7 +307,7 @@ curl -X POST http://localhost:8000/v1/images/generations \
 Metadata Field Analysis
 The metadata field is a dynamic dictionary containing hardware-specific telemetry and audit data, primarily used for verifying memory reclamation on various backends (e.g., AMD ROCm, NVIDIA CUDA).
 
-```
+```json
 "metadata": {
     "source": "Platform_AMD_Instinct_MI300X",
     "total_freed_gib": "78.57",

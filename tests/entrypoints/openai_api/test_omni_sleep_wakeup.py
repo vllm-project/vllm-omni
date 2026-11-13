@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import asyncio
 import dataclasses
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.requests import Request
+
+from vllm_omni.entrypoints.serve.omni_control.protocol import OmniSleepRequest, OmniWakeupRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -256,6 +260,51 @@ def test_wakeup_route_propagates_not_implemented_error(sleep_capable_engine, moc
 
     # Failed wake must not clear the sleeping set.
     assert app.state.sleeping_stages == {0}
+
+
+def test_health_reports_idle_sleep_controller_error(sleep_capable_engine, mocker):
+    app = _make_app(sleep_capable_engine)
+    sleep_capable_engine.check_health = mocker.AsyncMock()
+    controller = mocker.Mock()
+    controller.error_reason = "automatic idle wake failed"
+    app.state.idle_sleep_controller = controller
+
+    response = TestClient(app).get("/health")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "unhealthy", "reason": "automatic idle wake failed"}
+    sleep_capable_engine.check_health.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manual_wakeup_waits_for_concurrent_sleep(sleep_capable_engine, mocker):
+    from vllm_omni.entrypoints.openai.api_server import omni_sleep, omni_wakeup
+
+    sleep_started = asyncio.Event()
+    release_sleep = asyncio.Event()
+
+    async def blocking_sleep(*, stage_ids, level):
+        assert stage_ids == [0]
+        assert level == 1
+        sleep_started.set()
+        await release_sleep.wait()
+        return [FakeAck(stage_id=0)]
+
+    sleep_capable_engine.sleep = mocker.AsyncMock(side_effect=blocking_sleep)
+    app = _make_app(sleep_capable_engine)
+    raw_request = Request({"type": "http", "app": app})
+
+    sleep_task = asyncio.create_task(omni_sleep(OmniSleepRequest(stage_ids=[0], level=1), raw_request))
+    await sleep_started.wait()
+    wake_task = asyncio.create_task(omni_wakeup(OmniWakeupRequest(stage_ids=[0]), raw_request))
+    await asyncio.sleep(0)
+
+    assert not wake_task.done()
+
+    release_sleep.set()
+    await sleep_task
+    await wake_task
+    sleep_capable_engine.wake_up.assert_awaited_once_with(stage_ids=[0])
 
 
 def test_wakeup_removes_only_requested_stages(sleep_capable_engine):

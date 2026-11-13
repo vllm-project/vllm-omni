@@ -29,6 +29,7 @@ implementation contract; it is not, by itself, a general support claim.
 - [Mooncake KV and Hidden-State Cache](feature/mooncake_kv_hs_cache.md)
 - [Model-local KV Caches](feature/model_local_kv_caches.md)
 - [Realtime AR-Diffusion Sessions](feature/realtime_ar_diffusion.md)
+- [Consumer Profile Idle Sleep](feature/consumer_idle_sleep.md)
 
 ### Communication
 
