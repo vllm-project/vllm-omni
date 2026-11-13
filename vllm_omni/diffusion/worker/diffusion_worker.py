@@ -480,6 +480,14 @@ class DiffusionWorker:
                     format_gib(self.requested_memory),
                 )
             init_workspace_manager(self.device)
+            if (
+                parallel_config.ulysses_a2a_permute
+                and parallel_config.ulysses_degree > 1
+                and parallel_config.ulysses_mode == "strict"
+            ):
+                from vllm_omni.diffusion.distributed.a2a_permute import ensure_a2a_permute_available
+
+                ensure_a2a_permute_available()
 
     def _create_profiler(self) -> WorkerProfiler | None:
         profiler_config = self.od_config.profiler_config

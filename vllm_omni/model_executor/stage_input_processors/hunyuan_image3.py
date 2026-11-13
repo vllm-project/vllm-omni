@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage input processor for HunyuanImage3: AR to Diffusion transition.
 
 In IT2I (image editing) mode:
@@ -25,6 +25,8 @@ from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import
     get_cached_resolution_group,
 )
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+    HUNYUAN_AR_GENERATED_TOKEN_IDS_KEY,
+    HUNYUAN_AR_PROMPT_TOKEN_IDS_KEY,
     HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
@@ -189,6 +191,13 @@ def ar2diffusion(
             "ar_generated_text": cot_text_for_dit,
         },
     }
+
+    # The transferred KV belongs to these exact tokens. Decoding generated
+    # text and encoding it again can change both token IDs and token count.
+    prompt_token_ids = getattr(ar_output, "prompt_token_ids", None)
+    if prompt_token_ids is not None and generated_token_ids is not None:
+        diffusion_input["extra"][HUNYUAN_AR_PROMPT_TOKEN_IDS_KEY] = list(prompt_token_ids)
+        diffusion_input["extra"][HUNYUAN_AR_GENERATED_TOKEN_IDS_KEY] = list(generated_token_ids)
 
     # Forward use_system_prompt so the DiT can build the same system prefix.
     # Also forward the custom system prompt body when sys_type=custom so
