@@ -417,17 +417,17 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self.decode_dtype = torch.bfloat16
             self.remote.to(device=initial_device)
         decoder = getattr(self.remote.model, "decoder", None)
-        if decoder is not None and decoder_path is None:
+        if decoder is not None and decoder_path is None and (device.type != "npu" or lightvae_decoder_path is None):
             install_h3_vae_optimizations(
                 decoder,
                 device=device,
             )
         install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
         # The three decoder fast paths below are XPU-only: they were written
-        # against the XPU kernels/compile stack and validated there. CUDA keeps
-        # its own fused-operator path (install_h3_vae_optimizations above); on
-        # every other device the checkpoint's reference decoder runs unchanged
-        # and none of the switches prints or installs anything. Like
+        # against the XPU kernels/compile stack and validated there. CUDA and
+        # Ascend A5 use their own fused-operator paths above. Other devices keep
+        # the checkpoint's reference decoder. These XPU switches do not install
+        # anything on other platforms. Like
         # install_h3_vae_optimizations, they target the checkpoint's own
         # decoder, so a replacement (NVFP4) decoder skips them too.
         _xpu = device.type == "xpu" and decoder_path is None

@@ -20,8 +20,9 @@ migration can be handled separately without weakening the current contract.
 
 ## Current boundary
 
-The VAE installer validates the official model structure before making any
-change. It then binds the selected operator set, reuses Omni's existing
+For the existing bit-exact operator sets, the VAE installer validates the
+official model structure before making any change. It then binds the selected
+operator set, reuses Omni's existing
 `SiluAndMul`, and materializes only the decoder-block Linear weights in the FP16
 dtype already selected by decode autocast. Unsupported model contracts, tensor
 inputs, execution modes, and devices retain the original implementation.
@@ -31,6 +32,13 @@ other capabilities fall back to the reference path. Bit-exact full-decode and
 operator evidence has been collected on SM90, with independent full-decode and
 stress validation on SM103. Enabling a target and claiming it as validated are
 kept separate so the evidence remains clear.
+
+The native Ascend A5 decoder separately installs fused RMSNorm, RoPE and
+SwiGLU, independently of MXFP8 selection. These kernels can differ from the
+reference in floating-point rounding. This default is a proposed exception to
+the bitwise contract below and requires maintainer review and full decoded
+output validation; operator-level tolerance checks alone do not establish a
+video-quality contract. Unsupported inputs retain the original operations.
 
 ## Extending platform support
 
