@@ -228,6 +228,7 @@ from .vae import (
     _VideoVAEPartProxy,
     vae_compile_allowed,
 )
+from .vae_mxfp8 import supports_h3_vae_mxfp8_cpu_load
 from .variant import BASE_H3, FASTH3_PREVIEW, H3Variant, control_task
 from .vdnh3 import VDNCheckpoint
 
@@ -756,6 +757,7 @@ class MiniMaxH3Pipeline(
     _transformer_cls: ClassVar[type[MiniMaxH3DiTModel] | None] = None
     load_vae_decoder: bool = True
     supports_request_cancellation: ClassVar[bool] = True
+    supports_cpu_load_with_online_quantization = staticmethod(supports_h3_vae_mxfp8_cpu_load)
 
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformers_ref"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
@@ -1511,6 +1513,7 @@ class MiniMaxH3Pipeline(
                 ),
                 lightvae_decoder_path=lightvae_decoder_path,
                 stack_decode_tiles=od_config.vae_stack_tiles,
+                quantization_config=od_config.quantization_config,
                 allow_decoder_compile=vae_compile_allowed(
                     bool(od_config.enforce_eager),
                     current_omni_platform,

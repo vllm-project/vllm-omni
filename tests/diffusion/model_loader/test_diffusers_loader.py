@@ -32,7 +32,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 from vllm_omni.diffusion.model_loader.host_weights import source_identity as source_identity_module
 from vllm_omni.diffusion.models.helios import HeliosPipeline
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
-from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.diffusion.registry import DiffusionModelRegistry, initialize_model
 from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
@@ -1161,6 +1161,61 @@ def _stub_ordinary_loader(loader, model, monkeypatch, loader_mod) -> None:
         "build_checkpoint_mmap_plan",
         lambda *_args, **_kwargs: HostWeightPlanResult(None, "test fallback"),
     )
+
+
+@pytest.mark.parametrize(
+    ("model_class", "extra_component", "expected_device"),
+    [
+        ("MiniMaxH3Pipeline", None, "cpu"),
+        ("MiniMaxH3ModularPipeline", None, "cpu"),
+        ("MiniMaxH3DecoderPipeline", None, "cpu"),
+        ("TestMiniMaxH3Alias", None, "cpu"),
+        ("MiniMaxH3Pipeline", "transformer", "npu"),
+        ("MiniMaxH3Pipeline", "text_encoder", "npu"),
+        ("MiniMaxH3Pipeline", "default", "npu"),
+        ("DummyPipeline", None, "npu"),
+    ],
+)
+def test_video_vae_mxfp8_cpu_offload_load_device(
+    tmp_path, monkeypatch, mocker, model_class, extra_component, expected_device
+):
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    if model_class == "TestMiniMaxH3Alias":
+        models = DiffusionModelRegistry.models
+        monkeypatch.setitem(models, model_class, models["MiniMaxH3Pipeline"])
+
+    quant = DiffusionMXFP8Config()
+    components = {"video_vae": quant}
+    if extra_component not in (None, "default"):
+        components[extra_component] = quant
+    quant_config = ComponentQuantizationConfig(
+        components, default_config=quant if extra_component == "default" else None
+    )
+    config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        model_class_name=model_class,
+        dtype=torch.float32,
+        quantization_config=quant_config,
+        enable_cpu_offload=True,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), config)
+    model = nn.Module()
+    _stub_ordinary_loader(loader, model, monkeypatch, loader_module)
+    load_weights = mocker.patch.object(loader, "load_weights")
+
+    # Exercise the loader's routing on CPU without allocating an NPU tensor.
+    device = mocker.Mock(spec=torch.device, type="npu")
+    load_device = mocker.patch.object(loader_module, "torch", wraps=torch).device
+    load_device.return_value = torch.device("cpu")
+
+    assert loader.load_model(load_device="cpu", device=device) is model
+    load_device.assert_called_once_with(expected_device)
+    if expected_device == "cpu":
+        load_weights.assert_called_once_with(model)
+    else:
+        load_weights.assert_called_once_with(model, stream_online_quant_to_cpu=True)
+    assert loader.quant_config is quant_config
 
 
 def test_text_encoder_allgather_rejects_unsupported_online_quantization(monkeypatch):
