@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU fixtures exercise record-only scoring, failure integrity and the real CLI."""
+"""CPU fixtures exercise offline scoring, failure integrity and the real CLI."""
 
 from __future__ import annotations
 
@@ -79,11 +79,10 @@ def test_actual_shared_cli_records_and_saves_numeric_values_without_a_server(rec
     _, _, persist = recording
 
     async def unexpected_server_discovery(args):
-        pytest.fail("record-only CLI must not run model discovery or benchmark traffic")
+        pytest.fail("offline evaluation CLI must not run model discovery or benchmark traffic")
 
     monkeypatch.setattr(serve, "vllm_main_async", unexpected_server_discovery)
     arguments = [
-        "--realtime-video-record-only",
         "--realtime-video-evaluate",
         "precision",
         "--realtime-video-candidate",
@@ -98,14 +97,14 @@ def test_actual_shared_cli_records_and_saves_numeric_values_without_a_server(rec
     ]
     OmniBenchmarkServingSubcommand.cmd(build_serve_args(arguments))
     saved = evaluation.read_json(tmp_path / "results/recorded.json")["realtime_video_evaluation"]
-    assert saved["status"] == "recorded" and saved["passed"]
-    assert saved["record_only"] and saved["comparison_status"] == "pending_baseline"
+    assert saved["status"] == "measured" and saved["passed"]
+    assert "record_only" not in saved and "comparison_status" not in saved
     values = saved["measurements"]["replay"]["tensors"]["output/decoded"]
     assert values["mean"] == 4 and values["std"] == 1 and values["shape"] == [2]
     assert values["minimum"] == 3 and values["maximum"] == 5
     assert "reference" not in saved["measurements"] and "psnr_db" not in saved["measurements"]
     output = capsys.readouterr().out
-    assert "baseline comparison pending" in output and '"mean": 4.0' in output
+    assert "accuracy measurements (precision)" in output and '"mean": 4.0' in output
 
 
 @pytest.mark.parametrize("component", ["server", "cleanup", "precision"])
@@ -114,7 +113,6 @@ def test_precision_rejects_capture_errors_even_when_a_valid_npz_exists(recording
     manifest["errors"].append({"component": component, "error": "CPU injected capture failure"})
     report = evaluation.evaluate_saved(persist(), suite="precision", output_dir=tmp_path / "output")
     assert report["status"] == "failed" and not report["passed"] and report["errors"]
-    assert report["comparison_status"] == "pending_baseline"
 
 
 @pytest.mark.parametrize("corruption", ["changed_bytes", "nonfinite", "wrong_source", "old_recipe", "cleanup_false"])
@@ -211,8 +209,7 @@ def test_semantic_records_every_real_native_dimension_independently_of_missing_p
     (root / "candidate/precision.npz").unlink()
     manifest["errors"].append({"component": "precision", "error": "CPU fixture has only video"})
     report = _semantic(persist(), tmp_path, suite)
-    assert report["passed"] and report["status"] == "recorded"
-    assert report["comparison_status"] == "pending_baseline"
+    assert report["passed"] and report["status"] == "measured"
     assert set(report["measurements"]["scores"]["cpu-fixture"]) == set(dimensions)
     assert report["measurements"]["scores"]["cpu-fixture"]["dynamic_degree"] == 1.0
     assert scripted_native[1] == [(suite, {"cpu-fixture"})]
@@ -304,12 +301,21 @@ def test_relative_evaluator_root_stays_valid_when_the_worker_changes_directory(
     assert os.environ["VBENCH_CACHE_DIR"] == "CPU-fixture-original"
 
 
-@pytest.mark.parametrize("mode_args", [[], ["--realtime-video-record-only"]])
-def test_accuracy_cli_requires_explicit_record_only_inputs(mode_args):
+@pytest.mark.parametrize(
+    "arguments", [["--realtime-video-evaluate", "precision"], ["--realtime-video-candidate", "generation.json"]]
+)
+def test_accuracy_cli_requires_suite_and_candidate(arguments):
     from vllm_omni.benchmarks.realtime_video.serving import build_serve_args
 
-    with pytest.raises(ValueError, match="currently requires"):
-        build_serve_args(["--realtime-video-evaluate", "precision", *mode_args])
+    with pytest.raises(ValueError, match="requires both"):
+        build_serve_args(arguments)
+
+
+def test_record_only_flag_is_removed():
+    from vllm_omni.benchmarks.realtime_video.serving import build_serve_args
+
+    with pytest.raises(SystemExit):
+        build_serve_args(["--realtime-video-record-only"])
 
 
 def test_evaluator_checkout_guard_ignores_bytecode_caches_only(tmp_path):

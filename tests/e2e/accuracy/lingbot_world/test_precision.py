@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Record finite candidate numerical data for a future accuracy baseline."""
+"""Check a complete, finite fixed-input replay; no stored reference tensors exist yet."""
 
 import pytest
 

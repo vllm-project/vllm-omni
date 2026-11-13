@@ -1,28 +1,34 @@
 # LingBot World accuracy
 
-The CUDA profile (`configs/cuda.json`) carries WBench and VBench `score_floors`
-from vllm-omni Buildkite build 19532 at
-`d60e82c0d5deeaed6c7bbcb7725f12d02e694f82`: each recorded score minus 0.05,
-rounded down to four decimals. The largest per-dimension difference against
-CUDA build 18935 was 0.0175. Binary `dynamic_degree` is recorded only. Without
-`--lingbot-record-only`, those suites report `comparison_status: compared` and
-fail when any listed score is below its floor.
+Each profile carries WBench and VBench `score_floors`: every recorded score
+minus 0.05, rounded down to four decimals. Binary `dynamic_degree` is reported
+but has no floor. The semantic suites report `comparison_status: score_floor`
+and fail when any listed score is missing or below its floor. A profile without
+floors is rejected.
 
-Numerical precision has no stored reference tensors, so tensor error, PSNR and
-SSIM remain `pending_baseline`; the test checks only that the fixed-input replay
-is complete and finite. Profiles without floors (NPU) must run with
-`--lingbot-record-only`, which records outputs and scores with
-`comparison_status: pending_baseline`.
+- CUDA (`configs/cuda.json`): vllm-omni build 19532 at
+  `d60e82c0d5deeaed6c7bbcb7725f12d02e694f82`. The largest per-dimension
+  difference against CUDA build 18935 was 0.0175.
+- NPU (`configs/npu.json`): vllm-omni-npu-ci build 11412 at
+  `49a7059849dd235e26ce43221bf33c06ea2f7ba7` (A2 generation, H100 scoring).
+  The largest per-dimension difference against CUDA build 19532 was 0.0499.
+
+Known limitation: numerical precision has no stored reference tensors, so
+tensor error, PSNR and SSIM are not computed. `test_numeric_precision` reports
+`comparison_status: finite_only` and checks only that the fixed-input replay is
+complete and finite. Adding a reference needs an immutable artifact location
+for the NPZ; it is not generated from the candidate.
 
 The three independent tests use the packaged `vllm bench serve --omni` scoring
 path after the candidate server has stopped:
 
-- `test_precision.py::test_numeric_precision` records fixed-input Wan VAE NPZ
+- `test_precision.py::test_numeric_precision` reports fixed-input Wan VAE NPZ
   arrays, native/stored dtype, shape, finite checks and descriptive statistics.
-  Tensor errors, PSNR and SSIM remain pending until genuine reference data exist.
-- `test_wbench.py::test_wbench_quality` records native WBench dimensions.
-- `test_vbench.py::test_vbench_quality` records native VBench dimensions,
-  including full-frame background inference coverage.
+- `test_wbench.py::test_wbench_quality` checks native WBench dimensions against
+  the profile floors.
+- `test_vbench.py::test_vbench_quality` checks native VBench dimensions,
+  including full-frame background inference coverage, against the profile
+  floors.
 
 The session fixture starts the candidate server once and captures one 40-chunk
 rollout for each of the three existing image/prompt/camera cases. Each case has
@@ -31,8 +37,9 @@ There is no official source checkout, live reference server, or repeated
 reference/candidate campaign in routine CI.
 
 Each test checks its own authenticated inputs, prints real measurements as JSON,
-and writes `result_acc_*.json` before asserting recording validity. A missing
-NPZ fails numerical recording without hiding complete videos from the semantic
+and writes `result_acc_*.json` (with the floors under `baseline`) before
+asserting. A missing NPZ fails the numerical test without hiding complete
+videos from the semantic
 tests. Server/cleanup failures remain failures. Generation hardware, source,
 model and workload are separate from the CUDA evaluator hardware.
 
@@ -57,14 +64,13 @@ the CUDA evaluator worker; consuming it does not prepare or require an NPU
 model runtime on that worker:
 
 ```bash
-python -m tests.e2e.accuracy.lingbot_world.prepare capture --record-only \
+python -m tests.e2e.accuracy.lingbot_world.prepare capture \
   --profile tests/e2e/accuracy/lingbot_world/configs/npu.json \
   --output lingbot-artifacts/npu-accuracy
 python -m pytest -sv --run-level full_model \
   tests/e2e/accuracy/lingbot_world/test_precision.py \
   tests/e2e/accuracy/lingbot_world/test_wbench.py \
   tests/e2e/accuracy/lingbot_world/test_vbench.py \
-  --lingbot-record-only \
   --lingbot-profile=tests/e2e/accuracy/lingbot_world/configs/npu.json \
   --lingbot-generation=lingbot-artifacts/npu-accuracy \
   --lingbot-output=lingbot-artifacts/npu-accuracy-results
@@ -72,7 +78,6 @@ python -m pytest -sv --run-level full_model \
 
 CI saves the numerical NPZ, videos, raw evaluator scores, workload/source
 manifest and JSON reports as artifacts and prints measurements with `pytest -sv`.
-NPU score floors and precision reference data need their own recorded runs.
 Score floors come only from reviewed CI measurements; new results are never
 auto-promoted to a baseline.
 
@@ -84,7 +89,7 @@ contended A2 host took 57-126 s per shard (vllm-omni-npu-ci build 11393), versus
 ~22 s on earlier runs. Each accuracy job has a 120-minute timeout budget;
 actual native duration and two-GPU capacity still need matching CI evidence.
 
-For a CPU-only check of capture/recording contracts:
+For a CPU-only check of capture and scoring contracts:
 
 ```bash
 python -m pytest -q tests/benchmarks/test_lingbot_world_cases.py \

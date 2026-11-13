@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Run packaged benchmark scoring and publish the standard accuracy record."""
+"""Run packaged benchmark scoring, apply profile score floors and publish the accuracy record.
+
+WBench and VBench scores are compared with the profile's ``score_floors``.
+Numerical precision has no stored reference tensors, so tensor error, PSNR and
+SSIM are not computed; that suite checks a complete, finite fixed-input replay.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +26,7 @@ def run_accuracy(settings, data, suite):
     report = {
         "passed": False,
         "status": "failed",
-        "comparison_status": "pending_baseline",
+        "comparison_status": "finite_only" if suite == "precision" else "score_floor",
         "suite": suite,
         "measurements": {},
         "errors": [],
@@ -30,7 +35,6 @@ def run_accuracy(settings, data, suite):
         arguments = [
             "--model",
             read_json(ROOT / "tests/e2e/accuracy/lingbot_world/assets.lock.json")["model_id"],
-            "--realtime-video-record-only",
             "--realtime-video-evaluate",
             suite,
             "--realtime-video-candidate",
@@ -72,7 +76,7 @@ def run_accuracy(settings, data, suite):
         # Keep this suite's failure visible without consuming another test's
         # verdict or hiding its usable candidate data.
         report["errors"].append(str(error))
-        print(f"LingBot {suite} recording failed: {error}", flush=True)
+        print(f"LingBot {suite} measurement failed: {error}", flush=True)
     measurements = report["measurements"]
     if suite == "precision":
         metrics = {
@@ -86,11 +90,9 @@ def run_accuracy(settings, data, suite):
             for case, dimensions in measurements.get("scores", {}).items()
             for dimension, value in dimensions.items()
         }
-    # Precision has no stored reference tensors yet, so only semantic suites
-    # have floors. Record-only runs and profiles without floors stay pending.
-    floors = {} if settings.get("record_only") else settings.get("score_floors", {}).get(suite, {})
+    floors = {} if suite == "precision" else settings["score_floors"][suite]
+    report["comparison_status"] = "finite_only" if suite == "precision" else "score_floor"
     if floors:
-        report["comparison_status"] = "compared"
         report["floor_violations"] = [
             f"{name}: {metrics.get(name)!r} < {floor}"
             for name, floor in floors.items()
@@ -115,10 +117,9 @@ def run_accuracy(settings, data, suite):
             "candidate_revision": manifest["candidate_revision"],
             "model_revision": settings["model_revision"],
             "workload": manifest["contract"]["profile"],
-            "accuracy_mode": "score_floor" if floors else "record_only",
             "comparison_status": report["comparison_status"],
-            "recording_status": report["status"],
-            "recording_report": report,
+            "measurement_status": report["status"],
+            "measurement_report": report,
         },
     )
     if floors:
@@ -127,5 +128,5 @@ def run_accuracy(settings, data, suite):
             f"LingBot {suite}: {report['status']}; {len(violations)} of {len(floors)} score floors failed", flush=True
         )
     else:
-        print(f"LingBot {suite}: {report['status']}; baseline comparison pending", flush=True)
+        print(f"LingBot {suite}: {report['status']}; finite replay only, no stored reference tensors", flush=True)
     return report

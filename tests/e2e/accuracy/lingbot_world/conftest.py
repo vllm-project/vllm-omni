@@ -12,9 +12,6 @@ def pytest_addoption(parser):
     group = parser.getgroup("lingbot-world")
     group.addoption("--lingbot-profile", type=Path, help="Accuracy workload JSON")
     group.addoption("--lingbot-output", type=Path, default=Path("lingbot-artifacts/accuracy"))
-    group.addoption(
-        "--lingbot-record-only", action="store_true", help="Record accuracy data without applying profile score floors"
-    )
     group.addoption("--lingbot-generation", type=Path, help="Previously captured accuracy data, e.g. NPU outputs")
 
 
@@ -33,9 +30,8 @@ def lingbot_settings(request):
         request.config.getoption("--lingbot-output"),
         generation=request.config.getoption("--lingbot-generation"),
     )
-    settings["record_only"] = bool(request.config.getoption("--lingbot-record-only"))
-    if not settings["record_only"] and not settings.get("score_floors"):
-        raise RegressionError(f"{profile} has no score floors; record it with --lingbot-record-only")
+    if not all(settings.get("score_floors", {}).get(suite) for suite in ("wbench", "vbench")):
+        raise RegressionError(f"{profile} must define WBench and VBench score floors")
     return settings
 
 

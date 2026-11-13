@@ -70,16 +70,15 @@ and VBench tests. Each CI run captures one candidate server
 lifetime, one fixed VAE replay and one 40-chunk video per existing case, with
 excluded warmup. It does not check out or restart a live official reference.
 After generation releases its server, the packaged `vllm bench serve --omni`
-evaluation path records actual numerical and native WBench/VBench measurements.
+evaluation path measures numerical and native WBench/VBench results.
 Each test validates its own complete input population, prints measured values
 and writes its own accuracy JSON before asserting. It does not read another
 test's verdict. Raw tensors, complete videos and per-dimension/binary scores
-remain CI artifacts. On CUDA, WBench and VBench scores are checked against
-floors derived from a recorded CI run; numerical precision has no stored
-reference yet and stays baseline pending. NPU runs in **record-only** mode until
-its own measurements are reviewed; recording success there does not establish
-an accuracy regression pass. Generation and evaluator errors always fail. No
-performance verdict depends on accuracy results.
+remain CI artifacts. On CUDA and NPU, WBench and VBench scores are checked
+against per-platform floors derived from recorded CI runs. Numerical precision
+has no stored reference tensors: it checks a complete, finite replay and does
+not compute tensor error, PSNR or SSIM. Generation and evaluator errors always
+fail. No performance verdict depends on accuracy results.
 
 CUDA generation uses two H100 GPUs and SP=2. NPU uses its existing four-device A2
 profile, followed by CUDA evaluation; result metadata distinguishes generation
