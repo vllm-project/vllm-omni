@@ -4,10 +4,10 @@
 
 from __future__ import annotations
 
-import tomllib
 from pathlib import Path
 
 import pytest
+import tomllib
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
