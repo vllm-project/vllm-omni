@@ -542,6 +542,21 @@ class QwenImage21Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             impl_overrides={"SDPA": QwenImage21SDPAImpl} if quant_config is None else None,
         )
+        # Ring SP prefill (_ring_prefill) attends the replicated prefix rows locally: the same backend
+        # selection, never sharded. No weights; built only when ring is active.
+        self.prefix_attn = (
+            Attention(
+                num_heads=self.num_heads,
+                head_size=dim_head,
+                softmax_scale=1.0 / (dim_head**0.5),
+                causal=False,
+                num_kv_heads=self.num_kv_heads,
+                impl_overrides={"SDPA": QwenImage21SDPAImpl} if quant_config is None else None,
+                skip_sequence_parallel=True,
+            )
+            if getattr(self.attn, "use_ring", False)
+            else None
+        )
 
     def _apply_rotary_emb(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         if x.device.type == "cuda":
@@ -551,6 +566,42 @@ class QwenImage21Attention(nn.Module):
         # Platform fallback without complex-tensor kernels (the CustomOp rope layer
         # dispatches by platform, not tensor device, so it cannot serve CPU tensors).
         return _apply_qwen_image21_rotary_emb_native(x, freqs)
+
+    def _ring_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        prefix_len: int,
+    ) -> torch.Tensor:
+        r"""Block-causal prefill under ring SP. The local layout is `[replicated prefix P, target shard T]`.
+
+        Block-causal attention gives P rows causal attention over P alone (full within each condition-image
+        block) and T rows full attention over P and every T shard. The ring takes no mask, and its joint-query
+        path would let P rows attend to T as well; their hidden states feed the prefix KV cache of every later
+        step. So P is attended locally (it is replicated: every rank computes the same rows) with P's own spans,
+        and only the T rows go round the ring, with P as joint K/V prepended once.
+        """
+        prefix_spans = [[span for span in spans if span[1] <= prefix_len] for spans in attn_metadata.full_attn_spans]
+        prefix_output = self.prefix_attn(
+            query[:, :prefix_len],
+            key[:, :prefix_len],
+            value[:, :prefix_len],
+            AttentionMetadata(full_attn_spans=prefix_spans, extra=dict(attn_metadata.extra)),
+        )
+        target_output = self.attn(
+            query[:, prefix_len:],
+            key[:, prefix_len:],
+            value[:, prefix_len:],
+            AttentionMetadata(
+                joint_key=key[:, :prefix_len],
+                joint_value=value[:, :prefix_len],
+                joint_strategy="front",
+                extra=dict(attn_metadata.extra),
+            ),
+        )
+        return torch.cat([prefix_output, target_output], dim=1)
 
     def forward(
         self,
@@ -638,7 +689,9 @@ class QwenImage21Attention(nn.Module):
                         cached_value = _dequantize_prefix_kv_fp8(cached_value, branch_cache["value_scale"], value.dtype)
 
         metadata = copy.copy(attn_metadata) if attn_metadata is not None else None
-        if sp_prefix_len > 0:
+        if sp_prefix_len > 0 and self.prefix_attn is not None and metadata is not None and metadata.full_attn_spans:
+            attn_output = self._ring_prefill(query, key, value, metadata, sp_prefix_len)
+        elif sp_prefix_len > 0:
             # Ulysses joint attention: the prefix is replicated across SP ranks, so it is
             # concatenated (front) after the all-to-all instead of being sharded.
             if metadata is None:
@@ -944,6 +997,18 @@ class QwenImage21Transformer2DModel(CachedTransformer):
     ):
         super().__init__()
         self.parallel_config = od_config.parallel_config
+        if (
+            self.parallel_config is not None
+            and getattr(self.parallel_config, "ring_degree", 1) > 1
+            and getattr(self.parallel_config, "ulysses_degree", 1) > 1
+        ):
+            # Ring prefill attends the replicated prefix locally with all heads (QwenImage21Attention._ring_prefill);
+            # under Ulysses x ring the heads are split first, and that path is not implemented.
+            raise NotImplementedError(
+                "Qwen-Image-2.1 supports Ulysses SP (--usp) or ring SP (--ring), not both at once: got "
+                f"ulysses_degree={self.parallel_config.ulysses_degree}, "
+                f"ring_degree={self.parallel_config.ring_degree}."
+            )
         self._nz_weights_supported = self._nz_weights_supported_for(od_config, quant_config)
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
