@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     from vllm.config.logging import LogLevel
     from vllm.distributed.weight_transfer.base import WeightTransferEngine
 
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability
     from vllm_omni.distributed.weight_sharing.worker_registry import ConsumerWorkerRegistry
 
 logger = init_logger(__name__)
@@ -479,6 +480,14 @@ class DiffusionWorker:
                     format_gib(self.requested_memory),
                 )
             init_workspace_manager(self.device)
+            if (
+                parallel_config.ulysses_a2a_permute
+                and parallel_config.ulysses_degree > 1
+                and parallel_config.ulysses_mode == "strict"
+            ):
+                from vllm_omni.diffusion.distributed.a2a_permute import ensure_a2a_permute_available
+
+                ensure_a2a_permute_available()
 
     def _create_profiler(self) -> WorkerProfiler | None:
         profiler_config = self.od_config.profiler_config
@@ -553,6 +562,15 @@ class DiffusionWorker:
             rank=self.rank,
             device_index=current_omni_platform.current_device(),
             detach=detach_shared_model,
+        )
+
+    def get_mixfusion_capabilities(self) -> list[MixFusionCapability]:
+        from vllm_omni.diffusion.mixfusion.setup import inspect_mixfusion_capability
+
+        assert self.model_runner is not None and self.model_runner.pipeline is not None
+        pipeline = self.model_runner.pipeline
+        return _run_and_gather_rank_values(
+            "MixFusion capability discovery", lambda: inspect_mixfusion_capability(pipeline)
         )
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
@@ -712,10 +730,11 @@ class DiffusionWorker:
             max_num_batched_tokens = None
             if getattr(self.od_config, "is_moe", False) is True:
                 assert self.vllm_config is not None
-                max_num_batched_tokens = resolve_diffusion_moe_lora_token_capacity(
-                    self.od_config,
-                    self.vllm_config,
-                )
+                if self.vllm_config.lora_config is not None:
+                    max_num_batched_tokens = resolve_diffusion_moe_lora_token_capacity(
+                        self.od_config,
+                        self.vllm_config,
+                    )
             self.lora_manager = DiffusionLoRAManager(
                 pipeline=pipeline,
                 device=self.device,
