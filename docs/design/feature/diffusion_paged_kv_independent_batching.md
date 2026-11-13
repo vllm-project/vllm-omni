@@ -29,7 +29,7 @@ and [#9663](https://github.com/vllm-project/vllm-omni/issues/9663).
 
 ## Overview
 
-#9192 asks the Hunyuan pipeline to consume multiple request rows under paged
+[#9192](https://github.com/vllm-project/vllm-omni/issues/9192) asks the Hunyuan pipeline to consume multiple request rows under paged
 KV, and to group so that one mismatched boundary cannot fail the whole batch.
 That is one feature and three execution paths. CFG branches of one public
 request are already two paged rows; they are not independent-request batching.
@@ -113,12 +113,12 @@ row-pack path. This is a different merge than `_merge_step_model_inputs`.
 The first request-batch slice is local paged KV only. The native AR-KV
 connector stays `max_num_seqs=1` until that workstream lands.
 
-#9192 "consume multiple request rows" is slice 2 plus slice 3. Slice 1 is the
+[#9192](https://github.com/vllm-project/vllm-omni/issues/9192) "consume multiple request rows" is slice 2 plus slice 3. Slice 1 is the
 smallest paged step enablement.
 
 ## Grouping Rule
 
-#9192 said "CFG shape, sequence length, and prefix-hit boundary". Sequence
+[#9192](https://github.com/vllm-project/vllm-omni/issues/9192) said "CFG shape, sequence length, and prefix-hit boundary". Sequence
 length here means image-token / latent geometry, not full `prefix+image`
 `seq_len`. The span table above is two rows with different `seq_len` in one
 paged group. Current dense `_step_group_key` already groups by CFG, latent
