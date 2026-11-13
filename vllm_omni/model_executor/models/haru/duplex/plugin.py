@@ -44,6 +44,7 @@ from vllm_omni.model_executor.models.haru.prompt import prompt_length
 from vllm_omni.model_executor.models.haru.runtime import SessionOptions
 
 if TYPE_CHECKING:
+    from tokenizers import Tokenizer
     from vllm.config import ModelConfig
 
 SAMPLE_RATE = 24_000
@@ -127,6 +128,20 @@ def _decode_reference(ref_audio: str | None) -> tuple[str, int]:
     return base64.b64encode(pcm.tobytes()).decode("ascii"), len(pcm)
 
 
+def _client_options(extra_body: Mapping[str, object] | None) -> dict[str, object]:
+    """The typed Haru options a client set in ``extra_body`` (unset and null keys are left out)."""
+    extra: dict[str, object] = {}
+    for name, kind in _EXTRA_BODY.items():
+        value = (extra_body or {}).get(name)
+        if value is None:
+            continue
+        try:
+            extra[name] = kind(value)
+        except (TypeError, ValueError) as error:
+            raise DuplexRuntimeConfigError(f"extra_body.{name} must be {kind.__name__}") from error
+    return extra
+
+
 def _check_ranges(extra: Mapping[str, object], temperature: float | None) -> None:
     """Refuse values that would fail in the worker step (seed overflow, NaN or inf logits)."""
     checks = {
@@ -140,6 +155,11 @@ def _check_ranges(extra: Mapping[str, object], temperature: float | None) -> Non
             raise DuplexRuntimeConfigError(f"extra_body.{name} is out of range: {extra[name]!r}")
     if temperature is not None and not (math.isfinite(float(temperature)) and float(temperature) >= 0.0):
         raise DuplexRuntimeConfigError(f"temperature is out of range: {temperature!r}")
+
+
+def _load_checkpoint(model_path: str) -> tuple[Tokenizer, HaruSpec]:
+    """Tokenizer and audio spec of the served checkpoint (blocking file / Hub reads)."""
+    return load_tokenizer(model_path), HaruSpec.from_file(checkpoint_file(model_path, "config.json"))
 
 
 class HaruDuplexPlugin(DuplexModelPlugin):
@@ -228,8 +248,15 @@ class HaruDuplexPlugin(DuplexModelPlugin):
             raise DuplexRuntimeConfigError("the model path is unavailable", code="model_path_unavailable")
         async with self._load_lock:
             if self._tokenizer is None:
-                tokenizer = await asyncio.to_thread(load_tokenizer, model_path)
-                config = HaruSpec.from_file(checkpoint_file(model_path, "config.json"))
+                # Both reads may hit the Hub for a repo id: keep them off the event loop.
+                tokenizer, config = await asyncio.to_thread(_load_checkpoint, model_path)
+                # Prompt slots and the PCM framing use these constants; the worker uses the checkpoint's.
+                if (config.sample_rate, config.frame_samples) != (SAMPLE_RATE, FRAME_SAMPLES):
+                    raise DuplexRuntimeConfigError(
+                        f"the checkpoint uses {config.frame_samples}-sample frames at {config.sample_rate} Hz; "
+                        f"Haru duplex serving supports {FRAME_SAMPLES} at {SAMPLE_RATE} Hz",
+                        code="unsupported_checkpoint",
+                    )
                 self._guidance_range = config.head.guidance_range
                 self.data_plane.tokenizer = tokenizer
                 self.data_plane.silent_ids = {config.pad_token_id, config.eop_token_id}
@@ -240,13 +267,7 @@ class HaruDuplexPlugin(DuplexModelPlugin):
     ) -> dict[str, object]:
         self.validate_client_extra_body(config.extra_body)
         await self._load(model_config)
-        extra = {}
-        for name, kind in _EXTRA_BODY.items():
-            if name in config.extra_body and config.extra_body[name] is not None:
-                try:
-                    extra[name] = kind(config.extra_body[name])
-                except (TypeError, ValueError) as error:
-                    raise DuplexRuntimeConfigError(f"extra_body.{name} must be {kind.__name__}") from error
+        extra = _client_options(config.extra_body)
         low, high = self._guidance_range
         guidance = extra.get("guidance_scale", SessionOptions.guidance_scale)
         if not low <= guidance <= high:
@@ -278,5 +299,19 @@ class HaruDuplexPlugin(DuplexModelPlugin):
         if isinstance(options, Mapping) and (config.instructions or "") != options.get("system_prompt", ""):
             raise DuplexRuntimeConfigError(
                 "instructions cannot be changed after the session is created", code="instructions_update_unsupported"
+            )
+        # Options and sampling are fixed when the session's request is created: refuse a change instead
+        # of accepting an update that would not apply. (The framework already refuses a new ref_audio.)
+        sampling = current.get("haru_sampling")
+        sampling = sampling if isinstance(sampling, Mapping) else {}
+        created = dict(options) if isinstance(options, Mapping) else {}
+        created.update({k: sampling[k] for k in ("top_k", "top_p") if k in sampling})
+        requested = _client_options(config.extra_body)
+        changed = [name for name, value in requested.items() if created.get(name) != value]
+        if (None if config.temperature is None else float(config.temperature)) != sampling.get("temperature"):
+            changed.append("temperature")
+        if changed:
+            raise DuplexRuntimeConfigError(
+                f"{', '.join(changed)} cannot be changed after the session is created", code="option_update_unsupported"
             )
         return deepcopy(dict(current))

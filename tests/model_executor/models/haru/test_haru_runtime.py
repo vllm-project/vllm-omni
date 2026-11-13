@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import base64
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -25,6 +24,15 @@ HIDDEN, VOCAB = 8, 16
 CARD = "be brief"
 
 
+class _Backbone(nn.Module):
+    def __init__(self, embedding: nn.Embedding):
+        super().__init__()
+        self.embedding = embedding
+
+    def embed_input_ids(self, ids: torch.Tensor) -> torch.Tensor:
+        return self.embedding(ids)
+
+
 class _TinyHaru(nn.Module):
     """The attributes HaruRuntime reads from HaruForConditionalGeneration, at toy size."""
 
@@ -37,7 +45,7 @@ class _TinyHaru(nn.Module):
         torch.manual_seed(0)
         self.haru_config = TINY_SPEC
         self.embedding = nn.Embedding(VOCAB, HIDDEN)
-        self.model = SimpleNamespace(embed_input_ids=self.embedding)
+        self.model = _Backbone(self.embedding)
         self.lm_head = nn.Linear(HIDDEN, VOCAB, bias=False)
         self.model_audio_proj = AudioProjector(TINY_SPEC.latent_dim, HIDDEN)
         self.user_audio_proj = AudioProjector(TINY_SPEC.latent_dim, HIDDEN)
@@ -47,9 +55,14 @@ class _TinyHaru(nn.Module):
         self.register_buffer("latent_bias", torch.zeros(()))
 
 
+class _Encoding:
+    def __init__(self, ids: list[int]):
+        self.ids = ids
+
+
 class _Tokenizer:
-    def encode(self, text: str, add_special_tokens: bool = False):
-        return SimpleNamespace(ids=[1] * len(text.split()))
+    def encode(self, text: str, add_special_tokens: bool = False) -> _Encoding:
+        return _Encoding([1] * len(text.split()))
 
 
 PROMPT_LEN = prompt_length(_Tokenizer(), CARD, 0, False, TINY_SPEC.frame_samples)
@@ -86,7 +99,13 @@ def _step(runtime: HaruRuntime, rows: list[tuple[str, int, dict]], token: int = 
     logits = runtime.adjust_logits(hidden, torch.zeros(len(rows), VOCAB))
     assert logits.dtype == torch.float32
     runtime.record_sampled([[token] for _ in rows])
-    return runtime.finish_step([request_id for request_id, _, _ in rows])
+    # The engine discards the token of a row whose prompt has not reached its end yet.
+    invalid = [
+        i
+        for i, (_, span, info) in enumerate(rows)
+        if info["_omni_num_computed_tokens"] + span < info["_omni_prompt_len"]
+    ]
+    return runtime.finish_step([request_id for request_id, _, _ in rows], invalid)
 
 
 def test_prompt_then_live_frames_each_return_one_audio_frame(runtime: HaruRuntime) -> None:
@@ -141,7 +160,7 @@ def test_rows_without_a_conversation_use_plain_token_embeddings(runtime: HaruRun
     torch.testing.assert_close(embeds, runtime._model.embedding(ids))
     runtime.adjust_logits(torch.zeros(1, HIDDEN), torch.zeros(1, VOCAB))
     runtime.record_sampled([[EOS]])
-    assert runtime.finish_step(["warmup"])["model_outputs"] == []
+    assert runtime.finish_step(["warmup"], [])["model_outputs"] == []
 
 
 def test_mismatched_step_rows_are_rejected(runtime: HaruRuntime) -> None:
@@ -149,3 +168,12 @@ def test_mismatched_step_rows_are_rejected(runtime: HaruRuntime) -> None:
     runtime.add_row(torch.zeros(2, dtype=torch.long), None, _info("r1", 0, PROMPT_LEN, first=True))
     with pytest.raises(RuntimeError, match="logit rows"):
         runtime.adjust_logits(torch.zeros(2, HIDDEN), torch.zeros(2, VOCAB))
+
+
+def test_a_sampling_row_the_engine_discards_fails_loudly(runtime: HaruRuntime) -> None:
+    runtime.begin_step()
+    embeds = runtime.add_row(torch.zeros(PROMPT_LEN, dtype=torch.long), None, _info("r1", 0, PROMPT_LEN, first=True))
+    runtime.adjust_logits(embeds[-1:], torch.zeros(1, VOCAB))
+    runtime.record_sampled([[3]])
+    with pytest.raises(RuntimeError, match="disagree on whether it sampled"):
+        runtime.finish_step(["r1"], [0])

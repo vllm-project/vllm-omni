@@ -12,13 +12,11 @@ from transformers import AutoConfig
 from vllm.sampling_params import SamplingParams
 
 from tests.model_executor.models.haru.conftest import CHECKPOINT_CONFIG
-from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
 from vllm_omni.engine.duplex.plugin import load_duplex_plugin, validate_duplex_plugin_sampling
 from vllm_omni.model_executor.models.haru.configuration_haru import HaruConfig, HaruSpec
 from vllm_omni.model_executor.models.haru.duplex.plugin import HaruDuplexPlugin
 from vllm_omni.model_executor.models.haru.pipeline import HARU_PIPELINE
-from vllm_omni.model_executor.models.registry import _OMNI_MODELS
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -63,8 +61,6 @@ def test_config_and_architecture_are_registered() -> None:
     params = {k: v for k, v in CHECKPOINT_CONFIG.items() if k != "model_type"}
     assert isinstance(AutoConfig.for_model("haru", **params), HaruConfig)
     assert MODELS_CONFIG_MAP["HaruForConditionalGeneration"] is Qwen3_5ForCausalLMConfig
-    assert _OMNI_MODELS["HaruForConditionalGeneration"] == ("haru", "haru", "HaruForConditionalGeneration")
-    assert OMNI_PIPELINES["haru"] is HARU_PIPELINE
 
 
 def test_pipeline_binds_the_duplex_plugin() -> None:

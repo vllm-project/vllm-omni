@@ -144,7 +144,14 @@ def test_haru_realtime_duplex_two_sessions(omni_server) -> None:
     async def staggered():
         started = asyncio.Event()
         first = asyncio.create_task(_session(url, voice, frames, started))
-        await started.wait()  # the second conversation joins while the first is live
+        waiter = asyncio.create_task(started.wait())
+        # The second conversation joins while the first is live; a first session that fails early
+        # surfaces its error here instead of leaving the wait to hang.
+        await asyncio.wait({first, waiter}, timeout=600, return_when=asyncio.FIRST_COMPLETED)
+        waiter.cancel()
+        if first.done():
+            first.result()
+        assert started.is_set(), "the first session returned no frame"
         return await asyncio.gather(first, _session(url, voice, frames))
 
     for outputs, transcript in asyncio.run(staggered()):

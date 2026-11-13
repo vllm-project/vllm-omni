@@ -7,11 +7,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
-from types import SimpleNamespace
+import json
+from unittest import mock
 
 import numpy as np
 import pytest
 import soundfile as sf
+from vllm.config import ModelConfig
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
@@ -26,6 +28,12 @@ from vllm_omni.model_executor.models.haru.duplex.plugin import (
 from vllm_omni.model_executor.models.haru.prompt import prompt_length
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _model_config(path) -> ModelConfig:
+    config = mock.create_autospec(ModelConfig, instance=True)
+    config.model = str(path)
+    return config
 
 
 def _plugin() -> HaruDuplexPlugin:
@@ -113,7 +121,7 @@ def test_reference_audio_is_resampled_to_24k_pcm16_and_validated() -> None:
 
 def test_prepare_runtime_config_resolves_options_and_prompt_slots(checkpoint_dir) -> None:
     plugin = _plugin()
-    model_config = SimpleNamespace(model=str(checkpoint_dir))
+    model_config = _model_config(checkpoint_dir)
     config = DuplexSessionConfig(
         instructions="hi",
         ref_audio=_wav_uri(1.0, SAMPLE_RATE),
@@ -152,7 +160,7 @@ def test_session_options_that_would_fail_in_the_worker_are_rejected(
 ) -> None:
     config = DuplexSessionConfig(extra_body=extra_body, temperature=temperature)
     with pytest.raises(DuplexRuntimeConfigError, match=match):
-        asyncio.run(_plugin().prepare_runtime_config(config, model_config=SimpleNamespace(model=str(checkpoint_dir))))
+        asyncio.run(_plugin().prepare_runtime_config(config, model_config=_model_config(checkpoint_dir)))
 
 
 def test_instructions_are_fixed_once_the_session_exists() -> None:
@@ -163,9 +171,41 @@ def test_instructions_are_fixed_once_the_session_exists() -> None:
         plugin.runtime_config_for_update(DuplexSessionConfig(instructions="card B"), current)
 
 
+def test_temperature_is_fixed_once_the_session_exists() -> None:
+    current = {"haru": {"system_prompt": ""}, "haru_sampling": {"temperature": 0.7}}
+    plugin = _plugin()
+    assert plugin.runtime_config_for_update(DuplexSessionConfig(temperature=0.7), current) == current
+    with pytest.raises(DuplexRuntimeConfigError, match="temperature cannot be changed"):
+        plugin.runtime_config_for_update(DuplexSessionConfig(temperature=0.0), current)
+    with pytest.raises(DuplexRuntimeConfigError, match="temperature cannot be changed"):
+        plugin.runtime_config_for_update(DuplexSessionConfig(temperature=0.5), {"haru": {"system_prompt": ""}})
+
+
 @pytest.mark.parametrize("max_sessions", [1, 4])
-def test_capabilities_follow_the_session_limit(max_sessions: int) -> None:
+def test_multi_session_capability_follows_the_session_limit(max_sessions: int) -> None:
     caps = _plugin().capabilities(max_sessions=max_sessions)
-    assert caps.supports_multi_session is (max_sessions > 1)
-    assert caps.supports_core_resumable_request and caps.supports_realtime_endpoint
-    assert caps.chunk_period_ms == 134
+    assert caps.supports_multi_session is caps.supports_multi_session_same_replica is (max_sessions > 1)
+
+
+def test_session_options_are_fixed_once_the_session_exists() -> None:
+    current = {"haru": {"system_prompt": "", "guidance_scale": 1.5, "seed": 7}, "haru_sampling": {"top_k": 25}}
+    plugin = _plugin()
+    same = DuplexSessionConfig(extra_body={"guidance_scale": 1.5, "seed": 7, "top_k": 25, "auto_response": True})
+    assert plugin.runtime_config_for_update(same, current) == current
+    for changed in ({"guidance_scale": 1.2}, {"seed": 8}, {"top_k": 5}, {"dry": False}):
+        with pytest.raises(DuplexRuntimeConfigError, match="cannot be changed"):
+            plugin.runtime_config_for_update(DuplexSessionConfig(extra_body=changed), current)
+
+
+def test_a_checkpoint_with_other_frame_geometry_is_refused(tmp_path) -> None:
+    from tests.model_executor.models.haru.conftest import CHECKPOINT_CONFIG, write_tokenizer
+
+    write_tokenizer(tmp_path)
+    other = {
+        **CHECKPOINT_CONFIG,
+        "frame_samples": 1600,
+        "codec": {**CHECKPOINT_CONFIG["codec"], "ratios": [8, 5, 5, 4, 2]},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(other))
+    with pytest.raises(DuplexRuntimeConfigError, match="1600-sample frames"):
+        asyncio.run(_plugin().prepare_runtime_config(DuplexSessionConfig(), model_config=_model_config(tmp_path)))

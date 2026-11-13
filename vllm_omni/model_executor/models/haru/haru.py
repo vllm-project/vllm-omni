@@ -132,7 +132,7 @@ class HaruForConditionalGeneration(Qwen3_5ForCausalLM):
     ) -> dict[str, Any] | None:
         if not self.runtime.has_rows:
             return multimodal_outputs
-        return self.runtime.finish_step(list(req_ids))
+        return self.runtime.finish_step(list(req_ids), list(invalid_req_indices))
 
     # ------------------------------------------------------------ weights
 

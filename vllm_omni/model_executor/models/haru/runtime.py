@@ -219,12 +219,18 @@ class HaruRuntime:
         self._sampled = [list(tokens) for tokens in sampled]
 
     @torch.no_grad()
-    def finish_step(self, request_ids: list[str]) -> dict[str, Any]:
+    def finish_step(self, request_ids: list[str], invalid_req_indices: list[int]) -> dict[str, Any]:
         """Generate and decode the audio of every frame sampled in this step."""
         rows, sampled, hidden = self._rows, self._sampled, self._hidden
         self.begin_step()
         if request_ids != [row.request_id for row in rows] or sampled is None or hidden is None:
             raise RuntimeError("post-sample rows do not match the scheduled requests")
+        # The engine discards the token of a row that has not reached the end of its prompt; a conversation
+        # advances its stateful codec here, so both views must agree (state cannot be recomputed).
+        invalid = set(invalid_req_indices)
+        for index, row in enumerate(rows):
+            if row.conversation is not None and row.samples == (index in invalid):
+                raise RuntimeError(f"the engine and conversation {row.request_id!r} disagree on whether it sampled")
         active = [
             index for index, row in enumerate(rows) if row.conversation is not None and row.samples and sampled[index]
         ]
