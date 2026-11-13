@@ -24,10 +24,6 @@ from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
     LATENT_LEFT_CONTEXT,
     PATCH_SIZE,
 )
-from vllm_omni.model_executor.models.ming_tts.constants import (
-    KEY_DECODE_STEP,
-    KEY_FINAL_DECODE_STEP,
-)
 
 logger = init_logger(__name__)
 
@@ -55,50 +51,13 @@ def _select_snapshot_value(value: Any, selected_index: int | torch.Tensor) -> An
     return value
 
 
-def _extract_snapshot_metadata(
-    pooling_output: Mapping[str, Any],
-    selected_index: int | torch.Tensor,
-) -> tuple[Any, Any]:
-    decode_step_value = pooling_output.get(KEY_DECODE_STEP)
-    stop_reason_value = pooling_output.get(KEY_STOP_REASON)
-    if isinstance(selected_index, torch.Tensor) and (
-        isinstance(decode_step_value, (list, tuple)) or isinstance(stop_reason_value, (list, tuple))
-    ):
-        selected_index = int(selected_index.item())
-
-    final_decode_step = _select_snapshot_value(decode_step_value, selected_index)
-    stop_reason_code = _select_snapshot_value(stop_reason_value, selected_index)
-
-    if (
-        isinstance(final_decode_step, torch.Tensor)
-        and isinstance(stop_reason_code, torch.Tensor)
-        and final_decode_step.device == stop_reason_code.device
-    ):
-        final_decode_step, stop_reason_code = (
-            torch.stack(
-                (
-                    final_decode_step.to(torch.int64),
-                    stop_reason_code.to(torch.int64),
-                )
-            )
-            .cpu()
-            .tolist()
-        )
-    else:
-        if isinstance(final_decode_step, torch.Tensor):
-            final_decode_step = final_decode_step.item()
-        if isinstance(stop_reason_code, torch.Tensor):
-            stop_reason_code = stop_reason_code.item()
-    return final_decode_step, stop_reason_code
-
-
 def _extract_ming_output_snapshot(
     pooling_output: Mapping[str, Any] | None,
     *,
     all_patches: bool = False,
-) -> tuple[torch.Tensor | None, Any, str | None]:
+) -> tuple[torch.Tensor | None, str | None]:
     if not isinstance(pooling_output, Mapping):
-        return None, None, None
+        return None, None
 
     has_patch = pooling_output.get("ming_has_patch")
     active: torch.Tensor | None = None
@@ -108,7 +67,7 @@ def _extract_ming_output_snapshot(
         if all_patches:
             active = patch_mask.nonzero(as_tuple=True)[0]
             if active.numel() == 0:
-                return None, None, None
+                return None, None
             selected_index = active[-1]
         else:
             reversed_mask = patch_mask.flip(0)
@@ -123,7 +82,7 @@ def _extract_ming_output_snapshot(
                 .tolist()
             )
             if not has_active:
-                return None, None, None
+                return None, None
             selected_index = patch_mask.numel() - 1 - reverse_offset
 
     patch = pooling_output.get("ming_latent_patch")
@@ -146,8 +105,13 @@ def _extract_ming_output_snapshot(
 
         selected_patch = selected_patch.to(torch.float32).cpu() if selected_patch.numel() > 0 else None
 
-    final_decode_step, stop_reason_code = _extract_snapshot_metadata(pooling_output, selected_index)
-    return selected_patch, final_decode_step, _decode_stop_reason(stop_reason_code)
+    stop_reason_value = pooling_output.get(KEY_STOP_REASON)
+    if isinstance(selected_index, torch.Tensor) and isinstance(stop_reason_value, (list, tuple)):
+        selected_index = int(selected_index.item())
+    stop_reason_code = _select_snapshot_value(stop_reason_value, selected_index)
+    if isinstance(stop_reason_code, torch.Tensor):
+        stop_reason_code = stop_reason_code.item()
+    return selected_patch, _decode_stop_reason(stop_reason_code)
 
 
 def _decode_stop_reason(value: Any) -> str | None:
@@ -242,7 +206,7 @@ def llm2audio_vae_async_chunk(
     if bool(state.get("terminal_sent", False)):
         return None
 
-    patch, final_decode_step, stop_reason = _extract_ming_output_snapshot(pooling_output)
+    patch, stop_reason = _extract_ming_output_snapshot(pooling_output)
     if patch is not None:
         transfer_manager.code_prompt_token_ids[request_id].append(patch)
 
@@ -260,8 +224,6 @@ def llm2audio_vae_async_chunk(
                 KEY_REQUEST_ID: request_id,
                 **observability,
             }
-            if final_decode_step is not None:
-                kv_meta[KEY_FINAL_DECODE_STEP] = int(final_decode_step)
             if stop_reason is not None:
                 kv_meta[KEY_STOP_REASON] = stop_reason
             state["terminal_sent"] = True
@@ -296,8 +258,6 @@ def llm2audio_vae_async_chunk(
         KEY_REQUEST_ID: request_id,
         **observability,
     }
-    if final_decode_step is not None:
-        kv_meta[KEY_FINAL_DECODE_STEP] = int(final_decode_step)
     if stop_reason is not None:
         kv_meta[KEY_STOP_REASON] = stop_reason
     if finished:
@@ -329,7 +289,7 @@ def llm2audio_vae(
         if not finished:
             continue
         output = stage_output.outputs[0]
-        patches, final_decode_step, stop_reason = _extract_ming_output_snapshot(
+        patches, stop_reason = _extract_ming_output_snapshot(
             output.multimodal_output,
             all_patches=True,
         )
@@ -340,8 +300,6 @@ def llm2audio_vae(
             KEY_REQUEST_ID: getattr(stage_output, "request_id", None),
             "finished": torch.tensor(finished, dtype=torch.bool),
         }
-        if final_decode_step is not None:
-            additional_information[KEY_FINAL_DECODE_STEP] = int(final_decode_step)
         if stop_reason is not None:
             additional_information[KEY_STOP_REASON] = stop_reason
         outputs.append(

@@ -10,7 +10,6 @@ import torch
 
 from vllm_omni.model_executor.models.ming_tts.constants import (
     KEY_CHUNK_ID,
-    KEY_FINAL_DECODE_STEP,
     KEY_REQUEST_ID,
     KEY_STOP_REASON,
     LATENT_DIM,
@@ -72,6 +71,52 @@ def _append_patch(tm, req_id: str, idx: int, *, finished: bool = False):
     )
 
 
+@pytest.mark.parametrize("consumer", ["snapshot", "full_payload", "async_chunk", "terminal_flush"])
+def test_ming_snapshot_consumers_ignore_unused_decode_step(consumer):
+    class SnapshotOutput(dict):
+        def get(self, key, default=None):
+            if key == "ming_decode_step":
+                raise AssertionError("Snapshot consumers must not read unused decode-step metadata")
+            return super().get(key, default)
+
+    pooling_output = SnapshotOutput(
+        {
+            "ming_decode_step": torch.tensor([17]),
+            KEY_STOP_REASON: torch.tensor([2]),
+        }
+    )
+    if consumer != "terminal_flush":
+        pooling_output.update(_make_output(1.0))
+
+    if consumer == "snapshot":
+        latent, stop_reason = _extract_ming_output_snapshot(pooling_output)
+        torch.testing.assert_close(latent, pooling_output["ming_latent_patch"][0])
+        assert stop_reason == "max_decode_steps"
+        return
+
+    if consumer == "full_payload":
+        stage_output = SimpleNamespace(
+            finished=True,
+            request_id="req",
+            outputs=[SimpleNamespace(multimodal_output=pooling_output)],
+        )
+        outputs = llm2audio_vae([stage_output])
+        metadata = outputs[0]["additional_information"]
+    else:
+        payload = llm2audio_vae_async_chunk(
+            _make_transfer_manager(),
+            pooling_output,
+            _make_request(finished=True),
+        )
+        assert payload is not None
+        metadata = payload.kv_metadata
+        assert payload.meta.finished.item() is True
+
+    assert "ming_final_decode_step" not in metadata
+    assert metadata[KEY_REQUEST_ID] == "req"
+    assert metadata[KEY_STOP_REASON] == "max_decode_steps"
+
+
 def test_ming_output_snapshot_selects_last_active_row():
     patches = torch.arange(3 * PATCH_SIZE * LATENT_DIM, dtype=torch.float32).reshape(
         3,
@@ -85,10 +130,9 @@ def test_ming_output_snapshot_selects_last_active_row():
         KEY_STOP_REASON: torch.tensor([0, 1, 2]),
     }
 
-    patch, decode_step, stop_reason = _extract_ming_output_snapshot(pooling_output)
+    patch, stop_reason = _extract_ming_output_snapshot(pooling_output)
 
     torch.testing.assert_close(patch, patches[2])
-    assert decode_step == 33
     assert stop_reason == "max_decode_steps"
 
 
@@ -105,13 +149,12 @@ def test_ming_output_snapshot_selects_all_active_rows_for_full_payload():
         KEY_STOP_REASON: torch.tensor([0, 1, 2]),
     }
 
-    selected, decode_step, stop_reason = _extract_ming_output_snapshot(
+    selected, stop_reason = _extract_ming_output_snapshot(
         pooling_output,
         all_patches=True,
     )
 
     torch.testing.assert_close(selected, patches[[0, 2]])
-    assert decode_step == 33
     assert stop_reason == "max_decode_steps"
 
 
@@ -123,7 +166,7 @@ def test_ming_output_snapshot_returns_empty_when_no_row_is_active():
         KEY_STOP_REASON: torch.tensor([0, 1]),
     }
 
-    assert _extract_ming_output_snapshot(pooling_output) == (None, None, None)
+    assert _extract_ming_output_snapshot(pooling_output) == (None, None)
 
 
 def test_ming_output_snapshot_preserves_list_metadata_fallback():
@@ -139,10 +182,9 @@ def test_ming_output_snapshot_preserves_list_metadata_fallback():
         KEY_STOP_REASON: [0, 1],
     }
 
-    patch, decode_step, stop_reason = _extract_ming_output_snapshot(pooling_output)
+    patch, stop_reason = _extract_ming_output_snapshot(pooling_output)
 
     torch.testing.assert_close(patch, patches[1])
-    assert decode_step == 22
     assert stop_reason == "stop_head"
 
 
@@ -170,8 +212,6 @@ def test_ming_snapshot_keys_use_canonical_constants():
     from vllm_omni.model_executor.models.common.ming.continuous_tts import STOP_REASON_BY_CODE
     from vllm_omni.model_executor.stage_input_processors import ming_tts
 
-    assert KEY_FINAL_DECODE_STEP == "ming_final_decode_step"
-    assert ming_tts.KEY_FINAL_DECODE_STEP == KEY_FINAL_DECODE_STEP
     assert ming_tts.KEY_STOP_REASON == KEY_STOP_REASON
     assert ming_tts.STOP_REASON_BY_CODE is STOP_REASON_BY_CODE
 
@@ -202,12 +242,11 @@ def test_ming_output_snapshot_tensor_mask_selects_sequence_metadata_once(monkeyp
     with monkeypatch.context() as context:
         context.setattr(torch.Tensor, "item", counted_item)
         context.setattr(torch.Tensor, "__int__", counted_int)
-        selected, decode_step, stop_reason = _extract_ming_output_snapshot(pooling_output, all_patches=all_patches)
+        selected, stop_reason = _extract_ming_output_snapshot(pooling_output, all_patches=all_patches)
 
     assert len(item_calls) == int(all_patches)
     assert not int_calls
     torch.testing.assert_close(selected, patches[:2] if all_patches else patches[1])
-    assert decode_step == 22
     assert stop_reason == "stop_head"
 
 
@@ -240,7 +279,7 @@ def test_ming_two_dimensional_patch_preserves_consumer_payload(full_payload):
     torch.testing.assert_close(latents, patch.float().unsqueeze(0))
     assert latents.device.type == "cpu"
     assert metadata[KEY_REQUEST_ID] == "req"
-    assert metadata[KEY_FINAL_DECODE_STEP] == 17
+    assert "ming_final_decode_step" not in metadata
     assert metadata[KEY_STOP_REASON] == "max_decode_steps"
 
 
@@ -270,7 +309,7 @@ def test_ming_full_payload_reuses_snapshot_for_patches_and_metadata():
         additional_information["ming_latent_patches"],
         patches[[0, 2]],
     )
-    assert additional_information[KEY_FINAL_DECODE_STEP] == 33
+    assert "ming_final_decode_step" not in additional_information
     assert additional_information[KEY_STOP_REASON] == "max_decode_steps"
 
 
@@ -322,7 +361,7 @@ def test_ming_async_chunk_preserves_selected_final_metadata():
     torch.testing.assert_close(payload.latent, patches[1:2])
     assert payload.kv_metadata[KEY_REQUEST_ID] == "req"
     assert payload.kv_metadata[KEY_CHUNK_ID] == 3
-    assert payload.kv_metadata[KEY_FINAL_DECODE_STEP] == 22
+    assert "ming_final_decode_step" not in payload.kv_metadata
     assert payload.kv_metadata[KEY_STOP_REASON] == "stop_head"
     assert payload.kv_metadata[MING_EMIT_PATCH_COUNT_KEY] == 1
     assert payload.kv_metadata[MING_LATENT_SHAPE_KEY] == (1, PATCH_SIZE, LATENT_DIM)
@@ -348,7 +387,7 @@ def test_ming_async_chunk_zero_patch_terminal_flush_preserves_metadata():
     assert payload.codes.audio.numel() == 0
     assert payload.kv_metadata[KEY_REQUEST_ID] == "req"
     assert payload.kv_metadata[KEY_CHUNK_ID] == 1
-    assert payload.kv_metadata[KEY_FINAL_DECODE_STEP] == 23
+    assert "ming_final_decode_step" not in payload.kv_metadata
     assert payload.kv_metadata[KEY_STOP_REASON] == "max_decode_steps"
     assert payload.kv_metadata[MING_EMIT_PATCH_COUNT_KEY] == 0
     assert payload.kv_metadata[MING_LATENT_SHAPE_KEY] is None
@@ -413,7 +452,7 @@ def test_ming_worker_loads_hook_and_builds_terminal_payload(metadata_only):
         assert payload is not None
         assert payload.kv_metadata[KEY_REQUEST_ID] == "external-req"
         assert payload.kv_metadata[KEY_CHUNK_ID] == 3
-        assert payload.kv_metadata[KEY_FINAL_DECODE_STEP] == 22
+        assert "ming_final_decode_step" not in payload.kv_metadata
         assert payload.kv_metadata[KEY_STOP_REASON] == "stop_head"
         assert payload.meta.finished.item() is True
         assert payload.meta.stream_finished.item() is True
