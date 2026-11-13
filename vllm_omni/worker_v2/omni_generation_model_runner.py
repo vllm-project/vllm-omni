@@ -17,7 +17,6 @@ from typing import Any, Protocol
 import numpy as np
 import torch
 from vllm.config.compilation import CUDAGraphMode
-from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     get_ep_all2all_manager,
@@ -465,12 +464,9 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             assert batch_req_state is not None
             input_batch = self.prepare_inputs(scheduler_output, batch_req_state, batch_desc, 0)
         else:
-            from vllm.v1.worker.gpu.input_batch import InputBatch
-
-            input_batch = InputBatch.make_dummy(
+            input_batch = self._make_dummy_input_batch(
                 batch_desc.num_reqs or num_reqs,
                 batch_desc.num_tokens,
-                self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
                 is_padding=not is_profile,
             )
@@ -516,7 +512,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             has_lora=self.lora_config is not None,
             num_active_loras=batch_desc.num_active_loras,
         )
-        with set_forward_context(
+        with self._forward_context(
             attn_metadata,
             self.vllm_config,
             num_tokens=input_batch.num_tokens_after_padding,
@@ -649,7 +645,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 self._release_generation_slots(input_batch, keep=pending)
             return async_output
 
-        # CPU execution keeps the synchronous materialization path. Final
+        # Non-CUDA execution keeps the synchronous materialization path. Final
         # generation stages publish audio only through multimodal_outputs,
         # matching the V1 generation-runner contract.
         self._reserve_native_data_plane_outputs(list(req_ids))

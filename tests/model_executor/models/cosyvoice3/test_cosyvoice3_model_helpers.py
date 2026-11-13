@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from threading import Lock
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -1277,6 +1278,42 @@ def test_packed_flow_preserves_torch_estimator_when_speaker_trt_is_enabled(monke
     assert model._code2wav_trt_done
 
 
+@pytest.mark.parametrize("compile_dit", [None, False, True], ids=["missing", "disabled", "enabled"])
+def test_dit_compile_selection_controls_only_the_flow_trt_swap(monkeypatch, compile_dit):
+    from vllm_omni.model_executor.models.cosyvoice3 import flow_estimator_trt
+
+    model = _make_code2wav_model()
+    if compile_dit is not None:
+        model.config.cosyvoice3_compile_dit = compile_dit
+    model._code2wav_trt_done = False
+    decoder = nn.Module()
+    estimator = nn.Linear(2, 2)
+    decoder.estimator = estimator
+    model.code2wav.flow_model = SimpleNamespace(decoder=decoder)
+    resolver = Mock(return_value="flow.decoder.estimator.fp32.onnx")
+    wrapper = object()
+    builder = Mock(return_value=wrapper)
+    monkeypatch.setattr(model, "_resolve_flow_estimator_onnx", resolver)
+    monkeypatch.setattr(flow_estimator_trt, "build_flow_estimator_trt", builder)
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_inference_enabled", lambda: False)
+    monkeypatch.setattr(cosyvoice3.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setenv("COSYVOICE3_TRT", "1")
+
+    model._maybe_enable_code2wav_trt()
+    model._maybe_enable_code2wav_trt()
+
+    assert model._code2wav_trt_done
+    assert cosyvoice3._cosyvoice3_trt_enabled()
+    if compile_dit:
+        assert decoder.estimator is estimator
+        resolver.assert_not_called()
+        builder.assert_not_called()
+    else:
+        assert decoder.estimator is wrapper
+        resolver.assert_called_once_with()
+        builder.assert_called_once_with("flow.decoder.estimator.fp32.onnx", device="cuda")
+
+
 def test_standard_sampling_preserves_parameters_and_excludes_prompt_penalties(monkeypatch):
     model = _make_talker_model()
     model.config.cosyvoice3_sampling_mode = "standard"
@@ -1436,9 +1473,10 @@ def test_ras_mrv2_sample_matches_sampling_states_top_k_top_p():
     assert params == ["self", "expanded_idx_mapping", "idx_mapping_np", "vocab_size"]
 
 
-def test_ras_mrv2_sample_applies_logit_bias_and_no_other_logits_processor(monkeypatch):
+def test_ras_mrv2_sample_preserves_request_constraints_and_skips_penalties(monkeypatch):
     from vllm.v1.worker.gpu.sample import gumbel
     from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+    from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 
     vocab = 8
     seen = []
@@ -1452,9 +1490,18 @@ def test_ras_mrv2_sample_applies_logit_bias_and_no_other_logits_processor(monkey
             logits[:, 5] += 100.0
             return logits
 
-    class Penalty:
+    class Penalty(PenaltiesState):
+        def __init__(self):
+            pass
+
         def apply(self, logits, ctx):
             raise AssertionError("RAS applies no penalties")
+
+    class RequestConstraint:
+        def apply(self, logits, ctx):
+            seen.append(ctx)
+            logits[:, 5] = -torch.inf
+            return logits
 
     # A deterministic stand-in for the device Gumbel kernel.
     monkeypatch.setattr(gumbel, "gumbel_sample", lambda logits, *args, **kwargs: logits.argmax(dim=-1))
@@ -1469,7 +1516,7 @@ def test_ras_mrv2_sample_applies_logit_bias_and_no_other_logits_processor(monkey
         get_top_k_top_p=lambda rows, rows_np, vocab_size: (top_k[rows.long()], top_p[rows.long()], False),
     )
     sampler = SimpleNamespace(
-        logits_processors=[Bias(), Penalty()],
+        logits_processors=[Bias(), Penalty(), RequestConstraint()],
         sampling_states=states,
         req_states=SimpleNamespace(
             all_token_ids=SimpleNamespace(gpu=torch.zeros((2, 16), dtype=torch.int64)),
@@ -1495,7 +1542,9 @@ def test_ras_mrv2_sample_applies_logit_bias_and_no_other_logits_processor(monkey
         tau_r=0.1,
         eps=1e-5,
     )
-    assert sampled.tolist() == [5, 5]
+    assert sampled.tolist() == [0, 0]
+    assert len(seen) == 2
+    assert seen[0] is seen[1]
     assert seen[0].seq_lens_upper_bound_np.tolist() == [16, 16]
 
 

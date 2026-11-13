@@ -59,6 +59,7 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import 
     to_device_async,
 )
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
+    compile_cosyvoice3_padded_dit,
     cosyvoice3_batch_flow_debug,
     cosyvoice3_batch_flow_profile,
     cosyvoice3_flow_prefix_cache_bytes,
@@ -1251,3 +1252,6 @@ class CosyVoice3Code2Wav(nn.Module):
                 self.hift.enable_decode_graphs()
                 logger.info("CosyVoice3 streaming HiFT: decode CUDA graphs enabled")
         logger.info(f"Loaded hift weights from {hift_path}")
+        if self.config.cosyvoice3_compile_dit:
+            compile_cosyvoice3_padded_dit(self.flow_model.decoder.estimator, device)
+            logger.info("CosyVoice3 padded DiT compilation configured; first-use compilation occurs during warmup")
