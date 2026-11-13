@@ -4,7 +4,7 @@
 """Isolated AsyncOmni abort / sleep-admission regression for Qwen3-Omni.
 
 Nightly collects this module with the other single-GPU ``full_model`` omni
-tests. It stays in its own file so it does not share those modules' runners.
+tests under ``tests/e2e``.
 
 Both tests share one module-scoped AsyncOmni (the ``async_omni_runner``
 fixture, shadowed here only to wait for that teardown). ``wake_up`` /

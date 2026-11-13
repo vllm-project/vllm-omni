@@ -260,7 +260,7 @@ steps:
             bash -c 'source tests/e2e/accuracy/qwen_image_21/setup_reference.sh &&
             exec pytest -sv tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py
             -m "full_model and diffusion and H100 and cards_1"
-            --run-level full_model
+            --run-level full_model'
 
       - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
         source_file_dependencies: diffusion_hunyuan_image3_accuracy
