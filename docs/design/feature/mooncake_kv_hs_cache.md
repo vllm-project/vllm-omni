@@ -172,7 +172,9 @@ remains best effort.
 ## Deferred two-level cache cooperation
 
 M1 does not combine Mooncake with local Thinker prefix caching. Combining the
-two is outside M1 and needs the follow-up below.
+two is outside M1 and is tracked in
+[feature issue #10335](https://github.com/vllm-project/vllm-omni/issues/10335),
+using the design and acceptance criteria below.
 
 **Current limitation.** Local prefix hits and external loads both advance
 `num_computed_tokens`. A local hit finds its Thinker rows in

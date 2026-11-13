@@ -143,10 +143,13 @@ talker_dspark_params = [
             stage_config_path=modify_stage_config(
                 get_deploy_config_path("minicpmo_4_5_turn_mrv2.yaml"),
                 updates={
-                    # The temporary overlay lives outside deploy/, so anchor its parent.
-                    "base_config": get_deploy_config_path("minicpmo_4_5_turn.yaml"),
-                    # The CUDA block owns stage 1's speculative_config (index 0 is stage 1).
-                    "platforms.cuda.stages.0.speculative_config": {
+                    # modify_stage_config resolves the base chain
+                    # (turn_mrv2 -> turn -> minicpmo_4_5), so the overlay is
+                    # self-contained and needs no base_config re-anchoring.
+                    # The resolved CUDA stage list is [stage 0 (Thinker),
+                    # stage 1 (Talker)]: index 1 is the Talker that owns
+                    # the DSpark draft.
+                    "platforms.cuda.stages.1.speculative_config": {
                         "method": "dspark",
                         "model": str(_TALKER_DRAFT_DIR),
                         "num_speculative_tokens": 7,
