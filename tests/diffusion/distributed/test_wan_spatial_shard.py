@@ -863,8 +863,10 @@ def test_encode_keeps_the_regular_path_for_a_4d_input(monkeypatch: pytest.Monkey
         lambda vae, x, *, group, split_dim: pytest.fail("sharded encode took a 4D input"),
     )
     sentinel = object()
+    # The regular path is whatever OmniAutoencoderKLWan._encode does; it needs a fully built
+    # nn.Module (attention alignment walks named_modules), which this gate VAE is not.
     monkeypatch.setattr(
-        "diffusers.models.autoencoders.autoencoder_kl_wan.AutoencoderKLWan._encode",
+        "vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan.OmniAutoencoderKLWan._encode",
         lambda self, x: sentinel,
     )
 
