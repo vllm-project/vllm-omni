@@ -668,6 +668,9 @@ retain state across audio frames or requests. Qwen3-TTS enables this option
 by default when NPU frame graphs are enabled. Set it to false to use full
 re-prefill frame graphs. Disabling frame graphs also disables the implicit
 KV default; unsupported calls still use the existing re-prefill fallback.
+If frame capture fails or is skipped and no shared KV path is active, predictor setup
+warns that the requested KV cache is unavailable. The warning follows capture
+results, not just the requested graph flag.
 `code_predictor_fused_sampling: true` enables a separate sampling kernel and is
 enabled by default only for Qwen3-TTS on NPU. CUDA and other models retain
 their existing defaults; missing Triton uses reference sampling. Sampling retains the original per-request uniform
@@ -803,15 +806,20 @@ model and workload rather than assuming byte-identical audio.
 This combination was exercised with Qwen3-TTS 1.7B CustomVoice and Base on
 Ascend 910B1. It does not qualify other Ascend SKUs or Model Runner V1. To use
 V1 on NPU, also set stage 0 `cudagraph_mode: PIECEWISE` in the NPU platform
-section of a copied deployment configuration. Earlier integration smoke tests
-with `FULL_DECODE_ONLY` exhausted generation limits; those historical results
-neither qualify nor describe the current V2 combination.
+section of a copied deployment configuration. V1 full decode graphs can start
+and replay but exhaust generation limits: a matched short-input smoke test
+with `FULL_AND_PIECEWISE` reached the token ceiling, while `PIECEWISE` completed
+normally. The Talker now rejects NPU V1 full decode modes before loading
+weights. V1 `PIECEWISE`, `NONE` and eager execution remain available. This
+configuration check does not qualify V1 performance or audio quality.
 
 ### NPU Model Runner V2 sampling inputs
 
 The standard Qwen3-TTS NPU profile selects Model Runner V2. Sampling uniforms
 are prepared from request-local generators independently of the outer MTP graph
-wrapper. This lets predictor-owned frame graphs and fused sampling consume them
+wrapper on NPU. Other backends keep request-local per-step generators when
+the outer MTP wrapper is absent; their graph paths still prepare uniform
+tensors. This lets NPU predictor-owned frame graphs and fused sampling consume them
 under PIECEWISE or when nested outer graphs are disabled. Graph padding retains
 its own rows; seeded active rows keep request-local random streams. The changed
 random draw granularity requires fresh end-to-end quality and performance

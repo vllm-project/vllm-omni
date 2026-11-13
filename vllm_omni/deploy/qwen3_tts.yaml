@@ -162,11 +162,15 @@ platforms:
         # Stage 1 eager on ROCm so decoder convolutions execute normally.
         enforce_eager: true
   npu:
+    # V1 opt-out also requires stage 0 cudagraph_mode: PIECEWISE (or NONE).
+    # V1 full decode graphs can exhaust the generation budget; the Talker
+    # rejects that combination before loading weights.
     model_runner: v2
     stages:
       - stage_id: 0
         enforce_eager: false
         compilation_config:
+          # Full decode graphs require Model Runner V2 on NPU.
           cudagraph_mode: FULL_AND_PIECEWISE
       - stage_id: 1
         compilation_config:

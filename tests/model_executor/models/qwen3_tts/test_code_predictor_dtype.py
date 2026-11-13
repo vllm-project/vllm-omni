@@ -1581,3 +1581,33 @@ def test_eager_kv_preserves_graph_paths(mocker, loaded_target_classes, platform,
     assert cuda.called is (capture == "cuda")
     assert npu.called is (capture == "npu")
     assert compile_model.called is (platform == "cuda")
+
+
+@pytest.mark.parametrize("captured,shared_kv,warns", [(False, False, True), (True, False, False), (False, True, False)])
+def test_npu_kv_warning_uses_completed_capture(mocker, loaded_target_classes, captured, shared_kv, warns):
+    _, _, wrapper_class, _, _ = loaded_target_classes
+    common = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+    module = sys.modules[wrapper_class.__module__]
+    predictor = object.__new__(wrapper_class)
+    torch.nn.Module.__init__(predictor)
+    predictor._compiled_model_fwd = None
+    predictor._kv_requested = True
+    predictor._kv_cache_enabled = shared_kv
+    predictor._frame_graph_requested = True
+    predictor._frame_graphs = {}
+    mocker.patch.object(common.current_omni_platform, "is_cuda", return_value=False)
+    mocker.patch.object(common.current_omni_platform, "is_npu", return_value=True)
+
+    def prepare(self):
+        self._compiled_model_fwd = lambda: None
+
+    def capture():
+        if captured:
+            predictor._frame_graphs = {1: object()}
+
+    mocker.patch.object(common.CodePredictorWrapper, "_setup_compile", prepare)
+    mocker.patch.object(predictor, "_capture_frame_graphs", side_effect=capture)
+    warn = mocker.patch.object(module.logger, "warning_once")
+    predictor._setup_compile()
+    predictor._setup_compile()
+    assert warn.call_count == int(warns)

@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+from vllm.config import CUDAGraphMode
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
@@ -65,8 +66,22 @@ def test_rocm_does_not_probe_cuda_pdl_capability(monkeypatch):
     assert not _pdl_supported(torch.device("cuda"))
 
 
-@pytest.mark.parametrize("is_npu,enabled", [(False, True), (True, True), (True, False)])
-def test_frame_graph_only_disables_npu_outer_mtp(monkeypatch, is_npu, enabled):
+@pytest.mark.parametrize(
+    "is_npu,v2,mode,eager,enabled,rejected",
+    [
+        (False, False, CUDAGraphMode.FULL_AND_PIECEWISE, False, True, False),
+        (True, True, CUDAGraphMode.FULL_AND_PIECEWISE, False, True, False),
+        (True, False, CUDAGraphMode.PIECEWISE, False, True, False),
+        (True, False, CUDAGraphMode.PIECEWISE, False, False, False),
+        (True, False, CUDAGraphMode.NONE, False, True, False),
+        (True, False, CUDAGraphMode.FULL_AND_PIECEWISE, True, True, False),
+        (True, False, CUDAGraphMode.FULL_AND_PIECEWISE, False, True, True),
+        (True, False, CUDAGraphMode.FULL_AND_PIECEWISE, False, False, True),
+        (True, False, CUDAGraphMode.FULL_DECODE_ONLY, False, True, True),
+        (True, False, CUDAGraphMode.FULL, False, True, True),
+    ],
+)
+def test_talker_graph_configuration_before_loading_weights(monkeypatch, is_npu, v2, mode, eager, enabled, rejected):
     from types import SimpleNamespace
 
     from vllm_omni.model_executor.models.qwen3_tts import qwen3_tts_talker as talker_module
@@ -83,6 +98,8 @@ def test_frame_graph_only_disables_npu_outer_mtp(monkeypatch, is_npu, enabled):
     monkeypatch.setattr(talker_module, "Qwen3Model", stop_before_weights)
     config = SimpleNamespace(
         model="unused",
+        use_v2_model_runner=v2,
+        enforce_eager=eager,
         stage_connector_config={"extra": {"code_predictor_frame_graph": enabled}},
         hf_config=SimpleNamespace(
             talker_config=SimpleNamespace(
@@ -93,6 +110,11 @@ def test_frame_graph_only_disables_npu_outer_mtp(monkeypatch, is_npu, enabled):
         ),
     )
     talker = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
+    vllm_config = SimpleNamespace(model_config=config, compilation_config=SimpleNamespace(cudagraph_mode=mode))
+    if rejected:
+        with pytest.raises(ValueError, match="Model Runner V1.*PIECEWISE"):
+            talker.__init__(vllm_config=vllm_config)
+        return
     with pytest.raises(ReachedBackboneError):
-        talker.__init__(vllm_config=SimpleNamespace(model_config=config))
+        talker.__init__(vllm_config=vllm_config)
     assert talker.talker_mtp_graph_safe is not (is_npu and enabled)

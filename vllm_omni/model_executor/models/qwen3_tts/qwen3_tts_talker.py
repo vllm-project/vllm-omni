@@ -198,6 +198,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        from vllm_omni.platforms import current_omni_platform
+
+        if (
+            current_omni_platform.is_npu()
+            and not getattr(vllm_config.model_config, "use_v2_model_runner", False)
+            and not vllm_config.model_config.enforce_eager
+            and vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        ):
+            raise ValueError(
+                "Qwen3-TTS on NPU with Model Runner V1 does not support full decode graphs. "
+                "Set stage 0 compilation_config.cudagraph_mode to PIECEWISE (or NONE), "
+                "or select model_runner: v2."
+            )
         self.vllm_config = vllm_config
         self.model_path = vllm_config.model_config.model
         self.config: Qwen3TTSConfig = vllm_config.model_config.hf_config  # type: ignore[assignment]
@@ -243,7 +256,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # CB0 of the step that sampled it, so MRV2 may complete the frame at
         # the end of that step instead of in the next step's preprocess.
         self.stream_decode = talker_stream_decode_enabled(vllm_config)
-        from vllm_omni.platforms import current_omni_platform
 
         predictor = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
         extra = predictor._stage_connector_extra_config(vllm_config)
