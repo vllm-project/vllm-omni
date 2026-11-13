@@ -1,15 +1,19 @@
 # Scheduled backend comparison
 
-PR #1994 provides a separate SGLang-Omni image and one Qwen3-Omni audio
-benchmark on two H100 GPUs. Reuse the existing daily vLLM-Omni H100 artifacts
-for the other side of the comparison.
+PR #1994 provides weekly comparisons for Qwen3-Omni, Qwen3-TTS,
+Qwen-Image-2.1, MiniCPM-o 4.5 and Cosmos3 T2I on H100 GPUs. Audio jobs use
+a separate SGLang-Omni image; native SGLang diffusion jobs use a fixed image
+digest. Reuse the existing daily vLLM-Omni H100 artifacts for the other side
+of the comparison.
 
 ```mermaid
 flowchart LR
     S[Buildkite native schedule: weekly] --> P[Existing pipeline: comparison-only entry]
     P --> I[Build SGLang comparison image]
-    I --> B[Qwen3-Omni audio benchmark: 2 H100]
+    I --> B[Qwen3-Omni, Qwen3-TTS, MiniCPM-o]
+    P --> D[Fixed image: Qwen-Image-2.1, Cosmos3]
     B --> A[JSON artifacts]
+    D --> A
     N[Existing daily vLLM-Omni H100 job] --> V[Existing JSON artifacts]
     A --> C[Consumer verifies source and workload]
     V --> C
@@ -49,10 +53,21 @@ Buildkite resolves `HEAD` after checkout. The uploader embeds that immutable
 SHA in `BACKEND_COMPARISON_COMMIT`; both image and benchmark jobs verify their
 checkout against it before executing work. Image tags use the same SHA.
 
-The uploaded YAML contains only `image-build-sglang-omni` and
-`nightly-sglang-omni-qwen3-omni`. It directly selects the comparison image and
-two-GPU H100 pod. Scheduled builds do not require PR labels. This route does
-not upload the regular CUDA bootstrap/test pipelines, hardware mirrors or any
+The weekly YAML contains `image-build-sglang-omni` and these benchmark jobs:
+
+| Model | Step key | H100 GPUs | Formal workload |
+| --- | --- | --- | --- |
+| Qwen3-Omni | `nightly-sglang-omni-qwen3-omni` | 2 | 10 audio requests, 0.1 requests/s |
+| Qwen3-TTS | `nightly-sglang-omni-qwen3-tts` | 2 | 20 voice-clone requests, C1 |
+| Qwen-Image-2.1 | `perf-sglang-qwen-image-21` | 1 | 10 images, 512×512, 20 steps, C1 |
+| MiniCPM-o 4.5 | `perf-sglang-minicpm-o` | 1 | Smoke then 32 audio requests, C1 |
+| Cosmos3 T2I | `perf-sglang-cosmos3-t2i` | 2 | Smoke then 3 images, 1024×1024, 4 steps, C1 |
+
+Cosmos3's formal workload passed in
+[build #19030](https://buildkite.com/vllm/vllm-omni/builds/19030).
+All weekly GPU jobs share concurrency group `vllm-omni/pr1994/sglang-smoke`
+with a limit of two jobs; each job retains its declared GPU count. Scheduled
+builds do not require PR labels. This route does not upload the regular CUDA bootstrap/test pipelines, hardware mirrors or any
 NPU pipeline.
 Do not change labels to test the schedule: that would create a separate event.
 
@@ -72,29 +87,41 @@ Buildkite native schedule in **Settings > Schedules**:
 Do not copy `NIGHTLY`, `WEEKLY`, `NON_CRITICAL` or `MIRROR_HW` from another
 schedule. A comparison request with any of these variables fails before any
 test pipeline upload. The PR ref without the comparison flag, a wrong flag value,
-a wrong repository/pipeline/ref, or a non-schedule source also fails without
-falling through to ordinary CI. Normal builds without the flag or PR ref
+a wrong repository/pipeline/ref, or an unsupported mode/source pair also fails
+without falling through to ordinary CI. Normal builds without the flag or PR ref
 retain the existing entry behavior. Schedule management requires
 Buildkite `write_pipelines`; `write_builds` alone is insufficient. Buildkite
 documents the [schedule fields](https://buildkite.com/docs/apis/rest-api/pipeline-schedules)
 and [cron semantics](https://buildkite.com/docs/pipelines/configure/workflows/scheduled-builds).
 
-The kanban consumer must allow the existing `vllm-omni` pipeline with branch
-`refs/pull/1994/head`, source `schedule`, the upstream repository and step key
-`nightly-sglang-omni-qwen3-omni`. Require experiment metadata v1 and verify
-runner/build/job/source identities and immutable configuration hashes.
+Explicit API runs use `BACKEND_COMPARISON_ONLY=smoke` and
+`BACKEND_COMPARISON_CASES` to select model keys in
+`comparison_smoke_pipeline.py`; this route requires source `api` and the same
+pipeline, repository, PR ref and immutable checkout checks. A selection such
+as `cosmos3-t2i-perf` or `wan22-i2v-perf` runs that model's smoke and formal
+workload. HunyuanVideo-1.5 and MiniMax-H3 formal API validation is in progress;
+Wan2.2 I2V awaits a retry after an agent-lost run. These three video models
+are not included in the weekly set.
+
+The kanban consumer accepts the existing `vllm-omni` pipeline with branch
+`refs/pull/1994/head`, source `schedule` or `api`, the upstream repository and
+an explicitly supported step key. Import artifacts from passed jobs, including
+when a sibling job causes the overall build to fail. Require experiment
+metadata v1 and verify runner/build/job/source identities and immutable
+configuration hashes.
 New revisions may be imported as observations after these checks; equivalent
 settings across revisions still require workload and deployment evidence.
 
 Keep the schedule disabled while preparing the first GPU acceptance run.
 After the source configuration and version pins are ready, use Buildkite's
-**Run now** action for one acceptance build; this consumes two H100 GPUs.
+**Run now** action for one acceptance build; GPU allocations follow the table
+above and the shared two-job limit.
 Use **Run now**, which retains source `schedule`; **Run with edits** creates
 source `ui` and this entry rejects it. Confirm the resolved PR commit and
 that the executed jobs contain only init, the comparison uploader, image and
-target benchmark. The regular uploader is condition-skipped. Confirm
-no NPU or ordinary CUDA tasks, all 10 requests succeed, JSON is uploaded,
-kanban imports it and repeat discovery adds no duplicate. Enable the recurring
+selected benchmarks. The regular uploader is condition-skipped. Confirm
+no NPU or ordinary CUDA tasks, each configured request count succeeds, JSON is
+uploaded, kanban imports it and repeat discovery adds no duplicate. Enable the recurring
 schedule after that run passes and its artifact passes the consumer checks.
 
 To pause or remove these weekly tests, disable this schedule. Existing schedules,
@@ -127,18 +154,26 @@ GPU 0 and Talker/Code2Wav on GPU 1, with first/steady/context codec windows
 `docker/patches/sglang-omni-ignore-eos.patch`. A schedule repeats this fixed
 backend version. Updating its pin or patch requires a reviewed code change.
 
-The runner baseline is vLLM-Omni main
-`2031d5c8d603ec4bd1e4c7471a746d1916843c4c` (2026-11-03), with its vLLM 0.32.0
-wheel pin. The server's separate environment uses SGLang 0.5.22, Torch 2.14.1
+Native SGLang diffusion jobs instead use SGLang 0.5.22 from the immutable
+image digest
+`sha256:125988c0f4ec5f9e9f0e19d94b92b7e3855dbf6aaf063c3025af4ca8c3b990b7`.
+Qwen-Image and Cosmos jobs do not depend on the audio image build. Selected
+video jobs apply their checked-in API compatibility patches to this image;
+HunyuanVideo-1.5 uses its explicitly configured Diffusers fallback and pinned
+snapshot. The common vLLM benchmark client measures the online requests.
+
+The audio image builds the benchmark runner from the resolved comparison
+checkout with the vLLM 0.32.0 wheel pin. The SGLang-Omni server's separate
+environment uses SGLang 0.5.22, Torch 2.14.1
 and Transformers 5.19.0 as required by the pinned SGLang-Omni revision.
 Its image follows that revision's base-image digest, UCX commit and protobuf
 override, and preserves the matching FlashInfer 0.7.1 AOT packages. The image
 build runs CPU checks for ignore-EOS propagation and the two-GPU deployment
 configuration; it does not load model weights or run inference.
 
-Using `HEAD` in the schedule follows the comparison branch and does not track
-either upstream main automatically. Refresh both revisions before a future
-weekly run when current-version measurements are needed.
+Using `HEAD` in the schedule follows the comparison branch. Refresh the
+runner baseline, backend pins and fixed image through reviewed changes when
+current-version measurements are needed.
 
 For vLLM-Omni, select the existing
 `nightly-omni-performance-async-chunk` H100 job's **audio** result from
@@ -164,12 +199,13 @@ and filename pattern. SGLang runs add an `experiment_metadata` object:
 | `schema_version` | Integer `1` |
 | `runner_commit` | Actual Git HEAD of the executing test runner checkout |
 | `runner_files` | Runner source paths and SHA-256 hashes of their actual bytes |
-| `server_type` | `sglang-omni` |
-| `server_revision` | Installed server distribution's VCS commit, or `null` when unavailable |
+| `server_type` | `sglang-omni` or `sglang-diffusion` |
+| `server_revision` | SGLang-Omni VCS commit, or native SGLang distribution version; `null` when unavailable |
+| `image_digest` | Fixed image digest for `sglang-diffusion` runs |
 | `num_gpus`, `num_gpus_source` | Declared CUDA card count from `test_config.hardware_marks.num_cards`, or `null`; source records that origin |
 | `test_config` | Test JSON path and SHA-256 |
 | `server_config` | Selected deployment YAML path and SHA-256, or `null` |
-| `server_patches` | Comparison image recipe's patch paths and SHA-256 hashes |
+| `server_patches` | Applicable image or job-applied patch paths and SHA-256 hashes |
 | `workload` | Configured benchmark fields, excluding baselines, with resolved scalar sweep values, warmups, and seed |
 | `buildkite` | Build/job IDs, step key, pipeline slug, branch, source, and Buildkite commit |
 
@@ -179,6 +215,13 @@ which is separate from the vLLM benchmark client environment. A runner
 checkout's HEAD and the Buildkite commit are recorded separately. Patch
 fingerprints describe the recipe and do not independently prove that a local
 installation applied it.
+
+Video jobs also upload `validated_*_media.json` after benchmark timing.
+The audit decodes every saved MP4, including warmups, verifies count,
+dimensions, frame count and frame rate, and records file hashes. MiniMax-H3
+also checks decoded audio, sample rate, channels and audio/video duration.
+Require the matching passed media audit before accepting a video observation;
+this structural audit does not establish perceptual quality.
 
 Metadata records provenance. Consumers must independently verify the
 Buildkite API's repository/pipeline, branch, successful job, artifact owner,
