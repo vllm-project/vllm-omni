@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""SigLIP2 vision-tower fallbacks for quantization and attention shapes it cannot use."""
+"""SigLIP2 vision tower falls back to the checkpoint dtype for dims that block-scaled
+weight quantization cannot cover. Platform-independent."""
 
 from types import SimpleNamespace
 
