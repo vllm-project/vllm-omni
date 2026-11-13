@@ -517,9 +517,10 @@ immediate-key rows (hidden + non-deferred mm), independent of block-pool
 eviction. A session's rows survive until the session itself mutates its
 history or ends.
 
-- Namespace: `bind_session` / STARTED events carrying `session_id`
-  (the adapter reads it tolerantly from scheduler payloads; absent means
-  slot-pool-only). Wiring, all inside this repo: the duplex orchestrator
+- Namespace: STARTED events carrying `session_id` bind the request in
+  `SessionPrefixStore` (the adapter reads it tolerantly from scheduler
+  payloads; absent means slot-pool-only). Wiring, all inside this repo:
+  the duplex orchestrator
   stamps `session_id` on the stage request at submit time, the
   `OmniNewRequestData` conversions carry it to the worker-side adapter
   (explicitly, not relying on the upstream payload shape), and the
@@ -527,16 +528,21 @@ history or ends.
   fence epoch (`session_epoch`) on the same request; the manager
   compares it at STARTED and invalidates the session's stored rows
   when a barge-in bumped the epoch, so a new turn never serves rows
-  from a superseded history. Whether a stage request is
+  from a superseded history. The compare, invalidation and generation
+  write are one store-lock hold, and seed/append carry the step's
+  frozen epoch so a stale materialize cannot land rows in the new
+  generation. Whether a stage request is
   long-lived depends on the plugin: only plugins declaring
   `supports_core_resumable_request = True` (MiniCPM-o) resume a stage
   request across turns, so only there is FINISHED/ABORTED a
   worker-visible session-end signal whose termination drops the
   session's rows. For plugins that do not declare it (Qwen3-Omni),
   every turn is a new ephemeral request: its termination only unbinds,
-  the session continues, and its rows stay servable — and no
-  worker-visible session-end signal exists yet, so finished sessions'
-  rows are retained until restart or an explicit `drop_session`.
+  the session continues, and its rows stay servable. No worker-visible
+  session-end signal exists, so the manager reaps sessions idle longer
+  than `session_store_idle_ttl_s` (default 600 s) at the top of the next
+  step, and `SessionPrefixStore.terminate` / `drop_idle_sessions` do the
+  invalidate-and-forget under one lock hold.
 - Retention: each consumed step appends its new rows at their session
   position: exact continuation appends in full, a batch starting
   behind the stored length (a block-truncated pool hit) first passes a
@@ -550,26 +556,35 @@ history or ends.
   (including coalesced decode flushes) append through `discard_step`;
   materialized steps through `materialize`. The slot pool is
   untouched, so existing cross-request sharing is unchanged.
-- Coarse invalidation: `invalidate_session` drops a session's segments
-  wholesale when an appending batch's overlapping rows mismatch the
-  stored rows (a forked session detected at append time). Calling it
-  on any history mutation (edit, truncation, interruption) is the
+- Coarse invalidation: `SessionPrefixStore.invalidate` drops a session's
+  segments wholesale when an appending batch's overlapping rows mismatch
+  the stored rows (a forked session detected at append time). Calling
+  it on any history mutation (edit, truncation, interruption) is the
   intended design, but that wiring is not in place: no production
   path calls it, so a history mutation currently leaves stale rows
   servable until an appending batch's content check catches the
-  mismatch.
+  mismatch. The fence epoch (`session_epoch`) covers the barge-in case
+  at STARTED.
   Segments are per-session copies, so dropping one session can never
   corrupt another's hits. A later turn whose hit length is nonzero
   after an invalidation rebuilds the stream from its pool-hit prefix
   when the pool covers it (materialize seeds [0, hit_end) first); it
   only stalls when the pool does not cover the prefix.
 - Live-session resume: a later turn's hit is served from the session
-  store when it covers the hit prefix (snapshot under the lock,
-  concatenated unlocked, so a concurrent invalidate cannot corrupt an
-  in-flight read). Otherwise the slot-pool path serves it.
+  store when it covers the hit prefix. The segment views are frozen in
+  the step context at publish, so a terminal event or block reuse before
+  a delayed materialize cannot drop the rows the step already selected;
+  rows appended after publish use a live snapshot, and concatenation
+  happens unlocked so a concurrent invalidate cannot corrupt an
+  in-flight read. Otherwise the slot-pool path serves it.
 - Limits: `PrefixCacheConfig.session_store_max_bytes` (default 2 GiB)
-  caps host bytes; over-budget appends are refused and fall back to the
-  slot pool. Deferred mm is not stored (not on CPU at materialize time).
+  caps host bytes, including rows cloned and queued for out-of-order
+  appends (`reserve_pending`); over-budget appends are refused (the
+  first refusal per session is logged) and fall back to the slot pool.
+  `PrefixCacheConfig.session_store_idle_ttl_s` (default 600 s) reaps
+  sessions with no bind/append/serve/invalidate activity, the only
+  session-end signal for ephemeral requests. Deferred mm is not stored
+  (not on CPU at materialize time).
 
 Explicitly out of scope: fine-grained invalidation (builds on
 the snapshot/ledger work), and any change to vLLM block eviction —

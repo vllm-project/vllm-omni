@@ -36,9 +36,11 @@ Ownership rules, all enforced here so callers cannot misalign rows:
 - Per-session copies, never shared rows. Segments belong to exactly one
   session, so dropping a session can never corrupt another session's
   hits — the hazard that rules out namespacing the slot pool itself.
-- Bounded host memory. ``max_bytes`` caps total stored bytes; an append
-  that would exceed it is refused (the caller falls back to the slot
-  pool), never partially applied.
+- Bounded host memory. ``max_bytes`` caps stored plus reserved bytes; an
+  append or reservation that would exceed it is refused (the caller falls
+  back to the slot pool), never partially applied. ``reserve_pending``
+  covers rows the manager cloned and queued for an out-of-order append,
+  so the queue cannot grow past the budget either.
 
 Thread safety: every method takes the store's own lock. The manager
 additionally serializes its own tables with ``_state_lock``; lock order
@@ -100,6 +102,10 @@ class SessionPrefixStore:
         # cleared on drop/invalidate so a refilled session can warn again.
         self._refusal_warned: set[SessionId] = set()
         self._stored_bytes = 0
+        # Bytes reserved for rows the manager cloned and queued for a later
+        # out-of-order append (see reserve_pending). Counted against the
+        # budget so a long turn of queued rows cannot grow unbounded.
+        self._pending_bytes = 0
         self.refused_appends = 0
 
     # ---------------------------------------------------------- bindings
@@ -147,9 +153,10 @@ class SessionPrefixStore:
     def set_epoch(self, session_id: SessionId, epoch: int) -> None:
         """Record the history generation a session's rows belong to.
 
-        The manager is the only writer (on STARTED, see
-        ``OmniPrefixCacheManager._check_session_epoch``); the store
-        never infers an epoch itself.
+        Low-level writer: production advances the generation through
+        :meth:`compare_and_set_epoch` (STARTED, see
+        ``OmniPrefixCacheManager._check_session_epoch``), which pairs the
+        write with invalidation. The store never infers an epoch itself.
         """
         with self._lock:
             self._epochs[session_id] = int(epoch)
@@ -158,6 +165,44 @@ class SessionPrefixStore:
         """History generation recorded for a session, or None when unknown."""
         with self._lock:
             return self._epochs.get(session_id)
+
+    def compare_and_set_epoch(self, session_id: SessionId, epoch: int) -> int | None:
+        """Atomically advance a session's generation, dropping stale rows.
+
+        The manager calls this on STARTED. Invalidation and the epoch write
+        must be one lock hold: doing them as separate ``invalidate`` /
+        ``set_epoch`` calls leaves a window where an in-flight append sees
+        the old epoch, stores rows, and only then does the epoch advance.
+        Those rows would sit under the new generation and be servable.
+
+        A first-seen session only records the epoch. Returns the previous
+        epoch when the generation changed (segments invalidated), else
+        None.
+        """
+        with self._lock:
+            known = self._epochs.get(session_id)
+            if known is None:
+                self._epochs[session_id] = int(epoch)
+                return None
+            if known == epoch:
+                return None
+            self._invalidate_locked(session_id)
+            self._epochs[session_id] = int(epoch)
+            return known
+
+    def _epoch_matches_locked(self, session_id: SessionId, expected_epoch: int | None) -> bool:
+        """True when an append for ``expected_epoch`` still belongs here.
+
+        Caller holds ``_lock``. ``expected_epoch`` None (a pre-epoch payload)
+        and an unknown stored epoch both mean "no gate", matching the
+        manager's ``_session_epoch_mismatch``. A known, different epoch means
+        the step predates the session's current generation: its rows must
+        not enter the new stream.
+        """
+        if expected_epoch is None:
+            return True
+        current = self._epochs.get(session_id)
+        return current is None or current == int(expected_epoch)
 
     def _touch_locked(self, session_id: SessionId) -> None:
         """Mark a session live; the caller must hold ``_lock``."""
@@ -175,6 +220,66 @@ class SessionPrefixStore:
         with self._lock:
             return self._stored_bytes
 
+    def pending_bytes(self) -> int:
+        """Bytes reserved for queued appends that have not landed yet."""
+        with self._lock:
+            return self._pending_bytes
+
+    def reserve_pending(self, session_id: SessionId, nbytes: int) -> bool:
+        """Reserve budget for rows that will be appended later.
+
+        The manager clones out-of-order rows and queues them until the gap
+        ahead fills. Without a reservation those clones would be invisible
+        to ``max_bytes``; counting them here keeps the bound honest. Returns
+        False (nothing reserved) when the budget would be exceeded, and the
+        caller drops the rows exactly as a refused append.
+        """
+        with self._lock:
+            if not self._within_budget_locked(nbytes):
+                self._refuse_append_locked(session_id)
+                return False
+            self._pending_bytes += int(nbytes)
+            return True
+
+    def release_pending(self, nbytes: int) -> None:
+        """Release a reservation made by :meth:`reserve_pending`."""
+        with self._lock:
+            self._pending_bytes = max(0, self._pending_bytes - int(nbytes))
+
+    def _within_budget_locked(self, nbytes: int) -> bool:
+        """True when ``nbytes`` more fit; the caller must hold ``_lock``.
+
+        Stored and reserved-but-unappended bytes share one budget, so a
+        queue of out-of-order rows can never exceed ``max_bytes``.
+        """
+        return self._stored_bytes + self._pending_bytes + nbytes <= self._max_bytes
+
+    def _refuse_append_locked(self, session_id: SessionId) -> None:
+        """Count and log a budget refusal; the caller must hold ``_lock``.
+
+        The first refusal per session warns (budget, stored, pending); later
+        refusals drop to debug until the flag clears on drop/invalidate.
+        """
+        self.refused_appends += 1
+        if session_id not in self._refusal_warned:
+            self._refusal_warned.add(session_id)
+            logger.warning(
+                "session %s append refused: session store budget %s bytes would be "
+                "exceeded (stored %s bytes, pending %s bytes); falling back to the slot pool",
+                session_id,
+                self._max_bytes,
+                self._stored_bytes,
+                self._pending_bytes,
+            )
+        else:
+            logger.debug(
+                "session %s append refused again (stored %s, pending %s of %s bytes)",
+                session_id,
+                self._stored_bytes,
+                self._pending_bytes,
+                self._max_bytes,
+            )
+
     def append(self, session_id: SessionId, key: TensorName, rows: torch.Tensor) -> bool:
         """Append ``rows`` at the end of the (session, key) stream.
 
@@ -184,10 +289,16 @@ class SessionPrefixStore:
         The rows are cloned: callers may hand over views into reusable
         step buffers.
         """
-        return self._append(session_id, key, rows, expected_length=None)
+        return self._append(session_id, key, rows, expected_length=None, expected_epoch=None)
 
     def append_if_length(
-        self, session_id: SessionId, key: TensorName, expected_length: int, rows: torch.Tensor
+        self,
+        session_id: SessionId,
+        key: TensorName,
+        expected_length: int,
+        rows: torch.Tensor,
+        *,
+        expected_epoch: int | None = None,
     ) -> bool:
         """Append ``rows`` only when the stored length still equals
         ``expected_length``, atomically under the store lock.
@@ -196,12 +307,24 @@ class SessionPrefixStore:
         ``append_beyond``): a plain length check followed by ``append``
         lets a concurrent ``invalidate`` slip between the two and land
         the rows at the head of a fresh stream, where a later turn
-        could serve them as its prefix. A failed check returns False
-        and stores nothing.
+        could serve them as its prefix. ``expected_epoch`` closes the
+        matching TOCTOU against an epoch advance: the generation check
+        and the append happen under the same lock hold. A failed check
+        returns False and stores nothing.
         """
-        return self._append(session_id, key, rows, expected_length=expected_length)
+        return self._append(
+            session_id, key, rows, expected_length=expected_length, expected_epoch=expected_epoch
+        )
 
-    def append_beyond(self, session_id: SessionId, key: TensorName, batch_start: int, rows: torch.Tensor) -> bool:
+    def append_beyond(
+        self,
+        session_id: SessionId,
+        key: TensorName,
+        batch_start: int,
+        rows: torch.Tensor,
+        *,
+        expected_epoch: int | None = None,
+    ) -> bool:
         """Append the not-yet-stored tail of a batch starting at ``batch_start``.
 
         ``rows`` covers [batch_start, batch_start + len(rows)). Atomically
@@ -224,6 +347,10 @@ class SessionPrefixStore:
         invalidation itself (lengths reset to 0, so later same-round
         batches are gap-refused and the next round reseeds). False is
         only the truthful "nothing stored" signal.
+        ``expected_epoch`` refuses the batch (without touching the
+        session) when the session's generation moved on since the step was
+        published, closing the window between the manager's epoch check
+        and this append.
         Raises ValueError for a non-tensor/empty batch, a negative
         batch_start, or a trailing-shape mismatch with the stream.
         """
@@ -233,6 +360,8 @@ class SessionPrefixStore:
             raise ValueError(f"session store append_beyond needs batch_start >= 0, got {batch_start}")
         entry = (session_id, key)
         with self._lock:
+            if not self._epoch_matches_locked(session_id, expected_epoch):
+                return False
             self._touch_locked(session_id)
             stored = self._lengths.get(entry, 0)
             batch_end = batch_start + int(rows.shape[0])
@@ -312,10 +441,13 @@ class SessionPrefixStore:
         rows: torch.Tensor,
         *,
         expected_length: int | None,
+        expected_epoch: int | None,
     ) -> bool:
         if not isinstance(rows, torch.Tensor) or rows.ndim < 2 or rows.shape[0] == 0:
             raise ValueError(f"session store append needs a non-empty per-token tensor, got {type(rows)}")
         with self._lock:
+            if not self._epoch_matches_locked(session_id, expected_epoch):
+                return False
             self._touch_locked(session_id)
             return self._append_locked(session_id, key, rows, expected_length=expected_length)
 
@@ -338,24 +470,8 @@ class SessionPrefixStore:
                 f"stream {tuple(segments[0].shape[1:])} vs rows {tuple(rows.shape[1:])}"
             )
         nbytes = rows.numel() * rows.element_size()
-        if self._stored_bytes + nbytes > self._max_bytes:
-            self.refused_appends += 1
-            if session_id not in self._refusal_warned:
-                self._refusal_warned.add(session_id)
-                logger.warning(
-                    "session %s append refused: session store budget %s bytes would be "
-                    "exceeded (stored %s bytes); falling back to the slot pool",
-                    session_id,
-                    self._max_bytes,
-                    self._stored_bytes,
-                )
-            else:
-                logger.debug(
-                    "session %s append refused again (stored %s of %s bytes)",
-                    session_id,
-                    self._stored_bytes,
-                    self._max_bytes,
-                )
+        if not self._within_budget_locked(nbytes):
+            self._refuse_append_locked(session_id)
             return False
         stored = rows.detach().clone()
         if segments is None:
@@ -483,9 +599,17 @@ class SessionPrefixStore:
 
     def drop(self, session_id: SessionId) -> int:
         """End a session: invalidate its segments, unbind its requests,
-        and forget its recorded epoch and last-touch record."""
-        dropped = self.invalidate(session_id)
+        and forget its recorded epoch and last-touch record.
+
+        Invalidation and bookkeeping run under one lock hold, atomically
+        with respect to appends. Doing them in two separate lock holds
+        would let an ``append_beyond`` land in the window: it stores
+        segments and touches the session, then ``_drop_locked`` removes the
+        touch record, leaving segments that no reaper iterates but that
+        still count against ``max_bytes`` until restart.
+        """
         with self._lock:
+            dropped = self._invalidate_locked(session_id)
             self._drop_locked(session_id)
         return dropped
 

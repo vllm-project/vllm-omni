@@ -2262,6 +2262,37 @@ def test_session_frozen_identity_serves_after_finish_and_slot_reuse():
         mgr.shutdown()
 
 
+def test_session_frozen_rows_survive_resumable_drop_before_materialize():
+    """A3 (resumable): a terminal event drops the session before the delayed
+    materialize, so a live snapshot would miss and fall back to a slot ref
+    that the reuser now owns. The views frozen at publish must still serve
+    the step's original prefix."""
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        # Another request reuses the blocks with different values.
+        s2 = run_session_step(mgr, view, "b", [0, 1], 0, 8, offset=1000, finished=["a"])
+        mgr.materialize(s2, ["b"])
+        # Same session, resumable turn, prefix hit — saved, not materialized.
+        s3 = run_session_step(mgr, view, "a2", [0, 1, 2], 8, 4, hit=8, session="S", resumable=True)
+        # The resumable turn's FINISHED drops the session's rows, then a
+        # reuser overwrites the blocks — all before materialize.
+        s4 = run_session_step(mgr, view, "b2", [0, 1, 2], 0, 12, offset=2000, finished=["a2"])
+        mgr.materialize(s4, ["b2"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
+        assert float(mgr._pool.rows(HIDDEN_KEY, torch.tensor([0]))[0, 0]) == 2000.0
+        outs = mgr.materialize(s3, ["a2"])
+        merged = outs.hidden_states["a2"]
+        # Prefix comes from the publish-time session views (original values),
+        # not the reuser's rows.
+        assert torch.equal(merged[:8], expected_rows(view.slots_for("a", 0, 8)))
+        assert torch.equal(merged[8:], expected_rows(view.slots_for("a2", 8, 12)))
+    finally:
+        mgr.shutdown()
+
+
 def test_session_store_serves_hit_after_slot_reuse():
     mgr, view = make_manager()
     try:
@@ -2538,7 +2569,7 @@ def test_session_coarse_invalidation_is_negative():
     try:
         s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
         mgr.materialize(s1, ["a"])
-        assert mgr.invalidate_session("S") >= 1
+        assert mgr._session_store.invalidate("S") >= 1
         assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
         s2 = run_session_step(mgr, view, "b", [0, 1], 0, 8, offset=1000, finished=["a"])
         mgr.materialize(s2, ["b"])
@@ -2654,20 +2685,6 @@ def test_session_binding_dropped_on_finish_but_rows_survive():
         s2 = run_session_step(mgr, view, "a2", [0, 1, 2], 8, 4, hit=8, session="S")
         outs = mgr.materialize(s2, ["a2"])
         assert torch.equal(outs.hidden_states["a2"][:8], expected_rows(view.slots_for("a", 0, 8)))
-    finally:
-        mgr.shutdown()
-
-
-def test_session_bind_and_drop_api():
-    mgr, view = make_manager()
-    try:
-        mgr.bind_session("a", "S")
-        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8)
-        mgr.materialize(s1, ["a"])
-        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
-        assert mgr.drop_session("S") >= 1
-        assert mgr._session_store.session_of("a") is None
-        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
     finally:
         mgr.shutdown()
 
@@ -2808,6 +2825,45 @@ def test_session_epoch_absent_skips_check():
         assert mgr._session_store.epoch_of("S") == 0
         mgr.materialize(s2, ["a2"])
         assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+    finally:
+        mgr.shutdown()
+
+
+def test_seed_refuses_rows_when_epoch_advances_before_append(monkeypatch):
+    """An old materialize that passes the epoch pre-check must not seed into
+    a stream a concurrent STARTED has already advanced past its generation.
+
+    The race window is between ``_session_epoch_mismatch`` and the seed
+    append. Here ``stored_tokens`` (called between them) advances the epoch,
+    simulating the new STARTED; the append's epoch check under the store lock
+    must then refuse, leaving the new stream empty.
+    """
+    mgr, view = make_manager()
+    try:
+        # Unrelated request warms the pool; the session store stays empty.
+        s0 = run_session_step(mgr, view, "x", [0, 1], 0, 8)
+        mgr.materialize(s0, ["x"])
+        # Old turn, published under epoch 0, empty session store: its
+        # materialize would seed [0, 8) from the pool hit.
+        s_old = run_session_step(mgr, view, "a", [0, 1, 2], 8, 4, hit=8, session="S", session_epoch=0)
+        real_stored = mgr._session_store.stored_tokens
+        advanced = False
+
+        def racing_stored_tokens(session_id, key):
+            nonlocal advanced
+            n = real_stored(session_id, key)
+            if not advanced:
+                advanced = True
+                # A new STARTED invalidates and advances the generation
+                # before the old step's seed append runs.
+                mgr._session_store.compare_and_set_epoch(session_id, 1)
+            return n
+
+        monkeypatch.setattr(mgr._session_store, "stored_tokens", racing_stored_tokens)
+        mgr.materialize(s_old, ["a"])
+        assert advanced
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
+        assert mgr._session_store.epoch_of("S") == 1
     finally:
         mgr.shutdown()
 

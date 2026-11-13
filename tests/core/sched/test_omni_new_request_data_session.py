@@ -15,7 +15,7 @@ import logging
 import sys
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -96,6 +96,7 @@ except ModuleNotFoundError:  # pragma: no cover - vllm-less dev machines
 
     _req_mod.Request = Request
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheEventKind, PrefixCacheSchedulerAdapter
 from vllm_omni.core.sched.output import OmniNewRequestData
 
 if not _HAS_VLLM:
@@ -130,6 +131,7 @@ class _Req:
     lora_request: object = None
     session_id: str | None = None
     session_epoch: int | None = None
+    resumable: bool = False
 
 
 def test_from_request_carries_session_id():
@@ -199,3 +201,30 @@ def test_from_base_request_epoch_zero_beats_payload():
     base = NewRequestData(req_id="r", session_id="OLD", session_epoch=7)
     data = OmniNewRequestData.from_base(base, _Req(session_id="NEW", session_epoch=0))
     assert data.session_epoch == 0
+
+
+def test_from_request_payload_reaches_started_event():
+    """A real OmniNewRequestData built by from_request drives the adapter's
+    live translate_step path, without depending on the upstream
+    NewRequestData field list or the session-field skipif above."""
+    request = _Req(
+        request_id="r",
+        prompt_token_ids=list(range(12)),
+        num_computed_tokens=8,
+        session_id="S",
+        session_epoch=3,
+        resumable=True,
+    )
+    data = OmniNewRequestData.from_request(request, ([2, 3, 4],))
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[data],
+        scheduled_cached_reqs=None,
+        finished_req_ids=set(),
+        num_scheduled_tokens={"r": 4},
+    )
+    step = PrefixCacheSchedulerAdapter().translate_step(scheduler_output)
+    assert len(step.events) == 1
+    event = step.events[0]
+    assert event.kind is PrefixCacheEventKind.STARTED
+    assert (event.req_id, event.hit_end, event.block_ids) == ("r", 8, ((2, 3, 4),))
+    assert (event.session_id, event.session_epoch, event.resumable) == ("S", 3, True)

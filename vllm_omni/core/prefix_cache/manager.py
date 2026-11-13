@@ -296,6 +296,16 @@ class _StepContext:
     # can belong to a new tenant after block reuse (A3).
     session_for_req: dict[ReqId, str] = field(default_factory=dict)
 
+    # Session row views frozen at publish, keyed by (req, key). Taking them
+    # at publish (before the following steps can hand the blocks to another
+    # tenant, and before a terminal event can drop the session) keeps the
+    # step's served rows valid even if the session store drops the session
+    # or the slot pool reuses the blocks by the time materialize runs. The
+    # views keep their segments alive; a concurrent invalidate only stops
+    # later steps from covering the range. materialize falls back to a live
+    # snapshot for rows appended after publish.
+    session_parts: dict[tuple[ReqId, TensorName], list[torch.Tensor]] = field(default_factory=dict)
+
     # History generation, frozen at publish alongside session_for_req:
     # the fence epoch the request's turn belonged to at STARTED. The
     # serve/seed/append gates compare it with the store's current
@@ -497,14 +507,15 @@ class OmniPrefixCacheManager:
         # is ahead of the stored stream — an earlier step for the same
         # request has not landed yet — queues behind it instead of
         # being gap-refused and lost (B4). Entries are (expected,
-        # sequence, rows), sorted by expected position; the sequence
-        # breaks ties without ever comparing tensors. Guarded by
+        # sequence, rows, epoch), sorted by expected position; the
+        # sequence breaks ties without ever comparing tensors, and the
+        # epoch is re-checked when the queued rows finally land. Guarded by
         # _append_lock, which never covers a D2H wait and is never held
         # while taking _state_lock, so it cannot deadlock against the
         # state lock (new_step_starts takes it under _state_lock only
         # to drop a finished request's queue).
         self._append_lock = threading.Lock()
-        self._pending_appends: dict[tuple[ReqId, TensorName], list[tuple[int, int, torch.Tensor]]] = {}
+        self._pending_appends: dict[tuple[ReqId, TensorName], list[tuple[int, int, torch.Tensor, int | None]]] = {}
         self._pending_seq = 0
 
         # Planned-but-unread slot refs. A write reusing their slots copies the
@@ -533,44 +544,6 @@ class OmniPrefixCacheManager:
         if (hk := policy.hidden_key) is not None:
             self._slot_status.init_table(hk)
 
-    def bind_session(self, req_id: str, session_id: str, *, resumable: bool = False) -> None:
-        """Bind a request to a duplex session for session-level caching.
-
-        Currently a test-only entry point: no production caller binds
-        through this method — the adapter path binds STARTED events
-        that carry a session directly via ``_session_store.bind`` in
-        ``new_step_starts``. A non-resumable binding is dropped when
-        the request finishes or aborts; a resumable binding's
-        termination drops the session's stored rows as well (see
-        ``SessionPrefixStore.terminate``).
-        """
-        self._session_store.bind(req_id, session_id, resumable=resumable)
-
-    def invalidate_session(self, session_id: str) -> int:
-        """Coarse invalidation: drop all of a session's stored segments.
-
-        Intended to be called on any session-history mutation (edit,
-        truncation, interruption), but that wiring is not in place:
-        no production path calls this method yet. Barge-in mutations
-        are caught earlier — the manager invalidates on a fence-epoch
-        change at STARTED (see _check_session_epoch). Other mutations
-        still leave stale rows servable until an appending batch's
-        content check catches the mismatch.
-        Bindings are kept: the session continues and later appends
-        rebuild a fresh stream. Returns segments dropped.
-        """
-        return self._session_store.invalidate(session_id)
-
-    def drop_session(self, session_id: str) -> int:
-        """End a session: invalidate its segments and unbind its requests.
-
-        Currently a test-only entry point: no production path calls
-        this method on session close or expiry, so a finished
-        session's rows keep occupying the shared store budget until
-        restart or an explicit call.
-        """
-        return self._session_store.drop(session_id)
-
     def _check_session_epoch(self, session_id: str, epoch: int) -> None:
         """Invalidate a session whose history generation moved on.
 
@@ -581,20 +554,20 @@ class OmniPrefixCacheManager:
         so the new turn rebuilds from its pool-hit prefix instead of
         serving stale rows. A first-seen session just records its
         epoch; a request without an epoch never reaches here.
+
+        ``compare_and_set_epoch`` invalidates and advances the generation
+        in one store-lock hold, so an in-flight append from an older
+        materialize cannot slip between the two and land its rows under
+        the new generation.
         """
-        known = self._session_store.epoch_of(session_id)
-        if known is None:
-            self._session_store.set_epoch(session_id, epoch)
-            return
-        if known != epoch:
+        previous = self._session_store.compare_and_set_epoch(session_id, epoch)
+        if previous is not None:
             logger.info(
                 "session %s history generation moved %s -> %s; invalidating stored rows",
                 session_id,
-                known,
+                previous,
                 epoch,
             )
-            self._session_store.invalidate(session_id)
-            self._session_store.set_epoch(session_id, epoch)
 
     def _session_epoch_mismatch(self, ctx: _StepContext, req_id: str, session_id: str) -> bool:
         """True when the step's frozen epoch and the store's recorded
@@ -612,6 +585,30 @@ class OmniPrefixCacheManager:
             return False
         current = self._session_store.epoch_of(session_id)
         return current is not None and current != frozen
+
+    def _freeze_session_parts(self, ctx: _StepContext) -> None:
+        """Freeze this step's session row views at publish.
+
+        Caller holds ``_state_lock`` (the store lock is innermost). Taking
+        the views here — after the step is saved, before a terminal event or
+        block reuse can affect it — keeps the served prefix valid through a
+        delayed materialize (A3): a later ``drop``/``invalidate`` only drops
+        the store's references, while these views keep the segments alive
+        until the step is consumed. Rows appended after publish (an earlier
+        step's queued append) are picked up by materialize's live fallback.
+        """
+        if not ctx.session_for_req or not ctx.hits:
+            return
+        keys = self._policy.get_hit_keys(ctx.cached_keys)
+        for req_id, session_id in ctx.session_for_req.items():
+            hit = ctx.hits.get(req_id)
+            if not hit or self._session_epoch_mismatch(ctx, req_id, session_id):
+                continue
+            hit_upto, _, read_start = hit
+            for key in keys:
+                parts = self._session_store.snapshot_range(session_id, key, read_start, hit_upto)
+                if parts is not None:
+                    ctx.session_parts[(req_id, key)] = parts
 
     def _reap_idle_sessions(self, now_s: float | None = None) -> None:
         """Drop sessions idle longer than the configured TTL.
@@ -891,22 +888,7 @@ class OmniPrefixCacheManager:
                     )
 
                 cached_keys = ctx.cached_keys
-
-                hit_sources: dict[tuple[str, str], _SlotRef | Future] = {}
-                for req_id in req_ids:
-                    hit = ctx.hits.get(req_id)
-                    if not hit:
-                        continue
-                    hit_upto, hit_blocks, read_start = hit
-                    prefetched = ctx.hit_prefetch.get(req_id, {})
-                    slots = self._get_hit_slots(hit_upto, hit_blocks, read_start)
-                    keys = self._policy.get_hit_keys(cached_keys)
-                    for key in keys:
-                        fut = prefetched.get(key)
-                        if fut is not None:
-                            hit_sources[(req_id, key)] = fut
-                            continue
-                        hit_sources[(req_id, key)] = self._slot_ref(slots, key, req_id)
+                hit_keys = self._policy.get_hit_keys(cached_keys)
 
                 # Session-level serving, captured now so the unlocked
                 # merge and append below use one consistent view.
@@ -917,6 +899,11 @@ class OmniPrefixCacheManager:
                 # (see _StepContext.session_for_req).
                 session_for_req = {r: session_id for r, session_id in ctx.session_for_req.items() if r in req_ids}
                 # (req, key) -> segment views covering the hit prefix.
+                # Prefer the views frozen at publish (ctx.session_parts):
+                # those keep the step's rows valid even if the session was
+                # dropped or the blocks were reused before this delayed
+                # materialize (A3). Only rows the store gained after publish
+                # (an earlier step's queued append) need a live snapshot.
                 # Snapshot only: concatenation happens unlocked. The views
                 # keep their segments alive, so a concurrent invalidate
                 # cannot corrupt this step's read; it only stops later
@@ -927,37 +914,45 @@ class OmniPrefixCacheManager:
                     session_id = session_for_req.get(req_id)
                     if not hit or session_id is None:
                         continue
-                    if self._session_epoch_mismatch(ctx, req_id, session_id):
-                        # The step belongs to a superseded generation:
-                        # the store's rows now describe the new history,
-                        # so skip the session serve and fall back to the
-                        # pool hit (left in hit_sources above).
-                        continue
-                    # Index read, not a 2-tuple unpack: upstream extended
-                    # hits to (hit_upto, blocks, read_start), and this
-                    # branch must keep working on both shapes.
-                    hit_upto = hit[0]
-                    read_start = hit[2] if len(hit) > 2 else 0
-                    for key in self._policy.get_hit_keys(cached_keys):
+                    hit_upto, _, read_start = hit
+                    for key in hit_keys:
                         # Serve exactly the requested range: a replay
                         # span [read_start, hit_upto) must not prepend
                         # the [0, read_start) rows the downstream stage
                         # already has (A5/B1).
-                        parts = self._session_store.snapshot_range(session_id, key, read_start, hit_upto)
+                        parts = ctx.session_parts.get((req_id, key))
                         if parts is None:
+                            if self._session_epoch_mismatch(ctx, req_id, session_id):
+                                # The step belongs to a superseded generation:
+                                # the store's rows now describe the new
+                                # history, so skip the session serve and fall
+                                # back to the pool hit.
+                                continue
+                            parts = self._session_store.snapshot_range(session_id, key, read_start, hit_upto)
+                        if parts is not None:
+                            session_parts[(req_id, key)] = parts
+
+                # Pool sources only for hit keys the session does not serve:
+                # a session-served key must not plan a slot read even if the
+                # pool has since evicted the blocks (that is the point of the
+                # store). A prefetched future left unread still resolves and
+                # unregisters on its own thread.
+                hit_sources: dict[tuple[str, str], _SlotRef | Future] = {}
+                for req_id in req_ids:
+                    hit = ctx.hits.get(req_id)
+                    if not hit:
+                        continue
+                    hit_upto, hit_blocks, read_start = hit
+                    prefetched = ctx.hit_prefetch.get(req_id, {})
+                    slots = self._get_hit_slots(hit_upto, hit_blocks, read_start)
+                    for key in hit_keys:
+                        if (req_id, key) in session_parts:
                             continue
-                        session_parts[(req_id, key)] = parts
-                        src = hit_sources.pop((req_id, key), None)
-                        if isinstance(src, _SlotRef):
-                            # Unregister inline: this section holds the
-                            # lock, and _unregister_pending_read would
-                            # deadlock re-acquiring it. A dropped
-                            # prefetched future resolves (and
-                            # unregisters) on its own thread.
-                            before = len(self._pending_reads)
-                            self._pending_reads = [ref for ref in self._pending_reads if ref is not src]
-                            if len(self._pending_reads) < before:
-                                self._count_pending_slots(src, -1)
+                        fut = prefetched.get(key)
+                        if fut is not None:
+                            hit_sources[(req_id, key)] = fut
+                            continue
+                        hit_sources[(req_id, key)] = self._slot_ref(slots, key, req_id)
 
             # ---- unlocked: data movement + merge ----
             if ctx.mm_cpu_snapshot_event is not None:
@@ -1265,7 +1260,7 @@ class OmniPrefixCacheManager:
         for r in req_order:
             positions[r] = self._req_row_pos.get(r, 0)
             self._req_row_pos[r] = positions[r] + num_sched[r]
-        self._step_ctxs[step_id] = _StepContext(
+        ctx = _StepContext(
             spans={r: (query_start[r], query_start[r] + num_sched[r]) for r in req_order},
             num_tokens_unpadded=num_tokens_unpadded,
             hits=dict(self._hit_spans),
@@ -1282,6 +1277,8 @@ class OmniPrefixCacheManager:
             mm_cpu_snapshot_event=step_outputs.leftover_event,
             d2h_snapshot=write_ctx.snapshot,
         )
+        self._freeze_session_parts(ctx)
+        self._step_ctxs[step_id] = ctx
         self._clear_hit_infos()
 
     def _split_step_outputs(
@@ -1801,10 +1798,7 @@ class OmniPrefixCacheManager:
                 # expected, and the old rows would land as the new
                 # generation's prefix.
                 continue
-            # Index read, not a 2-tuple unpack: upstream extended hits
-            # to (hit_upto, blocks, read_start); this works on both.
-            hit_upto = hit[0]
-            read_start = hit[2] if len(hit) > 2 else 0
+            hit_upto, _, read_start = hit
             if hit_upto <= 0:
                 continue
             merged_by_key: dict[str, torch.Tensor] = {}
@@ -1836,8 +1830,17 @@ class OmniPrefixCacheManager:
                 if stored < read_start:
                     continue
                 try:
+                    # Pass the frozen epoch into the store: the pre-check
+                    # above can be stale if a new STARTED advances the
+                    # generation between it and this append. The store
+                    # re-checks under the same lock as the length, so an
+                    # empty new stream cannot accept these old rows.
                     self._session_store.append_if_length(
-                        session_id, key, stored, merged[stored - read_start : hit_upto - read_start]
+                        session_id,
+                        key,
+                        stored,
+                        merged[stored - read_start : hit_upto - read_start],
+                        expected_epoch=ctx.session_epochs.get(req_id),
                     )
                 except ValueError:
                     continue
@@ -1902,6 +1905,7 @@ class OmniPrefixCacheManager:
                 continue
             expected = ctx.session_offsets.get(req_id, 0) + ctx.positions.get(req_id, 0)
             trim = ctx.trims.get(req_id, 0)
+            epoch = ctx.session_epochs.get(req_id)
             for key, cur in current.items():
                 # Atomic overlap handling: the check, the tail slice,
                 # and the append happen under one store-lock hold, so a
@@ -1919,11 +1923,20 @@ class OmniPrefixCacheManager:
                         continue
                     rows = cur[a_start:end]
                     if a_expected > self._session_store.stored_tokens(session_id, key):
+                        # Charge the clone to the store budget before queuing:
+                        # a long turn of out-of-order rows must not grow past
+                        # session_store_max_bytes. A refusal drops these rows
+                        # exactly as a refused append would.
+                        nbytes = rows.numel() * rows.element_size()
+                        if not self._session_store.reserve_pending(session_id, nbytes):
+                            continue
                         self._pending_seq += 1
                         queue = self._pending_appends.setdefault((req_id, key), [])
-                        bisect.insort(queue, (a_expected, self._pending_seq, rows.clone()))
+                        bisect.insort(queue, (a_expected, self._pending_seq, rows.clone(), epoch))
                         continue
-                    self._session_store.append_beyond(session_id, key, a_expected, rows)
+                    self._session_store.append_beyond(
+                        session_id, key, a_expected, rows, expected_epoch=epoch
+                    )
                     self._drain_pending_appends_locked(req_id, session_id, key)
 
     def _drain_pending_appends_locked(self, req_id: ReqId, session_id: str, key: TensorName) -> None:
@@ -1939,11 +1952,15 @@ class OmniPrefixCacheManager:
         if not queue:
             return
         while queue:
-            expected, _, rows = queue[0]
+            expected, _, rows, epoch = queue[0]
             if expected > self._session_store.stored_tokens(session_id, key):
                 break
             queue.pop(0)
-            if not self._session_store.append_beyond(session_id, key, expected, rows):
+            # Turn the queue's reservation into a real append charge. If the
+            # append is still refused, the rows are lost exactly as a normal
+            # over-budget append (the stream stalls until a seeding turn).
+            self._session_store.release_pending(rows.numel() * rows.element_size())
+            if not self._session_store.append_beyond(session_id, key, expected, rows, expected_epoch=epoch):
                 break
         if not queue:
             self._pending_appends.pop((req_id, key), None)
@@ -1958,7 +1975,8 @@ class OmniPrefixCacheManager:
         """
         with self._append_lock:
             for entry in [k for k in self._pending_appends if k[0] == req_id]:
-                del self._pending_appends[entry]
+                for _, _, rows, _ in self._pending_appends.pop(entry):
+                    self._session_store.release_pending(rows.numel() * rows.element_size())
 
     def _merge_uncached_mm(
         self,

@@ -370,6 +370,39 @@ def test_session_epoch_survives_invalidate_but_not_drop():
     assert store.epoch_of("S") is None
 
 
+def test_compare_and_set_epoch_invalidates_atomically():
+    """Epoch advancement drops the old rows and records the new generation
+    in one lock hold (no window for an in-flight append)."""
+    store = SessionPrefixStore()
+    store.append("S", "hidden", _rows(0, 3))
+    # First sight records without touching rows.
+    assert store.compare_and_set_epoch("S", 0) is None
+    assert store.stored_tokens("S", "hidden") == 3
+    # Same generation keeps rows.
+    assert store.compare_and_set_epoch("S", 0) is None
+    assert store.stored_tokens("S", "hidden") == 3
+    # Advancing drops the rows and reports the previous generation.
+    assert store.compare_and_set_epoch("S", 1) == 0
+    assert store.stored_tokens("S", "hidden") == 0
+    assert store.epoch_of("S") == 1
+
+
+def test_append_refuses_rows_from_a_superseded_epoch():
+    """The epoch is re-checked under the store lock with the length/position,
+    so an old materialize cannot seed a stream a new STARTED already reset."""
+    store = SessionPrefixStore()
+    store.compare_and_set_epoch("S", 0)
+    store.append("S", "hidden", _rows(0, 3))
+    assert store.compare_and_set_epoch("S", 1) == 0
+    assert not store.append_if_length("S", "hidden", 0, _rows(0, 2), expected_epoch=0)
+    assert store.stored_tokens("S", "hidden") == 0
+    assert not store.append_beyond("S", "hidden", 0, _rows(0, 2), expected_epoch=0)
+    assert store.stored_tokens("S", "hidden") == 0
+    # A current-generation append still lands.
+    assert store.append_beyond("S", "hidden", 0, _rows(0, 2), expected_epoch=1)
+    assert store.stored_tokens("S", "hidden") == 2
+
+
 def test_drop_idle_sessions_reaps_only_idle():
     """7: the reaper drops sessions idle past the TTL and keeps live ones."""
     store = SessionPrefixStore()
@@ -421,3 +454,45 @@ def test_refused_append_warns_once_per_session(caplog):
         assert not store.append("S", "hidden", _rows(0, 3))
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
+
+
+def test_reserve_pending_shares_the_byte_budget():
+    """Queued (cloned) rows count against max_bytes until they land."""
+    store = SessionPrefixStore(max_bytes=32)
+    rows = _rows(0, 2)  # 2 * 4 float32 = 32 bytes
+    assert store.reserve_pending("S", rows.numel() * rows.element_size())
+    assert store.pending_bytes() == 32
+    # The budget is full: neither another reservation nor an append fits.
+    assert not store.reserve_pending("S", 1)
+    assert not store.append("S", "hidden", _rows(0, 1))
+    store.release_pending(32)
+    assert store.pending_bytes() == 0
+    assert store.append("S", "hidden", rows)
+
+
+def test_drop_does_not_orphan_segments_from_an_interleaved_append(monkeypatch):
+    """drop() must invalidate and forget under one lock hold.
+
+    On the old two-phase drop, an append that landed after ``invalidate``
+    released the lock stored segments and touched the session, then
+    ``_drop_locked`` removed the touch record — leaving segments that
+    ``drop_idle_sessions`` never scans but that still count against the
+    budget. Interleaving an append from the public ``invalidate`` call
+    reproduces that window; the atomic drop never takes it."""
+    store = SessionPrefixStore()
+    store.append("S", "hidden", _rows(0, 3))
+    store.bind("r", "S")
+    real_invalidate = SessionPrefixStore.invalidate
+
+    def racing_invalidate(session_id):
+        dropped = real_invalidate(store, session_id)
+        # The old drop() released the lock here; simulate another thread's
+        # append landing in the window before _drop_locked runs.
+        store.append(session_id, "hidden", _rows(0, 1))
+        return dropped
+
+    monkeypatch.setattr(store, "invalidate", racing_invalidate)
+    store.drop("S")
+    assert [e for e in store._segments if e[0] == "S"] == []
+    assert store.stored_bytes() == 0
+    assert "S" not in store._last_touch
