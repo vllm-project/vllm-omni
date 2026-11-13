@@ -235,9 +235,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
         # An explicitly declared model-state hook may return already determined
         # tokens. Unsupported sampling features retain the upstream path.
         sample_determined = getattr(type(self.model_state), "sample_determined_tokens", None)
+        determined_warmup = bool(
+            grammar_output is not None
+            and getattr(type(self.model_state), "sample_determined_tokens_during_warmup", False)
+            and input_batch.num_reqs > 0
+            and all(is_warmup_request(req_id) for req_id in input_batch.req_ids)
+        )
         if (
             sample_determined is not None
-            and grammar_output is None
+            and (grammar_output is None or determined_warmup)
             and self.batch_sharder is None
             and self.pp_handler is None
             and input_batch.num_draft_tokens == 0

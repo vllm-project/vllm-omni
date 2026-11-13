@@ -122,7 +122,6 @@ class Ids(TypedDict, total=False):
 
 
 class OmniPayloadMeta(TypedDict, total=False):
-    aborted: bool
     finished: torch.Tensor
     is_segment_finished: torch.Tensor
     stream_finished: torch.Tensor
@@ -130,10 +129,6 @@ class OmniPayloadMeta(TypedDict, total=False):
     chunk_seq: int
     cache_epoch: int
     codec_chunk_frames: int
-    transport_terminal: bool
-    terminal_output: bool
-    codec_frame_valid: torch.Tensor
-    codec_eos_valid: torch.Tensor
     codec_left_context_frames: int
     code_flat_numel: int
     last_chunk: bool
@@ -160,7 +155,6 @@ class OmniPayloadMeta(TypedDict, total=False):
     width: int
     decode_flag: bool
     codec_streaming: bool
-    codec_chunk_frames: int
     first_audio: bool | torch.Tensor
     codec_frame_valid: bool | torch.Tensor
     ref_code_len: int
@@ -257,7 +251,6 @@ class IdsStruct(_StructBase):
 
 
 class MetaStruct(_StructBase):
-    aborted: bool | None = None
     finished: torch.Tensor | None = None
     is_segment_finished: torch.Tensor | None = None
     stream_finished: torch.Tensor | None = None
@@ -289,11 +282,6 @@ class MetaStruct(_StructBase):
     width: int | None = None
     decode_flag: bool | None = None
     codec_streaming: bool | None = None
-    codec_chunk_frames: int | None = None
-    transport_terminal: bool | None = None
-    terminal_output: bool | None = None
-    codec_frame_valid: torch.Tensor | None = None
-    codec_eos_valid: torch.Tensor | None = None
     first_audio: torch.Tensor | None = None
     codec_frame_valid: torch.Tensor | None = None
     ref_code_len: int | None = None
@@ -440,7 +428,7 @@ def _dtype_to_name(dtype: torch.dtype) -> str:
 
 
 # ── Keys whose values are nested dicts (TypedDict sub-categories) ──
-_NESTED_KEYS = frozenset({"hidden_states", "embed", "ids", "codes", "meta", "zonos3_prompt"})
+_NESTED_KEYS = frozenset({"hidden_states", "embed", "ids", "codes", "meta"})
 
 
 def flatten_payload(payload: Mapping[str, Any]) -> dict[str, Any]:

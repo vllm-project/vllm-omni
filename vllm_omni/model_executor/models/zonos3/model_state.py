@@ -33,7 +33,7 @@ from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
-from .ar_config import ZONOS3_PROMPT_KEY, ZONOS3_SAMPLING_KEY, Zonos3Architecture
+from .ar_config import Zonos3Architecture
 from .modeling_zonos3_mini import Zonos3Backbone, Zonos3BackboneBatch, Zonos3PrefillSpan
 from .sampling_state import EOS, Zonos3ARSamplingState
 
@@ -56,14 +56,15 @@ class Zonos3SamplingOptions:
     def from_params(
         cls, params: SamplingParams, config: Zonos3Architecture, history_capacity: int
     ) -> Zonos3SamplingOptions:
-        extra = (params.extra_args or {}).get(ZONOS3_SAMPLING_KEY, {})
+        extra = params.extra_args or {}
         if not isinstance(extra, Mapping) or set(extra) - {
             "repetition_window",
             "repetition_codebooks",
             "min_frames",
             "eoa_policy",
+            "tts_local_seed",
         }:
-            raise ValueError("Invalid zonos3_sampling options")
+            raise ValueError("Invalid Zonos3 sampling options")
         if (
             params.logprobs is not None
             or params.prompt_logprobs is not None
@@ -83,7 +84,8 @@ class Zonos3SamplingOptions:
         if policy not in ("any", "codebook0"):
             raise ValueError("Zonos3 eoa_policy must be any or codebook0")
         codebooks = int(extra.get("repetition_codebooks", 6))
-        seed = int(params.seed) if params.seed is not None else secrets.randbits(63)
+        request_seed = extra.get("tts_local_seed", params.seed)
+        seed = int(request_seed) if request_seed is not None else secrets.randbits(63)
         seed = seed & ((1 << 64) - 1)
         if seed >= 1 << 63:
             seed -= 1 << 64
@@ -119,30 +121,24 @@ class _SamplingSettings:
 
 
 class Zonos3CodeSnapshot(PackedOutputSnapshot):
-    """One owned slab for RVQ codes and per-request validity/EOS flags.
+    """One owned slab of per-request RVQ rows.
 
     Request-owned lists keep the generic runner's token-span slicing out of
-    codebook rows, including mixed/partial prefills. No CPU flag is inspected
-    until the existing output worker has waited for its D2H completion event.
+    codebook rows, including mixed/partial prefills. Each row is the raw
+    sampled RVQ output; the AR sampler's GPU state decides when sampling ends.
     """
 
-    def __init__(self, codes: torch.Tensor, valid: torch.Tensor, finished: torch.Tensor) -> None:
-        self._frames = torch.cat((codes, valid[:, None], finished[:, None]), dim=-1)
-        dict.__init__(self, self._payload(self._frames))
+    def __init__(self, codes: torch.Tensor) -> None:
+        self._codes = codes
+        dict.__init__(self, self._payload(codes))
         self.producer_event = None
 
     @staticmethod
-    def _payload(frames: torch.Tensor) -> dict[str, Any]:
-        return {
-            "codes": {"audio": list(frames[:, :10].split(1))},
-            "meta": {
-                "codec_frame_valid": list(frames[:, 10:11].unbind(0)),
-                "codec_eos_valid": list(frames[:, 11:12].unbind(0)),
-            },
-        }
+    def _payload(codes: torch.Tensor) -> dict[str, Any]:
+        return {"codes": {"audio": list(codes.split(1))}}
 
     def copy_to_cpu(self, copy_tensor: Callable[[torch.Tensor], torch.Tensor]) -> dict[str, Any]:
-        return self._payload(copy_tensor(self._frames))
+        return self._payload(copy_tensor(self._codes))
 
 
 @dataclass
@@ -153,6 +149,11 @@ class _Prompt:
 
 class Zonos3ARModelState(OmniModelState):
     supports_prompt_embeds = False
+    # vLLM attaches an all-valid grammar mask to startup warmup requests and
+    # uses sampler-warmup SamplingParams (including logprobs > this model's
+    # two logical tokens). Zonos3 determines CONTINUE/EOS in its own GPU step;
+    # route only synthetic warmup requests through that result as well.
+    sample_determined_tokens_during_warmup = True
 
     def __init__(
         self, vllm_config: VllmConfig, model: Zonos3Backbone, encoder_cache: EncoderCache | None, device: torch.device
@@ -211,7 +212,12 @@ class Zonos3ARModelState(OmniModelState):
         if is_warmup_request(new_req_data.req_id):
             # Upstream startup requests can ask for text-only logprobs/grammar.
             # They are not serving requests and have no physical RVQ contract.
+            # Zonos3 emits only CONTINUE/EOS logical IDs, so the upstream text
+            # sampler's dummy logprob request (typically top-20) can exceed
+            # this tiny logical vocabulary during GPU startup warmup.
             params = SamplingParams(temperature=0.9, top_k=50, top_p=0.9, min_p=0.1, seed=0)
+            params.logprobs = None
+            params.prompt_logprobs = None
         options = Zonos3SamplingOptions.from_params(params, self.model.config, self.max_model_len)
         super().add_request(req_index, new_req_data)
         req_id = new_req_data.req_id
@@ -281,8 +287,8 @@ class Zonos3ARModelState(OmniModelState):
         length = self._lengths[req_id]
         if is_warmup_request(req_id):
             return _Prompt(torch.zeros((length, self._embed_dim), dtype=self.dtype, device=self.device), False)
-        payload = info.get(ZONOS3_PROMPT_KEY)
-        if not isinstance(payload, dict):
+        payload = info
+        if not payload:
             raise ValueError("Missing Zonos3 prompt conditioning metadata")
         ids = payload.get("frame_ids")
         c = self.model.config
@@ -577,6 +583,12 @@ class Zonos3ARModelState(OmniModelState):
             codes = self._draw_cpu(probs, [int(slot) for slot in input_batch.idx_mapping_np], active)
         else:
             raise ValueError("Zonos3 sampling supports CUDA serving and CPU numerical checks")
+        # Keep the producer contract simple: prefill rows and any scheduler
+        # step after the GPU-side EOS drain publish no RVQ row. The EOS step
+        # itself remains active and its raw codes are delivered to the processor.
+        # The row is represented by padding because the generic runner still
+        # partitions one output row per scheduled request token.
+        codes = torch.where(active[:, None], codes, self.model.config.audio_pad_id)
         step = self.sampling_state.accept(slots, codes, active)
         ring = position[:, None] % self.max_model_len
         old = self.history[slots[:, None], self.sampling_state.columns[None, :], ring]
@@ -588,7 +600,7 @@ class Zonos3ARModelState(OmniModelState):
         previous = self.next_embeddings.index_select(0, slots)
         self.next_embeddings.index_copy_(0, slots, torch.where(step.active[:, None], embeddings, previous))
         self._sample_output = SamplerOutput(step.logical_token_ids.long(), None, None, sampled, rejected)
-        return hidden, Zonos3CodeSnapshot(step.codes, step.active, step.finished)
+        return hidden, Zonos3CodeSnapshot(step.codes)
 
     def sample_determined_tokens(self, batch: InputBatch, sampler: Sampler) -> SamplerOutput:
         """Deliver the CONTINUE/EOS decided in postprocess without text sampling."""

@@ -336,6 +336,19 @@ class TestFlattenUnflattenRoundTrip:
 
 
 class TestSerializeDeserializePayload:
+    def test_model_owned_nested_namespace_round_trip(self):
+        original = {
+            "frame_ids": torch.arange(6).reshape(2, 3),
+            "speaker": torch.tensor([0.25, 0.5]),
+        }
+        wire = serialize_payload(original)
+        assert wire is not None
+        assert "frame_ids" in wire.entries
+        assert "speaker" in wire.entries
+        restored = deserialize_payload(wire)
+        assert torch.equal(restored["frame_ids"], original["frame_ids"])
+        assert torch.equal(restored["speaker"], original["speaker"])
+
     def test_tensor_round_trip(self):
         original: OmniPayload = {
             "hidden_states": {"output": torch.tensor([[1.0, 2.0], [3.0, 4.0]])},

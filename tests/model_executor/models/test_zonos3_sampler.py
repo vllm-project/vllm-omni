@@ -16,7 +16,6 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 from tests.model_executor.models.test_zonos3_model_state import make_owner, materialize_codes
 from vllm_omni.core.sched.output import OmniNewRequestData
-from vllm_omni.model_executor.models.zonos3.ar_config import ZONOS3_SAMPLING_KEY
 from vllm_omni.model_executor.models.zonos3.model_state import Zonos3SamplingOptions
 from vllm_omni.model_executor.models.zonos3.sampling_state import CONTINUE, EOS
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
@@ -69,7 +68,7 @@ def make_batch(slots, seq_lens=None, prefill_len=1, device="cpu"):
 
 
 def greedy_params(**extra):
-    return SamplingParams(temperature=0, stop_token_ids=[EOS], extra_args={ZONOS3_SAMPLING_KEY: extra})
+    return SamplingParams(temperature=0, stop_token_ids=[EOS], extra_args=extra)
 
 
 def run(state, slots, hidden, seq_lens=None, prefill_len=1):
@@ -102,7 +101,6 @@ def test_parallel_codebooks_one_scheduler_token_and_feedback_contract():
     torch.testing.assert_close(state.next_embeddings[[1, 0]], state.model.multi_embedder(frame))
     materialized = materialize_codes(snapshot)
     assert [p["codes"]["audio"].shape for p in materialized] == [(1, 10), (1, 10)]
-    assert all(bool(p["meta"]["codec_frame_valid"].item()) for p in materialized)
 
 
 def test_rvq_top_k_is_not_clamped_to_three_logical_tokens():
@@ -122,7 +120,10 @@ def test_chunked_prefill_does_not_advance_physical_state_or_rng():
     hidden = torch.randn(1, 16)
     output, first = run(state, [0], hidden, [2], prefill_len=5)
     assert output.num_sampled.item() == 0 and state.sampling_state.position[0].item() == 0
-    assert not materialize_codes(first)[0]["meta"]["codec_frame_valid"].any()
+    assert torch.equal(
+        materialize_codes(first)[0]["codes"]["audio"],
+        torch.full((1, 10), state.model.config.audio_pad_id, dtype=torch.int64),
+    )
     _, actual = run(state, [0], hidden, [5], prefill_len=5)
     _, expected = run(single, [0], hidden)
     assert torch.equal(codes(actual), codes(expected))
@@ -146,8 +147,13 @@ def test_tail_drain_logical_eos_is_independent_and_absorbs_async_extra_step():
             EOS if step >= 10 else CONTINUE,
             EOS if step >= 14 else CONTINUE,
         ]
+        if step > 10:
+            assert codes(snapshot)[0].eq(c.audio_pad_id).all()
     assert state.sampling_state.position.tolist()[:2] == [11, 15]
-    assert not materialize_codes(snapshot)[0]["meta"]["codec_frame_valid"].any()
+    assert torch.equal(
+        materialize_codes(snapshot)[0]["codes"]["audio"],
+        torch.full((1, 10), c.audio_pad_id, dtype=torch.int64),
+    )
 
 
 @pytest.mark.parametrize("concurrency", [1, 4, 8, 16, 32])
@@ -162,7 +168,7 @@ def test_seeded_rvq_sampling_is_invariant_to_batch_reordering(concurrency):
             top_p=0.85,
             seed=100 + slot,
             repetition_penalty=1.4,
-            extra_args={ZONOS3_SAMPLING_KEY: {"repetition_window": 4}},
+            extra_args={"repetition_window": 4},
         )
         add_sampling(single, 0, params)
         single.apply_staged_writes()
@@ -202,6 +208,13 @@ def test_state_rejects_unsupported_logical_constraints_and_dirty_staging():
         run(state, [0], torch.zeros(1, 16))
     with pytest.raises(ValueError, match="eoa_policy"):
         Zonos3SamplingOptions.from_params(greedy_params(eoa_policy="bad"), state.model.config, 128)
+
+
+def test_tts_local_seed_is_accepted_as_shared_speech_sampling_metadata():
+    state = make_state(1)
+    params = SamplingParams(temperature=0.7, extra_args={"tts_local_seed": 42})
+    options = Zonos3SamplingOptions.from_params(params, state.model.config, 128)
+    assert options.seed == 42
 
 
 @torch.inference_mode()
@@ -252,7 +265,7 @@ def test_official_rvq_filter_probabilities_with_repetition_and_delayed_min_frame
             min_p=0.05,
             repetition_penalty=1.4,
             seed=23,
-            extra_args={ZONOS3_SAMPLING_KEY: {"repetition_window": 5, "repetition_codebooks": 6, "min_frames": 2}},
+            extra_args={"repetition_window": 5, "repetition_codebooks": 6, "min_frames": 2},
         )
         for slot in range(2):
             add_sampling(state, slot, params)

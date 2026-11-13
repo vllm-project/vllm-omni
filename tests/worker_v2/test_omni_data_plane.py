@@ -348,7 +348,7 @@ def test_zonos3_native_materialization_hook_and_connector_terminal(raw_plane):
             rows[3 + j, j] = 1024
         rows[12, :] = 1025
         for i, row in enumerate(rows):
-            snapshot = Zonos3CodeSnapshot(row[None], torch.tensor([True]), torch.tensor([i == 12]))
+            snapshot = Zonos3CodeSnapshot(row[None])
             output = _Output(
                 payload=materialize_codes(snapshot)[0],
                 token=2 if i == 12 else 1,
