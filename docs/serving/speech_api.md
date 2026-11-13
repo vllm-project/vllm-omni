@@ -600,7 +600,8 @@ keeps its KV cache and its seat, and no other request takes the seat. Codec
 EOS waits for the end of the text. A request that waits for text longer than
 `VLLM_OMNI_TEXT_STREAM_TIMEOUT_S` seconds (default 5; 0 turns the deadline off)
 ends with an error output and frees its KV cache and its seat. An append that
-the engine cannot apply also ends the request with an error output. Multi-frame
+the Talker's AR scheduler cannot apply also ends the request with an error
+output. Multi-frame
 Talker decode does not support streamed text. As with the silence ban, a stage
 that sets `text_stream_policy` tracks every request's output tokens for the
 codec EOS check.

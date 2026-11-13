@@ -4280,9 +4280,10 @@ class Orchestrator(OrchestratorBase):
 
         The send starts in dispatch order, so appends reach the engine core
         after the request's ADD and in the order they were made, while the
-        dispatch loop does not wait for the engine's answer. The engine ends a
-        live request whose append it cannot apply, which the client sees as an
-        error output; an append for a request that already ended is dropped.
+        dispatch loop does not wait for the engine's answer. A scheduler that
+        refuses an append ends the live request with an error output; a stage
+        without ``append_text`` only refuses it, and this logs that. An append
+        for a request that already ended is dropped.
         """
         req_state = self.request_states.get(msg.request_id)
         if req_state is None:
@@ -4313,7 +4314,7 @@ class Orchestrator(OrchestratorBase):
                 )
         else:
             if refusal is not None:
-                # The engine has already ended a live request it refused; an ended request needs nothing.
+                # A scheduler refusal has already ended the request; a stage without append_text ends nothing.
                 logger.debug("[Orchestrator] append_text for req %s refused: %s", msg.request_id, refusal)
 
     async def _handle_interaction(self, msg: InteractionMessage) -> None:
