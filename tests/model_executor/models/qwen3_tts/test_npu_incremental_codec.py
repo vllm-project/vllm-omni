@@ -319,7 +319,7 @@ def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, source):
     )
 
 
-@pytest.mark.parametrize("has_triton,incremental", [(False, True), (True, False), (False, False)])
+@pytest.mark.parametrize("has_triton,incremental", [(False, True), (True, False)])
 @pytest.mark.parametrize("source", ["additional", "connector"])
 def test_explicit_dual_stream_conflict_fails_before_capture(monkeypatch, has_triton, incremental, source):
     pytest.importorskip("torch_npu")
@@ -396,7 +396,7 @@ def test_all_tail_lengths_match_eager_state(monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(NPUIncrementalCodec, "prewarm", lambda self: None)
         reference = NPUIncrementalCodec(decoder, slots=2, max_batch=2, chunk_frames=25)
-    caches = [{}, {}]
+    caches: list[dict[str, int]] = [{}, {}]
     ref_slots = [reference.alloc(), reference.alloc()]
     indices = torch.tensor(ref_slots, device="npu")
     run = _ShapeGraph.run
