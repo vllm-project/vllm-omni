@@ -428,6 +428,8 @@ class _MossTTSAdapterBase(ARTTSAdapter):
                 codec_path,
                 trust_remote_code=True,
             )
+            # This process only encodes references; Stage 1 decodes audio.
+            codec.decoder = None
             # Production follows the codec stage accelerator. Memory-constrained
             # qualification lanes can opt into CPU without weakening the
             # default cold-reference latency for user deployments.

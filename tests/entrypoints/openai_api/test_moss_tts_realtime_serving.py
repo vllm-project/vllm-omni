@@ -3,6 +3,7 @@
 
 import asyncio
 import threading
+import weakref
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -60,15 +61,21 @@ def test_realtime_components_use_the_realtime_model_and_codec(
     tokenizer = object()
     codec_devices: list[torch.device] = []
 
-    class Codec:
+    class Codec(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Linear(2, 2)
+            self.decoder = torch.nn.Linear(2, 2)
+
         def to(self, device):
+            assert self.decoder is None
+            assert decoder_ref() is None
             codec_devices.append(device)
             return self
 
-        def eval(self):
-            return self
-
     codec = Codec()
+    decoder_ref = weakref.ref(codec.decoder)
+    encoder = codec.encoder
     processor_calls = []
 
     class Processor:
@@ -109,6 +116,8 @@ def test_realtime_components_use_the_realtime_model_and_codec(
     assert tokenizer_calls == [("OpenMOSS-Team/MOSS-TTS-Realtime", True)]
     assert codec_calls == [(expected_codec_path, True)]
     assert codec_devices == [expected_codec_device]
+    assert codec.encoder is encoder
+    assert set(dict(codec.named_parameters())) == {"encoder.weight", "encoder.bias"}
     assert processor_calls == [tokenizer]
 
 
