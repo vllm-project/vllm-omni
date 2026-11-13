@@ -1,7 +1,7 @@
 # Scheduled backend comparison
 
 PR #1994 provides weekly comparisons for Qwen3-Omni, Qwen3-TTS,
-Qwen-Image-2.1, MiniCPM-o 4.5, Cosmos3 T2I and HunyuanVideo-1.5 on H100 GPUs. Audio jobs use
+Qwen-Image-2.1, MiniCPM-o 4.5, Cosmos3 T2I, HunyuanVideo-1.5 and MiniMax-H3 on H100 GPUs. Audio jobs use
 a separate SGLang-Omni image; native SGLang diffusion jobs use a fixed image
 digest. Reuse the existing daily vLLM-Omni H100 artifacts for the other side
 of the comparison.
@@ -11,7 +11,7 @@ flowchart LR
     S[Buildkite native schedule: weekly] --> P[Existing pipeline: comparison-only entry]
     P --> I[Build SGLang comparison image]
     I --> B[Qwen3-Omni, Qwen3-TTS, MiniCPM-o]
-    P --> D[Fixed image: Qwen-Image-2.1, Cosmos3, HunyuanVideo]
+    P --> D[Fixed image: Qwen-Image-2.1, Cosmos3, HunyuanVideo, MiniMax]
     B --> A[JSON artifacts]
     D --> A
     N[Existing daily vLLM-Omni H100 job] --> V[Existing JSON artifacts]
@@ -63,6 +63,7 @@ The weekly YAML contains `image-build-sglang-omni` and these benchmark jobs:
 | MiniCPM-o 4.5 | `perf-sglang-minicpm-o` | 1 | Smoke then 32 audio requests, C1 |
 | Cosmos3 T2I | `perf-sglang-cosmos3-t2i` | 2 | Smoke then 3 images, 1024×1024, 4 steps, C1 |
 | HunyuanVideo-1.5 | `perf-sglang-hunyuanvideo15` | 1 | Smoke then 10 videos, 832×480, 33 frames, 24fps, 4 steps, C1 |
+| MiniMax-H3 | `perf-sglang-minimax-h3` | 4 | Smoke then 3 videos with audio, 1344×768, 209 frames, 24fps, 8 steps, C1 |
 
 Cosmos3's formal workload passed in
 [build #19030](https://buildkite.com/vllm/vllm-omni/builds/19030).
@@ -70,6 +71,10 @@ HunyuanVideo's formal workload and cached configuration audit passed in
 [build #19558](https://buildkite.com/vllm/vllm-omni/builds/19558), with all 12
 videos including warmups fully decoded. It uses the Diffusers fallback with
 BF16 VAE; the paired native vLLM baseline uses FP32 VAE.
+MiniMax's formal workload passed in
+[build #19559](https://buildkite.com/vllm/vllm-omni/builds/19559), including
+four fully decoded videos with 32kHz stereo audio. Its API omits video
+statistics, so comparisons use end-to-end latency and request throughput.
 All weekly GPU jobs share concurrency group `vllm-omni/pr1994/sglang-smoke`
 with a limit of two jobs; each job retains its declared GPU count. Scheduled
 builds do not require PR labels. This route does not upload the regular CUDA bootstrap/test pipelines, hardware mirrors or any
@@ -104,9 +109,8 @@ Explicit API runs use `BACKEND_COMPARISON_ONLY=smoke` and
 `comparison_smoke_pipeline.py`; this route requires source `api` and the same
 pipeline, repository, PR ref and immutable checkout checks. A selection such
 as `cosmos3-t2i-perf` or `wan22-i2v-perf` runs that model's smoke and formal
-workload. MiniMax-H3 formal API validation is in progress; Wan2.2 I2V is
-retrying an agent-lost run. These two video models are not included in the
-weekly set.
+workload. Wan2.2 I2V is retrying an agent-lost run and is not included in the
+weekly set until its formal workload passes.
 
 The kanban consumer accepts the existing `vllm-omni` pipeline with branch
 `refs/pull/1994/head`, source `schedule` or `api`, the upstream repository and
