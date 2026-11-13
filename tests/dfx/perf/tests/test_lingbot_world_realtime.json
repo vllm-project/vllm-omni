@@ -1,7 +1,7 @@
 [
   {
     "test_name": "test_lingbot_world_realtime_cuda",
-    "description": "New recorded-data recipe on 2 H100 devices: three 40-chunk boardwalk-42 measured rollouts after one separate 8-chunk warmup. No matching recorded latency baseline is available; baseline is intentionally omitted. This records valid measurements, not a performance regression verdict.",
+    "description": "Recorded-data recipe on 2 H100 devices: three 40-chunk boardwalk-42 measured rollouts after one separate 8-chunk warmup. H100 baseline references vllm-omni Buildkite build 19532 (commit d60e82c0d5deeaed6c7bbcb7725f12d02e694f82, recorded request_throughput 0.0166, mean_e2el_ms 60157.5497, mean_video_ttfc_ms 7520.7890, min_video_fps 6.7644, mean_video_rtf 1.5133, mean_video_steady_interval_ms 1349.9387, p95_video_steady_interval_ms 1524.8343): request_throughput and min_video_fps are measured x 0.90, latency, interval and RTF are measured x 1.10, rounded to 4 decimals. This single run is a reference measurement, not validation of later revisions.",
     "mark": [
       {
         "hardware_marks": {
@@ -55,7 +55,18 @@
           "session_warmup_chunks=8",
           "attention_warmup_chunks=6",
           "sequence_parallel_size=2"
-        ]
+        ],
+        "baseline": {
+          "H100": {
+            "request_throughput": 0.015,
+            "mean_e2el_ms": 66173.3047,
+            "mean_video_ttfc_ms": 8272.8679,
+            "min_video_fps": 6.0879,
+            "mean_video_rtf": 1.6646,
+            "mean_video_steady_interval_ms": 1484.9326,
+            "p95_video_steady_interval_ms": 1677.3178
+          }
+        }
       }
     ]
   },

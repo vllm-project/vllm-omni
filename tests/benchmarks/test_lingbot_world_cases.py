@@ -23,6 +23,7 @@ def measurements(tmp_path, monkeypatch):
     profile = runner.ROOT / "tests/e2e/accuracy/lingbot_world/configs/cuda.json"
     root = tmp_path / "raw"
     settings = runner.load_settings(profile, tmp_path / "judgments", generation=root)
+    settings["record_only"] = True
     monkeypatch.setattr(runner, "git_revision", lambda _: "c" * 40)
     arm = root / "candidate"
     save_tensor_sample(arm / "precision.npz", inputs={"latent": np.ones(2)}, outputs={"decoded": np.ones(2)})
@@ -85,6 +86,47 @@ def test_three_scorers_use_shared_frontend_and_keep_independent_verdicts(measure
     assert semantic["boardwalk-42_dynamic_degree"] == 1.0
     assert numerical["recording_report"]["measurements"]["replay"]["tensors"]["output/decoded"]["shape"] == [2]
     assert all("passed" not in row and "status" not in row and "measurements" not in row for row in records)
+
+
+def test_cuda_score_floors_gate_semantic_suites_only(measurements, monkeypatch, tmp_path, capsys):
+    settings, data = measurements
+    settings["record_only"] = False
+    floors = settings["score_floors"]["vbench"]
+    assert floors and not any(name.endswith("dynamic_degree") for name in floors)
+    stub_semantic_boundary(monkeypatch, tmp_path)
+    scores = {name: floor + 0.01 for name, floor in floors.items()}
+    scores["street-42_imaging_quality"] = floors["street-42_imaging_quality"] - 0.001
+    monkeypatch.setattr(
+        evaluation,
+        "_record_semantic",
+        lambda root, manifest, *, suite, **kwargs: {
+            "scores": {
+                case["id"]: {
+                    name.removeprefix(f"{case['id']}_"): value
+                    for name, value in scores.items()
+                    if name.startswith(f"{case['id']}_")
+                }
+                for case in manifest["contract"]["profile"]["cases"]
+            }
+        },
+    )
+    failed = checks.run_accuracy(settings, data, "vbench")
+    assert not failed["passed"] and failed["comparison_status"] == "compared"
+    assert failed["floor_violations"] == [
+        f"street-42_imaging_quality: {scores['street-42_imaging_quality']!r} < {floors['street-42_imaging_quality']}"
+    ]
+    assert read_json(settings["output"] / "vbench.json")["floor_violations"] == failed["floor_violations"]
+    scores["street-42_imaging_quality"] = floors["street-42_imaging_quality"]
+    assert checks.run_accuracy(settings, data, "vbench")["passed"]
+    precision = checks.run_accuracy(settings, data, "precision")
+    assert precision["passed"] and precision["comparison_status"] == "pending_baseline"
+    records = {
+        row["dataset"]: row for row in map(read_json, (settings["output"] / "results").glob("result_acc_*.json"))
+    }
+    assert records["lingbot_world_vbench"]["baseline"] == {"H100": floors}
+    assert records["lingbot_world_vbench"]["accuracy_mode"] == "score_floor"
+    assert records["lingbot_world_precision"]["baseline"] == {}
+    assert "score floors failed" in capsys.readouterr().out
 
 
 def test_partial_numerical_capture_does_not_hide_valid_semantic_inputs(measurements, monkeypatch, tmp_path):
