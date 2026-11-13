@@ -52,7 +52,7 @@ def test_registered_as_reasoning_and_expert_stages():
     pipeline = OMNI_PIPELINES["alpamayo2_super"]
     reasoning, expert = pipeline.stages
     assert reasoning.execution_type == StageExecutionType.LLM_AR
-    assert reasoning.omni_kv_config == {"need_send_cache": True}
+    assert reasoning.omni_kv_config == {"need_send_cache": True, "per_sample_kv": True}
     assert expert.execution_type == StageExecutionType.DIFFUSION and expert.input_sources == (0,)
     assert expert.omni_kv_config == {"need_recv_cache": True} and expert.final_output
     assert _OMNI_MODELS["Alpamayo2SuperPolicy"][2] == "Alpamayo2SuperPolicyForConditionalGeneration"

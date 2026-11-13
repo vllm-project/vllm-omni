@@ -571,7 +571,7 @@ L4 level testing is a comprehensive quality audit before a version release. It e
 #### 3.3 Test Directory and Execution Files
 
 - ***Functional Testing***: Same directories as L3.
-- ***Performance Test Configuration***: `tests/dfx/perf/tests/test_qwen3_omni_*.json`, `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json`, and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (e.g. `test_qwen_image_vllm_omni.json`, `test_cosmos3_vllm_omni.json`). Optional per-case `mark` for local `-m` filtering is documented in Section 3.4 Performance Tests.
+- ***Performance Test Configuration***: `tests/dfx/perf/tests/test_qwen3_omni_*.json`, `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json`, and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (e.g. `test_bagel_vllm_omni.json`, `test_cosmos3_vllm_omni.json`). Optional per-case `mark` for local `-m` filtering is documented in Section 3.4 Performance Tests.
 - ***Documentation Example Tests***:
     - `tests/examples/online_serving/test_{model_name}.py`
     - `tests/examples/offline_inference/test_{model_name}.py`

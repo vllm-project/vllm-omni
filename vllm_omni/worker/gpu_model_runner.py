@@ -210,8 +210,9 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
-        group = getattr(self.vllm_config, "weight_sharing", None)
-        if getattr(group, "role", None) == "provider":
+        from vllm_omni.distributed.weight_sharing.worker_session import resolve_worker_sharing
+
+        if resolve_worker_sharing(self.vllm_config, role="provider") is not None:
             raise ValueError(
                 "weight sharing role='provider' requires the Model Runner V2 path; "
                 "the MRv1 runner cannot publish a shared backbone"
@@ -233,6 +234,15 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._prewarm_attention_capture_workspaces()
         self._report_model_local_kv()
         self._warn_unexposed_stage_hooks(model)
+        # After model ``__init__`` (which may set cudagraph_specialize_moe_routing).
+        self._ensure_moe_specialty_runner_compatible()
+
+    def _ensure_moe_specialty_runner_compatible(self) -> None:
+        from vllm_omni.cudagraph.moe_routing_compat import (
+            ensure_moe_specialty_runner_compatible,
+        )
+
+        ensure_moe_specialty_runner_compatible(self)
 
     # Read on the model this runner holds. A multi-stage wrapper that builds its
     # stage module as a child must re-export them, or the runner silently takes
@@ -995,6 +1005,24 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             return torch.tensor([])
         return super()._dummy_sampler_run(hidden_states=hidden_states)
 
+    def _annotate_moe_routing_batch_descriptor(
+        self,
+        batch_desc,
+        *,
+        num_tokens: int,
+        force_moe_routing_key: int | None = None,
+    ):
+        """Hook for MoE specialty capture; default no-op (Mammoth overrides)."""
+        # Same gate as post-``load_model``; keeps capture/replay fail-fast if
+        # the flag is flipped after load on a non-specialty V1 runner.
+        self._ensure_moe_specialty_runner_compatible()
+        return batch_desc
+
+    def _select_moe_replay_batch_descriptor(self, mode, batch_desc, num_tokens: int):
+        """Hook for MoE specialty replay; default no-op (Mammoth overrides)."""
+        self._ensure_moe_specialty_runner_compatible()
+        return batch_desc
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -1011,6 +1039,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         randomize_inputs: bool = False,
+        force_moe_routing_key: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -1123,6 +1152,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
             )
+        )
+        # #9865: Mammoth overrides this hook to pin moe_routing_key on capture.
+        batch_desc = self._annotate_moe_routing_batch_descriptor(
+            batch_desc,
+            num_tokens=num_tokens_unpadded,
+            force_moe_routing_key=force_moe_routing_key,
         )
 
         if cudagraph_runtime_mode is None:
@@ -1968,8 +2003,15 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             # need the scheduled token ids to build or replace those embeddings.
             preprocess_input_ids = input_ids if input_ids is not None else self.input_ids.gpu[:num_input_tokens]
             preprocess_device = preprocess_input_ids.device
+            batch_preprocess_embeds = inputs_embeds
+            if getattr(self.model, "preprocess_batch_requires_stable_decode", False) and (
+                scheduler_output.scheduled_new_reqs or scheduler_output.scheduled_cached_reqs.resumed_req_ids
+            ):
+                # Keep cleanup/prefetch hooks, but do not let a decode-only
+                # shortcut consume newly admitted or resumed requests.
+                batch_preprocess_embeds = None
             batch_filled_req_ids = self._maybe_run_batch_preprocess(
-                req_ids, preprocess_device, preprocess_input_ids, inputs_embeds, num_scheduled_tokens_np
+                req_ids, preprocess_device, preprocess_input_ids, batch_preprocess_embeds, num_scheduled_tokens_np
             )
 
             # Overlay custom prompt_embeds per request for the prompt portion;
