@@ -5,7 +5,7 @@ meta:
   provider: "MiniMax"
   description: "Open-weight text-to-image and reference-image editing on the MiniMax-H3 DiT — six CFG-distilled steps per image, up to 16 reference images, 2K-class canvases, served via vLLM-Omni"
   date_added: 2026-11-10
-  date_updated: 2026-11-12
+  date_updated: 2026-11-13
   tasks:
     - omni
   performance_headline: "A 2720×1536 image in about 0.8 s and a 2048² edit in 1.35 s end to end on 4×H200"
@@ -136,23 +136,16 @@ variants:
 compatible_strategies: []
 
 hardware_overrides:
-  # AMD Instinct runs the VAE tile decode eagerly. MI300X and MI355X share the
-  # MI325X (gfx942) and MI350X (gfx950) architectures (not measured).
+  # AMD Instinct uses the default VAE tile graphs with one replica on ROCm.
+  # MI300X and MI355X share the MI325X (gfx942) and MI350X (gfx950)
+  # architectures (not measured).
   mi300x:
-    extra_args:
-      - "--no-enable-cuda-graph-decode"
     install_note: "Use the vllm/vllm-omni:minimax-h3-image-rocm image; the pip command installs CUDA wheels."
   mi325x:
-    extra_args:
-      - "--no-enable-cuda-graph-decode"
     install_note: "Use the vllm/vllm-omni:minimax-h3-image-rocm image; the pip command installs CUDA wheels."
   mi350x:
-    extra_args:
-      - "--no-enable-cuda-graph-decode"
     install_note: "Use the vllm/vllm-omni:minimax-h3-image-rocm image; the pip command installs CUDA wheels."
   mi355x:
-    extra_args:
-      - "--no-enable-cuda-graph-decode"
     install_note: "Use the vllm/vllm-omni:minimax-h3-image-rocm image; the pip command installs CUDA wheels."
 
 strategy_overrides: {}
@@ -251,8 +244,11 @@ guide: |
   ## AMD Instinct
 
   Use `vllm/vllm-omni:minimax-h3-image-rocm` (vLLM 0.33.0+rocm100, kernels for
-  `gfx942` and `gfx950`) with the default command plus
-  `--no-enable-cuda-graph-decode`, which runs the VAE tile decode eagerly.
+  `gfx942` and `gfx950`) with the default command. VAE tile graphs are enabled
+  by default; ROCm replays one graph replica while the DiT remains eager.
+  Do not add `--enforce-eager` when using VAE graphs. If an older image lacks
+  the ROCm single-replica fix, update its vLLM-Omni source before enabling
+  graphs. `--no-enable-cuda-graph-decode` remains the eager fallback.
   MI325X and MI350X are verified; MI300X and MI355X share their architectures
   but were not measured.
 
