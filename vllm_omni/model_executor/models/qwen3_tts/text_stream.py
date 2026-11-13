@@ -53,6 +53,33 @@ def text_lead(info: Mapping[str, Any] | None) -> int:
     return int(value)
 
 
+class TextLeadError(ValueError):
+    """A request's ``text_lead`` that its prompt cannot lay out: a client error, raised before the request runs."""
+
+
+def text_lead_error(info: Mapping[str, Any] | None, num_text_ids: int | None = None) -> str | None:
+    """Why the request's ``text_lead`` cannot be laid out, or ``None``.
+
+    A lead applies to the CustomVoice prompt in streaming mode only, where it is
+    otherwise ignored. With ``num_text_ids`` (a whole text's token count) it is
+    also bounded: the lead rows may hold every id and the text END, no more.
+    """
+    try:
+        lead = text_lead(info)
+    except ValueError as exc:
+        return str(exc)
+    if lead == 0 or info is None:
+        return None
+    task_type = first_value(info.get("task_type")) or "CustomVoice"
+    if task_type != "CustomVoice":
+        return "'text_lead' is only valid for CustomVoice task"
+    if non_streaming_mode(info, task_type):
+        return "'text_lead' requires non_streaming_mode=false (the streaming prompt layout)"
+    if num_text_ids is not None and lead > num_text_ids + 1:
+        return f"'text_lead' {lead} exceeds the text's {num_text_ids} tokens plus its end"
+    return None
+
+
 def text_stream_spec(info: Mapping[str, Any], model_config: ModelConfig | None = None) -> TextStreamSpec:
     """``text_stream_policy`` of a Qwen3-TTS Talker stage: how a request reads its streamed text.
 

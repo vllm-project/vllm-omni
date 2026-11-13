@@ -24,7 +24,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     conditioning_cache_salt,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
-from vllm_omni.model_executor.models.qwen3_tts.text_stream import TEXT_LEAD_KEY
+from vllm_omni.model_executor.models.qwen3_tts.text_stream import TEXT_LEAD_KEY, TextLeadError, text_lead_error
 from vllm_omni.utils.speaker_cache import validate_qwen3_tts_profile
 
 if TYPE_CHECKING:
@@ -380,33 +380,12 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         return self._validate_max_new_tokens(request)
 
     def _validate_text_lead(self, request: "OpenAICreateSpeechRequest", task_type: str) -> str | None:
-        """A text lead lays out the streaming CustomVoice prompt (``build`` checks it against the text's length)."""
-        if not getattr(request, "text_lead", None):
-            return None
-        if task_type != "CustomVoice":
-            return "'text_lead' is only valid for CustomVoice task"
-        if request.non_streaming_mode is not False:
-            return "'text_lead' requires non_streaming_mode=false (the streaming prompt layout)"
-        return None
-
-    @staticmethod
-    def _text_lead_bound_error(tts_params: dict[str, Any]) -> str | None:
-        """Why a text lead passes the text's END (at most its token count plus one), or ``None``.
-
-        Reads the assistant-text ids that the prompt length estimate tokenized
-        on the executor, so the event loop does no tokenizer work.
-        """
-        from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY
-
-        lead = (tts_params.get(TEXT_LEAD_KEY) or [0])[0]
-        ids = (tts_params.get(PRECOMPUTED_TEXT_IDS_KEY) or [None])[0]
-        if not lead or ids is None:
-            return None
-        # The assistant template wraps the text in 3 + 5 tokens.
-        num_text_ids = len(ids) - 8
-        if lead > num_text_ids + 1:
-            return f"'text_lead' {lead} exceeds the text's {num_text_ids} tokens plus its end"
-        return None
+        """A text lead lays out the streaming CustomVoice prompt only; the prompt length estimate in ``build``
+        bounds it by the text, off the event loop."""
+        info: dict[str, Any] = {TEXT_LEAD_KEY: [getattr(request, "text_lead", None)], "task_type": [task_type]}
+        if request.non_streaming_mode is not None:
+            info["non_streaming_mode"] = [request.non_streaming_mode]
+        return text_lead_error(info)
 
     def _build_tts_params(self, request: "OpenAICreateSpeechRequest") -> dict[str, Any]:
         """Build TTS parameters from request.
@@ -606,7 +585,12 @@ class Qwen3TTSAdapter(ARTTSAdapter):
                 # Spares the engine tokenizing the same text on its step thread.
                 tts_params[PRECOMPUTED_TEXT_IDS_KEY] = [assistant_ids[0]]
             return prompt_len
+        except TextLeadError:
+            raise  # a client error (build() turns it into a 400), not a reason for the fallback length
         except Exception as e:
+            if tts_params.get(TEXT_LEAD_KEY):
+                # The fallback length cannot match a lead layout, and the bound went unchecked.
+                raise TextLeadError(f"'text_lead' needs the prompt length estimate, which failed: {e}") from e
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
             return 2048
 
@@ -646,9 +630,8 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             # encoding; a miss recomputes from this payload instead of failing.
             tts_params["ref_audio"] = [[_ref_audio_wire_waveform(waveform), sr]]
 
+        # Raises TextLeadError (a ValueError) for a text lead the text cannot fill.
         ph_len = await self._estimate_prompt_len_async(tts_params)
-        if (lead_error := self._text_lead_bound_error(tts_params)) is not None:
-            raise ValueError(lead_error)
         prompt = tokens_input(prompt_token_ids=[1] * ph_len)
         prompt["additional_information"] = tts_params
         prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)

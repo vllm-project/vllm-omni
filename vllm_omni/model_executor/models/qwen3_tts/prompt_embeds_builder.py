@@ -41,11 +41,12 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
 
+from vllm_omni.core.sched.text_stream import declares_text_stream
 from vllm_omni.utils.audio import mel_filter_bank
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
 from .streamed_text import lead_layout
-from .text_stream import non_streaming_mode, text_lead
+from .text_stream import TextLeadError, non_streaming_mode, text_lead, text_lead_error
 
 if TYPE_CHECKING:
     from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSTalkerConfig
@@ -75,6 +76,22 @@ PRECOMPUTED_REF_IDS_KEY = "_qwen3_tts_ref_ids"
 
 def build_assistant_text(text: str) -> str:
     return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+
+
+# Tokenized, build_assistant_text() is a 3-id role header, the text's ids, then 5 template ids.
+_ASSISTANT_TEXT_IDS = slice(3, -5)
+
+
+def assistant_text_ids(ids: Any) -> Any:
+    """The text's own ids in tokenized :func:`build_assistant_text` output (a sequence, or ``[batch, n]`` ids)."""
+    if isinstance(ids, torch.Tensor) and ids.ndim > 1:
+        return ids[..., _ASSISTANT_TEXT_IDS]
+    return ids[_ASSISTANT_TEXT_IDS]
+
+
+def num_assistant_text_ids(num_assistant_ids: int) -> int:
+    """How many text ids a tokenized :func:`build_assistant_text` output of this length holds."""
+    return len(range(num_assistant_ids)[_ASSISTANT_TEXT_IDS])
 
 
 def build_ref_text(text: str) -> str:
@@ -471,7 +488,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         """Where the rows of a cached non-streaming CustomVoice prompt come from, or ``None`` for the full path.
 
         For the requests :meth:`_cached_custom_voice_prompt` serves, the prompt
-        is ``prefix + (table[ids[3:-5]] + pad_row) + eos_row + tail``. Returns
+        is ``prefix + (table[assistant_text_ids(ids)] + pad_row) + eos_row + tail``. Returns
         the rows of those constant pieces in :meth:`prompt_row_table`
         (``prefix_start, prefix_len, pad_row, eos_row, tail``) and the request's
         full template ids, so a batch of prompts can be assembled by row
@@ -1136,7 +1153,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         if not items:
             return {}
         full_ids = [ids for _info, _req_id, ids in items]
-        text_ids = [ids[3:-5] for ids in full_ids]
+        text_ids = [assistant_text_ids(ids) for ids in full_ids]
         num_full = sum(ids.size for ids in full_ids)
         packed = to_device_nonblocking(torch.from_numpy(np.concatenate(full_ids + text_ids)), self._device())
         projected = self._project_text_ids(packed[num_full:].view(1, -1))
@@ -1588,7 +1605,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                         in_context_mode = False
             if in_context_mode:
                 icl_input_embed, trailing_text_hidden = self._generate_icl_prompt(
-                    text_id=input_ids[:, 3:-5],
+                    text_id=assistant_text_ids(input_ids),
                     ref_id=ref_ids[:, 3:-2],
                     ref_code=ref_code_t,  # type: ignore[arg-type]
                     tts_pad_embed=tts_pad_embed,
@@ -1601,7 +1618,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                 if non_streaming_mode:
                     # Official non-streaming mode: put the full text into the
                     # prefill prompt and use PAD for decode steps.
-                    text_all = text_projection(text_embedding(input_ids[:, 3:-5]))
+                    text_all = text_projection(text_embedding(assistant_text_ids(input_ids)))
                     text_all = torch.cat([text_all, tts_eos_embed], dim=1)
                     pad_ids = torch.full(
                         (1, int(text_all.shape[1])),
@@ -1624,7 +1641,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                     talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
                     trailing_text_hidden = torch.cat(
                         (
-                            text_projection(text_embedding(input_ids[:, 4:-5])),
+                            text_projection(text_embedding(assistant_text_ids(input_ids)[:, 1:])),
                             tts_eos_embed,
                         ),
                         dim=1,
@@ -1687,12 +1704,12 @@ class Qwen3TTSPromptEmbedsBuilder:
             if non_streaming_mode:
                 text_all = self._batched_text_embeds.pop(str(info_dict.get("req_id")), None)
                 if text_all is None:
-                    text_all = text_projection(text_embedding(input_ids[:, 3:-5]))
+                    text_all = text_projection(text_embedding(assistant_text_ids(input_ids)))
                 # (text + eos) + pad row, with the constant eos row added once per speaker.
                 talker_prompt = torch.cat([talker_prompt, text_all + pad_row, eos_row, tail], dim=1)
                 trailing_text_hidden = tts_pad_embed
             elif streamed_text is not None or text_lead(info_dict) > 0:
-                text_ids, ended = streamed_text if streamed_text is not None else (input_ids[:, 3:-5], True)
+                text_ids, ended = streamed_text if streamed_text is not None else (assistant_text_ids(input_ids), True)
                 talker_prompt, trailing_text_hidden = lead_layout(
                     talker_prompt,
                     text_ids,
@@ -1709,7 +1726,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                 talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
                 trailing_text_hidden = torch.cat(
                     (
-                        text_projection(text_embedding(input_ids[:, 4:-5])),
+                        text_projection(text_embedding(assistant_text_ids(input_ids)[:, 1:])),
                         tts_eos_embed,
                     ),
                     dim=1,
@@ -1727,7 +1744,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             if non_streaming_mode:
                 text_all = self._batched_text_embeds.pop(str(info_dict.get("req_id")), None)
                 if text_all is None:
-                    text_all = text_projection(text_embedding(input_ids[:, 3:-5]))
+                    text_all = text_projection(text_embedding(assistant_text_ids(input_ids)))
                 text_all = torch.cat([text_all, tts_eos_embed], dim=1)
                 pad_ids = torch.full(
                     (1, int(text_all.shape[1])),
@@ -1749,7 +1766,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                 talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
                 trailing_text_hidden = torch.cat(
                     (
-                        text_projection(text_embedding(input_ids[:, 4:-5])),
+                        text_projection(text_embedding(assistant_text_ids(input_ids)[:, 1:])),
                         tts_eos_embed,
                     ),
                     dim=1,
@@ -1850,11 +1867,16 @@ class Qwen3TTSPromptEmbedsBuilder:
         assistant_len = len(tokenize_prompt(build_assistant_text(text)))
         if assistant_len < 8:
             raise ValueError(f"Unexpected assistant prompt length: {assistant_len}")
+        # A text lead the prompt cannot lay out is a client error here, before the request reaches the worker.
+        # A streamed text has no length yet: the stage's text_stream_policy bounds its lead at admission.
+        num_text_ids = None if declares_text_stream(info) else num_assistant_text_ids(assistant_len)
+        if (lead_error := text_lead_error(info, num_text_ids)) is not None:
+            raise TextLeadError(lead_error)
 
         if task_type in ("CustomVoice", "VoiceDesign"):
             if non_streaming_mode:
-                # model: full text ids (input_ids[:, 3:-5]) + eos + codec_bos step
-                prompt_len += assistant_len - 6
+                # model: full text ids (assistant_text_ids(input_ids)) + eos + codec_bos step
+                prompt_len += num_assistant_text_ids(assistant_len) + 2
             else:
                 # model: only first text token in prefill, after any text lead
                 prompt_len += 1
@@ -1940,9 +1962,9 @@ class Qwen3TTSPromptEmbedsBuilder:
                     else:
                         ref_ids_len = 0
 
-                    # model uses ref_ids[:, 3:-2] (strip 5 tokens) and text_id=input_ids[:, 3:-5] (strip 8).
+                    # model uses ref_ids[:, 3:-2] (strip 5 tokens) and text_id=assistant_text_ids(input_ids) (strip 8).
                     ref_id_len = max(0, int(ref_ids_len) - 5)
-                    text_id_len = max(0, int(assistant_len) - 8)
+                    text_id_len = num_assistant_text_ids(int(assistant_len))
                     text_embed_len = ref_id_len + text_id_len + 1  # + eos
                     prompt_len += text_embed_len + codec_lens
                 else:
@@ -1952,7 +1974,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             else:
                 # Base without ICL behaves like CustomVoice.
                 if non_streaming_mode:
-                    prompt_len += assistant_len - 6
+                    prompt_len += num_assistant_text_ids(assistant_len) + 2
                 else:
                     prompt_len += 1
 

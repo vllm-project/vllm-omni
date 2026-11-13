@@ -11,8 +11,12 @@ from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechReques
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters import SpeechServingContext
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
-from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY
-from vllm_omni.model_executor.models.qwen3_tts.text_stream import TEXT_LEAD_KEY
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    Qwen3TTSPromptEmbedsBuilder,
+    assistant_text_ids,
+    num_assistant_text_ids,
+)
+from vllm_omni.model_executor.models.qwen3_tts.text_stream import TEXT_LEAD_KEY, TextLeadError, text_lead_error
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -75,12 +79,58 @@ def test_validation_does_no_tokenizer_work_on_the_event_loop(mocker):
     [(0, None), (4, None), (5, "exceeds the text's 3 tokens")],
 )
 def test_the_text_lead_cannot_pass_the_end_of_the_tokenized_text(lead, message):
-    params = {TEXT_LEAD_KEY: [lead], PRECOMPUTED_TEXT_IDS_KEY: [_TEXT_IDS]}
-    error = Qwen3TTSAdapter._text_lead_bound_error(params)
+    # One helper counts the text's ids for the adapter, the estimate and the builder.
+    num_text_ids = num_assistant_text_ids(len(_TEXT_IDS))
+    assert num_text_ids == len(assistant_text_ids(_TEXT_IDS)) == 3
+    error = text_lead_error({TEXT_LEAD_KEY: [lead], "non_streaming_mode": [False]}, num_text_ids)
     if message is None:
         assert error is None
     else:
         assert message in error
+
+
+def _estimate(**info):
+    return Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
+        additional_information={"text": ["three word text"], **{key: [value] for key, value in info.items()}},
+        task_type=info.get("task_type", "CustomVoice"),
+        tokenize_prompt=lambda text: _TEXT_IDS,
+        codec_language_id=None,
+        spk_is_dialect=None,
+    )
+
+
+def test_an_offline_whole_text_request_learns_its_text_lead_is_too_long_before_it_runs():
+    # Offline Omni / AsyncOmni requests set text_lead in additional_information and size their prompt with this
+    # estimate (examples/offline_inference/text_to_speech/qwen3_tts/end2end.py), so it refuses the lead there.
+    assert _estimate(task_type="CustomVoice", non_streaming_mode=False, text_lead=4)
+    with pytest.raises(TextLeadError, match="exceeds the text's 3 tokens"):
+        _estimate(task_type="CustomVoice", non_streaming_mode=False, text_lead=5)
+    # A streamed text has no length yet: the stage's text_stream_policy bounds its lead at admission.
+    assert _estimate(task_type="CustomVoice", non_streaming_mode=False, text_lead=9, text_stream=True)
+
+
+@pytest.mark.parametrize(
+    ("info", "message"),
+    [
+        ({"task_type": "CustomVoice"}, "non_streaming_mode=false"),
+        ({"task_type": "CustomVoice", "non_streaming_mode": True}, "non_streaming_mode=false"),
+        ({"task_type": "VoiceDesign", "non_streaming_mode": False, "instruct": "calm"}, "only valid for CustomVoice"),
+    ],
+)
+def test_an_offline_request_learns_its_prompt_ignores_its_text_lead(info, message):
+    with pytest.raises(TextLeadError, match=message):
+        _estimate(text_lead=2, **info)
+
+
+def test_a_text_lead_is_not_sent_with_a_fallback_prompt_length(mocker):
+    """When the prompt length estimate fails, a text lead goes unchecked and the fallback length fits no layout."""
+    adapter = _adapter(mocker)
+    adapter._load_text_tokenizer = mocker.Mock()
+    adapter.ctx.engine_client = mocker.Mock()
+    adapter.ctx.server._tts_tokenizer = mocker.Mock(side_effect=RuntimeError("tokenizer unavailable"))
+    with pytest.raises(TextLeadError, match="tokenizer unavailable"):
+        adapter._estimate_prompt_len({"text": ["three word text"], "task_type": ["CustomVoice"], TEXT_LEAD_KEY: [2]})
+    assert adapter._estimate_prompt_len({"text": ["three word text"], "task_type": ["CustomVoice"]}) == 2048
 
 
 @pytest.fixture

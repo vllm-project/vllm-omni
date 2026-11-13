@@ -151,7 +151,7 @@ Content-Type: application/json
 | `seed` | integer | null | Random seed for repeatable generation. |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
-| `text_lead` | integer | null | Qwen3-TTS CustomVoice with `non_streaming_mode=false` only: place the first `k` text tokens before codec BOS, the prompt layout of checkpoints trained with a text lead. At most the text's token count plus one. 0 or null keeps the stock streaming layout. |
+| `text_lead` | integer | null | Qwen3-TTS CustomVoice with `non_streaming_mode=false` only (any other request with a lead is refused): place the first `k` text tokens before codec BOS, the prompt layout of checkpoints trained with a text lead. At most the text's token count plus one. 0 or null keeps the stock streaming layout. |
 | `extra_params` | object | null | Model-specific generation controls. See the model sections for supported fields. |
 | `stream` | bool | false | When true, stream OpenAI `speech.audio.*` SSE events (requires `response_format="pcm"` or `"wav"`). For raw PCM/WAV byte streaming, set `stream_format="audio"`. |
 | `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
