@@ -1386,9 +1386,8 @@ and spans that arrive after a turn is final are counted in `late_spans` instead 
 changing it. A chunk's `done_ns` is the end of its last stage span: the wait for
 the next input is not engine time. Given the snapshot's `stages`, the helper also
 withholds numbers for a turn that emitted audio but has no spans from some stage
-(`missing_stage_ids`); this is the case for Code2Wav under the MRv2 model runner,
-whose native data plane does not carry the chunk id yet. The server still answers
-while the session closes. Times are comparable only when every stage runs on the API server's
+(`missing_stage_ids`). The server still answers while the session closes. Times are
+comparable only when every stage runs on the API server's
 host.
 
 ```json
