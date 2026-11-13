@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from pytest_mock import MockerFixture
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 
 from vllm_omni.entrypoints.openai import serving_speech_stream as streaming_speech_module
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
@@ -87,6 +88,8 @@ def _build_test_app(
         adapter = mocker.MagicMock(spec=TTSModelAdapter)
         adapter.text_commitment = Qwen3TTSAdapter.text_commitment
         speech_service._get_tts_adapter.return_value = adapter
+
+    speech_service.request_logger = RequestLogger(max_log_len=None)
 
     handler = OmniStreamingSpeechHandler(
         speech_service=speech_service,
