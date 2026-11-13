@@ -235,6 +235,14 @@ this Hunyuan integration: the diffusion KV manager uses
 
 ### Attention execution
 
+CUDA FA2 and FA3 piecewise segments use the native single-pass setting
+(`max_num_splits=1`). A prefix hit can shorten the remaining causal query
+while preserving its K/V; automatic SplitKV selection otherwise changes the
+reduction order between cold and warm execution. FA3 schedules built for the
+automatic policy are discarded so the native call uses a compatible
+single-pass schedule. Full-pipeline comparisons still use model-specific
+numerical tolerances.
+
 The two paths preserve the same mixed causal/full spans. In the paged path,
 the adapter converts each row into aligned native segments:
 
