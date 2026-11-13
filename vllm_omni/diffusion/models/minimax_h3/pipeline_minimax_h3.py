@@ -349,9 +349,6 @@ _MINIMAX_H3_DENOISE_INPUT_KEYS = (
     "audio_edit_clean_rows",
     "audio_edit_mask_rows",
     "audio_edit_restore_mask_rows",
-    "keep_steps",
-    "base_text_embeddings",
-    "base_text_tags",
 )
 
 # Request-context key for the FL2VA keyframes re-encoded at the refine size.
@@ -4154,9 +4151,18 @@ class MiniMaxH3Pipeline(
 
     @staticmethod
     def _denoise_kwargs(context: dict[str, Any]) -> dict[str, Any]:
-        """Select the denoise-input arguments from a prepared request context."""
+        """Select the denoise-input arguments from a prepared request context.
+
+        The keep_steps family is optional by construction: the regenerate and
+        controlnet paths build contexts without it, and `_build_denoise_inputs`
+        reads a missing key the same as an explicit "no base branch", so those
+        keys are fetched leniently while the required whitelist stays strict.
+        """
         return {
             **{key: context[key] for key in _MINIMAX_H3_DENOISE_INPUT_KEYS},
+            "keep_steps": context.get("keep_steps"),
+            "base_text_embeddings": context.get("base_text_embeddings"),
+            "base_text_tags": context.get("base_text_tags"),
             "sampler": context.get("sampler", "euler"),
         }
 
