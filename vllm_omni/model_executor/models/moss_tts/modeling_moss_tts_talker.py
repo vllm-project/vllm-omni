@@ -1718,6 +1718,10 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         # controls primary-token sampling, so Local owns its MTP schedule.
         from .local_model_state import MossLocalModelState
 
+        if current_omni_platform.is_npu():
+            from vllm_omni.platforms.npu.models.moss_tts_local_model_state import NPUMossLocalModelState
+
+            return NPUMossLocalModelState(vllm_config, self, encoder_cache, device)
         return MossLocalModelState(vllm_config, self, encoder_cache, device)
 
     @property
@@ -1874,9 +1878,12 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         # First audio is part of the MRV2 streaming slot-state path. Load it
         # here so its weights and graphs count toward model memory profiling.
         model_config = self.vllm_config.model_config
+        # The decoder's Triton kernels and torch.cuda graphs have no NPU path;
+        # without it Stage1 delivers the first chunk as well.
         if (
             model_config.use_v2_model_runner
             and model_config.async_chunk
+            and not current_omni_platform.is_npu()
             and supports_in_process_first_audio(self.vllm_config)
         ):
             from .first_frame_decoder import MossFirstFrameDecoder

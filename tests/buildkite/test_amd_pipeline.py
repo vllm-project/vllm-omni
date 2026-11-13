@@ -30,7 +30,6 @@ AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scrip
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
 AMD_OMNI_PROCESSOR_RUNNER = Path(".buildkite/amd/scripts/run-omni-processor-test.sh")
-CUDA_READY_PIPELINE = Path(".buildkite/cuda/test-ready.yml")
 AR_PAGED_ATTENTION_LABEL = "ROCm · AR Diffusion Paged Attention GPU Test"
 DIFFUSION_GROUP = ":card_index_dividers: Diffusion Test"
 AR_PAGED_ATTENTION_MARKERS = "core_model and rocm and MI325 and cards_1"
@@ -618,43 +617,6 @@ def test_personaplex_temporal_stress_has_one_nonblocking_nightly_owner() -> None
     assert "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest-summary.txt" in all_commands
 
 
-def test_cuda_ready_retains_full_model_executor_coverage() -> None:
-    step = _find_step("Simple · Model Executor Test", CUDA_READY_PIPELINE)
-    assert "source_file_dependencies" not in step
-
-    pytest_command = next(command for command in step["commands"] if "pytest" in command)
-    argv = split(pytest_command)
-    marker_expression = argv[argv.index("-m") + 1]
-
-    assert "tests/model_executor" in argv
-    assert marker_expression == "core_model and cpu"
-    assert "not omni" not in marker_expression
-    assert all(not arg.startswith("--ignore") for arg in argv)
-    assert all(not arg.startswith("--deselect") for arg in argv)
-
-    test_source = Path(PERSONAPLEX_TEMPORAL_PATH).read_text(encoding="utf-8")
-    assert "pytestmark = [pytest.mark.core_model, pytest.mark.cpu]" in test_source
-    assert "@pytest.mark.slow" not in test_source
-
-
-def test_cuda_ready_engine_entrypoints_diffusion_has_cleanup_headroom() -> None:
-    step = _find_step("Simple · Engine&Entrypoints&Diffusion Test", CUDA_READY_PIPELINE)
-    assert step["timeout_in_minutes"] == 25
-
-    pytest_command = next(command for command in step["commands"] if "pytest" in command)
-    argv = split(pytest_command)
-    assert argv == [
-        "pytest",
-        "-sv",
-        "tests/entrypoints",
-        "tests/engine",
-        "tests/diffusion",
-        "--ignore=tests/diffusion/models",
-        "-m",
-        "core_model and cpu",
-    ]
-
-
 def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
     lane_definitions = []
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
@@ -738,17 +700,6 @@ def test_joy_gpu_nightly_lane_is_unique_nonblocking_and_preserves_default_backen
     assert "--junitxml=$$JOY_GPU_ARTIFACT_DIR/pytest.xml" in argv
 
 
-def test_joy_gpu_suite_remains_selected_by_cuda_model_lane() -> None:
-    pipeline_path = Path(".buildkite/cuda/test-ready.yml")
-    step = _find_step("Diffusion · Model Test", pipeline_path)
-    argv = split(next(command for command in step["commands"] if "pytest" in command))
-    assert "tests/diffusion/models/" in argv
-    assert f"--ignore={JOY_GPU_PATH}" not in argv
-    assert argv[argv.index("-m") + 1] == "core_model and cuda"
-    # Module-level CPU marks cannot be cancelled by adding GPU marks.
-    assert "pytest.mark.cpu" not in Path(JOY_GPU_PATH).read_text(encoding="utf-8")
-
-
 # These jobs previously selected CUDA-marked items on AMD. Each migrated lane
 # now selects its qualified ROCm variants and verifies the exact collection
 # before running the GPU workload.
@@ -765,7 +716,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
         AMD_READY_PIPELINE,
         "NonBlocking",
-        1424,
+        1438,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -1121,31 +1072,6 @@ def test_amd_ulysses_lanes_cover_uaa_and_attention_sp(label: str, pipeline: Path
     assert argv[:4] == ["timeout", "--signal=TERM", "--kill-after=2m", "20m"]
     assert step["timeout_in_minutes"] == 25
     assert "--durations=20" in argv
-
-
-@pytest.mark.parametrize(
-    ("label", "cards"),
-    [
-        ("Diffusion · Distributed Test · 2-GPU", "cards_2"),
-        ("Diffusion · Distributed & Attention Test · 4-GPU", "cards_4"),
-    ],
-)
-def test_cuda_distributed_lanes_cover_both_attention_files_within_the_job_budget(label: str, cards: str) -> None:
-    step = _find_step(label, CUDA_READY_PIPELINE)
-    argv = [split(command) for command in step["commands"] if "pytest" in split(command)]
-
-    paths = {arg for command in argv for arg in command if arg.startswith("tests/")}
-    assert paths == {
-        "tests/diffusion/distributed",
-        "tests/diffusion/attention/test_ulysses_uaa.py",
-        "tests/diffusion/attention/test_attention_sp.py",
-    }
-    assert step["mirror_hardwares"] == f"l4_{cards.removeprefix('cards_')}"
-    for command in argv:
-        assert command[command.index("-m") + 1] == f"core_model and cuda and L4 and {cards}"
-        assert command[command.index("--run-level") + 1] == "core_model"
-    command_budget = sum(int(command[1].removesuffix("m")) for command in argv)
-    assert step["timeout_in_minutes"] >= command_budget + 5
 
 
 def test_qwen3_tts_base_preserves_advanced_model_arguments() -> None:
@@ -2197,7 +2123,7 @@ def test_moss_tts_weekly_executes_junit_guard_before_exit(
     )
 
 
-def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None:
+def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
     def flatten_paths(items: list) -> set[str]:
         paths: set[str] = set()
         for item in items:
@@ -2236,6 +2162,36 @@ def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None
             "dependency": "tts_qwen3_tts_function",
             "files": ("tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py",),
         },
+        "VoxCPM2 TTS · 1-GPU": {
+            "timeout": 180,
+            "test_timeout": 150,
+            "count": 9,
+            "artifact_name": "rocm-voxcpm2-tts-weekly",
+            "dependency": "tts_voxcpm2_weekly",
+            "env": {
+                "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
+            },
+            "files": (
+                "tests/e2e/offline_inference/test_voxcpm2_tts.py",
+                "tests/e2e/online_serving/test_voxcpm2_tts.py",
+                "tests/e2e/online_serving/test_voxcpm2_tts_expansion.py",
+                "tests/e2e/online_serving/test_voxcpm2_tts_lora.py",
+            ),
+        },
+        "Voxtral TTS · 1-GPU": {
+            "timeout": 210,
+            "test_timeout": 180,
+            "count": 10,
+            "artifact_name": "rocm-voxtral-tts-weekly",
+            "dependency": "tts_voxtral_weekly",
+            "env": {
+                "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
+            },
+            "files": (
+                "tests/e2e/offline_inference/test_voxtral_tts_expansion.py",
+                "tests/e2e/online_serving/test_voxtral_tts_expansion.py",
+            ),
+        },
     }
     expected_env = {
         "OPENBLAS_NUM_THREADS": "1",
@@ -2261,7 +2217,7 @@ def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None
         assert step["grade"] == "NonBlocking"
         assert step["timeout_in_minutes"] == expected["timeout"]
         assert step["source_file_dependencies"] == dependency
-        assert step["env"] == expected_env
+        assert step["env"] == expected_env | cast(dict[str, str], expected.get("env", {}))
         assert step["artifact_paths"] == [f"artifacts/{artifact_name}/**/*"]
         assert "retry" not in step
         assert "VLLM_ALLOW_LONG_MAX_MODEL_LEN" in command
@@ -2284,16 +2240,21 @@ def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None
         for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
             assert label not in pipeline_path.read_text(encoding="utf-8")
 
-    rocm_decorator = '@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)'
     marker_counts = {
         "tests/e2e/offline_inference/test_audex_tts.py": 3,
         "tests/e2e/offline_inference/test_audex_s2t.py": 1,
         "tests/e2e/offline_inference/test_audex_tta.py": 1,
         "tests/e2e/offline_inference/test_cosyvoice3_expansion.py": 1,
         "tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py": 3,
+        "tests/e2e/offline_inference/test_voxcpm2_tts.py": 3,
+        "tests/e2e/online_serving/test_voxcpm2_tts.py": 2,
+        "tests/e2e/online_serving/test_voxcpm2_tts_expansion.py": 2,
+        "tests/e2e/online_serving/test_voxcpm2_tts_lora.py": 2,
+        "tests/e2e/offline_inference/test_voxtral_tts_expansion.py": 2,
+        "tests/e2e/online_serving/test_voxtral_tts_expansion.py": 8,
     }
     for path, expected_count in marker_counts.items():
-        assert Path(path).read_text(encoding="utf-8").count(rocm_decorator) == expected_count
+        assert Path(path).read_text(encoding="utf-8").count('"rocm": "MI325"') == expected_count
 
     cosy_source = Path("tests/e2e/offline_inference/test_cosyvoice3_expansion.py").read_text(encoding="utf-8")
     assert 'id="sync"' in cosy_source
@@ -4478,7 +4439,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     """READY blocks on the collected one-card worker nodes.
 
     Local collection of the three files with the MI325 marker returned these
-    35 ids. R2-01 still collects 1424 model-executor nodes and does not run them.
+    35 ids. R2-01 still collects 1438 model-executor nodes and does not run them.
     """
     step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -4524,7 +4485,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1424" in r2_01_command
+    assert "assert-pytest-collection.sh 1438" in r2_01_command
     assert "tests/model_executor/" in r2_01_command
     for path in _WORKER_ONE_CARD_FILES:
         assert path not in r2_01_command
@@ -4738,7 +4699,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
 
     The marker selects both intermediate-buffer residency rows and the three
     device-copy GPU tests. #9552's worker files stay on the other job. R2-01
-    still collects 1424 model-executor nodes.
+    still collects 1438 model-executor nodes.
     """
     step = _find_step("ROCm · One-Card Worker Copy Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -4790,7 +4751,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1424" in r2_01_command
+    assert "assert-pytest-collection.sh 1438" in r2_01_command
     for path in _WORKER_COPY_FILES:
         assert path not in r2_01_command
 

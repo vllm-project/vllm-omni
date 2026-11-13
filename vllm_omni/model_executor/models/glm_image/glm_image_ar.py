@@ -96,6 +96,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from vllm_omni.model_executor.models.glm_image.prompt import DEFAULT_TARGET_SIZE, grid_token_layout
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -435,24 +436,21 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         )
         if target_h is None or target_w is None:
             target_h = (
-                hf_processor_mm_kwargs.get("height") if isinstance(hf_processor_mm_kwargs.get("height"), int) else 1024
+                hf_processor_mm_kwargs.get("height")
+                if isinstance(hf_processor_mm_kwargs.get("height"), int)
+                else DEFAULT_TARGET_SIZE
             )
             target_w = (
-                hf_processor_mm_kwargs.get("width") if isinstance(hf_processor_mm_kwargs.get("width"), int) else 1024
+                hf_processor_mm_kwargs.get("width")
+                if isinstance(hf_processor_mm_kwargs.get("width"), int)
+                else DEFAULT_TARGET_SIZE
             )
 
-        factor = 32
-        target_h = (target_h // factor) * factor
-        target_w = (target_w // factor) * factor
-        token_h = target_h // factor
-        token_w = target_w // factor
-
-        ratio = token_h / token_w if token_w > 0 else 1.0
-        small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
-        small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
-
+        # Same preview-grid construction as HF's processor; both go through
+        # grid_token_layout so the served budget and the prompt grid agree.
+        layout = grid_token_layout(target_h, target_w)
         return torch.tensor(
-            [[1, token_h, token_w], [1, small_token_h, small_token_w]],
+            [[1, layout.token_h, layout.token_w], [1, layout.small_token_h, layout.small_token_w]],
             dtype=torch.long,
         )
 
@@ -2045,10 +2043,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
     # Explicit M-RoPE support flag (also inherited from SupportsMRoPE)
     supports_mrope = True
 
-    # GLM-Image pre-computes M-RoPE positions for both prefill and decode
-    # phases (2D spatial grid encoding for generated image tokens).  This
-    # flag tells the runner to use those positions instead of the default
-    # linear increments during decode.
+    # GLM-Image pre-computes spatial M-RoPE positions for decode grids.
     precomputed_mrope_decode = True
 
     # The downstream GLM-Image diffusion stage consumes generated token ids and
@@ -2427,13 +2422,11 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             target_h = kwargs.get("target_h")
             target_w = kwargs.get("target_w")
             if isinstance(target_h, int) and isinstance(target_w, int) and target_h > 0 and target_w > 0:
-                factor = 32
-                token_h = target_h // factor
-                token_w = target_w // factor
-                ratio = token_h / token_w if token_w > 0 else 1.0
-                small_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
-                small_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
-                image_grid_thw = [[1, token_h, token_w], [1, small_h, small_w]]
+                layout = grid_token_layout(target_h, target_w)
+                image_grid_thw = [
+                    [1, layout.token_h, layout.token_w],
+                    [1, layout.small_token_h, layout.small_token_w],
+                ]
 
             # Try to parse from kwargs (passed from processor)
             hf_config_arg = kwargs.get("hf_config")
@@ -2496,10 +2489,8 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             target_h = kwargs.get("target_h")
             target_w = kwargs.get("target_w")
             if isinstance(target_h, int) and isinstance(target_w, int) and target_h > 0 and target_w > 0:
-                factor = 32
-                token_h = target_h // factor
-                token_w = target_w // factor
-                image_grid_thw = list(image_grid_thw) + [[1, token_h, token_w]]
+                layout = grid_token_layout(target_h, target_w)
+                image_grid_thw = list(image_grid_thw) + [[1, layout.token_h, layout.token_w]]
             else:
                 # Parse target grids from prompt tokens or use defaults
                 parsed_grids = self._parse_grid_from_tokens(input_tokens, hf_config)
@@ -2560,7 +2551,6 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 else:
                     # Fallback: estimate from token count
                     h = w = int(actual_image_tokens**0.5)
-                    t = 1
 
                 # Text tokens before this image (from prev_image_end to start)
                 # Note: start points to first image token, so text is [prev_image_end, start)
@@ -2649,7 +2639,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 # GLM-Image generates small image first (e.g., 16x16), then large (32x32)
                 for i in range(1, num_decode_grids + 1):
                     grid_idx = len(image_grid_thw) - i  # -1, -2, ... from end
-                    t, h, w = image_grid_thw[grid_idx]
+                    _, h, w = image_grid_thw[grid_idx]
                     total_tokens = h * w
 
                     # Build 2D positions following reference implementation
@@ -2690,7 +2680,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             # Process in reverse order for GLM-Image generation pattern
             for i in range(1, len(image_grid_thw) + 1):
                 grid_idx = -i  # -1, -2, ... (last grid first)
-                t, h, w = image_grid_thw[grid_idx]
+                _, h, w = image_grid_thw[grid_idx]
                 total_tokens = h * w
 
                 # Build 2D positions following reference implementation
@@ -2712,7 +2702,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             # Pure text - all dimensions same
             llm_positions = torch.arange(seq_len).view(1, -1).expand(3, -1)
 
-        mrope_position_delta = (llm_positions.max() + 1 - seq_len).item()
+        mrope_position_delta = 0
 
         # Debug logging for M-RoPE position calculation
         logger.debug(

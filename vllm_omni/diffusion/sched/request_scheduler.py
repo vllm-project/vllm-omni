@@ -7,6 +7,7 @@ from dataclasses import fields
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.attention.schedule import resolve_request_attention_schedule
+from vllm_omni.diffusion.mixfusion.request import request_batch_key_allowed
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -127,7 +128,16 @@ class RequestScheduler(BaseScheduler):
             or (decision.deadline is not None and now >= decision.deadline)
         )
 
-    def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
+    def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey | None:
+        """Build a request-batch compatibility key from sampling parameters.
+
+        Request-mode batches resolve one height/width for the whole batch from
+        the first request (see ``QwenImagePipeline.forward``), so resolution
+        stays in the key even for MixFusion requests; only per-prompt inputs
+        make a MixFusion request unbatchable.
+        """
+        if not request_batch_key_allowed(request, self.od_config, supported=self._mixfusion_supported):
+            return None
         return build_request_batch_sampling_params_key(
             request, getattr(self.od_config, "diffusion_attention_schedule", None)
         )

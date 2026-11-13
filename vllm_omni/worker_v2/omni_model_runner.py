@@ -996,7 +996,13 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     self.model._last_captured_layers = self._last_aux_output
             else:
                 hidden_states = model_output
-        if not dummy_run and isinstance(hidden_states, torch.Tensor):
+        if (
+            not dummy_run
+            and isinstance(hidden_states, torch.Tensor)
+            # These outputs are materialized by make_omni_output() in the AR
+            # sampling phase, so their state update must wait for that phase.
+            and not getattr(self.model, "postprocess_requires_multimodal_outputs", False)
+        ):
             self.model_state.run_postprocess(hidden_states, input_batch)
 
         self.execute_model_state = ExecuteModelState(
