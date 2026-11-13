@@ -36,14 +36,21 @@ def test_xpu_sdpa_op_type(op_type, dtype, causal, q_len, kv_len, expected):
 
 
 @pytest.mark.cpu
+def test_xpu_sdpa_op_type_without_aten_flash():
+    # Torch XPU builds without SYCL-TLA have no aten flash op; bf16 then takes the math path too.
+    assert ring_kernels._xpu_sdpa_op_type("efficient", torch.bfloat16, False, 128, 128, has_flash=False) == "math"
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize(("causal", "q_len", "kv_len"), [(False, 48, 80), (True, 64, 64), (True, 48, 80)])
-def test_math_attn_with_lse_matches_reference(causal, q_len, kv_len):
+@pytest.mark.parametrize("q_chunk", [1024, 20])  # 20: several query chunks, the last one partial
+def test_math_attn_with_lse_matches_reference(causal, q_len, kv_len, q_chunk):
     torch.manual_seed(0)
     q = torch.randn(1, 2, q_len, 32)
     k, v = torch.randn(1, 2, kv_len, 32), torch.randn(1, 2, kv_len, 32)
     scale = 32**-0.5
 
-    out, lse = ring_kernels._math_attn_with_lse(q, k, v, scale, causal)
+    out, lse = ring_kernels._math_attn_with_lse(q, k, v, scale, causal, q_chunk=q_chunk)
 
     scores = (q @ k.transpose(-2, -1)) * scale
     mask = torch.ones(q_len, kv_len, dtype=torch.bool).tril() if causal else None  # top-left, as F.sdpa is_causal
