@@ -43,8 +43,8 @@ TEXT_STREAM_KEY = "text_stream"
 # clock starts when the request first cannot run for lack of text and restarts
 # on every append. Set exactly 0 to disable the deadline. It is separate from
 # VLLM_OMNI_INPUT_WAIT_TIMEOUT_S (stage input, 600 s by default): a running
-# request that waits for text keeps its seat and its KV cache, and a client
-# that streams model output is gone after a few seconds without text.
+# request that waits for text keeps its seat and its KV cache, and a few
+# seconds without text usually means the client has stopped.
 _TIMEOUT_ENV = "VLLM_OMNI_TEXT_STREAM_TIMEOUT_S"
 _TIMEOUT_DEFAULT_S = 5.0
 

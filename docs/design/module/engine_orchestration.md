@@ -104,8 +104,11 @@ a task started in dispatch order, so the dispatch loop does not wait for the
 engine core between appends. Under weight sharing, `SharedRequestQueue` holds
 an append with its request, as it holds companions, until the request's ADD
 goes out. An append for a request that is no longer active is dropped
-(ORCH-INV-100). A stage that cannot take the append ends the request with a
-client error, and an append lost on its way ends it with a server error.
+(ORCH-INV-100). When the stage pool has no client for the request that can
+take the append, the request ends with a client error, and an append lost on
+its way ends it with a server error. Streamed text needs an AR entry stage: an
+engine core whose scheduler has no `append_text` refuses the append, and the
+Orchestrator only logs that refusal.
 
 ## Candidate invariants
 
