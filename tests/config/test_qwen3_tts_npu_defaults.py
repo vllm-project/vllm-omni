@@ -34,13 +34,20 @@ def test_resolved_defaults_are_npu_only(monkeypatch, platform):
     )
     options = Predictor._stage_connector_extra_config(config)
     assert all(options.get(key, False) is (platform == "npu") for key in PREDICTOR_OPTIONS)
-    codec = deploy.stages[1].engine_extras.get("additional_config", {})
-    assert codec.get("npu_incremental_codec", False) is (platform == "npu")
-    assert codec.get("npu_fused_snake", False) is (platform == "npu")
-    assert codec.get("npu_codec_streams", 1) == (2 if platform == "npu" else 1)
-    if platform == "npu":
-        assert options["code_predictor_kv_cache"] is False
-        assert len(codec["npu_conv_graph_shapes"]) == 12
+    assert options.get("code_predictor_kv_cache", False) is False
+    # Defaults belong to the model/loader. A YAML copy could mask a change
+    # to those defaults and give custom deployments different behavior.
+    npu_options = {
+        *PREDICTOR_OPTIONS,
+        "npu_fused_snake",
+        "npu_incremental_codec",
+        "npu_codec_streams",
+        "npu_conv_graph_shapes",
+        "code_predictor_kv_cache",
+    }
+    assert npu_options.isdisjoint(connector.get("extra", {}))
+    for stage in deploy.stages:
+        assert npu_options.isdisjoint(stage.engine_extras.get("additional_config", {}))
 
 
 @pytest.mark.parametrize("source", ["implicit", "additional", "connector"])

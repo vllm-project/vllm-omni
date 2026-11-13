@@ -73,8 +73,9 @@ connectors:
       # decode_cudagraph_batch_sizes: [1, 2, 4]
       # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.
       decode_batch_max_size: 4
-      # Qwen3-TTS NPU optimizations are configured in platforms.npu below.
-      # Shared predictor options remain unset here so CUDA keeps its defaults.
+      # Qwen3-TTS NPU optimization defaults are owned by the model and loader.
+      # Set explicit overrides here or in stage additional_config; CUDA keeps
+      # its existing defaults when these options are omitted.
 
 stages:
   - stage_id: 0
@@ -167,37 +168,9 @@ platforms:
         enforce_eager: false
         compilation_config:
           cudagraph_mode: PIECEWISE
-        additional_config:
-          code_predictor_fused_sampling: true
-          code_predictor_frame_graph: true
-          code_predictor_npu_native_gqa: true
-          code_predictor_npu_fused_swiglu: true
-          # NPU has no routed frame-local KV implementation; keep re-prefill.
-          code_predictor_kv_cache: false
       - stage_id: 1
         compilation_config:
           cudagraph_mode: PIECEWISE
-        additional_config:
-          npu_fused_snake: true
-          npu_incremental_codec: true
-          # Falls back to one stream without incremental decode or Triton.
-          npu_codec_streams: 2
-          # Incremental decode supersedes these stateless convolution graphs.
-          # These defaults apply when npu_incremental_codec is disabled;
-          # enforce_eager=true skips capture, [] disables it explicitly.
-          npu_conv_graph_shapes:
-            - [1, 1]
-            - [1, 26]
-            - [1, 37]
-            - [1, 73]
-            - [2, 1]
-            - [2, 26]
-            - [2, 37]
-            - [2, 73]
-            - [4, 1]
-            - [4, 26]
-            - [4, 37]
-            - [4, 73]
   xpu:
     model_runner: v1
     stages:

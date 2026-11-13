@@ -111,8 +111,7 @@ def _patched_load_weights(self, weights):
     if type(streams) is not int or streams not in (1, 2):
         raise ValueError("npu_codec_streams must be 1 or 2")
     if streams == 2 and (not incremental or not HAS_TRITON):
-        logger.warning("Using one codec stream: two streams require incremental codec and Triton")
-        streams = 1
+        raise ValueError("npu_codec_streams=2 requires npu_incremental_codec and Triton")
     if incremental:
         # The conv-tail graphs replay work this path no longer performs.
         from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec

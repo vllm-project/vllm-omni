@@ -688,13 +688,18 @@ stateless requests retain their configured attention backend. The existing NPU
 Code2Wav loader owns process-wide format and compile-mode setup; constructing
 an incremental arena does not change those settings.
 
-The NPU platform section of `qwen3_tts.yaml` sets stage-local defaults via
-`additional_config`. Model-local defaults also apply when no option is supplied.
+The Qwen3-TTS predictor and NPU codec loader own their respective defaults;
+`qwen3_tts.yaml` does not duplicate these model options. Omitting an option uses
+its code default. Override it via stage `additional_config` or connector `extra`.
 Explicit connector values override stage values, and explicit false/empty values
 remain authoritative. `code_predictor_npu_native_gqa` and
 `code_predictor_npu_fused_swiglu` default to true on NPU; `npu_codec_streams`
-defaults to two with incremental decode and Triton, otherwise one. Predictor
-frame-local KV has no routed NPU implementation and remains disabled.
+defaults to two with incremental decode and Triton, otherwise one. An explicit
+`npu_codec_streams: 2` without either prerequisite raises a configuration error;
+only the implicit default adapts to missing prerequisites. By contrast,
+`enforce_eager=true` deliberately skips stateless convolution graph capture,
+including explicitly requested shapes, as the documented graph opt-out.
+Predictor frame-local KV has no routed NPU implementation and remains disabled.
 
 Compare actual graph coverage, startup cost, memory, latency and audio quality
 on the deployed model before changing these settings; synthetic tests alone do

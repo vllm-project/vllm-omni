@@ -221,7 +221,7 @@ def test_eager_loader_skips_requested_conv_capture(monkeypatch):
 
 
 @torch.inference_mode()
-def test_incremental_attention_does_not_change_stateless_backend():
+def test_incremental_attention_does_not_change_stateless_backend(monkeypatch):
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("NPU required")
@@ -232,23 +232,40 @@ def test_incremental_attention_does_not_change_stateless_backend():
     _prepare_npu_code2wav_runtime()
     decoder = _make_decoder().to(device="npu", dtype=torch.bfloat16).eval()
     decoder.pre_transformer.config._attn_implementation = "sdpa"
+    for module in decoder.modules():
+        if hasattr(module, "precompute_embedding"):
+            module.embedding_sum.normal_()
+            module.precompute_embedding()
     decoder.precompute_snake_caches()
-    codes = torch.randint(0, 32, (1, 2, 4), device="npu")
+    codes = torch.randint(0, 32, (1, 2, 7), device="npu")
     expected = decoder(codes)
+    attention = decoder.pre_transformer.layers[0].self_attn
+    forward = Mock(wraps=attention.forward)
+    monkeypatch.setattr(attention, "forward", forward)
     arena = NPUIncrementalCodec(decoder, slots=1, max_batch=1, chunk_frames=4)
     try:
         assert decoder.pre_transformer.config._attn_implementation == "sdpa"
-        assert torch.isfinite(arena.decode_requests(codes, [4], [{}])[0]).all()
+        caches: list[dict[str, int]] = [{}]
+        # Compare both a captured full chunk and an eager tail against the
+        # same stateless codes, with BF16 streaming-codec tolerances.
+        chunks = [
+            arena.decode_requests(codes[:, :, :4], [4], caches)[0],
+            arena.decode_requests(codes[:, :, 4:], [3], caches)[0],
+        ]
+        torch.testing.assert_close(torch.cat(chunks), expected[0, 0], atol=0.02, rtol=0.02)
+        assert forward.call_args_list
+        assert all(call.kwargs.get("force_eager_attention") is True for call in forward.call_args_list)
+        forward.reset_mock()
         torch.testing.assert_close(decoder(codes), expected, atol=0, rtol=0)
+        assert all(not call.kwargs.get("force_eager_attention", False) for call in forward.call_args_list)
         assert decoder.pre_transformer.config._attn_implementation == "sdpa"
     finally:
         arena.close()
 
 
 @pytest.mark.parametrize("has_triton", [False, True])
-@pytest.mark.parametrize("disabled", [False, True])
-@pytest.mark.parametrize("stage_defaults", [False, True])
-def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, disabled, stage_defaults):
+@pytest.mark.parametrize("source", ["implicit", "additional", "connector"])
+def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, source):
     pytest.importorskip("torch_npu")
     import vllm.triton_utils
 
@@ -258,17 +275,20 @@ def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, disabled,
     from vllm_omni.platforms.npu.models import qwen3_tts
 
     decoder = _make_decoder()
+    disabled = source != "implicit"
     explicit = {"npu_fused_snake": False, "npu_incremental_codec": False, "npu_conv_graph_shapes": []}
     model = SimpleNamespace(
         decoder=decoder,
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(
-                enforce_eager=False, stage_connector_config={"extra": explicit if disabled else {}}
+                enforce_eager=False, stage_connector_config={"extra": explicit if source == "connector" else {}}
             ),
             # Explicit connector opt-outs must override stage defaults too.
             additional_config=(
-                {"npu_fused_snake": True, "npu_incremental_codec": True, "npu_codec_streams": 2}
-                if stage_defaults
+                {"npu_fused_snake": True, "npu_incremental_codec": True}
+                if source == "connector"
+                else explicit
+                if source == "additional"
                 else {}
             ),
             device_config=SimpleNamespace(device="cpu"),
@@ -290,3 +310,34 @@ def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, disabled,
         assert decoder._npu_incremental is incremental.return_value
     conv.assert_not_called()
     assert all(m.npu_fused is (has_triton and not disabled) for m in decoder.modules() if isinstance(m, SnakeBeta))
+
+
+@pytest.mark.parametrize("has_triton,incremental", [(False, True), (True, False), (False, False)])
+@pytest.mark.parametrize("source", ["additional", "connector"])
+def test_explicit_dual_stream_conflict_fails_before_capture(monkeypatch, has_triton, incremental, source):
+    pytest.importorskip("torch_npu")
+    import vllm.triton_utils
+
+    from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
+    from vllm_omni.platforms.npu.layers import codec_graph, incremental_codec
+    from vllm_omni.platforms.npu.models import qwen3_tts
+
+    explicit = {"npu_codec_streams": 2, "npu_incremental_codec": incremental}
+    model = SimpleNamespace(
+        decoder=_make_decoder(),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(stage_connector_config={"extra": explicit if source == "connector" else {}}),
+            additional_config=explicit if source == "additional" else {},
+            device_config=SimpleNamespace(device="cpu"),
+            scheduler_config=SimpleNamespace(max_num_seqs=4),
+        ),
+    )
+    monkeypatch.setattr(vllm.triton_utils, "HAS_TRITON", has_triton)
+    monkeypatch.setattr(qwen3_tts, "_original_load_weights", lambda *_: {"loaded"})
+    monkeypatch.setattr(qwen3_tts, "_prepare_npu_decoder_weights", lambda _: None)
+    capture = Mock()
+    monkeypatch.setattr(incremental_codec, "NPUIncrementalCodec", capture)
+    monkeypatch.setattr(codec_graph, "NPUCodecGraphs", capture)
+    with pytest.raises(ValueError, match="npu_codec_streams=2 requires"):
+        qwen3_tts._patched_load_weights(model, [])
+    capture.assert_not_called()
