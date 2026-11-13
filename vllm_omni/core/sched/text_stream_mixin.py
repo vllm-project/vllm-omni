@@ -127,12 +127,15 @@ class TextStreamMixin(_SchedulerBase):
         if streams is None or request.request_id in streams or not _payload_has_key(payload, TEXT_STREAM_KEY):
             return
         info = deserialize_additional_information(payload)
-        if not declares_text_stream(info):
+        held = self.requests.get(request.request_id)
+        # No held request: this add already ended it (the final update of a waiting session), so nothing streams.
+        if not declares_text_stream(info) or held is None:
             return
         if self._talker_kstep_armed():
             reason = "Streamed text is not supported with multi-frame Talker decode."
-        elif request.resumable:
-            # Each session update re-prefills the request, which a streamed text cannot replay.
+        elif request.resumable or held is not request:
+            # A streaming input session (a resumable request, or an update to one): each update re-prefills the
+            # request, which a streamed text cannot replay.
             reason = "Streamed text is not supported in a streaming input session."
         else:
             reason = streams.register(request.request_id, info)

@@ -357,6 +357,30 @@ def test_a_streaming_input_session_cannot_stream_its_text():
     assert "r" not in scheduler.requests and "r" not in scheduler._text_streams
 
 
+def test_a_session_update_that_declares_a_text_stream_ends_the_session():
+    scheduler, _ = _scheduler()
+    session = _request("r", stream=False)
+    session.resumable = True
+    scheduler.add_request(session)
+    _step(scheduler)
+    assert session.status == RequestStatus.RUNNING
+    scheduler.add_request(_request("r"))  # the session's final update (not resumable), declaring a stream
+    _, outputs = _step(scheduler)
+    assert "streaming input session" in _terminal_errors(outputs)["r"]
+    assert "r" not in scheduler.requests and "r" not in scheduler._text_streams
+
+
+def test_a_final_update_that_ends_a_parked_session_registers_no_text_stream():
+    scheduler, _ = _scheduler()
+    session = Request("r", list(range(PROMPT_LEN)), SamplingParams(max_tokens=1), None, client_index=0, resumable=True)
+    scheduler.add_request(session)
+    _step(scheduler)  # the prefill samples its one token, and the session waits for its next input
+    assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    scheduler.add_request(_request("r"))  # the final update ends the parked session inside add_request
+    # A stream registered here would belong to no request and would shadow a later request with this id.
+    assert "r" not in scheduler.requests and "r" not in scheduler._text_streams
+
+
 def test_a_text_that_ends_shorter_than_its_lead_allows_fails_before_its_prefill():
     scheduler, _ = _scheduler()
     scheduler.add_request(_request("r", lead=4))  # the lead rows hold at least 3 ids and the END
