@@ -15,9 +15,12 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     PreparedRequest,
     SpeechServingContext,
 )
-from vllm_omni.model_executor.models.zonos3.ar_config import ZONOS3_PROMPT_KEY, Zonos3Architecture
+from vllm_omni.model_executor.models.zonos3.ar_config import (
+    ZONOS3_PROMPT_KEY,
+    ZONOS3_SAMPLING_KEY,
+    Zonos3Architecture,
+)
 from vllm_omni.model_executor.models.zonos3.prompt import Zonos3PromptBuilder, condition_ids
-from vllm_omni.model_executor.models.zonos3.sampler import ZONOS3_SAMPLING_KEY
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest

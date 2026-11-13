@@ -4,31 +4,145 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
+import math
+import secrets
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, fields
 from typing import Any
 
 import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, apply_top_k_top_p_pytorch
+from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
-from .ar_config import ZONOS3_PROMPT_KEY
+from .ar_config import ZONOS3_PROMPT_KEY, ZONOS3_SAMPLING_KEY, Zonos3Architecture
 from .modeling_zonos3_mini import Zonos3Backbone, Zonos3BackboneBatch, Zonos3PrefillSpan
-from .sampler import Zonos3Sampler
-from .sampling_state import Zonos3ARSamplingState
+from .sampling_state import EOS, Zonos3ARSamplingState
+
+
+@dataclass(frozen=True)
+class Zonos3SamplingOptions:
+    temperature: float
+    top_k: int
+    top_p: float
+    min_p: float
+    repetition_penalty: float
+    repetition_window: int
+    repetition_codebooks: int
+    min_frames: int
+    seed: int
+    ignore_eos: bool
+    eoa_codebook0: bool
+
+    @classmethod
+    def from_params(
+        cls, params: SamplingParams, config: Zonos3Architecture, history_capacity: int
+    ) -> Zonos3SamplingOptions:
+        extra = (params.extra_args or {}).get(ZONOS3_SAMPLING_KEY, {})
+        if not isinstance(extra, Mapping) or set(extra) - {
+            "repetition_window",
+            "repetition_codebooks",
+            "min_frames",
+            "eoa_policy",
+        }:
+            raise ValueError("Invalid zonos3_sampling options")
+        if (
+            params.logprobs is not None
+            or params.prompt_logprobs is not None
+            or params.logit_bias
+            or params.allowed_token_ids
+            or params.bad_words
+            or params.structured_outputs
+            or params.stop
+            or params.frequency_penalty
+            or params.presence_penalty
+            or params.min_tokens
+            or params.n != 1
+            or any(token != EOS for token in params.stop_token_ids)
+        ):
+            raise ValueError("Unsupported logical-token sampling constraint for Zonos3 RVQ generation")
+        policy = extra.get("eoa_policy", "any")
+        if policy not in ("any", "codebook0"):
+            raise ValueError("Zonos3 eoa_policy must be any or codebook0")
+        codebooks = int(extra.get("repetition_codebooks", 6))
+        seed = int(params.seed) if params.seed is not None else secrets.randbits(63)
+        seed = seed & ((1 << 64) - 1)
+        if seed >= 1 << 63:
+            seed -= 1 << 64
+        values = (params.temperature, params.top_p, params.min_p, params.repetition_penalty)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Zonos3 sampling scalars must be finite")
+        return cls(
+            temperature=max(float(params.temperature), 0.0),
+            top_k=min(params.top_k if params.top_k > 0 else config.codebook_size, config.audio_vocab),
+            top_p=float(params.top_p) if params.top_p > 0 else 1.0,
+            min_p=max(float(params.min_p), 0.0),
+            repetition_penalty=max(float(params.repetition_penalty), 1.0),
+            repetition_window=min(max(int(extra.get("repetition_window", 96)), 0), history_capacity),
+            repetition_codebooks=10 if codebooks < 0 else min(codebooks, 10),
+            min_frames=max(int(extra.get("min_frames", 0)), 0),
+            seed=seed,
+            ignore_eos=bool(params.ignore_eos),
+            eoa_codebook0=policy == "codebook0",
+        )
+
+
+@dataclass
+class _SamplingSettings:
+    temperature: UvaBackedTensor
+    top_k: UvaBackedTensor
+    top_p: UvaBackedTensor
+    min_p: UvaBackedTensor
+    repetition_penalty: UvaBackedTensor
+    repetition_window: UvaBackedTensor
+    repetition_codebooks: UvaBackedTensor
+    min_frames: UvaBackedTensor
+    seed: UvaBackedTensor
+
+
+class Zonos3CodeSnapshot(PackedOutputSnapshot):
+    """One owned slab for RVQ codes and per-request validity/EOS flags.
+
+    Request-owned lists keep the generic runner's token-span slicing out of
+    codebook rows, including mixed/partial prefills. No CPU flag is inspected
+    until the existing output worker has waited for its D2H completion event.
+    """
+
+    def __init__(self, codes: torch.Tensor, valid: torch.Tensor, finished: torch.Tensor) -> None:
+        self._frames = torch.cat((codes, valid[:, None], finished[:, None]), dim=-1)
+        dict.__init__(self, self._payload(self._frames))
+        self.producer_event = None
+
+    @staticmethod
+    def _payload(frames: torch.Tensor) -> dict[str, Any]:
+        return {
+            "codes": {"audio": list(frames[:, :10].split(1))},
+            "meta": {
+                "codec_frame_valid": list(frames[:, 10:11].unbind(0)),
+                "codec_eos_valid": list(frames[:, 11:12].unbind(0)),
+            },
+        }
+
+    def copy_to_cpu(self, copy_tensor: Callable[[torch.Tensor], torch.Tensor]) -> dict[str, Any]:
+        return self._payload(copy_tensor(self._frames))
 
 
 @dataclass
@@ -59,6 +173,27 @@ class Zonos3ARModelState(OmniModelState):
             2 * self.max_num_reqs, model.config.eoa_id, model.config.audio_pad_id, device
         )
         self.next_embeddings = torch.zeros((2 * self.max_num_reqs, self._embed_dim), dtype=self.dtype, device=device)
+        self.history = torch.full((self.max_num_reqs, 10, self.max_model_len), -1, dtype=torch.int64, device=device)
+        self.settings = _SamplingSettings(
+            **{
+                name: UvaBackedTensor(self.max_num_reqs, dtype=dtype)
+                for name, dtype in (
+                    ("temperature", torch.float32),
+                    ("top_k", torch.int32),
+                    ("top_p", torch.float32),
+                    ("min_p", torch.float32),
+                    ("repetition_penalty", torch.float32),
+                    ("repetition_window", torch.int32),
+                    ("repetition_codebooks", torch.int32),
+                    ("min_frames", torch.int32),
+                    ("seed", torch.int64),
+                )
+            }
+        )
+        self.options: list[Zonos3SamplingOptions | None] = [None] * self.max_num_reqs
+        self._sampling_pending: set[int] = set()
+        self._generators: dict[int, torch.Generator] = {}
+        self._sample_output: SamplerOutput | None = None
         self._slots = torch.empty(self.max_num_reqs, dtype=torch.int64, device=device)
         self._batches: dict[int, Zonos3BackboneBatch] = {}
         self._prompts: dict[str, _Prompt] = {}
@@ -67,22 +202,17 @@ class Zonos3ARModelState(OmniModelState):
         self._decode_started: set[str] = set()
         self._startup = True
 
-    def custom_sampler(self, sampler: Sampler) -> tuple[Zonos3Sampler, None]:
-        return Zonos3Sampler(
-            sampler,
-            self.model.config,
-            self.model.multi_embedder,
-            self.model.multi_output,
-            self.sampling_state,
-            self.next_embeddings,
-            self.max_model_len,
-        ), None
-
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         if new_req_data.num_computed_tokens:
             raise ValueError("Zonos3 cannot restore a KV-only prefix or recomputed/preempted GDN state")
         if new_req_data.req_id in self._request_slots:
             raise ValueError("Zonos3 request was reinitialized without completion cleanup")
+        params = new_req_data.sampling_params
+        if is_warmup_request(new_req_data.req_id):
+            # Upstream startup requests can ask for text-only logprobs/grammar.
+            # They are not serving requests and have no physical RVQ contract.
+            params = SamplingParams(temperature=0.9, top_k=50, top_p=0.9, min_p=0.1, seed=0)
+        options = Zonos3SamplingOptions.from_params(params, self.model.config, self.max_model_len)
         super().add_request(req_index, new_req_data)
         req_id = new_req_data.req_id
         self._request_slots[req_id] = req_index
@@ -93,11 +223,41 @@ class Zonos3ARModelState(OmniModelState):
         slots = index_to_device([req_index], self.device)
         self.sampling_state.reset(slots, torch.zeros(1, dtype=torch.bool, device=self.device))
         self.next_embeddings.index_fill_(0, slots, 0)
+        self.history.index_fill_(0, slots, -1)
+        self._stage_sampling_options(req_index, options)
+
+    def _stage_sampling_options(self, req_index: int, options: Zonos3SamplingOptions) -> None:
+        self.options[req_index] = options
+        for field in fields(self.settings):
+            getattr(self.settings, field.name).np[req_index] = getattr(options, field.name)
+        self._sampling_pending.add(req_index)
+        if self.device.type == "cpu":
+            self._generators[req_index] = torch.Generator().manual_seed(options.seed)
+
+    def apply_staged_writes(self) -> None:
+        super().apply_staged_writes()
+        if not self._sampling_pending:
+            return
+        for field in fields(self.settings):
+            getattr(self.settings, field.name).copy_to_uva()
+        slots = sorted(self._sampling_pending)
+        indices = index_to_device(slots, self.device)
+        self.sampling_state.ignore_eos.index_copy_(
+            0, indices, index_to_device([self.options[i].ignore_eos for i in slots], self.device, dtype=torch.bool)
+        )
+        self.sampling_state.eoa_codebook0.index_copy_(
+            0, indices, index_to_device([self.options[i].eoa_codebook0 for i in slots], self.device, dtype=torch.bool)
+        )
+        self._sampling_pending.clear()
 
     def _drop(self, req_id: str) -> None:
         self._prompts.pop(req_id, None)
         self._lengths.pop(req_id, None)
-        self._request_slots.pop(req_id, None)
+        slot = self._request_slots.pop(req_id, None)
+        if slot is not None:
+            self.options[slot] = None
+            self._generators.pop(slot, None)
+            self._sampling_pending.discard(slot)
         self._decode_started.discard(req_id)
 
     def remove_request(self, req_index_or_id: int | str) -> None:
@@ -305,6 +465,168 @@ class Zonos3ARModelState(OmniModelState):
             batch.decode_rows = index_to_device(decode_rows, self.device)
         model_inputs["inputs_embeds"] = embeddings
         model_inputs["zonos3_batch"] = batch
+
+    def _setting(self, name: str, slots: torch.Tensor) -> torch.Tensor:
+        backed: UvaBackedTensor = getattr(self.settings, name)
+        if backed.gpu.device != slots.device:
+            values = backed.np[slots.detach().cpu().numpy()]
+            return torch.from_numpy(values.copy()).to(slots.device)
+        return backed.gpu.index_select(0, slots)
+
+    def probabilities(self, logits: torch.Tensor, slots: torch.Tensor, width: int) -> torch.Tensor:
+        """Per-codebook filters, using the same upstream kernels as before."""
+        c = self.model.config
+        logits = logits.float()
+        positions = self.sampling_state.position.index_select(0, slots)
+        ids = torch.arange(c.audio_vocab, device=logits.device)
+        invalid = (ids >= c.codebook_size) & (ids != c.eoa_id)
+        minimum = self._setting("min_frames", slots)
+        stop_blocked = (minimum[:, None] > 0) & (positions[:, None] < minimum[:, None] + self.sampling_state.columns)
+        logits = logits.masked_fill(
+            invalid[None, None, :] | (stop_blocked[:, :, None] & (ids == c.eoa_id)), float("-inf")
+        )
+        if width:
+            offsets = torch.arange(width, device=logits.device)
+            indices = (positions[:, None] - 1 - offsets) % self.max_model_len
+            history = self.history[
+                slots[:, None, None], self.sampling_state.columns[None, :, None], indices[:, None, :]
+            ]
+            window = self._setting("repetition_window", slots)
+            books = self._setting("repetition_codebooks", slots)
+            valid = (history >= 0) & (history < c.codebook_size)
+            valid = valid & (offsets[None, None, :] < torch.minimum(positions, window)[:, None, None])
+            valid = valid & (self.sampling_state.columns[None, :, None] < books[:, None, None])
+            repeated = torch.zeros_like(logits, dtype=torch.int32)
+            repeated.scatter_add_(-1, history.clamp(min=0, max=c.audio_vocab - 1), valid.to(torch.int32))
+            penalty = self._setting("repetition_penalty", slots)[:, None, None]
+            adjusted = torch.where(logits > 0, logits / penalty, logits * penalty)
+            logits = torch.where(repeated > 0, adjusted, logits)
+        temperature = self._setting("temperature", slots)[:, None, None]
+        logits = logits / torch.where(temperature > 0, temperature, 1.0)
+        # Triton expects contiguous per-codebook settings, including B=1.
+        k = self._setting("top_k", slots).repeat_interleave(10)
+        p = self._setting("top_p", slots).repeat_interleave(10)
+        flat = logits.reshape(-1, c.audio_vocab)
+        if flat.is_cuda:
+            logits = apply_top_k_top_p(flat, k, p, has_topp_only_rows=True)
+        else:
+            logits = apply_top_k_top_p_pytorch(flat, k.to(flat.device), p.to(flat.device))
+        logits = logits.view(-1, 10, c.audio_vocab)
+        probs = logits.softmax(-1)
+        min_p = self._setting("min_p", slots)[:, None, None]
+        probs = probs.masked_fill(probs < min_p * probs.amax(-1, keepdim=True), 0)
+        total = probs.sum(-1, keepdim=True)
+        fallback = torch.zeros_like(probs).scatter_(-1, logits.argmax(-1, keepdim=True), 1.0)
+        return torch.where(total > 0, probs / total.clamp(min=1e-8), fallback)
+
+    def _draw_cpu(self, probs: torch.Tensor, indices: list[int], active: torch.Tensor) -> torch.Tensor:
+        result = torch.full((len(indices), 10), self.model.config.audio_pad_id, dtype=torch.int64)
+        for row, slot in enumerate(indices):
+            if bool(active[row]):
+                if self.options[slot].temperature == 0:
+                    result[row] = probs[row].argmax(-1)
+                else:
+                    result[row] = torch.multinomial(
+                        probs[row, :, : self.model.config.audio_pad_id + 1], 1, generator=self._generators[slot]
+                    ).flatten()
+        return result
+
+    def postprocess_model_output(
+        self, model_output: Any, input_batch: InputBatch, req_states: RequestState
+    ) -> tuple[torch.Tensor, dict]:
+        hidden, _ = super().postprocess_model_output(model_output, input_batch, req_states)
+        if input_batch.num_draft_tokens or input_batch.logits_indices.numel() != input_batch.num_reqs:
+            raise ValueError("Zonos3 RVQ sampling does not support speculative scheduler tokens")
+        if self._sampling_pending:
+            raise RuntimeError("Zonos3 sampling staged writes must be applied before postprocess")
+        slots = input_batch.idx_mapping
+        options = [self.options[int(slot)] for slot in input_batch.idx_mapping_np]
+        if any(option is None for option in options):
+            raise RuntimeError("Zonos3 sampling request was not initialized")
+        if hidden.device.type == "cuda":
+            sampled, rejected = get_num_sampled_and_rejected(
+                input_batch.seq_lens.new_ones(input_batch.num_reqs),
+                input_batch.seq_lens,
+                input_batch.cu_num_logits,
+                slots,
+                req_states.prefill_len.gpu,
+            )
+        else:
+            prefill_len = req_states.prefill_len.gpu.to(device=hidden.device)
+            sampled = (input_batch.seq_lens >= prefill_len.index_select(0, slots)).to(torch.int32)
+            rejected = torch.zeros_like(sampled)
+        active = (sampled > 0) & ~(
+            (self.sampling_state.eoa_frame.index_select(0, slots) >= 0)
+            & (self.sampling_state.drain_remaining.index_select(0, slots) == 0)
+        )
+        position = self.sampling_state.position.index_select(0, slots)
+        logits = self.model.multi_output(hidden.index_select(0, input_batch.logits_indices))
+        probs = self.probabilities(logits, slots, max(option.repetition_window for option in options))
+        if hidden.device.type == "cuda":
+            noise_position = (position[:, None] * 10 + self.sampling_state.columns).reshape(-1)
+            codes = gumbel_sample(
+                probs.log().reshape(-1, self.model.config.audio_vocab),
+                slots.repeat_interleave(10),
+                self.settings.temperature.gpu,
+                self.settings.seed.gpu,
+                noise_position,
+                apply_temperature=False,
+                is_drafting=False,
+            ).view(-1, 10)
+        elif hidden.device.type == "cpu":
+            codes = self._draw_cpu(probs, [int(slot) for slot in input_batch.idx_mapping_np], active)
+        else:
+            raise ValueError("Zonos3 sampling supports CUDA serving and CPU numerical checks")
+        step = self.sampling_state.accept(slots, codes, active)
+        ring = position[:, None] % self.max_model_len
+        old = self.history[slots[:, None], self.sampling_state.columns[None, :], ring]
+        self.history[slots[:, None], self.sampling_state.columns[None, :], ring] = torch.where(
+            step.active[:, None], step.codes, old
+        )
+        frame = torch.cat((step.codes, torch.full_like(step.codes[:, :1], self.model.config.text_vocab)), -1)
+        embeddings = self.model.multi_embedder(frame)
+        previous = self.next_embeddings.index_select(0, slots)
+        self.next_embeddings.index_copy_(0, slots, torch.where(step.active[:, None], embeddings, previous))
+        self._sample_output = SamplerOutput(step.logical_token_ids.long(), None, None, sampled, rejected)
+        return hidden, Zonos3CodeSnapshot(step.codes, step.active, step.finished)
+
+    def sample_determined_tokens(self, batch: InputBatch, sampler: Sampler) -> SamplerOutput:
+        """Deliver the CONTINUE/EOS decided in postprocess without text sampling."""
+        output = self._sample_output
+        if output is None or output.sampled_token_ids.shape != (batch.num_reqs, 1):
+            raise RuntimeError("Zonos3 determined tokens require the current step's postprocess output")
+        return output
+
+    def warmup_sampling(self, hidden_states: torch.Tensor, req_states: RequestState) -> None:
+        """Exercise the serving sampling path before requests, then reset its state."""
+        rows = min(hidden_states.shape[0], self.max_num_reqs)
+        buckets = self.vllm_config.compilation_config.cudagraph_capture_sizes or ()
+        sizes = sorted({1, rows, *(size for size in buckets if 0 < size <= rows)})
+        options = Zonos3SamplingOptions.from_params(
+            SamplingParams(temperature=0.9, top_k=50, top_p=0.9, min_p=0.1, repetition_penalty=1.2, seed=0),
+            self.model.config,
+            self.max_model_len,
+        )
+        slots = index_to_device(list(range(rows)), self.device)
+        buffers = InputBuffers(rows, rows, self.device)
+        try:
+            for slot in range(rows):
+                self._stage_sampling_options(slot, options)
+            self.apply_staged_writes()
+            for size in sizes:
+                self.sampling_state.reset(slots, torch.zeros(rows, dtype=torch.bool, device=self.device))
+                self.history.index_fill_(0, slots, -1)
+                batch = InputBatch.make_dummy(size, size, buffers)
+                self.postprocess_model_output(hidden_states[:size], batch, req_states)
+        finally:
+            self.sampling_state.reset(slots, torch.zeros(rows, dtype=torch.bool, device=self.device))
+            self.history.index_fill_(0, slots, -1)
+            self.next_embeddings.index_fill_(0, slots, 0)
+            for slot in range(rows):
+                self.options[slot] = None
+                self._generators.pop(slot, None)
+                self._sampling_pending.discard(slot)
+            self._sample_output = None
 
     def prepare_attn(
         self,

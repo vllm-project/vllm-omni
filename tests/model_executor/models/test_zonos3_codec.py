@@ -802,6 +802,7 @@ def test_native_finalizer_transport_codec_lifecycle(checkpoint, termination, com
 
     from vllm import SamplingParams
 
+    from tests.model_executor.models.test_zonos3_model_state import materialize_codes
     from tests.worker_v2.test_omni_data_plane import (
         _make_plane,
         _new_request,
@@ -809,7 +810,7 @@ def test_native_finalizer_transport_codec_lifecycle(checkpoint, termination, com
         _start_save_thread,
         _stop_save_thread,
     )
-    from vllm_omni.model_executor.models.zonos3.sampler import finalize_zonos3_codes
+    from vllm_omni.model_executor.models.zonos3.model_state import Zonos3CodeSnapshot
     from vllm_omni.model_executor.stage_input_processors.zonos3 import zonos3_rvq_async_chunk
     from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 
@@ -859,14 +860,8 @@ def test_native_finalizer_transport_codec_lifecycle(checkpoint, termination, com
     try:
         for i, row in enumerate(rows):
             end = termination == "eos" and i == length - 1
-            materialized = finalize_zonos3_codes(
-                {
-                    "codes": {"audio": row[None, None]},
-                    "meta": {"codec_frame_valid": torch.tensor([True]), "codec_eos_valid": torch.tensor([end])},
-                },
-                [1],
-            )
-            worker.submit(_Output(payload=materialized.inter_stage[0], token=2 if end else 1), plane).get_output()
+            snapshot = Zonos3CodeSnapshot(row[None], torch.tensor([True]), torch.tensor([end]))
+            worker.submit(_Output(payload=materialize_codes(snapshot)[0], token=2 if end else 1), plane).get_output()
         plane.drain_outputs()
         # A speculative in-flight step after stop must not be published.
         if not cancelled:

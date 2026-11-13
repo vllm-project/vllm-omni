@@ -315,7 +315,8 @@ def _stop_save_thread(plane):
 
 
 def test_zonos3_native_materialization_hook_and_connector_terminal(raw_plane):
-    from vllm_omni.model_executor.models.zonos3.sampler import finalize_zonos3_codes
+    from tests.model_executor.models.test_zonos3_model_state import materialize_codes
+    from vllm_omni.model_executor.models.zonos3.model_state import Zonos3CodeSnapshot
     from vllm_omni.model_executor.stage_input_processors.zonos3 import zonos3_rvq_async_chunk
 
     sent = []
@@ -347,15 +348,9 @@ def test_zonos3_native_materialization_hook_and_connector_terminal(raw_plane):
             rows[3 + j, j] = 1024
         rows[12, :] = 1025
         for i, row in enumerate(rows):
-            materialized = finalize_zonos3_codes(
-                {
-                    "codes": {"audio": row[None, None]},
-                    "meta": {"codec_frame_valid": torch.tensor([True]), "codec_eos_valid": torch.tensor([i == 12])},
-                },
-                [1],
-            )
+            snapshot = Zonos3CodeSnapshot(row[None], torch.tensor([True]), torch.tensor([i == 12]))
             output = _Output(
-                payload=materialized.inter_stage[0],
+                payload=materialize_codes(snapshot)[0],
                 token=2 if i == 12 else 1,
             )
             worker.submit(output, raw_plane).get_output()
