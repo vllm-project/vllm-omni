@@ -270,13 +270,13 @@ def test_qwen_image_batch_is_core_on_ready_and_advanced_on_merge() -> None:
     assert "rocm" not in parallel_line
 
 
-def test_qwen_image_official_weight_nightly_smoke_follows_burn_in_contract() -> None:
+def test_qwen_image_official_weight_nightly_smoke_is_blocking() -> None:
     step = _find_step(QWEN_IMAGE_SMOKE_LABEL, AMD_NIGHTLY_PIPELINE)
 
     assert step["agent_pool"].startswith("mi300_")
     card_count = step["agent_pool"].rsplit("_", 1)[1]
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] >= 90
     assert "depends_on" not in step
     assert "retry" not in step
@@ -3024,6 +3024,50 @@ def test_promoted_nightly_accuracy_doc_execution_guard(
         errors=int(scenario == "error"),
         timeout_status=timeout_status,
         expected_status=expected_status,
+        extra_env={"BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path)},
+    )
+
+
+_NIGHTLY_SMOKES_PROMOTIONS = (
+    ("HunyuanVideo-1.5 Default T2V Smoke", 1, "HunyuanVideo-1.5 T2V smoke", "UNUSED_ARTIFACT_DIR", "pytest -s -v"),
+    ("LingBot-Video Dense CFG-off Smoke", 1, "LingBot CFG-off smoke", "UNUSED_ARTIFACT_DIR", "pytest -s -v"),
+    (
+        "Qwen-Image Official-Weight Smoke",
+        1,
+        "Qwen-Image official-weight smoke",
+        "QWEN_IMAGE_ARTIFACT_DIR",
+        "pytest -s -v",
+    ),
+    ("MiniMax-H3 Official T2VA Smoke", 1, "MiniMax-H3 T2VA smoke", "MINIMAX_H3_ARTIFACT_DIR", "pytest -s -v"),
+)
+
+
+@pytest.mark.parametrize("label,count,name,artifact_env,command_fragment", _NIGHTLY_SMOKES_PROMOTIONS)
+@pytest.mark.parametrize(
+    "scenario", ["pass", "skipped", "wrong-count", "zero-tests", "failure", "error", "pytest-failure", "timeout"]
+)
+def test_nightly_smokes_promotion_execution_guard(
+    tmp_path: Path, label: str, count: int, name: str, artifact_env: str, command_fragment: str, scenario: str
+) -> None:
+    assert _find_step(label, AMD_NIGHTLY_PIPELINE)["grade"] == "Blocking"
+    # LingBot and HunyuanVideo have a step timeout, not an inner timeout command.
+    pytest_status = 1 if scenario == "pytest-failure" else 124 if scenario == "timeout" else 0
+    timeout_status = 124 if scenario == "timeout" else None
+    tests = 0 if scenario == "zero-tests" else count + int(scenario == "wrong-count")
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label=label,
+        command_fragment=command_fragment,
+        expected_message=f"Expected exactly {count} executed {name} tests",
+        artifact_env=artifact_env,
+        job_id_prefix="nightly-smokes-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=int(scenario == "skipped"),
+        failures=int(scenario == "failure"),
+        errors=int(scenario == "error"),
+        timeout_status=timeout_status,
+        expected_status={"pass": 0, "pytest-failure": 1, "timeout": 124}.get(scenario, 5),
         extra_env={"BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path)},
     )
 
