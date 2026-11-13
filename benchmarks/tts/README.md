@@ -127,7 +127,10 @@ still hear gaps - common at high concurrency on streaming TTS pipelines.
 Set `VLLM_OMNI_BENCH_SAVE_AUDIO_DIR=<dir>` to dump each streamed response as a
 WAV with a correct self-describing header (raw-PCM transport itself carries
 none) plus a `manifest.jsonl` mapping every file to its request id, prompt,
-sample rate, frames, duration, TTFP and RTF. Saved copies are loudness
+sample rate, frames, duration, TTFP and RTF. Each benchmark run regenerates the
+`bench_*.wav` set (the per-run index restarts at 0001), so the run's first save
+rewrites the manifest: it always describes exactly the wav set on disk, never
+stale entries from earlier runs. Saved copies are loudness
 normalized (gain-up only, 0.95 peak clip) so a mixed set auditions
 consistently; saving runs off the event loop after the metrics are measured,
 so it never perturbs the numbers it documents.

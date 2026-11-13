@@ -13,6 +13,7 @@ import os
 import random
 import ssl
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -2834,6 +2835,11 @@ async def async_request_openai_image_edits_omni(
 
 
 _BENCH_AUDIO_SAVE_INDEX = itertools.count(1)
+# One bench run regenerates the whole bench_*.wav set (the per-process index
+# restarts at 0001), so the manifest must describe exactly the current run:
+# the first save of a process truncates it, saves within the run append.
+_BENCH_AUDIO_MANIFEST_OPENED: set[str] = set()
+_BENCH_AUDIO_MANIFEST_LOCK = threading.Lock()
 
 
 def _save_streamed_pcm_as_wav(
@@ -2882,26 +2888,29 @@ def _save_streamed_pcm_as_wav(
         wav_file.writeframes(pcm)
     frames = len(pcm) // max(sample_width * channels, 1)
     duration_s = frames / sample_rate if sample_rate > 0 else 0.0
-    with open(os.path.join(save_dir, "manifest.jsonl"), "a", encoding="utf-8") as manifest:
-        # ensure_ascii=False: prompts are typically non-ASCII and the manifest
-        # is read by humans first — keep it greppable, not \u-escaped.
-        manifest.write(
-            json.dumps(
-                {
-                    "file": filename,
-                    "request_id": request_tag,
-                    "prompt": prompt,
-                    "sample_rate": sample_rate,
-                    "channels": channels,
-                    "frames": frames,
-                    "duration_s": round(duration_s, 4),
-                    "ttfp_ms": round(ttfp_ms, 2),
-                    "rtf": round(rtf, 4),
-                },
-                ensure_ascii=False,
+    with _BENCH_AUDIO_MANIFEST_LOCK:
+        mode = "a" if save_dir in _BENCH_AUDIO_MANIFEST_OPENED else "w"
+        _BENCH_AUDIO_MANIFEST_OPENED.add(save_dir)
+        with open(os.path.join(save_dir, "manifest.jsonl"), mode, encoding="utf-8") as manifest:
+            # ensure_ascii=False: prompts are typically non-ASCII and the manifest
+            # is read by humans first — keep it greppable, not \u-escaped.
+            manifest.write(
+                json.dumps(
+                    {
+                        "file": filename,
+                        "request_id": request_tag,
+                        "prompt": prompt,
+                        "sample_rate": sample_rate,
+                        "channels": channels,
+                        "frames": frames,
+                        "duration_s": round(duration_s, 4),
+                        "ttfp_ms": round(ttfp_ms, 2),
+                        "rtf": round(rtf, 4),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
             )
-            + "\n"
-        )
     return path
 
 

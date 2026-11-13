@@ -857,6 +857,26 @@ def test_save_streamed_pcm_loud_clip_passes_through(tmp_path):
     assert _wav_rms(path) == pytest.approx(0.5 / (2**0.5), abs=0.01)
 
 
+def test_save_streamed_pcm_manifest_describes_exactly_one_run(tmp_path):
+    from vllm_omni.benchmarks.patch import patch
+
+    kwargs = dict(sample_rate=48000, channels=1, sample_width=2)
+    patch._save_streamed_pcm_as_wav(str(tmp_path), b"\x00\x00", request_tag="a", prompt="first", **kwargs)
+    patch._save_streamed_pcm_as_wav(str(tmp_path), b"\x00\x00", request_tag="b", prompt="second", **kwargs)
+    manifest_path = tmp_path / "manifest.jsonl"
+    lines = manifest_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+
+    # A new bench process restarts the bench_*.wav index at 0001, so its first
+    # save must rewrite the manifest: stale lines must never outlive the wav
+    # set they describe.
+    patch._BENCH_AUDIO_MANIFEST_OPENED.discard(str(tmp_path))
+    patch._save_streamed_pcm_as_wav(str(tmp_path), b"\x00\x00", request_tag="c", prompt="new-run", **kwargs)
+    lines = manifest_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["prompt"] == "new-run"
+
+
 @pytest.mark.asyncio
 async def test_positive_client_text_timings_take_precedence_over_stage0(mocker: MockerFixture):
     request_input = RequestFuncInput(
