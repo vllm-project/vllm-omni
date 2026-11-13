@@ -2394,12 +2394,50 @@ def test_session_out_of_order_discard_then_materialize_appends_in_order():
         # Reversed consumption order: decode first.
         mgr.discard_step(s2)
         assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
+        # The queued rows are charged to the budget while they wait.
+        assert mgr._session_store.pending_bytes() > 0
         mgr.materialize(s1, ["a"])
         assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+        # Draining turns the reservation into stored bytes.
+        assert mgr._session_store.pending_bytes() == 0
         assert torch.equal(
             mgr._session_store.fetch("S", HIDDEN_KEY, 12),
             expected_rows(view.slots_for("a", 0, 12)),
         )
+    finally:
+        mgr.shutdown()
+
+
+def test_session_pending_reservation_released_on_turn_end():
+    """A queued row whose turn ends must release its budget reservation."""
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        s2 = run_decode_step(mgr, view, "a", [0, 1, 2], 8, 4)
+        mgr.discard_step(s2)  # queues behind the unmaterialized prefill
+        assert mgr._session_store.pending_bytes() > 0
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
+        adapter = mgr._test_adapter
+        mgr.new_step_starts(adapter.translate_step(FakeSchedOut(finished=["a"])))
+        assert mgr._session_store.pending_bytes() == 0
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
+    finally:
+        mgr.shutdown()
+
+
+def test_session_epoch_advance_drops_stale_queued_reservations():
+    """A generation advance must drop the old generation's queued rows and
+    release their reservations, not hold them across turns."""
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S", session_epoch=0)
+        s2 = run_decode_step(mgr, view, "a", [0, 1, 2], 8, 4)
+        mgr.discard_step(s2)
+        assert mgr._session_store.pending_bytes() > 0
+        # A new STARTED advances the session generation and invalidates.
+        run_session_step(mgr, view, "a2", [0, 1], 0, 8, session="S", session_epoch=1)
+        assert mgr._session_store.pending_bytes() == 0
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
     finally:
         mgr.shutdown()
 

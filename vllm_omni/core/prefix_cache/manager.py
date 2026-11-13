@@ -507,15 +507,20 @@ class OmniPrefixCacheManager:
         # is ahead of the stored stream — an earlier step for the same
         # request has not landed yet — queues behind it instead of
         # being gap-refused and lost (B4). Entries are (expected,
-        # sequence, rows, epoch), sorted by expected position; the
-        # sequence breaks ties without ever comparing tensors, and the
-        # epoch is re-checked when the queued rows finally land. Guarded by
+        # sequence, rows, epoch, session), sorted by expected position;
+        # the sequence breaks ties without ever comparing tensors, the
+        # epoch is re-checked when the queued rows finally land, and the
+        # session lets an epoch advance drop that generation's stale
+        # reservations. Guarded by
         # _append_lock, which never covers a D2H wait and is never held
         # while taking _state_lock, so it cannot deadlock against the
         # state lock (new_step_starts takes it under _state_lock only
-        # to drop a finished request's queue).
+        # to drop a finished request's queue or a superseded session's
+        # generation).
         self._append_lock = threading.Lock()
-        self._pending_appends: dict[tuple[ReqId, TensorName], list[tuple[int, int, torch.Tensor, int | None]]] = {}
+        self._pending_appends: dict[
+            tuple[ReqId, TensorName], list[tuple[int, int, torch.Tensor, int | None, str]]
+        ] = {}
         self._pending_seq = 0
 
         # Planned-but-unread slot refs. A write reusing their slots copies the
@@ -568,6 +573,10 @@ class OmniPrefixCacheManager:
                 previous,
                 epoch,
             )
+            # Queued rows from the superseded generation can never land and
+            # would otherwise hold their reservation across turns (a
+            # resumable request outlives a barge-in). Release them now.
+            self._drop_pending_appends_for_session(session_id, epoch)
 
     def _session_epoch_mismatch(self, ctx: _StepContext, req_id: str, session_id: str) -> bool:
         """True when the step's frozen epoch and the store's recorded
@@ -1937,7 +1946,7 @@ class OmniPrefixCacheManager:
                             continue
                         self._pending_seq += 1
                         queue = self._pending_appends.setdefault((req_id, key), [])
-                        bisect.insort(queue, (a_expected, self._pending_seq, rows.clone(), epoch))
+                        bisect.insort(queue, (a_expected, self._pending_seq, rows.clone(), epoch, session_id))
                         continue
                     self._session_store.append_beyond(
                         session_id, key, a_expected, rows, expected_epoch=epoch
@@ -1951,21 +1960,42 @@ class OmniPrefixCacheManager:
         at the first entry still ahead of the stream (an earlier step
         has still not landed) or refused (a mismatch invalidated the
         session — the remaining queued rows belong to a dead stream and
-        are dropped at turn end).
+        are dropped at turn end). An entry from a superseded generation is
+        dropped and released instead of stopping the drain, so a ready
+        current-generation entry behind it still lands.
         """
         queue = self._pending_appends.get((req_id, key))
         if not queue:
             return
         while queue:
-            expected, _, rows, epoch = queue[0]
+            expected, _, rows, epoch, _session = queue[0]
+            current_epoch = self._session_store.epoch_of(session_id)
+            if epoch is not None and current_epoch is not None and current_epoch != epoch:
+                # The generation advanced since this row was queued: it can
+                # never land, and leaving it at the head would block ready
+                # current-generation entries behind it. Drop and release it.
+                queue.pop(0)
+                self._session_store.release_pending(rows.numel() * rows.element_size())
+                continue
             if expected > self._session_store.stored_tokens(session_id, key):
                 break
             queue.pop(0)
-            # Turn the queue's reservation into a real append charge. If the
-            # append is still refused, the rows are lost exactly as a normal
-            # over-budget append (the stream stalls until a seeding turn).
-            self._session_store.release_pending(rows.numel() * rows.element_size())
-            if not self._session_store.append_beyond(session_id, key, expected, rows, expected_epoch=epoch):
+            # Release the queue's reservation and append in one store-lock
+            # hold, so another session cannot take the freed budget first.
+            if not self._session_store.append_reserved_beyond(
+                session_id,
+                key,
+                expected,
+                rows,
+                reserved_bytes=rows.numel() * rows.element_size(),
+                expected_epoch=epoch,
+            ):
+                # An epoch that moved during the append is the only refusal
+                # we may skip over; a content/gap refusal invalidates or
+                # stalls the stream, so later queued rows must not land.
+                current_epoch = self._session_store.epoch_of(session_id)
+                if epoch is not None and current_epoch is not None and current_epoch != epoch:
+                    continue
                 break
         if not queue:
             self._pending_appends.pop((req_id, key), None)
@@ -1980,8 +2010,31 @@ class OmniPrefixCacheManager:
         """
         with self._append_lock:
             for entry in [k for k in self._pending_appends if k[0] == req_id]:
-                for _, _, rows, _ in self._pending_appends.pop(entry):
+                for _, _, rows, _, _ in self._pending_appends.pop(entry):
                     self._session_store.release_pending(rows.numel() * rows.element_size())
+
+    def _drop_pending_appends_for_session(self, session_id: str, epoch: int) -> None:
+        """Drop queued appends from a superseded generation of a session.
+
+        Caller holds ``_state_lock`` (``_check_session_epoch`` runs inside
+        ``new_step_starts``); takes ``_append_lock``. Only entries whose
+        recorded epoch is known and differs are dropped: a ``None`` epoch
+        is a pre-epoch payload with no gate, so it is left to the drain
+        path rather than guessed stale.
+        """
+        with self._append_lock:
+            for entry in list(self._pending_appends):
+                kept = []
+                for item in self._pending_appends[entry]:
+                    _, _, rows, item_epoch, item_session = item
+                    if item_session == session_id and item_epoch is not None and item_epoch != epoch:
+                        self._session_store.release_pending(rows.numel() * rows.element_size())
+                    else:
+                        kept.append(item)
+                if kept:
+                    self._pending_appends[entry] = kept
+                else:
+                    del self._pending_appends[entry]
 
     def _merge_uncached_mm(
         self,

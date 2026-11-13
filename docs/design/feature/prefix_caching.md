@@ -581,6 +581,10 @@ history or ends.
   caps host bytes, including rows cloned and queued for out-of-order
   appends (`reserve_pending`); over-budget appends are refused (the
   first refusal per session is logged) and fall back to the slot pool.
+  A generation advance drops the superseded generation's queued rows and
+  releases their reservations, and draining releases a reservation and
+  appends under one store-lock hold, so the reserved bytes cannot be
+  taken by another session in between.
   `PrefixCacheConfig.session_store_idle_ttl_s` (default 600 s) reaps
   sessions with no bind/append/serve/invalidate activity, the only
   session-end signal for ephemeral requests. Deferred mm is not stored

@@ -358,26 +358,61 @@ class SessionPrefixStore:
             raise ValueError(f"session store append needs a non-empty per-token tensor, got {type(rows)}")
         if batch_start < 0:
             raise ValueError(f"session store append_beyond needs batch_start >= 0, got {batch_start}")
-        entry = (session_id, key)
         with self._lock:
             if not self._epoch_matches_locked(session_id, expected_epoch):
                 return False
             self._touch_locked(session_id)
-            stored = self._lengths.get(entry, 0)
-            batch_end = batch_start + int(rows.shape[0])
-            if batch_end <= stored:
-                if not self._overlap_matches_locked(entry, batch_start, batch_end, rows):
-                    self._invalidate_locked(session_id)
-                    return False
-                return True
-            if stored < batch_start:
+            return self._append_beyond_locked(session_id, key, batch_start, rows)
+
+    def append_reserved_beyond(
+        self,
+        session_id: SessionId,
+        key: TensorName,
+        batch_start: int,
+        rows: torch.Tensor,
+        *,
+        reserved_bytes: int,
+        expected_epoch: int | None = None,
+    ) -> bool:
+        """Release a queued-append reservation and append under one lock.
+
+        ``reserve_pending`` promised these bytes; releasing them and then
+        appending in separate lock holds would let another session's append
+        take the freed budget in between, so the reservation would not
+        actually guarantee the append. This method does both atomically.
+        The append itself follows :meth:`append_beyond`'s rules.
+        """
+        if not isinstance(rows, torch.Tensor) or rows.ndim < 2 or rows.shape[0] == 0:
+            raise ValueError(f"session store append needs a non-empty per-token tensor, got {type(rows)}")
+        if batch_start < 0:
+            raise ValueError(f"session store append_beyond needs batch_start >= 0, got {batch_start}")
+        with self._lock:
+            self._pending_bytes = max(0, self._pending_bytes - int(reserved_bytes))
+            if not self._epoch_matches_locked(session_id, expected_epoch):
                 return False
-            if batch_start < stored and not self._overlap_matches_locked(
-                entry, batch_start, stored, rows[: stored - batch_start]
-            ):
+            self._touch_locked(session_id)
+            return self._append_beyond_locked(session_id, key, batch_start, rows)
+
+    def _append_beyond_locked(
+        self, session_id: SessionId, key: TensorName, batch_start: int, rows: torch.Tensor
+    ) -> bool:
+        """Append body; the caller holds ``_lock`` and has checked the epoch."""
+        entry = (session_id, key)
+        stored = self._lengths.get(entry, 0)
+        batch_end = batch_start + int(rows.shape[0])
+        if batch_end <= stored:
+            if not self._overlap_matches_locked(entry, batch_start, batch_end, rows):
                 self._invalidate_locked(session_id)
                 return False
-            return self._append_locked(session_id, key, rows[stored - batch_start :], expected_length=stored)
+            return True
+        if stored < batch_start:
+            return False
+        if batch_start < stored and not self._overlap_matches_locked(
+            entry, batch_start, stored, rows[: stored - batch_start]
+        ):
+            self._invalidate_locked(session_id)
+            return False
+        return self._append_locked(session_id, key, rows[stored - batch_start :], expected_length=stored)
 
     def _slice_locked(self, entry: tuple[SessionId, TensorName], start: int, end: int) -> torch.Tensor | None:
         """Concatenated stored rows for [start, end); caller holds ``_lock``.
