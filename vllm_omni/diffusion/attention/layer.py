@@ -430,6 +430,7 @@ class ScheduleCandidate:
 class Attention(nn.Module):
     _scheduler_paged_kv = False
     _has_custom_attention = False
+    _has_spec_quantization = False
     # Whether this layer saw a schedule at construction. Attention can be built with no current
     # diffusion config, and such a layer legitimately prepares no candidates, so startup
     # validation must not report it as a missing profile.
@@ -855,9 +856,10 @@ class Attention(nn.Module):
         if config is None or self._has_custom_attention:
             return
         assert self.attn_backend is not None
-        dtype = getattr(config, "diffusion_kv_cache_dtype", None)
-        if dtype == "auto":
-            dtype = None
+        global_dtype = getattr(config, "diffusion_kv_cache_dtype", None)
+        if global_dtype == "auto":
+            global_dtype = None
+        dtype = self._spec_quant_precision(self.attn_spec) or global_dtype
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
         if dtype and dtype != "float":
@@ -872,13 +874,21 @@ class Attention(nn.Module):
                 raise ValueError(
                     f"Attention backend {self.attn_backend.get_name()} does not support "
                     f"kv_cache_dtype={dtype!r} on {platform_key}. Select a compatible "
-                    "backend or set diffusion_kv_cache_dtype='auto'."
+                    "backend or disable attention quantization."
                 )
-        self._kv_cache_dtype = dtype
+        self._kv_cache_dtype = global_dtype
         self._kv_cache_skip_steps = getattr(config, "diffusion_kv_cache_skip_step_indices", None)
         self._kv_cache_skip_layers = getattr(config, "diffusion_kv_cache_skip_layer_indices", None)
         if self._kv_cache_skip_layers and self.layer_idx is None and not self._disable_kv_quant:
             raise ValueError("Attention quantization skip_layers requires a parseable transformer block index.")
+        self._has_spec_quantization = self._spec_quant_precision(self.attn_spec) is not None or any(
+            self._spec_quant_precision(candidate.spec) is not None for candidate in self._schedule_candidates.values()
+        )
+
+    @staticmethod
+    def _spec_quant_precision(spec: "AttentionSpec | None") -> str | None:
+        """Read only the spec's explicit precision, independent of the global policy."""
+        return spec.quant.precision if spec is not None and spec.quant is not None else None
 
     def _should_apply_kv_cache_quant(self) -> bool:
         skip_steps = self._kv_cache_skip_steps
@@ -895,6 +905,8 @@ class Attention(nn.Module):
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
         disabled = self._disable_kv_quant or not self._should_apply_kv_cache_quant()
         dtype = self._kv_cache_dtype
+        if self._has_spec_quantization:
+            dtype = self._spec_quant_precision(self.effective_attention()[2]) or dtype
         if dtype in (None, "float"):
             dtype = None
         elif disabled:
@@ -1622,6 +1634,7 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
       forward runs the native implementation bound to the baseline, so a candidate must support
       paged KV and match the baseline backend, explicit selection and backend kwargs;
     * KV-cache quantization: ``_init_kv_cache_quantization`` probes the baseline impl only;
+      candidates must support their resolved precision, and explicit ``quant.precision`` cannot use ring;
     * SP auto-pad: the pad-time mask probe checks only the baseline, so when the model masks SP
       padding (``mask_sp_padding``), a self-attention layer in a component that plans auto_pad
       needs mask-capable candidates;
@@ -1641,12 +1654,9 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
         return 0
 
     profiles = tuple(sorted(schedule.profiles))
-    kv_dtype = od_config.diffusion_kv_cache_dtype
-    if kv_dtype in ("auto", "float"):
-        # The baseline guard treats both as "no quantization" (see _init_kv_cache_quantization,
-        # which probes only `if dtype and dtype != "float"`). Probing them here would reject a
-        # configuration that loads fine without a schedule.
-        kv_dtype = None
+    global_kv_dtype = od_config.diffusion_kv_cache_dtype
+    if global_kv_dtype in ("auto", "float"):
+        global_kv_dtype = None
     platform_key = current_omni_platform.device_name
     sp_size = od_config.parallel_config.sequence_parallel_size
     # mask_sp_padding turns on the SP padding mask in Wan2.2 T2V, I2V and VACE; without it, padded tokens are unmasked.
@@ -1679,6 +1689,8 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
         for name in profiles:
             record = module._schedule_candidates[name]
             backend_name = record.backend_cls.get_name()
+            spec_precision = module._spec_quant_precision(record.spec)
+            kv_dtype = spec_precision or global_kv_dtype
             matches_baseline = (
                 _attention_identity(record.backend_cls, record.backend_explicit, record.spec) == baseline_identity
             )
@@ -1698,6 +1710,12 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
                     f"(explicit={module.backend_explicit}) and cannot represent a candidate whose backend, "
                     f"explicit selection or backend kwargs differ from it. Align that profile with the "
                     f"baseline or disable scheduler paged KV."
+                )
+            if spec_precision is not None and ring_degree > 1:
+                raise ValueError(
+                    f"attention schedule profile {name!r} requests kv_cache_dtype={kv_dtype!r}, "
+                    "but KV quantization is not compatible with ring attention (ring_degree > 1). "
+                    "Ring kernels do not propagate quantization descale factors. Use Ulysses SP instead."
                 )
             # Layers that can run ring: use_ring at construction (never explicit cross-attention), minus
             # layers that skip sequence parallelism, which always run local attention.
@@ -1733,8 +1751,7 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
                 raise ValueError(
                     f"attention schedule profile {name!r} selects backend {backend_name} which does "
                     f"not support kv_cache_dtype={kv_dtype!r} on {platform_key} (layer {layer_name!r}). "
-                    f"Select a compatible backend for that profile or set "
-                    f"diffusion_kv_cache_dtype='auto'."
+                    "Select a compatible backend for that profile or disable attention quantization."
                 )
             if requires_mask and not record.backend_cls.supports_attention_mask(record.spec):
                 raise ValueError(

@@ -169,11 +169,18 @@ def test_dense_legacy_allows_attention_quantization(dtype) -> None:
 
 
 @pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
-def test_unified_knob_conflicts_with_explicit_quant_spec(config_cls) -> None:
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8"}},
+        {"backend": "FLASH_ATTN", "quant": {"precision": "fp8"}},
+    ],
+)
+def test_unified_knob_conflicts_with_explicit_quant_spec(config_cls, spec) -> None:
     with pytest.raises(ValueError, match="conflicts with a diffusion_attention_config quant spec"):
         config_cls.from_kwargs(
             diffusion_kv_cache_dtype="fp8",
-            diffusion_attention_config={"default": {"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8"}}},
+            diffusion_attention_config={"default": spec},
         )
 
 
@@ -187,8 +194,44 @@ def test_unified_knob_allows_backend_pin_without_dtypes(config_cls) -> None:
 
 
 @pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
-def test_explicit_quant_spec_without_knob_is_allowed(config_cls) -> None:
+@pytest.mark.parametrize(
+    "dtype, quant",
+    [
+        ("fp8", {"fp8_fa_mode": "C8V16_TILING512"}),
+        ("mxfp4", {"mxfp4_scale_alg": 0, "mxfp4_dst_type_max": 6.0}),
+    ],
+)
+@pytest.mark.parametrize("per_role", [False, True])
+def test_unified_knob_allows_mindie_execution_options(config_cls, dtype, quant, per_role) -> None:
+    spec = {"backend": "FLASH_ATTN", "quant": quant}
+    attention_config = {"per_role": {"self": spec}} if per_role else {"default": spec}
     config = config_cls.from_kwargs(
-        diffusion_attention_config={"default": {"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8"}}},
+        diffusion_kv_cache_dtype=dtype,
+        diffusion_kv_cache_skip_steps="0-1",
+        diffusion_kv_cache_skip_layers="0",
+        diffusion_attention_config=attention_config,
+    )
+    assert config.diffusion_kv_cache_dtype == dtype
+    assert config.diffusion_kv_cache_skip_step_indices == {0, 1}
+    assert config.diffusion_kv_cache_skip_layer_indices == {0}
+    resolved, _ = config.diffusion_attention_config.resolve_with_source("self")
+    assert resolved.backend_kwargs() == {"quant": quant}
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"backend": "TRTLLM_ATTN", "quant": {"dtype_qk": "int8"}},
+        {"backend": "FLASH_ATTN", "quant": {"precision": "fp8", "fp8_fa_mode": "C8V16_TILING512"}},
+        {"backend": "FLASH_ATTN", "quant": {"precision": "mxfp8"}},
+        {"backend": "FLASH_ATTN", "quant": {"precision": "mxfp4", "mxfp4_scale_alg": 0}},
+    ],
+)
+def test_explicit_quant_spec_without_knob_is_allowed(config_cls, spec) -> None:
+    config = config_cls.from_kwargs(
+        diffusion_attention_config={"default": spec},
     )
     assert config.diffusion_kv_cache_dtype is None
+    backend_kwargs = config.diffusion_attention_config.default.backend_kwargs()
+    assert backend_kwargs["quant"].items() >= spec["quant"].items()

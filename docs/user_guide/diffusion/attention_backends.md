@@ -109,7 +109,9 @@ config = OmniDiffusionConfig(
 Backend-specific typed blocks are documented with their consumers:
 
 - `quant`: [FlashInfer](attention_backends/dense_backends.md#flashinfer-quantized-attention)
-  and [TRTLLM SAGE](attention_backends/trtllm.md#sage-quantization).
+  and [TRTLLM SAGE](attention_backends/trtllm.md#sage-quantization), plus
+  [MindIE-SD execution options](../quantization/quantized_kvcache.md#mindie-sd-quantization-options)
+  for `FLASH_ATTN` on Ascend.
 - `skip_softmax`: [TRTLLM Skip-Softmax](attention_backends/trtllm.md#skip-softmax).
 - `sparge`: [SPARGE Attention](attention_backends/sparge.md#configuration).
 - `block_sparse`: [RainFusion](attention_backends/rainfusion.md#configuration).
@@ -220,9 +222,12 @@ FP8 attention can therefore be slower than BF16, especially for short
 sequences. This option does not promise lower peak memory use or faster
 end-to-end generation.
 
-An explicit `diffusion_attention_config.*.quant` spec conflicts with the knob
-and is rejected at config load; drop one of them. A pure
-`flashinfer_backend` variant pin without dtypes is allowed to compose.
+An explicit `diffusion_attention_config.*.quant` spec that sets `dtype_qk`,
+`dtype_vo`, or `precision` conflicts with the knob and is rejected at config
+load; drop one of the precision selections. `FLASH_ATTN` can select its
+precision through `quant.precision` without the global knob. A
+`flashinfer_backend` variant pin or MindIE-SD execution options without a
+precision selection can be combined with the knob.
 
 ## Compatibility anchors
 
