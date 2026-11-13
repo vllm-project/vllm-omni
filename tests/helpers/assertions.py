@@ -578,6 +578,36 @@ def assert_wav_sample_rate(audio_bytes: bytes | None, sample_rate: int) -> None:
     assert info.samplerate == sample_rate, f"Expected a {sample_rate} Hz WAV, got {info.samplerate} Hz"
 
 
+def assert_wav_pcm_close(
+    first_audio_bytes: bytes | None,
+    second_audio_bytes: bytes | None,
+    *,
+    atol: int = 0,
+) -> None:
+    """Assert two uncompressed 16-bit WAV bodies have sample-close PCM."""
+    assert first_audio_bytes, "Expected first WAV bytes"
+    assert second_audio_bytes, "Expected second WAV bytes"
+    assert atol >= 0, "PCM absolute tolerance must be nonnegative"
+
+    def _decode(audio_bytes: bytes) -> tuple[tuple[int, int, int], np.ndarray]:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+            assert wav_file.getsampwidth() == 2, "Expected 16-bit PCM WAV"
+            assert wav_file.getcomptype() == "NONE", "Expected uncompressed PCM WAV"
+            sample_rate = wav_file.getframerate()
+            channels = wav_file.getnchannels()
+            frame_count = wav_file.getnframes()
+            pcm = np.frombuffer(wav_file.readframes(frame_count), dtype="<i2")
+
+        assert pcm.size == frame_count * channels, "WAV frame data is truncated"
+        return (sample_rate, channels, frame_count), pcm.reshape(frame_count, channels)
+
+    first_metadata, first_pcm = _decode(first_audio_bytes)
+    second_metadata, second_pcm = _decode(second_audio_bytes)
+    assert first_metadata == second_metadata
+    assert first_pcm.size > 0, "Expected nonempty WAV samples"
+    np.testing.assert_allclose(second_pcm, first_pcm, rtol=0, atol=atol)
+
+
 def assert_audio_valid(
     audio_or_path: Path | np.ndarray,
     *,

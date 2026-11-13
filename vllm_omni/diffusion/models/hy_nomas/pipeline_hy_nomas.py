@@ -38,6 +38,7 @@ from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import (
     HyNomasARConfig,
 )
 from vllm_omni.diffusion.models.hy_nomas.history import HyNomasHistoryFrame, action_tails, recent_history
+from vllm_omni.diffusion.models.hy_nomas.history_archive import HyNomasHistoryArchive
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
     build_transformer,
     load_component_weights,
@@ -199,6 +200,7 @@ class HyNomasSession:
     offline_cache: list[dict[str, torch.Tensor]] | None = None
     noise_generator: torch.Generator | None = None
     history_frames: list[HyNomasHistoryFrame] = field(default_factory=list)
+    history_archive: HyNomasHistoryArchive | None = None
 
 
 class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
@@ -467,7 +469,9 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             self._ar_state = None
 
     def reset_ar_diffusion_session(self, session_id: str) -> None:
-        self._ar_sessions.pop(session_id, None)
+        session = self._ar_sessions.pop(session_id, None)
+        if session is not None and session.history_archive is not None:
+            session.history_archive.clear()
 
     def close_ar_diffusion_session(self, session_id: str) -> None:
         self.reset_ar_diffusion_session(session_id)
@@ -544,6 +548,11 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             if recent:
                 session.noise_generator = torch.Generator(device="cpu").manual_seed(request.seed)
                 session.generator = torch.Generator(device="cpu").manual_seed(request.seed ^ 0x4E4F4D4153)
+                if config.history_archive_max_bytes:
+                    session.history_archive = HyNomasHistoryArchive(
+                        max_bytes=config.history_archive_max_bytes,
+                        max_frames=config.history_archive_max_frames,
+                    )
             if bound is not None:
                 self._ar_sessions[bound.session_id] = session
             else:
@@ -804,10 +813,23 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                         for layer in range(self.num_double_blocks):
                             cache.stage(layer)
                         cache.validate_commit(retain=retained)
+                        if session.history_archive is not None:
+                            session.history_archive.stage(
+                                cache.pending_layer_views(),
+                                mask[:, history:],
+                                frame_start=session.latent_frames,
+                                frame_count=latents.shape[2],
+                                tokens_per_frame=image_tokens // latents.shape[2],
+                                segment=state.extra["hy_nomas_segment_id"],
+                                text_tokens=state.prompt_embeds.shape[1] if first else 0,
+                                action_start=state.extra["hy_nomas_action_start"] if first else -1,
+                            )
                     except Exception as exc:
                         error = exc
                     self._check_sp_error(error, "KV staging")
                     cache.commit(retain=retained)
+                    if session.history_archive is not None:
+                        session.history_archive.publish()
                     if recent:
                         session.history_frames = frames
                         session.history_mask = torch.cat((session.history_mask, mask[:, history:]), 1)[:, cut:].clone()
@@ -834,6 +856,8 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         except BaseException:
             if commit and cache is not None:
                 cache.rollback()
+                if session.history_archive is not None:
+                    session.history_archive.rollback()
             raise
 
     def _check_sp_error(self, error: Exception | None, operation: str) -> None:
@@ -969,6 +993,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                         "segments": session.segments,
                         "history_tokens": session.history_mask.shape[1],
                         "history_mode": self.ar_config.history_mode,
+                        "archive_payload_bytes": session.history_archive.payload_bytes
+                        if session.history_archive
+                        else 0,
+                        "archive_latent_frames": session.history_archive.frames if session.history_archive else 0,
                         "sampling_version": "incremental_v1" if session.noise_generator is not None else "legacy_v1",
                     },
                 },
