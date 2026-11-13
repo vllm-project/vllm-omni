@@ -149,6 +149,10 @@ def encode_float32_mono_wav_base64(
         return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+#: Input formats :func:`convert_input_audio_to_pcm_f32` decodes; anything else passes through unchanged.
+CONVERTIBLE_INPUT_FORMATS = frozenset({"pcm16", "pcm_s16le", "s16le", "g711_ulaw", "g711_alaw"})
+
+
 def convert_input_audio_with_rate(
     audio: object,
     fmt: object,
@@ -156,17 +160,39 @@ def convert_input_audio_with_rate(
     sample_rate_hz: int | float | None = None,
     target_sample_rate_hz: int = 16_000,
 ) -> tuple[object, object, int | float | None]:
+    pcm, out_fmt, out_rate = convert_input_audio_to_pcm_f32(
+        audio, fmt, sample_rate_hz=sample_rate_hz, target_sample_rate_hz=target_sample_rate_hz
+    )
+    if pcm is None:
+        return audio, out_fmt, out_rate
+    return base64.b64encode(pcm).decode("ascii"), out_fmt, out_rate
+
+
+def convert_input_audio_to_pcm_f32(
+    audio: object,
+    fmt: object,
+    *,
+    sample_rate_hz: int | float | None = None,
+    target_sample_rate_hz: int = 16_000,
+) -> tuple[bytes | None, object, int | float | None]:
+    """:func:`convert_input_audio_with_rate` returning the converted PCM as raw bytes.
+
+    The bytes are little-endian float32 at ``target_sample_rate_hz``. None means
+    the audio is left as it came (a format this does not convert, or input it
+    cannot decode), with ``fmt`` and the rate as :func:`convert_input_audio_with_rate`
+    reports them. A caller that needs the samples skips a base64 round trip.
+    """
     if not isinstance(audio, str) or not isinstance(fmt, str):
-        return audio, fmt, sample_rate_hz
+        return None, fmt, sample_rate_hz
     normalized = fmt.lower()
-    if normalized not in {"pcm16", "pcm_s16le", "s16le", "g711_ulaw", "g711_alaw"}:
-        return audio, fmt, sample_rate_hz
+    if normalized not in CONVERTIBLE_INPUT_FORMATS:
+        return None, fmt, sample_rate_hz
     if isinstance(sample_rate_hz, int | float):
         sample_rate_hz = validate_input_sample_rate_hz(sample_rate_hz)
     try:
         raw = base64.b64decode(audio.strip(), validate=False)
     except (binascii.Error, ValueError):
-        return audio, fmt, sample_rate_hz
+        return None, fmt, sample_rate_hz
     if normalized == "g711_ulaw":
         raw = decode_g711_ulaw(raw)
         sample_rate_hz = sample_rate_hz if isinstance(sample_rate_hz, int | float) else 8_000
@@ -174,7 +200,7 @@ def convert_input_audio_with_rate(
         raw = decode_g711_alaw(raw)
         sample_rate_hz = sample_rate_hz if isinstance(sample_rate_hz, int | float) else 8_000
     elif len(raw) % 2:
-        return audio, fmt, sample_rate_hz
+        return None, fmt, sample_rate_hz
     if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) != target_sample_rate_hz:
         raw = resample_pcm16_mono(
             raw,
@@ -183,8 +209,17 @@ def convert_input_audio_with_rate(
         )
         sample_rate_hz = target_sample_rate_hz
     pcm = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
-    encoded = base64.b64encode(np.ascontiguousarray(pcm, dtype="<f4").tobytes()).decode("ascii")
-    return encoded, "pcm_f32le", sample_rate_hz
+    return np.ascontiguousarray(pcm, dtype="<f4").tobytes(), "pcm_f32le", sample_rate_hz
+
+
+def base64_decoded_size(encoded: str) -> int | None:
+    """Byte length ``encoded`` decodes to, from its length and padding alone; None if not padded base64.
+
+    For audio this process encoded itself, where decoding only to measure it is waste.
+    """
+    if len(encoded) % 4:
+        return None
+    return len(encoded) // 4 * 3 - (2 if encoded.endswith("==") else 1 if encoded.endswith("=") else 0)
 
 
 def convert_output_audio(

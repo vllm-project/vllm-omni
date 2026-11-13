@@ -233,6 +233,13 @@ upstream vLLM's media URL allowlist protection. Deployments should therefore
 treat remote media URLs as untrusted and choose this setting as part of their
 URL access policy.
 
+### MiniMax H3 Samplers
+
+Set `"sampler"` in `extra_params` to select the sampler. Supported values are
+`euler` (default) and `res_multistep`. Both request and step execution support
+them, and compatible requests share packed model evaluations. Fixed distilled
+schedules remain Euler-only.
+
 ### MiniMax H3 control and inpainting
 
 MiniMax H3 FL2VA accepts preprocessed control videos when the server is
@@ -374,6 +381,28 @@ For example, each mask file in the request above may contain the JSON scalar
 The server streams source files to temporary request-scoped storage and removes
 them after synchronous or asynchronous generation finishes. Models that do not
 declare latent-mask editing support reject these fields.
+
+### MiniMax H3 Regenerate
+
+A server started with the
+[Open-H3-Regenerate-2K](gh-file:recipes/Efficient-Large-Model/Open-H3-Regenerate-2K-H200.md)
+release re-renders a 768P H3 draft at a higher resolution. Send the draft as
+`source_video` with `extra_params` `{"regenerate": true}` and no noise masks;
+`width`, `height` and the frame count describe the draft canvas, and
+`latent_upscale` the output size (2560x1440 by default):
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F "prompt=The prompt the draft was generated from" \
+  -F "width=1344" -F "height=768" -F "aspect_ratio=16:9" -F "num_frames=124" -F "fps=24" \
+  -F 'extra_params={"task":"t2va","regenerate":true}' \
+  -F "source_video=@draft.mp4;type=video/mp4" \
+  -o regenerated.mp4
+```
+
+The output is refined at the upscaled size, so `latent_upscale` must land on
+the 32-pixel grid (`align` 32, the default). A regenerated video is not cached
+for `continue_from`: continue the draft, then regenerate the result.
 
 ### MiniMax H3 Timeline Guides
 

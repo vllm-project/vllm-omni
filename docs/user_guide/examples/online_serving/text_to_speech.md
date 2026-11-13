@@ -173,6 +173,90 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remot
 
 Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
+### Ascend Stage-1 graph regions
+
+On Ascend NPU, Stage 1 can capture the complete Flow Euler solve and the
+deterministic HiFT decode as separate exact-shape NPUGraph regions. In a copy
+of the deploy YAML, set Stage 1 to the following and opt in through the server
+environment:
+
+```bash
+export COSYVOICE3_STAGE1_NPU_GRAPH=1
+```
+
+```yaml
+enforce_eager: false
+compilation_config:
+  mode: 0
+  cudagraph_mode: NONE
+```
+
+The outer stage remains dynamic; graph capture happens inside Code2Wav.
+The opt-in NPU path uses `torch_npu.npu_fused_infer_attention_score` for the
+DiT's dense noncausal FP16/BF16 attention and the existing real-valued DFT
+implementation for HiFT. FIA applies whenever the adapter is enabled,
+including eager warmup, unsupported graph signatures, and new shapes beyond
+the graph-cache limit. Other attention backend selections do not replace FIA
+on these adapter-owned paths.
+Keep Stage 1 eager when comparing another attention backend.
+Fresh noise, reference preprocessing, CPU F0, oscillator state, and request
+cache updates stay outside capture. Final and non-final HiFT calls use
+separate signatures; output buffers remain owned by each request.
+
+The adapter is disabled by default. Leave `COSYVOICE3_STAGE1_NPU_GRAPH` unset,
+set it to `0`, or use Stage-1 `enforce_eager: true` to retain the generic path.
+`COSYVOICE3_STAGE1_NPU_GRAPH_MAX` defaults to 8 graphs per
+region; new shapes beyond that limit run eagerly. A new shape first runs an
+eager warmup and capture, so warm up at the intended concurrency before
+reporting steady-state latency. Capture errors require restarting the stage;
+they are not silently recovered in the same process. `ASCEND_LAUNCH_BLOCKING=1`
+is incompatible with this graph mode. The generic deploy YAML and non-NPU
+execution paths retain their defaults.
+
+### Optional padded DiT compilation
+
+The generic CUDA Code2Wav path can opt into DiT compilation through the existing HF override interface:
+
+```bash
+vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 \
+  --trust-remote-code --deploy-config cosyvoice3.yaml \
+  --hf-overrides '{"cosyvoice3_compile_dit": true}'
+```
+
+This option defaults to `false`, preserves the selected attention backend, and compiles only the padded DiT estimator after loading its weights. CUDA with CUDNN_ATTN, FLASH_ATTN, or TORCH_SDPA is required; CPU and the separately compiled packed Flow profiles reject this option. HiFT and the Talker are unchanged. It is independent of speculative decoding and introduces no environment variable.
+
+Selecting `cosyvoice3_compile_dit=true` keeps the PyTorch Flow estimator and prevents its lazy replacement by TensorRT, even when `COSYVOICE3_TRT=1` (the default). This precedence affects only the Flow estimator; the independent speaker-embedding TensorRT path retains its existing setting. With compilation disabled, the existing TensorRT selection is unchanged.
+
+Compilation occurs on first use, so warm up representative request batches and mel lengths before measuring serving latency. The default `torch.compile` automatic-dynamic policy can recompile when shapes change; warmup for one shape does not cover every future length. Use `TORCH_LOGS=recompiles` to check recompilation and fallback on the deployment workload, and measure cold-start latency separately. This experimental option is not waveform-equivalent to the eager path: finite-precision changes can affect generated audio, and a small automatic quality screen does not establish equivalence for all inputs. To measure its contribution, compare the same V2 deployment with compilation disabled and enabled; a combined V1-to-V2 deployment result does not isolate this option. Validate audio quality and latency for your deployment before enabling it.
+
+### Optional DSpark speculative decoding
+
+CosyVoice3 can use vLLM's DSpark drafter on the Talker stage with Model Runner V2 and tensor parallel size 1. This is opt-in and requires a compatible CosyVoice3 DSpark checkpoint; do not configure the drafter on Code2Wav.
+
+The public checkpoint used for validation is [yuekai/cosyvoice3_llm_dspark](https://huggingface.co/yuekai/cosyvoice3_llm_dspark) at revision `0b1b28dbb751bac3b74eea5dcc11e0570c91563b`. Download that revision as `/path/to/dspark-checkpoint`, then use the conversion below; the raw unified-vocabulary checkpoint is not the serving-ready speech-vocabulary directory.
+
+Convert the checkpoint's unified vocabulary to the speech vocabulary before serving:
+
+```bash
+python -m vllm_omni.entrypoints.convert_cosyvoice3_dspark \
+  /path/to/dspark-checkpoint /path/to/draft-speech
+```
+
+This packaged entry point works with wheel installations. A repository checkout with vLLM-Omni installed can also use `python tools/convert_cosyvoice3_dspark.py` with the same arguments. The conversion writes a new directory and records source and converted file hashes; it refuses to overwrite an existing directory. Keep its input embedding and output-head weights: the target Qwen decoder has a text embedding, not the drafter's speech-vocabulary embedding. Add the following fields to stage 0 in a copy of the deploy configuration, retaining the other stage and connector settings:
+
+```yaml
+model_runner: v2
+speculative_config:
+  model: /path/to/draft-speech
+  method: dspark
+  num_speculative_tokens: 7
+  draft_sample_method: probabilistic
+```
+
+RAS verification includes each draft prefix in the generated-token history while excluding reference-prompt tokens. Standard sampling uses the native rejection sampler. Acceptance and end-to-end gains depend on the workload and Code2Wav cost; enabling speculative decoding does not guarantee lower latency or higher audio throughput.
+
+RAS probability compilation is also lazy: warmup must exercise an actual draft-verification step, not just prefill or ordinary one-token decode. Check both the Talker verification and Code2Wav compiled paths before collecting steady-state metrics. A comparison against a V1 server measures the complete deployment change; to attribute gains to DSpark or DiT compilation, use a separate V2 baseline with both features disabled and change one feature at a time.
+
 ### CLI client
 
 The client defaults to the official upstream zero-shot prompt, so it runs without extra flags:

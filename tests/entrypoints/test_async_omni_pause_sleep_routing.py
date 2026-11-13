@@ -14,7 +14,7 @@ from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK
-from vllm_omni.engine.messages import ErrorMessage
+from vllm_omni.engine.messages import AddCompanionRequestMessage, ErrorMessage
 from vllm_omni.entrypoints.async_omni import CACHE_RESET_TIMEOUT_S, AsyncOmni
 
 pytestmark = [pytest.mark.core_model]
@@ -1780,7 +1780,12 @@ def test_cancelled_submit_with_landed_parent_keeps_mm_cache(mocker):
                 sampling_params_list=[object()],
             )
             mocker.patch.object(engine, "_build_add_request_message", return_value=parent)
-            mocker.patch.object(engine, "_build_cfg_companions", return_value=[object()])
+            companion = mocker.Mock(
+                spec=AddCompanionRequestMessage,
+                role="cfg_text",
+                companion_id="parent-1__cfg_text",
+            )
+            mocker.patch.object(engine, "_build_cfg_companions", return_value=[companion])
 
             await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(queue.async_q.join(), orch_loop))
             queue.sync_q.put_nowait(object())  # leave room for exactly the parent
@@ -2056,5 +2061,54 @@ def test_tracked_streaming_submit_waits_for_full_wake():
         await asyncio.wait_for(task, timeout=2)
         assert started.is_set()
         assert omni._admitting == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_ar_level2_sleep_wakes_with_discard_opt_in(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS", "1")
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        await omni.sleep(level=2)
+        assert omni._level2_sleeping is False
+
+        await omni.wake_up()
+
+        methods = [c.kwargs.get("method") for c in omni.collective_rpc.await_args_list]
+        assert methods[-1] == "wake_up"
+        assert not omni._sleeping_tags
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("value", [None, "0", "true"])
+def test_ar_level2_sleep_still_blocks_wake_without_opt_in(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS", value)
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        await omni.sleep(level=2)
+        with pytest.raises(NotImplementedError, match=r"sleep\(level=2\)"):
+            await omni.wake_up()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_level2_sleep_with_a_diffusion_stage_blocks_wake_even_with_opt_in(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS", "1")
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+        omni.collective_rpc = AsyncMock(return_value=[OmniACK(task_id="t", status="SUCCESS", stage_id=1, rank=0)])
+        await omni.sleep(level=2)
+        with pytest.raises(NotImplementedError):
+            await omni.wake_up()
 
     asyncio.run(run())

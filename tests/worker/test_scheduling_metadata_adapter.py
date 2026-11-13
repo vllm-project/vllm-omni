@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for runner-side payload-to-scheduler metadata translation."""
 
 from __future__ import annotations
@@ -40,6 +40,36 @@ def test_default_adapter_flattens_tensor_codes() -> None:
 def test_default_adapter_does_not_leak_codec_metadata_to_scheduler() -> None:
     update = DefaultSchedulingMetadataAdapter().extract(
         {"meta": {"left_context_size": 7}},
+        model_mode="generation",
+    )
+
+    assert update is None
+
+
+def test_default_adapter_extracts_duplex_perf_chunk_with_codes() -> None:
+    update = DefaultSchedulingMetadataAdapter().extract(
+        {"codes": {"audio": [1, 2]}, "meta": {"duplex_perf_chunk": [0, 2]}},
+        model_mode="generation",
+    )
+
+    assert update == SchedulingMetadataUpdate(
+        prompt_token_ids=(1, 2),
+        duplex_perf_chunk=(0, 2),
+    )
+
+
+def test_default_adapter_extracts_duplex_perf_chunk_without_codes() -> None:
+    update = DefaultSchedulingMetadataAdapter().extract(
+        {"meta": {"duplex_perf_chunk": [1, 3]}},
+        model_mode="generation",
+    )
+
+    assert update == SchedulingMetadataUpdate(duplex_perf_chunk=(1, 3))
+
+
+def test_default_adapter_ignores_invalid_duplex_perf_chunk() -> None:
+    update = DefaultSchedulingMetadataAdapter().extract(
+        {"meta": {"duplex_perf_chunk": [0]}},
         model_mode="generation",
     )
 
