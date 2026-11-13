@@ -22,7 +22,10 @@ def _sdpa(query, key, value, mask):
 
 
 def _piecewise_layer(query, key, value, attn_metadata):
-    """Stand-in for the never-sharded prefix layer: piecewise attention on the local rows."""
+    """Stand-in for the never-sharded prefix layer: piecewise attention on the local rows,
+    or the dense 4D mask when the transformer took the mask path (SDPA, padding)."""
+    if attn_metadata.full_attn_spans is None:
+        return _sdpa(query, key, value, attn_metadata.attn_mask[0, 0])
 
     def segment(q, k, v, causal, softmax_scale):
         # Varlen-flash convention: a causal query segment is aligned to the end of its K/V.
@@ -41,12 +44,13 @@ def _ring_layer(query, key, value, attn_metadata):
     return _sdpa(query, key, value, None)
 
 
+@pytest.mark.parametrize("attn_path", ["piecewise", "mask"])
 @pytest.mark.parametrize(
     "prefix_spans",
     [[], [(3, 6)]],
     ids=["text_only_prefix", "prefix_with_condition_image"],
 )
-def test_ring_prefill_matches_block_causal_attention(prefix_spans):
+def test_ring_prefill_matches_block_causal_attention(prefix_spans, attn_path):
     torch.manual_seed(0)
     prefix_len, target_len, heads, head_dim = 8, 8, 2, 16
     seq_len = prefix_len + target_len
@@ -62,7 +66,11 @@ def test_ring_prefill_matches_block_causal_attention(prefix_spans):
     reference = _sdpa(query, key, value, causal | same_block)
 
     fake_self = SimpleNamespace(prefix_attn=_piecewise_layer, attn=_ring_layer)
-    metadata = AttentionMetadata(full_attn_spans=[spans], extra={"kv_cache_dtype": None})
+    if attn_path == "piecewise":
+        metadata = AttentionMetadata(full_attn_spans=[spans], extra={"kv_cache_dtype": None})
+    else:
+        mask = (causal | same_block).view(1, 1, seq_len, seq_len)
+        metadata = AttentionMetadata(attn_mask=mask, extra={"kv_cache_dtype": None})
     output = QwenImage21Attention._ring_prefill(fake_self, query, key, value, metadata, prefix_len)
 
     torch.testing.assert_close(output, reference, atol=1e-5, rtol=1e-5)
@@ -83,3 +91,65 @@ def test_ring_prefill_keeps_prefix_rows_off_the_target():
 
     torch.testing.assert_close(output[:, :prefix_len], output_changed[:, :prefix_len])
     assert not torch.allclose(output[:, prefix_len:], output_changed[:, prefix_len:])
+
+
+class _RecordingAttention(torch.nn.Module):
+    """Stub for the `Attention` layer: records the metadata it is called with."""
+
+    use_ring = True
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(self, query, key, value, attn_metadata):
+        self.calls.append(attn_metadata)
+        return torch.zeros_like(query)
+
+
+def _build_ring_attention(monkeypatch):
+    from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer as transformer
+
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+    monkeypatch.setattr(transformer, "Attention", lambda **kwargs: _RecordingAttention())
+    return transformer.QwenImage21Attention(dim=64, heads=2, dim_head=32)
+
+
+@pytest.mark.parametrize("attn_path", ["piecewise", "mask"])
+def test_forward_routes_ring_prefill_on_both_attention_paths(monkeypatch, attn_path):
+    """`forward` must take the local-prefix ring path for spans and for the dense mask fallback."""
+    attention = _build_ring_attention(monkeypatch)
+    assert attention.prefix_attn is not None
+    prefix_len, seq_len = 6, 10
+    if attn_path == "piecewise":
+        metadata = AttentionMetadata(full_attn_spans=[[(prefix_len, seq_len)]])
+    else:
+        causal = torch.arange(seq_len).view(-1, 1) >= torch.arange(seq_len).view(1, -1)
+        metadata = AttentionMetadata(attn_mask=causal.view(1, 1, seq_len, seq_len))
+    freqs = torch.polar(torch.ones(seq_len, 16), torch.zeros(seq_len, 16))
+
+    attention(torch.randn(1, seq_len, 64), freqs, attn_metadata=metadata, sp_prefix_len=prefix_len)
+
+    (prefix_metadata,) = attention.prefix_attn.calls
+    (ring_metadata,) = attention.attn.calls
+    if attn_path == "piecewise":
+        assert prefix_metadata.full_attn_spans == [[]]
+    else:
+        assert prefix_metadata.attn_mask.shape[-2:] == (prefix_len, prefix_len)
+    assert ring_metadata.joint_query is None
+    assert ring_metadata.joint_key.shape[1] == prefix_len
+
+
+def test_forward_keeps_joint_query_without_block_causal_structure(monkeypatch):
+    """`causal_block=False` (no spans, no 4D mask): prefix rows attend everything, via the joint path."""
+    attention = _build_ring_attention(monkeypatch)
+    prefix_len, seq_len = 6, 10
+    freqs = torch.polar(torch.ones(seq_len, 16), torch.zeros(seq_len, 16))
+
+    attention(torch.randn(1, seq_len, 64), freqs, attn_metadata=None, sp_prefix_len=prefix_len)
+
+    assert attention.prefix_attn.calls == []
+    (ring_metadata,) = attention.attn.calls
+    assert ring_metadata.joint_query.shape[1] == prefix_len

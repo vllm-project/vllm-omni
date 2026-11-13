@@ -583,12 +583,22 @@ class QwenImage21Attention(nn.Module):
         step. So P is attended locally (it is replicated: every rank computes the same rows) with P's own spans,
         and only the T rows go round the ring, with P as joint K/V prepended once.
         """
-        prefix_spans = [[span for span in spans if span[1] <= prefix_len] for spans in attn_metadata.full_attn_spans]
+        if attn_metadata.full_attn_spans is not None:
+            prefix_metadata = AttentionMetadata(
+                full_attn_spans=[
+                    [span for span in spans if span[1] <= prefix_len] for spans in attn_metadata.full_attn_spans
+                ],
+                extra=dict(attn_metadata.extra),
+            )
+        else:
+            # Dense block-causal mask `(B, 1, S_pad, S_pad)` in global coordinates: the replicated prefix is
+            # the first `prefix_len` rows/cols on every rank, so its local mask is a slice.
+            prefix_metadata = AttentionMetadata(
+                attn_mask=attn_metadata.attn_mask[:, :, :prefix_len, :prefix_len],
+                extra=dict(attn_metadata.extra),
+            )
         prefix_output = self.prefix_attn(
-            query[:, :prefix_len],
-            key[:, :prefix_len],
-            value[:, :prefix_len],
-            AttentionMetadata(full_attn_spans=prefix_spans, extra=dict(attn_metadata.extra)),
+            query[:, :prefix_len], key[:, :prefix_len], value[:, :prefix_len], prefix_metadata
         )
         target_output = self.attn(
             query[:, prefix_len:],
@@ -689,7 +699,12 @@ class QwenImage21Attention(nn.Module):
                         cached_value = _dequantize_prefix_kv_fp8(cached_value, branch_cache["value_scale"], value.dtype)
 
         metadata = copy.copy(attn_metadata) if attn_metadata is not None else None
-        if sp_prefix_len > 0 and self.prefix_attn is not None and metadata is not None and metadata.full_attn_spans:
+        # Ring prefill with block-causal structure (piecewise spans or a dense 4D mask). Without it
+        # (`causal_block=False`) prefix rows attend everything, which the joint path below already does.
+        block_causal = metadata is not None and (
+            metadata.full_attn_spans is not None or (metadata.attn_mask is not None and metadata.attn_mask.dim() == 4)
+        )
+        if sp_prefix_len > 0 and self.prefix_attn is not None and block_causal:
             attn_output = self._ring_prefill(query, key, value, metadata, sp_prefix_len)
         elif sp_prefix_len > 0:
             # Ulysses joint attention: the prefix is replicated across SP ranks, so it is
@@ -1416,6 +1431,17 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 attn_metadata = AttentionMetadata(attn_mask=joint_key_valid)
         else:
             attn_path = self._resolve_attn_path(attn_path_hint, has_padding, sp_padding > 0)
+            if (
+                sp_active
+                and getattr(self.parallel_config, "ring_degree", 1) > 1
+                and attn_path == "mask"
+                and (has_padding or sp_padding > 0)
+            ):
+                # Ring attention takes no mask: target rows would attend padded text / SP keys.
+                raise NotImplementedError(
+                    "Qwen-Image-2.1 ring SP prefill cannot mask padded keys (text padding or SP padding); "
+                    "use Ulysses SP (--usp) or a batch without padding."
+                )
             if kv_cache is not None:
                 cache_write_len = prefix_len
             if attn_path == "piecewise":
