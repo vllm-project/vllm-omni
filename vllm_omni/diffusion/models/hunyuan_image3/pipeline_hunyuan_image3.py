@@ -1257,6 +1257,7 @@ class HunyuanImage3Pipeline(
         device=None,
         max_new_tokens=None,
         prepared_layout: HunyuanPreparedLayout | None = None,
+        batch_ar_token_ids: list[tuple[list[int], list[int]] | None] | None = None,
         **kwargs,
     ):
         # 1. Sanity check
@@ -1362,6 +1363,8 @@ class HunyuanImage3Pipeline(
                 batch_cond_image_info=batch_cond_image_info,
                 batch_system_prompt=batch_system_prompt,
                 batch_cot_text=batch_cot_text,
+                batch_ar_token_ids=batch_ar_token_ids,
+                validate_ar_kv_prefix=bool(kwargs.get("ar_kv_data")) or any(kwargs.get("kv_computed_tokens", ())),
                 max_length=kwargs.get("max_length"),
                 bot_task=bot_task,
                 image_base_size=self.config.image_base_size,
@@ -2105,9 +2108,14 @@ class HunyuanImage3Pipeline(
         pipe._guidance_rescale = getattr(sampling, "guidance_rescale", 0.0)
 
         ar_kv_kwargs = self._extract_ar_kv_from_sampling(sampling)
+        prepared_layout = request_layout_utils.get_hunyuan_prepared_layout(state)
         model_kwargs = self.prepare_model_inputs(
             prompt=prompt,
             cot_text=cot_text,
+            # A prepared layout was already built and validated from these IDs.
+            batch_ar_token_ids=(
+                request_layout_utils.extract_hunyuan_ar_token_ids([state.prompt]) if prepared_layout is None else None
+            ),
             system_prompt=system_prompt,
             mode="gen_image",
             generator=sampling.generator,
@@ -2116,7 +2124,7 @@ class HunyuanImage3Pipeline(
             guidance_scale=guidance_scale,
             batch_cond_image_info=batch_cond_image_info,
             bot_task=tokenizer_bot_task,
-            prepared_layout=request_layout_utils.get_hunyuan_prepared_layout(state),
+            prepared_layout=prepared_layout,
             kv_computed_tokens=state.extra.get("kv_computed_tokens", ()),
             **ar_kv_kwargs,
         )
@@ -2569,10 +2577,15 @@ class HunyuanImage3Pipeline(
 
         # ---- AR KV Reuse: extract injected KV from request ----
         ar_kv_kwargs = self._extract_ar_kv_from_request(req)
+        prepared_layout = request_layout_utils.get_hunyuan_prepared_layout(req.requests[0])
 
         model_inputs = self.prepare_model_inputs(
             prompt=prompt,
             cot_text=cot_text,
+            # A prepared layout was already built and validated from these IDs.
+            batch_ar_token_ids=(
+                request_layout_utils.extract_hunyuan_ar_token_ids(req.prompts) if prepared_layout is None else None
+            ),
             system_prompt=system_prompt,
             mode="gen_image",
             generator=generator,
@@ -2581,7 +2594,7 @@ class HunyuanImage3Pipeline(
             guidance_scale=guidance_scale,
             batch_cond_image_info=batch_cond_image_info,
             bot_task=tokenizer_bot_task,
-            prepared_layout=request_layout_utils.get_hunyuan_prepared_layout(req.requests[0]),
+            prepared_layout=prepared_layout,
             kv_computed_tokens=getattr(req.requests[0], "kv_computed_tokens", ()),
             **ar_kv_kwargs,
         )
