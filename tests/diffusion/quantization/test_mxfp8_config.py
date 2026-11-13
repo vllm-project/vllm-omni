@@ -234,16 +234,21 @@ def test_get_quant_method_ignored_subtree_requires_substring_mode(
     mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
 ):
     """Under the default exact mode the same prefix is quantized, not skipped."""
-    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, VllmMxfp8OnlineLinearMethod
 
+    # The method reads the model dtype from the active vLLM config, which no test has.
+    mocker.patch(
+        "vllm_omni.quantization.mxfp8_config.VllmMxfp8OnlineLinearMethod.__init__",
+        lambda self: None,
+    )
     config = DiffusionMXFP8Config(ignored_layers=["model.visual"])
     layer = mocker.Mock(spec=LinearBase)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
-    monkeypatch.setattr(current_omni_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_xpu", lambda: True)
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
 
-    with pytest.raises(NotImplementedError):
-        config.get_quant_method(layer, "model.visual.blocks.0.mlp.linear_fc1")
+    method = config.get_quant_method(layer, "model.visual.blocks.0.mlp.linear_fc1")
+    assert isinstance(method, VllmMxfp8OnlineLinearMethod)
 
 
 def test_get_quant_method_non_linear_returns_none(monkeypatch: pytest.MonkeyPatch):

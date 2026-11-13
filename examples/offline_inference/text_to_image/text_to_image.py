@@ -256,7 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["fp8", "mxfp8", "int8", "bitsandbytes"],
         help="Quantization method for the transformer. "
         "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), "
-        "'mxfp8' (online W8A8 MXFP8 on Intel XPU), "
+        "'mxfp8' (online W8A8 MXFP8 on Intel XPU / Ascend NPU), "
         "'int8' (Int8 W8A8), 'bitsandbytes' (NF4 4-bit weight-only, CUDA SM 75+). "
         "Default: None (no quantization, uses BF16).",
     )
