@@ -1,0 +1,72 @@
+# ZONOS2 deploy: Stage 0 (talker, 9-codebook DAC tokens) -> Stage 1 (DAC 44.1kHz code2wav).
+#
+# Native codec chunks use synchronous eager talker scheduling.
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 5000
+      connector_get_max_wait: 500
+
+stages:
+  - stage_id: 0
+    # B1 is the recommended quality-qualified profile; overrides allow batching.
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.6
+    enforce_eager: true
+    trust_remote_code: true
+    # ZONOS2 text path is NeMo-TN + UTF-8 bytes (no HF tokenizer).
+    skip_tokenizer_init: true
+    # The frozen reference uses FlashInfer tensor-core decode (GQA=4).
+    # FA2 is numerically different and has not met the L1 parity gate.
+    attention_config:
+      backend: FLASHINFER
+      use_trtllm_attention: false
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 4096
+    # ZONOS2 max_seqlen is 6144 frames; prompt + max_tokens must fit.
+    max_model_len: 6144
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      # Official ZONOS2 defaults (params.json / TTSSamplingParams):
+      # temperature=1.15, top_k=106, min_p=0.18, top_p off, max_tokens=1024.
+      # Per-codebook repetition penalty (window=50, penalty=1.2, CB0-CB7) is
+      # applied by the model-side sampler, not the LM sampler.
+      temperature: 1.15
+      top_k: 106
+      min_p: 0.18
+      repetition_penalty: 1.2
+      top_p: 1.0
+      max_tokens: 1024
+      seed: 42
+
+  - stage_id: 1
+    # B1 is the recommended quality-qualified profile; overrides allow batching.
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.25
+    enforce_eager: true
+    trust_remote_code: true
+    # ZONOS2 text path is NeMo-TN + UTF-8 bytes (no HF tokenizer).
+    skip_tokenizer_init: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    # Prefill length is num_codebooks * num_frames; 9 * 1024 = 9216 per
+    # request at the Stage-0 cap, with headroom for batching.
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42

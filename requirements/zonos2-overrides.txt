@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# audiotools 0.7.2 has a legacy protobuf<3.20 metadata pin that conflicts with Ray.
+# Its DAC inference path is verified with protobuf 6.33.6; retain the vLLM-compatible line.
+protobuf==6.33.6
