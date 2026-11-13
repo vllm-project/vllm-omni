@@ -1802,3 +1802,45 @@ def test_request_runner_preserves_client_error_before_rpc(monkeypatch, batch_siz
 
     runner.pipeline = _DummyPipeline(output=DiffusionOutput(output="next request"))
     assert runner.execute_model(_make_request()).output == "next request"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("native_transfer", [False, True])
+def test_update_states_distinguishes_local_hits_from_native_computed_tokens(native_transfer):
+    from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata, DiffusionKVSequenceMetadata
+
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.od_config.kv_transfer_config = object() if native_transfer else None
+    request = _make_request()
+    metadata = DiffusionKVMetadata(
+        request_id=request.request_id,
+        allocation_generation=1,
+        sequences=tuple(
+            DiffusionKVSequenceMetadata(
+                sequence_id=branch,
+                prefix_len=32,
+                target_len=8,
+                seq_len=40,
+                block_ids=([0, 1, 2],),
+                cached_prefix_len=16,
+                num_computed_tokens=32 if native_transfer else 0,
+            )
+            for branch in range(2)
+        ),
+    )
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        finished_req_ids=set(),
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request, diffusion_kv_metadata=metadata)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+    states, _ = DiffusionModelRunner._update_states(runner, scheduler_output)
+    if native_transfer:
+        assert states[0].extra["kv_computed_tokens"] == (32, 32)
+        assert "paged_kv_cached_prefix_lens" not in states[0].extra
+    else:
+        assert states[0].extra["paged_kv_cached_prefix_lens"] == (16, 16)
+        assert "kv_computed_tokens" not in states[0].extra

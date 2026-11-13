@@ -1279,7 +1279,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     )
                 elif sched_new_req.diffusion_kv_metadata is not None:
                     new_state.extra["paged_kv_cached_prefix_lens"] = tuple(
-                        seq.num_computed_tokens for seq in sched_new_req.diffusion_kv_metadata.sequences
+                        seq.cached_prefix_len for seq in sched_new_req.diffusion_kv_metadata.sequences
                     )
                 state_req = copy.copy(sched_new_req.req)
                 state_req.sampling_params = new_state.sampling
