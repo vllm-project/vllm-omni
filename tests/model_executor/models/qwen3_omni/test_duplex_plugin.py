@@ -47,6 +47,7 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.input import QwenPcmBuffe
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import MAX_PROMPT_IMAGES, Qwen3OmniDuplexPlugin
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.protocol.realtime.items import normalize_conversation_item
+from vllm_omni.sample_rate import MissingSampleRateError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -839,6 +840,22 @@ def test_audio_projector_handles_delta_tensor_lists_and_sample_rate():
     assert len(encoded) == 1 and encoded[0][0].shape == (24,)
     assert events[0]["audio_duration_ms"] == 1
     assert events[0]["end_of_turn"] is True
+
+
+def test_audio_projector_requires_a_rate_when_audio_ships():
+    import torch
+
+    plugin = Qwen3OmniDuplexPlugin(lambda *_args: "encoded")
+    output = SimpleNamespace(
+        request_id="r",
+        stage_id=2,
+        finished=True,
+        outputs=[],
+        multimodal_output={"audio": [torch.ones(8)]},
+    )
+
+    with pytest.raises(MissingSampleRateError, match="must emit 'sr'"):
+        list(plugin.data_plane.project({"data_plane_outputs": [output]}, context={"modalities": ["audio"]}))
 
 
 def test_format_history_merges_user_parts_but_preserves_empty_assistant_boundary():

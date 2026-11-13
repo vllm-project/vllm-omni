@@ -13,8 +13,10 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
 )
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexDataPlaneContext
+from vllm_omni.model_executor.common.request_outputs import sample_rate_hz
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.outputs.duplex import get_duplex_output_decision
+from vllm_omni.sample_rate import MissingSampleRateError
 
 logger = init_logger(__name__)
 
@@ -259,7 +261,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         if audio_chunks:
             delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id, chunk_key=chunk_key)
             last_idx = len(audio_chunks) - 1
-            sample_rate_hz = _sample_rate_hz(mm_output)
+            rate = _require_sample_rate_hz(mm_output)
             audio_text_marks = _audio_text_marks(mm_output)
             fallback_marks = _fallback_audio_text_marks(audio_chunks, delta_text)
             audio_results: list[dict[str, object]] = []
@@ -273,7 +275,7 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
                     audio_format=context.response_format,
                     audio_duration_ms=duration_ms,
                     audio_text_mark=idx == last_idx,
-                    sample_rate_hz=sample_rate_hz,
+                    sample_rate_hz=rate,
                     end_of_turn=unit_end_of_turn and idx == last_idx,
                     abort_data_plane_request=tts_segment_end and idx == last_idx,
                 )
@@ -554,19 +556,26 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
         response_format: str,
         speed: float | None,
     ) -> Iterator[tuple[str, int]]:
-        sample_rate_hz = _sample_rate_hz(mm_output)
         audio_data = next((mm_output[key] for key in ("audio", "model_outputs", "latent") if key in mm_output), None)
+        if audio_data is None:
+            return
         if isinstance(audio_data, list):
+            if not audio_data:
+                return
+            rate = _require_sample_rate_hz(mm_output)
             for value in audio_data:
-                encoded = self._encode_audio(value, sample_rate_hz, response_format, speed)
+                encoded = self._encode_audio(value, rate, response_format, speed)
                 if encoded:
-                    duration_ms = int((_audio_num_samples(value) or 0) * 1000 / max(1, sample_rate_hz))
+                    duration_ms = int((_audio_num_samples(value) or 0) * 1000 / max(1, rate))
                     yield encoded, duration_ms
             return
         sliced = self.slice_cumulative_audio(request_id, audio_data)
-        encoded = self._encode_audio(sliced, sample_rate_hz, response_format, speed)
+        if sliced is None:
+            return
+        rate = _require_sample_rate_hz(mm_output)
+        encoded = self._encode_audio(sliced, rate, response_format, speed)
         if encoded:
-            duration_ms = int((_audio_num_samples(sliced) or 0) * 1000 / max(1, sample_rate_hz))
+            duration_ms = int((_audio_num_samples(sliced) or 0) * 1000 / max(1, rate))
             yield encoded, duration_ms
 
     @staticmethod
@@ -778,21 +787,19 @@ def _bool_metadata(
     return default
 
 
-def _sample_rate_hz(mm_output: dict[str, object]) -> int:
-    sr_raw = mm_output.get("sr")
-    if sr_raw is None:
-        sr_raw = mm_output.get("sample_rate_hz", mm_output.get("sample_rate"))
-    meta = mm_output.get("meta")
-    if sr_raw is None and isinstance(meta, dict):
-        sr_raw = meta.get("sr") or meta.get("sample_rate_hz") or meta.get("sample_rate")
-    if sr_raw is None:
-        sr_raw = mm_output.get("meta.sr") or mm_output.get("meta.sample_rate_hz") or mm_output.get("meta.sample_rate")
-    if hasattr(sr_raw, "item"):
-        try:
-            return int(sr_raw.item())
-        except Exception:
-            return 24000
-    return int(sr_raw) if isinstance(sr_raw, (int, float)) else 24000
+def _require_sample_rate_hz(mm_output: dict[str, object]) -> int:
+    """The advertised audio sample rate, raising when audio shipped without one.
+
+    Zero-audio sparse steps legally carry no rate, so this is resolved only
+    once the caller knows the output carries samples to encode; the flat
+    ``sr`` key is the MiniCPM code2wav contract (``minicpmo_4_5_code2wav.py``).
+    """
+    rate = sample_rate_hz(mm_output)
+    if rate is None:
+        raise MissingSampleRateError(
+            "MiniCPM-Omni duplex audio carried no sample rate; the model must emit 'sr' on its multimodal output"
+        )
+    return rate
 
 
 def _audio_text_marks(mm_output: dict[str, object]) -> list[dict[str, object]]:
