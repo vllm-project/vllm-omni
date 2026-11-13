@@ -992,7 +992,8 @@ class OmniServeCommand(CLISubcommand):
             choices=("off", "lossless", "channels_last"),
             default="lossless",
             help=(
-                "Wan VAE decoder fast path. 'lossless' (default) installs bit-exact fused kernels; "
+                "Wan and HunyuanVideo-1.5 VAE decoder fast path. "
+                "'lossless' (default) installs bit-exact fused kernels; "
                 "'channels_last' additionally switches decoder convolutions to channels-last memory "
                 "format and fuses RMSNorm+SiLU (faster, not bit-exact); 'off' keeps the reference "
                 "diffusers implementation."
