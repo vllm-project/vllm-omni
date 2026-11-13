@@ -37,6 +37,36 @@ def test_default_adapter_flattens_tensor_codes() -> None:
     assert update == SchedulingMetadataUpdate(prompt_token_ids=(1, 2, 3))
 
 
+def test_explicit_generation_prompt_keeps_rvq_payload_out_of_scheduler(monkeypatch) -> None:
+    codes = torch.tensor([[17, -1, -1], [19, 2, 3]])
+    payload = {"codes": {"audio": codes}, "meta": {"next_stage_prompt_len": 1, "next_stage_prompt_ids": [0]}}
+    # The declared prompt must avoid even inspecting/flattening raw codec values.
+    monkeypatch.setattr(DefaultSchedulingMetadataAdapter, "_flatten", lambda _: pytest.fail("flattened RVQ payload"))
+    update = DefaultSchedulingMetadataAdapter().extract(payload, model_mode="generation")
+    assert update == SchedulingMetadataUpdate(prompt_token_ids=(0,), resize_prompt_to=1)
+    assert torch.equal(codes, torch.tensor([[17, -1, -1], [19, 2, 3]]))
+
+
+@pytest.mark.parametrize("ids", [[], [-1], [True], [0.0], "0"])
+def test_explicit_generation_prompt_rejects_invalid_ids(ids) -> None:
+    with pytest.raises(ValueError, match="non-empty list"):
+        DefaultSchedulingMetadataAdapter().extract({"meta": {"next_stage_prompt_ids": ids}}, model_mode="generation")
+
+
+def test_explicit_generation_prompt_validates_declared_length() -> None:
+    with pytest.raises(ValueError, match="must match"):
+        DefaultSchedulingMetadataAdapter().extract(
+            {"meta": {"next_stage_prompt_ids": [0], "next_stage_prompt_len": 2}}, model_mode="generation"
+        )
+
+
+def test_explicit_generation_prompt_does_not_change_ar_prompt() -> None:
+    update = DefaultSchedulingMetadataAdapter().extract(
+        {"meta": {"next_stage_prompt_ids": [0], "next_stage_prompt_len": 1}}, model_mode="ar"
+    )
+    assert update == SchedulingMetadataUpdate(resize_prompt_to=1)
+
+
 def test_default_adapter_does_not_leak_codec_metadata_to_scheduler() -> None:
     update = DefaultSchedulingMetadataAdapter().extract(
         {"meta": {"left_context_size": 7}},

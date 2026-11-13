@@ -45,7 +45,7 @@ from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 from vllm_omni.worker_v2.mooncake_capture import snapshot_mooncake_output
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
-from vllm_omni.worker_v2.omni_sampler import sample_with_output
+from vllm_omni.worker_v2.omni_sampler import OmniSampler, sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
 from vllm_omni.worker_v2.streaming_audio import StreamingAudioSnapshot
 from vllm_omni.worker_v2.warmup import is_warmup_request
@@ -87,6 +87,9 @@ def _resolve_sparse_pooler_routing(
         multimodal_outputs=multimodal_outputs,
     )
     return sparse_mm_index, audio_sparse_output
+
+
+_REQUEST_SCOPED_MM_KEYS = frozenset({"meta.codec_frame_valid", "meta.codec_eos_valid"})
 
 
 def _copy_mm_to_snapshot_slot(value: Any, slot: dict[tuple[Any, ...], torch.Tensor], path: tuple[Any, ...] = ()) -> Any:
@@ -149,6 +152,11 @@ def _guard_graph_replay_for_pooler_copy(
 
 class OmniARModelRunner(OmniGPUModelRunner):
     """AR stage runner. Produces per-request hidden states + multimodal outputs."""
+
+    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
+        if isinstance(self.sampler, OmniSampler) and self.sampler.warmup(hidden_states):
+            return
+        super()._dummy_sampler_run(hidden_states)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -868,8 +876,13 @@ def _slice_pooler_value(
     total_tokens: int,
     padded_total_tokens: int | None = None,
     request_scoped: bool = False,
+    path: tuple[str, ...] = (),
 ) -> Any:
     if isinstance(value, torch.Tensor):
+        if ".".join(path) in _REQUEST_SCOPED_MM_KEYS:
+            if value.ndim == 0 or value.shape[0] <= req_index:
+                raise ValueError(f"Request-scoped multimodal field {'.'.join(path)} has no request row")
+            return value[req_index : req_index + 1].contiguous()
         token_axis_sizes = {total_tokens}
         if padded_total_tokens is not None:
             token_axis_sizes.add(padded_total_tokens)
@@ -886,6 +899,7 @@ def _slice_pooler_value(
                 total_tokens=total_tokens,
                 padded_total_tokens=padded_total_tokens,
                 request_scoped=request_scoped,
+                path=path + (key,),
             )
             for key, val in value.items()
         }
@@ -903,6 +917,7 @@ def _slice_pooler_value(
                 end=end,
                 total_tokens=total_tokens,
                 request_scoped=True,
+                path=path,
             )
             for item in values
         ]

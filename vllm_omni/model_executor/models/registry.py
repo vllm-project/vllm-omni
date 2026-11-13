@@ -9,6 +9,8 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    "Zonos3ForCausalLM": ("zonos3", "modeling_zonos3_mini", "Zonos3ForCausalLM"),
+    "Zonos3CodecModel": ("zonos3", "codec", "Zonos3CodecModel"),
     "Alpamayo2SuperPolicy": ("alpamayo2_super", "alpamayo2_super", "Alpamayo2SuperPolicyForConditionalGeneration"),
     "Lfm3OmniForConditionalGeneration": ("lfm3_omni", "model", "Lfm3OmniForConditionalGeneration"),
     "Lfm3OmniCode2Wav": ("lfm3_omni", "code2wav", "Lfm3OmniCode2Wav"),

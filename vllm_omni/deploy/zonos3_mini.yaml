@@ -1,0 +1,70 @@
+# Native MRV2 two-stage streaming profile. GPU acceptance is pending.
+# Launch with FLA_TILELANG=0 and the zonos3 optional dependency installed.
+pipeline: zonos3
+model_runner: v2
+dtype: bfloat16
+async_chunk: true
+connectors:
+  shm:
+    name: SharedMemoryConnector
+    extra:
+      codec_chunk_frames: 15
+      codec_chunk_ramp: [1, 2, 4, 8, 15]
+      first_chunk_codebooks: 10
+      codebook_sizes: [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]
+      eoa_id: 4096
+      audio_pad_id: 4097
+      connector_get_sleep_s: 0.001
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+stages:
+  - stage_id: 0
+    config_format: zonos3
+    devices: '0'
+    max_num_seqs: 32
+    max_num_batched_tokens: 4096
+    max_model_len: 2048
+    gpu_memory_utilization: 0.60
+    skip_tokenizer_init: true
+    enable_prefix_caching: false
+    enforce_eager: false
+    async_scheduling: true
+    compilation_config:
+      mode: 0
+      cudagraph_mode: FULL_DECODE_ONLY
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
+    output_connectors:
+      to_stage_1: shm
+    default_sampling_params:
+      temperature: 0.75
+      top_k: 80
+      top_p: 0.69
+      repetition_penalty: 2.4
+      max_tokens: 1024
+      detokenize: false
+    skip_mm_profiling: true
+  - stage_id: 1
+    config_format: zonos3
+    devices: '0'
+    dtype: float32
+    max_num_seqs: 32
+    max_num_batched_tokens: 32
+    max_model_len: 64
+    gpu_memory_utilization: 0.25
+    skip_tokenizer_init: true
+    enable_prefix_caching: false
+    enforce_eager: true
+    # The native Generation runner stays eager; the model captures the complete
+    # stateful Codec separately, including synthesis, resampling and final flush.
+    additional_config:
+      zonos3_codec_cuda_graph: true
+      zonos3_codec_graph_batch_sizes: [1, 2, 4, 8, 16, 32]
+      zonos3_codec_graph_frame_sizes: [1, 2, 4, 8, 15]
+    async_scheduling: true
+    input_connectors:
+      from_stage_0: shm
+    default_sampling_params:
+      max_tokens: 1
+      temperature: 0.0
+      detokenize: false
+    skip_mm_profiling: true

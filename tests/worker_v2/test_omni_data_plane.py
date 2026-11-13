@@ -314,6 +314,71 @@ def _stop_save_thread(plane):
     assert not plane._save_thread.is_alive()
 
 
+def test_zonos3_native_materialization_hook_and_connector_terminal(raw_plane):
+    from vllm_omni.model_executor.models.zonos3.sampler import finalize_zonos3_codes
+    from vllm_omni.model_executor.stage_input_processors.zonos3 import zonos3_rvq_async_chunk
+
+    sent = []
+
+    def put(**kwargs):
+        sent.append((kwargs["put_key"], kwargs["data"]))
+        return True, 1, None
+
+    connector = SimpleNamespace(
+        put=put,
+        config={"extra": {"codebook_sizes": [1024] * 10, "eoa_id": 1024, "audio_pad_id": 1025}},
+    )
+    _start_save_thread(raw_plane, connector)
+    raw_plane._custom_process_func = zonos3_rvq_async_chunk
+    raw_plane._custom_process_batch_func = None
+    request = _new_request()
+    request.resumable = False
+    request.sampling_params = SamplingParams(max_tokens=100, stop_token_ids=[2])
+    raw_plane.register_request(request)
+    raw_plane._start_output_worker(max_pending_batches=2)
+    worker = NativeOutputWorker(capacity=2)
+    try:
+        frames = torch.arange(30).reshape(3, 10)
+        rows = torch.full((13, 10), 1025, dtype=torch.int64)
+        for f in range(3):
+            for j in range(10):
+                rows[f + j, j] = frames[f, j]
+        for j in range(10):
+            rows[3 + j, j] = 1024
+        rows[12, :] = 1025
+        for i, row in enumerate(rows):
+            materialized = finalize_zonos3_codes(
+                {
+                    "codes": {"audio": row[None, None]},
+                    "meta": {"codec_frame_valid": torch.tensor([True]), "codec_eos_valid": torch.tensor([i == 12])},
+                },
+                [1],
+            )
+            output = _Output(
+                payload=materialized.inter_stage[0],
+                token=2 if i == 12 else 1,
+            )
+            worker.submit(output, raw_plane).get_output()
+        raw_plane.drain_outputs()
+        raw_plane.request_terminal({"internal"})
+        assert [key for key, _ in sent] == ["external_0_0", "external_0_1", "external_0_2"]
+        from vllm_omni.data_entry_keys import to_dict
+
+        payloads = [to_dict(payload) if not isinstance(payload, dict) else payload for _, payload in sent]
+        assert torch.equal(torch.cat([p["codes"]["audio"] for p in payloads[:3]]), frames)
+        assert [p["meta"]["finished"].item() for p in payloads[:3]] == [False, False, True]
+        assert [p["meta"]["chunk_seq"] for p in payloads[:3]] == [0, 1, 2]
+        assert payloads[-1]["codes"]["audio"].shape == (0, 10)
+        assert payloads[-1]["meta"]["request_id"] == "external"
+        assert payloads[-1]["meta"]["num_processed_tokens"] == 3
+        assert not raw_plane.request_payload
+        assert raw_plane.record.cleaned == ["internal"]
+    finally:
+        worker.close()
+        raw_plane._stop_output_worker()
+        _stop_save_thread(raw_plane)
+
+
 class _Output:
     copy_event = None
 

@@ -61,6 +61,14 @@ class OmniSampler:
     def __call__(self, logits: torch.Tensor, input_batch: InputBatch) -> SamplerOutput:
         return self.base_sampler(logits, input_batch)
 
+    def warmup(self, hidden_states: torch.Tensor) -> bool:
+        """Return True after warming a model-owned sampling head/pipeline.
+
+        False preserves the upstream text-logits sampler warmup. This runs at
+        startup, outside Backbone graph capture and the serving hot path.
+        """
+        return False
+
     def sample_step(
         self,
         hidden_states: torch.Tensor,

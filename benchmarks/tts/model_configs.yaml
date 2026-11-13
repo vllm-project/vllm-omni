@@ -7,6 +7,17 @@
 # is tracked here.
 
 models:
+  # Experimental integration: server/GPU acceptance and quality are pending.
+  # PCM is 44.1 kHz; set VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=44100.
+  Zyphra/ZONOS3-Mini:
+    supported_tasks: [default_voice, voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: false
+    task_extra_body:
+      default_voice: {}
+      voice_clone: {}
+
   tencent/AuK: &auk
     supported_tasks: [default_voice, voice_clone]
     backend: openai-audio-speech
