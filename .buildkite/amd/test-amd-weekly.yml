@@ -839,8 +839,8 @@ steps:
             fi
             (exit "$$status")
 
-  # Only test_bagel_img2img_online carries rocm: MI325. The other Bagel
-  # weekly cases are H100-only and stay out of this job.
+  # The online owner selects only the MI325 img2img node. H100-only online
+  # Bagel cases stay out of this job.
   - group: "Diffusion E2E Weekly"
     steps:
       - label: "Bagel img2img · 1-GPU"
@@ -920,6 +920,98 @@ steps:
                 )
                 raise SystemExit(5)
             ' "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+      # These offline understanding and LoRA cases explicitly declare MI325.
+      # Keep them in one bounded job to avoid consuming three accelerator slots.
+      - label: "Bagel offline shared · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: diffusion_bagel_offline_weekly
+        artifact_paths:
+          - artifacts/rocm-bagel-offline-weekly/**/*
+        commands:
+          - export ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-bagel-offline-weekly"
+          - mkdir -p "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/offline_inference/test_bagel.py::test_bagel_text2text[omni_runner0]"
+              "tests/e2e/offline_inference/test_bagel.py::test_bagel_img2text[omni_runner0]"
+              "tests/e2e/offline_inference/test_bagel_expansion.py::test_bagel_lora_scale_and_deactivation[omni_runner0]"
+            )
+            set +e
+            pytest --collect-only -q "$${nodes[@]}" \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and diffusion and rocm and MI325 and cards_1" \
+              --run-level full_model \
+              > "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/collection.txt" 2>&1
+            collection_status=$$?
+            set -e
+            if [[ "$$collection_status" -ne 0 ]]; then
+              cat "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+              exit "$$collection_status"
+            fi
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 3 ]]; then
+              echo "Expected exactly three shared offline Bagel ROCm nodes, found $$count." >&2
+              cat "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/collection.txt"; then
+                echo "Bagel offline weekly node was not collected: $$node" >&2
+                cat "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            if (
+              trap - ERR
+              set +e
+              nodes=(
+                "tests/e2e/offline_inference/test_bagel.py::test_bagel_text2text[omni_runner0]"
+                "tests/e2e/offline_inference/test_bagel.py::test_bagel_img2text[omni_runner0]"
+                "tests/e2e/offline_inference/test_bagel_expansion.py::test_bagel_lora_scale_and_deactivation[omni_runner0]"
+              )
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra "$${nodes[@]}" \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and diffusion and rocm and MI325 and cards_1" \
+                --run-level full_model --durations=20 \
+                --junitxml="$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 3 or skipped != 0:
+                print(
+                    f"Expected exactly three executed shared offline Bagel tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_BAGEL_OFFLINE_WEEKLY_ARTIFACT_DIR/pytest.xml"
               then
                 status=0
               else
