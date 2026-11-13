@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import time
+import wave
 from argparse import Namespace
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -752,6 +753,106 @@ async def test_audio_speech_stream_uses_server_pcm_format(
 
     assert output.success is True
     assert output.audio_duration == pytest.approx(expected_duration_s)
+
+
+def _pcm_s16le_sine(amplitude: float, seconds: float, sample_rate: int = 48000) -> bytes:
+    import numpy as np
+
+    t = np.arange(int(sample_rate * seconds)) / sample_rate
+    return (amplitude * np.sin(2 * np.pi * 440.0 * t) * 32767.0).astype(np.int16).tobytes()
+
+
+def _wav_rms(path) -> float:
+    import numpy as np
+
+    with wave.open(str(path), "rb") as wav_file:
+        frames = wav_file.readframes(wav_file.getnframes())
+    samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    return float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
+
+
+@pytest.mark.asyncio
+async def test_audio_speech_stream_saves_wav_and_manifest(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    import itertools
+
+    from vllm_omni.benchmarks.patch import patch
+
+    monkeypatch.setenv("VLLM_OMNI_BENCH_SAVE_AUDIO_DIR", str(tmp_path))
+    patch._BENCH_AUDIO_SAVE_INDEX = itertools.count(1)
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="quiet clip audition",
+        api_url="http://test.com/v1/audio/speech",
+        prompt_len=10,
+        output_len=20,
+    )
+    # 0.5 s of 48 kHz mono s16le quiet sine: rms ~0.007, far under the 0.09 floor.
+    mock_response = MockResponse(200, [_pcm_s16le_sine(0.01, 0.5)])
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_audio_speech(request_input, mock_session)
+
+    assert output.success is True
+    wavs = list(tmp_path.glob("bench_*.wav"))
+    assert len(wavs) == 1
+    with wave.open(str(wavs[0]), "rb") as wav_file:
+        assert wav_file.getframerate() == 48000
+        assert wav_file.getnchannels() == 1
+        assert wav_file.getsampwidth() == 2
+    manifest_lines = (tmp_path / "manifest.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(manifest_lines) == 1
+    entry = json.loads(manifest_lines[0])
+    assert entry["file"] == wavs[0].name
+    assert entry["prompt"] == "quiet clip audition"
+    assert entry["sample_rate"] == 48000
+    assert entry["channels"] == 1
+    assert entry["frames"] == 24000
+    assert entry["duration_s"] == pytest.approx(0.5)
+    assert entry["ttfp_ms"] >= 0.0
+    assert entry["rtf"] >= 0.0
+    # The quiet clip is gained up toward the uniform 0.09 RMS audition level.
+    assert _wav_rms(wavs[0]) == pytest.approx(0.09, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_audio_speech_stream_without_save_dir_writes_nothing(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+):
+    from vllm_omni.benchmarks.patch import patch
+
+    monkeypatch.delenv("VLLM_OMNI_BENCH_SAVE_AUDIO_DIR", raising=False)
+    save_spy = mocker.patch.object(patch, "_save_streamed_pcm_as_wav", wraps=patch._save_streamed_pcm_as_wav)
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="no dump without the env",
+        api_url="http://test.com/v1/audio/speech",
+        prompt_len=10,
+        output_len=20,
+    )
+    mock_response = MockResponse(200, [b"\x00" * 96000])
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_audio_speech(request_input, mock_session)
+
+    assert output.success is True
+    assert save_spy.call_count == 0
+
+
+def test_save_streamed_pcm_loud_clip_passes_through(tmp_path):
+    from vllm_omni.benchmarks.patch import patch
+
+    pcm = _pcm_s16le_sine(0.5, 0.1)
+    path = patch._save_streamed_pcm_as_wav(
+        str(tmp_path), pcm, sample_rate=48000, channels=1, sample_width=2, request_tag="req-1", prompt="loud"
+    )
+    # A loud clip is already above the 0.09 RMS floor: normalization never touches it.
+    assert _wav_rms(path) == pytest.approx(0.5 / (2**0.5), abs=0.01)
 
 
 @pytest.mark.asyncio
