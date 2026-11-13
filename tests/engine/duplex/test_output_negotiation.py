@@ -3,10 +3,15 @@
 
 """Deployment output negotiation and text response lifecycle (RFC #10143)."""
 
+import asyncio
 import copy
+import threading
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
+from tokenizers import Tokenizer, models
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from tests.engine.duplex.test_session_manager import FakePlugin, FakeStagePort, Harness
 from tests.engine.duplex.test_session_runner import _fake_encode_audio, close_harness, open_harness
@@ -17,6 +22,7 @@ from vllm_omni.engine.duplex.config import (
     DuplexSessionConfig,
     ResponseCreateOptions,
 )
+from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.playback_ledger import apply_playback_ack
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex import plugin as minicpm_plugin
@@ -43,6 +49,12 @@ def _caps():
     return _text_plugin().deployment_capabilities(max_sessions=2)
 
 
+@pytest.fixture
+def fast_tokenizer():
+    backend = Tokenizer(models.WordLevel({"<unk>": 0}, unk_token="<unk>"))
+    return PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>")
+
+
 def test_effective_capabilities_follow_topology_and_preserve_inputs():
     plugin = _text_plugin()
     caps = plugin.deployment_capabilities(max_sessions=2)
@@ -59,17 +71,134 @@ def test_effective_capabilities_follow_topology_and_preserve_inputs():
 
 
 @pytest.mark.asyncio
-async def test_real_minicpm_text_topology_defaults_without_reference_audio(monkeypatch):
+async def test_real_minicpm_text_topology_defaults_without_reference_audio(monkeypatch, fast_tokenizer):
     async def reject_default_audio(model_config):
         raise AssertionError("Text deployment must not load the default reference audio")
 
     monkeypatch.setattr(minicpm_plugin, "resolve_default_ref_audio", reject_default_audio)
-    monkeypatch.setattr(minicpm_plugin, "_load_tokenizer", lambda model_config: None)
+    monkeypatch.setattr(minicpm_plugin, "_load_tokenizer", lambda model_config: fast_tokenizer)
     plugin = minicpm_plugin.MiniCPMO45DuplexPlugin(_fake_encode_audio)
     plugin.configure_pipeline(replace(MINICPMO_4_5_PIPELINE, stages=MINICPMO_4_5_PIPELINE.stages[:1]))
     assert plugin.deployment_capabilities(max_sessions=1).default_output_modalities == ("text",)
     runtime = await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=None)
     assert "ref_audio_data" not in runtime
+    context = plugin.data_plane_context(
+        epoch=0,
+        turn_id=0,
+        active_response_turn_id=None,
+        active_response_id=None,
+        auto_responds=True,
+        response_format="pcm16",
+        speed=None,
+        modalities=("text",),
+    )
+    assert context.tokenizer is fast_tokenizer.backend_tokenizer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tokenizer", [None, SimpleNamespace(backend_tokenizer=None), SimpleNamespace(backend_tokenizer=object())]
+)
+async def test_real_minicpm_text_topology_requires_a_fast_tokenizer(monkeypatch, tokenizer):
+    monkeypatch.setattr(minicpm_plugin, "_load_tokenizer", lambda model_config: tokenizer)
+    plugin = minicpm_plugin.MiniCPMO45DuplexPlugin(_fake_encode_audio)
+    plugin.configure_pipeline(replace(MINICPMO_4_5_PIPELINE, stages=MINICPMO_4_5_PIPELINE.stages[:1]))
+    with pytest.raises(DuplexRuntimeConfigError, match="requires a fast tokenizer"):
+        await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=None)
+
+
+@pytest.mark.asyncio
+async def test_real_minicpm_three_stage_topology_keeps_optional_tokenizer(monkeypatch):
+    monkeypatch.setattr(minicpm_plugin, "_load_tokenizer", lambda model_config: None)
+    plugin = minicpm_plugin.MiniCPMO45DuplexPlugin(_fake_encode_audio)
+    plugin.configure_pipeline(MINICPMO_4_5_PIPELINE)
+    runtime = await plugin.prepare_runtime_config(DuplexSessionConfig(modalities=["text"]), model_config=None)
+    assert "ref_audio_data" not in runtime
+    assert plugin.deployment_capabilities(max_sessions=1).supported_output_modalities == {"text", "audio"}
+
+
+@pytest.mark.asyncio
+async def test_real_minicpm_tokenizer_is_loaded_once_off_the_event_loop(monkeypatch, fast_tokenizer):
+    loader_threads = []
+
+    def load_tokenizer(model_config):
+        loader_threads.append(threading.get_ident())
+        return fast_tokenizer
+
+    monkeypatch.setattr(minicpm_plugin, "_load_tokenizer", load_tokenizer)
+    plugin = minicpm_plugin.MiniCPMO45DuplexPlugin(_fake_encode_audio)
+    plugin.configure_pipeline(replace(MINICPMO_4_5_PIPELINE, stages=MINICPMO_4_5_PIPELINE.stages[:1]))
+    await asyncio.gather(
+        plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=None),
+        plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=None),
+    )
+    assert len(loader_threads) == 1
+    assert loader_threads[0] != threading.get_ident()
+
+
+@pytest.mark.asyncio
+async def test_real_minicpm_text_projection_uses_the_configured_tokenizer(tmp_path):
+    special_tokens = ["<|speak|>", "<|listen|>", "<|turn_eos|>"]
+    for source, text in (("model", "默认"), ("tokenizer", "替代")):
+        vocabulary = {"<unk>": 0, **{token: index for index, token in enumerate(special_tokens, start=1)}, text: 4}
+        backend = Tokenizer(models.WordLevel(vocabulary, unk_token="<unk>"))
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend, unk_token="<unk>", additional_special_tokens=special_tokens
+        )
+        tokenizer.save_pretrained(tmp_path / source)
+    model_config = SimpleNamespace(model=str(tmp_path / "model"), tokenizer=str(tmp_path / "tokenizer"))
+    plugin = minicpm_plugin.MiniCPMO45DuplexPlugin(_fake_encode_audio)
+    plugin.configure_pipeline(replace(MINICPMO_4_5_PIPELINE, stages=MINICPMO_4_5_PIPELINE.stages[:1]))
+    await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config)
+    context = plugin.data_plane_context(
+        epoch=0,
+        turn_id=0,
+        active_response_turn_id=None,
+        active_response_id=None,
+        auto_responds=True,
+        response_format="pcm16",
+        speed=None,
+        modalities=("text",),
+    )
+    output = SimpleNamespace(
+        request_id="duplex-tokenizer-override",
+        outputs=[SimpleNamespace(token_ids=[1, 4, 3, 2], text="替代", finish_reason="stop")],
+        finished=False,
+        multimodal_output={"special_token_ids": {"speak_token_id": 1, "listen_token_id": 2, "turn_eos_token_id": 3}},
+    )
+    results = list(plugin.data_plane.project_output(output, context=context))
+    assert "".join(result.get("text", "") for result in results) == "替代"
+    assert [result["model_turn_id"] for result in results if result.get("end_of_turn")] == [0]
+
+
+@pytest.mark.asyncio
+async def test_real_minicpm_tokenizer_cache_distinguishes_sources_and_revisions(monkeypatch, fast_tokenizer):
+    loaded = []
+
+    def load_tokenizer(source, **kwargs):
+        loaded.append((source, kwargs.get("revision")))
+        assert kwargs["local_files_only"] is True
+        return fast_tokenizer
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", load_tokenizer)
+    plugin = minicpm_plugin.MiniCPMO45DuplexPlugin(_fake_encode_audio)
+    configurations = (
+        SimpleNamespace(model="model", tokenizer="first", tokenizer_revision="v1", revision="model-revision"),
+        SimpleNamespace(model="model", tokenizer="first", tokenizer_revision="v1", revision="changed-model-revision"),
+        SimpleNamespace(model="model", tokenizer="second", tokenizer_revision="v1"),
+        SimpleNamespace(model="model", tokenizer="first", tokenizer_revision="v2"),
+        SimpleNamespace(model="model", tokenizer=None, tokenizer_revision=None, revision="model-revision"),
+        SimpleNamespace(model="model", tokenizer="first", tokenizer_revision=None, revision="model-revision"),
+    )
+    for config in configurations:
+        assert await plugin._tokenizer_for(config) is fast_tokenizer
+    assert loaded == [
+        ("first", "v1"),
+        ("second", "v1"),
+        ("first", "v2"),
+        ("model", "model-revision"),
+        ("first", "model-revision"),
+    ]
 
 
 @pytest.mark.parametrize("factory", [DuplexSessionConfig.from_event, DuplexSessionConfig.from_realtime])

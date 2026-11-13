@@ -247,6 +247,7 @@ class DuplexEngineSession:
     #: before the response those tokens end up in exists, so they are held here
     #: and folded into the first response that opens after them.
     _pending_stage_metrics: list[dict[str, dict[str, object]]] = field(default_factory=list, repr=False)
+    _ended_response_stage_metrics: dict[str, dict[str, dict[str, object]]] = field(default_factory=dict, repr=False)
     _playback: PlaybackLedger = field(default_factory=PlaybackLedger, repr=False)
     _conversation: ConversationHistory = field(default_factory=ConversationHistory, repr=False)
     _context_ledger: DuplexContextLedger = field(default_factory=DuplexContextLedger, repr=False)
@@ -1178,6 +1179,11 @@ class DuplexEngineSession:
             self.reserve_history_item(f"item_{response_id}")
         return response_id
 
+    def pop_ended_response_stage_metrics(self, response_id: object) -> dict[str, dict[str, object]] | None:
+        if not isinstance(response_id, str):
+            return None
+        return self._ended_response_stage_metrics.pop(response_id, None)
+
     def _clear_response_metrics(self) -> None:
         self._response.stage_metrics.clear()
         self._response.stage_metric_tpot_weighted_ms.clear()
@@ -1570,6 +1576,15 @@ class DuplexEngineSession:
         ):
             self._conversation.retired_audio_item_ids.add(item_id)
 
+    def release_zero_audio_response(self, response_id: str | None) -> None:
+        """Release a reply that produced no audio; it never receives a playback ACK."""
+        if response_id is None:
+            return
+        playback = self._playback.by_response.get(response_id)
+        if playback is not None and max(playback.sent_ms, playback.generated_ms) == 0:
+            self.release_response_history_snapshot(response_id)
+            self.release_response_playback(response_id)
+
     def history_item_has_audio(self, item_id: str) -> bool:
         """Whether this item's response produced audio, including after cleanup.
 
@@ -1683,6 +1698,10 @@ class DuplexEngineSession:
     ) -> dict[str, object] | None:
         self._log_response_aggregator()
         response_id = self._response.active_response_id
+        if response_id is not None and not self.capabilities.emits_audio:
+            ended_metrics = self.accumulate_response_stage_metrics(None)
+            if ended_metrics:
+                self._ended_response_stage_metrics[response_id] = ended_metrics
         if self.perf is not None and response_id is not None:
             self.perf.end_response(response_id)
         response_input_commit_seq = self._response.active_response_input_commit_seq
@@ -2182,6 +2201,7 @@ class DuplexEngineSession:
         self._response.active_response_input_commit_seq = None
         self._response.active_response_awaits_input_commit = False
         self._clear_response_metrics()
+        self._ended_response_stage_metrics.clear()
         self._restore_response_config()
 
     def signal_turn(self, event_type: str, payload: Mapping[str, object] | None = None) -> TurnEvent:

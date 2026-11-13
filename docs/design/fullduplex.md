@@ -77,12 +77,32 @@ text depends on complete audio still follow alignment and playback checks.
 Selecting text output alone does not implement per-request TTS skipping.
 Cancellation rejects old-epoch results
 through the existing fence. Audio calibration is not started for deployments
-without audio output. These contracts do not register a Thinker-only model
-pipeline or provide MiniCPM Stage 0 token projection; those remain separate
-parts of RFC #10143.
+without audio output.
+
+MiniCPM-o 4.5 registers `minicpmo_4_5_thinker_only`, a Stage 0-only pipeline
+selected by a deploy config's `pipeline` key. Its data plane sends Stage 0
+output as text and ends a unit at LISTEN, `chunk_eos` or `chunk_tts_eos`; a
+unit ends the turn only when its final token before the terminator is
+`<|turn_eos|>`. Later text or a speak decision keeps the response open.
+The session requires a fast tokenizer and decodes cumulative tokens
+in unit order, so a snapshot spanning turns keeps each turn's text separate.
+Stage 0 metrics are reported once, under
+`metadata.vllm_omni.stage_metrics`, on the event that ends the response:
+`response.done`, or `audio.cancelled` when it is cancelled.
+The first text delta carries server TTFT under
+`metadata.vllm_omni.response_request_metrics`, including responses already
+opened by `response.create` or `input_audio_buffer.commit`.
 
 `DuplexEngineSession` owns response snapshots and playback cursors. Output
 completion and a client's full `playback.ack` can arrive in either order.
+On all deployments, continuation-limit endings discard uncommitted text and
+release response state if the reply produced no audio. Failed responses and
+`conversation: "none"` endings also release zero-audio state without committing
+text to history. On audio-capable
+deployments, a later ACK for that released response fails with
+`playback_item_not_found` without restoring its state. Text-only deployments
+reject ACKs with `unsupported_operation`. The built-in playback helper skips
+finished replies with no audio.
 `finalize_response_playback` is the shared check used by ACK processing,
 normal response completion, draining response completion, and cancellation.
 It retains state while that response is active, any of its requests are still
@@ -641,8 +661,8 @@ vllm_omni/
 │   └── openai/api_server.py         builds DuplexOmni for duplex models; session-backed app state
 ├── protocol/                        SHARED WIRE CODEC (no engine / no model / no transport)
 │   ├── realtime/                    the OpenAI Realtime API itself
-│   │   ├── events.py                RealtimeEvent + OpenAI's 30 server events (21 ship as Tier 1;
-│   │   │                            9 have a Tier 2 twin in protocol/duplex)
+│   │   ├── events.py                RealtimeEvent + OpenAI's 30 server events (20 ship as Tier 1;
+│   │   │                            10 have a Tier 2 twin in protocol/duplex)
 │   │   ├── commands.py              RealtimeCommand + OpenAI's 10 client commands (8 Tier 1,
 │   │   │                            2 with a Tier 2 twin) --- wire_type + fields, no payload()
 │   │   ├── formats.py               audio format spellings, what is supported, per-session validation
@@ -656,8 +676,8 @@ vllm_omni/
 │       ├── __init__.py              re-exports the Tier 1 helper functions (audio, formats,
 │       │                            items, session, capabilities) so the engine never
 │       │                            imports protocol/realtime directly
-│       ├── events.py                the whole 44-event vocabulary: 21 Tier-1 re-exports,
-│       │                            9 Tier-2 subclasses (session.created + resume_token, ...),
+│       ├── events.py                the whole 44-event vocabulary: 20 Tier-1 re-exports,
+│       │                            10 Tier-2 subclasses (session.created + resume_token, ...),
 │       │                            14 Tier-3 events (listen/speak, playback, resume, ...);
 │       │                            DuplexEvent = RealtimeEvent
 │       ├── commands.py              the whole 17-command vocabulary: 8 Tier-1 re-exports,

@@ -137,12 +137,13 @@ def test_the_duplex_capabilities_reject_unimplemented_turn_detection() -> None:
 # `docs/serving/realtime_duplex_api.md` sorts every message into three tiers.
 # Tier 1 is pure OpenAI and lives in protocol/realtime; Tier 2 (OpenAI names
 # carrying our extensions) and Tier 3 (ours alone) live in protocol/duplex.
-_TIER1_EVENTS = ("SessionUpdated", "ItemAdded", "ItemCreated", "TextDelta", "OutputItemAdded")
+_TIER1_EVENTS = ("SessionUpdated", "ItemAdded", "ItemCreated", "OutputItemAdded")
 _TIER2_EVENTS = (
     "SessionCreated",
     "ResponseCreated",
     "ResponseDone",
     "AudioDelta",
+    "TextDelta",
     "InputCommitted",
     "ItemDeleted",
     "ItemTruncated",

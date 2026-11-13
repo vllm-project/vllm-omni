@@ -811,6 +811,7 @@ class DuplexSessionRunner:
                 session.request_resources.pop((stage_id, request_id), None)
         elif response_id == session.active_response_id:
             session.end_response(commit_text=False)
+            session.release_zero_audio_response(response_id)
             settle_response_runtime(self.plugin, session, committed=False, response_id=response_id, release_owner=True)
         self.emit(
             {
@@ -2863,6 +2864,7 @@ class DuplexSessionRunner:
                     )
                     or committed
                 )
+        session.release_zero_audio_response(old_response_id)
         # Settle once, after every history write. A new user input may prevent
         # end_response from committing while the reserved older item still can.
         # Cancelling before audio starts releases the tool pair for a retry.

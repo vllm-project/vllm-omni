@@ -977,6 +977,7 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
                 item_id=_response_item_id(state, response_id),
                 content_index=1 if projection is not None and projection.audio_part_added else 0,
                 delta=str(text) if isinstance(text, str) else "",
+                metadata=_response_speak_metadata(event) or None,
             )
         )
         return events

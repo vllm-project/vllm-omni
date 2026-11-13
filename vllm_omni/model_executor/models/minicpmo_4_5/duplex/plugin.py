@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
+from tokenizers import Tokenizer
 from vllm.multimodal.image import open_image
 from vllm.multimodal.media import MediaConnector
 from vllm.sampling_params import SamplingParams
@@ -69,6 +70,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
     from vllm.config import ModelConfig
+
+    from vllm_omni.config.stage_config import PipelineConfig
 
 _DUPLEX_CHUNK_SAMPLES = 16000
 _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
@@ -354,15 +357,22 @@ def _stage_config_value(runtime_config: dict[str, object], key: str, stage_id: i
 # ---- session policy helpers: tokenizer / reference audio ----
 
 
+def _tokenizer_ref(model_config: ModelConfig | None) -> tuple[str, str | None]:
+    path = getattr(model_config, "tokenizer", None) or getattr(model_config, "model", None)
+    revision = getattr(model_config, "tokenizer_revision", None) or getattr(model_config, "revision", None)
+    return (path if isinstance(path, str) else "", revision if isinstance(revision, str) else None)
+
+
 def _load_tokenizer(model_config: ModelConfig | None) -> PreTrainedTokenizerBase | None:
-    model_path = getattr(model_config, "model", None)
-    if not isinstance(model_path, str) or not model_path:
+    tokenizer_path, revision = _tokenizer_ref(model_config)
+    if not tokenizer_path:
         return None
     try:
         from transformers import AutoTokenizer
 
         return AutoTokenizer.from_pretrained(
-            model_path,
+            tokenizer_path,
+            revision=revision,
             trust_remote_code=True,
             local_files_only=True,
         )
@@ -616,19 +626,19 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     plugin_id = "minicpmo45"
     private_runtime_config_keys = PRIVATE_RUNTIME_CONFIG_KEYS
     silence_continuation_samples = 16000
+    _thinker_only: bool = False
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
         self.data_plane = MiniCPMO45DataPlaneSession(encode_audio)
-        # The tokenizer is only needed for special-token ids and the session
-        # context token count; it is the same for every session, so load it
-        # once per model path, off the orchestrator loop.
-        self._tokenizers: dict[str, PreTrainedTokenizerBase | None] = {}
+        # Tokenization and Stage0 text decoding share a tokenizer across sessions; load it
+        # once per tokenizer path and revision, off the orchestrator loop.
+        self._tokenizers: dict[tuple[str, str | None], PreTrainedTokenizerBase | None] = {}
         self._tokenizer_lock = asyncio.Lock()
+        self._text_tokenizer: Tokenizer | None = None
 
     async def _tokenizer_for(self, model_config: ModelConfig | None) -> PreTrainedTokenizerBase | None:
-        model_path = getattr(model_config, "model", None)
-        key = model_path if isinstance(model_path, str) else ""
+        key = _tokenizer_ref(model_config)
         if key in self._tokenizers:
             return self._tokenizers[key]
         async with self._tokenizer_lock:
@@ -751,6 +761,10 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
         return minicpmo45_native_capabilities(max_sessions=max_sessions)
 
+    def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
+        super().configure_pipeline(pipeline_config)
+        self._thinker_only = not self.deployment_capabilities(max_sessions=1).emits_audio
+
     def validate_client_extra_body(self, extra_body: object) -> None:
         reject_private_runtime_keys(
             extra_body,
@@ -779,6 +793,11 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         if isinstance(initial_user_text, str) and initial_user_text:
             runtime_config["initial_user_text"] = initial_user_text
         tokenizer = await self._tokenizer_for(model_config)
+        if self._thinker_only:
+            backend = getattr(tokenizer, "backend_tokenizer", None)
+            if not isinstance(backend, Tokenizer):
+                raise DuplexRuntimeConfigError("MiniCPM-o Thinker-only output requires a fast tokenizer.")
+            self._text_tokenizer = backend
         _apply_default_scheduler_policy(runtime_config, config=config, tokenizer=tokenizer, model_config=model_config)
 
         ref_audio = config.ref_audio
@@ -916,6 +935,8 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             response_format=response_format,
             speed=speed,
             modalities=modalities,
+            thinker_only=self._thinker_only,
+            tokenizer=self._text_tokenizer,
         )
 
 

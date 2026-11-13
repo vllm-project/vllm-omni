@@ -1231,8 +1231,15 @@ alone does not implement per-request TTS skipping.
 Targeted playback ACKs for text-only items
 and audio truncation on text-only deployments fail with `unsupported_operation`
 without modifying history. The default MiniCPM three-stage deployment continues
-to advertise text and audio. This negotiation does not by itself register a
-Thinker-only MiniCPM deployment profile.
+to advertise text and audio. `minicpmo_4_5_duplex_thinker_only.yaml`
+advertises text only. Text arrives as `response.output_text.delta` events; a
+delta does not mark a unit or reply boundary. `response.done` carries engine
+metrics under `metadata.vllm_omni.stage_metrics`, and the first non-empty text
+delta carries server TTFT under `metadata.vllm_omni.response_request_metrics`.
+A reply that ends without audio (continuation limit, failure, cancellation, or
+`conversation: "none"`) releases its playback state; uncommitted text is
+discarded. A late ACK for it fails with `playback_item_not_found` (or
+`unsupported_operation` on text-only deployments).
 
 The event vocabulary is uniform, but several surfaces are gated by the
 `capabilities` object the server returns in `session.created`; a client must
@@ -1640,6 +1647,7 @@ A stock client ignores the extra keys; the extensions are additive.
 | `session.created` / `session.updated` | top-level `attachment_generation`, `resume_token`; inside `session`: `state`, `turn_state`, `epoch`, `turn_id`, `active_request_id`, `active_response_id`, `active_response_turn_id`, `overlap_policy`, `overlap_*_ms/rms`, `playback_commit_policy`, `playback`, `capabilities`, `ref_audio`, `extra_body`, `idle_timeout_s`, `response_format` |
 | `response.created` / `response.done` / `response.listen` | `response_id` at top level; the raw duplex event under `response.metadata` (`duplex_event`); `status_details.reason` uses vLLM reasons (`barge_in`, `client_cancelled`, `new_response`, …) |
 | `response.output_audio.delta` | `format`, `sample_rate_hz`, `metadata{session_id, epoch, model_speak, end_of_turn, audio_duration_ms, audio_text_marks, playback}` |
+| `response.output_text.delta` | optional `metadata.vllm_omni.response_request_metrics` with server TTFT |
 | `response.speak` (inserted before the first delta) | not an OpenAI event, but rides the OpenAI response envelope (`response_id`, `item_id`, `output_index`, `content_index`) |
 | `input_audio_buffer.append` | `is_speech`, `video_frames` (+ `max_slice_nums`), `duration_ms`, `audio_end_ms`, per-event `format` / `sample_rate_hz` |
 | `input_audio_buffer.commit` | `final`, `response_create`, `is_speech:false` (silence declaration) |
@@ -1814,13 +1822,13 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `response.speak` | 3 | Model chose to speak (native lane); at most once per response, before the first audio delta. |
 | `response.output_audio.delta` | 2 | One ordered audio chunk. OpenAI name; adds `format`, `sample_rate_hz`, `metadata{epoch, model_speak, end_of_turn, audio_text_marks, playback}`. |
 | `response.output_audio_transcript.delta` | 1 | Transcript text paired one-to-one with each audio delta. |
-| `response.output_text.delta` | 1 | Text delta for text-modality responses. |
+| `response.output_text.delta` | 2 | Text delta for text-modality responses; optional server TTFT under `metadata.vllm_omni.response_request_metrics`. |
 | `response.output_text.done` | 1 | Final text of a text-modality response. |
 | `response.output_audio.done` | 1 | Audio stream closed for the response. |
 | `response.output_audio_transcript.done` | 1 | Full transcript (concatenation of the deltas). |
 | `response.content_part.done` | 1 | Content part finalized with its transcript/text. |
 | `response.output_item.done` | 1 | Assistant item finalized. |
-| `response.done` | 2 | Terminal event; `status` ∈ `completed` \| `cancelled` \| `failed`. OpenAI name; vLLM-Omni `status_details.reason` values and raw duplex event under `metadata`. |
+| `response.done` | 2 | Terminal event; `status` ∈ `completed` \| `incomplete` \| `cancelled` \| `failed` (`incomplete` with `status_details.reason: "continuation_limit"` when the continuation budget ends the response). OpenAI name; vLLM-Omni `status_details.reason` values and raw duplex event under `metadata`. |
 | `rate_limits.updated` | 1 | Compatibility event after every `response.done`; always an empty list. |
 | `response.listen` | 3 | Model chose to keep listening at a unit boundary or after a silence commit. Carries `response_id` when the decision terminates a precreated response (a `response.done` with the same id follows); otherwise no `response.created` precedes it. |
 | `response.function_call_arguments.delta` | 1 | Tool-call arguments delta (Nemotron VoiceChat). |
