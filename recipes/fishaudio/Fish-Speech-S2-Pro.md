@@ -75,7 +75,10 @@ Notes:
 - `--omni` is required.
 - The default deploy config `vllm_omni/deploy/fish_qwen3_omni.yaml` is loaded
   automatically by model registry (HF `model_type=fish_qwen3_omni`).
-
+- On CUDA, both stages (Slow AR and the DAC decoder) run on Model Runner V2 in
+  every Fish Speech deploy config. To run them on V1, set `model_runner: v1`
+  under `platforms.cuda` in a copy of the file; a top-level `model_runner` does
+  not override it.
 
 #### Verification
 
@@ -90,6 +93,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "response_format": "wav"
     }' --output output.wav
 ```
+
 [output.wav](https://github.com/user-attachments/files/27134970/output.wav)
 
 Voice cloning:
@@ -104,10 +108,9 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "ref_text": "Transcript of the reference audio."
     }' --output cloned.wav
 ```
+
 [reference.wav](https://github.com/user-attachments/files/27134971/reference.wav) <br>
 [cloned.wav](https://github.com/user-attachments/files/27134969/cloned.wav)
-
-
 
 #### Notes
 

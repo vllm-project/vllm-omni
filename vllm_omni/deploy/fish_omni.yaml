@@ -74,6 +74,9 @@ stages:
       repetition_penalty: 1.0
 
   - stage_id: 1
+    # V1 unless a platform entry below sets model_runner for stage 1. On CUDA,
+    # platforms.cuda sets v2, and a top-level or stages: model_runner does not
+    # override it.
     model_runner: v1
     max_num_seqs: 128
     gpu_memory_utilization: 0.1
@@ -98,6 +101,13 @@ stages:
 platforms:
   cuda:
     cuda_mps: true
+    stages:
+      # The DAC stage runs on Model Runner V2 on CUDA. It receives each window
+      # through V2's native data plane as one placeholder token, as on V1, and
+      # loads the codec and captures its graphs before the worker is ready.
+      # Set model_runner: v1 here to opt out.
+      - stage_id: 1
+        model_runner: v2
   # Stage 0 stays on Model Runner V2. The NPU AR worker builds Ascend input
   # state and attention metadata. Tensor parallel shards the backbone; expert
   # parallel puts 128 of the 256 routed experts on each card. vLLM-Ascend

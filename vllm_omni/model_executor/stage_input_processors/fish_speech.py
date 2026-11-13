@@ -54,6 +54,15 @@ def _ready_codec_requests(transfer_manager: Any, min_frames: int) -> int:
     return sum(1 for value in transfer_manager.code_prompt_token_ids.values() if len(value) >= min_frames)
 
 
+def _scheduler_capacity(transfer_manager: Any) -> int:
+    capacity = getattr(transfer_manager, "scheduler_max_num_seqs", None)
+    if capacity is None:
+        # The MRV2 data plane has no scheduler handle; read the stage config.
+        scheduler_config = getattr(getattr(transfer_manager, "vllm_config", None), "scheduler_config", None)
+        capacity = getattr(scheduler_config, "max_num_seqs", None)
+    return max(1, int(capacity or 1))
+
+
 def _select_backlog_chunk_size(
     transfer_manager: Any,
     cfg: dict[str, Any],
@@ -68,7 +77,7 @@ def _select_backlog_chunk_size(
     if backlog_chunk_size <= base_chunk_size:
         return base_chunk_size
 
-    capacity = max(1, int(getattr(transfer_manager, "scheduler_max_num_seqs", 1)))
+    capacity = _scheduler_capacity(transfer_manager)
     active = _active_codec_requests(transfer_manager)
     load_factor = min(active / capacity, 1.0)
     threshold = _cfg_float(
@@ -95,14 +104,23 @@ def _select_backlog_chunk_size(
     return backlog_chunk_size
 
 
-def _extract_last_frame(multimodal_output: dict[str, Any]) -> torch.Tensor | None:
-    """Extract the last frame of audio codes from the multimodal output."""
+def _extract_last_frame(multimodal_output: Mapping[str, Any]) -> torch.Tensor | None:
+    """Extract the last frame of audio codes from the multimodal output.
+
+    The V1 runner publishes ``audio_codes`` (and optionally ``audio_code_valid``);
+    MRV2 publishes ``codes.audio`` with ``meta.codec_frame_valid``.
+    """
     audio_codes = multimodal_output.get("audio_codes")
+    valid = multimodal_output.get("audio_code_valid")
+    if audio_codes is None:
+        codes = multimodal_output.get("codes")
+        meta = multimodal_output.get("meta")
+        audio_codes = codes.get("audio") if isinstance(codes, Mapping) else None
+        valid = meta.get("codec_frame_valid") if isinstance(meta, Mapping) else None
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
         return None
     if audio_codes.ndim == 2:
         frame = audio_codes[-1]
-        valid = multimodal_output.get("audio_code_valid")
         if isinstance(valid, torch.Tensor) and valid.numel() > 0:
             is_valid = bool(valid.reshape(-1)[-1].item())
         elif valid is not None:

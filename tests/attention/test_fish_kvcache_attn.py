@@ -1289,3 +1289,40 @@ def test_fish_kvcache_native_long_op_can_be_captured_by_cuda_graph():
     torch.accelerator.synchronize()
 
     torch.testing.assert_close(out, expected, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize(
+    "arch,for_capture,expected",
+    [
+        # The input batch's CPU bound, padded rows included.
+        ("FishSpeechSlowARForConditionalGeneration", False, [17, 300, 0]),
+        # A captured decode graph replays at any length, so it takes the long path.
+        ("FishSpeechSlowARForConditionalGeneration", True, [4096, 4096, 4096]),
+        ("Qwen3ForCausalLM", False, None),
+    ],
+)
+def test_fish_kvcache_mrv2_attaches_input_batch_upper_bound(monkeypatch, arch, for_capture, expected):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
+    model_config = SimpleNamespace(model_arch=arch, max_model_len=4096)
+    bound = torch.tensor([17, 300, 0], dtype=torch.int32)
+    attn_metadata = {"layer.0": SimpleNamespace(), "layer.1": SimpleNamespace()}
+
+    fish_kvcache_backend.attach_fish_kvcache_seq_lens_upper_bound_mrv2(
+        model_config=model_config,
+        attn_metadata=attn_metadata,
+        seq_lens_cpu_upper_bound=bound,
+        for_cudagraph_capture=for_capture,
+    )
+
+    for metadata in attn_metadata.values():
+        attached = getattr(metadata, "seq_lens_cpu_upper_bound", None)
+        if expected is None:
+            assert attached is None
+        else:
+            assert attached is not None
+            assert attached.device.type == "cpu"
+            assert attached.tolist() == expected
+    # The input batch keeps its own bound.
+    assert bound.tolist() == [17, 300, 0]

@@ -29,7 +29,7 @@ Stage 0  fish_omni (LLM AR, Model Runner V2; one forward samples a whole frame)
   └─ codebook tower (13 layers, paged KV beside the backbone's) samples codes 1..9
   │   10-codebook frames, streamed in chunks (shared-memory connector)
   ▼
-Stage 1  dac_decoder (FishSpeechDACDecoder) → 44.1 kHz audio
+Stage 1  dac_decoder (FishSpeechDACDecoder, Model Runner V2 on CUDA) → 44.1 kHz audio
 ```
 
 ## References
@@ -63,6 +63,10 @@ Notes:
   automatically (HF `model_type=fish_omni`). Both stages share one GPU
   through a private MPS daemon; stage 0 runs on Model Runner V2 with CUDA
   graphs (FULL for decode steps, PIECEWISE for steps with prompt rows).
+  Stage 1 (the DAC) also runs on Model Runner V2 on CUDA and replays its own
+  CUDA graphs per window size. To run it on V1, set `model_runner: v1` for
+  stage 1 under `platforms.cuda` in a copy of the file. A `model_runner` set
+  at the top level or under `stages:` does not override that entry.
 - The checkpoint's `bsgemm-moe` quantization maps to vLLM's block-FP8 MoE
   kernels for the routed experts; all other weights stay bf16.
 

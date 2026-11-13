@@ -64,6 +64,10 @@ stages:
       repetition_penalty: 1.0
 
 platforms:
+  cuda:
+    # Both stages run on Model Runner V2 on CUDA. Set model_runner: v1 here to
+    # opt out.
+    model_runner: v2
   npu:
     # Ascend paged attention only accepts 128-token cache blocks
     # (AscendAttentionBackend.get_supported_kernel_block_sizes() == [128]),
