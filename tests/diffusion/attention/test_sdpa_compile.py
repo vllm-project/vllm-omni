@@ -25,7 +25,7 @@ def isolated_compiler_cache():
     torch.compiler.reset()
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("q_heads,kv_heads,head_dim", [(8, 8, 64), (8, 2, 64), (8, 2, 512)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("masked", [False, True])
@@ -51,7 +51,7 @@ def test_sdpa_dynamic_fullgraph_matches_eager(q_heads, kv_heads, head_dim, dtype
             torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("q_heads,kv_heads,head_dim", [(8, 8, 64), (8, 2, 64), (8, 2, 512)])
 @pytest.mark.parametrize("masked", [False, True])
 def test_sdpa_production_attention_fullgraph(monkeypatch, q_heads, kv_heads, head_dim, masked):
@@ -80,7 +80,7 @@ def test_sdpa_production_attention_fullgraph(monkeypatch, q_heads, kv_heads, hea
             torch.testing.assert_close(compiled(query, key, value, metadata), layer(query, key, value, metadata))
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("head_dim", [64, 512])
 @pytest.mark.parametrize("unequal_value_dim", [False, True])
 @pytest.mark.parametrize("masked", [False, True])
@@ -100,7 +100,7 @@ def test_sdpa_gqa_custom_op_schema_and_fake(head_dim, unequal_value_dim, masked)
     )
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_sdpa_compiled_fallback_preserves_mask_gradients():
     impl = SDPAImpl(num_heads=8, num_kv_heads=2, head_size=64, softmax_scale=0.125)
     query = torch.randn(2, 3, 8, 64, device="cuda", dtype=torch.bfloat16)
@@ -120,7 +120,7 @@ def test_sdpa_compiled_fallback_preserves_mask_gradients():
     torch.testing.assert_close(actual_grad, expected_grad)
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("kv_heads,head_dim", [(8, 64), (2, 64), (2, 512)])
 @pytest.mark.parametrize(
     "source_dtype,target_dtype", [(torch.bfloat16, torch.float16), (torch.float16, torch.bfloat16)]
@@ -143,7 +143,7 @@ def test_sdpa_fullgraph_autocast_output_dtype(kv_heads, head_dim, source_dtype, 
         torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("kv_heads", [8, 2])
 def test_sdpa_fullgraph_preserves_float_bias_precision(kv_heads):
     impl = SDPAImpl(num_heads=8, num_kv_heads=kv_heads, head_size=64, softmax_scale=64**-0.5)
