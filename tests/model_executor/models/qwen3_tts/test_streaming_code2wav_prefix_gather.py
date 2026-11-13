@@ -1,6 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import pytest
 import torch
 
 from vllm_omni.model_executor.models.qwen3_tts.streaming_code2wav import _gather_prefix_rows
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_prefix_gather_matches_per_row_cat():
