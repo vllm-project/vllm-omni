@@ -109,14 +109,18 @@ class VoxtralTTSForConditionalGeneration(
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False
+        self.postprocess_requires_multimodal_outputs = False
         self.config = config
         self.repo_id = vllm_config.model_config.model
         self.is_hf_model = not Path(self.repo_id).is_dir()
         self.model_stage = vllm_config.model_config.model_stage
         if self.model_stage == "audio_generation":
             self.has_preprocess = True
+            self.has_postprocess = True
+            self.postprocess_requires_multimodal_outputs = True
             self.requires_raw_input_tokens = True
             self.set_custom_preprocess(self.tts_preprocess)
+            self.set_custom_postprocess(self.tts_postprocess)
             self.audio_generation = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 hf_config=config,
@@ -270,6 +274,7 @@ class VoxtralTTSForConditionalGeneration(
         raise TypeError(f"Unsupported Voxtral acoustic history: {type(history).__name__}")
 
     def tts_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict | None):
+        self.post_process_idx = 0
         codes = info_dict.get("codes")
         audio_tokens = codes.get("audio") if isinstance(codes, Mapping) else None
         audio_history = codes.get("audio_history") if isinstance(codes, Mapping) else None
@@ -398,6 +403,36 @@ class VoxtralTTSForConditionalGeneration(
                 input_embeds[replay_mask] = frame_embeddings
             return input_ids, input_embeds, feedback_state_update
         return input_ids, input_embeds, feedback_state_update
+
+    def tts_postprocess(
+        self, hidden_states: torch.Tensor, multimodal_outputs: object, **info_dict: object | None
+    ) -> dict:
+        update_dict = {}
+        if isinstance(multimodal_outputs, Mapping):
+            codes = multimodal_outputs.get("codes")
+            if isinstance(codes, Mapping) and "audio" in codes:
+                audio = codes["audio"]
+                if isinstance(audio, torch.Tensor):
+                    audio_frames = [audio] if audio.ndim == 1 else list(audio.unbind(0))
+                elif isinstance(audio, (list, tuple)):
+                    audio_frames = list(audio)
+                else:
+                    return update_dict
+                batch_row = info_dict.get("_omni_batch_row")
+                if isinstance(batch_row, int):
+                    frame_index = batch_row
+                else:
+                    # V1 postprocess runs in request order and has no row index.
+                    frame_index = self.post_process_idx
+                    self.post_process_idx += 1
+                if frame_index >= len(audio_frames):
+                    raise IndexError(f"Expect {frame_index=} < {len(audio_frames)=}")
+                frame = audio_frames[frame_index]
+                # Chunked prefill outputs are explicitly filtered to None. Do not
+                # overwrite request feedback with a frame that cannot be sampled.
+                if isinstance(frame, torch.Tensor):
+                    update_dict["codes"] = {"audio": frame}
+        return update_dict
 
     @staticmethod
     def _filter_ineligible_feedback_outputs(
@@ -625,7 +660,10 @@ class VoxtralTTSForConditionalGeneration(
         )
 
     def make_omni_output(
-        self, model_outputs: torch.Tensor | OmniOutput | tuple, logits_index: int | None = None, **kwargs
+        self,
+        model_outputs: torch.Tensor | OmniOutput | tuple,
+        logits_index: torch.Tensor | int | None = None,
+        **kwargs,
     ) -> OmniOutput:
         if isinstance(model_outputs, torch.Tensor):
             if self.model_stage == "audio_generation":

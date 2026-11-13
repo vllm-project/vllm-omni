@@ -46,8 +46,8 @@ on CPU. Ordinary inference without weight transfer does not take this path.
 The initial supported pipeline is unquantized Qwen-Image, including custom
 pipelines that preserve its loading contract. Its `AutoWeightsLoader` and
 transformer loaders already dispatch through each parameter's `weight_loader`.
-The worker therefore constructs the original upstream engine through
-`WeightTransferEngineFactory`; no Omni IPC backend or apply strategy is needed.
+The worker constructs the receiving engine through `WeightTransferEngineFactory`.
+Dense updates use upstream IPC; merged adapter updates use `omni_lora_ipc`.
 
 For IPC and NCCL, upstream reload saves the live tensors, restores the recorded
 loading layout, and wraps parameter loaders. Weights may arrive in several
@@ -92,10 +92,50 @@ Worker shutdown closes the WTE and releases its pipeline references before
 distributed-environment and memory-pool teardown. Repeated shutdown is a no-op;
 transport cleanup failures are logged and do not prevent the remaining cleanup.
 
-Updates are not transactional. A failed chunk can leave partially updated or
+Dense updates are not transactional. A failed chunk can leave partially updated or
 meta tensors; resetting the target does not roll back model values. Stop training
 and recreate the rollout after a failed update. There is no automatic rollback
 or atomic commit across stages.
+
+## Merged adapter sessions
+
+`omni_lora_ipc` reuses upstream IPC handles and the same four HTTP/RPC phases.
+An update carrying `peft_config` is an adapter chunk. Its named tensors are cloned
+before returning to the sender, which may then reuse its IPC buffer. Every chunk
+must carry the same PEFT configuration and adapter ID. Omitting `peft_config`
+selects a dense update; kinds cannot be mixed within a session.
+
+At finish, the manager constructs a native `TensorLoRARequest`, resolves adapter
+names through the model mapper, and binds factors through existing diffusion
+LoRA wrappers. In merged mode these wrappers are staging helpers only: they never
+replace modules in the live model. AR binding enumerates the full stage model
+and uses its `packed_modules_mapping`; diffusion retains its component mapping.
+Qwen3-Omni thinker attention projections use the thinker's own weight mapper.
+Expert-routed MoE adapters are excluded, even when the surrounding model is MoE.
+
+The bank computes `W_base + (B @ A) * scale` in fp32 and casts once. Its snapshots
+retain the pristine base, so repeated updates never subtract a rounded delta.
+Packing and TP slicing operate on checkpoint-layout factors, as in upstream's
+IPC trainer; already-sharded factors must not be sent through this interface.
+Previously targeted modules omitted by a later adapter return to their base.
+
+All participating ranks vote on preparation success before any live write. The
+commit copies into existing parameters and retains previous values until a
+second vote succeeds. Recoverable copy failures roll back every rank. Device loss
+or a failed rollback requires recreating the engine. This guarantee is scoped to
+one stage's worker group, not a transaction across independently executing stages.
+
+Snapshots remain resident on their original device and are released on adapter
+removal, manager shutdown, or a full-base update. A dense session restores and
+discards the old bank before upstream reload; the next adapter update snapshots
+the new base. Dense-update failure retains upstream's nontransactional semantics.
+Inference weight offloading and HSDP are unsupported. Level-1 sleep leaves the
+bank resident while the original live weights use the normal weights pool.
+
+The steady-state bank holds one extra copy of targeted weights. Preparation and
+rollback also require temporary dense copies plus fp32 per-layer arithmetic.
+Measure peak memory on the intended TP topology before using this in training.
+No throughput or memory improvement is claimed without an end-to-end benchmark.
 
 ## Configuration and routing
 

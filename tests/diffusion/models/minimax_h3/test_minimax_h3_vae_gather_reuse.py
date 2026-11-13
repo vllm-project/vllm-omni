@@ -167,6 +167,10 @@ def _vae(sp_size, sp_rank=0):
     vae._tile_gather_workspace = None
     vae._tile_gather_stats = {"hits": 0, "allocs": 0, "workspace_bytes": 0}
     vae._checkpoint_tile_gather = None
+    # What decode_latent records from the grid geometry before dispatching
+    # tiles; these tests exercise the equal-shape protocol directly.
+    vae._tile_gather_grid_uniform = True
+    vae._tile_gather_expected_hw = TILE[-2:]
     vae._install_persistent_tile_gather()
     return vae
 
@@ -471,3 +475,305 @@ def test_the_receipt_line_reports_hits_allocs_and_the_address(fake_collective, g
         assert f"workspace_mib={needed:.2f}" in line
     assert f"buf_ptr=0x{first_ptr:x}" in lines[0]
     assert f"buf_ptr=0x{first_ptr:x}" in lines[1]
+
+
+# --------------------------------------------------------------------------
+# Protocol selection is never rank-local. decode_latent records one
+# geometry-derived decision that every rank resolves identically; the gather
+# reads only that. A rank-local choice would split the ranks between the
+# equal-shape collective and the checkpoint's variable-shape gather (only the
+# ranks holding edge tiles would fall back), mismatching or hanging the group.
+# --------------------------------------------------------------------------
+
+
+def _install_checkpoint_gather(vae, sp_rank, sp_size, collective_entries):
+    """Install the checkpoint's real ``_all_gather_tiled_results`` packing.
+
+    Transcribed from the checkpoint's ``klvae.py`` ``_all_gather_tiled_results``
+    (lines 252-273): the local share is ``torch.stack``-ed *before* the
+    variable-shape collective, then walked back into global tile order. Only
+    ``all_gather_var_shape`` itself is replaced -- by a recorder that notes
+    this rank entered the variable-shape collective and echoes the local stack
+    (peer ranks are out of process) -- so these tests exercise the
+    checkpoint's real local packing step instead of an always-succeeding stub.
+    """
+
+    def checkpoint_gather(tasks, num_tiles):
+        if not tasks:
+            raise ValueError(f"Found empty tasks on sp rank {sp_rank}")
+        stacked = torch.stack(tasks, dim=0)  # the checkpoint's local packing step
+        collective_entries.append((sp_rank, tuple(stacked.shape)))
+        gathered = [stacked]
+        results = [None] * num_tiles
+        for rank, rank_tensors in enumerate(gathered):
+            for k in range(rank_tensors.shape[0]):
+                global_index = k * sp_size + rank
+                if global_index >= num_tiles:
+                    break
+                results[global_index] = rank_tensors[k]
+        return results
+
+    vae._checkpoint_tile_gather = checkpoint_gather
+
+
+def test_no_recorded_uniform_grid_sends_every_rank_to_the_checkpoint_gather(monkeypatch):
+    """Counterexample 1: rank 0 holds mixed shapes, rank 1 a uniform pair.
+
+    The grid producing them is not equal-shape, so geometry records False on
+    every rank and both ranks take the checkpoint's variable-shape gather --
+    including the rank whose local share looks uniform. The checkpoint's own
+    packing then ``torch.stack``s the local share, which is where a rank-local
+    mix of shapes fails: a pre-existing checkpoint limitation, pinned here as
+    such (rank 1 has already entered the variable-shape collective when
+    rank 0's stack raises), not a success this branch claims to provide.
+    """
+    tile_a, tile_b = torch.rand(TILE), torch.rand((1, 3, 2, 4, 6))
+    entries: list[tuple] = []
+    equal_shape_calls: list[tuple] = []
+    monkeypatch.setattr(dist, "all_gather_into_tensor", lambda *a, **k: equal_shape_calls.append(a))
+
+    # rank 1, locally uniform share: must leave the equal-shape gather and
+    # enter the checkpoint's variable-shape collective.
+    vae = _vae(2, sp_rank=1)
+    vae._tile_gather_grid_uniform = False
+    vae._tile_gather_expected_hw = None
+    _install_checkpoint_gather(vae, 1, 2, entries)
+    vae.model._all_gather_tiled_results([tile_a, tile_a], 4)
+    assert entries == [(1, (2, 1, 3, 2, 4, 4))], "rank 1 left the common protocol"
+
+    # rank 0, mixed local share: also routed to the checkpoint gather, whose
+    # local stack cannot pack mixed shapes (known checkpoint limitation).
+    vae = _vae(2, sp_rank=0)
+    vae._tile_gather_grid_uniform = False
+    vae._tile_gather_expected_hw = None
+    _install_checkpoint_gather(vae, 0, 2, entries)
+    with pytest.raises(RuntimeError):
+        vae.model._all_gather_tiled_results([tile_a, tile_b], 4)
+    assert len(entries) == 1, "rank 0 must fail in the checkpoint's local stack, before its collective entry"
+    assert not equal_shape_calls, "no rank may enter the equal-shape collective"
+
+
+def test_locally_uniform_but_globally_unequal_shares_also_agree_on_the_protocol(monkeypatch):
+    """Counterexample 2: every rank's share is uniform, but the payloads differ
+    across ranks. Rank-local checks pass everywhere, so only the shared
+    geometry decision keeps the ranks in one collective: both must reach the
+    checkpoint's variable-shape collective through its real packing step, and
+    neither may enter the equal-shape collective."""
+    per_rank_tasks = {
+        0: [torch.rand(TILE), torch.rand(TILE)],
+        1: [torch.rand((1, 3, 2, 4, 6)), torch.rand((1, 3, 2, 4, 6))],
+    }
+    equal_shape_calls: list[tuple] = []
+    monkeypatch.setattr(
+        dist,
+        "all_gather_into_tensor",
+        lambda output, input_tensor, group=None, async_op=False: equal_shape_calls.append(tuple(input_tensor.shape)),
+    )
+    entries: list[tuple] = []
+    for rank, tasks in per_rank_tasks.items():
+        vae = _vae(2, sp_rank=rank)
+        vae._tile_gather_grid_uniform = False
+        vae._tile_gather_expected_hw = None
+        _install_checkpoint_gather(vae, rank, 2, entries)
+        vae.model._all_gather_tiled_results(tasks, 4)
+
+    assert entries == [
+        (0, (2, 1, 3, 2, 4, 4)),
+        (1, (2, 1, 3, 2, 4, 6)),
+    ], "a rank left the common protocol"
+    assert not equal_shape_calls, "no rank may enter the equal-shape collective"
+
+
+def test_a_wrong_uniformity_prediction_raises_before_the_collective(monkeypatch):
+    """Geometry said equal shapes but this rank's share is mixed: report the
+    violated prediction on the spot. Peer ranks may already be waiting in the
+    collective; the executor tears the group down."""
+    vae = _vae(2)
+    entries: list[tuple] = []
+    _install_checkpoint_gather(vae, 0, 2, entries)
+    equal_shape_calls: list[tuple] = []
+    monkeypatch.setattr(dist, "all_gather_into_tensor", lambda *a, **k: equal_shape_calls.append(a))
+    tasks = [torch.rand(TILE), torch.rand((1, 3, 2, 4, 6))]
+
+    with pytest.raises(ValueError, match="equal-shape decoder tile grid"):
+        vae.model._all_gather_tiled_results(tasks, 4)
+
+    assert not entries, "must not silently fall back on a rank-local observation"
+    assert not equal_shape_calls, "must not carry a violated prediction into the collective"
+
+
+def test_a_locally_uniform_share_violating_the_predicted_shape_raises(monkeypatch):
+    """Geometry predicted (4, 4) tiles but this rank's share is uniformly
+    (..., 4, 6). A check of the share only against its own first tile passes
+    and carries the wrong payload into the collective; checking against the
+    geometry-derived expected shape catches the cross-rank inconsistency on
+    the rank that holds it."""
+    vae = _vae(2, sp_rank=1)
+    entries: list[tuple] = []
+    _install_checkpoint_gather(vae, 1, 2, entries)
+    equal_shape_calls: list[tuple] = []
+    monkeypatch.setattr(dist, "all_gather_into_tensor", lambda *a, **k: equal_shape_calls.append(a))
+    tasks = [torch.rand((1, 3, 2, 4, 6)), torch.rand((1, 3, 2, 4, 6))]
+
+    with pytest.raises(ValueError, match="equal-shape decoder tile grid"):
+        vae.model._all_gather_tiled_results(tasks, 4)
+
+    assert not entries and not equal_shape_calls
+
+
+def test_decode_latent_records_the_geometry_decision_and_clears_it_after():
+    """The flag and expected tile shape the gather reads are written per decode
+    from the grid geometry (via _decoder_tile_grid_hw) and cleared once the
+    decode returns."""
+    vae = _vae(2)
+    observed = {}
+
+    def decode_base(sample):
+        observed["during"] = vae._tile_gather_grid_uniform
+        observed["during_hw"] = vae._tile_gather_expected_hw
+        return torch.zeros(1, 3, 2, 4, 4)
+
+    vae.config_dict = {"latent_channels": 4, "latents_mean": [0.0] * 4, "latents_std": [1.0] * 4}
+    vae.parallel_size = 1
+    vae.model.decode_base = decode_base
+    vae.model.processor = types.SimpleNamespace(revert_tensor=lambda decoded: decoded)
+    for uniform in (True, False):
+        vae.model.vae_ratio = 1
+        vae.model.split_tiles = lambda length, is_decoder, u=uniform: (
+            ([0, 1], [3, 3], [2]) if u else ([0, 1], [3, 1], [2])
+        )
+        vae._tile_gather_grid_uniform = None  # sentinel: decode must overwrite it
+        vae._tile_gather_expected_hw = (9, 9)  # sentinel: decode must overwrite it
+
+        MiniMaxH3VideoVAE.decode_latent(vae, torch.zeros(1, 4, 2, 4, 4))
+
+        assert observed["during"] is uniform
+        assert observed["during_hw"] == ((3, 3) if uniform else None)
+        assert vae._tile_gather_grid_uniform is False, "decision must not outlive the decode"
+        assert vae._tile_gather_expected_hw is None, "expected shape must not outlive the decode"
+
+
+class _ChunkedGatherModel(_FakeCheckpointModel):
+    """Temporal-clip decoder that gathers its tiles the way the checkpoint does.
+
+    ``_adaptive_decode`` mirrors ``klvae.tiled_decode``: the tile grid comes
+    from ``z.shape[-2:]`` alone, this rank decodes its round-robin share, and
+    the shares are gathered -- which is the call the adapter overrides. The
+    streaming entrypoint reaches it per temporal clip without ever entering
+    ``decode_latent``, so this is what a chunked MP4 request really exercises.
+    """
+
+    use_3d_conv = True
+    token_drop = 0
+    tokens_chunk_size = 2
+    token_overlap = 0
+    vae_ratio = 1
+    vae_ratio_t = 1
+    frame_pre_padding = 0
+    frame_overlap = 0
+    isolated_first_frame = False
+    isolated_last_frame = False
+    processor = None
+
+    def __init__(self, collective_calls, sp_size, sp_rank=0):
+        super().__init__()
+        self._calls = collective_calls
+        self._sp_size = sp_size
+        self._sp_rank = sp_rank
+        self.clips = 0
+
+    def split_tiles(self, length, is_decoder=False):
+        """Two equal tiles per axis: a 2x2 equal-shape grid, four tiles."""
+        extent = length // 2
+        return [0, extent], [extent, extent], [0]
+
+    def _decode_temporal_output_frame_plan(self, z, z_head, z_tail, num_chunks, pad_tokens):
+        del z, z_head, z_tail, pad_tokens
+        return num_chunks * 2, 0, num_chunks * 2
+
+    @staticmethod
+    def blend(overlap, part, frame_overlap, dim):  # pragma: no cover - no overlap here
+        del overlap, frame_overlap, dim
+        return part
+
+    def _adaptive_decode(self, clip):
+        self.clips += 1
+        all_tiles = _tiles(4, seed=self.clips)
+        self._calls.append({"peers": _peer_stacks(all_tiles, 4, self._sp_size)})
+        gathered = self._all_gather_tiled_results(_local_tiles(all_tiles, 4, self._sp_rank, self._sp_size), 4)
+        return gathered[0]
+
+
+def _chunked_vae(collective_calls, sp_size=2):
+    vae = _vae(sp_size)
+    vae.model = _ChunkedGatherModel(collective_calls, sp_size)
+    vae._checkpoint_tile_gather = None
+    vae._install_persistent_tile_gather()
+    vae.parallel_size = sp_size
+    vae._pixel_transform = None
+    vae.config_dict = {"latent_channels": 3, "latents_mean": [0.0] * 3, "latents_std": [1.0] * 3}
+    # No process group in these tests: the streaming path then runs the
+    # temporal loop locally, which is the part that reaches the gather.
+    vae.is_distributed_enabled = lambda: False
+    vae._tile_gather_grid_uniform = False
+    vae._tile_gather_expected_hw = None
+    return vae
+
+
+def test_repeated_chunked_decodes_reuse_the_workspace(fake_collective):
+    """Streaming MP4 requests must keep the bounded gather, like decode_latent.
+
+    ``decode_with_chunks`` calls the temporal decoder directly, so without a
+    recorded geometry decision every clip gather of every chunked request
+    would take the checkpoint's per-call-allocating gather and reopen the
+    XCCL registration accumulation this class exists to bound. The sentinel
+    checkpoint gather raises if it is reached, and the landing address must
+    stay the same across requests.
+    """
+    vae = _chunked_vae(fake_collective)
+    latent = torch.zeros(1, 3, 4, 8, 8)
+    frames: list[torch.Tensor] = []
+
+    for _ in range(3):
+        MiniMaxH3VideoVAE.decode_with_chunks(vae, latent, on_chunk=frames.append)
+        assert vae._tile_gather_grid_uniform is False, "decision must not outlive the decode"
+        assert vae._tile_gather_expected_hw is None, "expected shape must not outlive the decode"
+
+    # Two temporal clips per request, all through the equal-shape collective.
+    assert vae.model.clips == 6
+    assert len(fake_collective) == 6
+    assert len({call["buf_ptr"] for call in fake_collective}) == 1, "gather buffer moved between clips"
+    assert vae._tile_gather_stats == {
+        "hits": 5,
+        "allocs": 1,
+        "workspace_bytes": _workspace_bytes(4, 2),
+    }
+    assert [int(chunk.shape[2]) for chunk in frames] == [2] * 6
+
+
+def test_chunked_decode_records_the_geometry_decision_it_shares_with_decode_latent(fake_collective):
+    """The decision is recorded from the grid geometry before any clip runs,
+    and an unequal grid routes every rank to the checkpoint gather together --
+    the same protocol choice ``decode_latent`` makes, not a chunked variant."""
+    vae = _chunked_vae(fake_collective)
+    observed = {}
+    decode_clip = vae.model._adaptive_decode
+
+    def _adaptive_decode(clip):
+        observed["uniform"] = vae._tile_gather_grid_uniform
+        observed["hw"] = vae._tile_gather_expected_hw
+        return decode_clip(clip)
+
+    vae.model._adaptive_decode = _adaptive_decode
+    MiniMaxH3VideoVAE.decode_with_chunks(vae, torch.zeros(1, 3, 4, 8, 8), on_chunk=lambda _f: None)
+    assert observed == {"uniform": True, "hw": (4, 4)}
+
+    # An unequal grid: geometry records no decision, so the clip gathers take
+    # the checkpoint's variable-shape gather on every rank alike.
+    entries: list[tuple] = []
+    vae.model.split_tiles = lambda length, is_decoder=False: ([0, length // 2], [length // 2, length // 2 - 1], [0])
+    _install_checkpoint_gather(vae, 0, 2, entries)
+    vae.model._adaptive_decode = _adaptive_decode
+    MiniMaxH3VideoVAE.decode_with_chunks(vae, torch.zeros(1, 3, 4, 8, 8), on_chunk=lambda _f: None)
+    assert observed == {"uniform": False, "hw": None}
+    assert len(entries) == 2, "every clip gather must take the checkpoint path"

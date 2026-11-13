@@ -123,10 +123,6 @@ def _build_test_app(
         "vllm_omni.entrypoints.openai.serving_video_output_stream.build_stage_sampling_params_list",
         return_value=[OmniDiffusionSamplingParams()],
     )
-    mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video_output_stream.get_default_sampling_params_list",
-        return_value=[OmniDiffusionSamplingParams()],
-    )
 
     handler = OmniStreamingVideoOutputHandler(
         engine_client=engine_client,
@@ -300,7 +296,8 @@ class TestStreamingVideoOutputWebSocket:
             streaming_chunks=[],
             mock_generate=mock_generate,
         )
-        engine_client.default_sampling_params_list = [OmniDiffusionSamplingParams(quality="high")]
+        defaults = OmniDiffusionSamplingParams(quality="high", extra_args={"stage_default": "keep"})
+        engine_client.default_sampling_params_list = [defaults]
         request_data = handler._coerce_request_data(
             {
                 "type": "session.start",
@@ -312,6 +309,10 @@ class TestStreamingVideoOutputWebSocket:
         _prompt, sampling_params, _video_params = asyncio.run(handler._build_prompt_and_sampling_params(request))
 
         assert sampling_params.quality == "high"
+        sampling_params.extra_args["stage_default"] = "mutated"
+        _prompt, next_params, _video_params = asyncio.run(handler._build_prompt_and_sampling_params(request))
+        assert next_params.extra_args["stage_default"] == "keep"
+        assert defaults.extra_args == {"stage_default": "keep"}
 
     def test_streaming_session_emits_video_start_binary_chunks_and_done(self, mocker: MockerFixture):
         """A full session delivers video.start, binary chunks, then session.done."""
@@ -449,6 +450,50 @@ class TestStreamingVideoOutputWebSocket:
 
         engine_client.abort.assert_not_called()
         engine_client.submit_interaction_async.assert_not_called()
+
+    def test_zero_stable_frames_deliver_positions_and_control_acknowledgement(self, mocker: MockerFixture):
+        async def mock_generate(*_args, **_kwargs):
+            yield OmniRequestOutput.from_diffusion(
+                request_id="req-ws",
+                images=[np.empty((0, 4, 4, 3), dtype=np.uint8)],
+                final_output_type="video",
+                finished=False,
+                multimodal_output={
+                    "metadata": {
+                        "stream": {
+                            "generation_chunk_index": 0,
+                            "frame_start": 0,
+                            "generated_raw_frames": 4,
+                            "generated_frames": 1,
+                            "withheld_frames": 1,
+                            "completed_event_ids": ["camera-off"],
+                        }
+                    }
+                },
+            )
+            yield OmniRequestOutput.from_diffusion(
+                request_id="req-ws", images=[_fake_video_frames(1)], final_output_type="video", finished=True
+            )
+
+        app, _handler, engine = _build_test_app(
+            mocker=mocker,
+            streaming_chunks=[(b"", False), (b"video", True)],
+            mock_generate=mock_generate,
+            final_chunk=b"trailer",
+        )
+        with TestClient(app) as client, client.websocket_connect("/v1/realtime/video") as ws:
+            ws.send_json({"type": "session.start", "prompt": "A forest."})
+            assert ws.receive_json()["type"] == "video.start"
+            metadata, chunk = _receive_video_chunk(ws)
+            assert chunk == b"" and metadata["byte_length"] == metadata["num_frames"] == 0
+            assert metadata["generation_chunk_index"] == metadata["frame_start"] == 0
+            assert metadata["generated_raw_frames"] == 4
+            assert metadata["generated_frames"] == metadata["withheld_frames"] == 1
+            assert metadata["completed_event_ids"] == ["camera-off"]
+            assert _receive_video_chunk(ws)[1] == b"video"
+            assert _receive_video_chunk(ws)[1] == b"trailer"
+            assert ws.receive_json()["stopped"] is False
+        engine.abort.assert_not_called()
 
     def test_streaming_session_emits_final_encoder_delta_before_done(self, mocker: MockerFixture):
         """A non-empty encoder close delta is delivered as the final binary chunk."""
@@ -592,10 +637,6 @@ def _build_handler_for_async_tests(
     )
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video_output_stream.build_stage_sampling_params_list",
-        return_value=[OmniDiffusionSamplingParams()],
-    )
-    mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video_output_stream.get_default_sampling_params_list",
         return_value=[OmniDiffusionSamplingParams()],
     )
 

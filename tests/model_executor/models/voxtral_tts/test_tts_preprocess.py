@@ -414,3 +414,44 @@ def test_voxtral_pipeline_declares_both_mrv2_stages_native():
 
     assert len(VOXTRAL_TTS_PIPELINE.stages) == 2
     assert all(stage.supports_native_mrv2_data_plane for stage in VOXTRAL_TTS_PIPELINE.stages)
+
+
+def test_tts_postprocess_uses_explicit_batch_row_without_advancing_v1_counter():
+    model = _make_voxtral_tts_model()
+    model.post_process_idx = 0
+    frames = [torch.tensor([[1, 2]]), torch.tensor([[3, 4]])]
+
+    update = model.tts_postprocess(
+        torch.zeros(1, 4),
+        multimodal_outputs={"codes": {"audio": frames}},
+        _omni_batch_row=1,
+    )
+
+    torch.testing.assert_close(update["codes"]["audio"], frames[1])
+    assert model.post_process_idx == 0
+
+
+def test_tts_postprocess_retains_v1_request_order_fallback():
+    model = _make_voxtral_tts_model()
+    model.post_process_idx = 0
+    frames = [torch.tensor([[1, 2]]), torch.tensor([[3, 4]])]
+
+    first = model.tts_postprocess(torch.zeros(1, 4), multimodal_outputs={"codes": {"audio": frames}})
+    second = model.tts_postprocess(torch.zeros(1, 4), multimodal_outputs={"codes": {"audio": frames}})
+
+    torch.testing.assert_close(first["codes"]["audio"], frames[0])
+    torch.testing.assert_close(second["codes"]["audio"], frames[1])
+    assert model.post_process_idx == 2
+
+
+def test_tts_postprocess_skips_ineligible_prefill_frame():
+    model = _make_voxtral_tts_model()
+    model.post_process_idx = 0
+    update = model.tts_postprocess(
+        torch.zeros(1, 4),
+        multimodal_outputs={"codes": {"audio": [None]}},
+        _omni_batch_row=0,
+    )
+
+    assert update == {}
+    assert model.post_process_idx == 0

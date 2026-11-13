@@ -3,7 +3,7 @@
 
 """Unit tests for OmniARModelRunner v2: async output staging, snapshot ownership, payload slicing."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -175,7 +175,11 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     runner.model_config = SimpleNamespace(async_chunk=False)
     runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type=engine_output_type))
     text_hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
-    runner.model_state = SimpleNamespace(postprocess_model_output=MagicMock(return_value=(text_hidden, None)))
+    multimodal_outputs = {"codes": {"audio": torch.ones(3, 1)}}
+    runner.model_state = SimpleNamespace(
+        postprocess_model_output=MagicMock(return_value=(text_hidden, multimodal_outputs)),
+        run_postprocess=MagicMock(),
+    )
     runner.model_state.intermediate_buffer = SimpleNamespace(buffers={0: {"global_request_id": "global-req"}})
     runner.req_states = SimpleNamespace(req_id_to_index={"req": 0})
     runner.req_states.all_token_ids = SimpleNamespace(gpu=torch.tensor([[1]]))
@@ -194,13 +198,20 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
         yield
         sampling_active = False
 
+    # Exercise the deferred structured-output branch in one existing matrix
+    # case without doubling the full orchestration parametrization.
+    requires_multimodal_postprocess = not needs_history and include_hidden is None and engine_output_type == "text"
     runner.model = SimpleNamespace(
-        compute_logits=lambda hidden: hidden, logitsprocs_need_output_token_ids=needs_history
+        compute_logits=lambda hidden: hidden,
+        logitsprocs_need_output_token_ids=needs_history,
+        postprocess_requires_multimodal_outputs=requires_multimodal_postprocess,
     )
     if include_hidden is not None:
         runner.model.omni_pooler_payload_include_hidden = include_hidden
     runner.model.mrv2_sampling_context = sampling_context
     runner.sampler = None
+    runner.speculator = None
+    runner.num_speculative_steps = 0
     runner.sample = MagicMock(return_value=sampler_out)
     runner.sample.side_effect = lambda *_: sampler_out if sampling_active is needs_history else pytest.fail()
     logprobs_mock = MagicMock(side_effect=lambda *_: pytest.fail("inside ctx") if sampling_active else {})
@@ -221,6 +232,10 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     monkeypatch.setattr(omni_ar_model_runner, "OmniAsyncOutput", MagicMock(return_value=mock_out))
 
     assert runner.sample_tokens(None) is mock_out
+    if requires_multimodal_postprocess:
+        runner.model_state.run_postprocess.assert_called_once_with(text_hidden, input_batch, multimodal_outputs)
+    else:
+        runner.model_state.run_postprocess.assert_not_called()
     kwargs = omni_ar_model_runner.OmniAsyncOutput.call_args.kwargs
     if engine_output_type != "text" and include_hidden is not False:
         assert kwargs["text_hidden"] is text_hidden
@@ -319,6 +334,87 @@ def test_sample_tokens_drafts_from_target_layers_after_postprocess(monkeypatch, 
     batch, handed = runner.draft_tokens_handler.set_draft_tokens.call_args.args
     assert batch is input_batch
     torch.testing.assert_close(handed, expected[[1, 0], :num_spec_tokens])
+
+
+@pytest.mark.parametrize(
+    "steps,last_rank,has_verifier",
+    [
+        (0, True, False),
+        (7, False, False),
+        (7, True, True),
+        (7, True, False),
+        (0, True, None),
+        (7, False, None),
+        (7, True, None),
+    ],
+)
+def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, steps, last_rank, has_verifier):
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    calls = []
+
+    def load(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        self.num_speculative_steps = steps
+        self.is_last_pp_rank = last_rank
+        if has_verifier is not None:
+            self.rejection_sampler = object() if has_verifier else None
+
+    monkeypatch.setattr(omni_ar_model_runner.OmniGPUModelRunner, "load_model", load)
+    if steps and last_rank and has_verifier is None:
+        # Missing base-runner state is an API-contract violation, not a disabled verifier.
+        with pytest.raises(AttributeError, match="rejection_sampler"):
+            runner.load_model(load_dummy_weights=True)
+    elif steps and last_rank and not has_verifier:
+        with pytest.raises(ValueError, match="requires a rejection sampler"):
+            runner.load_model(load_dummy_weights=True)
+    else:
+        runner.load_model(load_dummy_weights=True)
+    assert calls == [((), {"load_dummy_weights": True})]
+
+
+@pytest.mark.parametrize("scheduled", [0, 3, 7])
+def test_speculative_proposal_preserves_aux_and_publishes_scheduled_drafts(monkeypatch, scheduled):
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner.num_speculative_steps = 7
+    runner._draft_workspace_lane = object()
+    runner.model = object()
+    runner.pp_handler = None
+    runner.adaptive_verification = None
+    proposed = torch.arange(14).reshape(2, 7)
+    runner.speculator = SimpleNamespace(propose=MagicMock(return_value=proposed.clone()))
+    runner.sampler = SimpleNamespace(
+        sampling_states=SimpleNamespace(
+            temperature=SimpleNamespace(gpu=torch.ones(3)), seeds=SimpleNamespace(gpu=torch.zeros(3))
+        )
+    )
+    runner.req_states = SimpleNamespace(
+        draft_tokens=torch.full((3, 7), -9), last_sampled_tokens=object(), next_prefill_tokens=object()
+    )
+    runner.draft_tokens_handler = SimpleNamespace(set_draft_tokens=MagicMock())
+    batch = SimpleNamespace(idx_mapping=torch.tensor([2, 0]))
+    aux = [torch.ones(4, 2) for _ in range(3)]
+    state = omni_ar_model_runner.DraftInputs(
+        num_spec_tokens=scheduled,
+        hidden_states=torch.zeros(4, 2),
+        aux_hidden_states=aux,
+        attn_metadata=object(),
+        slot_mappings_by_layer=object(),
+        dp_sync_state=None,
+    )
+    monkeypatch.setattr(omni_ar_model_runner, "use_workspace_lane", lambda lane: nullcontext())
+    monkeypatch.setattr(omni_ar_model_runner, "get_drafter_hidden_states", lambda model, hidden: hidden)
+    accepted, rejected = torch.tensor([2, 3]), torch.tensor([5, 4])
+    runner._propose_draft_tokens(batch, state, accepted, rejected, None)
+    args = runner.speculator.propose.call_args.args
+    assert args[0] is batch and args[3] is state.hidden_states and args[4] is aux
+    assert args[5] is accepted and args[6] is rejected
+    expected = proposed.clone()
+    expected[:, scheduled:] = -1
+    torch.testing.assert_close(runner.req_states.draft_tokens[batch.idx_mapping], expected)
+    assert (runner.req_states.draft_tokens[1] == -9).all()
+    published_batch, published = runner.draft_tokens_handler.set_draft_tokens.call_args.args
+    assert published_batch is batch
+    torch.testing.assert_close(published, expected[:, :scheduled])
 
 
 @pytest.mark.cpu
@@ -532,6 +628,12 @@ def test_async_output_slices_request_payloads_with_graph_padding(
         async_chunk=async_chunk,
     ).get_output()
 
+    # Native publication recognizes the redundant full-payload channel by
+    # identity, so a producer refactor must not introduce a shallow list copy.
+    if async_chunk:
+        assert output.pooler_output is None
+    else:
+        assert output.pooler_output is output.inter_stage_outputs
     for i, payload in enumerate(output.inter_stage_outputs):
         torch.testing.assert_close(payload["codes.audio"], codes[offsets[i] : offsets[i + 1]])
         torch.testing.assert_close(payload["codes.ref"], refs[i])
@@ -651,6 +753,7 @@ def test_finalized_full_payload_latent_ledger_is_accumulated_once(monkeypatch):
         finalize_multimodal=lambda payload, _num_sampled: payload,
     ).get_output()
     assert output.multimodal_outputs is None
+    assert output.pooler_output is output.inter_stage_outputs
     engine_output = _rehydrated_output(pooling_output=output.pooler_output[0])
     if output.multimodal_outputs:
         engine_output.multimodal_output = output.multimodal_outputs[0]
@@ -1168,6 +1271,44 @@ def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
     assert result.inter_stage_outputs[0]["codes.audio"].tolist() == [[10, 11]]
     assert result.inter_stage_outputs[1] is None
     assert (result.pooler_output is None) == streaming
+    if not streaming:
+        assert result.pooler_output is result.inter_stage_outputs
+
+
+@pytest.mark.cpu
+def test_stage0_async_chunk_publishes_thinker_latent_once(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = SimpleNamespace(
+        num_reqs=1,
+        query_start_loc_np=np.array([0, 2]),
+        num_scheduled_tokens=np.array([2]),
+        num_tokens_after_padding=2,
+    )
+    latent = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    # Stage 0 does not send connector chunks, so the orchestrator pooler keeps
+    # the latent. The client channel must not mirror it.
+    result = _async_output(
+        sampler_output=SamplerOutput(torch.tensor([[7]]), None, None, torch.tensor([1]), torch.tensor([0])),
+        num_sampled_tokens=torch.tensor([1]),
+        multimodal_outputs={"latent": latent},
+        input_batch=batch,
+        async_chunk=True,
+        partition_async_payload=False,
+    ).get_output()
+    assert result.multimodal_outputs is None
+    assert result.pooler_output[0]["latent"].tolist() == [[1.0, 2.0], [3.0, 4.0]]
+    assert result.inter_stage_outputs[0]["latent"].tolist() == [[1.0, 2.0], [3.0, 4.0]]
+
+    partitioned = _async_output(
+        sampler_output=SamplerOutput(torch.tensor([[7]]), None, None, torch.tensor([1]), torch.tensor([0])),
+        num_sampled_tokens=torch.tensor([1]),
+        multimodal_outputs={"latent": latent.clone()},
+        input_batch=batch,
+        async_chunk=True,
+    ).get_output()
+    assert partitioned.pooler_output is None
+    assert partitioned.multimodal_outputs is None
+    assert partitioned.inter_stage_outputs[0]["latent"].tolist() == [[1.0, 2.0], [3.0, 4.0]]
 
 
 @pytest.mark.cpu
