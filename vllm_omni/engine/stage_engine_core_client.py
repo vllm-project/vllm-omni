@@ -275,6 +275,17 @@ class StageEngineCoreClientBase(StageClientBase):
         )
         await super().add_request_async(request)
 
+    async def append_text_async(self, request_id: str, token_ids: list[int], final: bool) -> str | None:
+        """Add streamed text ids for a request on this replica.
+
+        Sent over the UTILITY channel, so the engine core applies it in order
+        with the request's ADD and ABORT. Returns why the engine refused the
+        append, or ``None``.
+        """
+        # A data-parallel client routes per request; send to the engine holding it.
+        engine = getattr(self, "reqs_in_flight", {}).get(request_id) or self.core_engine
+        return await self._call_utility_async("omni_append_text", request_id, token_ids, final, engine=engine)
+
     # ==================== Stage Methods ====================
 
     @staticmethod

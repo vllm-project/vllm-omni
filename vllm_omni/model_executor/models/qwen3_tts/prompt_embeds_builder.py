@@ -44,6 +44,9 @@ from vllm.multimodal.audio import AudioResampler
 from vllm_omni.utils.audio import mel_filter_bank
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
+from .streamed_text import lead_layout
+from .text_stream import non_streaming_mode, text_lead
+
 if TYPE_CHECKING:
     from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSTalkerConfig
 
@@ -927,15 +930,8 @@ class Qwen3TTSPromptEmbedsBuilder:
 
     @staticmethod
     def _non_streaming_mode(info_dict: dict[str, Any], task_type: str) -> bool:
-        value = info_dict.get("non_streaming_mode")
-        if isinstance(value, list):
-            value = value[0] if value else None
-        if isinstance(value, bool):
-            return value
-        # Match official inference defaults:
-        # - CustomVoice/VoiceDesign: non_streaming_mode=True
-        # - Base: non_streaming_mode=False
-        return task_type in ("CustomVoice", "VoiceDesign")
+        # Official inference defaults: CustomVoice/VoiceDesign on, Base off.
+        return non_streaming_mode(info_dict, task_type)
 
     @staticmethod
     def _needs_initial_prompt_preprocess(info_dict: dict[str, Any]) -> bool:
@@ -1212,6 +1208,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         *,
         task_type: str,
         info_dict: dict[str, Any],
+        streamed_text: tuple[torch.Tensor, bool] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, int | None, torch.Tensor | None]:
         """Build the prefill prompt embeddings for a single TTS request.
 
@@ -1223,6 +1220,9 @@ class Qwen3TTSPromptEmbedsBuilder:
                 ``PRECOMPUTED_REF_CODE_KEY``, ``NORMALIZED_REF_AUDIO_KEY``).
                 Consumed keys are popped so the caller doesn't re-feed them
                 on subsequent prefill chunks.
+            streamed_text: For a request whose text streams in (see
+                ``text_stream.py``): its text ids so far, ``[1, n]``, and
+                whether the text has ended. They replace the ids of ``text``.
 
         Returns:
             ``(talker_prompt, trailing_text_hidden, ref_code_len, ref_code)``:
@@ -1691,6 +1691,19 @@ class Qwen3TTSPromptEmbedsBuilder:
                 # (text + eos) + pad row, with the constant eos row added once per speaker.
                 talker_prompt = torch.cat([talker_prompt, text_all + pad_row, eos_row, tail], dim=1)
                 trailing_text_hidden = tts_pad_embed
+            elif streamed_text is not None or text_lead(info_dict) > 0:
+                text_ids, ended = streamed_text if streamed_text is not None else (input_ids[:, 3:-5], True)
+                talker_prompt, trailing_text_hidden = lead_layout(
+                    talker_prompt,
+                    text_ids,
+                    project=lambda ids: text_projection(text_embedding(ids)),
+                    ended=ended,
+                    lead=text_lead(info_dict),
+                    pad_row=pad_row,
+                    bos_row=codec_input[:, -1:],
+                    tts_eos_embed=tts_eos_embed,
+                    tts_pad_embed=tts_pad_embed,
+                )
             else:
                 first_text = text_projection(text_embedding(input_ids[:, 3:4])) + codec_input[:, -1:]
                 talker_prompt = torch.cat([talker_prompt, first_text], dim=1)
@@ -1753,6 +1766,11 @@ class Qwen3TTSPromptEmbedsBuilder:
             ref_code_len,
             ref_code_prompt.contiguous() if isinstance(ref_code_prompt, torch.Tensor) else None,
         )
+
+    def text_end_row(self, device: torch.device) -> torch.Tensor:
+        """The projected text END row, ``[1, 1, hidden]``, as the prompt builds it."""
+        config = self._config
+        return self._projected_tokens([config.tts_bos_token_id, config.tts_eos_token_id], device).chunk(2, dim=1)[1]
 
     # -------------------- prompt-length estimator --------------------
 
@@ -1838,8 +1856,10 @@ class Qwen3TTSPromptEmbedsBuilder:
                 # model: full text ids (input_ids[:, 3:-5]) + eos + codec_bos step
                 prompt_len += assistant_len - 6
             else:
-                # model: only first text token in prefill
+                # model: only first text token in prefill, after any text lead
                 prompt_len += 1
+                if task_type == "CustomVoice":
+                    prompt_len += text_lead(info)
 
         if task_type == "Base":
             xvec_only = bool(_first(info.get("x_vector_only_mode"), False))

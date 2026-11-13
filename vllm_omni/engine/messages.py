@@ -83,6 +83,15 @@ class InteractionMessage(EngineQueueMessage, kw_only=True):
     interaction: OmniInteractionPrompt
 
 
+class AppendTextMessage(EngineQueueMessage, kw_only=True):
+    """Streamed text token ids for a running request that declared a text stream."""
+
+    type: Literal["append_text"] = "append_text"
+    request_id: str
+    token_ids: list[int]
+    final: bool = False
+
+
 class CollectiveRPCRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["collective_rpc"] = "collective_rpc"
     rpc_id: str

@@ -914,6 +914,44 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         await self._settle_pending_submits(internal_ids)
         await self._abort(internal_ids, timeout=timeout)
 
+    async def append_text(self, request_id: str, token_ids: Sequence[int], final: bool = False) -> None:
+        """Append text token ids to a running request that declared a text stream.
+
+        ``request_id`` is the id given to :meth:`generate`; the request's
+        prompt set ``additional_information["text_stream"]``, and its entry
+        stage's model config names a ``text_stream_policy``. ``token_ids`` are
+        that model's text token ids, in order; ``final=True`` ends the text.
+        The request waits for text it has not received instead of reading
+        past it. An append the engine cannot apply (no text stream, an ended
+        stream), or no text for ``VLLM_OMNI_TEXT_STREAM_TIMEOUT_S`` while the
+        request waits for it, ends the request with an error output.
+        """
+        internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id == request_id]
+        if not internal_ids:
+            raise ValueError(f"No running request {request_id!r} to append text to")
+        ids = [int(token_id) for token_id in token_ids]
+        for internal_id in internal_ids:
+            await self._wait_for_submit(internal_id)
+            await self.engine.append_text_async(internal_id, ids, final)
+
+    async def _wait_for_submit(self, internal_id: str) -> None:
+        """Let a request's ADD still on its way to the engine queue go first, so appends follow it.
+
+        ``generate()`` registers the request before its ADD task runs; without
+        this wait an append could reach the Orchestrator first and be dropped.
+        """
+        task = getattr(self, "_pending_submits", {}).get(internal_id)
+        if task is None:
+            return
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            caller = asyncio.current_task()
+            if caller is not None and caller.cancelling() > 0:
+                raise
+            # The submit was revoked (pause, sleep or abort) before admission.
+            raise ValueError(f"Request {internal_id} was not admitted") from None
+
     async def update_streaming_playback(self, request_id: str, position_seconds: float) -> None:
         """Forward external-session playback progress to the diffusion engine."""
         self.validate_streaming_playback_request()

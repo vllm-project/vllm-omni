@@ -38,6 +38,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
+from vllm_omni.core.sched.text_stream import deliver_streamed_text
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import sanitize_sampling_params_min_tokens_stop_ids
@@ -1043,6 +1044,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         field, so we merge it into the intermediate buffer here.
         """
         super().update_requests(scheduler_output)
+        deliver_streamed_text(self.model, scheduler_output)
 
         cached = scheduler_output.scheduled_cached_reqs
         addl_info = getattr(cached, "additional_information", None)

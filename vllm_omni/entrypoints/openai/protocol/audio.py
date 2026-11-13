@@ -237,6 +237,16 @@ class OpenAICreateSpeechRequest(BaseModel):
             "When null, use model defaults: Base=False, CustomVoice/VoiceDesign=True."
         ),
     )
+    text_lead: int | None = Field(
+        default=None,
+        ge=0,
+        le=_INT64_MAX,
+        description=(
+            "Qwen3-TTS CustomVoice with non_streaming_mode=false only: place the first k text "
+            "tokens before codec BOS, the prompt layout of checkpoints trained with a text lead. "
+            "At most the text's token count plus one. 0 or null keeps the stock streaming layout."
+        ),
+    )
     extra_params: dict[str, Any] | None = Field(
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),

@@ -157,6 +157,10 @@ class OmniModelConfig(ModelConfig):
     )
     subtalker_sampling_params: dict[str, Any] | None = None
     silence_ban_frames: int = 0
+    # Optional dotted path of the function that says how a request's streamed
+    # text is read (core/sched/text_stream.py). Set: the stage accepts
+    # append_text. Read by the AR scheduler and the model.
+    text_stream_policy: str | None = None
     omni_kv_config: dict | None = None
     codec_frame_rate_hz: float | None = None
     task_type: str | None = None

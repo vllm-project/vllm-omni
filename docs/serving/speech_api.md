@@ -151,6 +151,7 @@ Content-Type: application/json
 | `seed` | integer | null | Random seed for repeatable generation. |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
+| `text_lead` | integer | null | Qwen3-TTS CustomVoice with `non_streaming_mode=false` only: place the first `k` text tokens before codec BOS, the prompt layout of checkpoints trained with a text lead. At most the text's token count plus one. 0 or null keeps the stock streaming layout. |
 | `extra_params` | object | null | Model-specific generation controls. See the model sections for supported fields. |
 | `stream` | bool | false | When true, stream OpenAI `speech.audio.*` SSE events (requires `response_format="pcm"` or `"wav"`). For raw PCM/WAV byte streaming, set `stream_format="audio"`. |
 | `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
@@ -571,6 +572,34 @@ Delete an uploaded voice sample.
 ```bash
 curl -X DELETE http://localhost:8091/v1/audio/voices/custom_voice_1
 ```
+
+## Streaming Text into a Running Request (Engine API)
+
+Each WebSocket segment above is a separate request. An engine-level caller can
+instead keep one Qwen3-TTS request running while its text arrives, so the audio
+has no seam between segments:
+
+1. Opt the Talker stage in: set
+   `text_stream_policy: vllm_omni.model_executor.models.qwen3_tts.text_stream.text_stream_spec`
+   in its engine args.
+2. Start a CustomVoice request with `non_streaming_mode: [false]`,
+   `text_stream: [true]` and an empty `text` in its `additional_information`:
+   the stream carries the whole text. An optional `text_lead: [k]` places the
+   first `k` text ids before codec BOS.
+3. As text arrives, call `AsyncOmni.append_text(request_id, token_ids)` with
+   the Talker tokenizer's ids of that text (without the assistant template).
+   The last call sets `final=True`.
+
+The request stays in the waiting queue until its prompt's `k + 1` ids have
+arrived. After its prefill it runs no step whose text id has not arrived: it
+keeps its KV cache and its seat, and no other request takes the seat. Codec
+EOS waits for the end of the text. A request that waits for text longer than
+`VLLM_OMNI_TEXT_STREAM_TIMEOUT_S` seconds (default 5; 0 turns the deadline off)
+ends with an error output and frees its KV cache and its seat. An append that
+the engine cannot apply also ends the request with an error output. Multi-frame
+Talker decode does not support streamed text. As with the silence ban, a stage
+that sets `text_stream_policy` tracks every request's output tokens for the
+codec EOS check.
 
 ## Examples
 

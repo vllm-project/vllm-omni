@@ -371,8 +371,29 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         if request.instructions and len(request.instructions) > server._max_instructions_length:
             return f"Instructions too long (max {server._max_instructions_length} characters)"
 
+        lead_err = self._validate_text_lead(request, task_type)
+        if lead_err is not None:
+            return lead_err
+
         # Validate max_new_tokens range
         return self._validate_max_new_tokens(request)
+
+    def _validate_text_lead(self, request: "OpenAICreateSpeechRequest", task_type: str) -> str | None:
+        """A text lead lays out the streaming CustomVoice prompt and cannot pass the text's END."""
+        if not request.text_lead:
+            return None
+        if task_type != "CustomVoice":
+            return "'text_lead' is only valid for CustomVoice task"
+        if request.non_streaming_mode is not False:
+            return "'text_lead' requires non_streaming_mode=false (the streaming prompt layout)"
+        from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import build_assistant_text
+
+        self._load_text_tokenizer()
+        # The assistant template wraps the text in 3 + 5 tokens.
+        num_text_ids = len(self.ctx.server._tts_tokenizer(build_assistant_text(request.input))["input_ids"]) - 8
+        if request.text_lead > num_text_ids + 1:
+            return f"'text_lead' {request.text_lead} exceeds the text's {num_text_ids} tokens plus its end"
+        return None
 
     def _build_tts_params(self, request: "OpenAICreateSpeechRequest") -> dict[str, Any]:
         """Build TTS parameters from request.
@@ -502,6 +523,9 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         # (True and False respectively).
         elif params["task_type"][0] == "VoiceDesign":
             params["non_streaming_mode"] = [True]
+
+        if request.text_lead:
+            params["text_lead"] = [request.text_lead]
 
         # Do not set ``full_utterance_decode`` here. That flag is an explicit
         # Code2Wav emit opt-in (offline / advanced callers via

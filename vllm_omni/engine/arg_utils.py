@@ -310,6 +310,7 @@ class OmniEngineArgs(EngineArgs):
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
     silence_ban_frames: int = 0
+    text_stream_policy: str | None = None
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
@@ -654,6 +655,7 @@ class OmniEngineArgs(EngineArgs):
             stage_connector_config=stage_connector_config,
             subtalker_sampling_params=self.subtalker_sampling_params,
             silence_ban_frames=self.silence_ban_frames,
+            text_stream_policy=self.text_stream_policy,
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
