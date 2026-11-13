@@ -1858,7 +1858,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # step. Default 1 = off; N>=2 enables. Opt-in for deployments where
         # the first-packet reserve matters more than the earliest possible
         # first byte.
-        burst_n = max(1, int(os.environ.get("VLLM_OMNI_SPEECH_INITIAL_BURST", "1")))
+        # Resolve with a safe fallback: a malformed value (deployment-template
+        # leftovers like an empty string) must not fail every streaming speech
+        # request — warn and degrade to off instead. NaN/inf are also caught
+        # by int(); float strings like "2.5" clamp to 2.
+        try:
+            burst_n = max(1, int(float(os.environ.get("VLLM_OMNI_SPEECH_INITIAL_BURST", "1"))))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid VLLM_OMNI_SPEECH_INITIAL_BURST=%r; disabling initial burst "
+                "buffering (1).", os.environ.get("VLLM_OMNI_SPEECH_INITIAL_BURST", ""))
+            burst_n = 1
         # Held chunks as (pcm_bytes, sample_rate) pairs; the WAV header built
         # for the first chunk is stashed here and emitted once at the release
         # (or at the end-of-stream flush) — the per-iteration `wav_header`
