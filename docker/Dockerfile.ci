@@ -97,7 +97,8 @@ ENV LD_LIBRARY_PATH="/opt/vllm-omni-cudnn/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-/u
 # installed torch, torchvision, and transformers. ftfy and regex are the
 # import-time deps of clip.simple_tokenizer that the image may not have.
 RUN uv pip install --system --no-deps -r requirements/ci-pan2-guardrail.txt \
-    && uv pip install --system "ftfy>=6.1.1" "regex>=2022.1.18"
+    && uv pip install --system "ftfy>=6.1.1" "regex>=2022.1.18" \
+    && uv pip check --system
 
 # Fail the image build if dependency resolution replaced the selected vLLM.
 # The CPU builder has no NVIDIA driver; CUDA imports are checked at the start

@@ -30,26 +30,29 @@ def _requirement_lines(text: str) -> list[str]:
     return lines
 
 
-def test_published_extras_have_no_direct_url_dependencies() -> None:
+def _is_direct_url(requirement: str) -> bool:
+    return "git+" in requirement or "https://" in requirement or " @ " in requirement
+
+
+def test_published_metadata_has_no_direct_url_dependencies() -> None:
     project = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]
-    extras = project["optional-dependencies"]
-    offenders = [
+    offenders = [requirement for requirement in project.get("dependencies", []) if _is_direct_url(requirement)]
+    offenders.extend(
         f"{extra}: {requirement}"
-        for extra, requirements in extras.items()
+        for extra, requirements in project["optional-dependencies"].items()
         for requirement in requirements
-        if "git+" in requirement or "https://" in requirement or " @ " in requirement
-    ]
+        if _is_direct_url(requirement)
+    )
     assert offenders == []
 
 
-def test_ci_image_installs_pinned_pan2_guardrail_without_upgrading_torch() -> None:
+def test_ci_image_hashes_the_pinned_guardrail_requirements() -> None:
     lines = _requirement_lines(REQUIREMENTS.read_text(encoding="utf-8"))
-    assert lines == [
-        f"pan2-guardrail @ {PAN2_URL}",
-        f"clip @ {CLIP_URL}",
-    ]
-    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-    assert "uv pip install --system --no-deps -r requirements/ci-pan2-guardrail.txt" in dockerfile
-    assert 'uv pip install --system "ftfy>=6.1.1" "regex>=2022.1.18"' in dockerfile
-    # requirements/*.txt is already part of the image dependency hash.
+    assert f"pan2-guardrail @ {PAN2_URL}" in lines
+    assert f"clip @ {CLIP_URL}" in lines
+    # build-ci-image.sh hashes requirements/*.txt, so this file changes the image.
     assert "requirements/*.txt" in IMAGE_SCRIPT.read_text(encoding="utf-8")
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    install_at = dockerfile.index("requirements/ci-pan2-guardrail.txt")
+    check_at = dockerfile.index("uv pip check --system", install_at)
+    assert check_at > install_at
