@@ -46,6 +46,7 @@ FISH_SPEECH_PIPELINE = PipelineConfig(
             model_arch="FishSpeechDACDecoder",
             execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(0,),
+            supports_native_mrv2_data_plane=True,
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",
