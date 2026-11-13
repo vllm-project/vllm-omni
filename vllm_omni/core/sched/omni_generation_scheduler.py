@@ -53,6 +53,19 @@ def _has_async_chunk_payload_to_run(request: Request) -> bool:
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     waiting: RequestQueue
 
+    # The Talker K-frame scheduling helpers live on OmniARScheduler (the V1 AR
+    # scheduler); MRv2 stages schedule through this class instead, so borrow
+    # them by reference. They only touch base-scheduler state (running queue,
+    # spec config, request fields), all present here, and are inert unless
+    # K-step is armed.
+    from vllm_omni.core.sched.omni_ar_scheduler import (
+        OmniARScheduler as _OmniARScheduler,
+    )
+
+    _talker_kstep_armed = _OmniARScheduler._talker_kstep_armed
+    _enforce_kstep_span_uniformity = _OmniARScheduler._enforce_kstep_span_uniformity
+    del _OmniARScheduler
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         model_config = self.vllm_config.model_config
@@ -354,6 +367,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         scheduler_output.kv_connector_block_state = None
 
         return scheduler_output
+
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        self._enforce_kstep_span_uniformity(scheduler_output)
+        super()._update_after_schedule(scheduler_output)
 
     def _is_done_receiving_chunks(self, request_id: str) -> bool:
         if self.chunk_transfer_adapter is not None:

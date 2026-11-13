@@ -267,6 +267,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # CUDA K-step fused graph hooks live on the Talker; the runner sees
             # this wrapper (after cudagraph unwrapping), so delegate them here.
             for hook_name in (
+                "flush_cuda_kstep_feedback",
                 "prepare_cuda_kstep",
                 "cuda_kstep_frame",
                 "commit_cuda_kstep",

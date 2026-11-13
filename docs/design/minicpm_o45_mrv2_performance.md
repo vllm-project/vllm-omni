@@ -217,6 +217,24 @@ confidence-head fields from the top level of the draft config. Talker drafters
 cover turn sessions only; duplex sessions and the K-step Talker reject them at
 load.
 
+### CUDA MRv2 Talker K-step
+
+Use the opt-in `minicpmo_4_5_turn_mrv2_kstep.yaml` deployment for single-GPU
+CUDA turn serving. The Talker uses FlashAttention, synchronous scheduling and
+seven continuation drafts to reserve eight query positions per request. The
+drafts reserve KV slots for sequential codec frames. The Talker samples the
+codec and re-embeds each confirmed frame before advancing to the next position.
+
+Mixed prefill and decode steps use the single-frame codec path. A K-step batch
+replays a CUDA graph when its sampling settings are supported, and falls back
+to the same per-frame attention view for other settings. The connector receives
+only valid codec frames, including the final short batch at EOS.
+
+The profile enables CUDA MPS for the colocated stages. CUDA Graphs are captured
+on demand for the batch sizes seen by the Talker. To prewarm a newly started
+C16 replica, send several request waves at different concurrency levels before
+measuring steady-state RTF.
+
 ## Code2Wav batching across reference audio
 
 With CUDA ragged Whole-Euler enabled, ready requests with different reference

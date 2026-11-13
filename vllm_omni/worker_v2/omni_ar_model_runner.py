@@ -405,6 +405,29 @@ class OmniARModelRunner(OmniGPUModelRunner):
     ) -> None:
         """Draft the next step's tokens, as the parent runner's ``sample_tokens`` does."""
         num_spec_tokens = draft.num_spec_tokens
+        if self._talker_kstep_frames() > 1:
+            # The placeholders reserve query positions for the next Talker
+            # step. Only rows with confirmed codec state may enter that loop.
+            from vllm_omni.platforms.npu.worker.talker_multiframe import CONTINUE_TOKEN_ID
+            from vllm_omni.worker_v2.warmup import is_warmup_request
+
+            talker = getattr(self.model, "talker", self.model)
+            assert talker is not None
+            states = talker._request_audio_states
+            ready = all(
+                not is_warmup_request(req_id) and states.get(req_id, {}).get("step", 0) > 0
+                for req_id in input_batch.req_ids
+            )
+            buffer = self.req_states.draft_tokens
+            if ready and num_spec_tokens > 0:
+                drafts = buffer.new_full((input_batch.num_reqs, buffer.shape[1]), -1)
+                drafts[:, :num_spec_tokens] = CONTINUE_TOKEN_ID
+                buffer[input_batch.idx_mapping] = drafts
+                drafts = drafts[:, :num_spec_tokens]
+            else:
+                drafts = buffer.new_empty((input_batch.num_reqs, 0))
+            self.draft_tokens_handler.set_draft_tokens(input_batch, drafts)
+            return
         if self.speculator is not None:
             assert self.sampler is not None
             if isinstance(self.speculator, DraftModelSpeculator):

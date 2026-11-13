@@ -14,7 +14,7 @@ Pipeline:
 
 import random
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import cached_property
 from types import SimpleNamespace
 from typing import Any, NamedTuple
@@ -69,7 +69,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_mrv2_sampling import dr
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
-from vllm_omni.utils.seeded_exponential import fill_exponential_rows
+from vllm_omni.utils.seeded_exponential import fill_exponential_rows, fill_exponential_steps
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
 logger = init_logger(__name__)
@@ -543,6 +543,79 @@ def _codec_int_param(state: Any, key: str, fallback: int) -> int:
 _CUDA_KSTEP_STATE_FIELDS = ("history", "steps", "finished", "last_tokens")
 
 
+@dataclass
+class _CudaKStepBankEntry:
+    state: dict
+    slot: int
+    signature: tuple | None = None
+
+
+class _CudaKStepRequestBank:
+    """Request-owned state gathered into each graph's fixed-address workspace."""
+
+    def __init__(self, workspace: TalkerCudaKStepState, capacity: int) -> None:
+        self.device = workspace.steps.device
+        self.tensors = {}
+        for name in _CUDA_KSTEP_STATE_FIELDS:
+            tensor = getattr(workspace, name)
+            self.tensors[name] = tensor.new_empty((capacity, *tensor.shape[1:]))
+        self.entries: dict[str, _CudaKStepBankEntry] = {}
+        self.free_slots = list(range(capacity - 1, -1, -1))
+        self.indices: dict[tuple[int, ...], torch.Tensor] = {}
+
+    def bind(self, request_id: str, state: dict) -> _CudaKStepBankEntry:
+        entry = self.entries.get(request_id)
+        if entry is not None:
+            if entry.state is not state:
+                entry = self.entries[request_id] = _CudaKStepBankEntry(state, entry.slot)
+            return entry
+        if not self.free_slots:
+            capacity = self.tensors["steps"].shape[0]
+            for name, tensor in self.tensors.items():
+                grown = tensor.new_empty((2 * capacity, *tensor.shape[1:]))
+                grown[:capacity].copy_(tensor)
+                self.tensors[name] = grown
+            self.free_slots.extend(range(2 * capacity - 1, capacity - 1, -1))
+        entry = self.entries[request_id] = _CudaKStepBankEntry(state, self.free_slots.pop())
+        return entry
+
+    def release(self, request_id: str) -> None:
+        entry = self.entries.pop(request_id, None)
+        if entry is not None:
+            self.free_slots.append(entry.slot)
+
+    def gather(
+        self,
+        workspace: TalkerCudaKStepState,
+        slots: tuple[int, ...],
+        refresh: list[tuple[int, tuple, list[int]]],
+    ) -> torch.Tensor:
+        if refresh:
+            updated_slots = index_to_device([slot for slot, _, _ in refresh], self.device)
+            values = {
+                "history": [[-1] * (HISTORY_WINDOW - len(history)) + history for _, _, history in refresh],
+                "steps": [signature[0] for _, signature, _ in refresh],
+                "finished": [signature[1] for _, signature, _ in refresh],
+                "last_tokens": [history[-1] if history else 0 for _, _, history in refresh],
+            }
+            for name, data in values.items():
+                tensor = self.tensors[name]
+                tensor.index_copy_(0, updated_slots, index_to_device(data, self.device, dtype=tensor.dtype))
+
+        indices = self.indices.get(slots)
+        if indices is None:
+            if len(self.indices) >= 16:
+                self.indices.clear()
+            indices = self.indices[slots] = index_to_device(slots, self.device)
+        for name, tensor in self.tensors.items():
+            torch.index_select(tensor, 0, indices, out=getattr(workspace, name))
+        return indices
+
+    def scatter(self, workspace: TalkerCudaKStepState, indices: torch.Tensor) -> None:
+        for name, tensor in self.tensors.items():
+            tensor.index_copy_(0, indices, getattr(workspace, name))
+
+
 def _cuda_kstep_host_signature(model: Any, request_id: str, state: dict) -> tuple:
     return (
         _codec_int_param(state, "step", 0),
@@ -592,6 +665,7 @@ def _apply_cuda_kstep_host_frames(
     generators,
     request_generators,
     rng_offsets,
+    rng_increment: int = 0,
 ) -> None:
     """Replay one packed step's host bookkeeping onto the request mirrors.
 
@@ -620,7 +694,9 @@ def _apply_cuda_kstep_host_frames(
             state["finished"] = bool(finished)
             was_finished = bool(finished)
         generator = generators[row]
-        if generator is not None:
+        if rng_increment:
+            request_generators[row].set_offset(rng_offsets[row] + draws * rng_increment)
+        elif generator is not None:
             # The graph always draws all K frames; only the frames the request
             # actually consumed may advance its own generator, otherwise the
             # random stream after an early EOS diverges from the native path.
@@ -644,9 +720,12 @@ def _apply_cuda_kstep_host_frames(
         history = model._request_codec_history.setdefault(request_id, [])
         history.extend(emitted)
         del history[:-HISTORY_WINDOW]
-        entry = getattr(model, "_cuda_kstep_request_bank", {}).get(request_id)
-        if entry is not None and entry["state"] is state:
-            entry["signature"] = _cuda_kstep_host_signature(model, request_id, state)
+        if emitted:
+            state["last_code"] = emitted[-1]
+        bank = getattr(model, "_cuda_kstep_request_bank", None)
+        entry = bank.entries.get(request_id) if bank is not None else None
+        if entry is not None and entry.state is state:
+            entry.signature = _cuda_kstep_host_signature(model, request_id, state)
 
 
 def _flush_cuda_kstep_host_pending(model: Any) -> None:
@@ -655,10 +734,10 @@ def _flush_cuda_kstep_host_pending(model: Any) -> None:
     if pending is None:
         return
     model._cuda_kstep_pending = None
-    event, pinned, frames, states, request_ids, generators, request_generators, rng_offsets = pending
+    event, pinned, frames, states, request_ids, generators, request_generators, rng_offsets, rng_increment = pending
     event.synchronize()
     _apply_cuda_kstep_host_frames(
-        model, pinned.tolist(), frames, states, request_ids, generators, request_generators, rng_offsets
+        model, pinned.tolist(), frames, states, request_ids, generators, request_generators, rng_offsets, rng_increment
     )
 
 
@@ -1006,7 +1085,40 @@ class MiniCPMO45TalkerSampler(OmniSampler):
         active_mask = torch.tensor(active, dtype=torch.bool, device=sampled.device)
         return rows, active_mask
 
+    def _sample_kstep_controls(self, logits: torch.Tensor, input_batch: Any) -> Any:
+        width = int(self.talker._k_step_frames)
+        starts = input_batch.cu_num_logits[:-1].long()
+        lengths = input_batch.cu_num_logits[1:] - input_batch.cu_num_logits[:-1]
+        positions = torch.arange(width, device=logits.device)
+        indices = starts[:, None] + positions[None, :]
+        valid = positions[None, :] < lengths[:, None]
+        controls = logits.argmax(dim=-1)
+        packed = controls[indices.clamp(max=controls.shape[0] - 1)]
+        stops = valid & (packed == 1)
+        first_stop = torch.where(stops, positions[None, :], width).amin(dim=1)
+        counts = torch.minimum(lengths, first_stop + 1).to(input_batch.seq_lens.dtype)
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            counts,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.req_states.prefill_len.gpu,
+        )
+        packed = packed.masked_fill(positions[None, :] >= num_sampled[:, None], -1)
+        output_kwargs = {
+            "sampled_token_ids": packed.to(torch.int32),
+            "logprobs_tensors": None,
+            "num_nans": None,
+            "num_sampled": num_sampled,
+            "num_rejected": num_rejected,
+        }
+        if "sampling_mask_tensors" in getattr(Mrv2SamplerOutput, "__dataclass_fields__", {}):
+            output_kwargs["sampling_mask_tensors"] = None
+        return Mrv2SamplerOutput(**output_kwargs)
+
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> Any:
+        if logits.is_cuda and int(getattr(self.talker, "_k_step_frames", 0) or 0) > 0 and logits.shape[-1] == 2:
+            return self._sample_kstep_controls(logits, input_batch)
         if logits.shape[-1] <= 2:
             # K-step control rows are two-wide; sampling already ran per frame,
             # so take the set bit and skip the codec-vocab pipeline.
@@ -1297,6 +1409,22 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._codec_repetition_penalty = resolved["repetition_penalty"]
             self._codec_min_tokens = resolved["min_tokens"]
             self._codec_max_tokens = resolved["max_tokens"]
+            logger.info(
+                "[codec-resolve-diag] resolved=%s deploy_defaults=%s",
+                {
+                    k: resolved[k]
+                    for k in (
+                        "temperature",
+                        "top_k",
+                        "top_p",
+                        "repetition_penalty",
+                        "min_tokens",
+                        "max_tokens",
+                        "seed",
+                    )
+                },
+                deploy_defaults,
+            )
         else:
             self._tts_config = None
             self._codec_eos_id = 0
@@ -1326,6 +1454,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # read back from the injected stage-1 speculative_config.
         self._k_step_frames = self._parse_k_step_frames(vllm_config)
         self.supports_multi_frame_decode = self._k_step_frames > 0
+        if self._k_step_frames > 0 and bool(
+            getattr(getattr(vllm_config, "model_config", None), "use_v2_model_runner", False)
+        ):
+            # K-step on MRv2: the runner's decode preprocess hook must run on
+            # single-frame steps too, so the per-request Talker state (step,
+            # last_code, codec history) the multi-frame loop reads stays
+            # current before the loop can engage.
+            self.mrv2_decode_preprocess_is_identity = False
         # Last frame's stop/continue rows and the flattened per-token stop
         # sequence the merged step presents to compute_logits.
         self._k_last_stop_rows: list[bool] | None = None
@@ -1389,7 +1525,21 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             getattr(vllm_config, "speculative_config", None),
         )
         if frames > 0:
-            logger.info("[minicpmo] Talker multi-frame decode armed: %d codec frames per step", frames)
+            if bool(getattr(model_cfg, "use_v2_model_runner", False)):
+                # MRv2 runs the same multi-frame loop through the runner's
+                # ``talker_multiframe`` orchestration (narrow graph replay, or
+                # the eager frame loop when the graph declines). That loop
+                # re-embeds the real previous codec frame through
+                # ``model.preprocess`` per frame, so the identity decode
+                # preprocess of the single-frame MRv2 path is never asked to
+                # condition on a placeholder continue id.
+                logger.info(
+                    "[minicpmo] Talker multi-frame decode armed on Model Runner V2 "
+                    "(runner multi-frame loop): %d codec frames per step",
+                    frames,
+                )
+            else:
+                logger.info("[minicpmo] Talker multi-frame decode armed: %d codec frames per step", frames)
         return frames
 
     @staticmethod
@@ -2047,23 +2197,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         spec_config = getattr(self.vllm_config, "speculative_config", None)
         if spec_config is None:
             return talker_sampler, None
-        session_mode = getattr(self.vllm_config.model_config, "session_mode", "turn")
         if self._mrv2_turn_drafts():
-            # DSpark turn-session draft verification: verification reuses the
-            # stock sampler, whose penalty stage is the codec window.
             return talker_sampler, MiniCPMO45TalkerRejectionSampler(sampler, spec_config, self)
         if self._k_step_frames > 0:
-            if session_mode == "duplex":
-                # Duplex with a stage-1 speculative_config is how the K-step count
-                # reaches the Talker (K > 0): the frame loop drives draft booking
-                # through the runner's _propose_draft_tokens and the per-frame
-                # boundary samplers, so no draft speculator is installed here and
-                # this combination must not raise.
+            if self._mrv2_duplex_session() or current_omni_platform.is_cuda():
                 return talker_sampler, None
-            # A turn session cannot book the K-step frame loop's drafts (the
-            # booking lives in the duplex runner), so its draft codes would be
-            # sampled without verification -- fail closed like any other draft
-            # method.
             raise NotImplementedError(
                 "MiniCPM-o 4.5 Talker (model_runner: v2) K-step frames require "
                 "session_mode: duplex; remove the stage-1 speculative_config "
@@ -2077,6 +2215,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             "turn sessions only; remove the stage-1 speculative_config for "
             "duplex sessions without the K-step frame loop"
         )
+
+    def _mrv2_duplex_session(self) -> bool:
+        return getattr(self.vllm_config.model_config, "session_mode", "turn") == "duplex"
 
     def _mrv2_turn_drafts(self) -> bool:
         """Whether this Talker can verify draft codes: turn sessions without the K-step loop.
@@ -2197,6 +2338,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if not native_duplex_batch:
             limit = torch.clamp(remaining, min=1, max=_OFFLINE_CODEC_MAX_NEW_TOKENS) - 1
             self._mrv2_forced_eos = empty | eos_input | (step >= limit)
+            # Keep a copy: the sampler consumes (and clears) the live tensor
+            # before the K-frame loop runs, and the loop has no engine layer to
+            # enforce this stop signal -- that is why K-step audio only ended
+            # at the codec ceiling (31-83 s) while the single-frame path stops
+            # at ``limit`` (~53 frames / 2.1 s). One frame of lag is fine.
             self._mrv2_masked_eos = None
         else:
             if num_rows != num_reqs:
@@ -2407,6 +2553,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     list(range(rows)),
                 )
 
+    def flush_cuda_kstep_feedback(self) -> None:
+        """Make the latest confirmed codec available to the next forward."""
+        _flush_cuda_kstep_host_pending(self)
+
     def prepare_cuda_kstep(self, hidden: torch.Tensor, frames: int, **kwargs: Any) -> TalkerCudaKStepState | None:
         """Bind a decode batch outside capture; unsupported sampling uses the native path."""
         _flush_cuda_kstep_host_pending(self)
@@ -2464,52 +2614,28 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         workspace.stops.zero_()
         workspace.uniforms.fill_(0.5)
         bank = getattr(self, "_cuda_kstep_request_bank", None)
-        if bank is None:
-            bank = self._cuda_kstep_request_bank = {}
+        if bank is None or bank.device != device:
+            scheduler_config = getattr(getattr(self, "vllm_config", None), "scheduler_config", None)
+            capacity = max(len(infos), getattr(scheduler_config, "max_num_seqs", 16))
+            bank = self._cuda_kstep_request_bank = _CudaKStepRequestBank(workspace, capacity)
+        slots: list[int] = []
+        refresh: list[tuple[int, tuple, list[int]]] = []
         row_cache = getattr(self, "_cuda_kstep_row_params", None)
         if row_cache is None:
             row_cache = self._cuda_kstep_row_params = {}
         sampling = []
         for index, (request_id, state) in enumerate(zip(request_ids, states)):
             signature = _cuda_kstep_host_signature(self, request_id, state)
-            entry = bank.get(request_id)
-            valid = (
-                entry is not None
-                and entry.get("ready", False)
-                and entry["state"] is state
-                and entry["signature"] == signature
-                and entry["device"] == device
-            )
-            if valid:
-                # Source slots do not alias batch rows, including during swaps.
-                for name in _CUDA_KSTEP_STATE_FIELDS:
-                    getattr(workspace, name)[index : index + 1].copy_(entry["tensors"][name])
-            else:
+            entry = bank.bind(request_id, state)
+            slots.append(entry.slot)
+            if entry.signature != signature:
                 history = list(signature[2])
                 if not history:
                     codes = state.get("codes")
                     if isinstance(codes, torch.Tensor) and codes.numel():
                         history = codes.reshape(-1)[-HISTORY_WINDOW:].tolist()
-                history = [int(token) for token in history]
-                for name, value in (
-                    ("history", [-1] * (HISTORY_WINDOW - len(history)) + history),
-                    ("last_tokens", history[-1] if history else 0),
-                    ("steps", signature[0]),
-                    ("finished", signature[1]),
-                ):
-                    _cuda_kstep_upload(self, workspace, name, index, value)
-                if entry is None or entry["state"] is not state or entry["device"] != device:
-                    entry = {
-                        "state": state,
-                        "device": device,
-                        "tensors": {
-                            name: torch.empty_like(getattr(workspace, name)[index : index + 1])
-                            for name in _CUDA_KSTEP_STATE_FIELDS
-                        },
-                    }
-                    bank[request_id] = entry
-                entry["signature"] = signature
-                entry["ready"] = False
+                refresh.append((entry.slot, signature, [int(token) for token in history]))
+                entry.signature = signature
             temperature = _codec_float_param(state, "codec_temperature", self._codec_temperature)
             row_top_k = _codec_int_param(state, "codec_top_k", self._codec_top_k)
             row_top_p = _codec_float_param(state, "codec_top_p", self._codec_top_p)
@@ -2533,37 +2659,48 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 _cuda_kstep_upload(self, workspace, "stop_mask", index, mask)
             row_cache[(key, index)] = dict(values, stop_ids=stop_ids)
             sampling.append((temperature, row_top_k, row_top_p, stop_ids))
+        self._cuda_kstep_bank_indices = bank.gather(workspace, tuple(slots), refresh)
         sampling = tuple(sampling)
         generators = tuple(
             self._request_generator(request_id, hidden.device) if config[0] else None
             for request_id, config in zip(request_ids, sampling)
         )
-        generator_cache = getattr(self, "_cuda_kstep_generator_cache", None)
-        if generator_cache is None:
-            generator_cache = self._cuda_kstep_generator_cache = {}
-        graph_generators = generator_cache.get(key)
-        if graph_generators is None:
-            graph_generators = tuple(torch.Generator(device=hidden.device) for _ in states)
-            generator_cache[key] = graph_generators
-        bindings = getattr(self, "_cuda_kstep_rng_bindings", None)
-        if bindings is None:
-            bindings = self._cuda_kstep_rng_bindings = {}
-        for row, (graph_generator, request_generator) in enumerate(zip(graph_generators, generators)):
-            slot = (key, row)
-            if request_generator is None:
-                bindings.pop(slot, None)
-                continue
-            seed = _codec_int_param(states[row], "codec_seed", self._codec_seed)
-            identity = (request_ids[row], id(states[row]), id(request_generator), seed)
-            previous = bindings.get(slot)
-            if previous != identity:
-                # Seeding belongs to ``_request_generator``; re-seeding here would
-                # discard a generator's advanced state (and its per-request seed).
-                graph_generator.set_state(request_generator.get_state())
-                bindings[slot] = identity
-            else:
-                graph_generator.set_offset(request_generator.get_offset())
+        rng_increment = 0
+        if hidden.is_cuda and getattr(self, "_use_v2_model_runner", False) and all(g is not None for g in generators):
+            if workspace.exponential_noise is None:
+                workspace.exponential_noise = torch.empty(
+                    (frames, len(infos), _CODEC_VOCAB_SIZE), dtype=torch.float32, device=device
+                )
+            rng_increment = fill_exponential_steps(workspace.exponential_noise, generators)
+            graph_generators = (None,) * len(states)
+        else:
+            generator_cache = getattr(self, "_cuda_kstep_generator_cache", None)
+            if generator_cache is None:
+                generator_cache = self._cuda_kstep_generator_cache = {}
+            graph_generators = generator_cache.get(key)
+            if graph_generators is None:
+                graph_generators = tuple(torch.Generator(device=hidden.device) for _ in states)
+                generator_cache[key] = graph_generators
+            bindings = getattr(self, "_cuda_kstep_rng_bindings", None)
+            if bindings is None:
+                bindings = self._cuda_kstep_rng_bindings = {}
+            for row, (graph_generator, request_generator) in enumerate(zip(graph_generators, generators)):
+                slot = (key, row)
+                if request_generator is None:
+                    bindings.pop(slot, None)
+                    continue
+                seed = _codec_int_param(states[row], "codec_seed", self._codec_seed)
+                identity = (request_ids[row], id(states[row]), id(request_generator), seed)
+                previous = bindings.get(slot)
+                if previous != identity:
+                    # Seeding belongs to ``_request_generator``; re-seeding here would
+                    # discard a generator's advanced state (and its per-request seed).
+                    graph_generator.set_state(request_generator.get_state())
+                    bindings[slot] = identity
+                else:
+                    graph_generator.set_offset(request_generator.get_offset())
         self._cuda_kstep_sampling = sampling
+        self._cuda_kstep_rng_increment = rng_increment
         self._cuda_kstep_request_generators = generators
         self._cuda_kstep_generators = tuple(
             graph_generator if request_generator is not None else None
@@ -2582,6 +2719,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._codec_eos_id,
             self._cuda_kstep_sampling,
             self._cuda_kstep_generators,
+            batched_noise=bool(self._cuda_kstep_rng_increment),
         )
         feedback = self.emb_code[0](tokens).reshape(hidden.shape[0], -1)
         stop_rows = hidden.new_full((hidden.shape[0], 2), float("-inf"))
@@ -2595,7 +2733,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         reader synchronizes the pinned copy before updating counters and RNG.
         """
         workspace, infos, states, request_ids = self._cuda_kstep_binding
-        bank = getattr(self, "_cuda_kstep_request_bank", {})
+        self._cuda_kstep_request_bank.scatter(workspace, self._cuda_kstep_bank_indices)
         # Invalidate the width-1 sampler caches for these rows: this commit
         # advances the workspace and the host mirrors but not the sampler, so
         # a following width-1 step must rebuild it from the host state
@@ -2606,18 +2744,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         device_states = getattr(self, "_request_codec_device_states", None)
         device_inputs = getattr(self, "_request_codec_device_inputs", None)
         device_budgets = getattr(self, "_request_codec_device_budgets", None)
-        for row, (request_id, state) in enumerate(zip(request_ids, states)):
+        for request_id in request_ids:
             if device_states is not None:
                 device_states.pop(request_id, None)
             if device_inputs is not None:
                 device_inputs.pop(request_id, None)
             if device_budgets is not None:
                 device_budgets.pop(request_id, None)
-            entry = bank.get(request_id)
-            if entry is not None and entry["state"] is state:
-                for name in _CUDA_KSTEP_STATE_FIELDS:
-                    entry["tensors"][name].copy_(getattr(workspace, name)[row : row + 1])
-                entry["ready"] = True
         frames = workspace.tokens.shape[0]
         packed = torch.stack((workspace.tokens, workspace.emits.long(), workspace.stops.long()), dim=-1)
         if packed.is_cuda:
@@ -2638,6 +2771,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 self._cuda_kstep_generators,
                 self._cuda_kstep_request_generators,
                 self._cuda_kstep_rng_offsets,
+                getattr(self, "_cuda_kstep_rng_increment", 0),
             )
         else:
             # CPU tensors only occur in unit tests; keep the bookkeeping
@@ -2651,6 +2785,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 self._cuda_kstep_generators,
                 self._cuda_kstep_request_generators,
                 self._cuda_kstep_rng_offsets,
+                getattr(self, "_cuda_kstep_rng_increment", 0),
             )
         finished_snapshot = workspace.finished.clone()
         last_snapshot = workspace.last_tokens.clone()
@@ -2675,7 +2810,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 old_codes = old_codes.to(delta.device)
             # Full-width mirror; only the host-side ``_request_codec_history``
             # (flushed one step later) is exact, and it is the one readers use.
-            state["codes"] = torch.cat((old_codes.reshape(-1), delta.reshape(-1)))
+            old_codes = old_codes.reshape(-1)[-HISTORY_WINDOW:].to(delta.device)
+            state["codes"] = torch.cat((old_codes, delta.reshape(-1)))[-HISTORY_WINDOW:]
             # ``last_tokens`` keeps the pre-step id when nothing emits, so the
             # unconditional snapshot matches the host loop's ``if emitted``
             # without a device->host read.
@@ -2773,7 +2909,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             request_id = _request_key(info, index)
             state = request_states.get(request_id)
             if not isinstance(state, dict):
+                # MRv2 seeds a thin state on the intermediate buffer rather
+                # than registering it here (V1 registers it at prefill). Cache
+                # it under the real request id so ``step``/``codes``/EOS
+                # bookkeeping survives across frames and steps: a fresh state
+                # every frame keeps step below min_tokens forever, masks codec
+                # EOS and runs the utterance to the max-token ceiling.
                 state = dict(info.get("audio_state", {}) or {})
+                request_states[request_id] = state
+            info["audio_state"] = state
             if state.get("finished") or not sample_eligible[index]:
                 continue
             confirmed = getattr(self, "_request_codec_history", {}).get(request_id) or []
@@ -3184,8 +3328,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     # never carry them. Drop them from the codec set only --
                     # the engine-side list stays untouched.
                     stop_ids = [token_id for token_id in stop_ids if token_id not in _SCHEDULER_CONTROL_STOP_IDS]
-                if stop_ids:
-                    state["codec_stop_token_ids"] = stop_ids
+            else:
+                # The request carried no stop ids (e.g. the native MRv2 data
+                # plane clones stage defaults without the codec EOS the legacy
+                # engine metadata attached). Fall back to the resolved codec
+                # EOS: the sampler has no separate eos slot, so
+                # ``codec_stop_token_ids`` is the ONLY stop channel -- without
+                # it the K-step stop_mask stays all-False and the request can
+                # never finish on the merged codec EOS (6561).
+                _eos_id = getattr(self, "_codec_eos_id", None)
+                stop_ids = [int(_eos_id)] if _eos_id is not None else []
+            if stop_ids:
+                state["codec_stop_token_ids"] = stop_ids
         # repetition_detection is a whole-stream pattern test
         # (v1/core/sched/utils.py:28-59), so its record has to keep every
         # emitted codec id. Started here, appended per frame below.
@@ -3357,11 +3511,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
         min_tokens_tensor, temperature_tensor, penalty_tensor = device_inputs
         eos_id = self._codec_eos_id
+        # The K-frame path projects all of the step's rows in one call and
+        # hands each row its slice; the single-frame path still projects
+        # here, so the default keeps that behaviour.
+        _raw_in = self.head_code[0](hidden_state).float() if logits is None else logits
         logits = prepare_codec_logits(
-            # The K-frame path projects all of the step's rows in one call and
-            # hands each row its slice; the single-frame path still projects
-            # here, so the default keeps that behaviour.
-            self.head_code[0](hidden_state).float() if logits is None else logits,
+            _raw_in,
             device_state,
             min_tokens_tensor,
             temperature_tensor,
@@ -3741,7 +3896,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if isinstance(host_codec_states, dict):
                 host_codec_states.pop(request_id, None)
             decode_codec_ids.pop(request_id, None)
-            getattr(self, "_cuda_kstep_request_bank", {}).pop(request_id, None)
+            bank = getattr(self, "_cuda_kstep_request_bank", None)
+            if bank is not None:
+                bank.release(request_id)
             bindings = getattr(self, "_cuda_kstep_rng_bindings", {})
             for slot, identity in list(bindings.items()):
                 if identity[0] == request_id:

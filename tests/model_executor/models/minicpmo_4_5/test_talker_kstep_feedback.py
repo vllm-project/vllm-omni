@@ -923,6 +923,25 @@ def test_incomplete_prefill_chunk_skips_sampling():
     assert out2.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [42]
 
 
+def test_draftless_mixed_step_samples_only_eligible_rows_and_stops():
+    model = _make_talker(k_step_frames=8, scripted_samples=[42, _EOS_ID])
+    decode = {"step": 7, "last_code": 43}
+    model._request_audio_states["decode"] = decode
+    buffers = [{"req_id": rid} for rid in ("prefill", "decode", "partial")]
+    out = model.make_omni_output(
+        torch.randn(10, 8),
+        model_intermediate_buffer=buffers,
+        request_token_spans=[(0, 5), (5, 6), (6, 10)],
+        request_sample_eligible=[True, True, False],
+    )
+    assert [delta.flatten().tolist() for delta in out.multimodal_outputs["codes"]["audio"]] == [[42], [], []]
+    assert model.batch_stop_logits.argmax(dim=1).tolist() == [0, 1, 0]
+    assert model._request_codec_history == {"prefill": [42]}
+    assert model._request_audio_states["prefill"]["step"] == 1
+    assert model._request_audio_states["partial"].get("step", 0) == 0
+    assert decode["finished"] is True
+
+
 def test_outer_wrapper_forwards_sampling_eligibility_flag():
     """The runner only sees the wrapper, so the flag must resolve through it.
 
@@ -1393,39 +1412,51 @@ def _cuda_prepare_stub():
     return model, states, prepare
 
 
-def test_cuda_kstep_bank_migrates_rows_without_host_upload(monkeypatch):
-    import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts as tts
+def test_cuda_kstep_feedback_updates_the_latest_committed_code():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        _apply_cuda_kstep_host_frames,
+    )
 
+    state = {"step": 1, "last_code": 11}
+    model = SimpleNamespace(
+        _request_audio_states={"a": state},
+        _request_codec_history={"a": [11]},
+    )
+    frames = [[[22, 1, 0]], [[_EOS_ID, 0, 1]], [[33, 0, 1]]]
+    _apply_cuda_kstep_host_frames(model, frames, 3, [state], ["a"], [None], [None], [None])
+    assert model._request_codec_history["a"] == [11, 22]
+    assert state == {"step": 3, "last_code": 22, "finished": True}
+
+
+def test_cuda_kstep_bank_migrates_rows_without_host_refresh(monkeypatch):
     model, states, prepare = _cuda_prepare_stub()
     workspace = prepare()
     pointers = workspace.storage_key()
-    for row, request_id in enumerate(("a", "b")):
-        entry = model._cuda_kstep_request_bank[request_id]
-        for name in tts._CUDA_KSTEP_STATE_FIELDS:
-            entry["tensors"][name].copy_(getattr(workspace, name)[row : row + 1])
-        entry["ready"] = True
-    uploads = []
-    original = tts._cuda_kstep_upload
+    bank = model._cuda_kstep_request_bank
+    bank.scatter(workspace, model._cuda_kstep_bank_indices)
+    refreshes = []
+    gather = bank.gather
 
-    def upload(*args):
-        uploads.append(args[2])
-        return original(*args)
+    def tracked_gather(workspace, slots, refresh):
+        refreshes.extend(refresh)
+        return gather(workspace, slots, refresh)
 
-    monkeypatch.setattr(tts, "_cuda_kstep_upload", upload)
+    monkeypatch.setattr(bank, "gather", tracked_gather)
     assert prepare(("b", "a")) is workspace
     assert workspace.steps.tolist() == [4, 2]
     assert workspace.last_tokens.tolist() == [22, 11]
     assert workspace.storage_key() == pointers
-    assert not uploads
+    assert not refreshes
     # An eager step invalidates the device mirror even with an unchanged id.
     states["a"]["step"] = 3
     prepare()
-    assert "steps" in uploads
-    uploads.clear()
-    # Replacing the state object is a new request lifetime, not a cache hit.
+    assert [row[0] for row in refreshes] == [bank.entries["a"].slot]
+    assert workspace.steps.tolist() == [3, 4]
+    refreshes.clear()
+    # Replacing the state object is a new request lifetime.
     states["b"] = dict(states["b"])
     prepare()
-    assert "history" in uploads
+    assert [row[0] for row in refreshes] == [bank.entries["b"].slot]
 
 
 def test_cuda_kstep_parameters_reuse_staging_and_refresh_changes(monkeypatch):
@@ -1440,15 +1471,21 @@ def test_cuda_kstep_parameters_reuse_staging_and_refresh_changes(monkeypatch):
 
 
 def test_cuda_kstep_cleanup_drops_request_bank_and_rng_binding():
-    model = SimpleNamespace(
-        _deferred_cleanup_ids={"done"},
-        _request_audio_states={"done": {}, "live": {}},
-        _cuda_kstep_request_bank={"done": object(), "live": object()},
-        _cuda_kstep_rng_bindings={(1, 0): ("done", 1, 2, 3), (1, 1): ("live", 4, 5, 6)},
-    )
+    model, _, prepare = _cuda_prepare_stub()
+    prepare()
+    bank = model._cuda_kstep_request_bank
+    released = bank.entries["a"].slot
+    model._deferred_cleanup_ids = {"a"}
+    model._cuda_kstep_rng_bindings = {(1, 0): ("a", 1, 2, 3), (1, 1): ("b", 4, 5, 6)}
     MiniCPMO45OmniTTSForConditionalGeneration._flush_deferred_cleanup(model)
-    assert set(model._cuda_kstep_request_bank) == {"live"}
+    assert set(bank.entries) == {"b"}
     assert set(model._cuda_kstep_rng_bindings) == {(1, 1)}
+    model._request_audio_states["c"] = {"step": 9, "finished": False}
+    model._request_codec_history["c"] = [99]
+    workspace = prepare(("c", "b"))
+    assert bank.entries["c"].slot == released
+    assert workspace.steps.tolist() == [9, 4]
+    assert workspace.last_tokens.tolist() == [99, 22]
 
 
 def _bias_head_to(model, token_id: int):

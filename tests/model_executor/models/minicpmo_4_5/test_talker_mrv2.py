@@ -745,7 +745,7 @@ def test_draft_verification_at_forced_rows_with_the_rejection_kernels():
     assert batch.input_ids[:kept].tolist() == [5, 6] and valid[:kept].tolist() == [True, True]
 
 
-def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
+def test_talker_verifies_drafts_with_its_codec_sampler(mocker, monkeypatch):
     import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts as module
 
     talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
@@ -766,8 +766,7 @@ def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
     assert rejection.sampler._sampler is sampler
     assert rejection.talker is talker
     # Any draft method is refused at load where draft codes can't be verified.
-    # duplex K=0 hits the shared fail-closed raise; turn K>0 hits the
-    # K-step-specific raise pointing at session_mode: duplex.
+    monkeypatch.setattr(module.current_omni_platform, "is_cuda", lambda: False)
     for session, k_step, pattern in (
         ("duplex", 0, "turn sessions only"),
         ("turn", 2, "K-step frames require session_mode: duplex"),
@@ -778,6 +777,14 @@ def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
         talker._k_step_frames = k_step
         with pytest.raises(NotImplementedError, match=pattern):
             talker.mrv2_custom_sampler(sampler)
+    # K-step frames on a turn session sample inside the runner's frame
+    # orchestration, so no draft-code verification sampler is built.
+    talker.vllm_config = SimpleNamespace(
+        speculative_config=spec_config, model_config=SimpleNamespace(session_mode="turn")
+    )
+    talker._k_step_frames = 2
+    monkeypatch.setattr(module.current_omni_platform, "is_cuda", lambda: True)
+    assert talker.mrv2_custom_sampler(sampler) == ("talker-sampler", None)
 
 
 def test_drafter_loading_finds_the_codec_table_and_no_head(mocker):

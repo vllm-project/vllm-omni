@@ -66,12 +66,15 @@ import dataclasses
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.interfaces import supports_multi_frame_decode
+
+if TYPE_CHECKING:
+    from vllm_omni.worker.talker_cuda_graph import CUDANarrowStep
 
 logger = init_logger(__name__)
 
@@ -462,7 +465,8 @@ def run(
     frames: int,
     model_kwargs: dict[str, Any],
     model_kwargs_extra: dict[str, Any],
-    narrow: NarrowStep | None = None,
+    narrow: NarrowStep | CUDANarrowStep | None = None,
+    keep_cuda_narrow_on_decline: bool = False,
 ) -> Any:
     """Run ``frames`` codec frames and return the merged step output.
 
@@ -475,11 +479,11 @@ def run(
     spans = model_kwargs_extra["request_token_spans"]
     infos = model_kwargs_extra["model_intermediate_buffer"]
 
-    if narrow is not None and hasattr(narrow, "run_fused") and narrow.inputs_embeds.is_cuda:
-        from vllm_omni.worker.talker_cuda_graph import run_cuda_fused_step
+    from vllm_omni.worker.talker_cuda_graph import CUDANarrowStep, run_cuda_fused_step
 
+    if isinstance(narrow, CUDANarrowStep) and narrow.inputs_embeds.is_cuda:
         fused = run_cuda_fused_step(
-            narrow,  # type: ignore[arg-type]
+            narrow,
             model=model,
             model_kwargs={**model_kwargs, **model_kwargs_extra},
             intermediate_tensors=model_kwargs.get("intermediate_tensors"),
@@ -489,12 +493,9 @@ def run(
             model.set_batch_stop_logits(stops.reshape(-1, stops.shape[-1]))
             after_forward()
             return output
-        # The fused graph declined: staying inside the narrow context would run
-        # every frame eagerly under CUDAGraphMode.NONE (2.2x slower than the
-        # dispatcher graph the plain path replays). Restore the original
-        # context and fall through to the plain frame loop.
-        narrow.restore()  # type: ignore[attr-defined]
-        narrow = None
+        if not keep_cuda_narrow_on_decline:
+            narrow.restore()
+            narrow = None
 
     frame_outputs = []
     frame_stop_logits = []
@@ -566,7 +567,7 @@ def _write_frame_embeddings(
     spans: list[tuple[int, int]],
     infos: list[dict[str, Any]],
     frame: int,
-    narrow: NarrowStep | None = None,
+    narrow: NarrowStep | CUDANarrowStep | None = None,
 ) -> None:
     """Put frame ``frame``'s decode embedding into the row the graph reads.
 

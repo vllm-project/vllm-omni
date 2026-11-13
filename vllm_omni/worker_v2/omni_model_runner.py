@@ -39,6 +39,7 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import sanitize_sampling_params_min_tokens_stop_ids
 from vllm_omni.worker_v2 import staged_writes
@@ -616,13 +617,20 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     ) -> Any:
         from vllm.v1.worker.gpu.input_batch import InputBatch
 
-        return InputBatch.make_dummy(
+        batch = InputBatch.make_dummy(
             num_reqs,
             num_tokens,
             self.input_buffers,
             max_query_len=max_query_len,
             is_padding=is_padding,
         )
+        # Graph capture (and any other dummy pass) must never drive the K-frame
+        # loop: its batch carries no real codec history, yet the simulated
+        # schedule books a uniform multi-token span that the loop's engage
+        # check would otherwise accept (observed: 8x9 capture batch engaged a
+        # 9-frame fused graph, one frame too many, and the engine died).
+        self._omni_dummy_batch = batch
+        return batch
 
     def _forward_context(self, attn_metadata: Any, vllm_config: Any, **kwargs: Any):
         """Forward-context scope. NPU replaces this with the Ascend context."""
@@ -693,6 +701,443 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         if skip_drafts:
             return 0
         return scheduler_output.num_spec_tokens_to_schedule
+
+    def _talker_kstep_frames(self) -> int:
+        if not current_omni_platform.is_cuda() or not getattr(self.model, "supports_multi_frame_decode", False):
+            return 0
+        from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
+
+        return talker_kstep_frames(self.model_config.model_stage, self.vllm_config.speculative_config)
+
+    def _dummy_sampler_run(self, hidden_states: Any) -> Any:
+        """Skip the sampler warmup while the Talker multi-frame loop is armed.
+
+        Under K-step ``compute_logits`` emits the two-wide continue/stop row
+        (the codec stream is sampled in-model), but the sampler's profile pass
+        asks for ``num_logprobs`` top-k scores, which is wider than 2 and trips
+        ``torch.topk``. The first real step compiles the sampler kernels
+        instead; that cost lands once, off the critical path.
+        """
+        if self._talker_kstep_frames() > 1:
+            return None
+        return super()._dummy_sampler_run(hidden_states)
+
+    def _build_kstep_model_kwargs_extra(self, model_inputs: dict[str, Any], input_batch: Any) -> dict[str, Any]:
+        """Per-step omni kwargs the Talker multi-frame loop reads.
+
+        Mirrors the V1 runner's ``_build_model_kwargs_extra``: the per-request
+        runtime buffers (the model state already gathered them into
+        ``model_inputs``) plus the exact hidden-row spans this step scheduled.
+        The loop only engages on a uniform decode (every request scheduled the
+        same K positions); everything else declines to the single forward.
+        """
+        extra: dict[str, Any] = {
+            "model_intermediate_buffer": model_inputs.get("model_intermediate_buffer"),
+            "runtime_additional_information": model_inputs.get("runtime_additional_information"),
+        }
+        num_reqs = int(input_batch.num_reqs)
+        nstp = input_batch.num_scheduled_tokens
+        counts = [int(nstp[i]) for i in range(num_reqs)]
+        spans: list[tuple[int, int]] = []
+        start = 0
+        for count in counts:
+            spans.append((start, start + count))
+            start += count
+        extra["request_token_spans"] = spans
+        # Tag prefilling rows: their spans are multi-token by construction, and
+        # both the loop's engage check and the multi-token guard must see them
+        # as prefill, not as a decode step whose frame loop declined.
+        prefilling = getattr(input_batch, "is_prefilling_np", None)
+        buffers = extra.get("model_intermediate_buffer")
+        if prefilling is not None and isinstance(buffers, (list, tuple)):
+            # Copy only the prefill rows: decode rows must stay the very dict
+            # the preprocess hooks write through, so the state they seed is
+            # visible to the loop on this same step.
+            marked = []
+            for index, info in enumerate(buffers):
+                if isinstance(info, dict) and index < len(prefilling) and bool(prefilling[index]):
+                    prefill_info = dict(info)
+                    prefill_info["_omni_is_prefill"] = True
+                    marked.append(prefill_info)
+                else:
+                    marked.append(info)
+            extra["model_intermediate_buffer"] = marked
+            extra["runtime_additional_information"] = marked
+        model = getattr(self, "model", None)
+        talker = getattr(model, "talker", model)
+        states = getattr(talker, "_request_audio_states", {})
+        for info in extra.get("model_intermediate_buffer") or []:
+            if isinstance(info, dict) and info.get("req_id") in states:
+                info["request_id"] = info["req_id"]
+                info["audio_state"] = states[info["req_id"]]
+        # The loop's prepare path declines ineligible rows; decode rows of a
+        # uniform step are always eligible. Params stay None so the model's
+        # stage defaults apply (V1 parity).
+        # The first K-frame decode step can arrive before any prefill-time
+        # advance of the request's Talker state. Seed only from a confirmed
+        # non-placeholder codec id; a missing seed must fall back to the
+        # single-frame path rather than silently conditioning on CONTINUE.
+        extra["request_sample_eligible"] = [True] * num_reqs
+        seed_ids = model_inputs.get("input_ids")
+        for index, info in enumerate(buffers or []):
+            if not isinstance(info, dict) or index >= len(extra["request_sample_eligible"]):
+                continue
+            from vllm_omni.worker_v2.warmup import is_warmup_request
+
+            if is_warmup_request(str(info.get("req_id") or info.get("request_id", index))):
+                extra["request_sample_eligible"][index] = False
+                continue
+            if prefilling is not None and index < len(prefilling) and bool(prefilling[index]):
+                # Prefill rows: the model's codec chain samples the prefill
+                # frame itself on the plain path (V1 parity). Seeding here
+                # would gate that chain off via sample_eligible and write a
+                # text-token last_code into a per-step buffer copy.
+                continue
+            state = info.get("audio_state")
+            if not isinstance(state, dict):
+                state = {}
+                info["audio_state"] = state
+            if state.get("finished") or int(state.get("step", 0)) > 0:
+                continue
+            row = int(spans[index][0]) if index < len(spans) else -1
+            seeded = None
+            handoff = info.get("audio_codes")
+            if not isinstance(handoff, dict):
+                handoff = info.get("codes")
+            candidates = []
+            if isinstance(handoff, dict):
+                for key in ("accumulated", "current", "audio"):
+                    handoff_value = handoff.get(key)
+                    if handoff_value is not None:
+                        candidates.append(handoff_value)
+            elif handoff is not None:
+                candidates.append(handoff)
+            for handoff_value in candidates:
+                if isinstance(handoff_value, torch.Tensor):
+                    if handoff_value.numel():
+                        candidate = int(handoff_value.reshape(-1)[-1].item())
+                    else:
+                        continue
+                elif isinstance(handoff_value, (list, tuple)) and handoff_value:
+                    candidate = int(handoff_value[-1])
+                else:
+                    continue
+                if candidate > 0:
+                    seeded = candidate
+                    break
+            if seeded is None and seed_ids is not None and row >= 0:
+                try:
+                    tok = seed_ids[row] if getattr(seed_ids, "ndim", 1) == 1 else seed_ids[row, 0]
+                    candidate = int(tok.item())
+                    if candidate > 0:
+                        seeded = candidate
+                except (IndexError, RuntimeError, TypeError, ValueError):
+                    pass
+            if seeded is None:
+                # MRv2 prefill seeds frame 1 into the Talker's confirmed
+                # history (make_omni_output_mrv2) and into its own audio state,
+                # but the per-step runtime buffer handed to the K-frame loop
+                # can be a fresh dict that carries only the sampling knobs. In
+                # a concurrent tier that left ``audio_codes``/``last_code``
+                # missing here, so the row was marked sample_eligible=False:
+                # the frame loop then emits only ``continue``, never advances
+                # state["step"], and ``state.step < min_tokens`` masks codec
+                # EOS forever (C4-C32 audio pinned at the frame cap). Fall back
+                # to the confirmed frame before disabling sampling.
+                # The Talker stage's model IS MiniCPMO45OmniTTSForConditional-
+                # Generation: make_omni_output_mrv2 and the confirmed-history
+                # / audio-state dicts live on self.model directly, not on a
+                # nested ``talker`` submodule (that name belongs to the Thinker
+                # wrapper on another stage).
+                _talker = getattr(self, "model", None)
+                if _talker is not None:
+                    # Prefill seeds under ``info["request_id"]``; the runner's
+                    # runtime buffer may key the same request by ``req_id``.
+                    # Try both before giving up on the seed.
+                    _rids = [
+                        str(info.get("request_id") or ""),
+                        str(info.get("req_id") or ""),
+                        str(index),
+                    ]
+                    for _rid in dict.fromkeys(r for r in _rids if r):
+                        _hist = getattr(_talker, "_request_codec_history", {}).get(_rid) or []
+                        if _hist:
+                            try:
+                                _candidate = int(_hist[-1])
+                                if _candidate > 0:
+                                    seeded = _candidate
+                            except (TypeError, ValueError):
+                                pass
+                        if seeded is None:
+                            _st = getattr(_talker, "_request_audio_states", {}).get(_rid) or {}
+                            _lc = _st.get("last_code") if isinstance(_st, dict) else None
+                            if isinstance(_lc, int) and _lc > 0:
+                                seeded = _lc
+                        if seeded is not None:
+                            break
+            if seeded is None:
+                state["_kstep_seed_missing"] = True
+                extra["request_sample_eligible"][index] = False
+                continue
+            state.pop("_kstep_seed_missing", None)
+            state["last_code"] = seeded
+            state["_kstep_last_code"] = (
+                seed_ids.new_tensor([seeded])
+                if isinstance(seed_ids, torch.Tensor)
+                else torch.tensor([seeded], dtype=torch.long)
+            )
+            state["step"] = 1
+        # MRv2 buffers carry the real request id under ``req_id`` and the
+        # request's SamplingParams under ``sampling_params``. The V1 K-step
+        # branch keys its host state by ``request_id`` and merges those params
+        # (min/max/stop/codec-EOS contract) into it; index ids plus [None]
+        # params made every frame see a fresh, contract-less state, so the
+        # codec stream ran to the 2048-frame ceiling (80 s of audio for a
+        # 51-char answer).
+        active_buffers = extra.get("model_intermediate_buffer") or []
+        for info in active_buffers:
+            if isinstance(info, dict) and "request_id" not in info and info.get("req_id") is not None:
+                info["request_id"] = str(info["req_id"])
+        extra["request_sampling_params"] = [
+            info.get("sampling_params") if isinstance(info, dict) else None for info in active_buffers
+        ]
+        extra["request_max_tokens_remaining"] = [None] * num_reqs
+        # The Thinker ends an utterance by injecting the codec EOS id into the
+        # Talker's input stream; the single-frame path reads it as ``last_ids``
+        # and forces EOS. A speculative K-row step's inputs are constant
+        # ``continue`` drafts, so the only place that signal can appear is the
+        # bonus row (span start). Without detecting it here the K-frame loop
+        # never sees the turn end and keeps emitting until ``step >= limit``
+        # (787 frames / 31 s of audio for a 51-char answer). Marking the state
+        # finished makes the loop skip the row and the draft supply stop, so
+        # the engine finishes the request on the same step as the single-frame
+        # path would.
+        model = getattr(self, "model", None)
+        talker = getattr(model, "talker", None) if model is not None else None
+        codec_eos = getattr(talker if talker is not None else model, "_codec_eos_id", None)
+        ib_ids = getattr(input_batch, "input_ids", None)
+        logits_idx = getattr(input_batch, "logits_indices", None)
+        if codec_eos is not None and int(codec_eos) > 0 and ib_ids is not None and logits_idx is not None:
+            try:
+                # logits_indices point at the last speculative draft row, which
+                # is always the constant continue id; the real previous token
+                # (and the upstream codec EOS) sits on each request's first
+                # (bonus) row, i.e. the span start.
+                last_ids = ib_ids.index_select(0, logits_idx[:num_reqs].long())
+                bonus_rows = torch.tensor(
+                    [int(span[0]) for span in spans[:num_reqs]],
+                    device=ib_ids.device,
+                    dtype=torch.long,
+                )
+                bonus_ids = ib_ids.index_select(0, bonus_rows)
+                eos_rows = (
+                    ((last_ids == int(codec_eos)) | (bonus_ids == int(codec_eos)))
+                    .nonzero(as_tuple=False)
+                    .flatten()
+                    .tolist()
+                )
+            except (RuntimeError, IndexError, AttributeError, TypeError):
+                eos_rows = []
+            for index in eos_rows:
+                if index >= len(active_buffers):
+                    continue
+                info = active_buffers[index]
+                if not isinstance(info, dict):
+                    continue
+                state = info.get("audio_state")
+                if isinstance(state, dict):
+                    state["finished"] = True
+        return extra
+
+    def _rewrite_kstep_initial_embeds(
+        self,
+        inputs_embeds: Any,
+        extra: dict[str, Any],
+        spans: list[tuple[int, int]],
+        input_ids: Any = None,
+    ) -> None:
+        """Replace each request's first-frame embed with its real last codec.
+
+        A speculative decode step embeds the *drafts* (constant ``continue``
+        ids), but the K-frame graph's first frame must be conditioned on the
+        codec frame the request actually emitted last -- the in-graph feedback
+        (``emb_code`` on the sampled frame) carries frames 2..K but nothing can
+        fix frame 1 from inside. Without this rewrite the model conditions on
+        the placeholder embed every step and its codec stream never converges
+        to EOS (observed as 80 s of runaway audio for a 51-char answer).
+        """
+        infos = extra.get("model_intermediate_buffer") or []
+        emb = getattr(self.model, "emb_code", None)
+        if emb is None:
+            talker_module = getattr(self.model, "talker", None)
+            if talker_module is not None:
+                emb = getattr(talker_module, "emb_code", None)
+        if not infos or not spans or inputs_embeds is None or emb is None:
+            return
+        try:
+            emb_rows = int(emb[0].weight.shape[0])
+        except (AttributeError, IndexError, TypeError, RuntimeError):
+            emb_rows = None
+        rows: list[int] = []
+        codes: list[int] = []
+        row_infos: list[dict[str, Any]] = []
+        for index, span in enumerate(spans):
+            try:
+                start, end = int(span[0]), int(span[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            # A K-row span books K rows for this request; the fused graph
+            # conditions frame 1 on the first of them and rebuilds the rest
+            # from the in-graph feedback, so only that row is rewritten.
+            if end <= start or index >= len(infos):
+                continue
+            info = infos[index]
+            state = info.get("audio_state") if isinstance(info, dict) else None
+            if not isinstance(state, dict):
+                continue
+            code = None
+            # Use the last emitted codec, which can differ from the last packed frame.
+            confirmed = None
+            if isinstance(info, dict):
+                host = getattr(self.model, "talker", None)
+                if host is None or not hasattr(host, "_request_codec_history"):
+                    host = self.model
+                history = getattr(host, "_request_codec_history", {})
+                for _rid_key in (info.get("request_id"), info.get("req_id")):
+                    if _rid_key is None:
+                        continue
+                    confirmed = history.get(str(_rid_key))
+                    if confirmed:
+                        break
+            if confirmed:
+                code = int(confirmed[-1])
+            # Only confirmed history or the explicit previous-frame shadow may
+            # condition the first row. ``state["codes"]`` is a full-width
+            # device mirror and its last element can be an un-emitted row.
+            if code is None:
+                device_last = state.get("_kstep_last_code")
+                if isinstance(device_last, torch.Tensor) and device_last.numel():
+                    candidate = int(device_last.reshape(-1)[-1].item())
+                    if candidate > 0:
+                        code = candidate
+            if code is None:
+                last_code = state.get("last_code")
+                if isinstance(last_code, int) and last_code > 0:
+                    code = last_code
+            if code is None and int(state.get("step", 0)) <= 1:
+                # V1 parity (preprocess_decode_batch embeds ``input_ids[-1:]``):
+                # at the first decode step the row's committed token is the
+                # PROMPT's last token, so the first K-row's codec slot must be
+                # that same id. The K-step's ``input_ids`` rows here carry the
+                # constant draft continues (0), not the prompt tail, so read
+                # the prompt ids from the request info first and only fall
+                # back to ``input_ids`` when the info carries none.
+                # Later K-steps resolve through the confirmed history above
+                # and never reach this fallback.
+                _ptids = info.get("prompt_token_ids") if isinstance(info, dict) else None
+                candidate = 0
+                if _ptids:
+                    try:
+                        candidate = int(_ptids[-1])
+                    except (TypeError, ValueError, IndexError):
+                        candidate = 0
+                if not candidate and input_ids is not None and int(input_ids.numel()) > start:
+                    try:
+                        candidate = int(input_ids[start].item())
+                    except (RuntimeError, IndexError, ValueError):
+                        candidate = 0
+                if candidate > 0 and (emb_rows is None or candidate < emb_rows):
+                    # The prompt tail normally lives in the text-vocab space
+                    # (audio placeholder ids), not the codec space; embedding
+                    # an out-of-range id trips a device-side index assert, so
+                    # only accept candidates the codec table can actually
+                    # embed.
+                    code = candidate
+            if code is None or code <= 0:
+                continue
+            rows.append(start)
+            codes.append(code)
+            row_infos.append(info)
+        if not rows:
+            return
+        tokens = torch.tensor(codes, device=inputs_embeds.device, dtype=torch.long).unsqueeze(1)
+        vectors = emb[0](tokens).to(inputs_embeds.dtype).reshape(len(rows), -1)
+        inputs_embeds[rows] = vectors
+        for code, info in zip(codes, row_infos, strict=True):
+            state = info["audio_state"]
+            state["_kstep_last_code"] = code
+            state["last_code"] = code
+        if input_ids is not None:
+            input_ids[rows] = tokens.view(-1).to(input_ids.dtype)
+
+    def _run_kstep_model_forward(
+        self,
+        model_inputs: dict[str, Any],
+        frames: int,
+        extra: dict[str, Any],
+    ) -> Any:
+        """Execute each codec frame against its own one-query attention view."""
+        from vllm.forward_context import get_forward_context
+
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        spans = extra.get("request_token_spans") or []
+        # Replace the first placeholder with the confirmed previous codec.
+        self._rewrite_kstep_initial_embeds(
+            model_inputs.get("inputs_embeds"), extra, spans, model_inputs.get("input_ids")
+        )
+        from vllm_omni.worker.talker_cuda_graph import begin_cuda_narrow_step
+
+        # The eager fallback needs the same per-frame positions and KV slots
+        # as graph replay. Reusing the wide context would overwrite KV entries.
+        narrow = begin_cuda_narrow_step(
+            forward_context=get_forward_context(),
+            frames=frames,
+            positions=model_inputs["positions"],
+            inputs_embeds=model_inputs.get("inputs_embeds"),
+            spans=spans,
+            graph_owner=self,
+        )
+        if narrow is None:
+            raise RuntimeError("MiniCPM-o MRv2 K-step requires a one-query CUDA attention view")
+
+        def run_model() -> Any:
+            active = narrow is not None and getattr(narrow, "context", None) is not None
+            kwargs = dict(model_inputs)
+            kwargs["input_ids"] = None if active else model_inputs.get("input_ids")
+            kwargs["positions"] = narrow.positions if active else model_inputs["positions"]
+            kwargs["inputs_embeds"] = narrow.inputs_embeds if active else model_inputs.get("inputs_embeds")
+            kwargs.update(extra)
+            return self.model(**kwargs)
+
+        try:
+            model_output = talker_multiframe.run(
+                model=self.model,
+                run_model=run_model,
+                after_forward=lambda: None,
+                inputs_embeds=model_inputs.get("inputs_embeds"),
+                input_ids=model_inputs.get("input_ids"),
+                frames=frames,
+                # ``run`` calls ``make_omni_output(hidden, **model_kwargs,
+                # **frame_kwargs)`` where frame_kwargs is built from
+                # model_kwargs_extra. v2's model_inputs carries the same omni
+                # extras (model_intermediate_buffer, ...); passing both would
+                # raise "got multiple values for keyword argument".
+                model_kwargs={k: v for k, v in model_inputs.items() if k not in extra},
+                model_kwargs_extra=extra,
+                narrow=narrow,
+                keep_cuda_narrow_on_decline=True,
+            )
+        finally:
+            if narrow is not None:
+                narrow.restore()
+        # The Talker's vLLM-level head is the two-wide continue/stop row; the
+        # rejection sampler drops every accepted token without this gate.
+        stop_rows = getattr(self.model, "batch_stop_logits", None)
+        talker_multiframe.ensure_stop_token_vocab(
+            self, stop_rows if stop_rows is not None else model_output.text_hidden_states
+        )
+        return model_output
 
     @torch.inference_mode()
     @staged_writes.runner_context
@@ -912,11 +1357,34 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
 
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
+        # --- Omni: Talker multi-frame (K-step) decode ---
+        # A decode step that schedules K positions per request runs K codec
+        # frames through the platform-neutral ``talker_multiframe`` loop (the
+        # same one the V1 runner calls): the loop re-embeds the real previous
+        # codec frame per frame and owns its own graph. The v2 graph manager is
+        # bypassed for these steps so the two graph layers cannot stack.
+        kstep_frames = 0
+        kstep_extra: dict[str, Any] = {}
+        if not dummy_run and not is_profile:
+            from vllm_omni.platforms.npu.worker import talker_multiframe
+
+            expected_frames = self._talker_kstep_frames()
+            if expected_frames and not any(is_warmup_request(req_id) for req_id in input_batch.req_ids):
+                self.model.flush_cuda_kstep_feedback()
+                kstep_extra = self._build_kstep_model_kwargs_extra(model_inputs, input_batch)
+            if kstep_extra and scheduler_output.scheduled_spec_decode_tokens:
+                kstep_frames = talker_multiframe.applies(self.model, kstep_extra)
+                if kstep_frames != expected_frames:
+                    raise RuntimeError(
+                        f"MiniCPM-o scheduled {expected_frames}-frame Talker drafts "
+                        "without an executable multi-frame decode batch"
+                    )
+
         # Target layers a drafter reads (EAGLE-3, DFlash, DSpark). They ride in
         # the forward's tuple output, separate from the Omni auxiliary output.
         draft_aux_hidden_states = None
         # --- Model forward ---
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+        if batch_desc.cg_mode == CUDAGraphMode.FULL and kstep_frames <= 1:
             # FULL graph replay.  Preprocess already wrote to the static
             # inputs_embeds buffer above.
             assert self.cudagraph_manager is not None
@@ -965,7 +1433,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     is_padding=input_batch.is_padding,
                 ):
                     self.kv_connector.pre_forward(scheduler_output)
-                    if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                    if kstep_frames > 1:
+                        model_output = self._run_kstep_model_forward(model_inputs, kstep_frames, kstep_extra)
+                    elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
                         assert self.cudagraph_manager is not None
                         model_output = self.cudagraph_manager.run_pw_graph(
                             self.model,
@@ -980,6 +1450,41 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             finally:
                 if runner_assisted_full_attn:
                     self.model.set_runner_assisted_full_attention_metadata_context(enabled=False)
+
+            if (
+                not dummy_run
+                and isinstance(model_output, torch.Tensor)
+                and getattr(self.model, "make_omni_output", None) is not None
+                # MRv2 exception: when the model exposes the MRv2
+                # device-side chain, that chain owns every step (prefill
+                # included) via model_state.postprocess_model_output.
+                # Running the V1 chain here first would return a
+                # truthy-multimodal OmniOutput whose
+                # _last_multimodal_outputs makes postprocess_model_output
+                # skip the MRv2 chain, so the prefill frame never gets
+                # sampled and the first K-row conditions on the placeholder
+                # codec embedding (observed 2026-11-10: ~2x audio duration,
+                # every first-frame rewrite missing the codec history).
+                and getattr(self.model, "make_omni_output_mrv2", None) is None
+                and not any(is_warmup_request(str(rid)) for rid in scheduler_output.num_scheduled_tokens)
+            ):
+                # V1 parity (gpu_model_runner.py:2467): every plain step, the
+                # prefill step included, must run the talker's codec chain so
+                # each request's audio state is created under its real request
+                # id with the sampled prefill frame and the codec contract.
+                # Without it the K-step loop engaged a step late on placeholder
+                # conditions and the stream diverged from frame one. OmniOutput
+                # results (the K-step frame loop) already carry their own
+                # bookkeeping and pass through untouched.
+                # Synthetic steps are excluded: the kernel warmup drives
+                # execute_model with dummy_run=False but `_warmup_*` requests
+                # and fabricated spec metadata; running the chain there
+                # registers bogus audio states and desyncs the sampler's
+                # codec-window warmup (observed 2026-11-10:
+                # _apply_codec_window_penalty_gpu scatter shape crash).
+                plain_kwargs = dict(model_inputs)
+                plain_kwargs.update(kstep_extra or {})
+                model_output = self.model.make_omni_output(model_output, **plain_kwargs)
 
             # Extract hidden_states from model output.
             self._last_aux_output = None
@@ -996,6 +1501,15 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     self.model._last_captured_layers = self._last_aux_output
             else:
                 hidden_states = model_output
+        if kstep_extra and kstep_frames == 0 and isinstance(hidden_states, torch.Tensor):
+            kstep_extra["request_sample_eligible"] = [
+                int(input_batch.num_computed_prefill_tokens_np[i]) + int(input_batch.num_scheduled_tokens[i])
+                >= int(input_batch.prefill_len_np[i])
+                for i in range(input_batch.num_reqs)
+            ]
+            output = self.model.make_omni_output(hidden_states, **kstep_extra)
+            hidden_states = output.text_hidden_states
+            self._last_multimodal_outputs = output.multimodal_outputs
         if (
             not dummy_run
             and isinstance(hidden_states, torch.Tensor)
