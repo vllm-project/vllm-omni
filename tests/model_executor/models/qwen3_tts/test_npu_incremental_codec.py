@@ -190,3 +190,56 @@ def test_selected_row_stores_preserve_unrelated_and_strided_state():
         expected = target.clone().index_copy_(0, indices, source)
         scatter_rows(target, indices, source)
         torch.testing.assert_close(target, expected, atol=0, rtol=0)
+
+
+def test_eager_loader_skips_requested_conv_capture(monkeypatch):
+    pytest.importorskip("torch_npu")
+    from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
+    from vllm_omni.platforms.npu.layers import codec_graph
+    from vllm_omni.platforms.npu.models import qwen3_tts
+
+    decoder = _make_decoder()
+    model = SimpleNamespace(
+        decoder=decoder,
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                enforce_eager=True,
+                stage_connector_config={
+                    "extra": {"npu_conv_graph_shapes": [[1, 1], [2, 37]]},
+                },
+            ),
+            device_config=SimpleNamespace(device="cpu"),
+        ),
+    )
+    monkeypatch.setattr(qwen3_tts, "_original_load_weights", lambda *_: {"loaded"})
+    monkeypatch.setattr(qwen3_tts, "_prepare_npu_decoder_weights", lambda _: None)
+    capture = Mock(side_effect=AssertionError("enforce_eager must not capture"))
+    monkeypatch.setattr(codec_graph, "NPUCodecGraphs", capture)
+    assert qwen3_tts._patched_load_weights(model, []) == {"loaded"}
+    assert decoder._npu_conv_graphs is None
+    capture.assert_not_called()
+
+
+@torch.inference_mode()
+def test_incremental_attention_does_not_change_stateless_backend():
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("NPU required")
+    from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
+    from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec
+    from vllm_omni.platforms.npu.models.qwen3_tts import _prepare_npu_code2wav_runtime
+
+    _prepare_npu_code2wav_runtime()
+    decoder = _make_decoder().to(device="npu", dtype=torch.bfloat16).eval()
+    decoder.pre_transformer.config._attn_implementation = "sdpa"
+    decoder.precompute_snake_caches()
+    codes = torch.randint(0, 32, (1, 2, 4), device="npu")
+    expected = decoder(codes)
+    arena = NPUIncrementalCodec(decoder, slots=1, max_batch=1, chunk_frames=4)
+    try:
+        assert decoder.pre_transformer.config._attn_implementation == "sdpa"
+        assert torch.isfinite(arena.decode_requests(codes, [4], [{}])[0]).all()
+        torch.testing.assert_close(decoder(codes), expected, atol=0, rtol=0)
+        assert decoder.pre_transformer.config._attn_implementation == "sdpa"
+    finally:
+        arena.close()

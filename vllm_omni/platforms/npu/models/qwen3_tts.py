@@ -134,7 +134,9 @@ def _patched_load_weights(self, weights):
         ):
             raise ValueError("npu_conv_graph_shapes must contain positive [batch, frames] pairs")
         if getattr(self.vllm_config.model_config, "enforce_eager", False):
-            raise ValueError("npu_conv_graph_shapes requires enforce_eager=false")
+            logger.warning("Skipping npu_conv_graph_shapes because enforce_eager=true")
+            shapes = []
+    if shapes:
         from vllm_omni.platforms.npu.layers.codec_graph import NPUCodecGraphs
 
         with torch.inference_mode():

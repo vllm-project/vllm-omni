@@ -6,15 +6,15 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["numel", "channels", "length"])
 def _snake(
     x_ptr,
     alpha_ptr,
     inverse_ptr,
     out_ptr,
-    numel: tl.constexpr,
-    channels: tl.constexpr,
-    length: tl.constexpr,
+    numel,
+    channels,
+    length,
     block: tl.constexpr,
 ):
     offsets = tl.program_id(0) * block + tl.arange(0, block)

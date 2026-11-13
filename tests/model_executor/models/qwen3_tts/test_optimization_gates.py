@@ -63,3 +63,36 @@ def test_rocm_does_not_probe_cuda_pdl_capability(monkeypatch):
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: pytest.fail("NVIDIA-only capability probe"))
     assert not _pdl_supported(torch.device("cuda"))
+
+
+@pytest.mark.parametrize("is_npu,enabled", [(False, True), (True, True), (True, False)])
+def test_frame_graph_only_disables_npu_outer_mtp(monkeypatch, is_npu, enabled):
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.qwen3_tts import qwen3_tts_talker as talker_module
+    from vllm_omni.platforms import current_omni_platform
+
+    class ReachedBackboneError(Exception):
+        pass
+
+    def stop_before_weights(**kwargs):
+        raise ReachedBackboneError
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: is_npu)
+    monkeypatch.setattr(talker_module, "talker_stream_decode_enabled", lambda _: False)
+    monkeypatch.setattr(talker_module, "Qwen3Model", stop_before_weights)
+    config = SimpleNamespace(
+        model="unused",
+        stage_connector_config={"extra": {"code_predictor_frame_graph": enabled}},
+        hf_config=SimpleNamespace(
+            talker_config=SimpleNamespace(
+                code_predictor_config=SimpleNamespace(vocab_size=32),
+                hidden_size=16,
+                num_code_groups=2,
+            )
+        ),
+    )
+    talker = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
+    with pytest.raises(ReachedBackboneError):
+        talker.__init__(vllm_config=SimpleNamespace(model_config=config))
+    assert talker.talker_mtp_graph_safe is not (is_npu and enabled)

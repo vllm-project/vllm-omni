@@ -95,3 +95,27 @@ def test_fused_snake_graph_replay():
     finally:
         torch.npu.synchronize()
         graph.reset()
+
+
+@torch.inference_mode()
+def test_changing_streaming_shapes_reuses_compiled_kernel(monkeypatch):
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("NPU required")
+    from unittest.mock import Mock
+
+    from vllm_omni.platforms.npu.layers.snake_beta import _snake
+
+    def run(shape):
+        snake = SnakeBeta(shape[1]).to(device="npu", dtype=torch.bfloat16).eval()
+        snake.precompute_exp_cache()
+        x = torch.randn(shape, device="npu", dtype=torch.bfloat16)
+        snake.npu_fused = True
+        torch.testing.assert_close(snake(x), snake._eager_forward(x), atol=0.03125, rtol=0.01)
+
+    run((1, 8, 128))
+    compile_kernel = Mock(wraps=_snake._do_compile)
+    monkeypatch.setattr(_snake, "_do_compile", compile_kernel)
+    for shape in [(2, 8, 17), (4, 32, 480), (1, 64, 1920), (1, 8, 1)]:
+        run(shape)
+    compile_kernel.assert_not_called()

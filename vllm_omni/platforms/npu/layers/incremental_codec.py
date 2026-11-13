@@ -100,6 +100,7 @@ class _ShapeGraph:
                 use_cache=True,
                 cache_position=positions,
                 position_embeddings=rotary,
+                force_eager_attention=True,
             )
         hidden = transformer.output_proj(transformer.norm(hidden)).permute(0, 2, 1)
         for blocks in decoder.upsample:
@@ -190,13 +191,8 @@ class NPUIncrementalCodec:
         self.free = list(range(slots))
         self.graphs: dict[tuple[int, int, int], _ShapeGraph] = {}
         self.streams = [torch.npu.Stream(device=self.device) for _ in range(2)] if streams == 2 else []
-        # The additive sliding mask is consumed by eager attention. sdpa's
-        # mask contract differs and would change which keys a frame sees.
-        decoder.pre_transformer.config._attn_implementation = "eager"
-        # Conv1d is lowered to Conv2D. Internal formats make that an aclop,
-        # which cannot be captured. The Code2Wav loader sets the same flag.
-        torch.npu.config.allow_internal_format = False
-        torch.npu.set_compile_mode(jit_compile=False)
+        # Runtime formats are prepared by the NPU Code2Wav loader. Attention
+        # selection is local to each incremental call; preserve the shared config.
         self.prewarm()
 
     def prewarm(self) -> None:
