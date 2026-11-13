@@ -7,6 +7,12 @@ from typing import Any
 
 from PIL import Image
 
+QWEN_IMAGE_21_EXTRA_BODY_PARAMS = frozenset(
+    {
+        "sigmas",
+    }
+)
+
 
 def build_image_to_image_prompt(
     prompt: str,

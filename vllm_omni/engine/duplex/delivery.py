@@ -24,9 +24,27 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
-from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent, ErrorEvent, ResponseDone, SessionClosed
+from vllm_omni.engine.duplex.events import (
+    AudioDelta,
+    DuplexEvent,
+    ErrorEvent,
+    ResponseDone,
+    SessionClosed,
+    SessionUpdated,
+)
 
 _MAX_TERMINAL_BYTES = 4096
+
+
+def _is_retained_update_outcome(event: DuplexEvent, event_id: str | None) -> bool:
+    """Whether ``event`` settles the ``session.update`` retained for ``event_id``.
+
+    One update is in flight, so the next ``session.updated`` is its acceptance.
+    A rejection is the error whose ``related_event_id`` is that update's id.
+    """
+    if isinstance(event, SessionUpdated):
+        return True
+    return isinstance(event, ErrorEvent) and bool(event_id) and event.related_event_id == event_id
 
 
 class DuplexOutputOverflowError(RuntimeError):
@@ -71,6 +89,21 @@ class DuplexOutputBuffer:
         self._waiter: tuple[asyncio.AbstractEventLoop, asyncio.Future[None]] | None = None
         self._closed = False
         self._terminal: SessionClosed | None = None
+        # Accepted or rejected session updates, recorded at enqueue so a reader
+        # still sees them after the consumer dequeues them for the wire.
+        self._observation_seq = 0
+        self._observe_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
+        # One outstanding session.update keeps its own copy until the reader
+        # that submitted it consumes the acceptance or the matching rejection.
+        self._retention_after: int | None = None
+        self._retention_event_id: str | None = None
+        self._retention_sealed = False
+        self._retained: list[tuple[int, DuplexEvent]] = []
+        # Latest accepted session payload, with a monotonic generation. Reader
+        # and pump both apply "latest if newer" so a later update is not
+        # overwritten when an earlier session.updated is finally dequeued.
+        self._accepted_session_seq = 0
+        self._accepted_session: dict[str, object] | None = None
 
     @property
     def pending_bytes(self) -> int:
@@ -121,9 +154,29 @@ class DuplexOutputBuffer:
                 self._reserved_events += 1
             else:
                 self._bytes += size
+            observe_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
+            if isinstance(event, SessionUpdated | ErrorEvent):
+                self._observation_seq += 1
+                if isinstance(event, SessionUpdated):
+                    self._accepted_session_seq += 1
+                    self._accepted_session = dict(event.session)
+                if (
+                    self._retention_after is not None
+                    and not self._retention_sealed
+                    and self._observation_seq > self._retention_after
+                    and _is_retained_update_outcome(event, self._retention_event_id)
+                ):
+                    # Only the settling event. Unrelated errors must not grow
+                    # this list: it outlives the outbox budget until disarm.
+                    self._retained.append((self._observation_seq, event))
+                    self._retention_sealed = True
+                observe_waiters = self._observe_waiters
+                self._observe_waiters = []
             waiter = self._waiter
             self._waiter = None
         self._notify(waiter)
+        for observe_waiter in observe_waiters:
+            self._notify(observe_waiter)
         return True
 
     @staticmethod
@@ -160,6 +213,65 @@ class DuplexOutputBuffer:
         """Check the current dequeued event; use ``guard`` for an atomic handoff."""
         with self._lock:
             return self._is_valid(event)
+
+    def latest_accepted_session(self) -> tuple[int, dict[str, object] | None]:
+        """Newest accepted ``session.updated`` payload, or ``(0, None)`` if none."""
+        with self._lock:
+            if self._accepted_session is None:
+                return 0, None
+            return self._accepted_session_seq, dict(self._accepted_session)
+
+    def observation_seq(self) -> int:
+        """How many ``session.updated`` / ``error`` events have been enqueued."""
+        with self._lock:
+            return self._observation_seq
+
+    def arm_observation_retention(self, after_seq: int, event_id: str) -> None:
+        """Keep this update's settling event until the reader consumes it.
+
+        ``after_seq`` is ``observation_seq()`` sampled before the update is
+        submitted. Only the next ``session.updated`` or the error with
+        ``event_id`` is stored; unrelated errors are not.
+        """
+        with self._lock:
+            self._retention_after = after_seq
+            self._retention_event_id = event_id
+            self._retention_sealed = False
+            self._retained.clear()
+
+    def disarm_observation_retention(self) -> None:
+        """Drop the retained outcome."""
+        with self._lock:
+            self._retention_after = None
+            self._retention_event_id = None
+            self._retention_sealed = False
+            self._retained.clear()
+
+    def retained_observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
+        """The settling event for the outstanding update, if it has arrived."""
+        with self._lock:
+            return tuple(event for observed_seq, event in self._retained if observed_seq > seq)
+
+    async def wait_for_observation(self, seen: int) -> bool:
+        """Wait until a newer control event is enqueued.
+
+        Return false when the buffer is already closed and nothing newer than
+        ``seen`` arrived. A publish that lands before this waits is not missed.
+        """
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            if self._observation_seq > seen:
+                return True
+            if self._closed:
+                return False
+            future: asyncio.Future[None] = loop.create_future()
+            self._observe_waiters.append((loop, future))
+        try:
+            await future
+        finally:
+            with self._lock:
+                self._observe_waiters = [item for item in self._observe_waiters if item[1] is not future]
+        return True
 
     @contextmanager
     def guard(self, event: DuplexEvent) -> Iterator[bool]:
@@ -223,7 +335,11 @@ class DuplexOutputBuffer:
             self._terminal = event
             waiter = self._waiter
             self._waiter = None
+            observe_waiters = self._observe_waiters
+            self._observe_waiters = []
         self._notify(waiter)
+        for observe_waiter in observe_waiters:
+            self._notify(observe_waiter)
 
     @staticmethod
     def _notify(waiter: tuple[asyncio.AbstractEventLoop, asyncio.Future[None]] | None) -> None:

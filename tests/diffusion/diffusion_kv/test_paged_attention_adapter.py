@@ -1079,8 +1079,10 @@ def test_forward_rejects_padded_full_kv(monkeypatch: pytest.MonkeyPatch) -> None
         adapter.prepare_layer_context("layer-0", query, full_kv, full_kv)
 
 
+@pytest.mark.parametrize("fail_forward", [False, True])
 def test_runner_runtime_switches_from_prefill_to_reusable_denoise_metadata(
     monkeypatch: pytest.MonkeyPatch,
+    fail_forward: bool,
 ) -> None:
     adapter, _, _, _ = _make_adapter(monkeypatch)
     metadata = DiffusionPagedAttentionMetadata(
@@ -1097,10 +1099,21 @@ def test_runner_runtime_switches_from_prefill_to_reusable_denoise_metadata(
     )
     runtime = DiffusionPagedAttentionRuntime(adapter, metadata)
 
-    with set_forward_context(paged_kv_runtime=runtime), runtime.activate():
+    expected_error = pytest.raises(RuntimeError, match="forward failed") if fail_forward else nullcontext()
+    with expected_error, set_forward_context(paged_kv_runtime=runtime), runtime.activate():
+        initial_batch = adapter._active_batch
+        assert initial_batch is None
+        assert Attention._active_paged_kv_adapter() is None
+        set_forward_context_denoise_step_idx(None)
+        inactive_batch = adapter._active_batch
+        assert inactive_batch is None
+
         set_forward_context_denoise_step_idx(0)
         assert Attention._active_paged_kv_adapter() is adapter
         assert adapter._active_batch.rows == metadata.prefill_rows
+        prefill_batch = adapter._active_batch
+        set_forward_context_denoise_step_idx(0)
+        assert adapter._active_batch is prefill_batch
 
         set_forward_context_denoise_step_idx(1)
         assert Attention._active_paged_kv_adapter() is adapter
@@ -1110,8 +1123,14 @@ def test_runner_runtime_switches_from_prefill_to_reusable_denoise_metadata(
         set_forward_context_denoise_step_idx(2)
         assert Attention._active_paged_kv_adapter() is adapter
         assert adapter._active_batch is denoise_batch
+        set_forward_context_denoise_step_idx(None)
+        assert adapter._active_batch is denoise_batch
+        if fail_forward:
+            raise RuntimeError("forward failed")
 
     assert adapter._active_batch is None
+    with pytest.raises(RuntimeError, match="already closed"):
+        runtime.ensure_active(1)
 
 
 def test_causal_batch_rejects_non_suffix_write(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1355,6 +1374,7 @@ def test_omni_attention_wraps_paged_kernel_with_sp_hooks() -> None:
 
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
     layer.prefix = "layer-0"
     layer.paged_kv_cache_role = "primary"
     layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
@@ -1401,6 +1421,7 @@ def test_omni_attention_strips_paged_ulysses_padding_around_kernel() -> None:
 
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
     layer.prefix = "layer-0"
     layer.paged_kv_cache_role = "primary"
     layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
@@ -1425,6 +1446,7 @@ def test_omni_attention_rejects_paged_request_for_backend_without_paged_support(
 
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
     layer.prefix = "layer-0"
     layer.paged_kv_cache_role = "primary"
     layer.attn_backend = SimpleNamespace(supports_paged_kv=False, get_name=lambda: "SDPA")
@@ -1456,6 +1478,7 @@ def test_omni_attention_keeps_dense_kernel_without_active_adapter() -> None:
 
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
     layer.paged_kv_cache_role = "primary"
     layer.use_ring = False
     layer._no_parallel_strategy = object()
@@ -1479,6 +1502,7 @@ def test_omni_attention_keeps_dense_kernel_without_active_adapter() -> None:
 def test_omni_attention_rejects_scheduler_paged_forward_without_active_adapter() -> None:
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
     layer._scheduler_paged_kv = True
     layer.paged_kv_cache_role = "primary"
     layer._get_active_parallel_strategy = lambda: object()

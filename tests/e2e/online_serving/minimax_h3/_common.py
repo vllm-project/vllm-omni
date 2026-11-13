@@ -141,6 +141,8 @@ def post_sync(
     client: OpenAIClientHandler,
     form_data: dict[str, str],
     files: Any = None,
+    *,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> bytes:
     """Submit one synchronous video request and return its MP4 body."""
     response = requests.post(
@@ -148,7 +150,7 @@ def post_sync(
         data=form_data,
         files=files,
         headers={"Accept": "video/mp4"},
-        timeout=REQUEST_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     response.raise_for_status()
     assert response.headers.get("content-type", "").startswith("video/mp4")
@@ -197,6 +199,27 @@ def run_ref2va(client: OpenAIClientHandler, seed: int) -> bytes:
     )
 
 
+def run_ref2va_video(
+    client: OpenAIClientHandler,
+    model: str,
+    reference: Path,
+    workload: dict[str, Any],
+) -> bytes:
+    """Submit a video-reference Ref2VA request with the benchmark workload."""
+    form = _h3_form("ref2va", workload["seed"])
+    form["model"] = model
+    for key in ("width", "height", "fps", "num_frames", "num_inference_steps", "seed", "flow_shift"):
+        form[key] = str(workload[key])
+    form["extra_params"] = workload["extra_params"]
+    with reference.open("rb") as video:
+        return post_sync(
+            client,
+            form,
+            files=[("input_references", (reference.name, video, "video/mp4"))],
+            timeout=3600,
+        )
+
+
 def fl2va_files() -> dict[str, tuple[str, io.BytesIO, str]]:
     """Return a fresh multipart first-frame payload for an FL2VA request."""
     return {"input_reference": ("first_frame.jpg", io.BytesIO(_FL2VA_IMAGE), "image/jpeg")}
@@ -212,6 +235,12 @@ def run_dlo_wave(
 
 
 def dlo_params(task_type: str) -> OmniServerParams:
+    """Build the two-card DP2 + DLO server for one MiniMax-H3 startup partition.
+
+    ``task_type="combined"`` loads the FL2VA and Ref2VA DiTs in one process.
+    Request ``extra_params.task`` still selects the task. ``fl2va`` or
+    ``ref2va`` downloads only that partition and cannot serve the other task.
+    """
     return OmniServerParams(
         model=MODEL,
         server_args=[*DLO_SERVER_ARGS, "--task-type", task_type],
@@ -282,12 +311,12 @@ def turbo_form(seed: int) -> dict[str, str]:
     }
 
 
-def fasth3_params(lora_path: str | None) -> OmniServerParams:
-    """Build the requested two-card FastH3 parallel layout.
+def fasth3_params(lora_path: str | None, *, num_cards: int = 2) -> OmniServerParams:
+    """Build the FastH3 parallel layout for two H100s or four A3 dies.
 
     HSDP owns DiT sharding (the model tensor-parallel degree stays at its
-    default 1), USP2 shards the sequence, text-encoder TP2 shards Qwen3-VL,
-    and VAE patch parallel 2 is the project's VPP2 setting.
+    default 1). USP, text-encoder TP, and VAE patch parallel use the same
+    card count as the HSDP shard group.
     """
     return OmniServerParams(
         model=MODEL,
@@ -296,18 +325,18 @@ def fasth3_params(lora_path: str | None) -> OmniServerParams:
             "--task-type",
             "fl2va",
             "--num-gpus",
-            "2",
+            str(num_cards),
             "--usp",
-            "2",
+            str(num_cards),
             "--ring",
             "1",
             "--use-hsdp",
             "--hsdp-shard-size",
-            "2",
+            str(num_cards),
             "--text-encoder-tp-size",
-            "2",
+            str(num_cards),
             "--vae-patch-parallel-size",
-            "2",
+            str(num_cards),
             "--vae-parallel-mode",
             "tile",
             "--vae-use-tiling",

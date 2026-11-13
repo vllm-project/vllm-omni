@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 # Copyright (c) Ant Group. All rights reserved.
 # Adapted from Ming repo's usage cookbook:
@@ -23,6 +24,8 @@ from __future__ import annotations
 import copy
 import json
 from typing import Any
+
+import regex as re
 
 # ============================================================
 # Image-gen query-token block (thinker stage)
@@ -85,6 +88,18 @@ def maybe_expand_image_gen_prompt(
 
 DEFAULT_PROMPT = "Please generate speech based on the following description.\n"
 
+
+def infer_omni_language(text: str) -> str:
+    """Treat any Chinese character as Chinese, otherwise use English."""
+    has_chinese = re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U000323af]", text)
+    return "Chinese" if has_chinese else "English"
+
+
+def create_omni_prompt(text: str) -> str:
+    """Select the default Omni speech language from the generated text."""
+    return DEFAULT_PROMPT + f"Target language: {infer_omni_language(text)}.\n"
+
+
 BASE_CAPTION_TEMPLATE: dict[str, Any] = {
     "audio_sequence": [
         {
@@ -122,6 +137,13 @@ def create_instruction(user_input: Any) -> str | None:
         return user_input
     if not isinstance(user_input, dict):
         raise ValueError(f"Ming instruction must be str, dict, or None; got {type(user_input).__name__}")
+    # Ming accepts complete caption objects. Do not replace their controls
+    # with the all-null template by treating audio_sequence as an unknown key.
+    if "audio_sequence" in user_input:
+        sequence = user_input["audio_sequence"]
+        if not isinstance(sequence, list) or not sequence or not all(isinstance(item, dict) for item in sequence):
+            raise ValueError("audio_sequence must be a nonempty list of caption objects")
+        return json.dumps(user_input, ensure_ascii=False)
     caption = copy.deepcopy(BASE_CAPTION_TEMPLATE)
     item = caption["audio_sequence"][0]
     for key, value in user_input.items():
@@ -135,6 +157,8 @@ __all__ = [
     "DEFAULT_NUM_QUERY_TOKENS",
     "maybe_expand_image_gen_prompt",
     "DEFAULT_PROMPT",
+    "create_omni_prompt",
+    "infer_omni_language",
     "BASE_CAPTION_TEMPLATE",
     "create_instruction",
 ]

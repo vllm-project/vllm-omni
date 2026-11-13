@@ -5,8 +5,8 @@
 These tests use mock request objects and mock queues.  They do not require
 GPU, vLLM runtime, or any connector.
 
-Chunk waiting (WAITING_FOR_CHUNK / process_pending_chunks) lives on
-OmniChunkTransferAdapter — see tests/distributed/omni_connectors/.
+Native chunk waiting and full-payload waiting use the coordinator; legacy
+adapter coverage lives under tests/distributed/omni_connectors/.
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ import unittest
 from types import SimpleNamespace
 
 import pytest
-import torch
 from vllm import SamplingParams
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 
 import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
@@ -26,6 +26,7 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import _LoadEntry
 from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
+from vllm_omni.outputs import SchedulingMetadataUpdate
 from vllm_omni.request import OmniRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -112,6 +113,47 @@ class TestNativeMRV2DataPlaneSelection(unittest.TestCase):
         self.assertFalse(uses_native_mrv2_data_plane(SimpleNamespace(async_chunk=False), use_v2_model_runner=True))
 
 
+@pytest.mark.parametrize("stage_id", [0, 1, 2])
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_receives_chunks_requires_a_downstream_async_receiver(stage_id: int, async_chunk: bool) -> None:
+    coordinator = OmniSchedulingCoordinator(stage_id=stage_id, async_chunk=async_chunk)
+
+    assert coordinator.receives_chunks is (stage_id > 0 and async_chunk)
+
+
+@pytest.mark.parametrize("receives_chunks", [False, True])
+def test_process_pending_chunks_uses_public_receive_gate(mocker, receives_chunks: bool) -> None:
+    coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=1, stage_id=1, async_chunk=True)
+    mocker.patch.object(
+        OmniSchedulingCoordinator,
+        "receives_chunks",
+        new_callable=mocker.PropertyMock,
+        return_value=receives_chunks,
+    )
+    request = OmniRequest(
+        "native-chunk",
+        [0],
+        SamplingParams(max_tokens=1),
+        pooling_params=None,
+        external_req_id="external-native-chunk",
+    )
+    waiting = create_request_queue(SchedulingPolicy.FCFS)
+    waiting.add_request(request)
+
+    coordinator.process_pending_chunks(waiting, [], set(), set())
+
+    if receives_chunks:
+        assert list(waiting) == []
+        assert request.status == RequestStatus.WAITING_FOR_CHUNK
+        [handle] = coordinator.pending_chunk_registrations
+        assert (handle.request_id, handle.external_req_id) == (request.request_id, request.external_req_id)
+    else:
+        assert list(waiting) == [request]
+        assert request.status == RequestStatus.WAITING
+        assert coordinator.pending_chunk_registrations == []
+    assert coordinator.requests_with_ready_chunks == set()
+
+
 def test_chunk_registration_ready_and_terminal_lifecycle():
     coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
     req = _make_request("internal", status=RequestStatus.WAITING)
@@ -129,6 +171,18 @@ def test_chunk_registration_ready_and_terminal_lifecycle():
     req.status = RequestStatus.WAITING_FOR_CHUNK
     coord.process_pending_chunks(waiting, [], set(), {"internal"})
     assert "internal" in coord.finished_requests
+    coord.update_request_metadata(
+        {"internal": req},
+        {"internal": SchedulingMetadataUpdate(input_terminal=True)},
+    )
+    unscheduled = SimpleNamespace(num_scheduled_tokens={})
+    assert coord.get_scheduled_input_terminal_req_ids(unscheduled) == set()
+    coord.postprocess_scheduler_output(SimpleNamespace(scheduled_new_reqs=[], scheduled_cached_reqs=None))
+    assert coord.input_terminal_req_ids == {"internal"}
+    scheduled = SimpleNamespace(num_scheduled_tokens={"internal": 1}, scheduled_new_reqs=[], scheduled_cached_reqs=None)
+    assert coord.get_scheduled_input_terminal_req_ids(scheduled) == {"internal"}
+    coord.postprocess_scheduler_output(scheduled)
+    assert coord.input_terminal_req_ids == set()
 
 
 def test_chunk_waiting_removes_request_from_running_list():
@@ -154,9 +208,9 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         requests = {"r1": req}
 
         # Only scheduling metadata is passed now (full payload stays in model runner)
-        request_metadata = {"r1": {"next_stage_prompt_len": 50}}
+        request_metadata = {"r1": SchedulingMetadataUpdate(resize_prompt_to=50)}
 
-        coord.update_request_metadata(requests, request_metadata, model_mode="ar")
+        coord.update_request_metadata(requests, request_metadata)
 
         # next_stage_prompt_len should update prompt_token_ids
         self.assertEqual(len(req.prompt_token_ids), 50)
@@ -175,13 +229,9 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         req._output_token_ids = [99]
         requests = {"r1": req}
 
-        request_metadata = {
-            "r1": {
-                "code_predictor_codes": [10, 20, 30],
-            }
-        }
+        request_metadata = {"r1": SchedulingMetadataUpdate(prompt_token_ids=(10, 20, 30))}
 
-        coord.update_request_metadata(requests, request_metadata, model_mode="generation")
+        coord.update_request_metadata(requests, request_metadata)
 
         self.assertEqual(req.prompt_token_ids, [10, 20, 30])
         self.assertEqual(req.num_prompt_tokens, 3)
@@ -190,7 +240,7 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertEqual(req._output_token_ids, [])
         self.assertIsNone(req.additional_information)
 
-    def test_generation_mode_flattens_tensor_code_predictor_codes(self):
+    def test_typed_prompt_update_replaces_existing_prompt(self):
         coord = OmniSchedulingCoordinator(stage_id=1)
 
         req = _make_request("r1")
@@ -202,8 +252,7 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
 
         coord.update_request_metadata(
             requests,
-            {"r1": {"code_predictor_codes": torch.tensor([[1, 2, 3]], dtype=torch.long)}},
-            model_mode="generation",
+            {"r1": SchedulingMetadataUpdate(prompt_token_ids=(1, 2, 3))},
         )
 
         self.assertEqual(req.prompt_token_ids, [1, 2, 3])
@@ -211,7 +260,7 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertEqual(req._all_token_ids, [1, 2, 3])
         self.assertEqual(req._output_token_ids, [])
 
-    def test_generation_mode_flattens_nested_code_predictor_codes(self):
+    def test_typed_prompt_update_preserves_all_token_invariants(self):
         coord = OmniSchedulingCoordinator(stage_id=1)
 
         req = _make_request("r1")
@@ -223,8 +272,7 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
 
         coord.update_request_metadata(
             requests,
-            {"r1": {"code_predictor_codes": [[1, 2], [3, 4]]}},
-            model_mode="generation",
+            {"r1": SchedulingMetadataUpdate(prompt_token_ids=(1, 2, 3, 4))},
         )
 
         self.assertEqual(req.prompt_token_ids, [1, 2, 3, 4])

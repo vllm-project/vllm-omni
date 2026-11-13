@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The fused attention prologue must equal the six steps it replaces.
 
 ``fused_qkv_norm_rope`` collapses split, per-head RMSNorm of Q and K, RoPE on
@@ -16,13 +16,14 @@ import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.omnivoice.fused_qkv_rope import (
     _eager_qkv_norm_rope,
     fused_cuda_supported,
     fused_qkv_norm_rope,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model]
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 triton_only = pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
@@ -46,6 +47,7 @@ def _inputs(batch, seq_len, num_heads, num_kv_heads, head_dim, dtype, device="cu
     return qkv, q_weight, k_weight, rope_table
 
 
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @cuda_only
 @triton_only
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -72,6 +74,7 @@ def test_matches_the_unfused_reference(dtype, batch, seq_len, num_heads, num_kv_
         torch.testing.assert_close(a, b, msg=lambda m, n=name: f"{n}: {m}", **TOL[dtype])
 
 
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @cuda_only
 @triton_only
 def test_v_is_the_untouched_projection_broadcast_into_place():
@@ -86,6 +89,7 @@ def test_v_is_the_untouched_projection_broadcast_into_place():
     torch.testing.assert_close(v, expected.contiguous(), atol=0, rtol=0)
 
 
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @cuda_only
 @triton_only
 def test_kv_heads_are_broadcast_not_reordered():
@@ -100,6 +104,7 @@ def test_kv_heads_are_broadcast_not_reordered():
         torch.testing.assert_close(k[:, head], k[:, (head // repeat) * repeat], atol=0, rtol=0)
 
 
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @cuda_only
 @triton_only
 def test_position_zero_is_a_pure_rmsnorm():
@@ -119,6 +124,7 @@ def test_position_zero_is_a_pure_rmsnorm():
     torch.testing.assert_close(q, expected.contiguous(), **TOL[torch.float32])
 
 
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @cuda_only
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,head_dim",

@@ -5,10 +5,11 @@
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer, sample_latents
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model]
 
 
 def _make_dit(device: str) -> AuKTransformer:
@@ -40,6 +41,7 @@ def _sample_inputs(device: str, offset: float = 0.0, ref_frames: int = 4) -> dic
     }
 
 
+@pytest.mark.cpu
 @torch.inference_mode()
 @pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
 def test_single_request_graph_wrapper_cpu_falls_back_to_eager(cfg_strength: float, mocker) -> None:
@@ -70,6 +72,7 @@ def test_single_request_graph_wrapper_cpu_falls_back_to_eager(cfg_strength: floa
     assert not wrapper._cache
 
 
+@pytest.mark.cpu
 def test_graph_inputs_use_bounded_length_buckets() -> None:
     wrapper = AuKCUDAGraphWrapper(_make_dit("cpu"))
     x = torch.ones(1, 65, 4)
@@ -92,6 +95,7 @@ def test_graph_inputs_use_bounded_length_buckets() -> None:
     assert wrapper.max_graphs == 32
 
 
+@pytest.mark.cpu
 def test_full_graph_cache_retires_as_one_generation() -> None:
     wrapper = AuKCUDAGraphWrapper(_make_dit("cpu"), max_graphs=2)
     first = (64, 64, 50, False)
@@ -106,6 +110,7 @@ def test_full_graph_cache_retires_as_one_generation() -> None:
     assert not wrapper._cache
 
 
+@pytest.mark.cpu
 @torch.inference_mode()
 @pytest.mark.parametrize("ref_frames", [0, 4])
 @pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
@@ -129,7 +134,7 @@ def test_bucket_padding_preserves_real_frame_outputs(cfg_strength: float, ref_fr
     torch.testing.assert_close(padded[:, : x.shape[1]], eager)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
 @pytest.mark.parametrize("ref_frames", [0, 4])
@@ -176,7 +181,7 @@ def test_single_request_graph_replay_matches_eager_and_updates_inputs(cfg_streng
     assert len(wrapper._cache) == 1
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
 def test_graph_capture_failure_is_propagated(mocker) -> None:

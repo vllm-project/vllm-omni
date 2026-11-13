@@ -1,5 +1,6 @@
 # Single-GPU JoyAI-VL-Interaction -> Qwen3-TTS all-sync profile.
 pipeline: joyai_vl_interaction
+session_mode: turn
 async_chunk: false
 trust_remote_code: true
 
@@ -77,3 +78,8 @@ stages:
       top_k: -1
       max_tokens: 65536
       repetition_penalty: 1.0
+
+# Use the shared MRv2 runners on CUDA; preserve other platforms.
+platforms:
+  cuda:
+    model_runner: v2

@@ -167,10 +167,16 @@ def _resolve_dit_children(
     themselves discovered DiTs are left to their own component.
     """
     children: list[ResolvedComponent] = []
+    block_ids = {id(block) for block in stack.blocks}
     for name, module in dit_module.named_children():
         if name in stack.attrs:
             continue
         declared_attr = None if declaration is None else declaration.offload_submodules.get(name)
+        # A boundary wrapper may alias the parent's streamed blocks (for
+        # example MOSSImage.denoise_body). Those blocks already have an owner;
+        # another hook ring would replace their host masters with placeholders.
+        if declared_attr is None and any(id(child) in block_ids for child in module.modules()):
+            continue
         if declared_attr is None and _module_size_mb(module) <= _NESTED_OFFLOAD_THRESHOLD_MB:
             continue
         path = f"{dit_path}.{name}"

@@ -7,14 +7,22 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams
 
+from tests.helpers.mark import hardware_marks
 from tests.model_executor.models.moss_tts.test_local_model_state import _admit, _batch, _state, _step
+from vllm_omni.model_executor.models.moss_tts.first_audio_state import MossEarlyFirstAudioState
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 
 pytestmark = pytest.mark.core_model
 
 
-@pytest.fixture(params=[pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=pytest.mark.cuda)])
+@pytest.fixture(
+    params=[
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)),
+    ]
+)
 def device(request):
     if request.param == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -29,7 +37,9 @@ def _run(state, device, schedule, stop_step):
     frames: dict[int, list[torch.Tensor]] = {3: [], 0: []}
     for index, (slots, counts) in enumerate(schedule):
         state.model.force_stop = index == stop_step
-        embed, payload, _ = _step(state, _batch(device, slots, counts), req_states)
+        batch = _batch(device, slots, counts)
+        batch.req_ids = [state.intermediate_buffer.buffers[slot]["req_id"] for slot in slots]
+        embed, payload, _ = _step(state, batch, req_states)
         embeds.append(embed)
         rows = payload.get("codes", {}).get("audio", [])
         for slot, row in zip(slots, rows):
@@ -40,24 +50,36 @@ def _run(state, device, schedule, stop_step):
     return embeds, frames
 
 
-def test_eager_frames_match_canonical_one_step_earlier(device):
+@pytest.mark.parametrize("first_only", [False, True])
+def test_eager_frames_match_canonical_one_step_earlier(device, mocker, first_only):
     schedule = [([3, 0], [2, 2]), ([3, 0], [2, 1]), ([3, 0], [1, 1]), ([0, 3], [1, 1]), ([3, 0], [1, 1])]
     canonical, eager = (_state(MossLocalModelState, device) for _ in range(2))
-    eager._local_eager_mtp = True
+    eager._local_eager_mtp = not first_only
+    eager._early_first_audio = MossEarlyFirstAudioState(eager, None)
+    eager._first_audio_sender = object()
+    publish = mocker.patch.object(eager._early_first_audio, "_publish", side_effect=lambda ids, *_: ids)
     for state in (canonical, eager):
         _admit(state, 3, "long", 17)
         _admit(state, 0, "short", 17)
+        for slot in (3, 0):
+            state.intermediate_buffer.buffers[slot]["sampling_params"] = SamplingParams(
+                max_tokens=10, extra_args={"tts_local_seed": 17}
+            )
     # Stop both streams at the canonical step that would draw the 4th step's frames.
     c_embeds, c_frames = _run(canonical, device, schedule, stop_step=4)
-    e_embeds, e_frames = _run(eager, device, schedule, stop_step=3)
+    e_embeds, e_frames = _run(eager, device, schedule, stop_step=4 if first_only else 3)
 
     for c, e in zip(c_embeds, e_embeds):
         torch.testing.assert_close(c, e, rtol=0, atol=0)
     for slot in (3, 0):
         assert [f for _, f in c_frames[slot]] and len(c_frames[slot]) == len(e_frames[slot])
         for (ci, cf), (ei, ef) in zip(c_frames[slot], e_frames[slot]):
-            assert ei == ci - 1
+            assert ei == ci - (0 if first_only else 1)
             torch.testing.assert_close(cf, ef, rtol=0, atol=0)
+    assert [call.args[0] for call in publish.call_args_list] == [["short"], ["long"]]
+    for call, slot in zip(publish.call_args_list, (0, 3), strict=True):
+        torch.testing.assert_close(call.args[1], e_frames[slot][0][1], rtol=0, atol=0)
+        assert call.args[2].tolist() == [True]
 
 
 def test_stopped_stream_does_not_emit_again(device):
@@ -102,7 +124,6 @@ def test_unmarked_decode_row_ignores_stale_slot_state(device):
 def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatch, mocker):
     """The Local config must not enable the parent's incompatible eager hook."""
     from vllm_omni.worker_v2 import omni_ar_model_runner as runner_module
-    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
     from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
     from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 
@@ -113,8 +134,8 @@ def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatc
 
     def initialize_parent(state, *args):
         state.__dict__.update(template.__dict__)
-        state._eager_mtp, state._eager_rows = False, None
-        state._eager_state = EagerMTPState(state)
+        state._has_mtp = False
+        state._mtp_state.owner = state
 
     monkeypatch.setattr(OmniModelState, "__init__", initialize_parent)
     state = MossLocalModelState(SimpleNamespace(), model, None, device)
@@ -124,7 +145,7 @@ def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatc
     computed, prompt = np.zeros(5, dtype=np.int32), np.zeros(5, dtype=np.int32)
     prompt[0] = 2
     _step(state, batch, SimpleNamespace(prompt_len=prompt, num_computed_tokens=computed))
-    hook = mocker.spy(state, "run_eager_mtp")
+    hook = mocker.spy(state, "post_sample")
 
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     runner.execute_model_state = SimpleNamespace(
@@ -165,5 +186,5 @@ def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatc
 
     assert runner.sample_tokens(None) is mock_out
     hook.assert_called_once()
-    assert state._eager_mtp is False and state._eager_rows is None
+    assert state._has_mtp is False
     assert state._local_eager_mtp is True

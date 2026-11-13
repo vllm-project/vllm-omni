@@ -47,12 +47,30 @@ logger = init_logger(__name__)
 
 
 def _float32_to_pcm16_bytes(audio: np.ndarray) -> bytes:
-    """PCM_16 bytes of float32 samples, bit-identical to libsndfile's RAW writer.
+    """Convert channels-last float32 audio to interleaved little-endian PCM.
 
-    libsndfile (1.2) converts with ``floor(x * 0x8000)`` clipped to int16.
+    Match libsndfile's clipped float32 -> int32 -> PCM16 conversion, including
+    rounding at the int32 boundary before dropping its low 16 bits. Directly
+    rounding or truncating audio * 32768 produces different output samples.
+    Convert planar input in contiguous channel order, then interleave int16
+    samples so only the final, smaller buffer needs strided writes.
     """
-    scaled = np.floor(audio.astype(np.float64) * 32768.0)
-    return np.clip(scaled, -32768, 32767).astype("<i2").tobytes()
+    planar = audio.ndim == 2 and not audio.flags.c_contiguous and audio.T.flags.c_contiguous
+    samples = audio.T if planar else audio
+    scaled = np.fmax(samples, np.float32(-1), order="C")
+    # Largest float32 below 1 keeps the int32 conversion in range.
+    np.minimum(scaled, np.float32(1 - 2**-24), out=scaled)
+    scaled *= 2147483648.0
+    np.rint(scaled, out=scaled)
+    pcm32 = scaled.astype(np.int32)
+    pcm32 >>= 16
+    pcm16 = pcm32.astype("<i2")
+    if planar:
+        interleaved = np.empty(audio.shape, dtype="<i2")
+        for index, channel in enumerate(pcm16):
+            interleaved[:, index] = channel
+        pcm16 = interleaved
+    return pcm16.tobytes()
 
 
 class AudioMixin:
@@ -82,7 +100,7 @@ class AudioMixin:
             # Convert from [channels, samples] to [samples, channels]
             audio_tensor = audio_tensor.T
 
-        audio_tensor, sample_rate = self._apply_speed_adjustment(audio_tensor, speed, sample_rate)
+        audio_tensor = self.apply_speed_adjustment(audio_tensor, speed)
 
         if audio_obj.output_sample_rate is not None and audio_obj.output_sample_rate != sample_rate:
             audio_tensor = self._resample_audio(audio_tensor, sample_rate, audio_obj.output_sample_rate)
@@ -141,7 +159,8 @@ class AudioMixin:
         resampled = torchaudio.functional.resample(waveform, source_rate, target_rate).cpu().numpy()
         return resampled.T if audio_array.ndim == 2 else resampled
 
-    def _apply_speed_adjustment(self, audio_tensor: np.ndarray, speed: float, sample_rate: int):
+    @staticmethod
+    def apply_speed_adjustment(audio_tensor: np.ndarray, speed: float) -> np.ndarray:
         """Apply speed adjustment to the audio tensor while preserving pitch.
 
         Uses torchaudio's phase vocoder (Spectrogram → TimeStretch →
@@ -149,7 +168,7 @@ class AudioMixin:
         changing pitch.
         """
         if speed == 1.0:
-            return audio_tensor, sample_rate
+            return audio_tensor
 
         try:
             if not np.issubdtype(audio_tensor.dtype, np.floating):
@@ -193,7 +212,7 @@ class AudioMixin:
             result = result.squeeze(0).numpy()
             if channels_last:
                 result = result.T
-            return result, sample_rate
+            return result
         except Exception as e:
             logger.error(f"An error occurred during speed adjustment: {e}")
             raise ValueError("Failed to apply speed adjustment.") from e

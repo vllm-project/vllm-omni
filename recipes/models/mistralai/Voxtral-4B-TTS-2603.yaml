@@ -1,0 +1,149 @@
+meta:
+  title: "Voxtral-4B-TTS-2603"
+  slug: "voxtral-4b-tts-2603"
+  provider: "Mistral AI"
+  description: "Mistral's 4B text-to-speech model served via vLLM-Omni with built-in voice presets, exposed through the OpenAI /v1/audio/speech API (24 kHz mono)."
+  date_added: 2026-06-17
+  date_updated: 2026-06-15
+  tasks:
+    - omni
+  related_recipes:
+    - Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    - mistralai/Voxtral-Mini-4B-Realtime-2602
+    - fishaudio/s2-pro
+
+model:
+  model_id: "mistralai/Voxtral-4B-TTS-2603"
+  min_vllm_version: "0.20.0"
+  architecture: dense
+  parameter_count: "4B"
+  active_parameters: "4B"
+  context_length: 0
+  base_args:
+    - "--omni"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: t2a
+      label: "Text → Speech"
+      endpoint: "/v1/audio/speech"
+      description: "Voxtral TTS with a built-in voice preset via /v1/audio/speech"
+      curl: |
+        curl -X POST http://localhost:8000/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "mistralai/Voxtral-4B-TTS-2603",
+            "input": "Hello, this is Voxtral TTS running with vLLM-Omni.",
+            "voice": "casual_female",
+            "language": "English",
+            "response_format": "wav"
+          }' --output voxtral.wav
+
+dependencies:
+  - note: "vLLM-Omni provides the TTS serving backend and the `--omni` serve path. See the installation guide for pre-built wheels or building from source."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+  - note: "Voxtral's tokenizer/audio path requires mistral_common >= 1.10.0"
+    command: 'uv pip install -U "mistral_common>=1.10.0"'
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 24
+    description: "BF16 weights — fits a single 24 GB GPU (observed server-startup peak ~20.5 GiB on an RTX 4090)"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [Voxtral-4B-TTS-2603](https://huggingface.co/mistralai/Voxtral-4B-TTS-2603) is
+  Mistral AI's 4B text-to-speech model, served through **vLLM-Omni** with the
+  OpenAI-compatible `/v1/audio/speech` API. It generates **24 kHz mono** audio
+  from text using model-provided voice presets.
+
+  ## Prerequisites
+
+  - **Hardware**: a single CUDA GPU with **≥ 24 GB** VRAM. Reference run: 1×
+    RTX 4090 24 GB — Stage 0 (`audio_generation`) ~18.95 GiB, Stage 1
+    (`audio_tokenizer`) ~1.55 GiB, server-startup peak ~20.5 GiB (~85%). Both
+    stages share GPU 0 via the bundled deploy config.
+  - **vLLM-Omni** targeting vLLM >= 0.20, with `mistral_common >= 1.10.0`.
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  uv pip install -U "mistral_common>=1.10.0"
+  ```
+
+  ## Launch the server
+
+  The deploy config (`vllm_omni/deploy/voxtral_tts.yaml`) is auto-discovered:
+
+  ```bash
+  vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8000
+  ```
+
+  ## Client usage
+
+  ### Voice preset (curl)
+
+  ```bash
+  curl -X POST http://127.0.0.1:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "mistralai/Voxtral-4B-TTS-2603",
+      "input": "Hello, this is Voxtral TTS running with vLLM-Omni.",
+      "voice": "casual_female",
+      "language": "English",
+      "response_format": "wav"
+    }' --output voxtral.wav
+  ```
+
+  ### Streaming PCM
+
+  ```bash
+  curl -X POST http://127.0.0.1:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "mistralai/Voxtral-4B-TTS-2603",
+      "input": "Hello, this is Voxtral TTS streaming PCM.",
+      "voice": "casual_female",
+      "language": "English",
+      "stream": true,
+      "response_format": "pcm"
+    }' --output voxtral_stream.pcm
+
+  # Convert raw 24 kHz mono PCM to WAV
+  ffmpeg -f s16le -ar 24000 -ac 1 -i voxtral_stream.pcm voxtral_stream.wav -y
+  ```
+
+  ### Examples
+
+  - [Offline end-to-end](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/text_to_speech/voxtral_tts/end2end.py)
+  - [Online Gradio demo](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/text_to_speech/voxtral_tts/gradio_demo.py)
+
+  ## Known limitations
+
+  - Output is **mono 24 kHz**.
+  - **Voice cloning is gated upstream.** With the public
+    `mistralai/Voxtral-4B-TTS-2603` checkpoint, supplying a `ref_audio` (or
+    running the voice-clone path) fails with
+    `RuntimeError: encode_waveforms requires encoder weights which are not
+    available in the open-source checkpoint.` — the public weights omit the
+    encoder needed to turn reference audio into conditioning features. Use the
+    built-in voice presets instead.
+
+  ## References
+
+  - [Model card](https://huggingface.co/mistralai/Voxtral-4B-TTS-2603)
+  - [vLLM-Omni text-to-speech examples](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_speech/voxtral_tts)

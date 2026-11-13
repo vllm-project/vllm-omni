@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from vllm_omni.data_entry_keys import OmniPayloadStruct, to_dict, unflatten_payload
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MINIMAX_H3_CONDITION_LABELS_KEY,
@@ -17,6 +18,7 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3EncoderConditioning,
 )
 from vllm_omni.model_executor.models.minimax_h3.encoder_processing import prepare_encoder_inputs
+from vllm_omni.model_executor.models.minimax_h3.timeline_guides import MINIMAX_H3_TIMELINE_GUIDES_KEY
 
 
 def _diffusion_sampling_params(sampling_params_list: Sequence[Any]) -> Any:
@@ -37,6 +39,9 @@ def prepare_encoder_prompt(
     prompt: Any,
     sampling_params_list: Sequence[Any],
 ) -> Any:
+    multi_modal_data = prompt.get("multi_modal_data") if isinstance(prompt, Mapping) else None
+    if isinstance(multi_modal_data, Mapping) and multi_modal_data.get(MINIMAX_H3_TIMELINE_GUIDES_KEY) is not None:
+        raise OmniClientError("MiniMax H3 timeline guides require the media encoder in the diffusion stage")
     prepared = prepare_encoder_inputs(prompt, _diffusion_sampling_params(sampling_params_list))
     if isinstance(prompt, str):
         prompt = {"prompt": prompt}
@@ -80,6 +85,11 @@ def _original_prompt(prompt: Any) -> dict[str, Any]:
     if isinstance(prompt, str):
         return {"prompt": prompt}
     raise TypeError(f"invalid MiniMax H3 prompt type {type(prompt)!r}")
+
+
+def prepare_encoder_prompt_with_decoder(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
+    # DiT sampling params determine input dimensions; the trailing params belong to the decoder.
+    return prepare_encoder_prompt(prompt, sampling_params_list[:2])
 
 
 def _global_request_id(prompt: Mapping[str, Any]) -> str | None:
@@ -177,3 +187,37 @@ def encoder2diffusion(
     diffusion_prompt["multi_modal_data"] = None
     diffusion_prompt.pop("model_intermediate_buffer", None)
     return diffusion_prompt
+
+
+def diffusion2decoder(
+    source_outputs: list[Any],
+    prompt: Any = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
+) -> dict[str, Any] | None:
+    del requires_multimodal_data, streaming_context
+    if not source_outputs:
+        return None
+    if len(source_outputs) != 1:
+        raise RuntimeError(f"MiniMax H3 decoder requires exactly one DiT source, got {len(source_outputs)}")
+    source = source_outputs[0]
+    if not source.finished:
+        return None
+    decoder_prompt = _original_prompt(prompt)
+    expected_request_id = _global_request_id(decoder_prompt)
+    if expected_request_id is not None and source.request_id != expected_request_id:
+        raise RuntimeError("MiniMax H3 DiT request ID does not match the decoder request")
+    latents = source.latents
+    metadata = (source.multimodal_output or {}).get("metadata", {})
+    options = metadata.get("minimax_h3_decode")
+    if not isinstance(latents, Mapping) or not isinstance(options, Mapping):
+        raise RuntimeError("MiniMax H3 DiT returned no decoder latent payload")
+    payload = {**options, "video_latents": latents["video"], "audio_latents": latents["audio"]}
+    # DiT has consumed source media and conditioning; pass only latents and decode options.
+    additional_information: dict[str, Any] = {"minimax_h3_decode": payload}
+    if expected_request_id is not None:
+        additional_information["global_request_id"] = expected_request_id
+    decoder_prompt["additional_information"] = additional_information
+    decoder_prompt["multi_modal_data"] = None
+    decoder_prompt.pop("model_intermediate_buffer", None)
+    return decoder_prompt

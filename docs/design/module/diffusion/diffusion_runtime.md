@@ -180,6 +180,16 @@ for distributed layerwise offload with AllGather DP concurrency.
 Async requests share one engine busy loop. Worker calls and control RPCs pass
 through that loop, so they cannot race on the executor transport.
 
+After each execution, the engine updates scheduler progress before draining
+queued control RPCs. A queued interaction belongs to the scheduler request
+instance present at submission. If that instance finishes, is removed, or is
+replaced before delivery, the interaction expires without a worker call or a
+scheduler wakeup. Its RPC completes without an error; this is not an
+acknowledgment that the control was applied. Unknown request IDs are rejected
+at submission. This preserves terminal output and worker cleanup when a
+control arrives during the final step or cancellation, and prevents queued
+controls from crossing request-ID reuse.
+
 ```mermaid
 sequenceDiagram
     participant Caller
@@ -400,9 +410,13 @@ closes scheduler state and worker resources before returning the error.
 
 `abort()` places request IDs on an abort queue. The busy loop marks those
 requests `FINISHED_ABORTED`; finalization removes scheduler state and emits an
-aborted output when a consumer still exists. The runner removes cached
-step-mode state when it receives a scheduler output that reports the finished
-request ID.
+aborted output when a consumer still exists, including when no requests remain
+to schedule. After an in-flight execution call returns, the engine explicitly
+retires cancelled step-mode state on the workers; cleanup does not depend on
+a future scheduler wave. The runner also retires completed state and invalidates
+any cached input batch containing a terminated request, so the batch cannot
+retain that request's model-private tensors. Outputs keep their own tensor
+references through transport and consumption.
 
 On the multiproc request-mode async path, abort or consumer drop while output
 is still materializing should release the associated async-output bookkeeping
@@ -413,6 +427,11 @@ output-stream consumer removes that consumer's queue. It does not take
 ownership of scheduler cleanup.
 
 ### Shutdown and worker failure
+
+For shared-weight consumers, the worker closes and drops its LoRA manager
+before detaching the runner and closing imported weights. The default manager
+retains the pipeline even when no adapter is loaded. A cleanup failure poisons
+the consumer session; it does not authorize the provider to release its weights.
 
 `DiffusionEngine.close()` is idempotent. It stops the busy loop, wakes pending
 streams with an error, closes scheduler state, and shuts down the executor.
@@ -502,6 +521,8 @@ Test the smallest affected slice, then cover its neighboring boundary:
 Always exercise success, cancellation, per-request failure, fatal worker
 failure, repeated shutdown, one request, and multiple compatible requests.
 For step-mode changes, also test partial progress and cleanup of runner state.
+`test_step_request_lifecycle.py` checks state and private-tensor weak references
+at idle through the engine, executor, worker, and runner using two CPU regressions.
 
 ## Related documents
 

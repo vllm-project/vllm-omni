@@ -159,6 +159,36 @@ def test_diffusion_base_linear_apply_falls_back_for_mixed_output_dtype(monkeypat
     assert torch.allclose(out, torch.tensor([[4.0, 8.0]], dtype=torch.float64))
 
 
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+def test_epilogue_scaling_preserves_native_bf16_order(output_dtype):
+    layer = DiffusionBaseLinearLayerWithLoRA.__new__(DiffusionBaseLinearLayerWithLoRA)
+    layer.tp_size = 1
+    layer.lora_config = _DummyLoRAConfig()
+    layer.base_layer = type("Base", (), {})()
+
+    class _Output:
+        def apply(self, _layer, x, _bias):
+            return x.to(output_dtype).clone()
+
+    generator = torch.Generator().manual_seed(12)
+    a = torch.randn(3, 4, generator=generator).bfloat16()
+    b = torch.randn(4, 3, generator=generator).bfloat16()
+    x = torch.randn(5, 4, generator=generator)  # Native hook casts input to the adapter dtype.
+    layer.base_layer.quant_method = _Output()
+    layer.lora_a_stacked = (a[None, None],)
+    layer.lora_b_stacked = (b[None, None],)
+    layer.output_slices = (4,)
+    layer._diffusion_lora_epilogue_scale = 1.37
+    with torch.inference_mode():
+        expected = x.to(output_dtype).clone()
+        low_rank = x.bfloat16() @ a.T
+        if output_dtype == torch.bfloat16:
+            expected.addmm_(low_rank, b.T, alpha=1.37)
+        else:
+            expected.add_(((low_rank @ b.T) * 1.37).to(output_dtype))
+        torch.testing.assert_close(layer.apply(x), expected, rtol=0, atol=0)
+
+
 def test_diffusion_lora_buffer_device_persists_across_reallocation(monkeypatch):
     from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
 

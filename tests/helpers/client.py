@@ -136,6 +136,7 @@ class HttpResponse:
     success: bool
     error_message: str | None = None
     json_body: dict[str, Any] | list[Any] | None = None
+    content: bytes = b""
 
 
 @dataclass
@@ -271,8 +272,11 @@ class OpenPIWebSocketSession:
             raise ModuleNotFoundError("GR00T OpenPI test dependencies are missing: websockets") from exc
         try:
             from openpi_client import msgpack_numpy
-        except ImportError as exc:  # pragma: no cover - optional e2e dependency
-            raise ModuleNotFoundError("GR00T OpenPI test dependencies are missing: openpi-client") from exc
+        except ImportError:
+            # Prefer the real library when it is installed. Otherwise use the
+            # standalone OpenPI codec. Do not call connection._pack/_unpack here:
+            # that round-trip accepts a wrong wire format.
+            from tests.helpers import openpi_msgpack as msgpack_numpy
         return websockets_client, msgpack_numpy
 
     def __init__(
@@ -365,6 +369,24 @@ def _merge_ws_expectation_kwargs(
     return cfg
 
 
+def _ws_error_code(jb: Mapping[str, Any]) -> Any:
+    """Read an error code from a WebSocket JSON frame.
+
+    Speech and video frames put ``code`` on the envelope. OpenAI Realtime nests
+    it under ``error`` (``{"type": "error", "error": {"code": "invalid_event"}}``).
+    The envelope wins when both differ; Realtime frames are expected to omit
+    top-level ``code`` (as in the Buildkite failure) so a stale envelope field
+    does not mask the nested code.
+    """
+    code = jb.get("code")
+    if code is not None:
+        return code
+    error = jb.get("error")
+    if isinstance(error, dict):
+        return error.get("code")
+    return None
+
+
 def _run_ws_expectations_from_request_config(cfg: dict[str, Any], resp: WebSocketJsonResponse) -> None:
     jb = resp.json_body
     want_type = cfg.get("ws_json_type")
@@ -372,7 +394,7 @@ def _run_ws_expectations_from_request_config(cfg: dict[str, Any], resp: WebSocke
         assert jb.get("type") == want_type, (jb, want_type)
     want_code = cfg.get("ws_error_code")
     if want_code is not None:
-        assert jb.get("code") == want_code, (jb, want_code)
+        assert _ws_error_code(jb) == want_code, (jb, want_code)
     err_message = cfg.get("err_message")
     if err_message is not None:
         assert_http_error(resp, err_message=err_message, websocket_json_message=True)
@@ -533,6 +555,7 @@ class OnlineOmniClient:
             success=ok,
             error_message=None if ok else (r.text[:8000] if r.text else None),
             json_body=payload,
+            content=r.content,
         )
 
     def send_health_http_request(
@@ -546,6 +569,7 @@ class OnlineOmniClient:
 
         ``request_config``: optional ``timeout`` plus optional ``err_code`` / ``err_message`` for
         :func:`~tests.helpers.assertions.assert_http_error` (also as keyword-only args).
+        With no ``err_code`` and no ``err_message``, the response must be HTTP 200.
         """
         cfg = _merge_http_expectation_kwargs(
             request_config,
@@ -554,11 +578,19 @@ class OnlineOmniClient:
         )
         r = requests.get(self._build_url("/health"), timeout=float(cfg.get("timeout", 120.0)))
         resp = self._http_response_from_requests(r)
-        assert_http_error(
-            resp,
-            err_code=cfg.get("err_code"),
-            err_message=cfg.get("err_message"),
-        )
+        expected_code = cfg.get("err_code")
+        expected_message = cfg.get("err_message")
+        if expected_code is None and expected_message is None:
+            assert resp.status_code == 200, (
+                "GET /health expected HTTP 200 when no error expectation is set, "
+                f"got {resp.status_code}: {resp.error_message!r}"
+            )
+        else:
+            assert_http_error(
+                resp,
+                err_code=expected_code,
+                err_message=expected_message,
+            )
         return [resp]
 
     def send_models_http_request(
@@ -594,7 +626,10 @@ class OnlineOmniClient:
         err_code: int | tuple[int, ...] | list[int] | None = None,
         err_message: str | tuple[str, ...] | list[str] | None = None,
     ) -> list[HttpResponse]:
-        """POST ``/v1/chat/completions`` with ``json`` or ``raw_body`` (malformed-body / contract tests)."""
+        """POST ``/v1/chat/completions`` with ``json`` or ``raw_body`` (malformed-body / contract tests).
+
+        With no ``err_code`` and no ``err_message``, the response must be HTTP 200.
+        """
         cfg = _merge_http_expectation_kwargs(
             request_config,
             err_code=err_code,
@@ -602,11 +637,19 @@ class OnlineOmniClient:
         )
         r = self._post_json_endpoint("/v1/chat/completions", cfg, default_timeout=120.0)
         resp = self._http_response_from_requests(r)
-        assert_http_error(
-            resp,
-            err_code=cfg.get("err_code"),
-            err_message=cfg.get("err_message"),
-        )
+        expected_code = cfg.get("err_code")
+        expected_message = cfg.get("err_message")
+        if expected_code is None and expected_message is None:
+            assert resp.status_code == 200, (
+                "POST /v1/chat/completions expected HTTP 200 when no error expectation is set, "
+                f"got {resp.status_code}: {resp.error_message!r}"
+            )
+        else:
+            assert_http_error(
+                resp,
+                err_code=expected_code,
+                err_message=expected_message,
+            )
         return [resp]
 
     def send_batched_chat_completions_http_request(
@@ -848,7 +891,10 @@ class OnlineOmniClient:
         err_code: int | tuple[int, ...] | list[int] | None = None,
         err_message: str | tuple[str, ...] | list[str] | None = None,
     ) -> list[HttpResponse]:
-        """POST ``/v1/images/generations`` — ``json`` or ``raw_body``, ``timeout``."""
+        """POST ``/v1/images/generations`` — ``json`` or ``raw_body``, ``timeout``.
+
+        With no ``err_code`` and no ``err_message``, the response must be HTTP 200.
+        """
         cfg = _merge_http_expectation_kwargs(
             request_config,
             err_code=err_code,
@@ -856,16 +902,23 @@ class OnlineOmniClient:
         )
         r = self._post_json_endpoint("/v1/images/generations", cfg, default_timeout=300.0)
         resp = self._http_response_from_requests(r)
-        assert_http_error(
-            resp,
-            err_code=cfg.get("err_code"),
-            err_message=cfg.get("err_message"),
-        )
-        if cfg.get("err_code") is None:
+        expected_code = cfg.get("err_code")
+        expected_message = cfg.get("err_message")
+        if expected_code is None and expected_message is None:
+            assert resp.status_code == 200, (
+                "POST /v1/images/generations expected HTTP 200 when no error expectation is set, "
+                f"got {resp.status_code}: {resp.error_message!r}"
+            )
             assert resp.success, resp.error_message
             payload = resp.json_body
             assert isinstance(payload, dict)
             assert_images_generations_response(payload, cfg, run_level=self.run_level)
+        else:
+            assert_http_error(
+                resp,
+                err_code=expected_code,
+                err_message=expected_message,
+            )
         return [resp]
 
     def send_images_edits_http_request(
@@ -897,7 +950,10 @@ class OnlineOmniClient:
         err_code: int | tuple[int, ...] | list[int] | None = None,
         err_message: str | tuple[str, ...] | list[str] | None = None,
     ) -> list[HttpResponse]:
-        """POST ``/v1/videos`` (async job) — multipart ``data`` / ``files``."""
+        """POST ``/v1/videos`` (async job) — multipart ``data`` / ``files``.
+
+        With no ``err_code`` and no ``err_message``, the response must be HTTP 200.
+        """
         cfg = _merge_http_expectation_kwargs(
             request_config,
             err_code=err_code,
@@ -905,11 +961,19 @@ class OnlineOmniClient:
         )
         r = self._post_form_endpoint("/v1/videos", cfg, default_timeout=120.0)
         resp = self._http_response_from_requests(r)
-        assert_http_error(
-            resp,
-            err_code=cfg.get("err_code"),
-            err_message=cfg.get("err_message"),
-        )
+        expected_code = cfg.get("err_code")
+        expected_message = cfg.get("err_message")
+        if expected_code is None and expected_message is None:
+            assert resp.status_code == 200, (
+                "POST /v1/videos expected HTTP 200 when no error expectation is set, "
+                f"got {resp.status_code}: {resp.error_message!r}"
+            )
+        else:
+            assert_http_error(
+                resp,
+                err_code=expected_code,
+                err_message=expected_message,
+            )
         return [resp]
 
     def send_videos_sync_http_request(
@@ -968,7 +1032,10 @@ class OnlineOmniClient:
         err_code: int | tuple[int, ...] | list[int] | None = None,
         err_message: str | tuple[str, ...] | list[str] | None = None,
     ) -> list[HttpResponse]:
-        """GET ``/v1/videos/{video_id}``."""
+        """GET ``/v1/videos/{video_id}``.
+
+        With no ``err_code`` and no ``err_message``, the response must be HTTP 200.
+        """
         cfg = _merge_http_expectation_kwargs(
             request_config,
             err_code=err_code,
@@ -982,11 +1049,19 @@ class OnlineOmniClient:
             timeout=timeout,
         )
         resp = self._http_response_from_requests(r)
-        assert_http_error(
-            resp,
-            err_code=cfg.get("err_code"),
-            err_message=cfg.get("err_message"),
-        )
+        expected_code = cfg.get("err_code")
+        expected_message = cfg.get("err_message")
+        if expected_code is None and expected_message is None:
+            assert resp.status_code == 200, (
+                "GET /v1/videos/{video_id} expected HTTP 200 when no error expectation is set, "
+                f"got {resp.status_code}: {resp.error_message!r}"
+            )
+        else:
+            assert_http_error(
+                resp,
+                err_code=expected_code,
+                err_message=expected_message,
+            )
         return [resp]
 
     def send_video_delete_http_request(

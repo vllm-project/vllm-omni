@@ -17,7 +17,7 @@ the committer:
                      tensors, then writes the pool.
 
 Async: high-priority then low-priority queues, then pool write.
-Eager: submit() does wait+write inline (CPU tests / no CUDA).
+Eager: StepWriteContext.start_writes() waits and writes inline (CPU tests / no CUDA).
 """
 
 from __future__ import annotations
@@ -26,9 +26,10 @@ import logging
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from types import TracebackType
 from typing import Literal, NamedTuple
 
 import torch
@@ -71,7 +72,7 @@ class StagingBufferHolder(NamedTuple):
 class _BudgetTicket:
     """GPU-byte-budget charge for one device clone shared by several writes.
 
-    Charged once at ``reserve()``; freed when the last pinned tid releases.
+    Charged once at ``prepare_step()``; freed when the last pinned tid releases.
     Immediate: the whole-step clone, pinned by that step's JOIN_NEXT_STEP
     tasks. Deferred: the shared deferred clone, pinned by every task a
     chunk of it was appended to. Does not store tensors.
@@ -153,11 +154,11 @@ def _is_legal_move(frm: TaskState, to: TaskState) -> bool:
 
 @dataclass
 class WriteTask:
-    """One write of (slot, key) rows for a single request.
+    """One write of (slot, key) rows for one request or a whole step.
 
     Identity: `tid` is the handle in the manager's (slot, key) tables.
-    `req_id` + `write_n` mark whose write this is and the nth time that
-    request opened a write. One write may cover several keys.
+    `req_id` + `write_n` label the write (first request for a shared task).
+    One write may cover several keys.
 
     `state` is the single source of truth for where the write is (see
     `TaskState`). `host_ready` / `done` are wait primitives set by the
@@ -457,13 +458,187 @@ class StagingBufferPool:
 class StepD2HClaim:
     """One whole-step landing in StagingBufferPool.
 
-    Return of ``stage_step_host``. The manager stores this on
-    ``_StepContext`` until materialize/discard releases the step holder.
+    Internal storage and completion event, owned by a StepSnapshot.
     """
 
     staging_slot: int  # StagingBufferPool index
     views: dict[TensorName, torch.Tensor]  # host rows [0:n)
     event: torch.cuda.Event | None = None  # torch.cuda.Event; None on eager/CPU
+
+
+@dataclass(frozen=True, eq=False)
+class WriteTaskHandle:
+    """Read-only reference to a write task, retaining its deferred rows after drain."""
+
+    _task: WriteTask = field(repr=False)
+
+    @property
+    def tid(self) -> Tid:
+        return self._task.tid
+
+    @property
+    def req_id(self) -> ReqId:
+        return self._task.req_id
+
+    @property
+    def write_n(self) -> int:
+        return self._task.write_n
+
+    @property
+    def schedule(self) -> WriteSchedule:
+        return self._task.schedule
+
+
+@dataclass(eq=False)
+class StepSnapshot:
+    """Step-owned host rows; release after materialize or discard."""
+
+    _pool: StagingBufferPool
+    _claim: StepD2HClaim
+    _holder: StagingBufferHolder
+
+    @property
+    def staging_slot(self) -> int:
+        return self._claim.staging_slot
+
+    @property
+    def event(self) -> torch.cuda.Event | None:
+        return self._claim.event
+
+    def host_rows(self, start: int, end: int) -> dict[str, torch.Tensor]:
+        """Views of staged rows [start, end) per key; no copy."""
+        return {k: v[start:end] for k, v in self._claim.views.items()}
+
+    def wait(self) -> None:
+        """Block until this step's device→host copy has landed."""
+        if self._claim.event is not None:
+            self._claim.event.synchronize()
+
+    def copy_to_cpu(self) -> dict[str, torch.Tensor]:
+        self.wait()
+        return {k: v.clone() for k, v in self._claim.views.items()}
+
+    def release(self) -> None:
+        self._pool.release(self._claim.staging_slot, self._holder)
+
+
+class StepWriteContext:
+    """Own a step's write registrations and shared resource reservations.
+
+    Registers new tasks and appends to deferred tasks that may span steps.
+    Exiting without a successful start fails affected tasks and releases
+    reservations and the step snapshot.
+    """
+
+    def __init__(
+        self,
+        controller: OmniPrefixCacheController,
+        snapshot: StepSnapshot,
+        tensors: dict[WriteSchedule, dict[str, torch.Tensor]],
+        tickets: dict[WriteSchedule, _BudgetTicket],
+        slots: torch.Tensor | None,
+        freeze_event: torch.cuda.Event | None,
+    ) -> None:
+        self.snapshot = snapshot
+        self._controller = controller
+        self._tensors = tensors
+        self._tickets = tickets
+        self._slots = slots
+        self._freeze_event = freeze_event
+        self._touched: dict[Tid, WriteTask] = {}
+        self._queued: list[WriteTask] = []
+        self._started = False
+        self._closed = False
+
+    def __enter__(self) -> StepWriteContext:
+        return self
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> None:
+        self._closed = True
+        try:
+            if not self._started:
+                # Do not recycle a page while its device copy is in flight.
+                try:
+                    self.snapshot.wait()
+                finally:
+                    for task in self._touched.values():
+                        if self._controller._tasks.get(task.tid) is task:
+                            self._controller._fail_task(task.tid)
+                        else:
+                            self._controller._release_staged_bytes(task)
+                            self._controller._release_task_slot(task)
+                    self.snapshot.release()
+        finally:
+            self._controller._release_unused_tickets(self._tickets.values())
+
+    def _check_open(self) -> None:
+        if self._started or self._closed:
+            raise OmniPrefixCacheUnmatchError("step write context already started or closed")
+
+    def _chunk(self, schedule: WriteSchedule, start: int, end: int) -> _WriteChunk:
+        assert self._slots is not None
+        return _WriteChunk(
+            slots_cpu=self._slots[start:end],
+            tensors={k: v[start:end] for k, v in self._tensors[schedule].items()},
+            budget=self._tickets[schedule],
+        )
+
+    def register(
+        self, *, tid: Tid, req_id: ReqId, write_n: int, schedule: WriteSchedule, start: int, end: int
+    ) -> WriteTaskHandle:
+        """Bind resources and publish a write without running or waiting."""
+        self._check_open()
+        chunk = self._chunk(schedule, start, end)
+        task = WriteTask(
+            tid=tid,
+            req_id=req_id,
+            write_n=write_n,
+            schedule=schedule,
+            chunks=[chunk],
+            freeze_event=self._freeze_event,
+        )
+        self._touched[tid] = task
+        immediate = schedule is WriteSchedule.JOIN_NEXT_STEP
+        if immediate:
+            snapshot = self.snapshot
+            chunk.host = snapshot.host_rows(start, end)
+            task.staging_slot = snapshot.staging_slot
+            task.step_d2h_event = snapshot.event
+            self._controller._staging_pool.bind(snapshot.staging_slot, StagingBufferHolder.for_task(tid))
+        self._controller._pin_budget(self._tickets[schedule], tid)
+        self._controller._register(task, queued=immediate)
+        if immediate:
+            self._queued.append(task)
+        return WriteTaskHandle(task)
+
+    def append(self, handle: WriteTaskHandle, *, start: int, end: int) -> bool:
+        """Append deferred rows; return False if a new task is required."""
+        self._check_open()
+        task = handle._task
+        chunk = self._chunk(WriteSchedule.JOIN_ON_FINISH, start, end)
+        # `reassigned` only changes on this thread under the manager state
+        # lock, so the check needs no controller lock.
+        if task.reassigned_intersects(chunk):
+            return False
+        # The worker claims copies under this same lock. Publish the new
+        # budget owner before it can copy and release the appended chunk.
+        with self._controller._lock:
+            if task.append_chunk(chunk, self._freeze_event) is not None:
+                return False
+            self._tickets[WriteSchedule.JOIN_ON_FINISH].tids.add(task.tid)
+            self._touched[task.tid] = task
+        return True
+
+    def start_writes(self) -> None:
+        """Close registration and dispatch immediate writes; leave deferred tasks pending.
+
+        May execute writes inline, so call without holding the state lock.
+        """
+        self._check_open()
+        self._controller._dispatch(self._queued)
+        self._started = True
 
 
 class OmniPrefixCacheController:
@@ -498,6 +673,44 @@ class OmniPrefixCacheController:
 
     # --------------------------------------------------------- step device→host staging
 
+    def prepare_step(
+        self,
+        *,
+        step_id: int,
+        immediate: dict[str, torch.Tensor],
+        deferred: dict[str, torch.Tensor],
+        slots: torch.Tensor | None,
+        num_tokens: int,
+        freeze_event: torch.cuda.Event | None,
+    ) -> StepWriteContext:
+        """Reserve clones and launch staging outside the manager lock.
+
+        Inputs are frozen device snapshots. Each packed clone is charged
+        once, regardless of how many per-request writes share its rows.
+        """
+        tensors = {WriteSchedule.JOIN_NEXT_STEP: immediate, WriteSchedule.JOIN_ON_FINISH: deferred}
+        tickets = {
+            schedule: _BudgetTicket(sum(t.numel() * t.element_size() for t in rows.values()))
+            for schedule, rows in tensors.items()
+            if rows
+        }
+        if tickets:
+            self.reserve_bytes(sum(ticket.nbytes for ticket in tickets.values()))
+        holder = StagingBufferHolder.for_step(step_id)
+        try:
+            claim = self._stage_step_host(immediate, num_tokens, freeze_event, holder)
+        except BaseException:
+            self._release_unused_tickets(tickets.values())
+            raise
+        snapshot = StepSnapshot(self._staging_pool, claim, holder)
+        return StepWriteContext(self, snapshot, tensors, tickets, slots, freeze_event)
+
+    def _release_unused_tickets(self, tickets: Iterable[_BudgetTicket]) -> None:
+        with self._lock:
+            for ticket in tickets:
+                if not ticket.tids:
+                    self._staged_bytes -= ticket.release(0)
+
     def _d2h_on_stream(
         self,
         stream: torch.cuda.Stream,
@@ -513,7 +726,7 @@ class OmniPrefixCacheController:
             ev.record()
         return ev
 
-    def stage_step_host(
+    def _stage_step_host(
         self,
         tensors: dict[str, torch.Tensor],
         n: int,
@@ -527,8 +740,8 @@ class OmniPrefixCacheController:
         (empty views) so every step id shares this bound. A full pool
         waits for materialize/discard; timeout then errors. A step
         larger than the page overflows the next slot — that is a config
-        break. The caller binds tasks after submit; `step_holder` is
-        released by materialize/discard via staging_release.
+        break. StepWriteContext binds task holders; StepSnapshot owns the
+        step holder until materialize/discard.
         """
         if tensors and n > self._staging_pool.capacity:
             raise OmniPrefixCacheUnmatchError(
@@ -559,12 +772,6 @@ class OmniPrefixCacheController:
             self._staging_pool.release(slot, step_holder)
             raise
 
-    def staging_bind(self, slot: int, holder: StagingBufferHolder) -> None:
-        self._staging_pool.bind(slot, holder)
-
-    def staging_release(self, slot: int, holder: StagingBufferHolder) -> None:
-        self._staging_pool.release(slot, holder)
-
     def _release_task_slot(self, task: WriteTask) -> None:
         """Drop the task's staging hold at a terminal state (pool write or failure)."""
         if task.staging_slot is not None:
@@ -576,16 +783,13 @@ class OmniPrefixCacheController:
 
     # ------------------------------------------------------------------ submit
 
-    def register(self, task: WriteTask, queued: bool = True) -> None:
+    def _register(self, task: WriteTask, queued: bool = True) -> None:
         """Make a task visible (registry + QUEUED) without running anything;
         safe under the manager's state lock. queued=False (deferred tasks)
         stays PENDING on the GPU clone until finish/abort or the GPU-byte
         budget forces a copy. Queued tasks must then go through
-        ``dispatch``.
-
-        Caller must reserve() the task bytes first (budget flush can
-        block; the manager does that outside the state lock) and pin the
-        task on its budget ticket(s) before register.
+        ``_dispatch``. StepWriteContext binds staging and budget owners
+        before registering either schedule.
         """
         task.enqueued_time = time.monotonic()
         with self._lock:
@@ -593,7 +797,7 @@ class OmniPrefixCacheController:
             if queued:
                 task.transition(TaskState.QUEUED)
 
-    def dispatch(self, tasks: list[WriteTask]) -> None:
+    def _dispatch(self, tasks: list[WriteTask]) -> None:
         """Hand registered, queued tasks to the copy path. Threaded: enqueue.
         Eager: the copy + pool write run here, inline — never call this
         under the manager's state lock."""
@@ -615,27 +819,10 @@ class OmniPrefixCacheController:
                 (self._queue_hi if task.schedule is WriteSchedule.JOIN_NEXT_STEP else self._queue_lo).append(task.tid)
             self._wake.notify_all()
 
-    def submit(self, task: WriteTask, queued: bool = True) -> None:
-        """register + dispatch in one call (callers not holding the state lock)."""
-        self.register(task, queued)
-        if queued:
-            self.dispatch([task])
-
-    def append_chunk(
-        self, task: WriteTask, chunk: _WriteChunk, freeze_event: torch.cuda.Event | None = None
-    ) -> TaskState | None:
-        """Append to a pending task. None when appended, else the closing state."""
-        return task.append_chunk(chunk, freeze_event)
-
-    def pin_budget(self, ticket: _BudgetTicket, tid: int) -> None:
+    def _pin_budget(self, ticket: _BudgetTicket, tid: int) -> None:
         """Record that ``tid`` holds a view of the clone ``ticket`` charges."""
         with self._lock:
             ticket.tids.add(tid)
-
-    def reserve(self, nbytes: int) -> None:
-        """Reserve GPU-clone bytes; blocking flush happens here, so callers
-        must not hold the manager's state lock."""
-        self._reserve_bytes(nbytes)
 
     def _release_staged_bytes(self, task: WriteTask) -> None:
         """Drop this task's hold on its budget ticket(s). Idempotent; a
@@ -645,7 +832,7 @@ class OmniPrefixCacheController:
             for ticket in tickets:
                 self._staged_bytes -= ticket.release(task.tid)
 
-    def _reserve_bytes(self, nbytes: int) -> None:
+    def reserve_bytes(self, nbytes: int) -> None:
         # GPU-byte budget: force-copy oldest pending tasks until under
         # budget. Bounded wait: their device→host has usually long completed.
         while True:
@@ -660,6 +847,15 @@ class OmniPrefixCacheController:
             self.escalate([oldest])
             self.join([oldest])
 
+    def release_bytes(self, nbytes: int) -> None:
+        """Uncharge a `reserve_bytes` hold that no task owns."""
+        with self._lock:
+            if nbytes > self._staged_bytes:
+                raise OmniPrefixCacheUnmatchError(
+                    f"releasing {nbytes} GPU-budget bytes with only {self._staged_bytes} charged"
+                )
+            self._staged_bytes -= nbytes
+
     # ------------------------------------------------------------- lifecycle
 
     def escalate(self, tids: list[int]) -> None:
@@ -671,7 +867,9 @@ class OmniPrefixCacheController:
         `_wake` too, so a task cannot be popped and re-queued behind its back.
         """
         if self._eager:
-            self.dispatch([task for tid in tids if (task := self._tasks.get(tid)) is not None and not task.is_terminal])
+            self._dispatch(
+                [task for tid in tids if (task := self._tasks.get(tid)) is not None and not task.is_terminal]
+            )
             return
         with self._wake:
             for tid in tids:
@@ -734,8 +932,14 @@ class OmniPrefixCacheController:
                 out.append(self._failed.popleft())
         return out
 
-    def get_task(self, tid: int) -> WriteTask | None:
-        return self._tasks.get(tid)
+    def lookup(self, tid: Tid) -> WriteTaskHandle | None:
+        task = self._tasks.get(tid)
+        return WriteTaskHandle(task) if task is not None else None
+
+    def mark_reassigned(self, tid: Tid, key: str, slots: torch.Tensor) -> None:
+        task = self._tasks.get(tid)
+        if task is not None:
+            task.add_reassigned(key, slots)
 
     def shutdown(self) -> None:
         self._staging_pool.close()
@@ -748,13 +952,14 @@ class OmniPrefixCacheController:
     # ------------------------------------------------------------ fetch_host
 
     @torch.inference_mode()
-    def fetch_host(self, task: WriteTask, slots: torch.Tensor, key: str) -> torch.Tensor:
+    def fetch_host(self, handle: WriteTaskHandle, slots: torch.Tensor, key: str) -> torch.Tensor:
         """Rows for `slots` of one not-yet-done JOIN_ON_FINISH task.
 
         `_slot_ref` puts JOIN_NEXT_STEP tids in `join_tids` (wait then
         pool). This path reads committer-written `chunk.host`, or the
         device clone if that device→host has not landed.
         """
+        task = handle._task
         if task.step_d2h_event is not None:
             task.step_d2h_event.synchronize()
         return self._rows_from(task, slots, key)

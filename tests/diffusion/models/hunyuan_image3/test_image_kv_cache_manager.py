@@ -40,9 +40,13 @@ class MockAttention(nn.Module):
         self.calls = []
         self.paged_calls = []
         self.paged_metadata = []
+        self.schedule_candidate_checks = []
 
     def is_paged_kv_active(self):
         return self.paged_kv_active
+
+    def add_schedule_candidate_check(self, check) -> None:
+        self.schedule_candidate_checks.append(check)
 
     def forward(self, query, key, value, attn_metadata=None, **kwargs):
         self.calls.append((query, key, value))

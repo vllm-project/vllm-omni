@@ -434,6 +434,39 @@ async def test_stalled_send_does_not_cause_catchup_burst():
 
 
 @pytest.mark.asyncio
+async def test_sleep_overshoot_does_not_slow_the_input_cadence():
+    class Clock:
+        now = 10.0
+
+        def monotonic(self):
+            return self.now
+
+        async def sleep(self, delay):
+            self.now += delay + 0.0015
+
+    class Client(driver.RawRealtimeProbe):
+        async def send(self, event):
+            clock.now += 0.0001
+
+    clock = Clock()
+    frames = 250
+    sends: list[tuple[float, float, float]] = []
+    await driver._paced_load_frames(
+        Client("ws://unused"),
+        np.zeros(driver.FRAME_SAMPLES * frames, dtype="<f4"),
+        epoch=10.0,
+        timeout_s=1.0,
+        sends=sends,
+        clock=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    assert len(sends) == frames
+    # Each frame is at most one overshoot late; lateness does not grow with the frame index.
+    assert max(started - planned for planned, started, _ in sends) == pytest.approx(0.0015, abs=1e-6)
+    assert sends[-1][1] - sends[0][1] == pytest.approx((frames - 1) * driver.FRAME_PERIOD_S, abs=1e-6)
+
+
+@pytest.mark.asyncio
 async def test_failed_frame_acceptance_preserves_numeric_diagnostics(tmp_path):
     args = _args(tmp_path, "--sessions", "1")
     async with _server("short_audio") as (url, states):

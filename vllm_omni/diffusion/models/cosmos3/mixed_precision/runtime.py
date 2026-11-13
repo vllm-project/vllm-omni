@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Format-agnostic schedule state, linear discovery, and dispatch."""
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Literal
 
 import torch
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
+from vllm.model_executor.models.utils import PPMissingLayer
 
 from .config import Cosmos3MixedPrecisionConfig
 from .strategy import (
@@ -16,6 +19,8 @@ from .strategy import (
     Fp8W8A8W8A16Strategy,
     Nvfp4W4A4W4A16Strategy,
 )
+
+logger = init_logger(__name__)
 
 PrecisionPath = Literal["reasoner", "generation"]
 _STRATEGIES: tuple[Cosmos3PrecisionStrategy, ...] = (
@@ -45,6 +50,10 @@ class Cosmos3MixedPrecisionLinearMethod(LinearMethodBase):
         self.module_name = module_name
         self.path = path
 
+    def get_base_quant_method(self) -> LinearMethodBase:
+        """Expose the storage/backend method while retaining MAPS dispatch."""
+        return self.base_method
+
     def create_weights(self, *args, **kwargs) -> None:
         self.base_method.create_weights(*args, **kwargs)
 
@@ -64,7 +73,7 @@ class Cosmos3MixedPrecisionLinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not self.runtime.use_high_precision(self.path):
-            return self.base_method.apply(layer, x, bias)
+            return self.strategy.apply_native(self.base_method, layer, x, bias)
         return self.strategy.apply_high(layer, x, bias)
 
 
@@ -81,10 +90,12 @@ class Cosmos3MixedPrecisionRuntime:
         components: dict[PrecisionPath, torch.nn.Module] = {
             "generation": transformer.gen_layers,
         }
-        if self.config.reasoner == "a16":
+        # Under pipeline parallelism the UND reasoner lives only on the first
+        # stage; later stages hold a PPMissingLayer placeholder without layers.
+        if self.config.reasoner == "a16" and not isinstance(transformer.language_model, PPMissingLayer):
             components["reasoner"] = transformer.language_model.layers
 
-        wrapped_count = 0
+        wrapped_counts: Counter[str] = Counter()
         for path, component in components.items():
             for local_name, layer in component.named_modules():
                 if not isinstance(layer, LinearBase):
@@ -101,10 +112,16 @@ class Cosmos3MixedPrecisionRuntime:
                     module_name,
                     path,
                 )
-                wrapped_count += 1
+                wrapped_counts[strategy.format_name] += 1
 
-        if not wrapped_count:
+        if not wrapped_counts:
             raise ValueError("Cosmos3 mixed precision found no compatible FP8 or NVFP4 ModelOpt linears")
+
+        logger.info(
+            "Cosmos3 mixed precision wrapped linears: fp8=%d, nvfp4=%d",
+            wrapped_counts["fp8"],
+            wrapped_counts["nvfp4"],
+        )
 
     def use_high_precision(self, path: PrecisionPath) -> bool:
         return self.config.reasoner == "a16" if path == "reasoner" else self._generation_high_precision

@@ -27,15 +27,16 @@ def test_stream_priming_graph_workspace_respects_token_budget(monkeypatch, capac
 
     captures = []
 
-    def capture(stream, sizes, frames=1):
+    def capture(stream, sizes, frames=1, pool=None):
         captures.append((sizes, frames))
-        return SimpleNamespace(sizes=sizes, frames=frames)
+        return SimpleNamespace(sizes=sizes, frames=frames, pool=pool)
 
     monkeypatch.setattr(streaming_decoder, "StreamingDecodeGraphs", capture)
     model = SimpleNamespace(
         stream_decoder=SimpleNamespace(max_frames=33),
         stream_graphs=None,
         stream_prime_graphs=None,
+        stream_prime_pieces={},
         stream_ref_context_frames=25,
         stream_chunk_frames=25,
         config=SimpleNamespace(tts_model_type=model_type),
@@ -45,7 +46,9 @@ def test_stream_priming_graph_workspace_respects_token_budget(monkeypatch, capac
     Qwen3TTSTalkerForConditionalGeneration.capture_stream_decode_graphs(model, sizes)
     expected = [(sizes, 1)]
     if model_type == "base":
-        expected.append(([size for size in sizes if size * 25 <= 512], 25))
+        # The priming chunk plus the power-of-two pieces of a shorter tail.
+        for frames in (25, 16, 8, 4, 2):
+            expected.append((sorted({1, *(size for size in sizes if size * frames <= 512)}), frames))
     assert captures == expected
     Qwen3TTSTalkerForConditionalGeneration.capture_stream_decode_graphs(model, sizes)
     assert captures == expected
@@ -117,7 +120,7 @@ def test_xvec_first_chunk_replays_prefix_graph(monkeypatch, skip_flags, initial_
         torch.testing.assert_close(outputs[row], expected)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("initial_frames", [1, 3])
 @pytest.mark.parametrize("time_major", [False, True])
 @torch.inference_mode()
@@ -159,7 +162,7 @@ def test_xvec_graphs_follow_request_first_audio_flags(initial_frames, time_major
                 torch.testing.assert_close(cache[key], expected_cache[key], atol=1e-5, rtol=1e-5)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_stream_decoder_preemption_restores_all_state_into_a_different_slot():
     from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
@@ -200,8 +203,8 @@ def test_stream_decoder_preemption_restores_all_state_into_a_different_slot():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("use_graph", [False, True])
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("use_graph", [False, True, "pieces"])
 @torch.inference_mode()
 def test_batched_reference_priming_matches_serial_decoder_continuation(use_graph):
     from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
@@ -223,6 +226,13 @@ def test_batched_reference_priming_matches_serial_decoder_continuation(use_graph
     model.stream_decoder = stream
     model.stream_prime_graphs = graphs
     model.stream_chunk_frames = 25
+    model.stream_prime_pieces = {}
+    if use_graph == "pieces":
+        # Tails of 3 and 51 frames replay 2 + 1 and 25 + 25 + 1 frame graphs.
+        model.stream_prime_pieces = {
+            f: StreamingDecodeGraphs(stream, [2], frames=f, pool=graphs.pool) for f in (16, 8, 4, 2)
+        }
+        model.stream_graphs = StreamingDecodeGraphs(stream, [2])
     refs = [torch.randint(0, 32, (length, 2), device=DEVICE) for length in [25, 3, 51, 25]]
     slots = [2, 0, 3, 4]
     frame = torch.randint(0, 32, (4, 1, 2), device=DEVICE)
@@ -245,8 +255,8 @@ def test_batched_reference_priming_matches_serial_decoder_continuation(use_graph
         torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("use_graph", [False, True])
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("use_graph", [False, True, "prepared"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
 def test_stream_frames_match_fp32_exact_decoder(use_graph, dtype):
@@ -281,7 +291,14 @@ def test_stream_frames_match_fp32_exact_decoder(use_graph, dtype):
     spf = int(stream.spf)
     for frame in range(codes.shape[1]):
         positions = torch.full((2,), frame, device=DEVICE, dtype=torch.int32)
-        actual = decode(codes[:, frame : frame + 1].contiguous().to(torch.int32), slots, positions).reshape(2, -1)
+        if use_graph == "prepared":
+            static_codes, static_slots, static_pos = decode.input_buffers(2)
+            static_codes.copy_(codes[:, frame : frame + 1])
+            static_slots.copy_(slots)
+            static_pos.copy_(positions)
+            actual = decode.replay_prepared(2, 2).reshape(2, -1)
+        else:
+            actual = decode(codes[:, frame : frame + 1].contiguous().to(torch.int32), slots, positions).reshape(2, -1)
         exact_frame = expected[:, frame * spf : (frame + 1) * spf]
         relative_rms = (actual - exact_frame).square().mean(1).sqrt() / exact_frame.square().mean(1).sqrt()
         # BF16 kernels are approximate; compare every frame to the independent
