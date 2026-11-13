@@ -8,6 +8,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 - **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
 - **Gepard-1.0** (`nineninesix/gepard-1.0`) -- single-stage native-AR TTS with a 22.05 kHz NanoCodec. Zero-shot default voice only.
+- **ZONOS3-Mini** (`Zyphra/ZONOS3-Mini`) -- two-stage AR + ZAC decoder, native 44.1 kHz mono audio. For required weights and cached startup, see the [RTX 3090 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Zyphra/ZONOS3-Mini-RTX3090.md).
 
 See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, MOSS-TTS-Nano, and Breeze-TTS-2.
 
