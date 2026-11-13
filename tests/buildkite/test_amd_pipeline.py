@@ -2442,10 +2442,12 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
 
     indextts_source = Path("tests/e2e/online_serving/test_indextts2_expansion.py").read_text(encoding="utf-8")
     stable_indextts_prompt = '"input": "Please read this sentence clearly and naturally."'
-    assert indextts_source.count(stable_indextts_prompt) == 2
-    assert '"input": "Hello, this is a voice cloning demo."' not in indextts_source
-    assert indextts_source.count('"transcript_language": "en"') == 2
-    assert indextts_source.count('"transcript_escalation_model": "large-v3"') == 2
+    assert indextts_source.count(stable_indextts_prompt) == 1
+    assert indextts_source.count('"input": "Hello, this is a voice cloning demo."') == 1
+    assert indextts_source.count('"transcript_language": "en"') == 1
+    assert indextts_source.count('"transcript_escalation_model": "large-v3"') == 1
+    assert "SAMPLE_RATE = 22050" in indextts_source
+    assert '"expected_sample_rate": SAMPLE_RATE' in indextts_source
 
     cosy_source = Path("tests/e2e/offline_inference/test_cosyvoice3_expansion.py").read_text(encoding="utf-8")
     assert 'id="sync"' in cosy_source

@@ -22,6 +22,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 MODEL = "IndexTeam/IndexTTS-2"
+SAMPLE_RATE = 22050
 
 REF_AUDIO_URL = get_asset_path("indextts2/ref_audio.wav", as_data_url=True)
 
@@ -75,13 +76,14 @@ def test_streaming(omni_server, online_client) -> None:
     """
     request_config = {
         "model": omni_server.model,
-        "input": "Please read this sentence clearly and naturally.",
+        "input": "Hello, this is a voice cloning demo.",
         "stream": True,
         "stream_format": "audio",
         "response_format": "pcm",
         "ref_audio": REF_AUDIO_URL,
         "min_audio_bytes": 1024,
-        "transcript_language": "en",
-        "transcript_escalation_model": "large-v3",
+        # Raw PCM has no header; pin IndexTTS2's decoder rate so the HNR pitch
+        # window is not calibrated against the speech helper's 24 kHz default.
+        "expected_sample_rate": SAMPLE_RATE,
     }
     online_client.send_audio_speech_request(request_config)
