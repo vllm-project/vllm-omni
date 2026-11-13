@@ -8,7 +8,7 @@ L2 (test-ready.yml):
 L3 (test-merge.yml):
   test_i2i_001       — advanced_model, L4
 
-All tests skip when FLUX3_MODEL_PATH is unset.
+Uses the Hugging Face checkpoint black-forest-labs/flux-3-image-klein.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from tests.helpers.runtime import (
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-MODEL = os.getenv("FLUX3_MODEL_PATH", "")
+MODEL = "black-forest-labs/flux-3-image-klein"
 
 PROMPT = "a scenic mountain landscape at golden hour"
 
@@ -55,7 +55,6 @@ def _server_cases(marks):
 # ── L2 baseline: core_model + advanced_model ────────────────────────────────
 
 
-@pytest.mark.skipif(not MODEL, reason="Set FLUX3_MODEL_PATH to run.")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
@@ -86,7 +85,6 @@ def test_t2i_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) ->
 # ── L3 additional image test: advanced_model only ───────────────────────────
 
 
-@pytest.mark.skipif(not MODEL, reason="Set FLUX3_MODEL_PATH to run.")
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _server_cases(L4_MARKS), indirect=True)
