@@ -103,6 +103,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     use_aux_hidden_state_outputs: bool = False
     speculator: Any = None
     num_speculative_steps: int = 0
+    _kstep_frames: int = 0
     _last_aux_output: Any
     _last_multimodal_outputs: dict[str, Any] | None
     _model_returns_tuple: bool
@@ -402,6 +403,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     super().load_model(*args, **kwargs)
             finally:
                 _mr_module.init_model_state = _orig
+        self._kstep_frames = self._resolve_talker_kstep_frames()
         self._last_aux_output = None
         self._last_multimodal_outputs = None
         self._configure_cudagraph_output_contract()
@@ -694,7 +696,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             return 0
         return scheduler_output.num_spec_tokens_to_schedule
 
-    def _talker_kstep_frames(self) -> int:
+    def _resolve_talker_kstep_frames(self) -> int:
         if not current_omni_platform.is_cuda() or not getattr(self.model, "supports_multi_frame_decode", False):
             return 0
         from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
@@ -705,7 +707,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
 
     def _dummy_sampler_run(self, hidden_states: Any) -> Any:
         """The Talker's two control logits cannot satisfy profiling's top-k request."""
-        if self._talker_kstep_frames() > 1:
+        if self._kstep_frames > 1:
             return None
         return super()._dummy_sampler_run(hidden_states)
 
@@ -1022,7 +1024,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         if not dummy_run and not is_profile:
             from vllm_omni.worker import talker_multiframe
 
-            expected_frames = self._talker_kstep_frames()
+            expected_frames = self._kstep_frames
             if expected_frames and not any(is_warmup_request(req_id) for req_id in input_batch.req_ids):
                 cast(SupportsMRv2MultiFrameDecode, self.model).flush_cuda_kstep_feedback()
                 kstep_extra = self._build_kstep_model_kwargs_extra(model_inputs, input_batch)

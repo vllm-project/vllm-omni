@@ -125,12 +125,11 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         super().load_model(*args, **kwargs)
-        kstep_frames = self._talker_kstep_frames()
         if (
             self.num_speculative_steps > 0
             and self.is_last_pp_rank
             and self.rejection_sampler is None
-            and kstep_frames == 0
+            and self._kstep_frames == 0
         ):
             raise ValueError(
                 "MRv2 AR speculative decoding requires a rejection sampler; check the model's custom sampler"
@@ -413,7 +412,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
     ) -> None:
         """Draft the next step's tokens, as the parent runner's ``sample_tokens`` does."""
         num_spec_tokens = draft.num_spec_tokens
-        if self._talker_kstep_frames() > 1:
+        if self._kstep_frames > 1:
             # The placeholders reserve query positions for the next Talker
             # step. Only rows with confirmed codec state may enter that loop.
             model = cast(SupportsMRv2MultiFrameDecode, self.model)

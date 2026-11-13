@@ -42,7 +42,7 @@ def test_model_load_skips_rejection_sampler_only_for_talker_kstep(monkeypatch, f
     runner.is_last_pp_rank = True
     runner.rejection_sampler = None
     monkeypatch.setattr(OmniGPUModelRunner, "load_model", lambda self: None)
-    monkeypatch.setattr(runner, "_talker_kstep_frames", lambda: frames)
+    runner._kstep_frames = frames
     if frames:
         runner.load_model()
     else:
@@ -62,7 +62,7 @@ def test_cuda_kstep_requires_model_hooks_before_execution():
         merge_frame_outputs=lambda outputs, stop_logits: outputs,
     )
     with pytest.raises(TypeError, match="kstep_rows_ready"):
-        runner._talker_kstep_frames()
+        runner._resolve_talker_kstep_frames()
 
 
 def _scheduled_batch(*counts):
@@ -132,7 +132,7 @@ def test_existing_state_is_not_reseeded():
 @pytest.mark.parametrize("width", [7, 8])
 def test_propose_kstep_drafts_records_booked_width(dtype, width):
     runner = _runner()
-    runner._talker_kstep_frames = lambda: 8
+    runner._kstep_frames = 8
     runner.num_speculative_steps = width
     runner.model._request_audio_states = {"request-a": {"step": 1}}
     buffer = torch.full((3, width), -1, dtype=dtype)
@@ -152,7 +152,7 @@ def test_propose_kstep_drafts_records_booked_width(dtype, width):
 def test_propose_drafts_unready_request_emits_empty_drafts():
     """An unseeded request keeps the next batch in single-frame mode."""
     runner = _runner()
-    runner._talker_kstep_frames = lambda: 8
+    runner._kstep_frames = 8
     runner.num_speculative_steps = 7
     runner.model._request_audio_states = {"request-a": {"step": 0}}
     runner.req_states = SimpleNamespace(draft_tokens=torch.full((3, 7), -1, dtype=torch.int32))
@@ -180,7 +180,7 @@ def test_propose_drafts_unready_request_emits_empty_drafts():
 def test_propose_drafts_nonkstep_model_keeps_generic_buffer_slice():
     """With no speculator, the generic handler records the existing drafts."""
     runner = _runner()
-    runner._talker_kstep_frames = lambda: 0
+    runner._kstep_frames = 0
     runner.num_speculative_steps = 7
     runner.model._request_audio_states = {"request-a": {"step": 1}}
     runner.req_states = SimpleNamespace(draft_tokens=torch.tensor([[5, 5, 5, 5, 5, 5, 5]] * 3, dtype=torch.int32))
