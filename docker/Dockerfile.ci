@@ -91,6 +91,14 @@ RUN uv pip install --target /opt/vllm-omni-cudnn --no-deps --only-binary=:all: \
 ENV LD_PRELOAD="/opt/vllm-omni-cudnn/nvidia/cudnn/lib/libcudnn.so.9 ${LD_PRELOAD:-}"
 ENV LD_LIBRARY_PATH="/opt/vllm-omni-cudnn/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-/usr/local/nvidia/lib:/usr/local/nvidia/lib64}"
 
+# PAN 2 guardrails stay on for the image-to-video doc test. This file is not
+# part of the published extras: a git URL in pyproject optional-dependencies
+# would be Requires-Dist, which PyPI rejects. --no-deps keeps the already
+# installed torch, torchvision, and transformers. ftfy and regex are the
+# import-time deps of clip.simple_tokenizer that the image may not have.
+RUN uv pip install --system --no-deps -r requirements/ci-pan2-guardrail.txt \
+    && uv pip install --system "ftfy>=6.1.1" "regex>=2022.1.18"
+
 # Fail the image build if dependency resolution replaced the selected vLLM.
 # The CPU builder has no NVIDIA driver; CUDA imports are checked at the start
 # of each GPU test job by .buildkite/cuda/scripts/check_vllm_runtime.py.
@@ -104,16 +112,26 @@ import json
 import os
 from pathlib import Path
 
+import importlib.metadata as metadata
+
 import torch
+from clip.model import VisionTransformer
+import pan2_guardrail
 
 maps = Path("/proc/self/maps").read_text()
 assert any(os.path.realpath(path) in maps for path in os.environ["LD_PRELOAD"].split() if "libcudnn.so.9" in path)
 assert torch.arange(4, device="cpu").sum().item() == 6
 cuda_available = torch.cuda.is_available()
 assert not torch.cuda.is_initialized()
+assert VisionTransformer is not None
+assert pan2_guardrail.PAN2SafetyChecker is not None
 print(json.dumps({
     "cpu_preload_smoke": "passed",
     "cudnn": torch.backends.cudnn.version(),
+    "torch": metadata.version("torch"),
+    "torchvision": metadata.version("torchvision"),
+    "transformers": metadata.version("transformers"),
+    "pan2-guardrail": metadata.version("pan2-guardrail"),
     "cuda_available": cuda_available,
     "cuda_initialized": torch.cuda.is_initialized(),
     "gpu_device_nodes": sorted(glob.glob("/dev/nvidia*")),
