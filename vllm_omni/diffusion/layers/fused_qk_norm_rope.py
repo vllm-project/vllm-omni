@@ -648,6 +648,28 @@ def _fused_cuda_supported(
     return head_dim == _FUSED_HEAD_DIM and rotary_dim == _FUSED_ROTARY_DIM
 
 
+def _fused_maca_supported(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
+    interleaved: bool = False,
+) -> bool:
+    return (
+        HAS_TRITON
+        and current_platform.device_name == "maca"
+        and not torch.compiler.is_compiling()
+        and not torch.is_grad_enabled()
+        and not interleaved
+        and head_dim == _FUSED_HEAD_DIM
+        and rotary_dim == _FUSED_ROTARY_DIM
+        and q.device.type == "cuda"
+        and q.numel() > 0
+        and k.numel() > 0
+        and q.dtype == k.dtype == torch.bfloat16
+    )
+
+
 def _fused_npu_supported(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1217,6 +1239,12 @@ def fused_qk_norm_rope(
     q_weight = q_weight.contiguous()
     k_weight = k_weight.contiguous()
     rope_table = rope_table.contiguous()
+    if _fused_maca_supported(q, k, head_dim, rotary_dim, interleaved):
+        return (
+            _launch_fused_rms_norm_rope(q, q_weight, rope_table, eps),
+            _launch_fused_rms_norm_rope(k, k_weight, rope_table, eps),
+        )
+
     if _fused_npu_supported(q, k, head_dim, rotary_dim, interleaved):
         return _npu_qk_norm_rope(
             q,
