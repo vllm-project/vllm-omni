@@ -25,12 +25,15 @@ import os
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.core.sched.output import TextStreamDelivery
+
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig
 
 logger = init_logger(__name__)
 
@@ -38,7 +41,10 @@ TEXT_STREAM_KEY = "text_stream"
 
 # How long a request may wait for text before the scheduler fails it. The
 # clock starts when the request first cannot run for lack of text and restarts
-# on every append. Set exactly 0 to disable the deadline.
+# on every append. Set exactly 0 to disable the deadline. It is separate from
+# VLLM_OMNI_INPUT_WAIT_TIMEOUT_S (stage input, 600 s by default): a running
+# request that waits for text keeps its seat and its KV cache, and a client
+# that streams model output is gone after a few seconds without text.
 _TIMEOUT_ENV = "VLLM_OMNI_TEXT_STREAM_TIMEOUT_S"
 _TIMEOUT_DEFAULT_S = 5.0
 
@@ -66,10 +72,10 @@ class TextStreamSpec:
 
 
 # (the request's additional information, the stage's model config) -> spec
-TextStreamPolicy = Callable[[Mapping[str, Any], Any], TextStreamSpec]
+TextStreamPolicy = Callable[[Mapping[str, Any], "ModelConfig | None"], TextStreamSpec]
 
 
-def first_value(value: Any) -> Any:
+def first_value(value: object) -> object:
     """Unwrap the list-wrapped ``additional_information`` value convention."""
     if isinstance(value, (list, tuple)):
         return value[0] if value else None
@@ -118,7 +124,7 @@ def text_stream_timeout_s() -> float:
     return value
 
 
-def deliver_streamed_text(model: Any, scheduler_output: Any) -> None:
+def deliver_streamed_text(model: object, scheduler_output: object) -> None:
     """Hand a model the streamed text that reaches a step's requests; runners call it once per step."""
     deliveries = getattr(scheduler_output, "text_stream_deliveries", None)
     if not deliveries:
@@ -164,7 +170,7 @@ class TextStreams:
         policy: TextStreamPolicy | None,
         timeout_s: float,
         *,
-        model_config: Any = None,
+        model_config: ModelConfig | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._policy = policy

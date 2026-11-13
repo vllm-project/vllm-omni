@@ -95,6 +95,18 @@ payload schemas, public protocol rendering, connector transport, or semantic
 error classification. Those responsibilities belong to the stage runtime,
 I/O, entrypoint, connector, and error contracts.
 
+## Streamed text appends
+
+`AsyncOmni.append_text` waits until the request's ADD is on the request queue,
+then `AsyncOmniEngine.append_text_async` puts an `AppendTextMessage` on that
+same queue. The Orchestrator sends each append to the request's entry stage as
+a task started in dispatch order, so the dispatch loop does not wait for the
+engine core between appends. Under weight sharing, `SharedRequestQueue` holds
+an append with its request, as it holds companions, until the request's ADD
+goes out. An append for a request that is no longer active is dropped
+(ORCH-INV-100). A stage that cannot take the append ends the request with a
+client error, and an append lost on its way ends it with a server error.
+
 ## Candidate invariants
 
 These identifiers are proposals while the document is `draft`.
@@ -113,6 +125,11 @@ without selecting the next logical stage.
 
 **Rule:** Once a request reaches a terminal state, orchestration MUST NOT
 forward new work for that request.
+
+### ORCH-INV-101: A text append follows its request's ADD
+
+**Rule:** Orchestration MUST deliver a request's text appends to its entry
+stage after the request's ADD and in the order the client made them.
 
 ## Invariant namespace
 

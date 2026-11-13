@@ -16,10 +16,14 @@ This module stays light: the scheduler imports it by name.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm_omni.core.sched.text_stream import TextStreamSpec, first_value
+
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig
 
 TEXT_LEAD_KEY = "text_lead"
 
@@ -37,16 +41,19 @@ def text_lead(info: Mapping[str, Any] | None) -> int:
     value = first_value(info.get(TEXT_LEAD_KEY)) if info else None
     if value is None:
         return 0
-    try:
-        lead = int(value)
-    except (TypeError, ValueError):
-        lead = -1
-    if isinstance(value, bool) or lead != value or lead < 0:
+    # An integral float (2.0) is accepted; bool, NaN, infinities and fractions are not.
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value != int(value)
+        or value < 0
+    ):
         raise ValueError(f"text_lead must be an integer >= 0, got {value!r}")
-    return lead
+    return int(value)
 
 
-def text_stream_spec(info: Mapping[str, Any], model_config: Any = None) -> TextStreamSpec:
+def text_stream_spec(info: Mapping[str, Any], model_config: ModelConfig | None = None) -> TextStreamSpec:
     """``text_stream_policy`` of a Qwen3-TTS Talker stage: how a request reads its streamed text.
 
     Raises ``ValueError`` for a request whose prompt layout cannot stream.
@@ -55,7 +62,7 @@ def text_stream_spec(info: Mapping[str, Any], model_config: Any = None) -> TextS
     task_type = first_value(info.get("task_type")) or "CustomVoice"
     if task_type != "CustomVoice":
         raise ValueError(f"Qwen3-TTS streams text only for CustomVoice requests, not {task_type}.")
-    if non_streaming_mode(info, task_type):
+    if non_streaming_mode(info, "CustomVoice"):
         raise ValueError("Qwen3-TTS streams text only in streaming mode: set non_streaming_mode to false.")
     lead = text_lead(info)
     talker_config = getattr(getattr(model_config, "hf_config", None), "talker_config", None)

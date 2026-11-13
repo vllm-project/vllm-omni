@@ -586,7 +586,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             texts = self.__dict__["_streamed_text_state"] = StreamedTexts()
         return texts
 
-    def _forbid_early_eos(self, logits: torch.Tensor, sampling_metadata: Any) -> torch.Tensor:
+    def _forbid_early_eos(self, logits: torch.Tensor, sampling_metadata: object) -> torch.Tensor:
         """Forbid codec EOS to streamed requests that have not read their text END (v1 and MRV2)."""
         req_ids = self._batch_req_ids
         if len(req_ids) != logits.shape[0]:
@@ -612,7 +612,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         """Drop per-request state of finished or aborted requests."""
         self._streamed_texts.release(finished_req_ids)
 
-    def _queue_streamed_text(self, info_dict: Mapping[str, Any], tail: Any, text_offset: int) -> tuple[Any, int, bool]:
+    def _queue_streamed_text(
+        self, info_dict: Mapping[str, Any], tail: torch.Tensor | None, text_offset: int
+    ) -> tuple[torch.Tensor | None, int, bool]:
         """Append the request's newly received streamed text rows to its trailing queue (see streamed_text.py)."""
         if not self._streamed_texts:
             return tail, text_offset, False
@@ -909,11 +911,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             # Subsequent chunks slice the buffer stored by the first round.
             is_first_prefill = not isinstance(prompt_embeds_buffer, torch.Tensor) or prompt_embeds_buffer.ndim != 2
             if is_first_prefill:
-                streamed_text = self._streamed_texts.prompt_text(req_id, input_ids.device)
-                # Only a streamed request passes its text; others keep the plain call.
-                build_kwargs = {"streamed_text": streamed_text} if streamed_text is not None else {}
                 full_prompt_embeds, tailing_text_hidden, ref_code_len, ref_code = (
-                    self._prompt_builder.build_prompt_embeds(task_type=task_type, info_dict=info_dict, **build_kwargs)
+                    self._prompt_builder.build_prompt_embeds(
+                        task_type=task_type,
+                        info_dict=info_dict,
+                        streamed_text=self._streamed_texts.prompt_text(req_id, input_ids.device),
+                    )
                 )
                 prompt_embeds_buffer = full_prompt_embeds.detach()
                 if not bool(getattr(self, "_use_v2_model_runner", False)):

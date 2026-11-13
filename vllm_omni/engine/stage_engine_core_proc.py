@@ -196,7 +196,8 @@ class StageEngineCoreProc(EngineCoreProc):
             logger.warning_once("Streamed text was sent to a stage whose scheduler does not accept it; dropping it.")
             return "This stage does not accept streamed text."
         try:
-            append(request_id, [int(token_id) for token_id in token_ids], bool(final))
+            # The scheduler checks each id against the stream's limits.
+            append(request_id, token_ids, final)
         except ValueError as exc:
             return str(exc)
         return None

@@ -170,6 +170,29 @@ class _OmniWaitingQueue:
         self.scheduler.deferred_waiting.difference_update(requests)
 
 
+def finish_requests_with_error(scheduler: OmniSchedulerMixin, reasons: Mapping[str, str]) -> None:
+    """Finish requests with FINISHED_ERROR and an explicit ERROR output that carries each one's reason."""
+    # Upstream finish_requests frees scheduler state, but does not emit
+    # EngineCoreOutput. Keep an explicit ERROR for both AR and generation
+    # callers, including a tick with no scheduled model work.
+    pending = getattr(scheduler, "_pending_input_timeout_outputs", None)
+    if pending is None:
+        pending = scheduler._pending_input_timeout_outputs = {}
+    for request_id, reason in reasons.items():
+        request = scheduler.requests[request_id]
+        request.stop_reason = reason
+        pending[request_id] = (
+            request.client_index,
+            OmniEngineCoreOutput(
+                request_id=request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                stop_reason=reason,
+            ),
+        )
+    scheduler.finish_requests(set(reasons), RequestStatus.FINISHED_ERROR)
+
+
 class OmniSchedulerMixin(_SchedulerMixinBase):
     """Shared scheduler helpers for omni-specific request handling."""
 
@@ -552,26 +575,8 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         self._finish_input_timeout_requests(present_ids)
 
     def _finish_input_timeout_requests(self, request_ids: set[str]) -> None:
-        # Upstream finish_requests frees scheduler state, but does not emit
-        # EngineCoreOutput. Keep an explicit ERROR for both AR and generation
-        # callers, including a tick with no scheduled model work.
-        pending = getattr(self, "_pending_input_timeout_outputs", None)
-        if pending is None:
-            pending = self._pending_input_timeout_outputs = {}
-        for request_id in request_ids:
-            request = self.requests[request_id]
-            reason = f"Timed out waiting for connector input after {DEFAULT_INPUT_WAIT_TIMEOUT_S:g}s"
-            request.stop_reason = reason
-            pending[request_id] = (
-                request.client_index,
-                OmniEngineCoreOutput(
-                    request_id=request_id,
-                    new_token_ids=[],
-                    finish_reason=FinishReason.ERROR,
-                    stop_reason=reason,
-                ),
-            )
-        self.finish_requests(request_ids, RequestStatus.FINISHED_ERROR)
+        reason = f"Timed out waiting for connector input after {DEFAULT_INPUT_WAIT_TIMEOUT_S:g}s"
+        finish_requests_with_error(self, dict.fromkeys(request_ids, reason))
 
     def reset_prefix_cache(self, reset_running_requests: bool = False, reset_connector: bool = False) -> bool:
         # Upstream uses drop_stale_output for both reset and KV-delivery

@@ -1034,15 +1034,13 @@ class AsyncOmniEngine(OmniEngineBase):
         """Async interaction API."""
         self.submit_interaction(request_id, interaction)
 
-    async def append_text_async(self, request_id: str, token_ids: Sequence[int], final: bool = False) -> None:
+    async def append_text_async(self, request_id: str, token_ids: list[int], final: bool = False) -> None:
         """Send streamed text ids for a running request to the Orchestrator.
 
         The message takes the same ordered request queue as the request's ADD,
         so appends follow it and keep their order.
         """
-        await self._put_request_queue(
-            AppendTextMessage(request_id=request_id, token_ids=[int(token_id) for token_id in token_ids], final=final)
-        )
+        await self._put_request_queue(AppendTextMessage(request_id=request_id, token_ids=token_ids, final=final))
 
 
 # ``StageRuntimeInfo`` moved to ``omni_engine_base``; keep the historical import path.

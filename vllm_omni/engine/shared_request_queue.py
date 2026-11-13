@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from vllm_omni.distributed.weight_sharing.runtime import SharingRuntime
 from vllm_omni.engine.messages import (
     AddCompanionRequestMessage,
+    AppendTextMessage,
     EngineQueueMessage,
     NextStageInputMessage,
     StageSubmissionMessage,
@@ -52,7 +53,7 @@ class SharedRequestQueue:
                 self._idle.set()
 
     def enqueue(self, message: EngineQueueMessage) -> bool:
-        """Queue new requests and their deferred companions; leave controls alone."""
+        """Queue new requests with their deferred companions and text appends; leave controls alone."""
         if isinstance(message, NextStageInputMessage) or (
             isinstance(message, StageSubmissionMessage) and message.type == "add_request"
         ):
@@ -62,9 +63,11 @@ class SharedRequestQueue:
             self.pending[request_id] = [message]
             self._wake.set()
             return True
-        if isinstance(message, AddCompanionRequestMessage):
-            messages = self.pending.get(message.parent_id)
-            if message.parent_id == self.active:
+        if isinstance(message, (AddCompanionRequestMessage, AppendTextMessage)):
+            # Both must follow their request's ADD, which may still wait here.
+            owner_id = message.parent_id if isinstance(message, AddCompanionRequestMessage) else message.request_id
+            messages = self.pending.get(owner_id)
+            if owner_id == self.active:
                 messages = self._submitting
             if messages is not None:
                 messages.append(message)

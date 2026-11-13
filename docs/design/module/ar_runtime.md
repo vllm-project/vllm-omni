@@ -84,6 +84,34 @@ receive also uses this coordinator and typed updates, with the built-in
 metadata adapter. Other async-chunk paths retain `OmniChunkTransferAdapter`
 ownership of chunk transfer and request updates.
 
+## Streamed text input
+
+A stage whose model config sets `text_stream_policy` (a dotted path) takes
+text for running requests through `AsyncOmni.append_text`. The text reaches
+the scheduler as the engine-core utility call `omni_append_text`, and
+`TextStreamMixin` (`core/sched/text_stream_mixin.py`) owns each stream: its
+ids, its end, and its deadline. The policy runs once, at admission, and says
+how many ids the request's prompt reads; after the prompt, each sampled frame
+reads one more id (`text_row`). A request that declares a stream on a stage
+without a policy is refused at admission.
+
+While some request streams text, each step the scheduler:
+
+- parks a waiting request whose prompt ids have not arrived (no KV cache, no
+  seat) and returns it to its place in the queue after the step;
+- holds a running request whose next frame reads an id that has not arrived:
+  it keeps its KV blocks and its seat, and the step's running and active
+  request caps shrink by the held count, so no waiting request takes the seat;
+- ends a request that waited for text longer than
+  `VLLM_OMNI_TEXT_STREAM_TIMEOUT_S` with `FINISHED_ERROR` and an ERROR output;
+- hands newly arrived ids to the worker with the request's step, in
+  `OmniSchedulerOutput.text_stream_deliveries`.
+
+The frame count reads `num_computed_tokens`, which includes the steps still in
+flight under async scheduling. A held request is skipped for the step, not
+preempted; this is the documented difference from upstream scheduling that
+AR-INV-001 asks for. Requests without a stream reach none of these rules.
+
 ## Candidate invariants
 
 ### AR-INV-001: vLLM owns base scheduling semantics

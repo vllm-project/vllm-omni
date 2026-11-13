@@ -4295,12 +4295,22 @@ class Orchestrator(OrchestratorBase):
     async def _append_text(self, msg: AppendTextMessage, stage_id: int) -> None:
         """Send one append to the stage, then act on the answer."""
         try:
-            refusal = await self.stage_pools[stage_id].append_text(msg.request_id, list(msg.token_ids), bool(msg.final))
+            refusal = await self.stage_pools[stage_id].append_text(msg.request_id, msg.token_ids, msg.final)
         except ValueError as exc:
             # The stage cannot take streamed text for this request: end it with the reason.
             await self._fail_request_client_error(msg.request_id, stage_id, str(exc))
         except Exception as exc:
+            # The text is lost (a transport or engine fault): end the request rather than leave
+            # it holding its seat until the text deadline, or forever with the deadline off.
             logger.warning("[Orchestrator] append_text for req %s failed: %r", msg.request_id, exc)
+            if msg.request_id in self.request_states:
+                await self._fail_request_client_error(
+                    msg.request_id,
+                    stage_id,
+                    f"Streamed text could not be delivered: {exc}",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                    error_type="TextStreamDeliveryError",
+                )
         else:
             if refusal is not None:
                 # The engine has already ended a live request it refused; an ended request needs nothing.

@@ -17,13 +17,10 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 import torch
-from vllm.logger import init_logger
 
 from vllm_omni.core.sched.output import TextStreamDelivery
 from vllm_omni.core.sched.text_stream import end_read, text_row
 from vllm_omni.utils.device_copy import index_to_device
-
-logger = init_logger(__name__)
 
 
 def lead_layout(

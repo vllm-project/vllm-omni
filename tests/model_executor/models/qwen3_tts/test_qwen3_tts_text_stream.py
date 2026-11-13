@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3-TTS streamed text: the stage policy, the text lead layout, the Talker's text queue and EOS gate."""
 
-from types import SimpleNamespace
+from unittest.mock import create_autospec
 
 import pytest
 import torch
+from vllm.config import ModelConfig
+from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.core.sched.output import TextStreamDelivery
 from vllm_omni.core.sched.text_stream import TextStreamSpec, end_read
@@ -50,7 +52,8 @@ def test_the_policy_reads_the_text_lead_of_a_streaming_custom_voice_request():
     assert text_stream_spec(_info()) == TextStreamSpec(prompt_ids=1, min_ids=0)
     assert text_stream_spec(_info(text_lead=[3])) == TextStreamSpec(prompt_ids=4, min_ids=2)
     # Appended ids must index the Talker's text embedding.
-    model_config = SimpleNamespace(hf_config=SimpleNamespace(talker_config=SimpleNamespace(text_vocab_size=151936)))
+    model_config = create_autospec(ModelConfig, instance=True)
+    model_config.hf_config = Qwen3TTSConfig(talker_config={"text_vocab_size": 151936})
     assert text_stream_spec(_info(), model_config).id_limit == 151936
 
 
@@ -69,7 +72,7 @@ def test_the_policy_refuses_requests_whose_prompt_cannot_stream(info, message):
         text_stream_spec(info)
 
 
-@pytest.mark.parametrize("value", [-1, 1.5, True, "2", [3]])
+@pytest.mark.parametrize("value", [-1, 1.5, True, "2", [3], float("inf"), float("nan")])
 def test_a_text_lead_must_be_a_non_negative_integer(value):
     with pytest.raises(ValueError, match="text_lead"):
         text_lead({"text_lead": [value]})
@@ -267,7 +270,7 @@ def test_an_open_stream_trails_no_end_and_a_short_ended_text_fills_the_lead():
 
 def _talker(builder=None):
     model = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
-    model.talker_config = SimpleNamespace(codec_pad_id=CODEC_PAD, num_code_groups=4)
+    model.talker_config = Qwen3TTSTalkerConfig(codec_pad_id=CODEC_PAD, num_code_groups=4)
     model._codebook_vocab_size = 2048
     model._embedding_dtype = torch.float32
     model._tts_pad_embed = torch.full((1, HIDDEN), -1.0)
@@ -323,7 +326,8 @@ def test_a_streamed_request_builds_its_prompt_from_the_ids_it_has_received():
         return torch.zeros(6, HIDDEN), torch.zeros(0, HIDDEN), None, None
 
     model = _talker()
-    model._prompt_builder = SimpleNamespace(build_prompt_embeds=build_prompt_embeds)
+    model._prompt_builder = create_autospec(Qwen3TTSPromptEmbedsBuilder, instance=True)
+    model._prompt_builder.build_prompt_embeds.side_effect = build_prompt_embeds
     model.append_streamed_text({"r": _delivery(0, [20, 21], prompt_ids=2)})
     with torch.inference_mode():
         model.preprocess(
@@ -354,13 +358,19 @@ def test_an_empty_queue_of_an_open_stream_is_not_settled():
     assert model.eager_decode_settled(spent)
 
 
+def _sampling_metadata(output_token_ids: list[list[int]]) -> SamplingMetadata:
+    metadata = create_autospec(SamplingMetadata, instance=True)
+    metadata.output_token_ids = output_token_ids
+    return metadata
+
+
 def test_the_eos_gate_reads_the_frame_counts_of_both_runners():
     model = _talker()
     model.append_streamed_text({"r": _delivery(0, [20, 21], ended=True)})
     model.set_batch_req_ids(["plain", "r"])
     # v1: sampling metadata carries each row's sampled tokens.
-    early = model._forbid_early_eos(torch.zeros(2, 16), SimpleNamespace(output_token_ids=[[1], [1]]))
-    late = model._forbid_early_eos(torch.zeros(2, 16), SimpleNamespace(output_token_ids=[[1], [1, 1]]))
+    early = model._forbid_early_eos(torch.zeros(2, 16), _sampling_metadata([[1], [1]]))
+    late = model._forbid_early_eos(torch.zeros(2, 16), _sampling_metadata([[1], [1, 1]]))
     assert torch.isinf(early[1, CODEC_EOS]) and not torch.isinf(early[0, CODEC_EOS])
     assert not torch.isinf(late[1, CODEC_EOS])
     # MRV2: the per-row counts stay on the device inside the sampling context.

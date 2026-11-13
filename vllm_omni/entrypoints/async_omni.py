@@ -921,6 +921,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         prompt set ``additional_information["text_stream"]``, and its entry
         stage's model config names a ``text_stream_policy``. ``token_ids`` are
         that model's text token ids, in order; ``final=True`` ends the text.
+        Raises ``ValueError`` until :meth:`generate` has registered the request,
+        which it does right after its admission check (that check waits while
+        the engine is paused or asleep).
         The request waits for text it has not received instead of reading
         past it. An append the engine cannot apply (no text stream, an ended
         stream), or no text for ``VLLM_OMNI_TEXT_STREAM_TIMEOUT_S`` while the

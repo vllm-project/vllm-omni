@@ -12,12 +12,13 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
-from vllm.v1.engine import FinishReason
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.core.sched.request_queue import RequestQueue
+from vllm.v1.request import Request
 
+from vllm_omni.core.sched.omni_scheduler_mixin import finish_requests_with_error
 from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.core.sched.text_stream import (
     TEXT_STREAM_KEY,
@@ -26,18 +27,18 @@ from vllm_omni.core.sched.text_stream import (
     load_text_stream_policy,
     text_stream_timeout_s,
 )
-from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.scheduler import Scheduler as _SchedulerBase
+    # Mixed into the AR scheduler beside OmniSchedulerMixin.
+    from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin as _SchedulerBase
 else:
     _SchedulerBase = object
 
 logger = init_logger(__name__)
 
 
-def _payload_has_key(payload: Any, key: str) -> bool:
+def _payload_has_key(payload: object, key: str) -> bool:
     """Whether an additional_information payload carries ``key``, without decoding its values."""
     if isinstance(payload, dict):
         return key in payload
@@ -66,7 +67,7 @@ def restore_running_order(running: list[Request], held: list[Request], order: li
     return merged
 
 
-def restore_queue_order(queue: Any, parked: list[Request], order: list[Request]) -> None:
+def restore_queue_order(queue: RequestQueue, parked: list[Request], order: list[Request]) -> None:
     """Put parked requests back into a waiting queue where they stood before the step.
 
     ``order`` is the queue before they were taken out. A first-come-first-served
@@ -96,7 +97,7 @@ class TextHold:
     """Requests kept out of one scheduler step because their text has not arrived."""
 
     # (waiting queue, the requests taken from it, the queue before): no KV cache, no seat yet.
-    parked: list[tuple[Any, list[Request], list[Request]]] = field(default_factory=list)
+    parked: list[tuple[RequestQueue, list[Request], list[Request]]] = field(default_factory=list)
     # Requests taken out of ``running``: they keep their KV cache and seat.
     held: list[Request] = field(default_factory=list)
     # ``running`` before the held requests were taken out.
@@ -137,11 +138,7 @@ class TextStreamMixin(_SchedulerBase):
 
     if TYPE_CHECKING:
         # Provided by the AR scheduler.
-        _pending_input_timeout_outputs: dict[str, tuple[int, OmniEngineCoreOutput]]
-
         def _talker_kstep_armed(self) -> bool: ...
-
-        def _get_confirmed_num_computed_tokens(self, request: Request) -> int: ...
 
     def append_text(self, request_id: str, token_ids: list[int], final: bool) -> None:
         """Add text ids that arrived for a request that declared a text stream.
@@ -161,42 +158,23 @@ class TextStreamMixin(_SchedulerBase):
             raise
 
     def _fail_with_error(self, reasons: dict[str, str]) -> None:
-        """Finish requests with FINISHED_ERROR and an explicit ERROR output that carries each reason.
-
-        The outputs go out with the next ``update_from_output``, through the
-        same queue as the stage-input timeouts.
-        """
-        pending = getattr(self, "_pending_input_timeout_outputs", None)
-        if pending is None:
-            pending = self._pending_input_timeout_outputs = {}
+        """Finish the requests the scheduler still holds, each with its reason as an ERROR output."""
         present = {request_id: reason for request_id, reason in reasons.items() if request_id in self.requests}
-        for request_id, reason in present.items():
-            request = self.requests[request_id]
-            request.stop_reason = reason
-            pending[request_id] = (
-                request.client_index,
-                OmniEngineCoreOutput(
-                    request_id=request_id,
-                    new_token_ids=[],
-                    finish_reason=FinishReason.ERROR,
-                    stop_reason=reason,
-                ),
-            )
         if present:
             logger.warning("Failing %d request(s) on their text stream: %s", len(present), present)
-            self.finish_requests(set(present), RequestStatus.FINISHED_ERROR)
+            finish_requests_with_error(self, present)
 
     def _text_stream_frame(self, request: Request) -> int:
         """The codec frame the request's next step samples (0 before and during its prefill).
 
-        Counted as the confirmed decode tokens plus the steps still in flight
-        under async scheduling, so the hold rule sees every scheduled frame.
+        ``num_computed_tokens`` counts every scheduled token, so under async
+        scheduling it includes the steps still in flight (the confirmed tokens
+        alone would lag one frame per step in flight).
         """
         prompt_len = request.num_prompt_tokens
         if request.num_computed_tokens < prompt_len:
             return 0
-        in_flight = request.num_output_placeholders
-        return self._get_confirmed_num_computed_tokens(request) + in_flight - prompt_len + 1
+        return request.num_computed_tokens - prompt_len + 1
 
     def _fail_text_stream_requests(self) -> None:
         """Fail requests past their text deadline, and requests whose text ended shorter than
@@ -231,10 +209,10 @@ class TextStreamMixin(_SchedulerBase):
         hold.held = self._hold_text_starved_running()
         return hold
 
-    def _park_text_starved_waiting(self) -> list[tuple[Any, list[Request], list[Request]]]:
+    def _park_text_starved_waiting(self) -> list[tuple[RequestQueue, list[Request], list[Request]]]:
         """Take out of the waiting queues the requests whose prompt text has not arrived."""
         streams = self._text_streams
-        parked: list[tuple[Any, list[Request], list[Request]]] = []
+        parked: list[tuple[RequestQueue, list[Request], list[Request]]] = []
         for queue in (self.waiting, self.kv_holding_waiting):
             starved = [
                 request

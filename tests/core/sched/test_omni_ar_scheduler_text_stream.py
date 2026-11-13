@@ -7,7 +7,7 @@ The stage uses the Qwen3-TTS text_stream_policy: a request with text lead k
 waits for k + 1 ids before its prefill, and each later frame reads one id.
 """
 
-from types import SimpleNamespace
+from dataclasses import dataclass
 from unittest.mock import Mock
 
 import pytest
@@ -21,10 +21,11 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
-from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.output import TextStreamDelivery
 from vllm_omni.core.sched.text_stream import TextStreams, load_text_stream_policy
 from vllm_omni.core.sched.text_stream_mixin import restore_running_order
+from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -43,20 +44,35 @@ class _Clock:
         return self.now
 
 
-def _scheduler(*, max_num_seqs: int = 2, num_blocks: int = 8, policy: str | None = POLICY, test_clock: bool = True):
+@dataclass
+class _ModelConfig:
+    """The ModelConfig fields this scheduler reads, for a stage with no checkpoint to load."""
+
+    text_stream_policy: str | None
+    hf_config: Qwen3TTSConfig
+    max_model_len: int = 64
+    runner_type: str = "generate"
+    recompute_preemption: str = "allow"
+    multimodal_config: None = None
+    uses_mrope: bool = False
+    is_encoder_decoder: bool = False
+    is_diffusion: bool = False
+    supports_multimodal_inputs: bool = False
+    return_sampling_mask: bool = False
+
+
+def _scheduler(
+    *,
+    max_num_seqs: int = 2,
+    num_blocks: int = 8,
+    policy: str | None = POLICY,
+    test_clock: bool = True,
+    scheduler_cls: type[OmniARScheduler] = OmniARScheduler,
+):
     config = VllmConfig()
-    config.model_config = SimpleNamespace(
-        multimodal_config=None,
-        uses_mrope=False,
-        is_encoder_decoder=False,
-        max_model_len=64,
-        runner_type="generate",
-        is_diffusion=False,
-        supports_multimodal_inputs=False,
-        return_sampling_mask=False,
-        recompute_preemption="allow",
+    config.model_config = _ModelConfig(  # type: ignore[assignment]
         text_stream_policy=policy,
-        hf_config=SimpleNamespace(talker_config=SimpleNamespace(text_vocab_size=TEXT_VOCAB)),
+        hf_config=Qwen3TTSConfig(talker_config={"text_vocab_size": TEXT_VOCAB}),
     )
     config.scheduler_config = SchedulerConfig(
         max_model_len=64,
@@ -77,7 +93,7 @@ def _scheduler(*, max_num_seqs: int = 2, num_blocks: int = 8, policy: str | None
             )
         ],
     )
-    scheduler = OmniARScheduler(config, kv_config, Mock(spec=StructuredOutputManager), BLOCK_SIZE)
+    scheduler = scheduler_cls(config, kv_config, Mock(spec=StructuredOutputManager), BLOCK_SIZE)
     clock = _Clock()
     if test_clock:
         # The scheduler's own state, with a clock the test moves.
@@ -230,7 +246,7 @@ def test_a_bad_deadline_setting_does_not_stop_a_stage_without_streamed_text(monk
 
 
 def test_restore_running_order_puts_held_requests_back_before_later_and_new_requests():
-    a, b, c, d, new = (SimpleNamespace(name=n) for n in "abcdn")
+    a, b, c, d, new = (_request(n, stream=False) for n in "abcdn")
     # b and d were held; c was preempted by the step; new was admitted.
     assert restore_running_order([a, new], [b, d], [a, b, c, d]) == [a, b, d, new]
     assert restore_running_order([], [b], [a, b]) == [b]
@@ -283,6 +299,22 @@ def test_the_hold_counts_frames_still_in_flight_under_async_scheduling():
     scheduler.running.append(request)
     scheduler.append_text("r", [7], final=False)
     assert scheduler._hold_text_starved_running() == []
+
+
+def test_the_async_scheduler_holds_a_step_whose_row_has_not_arrived_while_earlier_steps_are_in_flight():
+    """The Talker stage's default scheduler schedules a step before the previous step's output returns."""
+    scheduler, _ = _scheduler(max_num_seqs=1, scheduler_cls=OmniARAsyncScheduler)
+    request = _request("r")
+    scheduler.add_request(request)
+    scheduler.append_text("r", [5, 6], final=False)
+    assert "r" in scheduler.schedule().num_scheduled_tokens  # prefill: frame 0 reads id 0
+    assert "r" in scheduler.schedule().num_scheduled_tokens  # frame 1 reads id 1; frame 0 is still in flight
+    assert request.num_output_placeholders == 2
+    # Frame 2 reads id 2, which has not arrived: no step, and the request keeps its seat.
+    assert "r" not in scheduler.schedule().num_scheduled_tokens
+    assert scheduler.running == [request]
+    scheduler.append_text("r", [7], final=False)
+    assert "r" in scheduler.schedule().num_scheduled_tokens
 
 
 @pytest.mark.parametrize(

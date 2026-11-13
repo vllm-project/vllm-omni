@@ -588,7 +588,11 @@ has no seam between segments:
    first `k` text ids before codec BOS.
 3. As text arrives, call `AsyncOmni.append_text(request_id, token_ids)` with
    the Talker tokenizer's ids of that text (without the assistant template).
-   The last call sets `final=True`.
+   The last call sets `final=True`. `append_text` raises `ValueError` until
+   `generate()` has registered the request. `generate()` registers it right
+   after its admission check, which waits while the engine is paused or
+   asleep, so a client that appends as soon as it starts `generate()` should
+   retry on that error.
 
 The request stays in the waiting queue until its prompt's `k + 1` ids have
 arrived. After its prefill it runs no step whose text id has not arrived: it

@@ -24,6 +24,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     conditioning_cache_salt,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
+from vllm_omni.model_executor.models.qwen3_tts.text_stream import TEXT_LEAD_KEY
 from vllm_omni.utils.speaker_cache import validate_qwen3_tts_profile
 
 if TYPE_CHECKING:
@@ -379,21 +380,32 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         return self._validate_max_new_tokens(request)
 
     def _validate_text_lead(self, request: "OpenAICreateSpeechRequest", task_type: str) -> str | None:
-        """A text lead lays out the streaming CustomVoice prompt and cannot pass the text's END."""
-        text_lead = getattr(request, "text_lead", None)
-        if not text_lead:
+        """A text lead lays out the streaming CustomVoice prompt (``build`` checks it against the text's length)."""
+        if not getattr(request, "text_lead", None):
             return None
         if task_type != "CustomVoice":
             return "'text_lead' is only valid for CustomVoice task"
         if request.non_streaming_mode is not False:
             return "'text_lead' requires non_streaming_mode=false (the streaming prompt layout)"
-        from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import build_assistant_text
+        return None
 
-        self._load_text_tokenizer()
+    @staticmethod
+    def _text_lead_bound_error(tts_params: dict[str, Any]) -> str | None:
+        """Why a text lead passes the text's END (at most its token count plus one), or ``None``.
+
+        Reads the assistant-text ids that the prompt length estimate tokenized
+        on the executor, so the event loop does no tokenizer work.
+        """
+        from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY
+
+        lead = (tts_params.get(TEXT_LEAD_KEY) or [0])[0]
+        ids = (tts_params.get(PRECOMPUTED_TEXT_IDS_KEY) or [None])[0]
+        if not lead or ids is None:
+            return None
         # The assistant template wraps the text in 3 + 5 tokens.
-        num_text_ids = len(self.ctx.server._tts_tokenizer(build_assistant_text(request.input))["input_ids"]) - 8
-        if text_lead > num_text_ids + 1:
-            return f"'text_lead' {text_lead} exceeds the text's {num_text_ids} tokens plus its end"
+        num_text_ids = len(ids) - 8
+        if lead > num_text_ids + 1:
+            return f"'text_lead' {lead} exceeds the text's {num_text_ids} tokens plus its end"
         return None
 
     def _build_tts_params(self, request: "OpenAICreateSpeechRequest") -> dict[str, Any]:
@@ -528,7 +540,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         # Batch items and other request forms have no text_lead field.
         text_lead = getattr(request, "text_lead", None)
         if text_lead:
-            params["text_lead"] = [text_lead]
+            params[TEXT_LEAD_KEY] = [text_lead]
 
         # Do not set ``full_utterance_decode`` here. That flag is an explicit
         # Code2Wav emit opt-in (offline / advanced callers via
@@ -635,6 +647,8 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             tts_params["ref_audio"] = [[_ref_audio_wire_waveform(waveform), sr]]
 
         ph_len = await self._estimate_prompt_len_async(tts_params)
+        if (lead_error := self._text_lead_bound_error(tts_params)) is not None:
+            raise ValueError(lead_error)
         prompt = tokens_input(prompt_token_ids=[1] * ph_len)
         prompt["additional_information"] = tts_params
         prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
