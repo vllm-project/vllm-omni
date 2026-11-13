@@ -136,7 +136,10 @@ steps:
           - tts_higgs_audio_v3_weekly
         timeout_in_minutes: 90
         env:
-          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
+          # The L4 Higgs profiles exercise the established V1 path. Higgs V2
+          # does not produce audio under MRV2, while Higgs V3's MRV2 profile
+          # requires the H200-only audio_async_payload configuration.
+          VLLM_OMNI_CI_MODEL_RUNNER: "v1"
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"

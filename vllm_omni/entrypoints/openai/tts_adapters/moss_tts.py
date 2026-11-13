@@ -411,9 +411,11 @@ class _MossTTSAdapterBase(ARTTSAdapter):
                 codec_path,
                 trust_remote_code=True,
             )
-            # Reference encoding runs in the API process; follow the codec
-            # (code2wav) stage's GPU like the processor path above.
-            codec = codec.to(self._resolve_ref_encoder_device()).eval()
+            # The standalone v1 codec is about 7 GiB and cannot coexist with
+            # both serving stages on a 24 GiB L4. Reference codes are cached,
+            # and the upstream/offline path also performs this encode on CPU,
+            # so keep it out of the serving workers' accelerator budget.
+            codec = codec.to("cpu").eval()
             cached = (tokenizer, processor, codec)
             self._moss_realtime_components = cached
             return cached

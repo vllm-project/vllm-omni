@@ -107,6 +107,11 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "stream": False,
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                # A concurrent sample can be misheard by whisper-small. As in
+                # the single-request case, confirm a failed match with the
+                # stronger ASR model before treating the generated speech as
+                # a semantic regression.
+                "transcript_escalation_model": "large-v3",
             },
             request_num=3,
         )
@@ -123,12 +128,10 @@ class TestHiggsAudioV3OnlineHappyPath:
         windows stitch into a coherent PCM stream. The byte-count gate is the same as
         the sync paths; per-chunk audio content is verified offline against Whisper.
 
-        NOTE: ``min_hnr_db=0.0`` sit below the typical speech-noise floor so the
-        check still catches catastrophic codec failure (silence, white noise, sample
-        scramble all give HNR << 0) while allowing for the sliding-window codec's
-        slightly-noisier-than-sync output. The default 1.0 dB threshold has only
-        ~0.16 dB margin over measured single-request output (1.16 dB on L4), so
-        flake risk is too high there.
+        NOTE: ``min_hnr_db=-2.0`` is the same catastrophic-codec floor used by
+        the concurrent streaming case. It covers the measured accelerator
+        range (1.16 dB on L4 and -0.82 dB on MI325) while silence, white noise,
+        and sample scramble remain well below the floor.
         """
         online_client.send_audio_speech_request(
             {
@@ -138,7 +141,7 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "stream_format": "audio",
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "min_hnr_db": 0.0,
+                "min_hnr_db": -2.0,
             }
         )
 

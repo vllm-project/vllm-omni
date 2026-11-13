@@ -3,6 +3,7 @@
 
 import asyncio
 import threading
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -45,7 +46,17 @@ def test_realtime_components_use_the_realtime_model_and_codec(
     server = MossTTSAdapter(SpeechServingContext(server=object(), engine_client=engine_client))
 
     tokenizer = object()
-    codec = type("Codec", (), {"to": lambda self, device: self, "eval": lambda self: self})()
+    codec_devices: list[str] = []
+
+    class Codec:
+        def to(self, device):
+            codec_devices.append(device)
+            return self
+
+        def eval(self):
+            return self
+
+    codec = Codec()
     processor_calls = []
 
     class Processor:
@@ -85,6 +96,7 @@ def test_realtime_components_use_the_realtime_model_and_codec(
     ]
     assert tokenizer_calls == [("OpenMOSS-Team/MOSS-TTS-Realtime", True)]
     assert codec_calls == [(expected_codec_path, True)]
+    assert codec_devices == ["cpu"]
     assert processor_calls == [tokenizer]
 
 
@@ -278,6 +290,39 @@ def test_realtime_reference_batch_trims_each_item():
             await encoder.aclose()
 
     asyncio.run(run())
+
+
+def test_realtime_reference_batch_uses_the_codec_device():
+    seen_devices: list[torch.device] = []
+
+    @dataclass
+    class EncodedBatch:
+        audio_codes: torch.Tensor
+        audio_codes_lengths: torch.Tensor
+
+    class Codec(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.device_anchor = torch.nn.Parameter(torch.empty(0, device="meta"))
+
+        def batch_encode(self, wavs, *, num_quantizers):
+            assert num_quantizers == 16
+            seen_devices.extend(wav.device for wav in wavs)
+            return EncodedBatch(
+                audio_codes=torch.arange(16 * 3).reshape(16, 1, 3),
+                audio_codes_lengths=torch.tensor([3]),
+            )
+
+    encoder = reference_encoder.build_reference_encoder(
+        Codec(),
+        variant="realtime",
+        speaker_cache=SpeakerEmbeddingCache(),
+    )
+
+    (codes,) = encoder._encode_prepared([torch.ones(1, 8)])
+
+    assert seen_devices == [torch.device("meta")]
+    assert codes.shape == (3, 16)
 
 
 def test_failed_realtime_reference_encoding_does_not_populate_cache():
