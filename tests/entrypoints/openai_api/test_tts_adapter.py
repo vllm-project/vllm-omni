@@ -934,14 +934,19 @@ def test_ming3_tts_does_not_reinterpret_ip_voice_as_ming2_preset():
     assert prepared.model_type == "ming3_audio_tts"
 
 
-def test_step_audio2_build_constructs_open_assistant_turn():
+@pytest.mark.parametrize(
+    "instructions,expected_system",
+    [(None, "以自然的语速读出下面的文字。"), ("Read warmly.", "Read warmly.")],
+)
+def test_step_audio2_build_constructs_open_assistant_turn(instructions, expected_system):
     adapter = StepAudio2Adapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
-    request = OpenAICreateSpeechRequest(input="hello", instructions="Read warmly.")
+    request = OpenAICreateSpeechRequest(input="hello", instructions=instructions)
 
     prepared = asyncio.run(adapter.build(request, [], False))
 
-    assert "<|im_start|>system\nRead warmly.<|im_end|>" in prepared.prompt["prompt"]
-    assert prepared.prompt["prompt"].endswith("<|im_start|>assistant\n<tts_start>")
+    assert prepared.prompt["prompt"] == (
+        f"<|BOT|>system\n{expected_system}<|EOT|><|BOT|>human\nhello<|EOT|><|BOT|>assistant\n<tts_start>"
+    )
     assert prepared.tts_params == {}
     assert prepared.model_type == "step_audio2"
 
