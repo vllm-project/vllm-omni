@@ -38,10 +38,12 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
+from vllm_omni.model_executor.mm_request_rng import supports_mm_request_rng
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import sanitize_sampling_params_min_tokens_stop_ids
 from vllm_omni.worker_v2 import staged_writes
+from vllm_omni.worker_v2.mm_request_rng import MMRequestRNGState
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     _resolve_additional_information,
@@ -96,6 +98,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     encoder_cache: EncoderCache | None
     _native_output_materializer: NativeOutputWorker | None
     model_state: OmniModelState
+    _mm_rng_state: MMRequestRNGState | None = None
     vocab_size: int
     # Speculative decoding state; the upstream __init__ sets the real values.
     use_aux_hidden_state_outputs: bool = False
@@ -170,11 +173,17 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         input_batch: Any,
     ) -> torch.Tensor:
         """Call the native vLLM multimodal embedding contract."""
-        return self.model_state.prepare_inputs_embeds(
-            scheduled_encoder_inputs,
-            input_batch,
-            self.req_states,
+        rng_scope = (
+            self._mm_rng_state.tagged_inputs(scheduled_encoder_inputs, self.encoder_cache)
+            if self._mm_rng_state is not None and self.encoder_cache is not None
+            else nullcontext()
         )
+        with rng_scope:
+            return self.model_state.prepare_inputs_embeds(
+                scheduled_encoder_inputs,
+                input_batch,
+                self.req_states,
+            )
 
     def _prepare_mm_inputs(
         self,
@@ -253,6 +262,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         ] == [LogitBiasState, PenaltiesState, BadWordsState]
         if not scheduler_output.scheduled_new_reqs and static_staged_writes:
             return
+        if self._mm_rng_state is not None:
+            for request_data in scheduler_output.scheduled_new_reqs:
+                self._mm_rng_state.add_request(request_data.req_id, request_data.mm_features)
         logits_processor = getattr(self.model, "logits_processor", None)
         logits_vocab = getattr(logits_processor, "vocab_size", None)
         if logits_vocab is None:
@@ -272,6 +284,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             super().add_requests(scheduler_output)
 
     def shutdown(self) -> None:
+        if self._mm_rng_state is not None:
+            self._mm_rng_state.clear()
         # Every owner must release its resources even if an earlier drain fails.
         try:
             state = getattr(self, "model_state", None)
@@ -421,6 +435,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         ):
             self.supports_mm_inputs = False
             self.encoder_cache = None
+        self._mm_rng_state = MMRequestRNGState(self.model) if supports_mm_request_rng(self.model) else None
 
         self._publish_shared_backbone_if_configured()
         # After model ``__init__`` (which may set cudagraph_specialize_moe_routing).
@@ -1068,6 +1083,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         # because super() calls req_states.remove_request(req_id) which pops the
         # mapping and returns the slot index to free_indices.
         finished = scheduler_output.finished_req_ids
+        if self._mm_rng_state is not None:
+            for req_id in finished:
+                self._mm_rng_state.discard(req_id)
         on_finished = getattr(self.model, "on_requests_finished", None)
         if finished and callable(on_finished):
             # Request-owned state outlives generation slots and chunk boundaries.
