@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from PIL import Image
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from tests.engine.duplex.test_session_runner import (
@@ -55,7 +55,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
     JOYAI_VL_INTERACTION_ASR_PIPELINE,
     JOYAI_VL_INTERACTION_PIPELINE,
 )
-from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import asr_to_joyai
+from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import asr_to_joyai, joyai_action_to_tts
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -314,7 +314,7 @@ def test_opt_in_profile_preserves_turn_pipeline():
     assert duplex.session_mode == "duplex"
     assert normal.stages == duplex.stages
     assert normal.connectors == duplex.connectors
-    assert not duplex.async_chunk
+    assert duplex.async_chunk
     stages = merge_pipeline_deploy(JOYAI_VL_INTERACTION_PIPELINE, duplex)
     assert len(stages) == 3
     assert all(stage.session_mode == "duplex" for stage in stages)
@@ -1246,6 +1246,90 @@ async def test_asr_visuals_stay_on_raw_prompt_across_engine_wire(mocker, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_async_chunk_prewarm_request_crosses_engine_wire(mocker, monkeypatch):
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "0")
+    plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
+    plugin.processor = Processor()
+    plugin.max_model_len = 16384
+    plugin.max_images = 999
+    orchestrator, clients, rpc_q, _ = _build(stages=3, plugin=plugin)
+    # joyai_vl_interaction_duplex.yaml: the Talker is orchestrator-fed, Code2Wav is prewarmed.
+    orchestrator.async_chunk = True
+    clients[1].custom_process_input_func = joyai_action_to_tts
+
+    async def process_inputs(stage_id, *, request_id, params, **kwargs):
+        return _processed_request(request_id, params)
+
+    mocker.patch.object(orchestrator, "_process_stage_inputs", side_effect=process_inputs)
+    try:
+        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+        await _submit(orchestrator, AppendAudio(video_frames=(frame(),)))
+        await _submit(orchestrator, Commit(final=True, create_response=True))
+        assert not clients[1].add_request_calls
+        (prewarm,) = [call[0] for call in clients[2].add_request_calls]
+        MsgpackDecoder(type(prewarm)).decode(MsgpackEncoder().encode(prewarm))
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "last_response_text"),
+    [
+        ("</silence>", ""),
+        ("</response> The pot is smoking.", "The pot is smoking."),  # suppressed repeat
+        ("</response> Let me check.</delegation> What is in the pot?", ""),  # no delegate tool declared
+        ("</response> The pot is boiling.", ""),  # the harness session is text-only
+    ],
+    ids=["silence", "repeat", "undeclared-delegation", "text-only"],
+)
+async def test_async_chunk_turn_without_speech_aborts_prewarmed_code2wav(mocker, text, last_response_text):
+    from tests.engine.test_duplex_orchestrator import _settle
+
+    plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
+    plugin.processor = Processor()
+    plugin.max_model_len = 16384
+    plugin.max_images = 999
+    orchestrator, clients, rpc_q, _ = _build(stages=3, plugin=plugin)
+    orchestrator.async_chunk = True
+    clients[1].custom_process_input_func = joyai_action_to_tts
+
+    async def process_inputs(stage_id, *, request_id, params, **kwargs):
+        return _processed_request(request_id, params)
+
+    mocker.patch.object(orchestrator, "_process_stage_inputs", side_effect=process_inputs)
+    try:
+        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+        runner = orchestrator.session_manager.runners[ORCHESTRATOR_SESSION_ID]
+        runner.model_state.last_response_text = last_response_text
+        await _submit(orchestrator, AppendAudio(video_frames=(frame(),)))
+        await _submit(orchestrator, Commit(final=True, create_response=True))
+        request_id = clients[0].add_request_calls[-1][0].request_id
+        assert [call[0].request_id for call in clients[2].add_request_calls] == [request_id]
+        request = orchestrator.request_states[request_id]
+        runner.on_stage_output(
+            0,
+            tts_output(request_id, finished=True, text=text),
+            None,
+            request_id=request_id,
+            context=DuplexOutputContext(
+                identity=DuplexRequestIdentity(session_id=ORCHESTRATOR_SESSION_ID, fence=request.fence),
+                final_stage_id=2,
+                segment_finished=True,
+            ),
+        )
+        await _settle(orchestrator)
+        assert not clients[1].add_request_calls
+        # Nothing feeds the prewarmed Code2Wav request; abort it rather than let it
+        # wait out VLLM_OMNI_INPUT_WAIT_TIMEOUT_S.
+        assert any(request_id in ids for ids in clients[2].abort_calls)
+        assert request_id not in orchestrator.request_states
+        assert not runner.session.resource_request_ids()
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_late_asr_does_not_transcribe_recreated_audio_item():
     h = await open_joyai(asr=True, modalities=("text",))
     try:
@@ -1401,6 +1485,94 @@ async def test_spoken_action_forwards_once_and_audio_completes_response():
         assert any(e.get("delta") == "The pot is smoking." for e in events)
         assert any(e["type"] == "response.output_audio.delta" for e in events)
         assert h.port.cleanups[-1][0] == [request_id]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_streamed_audio_chunks_complete_on_empty_final_delta():
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_PIPELINE)
+    params = plugin.configure_sampling_params(runtime_config={}, defaults=tuple(SamplingParams() for _ in range(3)))
+    assert [p.output_kind for p in params] == [
+        RequestOutputKind.FINAL_ONLY,
+        RequestOutputKind.FINAL_ONLY,
+        RequestOutputKind.DELTA,
+    ]
+    h = await open_joyai()
+    try:
+        request_id = await observe(h)
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> The pot is smoking.", finished=True),
+            stage_id=0,
+            segment_finished=True,
+        )
+        # A spoken turn hands its text to the Talker; the prewarmed Code2Wav request must survive.
+        assert not h.port.aborts
+        # DELTA Code2Wav: each output carries only new samples, and the final one may carry none.
+        await h.deliver_and_settle(tts_output(request_id, samples=2400), stage_id=2)
+        await h.deliver_and_settle(tts_output(request_id, samples=2400), stage_id=2)
+        final = tts_output(request_id, finished=True)
+        final.multimodal_output = {"audio": []}
+        await h.deliver_and_settle(final, stage_id=2, segment_finished=True)
+        await h.run(AckPlayback(response_id=response_id, played_ms=200))
+        assert h.session.active_response_id is None
+        events = [event.to_realtime() for event in h.events]
+        assert sum(e["type"] == "response.output_audio.delta" for e in events) == 2
+        done = [e for e in events if e["type"] == "response.done"]
+        assert len(done) == 1 and done[0]["response"]["status"] == "completed"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_streamed_audio_without_samples_still_reports_missing_audio():
+    h = await open_joyai()
+    try:
+        request_id = await observe(h)
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> Smoke!", finished=True), stage_id=0, segment_finished=True
+        )
+        # Every DELTA output is empty, the final one included: the request never emitted audio.
+        await h.deliver_and_settle(tts_output(request_id, samples=0), stage_id=2)
+        final = tts_output(request_id, finished=True)
+        final.multimodal_output = {"audio": []}
+        await h.deliver_and_settle(final, stage_id=2, segment_finished=True)
+        assert h.session.active_response_id is None
+        assert h.runner.plugin.data_plane.is_terminal(request_id)
+        events = [event.to_realtime() for event in h.events]
+        assert not any(e["type"] == "response.output_audio.delta" for e in events)
+        done = [e for e in events if e["type"] == "response.done"]
+        assert len(done) == 1 and done[0]["response"]["status"] == "failed"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancel_between_streamed_audio_chunks_stops_audio_and_commits_no_text():
+    h = await open_joyai()
+    try:
+        request_id = await observe(h)
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> The pot is smoking.", finished=True),
+            stage_id=0,
+            segment_finished=True,
+        )
+        await h.deliver_and_settle(tts_output(request_id, samples=2400), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=50))
+        await h.run(CancelResponse())
+        assert h.runner.plugin.data_plane.is_terminal(request_id)
+        # Chunks Code2Wav decoded before the abort landed arrive on the old epoch.
+        await h.deliver_and_settle(tts_output(request_id, samples=2400), stage_id=2, epoch=0)
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2, segment_finished=True, epoch=0)
+        events = [event.to_realtime() for event in h.events]
+        assert sum(e["type"] == "response.output_audio.delta" for e in events) == 1
+        done = [e for e in events if e["type"] == "response.done"]
+        assert len(done) == 1 and done[0]["response"]["status"] == "cancelled"
+        # JoyAI text is not aligned with its audio, so a partly played answer commits no transcript.
+        assert not any("smoking" in str(message.get("content")) for message in h.session.history)
     finally:
         await h.manager.shutdown()
 
@@ -1690,7 +1862,8 @@ async def test_new_camera_commit_supersedes_queued_promotion():
         latest = h.port.submissions[-1]
         assert latest.prompt["multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 128, 0)
         assert not any(abort for _, abort in h.port.cleanups)
-        assert not h.port.aborts
+        # A's silent terminal frees its own async-chunk prewarm; nothing else may be aborted.
+        assert h.port.aborts == [[request_id]]
         response_id = h.session.active_response_id
         await h.deliver_and_settle(
             tts_output(latest.context.request_id, text="</silence>", finished=True),

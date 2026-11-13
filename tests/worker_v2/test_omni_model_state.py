@@ -40,11 +40,13 @@ class _DummyInputBatch:
     req_ids: list[str]
 
     input_ids: SimpleNamespace
+    logits_indices: torch.Tensor
     query_start_loc: torch.Tensor
 
     def __init__(self, indices, *, num_computed_tokens_cpu=None):
         self.idx_mapping_np = indices
         self.num_reqs = len(indices)
+        self.logits_indices = torch.arange(self.num_reqs)
         self.num_scheduled_tokens = [1] * len(indices)
         self.query_start_loc_np = list(range(len(indices)))
         if num_computed_tokens_cpu is not None:
@@ -74,6 +76,7 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
     model.postprocess_batch_mrv2 = None
     model.eager_decode_settled = None
     model.eager_frames_need_postprocess = True
+    model.postprocess_requires_multimodal_outputs = False
     state.model = model
     state.scheduler_config = SimpleNamespace(max_num_seqs=max_num_reqs)
     state.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
@@ -213,6 +216,7 @@ def test_output_spans_follow_reordered_mixed_batch():
     batch.req_ids = ["prefill", "decode"]
     batch.num_scheduled_tokens = [3, 1]
     batch.query_start_loc_np = [0, 3]
+    batch.logits_indices = torch.tensor([2, 3])
     state.intermediate_buffer.buffers[2] = {"req_id": "prefill"}
     state.intermediate_buffer.buffers[0] = {"req_id": "decode"}
     seen = {}
@@ -221,7 +225,20 @@ def test_output_spans_follow_reordered_mixed_batch():
     )
     state.postprocess_model_output(torch.zeros(4, 2), batch, SimpleNamespace())
     assert seen["request_token_spans"] == [(0, 3), (3, 4)]
+    assert seen["logits_index"] is batch.logits_indices
     assert [info["req_id"] for info in seen["model_intermediate_buffer"]] == ["prefill", "decode"]
+
+
+def test_structured_postprocess_rejects_multiple_logits_rows_per_request():
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.postprocess_requires_multimodal_outputs = True
+    batch = _DummyInputBatch([0, 1])
+    batch.logits_indices = torch.tensor([0, 1, 1])
+
+    with pytest.raises(RuntimeError, match="exactly one logits row per request"):
+        state.postprocess_model_output(torch.zeros(2, 4), batch, SimpleNamespace())
+
+    state.model.make_omni_output.assert_not_called()
 
 
 @pytest.mark.parametrize("hook_name", ["preprocess_decode_batch_mrv2", "preprocess_decode_batch", "legacy"])
@@ -460,6 +477,31 @@ def test_batched_postprocess_gpu_snapshot_writeback(owned):
     else:
         # Borrowed/graph output: the snapshot owns its storage, not the producer.
         assert first.untyped_storage().data_ptr() != produced[0].untyped_storage().data_ptr()
+
+
+def test_scalar_postprocess_uses_declared_multimodal_output_batch_row():
+    state = _make_state(max_num_reqs=3, has_postprocess=True)
+    state.model.postprocess_requires_multimodal_outputs = True
+    # The first batch row has no live request buffer.  The second row must
+    # still consume frame 1 rather than silently shifting to frame 0.
+    state.intermediate_buffer.buffers[0] = {"req_id": "r0"}
+    batch = _DummyInputBatch([2, 0])
+    batch.num_scheduled_tokens = [1, 1]
+    batch.query_start_loc_np = [0, 1]
+    frames = [torch.tensor([[1, 2]]), torch.tensor([[3, 4]])]
+    multimodal_outputs = {"codes": {"audio": frames}}
+    seen_rows = []
+
+    def postprocess(_hidden_states, *, multimodal_outputs, _omni_batch_row, **_info):
+        seen_rows.append(_omni_batch_row)
+        return {"codes": {"audio": multimodal_outputs["codes"]["audio"][_omni_batch_row]}}
+
+    state.model.postprocess = postprocess
+    hidden = torch.tensor([[10.0, 11.0], [20.0, 21.0]])
+    state.run_postprocess(hidden, batch, multimodal_outputs)
+
+    assert seen_rows == [1]
+    torch.testing.assert_close(state.intermediate_buffer.buffers[0]["codes"]["audio"], frames[1])
 
 
 def test_seed_independence_resolve_once_and_sampling_kwargs():

@@ -539,6 +539,11 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "NPU cross-reference batching will remain inactive and existing dispatch will be used",
                 self._min_batch_size,
             )
+        # Merge the step's exact-shape buckets into one ragged solve: serving
+        # steps hold one chunk per request, so per-bucket decoding would run CFM
+        # once per row and never fill the wider graph buckets.
+        self._cross_bucket_merge = read_bool_flag(extra, "cfm_cross_bucket_merge", False)
+        self._cross_bucket_merge_limit = int(extra.get("cfm_cross_bucket_merge_limit", 0) or 0)
         self._row_offset_merge = self._cfm_graph_config["row_offset_merge"]
         self._precapture_empty_cache = read_bool_flag(extra, "cfm_precapture_empty_cache", False)
 
@@ -895,6 +900,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         row_offsets: bool = False,
         cross_reference: bool = False,
         npu_same_shape: bool = False,
+        npu_mixed_history: bool = False,
     ) -> tuple[Any, ...]:
         cache_signature: Any
         if item.previous is None:
@@ -916,35 +922,51 @@ class MiniCPMO45Code2Wav(nn.Module):
             # from reference identity or from normalized audio duration.
             cache_signature = (
                 "npu_same_shape",
-                cache_signature,
-                tuple(item.tokens.shape),
+                (row_offset_signature(item.previous.token2wav) if item.previous is not None else ("uninitialized",))
+                if npu_mixed_history
+                else cache_signature,
+                None if npu_mixed_history else tuple(item.tokens.shape),
                 str(item.tokens.dtype),
                 str(item.tokens.device),
-                item.last_chunk,
+                None if npu_mixed_history else item.last_chunk,
             )
         prompt = (None, None) if cross_reference or npu_same_shape else (item.prompt_cache_id, item.prompt_wav)
         if cross_turn:
             return (*prompt, cache_signature)
         return (*prompt, cache_signature, item.cache_epoch)
 
+    def _npu_cross_reference_inactive_reason(self) -> str | None:
+        """Share admission conditions with initialization diagnostics."""
+        if not getattr(self, "_npu_cross_reference_batching", False):
+            return "configuration switch is disabled"
+        if self.backend is None:
+            return "backend is unavailable"
+        if getattr(self, "_min_batch_size", 1) != 1:
+            return "code2wav_min_batch_size must be 1"
+        wrapper = self.backend._whole_euler_graph_wrapper
+        if wrapper is None:
+            return "Whole-Euler wrapper is unavailable"
+        if not wrapper.enabled:
+            return "Whole-Euler graph is disabled"
+        if wrapper.ragged_body is None:
+            return "ragged Whole-Euler body is unavailable"
+        if not self.backend._whole_euler_ragged_active():
+            return "Whole-Euler ragged execution is inactive"
+        if wrapper.device.type != "npu":
+            return "wrapper device must be NPU"
+        if getattr(wrapper, "dtype", None) != torch.float32:
+            return "wrapper dtype must be FP32"
+        if getattr(wrapper, "att_slots", 0) != 0:
+            return "attention slot pool must be disabled"
+        if not getattr(self.backend, "_ragged_fused_body", False):
+            return "fused ragged body is required"
+        if getattr(self.backend, "_estimator_att_cache_dtype", None) != torch.float32:
+            return "attention cache dtype must be FP32"
+        return None
+
     def _npu_cross_reference_active(self) -> bool:
         """Admit only the already-supported FP32 fused Whole-Euler arena."""
-        if not getattr(self, "_npu_cross_reference_batching", False) or self.backend is None:
-            return False
-        if getattr(self, "_min_batch_size", 1) != 1:
-            # Post-setup shape splitting can create singleton groups. Preserve
-            # the existing strict minimum-bucket contract for such profiles.
-            return False
-        if not self.backend._whole_euler_ragged_active():
-            return False
-        wrapper = self.backend._whole_euler_graph_wrapper
-        return (
-            wrapper.device.type == "npu"
-            and getattr(wrapper, "dtype", None) == torch.float32
-            and getattr(wrapper, "att_slots", 0) == 0
-            and getattr(self.backend, "_ragged_fused_body", False)
-            and getattr(self.backend, "_estimator_att_cache_dtype", None) == torch.float32
-        )
+        return self._npu_cross_reference_inactive_reason() is None
 
     @staticmethod
     def _npu_same_shape_groups(
@@ -953,29 +975,43 @@ class MiniCPMO45Code2Wav(nn.Module):
         features: PromptFeatures | list[PromptFeatures],
         *,
         cross_turn: bool,
+        mixed_history: bool = False,
     ) -> list[list[int]]:
         """Partition prepared rows without reading tensor values or mixing histories."""
         groups: dict[tuple[Any, ...], list[int]] = {}
         for row, (item, state) in enumerate(zip(items, states, strict=True)):
             feature = features[row] if isinstance(features, list) else features
-            # Full shapes include prompt/history lengths. Full device strings
-            # additionally prevent combining rows from different NPU indices.
-            caches = tuple(
-                (kind, name, tuple(value.shape), str(value.dtype), str(value.device))
-                for kind, cache in (("flow", state.flow_cache), ("hift", state.hift_cache))
-                for name, value in sorted(cache.items())
+            # Match CUDA's row-offset compatibility: encoder attention histories
+            # may differ, but CNN and HiFT cache shapes must remain compatible.
+            caches = row_offset_signature(state) if mixed_history else state_shape_signature(state)
+            devices = tuple(
+                str(value.device)
+                for cache in (state.flow_cache, state.hift_cache)
+                for _, value in sorted(cache.items())
             )
             conditioning = tuple(
                 (tuple(value.shape), str(value.dtype), str(value.device))
                 for value in (feature.speech_tokens, feature.speaker_embedding, feature.mels)
             )
+            if mixed_history:
+                conditioning = tuple(
+                    (
+                        tuple(value.shape[:1]) + (None,) + tuple(value.shape[2:])
+                        if index in (0, 2)
+                        else tuple(value.shape),
+                        str(value.dtype),
+                        str(value.device),
+                    )
+                    for index, value in enumerate((feature.speech_tokens, feature.speaker_embedding, feature.mels))
+                )
             signature = (
                 caches,
+                devices,
                 conditioning,
-                tuple(item.tokens.shape),
+                None if mixed_history else tuple(item.tokens.shape),
                 str(item.tokens.dtype),
                 str(item.tokens.device),
-                item.last_chunk,
+                None if mixed_history else item.last_chunk,
                 None if cross_turn else item.cache_epoch,
             )
             groups.setdefault(signature, []).append(row)
@@ -1057,13 +1093,15 @@ class MiniCPMO45Code2Wav(nn.Module):
         last_chunks = [item.last_chunk for item in items]
         if len(items) > 1 and self._npu_cross_reference_active():
             groups = self._npu_same_shape_groups(
-                items, states, features, cross_turn=getattr(self, "_cross_turn_buckets", False)
+                items,
+                states,
+                features,
+                cross_turn=getattr(self, "_cross_turn_buckets", False),
+                mixed_history=getattr(self, "_npu_cross_reference_batching", False),
             )
             if len(groups) != 1:
                 raise _batch_error("npu_cross_reference_shape_mismatch")
-            # Keep uniform padding and fallback policy; conditions and caches
-            # remain per request. Mixed-history NPU guards are unchanged.
-            return self.backend.decode_batch(torch.stack(tokens, dim=0), features, states, last_chunk=last_chunks[0])
+            return self.backend.decode_ragged_batch(tokens, features, states, last_chunks=last_chunks)
         if (
             ragged
             or (isinstance(features, list) and self.backend._whole_euler_ragged_active())
@@ -1278,6 +1316,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         # original keys and dispatch without inspecting NPU capability.
         npu_same_shape = len(compute_items) > 1 and self._npu_cross_reference_active()
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
+        mixed_history_options = (
+            {"npu_mixed_history": True}
+            if npu_same_shape and getattr(self, "_npu_cross_reference_batching", False)
+            else {}
+        )
         for item in compute_items:
             key = self._bucket_key(
                 item,
@@ -1285,6 +1328,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 row_offsets=row_offsets,
                 cross_reference=cross_reference,
                 npu_same_shape=npu_same_shape,
+                **mixed_history_options,
             )
             buckets.setdefault(key, []).append(item)
         undersized = [
@@ -1389,6 +1433,20 @@ class MiniCPMO45Code2Wav(nn.Module):
             decode_buckets = merged
         else:
             decode_buckets = buckets.values()
+        merged_ragged = False
+        if (
+            self._cross_bucket_merge
+            and self.backend is not None
+            and self.backend._whole_euler_ragged_active()
+            and len(buckets) > 1
+        ):
+            # One solve for the whole step: every row keeps its own caches and
+            # reference, which is what the ragged Whole-Euler path supports.
+            merge_items = [item for bucket in buckets.values() for item in bucket]
+            merge_limit = self._cross_bucket_merge_limit or int(self._cfm_graph_config.get("max_graph_batch") or 0)
+            if not merge_limit or len(merge_items) <= merge_limit:
+                decode_buckets = [merge_items]
+                merged_ragged = True
         for bucket in self._iter_decode_batches(decode_buckets):
             batch_size = len(bucket)
             try:
@@ -1409,7 +1467,17 @@ class MiniCPMO45Code2Wav(nn.Module):
                 row_groups: list[list[int]] | None = None
                 offset_mix = False
                 if npu_same_shape and batch_size > 1:
-                    row_groups = self._npu_same_shape_groups(bucket, states, features, cross_turn=cross_turn)
+                    row_groups = self._npu_same_shape_groups(
+                        bucket,
+                        states,
+                        features,
+                        cross_turn=cross_turn,
+                        mixed_history=getattr(self, "_npu_cross_reference_batching", False),
+                    )
+                elif merged_ragged and len(bucket) > 1:
+                    # Keep the merged rows in one solve: re-splitting by cache
+                    # signature is exactly what the merge removed.
+                    offset_mix = True
                 elif isinstance(features, list):
                     # Each reference has its own cache lengths and conditioning.
                     # The ragged path handles them in one solve.
@@ -1506,6 +1574,8 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "meta.duplex_turn_id": [torch.tensor(item.duplex_turn_id, dtype=torch.int32) for item in items],
                 "meta.llm_output_text_utf8": [item.segment_text_utf8 for item in items],
                 "meta.tts_is_last_chunk": [torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items],
+                "meta.duplex_audio_cache_epoch": [torch.tensor(item.cache_epoch, dtype=torch.int64) for item in items],
+                "meta.duplex_audio_chunk_seq": [torch.tensor(item.chunk_seq, dtype=torch.int64) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
                 "meta.turn_end": [torch.tensor(item.turn_end, dtype=torch.bool) for item in items],
             },
@@ -1764,7 +1834,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         # Parsed before the platform branches: a typo in a shared stage config
         # must fail at startup on every platform, not only where the toggle is
         # consumed (CUDA for TensorRT, NPU for the device speaker embedding).
-        device_spk = read_bool_flag(extra, "token2wav_device_spk", True)
+        device_spk = read_bool_flag(
+            extra, "token2wav_device_spk", current_omni_platform.is_cuda() or current_omni_platform.is_npu()
+        )
         use_trt = read_bool_flag(extra, "token2wav_trt", False) or (os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1")
         cpu_reference_spk = read_bool_flag(extra, "token2wav_spk_cpu_reference", False)
         # The flag selects a CUDA speaker-only engine. Keep the previous path
@@ -1825,20 +1897,26 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
             token2wav.enable_trt_spk_embedding(cpu_reference=True)
             logger.info("MiniCPM-o Code2Wav: CPU-reference campplus speaker embedding on TensorRT")
-        elif current_omni_platform.is_cuda() or current_omni_platform.is_npu():
+        elif device_spk:
             # CAM++ speaker embedding on device via torch (weights loaded from
             # the same campplus.onnx) — replaces the per-request CPU
             # onnxruntime run that blocks the host ~120-155ms per request.
             # "token2wav_device_spk": false in the stage extra config falls
             # back to the CPU onnxruntime path (accuracy triage).
-            if device_spk:
+            flow_parameter = next(token2wav.flow.parameters(), None)
+            if flow_parameter is not None and flow_parameter.device.type != "cpu":
                 token2wav.enable_device_spk_embedding(use_trt=False)
                 logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on device (torch)")
             else:
-                logger.info(
-                    "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
-                    "(token2wav_device_spk=false)"
+                logger.warning(
+                    "MiniCPM-o Code2Wav: token2wav_device_spk=true but %s; using CPU onnxruntime",
+                    "flow has no parameters" if flow_parameter is None else "flow is on CPU",
                 )
+        else:
+            logger.info(
+                "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
+                "(token2wav_device_spk=false)"
+            )
         if read_bool_flag(extra, "token2wav_spk_cuda_graph", False):
             token2wav.enable_speaker_cuda_graph(self.vllm_config)
             logger.info("MiniCPM-o Code2Wav: exact-shape Torch speaker CUDA graphs enabled")
@@ -1856,6 +1934,16 @@ class MiniCPMO45Code2Wav(nn.Module):
             cfm_float16=read_bool_flag(extra, "cfm_float16", False),
             watchdog=self._watchdog,
         )
+        wrapper = self.backend._whole_euler_graph_wrapper
+        inactive_reason = self._npu_cross_reference_inactive_reason()
+        if wrapper is not None:
+            wrapper.npu_mixed_history = inactive_reason is None
+        if self._npu_cross_reference_batching and (wrapper is None or not wrapper.npu_mixed_history):
+            logger.warning(
+                "NPU cross-reference CFM batching is inactive: requires NPU FP32 fused Whole-Euler, "
+                "FP32 attention caches, no slot pool and code2wav_min_batch_size=1; reason: %s",
+                inactive_reason,
+            )
         # Deferred until the worker warmup hook (capture_auxiliary_graphs) or, on
         # runners without that hook, the first chunk that needs a graph. Capturing
         # under vLLM's weight load held GiBs, so the sweep must not run here.

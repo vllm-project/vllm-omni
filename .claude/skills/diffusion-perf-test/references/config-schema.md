@@ -47,7 +47,7 @@ run through `run_benchmark.py` writes results to the wrong place, and vice versa
 | Single-GPU image baseline | [test_qwen_image_21_vllm_omni.json](../../../../tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json) | `run_benchmark.py`, `/v1/images/generations`, `extra_body` size/steps; the same file's `step-execution` case adds `max-num-seqs` for a concurrency sweep |
 | Multi-GPU image (Ulysses) | same file, `ulysses-degree: 4` case | `serve_args` parallelism; `cards_4` mark |
 | Video I2V | [test_wan22_i2v_vllm_omni.json](../../../../tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json) | `dataset_name: random-mm`, `/v1/videos`, `extra_body` frames/fps/seed |
-| Legacy diffusion | [test_qwen_image_vllm_omni.json](../../../../tests/dfx/perf/tests/test_qwen_image_vllm_omni.json) | `server_type`/`task`/`dataset` kebab-case schema |
+| Legacy diffusion | [test_bagel_vllm_omni.json](../../../../tests/dfx/perf/tests/test_bagel_vllm_omni.json) | `server_type`/`task`/`dataset` kebab-case schema |
 
 Reuse these for lifecycle and interface patterns. Their resolution, steps,
 guidance, parallelism, and hardware rows are model-specific.
