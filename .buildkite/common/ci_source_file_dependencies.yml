@@ -404,9 +404,9 @@ x-lingbot-world: &lingbot_world
 source_file_dependencies:
   lingbot_world_perf:
     - tests/dfx/perf/tests/test_lingbot_world_realtime.json
+    - tests/e2e/accuracy/lingbot_world/configs/
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/conftest.py
-    - benchmarks/lingbot_world/configs/
     - vllm_omni/benchmarks/realtime_video/
     - vllm_omni/benchmarks/serve.py
     - vllm_omni/benchmarks/patch/patch.py
@@ -434,7 +434,6 @@ source_file_dependencies:
   lingbot_world_accuracy:
     - tests/e2e/accuracy/lingbot_world/
     - pyproject.toml
-    - benchmarks/lingbot_world/
     - requirements/lingbot-quality.txt
     - requirements/lingbot-quality.in
     - vllm_omni/benchmarks/realtime_video/
