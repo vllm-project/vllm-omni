@@ -3311,6 +3311,9 @@ class TestPlatformOverrides:
             "minicpmo_4_5.yaml",
             "minicpmo_4_5_turn.yaml",
             "minicpmo_4_5_duplex_h200.yaml",
+            "qwen3_tts.yaml",
+            "qwen3_tts_high_concurrency.yaml",
+            "qwen3_tts_mrv2.yaml",
         )
         if platform == "cuda":
             expected_runner = cuda_default_runner
