@@ -101,6 +101,9 @@ class DiffusionMXFP8Config(QuantizationConfig):
         super().__init__()
         self.is_checkpoint_mxfp8_serialized = is_checkpoint_mxfp8_serialized
         self.ignored_layers = ignored_layers or []
+        # Model pipelines (e.g. Qwen-Image-2.1) switch this to "substring" to
+        # exclude whole subtrees such as the Qwen3-VL vision tower.
+        self.ignored_layers_match_mode = "exact"
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -149,6 +152,7 @@ class DiffusionMXFP8Config(QuantizationConfig):
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
+                match_mode=self.ignored_layers_match_mode,
             ):
                 return UnquantizedLinearMethod()
             if current_omni_platform.is_npu():
@@ -168,6 +172,7 @@ class DiffusionMXFP8Config(QuantizationConfig):
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
+                match_mode=self.ignored_layers_match_mode,
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if current_omni_platform.is_xpu():
