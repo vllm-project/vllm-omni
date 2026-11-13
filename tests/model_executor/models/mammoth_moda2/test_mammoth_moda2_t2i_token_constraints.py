@@ -123,6 +123,35 @@ def test_non_t2i_masks_gen_vocab() -> None:
     assert torch.isneginf(out[0, _BASE_VOCAB:]).all()
 
 
+def test_logits_rows_exceed_runtime_infos_no_index_error() -> None:
+    """FULL-cudagraph padding can make logit rows exceed active runtime_infos (#7443)."""
+    host = _host()
+    host.update_decode_step_metadata(runtime_additional_information=[_t2i_info(0)])
+    logits = torch.ones(3, 16)
+    out = host._apply_t2i_token_constraints(logits.clone())
+    # Active row 0 is constrained; padded rows 1.. are left untouched.
+    assert torch.isfinite(out[0, _VISUAL_START])
+    assert torch.isneginf(out[0, _EOL])
+    torch.testing.assert_close(out[1:], logits[1:])
+
+
+def test_mixed_t2i_and_chat_batch_row_local() -> None:
+    host = _host()
+    host.update_decode_step_metadata(
+        runtime_additional_information=[_t2i_info(0), {"omni_task": ["chat"]}, None, "bad"]
+    )
+    logits = torch.ones(4, 16)
+    out = host._apply_t2i_token_constraints(logits.clone())
+
+    assert torch.isfinite(out[0, _VISUAL_START])
+    assert torch.isneginf(out[0, _EOL])
+    assert torch.isfinite(out[1, :_BASE_VOCAB]).all()
+    assert torch.isneginf(out[1, _BASE_VOCAB:]).all()
+    # None / non-dict infos are treated as empty meta → non-t2i gen-vocab mask.
+    assert torch.isneginf(out[2, _BASE_VOCAB:]).all()
+    assert torch.isneginf(out[3, _BASE_VOCAB:]).all()
+
+
 def test_top_level_wrapper_delegates_decode_metadata() -> None:
     inner = _host()
     wrapper = m.MammothModa2ForConditionalGeneration.__new__(m.MammothModa2ForConditionalGeneration)
