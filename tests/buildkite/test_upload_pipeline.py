@@ -850,16 +850,19 @@ def test_moss_higgs_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPa
             "tts_higgs_audio_v3_weekly",
         ],
     }
-    expected_runners = {
-        "TTS · Moss · L4": "v2",
-        "TTS · Higgs · L4": "v1",
+    expected_env = {
+        "TTS · Moss · L4": {
+            "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
+            "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE": "cpu",
+        },
+        "TTS · Higgs · L4": {"VLLM_OMNI_CI_MODEL_RUNNER": "v1"},
     }
     for label, dependencies in expected_dependencies.items():
         matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
         assert len(matching_steps) == 1
         step = matching_steps[0]
         assert step["source_file_dependencies"] == dependencies
-        assert step["env"]["VLLM_OMNI_CI_MODEL_RUNNER"] == expected_runners[label]
+        assert step["env"] == expected_env[label]
 
     group = next(step for step in doc["steps"] if "Moss and Higgs Weekly" in step.get("group", ""))
     assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')

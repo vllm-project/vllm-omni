@@ -111,6 +111,9 @@ steps:
         timeout_in_minutes: 90
         env:
           VLLM_OMNI_CI_MODEL_RUNNER: "v2"
+          # The standalone realtime reference codec is about 7 GiB. Keep only
+          # this 24 GiB L4 qualification lane on CPU so both serving stages fit.
+          VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE: "cpu"
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"

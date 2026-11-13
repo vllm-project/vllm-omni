@@ -8,6 +8,7 @@ handles each); they are registered under distinct model-type names.
 
 import asyncio
 import hashlib
+import os
 import threading
 from typing import TYPE_CHECKING, Any, cast
 
@@ -32,6 +33,8 @@ if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
 logger = init_logger(__name__)
+
+_MOSS_REALTIME_REF_ENCODER_DEVICE_ENV = "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE"
 
 
 def _local_continuation_prompt(proc: Any, user_kwargs: dict[str, Any], reference: Any) -> tuple[list[int], Any] | None:
@@ -411,11 +414,12 @@ class _MossTTSAdapterBase(ARTTSAdapter):
                 codec_path,
                 trust_remote_code=True,
             )
-            # The standalone v1 codec is about 7 GiB and cannot coexist with
-            # both serving stages on a 24 GiB L4. Reference codes are cached,
-            # and the upstream/offline path also performs this encode on CPU,
-            # so keep it out of the serving workers' accelerator budget.
-            codec = codec.to("cpu").eval()
+            device = os.getenv(_MOSS_REALTIME_REF_ENCODER_DEVICE_ENV, "").strip()
+            device = device or self._resolve_ref_encoder_device()
+            # Production follows the codec stage accelerator. Memory-constrained
+            # qualification lanes can opt into CPU without weakening the
+            # default cold-reference latency for user deployments.
+            codec = codec.to(device).eval()
             cached = (tokenizer, processor, codec)
             self._moss_realtime_components = cached
             return cached

@@ -31,10 +31,17 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
     ],
     ids=["default-codec", "configured-codec"],
 )
+@pytest.mark.parametrize(
+    ("device_override", "expected_codec_device"),
+    [(None, torch.device("cuda:2")), ("cpu", "cpu")],
+    ids=["codec-stage-device", "cpu-override"],
+)
 def test_realtime_components_use_the_realtime_model_and_codec(
     monkeypatch: pytest.MonkeyPatch,
     hf_config: SimpleNamespace,
     expected_codec_path: str,
+    device_override: str | None,
+    expected_codec_device: torch.device | str,
 ) -> None:
     engine_client = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -44,9 +51,14 @@ def test_realtime_components_use_the_realtime_model_and_codec(
     )
 
     server = MossTTSAdapter(SpeechServingContext(server=object(), engine_client=engine_client))
+    monkeypatch.setattr(server, "_resolve_ref_encoder_device", lambda: torch.device("cuda:2"))
+    if device_override is None:
+        monkeypatch.delenv(adapter_module._MOSS_REALTIME_REF_ENCODER_DEVICE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(adapter_module._MOSS_REALTIME_REF_ENCODER_DEVICE_ENV, device_override)
 
     tokenizer = object()
-    codec_devices: list[str] = []
+    codec_devices: list[torch.device | str] = []
 
     class Codec:
         def to(self, device):
@@ -96,7 +108,7 @@ def test_realtime_components_use_the_realtime_model_and_codec(
     ]
     assert tokenizer_calls == [("OpenMOSS-Team/MOSS-TTS-Realtime", True)]
     assert codec_calls == [(expected_codec_path, True)]
-    assert codec_devices == ["cpu"]
+    assert codec_devices == [expected_codec_device]
     assert processor_calls == [tokenizer]
 
 
