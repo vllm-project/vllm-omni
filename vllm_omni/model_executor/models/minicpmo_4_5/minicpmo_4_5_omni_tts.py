@@ -20,7 +20,6 @@ from types import SimpleNamespace
 from typing import Any, NamedTuple
 
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -2788,9 +2787,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # Single-row projection: a Python slice of ``hidden`` avoids
                 # the implicit H2D copy and stream sync that building a
                 # device-side index tensor would trigger on NPU.
-                head_logits_all = self.head_code[0](
-                    hidden[projection_rows[0] : projection_rows[0] + 1]
-                ).float()
+                head_logits_all = self.head_code[0](hidden[projection_rows[0] : projection_rows[0] + 1]).float()
             else:
                 frame_rows = torch.tensor(projection_rows, device=hidden.device, dtype=torch.long)
                 head_logits_all = self.head_code[0](hidden.index_select(0, frame_rows)).float()
