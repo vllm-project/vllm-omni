@@ -10,6 +10,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.pipeline_registry import resolve_pipeline_config
 from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler, VLLMScheduler
+from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -42,6 +43,23 @@ def _config(*, native=True, stateful=True, tp=1, pp=1, extras=None, capacity=128
         parallel_config=SimpleNamespace(tensor_parallel_size=tp, pipeline_parallel_size=pp),
         scheduler_config=SimpleNamespace(max_num_seqs=capacity),
     )
+
+
+def test_cosyvoice3_mrv2_profile_accepts_generation_batch_waiting(construct_scheduler, monkeypatch):
+    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+    deploy = load_deploy_config(get_deploy_config_path("cosyvoice3_mrv2.yaml"))
+    codec = merge_pipeline_deploy(COSYVOICE3_PIPELINE, deploy)[1]
+    assert codec.yaml_engine_args["retains_state_across_chunks"] is True
+    config = _config(
+        native=codec.yaml_engine_args["use_v2_model_runner"],
+        stateful=codec.yaml_engine_args["retains_state_across_chunks"],
+        capacity=codec.yaml_engine_args["max_num_seqs"],
+        extras={"generation_min_batch_size": 8, "generation_max_wait_ms": 6},
+    )
+    scheduler = construct_scheduler(config)
+    assert scheduler._native_data_plane
+    assert scheduler._generation_min_batch_size == 8
+    assert scheduler._generation_max_wait_s == 0.006
 
 
 @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
