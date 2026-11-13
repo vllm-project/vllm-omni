@@ -32,6 +32,7 @@ from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.config import SpeculativeConfig as VllmSpeculativeConfig
 from vllm.config.utils import config
+from vllm.config.weight_transfer import WeightTransferConfig as VllmWeightTransferConfig
 from vllm.engine.arg_utils import EngineArgs as VllmEngineArgs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -317,7 +318,7 @@ class _StageEngineValues:
     kernel_config: Mapping[str, Any] | KernelConfig | None
     profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
     speculative_config: Mapping[str, Any] | VllmSpeculativeConfig | None
-    weight_transfer_config: dict[str, Any] | None
+    weight_transfer_config: Mapping[str, Any] | VllmWeightTransferConfig | None
 
 
 @dataclass(frozen=True)
@@ -1815,7 +1816,7 @@ class BaseVllmOmniStageConfig:
     # dict early and break that step with "SpeculativeConfig object has no
     # attribute 'items'". Keep the Mapping shape and let vLLM do the conversion.
     speculative_config: Mapping[str, Any] | None = None
-    weight_transfer_config: Mapping[str, Any] | None = None
+    weight_transfer_config: Mapping[str, Any] | VllmWeightTransferConfig | None = None
     quantization_config: _QuantizationConfigType = None
 
     @property
@@ -1991,8 +1992,10 @@ def _build_common_stage_config_kwargs(
             "kernel_config": _copy_value(engine.kernel_config),
             "profiler_config": _copy_value(engine.profiler_config),
             "speculative_config": _copy_value(engine.speculative_config),
+            "weight_transfer_config": _copy_value(
+                _first_defined(engine.weight_transfer_config, deploy.weight_transfer_config)
+            ),
             "quantization_config": _copy_value(quantization_config),
-            "weight_transfer_config": _first_defined(engine.weight_transfer_config, deploy.weight_transfer_config),
         },
         input_proc,
         next_stage_proc,
