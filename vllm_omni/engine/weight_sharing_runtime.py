@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import msgspec
+from vllm.transformers_utils.repo_utils import resolve_revision
 from vllm.utils.system_utils import get_mp_context
 
 from vllm_omni.config.omni_config import VllmOmniARStageConfig, VllmOmniDiffusionStageConfig
@@ -57,20 +58,38 @@ def resolve_sharing_plan(
     if provider.stage_cfg.stage_pipeline_config.model_arch != "HunyuanImage3ForCausalMM":
         raise ValueError("the shared deployment profile currently supports HunyuanImage3 only")
     model = str(ar.model)
-    if (dit.model or runtime._model) != model or dit.revision != ar.revision:
+    dit_model = str(dit.model or runtime._model or "")
+    if not dit_model:
         raise ValueError("shared stages must load the same model and checkpoint revision")
-    if Path(model).is_dir():
-        root = Path(model).resolve()
+    ar_path, dit_path = Path(model), Path(dit_model)
+    if ar_path.is_dir() and dit_path.is_dir():
+        root = ar_path.resolve()
+        if root != dit_path.resolve():
+            raise ValueError("shared stages must load the same model and checkpoint revision")
         # Fingerprint metadata without reading another full model into CPU RAM.
         # Both workers use this same local snapshot; files must stay immutable.
         files = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix in (".json", ".safetensors", ".bin"))
         metadata = [(str(p.relative_to(root)), p.stat().st_size, p.stat().st_mtime_ns) for p in files]
         revision = "local-" + hashlib.sha256(json.dumps(metadata).encode()).hexdigest()
         model = str(root)
+    elif ar_path.is_dir() or dit_path.is_dir():
+        raise ValueError("shared stages must both load a local checkpoint directory or the same HF repository")
     else:
-        resolved_revision = getattr(ar.hf_config, "_commit_hash", None)
+        if dit_model != model:
+            raise ValueError("shared stages must load the same model and checkpoint revision")
+        # vLLM resolves the AR revision to a commit and keeps the requested
+        # ref as the ResolvedRevision's string value; DiT normally leaves its
+        # revision unset. Compare resolved commits, inherit an unset DiT
+        # revision from AR, and pin both sides so later downloads cannot race
+        # a moving ref.
+        resolved_revision = getattr(ar.hf_config, "_commit_hash", None) or getattr(ar.revision, "resolved", None)
         if not resolved_revision:
             raise ValueError("weight sharing requires a resolved HF commit or a local checkpoint directory")
+        if dit.revision is not None:
+            requested = resolve_revision(dit_model, dit.revision)
+            dit_revision = getattr(requested, "resolved", None) or str(requested)
+            if dit_revision != str(resolved_revision):
+                raise ValueError("shared stages must load the same model and checkpoint revision")
         revision = str(resolved_revision)
         # Pin the download performed later by DiT to the commit AR resolved.
         ar.revision = revision
