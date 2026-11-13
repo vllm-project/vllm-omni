@@ -259,6 +259,7 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
                 weekly_steps["nightly-sglang-omni-qwen3-tts"],
                 qwen_image_performance_job(benchmark),
                 cosmos_performance_job(benchmark),
+                video_performance_job(benchmark, "hunyuanvideo15"),
             ]
         )
     for case in cases:
