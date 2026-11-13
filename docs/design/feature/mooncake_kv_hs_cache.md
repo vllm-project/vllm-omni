@@ -166,7 +166,7 @@ can delay other saves but never a load.
 
 The pinned native connector has one KV send thread. A stalled write can make
 unrelated requests' saves miss the deadline even when their HS workers are free.
-`load_timeout_seconds` (1 s in the fault tests) sets a deadline; cache population
+`load_timeout_seconds` sets the KV-readiness deadline; cache population
 remains best effort.
 
 ## Deferred two-level cache cooperation
@@ -249,27 +249,3 @@ cold, full-hit, and partial-hit pipeline on GPUs. The acceptance test compares
 embeddings, hidden states, packed Talker inputs, generated tokens, and audio
 against independent cache-off runs. Image and audio cases also check that
 changing media prevents reuse. Neither test runs in CI.
-
-Two manual benchmarks use the same pinned Qwen3-Omni MRv2 deployment:
-
-- `benchmarks/qwen3_omni/mooncake_cache_benchmark.py` compares cache off, local
-  prefix caching, and Mooncake-only caching in separate processes. It records
-  client TTFT, first audio, end-to-end latency, RTF, throughput, cache hits,
-  restored rows, and memory snapshots. Serial and concurrent waves include
-  an overflow working set that exceeds the configured GPU KV capacity.
-- `benchmarks/qwen3_omni/mooncake_faults.py` delays lookup and native KV-write
-  calls against a real Store, checking unaffected requests' progress, latency,
-  and generated tokens. A cold peer checks that an unrelated HS save can start
-  while a writer's successor waits; per-request counters distinguish admission
-  drops, skipped saves, failed saves, and pending saves. Delays are injected at
-  API entry; they do not model Store-internal mutex or transport stalls.
-
-Performance runs use explicit greedy sampling and disable residual-codebook
-sampling. They contain no source-tensor dumps or save barriers. Output hashes
-and memory snapshots are collected between timed waves. Two-level cache
-cooperation and duplex sessions remain outside this validation.
-
-See the [controlled M1 measurements and reproduction commands](https://github.com/vllm-project/vllm-omni/blob/main/benchmarks/qwen3_omni/README.md)
-for measured revisions, variability, fault timing, and the limits of the
-recorded evidence. The report distinguishes media correctness from performance
-coverage and records cache-population failures separately from serving progress.

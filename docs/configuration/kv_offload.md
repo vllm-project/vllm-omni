@@ -122,9 +122,7 @@ similarly named inter-stage `MooncakeStoreConnector`, which transports stage
 outputs and does not add prefix reuse.
 
 This is the M1 implementation of [RFC #9908](https://github.com/vllm-project/vllm-omni/issues/9908).
-The [validation report](https://github.com/vllm-project/vllm-omni/blob/main/benchmarks/qwen3_omni/README.md)
-records full-pipeline text/image/audio acceptance and turn-serving performance
-for the tested revisions and deployment. Duplex serving is unsupported.
+Duplex serving is unsupported.
 M1 is a Mooncake-only external cache: local Thinker prefix caching is disabled,
 so the two caches do not cooperate. The
 [design document](../design/feature/mooncake_kv_hs_cache.md) describes the
