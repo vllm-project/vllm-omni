@@ -102,9 +102,14 @@ HF_CACHE="${HF_CACHE:-$(realpath ~)/.cache/huggingface}"
 mkdir -p "${HF_CACHE}"
 HF_MOUNT="/root/.cache/huggingface"
 
+# One hour of tests inside the container. The stage budgets below sum to less
+# than this; timeout_in_minutes on the step has to cover this plus the image
+# build (check the "time docker build" line above when tuning either).
+XPU_TEST_BUDGET="${XPU_TEST_BUDGET:-60m}"
+
 # Container variables below must expand in the container shell.
 # shellcheck disable=SC2016
-time timeout -k 30 30m docker run \
+time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     --device /dev/dri:/dev/dri \
     --net=host \
     --ipc=host \
@@ -115,17 +120,72 @@ time timeout -k 30 30m docker run \
     -e VLLM_LOGGING_LEVEL \
     -e VLLM_OMNI_LOGGING_LEVEL \
     -e HF_TOKEN \
+    -e HF_HUB_OFFLINE \
     -e ZE_AFFINITY_MASK \
     --name "${container_name}" \
     "${image_name}" \
     bash -c '
-    set -e
-    echo $ZE_AFFINITY_MASK
-    pip install tblib==3.1.0
-    cd /workspace/vllm-omni
-    XPU_TEST_PATHS="tests/diffusion tests/dfx tests/e2e tests/platforms"
-    pytest -v -s $XPU_TEST_PATHS -m "core_model and xpu and B60"
-    pytest -v -s tests/diffusion/quantization/test_mxfp8_config.py
-    pytest -v -s $XPU_TEST_PATHS -m "advanced_model and xpu and B60"
-    pytest -v -s $XPU_TEST_PATHS -m "omni and xpu and B60"
+    set -uo pipefail
+    pip install tblib==3.1.0 || exit 1
+    cd /workspace/vllm-omni || exit 1
+
+    # One card per job. The agent sets ZE_AFFINITY_MASK; keep only its first
+    # entry so a cards_2+ test cannot take cards another agent on this host is
+    # using - with a single visible device the hardware_test(num_cards>=2)
+    # skipif fires instead. Every marker expression below also pins cards_1.
+    mask="${ZE_AFFINITY_MASK:-0}"
+    export ZE_AFFINITY_MASK="${mask%%,*}"
+    echo "ZE_AFFINITY_MASK=${mask} -> using card ${ZE_AFFINITY_MASK}"
+
+    # Paths that hold XPU-tagged tests. Scoped explicitly: a bare
+    # "pytest tests/" still crashes during collection on XPU (#6175).
+    paths=(tests/diffusion tests/dfx tests/e2e tests/platforms
+           tests/model_executor tests/entrypoints tests/engine
+           tests/worker tests/worker_v2)
+
+    # Resolves a model directory at import time, so collection of the whole
+    # path list fails (pytest exit 2) whenever those weights are absent from
+    # the mounted cache. It carries no XPU marker, so skip the file outright.
+    ignore=(--ignore tests/e2e/offline_inference/test_cosyvoice3_expansion.py)
+
+    # Known-red on XPU, tracked separately: these assert CUDA-only behaviour
+    # (pointer ranges, torch.cuda stream semantics) rather than the kernel.
+    deselect=(--deselect tests/worker/test_device_copy.py::test_tensor_copy_cuda_handles_pageable_and_pinned_sources
+              --deselect tests/worker/test_device_copy.py::test_device_stager_views_survive_until_their_readers_finish
+              --deselect tests/worker/test_device_copy.py::test_device_stager_empty_input_does_not_consume_a_ring_slot
+              --deselect tests/worker_v2/test_eager_frame_kernels.py::test_history_scatter_preserves_independent_storage_and_offsets
+              --deselect tests/worker_v2/test_eager_frame_kernels.py::test_codec_direct_inputs_wait_for_slow_side_stream)
+
+    rc=0
+    # stage <name> <budget> <pytest args...>
+    stage() {
+        local name="$1" budget="$2"
+        shift 2
+        local t0=${SECONDS} code=0
+        echo "--- :pytest: ${name}"
+        timeout -k 30 "${budget}" pytest -v -s --durations=25 "$@" || code=$?
+        # 5 = nothing collected for this marker set, which is not a failure.
+        if [ "${code}" = 0 ] || [ "${code}" = 5 ]; then
+            echo "+++ PASS ${name} ($((SECONDS - t0))s)"
+        else
+            echo "FAIL ${name} ($((SECONDS - t0))s, rc=${code})"
+            rc=1
+        fi
+    }
+
+    # core_model excludes omni: the async-omni tests carry both markers and
+    # would otherwise run twice, and they need their own process (below).
+    stage "core_model" 30m "${paths[@]}" "${ignore[@]}" "${deselect[@]}" \
+        -m "core_model and not omni and xpu and B60 and cards_1" --run-level core_model
+    stage "mxfp8 config" 2m tests/diffusion/quantization/test_mxfp8_config.py
+    # full_model is excluded: those cases pull tens of GB of weights.
+    stage "advanced_model" 15m "${paths[@]}" "${ignore[@]}" "${deselect[@]}" \
+        -m "advanced_model and not full_model and xpu and B60 and cards_1" --run-level core_model
+    # The async-omni engine leaves worker VRAM mapped in the pytest parent, so
+    # a 16 GiB thinker started after the other tests in the same process OOMs.
+    # CUDA splits this test out for the same reason; keep it last and alone.
+    stage "omni" 10m "${paths[@]}" "${ignore[@]}" "${deselect[@]}" \
+        -m "omni and xpu and B60 and cards_1" --run-level core_model
+
+    exit "${rc}"
 '
