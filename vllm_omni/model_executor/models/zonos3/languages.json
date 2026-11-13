@@ -1,0 +1,34 @@
+{
+  "description": "The languages of every server and the studio (zonos3.languages). server: the TTS language codes requests use, in display order (label: the studio's name; nemo: the NeMo text-normalization package; lexicon: the pronunciation lexicon's ISO 639-3 code; speech: its row in spoken). spoken: the languages speech recognition, forced alignment and other references understand, by Whisper-style code (name: the Qwen3-ASR language name; unspaced: written without spaces between words; tts: the server language that speaks it). espeak: lexicon code -> the espeak-ng voice that guesses its unknown words.",
+  "server": [
+    {"code": "en_us", "label": "US English", "nemo": "en", "lexicon": "eng", "speech": "en"},
+    {"code": "en_gb", "label": "UK English", "nemo": "en", "lexicon": "eng", "speech": "en"},
+    {"code": "fr_fr", "label": "French", "nemo": "fr", "lexicon": "fra", "speech": "fr"},
+    {"code": "de", "label": "German", "nemo": "de", "lexicon": "deu", "speech": "de"},
+    {"code": "es", "label": "Spanish", "nemo": "es", "lexicon": "spa", "speech": "es"},
+    {"code": "it", "label": "Italian", "nemo": "it", "lexicon": "ita", "speech": "it"},
+    {"code": "pt_br", "label": "Portuguese", "nemo": "pt", "lexicon": "por", "speech": "pt"},
+    {"code": "ja", "label": "Japanese", "nemo": "ja", "lexicon": "jpn", "speech": "ja"},
+    {"code": "cmn", "label": "Mandarin", "nemo": "zh", "lexicon": "cmn", "speech": "zh"},
+    {"code": "ko", "label": "Korean", "nemo": "ko", "lexicon": "kor", "speech": "ko"}
+  ],
+  "spoken": [
+    {"code": "en", "name": "English", "tts": "en_us"},
+    {"code": "fr", "name": "French", "tts": "fr_fr"},
+    {"code": "de", "name": "German", "tts": "de"},
+    {"code": "es", "name": "Spanish", "tts": "es"},
+    {"code": "it", "name": "Italian", "tts": "it"},
+    {"code": "pt", "name": "Portuguese", "tts": "pt_br"},
+    {"code": "ja", "name": "Japanese", "tts": "ja", "unspaced": true},
+    {"code": "zh", "name": "Chinese", "tts": "cmn", "unspaced": true},
+    {"code": "ko", "name": "Korean", "tts": "ko"},
+    {"code": "ru", "name": "Russian"},
+    {"code": "yue", "name": "Cantonese", "unspaced": true}
+  ],
+  "espeak": {
+    "eng": "en-us", "deu": "de", "fra": "fr", "spa": "es-419", "ita": "it", "por": "pt-br",
+    "nld": "nl", "pol": "pl", "ces": "cs", "swe": "sv", "fin": "fi", "dan": "da", "nob": "nb",
+    "isl": "is", "hun": "hu", "ron": "ro", "cat": "ca", "tur": "tr", "ind": "id", "msa": "ms",
+    "rus": "ru", "ukr": "uk", "ell": "el", "heb": "he", "ara": "ar", "fas": "fa", "hin": "hi"
+  }
+}
