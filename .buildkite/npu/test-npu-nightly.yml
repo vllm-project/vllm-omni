@@ -432,7 +432,7 @@ steps:
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
-      - label: ":full_moon: Diffusion X2V · LingBot World Perf Recording · A2 4-NPU · Baseline Pending"
+      - label: ":full_moon: Diffusion X2V · LingBot World Perf Test · A2 4-NPU"
         key: lingbot-npu-nightly-performance
         if: build.pull_request.id == null || build.pull_request.labels includes "npu-test"
         source_file_dependencies: lingbot_world_perf

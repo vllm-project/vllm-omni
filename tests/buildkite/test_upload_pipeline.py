@@ -1284,11 +1284,11 @@ def test_lingbot_nightly_uses_independent_perf_and_accuracy_frameworks(monkeypat
     assert perf["artifact_paths"] == ["tests/dfx/perf/results/*.json"]
     assert _gpu_limit(accuracy) == 2
     assert accuracy["agents"]["queue"] == "mithril-h100-pool"
-    # CUDA has recorded baselines; NPU records until its own measurements exist.
+    # NPU accuracy records until its own scores are reviewed; both perf jobs have baselines.
     record_only = platform == "npu"
-    for label in (perf["label"], accuracy["label"]):
-        assert ("Recording" in label and "Baseline Pending" in label) is record_only
-        assert ("Recording" in label or "Baseline Pending" in label) is record_only
+    assert "Recording" not in perf["label"] and "Baseline Pending" not in perf["label"]
+    assert ("Recording" in accuracy["label"] and "Baseline Pending" in accuracy["label"]) is record_only
+    assert ("Recording" in accuracy["label"] or "Baseline Pending" in accuracy["label"]) is record_only
     assert accuracy["timeout_in_minutes"] == 120
     assert ("--lingbot-record-only" in " ".join(accuracy["commands"])) is record_only
     for name in ("precision", "wbench", "vbench"):

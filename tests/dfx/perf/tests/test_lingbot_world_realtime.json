@@ -72,7 +72,7 @@
   },
   {
     "test_name": "test_lingbot_world_realtime_npu",
-    "description": "New recorded-data recipe on 4 A2 devices: three 40-chunk boardwalk-42 measured rollouts after one separate 8-chunk warmup. No matching recorded latency baseline is available; baseline is intentionally omitted. This records valid measurements, not a performance regression verdict.",
+    "description": "Recorded-data recipe on 4 A2 devices: three 40-chunk boardwalk-42 measured rollouts after one separate 8-chunk warmup. A2 baseline references vllm-omni-npu-ci Buildkite build 11393 (commit 414a6bbc0e04fed9935c12e10bffad53ac6878a2, runtime label 910B, recorded request_throughput 0.0079, mean_e2el_ms 127264.2863, mean_video_ttfc_ms 5756.7185, min_video_fps 3.7321, mean_video_rtf 3.2015, mean_video_steady_interval_ms 3152.5593, p95_video_steady_interval_ms 3816.8109): request_throughput and min_video_fps are measured x 0.90, latency, interval and RTF are measured x 1.10, rounded to 4 decimals. This single run is a reference measurement, not validation of later revisions.",
     "mark": [
       {
         "hardware_marks": {
@@ -126,7 +126,18 @@
           "session_warmup_chunks=8",
           "attention_warmup_chunks=6",
           "sequence_parallel_size=4"
-        ]
+        ],
+        "baseline": {
+          "A2": {
+            "request_throughput": 0.0071,
+            "mean_e2el_ms": 139990.7149,
+            "mean_video_ttfc_ms": 6332.3904,
+            "min_video_fps": 3.3589,
+            "mean_video_rtf": 3.5217,
+            "mean_video_steady_interval_ms": 3467.8152,
+            "p95_video_steady_interval_ms": 4198.492
+          }
+        }
       }
     ]
   }

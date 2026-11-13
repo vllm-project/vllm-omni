@@ -151,9 +151,8 @@ Performance uses the existing [`tests/dfx/perf`](../../tests/dfx/perf) JSON
 configuration and recorded hardware baseline workflow with this common backend.
 It runs the candidate without live A/B calibration or a separate scheduler.
 A missing recorded hardware baseline is reported as unavailable, not a fabricated
-regression pass. The H100 case has a baseline from a recorded CI run (see the
-JSON description); the A2 case has none yet, and its CI label identifies
-performance recording with a baseline pending.
+regression pass. The H100 and A2 cases have baselines from recorded CI runs
+(see the JSON descriptions).
 Twelve FPS remains a playback/SLO basis, not an absolute gate.
 
 The [accuracy tests](../../tests/e2e/accuracy/lingbot_world/README.md) keep

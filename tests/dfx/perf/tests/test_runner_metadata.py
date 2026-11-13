@@ -1341,7 +1341,7 @@ def _realtime_video_perf_record():
     }
 
 
-def test_realtime_video_json_uses_standard_candidate_runner_with_h100_baseline_only(monkeypatch):
+def test_realtime_video_json_uses_standard_candidate_runner_with_hardware_baselines(monkeypatch):
     from pathlib import Path
 
     from tests.dfx.conftest import is_diffusion_perf_config, load_benchmark_configs
@@ -1365,8 +1365,7 @@ def test_realtime_video_json_uses_standard_candidate_runner_with_h100_baseline_o
         )
         assert f"workload_image={args.realtime_video_image}" in args.metadata
         assert "model_revision=59cccf49f2d2dd27418ae7a04b82b10868d455c2" in args.metadata
-        expected_baseline = configs[0]["benchmark_params"][0]["baseline"] if len(calls) == 1 else None
-        assert kwargs["baseline_config"] == expected_baseline
+        assert kwargs["baseline_config"] == configs[len(calls) - 1]["benchmark_params"][0]["baseline"]
         assert args.backend == args.dataset_name == "realtime-video"
         return _realtime_video_perf_record()
 
@@ -1376,10 +1375,7 @@ def test_realtime_video_json_uses_standard_candidate_runner_with_h100_baseline_o
         assert config["mark"][0]["hardware_marks"] == {"res": {platform: resource}, "num_cards": cards}
         assert config["server_params"]["serve_args"]["deploy-config"].endswith(deploy)
         params = config["benchmark_params"][0]
-        # H100 has a recorded baseline; A2 still records without one.
-        assert ("baseline" in params) is (platform == "cuda")
-        if platform == "cuda":
-            assert set(params["baseline"]) == {"H100"}
+        assert set(params["baseline"]) == {resource}
         monkeypatch.setattr(runner, "get_runtime_resource_label", lambda resource=resource: resource)
         runner.test_performance_benchmark(
             SimpleNamespace(host="localhost", port=8000, model="fixture-model"),
