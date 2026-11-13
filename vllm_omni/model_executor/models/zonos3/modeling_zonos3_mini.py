@@ -795,6 +795,10 @@ class Zonos3ForCausalLM(Zonos3Backbone):
             with torch.device("cpu"):
                 self.speaker_encoder = Zonos3SpeakerEncoder(checkpoint)
             self.speaker_encoder.to(device=next(self.multi_output.parameters()).device)
+            # This companion checkpoint is loaded strictly by its constructor,
+            # separately from the AR checkpoint. Report its parameters too so
+            # the upstream loader can account for the entire registered model.
+            loaded.update(f"speaker_encoder.{name}" for name, _ in self.speaker_encoder.named_parameters())
         if next(self.parameters()).device.type == "cuda":
             buckets = self.vllm_config.compilation_config.cudagraph_capture_sizes or [
                 self.vllm_config.scheduler_config.max_num_seqs

@@ -220,8 +220,12 @@ class Request:
         return self.finished
 
 
-def test_native_hook_independent_requests_terminal_cancel_and_identity_reuse():
+@pytest.mark.parametrize("flat_config", [False, True])
+def test_native_hook_independent_requests_terminal_cancel_and_identity_reuse(flat_config):
     manager = Manager()
+    if flat_config:
+        # ConnectorFactory passes spec.extra directly to the constructor.
+        manager.connector.config = manager.connector.config["extra"]
     a, b = Request("external-a"), Request("external-b")
     frames = torch.arange(200).reshape(20, 10)
     rows = delayed(frames)

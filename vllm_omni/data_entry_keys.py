@@ -389,7 +389,7 @@ def _dtype_to_name(dtype: torch.dtype) -> str:
 
 
 # ── Keys whose values are nested dicts (TypedDict sub-categories) ──
-_NESTED_KEYS = frozenset({"hidden_states", "embed", "ids", "codes", "meta"})
+_NESTED_KEYS = frozenset({"hidden_states", "embed", "ids", "codes", "meta", "zonos3_prompt"})
 
 
 def flatten_payload(payload: Mapping[str, Any]) -> dict[str, Any]:

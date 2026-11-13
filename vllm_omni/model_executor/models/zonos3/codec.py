@@ -356,7 +356,12 @@ class ZACDecoderNetwork(nn.Module):
         if isinstance(final_spec, int):
             raise ValueError("Last retained ZAC stage must be a transformer")
         self.head = ZACSpectralHead(final_spec["d_model"], config)
-        self.to_external = Resample(44160, 44100, lowpass_filter_width=16, rolloff=0.99)
+        # Torchaudio builds its resampling kernel on CPU even when the network
+        # is constructed inside vLLM's CUDA device context. Align the registered
+        # buffer before either eager synthesis or graph capture uses it.
+        self.to_external = Resample(44160, 44100, lowpass_filter_width=16, rolloff=0.99).to(
+            device=next(self.parameters()).device
+        )
 
     def allocate_state(self, capacity: int) -> ZACDecoderState:
         parameter = next(self.parameters())
