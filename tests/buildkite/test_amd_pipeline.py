@@ -2435,6 +2435,8 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         assert Path(path).read_text(encoding="utf-8").count('"rocm": "MI325"') == expected_count
 
     breeze_source = Path("tests/e2e/online_serving/test_breeze_tts_2.py").read_text(encoding="utf-8")
+    assert '"input": "今天天气很好，非常适合去公园散步。"' in breeze_source
+    assert '"input": "你好，欢迎使用语音合成系统。今天的天气很好。"' not in breeze_source
     assert '"transcript_escalation_model": "large-v3"' in breeze_source
     assert '"transcript_model":' not in breeze_source
 

@@ -27,13 +27,13 @@ def test_chinese_voice_design(omni_server, online_client, run_level) -> None:
     online_client.send_audio_speech_request(
         {
             "model": omni_server.model,
-            "input": "你好，欢迎使用语音合成系统。今天的天气很好。",
+            "input": "今天天气很好，非常适合去公园散步。",
             "instructions": "年轻女性，使用标准普通话，语速适中。",
             "extra_params": {"guidance_scale": 4.0},
             "transcript_language": "zh",
-            # Whisper-small transcribes "合成" as "和程" on this fixed clip.
-            # Escalate to the stronger ASR without changing the expected text
-            # or similarity threshold, or retrying after a failed assertion.
+            # Avoid the dense "语音合成系统" compound, which Breeze consistently
+            # compresses to "云合成". Keep strong ASR as a fallback without
+            # changing the expected text or similarity threshold.
             "transcript_escalation_model": "large-v3",
             "response_format": "wav",
             "sample_rate": 24000,
