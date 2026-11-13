@@ -695,11 +695,13 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         return scheduler_output.num_spec_tokens_to_schedule
 
     def _talker_kstep_frames(self) -> int:
-        if not current_omni_platform.is_cuda() or not supports_multi_frame_decode(self.model):
+        if not current_omni_platform.is_cuda() or not getattr(self.model, "supports_multi_frame_decode", False):
             return 0
         from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
 
-        return talker_kstep_frames(self.model_config.model_stage, self.vllm_config.speculative_config)
+        frames = talker_kstep_frames(self.model_config.model_stage, self.vllm_config.speculative_config)
+        supports_multi_frame_decode(self.model, mrv2=frames > 1)
+        return frames
 
     def _dummy_sampler_run(self, hidden_states: Any) -> Any:
         """The Talker's two control logits cannot satisfy profiling's top-k request."""

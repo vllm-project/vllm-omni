@@ -125,11 +125,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         super().load_model(*args, **kwargs)
+        kstep_frames = self._talker_kstep_frames()
         if (
             self.num_speculative_steps > 0
             and self.is_last_pp_rank
             and self.rejection_sampler is None
-            and self._talker_kstep_frames() == 0
+            and kstep_frames == 0
         ):
             raise ValueError(
                 "MRv2 AR speculative decoding requires a rejection sampler; check the model's custom sampler"

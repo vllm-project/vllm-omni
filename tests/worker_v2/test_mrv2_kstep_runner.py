@@ -50,6 +50,21 @@ def test_model_load_skips_rejection_sampler_only_for_talker_kstep(monkeypatch, f
             runner.load_model()
 
 
+def test_cuda_kstep_requires_model_hooks_before_execution():
+    runner = _runner()
+    runner.model_config = SimpleNamespace(model_stage="tts")
+    runner.vllm_config = SimpleNamespace(speculative_config={"method": "ngram", "num_speculative_tokens": 7})
+    runner.model = SimpleNamespace(
+        supports_multi_frame_decode=True,
+        batch_stop_logits=None,
+        take_batch_stop_logits=lambda: None,
+        set_batch_stop_logits=lambda logits: None,
+        merge_frame_outputs=lambda outputs, stop_logits: outputs,
+    )
+    with pytest.raises(TypeError, match="kstep_rows_ready"):
+        runner._talker_kstep_frames()
+
+
 def _scheduled_batch(*counts):
     starts = [0]
     for count in counts:
@@ -111,75 +126,6 @@ def test_existing_state_is_not_reseeded():
     runner._build_kstep_model_kwargs_extra({"model_intermediate_buffer": [info]}, batch)
     assert info["audio_state"] is state
     assert state == {"step": 9, "last_code": 37}
-
-
-def test_initial_embedding_uses_confirmed_history_only():
-    runner = _runner()
-    embedding = torch.nn.Embedding(64, 3)
-    runner.model.emb_code = [embedding]
-    runner.model._request_codec_history = {"embedding-test": [17, 23]}
-    state = {"step": 2, "last_code": 11, "codes": torch.tensor([61, 62])}
-    info = {"req_id": "embedding-test", "audio_state": state}
-    embeds = torch.zeros(8, 3)
-    ids = torch.zeros(8, dtype=torch.long)
-    runner.model.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
-    torch.testing.assert_close(embeds[0], embedding.weight[23])
-    assert torch.count_nonzero(embeds[1:]) == 0
-    assert ids.tolist() == [23, 0, 0, 0, 0, 0, 0, 0]
-    assert state["last_code"] == 23
-
-
-def test_initial_embedding_resolves_history_by_request_id():
-    """Find the committed codec under the request ID used by the model."""
-    runner = _runner()
-    embedding = torch.nn.Embedding(64, 3)
-    runner.model.emb_code = [embedding]
-    runner.model._request_codec_history = {"req-abc-1": [17, 23]}
-    state = {"step": 10, "last_code": 11}
-    info = {"req_id": "sched-internal-9", "request_id": "req-abc-1", "audio_state": state}
-    embeds = torch.zeros(8, 3)
-    ids = torch.zeros(8, dtype=torch.long)
-    runner.model.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
-    torch.testing.assert_close(embeds[0], embedding.weight[23])
-    assert torch.count_nonzero(embeds[1:]) == 0
-    assert ids.tolist() == [23, 0, 0, 0, 0, 0, 0, 0]
-    assert state["last_code"] == 23
-
-
-@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_initial_embedding_falls_back_to_row_token_on_first_kstep(dtype):
-    runner = _runner()
-    embedding = torch.nn.Embedding(64, 3)
-    runner.model.emb_code = [embedding]
-    state = {"step": 1}
-    info = {"req_id": "first-kstep", "audio_state": state}
-    embeds = torch.zeros(8, 3)
-    ids = torch.tensor([23, 0, 0, 0, 0, 0, 0, 0], dtype=dtype)
-    runner.model.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
-    torch.testing.assert_close(embeds[0], embedding.weight[23])
-    assert torch.count_nonzero(embeds[1:]) == 0
-    assert ids.tolist() == [23, 0, 0, 0, 0, 0, 0, 0]
-    assert state["last_code"] == 23
-    assert state["_kstep_last_code"] == 23
-
-
-def test_initial_embedding_declines_control_row_token_after_first_step():
-    """Later K-steps must not treat the 2-wide control token as a codec.
-
-    Once past the first K-step the row's first slot is the previous step's
-    continue/stop sample (0/1), not a codec id; conditioning frame 1 on it
-    would poison the state. The fallback is gated on ``step <= 1``.
-    """
-    runner = _runner()
-    embedding = torch.nn.Embedding(64, 3)
-    runner.model.emb_code = [embedding]
-    state = {"step": 9}
-    info = {"req_id": "later-kstep", "audio_state": state}
-    embeds = torch.zeros(8, 3)
-    ids = torch.tensor([1, 0, 0, 0, 0, 0, 0, 0], dtype=torch.long)
-    runner.model.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
-    assert torch.count_nonzero(embeds) == 0
-    assert "last_code" not in state
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])

@@ -16,6 +16,83 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.fixture
+def talker():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration as Talker,
+    )
+
+    model = Talker.__new__(Talker)
+    torch.nn.Module.__init__(model)
+    model._request_codec_history = {}
+    return model
+
+
+def test_initial_embedding_uses_confirmed_history_only(talker):
+    embedding = torch.nn.Embedding(64, 3)
+    talker.emb_code = [embedding]
+    talker._request_codec_history = {"embedding-test": [17, 23]}
+    state = {"step": 2, "last_code": 11, "codes": torch.tensor([61, 62])}
+    info = {"req_id": "embedding-test", "audio_state": state}
+    embeds = torch.zeros(8, 3)
+    ids = torch.zeros(8, dtype=torch.long)
+    talker.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
+    torch.testing.assert_close(embeds[0], embedding.weight[23])
+    assert torch.count_nonzero(embeds[1:]) == 0
+    assert ids.tolist() == [23, 0, 0, 0, 0, 0, 0, 0]
+    assert state["last_code"] == 23
+
+
+def test_initial_embedding_resolves_history_by_request_id(talker):
+    """Find the committed codec under the request ID used by the model."""
+    embedding = torch.nn.Embedding(64, 3)
+    talker.emb_code = [embedding]
+    talker._request_codec_history = {"req-abc-1": [17, 23]}
+    state = {"step": 10, "last_code": 11}
+    info = {"req_id": "sched-internal-9", "request_id": "req-abc-1", "audio_state": state}
+    embeds = torch.zeros(8, 3)
+    ids = torch.zeros(8, dtype=torch.long)
+    talker.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
+    torch.testing.assert_close(embeds[0], embedding.weight[23])
+    assert torch.count_nonzero(embeds[1:]) == 0
+    assert ids.tolist() == [23, 0, 0, 0, 0, 0, 0, 0]
+    assert state["last_code"] == 23
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_initial_embedding_falls_back_to_row_token_on_first_kstep(talker, dtype):
+    embedding = torch.nn.Embedding(64, 3)
+    talker.emb_code = [embedding]
+    state = {"step": 1}
+    info = {"req_id": "first-kstep", "audio_state": state}
+    embeds = torch.zeros(8, 3)
+    ids = torch.tensor([23, 0, 0, 0, 0, 0, 0, 0], dtype=dtype)
+    talker.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
+    torch.testing.assert_close(embeds[0], embedding.weight[23])
+    assert torch.count_nonzero(embeds[1:]) == 0
+    assert ids.tolist() == [23, 0, 0, 0, 0, 0, 0, 0]
+    assert state["last_code"] == 23
+    assert state["_kstep_last_code"] == 23
+
+
+def test_initial_embedding_declines_control_row_token_after_first_step(talker):
+    """Later K-steps must not treat the 2-wide control token as a codec.
+
+    Once past the first K-step the row's first slot is the previous step's
+    continue/stop sample (0/1), not a codec id; conditioning frame 1 on it
+    would poison the state. The fallback is gated on ``step <= 1``.
+    """
+    embedding = torch.nn.Embedding(64, 3)
+    talker.emb_code = [embedding]
+    state = {"step": 9}
+    info = {"req_id": "later-kstep", "audio_state": state}
+    embeds = torch.zeros(8, 3)
+    ids = torch.tensor([1, 0, 0, 0, 0, 0, 0, 0], dtype=torch.long)
+    talker.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
+    assert torch.count_nonzero(embeds) == 0
+    assert "last_code" not in state
+
+
 def workspace(rows=2, frames=3):
     state = TalkerCudaKStepState.allocate(rows, frames, torch.device("cpu"))
     state.temperatures.zero_()
