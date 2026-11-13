@@ -184,6 +184,32 @@ layer-wise offload are designed to work with this live-weight path but still
 require GPU validation. Distributed layer-wise offload and incompatible native
 weight layouts fail during loading.
 
+#### Low-precision attention
+
+Add the appropriate option to your `vllm serve` command:
+
+- **Blackwell** — FlashInfer attention:
+
+    ```bash
+    --diffusion-attention-config \
+    '{"default": {
+      "backend": "FLASHINFER_ATTN",
+      "quant": {
+        "dtype_qk": "bfloat16",
+        "dtype_vo": "fp8_e4m3",
+        "flashinfer_backend": "auto"
+      }
+    }}'
+    ```
+
+- **Ampere / Ada / Hopper** — first
+  [install SageAttention](../../docs/user_guide/diffusion/attention_backends/sage.md#installation),
+  then use:
+
+    ```bash
+    --diffusion-attention-backend SAGE_ATTN
+    ```
+
 #### Verification
 
 Best quality uses the JSON-upsampled prompts from `assets/` (download with
@@ -418,11 +444,21 @@ OpenPI route uses the normal API authentication middleware. RoboLab's
 
 #### Notes
 
-- **Measured latency (1x B300, bf16, guardrails off, diffusion cache off):**
-    - T2I 1024² — 10 / 25 / 50 steps → ~0.4 / 0.7 / **1.3 s**
-    - T2V 1280×720 @ 35 steps — 25 / 49 / 93 / **189** frames → ~7 / 15 / 33 / **~93 s**
-    - I2V 1280×720, 189 frames @ 35 steps → ~**99 s**
-    - Action 640×480 @ 30 steps — forward-dynamics 61f ~**4 s**, policy 17f ~**1–3 s**.
+- **Measured latency (1x B300, BF16 weights, guardrails off, diffusion cache off):**
+
+    | Workload | Baseline (BF16 attention) | Low-precision attention (BF16 Q/K + FP8 V) |
+    | --- | --- | --- |
+    | T2I 1024², 10 / 25 / **50** steps | ~0.4 / 1 / **2 s** | ~1 / 2 / **5 s** |
+    | T2V 1280×720, 25 / 49 / 93 / **189** frames, 35 steps | ~7 / 15 / 34 / **94 s** | ~8 / 15 / 32 / **82 s** |
+    | I2V 1280×720, 189 frames, 35 steps | **~94 s** | **~82 s** |
+    | Forward dynamics, AV, 640×480, 61 frames, 30 steps | **~3 s** | **~3 s** |
+    | Policy, Bridge, 640×480, 17 frames, 30 steps | **~1 s** | **~1 s** |
+
+    Measured using `vllm/vllm-omni:nightly-2139e3f158256c0480b5d848a9293980b14ef78d`.
+    Values are means of three end-to-end generations after one warmup
+    per workload and attention setting, using the server commands above with
+    guardrails and diffusion caching disabled.
+
     - Guardrails-on overhead: ~8% on T2I, negligible on video.
 - **Memory:** transformer ~17 GiB (bf16); peak ~46 GiB for 720p video on 1 GPU;
   full repo (transformer + Wan VAE + Qwen3-VL vision encoder + audio tokenizer)
