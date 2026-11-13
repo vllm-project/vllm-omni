@@ -52,13 +52,19 @@ from vllm_omni.worker_v2.prefix_cache import MRv2PrefixCacheMixin
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
 if TYPE_CHECKING:
+    import torch.nn as nn
+    from vllm.config import VllmConfig
     from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+    from vllm.v1.worker.gpu.model_states.interface import ModelState
 
     from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter
     from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 
 logger = init_logger(__name__)
 
+# vLLM releases without the runner hook build the state through a module-level
+# factory, which load_model swaps under this lock instead.
+_UPSTREAM_HAS_MODEL_STATE_HOOK = hasattr(GPUModelRunner, "_init_model_state")
 _model_state_patch_lock = threading.RLock()
 
 
@@ -373,6 +379,23 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             return output
         return plane.attach_omni_connector_output(output)
 
+    def _init_model_state(self) -> ModelState:
+        return self._build_omni_model_state(self.vllm_config, self.model, self.encoder_cache, self.device)
+
+    def _build_omni_model_state(
+        self,
+        vllm_config: VllmConfig,
+        model: nn.Module,
+        encoder_cache: EncoderCache | None,
+        device: torch.device,
+    ) -> ModelState:
+        # Runs after the model is built and before the sampler is: a model
+        # whose logits head is narrower than its HF config reports (the
+        # MiniCPM-o codec Talker's config has no vocab_size at all) sizes
+        # the MRv2 sampler and request state by that head.
+        self._adopt_model_logits_vocab(model)
+        return init_omni_model_state(vllm_config, model, encoder_cache, device)
+
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         # Shared weights allow only one load attempt per worker lifetime.
         # Reload requires full sharing-group teardown and worker recreation.
@@ -380,26 +403,21 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             raise RuntimeError(
                 "A weight-sharing load was already attempted; tear down the sharing group before retrying."
             )
-        import vllm.v1.worker.gpu.model_runner as _mr_module
+        # Upstream's model-construction scope ends before custom_sampler.
+        # Collect kernels selected by that hook in this runner's registry.
+        with self.jit_warmup_registry.activate():
+            if _UPSTREAM_HAS_MODEL_STATE_HOOK:
+                super().load_model(*args, **kwargs)
+            else:
+                import vllm.v1.worker.gpu.model_runner as _mr_module
 
-        def _init_model_state(vllm_config: Any, model: Any, encoder_cache: Any, device: Any) -> Any:
-            # Runs after the model is built and before the sampler is: a model
-            # whose logits head is narrower than its HF config reports (the
-            # MiniCPM-o codec Talker's config has no vocab_size at all) sizes
-            # the MRv2 sampler and request state by that head.
-            self._adopt_model_logits_vocab(model)
-            return init_omni_model_state(vllm_config, model, encoder_cache, device)
-
-        with _model_state_patch_lock:
-            _orig = _mr_module.init_model_state
-            _mr_module.init_model_state = _init_model_state
-            try:
-                # Upstream's model-construction scope ends before custom_sampler.
-                # Collect kernels selected by that hook in this runner's registry.
-                with self.jit_warmup_registry.activate():
-                    super().load_model(*args, **kwargs)
-            finally:
-                _mr_module.init_model_state = _orig
+                with _model_state_patch_lock:
+                    _orig = _mr_module.init_model_state
+                    _mr_module.init_model_state = self._build_omni_model_state
+                    try:
+                        super().load_model(*args, **kwargs)
+                    finally:
+                        _mr_module.init_model_state = _orig
         self._last_aux_output = None
         self._last_multimodal_outputs = None
         self._configure_cudagraph_output_contract()
