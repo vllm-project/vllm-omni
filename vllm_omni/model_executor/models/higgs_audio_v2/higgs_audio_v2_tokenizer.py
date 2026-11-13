@@ -165,10 +165,7 @@ def _build_delay_pattern(codes: torch.Tensor) -> torch.Tensor:
 _ENCODER_CACHE: Any | None = None
 _K2_OMNIVOICE_REPO = "k2-fsa/OmniVoice"
 _K2_OMNIVOICE_SUBDIR = "audio_tokenizer"
-_AUDIO_TOKENIZER_PATH_ENVS = (
-    "HIGGS_AUDIO_TOKENIZER_PATH",
-    "HIGGS_AUDIO_V2_TOKENIZER_PATH",
-)
+_AUDIO_TOKENIZER_PATH_ENV = "HIGGS_AUDIO_TOKENIZER_PATH"
 
 
 def _is_higgs_audio_tokenizer_config(config_path: str) -> bool:
@@ -201,10 +198,9 @@ def _resolve_audio_tokenizer_dir() -> str | None:
     offline, so prefer explicit local directories and already-populated HF cache
     before falling back to ``snapshot_download``.
     """
-    for env_name in _AUDIO_TOKENIZER_PATH_ENVS:
-        candidate = _normalize_audio_tokenizer_dir(os.getenv(env_name, ""))
-        if candidate is not None:
-            return candidate
+    candidate = _normalize_audio_tokenizer_dir(os.getenv(_AUDIO_TOKENIZER_PATH_ENV, ""))
+    if candidate is not None:
+        return candidate
 
     from huggingface_hub import try_to_load_from_cache
 
