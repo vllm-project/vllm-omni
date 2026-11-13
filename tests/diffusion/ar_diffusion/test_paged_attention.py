@@ -401,7 +401,7 @@ def test_layer_inputs_preserve_static_staging_tensors(monkeypatch, window_chunks
         assert stage_key.shape[0] == (window_chunks + 1) * BLOCK
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("history_chunks", [1, 3])
 @pytest.mark.parametrize("action_len", [0, 3])
 @pytest.mark.parametrize("commit_current", [False, True])
@@ -1214,7 +1214,7 @@ def test_the_shipped_resolution_geometry_matches_dense_attention():
     torch.testing.assert_close(paged, ref, rtol=1e-5, atol=1e-5)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("commit_current", [False, True])
 def test_the_shipped_resolution_geometry_on_the_real_kernel(commit_current):
     """The shipped 832x480 geometry through FlashAttention's paged kernel.
@@ -1256,7 +1256,7 @@ def test_the_shipped_resolution_geometry_on_the_real_kernel(commit_current):
     torch.testing.assert_close(paged, ref, rtol=2e-2, atol=2e-2)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("history_chunks", [0, 1, 3])
 @pytest.mark.parametrize("action_len", [0, 3])
 def test_contiguous_kv_gather_path_matches_paged_path_gpu(monkeypatch, history_chunks, action_len):

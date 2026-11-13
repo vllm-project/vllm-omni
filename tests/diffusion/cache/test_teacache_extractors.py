@@ -463,7 +463,7 @@ class TestFlux2KleinExtractor(BaseExtractorTest):
     def get_sample_inputs(self, sample_inputs):
         return sample_inputs
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_modulated_input_shape(self, flux2_klein_module, sample_inputs):
         """Test that modulated_input has correct shape matching the model's inner_dim.
 
@@ -477,19 +477,19 @@ class TestFlux2KleinExtractor(BaseExtractorTest):
         inner_dim = flux2_klein_module.inner_dim
         assert context.modulated_input.shape == (batch_size, img_seq_len, inner_dim)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_run_transformer_blocks_callable(self, flux2_klein_module, sample_inputs):
         """Test that run_transformer_blocks is callable."""
         context = extract_flux2_klein_context(flux2_klein_module, **sample_inputs)
         assert callable(context.run_transformer_blocks)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_postprocess_callable(self, flux2_klein_module, sample_inputs):
         """Test that postprocess is callable."""
         context = extract_flux2_klein_context(flux2_klein_module, **sample_inputs)
         assert callable(context.postprocess)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_extra_states_contains_full_transformer(self, flux2_klein_module, sample_inputs):
         """Test that extra_states contains run_flux2_full_transformer_with_single."""
         context = extract_flux2_klein_context(flux2_klein_module, **sample_inputs)
@@ -575,7 +575,7 @@ class TestFlux2Extractor(BaseExtractorTest):
     def get_sample_inputs(self, sample_inputs):
         return sample_inputs
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_modulated_input_shape(self, flux2_module, sample_inputs):
         """Test that modulated_input has correct shape matching the model's inner_dim.
 
@@ -589,13 +589,13 @@ class TestFlux2Extractor(BaseExtractorTest):
         inner_dim = flux2_module.inner_dim
         assert context.modulated_input.shape == (batch_size, img_seq_len, inner_dim)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_run_transformer_blocks_callable(self, flux2_module, sample_inputs):
         """Test that run_transformer_blocks is callable."""
         context = extract_flux2_context(flux2_module, **sample_inputs)
         assert callable(context.run_transformer_blocks)
 
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
     def test_postprocess_callable(self, flux2_module, sample_inputs):
         """Test that postprocess is callable."""
         context = extract_flux2_context(flux2_module, **sample_inputs)

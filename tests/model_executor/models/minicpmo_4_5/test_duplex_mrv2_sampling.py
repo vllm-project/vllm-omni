@@ -7,6 +7,7 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingHelper
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2_sampling import (
@@ -47,11 +48,11 @@ def test_mrv2_thinker_payload_uses_output_channel_contract():
     assert output.finalize_multimodal(payload, [1]) is payload
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("partial_prefill", [True, False])
 def test_mrv2_sampler_preserves_history_seed_counts_and_prefill_eligibility(mocker, partial_prefill):
-    device = "cuda"
+    device = DEVICE_TYPE
     params = SamplingParams(temperature=0.2, top_k=7, top_p=0.5, seed=13)
     model = SimpleNamespace(
         _mrv2_sampling_infos={
@@ -151,7 +152,7 @@ def test_thinker_history_copies_only_new_ids_and_resets_at_condition_change():
 @pytest.mark.cpu
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_thinker_histories_and_rng_follow_requests_across_reorder_and_slot_reuse(device):
-    if device == "cuda" and not torch.cuda.is_available():
+    if device == "cuda" and not DEVICE_MODULE.is_available():
         pytest.skip("CUDA required")
     request_ids = [f"request-{slot}" for slot in range(4)]
     tokens = torch.arange(32, device=device).reshape(4, 8)
@@ -203,7 +204,7 @@ def test_thinker_histories_and_rng_follow_requests_across_reorder_and_slot_reuse
 @pytest.mark.cpu
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_thinker_decode_reuses_deferred_samples_without_device_ledger_reads(device):
-    if device == "cuda" and not torch.cuda.is_available():
+    if device == "cuda" and not DEVICE_MODULE.is_available():
         pytest.skip("CUDA required")
 
     class NoLedgerReads:

@@ -6,12 +6,13 @@ import numpy as np
 import pytest
 import torch
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 
 pytestmark = pytest.mark.core_model
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32])
 @pytest.mark.parametrize("uva", [False, True])
 def test_staged_writes_match_a_host_model(dtype, uva):
@@ -20,7 +21,7 @@ def test_staged_writes_match_a_host_model(dtype, uva):
     from vllm_omni.worker_v2 import staged_writes
 
     staged_writes.install()
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     rows, cols = 8, 2048
     t = StagedWriteTensor((rows, cols), dtype=dtype, device=device, uva_instead_of_gpu=uva)
     expected = np.zeros((rows, cols), dtype=torch.empty((), dtype=dtype).numpy().dtype)
@@ -53,14 +54,14 @@ def test_staged_writes_match_a_host_model(dtype, uva):
         np.testing.assert_array_equal(t.gpu.cpu().numpy(), expected)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_fused_staged_writes_match_a_host_model():
     from vllm.v1.worker.gpu.buffer_utils import FusedStagedWriter, StagedWriteTensor
 
     from vllm_omni.worker_v2 import staged_writes
 
     staged_writes.install()
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     tables = [StagedWriteTensor((4, 64), dtype=torch.int32, device=device) for _ in range(3)]
     ptrs = torch.tensor([t.gpu.data_ptr() for t in tables], dtype=torch.uint64, device=device)
     strides = torch.tensor([t.gpu.stride(0) for t in tables], dtype=torch.int64, device=device)
@@ -81,14 +82,14 @@ def test_fused_staged_writes_match_a_host_model():
             assert not t._staged_write_indices and t._staged_len == 0
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_deferred_writes_land_together_like_immediate_writes():
     from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 
     from vllm_omni.worker_v2 import staged_writes
 
     staged_writes.install()
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     specs = [
         ((6, 300), torch.int64, False),
         ((6, 40), torch.int32, True),
@@ -136,14 +137,14 @@ def test_deferred_writes_land_together_like_immediate_writes():
     np.testing.assert_array_equal(tensors[2].gpu.cpu().numpy(), expected[2])
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_repeated_flushes_survive_a_slow_stream():
     from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 
     from vllm_omni.worker_v2 import staged_writes
 
     staged_writes.install()
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     t = StagedWriteTensor((64, 32), dtype=torch.int64, device=device)
     expected = np.zeros((64, 32), dtype=np.int64)
     rng = np.random.default_rng(3)
@@ -154,7 +155,7 @@ def test_repeated_flushes_survive_a_slow_stream():
         t.apply_write()
     torch.accelerator.synchronize()
     with writes.deferred():
-        torch.cuda._sleep(1_000_000_000)  # ~0.5 s: the flushes queue behind it while the host keeps going
+        DEVICE_MODULE._sleep(1_000_000_000)  # ~0.5 s: the flushes queue behind it while the host keeps going
         # Each re-apply of the same tensor flushes the window: many flushes in one window.
         for row in range(64):
             values = rng.integers(0, 1 << 30, 32)
@@ -165,7 +166,7 @@ def test_repeated_flushes_survive_a_slow_stream():
     np.testing.assert_array_equal(t.gpu.cpu().numpy(), expected)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_staged_h2d_matches_the_pinned_copy_and_survives_slow_readers():
     from vllm.utils.torch_utils import async_tensor_h2d as original
     from vllm.v1.worker.gpu import model_runner
@@ -180,13 +181,13 @@ def test_staged_h2d_matches_the_pinned_copy_and_survives_slow_readers():
             return model_runner.async_tensor_h2d(*args, **kwargs)
 
     assert staged is not original
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     rng = np.random.default_rng(2)
     results, expected = [], []
     for step in range(100):  # more calls than ring slots
         n = int(rng.integers(1, 300))
         values = rng.integers(0, 1 << 20, n)
-        torch.cuda._sleep(200_000)  # the copies queue behind slow work
+        DEVICE_MODULE._sleep(200_000)  # the copies queue behind slow work
         if step % 3 == 0:
             results.append(staged(values.astype(np.int32), device=device, dtype=torch.int32))
         elif step % 3 == 1:
@@ -208,14 +209,14 @@ def test_staged_h2d_matches_the_pinned_copy_and_survives_slow_readers():
     torch.testing.assert_close(staged([1, 2, 3], device=device).cpu(), torch.tensor([1, 2, 3]))
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_fused_bincount_matches_a_host_count():
     from vllm.v1.worker.gpu.sample import penalties
 
     from vllm_omni.worker_v2 import staged_writes
 
     staged_writes.install()
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     vocab, rows, max_len = 3072, 8, 1500
     rng = np.random.default_rng(3)
     token_ids = torch.from_numpy(rng.integers(0, vocab, (rows, max_len)).astype(np.int32)).to(device)
@@ -240,7 +241,7 @@ def test_fused_bincount_matches_a_host_count():
         np.testing.assert_array_equal(got_counts[r], np.bincount(tok[r, pl[r] : fl[r]], minlength=vocab))
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_nested_runner_contexts_keep_pending_writes_isolated():
     from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 
@@ -248,7 +249,7 @@ def test_nested_runner_contexts_keep_pending_writes_isolated():
 
     staged_writes.install()
     a, b = staged_writes.StagedWrites(), staged_writes.StagedWrites()
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     ta, tb = [StagedWriteTensor((1, 2), dtype=torch.int32, device=device) for _ in range(2)]
     with a.deferred():
         ta.stage_write(0, 0, [11, 12])
