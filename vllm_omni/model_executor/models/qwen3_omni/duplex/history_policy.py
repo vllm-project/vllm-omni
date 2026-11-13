@@ -24,6 +24,24 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.history_visual import Qwe
 Message = Mapping[str, object]
 AudioEntry = tuple[tuple[object, ...], Mapping[str, object]]
 
+_PREVIOUS_MEMORY = "PREVIOUS_MEMORY"
+_END_PREVIOUS_MEMORY = "END_PREVIOUS_MEMORY"
+_NEW_DIALOGUE = "NEW_DIALOGUE"
+_END_NEW_DIALOGUE = "END_NEW_DIALOGUE"
+_END_SOURCE_MESSAGE = "END_SOURCE_MESSAGE"
+_COMPRESSION_RETURN_INSTRUCTION = "Return the complete updated memory."
+_COMPRESSION_ECHO_LINES = frozenset(
+    {
+        _PREVIOUS_MEMORY,
+        _END_PREVIOUS_MEMORY,
+        _NEW_DIALOGUE,
+        _END_NEW_DIALOGUE,
+        _END_SOURCE_MESSAGE,
+        _COMPRESSION_RETURN_INSTRUCTION,
+        "END_MEMORY",  # Observed in model completions, although not emitted by this prompt.
+    }
+)
+
 
 @dataclass(frozen=True)
 class HistoryLimits:
@@ -490,17 +508,17 @@ class IncrementalHistoryPolicy(QwenHistoryPolicy):
     ) -> CompressionPrompt:
         """Merge previous memory and new quoted dialogue in one Thinker request."""
         parts: list[str | CompressionAudioRef | CompressionImageRef] = [
-            "PREVIOUS_MEMORY\n" + previous_memory + "\nEND_PREVIOUS_MEMORY\nNEW_DIALOGUE\n"
+            f"{_PREVIOUS_MEMORY}\n{previous_memory}\n{_END_PREVIOUS_MEMORY}\n{_NEW_DIALOGUE}\n"
         ]
         for message in batch:
-            parts.extend((f"Source role: {message.role}", *message.content, "\nEND_SOURCE_MESSAGE\n"))
-        parts.append("END_NEW_DIALOGUE\nReturn the complete updated memory.")
+            parts.extend((f"Source role: {message.role}", *message.content, f"\n{_END_SOURCE_MESSAGE}\n"))
+        parts.append(f"{_END_NEW_DIALOGUE}\n{_COMPRESSION_RETURN_INSTRUCTION}")
         instructions = (
             "Maintain a durable conversation memory for future turns. Return the COMPLETE updated "
             "memory, "
-            "merging PREVIOUS_MEMORY with NEW_DIALOGUE. Carry forward all still-valid user facts, "
+            f"merging {_PREVIOUS_MEMORY} with {_NEW_DIALOGUE}. Carry forward all still-valid user facts, "
             "preferences, "
-            "requirements, decisions and unresolved tasks from PREVIOUS_MEMORY even when NEW_DIALOGUE"
+            f"requirements, decisions and unresolved tasks from {_PREVIOUS_MEMORY} even when {_NEW_DIALOGUE}"
             " does not "
             "mention them. Replace a fact only when the user explicitly corrects it; changing topic "
             "does not "
@@ -521,18 +539,9 @@ class IncrementalHistoryPolicy(QwenHistoryPolicy):
         return CompressionPrompt(instructions, tuple(parts))
 
     def parse_compression(self, text: str) -> str | None:
-        """Reject source delimiters without memory instead of retiring evidence."""
+        """Reject exact standalone control-line echoes without retiring evidence."""
         memory = text.strip()
-        markers = {
-            "PREVIOUS_MEMORY",
-            "END_PREVIOUS_MEMORY",
-            "NEW_DIALOGUE",
-            "END_NEW_DIALOGUE",
-            "END_SOURCE_MESSAGE",
-            "END_MEMORY",
-            "Return the complete updated memory.",
-        }
-        if not memory or all(line.strip() in markers for line in memory.splitlines() if line.strip()):
+        if not memory or all(line.strip() in _COMPRESSION_ECHO_LINES for line in memory.splitlines() if line.strip()):
             return None
         return memory
 

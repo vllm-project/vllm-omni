@@ -204,6 +204,8 @@ The built-in incremental parser also rejects output containing only source
 delimiter markers and the closing instruction `Return the complete updated memory.`
 Such an output supplies no memory and must leave the source pending for retry.
 Marker words inside actual memory facts remain valid text.
+Matching ignores surrounding whitespace but otherwise requires exact case and
+punctuation for each control line.
 
 Configure the policy in a deployment overlay:
 

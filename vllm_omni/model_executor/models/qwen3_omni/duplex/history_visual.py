@@ -3,8 +3,9 @@
 """Qwen source bindings for the shared visual memory store.
 
 Session retains image URLs. Only bounded batches are decoded in preparation
-workers. Published visual memory refers to source message positions, not an
-invented video clock; input_image may represent a photo or an extracted frame.
+workers. Published visual memory depends on Session source IDs and revisions.
+Message positions label compression requests. input_image may represent a
+photo or an extracted frame.
 """
 
 from collections.abc import Mapping, Sequence
@@ -82,6 +83,7 @@ class QwenVisualHistory:
         # A reply placeholder is invisible until generation/playback materializes
         # it. That can move unchanged camera sources to later history positions.
         # Published memory depends on source identity/revision, not list offsets.
+        # DuplexSourceRef equality checks both the source ID and revision.
         sources_changed = len(inputs) < len(self.inputs) or any(
             old.source != new.source or old.part_index != new.part_index or old.url != new.url
             for old, new in zip(self.inputs, inputs)
