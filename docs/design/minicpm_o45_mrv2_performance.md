@@ -375,6 +375,36 @@ transpose per body, instead of a per-block gather/transpose/copy or a per-block
 Triton kernel. The whole-block CNN cache is transposed to frames-major once per
 body rather than per block. CUDA and the unfused DiT body are unaffected.
 
+## NPU packed QKV normalization and cache writes
+
+The NPU fused CFM body reuses `qkv_head_layer_norm` for FP32 packed QKV with
+standard per-head LayerNorm. One Triton kernel reads the packed projection,
+normalizes Q/K in FP32 and writes Q plus the current K/V frames directly into
+the existing split cache. LayerNorm epsilon and affine parameters are retained;
+NPU launch disables implicit floating-point multiply/add contraction. Reduction
+rounding can differ from ACLNN, so this does not promise bitwise-identical audio.
+Unsupported types, partial affine parameters, indexed slot writes and environments
+without Triton retain the native operator path. CUDA launch behavior is unchanged.
+History copies, masked cache-gap clearing, attention masks and attention itself
+retain their existing semantics.
+
+The NPU stage-2 `additional_config.code2wav_fused_qkv_norm` boolean defaults to
+`true`; set it to `false` to use the previous attention preparation path.
+The setting belongs to each estimator instance and is applied before graph
+capture. Restart the server between settings so captured graphs are rebuilt.
+
+```yaml
+platforms:
+  npu:
+    stages:
+      - stage_id: 2
+        additional_config:
+          code2wav_fused_qkv_norm: true
+```
+
+NPU compilation, graph replay, numerical parity and service performance must be
+validated on the target stack; implementation alone does not establish a speedup.
+
 ## Reference prefetch at higher concurrency
 
 `token2wav_ref_prefetch_max_waiters` (connector extra, default `1`, minimum `1`)

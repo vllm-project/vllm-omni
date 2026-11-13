@@ -334,6 +334,8 @@ platforms:
         # #8735).
         additional_config:
           code2wav_enable_npu_graph: true
+          # Fuse FP32 packed-QKV split, Q/K LayerNorm and current K/V writes.
+          code2wav_fused_qkv_norm: true
           # Batch sizes round up to the next bucket before capture, so the
           # captured shape space becomes (#buckets x #mel buckets) instead of
           # one entry per observed batch size. Padded slots are all-zero

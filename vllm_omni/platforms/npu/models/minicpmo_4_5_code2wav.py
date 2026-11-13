@@ -13,6 +13,7 @@ from weakref import WeakKeyDictionary
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.minicpmo_4_5.config_flags import read_bool_flag
 from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 
 logger = init_logger(__name__)
@@ -27,6 +28,7 @@ _ENABLE_KEY = "code2wav_enable_npu_graph"
 _MAX_GRAPHS_KEY = "code2wav_max_npu_graphs"
 _BATCH_BUCKETS_KEY = "cfm_graph_batch_buckets"
 _BF16_ATTENTION_CACHE_KEY = "code2wav_bfloat16_attention_cache"
+_FUSED_QKV_NORM_KEY = "code2wav_fused_qkv_norm"
 
 
 def _batch_bucket(batch: int, buckets: tuple[int, ...]) -> int:
@@ -367,6 +369,7 @@ def _patched_build_backend(self) -> None:
         )
 
     config = _graph_config(self)
+    fused_qkv_norm = read_bool_flag(config, _FUSED_QKV_NORM_KEY, True)
     cfm_config = getattr(self, "_cfm_graph_config", {})
     max_graphs = max(0, int(cast(int | str, config.get(_MAX_GRAPHS_KEY, cfm_config.get("max_graphs", 32)))))
     graph_enabled = max_graphs > 0 and _config_bool(config.get(_ENABLE_KEY), bool(cfm_config.get("enabled", False)))
@@ -376,7 +379,12 @@ def _patched_build_backend(self) -> None:
     # Preserve the NPU stage switches while routing enabled CFM work through
     # the shared Whole-Euler/step wrappers (including masks and shared arenas).
     if hasattr(self, "_cfm_graph_config"):
-        self._cfm_graph_config = {**self._cfm_graph_config, "enabled": graph_enabled, "max_graphs": max_graphs}
+        self._cfm_graph_config = {
+            **self._cfm_graph_config,
+            "enabled": graph_enabled,
+            "max_graphs": max_graphs,
+            "npu_fused_qkv_norm": fused_qkv_norm,
+        }
     needs_runtime = graph_enabled or any(
         getattr(self, name, {}).get("enabled", False)
         for name in ("_hift_graph_config", "_chunk_encoder_graph_config", "_encoder_graph_config")
@@ -395,6 +403,7 @@ def _patched_build_backend(self) -> None:
 
     assert _original_build_backend is not None
     _original_build_backend(self)
+    logger.info("MiniCPM-o Code2Wav code2wav_fused_qkv_norm=%s", str(fused_qkv_norm).lower())
     # The estimator-step patch runs on the backend, so the bucket set lives
     # there. Unset (or graphs off) means every distinct batch size keeps its
     # own captured shape. Plain-object test doubles cannot carry attributes;
