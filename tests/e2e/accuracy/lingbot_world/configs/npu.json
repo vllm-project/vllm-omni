@@ -39,7 +39,7 @@
   "cpu_threads_per_worker": 1,
   "cards": 4,
   "dies": 4,
-  "deploy_config": "benchmarks/lingbot_world/configs/npu_usp4_eager.yaml",
+  "deploy_config": "benchmarks/lingbot_world/configs/npu_usp4_offload.yaml",
   "warmup_num_chunks": 8,
   "hardware": "A2"
 }

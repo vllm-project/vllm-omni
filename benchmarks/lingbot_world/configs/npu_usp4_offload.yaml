@@ -1,0 +1,44 @@
+# CI deployment for four 64GB Ascend A2 NPUs: full 480x832 and the default KV window.
+#
+# Same topology as npu_usp4_eager.yaml (Ulysses SP-4, eager). A2 exposes only
+# ~60.96 GiB, and the all-resident deployment OOMs in the first chunk's VAE
+# condition encode on the CI runner. Keep the DiT resident, release the text
+# encoder before denoising, and size the KV pool for one session (the manager
+# raises the budget to admit one session) to leave activation headroom.
+pipeline: lingbot_world
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    enforce_eager: true
+    # Read one safetensors shard at a time on the shared checkpoint filesystem.
+    # Four ranks otherwise eagerly load four whole shards each concurrently.
+    enable_multithread_weight_load: false
+    diffusion_offload_config:
+      mode: module
+      components: [text_encoder]
+      pin_memory: false
+    model_class_name: LingBotWorldCausalDMDPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    step_execution: true
+    streaming_output: true
+    parallel_config:
+      tensor_parallel_size: 1
+      sequence_parallel_size: 4
+      ulysses_degree: 4
+      ring_degree: 1
+    default_sampling_params:
+      num_inference_steps: 4
+      output_type: pil
+      extra_args:
+        flow_shift: 5.0
+    model_config:
+      ar_diffusion_height: 480
+      ar_diffusion_width: 832
+      ar_diffusion_kv_config:
+        gpu_memory_fraction: 0.1
+        warmup_cudagraph: false

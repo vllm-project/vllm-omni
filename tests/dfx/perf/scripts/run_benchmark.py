@@ -216,7 +216,16 @@ def _omni_server_env() -> dict[str, str]:
     return {"VLLM_OMNI_STORAGE_PATH": str(storage_path)}
 
 
-def _resolve_offline_model(model: str) -> str:
+def _cli_flag_value(args: tuple[str, ...] | list[str], flag: str) -> str | None:
+    for index, arg in enumerate(args):
+        if arg == flag and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith(f"{flag}="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _resolve_offline_model(model: str, revision: str | None = None) -> str:
     """Resolve HF ids / MiniMax env overrides the same way as the diffusion runner."""
     import huggingface_hub
 
@@ -249,14 +258,15 @@ def _resolve_offline_model(model: str) -> str:
 
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         return model
-    return hf_api().snapshot_download(model, local_files_only=True)
+    # A pinned download (``hf download --revision <sha>``) caches no refs/main.
+    return hf_api().snapshot_download(model, revision=revision, local_files_only=True)
 
 
 @contextmanager
 def _start_omni_server(server_param):
     test_name, model, stage_config_path, stage_overrides, extra_cli_args, use_omni = server_param
     extra = tuple(extra_cli_args or ())
-    model = _resolve_offline_model(model)
+    model = _resolve_offline_model(model, revision=_cli_flag_value(extra, "--revision"))
 
     print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
