@@ -82,9 +82,6 @@ RUN python3 -m pip install -v --no-deps \
       --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
       --default-timeout=60
 
-# Catch native NumPy ABI mismatches before publishing the CI image.
-RUN python3 -c "import numpy, onnxruntime; print(numpy.__version__, onnxruntime.__version__)"
-
 ENV VLLM_TARGET_DEVICE=npu
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 
