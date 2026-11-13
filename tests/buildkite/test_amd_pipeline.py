@@ -2431,14 +2431,14 @@ def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
         assert "full_model and rocm and MI325 and cards_1" not in text
 
 
-def test_stable_audio_layerwise_offload_is_one_nonblocking_nightly_job() -> None:
+def test_stable_audio_layerwise_offload_is_one_blocking_nightly_job() -> None:
     step = _find_step("Stable Audio Layerwise Offload", AMD_NIGHTLY_PIPELINE)
     command = "\n".join(step["commands"])
     nightly = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
     nightly_labels = [item.get("label") for item in _walk_steps(nightly["steps"])]
 
     assert nightly_labels.count("Stable Audio Layerwise Offload") == 1
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 60

@@ -817,7 +817,7 @@ steps:
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 60
         source_file_dependencies:
           - diffusion_offloader
@@ -1681,7 +1681,7 @@ steps:
         agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 60
         source_file_dependencies: diffusion_collective_parity
         artifact_paths:
@@ -1698,7 +1698,7 @@ steps:
         agent_pool: mi300_4
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 60
         source_file_dependencies: diffusion_collective_parity
         artifact_paths:
@@ -1717,7 +1717,7 @@ steps:
         agent_pool: mi300_4
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 60
         source_file_dependencies: diffusion_collective_parity
         artifact_paths:
