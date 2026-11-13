@@ -233,6 +233,8 @@ _MODEL_PROMOTE = (
     "H3_VAE_COMPILE",
     "H3_VAE_FP16_WEIGHTS",
     "H3_VAE_XEFMHA",
+    # MiniMax-H3 manual component allocator-cache policy.
+    "H3_COMPONENT_CACHE_REUSE",
 )
 
 _MODEL_REQUEST_SCOPE = (

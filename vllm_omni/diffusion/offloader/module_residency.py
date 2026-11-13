@@ -568,7 +568,12 @@ class PinnedModuleStager:
             self._cleanup_failed_load()
             raise
 
-    def offload(self) -> None:
+    def offload(self, *, release_cache: bool = True) -> None:
+        """Restore CPU masters, optionally skipping unconditional cache purges.
+
+        An explicit bounded cache policy still checks its limits when release
+        is disabled. Offload failures always force cache release.
+        """
         if not self.loaded:
             return
 
@@ -585,7 +590,8 @@ class PinnedModuleStager:
         if not self.retain_device_storage:
             self._device_storages.clear()
         self.loaded = False
-        self._release_cache()
+        if release_cache or self.cache_retention is not None:
+            self._release_cache()
 
 
 __all__ = ["BoundedAllocatorCache", "PinnedModuleStager"]

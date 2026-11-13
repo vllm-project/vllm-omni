@@ -34,6 +34,7 @@ from vllm_omni.diffusion.offloader.module_residency import (
 from vllm_omni.platforms import current_omni_platform
 
 from .chunked_decode import decode_h3_chunks
+from .component_cache_policy import release_component_cache
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 from .vae_temporal import install_temporal_stream_patches
@@ -542,20 +543,20 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     def _offload_part_to_cpu(self, part: str) -> None:
         stager = self._part_stager(part)
         if stager is not None:
-            stager.offload()
+            stager.offload(release_cache=release_component_cache())
             return
         if self._stager is not None:
-            self._stager.offload()
+            self._stager.offload(release_cache=release_component_cache())
             return
         self.remote.to("cpu")
         self._release_component_cache()
 
     def _release_component_cache(self) -> None:
         cache = getattr(self, "_omni_component_cache", None)
-        if cache is None:
-            torch.accelerator.empty_cache()
-        else:
+        if cache is not None:
             cache.release_if_needed()
+        elif release_component_cache():
+            torch.accelerator.empty_cache()
 
     def load_to_device(self) -> None:
         if self._encoder_stager is not None:
@@ -574,10 +575,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
     def offload_to_cpu(self) -> None:
         if self._encoder_stager is not None:
-            self._encoder_stager.offload()
-            self._decoder_stager.offload()
+            self._encoder_stager.offload(release_cache=release_component_cache())
+            self._decoder_stager.offload(release_cache=release_component_cache())
         elif self._stager is not None:
-            self._stager.offload()
+            self._stager.offload(release_cache=release_component_cache())
         else:
             self.remote.to("cpu")
             self._release_component_cache()
@@ -1414,14 +1415,14 @@ class MiniMaxH3AudioVAE(nn.Module):
 
     def offload_to_cpu(self) -> None:
         if self._stager is not None:
-            self._stager.offload()
+            self._stager.offload(release_cache=release_component_cache())
         else:
             self.remote.to("cpu")
             cache = getattr(self, "_omni_component_cache", None)
-            if cache is None:
-                torch.accelerator.empty_cache()
-            else:
+            if cache is not None:
                 cache.release_if_needed()
+            elif release_component_cache():
+                torch.accelerator.empty_cache()
 
     @torch.inference_mode()
     def encode_waveform(

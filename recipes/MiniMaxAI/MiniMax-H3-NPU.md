@@ -221,6 +221,27 @@ The following sections list only the **increment or replacement** relative to
 the recommended lossless configuration; environment variables and the
 remaining flags stay unchanged.
 
+#### Reuse idle component allocator cache
+
+For ordinary MiniMax-H3 component offload, set the following before starting
+the workers:
+
+```bash
+export H3_COMPONENT_CACHE_REUSE=1
+```
+
+This skips unconditional idle allocator-cache purges after Text/Video/Audio
+component offload. Components still return to CPU, synchronization and tensor
+values remain unchanged, and the default `0` keeps the original release
+behavior. It does not make the weights resident.
+
+An explicit bounded component cache, including the existing DLO policy, still
+enforces its cache and physical-free-memory thresholds. Failure, OOM retry,
+forced stage release, and shutdown retain their existing cleanup. Without a
+bounded owner this option can keep more reserved device memory between stages;
+check that tradeoff for the deployment. Historical 0.26 Ascend experiments are
+not a main-branch or current-image performance guarantee.
+
 #### Cache-DiT
 
 Append to enable DiT block caching with TaylorSeer extrapolation — see the
@@ -663,3 +684,46 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - [Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
+
+## Independent VAE optimization validation
+
+Keep opt-in idle allocator-cache reuse for ordinary H3 manual component offload. Explicit bounded cache owners, failure cleanup, OOM retry and forced stage/shutdown release remain authoritative. No production allocator repair was needed; fix the environment-inventory snapshot and add a portable repeated load/decode/offload benchmark that inspects the actual whole-module fallback stager used by decoder-only models.
+
+```bash
+# MAIN and CANDIDATE are the source checkouts; MODEL is the Ref2VA task partition.
+# LATENTS contains torch.save((video_z, audio_z)); use the same nightly software/driver.
+BENCHMARK="$CANDIDATE/benchmarks/diffusion/minimax_h3_vae_lifecycle.py"
+H3_VIDEO_DECODER_FUSED_INFER_ATTENTION=0 H3_VAE_OPERATOR_FIR_C16_INSTALL=0 \
+H3_VAE_OPERATOR_FIR_C16=0 H3_VIDEO_DECODER_CROSS_CHUNK=0 H3_COMPONENT_CACHE_REUSE=0 \
+PYTHONPATH="$MAIN" python3 -m torch.distributed.run --nproc_per_node=8 \
+  "$BENCHMARK" --arm baseline --model "$MODEL" --inputs "$LATENTS" \
+  --output-dir baseline-results --warmups 3 --formals 5 --precision
+H3_COMPONENT_CACHE_REUSE=1 PYTHONPATH="$CANDIDATE" python3 -m torch.distributed.run --nproc_per_node=8 \
+  "$BENCHMARK" --arm candidate --model "$MODEL" --inputs "$LATENTS" \
+  --output-dir candidate-results --warmups 3 --formals 5 --precision
+python3 -m pytest -q tests/diffusion/offloader/test_module_residency.py tests/diffusion/models/minimax_h3/test_minimax_h3_component_cache_policy.py tests/diffusion/models/minimax_h3/test_minimax_h3_offload.py tests/diffusion/models/minimax_h3/test_minimax_h3_dlo_lifecycle.py tests/config/test_environment_variables.py
+```
+
+Measured scope: **staged Video+Audio load/decode/offload, excludes DiT/MP4/HTTP**.
+
+| Arm | Mean ± sample std (s) | Min–max (s) | Independent round means (s) |
+| --- | ---: | ---: | --- |
+| main | 7.044054 ± 0.023606 | 7.012395–7.082367 | 7.047040, 7.041068 |
+| PR | 6.966055 ± 0.038991 | 6.913597–7.020069 | 6.931738, 7.000372 |
+
+Latency reduction: **1.107%**; speedup: **1.011197x** (main mean / PR mean).
+
+Main samples (s): 7.029427, 7.056656, 7.065480, 7.029387, 7.054247, 7.020323, 7.012395, 7.082367, 7.065485, 7.024770.
+
+PR samples (s): 6.913597, 6.954741, 6.930870, 6.940329, 6.919152, 7.020069, 7.003528, 6.991181, 7.004475, 6.982605.
+
+Peak device memory in the accepted repeat (max rank/request, allocated / reserved GiB): main 14.812 / 16.180; PR 14.801 / 16.188.
+Maximum reserved memory after offload (GiB): main 0.018; PR 16.188. Live model weight storage is not retained.
+
+Full normalized Float32 video, canonical RGB24, ordinary decode RGB and all 784,000 Float32 audio samples are **bit-exact** against main on the validated input (max error = RMSE = 0). This is measured equality on this workload, not a claim that every possible input/kernel implementation has identical rounding.
+
+The actual default-codec MP4 capture is decoded and measured separately: H.264 RGB PSNR 46.725369 dB, max channel difference 38; AAC-decoded PCM is bit-exact (including codec padding). These H.264 differences are not treated as isolated patch error: encoding the SAME saved immutable RGB/PCM twice through the unchanged main encoder produces different decoded RGB hashes, and setting threads=1 did not remove this reference variability. The predeclared precision acceptance uses the complete PRE-CODEC tensors above; encoded MP4 bit equality is not claimed. Both the repeatability diagnostic and all per-arm MP4 differences are retained.
+
+The cache switch targets ordinary manual offload; explicit bounded cache owners still control retention.
+
+The result measures decoder work on eight 910B4-1 NPUs using the nightly image software stack (CANN 9.2.1), main `b7bbfbdb4f2b3c070d9632043ea6cd2b1c601270`, original Ref2VA weights and identical captured latents. Each of two launches uses three warmups and five formal samples. It excludes conditioning/DiT and HTTP latency.
