@@ -1,4 +1,4 @@
-# CUDA turn serving with MRv2 on all three stages and K-step on the Talker.
+# Turn MRv2 tuning for shared-GPU audio generation.
 base_config: minicpmo_4_5_turn.yaml
 
 connectors:
@@ -19,17 +19,10 @@ connectors:
 
 stages:
   - stage_id: 0
-    model_runner: v2
-    # llm2tts consumes the completed Thinker payload via the orchestrator.
-    # Only Talker -> Code2Wav is a streaming connector edge. Keep the latent
-    # rows on the full-payload output channel instead of partitioning them
-    # into an async connector that this stage does not have.
     async_chunk: false
   - stage_id: 1
-    model_runner: v2
     max_num_seqs: 8
   - stage_id: 2
-    model_runner: v2
     max_num_seqs: 8
     async_scheduling: false
 
@@ -39,9 +32,6 @@ platforms:
       - stage_id: 1
         # Reserve enough KV for eight concurrent 4096-token Talker requests.
         kv_cache_memory_bytes: 2147483648
-        # K-step uses a one-query FlashAttention view for each codec frame.
-        model_runner: v2
-        attention_backend: FLASH_ATTN
   npu:
     model_runner: v1
   xpu:

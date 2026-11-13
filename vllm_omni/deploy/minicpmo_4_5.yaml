@@ -208,9 +208,8 @@ platforms:
         # Keep this scoped to stage 0; Talker retains its own backend selection.
         attention_backend: TRITON_ATTN
       - stage_id: 1
-        # The default duplex Talker uses MRv1. The turn MRv2 profile
-        # overrides the runner and inherits the K-step settings below.
-        model_runner: v1
+        # K-step advances one codec frame per FlashAttention query.
+        attention_backend: FLASH_ATTN
         # Cover 16 full 4096-token requests while leaving room for Code2Wav.
         kv_cache_memory_bytes: 4294967296  # 4 GiB
         # Seven continuation drafts reserve eight codec positions per step.

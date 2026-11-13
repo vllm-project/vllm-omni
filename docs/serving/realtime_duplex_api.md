@@ -457,8 +457,7 @@ for the command and configuration requirements.
 #### Compare MiniCPM-o attention backends
 
 The default `minicpmo_4_5.yaml` selects Triton attention for the CUDA Thinker
-(stage 0). The Talker's backend selection and graph settings are unchanged.
-The vision tower defaults to reference attention for CUDA BF16 duplex sessions to
+(stage 0) and FlashAttention for the CUDA Talker (stage 1). The vision tower defaults to reference attention for CUDA BF16 duplex sessions to
 preserve long-video scene recognition. Turn-mode and non-CUDA vision use
 SDPA by default; explicit engine or vision overrides still win. The turn-mode
 profile also inherits the CUDA Thinker's Triton backend from the base

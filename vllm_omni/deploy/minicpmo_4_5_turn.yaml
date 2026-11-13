@@ -12,6 +12,8 @@ platforms:
   cuda:
     stages:
       - stage_id: 0
+        # The Talker consumes the completed Thinker payload.
+        async_chunk: false
         # Keep the turn engine's upstream kernel and compilation defaults.
         kernel_config: {}
         compilation_config: {}

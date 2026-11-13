@@ -15,13 +15,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize(
-    "profile,capacities,kv_gib,runners",
+    "profile,capacities,kv_gib",
     [
-        ("minicpmo_4_5_turn_mrv2.yaml", [16, 8, 8], 2, [True, True, True]),
-        ("minicpmo_4_5_turn_mrv2_h200.yaml", [16, 16, 8], 4, [True, True, True]),
+        ("minicpmo_4_5_turn.yaml", [16, 16, 16], 4),
+        ("minicpmo_4_5_turn_mrv2.yaml", [16, 8, 8], 2),
+        ("minicpmo_4_5_turn_mrv2_h200.yaml", [16, 16, 8], 4),
     ],
 )
-def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, runners, monkeypatch):
+def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, monkeypatch):
     from pathlib import Path
 
     from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config, merge_pipeline_deploy
@@ -34,7 +35,8 @@ def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, 
     deploy = Path(__file__).resolve().parents[4] / "vllm_omni/deploy" / profile
     config = _apply_platform_overrides(load_deploy_config(deploy), platform="cuda")
     stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == runners
+    assert config.session_mode == "turn"
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [False, True, True]
     assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == capacities
     assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == kv_gib * 1024**3

@@ -158,8 +158,16 @@ class TestDeployTopology:
         deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / filename), platform=platform)
         stages = {stage.stage_id: stage for stage in deploy.stages}
         assert stages[0].attention_backend == ("TRITON_ATTN" if platform == "cuda" else None)
-        mrv2_turn_profiles = {"minicpmo_4_5_turn_mrv2.yaml", "minicpmo_4_5_turn_mrv2_h200.yaml"}
-        talker_backend = "FLASH_ATTN" if platform == "cuda" and filename in mrv2_turn_profiles else None
+        cuda_flash_talker_profiles = {
+            "minicpmo_4_5.yaml",
+            "minicpmo_4_5_3gpu_stage1_replicas.yaml",
+            "minicpmo_4_5_4gpu_stage1_replicas.yaml",
+            "minicpmo_4_5_stage2_replicas.yaml",
+            "minicpmo_4_5_turn.yaml",
+            "minicpmo_4_5_turn_mrv2.yaml",
+            "minicpmo_4_5_turn_mrv2_h200.yaml",
+        }
+        talker_backend = "FLASH_ATTN" if platform == "cuda" and filename in cuda_flash_talker_profiles else None
         assert stages[1].attention_backend == talker_backend
         assert stages[2].attention_backend is None
 

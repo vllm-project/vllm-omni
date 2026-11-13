@@ -28,8 +28,8 @@ def _resolve_cuda_stages(monkeypatch):
 def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
     config, stages = _resolve_cuda_stages(monkeypatch)
     assert config.session_mode == "duplex"
-    # The default CUDA duplex profile uses the V1 Talker.
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, False, True]
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
+    assert stages[1].yaml_engine_args["attention_backend"] == "FLASH_ATTN"
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [True, True, True]
     assert stages[0].yaml_engine_args["async_scheduling"] is True
     # K-step books its span with the synchronous runner contract.

@@ -41,3 +41,6 @@ stages:
 platforms:
   cuda:
     model_runner: v1
+    stages:
+      - stage_id: 1
+        attention_backend: null
