@@ -3,21 +3,18 @@
 
 """Isolated AsyncOmni abort / sleep-admission regression for Qwen3-Omni.
 
-This lives in its own module so the L3 merge job can run it *after*
-``test_qwen3_omni.py`` (offline) and the online serving file. Those modules keep
-module-scoped OmniRunner / OmniServer instances until teardown; overlapping a
-CuMem sleep-mode engine with them kills StageEngineCoreProc at handshake
-(``Failed core proc(s): {}``).
+Nightly collects this module with the other single-GPU ``full_model`` omni
+tests. It stays in its own file so it does not share those modules' runners.
 
 Both tests share one module-scoped AsyncOmni (the ``async_omni_runner``
 fixture, shadowed here only to wait for that teardown). ``wake_up`` /
 ``resume_generation`` run between tests so the second case does not boot
-another engine. File order after the online module is what keeps CuMem off
-the other runners.
+another engine.
 """
 
 import asyncio
 import os
+import sys
 from contextlib import asynccontextmanager, suppress
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -71,8 +68,8 @@ def _colocate_async_deploy() -> str:
     """Thinker-only Instruct deploy with sleep mode on a single GPU.
 
     Abort / sleep admission is a thinker control-plane contract. The 3-stage
-    CI yaml plus CuMem on every stage fails engine-core startup in the L3
-    merge job: Stage 1 resolves ``devices: "1"`` while only GPU 0 is visible.
+    CI yaml plus CuMem on every stage fails engine-core startup when Stage 1
+    resolves ``devices: "1"`` while only GPU 0 is visible.
     """
     return get_deploy_config_path("ci/qwen3_omni_moe_colocate_async.yaml")
 
@@ -158,7 +155,11 @@ async def _release_colocate_engine(engine, request_ids: tuple[str, ...]):
         if wake_timeout is not None:
             if body_error is None:
                 raise wake_timeout
-            body_error.add_note(f"colocate wake/resume timed out after {_ENGINE_CONTROL_TIMEOUT_S}s; abort still ran")
+            # add_note is 3.11+. Pre-commit also type-checks this file as 3.10.
+            if sys.version_info >= (3, 11):
+                body_error.add_note(
+                    f"colocate wake/resume timed out after {_ENGINE_CONTROL_TIMEOUT_S}s; abort still ran"
+                )
 
 
 @pytest_asyncio.fixture(loop_scope="module")
@@ -169,9 +170,9 @@ async def colocate_engine(async_omni_runner):
     yield engine
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.parametrize("async_omni_runner", _COLOCATE_ASYNC_PARAMS, indirect=True)
 async def test_colocate_async_abort_tokens_and_sleep_admission(colocate_engine, async_omni_runner) -> None:
@@ -264,9 +265,9 @@ async def test_colocate_async_abort_tokens_and_sleep_admission(colocate_engine, 
         assert _finish_reason(outputs[-1]) != "abort"
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.parametrize("async_omni_runner", _COLOCATE_ASYNC_PARAMS, indirect=True)
 async def test_colocate_async_resubmit_window_pause_sleep_cycle(colocate_engine, async_omni_runner) -> None:

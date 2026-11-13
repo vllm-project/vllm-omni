@@ -10,7 +10,7 @@ projection into ``VllmConfig`` and ``SamplingParams`` is covered by
 the 30B model.
 
 Abort / sleep-admission lives in ``test_qwen3_omni_colocate_async.py`` so it
-does not overlap this module's OmniRunners.
+does not share this module's OmniRunners.
 """
 
 import os
