@@ -1993,7 +1993,6 @@ def _build_common_stage_config_kwargs(
                 _first_defined(engine.weight_transfer_config, deploy.weight_transfer_config)
             ),
             "quantization_config": _copy_value(quantization_config),
-            "weight_transfer_config": _first_defined(engine.weight_transfer_config, deploy.weight_transfer_config),
         },
         input_proc,
         next_stage_proc,
