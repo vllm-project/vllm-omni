@@ -1551,9 +1551,7 @@ class MiniMaxH3Pipeline(
             return positions, len(positions) - 1
         sigma_schedule = self._sigma_schedule_for_request(sampling, task)
         if sigma_schedule is None:
-            return None, int(
-                sampling.num_inference_steps or MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS
-            )
+            return None, int(sampling.num_inference_steps or MINIMAX_H3_DEFAULT_NUM_INFERENCE_STEPS)
         # The schedule lists sigma boundaries; the denoise loop runs one step
         # per interval, and that count is what requests and Cache-DiT speak in.
         num_steps = sigma_schedule.num_inference_steps
@@ -2202,9 +2200,11 @@ class MiniMaxH3Pipeline(
                 raise ValueError("keep_steps requires base text conditioning (image-only presentation)")
             kinds = [str(block.get("kind")) for block in (ref_blocks or [])]
             n_images = kinds.count("image")
-            if kinds != ["image"] * n_images + ["video"] or not visual_condition_shapes or len(
-                visual_condition_shapes
-            ) != len(kinds):
+            if (
+                kinds != ["image"] * n_images + ["video"]
+                or not visual_condition_shapes
+                or len(visual_condition_shapes) != len(kinds)
+            ):
                 raise ValueError("keep_steps expects image reference(s) plus exactly one silent video reference")
             image_shapes = [tuple(int(v) for v in shape) for shape in visual_condition_shapes[:n_images]]
             shape_image_rows = sum(
@@ -2213,8 +2213,7 @@ class MiniMaxH3Pipeline(
             if visual_anchor is None or int(visual_anchor.shape[0]) <= shape_image_rows:
                 raise ValueError("keep_steps found no video reference rows to drop")
             base_ref_blocks = [
-                {"kind": "image", "latent_h": int(shape[1]), "latent_w": int(shape[2])}
-                for shape in image_shapes
+                {"kind": "image", "latent_h": int(shape[1]), "latent_w": int(shape[2])} for shape in image_shapes
             ]
             base_packed = minimax_h3_packed_sequence_ref2va_blocks(
                 text_len=int(base_text_embeddings.shape[0]),
@@ -2245,9 +2244,7 @@ class MiniMaxH3Pipeline(
             # instead of slicing the wrong prefix.
             base_image_rows = int((~base_branch.update_mask).sum())
             if base_image_rows != shape_image_rows:
-                raise ValueError(
-                    "keep_steps image row count disagrees with the packed layout; the packer changed"
-                )
+                raise ValueError("keep_steps image row count disagrees with the packed layout; the packer changed")
             base_cond_rows = visual_anchor[:base_image_rows].to(device=self.device, dtype=torch.float32)
 
         if locked_audio_rows is not None:
@@ -3235,9 +3232,7 @@ class MiniMaxH3Pipeline(
                         latent_hw=(int(prepared.media.height) // 16, int(prepared.media.width) // 16),
                         continuation=continuation,
                     )
-                base_encode_needed = (
-                    keep_steps is not None and bool(prepared.qwen_videos) and bool(prepared.images)
-                )
+                base_encode_needed = keep_steps is not None and bool(prepared.qwen_videos) and bool(prepared.images)
                 if prompts is not None:
                     if continuation is None or not self.load_text_encoder:
                         raise OmniClientError(
@@ -3323,9 +3318,7 @@ class MiniMaxH3Pipeline(
                         prepared,
                         qwen_videos=[],
                         video_timestamps=[],
-                        condition_labels=[
-                            label for label in prepared.condition_labels if label[0] != "video"
-                        ],
+                        condition_labels=[label for label in prepared.condition_labels if label[0] != "video"],
                     )
                     if rank == 0
                     else None
@@ -3653,15 +3646,9 @@ class MiniMaxH3Pipeline(
         if keep_steps is not None:
             if control_rows is not None:
                 raise OmniClientError("MiniMax H3 keep_steps does not support control conditioning")
-            if (
-                conditioning.video_edit_clean_rows is not None
-                or conditioning.audio_edit_clean_rows is not None
-            ):
+            if conditioning.video_edit_clean_rows is not None or conditioning.audio_edit_clean_rows is not None:
                 raise OmniClientError("MiniMax H3 keep_steps cannot be combined with latent-mask editing")
-            if (
-                conditioning.audio_condition is not None
-                or extra.get("audio_mode", "native") == "lock_source"
-            ):
+            if conditioning.audio_condition is not None or extra.get("audio_mode", "native") == "lock_source":
                 raise OmniClientError("MiniMax H3 keep_steps does not support audio references in this revision")
             if conditioning.guide_blocks:
                 # Guide rows pack ahead of the reference rows, so the

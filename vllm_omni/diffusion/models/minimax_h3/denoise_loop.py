@@ -334,9 +334,7 @@ def minimax_h3_switch_denoise_branch(
     """
     if int(base.update_mask.sum()) != int(update.sum()):
         raise ValueError("base branch target row count differs from the active branch")
-    switched = torch.zeros(
-        int(base.img_pos.shape[0]), MINIMAX_H3_VIDEO_ROW_WIDTH, dtype=torch.float32, device=device
-    )
+    switched = torch.zeros(int(base.img_pos.shape[0]), MINIMAX_H3_VIDEO_ROW_WIDTH, dtype=torch.float32, device=device)
     switched[base.update_mask_dev] = video_rows[update]
     anchor = base_cond_rows.to(device=device, dtype=torch.float32)
     switched[~base.update_mask_dev] = anchor
@@ -414,16 +412,14 @@ def minimax_h3_denoise_loop(
     num_steps = len(sigmas_video) - 1
     if base is not None:
         if type(keep_steps) is not int or not 1 <= keep_steps < num_steps:
-            raise ValueError(
-                f"keep_steps must be an integer in [1, {num_steps}) when a base branch is supplied"
-            )
+            raise ValueError(f"keep_steps must be an integer in [1, {num_steps}) when a base branch is supplied")
         if base_cond_rows is None:
             raise ValueError("keep_steps requires base_cond_rows (image-only condition anchor rows)")
         if int(base.update_mask.sum()) != int(update.sum()):
             raise ValueError("base branch target row count differs from the full branch")
-        if int(base.audio_pos.shape[0]) != int(positive.audio_pos.shape[0]) or int(
-            base.audio_update_mask.sum()
-        ) != int(audio_update.sum()):
+        if int(base.audio_pos.shape[0]) != int(positive.audio_pos.shape[0]) or int(base.audio_update_mask.sum()) != int(
+            audio_update.sum()
+        ):
             raise ValueError("keep_steps branches must share the same audio row layout")
         if current_omni_platform.is_npu():
             base.prepare_rope_table(model)

@@ -248,7 +248,7 @@ def test_base_cond_rows_equal_image_only_anchor(pipeline):
     independently.
     """
     inputs = pipeline._build_denoise_inputs(**_keep_steps_kwargs())
-    branch, base = inputs["branch"], inputs["base_branch"]
+    base = inputs["base_branch"]
     assert int((~base.update_mask).sum()) == BASE_IMAGE_ROWS
     torch.testing.assert_close(
         inputs["base_cond_rows"],
@@ -307,9 +307,7 @@ def _run_loop(
         positive=positive,
         initial_video_rows=initial_rows,
         initial_audio_rows=(
-            torch.zeros(positive.audio_pos.shape[0], 32)
-            if initial_audio_rows is None
-            else initial_audio_rows
+            torch.zeros(positive.audio_pos.shape[0], 32) if initial_audio_rows is None else initial_audio_rows
         ),
         keyframe_cond_rows=keyframe,
         sigmas_video=SIGMAS_VIDEO if sigmas is None else sigmas,
@@ -541,9 +539,7 @@ def test_keep_steps_rejects_pinned_distilled_schedule():
         (dict(), {"keep_steps": -1}, "must be an integer"),
     ],
 )
-def test_keep_steps_request_validation_rejects_unsupported_combinations(
-    conditioning_overrides, extra_args, match
-):
+def test_keep_steps_request_validation_rejects_unsupported_combinations(conditioning_overrides, extra_args, match):
     pipeline = _validation_pipeline()
     conditioning = _keep_steps_conditioning(**conditioning_overrides)
     with pytest.raises(OmniClientError, match=match):
@@ -602,9 +598,7 @@ def _wire_conditioning():
         visual_condition_shapes=((1, 2, 2),),
         audio_condition=torch.ones(160, 32),
         audio_condition_lengths=(80,),
-        ref_blocks=(
-            {"kind": "video_audio", "ref_audio_t": 80, "latent_t": 1, "latent_h": 2, "latent_w": 2},
-        ),
+        ref_blocks=({"kind": "video_audio", "ref_audio_t": 80, "latent_t": 1, "latent_h": 2, "latent_w": 2},),
         keyframe_frame_indices=(0, -1),
         base_hidden_states=torch.arange(6, dtype=torch.float32).reshape(3, 2),
         base_token_tags=torch.tensor([0, 0, 1]),
@@ -878,7 +872,9 @@ def test_request_path_normalizes_video_first_references(monkeypatch: pytest.Monk
     monkeypatch.setattr(
         # 512x512 clears the real reference-image validation ([256, 5760]
         # pixels per side, ratio in [0.4, 2.5]) that this request path runs.
-        encoder_processing, "load_minimax_h3_images", lambda values: [Image.new("RGB", (512, 512))]
+        encoder_processing,
+        "load_minimax_h3_images",
+        lambda values: [Image.new("RGB", (512, 512))],
     )
     monkeypatch.setattr(
         encoder_processing,
@@ -894,9 +890,7 @@ def test_request_path_normalizes_video_first_references(monkeypatch: pytest.Monk
             }
         ],
     )
-    monkeypatch.setattr(
-        encoder_processing, "load_video_frames", lambda path: np.zeros((4, 8, 8, 3), dtype=np.uint8)
-    )
+    monkeypatch.setattr(encoder_processing, "load_video_frames", lambda path: np.zeros((4, 8, 8, 3), dtype=np.uint8))
     monkeypatch.setattr(
         encoder_processing,
         "sample_reference_video_frames",
@@ -998,9 +992,7 @@ def test_pinned_schedule_step_counts_diverge_between_intake_and_diffusion(monkey
     # num_inference_steps is left unspecified so the case matches the
     # documented divergence scenario exactly: the resolver returns the
     # pinned schedule's own count (4).
-    sampling = OmniDiffusionSamplingParams(
-        quality="lossless", fps=24, extra_args={"task": "ref2va", "keep_steps": 4}
-    )
+    sampling = OmniDiffusionSamplingParams(quality="lossless", fps=24, extra_args={"task": "ref2va", "keep_steps": 4})
     context = pipeline._prepare_encoder_conditioning_inputs(_keep_steps_conditioning(), sampling)
     assert context["keep_steps"] is None
     assert context["base_text_embeddings"] is None

@@ -971,14 +971,10 @@ class MiniMaxH3EncoderConditioning:
             audio_edit_mask=audio_edit_mask,
             audio_edit_source_t=audio_edit_source_t,
             base_hidden_states=(
-                payload["base_hidden_states"]
-                if isinstance(payload.get("base_hidden_states"), torch.Tensor)
-                else None
+                payload["base_hidden_states"] if isinstance(payload.get("base_hidden_states"), torch.Tensor) else None
             ),
             base_token_tags=(
-                payload["base_token_tags"]
-                if isinstance(payload.get("base_token_tags"), torch.Tensor)
-                else None
+                payload["base_token_tags"] if isinstance(payload.get("base_token_tags"), torch.Tensor) else None
             ),
         )
 
