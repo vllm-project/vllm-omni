@@ -117,6 +117,14 @@ integrations must verify the actual runtime prefixes, especially when a
 a layer to the default configuration, so component-routing tests should cover
 both positive matches and fall-through behavior.
 
+MiniMax H3 uses an explicit `video_vae` component for its native Ascend A5
+decoder. It eagerly quantizes the decoder block projections from a floating
+checkpoint before offload snapshots and uses the same component selection for
+eligible MXFP8 attention. The global configuration and component default do not
+activate this path. An explicit non-null component configuration must select
+Omni online MXFP8. See the [MXFP8 guide](../../user_guide/quantization/mxfp8.md)
+for supported checkpoints and residency modes.
+
 ## Online and pre-quantized checkpoints
 
 The same method name can represent two different loading paths:

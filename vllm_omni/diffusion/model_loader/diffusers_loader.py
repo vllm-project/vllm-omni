@@ -67,6 +67,7 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery, Pipe
 from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 if TYPE_CHECKING:
@@ -755,7 +756,21 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
                 quant_cfg, "is_checkpoint_quantized", False
             )
-            if not is_offline:
+            # The native H3 VAE moves individual projections to A5 for eager quantization.
+            is_h3_vae_only = (
+                device.type == "npu"
+                and load_format == "default"
+                and isinstance(quant_cfg, ComponentQuantizationConfig)
+                and getattr(self.od_config, "model_class_name", None)
+                in ("MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline", "MiniMaxH3DecoderPipeline")
+                and quant_cfg.default_config is None
+                and (video_vae_config := quant_cfg.component_configs.get("video_vae")) is not None
+                and video_vae_config.get_name() == "mxfp8"
+                and all(name == "video_vae" or config is None for name, config in quant_cfg.component_configs.items())
+            )
+            if is_h3_vae_only:
+                logger.info("MiniMax H3 Video VAE quantizes projections on A5; loading the pipeline on CPU")
+            elif not is_offline:
                 load_device = device.type
                 offload_after_quant = True
                 logger.info(
