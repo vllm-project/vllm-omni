@@ -1866,8 +1866,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             burst_n = max(1, int(float(os.environ.get("VLLM_OMNI_SPEECH_INITIAL_BURST", "1"))))
         except (TypeError, ValueError):
             logger.warning(
-                "Invalid VLLM_OMNI_SPEECH_INITIAL_BURST=%r; disabling initial burst "
-                "buffering (1).", os.environ.get("VLLM_OMNI_SPEECH_INITIAL_BURST", ""))
+                "Invalid VLLM_OMNI_SPEECH_INITIAL_BURST=%r; disabling initial burst buffering (1).",
+                os.environ.get("VLLM_OMNI_SPEECH_INITIAL_BURST", ""),
+            )
             burst_n = 1
         # Held chunks as (pcm_bytes, sample_rate) pairs; the WAV header built
         # for the first chunk is stashed here and emitted once at the release
