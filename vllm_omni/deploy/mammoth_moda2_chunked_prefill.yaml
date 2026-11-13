@@ -1,5 +1,7 @@
 # MammothModa2 AR→DiT with chunked prefill enabled on the AR stage (#7116).
 # Pair with mammoth_moda2_chunked_prefill_off.yaml for latent / image A/B.
+# For a forced multi-chunk stress A/B on short prompts, use
+# mammoth_moda2_chunked_prefill_stress.yaml.
 
 async_chunk: false
 pipeline: mammoth_moda2
@@ -9,8 +11,8 @@ stages:
     devices: "0"
     max_num_seqs: 100
     max_model_len: 8192
-    # Force multi-chunk prefills for long multimodal / visual-token prompts;
-    # full-payload accumulation rebuilds contiguous AR→DiT latents.
+    # Chunked prefill; full-payload accumulation rebuilds contiguous AR→DiT
+    # latents across prefill chunks.
     enable_chunked_prefill: true
     max_num_batched_tokens: 2048
     gpu_memory_utilization: 0.5
