@@ -143,15 +143,6 @@ fraction to select additional resident sessions up to the model-declared cap.
 All model-owned reservations are deducted before the paged self-attention pool
 is allocated.
 
-Hy-Nomas can separately opt into a model-owned CPU history archive. Its byte
-quota covers committed plus pending local-rank tensor payload; a frame quota
-bounds metadata. Archive copies are prepared after every KV layer is staged and
-before the existing rank agreement and retention publication. The archive
-publishes after KV commit and is cleared by session reset/close. These host
-quotas are separate from the CUDA admission equation above; they do not reserve
-physical host memory. The [Hy-Nomas archive contract](hy_nomas.md#c1-bounded-cpu-archive)
-defines limit behavior and the validation boundary.
-
 LingBot advances a session-owned causal Wan VAE encoder for each condition
 block: the opening pixel frame is followed by four zero pixel frames per later
 latent frame. It retains one current condition block, with separate committed
