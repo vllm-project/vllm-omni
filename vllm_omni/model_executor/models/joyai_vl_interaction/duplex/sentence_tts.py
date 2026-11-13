@@ -15,19 +15,23 @@ is still open may not be the note after all.
 Sentence TTS follows AURA's orchestrator contract: each confirmed sentence is a
 resumable Talker update on the same request id. Only one sentence is in flight
 at a time: later sentences wait in ``queued`` until Talker parks on 2150, then
-the plugin submits the next one from the Talker-stage poll. The last sentence
-is a resumable unpark stamped ``joyai_finish_on_next_stop`` so that utterance's
-2150 is Code2Wav's request terminal. A later parked close_only is too late:
-the vocoder already treated 2150 as a segment stop. Do not prefix the next
-sentence with ``。``: Talker vocalizes that as a filler. The pause is the
-terminator already in the sentence text. ``joyai_action_to_tts`` reads the
+the plugin submits the next one from the Talker-stage poll. MRv2 async_chunk
+Talker only emits those 2150 parks (no generating deltas), so a new park with
+different token ids must drain even while ``releasing`` is still set. The last
+sentence is a resumable unpark stamped ``joyai_finish_on_next_stop`` so that
+utterance's 2150 is Code2Wav's request terminal. A later parked close_only is
+too late: the vocoder already treated 2150 as a segment stop. Do not prefix
+the next sentence with ``。``: Talker vocalizes that as a filler. The pause is
+the terminator already in the sentence text. ``joyai_action_to_tts`` reads the
 flags written here; do not duplicate the key strings elsewhere.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 
+import regex as re
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.plugin import PartialStageForward
@@ -38,6 +42,7 @@ from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import (
     SILENCE_TOKEN,
     parse_action,
 )
+from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import USER_QUERY_HEADER
 
 logger = init_logger(__name__)
 
@@ -56,6 +61,13 @@ JOYAI_TTS_SEED = 0
 # and sentences. 0.4 is the Qwen3-Omni Talker recommendation: still sampled,
 # but stable enough that recitation does not change speaker mid-paragraph.
 JOYAI_TTS_TEMPERATURE = 0.4
+# V1 can rebroadcast the same 2150 in the following polls. MRv2 DELTA parks
+# often look like ``(2150,)`` every sentence, so same ids after this window
+# are the next utterance, not a leftover.
+_PARK_REBROADCAST_WINDOW_S = 0.2
+# JoyAI wraps the user turn with USER_QUERY_HEADER and may echo chunk-duration
+# tags plus a trailing </silence>. None of that is speech.
+_DURATION_TAG = re.compile(r"<\s*[\d.]+\s*seconds\s*>", re.IGNORECASE)
 
 
 def incomplete_marker_prefix(raw: str) -> bool:
@@ -100,12 +112,34 @@ def spoken_text_ready(raw: str, *, finished: bool) -> bool:
     return not incomplete_delegation_hold(text[response_at + len(RESPONSE_TOKEN) :], finished=finished)
 
 
+def sanitize_spoken_text(text: str) -> str:
+    """Drop prompt scaffolding that must not be handed to Talker.
+
+    Recitation and normal turns both see ``USER_QUERY_HEADER`` in the prompt.
+    Copying it verbatim, then a ``<0.0 seconds></silence>`` tail, is what the
+    Seed-TTS WER bad cases spoke as "User query, important..." / "sillings".
+    """
+    payload = (text or "").lstrip()
+    if payload and USER_QUERY_HEADER.startswith(payload) and payload != USER_QUERY_HEADER:
+        # Header still arriving; do not start TTS on ``[User Query (IMP``.
+        return ""
+    header_at = payload.find(USER_QUERY_HEADER)
+    if header_at != -1:
+        payload = payload[header_at + len(USER_QUERY_HEADER) :]
+    payload = payload.replace(SILENCE_TOKEN, " ")
+    payload = _DURATION_TAG.sub(" ", payload)
+    return " ".join(payload.split())
+
+
 def spoken_payload(raw: str, *, finished: bool) -> str | None:
     """The text JoyAI chose to speak, or None when nothing may be handed over yet."""
     if not spoken_text_ready(raw, finished=finished):
         return None
     parsed = parse_action(raw)
-    return parsed.text if parsed.spoke else None
+    if not parsed.spoke:
+        return None
+    cleaned = sanitize_spoken_text(parsed.text)
+    return cleaned or None
 
 
 def _pending_units(state: dict[str, object]) -> list[str]:
@@ -341,7 +375,16 @@ def _schedule_talker_followup(
     )
 
 
-def _talker_segment_finished(req_state: object, talker_stage_id: int) -> bool:
+def _talker_segment_finished(req_state: object, talker_stage_id: int, output: object | None = None) -> bool:
+    """Whether this Talker poll is a 2150 park.
+
+    Prefer ``output.is_segment_finished`` from this poll. MRv2 async_chunk Talker
+    only emits EngineCoreOutputs at 2150, so ``streaming.segments`` can keep a
+    leftover True from the previous sentence and hide the next park.
+    """
+    poll_flag = getattr(output, "is_segment_finished", None) if output is not None else None
+    if poll_flag is not None:
+        return bool(poll_flag)
     streaming = getattr(req_state, "streaming", None)
     if streaming is None or not getattr(streaming, "enabled", False):
         return False
@@ -351,19 +394,33 @@ def _talker_segment_finished(req_state: object, talker_stage_id: int) -> bool:
     return bool(getattr(segment(talker_stage_id), "finished", False))
 
 
-def _talker_token_ids(output: object) -> tuple[int, ...]:
-    ids = getattr(output, "token_ids", None)
-    if not isinstance(ids, list) or not ids:
-        outputs = getattr(output, "outputs", None)
-        if not isinstance(outputs, (list, tuple)) or not outputs:
-            return ()
-        ids = getattr(outputs[0], "token_ids", None)
+def _coerce_token_ids(ids: object) -> tuple[int, ...]:
     if not isinstance(ids, list) or not ids:
         return ()
     try:
         return tuple(int(token_id) for token_id in ids)
     except (TypeError, ValueError):
         return ()
+
+
+def _talker_token_ids(output: object) -> tuple[int, ...]:
+    ids = _coerce_token_ids(getattr(output, "token_ids", None))
+    if ids:
+        return ids
+    outputs = getattr(output, "outputs", None)
+    if not isinstance(outputs, (list, tuple)) or not outputs:
+        return ()
+    return _coerce_token_ids(getattr(outputs[0], "token_ids", None))
+
+
+def _talker_park_identity(output: object) -> tuple[int, ...]:
+    """Identity of this 2150. Prefer cumulative ids; DELTA parks are often (2150,)."""
+    outputs = getattr(output, "outputs", None)
+    completion = outputs[0] if isinstance(outputs, (list, tuple)) and outputs else output
+    cumulative = _coerce_token_ids(getattr(completion, "cumulative_token_ids", None))
+    if cumulative:
+        return cumulative
+    return _talker_token_ids(output)
 
 
 def _talker_output_has_progress(output: object, park_ids: object) -> bool:
@@ -383,6 +440,25 @@ def _talker_output_has_progress(output: object, park_ids: object) -> bool:
     return ids[: len(park_ids)] != park_ids
 
 
+def _is_same_park_rebroadcast(output: object, park_ids: object, *, released_at: object) -> bool:
+    """True when this 2150 is the previous park replayed, not the next sentence.
+
+    V1 leftovers still carry the parked sentence's ids and arrive in the next
+    polls. MRv2 DELTA often reports ``(2150,)`` for every sentence; those later
+    parks must drain after ``_PARK_REBROADCAST_WINDOW_S``.
+    """
+    if not isinstance(park_ids, tuple) or not park_ids:
+        return False
+    ids = _talker_park_identity(output)
+    if ids != park_ids:
+        return False
+    try:
+        age = time.monotonic() - float(released_at or 0)
+    except (TypeError, ValueError):
+        return True
+    return age < _PARK_REBROADCAST_WINDOW_S
+
+
 def _plan_after_talker_park(
     orchestrator: object,
     output: object,
@@ -394,20 +470,25 @@ def _plan_after_talker_park(
     bridge = _sentence_tts_bridge(req_state)
     if bridge is None:
         return None
-    parked = _talker_segment_finished(req_state, joyai_stage_id + 1)
+    parked = _talker_segment_finished(req_state, joyai_stage_id + 1, output)
     if not parked:
         # Only a real decode delta unlocks the next park. Empty leftovers
         # after 2150 used to clear ``releasing`` and dump the queue.
         if _talker_output_has_progress(output, bridge.get("park_token_ids")):
             bridge["releasing"] = False
         return None
-    if bridge.get("releasing"):
+    # MRv2 never sends the generating heartbeat that clears ``releasing``.
+    # A new 2150 (ids that are not the previous park replayed) must drain.
+    if bridge.get("releasing") and _is_same_park_rebroadcast(
+        output, bridge.get("park_token_ids"), released_at=bridge.get("park_released_at")
+    ):
         return None
     request_id = str(getattr(output, "request_id", getattr(req_state, "request_id", "")))
     chunk = _pop_queued_sentence(bridge)
     if chunk:
         bridge["releasing"] = True
-        bridge["park_token_ids"] = _talker_token_ids(output)
+        bridge["park_token_ids"] = _talker_park_identity(output)
+        bridge["park_released_at"] = time.monotonic()
         bridge["talker_busy"] = True
         enable_talker_streaming(req_state)
         queued = _queued_sentences(bridge)
@@ -595,6 +676,7 @@ __all__ = [
     "mark_talker_prompt_flags",
     "next_spoken_sentence_chunk",
     "plan_partial_stage_output",
+    "sanitize_spoken_text",
     "spoken_payload",
     "spoken_text_ready",
 ]

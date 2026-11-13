@@ -25,6 +25,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts im
     JOYAI_TTS_CLOSE_ONLY_KEY,
     JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY,
     JOYAI_TTS_PARTIAL_KEY,
+    sanitize_spoken_text,
 )
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     Qwen3TTSPromptEmbedsBuilder,
@@ -339,7 +340,12 @@ def joyai_action_to_tts(
             parsed_action = parse_action(_extract_completed_action_text(joyai_output))
             if not parsed_action.spoke or not parsed_action.text:
                 continue
-            spoken_text = parsed_action.text
+            # One-shot Talker (async_chunk=false) never goes through
+            # spoken_payload. Strip the same prompt scaffolding so a leaked
+            # USER_QUERY_HEADER / duration / trailing </silence> is not spoken.
+            spoken_text = sanitize_spoken_text(parsed_action.text)
+            if not spoken_text:
+                continue
 
         tts_metadata = _build_tts_metadata(request_prompt, spoken_text)
         _validate_talker_speaker(tts_metadata, target_model_config)
