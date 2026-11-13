@@ -663,3 +663,43 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - [Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
+
+## Independent VAE optimization validation
+
+Pack independent FIR channels into diagonal dense convolutions and split stride-two upsampling into even/odd six-tap phases. Preserve native forwards when filters are absent, non-tensors or not twelve taps, or the upsample stride/ratio is unsupported. Derived non-persistent buffers are installed before residency staging; the full model activates 254 supported FIR modules. Add five unsupported-topology regressions, model-control inventory and a portable benchmark.
+
+```bash
+# MAIN and CANDIDATE are the source checkouts; MODEL is the Ref2VA task partition.
+# LATENTS contains torch.save((video_z, audio_z)); use the same nightly software/driver.
+BENCHMARK="$CANDIDATE/benchmarks/diffusion/minimax_h3_vae_decode.py"
+H3_VIDEO_DECODER_FUSED_INFER_ATTENTION=0 H3_VAE_OPERATOR_FIR_C16_INSTALL=0 \
+H3_VAE_OPERATOR_FIR_C16=0 H3_VIDEO_DECODER_CROSS_CHUNK=0 H3_COMPONENT_CACHE_REUSE=0 \
+PYTHONPATH="$MAIN" python3 -m torch.distributed.run --nproc_per_node=8 \
+  "$BENCHMARK" --arm baseline --model "$MODEL" --inputs "$LATENTS" \
+  --output-dir baseline-results --warmups 3 --formals 5 --precision
+H3_VAE_OPERATOR_FIR_C16_INSTALL=1 H3_VAE_OPERATOR_FIR_C16=1 PYTHONPATH="$CANDIDATE" python3 -m torch.distributed.run --nproc_per_node=8 \
+  "$BENCHMARK" --arm candidate --model "$MODEL" --inputs "$LATENTS" \
+  --output-dir candidate-results --warmups 3 --formals 5 --precision
+python3 -m pytest -q tests/diffusion/models/minimax_h3/test_minimax_h3_audio_vae_fir_c16.py tests/config/test_environment_variables.py
+```
+
+Measured scope: **resident Audio VAE decode, rank zero**.
+
+| Arm | Mean ± sample std (s) | Min–max (s) | Independent round means (s) |
+| --- | ---: | ---: | --- |
+| main | 2.446194 ± 0.023376 | 2.427703–2.480392 | 2.464653, 2.427735 |
+| PR | 0.366426 ± 0.098203 | 0.277999–0.497763 | 0.454678, 0.278174 |
+
+Latency reduction: **85.021%**; speedup: **6.675818x** (main mean / PR mean).
+
+Main samples (s): 2.432610, 2.466009, 2.480392, 2.464298, 2.479954, 2.427807, 2.427707, 2.427723, 2.427703, 2.427736.
+
+PR samples (s): 0.497763, 0.373613, 0.467244, 0.468493, 0.466276, 0.278738, 0.278052, 0.277999, 0.278061, 0.278022.
+
+Peak device memory in the accepted repeat (max rank/request, allocated / reserved GiB): main 0.879 / 1.041; PR 0.884 / 1.047.
+
+Full normalized Float32 video, canonical RGB24, ordinary decode RGB and all 784,000 Float32 audio samples are **bit-exact** against main on the validated input (max error = RMSE = 0). This is measured equality on this workload, not a claim that every possible input/kernel implementation has identical rounding.
+
+The actual default-codec MP4 capture is decoded and measured separately: H.264 RGB PSNR 46.689677 dB, max channel difference 35; AAC-decoded PCM is bit-exact (including codec padding). These H.264 differences are not treated as isolated patch error: encoding the SAME saved immutable RGB/PCM twice through the unchanged main encoder produces different decoded RGB hashes, and setting threads=1 did not remove this reference variability. The predeclared precision acceptance uses the complete PRE-CODEC tensors above; encoded MP4 bit equality is not claimed. Both the repeatability diagnostic and all per-arm MP4 differences are retained.
+
+The result measures decoder work on eight 910B4-1 NPUs using the nightly image software stack (CANN 9.2.1), main `b7bbfbdb4f2b3c070d9632043ea6cd2b1c601270`, original Ref2VA weights and identical captured latents. Each of two launches uses three warmups and five formal samples. It excludes conditioning/DiT and HTTP latency.
