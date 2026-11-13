@@ -2248,7 +2248,7 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         "OmniVoice online · 1-GPU": {
             "timeout": 300,
             "test_timeout": 270,
-            "count": 18,
+            "count": 19,
             "artifact_name": "rocm-omnivoice-online-weekly",
             "dependency": "tts_omnivoice_online_weekly",
             "files": ("tests/e2e/online_serving/test_omnivoice_expansion.py",),
