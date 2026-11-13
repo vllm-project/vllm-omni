@@ -11,7 +11,11 @@ import torch.nn.functional as F
 from tests.helpers.mark import hardware_marks
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.diffusion,
+    *hardware_marks(res={"cuda": ["L4", "H100", "B200"]}, num_cards=1),
+]
 
 
 def _selected_operators():

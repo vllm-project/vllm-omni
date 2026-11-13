@@ -31,6 +31,19 @@ reference media is still encoded locally.
 
 The generated MP4 contains H.264 video and synchronized stereo audio.
 
+## Optional LiteVAE video decoder
+
+To use the standard non-INT8 H3 Lite decoder, add:
+
+```bash
+--additional-config '{"lightvae_decoder_path":"/weights/lightvae-lite-h3-decoder.safetensors"}'
+```
+
+LiteVAE changes the video decoder while preserving the video encoder and audio
+VAE. Omit `video_vae_decoder` when selecting LiteVAE. See the
+[LiteVAE guide](../../docs/user_guide/diffusion/light_vae.md) for checkpoint
+requirements, decoder selection, and quality review.
+
 ## Prerequisites
 
 The checkpoint requires Hugging Face access approval. Authenticate once;
@@ -609,16 +622,18 @@ Select the device with `HIP_VISIBLE_DEVICES` (not `CUDA_VISIBLE_DEVICES`), drop 
 CUDA-only `FLASHINFER_DISABLE_VERSION_CHECK`, and install without the `[fa4]` extra
 (FA4 is CUDA-only). The VAE uses AITER GroupNorm on ROCm.
 
-Install (ROCm wheel + source vLLM-Omni):
+For this source checkout, build the frozen vLLM 0.33.0 ROCm runtime from
+source using the repository Dockerfile, from the Omni repository root:
 
 ```bash
-pip install "vllm==0.26.0+rocm723" \
-  --extra-index-url https://wheels.vllm.ai/rocm/0.26.0/rocm723
-VLLM_OMNI_TARGET_DEVICE=rocm pip install -e . --no-build-isolation
+docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm:v033-source .
 ```
 
-Prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. All tasks work out of the box:
-the image bundles TorchCodec (for image+audio Ref2VA) and `ffmpeg` (for
+See the [ROCm installation guide](../../docs/getting_started/installation/gpu/rocm.inc.md)
+for source/runtime details. Container and native H3 validation on ROCm remain
+pending for this checkout; an older ROCm wheel cannot provide its 0.33 APIs.
+
+Historical prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. That image bundles TorchCodec (for image+audio Ref2VA) and `ffmpeg` (for
 video-reference Ref2VA).
 
 ### ROCm single GPU
@@ -1115,6 +1130,9 @@ The workflow's custom Dasiwa weights, Sol attention, and T8-specific LoRA are
 not supplied by this feature.
 
 ### Latent-tail continuation with global temporal positions (A+B)
+
+To continue a finished job in a separate request, see
+[MiniMax H3 Continuation Across Requests](../../docs/serving/videos_api.md#minimax-h3-continuation-across-requests).
 
 `long_video=true` selects this mode by default for Ref2VA. It can also be selected
 explicitly with `long_video_mode=continuation`. This experimental mode supports
@@ -1614,6 +1632,13 @@ differ from each other.
 The four-step adapter recipe has moved to the [FastH3 section](../FastVideo/README.md):
 [FastH3](../FastVideo/FastH3.md).
 
+### Open-H3-Regenerate-2K
+
+[Open-H3-Regenerate-2K](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K)
+re-renders a 768P draft from this model at 2560x1440 in three steps. It is a
+load-time adapter served as its own deployment; see
+[Open-H3-Regenerate-2K — H200](../Efficient-Large-Model/Open-H3-Regenerate-2K-H200.md).
+
 ### FastH3 8-Step V2 full checkpoint
 
 See [FastH3 V2 — T2VA](../FastVideo/FastH3-V2.md) in the
@@ -1959,6 +1984,7 @@ reused as they are.
 | `latent_refine_max_tokens_per_rank` | `65536` | Reject larger refine layouts before denoising. Set `0` only after validating a larger deployment. |
 | `latent_upscale` | unset | A default target applied to every request, in the request's own format. A request overrides it, and `false` opts out. |
 | `latent_refine` | unset | A default refine strength applied to every request. A request overrides it, and `false` opts out. |
+| `latent_cache_clips` | `16` | Finished clips whose latents each DiT worker keeps for `continue_from`. `0` disables continuation. |
 
 The `latent_upscale` request value is a multiplier (`2.0`), `false`, or an
 object naming one mode: `{"scale": 2.0}`, `{"width": …, "height": …}` or
@@ -1994,6 +2020,8 @@ memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
   own resolution and its own truncated schedule, and the step contract carries
   one schedule per request, so step execution rejects it. `latent_upscale`
   without `latent_refine` works in both modes.
+- Non-empty attention schedules reject `latent_refine` in request mode too;
+  disable the schedule (`attention_schedule=[]`) or refinement (`latent_refine=false`).
 - Large refine layouts can abort workers with `CUDA error: an illegal memory
   access was encountered`. On B300, observed video token counts of 54,144 per
   rank complete while 108,288 and 109,360 abort. The preflight limit of 65,536

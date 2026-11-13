@@ -625,6 +625,33 @@ async def _persist_latent_edit_source(
     )
 
 
+async def validate_latent_continuation_source(
+    handler: OmniOpenAIServingVideo,
+    request: VideoGenerationRequest,
+) -> str | None:
+    """Return ``extra_params["continue_from"]`` once it names a completed job of this server."""
+    source = (request.extra_params or {}).get("continue_from")
+    if source is None:
+        return None
+    if not handler.supports_latent_continuation:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="continue_from is not supported by this model.",
+        )
+    if not isinstance(source, str) or not source:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="continue_from must be a video id returned by POST /v1/videos.",
+        )
+    job = await VIDEO_STORE.get(source)
+    if job is None or job.status != VideoGenerationStatus.COMPLETED:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"continue_from video {source!r} is unknown or has not completed.",
+        )
+    return source
+
+
 def _validate_latent_edit_inputs(
     handler: OmniOpenAIServingVideo,
     *,
@@ -632,8 +659,13 @@ def _validate_latent_edit_inputs(
     source_audio: UploadFile | None,
     video_noise_mask: Any | None,
     audio_noise_mask: Any | None,
+    regenerate: bool = False,
 ) -> bool:
-    """Validate cross-field latent-edit requirements before persisting files."""
+    """Validate cross-field latent-edit requirements before persisting files.
+
+    A MiniMax H3 ``regenerate`` request carries its draft as ``source_video``
+    without masks; the encoder supplies the all-keep mask itself.
+    """
     has_any_input = any(value is not None for value in (source_video, source_audio, video_noise_mask, audio_noise_mask))
     if not has_any_input:
         return False
@@ -642,7 +674,7 @@ def _validate_latent_edit_inputs(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Latent-mask editing is not supported by this model.",
         )
-    if video_noise_mask is None and audio_noise_mask is None:
+    if video_noise_mask is None and audio_noise_mask is None and not (regenerate and source_video is not None):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Latent-mask editing requires at least one of video_noise_mask or audio_noise_mask.",
@@ -1230,6 +1262,7 @@ async def _parse_video_form(
         source_audio=source_audio,
         video_noise_mask=parsed_video_noise_mask,
         audio_noise_mask=parsed_audio_noise_mask,
+        regenerate=(request.extra_params or {}).get("regenerate") is True,
     )
 
     h3_control = handler.is_minimax_h3

@@ -571,7 +571,7 @@ L4 level testing is a comprehensive quality audit before a version release. It e
 #### 3.3 Test Directory and Execution Files
 
 - ***Functional Testing***: Same directories as L3.
-- ***Performance Test Configuration***: `tests/dfx/perf/tests/test_qwen3_omni_*.json`, `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json`, and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (e.g. `test_qwen_image_vllm_omni.json`, `test_cosmos3_vllm_omni.json`). Optional per-case `mark` for local `-m` filtering is documented in Section 3.4 Performance Tests.
+- ***Performance Test Configuration***: `tests/dfx/perf/tests/test_qwen3_omni_*.json`, `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json`, and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (e.g. `test_bagel_vllm_omni.json`, `test_cosmos3_vllm_omni.json`). Optional per-case `mark` for local `-m` filtering is documented in Section 3.4 Performance Tests.
 - ***Documentation Example Tests***:
     - `tests/examples/online_serving/test_{model_name}.py`
     - `tests/examples/offline_inference/test_{model_name}.py`
@@ -621,7 +621,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
 
 - ***Trigger Timing***: **`Weekly`** (weekly) or **`Days before Release`** (several days before a major release). Due to long execution times, the frequency is lower.
 - ***Run Command***:
-    - ***Stability***: `pytest -s -v tests/dfx/stability/scripts/run_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/run_stability_wan22.py` (or add `run_stability_<model>.py` alongside a matching JSON config)
+    - ***Stability***: `pytest -s -v tests/dfx/stability/scripts/run_stability_benchmark.py --test-config-file tests/dfx/stability/tests/test_qwen3_omni.json` (one runner for all models; add a matching JSON config under `tests/dfx/stability/tests/` for a new model)
     - ***Reliability***: `pytest -s -v tests/dfx/reliability/test_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`, `minicpmo_4_5`).
 - ***Script Example***:
 
@@ -630,7 +630,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
 
 ##### Stability
 
-When you want to add L5-level stability test cases, add or extend the appropriate JSON file under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` for Omni bench traffic, or `test_wan22.json` for diffusion `/v1/videos` workloads). Pair the JSON with `tests/dfx/stability/scripts/run_stability_<model>.py`. The following illustrates the Qwen3-Omni shape:
+When you want to add L5-level stability test cases, add or extend the appropriate JSON file under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` for Omni bench traffic, or `test_wan22.json` for diffusion `/v1/videos` workloads). All models are driven by the single runner `tests/dfx/stability/scripts/run_stability_benchmark.py` via `--test-config-file`. The following illustrates the Qwen3-Omni shape:
 
 ```json
 {

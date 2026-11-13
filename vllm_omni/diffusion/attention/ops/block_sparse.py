@@ -159,6 +159,16 @@ if not hasattr(torch.ops.vllm_omni, "fastvideo_block_sparse_attn_bshd"):
 fastvideo_block_sparse_attn_bshd = torch.ops.vllm_omni.fastvideo_block_sparse_attn_bshd
 
 
+def require_fastvideo_sparse() -> None:
+    """Fail before launch when fastvideo-kernel lacks the tile64 block-sparse kernel."""
+    try:
+        kernel = importlib.import_module("fastvideo_kernel.block_sparse_attn").block_sparse_attn
+    except (ImportError, AttributeError) as exc:
+        raise ImportError("FastVideo tile64 requires fastvideo-kernel; install vllm-omni[vsa]") from exc
+    if not callable(kernel):
+        raise ImportError("FastVideo block_sparse_attn is unavailable")
+
+
 @functools.lru_cache(maxsize=32)
 def resolve_block_sparse_provider(
     provider: str, precision: str, device: torch.device, dtype: torch.dtype, head_size: int, block_size: int = 64
@@ -252,10 +262,8 @@ def resolve_block_sparse_provider(
     elif precision == "sage":
         raise ValueError(reason)
     try:
-        kernel = importlib.import_module("fastvideo_kernel.block_sparse_attn").block_sparse_attn
-        if not callable(kernel):
-            raise ImportError("FastVideo block_sparse_attn is unavailable")
-    except (ImportError, AttributeError) as exc:
+        require_fastvideo_sparse()
+    except ImportError as exc:
         raise ImportError(
             f"VSA auto cannot use FlashInfer ({reason}) and fastvideo-kernel is unavailable. "
             "Install vllm-omni[vsa] for the FastVideo provider."
