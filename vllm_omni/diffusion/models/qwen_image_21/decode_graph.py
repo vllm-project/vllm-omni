@@ -458,8 +458,7 @@ class QwenImage21DecodeGraphManager:
             logger.info("Captured Qwen-Image-2.1 decode graph for key=%s", key)
         entry.graph.replay()
         assert entry.output is not None
-        # Clone before returning: the output lives in the shared graph pool and
-        # the next replay (of this or another graph on the pool) overwrites it.
+        # Clone before returning: the next replay of this graph overwrites its output.
         return entry.output.clone()
 
     def release_idle_entries(self) -> None:
