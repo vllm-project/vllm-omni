@@ -304,37 +304,6 @@ an explicit option. Recent history is functional qualification work, not a
 real-time performance guarantee. GPU qualification status must be read with
 the revision and workloads in [Verification](#verification).
 
-### Experimental CPU history archive (C1)
-
-On the recent AR deployment, explicitly set these fields under the existing
-`custom_pipeline_args` mapping:
-
-```yaml
-ar_history_mode: recent
-ar_history_archive_max_bytes: 8589934592  # 8 GiB per session, per SP rank
-ar_history_archive_max_frames: 256
-```
-
-The byte limit defaults to `0` (disabled); the frame limit defaults to `4096`.
-The example limits are illustrative, not a qualified duration profile.
-The archive copies each committed chunk's local-head K/V and original masks to
-CPU, preserving absolute frame, segment, text, and action offsets even after
-GPU history eviction. It leaves recent-history selection and sampling unchanged.
-
-Both committed and pending tensor payload must fit the byte quota. Python record
-count is bounded by the frame quota. Exceeding either fails the request before
-KV publication and releases its session; it never silently drops archive data.
-Budget host memory across all sessions and SP ranks in addition to model offload
-and decoder/output state. This limit is not a physical host-memory reservation.
-
-Chunk metadata adds `archive_payload_bytes` and `archive_latent_frames` (zero
-when disabled). Reset, close, cancellation, and failure clear the archive.
-CPU copies add transfer cost. Local BF16 SP1/SP2 storage parity and host-memory
-measurements were checked at 384×640 on an earlier base; the complete
-target-resolution and public-service matrix remains unqualified.
-This initial archive does not enable non-recent sampling, undo, or pause/resume;
-see the [C1 archive contract](../../docs/design/feature/hy_nomas.md).
-
 ## Multi-turn continuation
 
 ```bash
@@ -384,8 +353,7 @@ the recorded adapter revisions; native GPU requalification is pending. Relative 
 | A3 | Session-bound rolling decode, positions, empty stable metadata, normal final flush | Full cancellation/transport qualification |
 | A4 | Full/recent transactional retention; offline AR and normal realtime/typed output; 18/36 precision and 120+ second delivery | Remaining A4 service matrix, 72 precision, complete high-water accounting and broad W6/full-vs-recent quality |
 | B1–B9 | Basic SP/module offload remains supported; no new B-series optimization claimed | Media/kernel/attention/staging optimization, chunk residency/prefetch, decode parallelism, encoder sharding, regional compile/graphs and sparsity |
-| C1 | Opt-in bounded CPU KV/mask archive; local BF16 SP1/SP2 storage parity at 384×640 | Target-resolution and complete public-service/quality qualification |
-| C2–C8 | Full/recent through AR state interfaces | Other history sampling, KV/weight quantization, undo and pause/resume |
+| C1–C8 | Full/recent through AR state interfaces | CPU archival, other history sampling, KV/weight quantization, undo and pause/resume |
 | D1–D3 | Camera trajectory conditioning | Nomas-PE, official LoRA and browser camera UI |
 
 The shared runtime retains its existing cancellation, timeout, quota and
