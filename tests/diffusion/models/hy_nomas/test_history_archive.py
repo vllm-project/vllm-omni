@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import gc
+import weakref
+
 import pytest
 import torch
 
@@ -65,6 +68,55 @@ def test_archive_quota_rejects_whole_chunk_without_changing_committed_records(li
     assert archive.records is committed and archive.payload_bytes == 390 and archive.frames == 2
     with pytest.raises(RuntimeError, match="no pending"):
         archive.publish()
+
+
+@pytest.mark.parametrize("fail_at_copy", [3, 5], ids=["second-layer", "mask"])
+def test_partial_copy_failure_preserves_records_and_reclaims_tensors(monkeypatch, fail_at_copy):
+    archive = HyNomasHistoryArchive(max_bytes=780, max_frames=4)
+    stage(archive)
+    archive.publish()
+    committed = archive.records
+    record = committed[0]
+    committed_tensors = (*[tensor for pair in record.layers for tensor in pair], record.mask)
+    snapshots = [tensor.clone() for tensor in committed_tensors]
+    temporary_refs = []
+    copy_calls = 0
+    tensor_to = torch.Tensor.to
+
+    def failing_cpu_copy(tensor, *args, **kwargs):
+        nonlocal copy_calls
+        assert kwargs.get("device") == "cpu" and kwargs.get("copy") is True
+        copy_calls += 1
+        if copy_calls == fail_at_copy:
+            raise RuntimeError("injected CPU copy failure")
+        copied = tensor_to(tensor, *args, **kwargs)
+        assert copied.device.type == "cpu" and copied.data_ptr() != tensor.data_ptr()
+        temporary_refs.append(weakref.ref(copied))
+        return copied
+
+    # Exercise real stage() copies, failing after a complete layer or all KV.
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "to", failing_cpu_copy)
+        with pytest.raises(RuntimeError, match="injected CPU copy failure"):
+            stage(archive, frame_start=2)
+
+    # Do not retain the exception traceback: its frames may own temporary KV.
+    gc.collect()
+    assert copy_calls == fail_at_copy
+    assert len(temporary_refs) == fail_at_copy - 1
+    assert all(ref() is None for ref in temporary_refs)
+    assert archive.records is committed
+    assert archive.payload_bytes == 390 and archive.frames == 2
+    for tensor, snapshot in zip(committed_tensors, snapshots):
+        torch.testing.assert_close(tensor, snapshot)
+    with pytest.raises(RuntimeError, match="no pending"):
+        archive.publish()
+
+    # The failed transaction must not prevent a fresh stage and publication.
+    stage(archive, frame_start=2)
+    archive.publish()
+    assert archive.records[0] is record
+    assert archive.payload_bytes == 780 and archive.frames == 4
 
 
 def test_archive_rejects_gaps_and_overlapping_transactions():
