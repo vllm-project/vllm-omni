@@ -65,7 +65,7 @@ case "$QUERY_TYPE" in
     }'
     ;;
   text_to_audio)
-    system_content='[{"type": "text", "text": "You are a text-to-speech assistant. Read the text aloud exactly as provided."}]'
+    system_content='[{"type": "text", "text": "以自然的语速读出下面的文字。"}]'
     user_content='[
       {"type": "text", "text": "Hello, this is a test of Step Audio 2 text to speech synthesis."}
     ]'

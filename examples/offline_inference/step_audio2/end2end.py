@@ -110,12 +110,7 @@ def get_text_to_audio_query(
         text = "Hello, this is a test of Step Audio 2 text to speech synthesis."
 
     prompt = (
-        "<|BOT|>system\n"
-        "请逐字朗读用户提供的文本，不要改写或补充。<|EOT|>"
-        "<|BOT|>human\n"
-        f"{text}<|EOT|>"
-        "<|BOT|>assistant\n"
-        "<tts_start>"
+        f"<|BOT|>system\n以自然的语速读出下面的文字。<|EOT|><|BOT|>human\n{text}<|EOT|><|BOT|>assistant\n<tts_start>"
     )
 
     inputs = {

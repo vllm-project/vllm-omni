@@ -155,7 +155,7 @@ def get_system_prompt(query_type: str, custom_prompt: str | None = None) -> dict
     if query_type == "audio_to_text":
         system_text = custom_prompt or "请记录下你所听到的语音内容。"
     elif query_type == "text_to_audio":
-        system_text = "You are a text-to-speech assistant. Read the text aloud exactly as provided."
+        system_text = "以自然的语速读出下面的文字。"
     else:  # audio_to_audio
         system_text = "You are an audio processing assistant. Listen and repeat the audio content."
 
