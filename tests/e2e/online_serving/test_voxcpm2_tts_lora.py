@@ -16,6 +16,7 @@ from tests.helpers.fixtures.runtime import omni_fixture_lock
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams, get_model_prefix, iter_omni_server
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.config.stage_config import resolve_deploy_yaml
 
 pytestmark = [pytest.mark.slow, pytest.mark.tts]
 MODEL = "openbmb/VoxCPM2"
@@ -51,8 +52,7 @@ def omni_server(request, run_level, tmp_path_factory):
         json.dumps({"lora_config": {"r": 2, "alpha": 2, "enable_lm": True, "enable_dit": True, "enable_proj": True}})
     )
 
-    with open(get_deploy_config_path("voxcpm2.yaml")) as stream:
-        config = yaml.safe_load(stream)
+    config = resolve_deploy_yaml(get_deploy_config_path("ci/voxcpm2.yaml"))
     stage = config["stages"][0]
     stage.update(
         max_num_seqs=4,
@@ -74,7 +74,7 @@ def omni_server(request, run_level, tmp_path_factory):
     yield from iter_omni_server(request, run_level, omni_fixture_lock)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_startup_lora_concurrent_speech(omni_server, online_client):
     online_client.send_audio_speech_request(
         {
@@ -90,7 +90,7 @@ def test_startup_lora_concurrent_speech(omni_server, online_client):
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_startup_lora_streaming_speech(omni_server, online_client):
     online_client.send_audio_speech_request(
         {

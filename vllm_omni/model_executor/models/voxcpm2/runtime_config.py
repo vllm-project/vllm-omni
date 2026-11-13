@@ -41,6 +41,7 @@ class _VoxCPM2RuntimeConfig:
     enable_profiling: bool = False
     enable_nvtx_profile: bool = False
     enable_loc_dit_layer_nvtx: bool = False
+    enable_torch_compile: bool = True
     enable_loc_dit_fused_qkv: bool = True
     enable_loc_dit_fused_mlp: bool = True
     enable_loc_dit_zero_dt_cache: bool = True

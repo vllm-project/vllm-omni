@@ -1095,6 +1095,65 @@ steps:
             tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py
             3 tts rocm-qwen3-tts-word-timestamps-weekly
 
+      # Split CUDA's combined VoxCPM2/Voxtral lane so each model family has a
+      # bounded MI325 owner while preserving every CUDA weekly test file.
+      - label: "VoxCPM2 TTS · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: tts_voxcpm2_weekly
+        env:
+          # Match CUDA weekly's runner. The test-only deploy overlay selects the
+          # native ROCm attention profile without changing production defaults.
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-voxcpm2-tts-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=150
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_voxcpm2_tts.py
+            9 tts rocm-voxcpm2-tts-weekly
+            tests/e2e/online_serving/test_voxcpm2_tts.py
+            tests/e2e/online_serving/test_voxcpm2_tts_expansion.py
+            tests/e2e/online_serving/test_voxcpm2_tts_lora.py
+
+      - label: "Voxtral TTS · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 210
+        source_file_dependencies: tts_voxtral_weekly
+        env:
+          # Preserve the existing CUDA weekly runner contract on ROCm.
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-voxtral-tts-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=180
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_voxtral_tts_expansion.py
+            10 tts rocm-voxtral-tts-weekly
+            tests/e2e/online_serving/test_voxtral_tts_expansion.py
+
   - group: "HunyuanImage Expert Parallel"
     steps:
       - label: "HunyuanImage Expert Parallel Startup"
