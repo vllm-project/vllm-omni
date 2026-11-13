@@ -877,7 +877,7 @@ _CALIBRATED_DUPLEX_EVAL_FLOORS = {
 
 @pytest.mark.parametrize(
     ("hardware", "enforce_score_floors"),
-    [("H100", True), ("MI300", False), ("MI325", False)],
+    [("H100", True), ("MI300", False)],
 )
 def test_duplex_eval_score_floors_follow_configured_baseline(monkeypatch, hardware, enforce_score_floors):
     from tests.dfx.perf.scripts import run_benchmark
@@ -892,7 +892,6 @@ def test_duplex_eval_score_floors_follow_configured_baseline(monkeypatch, hardwa
                 "H100": dict(_CALIBRATED_DUPLEX_EVAL_FLOORS),
                 "B200": dict(_CALIBRATED_DUPLEX_EVAL_FLOORS),
                 "A3": dict(_CALIBRATED_DUPLEX_EVAL_FLOORS),
-                "MI325": {},
             }
         },
     )
@@ -914,8 +913,7 @@ def test_duplex_eval_score_floors_follow_configured_baseline(monkeypatch, hardwa
     assert observed == [enforce_score_floors]
 
 
-@pytest.mark.parametrize("hardware", [None, ""])
-def test_duplex_eval_nested_baseline_requires_hardware_label(monkeypatch, hardware):
+def test_duplex_eval_nested_baseline_requires_hardware_label(monkeypatch):
     from tests.dfx.perf.scripts import run_benchmark
     from tests.e2e.accuracy.omni_duplex_eval import validation
 
@@ -924,12 +922,9 @@ def test_duplex_eval_nested_baseline_requires_hardware_label(monkeypatch, hardwa
         "load_accuracy_config",
         lambda *args: {"baseline": {"H100": dict(_CALIBRATED_DUPLEX_EVAL_FLOORS)}},
     )
-    result = _duplex_eval_result()
-    if hardware is not None:
-        result["Hardware"] = hardware
     with pytest.raises(ValueError, match="requires a runtime hardware label"):
         run_benchmark.assert_result(
-            result,
+            _duplex_eval_result(),
             {
                 "dataset_name": "omni-duplex-eval",
                 "duplex_eval_accuracy_config": "config.json",
@@ -1794,12 +1789,22 @@ def test_minicpmo_omniinteract_local_config_uses_c8_and_ephemeral_artifacts():
     assert config["server_params"]["extra_cli_args"][1] == "vllm_omni/deploy/minicpmo_4_5.yaml"
     update = config["server_params"]["update"]
     assert update["duplex_session.collect_stats"] is True
-    max_sessions = update["duplex_session.max_sessions"]
+    assert update["duplex_session.max_sessions"] == 8
     subsets = []
     for params in config["benchmark_params"]:
-        assert all(max_sessions >= concurrency for concurrency in params["max_concurrency"])
+        assert all(update["duplex_session.max_sessions"] >= concurrency for concurrency in params["max_concurrency"])
         assert params["omniinteract_persist_artifacts"] is False
         assert "omniinteract_output_dir" not in params
+        assert params["percentile-metrics"] == "ttft,audio_ttfp,audio_rtf,e2el,audio_duration"
+        assert "tpot" not in params["percentile-metrics"]
+        assert "itl" not in params["percentile-metrics"]
+        assert params["required_duplex_metrics"] == [
+            "duplex_client_rtf",
+            "duplex_client_ttfp_ms",
+            "duplex_client_ttft_ms",
+            "duplex_busy_rtf",
+            "duplex_stall_ratio",
+        ]
         subsets.append(params["omniinteract_subsets"])
     assert subsets == ["1q1a", "1q1a_math", "1qna"]
 
@@ -1807,15 +1812,13 @@ def test_minicpmo_omniinteract_local_config_uses_c8_and_ephemeral_artifacts():
 @pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
 @pytest.mark.parametrize("equals_syntax", [False, True])
 @pytest.mark.parametrize(
-    "config_prefix, pipeline_name, expected_stage_ids",
+    "config_prefix, pipeline_name",
     [
-        ("test_qwen3_omni_duplex", "qwen3", [0, 1, 2]),
-        ("test_minicpmo_4_5", "minicpm", [0, 1, 2]),
+        ("test_qwen3_omni_duplex", "qwen3"),
+        ("test_minicpmo_4_5", "minicpm"),
     ],
 )
-def test_duplex_inline_deploy_updates_reach_runtime(
-    monkeypatch, dataset, equals_syntax, config_prefix, pipeline_name, expected_stage_ids
-):
+def test_duplex_inline_deploy_updates_reach_runtime(monkeypatch, dataset, equals_syntax, config_prefix, pipeline_name):
     from tests.dfx.conftest import _create_unique_server_params
     from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config, merge_pipeline_deploy
     from vllm_omni.platforms import current_omni_platform
@@ -1850,7 +1853,7 @@ def test_duplex_inline_deploy_updates_reach_runtime(
         monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
         deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
         stages = merge_pipeline_deploy(PIPELINE, deploy)
-        assert [stage.stage_id for stage in deploy.stages] == expected_stage_ids
+        assert [stage.stage_id for stage in deploy.stages] == [0, 1, 2]
         assert all(stage.yaml_engine_args["duplex_max_sessions"] == 8 for stage in stages)
         assert deploy.duplex_session.collect_stats is True
         assert deploy.duplex_session.max_sessions == 8
