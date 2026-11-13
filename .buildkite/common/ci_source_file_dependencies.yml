@@ -869,6 +869,47 @@ source_file_dependencies:
     - vllm_omni/model_executor/stage_input_processors/audex.py
     - vllm_omni/outputs/
 
+  tts_voxcpm2_weekly:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - tests/e2e/offline_inference/test_voxcpm2_tts.py
+    - tests/e2e/online_serving/test_voxcpm2_tts.py
+    - tests/e2e/online_serving/test_voxcpm2_tts_expansion.py
+    - tests/e2e/online_serving/test_voxcpm2_tts_lora.py
+    - tests/helpers/assertions.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/voxcpm2.yaml
+    - vllm_omni/deploy/voxcpm2_mrv2.yaml
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/openai/tts_adapters/voxcpm2.py
+    - vllm_omni/metrics/utils.py
+    - vllm_omni/model_executor/models/voxcpm2/
+    - vllm_omni/outputs/
+    - vllm_omni/transformers_utils/configs/voxcpm2.py
+
+  tts_voxtral_weekly:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - tests/e2e/offline_inference/test_voxtral_tts_expansion.py
+    - tests/e2e/online_serving/test_voxtral_tts_expansion.py
+    - tests/helpers/assertions.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/voxtral_tts.yaml
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/openai/tts_adapters/voxtral.py
+    - vllm_omni/metrics/utils.py
+    - vllm_omni/model_executor/models/voxtral_tts/
+    - vllm_omni/model_executor/stage_input_processors/voxtral_tts.py
+    - vllm_omni/outputs/
+    - vllm_omni/transformers_utils/configs/voxtral_tts.py
+    - vllm_omni/transformers_utils/parsers/voxtral_tts.py
+
   tts_moss_tts_expansion:
     - tests/e2e/offline_inference/test_moss_tts_expansion.py
     - tests/conftest.py
