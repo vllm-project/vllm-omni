@@ -2,7 +2,7 @@
 
 Measured 2026-11-12 at source `83b8c3102`. Mooncake retains full-prefix hits after the local KV working set overflows; local prefix caching is faster when its working set fits. These are bounded turn-serving measurements, not production tail-latency estimates.
 
-These measurements precede the change that submits a successor to the save executor only after its predecessor finishes. That scheduling change requires a new GPU run; the results below remain evidence for the recorded revision.
+The initial performance and quality measurements precede the change that submits a successor to the save executor only after its predecessor finishes. The Store fault test and cold concurrency-2 benchmark were rerun at `a67b7a721` on 2026-11-13 and are reported separately below; the earlier measurements remain evidence for their recorded revision.
 
 ## Configuration and workload
 
@@ -54,20 +54,45 @@ Mean ± sample standard deviation, pooled across the two processes. Latencies ar
 
 At concurrency 2, Mooncake's cold E2E latency was 3.7% higher and throughput 4.2% lower than cache off. The run did not isolate HS staging, serialization, background saves, or native KV transfer costs, so it does not establish which operation caused this overhead.
 
+### Concurrency-2 recheck after the save-scheduling fix
+
+At `a67b7a721`, four fresh processes ran in A/D/D/A order with the same checkpoint, environment, sampling, cache capacity, two warmups, and three repeats described above, restricted to text inputs at concurrency 2. All 168 timed requests completed. Each cold row below contains 12 requests across six waves; values are mean ± sample standard deviation.
+
+| Mode | Cold TTFT ms | Cold E2E ms | Requests/s |
+| --- | ---: | ---: | ---: |
+| A: cache off | 237.6 ± 53.8 | 921.6 ± 19.6 | 2.1266 ± 0.0023 |
+| D: Mooncake | 253.4 ± 82.8 | 957.5 ± 26.6 | 2.0344 ± 0.0030 |
+
+Mooncake's measured cold overhead was 6.67% in TTFT, 3.90% in E2E latency, and 4.33% lower throughput. The E2E/throughput cost remains around 4%, close to the earlier 3.7%/4.2% measurements; this bounded recheck does not establish zero overhead or a production tail-latency bound. All four processes exited cleanly. Reports and commands are under `results/mooncake_m1_review_20261113/performance/`.
+
+Matched inputs had identical token IDs and audio sample counts across all 168 observations. One input had varying waveform hashes between cache-off runs; no cached output differed from its selected baseline. Universal waveform-hash equality is therefore not established.
+
 ## Store fault injection
 
-The recorded run at `bb18ac89a` used `--repeats 3 --delay 5 --lookup-timeout 1`, the same model/hardware above, and a real single-host Store. It requested Thinker text only: a 256-token ongoing decode, a cold 48-token writer, and a 48-token healthy request. A zero-delay control preceded each delayed trial. The following values are healthy-request means ± sample standard deviation over three trials, in milliseconds.
+The primary rerun at `a67b7a721` used the original Python 3.12.15 environment, `--repeats 3 --delay 5 --lookup-timeout 1`, the same model/hardware above, and a real single-host Store. It requested Thinker text only: a 256-token ongoing decode, a cold 48-token writer, and a 48-token healthy request. KV-write trials also submitted a cold 48-token peer after the writer queued a successor. A zero-delay control preceded each delayed trial.
 
-| Delayed operation | Delay s | TTFT ms | E2E ms | First scheduling ms |
-| --- | ---: | ---: | ---: | ---: |
-| Lookup | 0 | 221.1 ± 10.5 | 1152.6 ± 7.8 | 166.5 ± 9.8 |
-| Lookup | 5 | 230.9 ± 3.2 | 1269.8 ± 3.6 | 41.2 ± 6.0 |
-| KV write | 0 | 332.4 ± 2.2 | 1356.5 ± 3.1 | 275.4 ± 2.3 |
-| KV write | 5 | 301.7 ± 43.7 | 1328.2 ± 41.8 | 243.5 ± 43.0 |
+**All 12 trials, containing 42 requests, passed the progress checks.** In all three delayed KV-write trials, the cold peer started its HS save while the writer still had an unfinished save and a queued successor. The table reports mean ± sample standard deviation across three trials, in milliseconds; each cell is **control / five-second delay**. HS-save start is measured from that request's submission; a dash means no save started.
 
-All 12 trials passed: healthy token IDs matched their controls, healthy requests produced text before the five-second delay ended, ongoing decode progressed during lookup delays, and cached HS reads completed during KV-write delays. The lookup deadline changes the healthy request from a cache hit to recomputation, so scheduling-time differences are not a speedup claim. Delays occur at Store API entry and do not reproduce Store-internal transport or mutex stalls.
+| Delayed operation and request | TTFT ms | E2E ms | First HS-save start ms |
+| --- | ---: | ---: | ---: |
+| Lookup, healthy request | 242.7 ± 0.5 / 230.3 ± 0.2 | 1156.3 ± 0.5 / 1266.3 ± 6.4 | — / 117.7 ± 0.7 |
+| KV write, cached healthy request | 357.7 ± 21.4 / 316.3 ± 2.1 | 1476.2 ± 34.5 / 1417.4 ± 35.5 | — / — |
+| KV write, cold peer | 293.9 ± 20.8 / 263.5 ± 3.4 | 1409.5 ± 29.0 / 1364.6 ± 36.8 | 152.1 ± 3.7 / 156.4 ± 3.4 |
 
-**Save-drop/skip counts were not measured in this run.** The healthy KV-write peer was a cache hit, so these results establish read/serving progress, not isolation between unrelated saves. The updated harness adds a cold peer and checks that its HS save starts while the first writer has both an unfinished save and a queued successor. It records complete computed prompt blocks dropped before admission, admitted blocks skipped before execution, failed started batches, and batches pending at the final snapshot, per request and in aggregate. The cold-peer run and its counters have not yet been measured on GPUs.
+All 42 requests had **zero admission drops and zero pending save batches** at the final snapshots. The following nonzero counts distinguish blocks skipped before execution from started batches that failed:
+
+| Delayed trial | Request | Skipped blocks per request | Failed batches per request |
+| --- | --- | ---: | ---: |
+| KV write, each of three repeats | Writer | 19 | 1 |
+| KV write, each of three repeats | Cold peer | 19 | 1 |
+
+All other request counters, including all controls and lookup trials, were zero. Totals across the delayed KV-write trials were **114 skipped blocks / 6 failed batches**. The pinned native connector uses one KV sending thread: the injected five-second write delay holds subsequent KV writes beyond the test's one-second HS readiness deadline. The cold peer can start its HS save but still fail waiting for its KV. Thus the run establishes serving and HS-worker progress, **not successful cache population for unrelated requests under a stalled KV writer**. No per-attempt queue cap was added; this workload measured no admission drops.
+
+Ongoing and healthy requests retained identical token IDs against their controls. Each cold peer computed 550 prompt tokens, restored zero rows, and generated 48 tokens. Its prompt contains a distinct control/delay case prefix, so paired peers are not an output-parity comparison. Healthy requests produced text before each five-second delay ended; ongoing decode progressed during lookup delays, and cached HS reads completed during KV-write delays. The lookup deadline changes the healthy request from a cache hit to recomputation. These small-sample timing differences are not speedup claims. Delays occur at Store API entry and do not reproduce Store-internal transport or mutex stalls.
+
+A supplemental run at the same source in a separate Python 3.12.16 environment also passed all 12 trials. Cold-peer mean HS-save start was 152.8/136.2 ms, TTFT 280.0/248.8 ms, and E2E 1377.2/1362.5 ms (control/delay). KV-write counters were the same; delayed lookup repeats 0 and 1 each additionally had 18 skipped blocks and one failed batch for the healthy request (36/2 total), with zero in repeat 2. Admission drops and pending batches remained zero. These environments are reported separately, not pooled.
+
+For comparison, the earlier `bb18ac89a` run passed 12 trials without a cold peer or save counters. Healthy TTFT/E2E means were 221.1/1152.6 ms (lookup control), 230.9/1269.8 ms (lookup delay), 332.4/1356.5 ms (KV-write control), and 301.7/1328.2 ms (KV-write delay). Those results established serving/read progress only.
 
 ## Cache and memory observations
 
@@ -96,7 +121,9 @@ Every process reported first-image inference JIT for `matmul_kernel_persistent` 
 
 ## Correctness and limitations
 
-All 432 requests completed. Matched text token IDs and audio sample counts agree; all eight image/audio changed-media checks pass. Strict waveform-SHA equality is **not established**: the two cache-off processes show five input digests with multiple hashes, and cached arms have four observations differing from the first baseline hash, all on the same concurrent overflow cache miss. Every cached waveform hash occurs among cache-off observations for that input. Strict per-observation hash equality therefore remains qualified by baseline variability.
+The exact GPU acceptance test was rerun at `a67b7a721` and passed all nine text/image/audio scenarios: cold/full/partial text hits and unchanged/changed media. Restored embeddings, hidden states, packed Talker inputs, token IDs, and audio matched two independent cache-off engines exactly. This is a separate correctness run; its tensor dumps and save barriers do not contribute timing results. Evidence is under `results/mooncake_m1_review_20261113/acceptance/`.
+
+In the original `83b8c3102` comparison, all 432 requests completed. Matched text token IDs and audio sample counts agree; all eight image/audio changed-media checks pass. Strict waveform-SHA equality is **not established**: the two cache-off processes show five input digests with multiple hashes, and cached arms have four observations differing from the first baseline hash, all on the same concurrent overflow cache miss. Every cached waveform hash occurs among cache-off observations for that input. Strict per-observation hash equality therefore remains qualified by baseline variability.
 
 Separate quality-only runs saved client waveforms after each wave. Two independent cache-off engines supplied 144 requests and 260 same-input pairs. Their maximum absolute difference was `0.001953125`, maximum RMSE `4.9504e-5`, and minimum finite SNR 59.75 dB. Before either cached quality run, tolerances were frozen at twice those absolute/RMSE maxima (`0.00390625`, `9.9008e-5`).
 
@@ -104,11 +131,11 @@ All 144 cached quality requests passed those fixed limits with exact tokens and 
 
 The audio full-hit workload exposed a pre-existing PIECEWISE capture bug: flattening auxiliary outputs for FULL-graph buffers also changed the PIECEWISE replay payload from a dictionary to a list. The measured source preserves the original auxiliary pytree for PIECEWISE and retains flattening for NONE warmup/FULL. Earlier failed local/Mooncake audio runs are retained as diagnostic artifacts and excluded from these tables.
 
-Exact source-embedding, hidden-state, and Talker-input checks use the separate [acceptance test](../../tests/engine/test_mooncake_turn_consistency_qwen3.py). Fault injection uses [mooncake_faults.py](mooncake_faults.py); its recorded report is `results/mooncake_m1_review_20261112/fault-final-data/report.json`. CPU failure coverage and feature constraints are documented in the [feature contract](../../docs/design/feature/mooncake_kv_hs_cache.md).
+Exact source-embedding, hidden-state, and Talker-input checks use the separate [acceptance test](../../tests/engine/test_mooncake_turn_consistency_qwen3.py). Fault injection uses [mooncake_faults.py](mooncake_faults.py); the primary raw report is `results/mooncake_m1_review_20261113/fault-local/fault-data/report.json`, the supplemental run is `results/mooncake_m1_review_20261113/fault-data/report.json`, and the earlier run is `results/mooncake_m1_review_20261112/fault-final-data/report.json`. CPU failure coverage and feature constraints are documented in the [feature contract](../../docs/design/feature/mooncake_kv_hs_cache.md).
 
 ## Reproduction
 
-Run from the repository root with the pinned environment, local checkpoint, and a running Store configured above. `MOONCAKE_METRICS_URL` names its Prometheus endpoint. The six report files, logs, source manifests, per-process statistics, and failed diagnostics are local artifacts under ignored `results/mooncake_m1_review_20261112/`; no public artifact URL is provided.
+Run from the repository root with the pinned environment, local checkpoint, and a running Store configured above. `MOONCAKE_METRICS_URL` names its Prometheus endpoint. Reports, logs, source manifests, per-process statistics, and failed diagnostics are local artifacts under ignored `results/mooncake_m1_review_20261112/` and `results/mooncake_m1_review_20261113/`; no public artifact URL is provided.
 
 ```bash
 export VLLM_TARGET_DEVICE=cuda VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -148,6 +175,8 @@ python -m benchmarks.qwen3_omni.mooncake_cache_benchmark \
   compare-local04.json compare-mooncake03.json compare-mooncake04.json \
   --output comparison.json
 ```
+
+For the `a67b7a721` concurrency-2 recheck, use process order `off01 mooncake01 mooncake02 off02`, set `--concurrency 2`, and omit `--media image audio`.
 
 ```bash
 python /tmp/mooncake_benchmark_runner.py pytest \

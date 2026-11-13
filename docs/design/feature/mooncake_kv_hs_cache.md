@@ -261,12 +261,30 @@ sampling. They contain no source-tensor dumps or save barriers. Output hashes
 and memory snapshots are collected between timed waves. Two-level cache
 cooperation and duplex sessions remain outside this validation.
 
-The recorded `bb18ac89a` fault run passed 12 trials. Healthy-request mean
-TTFT/E2E was 221.1/1152.6 ms without a lookup delay and 230.9/1269.8 ms with a
-five-second delay; the KV-write counterparts were 332.4/1356.5 and
-301.7/1328.2 ms. That run measured serving/read progress, not save drops or
-unrelated save progress. The revised save scheduling and cold-peer probe still
-need a GPU rerun.
+The `a67b7a721` GPU fault rerun passed 12 trials with 42 requests. During a
+five-second KV-write stall, the cold peer started its HS save in all three
+trials while the writer still had an unfinished save and a queued successor.
+In the original Python 3.12.15 environment, its mean HS-save start latency was
+156.4 ms (152.1 ms in controls), with TTFT/E2E of 263.5/1364.6 ms
+(293.9/1409.5 ms in controls).
+
+Admission drops and final pending batches were zero for every request. In each
+delayed KV-write trial, both writer and peer skipped 19 blocks and failed one
+started batch: 114 skipped blocks and 6 failed batches in total. All other
+request counters, including lookup trials, were zero. The pinned native KV
+sender is a single thread, so its five-second stall delays queued KV writes
+beyond the test's one-second HS readiness deadline. Freeing an HS worker does
+not guarantee successful cache population while that KV writer is stalled.
+These measurements do not justify a per-attempt queue cap: no admission drops
+were observed. A separate Python 3.12.16 run also passed all 12 trials, with
+the same KV-write counters but 36 skipped blocks and 2 failed batches across
+two healthy requests during lookup delays. It is reported separately from
+the original environment. The earlier `bb18ac89a` run measured serving/read
+progress only, without the cold peer or save counters.
+
+A matched concurrency-2 cold-path recheck at `a67b7a721` retained the roughly
+4% cost: Mooncake E2E was 3.90% higher and throughput 4.33% lower than cache
+off, compared with 3.7% and 4.2% in the earlier run.
 
 See the [controlled M1 measurements and reproduction commands](https://github.com/vllm-project/vllm-omni/blob/main/benchmarks/qwen3_omni/README.md)
 for variability, fault timing, and the limits of the recorded evidence.
