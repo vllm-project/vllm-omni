@@ -784,7 +784,7 @@ async def test_audio_speech_stream_saves_wav_and_manifest(
     request_input = RequestFuncInput(
         model="test-model",
         model_name="test-model",
-        prompt="quiet clip audition",
+        prompt="小美播报下午三点的会议",
         api_url="http://test.com/v1/audio/speech",
         prompt_len=10,
         output_len=20,
@@ -807,7 +807,9 @@ async def test_audio_speech_stream_saves_wav_and_manifest(
     assert len(manifest_lines) == 1
     entry = json.loads(manifest_lines[0])
     assert entry["file"] == wavs[0].name
-    assert entry["prompt"] == "quiet clip audition"
+    assert entry["prompt"] == "小美播报下午三点的会议"
+    # ensure_ascii=False: the non-ASCII prompt is written as readable UTF-8, not \u-escapes.
+    assert "小美播报下午三点的会议" in manifest_lines[0]
     assert entry["sample_rate"] == 48000
     assert entry["channels"] == 1
     assert entry["frames"] == 24000

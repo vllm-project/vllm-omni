@@ -2883,6 +2883,8 @@ def _save_streamed_pcm_as_wav(
     frames = len(pcm) // max(sample_width * channels, 1)
     duration_s = frames / sample_rate if sample_rate > 0 else 0.0
     with open(os.path.join(save_dir, "manifest.jsonl"), "a", encoding="utf-8") as manifest:
+        # ensure_ascii=False: prompts are typically non-ASCII and the manifest
+        # is read by humans first — keep it greppable, not \u-escaped.
         manifest.write(
             json.dumps(
                 {
@@ -2895,7 +2897,8 @@ def _save_streamed_pcm_as_wav(
                     "duration_s": round(duration_s, 4),
                     "ttfp_ms": round(ttfp_ms, 2),
                     "rtf": round(rtf, 4),
-                }
+                },
+                ensure_ascii=False,
             )
             + "\n"
         )
