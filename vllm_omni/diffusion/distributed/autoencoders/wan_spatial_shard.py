@@ -23,7 +23,6 @@ every stride-2 downsample, which makes it exact with respect to untiled encode.
 
 from __future__ import annotations
 
-import copy
 import math
 from contextlib import nullcontext
 from contextvars import ContextVar
@@ -41,6 +40,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.wan_decoder_utils import _persistent_input_buffer
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath.families import is_role
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath.install import reference_forward_copy
 from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
 from vllm_omni.platforms import current_omni_platform
 
@@ -1129,8 +1129,9 @@ def install_wan_spatial_shard_encode(vae: Any, group: dist.ProcessGroup, split_d
     if encoder is None:
         raise ValueError("Wan spatial-shard VAE encode requires an encoder module.")
 
-    memo: dict[int, Any] = {id(t): t for t in (*encoder.parameters(), *encoder.buffers())}
-    sharded = copy.deepcopy(encoder, memo)
+    # Shares parameters and buffers, and leaves any fast-path forwards behind: they inline the
+    # convolutions the halo modules below replace.
+    sharded = reference_forward_copy(encoder)
     _patch_decoder_modules(sharded, group, split_dim)
     # The halo modules copy their source weights on construction; point them back at the shared ones.
     for name, module in sharded.named_modules():

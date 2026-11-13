@@ -756,7 +756,8 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         split_dim = self._spatial_shard_decode_split_dim()
         if split_dim is None or x.ndim != 5 or not self.is_distributed_enabled():
             return False
-        # The encoder fast path inlines the convolutions the halo modules replace.
+        # The encode copy drops the fast forwards (reference_forward_copy), so this could run with
+        # the fast path installed; keep declining until that combination has its own coverage.
         if is_encoder_installed(self):
             return False
         if not self._spatial_shard_group_matches("encode", split_dim):
