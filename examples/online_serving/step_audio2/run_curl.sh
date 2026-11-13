@@ -49,10 +49,9 @@ token2wav_sampling_params='{
 case "$QUERY_TYPE" in
   audio_to_text)
     MODALITIES='["text"]'
-    system_content='[{"type": "text", "text": "You are a speech recognition assistant. Transcribe the audio accurately."}]'
+    system_content='[{"type": "text", "text": "请记录下你所听到的语音内容。"}]'
     user_content='[
-      {"type": "audio_url", "audio_url": {"url": "'"$MARY_HAD_LAMB_URL"'"}},
-      {"type": "text", "text": "Please transcribe this audio."}
+      {"type": "audio_url", "audio_url": {"url": "'"$MARY_HAD_LAMB_URL"'"}}
     ]'
     # Use the model EOT EOS; no additional legacy stop token.
     thinker_sampling_params='{

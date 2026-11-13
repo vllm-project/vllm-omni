@@ -84,7 +84,7 @@ def _build_audio_to_text_request_config(omni_server, audio_base64: str) -> dict:
                 "content": [
                     {
                         "type": "text",
-                        "text": "You are a speech recognition assistant. Transcribe the audio accurately.",
+                        "text": "请记录下你所听到的语音内容。",
                     }
                 ],
             },
@@ -92,7 +92,6 @@ def _build_audio_to_text_request_config(omni_server, audio_base64: str) -> dict:
                 "role": "user",
                 "content": [
                     {"type": "audio_url", "audio_url": {"url": audio_url}},
-                    {"type": "text", "text": "Please transcribe the audio content."},
                 ],
             },
         ],

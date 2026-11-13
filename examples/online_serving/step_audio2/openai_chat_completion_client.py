@@ -89,14 +89,12 @@ def get_audio_to_text_query(
     custom_prompt: str | None = None,
 ) -> dict:
     """Build query for Audio-to-Text (ASR) mode."""
-    question = custom_prompt or "Please transcribe the audio content."
     audio_url = get_audio_url(audio_path)
 
     return {
         "role": "user",
         "content": [
             {"type": "audio_url", "audio_url": {"url": audio_url}},
-            {"type": "text", "text": question},
         ],
     }
 
@@ -152,10 +150,10 @@ def get_audio_to_audio_query(
     ]
 
 
-def get_system_prompt(query_type: str) -> dict:
+def get_system_prompt(query_type: str, custom_prompt: str | None = None) -> dict:
     """Get system prompt based on query type."""
     if query_type == "audio_to_text":
-        system_text = "You are a speech recognition assistant. Transcribe the audio accurately."
+        system_text = custom_prompt or "请记录下你所听到的语音内容。"
     elif query_type == "text_to_audio":
         system_text = "You are a text-to-speech assistant. Read the text aloud exactly as provided."
     else:  # audio_to_audio
@@ -219,7 +217,7 @@ def run_step_audio2(args) -> None:
     else:  # audio_to_audio
         user_message = query_func(audio_path=args.audio_path, custom_prompt=args.prompt)
 
-    system_message = get_system_prompt(args.query_type)
+    system_message = get_system_prompt(args.query_type, args.prompt)
 
     logger.info(f"Query type: {args.query_type}")
     logger.info(f"Model: {model_name}")
