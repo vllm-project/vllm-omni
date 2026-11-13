@@ -43,6 +43,33 @@ if HAS_FLASHINFER:
     _LOG2_E = math.log2(math.e)
 
 
+def _xpu_sdpa_op_type(op_type: str, dtype: torch.dtype, causal: bool, q_len: int, kv_len: int) -> str:
+    """Pick the aten SDPA op that returns a usable LSE on XPU.
+
+    XPU's ``_scaled_dot_product_efficient_attention`` returns a correct output but an all-zero
+    log-sum-exp, which silently breaks the ring merge. Its flash op returns the right fp32 LSE, but
+    only for fp16/bf16, and aligns a causal mask to the bottom-right when ``q_len != kv_len`` (the
+    efficient op aligns it to the top-left). Those cases use the fp32 ``"math"`` path instead.
+    """
+    if op_type != "efficient":
+        return op_type
+    if dtype in (torch.float16, torch.bfloat16) and (not causal or q_len == kv_len):
+        return "flash"
+    return "math"
+
+
+def _math_attn_with_lse(q, k, v, softmax_scale, causal):
+    """Reference attention in fp32 on (B, H, S, D) tensors: returns (out, lse) like the aten SDPA ops."""
+    scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * softmax_scale
+    if causal:
+        q_len, kv_len = scores.shape[-2:]
+        keep = torch.ones(q_len, kv_len, dtype=torch.bool, device=scores.device).tril()
+        scores = scores.masked_fill(~keep, float("-inf"))
+    lse = torch.logsumexp(scores, dim=-1)
+    out = torch.matmul(torch.softmax(scores, dim=-1), v.float()).to(q.dtype)
+    return out, lse
+
+
 def pytorch_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -97,7 +124,16 @@ def pytorch_attn_forward(
         k = k.repeat_interleave(n_rep, dim=1)
         v = v.repeat_interleave(n_rep, dim=1)
 
-    if op_type == "flash":
+    if q.device.type == "xpu":
+        op_type = _xpu_sdpa_op_type(op_type, q.dtype, causal, q.shape[2], k.shape[2])
+
+    if op_type == "math":
+        if dropout_p:
+            raise ValueError("The math ring kernel does not support dropout.")
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** -0.5
+        out, lse = _math_attn_with_lse(q, k, v, softmax_scale, causal)
+    elif op_type == "flash":
         out, lse = _scaled_dot_product_flash_attention(
             q,
             k,
