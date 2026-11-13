@@ -143,7 +143,8 @@ def _estimate_prompt_len(
         except ValueError as lead_exc:
             raise TextLeadError(str(lead_exc)) from lead_exc
         if lead:
-            raise TextLeadError(f"'text_lead' needs the prompt length estimate, which failed: {exc}") from exc
+            # The lead itself may be valid: the estimate failed, not the request.
+            raise RuntimeError(f"'text_lead' needs the prompt length estimate, which failed: {exc}") from exc
         logger.warning("Failed to estimate prompt length, using fallback 2048: %s", exc)
         return 2048
 

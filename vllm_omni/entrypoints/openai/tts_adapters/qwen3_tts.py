@@ -589,8 +589,9 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             raise  # a client error (build() turns it into a 400), not a reason for the fallback length
         except Exception as e:
             if tts_params.get(TEXT_LEAD_KEY):
-                # The fallback length cannot match a lead layout, and the bound went unchecked.
-                raise TextLeadError(f"'text_lead' needs the prompt length estimate, which failed: {e}") from e
+                # The fallback length cannot match a lead layout, and the bound went unchecked. The request itself
+                # may be valid, so this is a server error (a 500), not a TextLeadError.
+                raise RuntimeError(f"'text_lead' needs the prompt length estimate, which failed: {e}") from e
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
             return 2048
 
@@ -630,7 +631,8 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             # encoding; a miss recomputes from this payload instead of failing.
             tts_params["ref_audio"] = [[_ref_audio_wire_waveform(waveform), sr]]
 
-        # Raises TextLeadError (a ValueError) for a text lead the text cannot fill.
+        # Raises TextLeadError (a ValueError) for a text lead the text cannot fill, and RuntimeError when the
+        # estimate fails for a request with a lead.
         ph_len = await self._estimate_prompt_len_async(tts_params)
         prompt = tokens_input(prompt_token_ids=[1] * ph_len)
         prompt["additional_information"] = tts_params

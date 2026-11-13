@@ -100,11 +100,12 @@ def test_the_text_id_slice_reads_the_last_axis(ids):
 
 
 def test_the_estimate_checks_a_lead_against_the_task_type_it_lays_out():
-    # The estimate counts the layout of its task_type argument, whatever the request's own entry says.
+    # The estimate checks the lead against its task_type argument, not against the request's own entry.
     with pytest.raises(TextLeadError, match="only valid for CustomVoice"):
         Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
             additional_information={
                 "text": ["three word text"],
+                "task_type": ["CustomVoice"],
                 "instruct": ["calm"],
                 "non_streaming_mode": [False],
                 TEXT_LEAD_KEY: [2],
@@ -150,12 +151,15 @@ def test_an_offline_request_learns_its_prompt_ignores_its_text_lead(info, messag
 
 
 def test_a_text_lead_is_not_sent_with_a_fallback_prompt_length(mocker):
-    """When the prompt length estimate fails, a text lead goes unchecked and the fallback length fits no layout."""
+    """When the prompt length estimate fails, a text lead goes unchecked and the fallback length fits no layout.
+
+    The request itself may be valid, so the refusal is a server error, not a TextLeadError (a 400).
+    """
     adapter = _adapter(mocker)
     adapter._load_text_tokenizer = mocker.Mock()
     adapter.ctx.engine_client = mocker.Mock()
     adapter.ctx.server._tts_tokenizer = mocker.Mock(side_effect=RuntimeError("tokenizer unavailable"))
-    with pytest.raises(TextLeadError, match="tokenizer unavailable"):
+    with pytest.raises(RuntimeError, match="tokenizer unavailable"):
         adapter._estimate_prompt_len({"text": ["three word text"], "task_type": ["CustomVoice"], TEXT_LEAD_KEY: [2]})
     assert adapter._estimate_prompt_len({"text": ["three word text"], "task_type": ["CustomVoice"]}) == 2048
 
