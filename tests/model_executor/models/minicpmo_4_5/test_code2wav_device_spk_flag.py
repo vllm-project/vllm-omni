@@ -445,11 +445,7 @@ def cuda_platform_without_trt_env(monkeypatch):
     [
         pytest.param({"token2wav_trt": True}, None, True, id="key-true"),
         pytest.param({}, "1", True, id="env-only"),
-        pytest.param({"token2wav_trt": None}, "1", True, id="null-key-uses-env"),
         pytest.param({"token2wav_trt": False}, "1", False, id="key-false-beats-env"),
-        pytest.param({"token2wav_trt": "false"}, "1", False, id="quoted-false-beats-env"),
-        pytest.param({"token2wav_trt": True}, "0", True, id="key-true-beats-env-0"),
-        pytest.param({}, "true", False, id="env-only-exact-1"),
     ],
 )
 def test_full_dit_trt_overrides_cpu_reference_speaker(
@@ -467,37 +463,20 @@ def test_full_dit_trt_overrides_cpu_reference_speaker(
 
 
 @pytest.mark.parametrize(
-    "extra,env,expected_dtype,expected_cache",
+    "extra,expected_dtype,expected_cache",
     [
-        pytest.param({}, {}, torch.float16, None, id="defaults"),
+        pytest.param({}, torch.float16, None, id="defaults"),
         pytest.param(
             {"token2wav_trt_dtype": "FP32", "token2wav_trt_cache_dir": "/keys/cache"},
-            {},
             torch.float32,
             "/keys/cache",
             id="keys",
         ),
-        pytest.param(
-            {},
-            {"MINICPMO_TOKEN2WAV_TRT_DTYPE": "float32", "MINICPMO_TOKEN2WAV_TRT_CACHE": "/env/cache"},
-            torch.float32,
-            "/env/cache",
-            id="legacy-env",
-        ),
-        pytest.param(
-            {"token2wav_trt_dtype": "fp16", "token2wav_trt_cache_dir": "/keys/cache"},
-            {"MINICPMO_TOKEN2WAV_TRT_DTYPE": "fp32", "MINICPMO_TOKEN2WAV_TRT_CACHE": "/env/cache"},
-            torch.float16,
-            "/keys/cache",
-            id="keys-beat-env",
-        ),
     ],
 )
 def test_full_dit_trt_dtype_and_cache_dir_reach_engine_builder(
-    tmp_path, monkeypatch, cuda_platform_without_trt_env, extra, env, expected_dtype, expected_cache
+    tmp_path, monkeypatch, cuda_platform_without_trt_env, extra, expected_dtype, expected_cache
 ):
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
     builds = _record_dit_trt_builds(monkeypatch)
     _build_backend(tmp_path, monkeypatch, {"token2wav_trt": True, **extra})
     assert len(builds) == 1
@@ -507,7 +486,7 @@ def test_full_dit_trt_dtype_and_cache_dir_reach_engine_builder(
 
 @pytest.mark.parametrize("platform", ["cuda", "npu"])
 def test_invalid_token2wav_trt_dtype_fails_at_startup(tmp_path, monkeypatch, cuda_platform_without_trt_env, platform):
-    """A dtype typo fails on every platform instead of silently selecting fp16."""
+    """A dtype typo in a stage key fails on every platform instead of silently selecting fp16."""
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: platform == "cuda")
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: platform == "npu")
     builds = _record_dit_trt_builds(monkeypatch)

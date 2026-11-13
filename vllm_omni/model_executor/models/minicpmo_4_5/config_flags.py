@@ -88,41 +88,52 @@ def _legacy_env(name: str, key: str, *, used: bool) -> str | None:
     return raw
 
 
-def resolve_token2wav_trt_config(extra: Mapping[str, Any]) -> Token2WavTrtConfig:
+def _parse_trt_dtype(value: Any, source: str) -> str:
+    dtype = _TRT_DTYPE_ALIASES.get(value.strip().lower()) if isinstance(value, str) else None
+    if dtype is None:
+        raise ValueError(f"{source} must be one of fp16, float16, fp32 or float32, got {value!r}")
+    return dtype
+
+
+def _parse_trt_cache_dir(value: Any) -> str:
+    if not isinstance(value, (str, os.PathLike)) or not os.fspath(value).strip():
+        raise ValueError(f"token2wav_trt_cache_dir must be a non-empty path, got {value!r}")
+    return os.fspath(value).strip()
+
+
+def resolve_token2wav_trt_config(extra: Mapping[str, Any], *, cuda: bool) -> Token2WavTrtConfig:
     """Resolve the Token2Wav TensorRT settings from the stage config.
 
-    An explicitly set stage key always wins, including ``token2wav_trt: false``.
-    A legacy ``MINICPMO_TOKEN2WAV_TRT*`` env var applies only when its key is
-    unset (missing or ``null``). The dtype is validated wherever it comes from,
-    so a typo fails at startup instead of silently selecting fp16.
+    An explicitly set stage key always wins, including ``token2wav_trt: false``,
+    and is validated on every platform so a typo fails at startup.
+
+    A legacy ``MINICPMO_TOKEN2WAV_TRT*`` env var applies only while its key is
+    unset (missing or ``null``), and is read only where it would take effect:
+    ``MINICPMO_TOKEN2WAV_TRT`` on CUDA (TensorRT is CUDA-only), and the dtype
+    and cache variables only when full DiT TensorRT is enabled on CUDA. Reading
+    is what logs the deprecation warning, so a deployment where the value is
+    ignored gets no advice that would do nothing.
     """
     trt_value = extra.get("token2wav_trt")
-    trt_env = _legacy_env(TOKEN2WAV_TRT_ENV, "token2wav_trt", used=trt_value is None)
     if trt_value is not None:
         enabled = parse_bool_flag(trt_value, "token2wav_trt")
+        if cuda:
+            _legacy_env(TOKEN2WAV_TRT_ENV, "token2wav_trt", used=False)
     else:
         # Keep the legacy contract: only exactly "1" turned the env switch on.
-        enabled = trt_env == "1"
+        enabled = cuda and _legacy_env(TOKEN2WAV_TRT_ENV, "token2wav_trt", used=True) == "1"
 
     dtype_value = extra.get("token2wav_trt_dtype")
-    dtype_env = _legacy_env(TOKEN2WAV_TRT_DTYPE_ENV, "token2wav_trt_dtype", used=dtype_value is None)
-    if dtype_value is not None:
-        dtype_source, raw_dtype = "token2wav_trt_dtype", dtype_value
-    elif dtype_env is not None:
-        dtype_source, raw_dtype = TOKEN2WAV_TRT_DTYPE_ENV, dtype_env
-    else:
-        dtype_source, raw_dtype = "default", "fp16"
-    dtype = _TRT_DTYPE_ALIASES.get(str(raw_dtype).strip().lower()) if isinstance(raw_dtype, str) else None
-    if dtype is None:
-        raise ValueError(f"{dtype_source} must be one of fp16, float16, fp32 or float32, got {raw_dtype!r}")
-
+    dtype = "fp16" if dtype_value is None else _parse_trt_dtype(dtype_value, "token2wav_trt_dtype")
     cache_value = extra.get("token2wav_trt_cache_dir")
-    cache_env = _legacy_env(TOKEN2WAV_TRT_CACHE_ENV, "token2wav_trt_cache_dir", used=cache_value is None)
-    if cache_value is not None:
-        if not isinstance(cache_value, (str, os.PathLike)) or not os.fspath(cache_value).strip():
-            raise ValueError(f"token2wav_trt_cache_dir must be a non-empty path, got {cache_value!r}")
-        cache_dir: str | None = os.fspath(cache_value).strip()
-    else:
-        cache_dir = cache_env.strip() if cache_env is not None else None
+    cache_dir = None if cache_value is None else _parse_trt_cache_dir(cache_value)
+
+    if cuda and enabled:
+        dtype_env = _legacy_env(TOKEN2WAV_TRT_DTYPE_ENV, "token2wav_trt_dtype", used=dtype_value is None)
+        if dtype_value is None and dtype_env is not None:
+            dtype = _parse_trt_dtype(dtype_env, TOKEN2WAV_TRT_DTYPE_ENV)
+        cache_env = _legacy_env(TOKEN2WAV_TRT_CACHE_ENV, "token2wav_trt_cache_dir", used=cache_value is None)
+        if cache_value is None and cache_env is not None:
+            cache_dir = cache_env.strip()
 
     return Token2WavTrtConfig(enabled=enabled, dtype=dtype, cache_dir=cache_dir)

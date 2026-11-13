@@ -1838,8 +1838,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             extra, "token2wav_device_spk", current_omni_platform.is_cuda() or current_omni_platform.is_npu()
         )
         # An explicit stage key wins over its legacy MINICPMO_TOKEN2WAV_TRT* env
-        # var (#6232); resolved here so a bad dtype fails on every platform.
-        trt_config = resolve_token2wav_trt_config(extra)
+        # var (#6232). Keys are validated on every platform; the env vars are
+        # read (and warn) only where they take effect.
+        trt_config = resolve_token2wav_trt_config(extra, cuda=current_omni_platform.is_cuda())
         use_trt = trt_config.enabled
         cpu_reference_spk = read_bool_flag(extra, "token2wav_spk_cpu_reference", False)
         # The flag selects a CUDA speaker-only engine. Keep the previous path

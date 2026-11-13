@@ -415,7 +415,9 @@ DiT TensorRT path or the CPU onnxruntime fallback and drops this flag.
 Full DiT TensorRT is configured with connector `extra` keys. Each key, when
 set, wins over its deprecated environment variable, including an explicit
 `token2wav_trt: false`. The environment variable applies only while its key is
-unset or `null`, and logs a one-time deprecation warning.
+unset or `null`, and logs a one-time deprecation warning. Because TensorRT is
+CUDA-only, the environment variables are read only on CUDA, and the dtype and
+cache variables only when full DiT TensorRT is enabled.
 
 | Key | Values | Deprecated environment variable |
 | --- | --- | --- |
@@ -423,8 +425,9 @@ unset or `null`, and logs a one-time deprecation warning.
 | `token2wav_trt_dtype` | `fp16` (default), `float16`, `fp32`, `float32` | `MINICPMO_TOKEN2WAV_TRT_DTYPE` |
 | `token2wav_trt_cache_dir` | path, default `$HF_HOME/vllm_omni/token2wav_trt` | `MINICPMO_TOKEN2WAV_TRT_CACHE` |
 
-Any other dtype, from either source, fails at startup instead of silently
-selecting fp16.
+Any other `token2wav_trt_dtype` fails at startup on every platform instead of
+silently selecting fp16. An invalid `MINICPMO_TOKEN2WAV_TRT_DTYPE` fails when
+it is used.
 The CAM++ TensorRT profile accepts 4 to 3000 fbank frames. The default 6 s
 window is 598 frames and stays on this path. A wider
 `ref_audio_max_seconds` is checked before the engine is installed: 31 s
