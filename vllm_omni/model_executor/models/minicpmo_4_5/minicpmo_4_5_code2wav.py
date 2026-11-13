@@ -34,7 +34,7 @@ from .batched_token2wav import (
     state_shape_signature,
 )
 from .code2wav_watchdog import Code2WavWatchdog
-from .config_flags import read_bool_flag
+from .config_flags import read_bool_flag, resolve_token2wav_trt_config
 from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
 
 if TYPE_CHECKING:
@@ -1837,7 +1837,10 @@ class MiniCPMO45Code2Wav(nn.Module):
         device_spk = read_bool_flag(
             extra, "token2wav_device_spk", current_omni_platform.is_cuda() or current_omni_platform.is_npu()
         )
-        use_trt = read_bool_flag(extra, "token2wav_trt", False) or (os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1")
+        # An explicit stage key wins over its legacy MINICPMO_TOKEN2WAV_TRT* env
+        # var (#6232); resolved here so a bad dtype fails on every platform.
+        trt_config = resolve_token2wav_trt_config(extra)
+        use_trt = trt_config.enabled
         cpu_reference_spk = read_bool_flag(extra, "token2wav_spk_cpu_reference", False)
         # The flag selects a CUDA speaker-only engine. Keep the previous path
         # when it cannot apply, including explicit overrides that predate it:
@@ -1870,10 +1873,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         if use_trt and current_omni_platform.is_cuda():
             from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
 
-            dtype_name = str(
-                extra.get("token2wav_trt_dtype", os.environ.get("MINICPMO_TOKEN2WAV_TRT_DTYPE", "fp16"))
-            ).lower()
-            trt_dtype = torch.float32 if dtype_name in ("fp32", "float32") else torch.float16
+            dtype_name = trt_config.dtype
+            trt_dtype = torch.float32 if dtype_name == "fp32" else torch.float16
             max_batch = int(extra.get("token2wav_trt_max_batch", 16))
             device = next(token2wav.flow.parameters()).device
             trt_stepper = build_dit_trt_stepper(
@@ -1881,6 +1882,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 device=device,
                 dtype=trt_dtype,
                 max_batch=max_batch,
+                cache_dir=trt_config.cache_dir,
             )
             logger.info("MiniCPM-o Code2Wav: DiT estimator running on TensorRT (%s)", dtype_name)
             token2wav.enable_trt_spk_embedding()
