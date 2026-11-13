@@ -67,6 +67,23 @@ class SuccessRateGate:
     concurrency: int | None = None
 
 
+def assert_duplex_artifact_publication(result: dict, params: dict, num_prompt: int) -> None:
+    if params.get("dataset_name") == "omni-duplex-eval":
+        summary = result.get("omni_duplex_eval")
+        assert isinstance(summary, dict), "Omni-DuplexEval summary is missing"
+        assert summary.get("published") == num_prompt, "Omni-DuplexEval artifacts are incomplete"
+        assert summary.get("artifact_errors") == [], "Omni-DuplexEval artifact publication failed"
+    elif params.get("dataset_name") == "omniinteract":
+        summary = result.get("omniinteract")
+        assert isinstance(summary, dict), "OmniInteract summary is missing"
+        assert (summary.get("total"), summary.get("success"), summary.get("failed")) == (
+            num_prompt,
+            num_prompt,
+            0,
+        ), "OmniInteract requests did not all succeed"
+        assert summary.get("artifacts_complete") is True, "OmniInteract artifacts are incomplete"
+
+
 def is_quality_failure(exc: BaseException) -> bool:
     """True when ``exc`` is one of the sampled quality assertions above.
 
@@ -554,6 +571,13 @@ def assert_video_audio_valid(
         assert actual_channels == channels, f"Expected audio channels={channels}, got {actual_channels}"
 
 
+def assert_wav_sample_rate(audio_bytes: bytes | None, sample_rate: int) -> None:
+    """Assert a WAV body's native rate when the request did not ask the server for one."""
+    assert audio_bytes, "Expected WAV bytes"
+    info = sf.info(io.BytesIO(audio_bytes))
+    assert info.samplerate == sample_rate, f"Expected a {sample_rate} Hz WAV, got {info.samplerate} Hz"
+
+
 def assert_audio_valid(
     audio_or_path: Path | np.ndarray,
     *,
@@ -735,6 +759,7 @@ def _assert_pcm_int16_speech_hnr(
     audio_bytes: bytes,
     min_hnr_db: float = _MIN_PCM_SPEECH_HNR_DB,
     sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ,
+    channels: int = 1,
 ) -> None:
     """Validate harmonic-to-noise ratio on raw int16 PCM from /v1/audio/speech.
 
@@ -750,8 +775,11 @@ def _assert_pcm_int16_speech_hnr(
     understates HNR for models that do not decode at 24 kHz.
     """
     assert audio_bytes is not None and len(audio_bytes) >= 2, "missing PCM bytes"
-    assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
+    assert len(audio_bytes) % (2 * channels) == 0, "PCM byte length must be aligned to int16 frames"
     pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        # Interleaved multi-channel PCM: downmix so the pitch search sees one waveform.
+        pcm_samples = pcm_samples.reshape(-1, channels).mean(axis=1)
     hnr = _compute_pcm_hnr_db(pcm_samples, sr=sr)
     print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {min_hnr_db} dB, sr={sr})")
     assert hnr >= min_hnr_db, f"PCM speech HNR={hnr:.2f} dB is below the configured floor of {min_hnr_db} dB."
@@ -808,15 +836,22 @@ def _speech_pcm_sample_rate(request_config: dict[str, Any]) -> int:
     return int(expected or _PCM_SPEECH_SAMPLE_RATE_HZ)
 
 
+def _speech_pcm_channels(request_config: dict[str, Any]) -> int:
+    channels = request_config.get("transcript_pcm_channels", 1)
+    assert type(channels) is int and channels > 0, "transcript_pcm_channels must be a positive integer"
+    return channels
+
+
 def _speech_audio_for_transcription(audio_bytes: bytes | None, request_config: dict[str, Any]) -> bytes | None:
     """Give ASR a WAV container when a speech test opts into raw PCM transcription."""
     if not audio_bytes or request_config.get("response_format") != "pcm":
         return audio_bytes
     sample_rate = _speech_pcm_sample_rate(request_config)
-    assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
+    channels = _speech_pcm_channels(request_config)
+    assert len(audio_bytes) % (2 * channels) == 0, "PCM byte length must be aligned to int16 frames"
     with io.BytesIO() as buffer:
         with wave.open(buffer, "wb") as wav_file:
-            wav_file.setnchannels(1)
+            wav_file.setnchannels(channels)
             wav_file.setsampwidth(2)
             wav_file.setframerate(sample_rate)
             wav_file.writeframes(audio_bytes)
@@ -1108,8 +1143,14 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
             # search window to 147-735 Hz and misses the fundamental entirely,
             # scoring clean speech ~1.9 dB lower than it is.
             sample_rate = _speech_pcm_sample_rate(request_config)
+            channels = _speech_pcm_channels(request_config)
             try:
-                _assert_pcm_int16_speech_hnr(response.audio_bytes, min_hnr_db=min_hnr_db, sr=sample_rate)
+                _assert_pcm_int16_speech_hnr(
+                    response.audio_bytes,
+                    min_hnr_db=min_hnr_db,
+                    sr=sample_rate,
+                    channels=channels,
+                )
             except AssertionError as exc:
                 _retain_failed_speech_audio(
                     response.audio_bytes,

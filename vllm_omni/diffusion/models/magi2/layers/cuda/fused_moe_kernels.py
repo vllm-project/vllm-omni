@@ -9,8 +9,8 @@ The BF16 grouped GEMM is adapted from SGLang's Apache-2.0 implementation at
 ``d533d3bf464d280f180e18d4d396e613a5998502``. This module implements only
 MAGI-2's interleaved gate/up GEMM with SwiGLU7 and routed down GEMM.
 CUDA and MUSA share these kernels, with launch settings owned by each backend.
-The SandAI-derived Triton reference kernel is retained below unchanged;
-the pure-Torch reference implementation is owned by the native backend.
+The SandAI-derived Triton reference kernel supports resource-aware tile selection.
+The pure-Torch reference implementation is owned by the native backend.
 """
 
 from __future__ import annotations
@@ -18,11 +18,14 @@ from __future__ import annotations
 import math
 
 import torch
+from vllm.logger import init_logger
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
 from vllm_omni.platforms import current_omni_platform
 
 from ..native.mh_moe import torch_mh_moe_forward
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -506,15 +509,21 @@ def _deterministic_scatter(
     return output.view_as(reference)
 
 
-def _select_block_config() -> tuple[int, int, int, int, int]:
-    """Return the reference kernel config, capped for pre-Blackwell GPUs."""
+# Cache successful tiles separately for each device, dtype, expert shape and
+# scatter mode. Resource requirements can differ between kernel specializations.
+_RESOLVED_BLOCK_CONFIG: dict[tuple[torch.device, torch.dtype, int, int, bool], tuple[int, int, int, int, int]] = {}
 
-    capability = current_omni_platform.get_device_capability()
+
+def _block_config_candidates(device_id: int) -> tuple[tuple[int, int, int, int, int], ...]:
+    """Return supported reference-kernel tiles in preference order."""
+
+    capability = current_omni_platform.get_device_capability(device_id)
     if capability is not None and capability.major >= 10:  # Blackwell
-        return (128, 64, 32, 2, 8)
+        # The [block_t, d_head] accumulator can exceed Blackwell tensor memory.
+        return ((128, 64, 32, 2, 8), (64, 64, 32, 2, 8), (64, 64, 32, 2, 4))
     # BLOCK_T=128 needs 122,880 bytes of shared memory and is not safe on the
     # qualified L20X path.  This is the reference kernel's portable config.
-    return (64, 64, 32, 2, 4)
+    return ((64, 64, 32, 2, 4),)
 
 
 def triton_mh_moe_forward(
@@ -534,8 +543,7 @@ def triton_mh_moe_forward(
     if routed_tokens == 0:
         return torch.zeros_like(x)
     d_head, d_expert = x.shape[-1], w_down.shape[1]
-    block_t, block_dh, block_de, num_stages, num_warps = _select_block_config()
-    if d_head % block_dh or d_expert % block_de:
+    if d_head % 64 or d_expert % 32:
         return torch_mh_moe_forward(x, gather_ids, probs, expert_offsets, w_gate, w_up, w_down)
 
     if deterministic:
@@ -543,52 +551,80 @@ def triton_mh_moe_forward(
     else:
         output = torch.zeros_like(x)
     num_flat_experts = expert_offsets.numel() - 1
-    expert_tiles = (torch.diff(expert_offsets) + block_t - 1) // block_t
-    cumulative_tiles = torch.cat(
-        (torch.zeros(1, dtype=torch.int32, device=x.device), expert_tiles.cumsum(0, dtype=torch.int32))
-    )
-    # Match the reference launch bound.  Empty/excess programs return after
-    # comparing against ``cumulative_tiles[-1]`` inside the kernel.
-    grid = ((routed_tokens + block_t - 1) // block_t + num_flat_experts,)
     log2_experts = max(1, math.ceil(math.log2(max(num_flat_experts, 1) + 1)))
-    _mh_moe_kernel[grid](
-        x,
-        w_gate,
-        w_up,
-        w_down,
-        output,
-        gather_ids,
-        probs,
-        expert_offsets,
-        cumulative_tiles,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        w_gate.stride(0),
-        w_gate.stride(1),
-        w_gate.stride(2),
-        w_up.stride(0),
-        w_up.stride(1),
-        w_up.stride(2),
-        w_down.stride(0),
-        w_down.stride(1),
-        w_down.stride(2),
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        d_head,
-        d_expert,
-        x.shape[1],
-        num_flat_experts,
-        log2_experts,
-        block_t,
-        block_dh,
-        block_de,
-        tl.float32,
-        deterministic,
-        num_stages=num_stages,
-        num_warps=num_warps,
-    )
+    cache_key = (x.device, x.dtype, d_head, d_expert, deterministic)
+    device_id = 0 if x.device.index is None else x.device.index
+    candidates = _block_config_candidates(device_id)
+    resolved = _RESOLVED_BLOCK_CONFIG.get(cache_key)
+    if resolved is not None:
+        try:
+            candidates = candidates[candidates.index(resolved) :]
+        except ValueError:
+            # Cached tile is no longer offered for this device; restart.
+            _RESOLVED_BLOCK_CONFIG.pop(cache_key, None)
+    for candidate in candidates:
+        block_t, block_dh, block_de, num_stages, num_warps = candidate
+        expert_tiles = (torch.diff(expert_offsets) + block_t - 1) // block_t
+        cumulative_tiles = torch.cat(
+            (torch.zeros(1, dtype=torch.int32, device=x.device), expert_tiles.cumsum(0, dtype=torch.int32))
+        )
+        # Empty/excess programs return after comparing against the tile count.
+        grid = ((routed_tokens + block_t - 1) // block_t + num_flat_experts,)
+        try:
+            _mh_moe_kernel[grid](
+                x,
+                w_gate,
+                w_up,
+                w_down,
+                output,
+                gather_ids,
+                probs,
+                expert_offsets,
+                cumulative_tiles,
+                x.stride(0),
+                x.stride(1),
+                x.stride(2),
+                w_gate.stride(0),
+                w_gate.stride(1),
+                w_gate.stride(2),
+                w_up.stride(0),
+                w_up.stride(1),
+                w_up.stride(2),
+                w_down.stride(0),
+                w_down.stride(1),
+                w_down.stride(2),
+                output.stride(0),
+                output.stride(1),
+                output.stride(2),
+                d_head,
+                d_expert,
+                x.shape[1],
+                num_flat_experts,
+                log2_experts,
+                block_t,
+                block_dh,
+                block_de,
+                tl.float32,
+                deterministic,
+                num_stages=num_stages,
+                num_warps=num_warps,
+            )
+        except triton.runtime.errors.OutOfResources as error:
+            # Resource rejection happens before launch, so output is untouched.
+            # Drop a rejected cache entry so later calls resume remaining tiles
+            # instead of replaying the failing specialization.
+            if _RESOLVED_BLOCK_CONFIG.get(cache_key) == candidate:
+                _RESOLVED_BLOCK_CONFIG.pop(cache_key, None)
+            if candidate == candidates[-1]:
+                raise
+            logger.warning(
+                "MAGI-2 expert tile %s exceeds device resources (%s); trying the next candidate",
+                candidate,
+                error,
+            )
+            continue
+        _RESOLVED_BLOCK_CONFIG[cache_key] = candidate
+        break
     if deterministic:
         return _deterministic_scatter(output.view(routed_tokens, d_head), x, gather_ids, expert_offsets)
     return output

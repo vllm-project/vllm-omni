@@ -11,6 +11,7 @@ rendered YAML is checked with check-jsonschema.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,10 @@ def _prepare_pipeline(path: Path) -> dict[str, Any]:
     if "/amd/" in f"/{rel}":
         return _strip_keys(doc, AMD_STRIP_KEYS)
 
+    # Rendering plans automatic shards. Skip the history download and the
+    # timings/file-shards files; this hook only checks the rendered YAML.
+    os.environ["VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD"] = "1"
+    os.environ["VLLM_OMNI_SKIP_SHARD_FILE_WRITE"] = "1"
     return _render_test_pipeline(doc, changed_files=None)
 
 

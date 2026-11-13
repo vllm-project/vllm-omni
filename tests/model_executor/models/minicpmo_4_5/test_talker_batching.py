@@ -35,6 +35,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     MiniCPMO45OmniTTSForConditionalGeneration,
     _apply_batched_repetition_penalty,
     _native_duplex_chunk_budget,
+    _native_duplex_row_meta,
     _restore_weight_norm_weight,
     _trailing_code_runs,
     _turn_end_boundary_eos_masked,
@@ -782,6 +783,21 @@ def test_make_omni_output_reads_history_from_runner_cpu_buffer(device, default_d
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize("as_tensor", [False, True], ids=["transport-list", "tensor"])
+@pytest.mark.parametrize(
+    "condition_ids,turn_end",
+    [([99, 41], False), ([99, 41, 99], True), ([99], True), ([], False)],
+)
+def test_talker_turn_end_follows_last_condition_token(condition_ids, turn_end, as_tensor) -> None:
+    info = {
+        "native_duplex": True,
+        "duplex": {"epoch": 0, "turn_id": 10},
+        "ids": {"tts": torch.tensor(condition_ids, dtype=torch.long) if as_tensor else condition_ids},
+        "meta": {"turn_eos_token_id": 99},
+    }
+    assert _native_duplex_row_meta(info)[-1] is turn_end
+
+
 def test_talker_projects_request_aligned_duplex_metadata() -> None:
     talker = _make_talker()
     infos = [
@@ -789,7 +805,7 @@ def test_talker_projects_request_aligned_duplex_metadata() -> None:
             "request_id": "req-a",
             "native_duplex": True,
             "duplex": {"epoch": 3, "turn_id": 7},
-            "ids": {"tts": [41]},
+            "ids": {"tts": [99, 41]},
             "meta": {
                 "native_duplex_segment_text": "first",
                 "turn_eos_token_id": 99,

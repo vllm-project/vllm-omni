@@ -245,6 +245,23 @@ class ARDiffusionSegmentedKVState:
         self._pending = None
         self._publish_retention(retained)
 
+    def pending_layer_views(self) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """Borrow initialized pending rows for archival before publication.
+
+        Call after staging every layer. These views exclude temporary condition
+        rows and must be copied before commit/rollback or another forward.
+        """
+        self._check_open()
+        pending = self._pending
+        if pending is None or len(pending.written_layers) != self.cache.num_layers:
+            raise RuntimeError("Stage every pending KV layer before reading archive views")
+        staging = self._staging()
+        if staging.owner is not self or staging.revision != self._revision:
+            raise RuntimeError("Segmented staging changed before archival")
+        start = self.history_tokens
+        end = start + pending.slots.numel()
+        return tuple((key[start:end], value[start:end]) for key, value in staging.layers)
+
     def retain(self, handles: Sequence[SegmentHandle]) -> None:
         """Drop/reorder committed segments without changing their valid rows."""
         self._check_open()

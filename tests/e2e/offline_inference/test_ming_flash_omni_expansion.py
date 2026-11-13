@@ -14,6 +14,7 @@ from tests.helpers.media import (
     generate_synthetic_video,
 )
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from vllm_omni.platforms import current_omni_platform
 
 models = ["Jonathan1909/Ming-flash-omni-2.0"]
 
@@ -34,6 +35,7 @@ def build_prompt(user_text: str) -> str:
 
 _CI_DEPLOY_THINKER_ONLY = get_deploy_config_path("ci/ming_flash_omni_thinker_only.yaml")
 _CI_DEPLOY = get_deploy_config_path("ci/ming_flash_omni.yaml")
+MING_FLASH_OMNI_ROCM_STAGE_INIT_TIMEOUT_S = 1800
 
 
 def get_eager_config_thinker():
@@ -45,8 +47,14 @@ def get_eager_config():
     return modify_stage_config(_CI_DEPLOY, updates={"stages": {0: {"enforce_eager": True}}})
 
 
-test_params_thinker = [(m, c) for m in models for c in [get_eager_config_thinker()]]
-test_params = [(m, c) for m in models for c in [get_eager_config()]]
+# Ming's 194 GiB checkpoint can need more than the fixture's default 600-second
+# stage-readiness deadline when the ROCm worker cache is backed by shared NFS.
+# Keep CUDA on the default deadline so this allowance is platform-specific.
+_ROCM_STAGE_INIT_KWARGS = (
+    {"stage_init_timeout": MING_FLASH_OMNI_ROCM_STAGE_INIT_TIMEOUT_S} if current_omni_platform.is_rocm() else {}
+)
+test_params_thinker = [(m, c, _ROCM_STAGE_INIT_KWARGS) for m in models for c in [get_eager_config_thinker()]]
+test_params = [(m, c, _ROCM_STAGE_INIT_KWARGS) for m in models for c in [get_eager_config()]]
 
 
 @pytest.mark.slow
