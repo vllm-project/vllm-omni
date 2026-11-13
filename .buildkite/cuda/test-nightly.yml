@@ -501,7 +501,7 @@ steps:
       - label: ":full_moon: Diffusion X2V · LingBot World Perf Test · 2-GPU"
         key: lingbot-cuda-nightly-performance
         source_file_dependencies: lingbot_world_perf
-        timeout_in_minutes: 180
+        timeout_in_minutes: 45
         mirror_hardwares: h100_2
         artifact_paths:
           - "tests/dfx/perf/results/*.json"
@@ -511,7 +511,7 @@ steps:
       - label: ":full_moon: Diffusion X2V · LingBot World Accuracy Test"
         key: lingbot-cuda-nightly-accuracy
         source_file_dependencies: lingbot_world_accuracy
-        timeout_in_minutes: 120
+        timeout_in_minutes: 60
         mirror_hardwares: h100_2
         artifact_paths:
           - "lingbot-artifacts/cuda-accuracy/**/*"

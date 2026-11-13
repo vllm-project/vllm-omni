@@ -26,7 +26,6 @@ def run_accuracy(settings, data, suite):
     report = {
         "passed": False,
         "status": "failed",
-        "comparison_status": "finite_only" if suite == "precision" else "score_floor",
         "suite": suite,
         "measurements": {},
         "errors": [],
@@ -91,6 +90,7 @@ def run_accuracy(settings, data, suite):
             for dimension, value in dimensions.items()
         }
     floors = {} if suite == "precision" else settings["score_floors"][suite]
+    # bench_serve returns a fresh report, so the status is set after measurement.
     report["comparison_status"] = "finite_only" if suite == "precision" else "score_floor"
     if floors:
         report["floor_violations"] = [

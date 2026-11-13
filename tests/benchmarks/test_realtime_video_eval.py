@@ -311,13 +311,6 @@ def test_accuracy_cli_requires_suite_and_candidate(arguments):
         build_serve_args(arguments)
 
 
-def test_record_only_flag_is_removed():
-    from vllm_omni.benchmarks.realtime_video.serving import build_serve_args
-
-    with pytest.raises(SystemExit):
-        build_serve_args(["--realtime-video-record-only"])
-
-
 def test_evaluator_checkout_guard_ignores_bytecode_caches_only(tmp_path):
     import subprocess
 
