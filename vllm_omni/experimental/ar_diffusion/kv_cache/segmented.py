@@ -9,7 +9,7 @@ This path does not change the frame-window attention contract.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -174,10 +174,18 @@ class ARDiffusionSegmentedKVState:
         staging = self._staging()
         if self._prepared is None or staging.owner is not self or staging.revision != self._revision:
             raise RuntimeError("prepare_layer_views() must precede begin_commit()")
-        if not lengths or len(lengths) > self.spec.max_pending_segments or any(length <= 0 for length in lengths):
-            raise ValueError("Invalid segmented KV pending segment lengths")
         if sum(lengths) != self._prepared[0]:
             raise ValueError("Pending segment lengths must exactly cover current media rows")
+        return self._reserve_pending(lengths)
+
+    def _reserve_pending(self, lengths: tuple[int, ...]) -> tuple[SegmentHandle, ...]:
+        if (
+            not lengths
+            or len(lengths) > self.spec.max_pending_segments
+            or any(length <= 0 for length in lengths)
+            or sum(lengths) > self.spec.max_pending_tokens
+        ):
+            raise ValueError("Invalid segmented KV pending segment lengths")
         handles: list[SegmentHandle] = []
         try:
             for length in lengths:
@@ -197,6 +205,50 @@ class ARDiffusionSegmentedKVState:
         self._pending = _Pending(tuple(handles), pending_slots)
         self._assembled.clear()
         return tuple(handles)
+
+    def stage_replacement(
+        self,
+        segment_lengths: Sequence[int],
+        layers: Iterable[tuple[torch.Tensor, torch.Tensor]],
+    ) -> tuple[SegmentHandle, ...]:
+        """Restore CPU rows into unpublished pages, keeping old history intact.
+
+        Consume one layer at a time through budgeted shared staging. The caller
+        validates/agrees with peers before commit; any copy/allocation failure
+        releases replacement pages. Rollback forces the next forward to gather
+        the unchanged committed history again.
+        """
+        self._check_open()
+        if self._pending is not None:
+            raise RuntimeError("Finish the active commit before staging a replacement")
+        lengths = tuple(segment_lengths)
+        handles = self._reserve_pending(lengths)
+        staging = self._staging()
+        staging.owner, staging.revision = None, -1
+        self._prepared = None
+        count = sum(lengths)
+        expected = (count, self.cache.num_kv_heads, self.cache.head_size)
+        try:
+            assert self._pending is not None
+            for layer, (key, value) in enumerate(layers):
+                self._validate_layer(layer)
+                for source, buffer, pool in zip(
+                    (key, value), staging.layers[layer], (self.cache._k_pools[layer], self.cache._v_pools[layer])
+                ):
+                    if (
+                        source.device.type != "cpu"
+                        or tuple(source.shape) != expected
+                        or source.dtype != self.cache.dtype
+                    ):
+                        raise ValueError("Replacement requires matching CPU KV rows in the cache dtype")
+                    buffer[:count].copy_(source, non_blocking=False)
+                    pool.index_copy_(0, self._pending.slots, buffer[:count])
+                self._pending.written_layers.add(layer)
+            self.validate_commit(retain=handles)
+        except BaseException:
+            self.rollback()
+            raise
+        return handles
 
     def stage(self, layer_idx: int) -> None:
         """Write this clean layer's assembled media into unpublished pages."""

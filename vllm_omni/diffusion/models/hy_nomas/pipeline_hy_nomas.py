@@ -39,6 +39,13 @@ from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import (
 )
 from vllm_omni.diffusion.models.hy_nomas.history import HyNomasHistoryFrame, action_tails, recent_history
 from vllm_omni.diffusion.models.hy_nomas.history_archive import HyNomasHistoryArchive
+from vllm_omni.diffusion.models.hy_nomas.history_sampling import (
+    ARCHIVED_HISTORY_MODES,
+    history_frame_indices,
+    select_history,
+    selected_layers,
+    selected_mask,
+)
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
     build_transformer,
     load_component_weights,
@@ -416,17 +423,24 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             config.width // self.s_ratio // self.patch_size[2]
         )
         text_tokens = int(self.args.text_len)
-        recent = config.history_mode == "recent"
+        recent = config.history_mode != "full"
+        sampled = config.history_mode in ARCHIVED_HISTORY_MODES
         retained = (
             config.history_latent_frames * frame_tokens
             if recent
             else config.max_latent_frames * frame_tokens + config.max_segments * text_tokens
         )
+        if sampled:
+            # One text block per represented segment, at most one per selected frame.
+            retained += min(config.history_latent_frames, config.max_total_segments) * text_tokens
         pending_frames = min(
             config.max_chunk_latent_frames,
             config.max_total_latent_frames if recent else config.max_latent_frames,
         )
         pending = pending_frames * frame_tokens + text_tokens
+        if sampled:
+            # Old working set and unpublished replacement must coexist until agreement.
+            pending = max(pending, retained)
         window = int(self.vae.temporal_window_latents)
         decoder_frames = 3 * window + pending_frames
         spatial = (config.height // self.s_ratio) * (config.width // self.s_ratio)
@@ -452,7 +466,9 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 max_retained_tokens=retained,
                 max_retained_segments=config.history_latent_frames if recent else config.max_latent_frames,
                 max_pending_tokens=pending,
-                max_pending_segments=pending_frames if recent else 1,
+                max_pending_segments=max(pending_frames, config.history_latent_frames)
+                if sampled
+                else (pending_frames if recent else 1),
                 initial_staging_tokens=retained + pending,
             ),
             model_owned_state_bytes_per_session=model_bytes,
@@ -502,7 +518,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         if frame_tokens % self.sp_size:
             raise OmniClientError("Hy-Nomas spatial tokens per frame must be divisible by ulysses_degree.")
         frames = (request.num_frames - 1) // 4 + 1
-        recent = bound is not None and config.history_mode == "recent"
+        recent = bound is not None and config.history_mode != "full"
         total_limit = config.max_total_latent_frames if recent else config.max_latent_frames
         if bound is not None and frames > total_limit:
             raise OmniClientError("Hy-Nomas request exceeds the deployed total latent-frame limit.")
@@ -606,7 +622,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         if first:
             segment_limit = (
                 self.ar_config.max_total_segments
-                if self.ar_config.history_mode == "recent"
+                if self.ar_config.history_mode != "full"
                 else self.ar_config.max_segments
             )
             if self._ar_state is not None and session.segments >= segment_limit:
@@ -640,7 +656,8 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         state.extra["hy_nomas_intra_offsets"] = [offsets] if offsets is not None and windows is not None else None
         state.extra["hy_nomas_intra_windows"] = windows
         state.extra["hy_nomas_cache_text"] = first or (
-            session.noise_generator is not None
+            self.ar_config.history_mode == "recent"
+            and session.noise_generator is not None
             and not any(frame.text_tokens and frame.segment == session.segments for frame in session.history_frames)
         )
         start = state.extra["hy_nomas_request_latent_start"] + chunk.start
@@ -741,6 +758,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         pending = ()
         error = None
         recent = cache is not None and self.ar_config.history_mode == "recent"
+        sampled = cache is not None and self.ar_config.history_mode in ARCHIVED_HISTORY_MODES
         if commit and cache is not None:
             lengths = (
                 [image_tokens // latents.shape[2]] * (latents.shape[2] - 1)
@@ -812,7 +830,8 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                             retained = tuple(frame.handle for frame in frames)
                         for layer in range(self.num_double_blocks):
                             cache.stage(layer)
-                        cache.validate_commit(retain=retained)
+                        if not sampled:
+                            cache.validate_commit(retain=retained)
                         if session.history_archive is not None:
                             session.history_archive.stage(
                                 cache.pending_layer_views(),
@@ -824,23 +843,55 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                                 text_tokens=state.prompt_embeds.shape[1] if first else 0,
                                 action_start=state.extra["hy_nomas_action_start"] if first else -1,
                             )
+                        if sampled:
+                            assert session.history_archive is not None
+                            positions = history_frame_indices(
+                                session.latent_frames + latents.shape[2],
+                                self.ar_config.history_latent_frames,
+                                self.ar_config.history_mode,
+                                gamma=self.ar_config.history_temporal_gamma,
+                            )
+                            selected = select_history(session.history_archive.staged_records, positions)
+                            rebuilt_mask = selected_mask(selected).to(self.device)
+                            # The archive owns the clean chunk now. Reuse its unpublished
+                            # pages for the replacement, without releasing committed history.
+                            cache.rollback()
+                            retained = cache.stage_replacement(
+                                [frame.num_tokens for frame in selected],
+                                selected_layers(selected, self.num_double_blocks),
+                            )
+                            frames = [
+                                HyNomasHistoryFrame(
+                                    handle,
+                                    frame.position,
+                                    frame.video.segment,
+                                    frame.text_tokens,
+                                    frame.text.action_start if frame.text else -1,
+                                )
+                                for handle, frame in zip(retained, selected)
+                            ]
                     except Exception as exc:
                         error = exc
                     self._check_sp_error(error, "KV staging")
                     cache.commit(retain=retained)
                     if session.history_archive is not None:
                         session.history_archive.publish()
-                    if recent:
+                    if recent or sampled:
                         session.history_frames = frames
-                        session.history_mask = torch.cat((session.history_mask, mask[:, history:]), 1)[:, cut:].clone()
+                        session.history_mask = (
+                            rebuilt_mask
+                            if sampled
+                            else torch.cat((session.history_mask, mask[:, history:]), 1)[:, cut:].clone()
+                        )
                         session.action_tails = action_tails(frames)
                 elif written != current_tokens:
                     raise RuntimeError("Hy-Nomas clean forward wrote an unexpected KV token count.")
-                if not recent:
+                if not recent and not sampled:
                     session.history_mask = torch.cat((session.history_mask, mask[:, history:].clone()), 1)
                 action_start = state.extra["hy_nomas_action_start"]
                 if (
                     not recent
+                    and not sampled
                     and first
                     and action_start is not None
                     and 0 <= action_start < state.prompt_embeds.shape[1]
