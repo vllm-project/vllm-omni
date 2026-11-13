@@ -149,10 +149,15 @@ class MiniMaxMusic3TalkerForConditionalGeneration(nn.Module):
     # The acoustic stage consumes the composed 32768-d frame, never the raw
     # backbone hidden state, so suppress the runner's automatic "hidden" key.
     omni_pooler_payload_include_hidden: bool = False
+    # With async_chunk the song goes to stage 1 window by window. Without it,
+    # the engine collects stage 0's outputs and ar2acoustic hands stage 1 the
+    # whole song, so the talker publishes it once, when the song ends.
+    publishes_windows: bool = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         self.vllm_config = vllm_config
+        self.publishes_windows = bool(getattr(vllm_config.model_config, "async_chunk", False))
         config = vllm_config.model_config.hf_config
         self.config = config
         hidden_size = int(getattr(config, "hidden_size", BACKBONE_HIDDEN_SIZE))
@@ -273,6 +278,11 @@ class MiniMaxMusic3TalkerForConditionalGeneration(nn.Module):
 
         # The depth loop is recorded per pair count and replayed after that.
         self._depth_graphs = DepthGraphCache(self._depth_decode_eager)
+
+    def create_mrv2_model_state(self, vllm_config, encoder_cache, device):
+        from .model_state import create_minimax_music3_talker_model_state
+
+        return create_minimax_music3_talker_model_state(vllm_config, self, encoder_cache, device)
 
     # ---------------------------------------------------------------- forward
 
@@ -650,9 +660,11 @@ class MiniMaxMusic3TalkerForConditionalGeneration(nn.Module):
         # ``max_audio_frames``. It does not cover the engine ending a request
         # underneath the model, because the payload for a step is fixed before
         # the model is told. Hitting ``max_model_len`` mid-song therefore drops
-        # the final window. In practice the frame budget is reached first; a
-        # request can only hit the context limit with a prompt long enough that
-        # the two limits collide, which the deploy config documents.
+        # the final window, or the whole song without async_chunk, which only
+        # publishes the song once it ends. In practice the frame budget is
+        # reached first; a request can only hit the context limit with a prompt
+        # long enough that the two limits collide, which the deploy config
+        # documents.
         for index, (cond_row, uncond_row) in enumerate(pairs):
             state = states[index]
             if state.pending_stop:
@@ -846,6 +858,10 @@ class MiniMaxMusic3TalkerForConditionalGeneration(nn.Module):
             return {}
         if state.finished:
             return self._terminal_payload(state)
+        if not self.publishes_windows:
+            # No window is taken, so the buffer keeps the whole song and the
+            # terminal span covers it from frame 0.
+            return {}
         window = state.ready_window()
         if window is None:
             return {}
@@ -911,7 +927,7 @@ class MiniMaxMusic3TalkerForConditionalGeneration(nn.Module):
             if isinstance(latent, torch.Tensor) and latent.numel():
                 latents.append(latent)
                 sub = info.get("codes")
-                codes.append(sub.get("audio") if isinstance(sub, dict) else torch.empty(0))
+                codes.append(sub.get("audio") if isinstance(sub, dict) else torch.empty(0, dtype=torch.long))
                 meta = info.get("meta")
                 metas.append(dict(meta) if isinstance(meta, dict) else {})
                 any_payload = True
@@ -923,8 +939,10 @@ class MiniMaxMusic3TalkerForConditionalGeneration(nn.Module):
                 info.pop("codes", None)
                 info.pop("meta", None)
             else:
-                latents.append(torch.empty(0))
-                codes.append(torch.empty(0))
+                # Without async_chunk the engine joins each request's outputs,
+                # so a float32 placeholder would turn its bf16 song float32.
+                latents.append(torch.empty(0, dtype=model_outputs.dtype))
+                codes.append(torch.empty(0, dtype=torch.long))
                 metas.append({})
         if not any_payload:
             return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs=None)
