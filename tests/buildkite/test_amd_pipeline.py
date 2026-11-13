@@ -708,7 +708,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "Diffusion · Model Test",
         AMD_READY_PIPELINE,
         "Blocking",
-        117,
+        120,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -753,7 +753,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "Omni Model Test Qwen3-Omni",
         AMD_MERGE_PIPELINE,
         "Blocking",
-        13,
+        11,
         "advanced_model and rocm and MI325 and not nvidia_only",
     ),
     (
@@ -2192,6 +2192,48 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
                 "tests/e2e/online_serving/test_voxtral_tts_expansion.py",
             ),
         },
+        "Moss TTS realtime and online · 1-GPU": {
+            "timeout": 180,
+            "test_timeout": 150,
+            "count": 6,
+            "artifact_name": "rocm-moss-tts-extended-weekly",
+            "dependency": "tts_moss_tts_extended_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_moss_tts_realtime.py",
+                "tests/e2e/offline_inference/test_moss_tts_realtime_expansion.py",
+                "tests/e2e/online_serving/test_moss_tts_expansion.py",
+            ),
+        },
+        "Moss TTS Nano · 1-GPU": {
+            "timeout": 210,
+            "test_timeout": 180,
+            "count": 9,
+            "artifact_name": "rocm-moss-tts-nano-weekly",
+            "dependency": "tts_moss_tts_nano_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_moss_tts_nano_expansion.py",
+                "tests/e2e/online_serving/test_moss_tts_nano_expansion.py",
+            ),
+        },
+        "Higgs Audio V2 · 1-GPU": {
+            "timeout": 210,
+            "test_timeout": 180,
+            "count": 9,
+            "artifact_name": "rocm-higgs-audio-v2-weekly",
+            "dependency": "tts_higgs_audio_v2_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_higgs_audio_v2_expansion.py",
+                "tests/e2e/online_serving/test_higgs_audio_v2_expansion.py",
+            ),
+        },
+        "Higgs Audio V3 · 1-GPU": {
+            "timeout": 240,
+            "test_timeout": 210,
+            "count": 12,
+            "artifact_name": "rocm-higgs-audio-v3-weekly",
+            "dependency": "tts_higgs_audio_v3_weekly",
+            "files": ("tests/e2e/online_serving/test_higgs_audio_v3.py",),
+        },
     }
     expected_env = {
         "OPENBLAS_NUM_THREADS": "1",
@@ -2252,6 +2294,14 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         "tests/e2e/online_serving/test_voxcpm2_tts_lora.py": 2,
         "tests/e2e/offline_inference/test_voxtral_tts_expansion.py": 2,
         "tests/e2e/online_serving/test_voxtral_tts_expansion.py": 8,
+        "tests/e2e/offline_inference/test_moss_tts_realtime.py": 2,
+        "tests/e2e/offline_inference/test_moss_tts_realtime_expansion.py": 1,
+        "tests/e2e/online_serving/test_moss_tts_expansion.py": 3,
+        "tests/e2e/offline_inference/test_moss_tts_nano_expansion.py": 4,
+        "tests/e2e/online_serving/test_moss_tts_nano_expansion.py": 5,
+        "tests/e2e/offline_inference/test_higgs_audio_v2_expansion.py": 3,
+        "tests/e2e/online_serving/test_higgs_audio_v2_expansion.py": 6,
+        "tests/e2e/online_serving/test_higgs_audio_v3.py": 12,
     }
     for path, expected_count in marker_counts.items():
         assert Path(path).read_text(encoding="utf-8").count('"rocm": "MI325"') == expected_count
@@ -3680,8 +3730,9 @@ def test_qwen3_omni_shm_leak_is_a_separate_blocking_merge_job() -> None:
 
     assert blocking_step["agent_pool"] == "mi300_2"
     assert blocking_step["grade"] == "Blocking"
-    assert "assert-pytest-collection.sh 13" in blocking_commands
+    assert "assert-pytest-collection.sh 11" in blocking_commands
     assert shm_path not in blocking_commands
+    assert "test_qwen3_omni_colocate_async.py" not in blocking_commands
 
     step = _find_step("Qwen3-Omni SHM Leak Test", AMD_MERGE_PIPELINE)
     commands = "\n".join(step["commands"])

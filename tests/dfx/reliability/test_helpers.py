@@ -400,9 +400,21 @@ float16 = object()
     assert completed.stdout.rstrip().endswith("DONE")
 
 
-def test_sidecar_accepts_small_reported_residual_without_allocator_rejection(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("reporting_reserve_mib", "expected_returncode", "expected_status"),
+    [
+        (6, 0, "READY:"),
+        (9, 2, "ERROR:"),
+    ],
+)
+def test_sidecar_bounds_reported_residual_without_allocator_rejection(
+    tmp_path: Path,
+    reporting_reserve_mib: int,
+    expected_returncode: int,
+    expected_status: str,
+) -> None:
     (tmp_path / "torch.py").write_text(
-        """
+        f"""
 _MIB = 1024 * 1024
 
 
@@ -436,7 +448,7 @@ class _Cuda:
 
     @staticmethod
     def mem_get_info(device):
-        reporting_reserve = 2 * _MIB if _Cuda.allocated else 0
+        reporting_reserve = {reporting_reserve_mib} * _MIB if _Cuda.allocated else 0
         return _Cuda.initial_free - _Cuda.allocated + reporting_reserve, 1024 * _MIB
 
 
@@ -464,10 +476,11 @@ float16 = object()
         timeout=5,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    assert "free_after=35651584" in completed.stdout
-    assert "READY:" in completed.stdout
-    assert completed.stdout.rstrip().endswith("DONE")
+    expected_free_after = (32 + reporting_reserve_mib) * 1024 * 1024
+    assert completed.returncode == expected_returncode, completed.stderr
+    assert f"free_after={expected_free_after}" in completed.stdout
+    assert expected_status in completed.stdout
+    assert completed.stdout.rstrip().endswith("DONE") is (expected_returncode == 0)
 
 
 @pytest.mark.parametrize(
