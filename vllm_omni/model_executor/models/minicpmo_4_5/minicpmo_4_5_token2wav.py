@@ -21,6 +21,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from vllm.config import VllmConfig
 
 from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import (
     StepAudio2Token2WavCore,
@@ -139,6 +140,14 @@ class MiniCPMO45Token2wav:
         if not isinstance(speaker, CampplusTorch) or speaker.device.type != "cuda":
             raise ValueError("Speaker CUDA graphs require the CUDA Torch speaker model")
         self._core._spk_model = SpeakerCudaGraph(speaker, vllm_config)
+
+    def enable_s3_cuda_graph(self, vllm_config: VllmConfig) -> None:
+        """Replay short reference tokenization with unchanged S3 weights/math."""
+        from .s3_cuda_graph import S3CudaGraph
+
+        if self._core.device.type != "cuda":
+            raise ValueError("S3 CUDA graphs require a CUDA tokenizer")
+        self._core._s3_cuda_graph = S3CudaGraph(self._core.audio_tokenizer, vllm_config)
 
     def __call__(self, generated_speech_tokens, prompt_wav) -> bytes:
         """One-shot tokens → 24 kHz WAV bytes."""

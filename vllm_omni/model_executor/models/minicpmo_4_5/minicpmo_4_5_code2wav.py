@@ -1920,6 +1920,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         if read_bool_flag(extra, "token2wav_spk_cuda_graph", False):
             token2wav.enable_speaker_cuda_graph(self.vllm_config)
             logger.info("MiniCPM-o Code2Wav: exact-shape Torch speaker CUDA graphs enabled")
+        if read_bool_flag(extra, "token2wav_s3_cuda_graph", False):
+            token2wav.enable_s3_cuda_graph(self.vllm_config)
+            logger.info("MiniCPM-o Code2Wav: exact-shape S3 CUDA graphs enabled")
         self.backend = BatchedToken2Wav(
             token2wav,
             trt_stepper=trt_stepper,
