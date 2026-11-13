@@ -218,6 +218,26 @@ class DuplexCapabilities:
         return None
 
 
+@dataclass(frozen=True)
+class DuplexContextViewPolicy:
+    """A stage's opt-in to the L1 history view.
+
+    User messages before the Nth most recent user run (consecutive user
+    messages) render without audio and image parts. With N == 0, every user
+    run is eligible, including unanswered input. This is a candidate context
+    view: consumers must preserve current request media from authoritative
+    ``conversation`` and bind payloads there, rather than directly formatting
+    the entire view as a complete prompt.
+    """
+
+    keep_media_user_turns: int
+
+    def __post_init__(self) -> None:
+        value = self.keep_media_user_turns
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("keep_media_user_turns must be an integer >= 0")
+
+
 def apply_session_stats_capability(capabilities: DuplexCapabilities, collect_stats: bool) -> DuplexCapabilities:
     """Advertise ``supports_session_stats`` exactly when the deployment collects stats.
 
