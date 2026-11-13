@@ -38,7 +38,7 @@
   "platform": "cuda",
   "cards": 2,
   "dies": 2,
-  "deploy_config": "benchmarks/lingbot_world/configs/usp2_compiled.yaml",
+  "deploy_config": "tests/e2e/accuracy/lingbot_world/configs/usp2_compiled.yaml",
   "warmup_num_chunks": 8,
   "hardware": "H100",
   "score_floors": {

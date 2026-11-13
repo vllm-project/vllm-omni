@@ -89,7 +89,10 @@ def test_device_cleanup_cannot_accept_empty_or_invalid_device_populations(tmp_pa
 
 @pytest.mark.parametrize("timeout", [37, 1200])
 def test_server_initialization_and_stage_deadlines_use_the_explicit_profile_budget(timeout):
-    settings = {"deploy_config": "benchmarks/lingbot_world/configs/npu_usp4_eager.yaml", "startup_timeout_s": timeout}
+    settings = {
+        "deploy_config": "tests/e2e/accuracy/lingbot_world/configs/npu_usp4_offload.yaml",
+        "startup_timeout_s": timeout,
+    }
     arguments = server_arguments(settings)
     assert dict(zip(arguments[::2], arguments[1::2])) == {
         "--deploy-config": str(ROOT / settings["deploy_config"]),

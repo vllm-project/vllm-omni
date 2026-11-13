@@ -17,7 +17,7 @@
     "server_params": {
       "model": "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
       "serve_args": {
-        "deploy-config": "benchmarks/lingbot_world/configs/usp2_compiled.yaml",
+        "deploy-config": "tests/e2e/accuracy/lingbot_world/configs/usp2_compiled.yaml",
         "revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2"
       }
     },
@@ -47,7 +47,7 @@
         "metadata": [
           "recipe=boardwalk42_832x480_chunks40",
           "model_revision=59cccf49f2d2dd27418ae7a04b82b10868d455c2",
-          "deploy_config=benchmarks/lingbot_world/configs/usp2_compiled.yaml",
+          "deploy_config=tests/e2e/accuracy/lingbot_world/configs/usp2_compiled.yaml",
           "workload_image=https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
           "workload_seed=42",
           "workload_geometry=832x480",
@@ -88,7 +88,7 @@
     "server_params": {
       "model": "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
       "serve_args": {
-        "deploy-config": "benchmarks/lingbot_world/configs/npu_usp4_offload.yaml",
+        "deploy-config": "tests/e2e/accuracy/lingbot_world/configs/npu_usp4_offload.yaml",
         "revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2"
       }
     },
@@ -118,7 +118,7 @@
         "metadata": [
           "recipe=boardwalk42_832x480_chunks40",
           "model_revision=59cccf49f2d2dd27418ae7a04b82b10868d455c2",
-          "deploy_config=benchmarks/lingbot_world/configs/npu_usp4_offload.yaml",
+          "deploy_config=tests/e2e/accuracy/lingbot_world/configs/npu_usp4_offload.yaml",
           "workload_image=https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
           "workload_seed=42",
           "workload_geometry=832x480",

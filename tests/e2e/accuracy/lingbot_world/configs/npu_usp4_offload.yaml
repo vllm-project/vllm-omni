@@ -1,6 +1,6 @@
 # CI deployment for four 64GB Ascend A2 NPUs: full 480x832 and the default KV window.
 #
-# Same topology as npu_usp4_eager.yaml (Ulysses SP-4, eager). A2 exposes only
+# Ulysses SP-4, eager (no torch.compile or graphs on NPU). A2 exposes only
 # ~60.96 GiB, and the all-resident deployment OOMs in the first chunk's VAE
 # condition encode on the CI runner. Keep the DiT resident, release the text
 # encoder before denoising, and size the KV pool for one session (the manager
