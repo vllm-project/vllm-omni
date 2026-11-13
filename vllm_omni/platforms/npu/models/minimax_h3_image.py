@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Opt-in NPU VAE tile graphs and approximate batching for H3 image."""
+"""Default NPU VAE tile graphs and approximate batching for H3 image."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def apply_minimax_h3_image_graphs(model: nn.Module, od_config: OmniDiffusionConf
 
     if not isinstance(model, MiniMaxH3ImagePipeline):
         return
-    deterministic = (od_config.additional_config or {}).get("npu_deterministic", False)
+    deterministic = (od_config.additional_config or {}).get("npu_deterministic", True)
     if type(deterministic) is not bool:
         raise ValueError("npu_deterministic must be a bool")
     if deterministic:
@@ -40,7 +40,7 @@ def apply_minimax_h3_image_graphs(model: nn.Module, od_config: OmniDiffusionConf
                 torch.use_deterministic_algorithms(previous, warn_only=warn_only)
 
         model.forward = MethodType(deterministic_forward, model)
-    enabled = (od_config.additional_config or {}).get("npu_vae_tile_graph", False)
+    enabled = (od_config.additional_config or {}).get("npu_vae_tile_graph", True)
     if type(enabled) is not bool:
         raise ValueError("npu_vae_tile_graph must be a bool")
     disable_internal_format = (od_config.additional_config or {}).get("npu_disable_internal_format", False)
@@ -63,10 +63,12 @@ def apply_minimax_h3_image_graphs(model: nn.Module, od_config: OmniDiffusionConf
     vae = model.vae
     if getattr(vae, "_h3_npu_tile_graph_installed", False):
         return
-    encoder_precision = (od_config.additional_config or {}).get("npu_vae_encoder_precision", "fp32")
+    encoder_precision = (od_config.additional_config or {}).get("npu_vae_encoder_precision", "fp16")
     if encoder_precision not in {"fp32", "fp16", "bf16"}:
         raise ValueError("npu_vae_encoder_precision must be fp32, fp16, or bf16")
-    encoder_batch = (od_config.additional_config or {}).get("npu_vae_encoder_batch", 1)
+    encoder_batch = (od_config.additional_config or {}).get(
+        "npu_vae_encoder_batch", 1 if encoder_precision == "fp32" else 8
+    )
     if type(encoder_batch) is not int or encoder_batch not in (1, 2, 4, 8, 16):
         raise ValueError("npu_vae_encoder_batch must be 1, 2, 4, 8, or 16")
     if encoder_batch > 1 and encoder_precision == "fp32":
@@ -116,7 +118,8 @@ def apply_minimax_h3_image_graphs(model: nn.Module, od_config: OmniDiffusionConf
     stream_count = (od_config.additional_config or {}).get("npu_vae_tile_streams", 1)
     if type(stream_count) is not int or not 1 <= stream_count <= 8:
         raise ValueError("npu_vae_tile_streams must be an integer in [1, 8]")
-    batch_size = (od_config.additional_config or {}).get("npu_vae_tile_batch", 1)
+    # An explicit multi-stream choice replaces the default batched decoder.
+    batch_size = (od_config.additional_config or {}).get("npu_vae_tile_batch", 1 if stream_count > 1 else 32)
     if type(batch_size) is not int or batch_size not in (1, 2, 4, 8, 16, 32):
         raise ValueError("npu_vae_tile_batch must be 1, 2, 4, 8, 16, or 32")
     if batch_size > 1 and stream_count > 1:

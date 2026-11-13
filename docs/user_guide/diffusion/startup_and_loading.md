@@ -60,5 +60,7 @@ configurations.
 | **Wan-AI/Wan2.2-I2V-A14B-Diffusers** (64.5 GiB) | 283 s | 56 s | **5.1x** |
 
 For MiniMax-H3-Image on Ascend, see the
-[NPU serving and VAE graph options](minimax_h3_image_npu.md), including host-master
-AdaLN staging for memory-constrained resident sequence parallelism.
+[NPU serving and VAE graph options](minimax_h3_image_npu.md). VAE graphs with
+batch32 decoding and FP16 batch8 encoding default on; eligible unquantized image
+deployments also default to host-master AdaLN staging. The guide documents
+explicit opt-outs and memory/precision limits.

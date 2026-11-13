@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Opt-in routing and weight lifetime for H3 image decode graphs."""
+"""Default routing, opt-outs and weight lifetime for H3 image graphs."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -19,13 +20,24 @@ class _VAE(torch.nn.Module):
         super().__init__()
         self.post_quant_conv = torch.nn.Linear(2, 2)
         self.decoder = torch.nn.Linear(2, 2)
+        self.encoder = torch.nn.Linear(2, 2)
+        self.quant_conv = torch.nn.Linear(2, 2)
+        self.encode_batches = []
+        self.decode_batches = []
 
     def prepare_decoder_weights(self, dtype=torch.bfloat16):
         self.post_quant_conv.to(dtype)
         self.decoder.to(dtype)
 
     def _decode_tile(self, value):
+        if isinstance(value, torch.Tensor):
+            self.decode_batches.append(value.shape[0])
+            return value * 2
         return value.value * 2
+
+    def _encode_moments(self, value):
+        self.encode_batches.append(value.shape[0])
+        return value * 3
 
 
 def _model():
@@ -39,11 +51,13 @@ def _config(**additional):
     return OmniDiffusionConfig(additional_config=additional, enforce_eager=False, enable_cuda_graph_decode=True)
 
 
-def test_default_preserves_native_decoder():
+def test_explicit_graph_off_preserves_native_vae():
     model = _model()
     original = model.vae._decode_tile
-    adapter.apply_minimax_h3_image_graphs(model, _config())
+    original_encode = model.vae._encode_moments
+    adapter.apply_minimax_h3_image_graphs(model, _config(npu_vae_tile_graph=False))
     assert model.vae._decode_tile == original
+    assert model.vae._encode_moments == original_encode
 
 
 def test_graph_flag_requires_boolean():
@@ -51,18 +65,21 @@ def test_graph_flag_requires_boolean():
         adapter.apply_minimax_h3_image_graphs(_model(), _config(npu_vae_tile_graph="true"))
 
 
-def test_enforce_eager_disables_graphs():
+@pytest.mark.parametrize("option,value", [("enforce_eager", True), ("enable_cuda_graph_decode", False)])
+def test_eager_override_disables_default_graphs(option, value):
     model = _model()
-    config = _config(npu_vae_tile_graph=True)
-    config.enforce_eager = True
+    config = _config()
+    setattr(config, option, value)
     original = model.vae._decode_tile
+    original_encode = model.vae._encode_moments
     adapter.apply_minimax_h3_image_graphs(model, config)
     assert model.vae._decode_tile == original
+    assert model.vae._encode_moments == original_encode
 
 
 def test_non_image_model_is_untouched():
     model = torch.nn.Linear(2, 2)
-    adapter.apply_minimax_h3_image_graphs(model, _config(npu_vae_tile_graph=True))
+    adapter.apply_minimax_h3_image_graphs(model, _config())
     assert not hasattr(model, "vae")
 
 
@@ -117,7 +134,7 @@ def test_deterministic_execution_restores_caller_settings(initial, warn_only, fa
     model.forward = forward
     try:
         torch.use_deterministic_algorithms(initial, warn_only=warn_only)
-        adapter.apply_minimax_h3_image_graphs(model, _config(npu_deterministic=True))
+        adapter.apply_minimax_h3_image_graphs(model, _config(npu_vae_tile_graph=False))
         assert torch.are_deterministic_algorithms_enabled() == initial
         if fail:
             with pytest.raises(RuntimeError, match="request failure"):
@@ -143,7 +160,7 @@ def test_graph_off_control_can_match_internal_format(monkeypatch):
     monkeypatch.setattr(torch, "npu", SimpleNamespace(config=config), raising=False)
     model = _model()
     original = model.vae._decode_tile
-    adapter.apply_minimax_h3_image_graphs(model, _config(npu_disable_internal_format=True))
+    adapter.apply_minimax_h3_image_graphs(model, _config(npu_vae_tile_graph=False, npu_disable_internal_format=True))
     assert not config.allow_internal_format
     assert model.vae._decode_tile == original
 
@@ -159,7 +176,7 @@ def test_graph_off_control_can_match_jit_mode(mocker, monkeypatch):
     monkeypatch.setattr(torch, "npu", SimpleNamespace(set_compile_mode=set_compile_mode), raising=False)
     model = _model()
     original = model.vae._decode_tile
-    adapter.apply_minimax_h3_image_graphs(model, _config(npu_disable_jit_compile=True))
+    adapter.apply_minimax_h3_image_graphs(model, _config(npu_vae_tile_graph=False, npu_disable_jit_compile=True))
     set_compile_mode.assert_called_once_with(jit_compile=False)
     assert model.vae._decode_tile == original
 
@@ -167,3 +184,100 @@ def test_graph_off_control_can_match_jit_mode(mocker, monkeypatch):
 def test_graph_off_jit_control_requires_boolean():
     with pytest.raises(ValueError, match="npu_disable_jit_compile must be a bool"):
         adapter.apply_minimax_h3_image_graphs(_model(), _config(npu_disable_jit_compile="true"))
+
+
+class _NpuTensor(torch.Tensor):
+    """CPU storage with NPU routing, for testing packing without a device."""
+
+    @property
+    def device(self):
+        return SimpleNamespace(type="npu")
+
+
+@pytest.fixture
+def graph_runtime(monkeypatch, mocker):
+    class Runner:
+        @staticmethod
+        def is_supported():
+            return True
+
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, operation, inputs, constants, compute):
+            return compute(*inputs)
+
+    monkeypatch.setattr(adapter, "NPUExactGraphRunner", Runner)
+    npu = SimpleNamespace(set_compile_mode=mocker.Mock(), config=SimpleNamespace(allow_internal_format=True))
+    monkeypatch.setattr(torch, "npu", npu, raising=False)
+    autocast = mocker.patch.object(torch, "autocast", side_effect=lambda *args, **kwargs: nullcontext())
+    return npu, autocast
+
+
+def test_default_graphs_batch_decoder_and_fp16_encoder(graph_runtime):
+    npu, autocast = graph_runtime
+    model = _model()
+    adapter.apply_minimax_h3_image_graphs(model, _config())
+    tiles = [torch.full((1, 2, 2), float(i)).as_subclass(_NpuTensor) for i in range(35)]
+    decoded = model.vae._decode_tile.map(tiles)
+    encoded = model.vae._encode_moments.map(tiles[:11])
+    assert model.vae.decode_batches == [32, 3]
+    assert model.vae.encode_batches == [8, 3]
+    assert len(decoded) == 35 and len(encoded) == 11
+    assert all(torch.equal(result, tile * 2) for result, tile in zip(decoded, tiles))
+    assert all(torch.equal(result, tile * 3) for result, tile in zip(encoded, tiles))
+    assert autocast.call_count == 2
+    autocast.assert_called_with(device_type="npu", dtype=torch.float16, cache_enabled=False)
+    npu.set_compile_mode.assert_called_once_with(jit_compile=False)
+    assert not npu.config.allow_internal_format
+
+
+def test_explicit_streams_replace_default_decoder_batch(graph_runtime, monkeypatch):
+    counts = []
+
+    class Streams:
+        replicas = 1
+
+        def __init__(self, fn, *, autocast_dtype):
+            self.fn = fn
+
+        def map(self, tiles):
+            counts.append(self.replicas)
+            return [self.fn(tile) for tile in tiles]
+
+    monkeypatch.setattr(adapter, "_NPUTileGraphs", Streams)
+    model = _model()
+    original_encode = model.vae._encode_moments
+    adapter.apply_minimax_h3_image_graphs(model, _config(npu_vae_tile_streams=4, npu_vae_encoder_precision="fp32"))
+    tiles = [torch.ones(1, 2, 2).as_subclass(_NpuTensor) for _ in range(3)]
+    results = model.vae._decode_tile.map(tiles)
+    assert counts == [4]
+    assert model.vae.decode_batches == [1, 1, 1]
+    assert len(results) == 3 and all(torch.equal(result, tile * 2) for result, tile in zip(results, tiles))
+    assert model.vae._encode_moments == original_encode
+
+
+def test_explicit_single_tile_batches_disable_default_batching(graph_runtime):
+    model = _model()
+    adapter.apply_minimax_h3_image_graphs(model, _config(npu_vae_tile_batch=1, npu_vae_encoder_batch=1))
+    assert not hasattr(model.vae._decode_tile, "map")
+    assert not hasattr(model.vae._encode_moments, "map")
+
+
+@pytest.mark.parametrize(
+    "settings,match",
+    [
+        ({"npu_vae_tile_streams": 4, "npu_vae_tile_batch": 32}, "batching and multiple streams"),
+        ({"npu_vae_encoder_precision": "fp32", "npu_vae_encoder_batch": 8}, "requires reduced precision"),
+    ],
+)
+def test_explicit_incompatible_choices_are_rejected(graph_runtime, settings, match):
+    with pytest.raises(ValueError, match=match):
+        adapter.apply_minimax_h3_image_graphs(_model(), _config(**settings))
+
+
+def test_determinism_can_be_disabled():
+    model = _model()
+    original = model.forward
+    adapter.apply_minimax_h3_image_graphs(model, _config(npu_vae_tile_graph=False, npu_deterministic=False))
+    assert model.forward == original

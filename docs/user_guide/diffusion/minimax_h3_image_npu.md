@@ -1,24 +1,24 @@
 # MiniMax-H3-Image on Ascend
 
-MiniMax-H3-Image has opt-in Ascend VAE tile graphs and tile batching. These
-settings apply only to the image pipeline; they do not change other models.
+MiniMax-H3-Image enables Ascend VAE graphs, batch32 decoding, FP16 batch8
+encoding and scoped deterministic execution by default. Host-master AdaLN
+offload also defaults on for the unquantized image pipeline when the AdaLN
+cache is enabled and DiT offload/HSDP is not selected. These defaults apply
+only to the NPU image pipeline; other platforms and pipelines are unchanged.
 Keep the native six denoising steps, canvas, prompts and output transport when
 comparing latency. Graph capture and the first request are warmup costs.
 
 ## Four-device serving
 
 Select four exclusively allocated devices in your deployment environment and
-source the installed CANN environment before starting the server. For a
-memory-constrained resident Ulysses deployment, the existing host-master AdaLN
-stager can also run on NPU:
+source the installed CANN environment before starting the server. The defaults
+include the host-master AdaLN stager for resident Ulysses deployment:
 
 ```bash
-HCCL_DETERMINISTIC=true vllm serve "${MODEL_PATH:?Set the model directory}" \
+HCCL_DETERMINISTIC=true TASK_QUEUE_ENABLE=1 vllm serve "${MODEL_PATH:?Set the model directory}" \
   --omni --served-model-name MiniMaxAI/MiniMax-H3-Image \
   --num-gpus 4 --tensor-parallel-size 1 --usp 4 \
-  --text-encoder-tp-size 4 \
-  --cache-config '{"minimax_h3_adaln_offload":true}' \
-  --additional-config '{"text_encoder_cudnn_sdp":false,"npu_deterministic":true,"npu_vae_tile_graph":true,"npu_vae_tile_streams":4}'
+  --text-encoder-tp-size 4
 ```
 
 AdaLN offload preserves the existing projection-cache and staging ownership.
@@ -27,6 +27,10 @@ cross-step activation reuse. The deterministic option enables PyTorch's
 process-wide deterministic algorithms during each forward and restores the caller's
 previous enabled/warn-only settings on return or exception. Set `HCCL_DETERMINISTIC=true` separately
 before starting the worker processes.
+To keep AdaLN weights resident, pass
+`--cache-config '{"minimax_h3_adaln_offload":false}'`. Disabling AdaLN offload
+does not disable the projection cache. Explicitly enabling it with quantization,
+DiT offload or HSDP remains an error.
 
 ## VAE options
 
@@ -34,33 +38,43 @@ Pass these options through `--additional-config`:
 
 | Option | Default | Behavior |
 | --- | --- | --- |
-| `npu_deterministic` | `false` | Enable deterministic PyTorch algorithms during each forward; restore caller settings afterward. |
+| `npu_deterministic` | `true` | Enable deterministic PyTorch algorithms during each forward; restore caller settings afterward. |
 | `npu_disable_internal_format` | `false` | Disable NPU internal formats even with VAE graphs off, for matched integration controls. This is worker-wide. |
 | `npu_disable_jit_compile` | `false` | Disable NPU JIT compilation even with VAE graphs off, for matched integration controls. This is worker-wide. |
-| `npu_vae_tile_graph` | `false` | Replay VAE tile kernels using NPU graphs. |
+| `npu_vae_tile_graph` | `true` | Replay VAE tile kernels using NPU graphs. Set false for native VAE execution. |
 | `npu_vae_tile_streams` | `1` | Independent decoder graph streams, from 1 to 8. |
-| `npu_vae_tile_batch` | `1` | Decode tiles in batches of 1, 2, 4, 8, 16 or 32. |
-| `npu_vae_encoder_precision` | `fp32` | Optional encoder graph autocast: `fp16` or `bf16`. |
-| `npu_vae_encoder_batch` | `1` | Encode tiles in batches of 1, 2, 4, 8 or 16; batching requires reduced encoder precision. |
+| `npu_vae_tile_batch` | `32` (`1` with multiple streams) | Decode tiles in batches of 1, 2, 4, 8, 16 or 32. |
+| `npu_vae_encoder_precision` | `fp16` | Encoder graph autocast: `fp16` or `bf16`; `fp32` retains the native encoder. |
+| `npu_vae_encoder_batch` | `8` (`1` with FP32) | Encode tiles in batches of 1, 2, 4, 8 or 16; batching requires reduced encoder precision. |
 
 `--enforce-eager` or disabling graph decode disables these VAE graph paths.
 Decoder batching and multiple decoder streams cannot be enabled together.
+An explicit `npu_vae_tile_streams=4` selects single-tile multi-stream decoding
+unless a decoder batch is also specified. Explicitly requesting both a batch
+greater than one and multiple streams is an error. Likewise, selecting FP32
+defaults the encoder batch to one; explicitly requesting a larger FP32 batch
+is an error.
 Single-tile graph replay retains the eager kernels. Tile batching and reduced
-encoder precision are **approximate options**: validate final images for your
-workload, including editing references, before selecting them. Component parity
+encoder precision are **approximate and enabled by default**: outputs can differ
+from the previous native VAE defaults. Validate final images for your workload,
+including editing references. Component parity
 alone is insufficient to establish final-image quality.
 
-For example, a separately evaluated approximate configuration is:
+To use four decoder streams with the native FP32 encoder instead of batching:
 
 ```json
 {
-  "text_encoder_cudnn_sdp": false,
-  "npu_deterministic": true,
-  "npu_vae_tile_graph": true,
-  "npu_vae_tile_batch": 32,
-  "npu_vae_encoder_precision": "fp16",
-  "npu_vae_encoder_batch": 8
+  "npu_vae_tile_streams": 4,
+  "npu_vae_encoder_precision": "fp32"
 }
+```
+
+To restore the previous native VAE, resident AdaLN weights and caller-controlled
+PyTorch determinism, append:
+
+```bash
+--cache-config '{"minimax_h3_adaln_offload":false}' \
+--additional-config '{"npu_vae_tile_graph":false,"npu_deterministic":false}'
 ```
 
 Graphs retain static buffers and private stream workspaces. Larger batches use

@@ -73,14 +73,19 @@ tests in a fresh `uv` environment on every affected device platform.
 
 ## MiniMax H3 image NPU adapter
 
-The NPU model-patch hook owns opt-in image VAE graph replay, independent decoder
-streams, and approximate encoder/decoder tile batching. Other platforms and
+The NPU model-patch hook defaults the image pipeline to VAE graph replay,
+batch32 decoding and FP16 batch8 encoding. Independent decoder streams are an
+alternative: explicitly selecting multiple streams defaults decoding to one
+tile per graph; explicitly selecting FP32 defaults encoding to one tile and
+retains the native encoder. Graph disable/eager overrides retain native VAE
+execution, and explicit batching/stream or FP32/batching conflicts are rejected.
+Other platforms and
 pipelines retain their existing behavior. Graph buffers belong to the VAE
 instance, and weight relocation invalidates its captures. User configuration
 and precision limits are documented in the
 [Ascend image guide](../../user_guide/diffusion/minimax_h3_image_npu.md).
 
-H3 deterministic execution restores the caller's enabled and warn-only modes
+H3 deterministic execution defaults on and restores the caller's enabled and warn-only modes
 when forward returns or raises, so inline engine setup and teardown leave no
 persistent deterministic-mode change. VAE graphs disable NPU internal formats;
 `npu_disable_internal_format` exposes that worker setting independently for
@@ -88,3 +93,8 @@ matched graph-off controls. `npu_disable_jit_compile` independently matches the
 graph path's disabled JIT compilation mode. Both options default to false and
 apply to the worker, including the DiT. Graph replica outputs are copied on the producer
 stream before reuse, then joined to the consumer stream.
+
+AdaLN host staging defaults on only for the NPU H3 image pipeline when its
+projection cache is enabled, weights are unquantized and DiT offload/HSDP is
+absent. Explicit `minimax_h3_adaln_offload=false` keeps weights resident;
+existing CUDA SM120 defaults and other pipeline defaults are unchanged.
