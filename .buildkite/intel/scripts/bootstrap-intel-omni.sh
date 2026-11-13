@@ -1,6 +1,6 @@
 #!/bin/bash
 # vllm-omni Intel bootstrap
-# Uses static pipeline-intel.yml for Intel XPU tests
+# Keeps the existing pipeline-intel.yml path and offers an opt-in diff-aware Ready path.
 
 set -euo pipefail
 
@@ -13,4 +13,10 @@ upload_pipeline() {
 
 gate_bootstrap_ci intel l2
 
-upload_pipeline
+if [[ "${INTEL_XPU_READY:-0}" == "1" ]]; then
+    echo "--- 🧪 Preparing optional Intel XPU Ready bootstrap pipeline"
+    python3 .buildkite/common/scripts/upload_pipeline.py \
+    --upload .buildkite/intel/bootstrap-upload-steps.yml
+else
+    upload_pipeline
+fi

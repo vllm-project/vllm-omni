@@ -34,8 +34,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
 CUDA_READY_YAML = Path(".buildkite/cuda/test-ready.yml")
+INTEL_BOOTSTRAP_STEPS = Path(".buildkite/intel/bootstrap-upload-steps.yml")
 AMD_MERGE_YAML = Path(".buildkite/amd/test-amd-merge.yml")
 NIGHTLY_YAML = Path(".buildkite/cuda/test-nightly.yml")
+INTEL_READY_YAML = Path(".buildkite/intel/test-ready.yml")
 BOOTSTRAP_STEPS_TEMPLATE = """steps:
   - key: image-build
   - key: upload-ready-pipeline
@@ -110,6 +112,29 @@ def test_bootstrap_steps_loaded_from_file() -> None:
     assert "key: image-build" in steps
     assert "key: upload-ready-pipeline" in steps
     assert "placeholder:" not in steps
+
+
+def test_intel_bootstrap_reuses_image_for_opt_in_ready_upload() -> None:
+    steps = _load_bootstrap_steps(INTEL_BOOTSTRAP_STEPS)
+    decision = resolve_ci_decision(["vllm_omni/platforms/xpu/xpu_platform.py"])
+    rendered = _render_bootstrap_pipeline(
+        steps,
+        decision=decision,
+        path=INTEL_BOOTSTRAP_STEPS,
+    )
+    by_key = {step["key"]: step for step in yaml.safe_load(rendered)["steps"]}
+
+    assert by_key["intel-xpu-image-build"]["if"] == '(build.env("INTEL_XPU_READY") == "1")'
+    assert by_key["upload-intel-xpu-ready-pipeline"]["if"] == '(build.env("INTEL_XPU_READY") == "1")'
+    assert by_key["upload-intel-xpu-ready-pipeline"]["depends_on"] == "intel-xpu-image-build"
+
+    docs_only = resolve_ci_decision(["docs/intel-xpu-ready.md"])
+    skipped = _render_bootstrap_pipeline(
+        steps,
+        decision=docs_only,
+        path=INTEL_BOOTSTRAP_STEPS,
+    )
+    assert yaml.safe_load(skipped)["steps"] == []
 
 
 def test_docs_only_allows_main_scheduled_nightly_weekly_only() -> None:
@@ -749,6 +774,7 @@ def test_pipeline_source_file_dependency_keys_are_registered() -> None:
         | _pipeline_dep_keys(Path(".buildkite/cuda/test-merge.yml"))
         | _pipeline_dep_keys(Path(".buildkite/cuda/test-nightly.yml"))
         | _pipeline_dep_keys(Path(".buildkite/cuda/test-weekly.yml"))
+        | _pipeline_dep_keys(INTEL_READY_YAML)
         | _pipeline_dep_keys(Path(".buildkite/amd/test-amd-nightly.yml"))
         | _pipeline_dep_keys(Path(".buildkite/amd/test-amd-weekly.yml"))
         | _pipeline_dep_keys(Path(".buildkite/npu/test-npu-nightly.yml"))
@@ -782,6 +808,25 @@ def test_npu_platform_change_does_not_select_shared_minimax_h3_jobs() -> None:
         ]
     }
     assert not _surviving_labels(doc, ["vllm_omni/platforms/npu/platform.py"])
+
+
+def test_intel_xpu_ready_pipeline_filters_by_supported_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    doc = yaml.safe_load(INTEL_READY_YAML.read_text(encoding="utf-8"))
+
+    def selected_labels(changed_files: list[str]) -> set[str]:
+        rendered = _render_test_pipeline(
+            copy.deepcopy(doc),
+            changed_files=changed_files,
+            pipeline_path=INTEL_READY_YAML,
+        )
+        return {step["label"] for step in _iter_steps(rendered) if "label" in step}
+
+    assert selected_labels(["tests/diffusion/batching/test_diffusion_batching.py"]) == {
+        "Intel XPU: Core model",
+        "Intel XPU: Advanced model",
+    }
+    assert selected_labels(["vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py"]) == set()
 
 
 @pytest.mark.parametrize("pipeline", ["test-ready.yml", "test-merge.yml", "test-nightly.yml"])
