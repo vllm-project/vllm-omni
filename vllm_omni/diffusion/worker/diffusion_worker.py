@@ -479,6 +479,14 @@ class DiffusionWorker:
                     format_gib(self.requested_memory),
                 )
             init_workspace_manager(self.device)
+            if (
+                parallel_config.ulysses_a2a_permute
+                and parallel_config.ulysses_degree > 1
+                and parallel_config.ulysses_mode == "strict"
+            ):
+                from vllm_omni.diffusion.distributed.a2a_permute import ensure_a2a_permute_available
+
+                ensure_a2a_permute_available()
 
     def _create_profiler(self) -> WorkerProfiler | None:
         profiler_config = self.od_config.profiler_config
@@ -712,10 +720,11 @@ class DiffusionWorker:
             max_num_batched_tokens = None
             if getattr(self.od_config, "is_moe", False) is True:
                 assert self.vllm_config is not None
-                max_num_batched_tokens = resolve_diffusion_moe_lora_token_capacity(
-                    self.od_config,
-                    self.vllm_config,
-                )
+                if self.vllm_config.lora_config is not None:
+                    max_num_batched_tokens = resolve_diffusion_moe_lora_token_capacity(
+                        self.od_config,
+                        self.vllm_config,
+                    )
             self.lora_manager = DiffusionLoRAManager(
                 pipeline=pipeline,
                 device=self.device,

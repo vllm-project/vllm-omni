@@ -264,6 +264,42 @@ _CI_GENERATED_DIR = _REPO_ROOT / "tests" / ".ci_generated"
 # CI overlays as Python dicts (LSP-friendly). Materialized on demand to
 # tests/.ci_generated/<model>.yaml via get_deploy_config_path("ci/<name>.yaml").
 _CI_OVERLAYS: dict[str, dict[str, Any]] = {
+    "voxcpm2": {
+        "base_config": "voxcpm2.yaml",
+        # Run-level test modifiers inspect the raw overlay before resolving its
+        # base config. Keep a stage-id anchor so those modifiers can preserve
+        # the inherited stage while applying CI-only runner selection.
+        "stages": [{"stage_id": 0}],
+        "platforms": {
+            "rocm": {
+                "stages": [
+                    {
+                        "stage_id": 0,
+                        # Qualify vLLM's native ROCm attention path for transcript
+                        # quality without changing the production deploy profile.
+                        "attention_backend": "ROCM_ATTN",
+                        # MI325 qualification currently produces corrupted speech
+                        # when VoxCPM2's internal Inductor path and LocDiT rewrites
+                        # are active. Keep this correctness-first compatibility
+                        # profile CI-only while preserving production and CUDA
+                        # defaults. Re-enable each optimization independently after
+                        # it passes transcript-quality qualification on ROCm.
+                        "engine_extras": {
+                            "hf_overrides": {
+                                "voxcpm2_runtime_config": {
+                                    "enable_torch_compile": False,
+                                    "enable_loc_dit_fused_qkv": False,
+                                    "enable_loc_dit_fused_mlp": False,
+                                    "enable_loc_dit_zero_dt_cache": False,
+                                    "enable_loc_dit_skip_qkv_contig": False,
+                                },
+                            },
+                        },
+                    },
+                ],
+            },
+        },
+    },
     "qwen2_5_omni": {
         "base_config": "qwen2_5_omni.yaml",
         "async_chunk": False,
