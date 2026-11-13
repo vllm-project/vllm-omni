@@ -1,0 +1,55 @@
+# Optional, diff-aware Intel XPU Ready suites. Uploaded only when
+# INTEL_XPU_READY=1; the existing pipeline-intel.yml remains unchanged.
+
+env:
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 60
+  VLLM_VERSION: "v0.33.0"
+  VLLM_OMNI_IMAGE: "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:${BUILDKITE_COMMIT}-intel-xpu-ready"
+
+steps:
+  - group: "Intel XPU Ready tests"
+    depends_on: upload-intel-xpu-ready-pipeline
+    steps:
+      - label: "Intel XPU: Core model"
+        source_file_dependencies:
+          - intel_xpu_diffusion_function
+          - diffusion_distributed_attention
+          - intel_xpu_omni_tts_function
+          - diffusion_quantization
+          - intel_xpu_platform_function
+        timeout_in_minutes: 60
+        commands:
+          - bash .buildkite/intel/scripts/run-xpu-test.sh core_model
+        agents:
+          queue: intel-gpu-omni
+
+      - label: "Intel XPU: MXFP8 quantization"
+        source_file_dependencies: diffusion_quantization
+        timeout_in_minutes: 30
+        commands:
+          - bash .buildkite/intel/scripts/run-xpu-test.sh quantization
+        agents:
+          queue: intel-gpu-omni
+
+      - label: "Intel XPU: Advanced model"
+        source_file_dependencies:
+          - intel_xpu_diffusion_function
+          - diffusion_distributed_attention
+          - intel_xpu_omni_tts_function
+          - diffusion_quantization
+          - intel_xpu_platform_function
+        timeout_in_minutes: 60
+        commands:
+          - bash .buildkite/intel/scripts/run-xpu-test.sh advanced_model
+        agents:
+          queue: intel-gpu-omni
+
+      - label: "Intel XPU: Omni"
+        source_file_dependencies: intel_xpu_omni_tts_function
+        timeout_in_minutes: 60
+        commands:
+          - bash .buildkite/intel/scripts/run-xpu-test.sh omni
+        agents:
+          queue: intel-gpu-omni
