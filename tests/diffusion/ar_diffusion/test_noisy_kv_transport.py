@@ -10,7 +10,13 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
-from vllm_omni.experimental.ar_diffusion.cell_schedule import Cell, CellSchedule, Inflight, Ordering, build_cell_plan
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
+    Cell,
+    CellSchedule,
+    Inflight,
+    Ordering,
+    build_cell_plan,
+)
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
     NoisyKVCache,
@@ -153,8 +159,8 @@ def _sink_pipeline_worker(
     fixed_shape: bool = False,
     device_kind: str = "cpu",
 ) -> None:
-    from vllm_omni.experimental.ar_diffusion import cell_executor
-    from vllm_omni.experimental.ar_diffusion.cell_executor import (
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel import noisy_pp_executor as cell_executor
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
         ARDiffusionCellContext,
         CellAdapter,
         CellRunSpec,
@@ -317,8 +323,9 @@ def _sink_pipeline_worker(
         cell_executor._post_activations_ws = original_post
 
 
-# Ready-lane budget: Simple · Engine&Entrypoints&Diffusion is 20 minutes and
-# each Gloo spawn re-imports the stack (~30–60s wall). One scalar + one
+# Ready-lane budget: Simple Test is 15 minutes. The uploader adds shards only
+# when measured durations exceed that budget. Each Gloo spawn re-imports the
+# stack (~30–60s wall). One scalar + one
 # fixed-shape case here; the CUDA harness only varies chunks×history at
 # fixed S=2,G=2 fixed-shape (no scalar NCCL twin).
 @pytest.mark.parametrize("steps,groups,chunks", [(2, 1, 6)])

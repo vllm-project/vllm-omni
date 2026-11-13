@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS: str | None = None
     VLLM_OMNI_NPU_INT8_WEIGHT_NZ: bool = False
     VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE: str = "reactor"
+    VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Runtime Env Vars ==================
@@ -42,6 +43,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Select the DLO upload path; validated by get_weight_nz_mode().
     "VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE": lambda: os.environ.get("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", "reactor"),
+    # On ROCm, run the shared diffusion RMSNorm and SiluAndMul in PyTorch instead
+    # of vLLM's precompiled kernels. Opt-in for runtimes whose vLLM build lacks
+    # kernels for the GPU arch (hipErrorInvalidImage); off by default.
+    "VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS": lambda: os.environ.get("VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS", "0").lower()
+    in ("1", "true"),
 }
 
 

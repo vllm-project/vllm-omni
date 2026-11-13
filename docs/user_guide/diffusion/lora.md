@@ -9,6 +9,18 @@ LoRA adapters are lightweight, model-specific fine-tuning weights that can be ap
 - **PEFT backend** (`--lora-backend peft`, default): Loads a PEFT-format adapter folder via `DiffusionLoRAManager`. Adapters are cached (LRU) and activated per request via `LoRARequest`. It uses a unified LoRA handling mechanisms similar to vLLM with LRU cache management.
 - **Distill backend** (`--lora-backend distill`): Calls `pipeline.load_lora_weights` once at initialization to fuse one or more concrete checkpoint files directly into the base weights. Typically used for distilled few-step LoRAs (e.g. Lightning, LightX2V).
 
+### Global merged policy
+
+`--lora-application merged` with `--lora-backend peft` merges a single startup
+`--lora-path` into unquantized dense weights. Requests use the merged policy
+without attaching a `LoRARequest`; per-request adapter selection is rejected.
+Removing the adapter restores the exact base weights. Runtime application is
+the default. Fixed-model adapters, MoE, HSDP and inference weight offloading are
+not supported by this generic path.
+
+For adapter-only RL updates and memory/validation requirements, see
+[engine-side LoRA merge](../weight_transfer.md#engine-side-lora-merge).
+
 ## LoRA Adapter Format
 
 ### PEFT (Parameter-Efficient Fine-Tuning) format (default)
@@ -82,6 +94,7 @@ Load a PEFT-format LoRA adapter at initialization. The adapter is pre-loaded int
 
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 
 lora_path = "/path/to/lora_adapter"
@@ -99,9 +112,11 @@ lora_request = LoRARequest(
 )
 
 outputs = omni.generate(
-    prompt="A piece of cheesecake",
-    lora_request=lora_request,
-    lora_scale=2.0, # optional arg, default 1.0
+    "A piece of cheesecake",
+    OmniDiffusionSamplingParams(
+        lora_request=lora_request,
+        lora_scale=2.0,  # optional arg, default 1.0
+    ),
 )
 ```
 
@@ -132,7 +147,7 @@ omni = Omni(
     lora_backend="distill",
 )
 
-outputs = omni.generate(prompt="A piece of cheesecake")
+outputs = omni.generate("A piece of cheesecake")
 ```
 
 Multi-file example (Wan2.2 MoE, high + low noise):
