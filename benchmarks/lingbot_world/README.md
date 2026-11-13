@@ -157,15 +157,13 @@ Twelve FPS remains a playback/SLO basis, not an absolute gate.
 
 The [accuracy tests](../../tests/e2e/accuracy/lingbot_world/README.md) keep
 numerical precision, WBench and VBench as separate tests. One candidate server
-lifetime captures the
-fixed VAE inputs and one video per case, then the packaged `vllm bench serve
---omni` evaluation path records measurements after that server exits. Each test
-prints its measured values and saves its own accuracy JSON alongside the raw
-tensors, videos and evaluator outputs. On CUDA, WBench and VBench scores must
-stay above floors from a recorded CI run; numerical precision has no stored
-reference yet. NPU uses explicit **record-only** mode until its own values are
-reviewed; there, successful recording does not establish an accuracy
-regression pass.
+lifetime captures the fixed VAE inputs and one video per case, then the
+packaged `vllm bench serve --omni` evaluation path measures them after that
+server exits. Each test prints its measured values and saves its own accuracy
+JSON alongside the raw tensors, videos and evaluator outputs. On CUDA and NPU,
+WBench and VBench scores must stay above per-platform floors from recorded CI
+runs. Numerical precision has no stored reference tensors, so it checks only a
+complete, finite replay; tensor error, PSNR and SSIM are not computed.
 
 CUDA uses two H100 GPUs; NPU capture uses the existing four-device A2
 configuration before CUDA-based quality evaluation. Each accuracy job has a

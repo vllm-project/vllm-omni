@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Record candidate numerical and native semantic measurements for future baselines.
+"""Measure candidate numerical and native semantic accuracy from saved outputs.
 
-This temporary recording mode validates the capture and scorer output. It does
-not compare model accuracy or claim that an unrecorded baseline has passed.
+This path validates the capture and reports scorer output. Score floors are
+applied by the caller (``tests/e2e/accuracy/lingbot_world``). Numerical
+precision has no stored reference, so tensor error, PSNR and SSIM are not
+computed here.
 """
 
 from __future__ import annotations
@@ -186,8 +188,7 @@ def _record_numerical(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     return {
         "replay": describe_tensor_sample(path),
         "artifact_sha256": sha256(path),
-        "comparison": "pending_baseline",
-        "scope": "Finite fixed-input replay measurements; tensor error, PSNR and SSIM require a recorded reference.",
+        "scope": "Finite fixed-input replay measurements; tensor error, PSNR and SSIM need a stored reference.",
         "packages": {name: importlib.metadata.version(name) for name in ("numpy",)},
     }
 
@@ -308,20 +309,18 @@ def evaluate_saved(
     evaluator_python: Path | None = None,
     evaluator_requirements: Path | None = None,
 ) -> dict[str, Any]:
-    """Record one independent suite, retaining failures and never inventing a baseline."""
+    """Measure one independent suite, retaining failures; comparison is the caller's job."""
     if suite not in SUITES:
         raise RegressionError(f"Unknown accuracy suite: {suite}")
     report: dict[str, Any] = {
         "schema_version": 1,
         "status": "failed",
         "suite": suite,
-        "record_only": True,
-        "comparison_status": "pending_baseline",
         "passed": False,
         "measurements": {},
         "errors": [],
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "scope": "Recording validity only; accuracy regression comparison is pending a follow-up baseline PR.",
+        "scope": "Measurement validity only; score floors are applied by the accuracy test.",
     }
     try:
         manifest = load_candidate(candidate_path)
@@ -337,7 +336,7 @@ def evaluate_saved(
             report["measurements"] = _record_numerical(root, manifest)
         else:
             if evaluator_root is None or evaluator_python is None or evaluator_requirements is None:
-                raise RegressionError("Semantic recording requires evaluator root, Python and requirements lock")
+                raise RegressionError("Semantic evaluation requires evaluator root, Python and requirements lock")
             report["measurements"] = _record_semantic(
                 root,
                 manifest,
@@ -347,23 +346,21 @@ def evaluate_saved(
                 evaluator_python=evaluator_python,
                 evaluator_requirements=evaluator_requirements,
             )
-        report.update(status="recorded", passed=True)
+        report.update(status="measured", passed=True)
     except Exception as error:
         # A scorer/capture failure fails this test while preserving independent
         # suite results and a JSON diagnostic for CI artifacts and console logs.
         report["errors"].append(f"{type(error).__name__}: {error}")
     write_json(output_dir / f"{suite}.json", report)
-    print(f"Realtime video accuracy record-only ({suite}); baseline comparison pending:")
+    print(f"Realtime video accuracy measurements ({suite}):")
     print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
     return report
 
 
 def evaluate_from_args(args: argparse.Namespace) -> dict[str, Any]:
-    """Use the real serving frontend's result path for explicit offline recording."""
+    """Use the real serving frontend's result path for offline evaluation."""
     from vllm.benchmarks.serve import compute_result_filename
 
-    if not args.realtime_video_record_only:
-        raise RegressionError("Accuracy baseline comparison is pending; select --realtime-video-record-only")
     report = evaluate_saved(
         args.realtime_video_candidate,
         suite=args.realtime_video_evaluate,

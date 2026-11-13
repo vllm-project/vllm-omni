@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Candidate capture lifecycle and independent shared benchmark recording."""
+"""Candidate capture lifecycle, independent shared scoring and profile score floors."""
 
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -23,7 +23,6 @@ def measurements(tmp_path, monkeypatch):
     profile = runner.ROOT / "tests/e2e/accuracy/lingbot_world/configs/cuda.json"
     root = tmp_path / "raw"
     settings = runner.load_settings(profile, tmp_path / "judgments", generation=root)
-    settings["record_only"] = True
     monkeypatch.setattr(runner, "git_revision", lambda _: "c" * 40)
     arm = root / "candidate"
     save_tensor_sample(arm / "precision.npz", inputs={"latent": np.ones(2)}, outputs={"decoded": np.ones(2)})
@@ -48,7 +47,8 @@ def measurements(tmp_path, monkeypatch):
     return settings, (root, manifest)
 
 
-def stub_semantic_boundary(monkeypatch, tmp_path):
+def stub_semantic_boundary(monkeypatch, tmp_path, scores=None):
+    """Score every floored dimension 0.01 above its floor unless ``scores`` overrides it."""
     from tests.e2e.accuracy import helpers
 
     monkeypatch.setenv("LINGBOT_EVALUATOR_ROOT", str(tmp_path / "evaluator"))
@@ -56,9 +56,23 @@ def stub_semantic_boundary(monkeypatch, tmp_path):
     monkeypatch.setattr(helpers, "_accuracy_hardware_label", lambda: "H100")
 
     def scorer(root, manifest, *, suite, **kwargs):
-        if suite == "wbench":
+        if suite == "wbench" and scores is None:
             raise RegressionError("native WBench failed")
-        return {"scores": {case["id"]: {"dynamic_degree": 1.0} for case in manifest["contract"]["profile"]["cases"]}}
+        profile = manifest["contract"]["profile"]
+        values = scores or {name: floor + 0.01 for name, floor in profile["score_floors"][suite].items()}
+        return {
+            "scores": {
+                case["id"]: {
+                    "dynamic_degree": 1.0,
+                    **{
+                        name.removeprefix(f"{case['id']}_"): value
+                        for name, value in values.items()
+                        if name.startswith(f"{case['id']}_")
+                    },
+                }
+                for case in profile["cases"]
+            }
+        }
 
     monkeypatch.setattr(evaluation, "_record_semantic", scorer)
 
@@ -69,49 +83,32 @@ def test_three_scorers_use_shared_frontend_and_keep_independent_verdicts(measure
     reports = {suite: checks.run_accuracy(settings, data, suite) for suite in ("wbench", "vbench", "precision")}
     assert not reports["wbench"]["passed"]
     assert reports["vbench"]["passed"] and reports["precision"]["passed"]
-    assert all(row["comparison_status"] == "pending_baseline" for row in reports.values())
+    assert reports["precision"]["comparison_status"] == "finite_only"
+    assert reports["vbench"]["comparison_status"] == reports["wbench"]["comparison_status"] == "score_floor"
     assert reports["precision"]["measurements"]["replay"]["tensors"]["output/decoded"]["mean"] == 1.0
-    assert "baseline comparison pending" in capsys.readouterr().out
+    assert "no stored reference tensors" in capsys.readouterr().out
     files = list((settings["output"] / "results").glob("result_acc_*.json"))
     assert len(files) == 3
     records = [read_json(path) for path in files]
-    assert all(
-        row["accuracy_mode"] == "record_only" and row["comparison_status"] == "pending_baseline" for row in records
-    )
-    assert all(row["baseline"] == {} for row in records)
-    assert any(row["recording_status"] == "failed" for row in records)
+    assert not any("record_only" in str(row) or "pending_baseline" in str(row) for row in records)
+    assert any(row["measurement_status"] == "failed" for row in records)
     numerical = next(row for row in records if row["dataset"] == "lingbot_world_precision")
     semantic = next(row for row in records if row["dataset"] == "lingbot_world_vbench")
     assert numerical["output_decoded_mean"] == 1.0 and numerical["output_decoded_std"] == 0.0
     assert semantic["boardwalk-42_dynamic_degree"] == 1.0
-    assert numerical["recording_report"]["measurements"]["replay"]["tensors"]["output/decoded"]["shape"] == [2]
+    assert numerical["measurement_report"]["measurements"]["replay"]["tensors"]["output/decoded"]["shape"] == [2]
     assert all("passed" not in row and "status" not in row and "measurements" not in row for row in records)
 
 
 def test_cuda_score_floors_gate_semantic_suites_only(measurements, monkeypatch, tmp_path, capsys):
     settings, data = measurements
-    settings["record_only"] = False
     floors = settings["score_floors"]["vbench"]
     assert floors and not any(name.endswith("dynamic_degree") for name in floors)
-    stub_semantic_boundary(monkeypatch, tmp_path)
     scores = {name: floor + 0.01 for name, floor in floors.items()}
     scores["street-42_imaging_quality"] = floors["street-42_imaging_quality"] - 0.001
-    monkeypatch.setattr(
-        evaluation,
-        "_record_semantic",
-        lambda root, manifest, *, suite, **kwargs: {
-            "scores": {
-                case["id"]: {
-                    name.removeprefix(f"{case['id']}_"): value
-                    for name, value in scores.items()
-                    if name.startswith(f"{case['id']}_")
-                }
-                for case in manifest["contract"]["profile"]["cases"]
-            }
-        },
-    )
+    stub_semantic_boundary(monkeypatch, tmp_path, scores)
     failed = checks.run_accuracy(settings, data, "vbench")
-    assert not failed["passed"] and failed["comparison_status"] == "compared"
+    assert not failed["passed"] and failed["comparison_status"] == "score_floor"
     assert failed["floor_violations"] == [
         f"street-42_imaging_quality: {scores['street-42_imaging_quality']!r} < {floors['street-42_imaging_quality']}"
     ]
@@ -119,12 +116,12 @@ def test_cuda_score_floors_gate_semantic_suites_only(measurements, monkeypatch, 
     scores["street-42_imaging_quality"] = floors["street-42_imaging_quality"]
     assert checks.run_accuracy(settings, data, "vbench")["passed"]
     precision = checks.run_accuracy(settings, data, "precision")
-    assert precision["passed"] and precision["comparison_status"] == "pending_baseline"
+    assert precision["passed"] and precision["comparison_status"] == "finite_only"
     records = {
         row["dataset"]: row for row in map(read_json, (settings["output"] / "results").glob("result_acc_*.json"))
     }
     assert records["lingbot_world_vbench"]["baseline"] == {"H100": floors}
-    assert records["lingbot_world_vbench"]["accuracy_mode"] == "score_floor"
+    assert records["lingbot_world_vbench"]["comparison_status"] == "score_floor"
     assert records["lingbot_world_precision"]["baseline"] == {}
     assert "score floors failed" in capsys.readouterr().out
 

@@ -41,5 +41,45 @@
   "dies": 4,
   "deploy_config": "benchmarks/lingbot_world/configs/npu_usp4_offload.yaml",
   "warmup_num_chunks": 8,
-  "hardware": "A2"
+  "hardware": "A2",
+  "score_floors": {
+    "source": "vllm-omni-npu-ci Buildkite build 11412 at 49a7059849dd235e26ce43221bf33c06ea2f7ba7 (A2 generation, H100 scoring): each recorded score minus 0.05, rounded down to 4 decimals. The largest per-dimension difference against CUDA build 19532 was 0.0499. Binary dynamic_degree is recorded only.",
+    "wbench": {
+      "boardwalk-42_aesthetic_quality": 0.6413,
+      "boardwalk-42_hpsv3_quality": 0.8685,
+      "boardwalk-42_imaging_quality": 0.6635,
+      "boardwalk-42_motion_smoothness": 0.9273,
+      "boardwalk-42_temporal_flickering": 0.8939,
+      "blossom-42_aesthetic_quality": 0.7359,
+      "blossom-42_hpsv3_quality": 0.7847,
+      "blossom-42_imaging_quality": 0.6354,
+      "blossom-42_motion_smoothness": 0.9163,
+      "blossom-42_temporal_flickering": 0.8635,
+      "street-42_aesthetic_quality": 0.4545,
+      "street-42_hpsv3_quality": 0.8906,
+      "street-42_imaging_quality": 0.6723,
+      "street-42_motion_smoothness": 0.8972,
+      "street-42_temporal_flickering": 0.8638
+    },
+    "vbench": {
+      "boardwalk-42_aesthetic_quality": 0.6392,
+      "boardwalk-42_background_consistency": 0.9182,
+      "boardwalk-42_imaging_quality": 0.7394,
+      "boardwalk-42_motion_smoothness": 0.932,
+      "boardwalk-42_subject_consistency": 0.9039,
+      "boardwalk-42_temporal_flickering": 0.9116,
+      "blossom-42_aesthetic_quality": 0.7653,
+      "blossom-42_background_consistency": 0.8797,
+      "blossom-42_imaging_quality": 0.7109,
+      "blossom-42_motion_smoothness": 0.9259,
+      "blossom-42_subject_consistency": 0.8907,
+      "blossom-42_temporal_flickering": 0.8955,
+      "street-42_aesthetic_quality": 0.4453,
+      "street-42_background_consistency": 0.8468,
+      "street-42_imaging_quality": 0.7462,
+      "street-42_motion_smoothness": 0.9149,
+      "street-42_subject_consistency": 0.8609,
+      "street-42_temporal_flickering": 0.8901
+    }
+  }
 }

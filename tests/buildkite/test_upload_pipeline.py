@@ -1284,13 +1284,10 @@ def test_lingbot_nightly_uses_independent_perf_and_accuracy_frameworks(monkeypat
     assert perf["artifact_paths"] == ["tests/dfx/perf/results/*.json"]
     assert _gpu_limit(accuracy) == 2
     assert accuracy["agents"]["queue"] == "mithril-h100-pool"
-    # NPU accuracy records until its own scores are reviewed; both perf jobs have baselines.
-    record_only = platform == "npu"
-    assert "Recording" not in perf["label"] and "Baseline Pending" not in perf["label"]
-    assert ("Recording" in accuracy["label"] and "Baseline Pending" in accuracy["label"]) is record_only
-    assert ("Recording" in accuracy["label"] or "Baseline Pending" in accuracy["label"]) is record_only
+    for job in jobs.values():
+        assert "Recording" not in job["label"] and "Baseline Pending" not in job["label"]
+        assert "record-only" not in " ".join(job.get("commands", []))
     assert accuracy["timeout_in_minutes"] == 120
-    assert ("--lingbot-record-only" in " ".join(accuracy["commands"])) is record_only
     for name in ("precision", "wbench", "vbench"):
         assert f"tests/e2e/accuracy/lingbot_world/test_{name}.py" in " ".join(accuracy["commands"])
     retry = _load_mirror_hardwares()["h100_2"]["retry"]
@@ -1311,7 +1308,6 @@ def test_lingbot_nightly_uses_independent_perf_and_accuracy_frameworks(monkeypat
         capture = jobs["lingbot-npu-nightly-accuracy-data"]
         assert capture["agents"] == perf["agents"]
         assert "prepare capture" in " ".join(capture["commands"])
-        assert "--record-only" in " ".join(capture["commands"])
         assert accuracy["depends_on"] == [
             {"step": "lingbot-npu-nightly-accuracy-data", "allow_failure": True},
             "lingbot-npu-accuracy-ci-image",
@@ -1356,7 +1352,6 @@ def test_lingbot_recording_commands_preserve_independent_checks_and_failure_stat
     calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
     pytest_args = calls[-1]["args"]
     assert calls[-1]["tool"] == "pytest"
-    assert ("--lingbot-record-only" in pytest_args) is (platform == "npu")
     for name in ("precision", "wbench", "vbench"):
         assert f"tests/e2e/accuracy/lingbot_world/test_{name}.py" in pytest_args
     assert not any("baseline" in arg or "reference" in arg for arg in pytest_args)

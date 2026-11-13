@@ -362,15 +362,14 @@ def main():
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--root", type=Path, help="Evaluator cache")
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--record-only", action="store_true", help="Record real inputs; baseline comparison is pending")
     args = parser.parse_args()
     if args.stage == "evaluators":
         if args.root is None:
             parser.error("--root is required for evaluators")
         print(prepare_evaluators(args.root.resolve()))
         return
-    if args.profile is None or args.output is None or not args.record_only:
-        parser.error("capture requires --profile, --output and explicit --record-only (baseline comparison pending)")
+    if args.profile is None or args.output is None:
+        parser.error("capture requires --profile and --output")
     from tests.e2e.accuracy.lingbot_world.runner import load_settings
 
     report = prepare_capture(load_settings(args.profile, args.output))
