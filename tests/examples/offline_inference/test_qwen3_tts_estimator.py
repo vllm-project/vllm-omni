@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Offline inference regression tests: Qwen3-TTS _estimate_prompt_len.
 
