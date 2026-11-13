@@ -452,6 +452,58 @@ def test_grouped_denoise_allows_flash_attn_when_paged():
     pipeline._ensure_grouped_attention_backend_supported(2)
 
 
+def test_paged_step_merge_slices_each_cfg_row_at_its_own_cache_hit():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+    states = [_state("cold", 0), _state("warm", 0)]
+    for state, cached in zip(states, [0, 2], strict=True):
+        state.extra[_STEP_CFG_FACTOR] = 2
+        state.extra[_STEP_INPUT_IDS] = torch.arange(14).reshape(2, 7)
+        state.extra[_STEP_MODEL_KWARGS].update(
+            attention_mask=torch.ones(2, 1, 7, 7, dtype=torch.bool),
+            full_attn_spans=[[(4, 7)], [(4, 7)]],
+            num_image_tokens=3,
+            hunyuan_paged_prefix_cut=cached,
+        )
+    indexes, branches = pipeline._step_row_order(states, 2)
+    input_ids, merged = pipeline._merge_step_model_inputs(states, indexes, branches, first_step=True)
+    assert merged["hunyuan_paged_prefix_cut"] == (0, 2, 0, 2)
+    embeds = input_ids.unsqueeze(-1).float()
+    positions = input_ids.clone()
+    sliced = pipeline._slice_cached_prefix_inputs(
+        embeds,
+        merged["attention_mask"],
+        positions,
+        (embeds.clone(), embeds.clone()),
+        torch.ones_like(input_ids, dtype=torch.bool),
+        torch.full((4, 1), 4, dtype=torch.long),
+        merged["query_lens"],
+        merged["seq_lens"],
+        merged["hunyuan_paged_prefix_cut"],
+    )
+    assert sliced[6] == [7, 5, 7, 5]
+    assert torch.equal(sliced[0][1, :5], embeds[1, 2:])
+    assert torch.equal(sliced[0][3, :5], embeds[3, 2:])
+    assert merged["seq_lens"] == [7, 7, 7, 7]
+    pipeline._capture_paged_prefix_lens(states)
+    for state in states:
+        state.step_index = 1
+    _, later = pipeline._merge_step_model_inputs(states, indexes, branches, first_step=False)
+    assert later["hunyuan_paged_prefix_cut"] is None
+
+
+def test_paged_step_grouping_uses_post_hit_segment_structure():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+    state = _state("warm", 0)
+    state.extra[_STEP_MODEL_KWARGS].update(
+        attention_mask=torch.ones(1, 1, 7, 7, dtype=torch.bool),
+        full_attn_spans=[[(1, 3), (4, 7)]],
+        hunyuan_paged_prefix_cut=4,
+    )
+    assert pipeline._step_segment_structure(state) == ("full",)
+
+
 def test_scheduler_paged_allows_step_request_validation():
     pipeline = _pipeline()
     pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER

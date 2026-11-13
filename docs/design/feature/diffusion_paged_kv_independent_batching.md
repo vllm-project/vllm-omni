@@ -143,6 +143,16 @@ lengths that still leave one image-tail full-attn segment may stay together.
 One mismatched row is split into another group. It must not fail the rest of
 the batch.
 
+Local prefix hits in step execution are carried from admission metadata to each
+request state separately from native AR-KV computed tokens. The first forward
+slices each CFG row at its own cached boundary; later image-only steps do not
+apply that cut again. Group signatures use the planner's segment construction.
+
+The initial step implementation still groups first-step requests by their full
+query width. Different prompt lengths can therefore prefill in separate groups
+and join compatible image-only groups on later steps. Request-level packing
+supports heterogeneous prompt lengths within a compatible group.
+
 ## Image-to-Image Spans
 
 Do not treat "reference spans at different prefix offsets" as a planner

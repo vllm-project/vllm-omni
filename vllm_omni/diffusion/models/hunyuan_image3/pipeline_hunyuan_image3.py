@@ -21,6 +21,7 @@ from vllm.config.vllm import get_current_vllm_config
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.transformers_utils.config import get_config
 
+from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import build_segments
 from vllm_omni.diffusion.attention.schedule import require_request_attention_schedule_fits
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -200,22 +201,7 @@ def _piecewise_segment_modes(
     query_len: int,
 ) -> tuple[str, ...]:
     """Return the causal/full mode sequence used to isolate incompatible paged groups."""
-    q_start = query_offset
-    q_end = query_offset + query_len
-    modes: list[str] = []
-    cur = q_start
-    for span_start, span_end in spans:
-        overlap_start = max(span_start, q_start)
-        overlap_end = min(span_end, q_end)
-        if overlap_start >= overlap_end:
-            continue
-        if cur < overlap_start:
-            modes.append("causal")
-        modes.append("full")
-        cur = overlap_end
-    if cur < q_end:
-        modes.append("causal")
-    return tuple(modes)
+    return tuple(segment.mode for segment in build_segments(spans, query_offset, query_len))
 
 
 def _shift_full_attn_spans(
@@ -838,8 +824,8 @@ class HunyuanImage3Pipeline(
         spans = kwargs.get("full_attn_spans") or []
         row_spans = spans[0] if spans else []
         if state.step_index == 0:
-            query_offset = 0
-            query_len = self._row_step_query_len(kwargs, 0, None)
+            query_offset = int(kwargs.get("hunyuan_paged_prefix_cut", 0))
+            query_len = self._row_step_query_len(kwargs, 0, None) - query_offset
         else:
             prompt_kv = state.extra.get(_STEP_PROMPT_KV)
             query_offset = int(prompt_kv[0]["lens"][0].item()) if prompt_kv is not None else 0
@@ -871,6 +857,11 @@ class HunyuanImage3Pipeline(
             }:
                 continue
             values = [kwargs.get(key) for kwargs in per_row_kwargs]
+            if key == "hunyuan_paged_prefix_cut":
+                # Slice only the first-step forward; keep state lengths in
+                # full KV coordinates for subsequent image-only steps.
+                merged[key] = tuple(int(value or 0) for value in values) if first_step else None
+                continue
             if key == "full_attn_spans" and values[0] is not None:
                 if self._uses_scheduler_paged_kv():
                     merged[key] = [list(value[branch]) for value, branch in zip(values, row_branches, strict=True)]
@@ -2340,6 +2331,12 @@ class HunyuanImage3Pipeline(
             device=self.device,
         )
         model_kwargs["ar_kv_reuse_len"] = ar_kv_reuse_len
+
+        if self._uses_scheduler_paged_kv() and getattr(self.od_config, "kv_transfer_config", None) is None:
+            computed = tuple(state.extra.get("paged_kv_cached_prefix_lens", ()))
+            if computed and len(set(computed)) != 1:
+                raise ValueError("Hunyuan paged step execution requires uniform cached prefixes across CFG rows")
+            model_kwargs["hunyuan_paged_prefix_cut"] = int(computed[0]) if computed else 0
 
         state.latents = latents
         state.timesteps = timesteps
