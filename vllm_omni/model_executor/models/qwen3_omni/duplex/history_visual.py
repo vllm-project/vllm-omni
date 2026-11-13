@@ -79,7 +79,14 @@ class QwenVisualHistory:
             for part_index, part in enumerate(message["content"])
             if isinstance(part, dict) and part.get("type") == "image_url"
         )
-        if inputs[: len(self.inputs)] != self.inputs or any(not ledger.valid(node) for node in self.nodes.values()):
+        # A reply placeholder is invisible until generation/playback materializes
+        # it. That can move unchanged camera sources to later history positions.
+        # Published memory depends on source identity/revision, not list offsets.
+        sources_changed = len(inputs) < len(self.inputs) or any(
+            old.source != new.source or old.part_index != new.part_index or old.url != new.url
+            for old, new in zip(self.inputs, inputs)
+        )
+        if sources_changed or any(not ledger.valid(node) for node in self.nodes.values()):
             ledger.remove(*self.nodes.values())
             self.nodes.clear()
             self.omitted.clear()

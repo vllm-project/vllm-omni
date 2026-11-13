@@ -120,6 +120,13 @@ metadata; its published text is also read from ledger nodes. Original Session
 records and source dependencies remain retained, so the bounded prompt and media
 limits do not bound total Session storage.
 
+An assistant reply reserves a history position before becoming visible. When
+generation or playback materializes that reply, unchanged camera sources can
+move to later list positions. Their published visual summaries remain valid
+while source IDs, revisions, image parts and URLs are unchanged. Pending
+compression work still validates its original message labels and is retried
+when those positions move.
+
 Unanswered user items and intervening system messages form one protected turn.
 Foreground fitting preserves that complete turn, including original media, or
 returns an explicit capacity error. Background dialogue and visual compression
