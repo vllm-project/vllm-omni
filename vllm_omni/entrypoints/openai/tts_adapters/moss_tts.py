@@ -30,6 +30,8 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
 from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realtime_prompt
 
 if TYPE_CHECKING:
+    import torch
+
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
 logger = init_logger(__name__)
@@ -306,7 +308,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         devices = getattr(anchor, "devices", None)
         return str(devices) if devices is not None and str(devices).strip() else None
 
-    def _resolve_ref_encoder_device(self):
+    def _resolve_ref_encoder_device(self) -> "torch.device":
         """Pick the device of the API-process reference-audio encoder.
 
         The encoder follows the code2wav stage onto its first accelerator: the stage
@@ -342,14 +344,16 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             return torch.device("cpu")
         return platform.get_torch_device(index)
 
-    def _resolve_realtime_ref_encoder_device(self):
+    def _resolve_realtime_ref_encoder_device(self) -> "torch.device":
         """Resolve the Realtime codec device, allowing only the CI CPU fallback."""
         override = os.getenv(_MOSS_REALTIME_REF_ENCODER_DEVICE_ENV, "").strip().lower()
         if not override:
             return self._resolve_ref_encoder_device()
         if override != "cpu":
             raise ValueError(f"{_MOSS_REALTIME_REF_ENCODER_DEVICE_ENV} only supports 'cpu'; got {override!r}")
-        return "cpu"
+        import torch
+
+        return torch.device("cpu")
 
     def _get_moss_processor(self):
         """Lazily load the upstream MOSS-TTS processor once per server.

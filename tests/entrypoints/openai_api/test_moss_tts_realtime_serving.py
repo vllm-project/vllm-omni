@@ -33,7 +33,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 )
 @pytest.mark.parametrize(
     ("device_override", "expected_codec_device"),
-    [(None, torch.device("cuda:2")), ("cpu", "cpu")],
+    [(None, torch.device("cuda:2")), ("cpu", torch.device("cpu"))],
     ids=["codec-stage-device", "cpu-override"],
 )
 def test_realtime_components_use_the_realtime_model_and_codec(
@@ -41,7 +41,7 @@ def test_realtime_components_use_the_realtime_model_and_codec(
     hf_config: SimpleNamespace,
     expected_codec_path: str,
     device_override: str | None,
-    expected_codec_device: torch.device | str,
+    expected_codec_device: torch.device,
 ) -> None:
     engine_client = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -58,7 +58,7 @@ def test_realtime_components_use_the_realtime_model_and_codec(
         monkeypatch.setenv(adapter_module._MOSS_REALTIME_REF_ENCODER_DEVICE_ENV, device_override)
 
     tokenizer = object()
-    codec_devices: list[torch.device | str] = []
+    codec_devices: list[torch.device] = []
 
     class Codec:
         def to(self, device):
