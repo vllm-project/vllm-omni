@@ -941,7 +941,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "transformer",
         cuda_graph_max_decode_graphs: int = 8,
-        cuda_graph_persistent_decode: bool = True,
+        cuda_graph_persistent_decode: bool = False,
     ):
         super().__init__()
         self.parallel_config = od_config.parallel_config
@@ -1033,11 +1033,17 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # on this top-level module rather than on individual blocks; graphs
         # stay eligible only when that hook keeps weights on persistent
         # staging storage (see QwenImage21DecodeGraphManager._offload_reason).
-        # Captured entries persist across requests by default (#8586 A2) so a
-        # repeated key replays without recapture; cuda_graph_persistent_decode
-        # =False restores dropping idle entries each request (lower peak memory).
+        # Idle entries are dropped each request by default (#8831 reclaim).
+        # Opt-in retention (cuda_graph_persistent_decode=True, #8586 A2) keeps
+        # them for re-adoption so a repeated key replays without recapture,
+        # trading VRAM for recapture latency. The operator-facing knob
+        # (od_config.cuda_graph_persistent_decode, set via CLI or stage YAML)
+        # overrides the checkpoint-level constructor default when not None.
         self._enforce_eager = bool(od_config.enforce_eager)
         self.enable_cuda_graph_decode = getattr(od_config, "enable_cuda_graph_decode", True) and not self._enforce_eager
+        persistent_decode = getattr(od_config, "cuda_graph_persistent_decode", None)
+        if persistent_decode is None:
+            persistent_decode = cuda_graph_persistent_decode
         # Ascend does not torch.compile this transformer. CUDA graph capture
         # also refuses non-CUDA devices, so a default graph manager still
         # executes eagerly on NPU. NZ eligibility uses this fact directly.
@@ -1048,7 +1054,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             QwenImage21DecodeGraphManager(
                 self,
                 max_entries=cuda_graph_max_decode_graphs,
-                persistent_entries=cuda_graph_persistent_decode,
+                persistent_entries=persistent_decode,
                 model_level_offload=resolve_offload_strategy(od_config)
                 in {OffloadStrategy.MODEL_LEVEL, OffloadStrategy.DISTRIBUTED_LAYER_WISE},
             )

@@ -709,6 +709,19 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--cuda-graph-persistent-decode",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Retain captured KV-cache decode-graph entries across requests on models that implement "
+                "them (currently Qwen-Image-2.1), so a repeated request key replays without recapture. "
+                "Off by default: retention trades VRAM (one prefix K/V copy per retained entry, bounded "
+                "by the transformer's cuda_graph_max_decode_graphs LRU cap on entries, not bytes) for "
+                "recapture latency. Requires --enable-cuda-graph-decode; disable with "
+                "--no-cuda-graph-persistent-decode."
+            ),
+        )
+        omni_config_group.add_argument(
             "--enable-cfg-batching",
             action=argparse.BooleanOptionalAction,
             default=None,

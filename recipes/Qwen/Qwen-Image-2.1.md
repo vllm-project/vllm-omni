@@ -265,14 +265,26 @@ Each captured graph owns its private memory pool, so dropping idle entries
 cannot leave later captures reusing a pool whose last graph was destroyed.
 Capture failures restore the caller's CUDA stream before falling back to
 eager decode, preserving output ordering across consecutive requests.
-Captured entries persist across requests by default (#8586 A2): once a request
-finishes, its graph and static buffers are retained and re-adopted by the next
-request with a matching key, so repeated identical requests replay without
-paying a recapture. Retention is bounded by the same LRU cache limit
-(`cuda_graph_max_decode_graphs`, default 8), which trades the earlier
-drop-idle-entries-each-request reclaim for recapture avoidance. Set
-`cuda_graph_persistent_decode=False` on the transformer to restore the
-pre-A2 behavior (lower peak prefix-copy memory, one recapture per request).
+By default, idle graph entries are dropped once their request finishes (the
+#8831 reclaim), so each request recaptures its key. Opt-in retention (#8586
+A2) keeps a finished request's graph and static buffers so the next request
+with a matching key re-adopts them and replays without paying a recapture:
+
+```bash
+vllm serve Qwen/Qwen-Image-2.1 --omni --cuda-graph-persistent-decode
+```
+
+The same control is available as `Omni(..., cuda_graph_persistent_decode=True)`
+and as `cuda_graph_persistent_decode: true` on a stage in the deployment YAML;
+the transformer's `config.json` may also set `cuda_graph_persistent_decode`,
+and an explicit CLI/stage value overrides that checkpoint default. Retention
+trades VRAM for recapture latency: every retained entry holds a full prefix
+K/V copy, bounded by the same LRU cache limit (`cuda_graph_max_decode_graphs`,
+default 8) — a cap on entries, not bytes — so workloads with many distinct
+keys (e.g. image edits with varying condition layouts) can stack gigabytes of
+retained copies. Disable with `--no-cuda-graph-persistent-decode` (the
+default) to restore the drop-idle-entries-each-request reclaim (lower peak
+prefix-copy memory, one recapture per request).
 
 ### Verification
 

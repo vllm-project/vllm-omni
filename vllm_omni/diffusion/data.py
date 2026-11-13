@@ -1040,6 +1040,16 @@ class OmniDiffusionConfig:
     # a second in-flight request aliasing the same graph key) log and fall
     # back to eager decode.
     enable_cuda_graph_decode: bool = True
+    # Opt-in retention of captured decode-graph entries across requests
+    # (#8586 A2, Qwen-Image-2.1). None defers to the transformer constructor /
+    # checkpoint default (False): idle entries are dropped each request
+    # (#8831 reclaim). True keeps idle entries for re-adoption so a repeated
+    # key replays without recapture, trading VRAM (one prefix K/V copy per
+    # retained entry, bounded by the cuda_graph_max_decode_graphs LRU cap —
+    # entries, not bytes) for recapture latency. Set via
+    # --cuda-graph-persistent-decode or the stage YAML field of the same name;
+    # only effective when enable_cuda_graph_decode is on.
+    cuda_graph_persistent_decode: bool | None = None
     # Controls the generic compilation path used when a pipeline does not
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
