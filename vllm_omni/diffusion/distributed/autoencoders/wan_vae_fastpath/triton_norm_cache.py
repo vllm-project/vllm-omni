@@ -151,6 +151,7 @@ def norm_act_cat_time(
     channels_last: bool,
     silu: bool,
     bias: torch.Tensor | None = None,
+    probe_reduction: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Return ``[zeros | history | norm_act(x)]`` and its last (at most two) history/``x`` frames.
 
@@ -248,7 +249,7 @@ def norm_act_cat_time(
                 enable_fp_fusion=False,
             )
         else:
-            denom = vrn.fp32_channel_norm(x, probe=True).clamp_min_(1e-12)
+            denom = vrn.fp32_channel_norm(x, probe=probe_reduction).clamp_min_(1e-12)
             if not denom.is_contiguous():
                 denom = denom.contiguous()
             _norm_scale_cat_time_kernel[(b * c * out_t, tiles)](

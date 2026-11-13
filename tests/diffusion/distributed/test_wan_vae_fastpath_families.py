@@ -441,3 +441,39 @@ def test_probes_never_run_on_an_assembled_tensor(name: str, monkeypatch) -> None
     assert probed_devices, "the decode should have probed at least one shape"
     assert set(probed_devices) == {"meta"}, f"a probe ran on a real tensor: {sorted(set(probed_devices))}"
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("name", sorted(BUILDERS))
+def test_decode_reads_the_norm_reduction_its_reference_reads(name: str, monkeypatch) -> None:
+    """A ``lossless`` decode must ask for its family's reference reduction, or it is not bitwise ``off``.
+
+    diffusers' norms normalize an fp32 copy, so their fast path probes and prefers that; Qwen-Image-2.1's norm
+    calls ``vae_rms_norm`` itself, so ``off`` reads the low-precision tensor and the fast path must too. Backends
+    where the two reductions agree cannot see the difference, hence this checks the request, not the values.
+    """
+    from vllm_omni.diffusion.layers import vae_rms_norm as vrn
+
+    family = next(f for f in fam.families() if f.name == name)
+    original = vrn.fp32_channel_norm
+    asked: list[bool] = []
+
+    def recording(x, *, probe=False):
+        asked.append(probe)
+        return original(x, probe=probe)
+
+    monkeypatch.setattr(vrn, "fp32_channel_norm", recording)
+    monkeypatch.setattr(fp, "_kernels_allowed", lambda x: not torch.is_grad_enabled())
+    reference, candidate = _build_pair(name, torch.float32)
+    assert install_wan_vae_fastpath(candidate, level="lossless").installed
+    _, _, _, latent_frames = BUILDERS[name]
+    latents = torch.randn(1, 4, latent_frames, 6, 8)
+    with torch.no_grad():
+        expected = reference.decode(latents, return_dict=False)[0]
+        actual = candidate.decode(latents, return_dict=False)[0]
+    if family.rms_norm is None:
+        assert not asked, f"{name} keeps its own RMS norm forward, so the fast path must not take this path"
+    else:
+        assert set(asked) == {family.rms_norm_upcasts}, (
+            f"{name}: decode asked for probe={sorted(set(asked))}, its reference needs {family.rms_norm_upcasts}"
+        )
+    assert torch.equal(actual, expected)

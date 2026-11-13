@@ -11,6 +11,10 @@ class that plays each role in one implementation, plus the few places where impl
 * ``causal_conv_kind``: ``"conv3d"`` (``nn.Conv3d`` with a temporal feature cache, Wan) or ``"conv2d_single_frame"``
   (``nn.Conv2d`` on the squeezed frame, never cached, Qwen-Image-2.1).
 * ``up_blocks_take_first_chunk``: whether the decoder passes ``first_chunk`` to its up blocks.
+* ``rms_norm_upcasts``: whether the family's RMS norm reference normalizes an fp32 copy of its input
+  (diffusers' ``F.normalize(x.float(), dim=1)``). ``False`` for a norm whose own forward already reads the
+  low-precision tensor through ``vae_rms_norm``, so the bound forward must read it the same way to stay bitwise
+  ``off`` on backends where the two reductions differ.
 
 A new Wan-style VAE gets the fast path by registering a family (:func:`register_family`) rather than by copying the
 forwards. Module types are matched exactly (``type(m) is cls``), so subclasses with their own forwards (for example
@@ -55,6 +59,7 @@ class WanVaeFamily:
     attention_block: type[nn.Module] | None = None
     causal_conv_kind: str = "conv3d"
     up_blocks_take_first_chunk: bool = True
+    rms_norm_upcasts: bool = True
     # channels_last level only: single-head attention as chunked low-precision matmuls (see forwards).
     chunked_attention: bool = False
 
@@ -146,6 +151,9 @@ def _qwen_image_21(q: ModuleType) -> WanVaeFamily:
         attention_block=q.QwenImage21AttentionBlock,
         causal_conv_kind="conv2d_single_frame",
         chunked_attention=True,
+        # QwenImage21RMS_norm.forward calls vae_rms_norm.rms_norm_fastpath itself, so ``off`` reads the
+        # reduction from the low-precision tensor; the bound forward must not switch to the fp32 copy.
+        rms_norm_upcasts=False,
     )
 
 

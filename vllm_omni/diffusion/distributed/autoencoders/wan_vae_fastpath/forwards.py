@@ -82,6 +82,9 @@ class FastPathConfig:
     verify_spatial_padding: bool = True
     # The decoder passes ``first_chunk`` to its up blocks (Wan); Qwen-Image's up blocks take no such argument.
     up_blocks_take_first_chunk: bool = True
+    # Probe the norm reduction (see vae_rms_norm.fp32_channel_norm): only for families whose reference norm
+    # normalizes an fp32 copy. A family whose reference reads the low-precision tensor keeps that reduction.
+    probe_norm_reduction: bool = True
     # Single-frame ``Conv2d`` causal convs under channels_last: keep the output channels-last for the next consumer
     # (decoder), or return it contiguous (encoder, whose strided downsample convs are slower on channels-last input).
     keep_channels_last: bool = True
@@ -158,8 +161,10 @@ def rms_norm_fastpath(
         out = cl.rms_norm_channels_last(x, gamma, norm.scale, silu=silu, bias=bias, exact_bf16=cfg.exact_bf16_norm)
         if out is not None:
             return out
-    # A fast-path binding: its output must be bitwise ``off``, so the norm reduction is probed.
-    return shared_rms_norm_fastpath(norm, x, silu=silu, bias=bias, probe_reduction=True)
+    # A fast-path binding: its output must be bitwise ``off``, which for most families means the reduction over
+    # an fp32 copy (probed); for a family whose reference reads the low-precision tensor it means that instead.
+    probe_reduction = cfg.probe_norm_reduction if cfg is not None else True
+    return shared_rms_norm_fastpath(norm, x, silu=silu, bias=bias, probe_reduction=probe_reduction)
 
 
 def rms_norm_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -739,6 +744,7 @@ def _run_norm_act_cached_conv(
                     channels_last=cfg.channels_last,
                     silu=True,
                     bias=pending_bias,
+                    probe_reduction=cfg.probe_norm_reduction,
                 )
                 if pair is not None:
                     assembled, cache_list[index] = pair

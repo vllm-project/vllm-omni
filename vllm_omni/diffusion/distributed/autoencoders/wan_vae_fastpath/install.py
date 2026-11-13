@@ -256,6 +256,7 @@ def _install_bindings(
         exact_bf16_norm=encoder,
         verify_spatial_padding=encoder or level != "channels_last",
         up_blocks_take_first_chunk=family.up_blocks_take_first_chunk,
+        probe_norm_reduction=family.rms_norm_upcasts,
         keep_channels_last=not encoder,
     )
     # Preserve the output projection's validated formulation. Internal decoder
