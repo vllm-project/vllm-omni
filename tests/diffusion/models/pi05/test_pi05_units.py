@@ -483,6 +483,10 @@ class _P0GraphAdapterModel:
         self.calls = []
         self.paligemma_with_expert = SimpleNamespace(forward=self.forward)
 
+    def embed_prefix(self, images, image_masks, lang_tokens, lang_masks):
+        self.calls.append(("embed", lang_tokens))
+        return torch.tensor(456), lang_masks, lang_masks
+
     def forward(self, **kwargs):
         self.calls.append(("prefix", kwargs))
         return [torch.tensor(123), None], kwargs["past_key_values"]
@@ -714,6 +718,53 @@ def test_batched_prefix_graph_serves_exactly_its_size():
         assert hidden.item() == 123 and returned is kv_cache
     assert [call[0] for call in model.calls] == ["prefix"] * 3
     assert graphs.num_replays["prefix_forward"] == 1
+
+
+def test_batched_embed_prefix_graph_serves_exactly_its_size():
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.pi05 import cuda_graph_pi05 as adapter
+
+    model = _P0GraphAdapterModel(Pi05RuntimeOptions())
+    graphs = Pi05CUDAGraphs(model, batch_sizes=(1, 4))
+    images = [torch.zeros(4, 3, 2, 2) for _ in range(2)]
+    image_masks = [torch.ones(4, dtype=torch.bool) for _ in range(2)]
+    lang_tokens = torch.zeros(4, 3, dtype=torch.long)
+    lang_masks = torch.ones(4, 3, dtype=torch.bool)
+    output = torch.zeros(4)
+    static = adapter._EmbedPrefixGraph(
+        SimpleNamespace(
+            replay=lambda: output.copy_(static.lang_tokens.sum(dim=1) + static.images[1].sum(dim=(1, 2, 3)))
+        ),
+        images,
+        image_masks,
+        lang_tokens,
+        lang_masks,
+        (output, lang_masks, lang_masks),
+    )
+    graphs._embed_batches[4] = static
+
+    def run(batch):
+        return graphs.embed_prefix(
+            [torch.ones(batch, 3, 2, 2) for _ in range(2)],
+            [torch.ones(batch, dtype=torch.bool) for _ in range(2)],
+            torch.ones(batch, 3, dtype=torch.long),
+            torch.ones(batch, 3, dtype=torch.bool),
+        )
+
+    # The batch of the graph's size replays it: the inputs are loaded into the
+    # static buffers, and the graph's outputs are returned.
+    embs, pad_masks, att_masks = run(4)
+    assert embs is output and pad_masks is lang_masks and att_masks is lang_masks
+    assert embs.tolist() == [15.0] * 4
+    assert graphs.num_replays["embed_prefix"] == 1
+    # A batch between captured sizes, a batch above the largest size and batch 1
+    # without its graph run the model's embedding.
+    for batch in (3, 5, 1):
+        embs, _, _ = run(batch)
+        assert embs.item() == 456
+    assert [call[0] for call in model.calls] == ["embed"] * 3
+    assert graphs.num_replays["embed_prefix"] == 1
 
 
 # ----------------------------------------------------------------------------

@@ -9,40 +9,40 @@
    ``model.kv_cache`` (``paligemma_with_expert.forward`` with prefix inputs);
 3. one denoising step (``denoise_step``), replayed once per step.
 
-One graph per region is enough. Every shape is fixed for a serving instance:
-batch 1, ``max_cameras`` image slots (a missing camera only flips its mask),
-``image_resolution`` images, a ``tokenizer_max_length`` text block and a
-``chunk_size`` suffix. With schedule precomputation off, the per-request step
-count only changes how often region 3 replays. With it on, the default schedule
-supplies a new conditioning/modulation row on every replay; unsupported
+One graph per region and batch size is enough. Every other shape is fixed for
+a serving instance: ``max_cameras`` image slots (a missing camera only flips
+its mask), ``image_resolution`` images, a ``tokenizer_max_length`` text block
+and a ``chunk_size`` suffix. With schedule precomputation off, the per-request
+step count only changes how often region 3 replays. With it on, the default
+schedule supplies a new conditioning/modulation row on every replay; unsupported
 schedules use eager denoising. No captured control flow depends on tensor data.
 
-Regions 2 and 3 are also captured for every other size in ``batch_sizes`` (the
-pipeline declares them from ``max_num_seqs``), over a KV cache and a memory
-pool of that size, which ``kv_cache_for`` hands ``sample_actions``. A formed
-batch of such a size replays its prefix forward and its denoising graphs; its
-prefix embedding is not captured yet and runs eagerly, batched, its output
-copied into the prefix graph's static input. A batch between two captured
-sizes runs over the first rows of the next larger size's cache. Its prefix
-forward runs on the fused kernels without a graph, at its own size: the prefix
-pass is compute-bound, so the rows a padded replay would add cost their full
-time, and its cuBLAS GEMMs may round a row differently among more rows. Its
-denoising steps replay the larger graph, which is launch-bound: the rows
-behind the batch carry stale data and are dropped from the output (every row
-is computed on its own). A batch above the largest captured size runs without
-a graph.
+The three regions are captured for batch 1 and for every other size in
+``batch_sizes`` (the pipeline declares them from ``max_num_seqs``), each size
+over a KV cache and a memory pool of its own; ``kv_cache_for`` hands a formed
+batch's cache to ``sample_actions``. A formed batch of a captured size replays
+its three graphs as batch 1 does. A batch between two captured sizes runs over
+the first rows of the next larger size's cache. Its prefix embedding and prefix
+forward run without a graph, at its own size (the prefix forward on the fused
+kernels): both are compute-bound, so the rows a padded replay would add cost
+their full time, and their cuBLAS GEMMs may round a row differently among more
+rows. Its denoising steps replay the larger graph, which is launch-bound: the
+rows behind the batch carry stale data and are dropped from the output (every
+row is computed on its own). A batch above the largest captured size runs
+without a graph.
 
 Optional request-invariant masks, positions and RoPE tables are copied into
 stable buffers once per request, before its denoising loop. Optional KV-only
 prefix capture is used only by callers explicitly requesting KV-only output;
 generic prefix calls retain the eager full-hidden-state semantics.
 
-The graphs are captured once at init (``Pi05CUDAGraphs.capture``), in replay
-order and into one memory pool. Regions hand data to each other without
-copies: region 1's ``prefix_embs`` output is region 2's static input, its
-``prefix_pad_masks`` output is region 3's, and ``model.kv_cache`` is written by
-region 2 and extended and read by region 3. A region copies an input into its
-static buffer only when the caller passes a different tensor.
+The graphs are captured once at init (``Pi05CUDAGraphs.capture``), each size's
+in replay order and into its memory pool. Regions hand data to each other
+without copies: region 1's ``prefix_embs`` output is region 2's static input,
+its ``prefix_pad_masks`` output is region 3's, and the size's KV cache
+(``model.kv_cache`` for batch 1) is written by region 2 and extended and read
+by region 3. A region copies an input into its static buffer only when the
+caller passes a different tensor.
 
 Each region method has the signature of the eager call it replaces and falls
 back to that call when nothing is captured, its inputs differ from the
@@ -210,21 +210,21 @@ class Pi05CUDAGraphs:
         self._embed_prefix: _EmbedPrefixGraph | None = None
         self._prefix_forward: _PrefixForwardGraph | None = None
         self._denoise_step: _DenoiseStepGraph | None = None
-        # Batch 1 is always captured, all three regions; ``batch_sizes`` adds
-        # the formed-batch sizes regions 2 and 3 are also captured for.
+        # Batch 1 is always captured; ``batch_sizes`` adds the formed-batch
+        # sizes the three regions are also captured for.
         sizes = tuple(sorted(set(batch_sizes)))
         if any(not isinstance(size, int) or size < 1 for size in sizes):
             raise ValueError(f"batch_sizes must be positive integers, got {sizes}.")
         self._batch_sizes = sizes
+        self._embed_batches: dict[int, _EmbedPrefixGraph] = {}
         self._prefix_batches: dict[int, _PrefixForwardGraph] = {}
         self._denoise_batches: dict[int, _DenoiseStepGraph] = {}
         self.num_replays: Counter[str] = Counter()
 
     # ── Capture ──────────────────────────────────────────────────────
     def capture(self) -> None:
-        """Capture all three regions at the deployed shapes, batch size 1, and
-        the prefix forward and the denoising step at every other declared
-        batch size.
+        """Capture all three regions at the deployed shapes, at batch size 1
+        and at every other declared batch size.
 
         Needs ``model.kv_cache``. Raises on failure: ``enforce_eager=False`` asks
         for the graph path, so a silent eager fallback would hide a slowdown.
@@ -233,6 +233,7 @@ class Pi05CUDAGraphs:
             self._capture()
         except Exception as exc:
             self._embed_prefix = self._prefix_forward = self._denoise_step = None
+            self._embed_batches = {}
             self._prefix_batches = {}
             self._denoise_batches = {}
             raise RuntimeError(
@@ -246,156 +247,75 @@ class Pi05CUDAGraphs:
         if kv_cache is None or kv_cache.batch_size != 1:
             raise ValueError(f"Capture needs a batch-size-1 model.kv_cache, got {kv_cache!r}.")
         device = kv_cache.key.device
-        config = model.config
-        height, width = config.image_resolution
-        text_len = int(config.tokenizer_max_length)
 
         # Override an outer loader inference_mode as well: static buffers must
         # remain normal tensors, which callers in either mode may copy into.
         with torch.inference_mode(False), torch.no_grad(), set_default_torch_dtype(_CAPTURE_DEFAULT_DTYPE):
-            # Dummy inputs; only their shapes and dtypes are captured.
-            images = [torch.zeros(1, 3, height, width, device=device) for _ in range(int(config.max_cameras))]
-            image_masks = [torch.ones(1, dtype=torch.bool, device=device) for _ in images]
-            lang_tokens = torch.zeros(1, text_len, dtype=torch.long, device=device)
-            lang_masks = torch.ones(1, text_len, dtype=torch.bool, device=device)
+            # Batch 1 runs over ``model.kv_cache`` and the global pool; a formed
+            # batch over a cache and a pool of its own, since batches of
+            # different sizes replay in any order.
+            regions = self._capture_regions(1, kv_cache, current_platform.get_global_graph_pool(), device)
+            batches = {
+                batch: self._capture_regions(batch, None, torch.cuda.graph_pool_handle(), device)
+                for batch in self._batch_sizes
+                if batch > 1
+            }
 
-            # Eager warmup, outside capture: lazy initialization and library
-            # workspaces. It also builds regions 2 and 3's inputs with the same
-            # calls ``sample_actions`` uses, so their shapes and dtypes match.
-            prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
-                images, image_masks, lang_tokens, lang_masks
-            )
-            attention_mask = prepare_attention_masks_4d(make_att_2d_masks(prefix_pad_masks, prefix_att_masks))
-            position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-            prefix_kwargs = {}
-            rotary_emb = None
-            if self._runtime_options.prefix_kv_only:
-                prefix_kwargs["prefix_kv_only"] = True
-            if self._runtime_options.hoist_denoise_invariants:
-                rotary_emb = model.prepare_prefix_rotary(prefix_embs, position_ids)
-                prefix_kwargs["rotary_emb"] = rotary_emb
-            model.paligemma_with_expert.forward(
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=kv_cache,
-                inputs_embeds=[prefix_embs, None],
-                use_cache=True,
-                **prefix_kwargs,
-            )
-            x_t = torch.zeros(1, model.action_horizon, model.action_dim, dtype=torch.float32, device=device)
-            timestep = torch.ones(1, dtype=torch.float32, device=device)
-            context = None
-            step_data = None
-            denoise_kwargs = {}
-            if self._runtime_options.hoist_denoise_invariants:
-                context = model.prepare_denoise_context(prefix_pad_masks)
-                denoise_kwargs["context"] = context
-            if self._runtime_options.precompute_adarms:
-                table = model.runtime_step_table(model.num_inference_steps, 1)
-                if table is None:
-                    raise ValueError("Prepare the default BS=1 AdaRMS schedule after loading weights, before capture.")
-                row = table[0]
-                # All rows use these same static addresses. A replay loads the
-                # selected row in bulk; it never keeps using capture's row 0.
-                timestep = row.timestep.clone()
-                step_data = Pi05DenoiseStepData(timestep, row.time_cond.clone(), row.modulations.clone())
-                denoise_kwargs["step_data"] = step_data
-            model.denoise_step(
-                prefix_pad_masks=prefix_pad_masks,
-                past_key_values=kv_cache,
-                x_t=x_t,
-                timestep=timestep,
-                **denoise_kwargs,
-            )
-            torch.accelerator.synchronize(device)
+        self._embed_prefix, self._prefix_forward, self._denoise_step = regions
+        self._embed_batches = {batch: embed for batch, (embed, _, _) in batches.items()}
+        self._prefix_batches = {batch: prefix for batch, (_, prefix, _) in batches.items()}
+        self._denoise_batches = {batch: denoise for batch, (_, _, denoise) in batches.items()}
 
-            # Graphs sharing a pool must replay in the order they were captured,
-            # which is the order ``sample_actions`` runs the regions in.
-            pool = current_platform.get_global_graph_pool()
+    def _capture_regions(
+        self, batch: int, kv_cache: Pi05KVCache | None, pool, device: torch.device
+    ) -> tuple[_EmbedPrefixGraph, _PrefixForwardGraph, _DenoiseStepGraph]:
+        """The three regions for a batch of ``batch`` requests, over ``kv_cache``
+        (a new one of the batch's size when None), captured into ``pool`` in
+        replay order.
 
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=pool):
-                outputs = model.embed_prefix(images, image_masks, lang_tokens, lang_masks)
-            embed_prefix = _EmbedPrefixGraph(graph, images, image_masks, lang_tokens, lang_masks, outputs)
-            prefix_embs, prefix_pad_masks, _ = outputs
-
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=pool):
-                outputs = model.paligemma_with_expert.forward(
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=kv_cache,
-                    inputs_embeds=[prefix_embs, None],
-                    use_cache=True,
-                    **prefix_kwargs,
-                )
-            prefix_forward = _PrefixForwardGraph(
-                graph,
-                attention_mask,
-                position_ids,
-                prefix_embs,
-                kv_cache,
-                outputs,
-                self._runtime_options.prefix_kv_only,
-                rotary_emb,
-            )
-
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=pool):
-                v_t = model.denoise_step(
-                    prefix_pad_masks=prefix_pad_masks,
-                    past_key_values=kv_cache,
-                    x_t=x_t,
-                    timestep=timestep,
-                    **denoise_kwargs,
-                )
-            denoise_step = _DenoiseStepGraph(graph, prefix_pad_masks, kv_cache, x_t, timestep, v_t, context, step_data)
-            prefix_batches, denoise_batches = {}, {}
-            for batch in self._batch_sizes:
-                if batch > 1:
-                    prefix_batches[batch], denoise_batches[batch] = self._capture_batch(batch, prefix_embs, device)
-
-        self._embed_prefix, self._prefix_forward, self._denoise_step = embed_prefix, prefix_forward, denoise_step
-        self._prefix_batches, self._denoise_batches = prefix_batches, denoise_batches
-
-    def _capture_batch(
-        self, batch: int, prefix_embs: torch.Tensor, device: torch.device
-    ) -> tuple[_PrefixForwardGraph, _DenoiseStepGraph]:
-        """Regions 2 and 3 for a formed batch of ``batch`` requests, over their own KV cache.
-
-        The batch's prefix embedding runs eagerly, and ``prefix_forward`` copies
-        its output into the static input captured here, ``batch`` rows of the
-        shape and dtype of batch 1's ``prefix_embs``. The two graphs share a
-        memory pool of their own, captured and replayed in that order: batches
-        of different sizes replay in any order, so none may share the pool of
-        another. The AdaRMS schedule table serves batch 1 only; a batch embeds
+        The AdaRMS schedule table serves batch 1 only; a formed batch embeds
         its timestep inside its denoising graph.
         """
         model = self._model
-        _, prefix_len, width = prefix_embs.shape
-        kv_cache = model.new_kv_cache(batch, prefix_len)
-        # Dummy inputs and prefix K/V; only shapes, dtypes and addresses are captured.
-        kv_cache.key.zero_()
-        kv_cache.value.zero_()
-        inputs_embeds = torch.zeros(batch, prefix_len, width, dtype=prefix_embs.dtype, device=device)
-        prefix_pad_masks = torch.ones(batch, prefix_len, dtype=torch.bool, device=device)
-        prefix_att_masks = torch.zeros(batch, prefix_len, dtype=torch.bool, device=device)
+        options = self._runtime_options
+        config = model.config
+        height, width = config.image_resolution
+        text_len = int(config.tokenizer_max_length)
+
+        # Dummy inputs; only their shapes, dtypes and addresses are captured.
+        images = [torch.zeros(batch, 3, height, width, device=device) for _ in range(int(config.max_cameras))]
+        image_masks = [torch.ones(batch, dtype=torch.bool, device=device) for _ in images]
+        lang_tokens = torch.zeros(batch, text_len, dtype=torch.long, device=device)
+        lang_masks = torch.ones(batch, text_len, dtype=torch.bool, device=device)
+
+        def embed():
+            return model.embed_prefix(images, image_masks, lang_tokens, lang_masks)
+
+        # Eager warmup, outside capture: lazy initialization and library
+        # workspaces. It also builds regions 2 and 3's inputs with the same
+        # calls ``sample_actions`` uses, so their shapes and dtypes match.
+        prefix_embs, prefix_pad_masks, prefix_att_masks = embed()
+        if kv_cache is None:
+            kv_cache = model.new_kv_cache(batch, prefix_embs.shape[1])
+            # Dummy prefix K/V; only its addresses are captured.
+            kv_cache.key.zero_()
+            kv_cache.value.zero_()
         attention_mask = prepare_attention_masks_4d(make_att_2d_masks(prefix_pad_masks, prefix_att_masks))
         position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_kwargs = {}
         rotary_emb = None
-        if self._runtime_options.prefix_kv_only:
+        if options.prefix_kv_only:
             prefix_kwargs["prefix_kv_only"] = True
-        if self._runtime_options.hoist_denoise_invariants:
-            rotary_emb = model.prepare_prefix_rotary(inputs_embeds, position_ids)
+        if options.hoist_denoise_invariants:
+            rotary_emb = model.prepare_prefix_rotary(prefix_embs, position_ids)
             prefix_kwargs["rotary_emb"] = rotary_emb
 
-        def prefix():
+        def prefix(embs):
             return model.paligemma_with_expert.forward(
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=kv_cache,
-                inputs_embeds=[inputs_embeds, None],
+                inputs_embeds=[embs, None],
                 use_cache=True,
                 **prefix_kwargs,
             )
@@ -403,44 +323,62 @@ class Pi05CUDAGraphs:
         x_t = torch.zeros(batch, model.action_horizon, model.action_dim, dtype=torch.float32, device=device)
         timestep = torch.ones(batch, dtype=torch.float32, device=device)
         context = None
+        step_data = None
         denoise_kwargs = {}
-        if self._runtime_options.hoist_denoise_invariants:
+        if options.hoist_denoise_invariants:
             context = model.prepare_denoise_context(prefix_pad_masks)
             denoise_kwargs["context"] = context
+        if options.precompute_adarms and batch == 1:
+            table = model.runtime_step_table(model.num_inference_steps, 1)
+            if table is None:
+                raise ValueError("Prepare the default BS=1 AdaRMS schedule after loading weights, before capture.")
+            row = table[0]
+            # All rows use these same static addresses. A replay loads the
+            # selected row in bulk; it never keeps using capture's row 0.
+            timestep = row.timestep.clone()
+            step_data = Pi05DenoiseStepData(timestep, row.time_cond.clone(), row.modulations.clone())
+            denoise_kwargs["step_data"] = step_data
 
-        def step():
+        def step(pad_masks):
             return model.denoise_step(
-                prefix_pad_masks=prefix_pad_masks,
+                prefix_pad_masks=pad_masks,
                 past_key_values=kv_cache,
                 x_t=x_t,
                 timestep=timestep,
                 **denoise_kwargs,
             )
 
-        # Eager warmup, outside capture.
-        prefix()
-        step()
+        prefix(prefix_embs)
+        step(prefix_pad_masks)
         torch.accelerator.synchronize(device)
 
-        pool = torch.cuda.graph_pool_handle()
+        # Graphs sharing a pool must replay in the order they were captured,
+        # which is the order ``sample_actions`` runs the regions in.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=pool):
-            outputs = prefix()
+            outputs = embed()
+        embed_prefix = _EmbedPrefixGraph(graph, images, image_masks, lang_tokens, lang_masks, outputs)
+        prefix_embs, prefix_pad_masks, _ = outputs
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            outputs = prefix(prefix_embs)
         prefix_forward = _PrefixForwardGraph(
             graph,
             attention_mask,
             position_ids,
-            inputs_embeds,
+            prefix_embs,
             kv_cache,
             outputs,
-            self._runtime_options.prefix_kv_only,
+            options.prefix_kv_only,
             rotary_emb,
         )
+
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=pool):
-            v_t = step()
-        denoise_step = _DenoiseStepGraph(graph, prefix_pad_masks, kv_cache, x_t, timestep, v_t, context)
-        return prefix_forward, denoise_step
+            v_t = step(prefix_pad_masks)
+        denoise_step = _DenoiseStepGraph(graph, prefix_pad_masks, kv_cache, x_t, timestep, v_t, context, step_data)
+        return embed_prefix, prefix_forward, denoise_step
 
     def kv_cache_for(self, batch_size: int, prefix_len: int) -> Pi05KVCache | None:
         """The KV cache a formed batch of ``batch_size`` requests runs over: the
@@ -451,6 +389,11 @@ class Pi05CUDAGraphs:
         if g is None or not g.kv_cache.fits(g.kv_cache.batch_size, prefix_len):
             return None
         return g.kv_cache if g.kv_cache.batch_size == batch_size else g.kv_cache.rows(batch_size)
+
+    def _embed_graph(self, batch_size: int) -> _EmbedPrefixGraph | None:
+        """The prefix embedding graph of exactly ``batch_size``; a batch between
+        captured sizes runs its prefix embedding without a graph."""
+        return self._embed_prefix if batch_size == 1 else self._embed_batches.get(batch_size)
 
     def _prefix_graph(self, batch_size: int) -> _PrefixForwardGraph | None:
         """The prefix forward graph of exactly ``batch_size``; a batch between
@@ -475,7 +418,7 @@ class Pi05CUDAGraphs:
         lang_tokens: torch.Tensor,
         lang_masks: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        g = self._embed_prefix
+        g = self._embed_graph(lang_tokens.shape[0]) if isinstance(lang_tokens, torch.Tensor) else None
         if g is None:
             return self._model.embed_prefix(images, image_masks, lang_tokens, lang_masks)
         if not (

@@ -122,7 +122,7 @@ def pipeline(request):
         dtype=request.param,
         model_config=_deploy_model_config(),
         enforce_eager=False,
-        # Formed batches: the denoising step is captured for 1, 2 and 4 requests.
+        # Formed batches: every region is captured for 1, 2 and 4 requests.
         max_num_seqs=4,
     )
     # Constructed the way DiffusersLoader does it: under the serving dtype as
@@ -432,12 +432,11 @@ def _assert_rows_as_alone(pipeline, outputs, actual: torch.Tensor, rows, label: 
 
 
 @pytest.mark.parametrize("batch", sorted(BATCH_ROWS), ids=lambda batch: f"batch={batch}")
-def test_formed_batch_replays_its_prefix_and_denoise_graphs(outputs, pipeline, batch):
-    """A batch of a declared size replays the prefix forward and denoising
-    graphs captured for it (its prefix embedding runs eagerly), equals its
-    kernels run eagerly on the batch bit for bit, and gives each request the
-    chunk it gets alone within ``TOLERANCE``: the vision tower and prefix run
-    batched."""
+def test_formed_batch_replays_its_three_graphs(outputs, pipeline, batch):
+    """A batch of a declared size replays the three graphs captured for it,
+    equals its kernels run eagerly on the batch bit for bit, and gives each
+    request the chunk it gets alone within ``TOLERANCE``: the vision tower and
+    prefix run batched."""
     model = pipeline.model
     graphs = model.cuda_graphs
     rows = BATCH_ROWS[batch]
@@ -445,7 +444,7 @@ def test_formed_batch_replays_its_prefix_and_denoise_graphs(outputs, pipeline, b
 
     replays_before = graphs.num_replays.copy()
     actual = _sample_batch(model, inputs)
-    expected_replays = {"prefix_forward": 1, "denoise_step": pipeline.config.num_inference_steps}
+    expected_replays = {"embed_prefix": 1, "prefix_forward": 1, "denoise_step": pipeline.config.num_inference_steps}
     assert graphs.num_replays - replays_before == expected_replays
     assert actual.shape == (batch, pipeline.config.chunk_size, pipeline.config.max_action_dim)
     assert torch.isfinite(actual).all()
@@ -458,7 +457,7 @@ def test_formed_batch_replays_its_prefix_and_denoise_graphs(outputs, pipeline, b
 
 def test_batch_between_captured_sizes_pads_to_the_next_graph(outputs, pipeline):
     """A batch of 3 runs over the first rows of the batch-4 cache: its prefix
-    forward runs on the fused kernels without a graph, at its own size, and its
+    embedding and prefix forward run without a graph, at its own size, and its
     steps replay the batch-4 graph; the stale fourth row changes nothing. In
     bfloat16 every GEMM of the step runs in Triton, so the chunks are the ones
     its kernels give the batch of 3 eagerly, bit for bit; in float32 the expert

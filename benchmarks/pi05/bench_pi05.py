@@ -67,9 +67,8 @@ def build_model(
     max_num_seqs: int = 1,
 ):
     """The model ``Pi05Pipeline`` serves: its dtype layout, KV cache, and with
-    ``enforce_eager`` unset its fused kernels and CUDA graphs (the prefix
-    forward's and the denoising step's for the batch sizes ``max_num_seqs``
-    declares)."""
+    ``enforce_eager`` unset its fused kernels and CUDA graphs (every region's,
+    for the batch sizes ``max_num_seqs`` declares)."""
     import yaml
     from vllm.utils.torch_utils import set_default_torch_dtype
 
