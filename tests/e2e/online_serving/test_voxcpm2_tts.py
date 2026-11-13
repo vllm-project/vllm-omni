@@ -43,7 +43,7 @@ tts_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=get_deploy_config_path("voxcpm2.yaml"),
+            stage_config_path=get_deploy_config_path("ci/voxcpm2.yaml"),
             server_args=["--trust-remote-code", "--disable-log-stats"],
         ),
         id="voxcpm2",
@@ -53,7 +53,7 @@ tts_server_params = [
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_server, online_client) -> None:
     """
@@ -79,7 +79,7 @@ def test_text_to_audio_001(omni_server, online_client) -> None:
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_002(omni_server, online_client) -> None:
     """

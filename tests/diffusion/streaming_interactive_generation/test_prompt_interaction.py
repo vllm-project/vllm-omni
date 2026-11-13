@@ -505,6 +505,7 @@ class TestPromptUpdateExecution:
             prompt="a prompt",
             sampling_params=sampling,
             kv_sender_info=None,
+            mixfusion_info=None,
         )
 
         @contextmanager

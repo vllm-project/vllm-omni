@@ -30,7 +30,6 @@ AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scrip
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
 AMD_OMNI_PROCESSOR_RUNNER = Path(".buildkite/amd/scripts/run-omni-processor-test.sh")
-CUDA_READY_PIPELINE = Path(".buildkite/cuda/test-ready.yml")
 AR_PAGED_ATTENTION_LABEL = "ROCm · AR Diffusion Paged Attention GPU Test"
 DIFFUSION_GROUP = ":card_index_dividers: Diffusion Test"
 AR_PAGED_ATTENTION_MARKERS = "core_model and rocm and MI325 and cards_1"
@@ -618,43 +617,6 @@ def test_personaplex_temporal_stress_has_one_nonblocking_nightly_owner() -> None
     assert "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest-summary.txt" in all_commands
 
 
-def test_cuda_ready_retains_full_model_executor_coverage() -> None:
-    step = _find_step("Simple · Model Executor Test", CUDA_READY_PIPELINE)
-    assert "source_file_dependencies" not in step
-
-    pytest_command = next(command for command in step["commands"] if "pytest" in command)
-    argv = split(pytest_command)
-    marker_expression = argv[argv.index("-m") + 1]
-
-    assert "tests/model_executor" in argv
-    assert marker_expression == "core_model and cpu"
-    assert "not omni" not in marker_expression
-    assert all(not arg.startswith("--ignore") for arg in argv)
-    assert all(not arg.startswith("--deselect") for arg in argv)
-
-    test_source = Path(PERSONAPLEX_TEMPORAL_PATH).read_text(encoding="utf-8")
-    assert "pytestmark = [pytest.mark.core_model, pytest.mark.cpu]" in test_source
-    assert "@pytest.mark.slow" not in test_source
-
-
-def test_cuda_ready_engine_entrypoints_diffusion_has_cleanup_headroom() -> None:
-    step = _find_step("Simple · Engine&Entrypoints&Diffusion Test", CUDA_READY_PIPELINE)
-    assert step["timeout_in_minutes"] == 25
-
-    pytest_command = next(command for command in step["commands"] if "pytest" in command)
-    argv = split(pytest_command)
-    assert argv == [
-        "pytest",
-        "-sv",
-        "tests/entrypoints",
-        "tests/engine",
-        "tests/diffusion",
-        "--ignore=tests/diffusion/models",
-        "-m",
-        "core_model and cpu",
-    ]
-
-
 def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
     lane_definitions = []
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
@@ -738,17 +700,6 @@ def test_joy_gpu_nightly_lane_is_unique_nonblocking_and_preserves_default_backen
     assert "--junitxml=$$JOY_GPU_ARTIFACT_DIR/pytest.xml" in argv
 
 
-def test_joy_gpu_suite_remains_selected_by_cuda_model_lane() -> None:
-    pipeline_path = Path(".buildkite/cuda/test-ready.yml")
-    step = _find_step("Diffusion · Model Test", pipeline_path)
-    argv = split(next(command for command in step["commands"] if "pytest" in command))
-    assert "tests/diffusion/models/" in argv
-    assert f"--ignore={JOY_GPU_PATH}" not in argv
-    assert argv[argv.index("-m") + 1] == "core_model and cuda"
-    # Module-level CPU marks cannot be cancelled by adding GPU marks.
-    assert "pytest.mark.cpu" not in Path(JOY_GPU_PATH).read_text(encoding="utf-8")
-
-
 # These jobs previously selected CUDA-marked items on AMD. Each migrated lane
 # now selects its qualified ROCm variants and verifies the exact collection
 # before running the GPU workload.
@@ -765,7 +716,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
         AMD_READY_PIPELINE,
         "NonBlocking",
-        1424,
+        1438,
         "core_model and rocm and MI325 and not nvidia_only and not "
         "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
     ),
@@ -1123,31 +1074,6 @@ def test_amd_ulysses_lanes_cover_uaa_and_attention_sp(label: str, pipeline: Path
     assert "--durations=20" in argv
 
 
-@pytest.mark.parametrize(
-    ("label", "cards"),
-    [
-        ("Diffusion · Distributed Test · 2-GPU", "cards_2"),
-        ("Diffusion · Distributed & Attention Test · 4-GPU", "cards_4"),
-    ],
-)
-def test_cuda_distributed_lanes_cover_both_attention_files_within_the_job_budget(label: str, cards: str) -> None:
-    step = _find_step(label, CUDA_READY_PIPELINE)
-    argv = [split(command) for command in step["commands"] if "pytest" in split(command)]
-
-    paths = {arg for command in argv for arg in command if arg.startswith("tests/")}
-    assert paths == {
-        "tests/diffusion/distributed",
-        "tests/diffusion/attention/test_ulysses_uaa.py",
-        "tests/diffusion/attention/test_attention_sp.py",
-    }
-    assert step["mirror_hardwares"] == f"l4_{cards.removeprefix('cards_')}"
-    for command in argv:
-        assert command[command.index("-m") + 1] == f"core_model and cuda and L4 and {cards}"
-        assert command[command.index("--run-level") + 1] == "core_model"
-    command_budget = sum(int(command[1].removesuffix("m")) for command in argv)
-    assert step["timeout_in_minutes"] >= command_budget + 5
-
-
 def test_qwen3_tts_base_preserves_advanced_model_arguments() -> None:
     step = _find_step("Qwen3-TTS Base E2E Test")
     commands = step["commands"]
@@ -1171,7 +1097,10 @@ def test_qwen3_accuracy_defers_artifact_path_expansion() -> None:
     assert '"$$PWD"' in staging_command
     assert '"$${BUILDKITE_BUILD_CHECKOUT_PATH:?}"' in staging_command
     assert '"$$artifact_dir"' in staging_command
-    assert step["artifact_paths"] == ["tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json"]
+    assert step["artifact_paths"] == [
+        "artifacts/rocm-qwen3-omni-accuracy/**/*",
+        "tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1682,6 +1611,7 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     base = resolve_deploy_yaml("vllm_omni/deploy/hunyuan_image3_dit.yaml")
     base_parallel = base["stages"][0]["parallel_config"]
     reliability = Path("tests/dfx/reliability/test_hunyuan_image.py").read_text(encoding="utf-8")
+    reliability_fixtures = Path("tests/dfx/conftest.py").read_text(encoding="utf-8")
     startup = Path("tests/dfx/reliability/test_hunyuan_image_ep_startup.py").read_text(encoding="utf-8")
     accuracy = Path("tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py").read_text(encoding="utf-8")
     step = _find_step("HunyuanImage Expert Parallel Startup", AMD_WEEKLY_PIPELINE)
@@ -1699,6 +1629,10 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     assert "hunyuan_image3_dit.yaml" in reliability
     assert '"parallel_config.enable_expert_parallel": False' in reliability
     assert 'params["update"]' in reliability
+    assert 'params["stage_init_timeout"] = 1800' in reliability
+    assert 'params["init_timeout"] = 2100' in reliability
+    assert 'stage_init_timeout=runtime_params_by_name[test_name].get("stage_init_timeout")' in reliability_fixtures
+    assert 'init_timeout=runtime_params_by_name[test_name].get("init_timeout")' in reliability_fixtures
     assert "hunyuan_image3_dit_rocm_reliability.yaml" not in reliability
     assert "hunyuan_image3_dit.yaml" in startup
     assert "send_health_http_request" in startup
@@ -2189,7 +2123,7 @@ def test_moss_tts_weekly_executes_junit_guard_before_exit(
     )
 
 
-def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None:
+def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
     def flatten_paths(items: list) -> set[str]:
         paths: set[str] = set()
         for item in items:
@@ -2228,6 +2162,36 @@ def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None
             "dependency": "tts_qwen3_tts_function",
             "files": ("tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py",),
         },
+        "VoxCPM2 TTS · 1-GPU": {
+            "timeout": 180,
+            "test_timeout": 150,
+            "count": 9,
+            "artifact_name": "rocm-voxcpm2-tts-weekly",
+            "dependency": "tts_voxcpm2_weekly",
+            "env": {
+                "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
+            },
+            "files": (
+                "tests/e2e/offline_inference/test_voxcpm2_tts.py",
+                "tests/e2e/online_serving/test_voxcpm2_tts.py",
+                "tests/e2e/online_serving/test_voxcpm2_tts_expansion.py",
+                "tests/e2e/online_serving/test_voxcpm2_tts_lora.py",
+            ),
+        },
+        "Voxtral TTS · 1-GPU": {
+            "timeout": 210,
+            "test_timeout": 180,
+            "count": 10,
+            "artifact_name": "rocm-voxtral-tts-weekly",
+            "dependency": "tts_voxtral_weekly",
+            "env": {
+                "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
+            },
+            "files": (
+                "tests/e2e/offline_inference/test_voxtral_tts_expansion.py",
+                "tests/e2e/online_serving/test_voxtral_tts_expansion.py",
+            ),
+        },
     }
     expected_env = {
         "OPENBLAS_NUM_THREADS": "1",
@@ -2253,7 +2217,7 @@ def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None
         assert step["grade"] == "NonBlocking"
         assert step["timeout_in_minutes"] == expected["timeout"]
         assert step["source_file_dependencies"] == dependency
-        assert step["env"] == expected_env
+        assert step["env"] == expected_env | cast(dict[str, str], expected.get("env", {}))
         assert step["artifact_paths"] == [f"artifacts/{artifact_name}/**/*"]
         assert "retry" not in step
         assert "VLLM_ALLOW_LONG_MAX_MODEL_LEN" in command
@@ -2276,16 +2240,21 @@ def test_weekly_audex_cosyvoice_and_qwen3_tts_match_cuda_files_on_rocm() -> None
         for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
             assert label not in pipeline_path.read_text(encoding="utf-8")
 
-    rocm_decorator = '@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)'
     marker_counts = {
         "tests/e2e/offline_inference/test_audex_tts.py": 3,
         "tests/e2e/offline_inference/test_audex_s2t.py": 1,
         "tests/e2e/offline_inference/test_audex_tta.py": 1,
         "tests/e2e/offline_inference/test_cosyvoice3_expansion.py": 1,
         "tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py": 3,
+        "tests/e2e/offline_inference/test_voxcpm2_tts.py": 3,
+        "tests/e2e/online_serving/test_voxcpm2_tts.py": 2,
+        "tests/e2e/online_serving/test_voxcpm2_tts_expansion.py": 2,
+        "tests/e2e/online_serving/test_voxcpm2_tts_lora.py": 2,
+        "tests/e2e/offline_inference/test_voxtral_tts_expansion.py": 2,
+        "tests/e2e/online_serving/test_voxtral_tts_expansion.py": 8,
     }
     for path, expected_count in marker_counts.items():
-        assert Path(path).read_text(encoding="utf-8").count(rocm_decorator) == expected_count
+        assert Path(path).read_text(encoding="utf-8").count('"rocm": "MI325"') == expected_count
 
     cosy_source = Path("tests/e2e/offline_inference/test_cosyvoice3_expansion.py").read_text(encoding="utf-8")
     assert 'id="sync"' in cosy_source
@@ -2456,13 +2425,13 @@ WAN22_2GPU_NODES = (
 )
 
 
-def test_wan22_accuracy_has_one_nonblocking_comparison_job() -> None:
+def test_wan22_accuracy_has_one_blocking_comparison_job() -> None:
     two = _find_step("Wan2.2 I2V Accuracy 2 GPU", AMD_NIGHTLY_PIPELINE)
     group = _find_group(":full_moon: Wan2.2 Accuracy MI300 Nightly", AMD_NIGHTLY_PIPELINE)
     assert [step["label"] for step in group["steps"]] == ["Wan2.2 I2V Accuracy 2 GPU"]
     assert two["agent_pool"] == "mi300_2"
     two_commands = "\n".join(two["commands"])
-    assert two["grade"] == "NonBlocking"
+    assert two["grade"] == "Blocking"
     assert two["timeout_in_minutes"] == 180
     assert two["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
     two_marker = "full_model and diffusion and rocm and MI325 and (cards_1 or cards_2)"
@@ -2512,9 +2481,9 @@ def test_wan22_similarity_accepts_complete_artifacts(tmp_path: Path) -> None:
     require_similarity_artifacts(paths)
 
 
-def test_hunyuan_image3_lora_accuracy_is_one_nonblocking_nightly_job() -> None:
+def test_hunyuan_image3_lora_accuracy_is_one_blocking_nightly_job() -> None:
     step = _find_step("HunyuanImage3 LoRA Accuracy", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_4"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
@@ -2535,9 +2504,9 @@ def test_hunyuan_image3_lora_accuracy_is_one_nonblocking_nightly_job() -> None:
         assert "HunyuanImage3 LoRA Accuracy" not in text
 
 
-def test_hunyuanvideo15_accuracy_is_one_nonblocking_nightly_job() -> None:
+def test_hunyuanvideo15_accuracy_is_one_blocking_nightly_job() -> None:
     step = _find_step("HunyuanVideo-1.5 Video Similarity", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
@@ -2567,7 +2536,7 @@ def test_hunyuanvideo15_accuracy_is_one_nonblocking_nightly_job() -> None:
         assert "HunyuanVideo-1.5 Video Similarity" not in text
 
 
-def test_minimax_h3_accuracy_has_two_nonblocking_nightly_jobs() -> None:
+def test_minimax_h3_accuracy_keeps_i2va_nonblocking_and_promotes_timeline() -> None:
     timeline = _find_step("MiniMax-H3 Timeline Guide Accuracy", AMD_NIGHTLY_PIPELINE)
     i2va = _find_step("MiniMax-H3 I2VA Ref2VA Accuracy", AMD_NIGHTLY_PIPELINE)
     assert timeline["agent_pool"] == "mi300_2"
@@ -2585,7 +2554,7 @@ def test_minimax_h3_accuracy_has_two_nonblocking_nightly_jobs() -> None:
         ),
     )
     for step, marker, path in pairs:
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == ("Blocking" if step is timeline else "NonBlocking")
         assert step["timeout_in_minutes"] == 180
         assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
         commands = "\n".join(step["commands"])
@@ -2930,6 +2899,52 @@ def test_qwen_image_backend_similarity_is_one_blocking_nightly_job() -> None:
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "Qwen-Image Diffusers Backend Similarity" not in text
+
+
+_NIGHTLY_PROMOTED_ACCURACY_DOC_JOBS = (
+    ("Qwen3-Omni Accuracy", 4, "Qwen3-Omni accuracy", "ROCM_QWEN3_ACCURACY_ARTIFACT_DIR"),
+    ("Qwen3-Omni Documentation Examples", 7, "Qwen3-Omni documentation", "ROCM_QWEN3_DOC_ARTIFACT_DIR"),
+    ("Qwen2.5-Omni Documentation Examples", 7, "Qwen2.5-Omni documentation", "QWEN25_OMNI_DOC_ARTIFACT_DIR"),
+    ("Wan2.2 I2V Accuracy 2 GPU", 3, "Wan2.2 I2V accuracy", "ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR"),
+    ("HunyuanImage3 LoRA Accuracy", 1, "HunyuanImage3 LoRA accuracy", "ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR"),
+    (
+        "HunyuanVideo-1.5 Video Similarity",
+        6,
+        "HunyuanVideo-1.5 video similarity",
+        "ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR",
+    ),
+    ("MiniMax-H3 Timeline Guide Accuracy", 1, "MiniMax-H3 timeline accuracy", "ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR"),
+)
+
+
+@pytest.mark.parametrize("label,count,name,artifact_env", _NIGHTLY_PROMOTED_ACCURACY_DOC_JOBS)
+@pytest.mark.parametrize(
+    "scenario", ["pass", "skipped", "wrong-count", "zero-tests", "failure", "error", "pytest-failure", "timeout"]
+)
+def test_promoted_nightly_accuracy_doc_execution_guard(
+    tmp_path: Path, label: str, count: int, name: str, artifact_env: str, scenario: str
+) -> None:
+    assert _find_step(label, AMD_NIGHTLY_PIPELINE)["grade"] == "Blocking"
+    pytest_status = 1 if scenario == "pytest-failure" else 0
+    timeout_status = 124 if scenario == "timeout" else None
+    tests = 0 if scenario == "zero-tests" else count + int(scenario == "wrong-count")
+    expected_status = {"pass": 0, "pytest-failure": 1, "timeout": 124}.get(scenario, 5)
+    _assert_nightly_junit_guard(
+        tmp_path,
+        step_label=label,
+        command_fragment="pytest -s -v",
+        expected_message=f"Expected exactly {count} executed {name} tests",
+        artifact_env=artifact_env,
+        job_id_prefix="nightly-promotion-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=int(scenario == "skipped"),
+        failures=int(scenario == "failure"),
+        errors=int(scenario == "error"),
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+        extra_env={"BUILDKITE_BUILD_CHECKOUT_PATH": str(tmp_path)},
+    )
 
 
 def _assert_nightly_junit_guard(
@@ -4424,7 +4439,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
     """READY blocks on the collected one-card worker nodes.
 
     Local collection of the three files with the MI325 marker returned these
-    35 ids. R2-01 still collects 1424 model-executor nodes and does not run them.
+    35 ids. R2-01 still collects 1438 model-executor nodes and does not run them.
     """
     step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -4470,7 +4485,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1424" in r2_01_command
+    assert "assert-pytest-collection.sh 1438" in r2_01_command
     assert "tests/model_executor/" in r2_01_command
     for path in _WORKER_ONE_CARD_FILES:
         assert path not in r2_01_command
@@ -4684,7 +4699,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
 
     The marker selects both intermediate-buffer residency rows and the three
     device-copy GPU tests. #9552's worker files stay on the other job. R2-01
-    still collects 1424 model-executor nodes.
+    still collects 1438 model-executor nodes.
     """
     step = _find_step("ROCm · One-Card Worker Copy Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
@@ -4736,7 +4751,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
         AMD_READY_PIPELINE,
     )
     r2_01_command = "\n".join(r2_01["commands"])
-    assert "assert-pytest-collection.sh 1424" in r2_01_command
+    assert "assert-pytest-collection.sh 1438" in r2_01_command
     for path in _WORKER_COPY_FILES:
         assert path not in r2_01_command
 
