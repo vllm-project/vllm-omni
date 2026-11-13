@@ -71,7 +71,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supported_speakers
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
-from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import MossTTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import MossTTSAdapter, MossTTSCodecLimitError
 from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter, Qwen3TTSCodecLimitError
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
@@ -6113,6 +6113,39 @@ class TestTTSAsyncOffloading:
         yield server
         server.shutdown()
 
+    @pytest.fixture
+    def moss_tts_server(self, mocker: MockerFixture):
+        mocker.patch(
+            "vllm_omni.entrypoints.openai.tts_adapters.base.load_supported_speakers",
+            return_value=set(),
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.openai.tts_adapters.base.load_codec_frame_rate",
+            return_value=None,
+        )
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.model_config = mocker.MagicMock(model="OpenMOSS-Team/MOSS-TTS", hf_config=mocker.MagicMock())
+        mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=4096)]
+        mock_engine_client.tts_batch_max_items = 32
+        mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+        mock_engine_client.tts_max_instructions_length = None
+        mock_engine_client.stage_configs = [
+            SimpleNamespace(
+                engine_args=SimpleNamespace(model_stage="moss_tts"),
+                tts_args={},
+            )
+        ]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        yield server
+        server.shutdown()
+
     @pytest.fixture(params=[True, False], ids=["stage-metrics-on", "stage-metrics-off"])
     def qwen3_stage_output(self, request, mocker: MockerFixture):
         """Use the real stage-stat builder and merge, not hand-written usage metadata."""
@@ -6576,6 +6609,59 @@ class TestTTSAsyncOffloading:
 
         assert response.status_code == 500
         qwen3_tts_server._generate_audio_bytes.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_moss_tts_nonstream_retries_codec_limit_once(self, moss_tts_server, mocker: MockerFixture) -> None:
+        """A retryable codec-limit error under the server-derived budget retries
+        once with a fresh seed and the same cap, then succeeds."""
+        moss_tts_server._check_model = mocker.AsyncMock(return_value=None)
+        moss_tts_server._generate_audio_bytes = mocker.AsyncMock(
+            side_effect=[
+                MossTTSCodecLimitError("codec limit"),
+                (b"RIFF" + b"\x00" * 32, "audio/wav"),
+            ]
+        )
+        request = OpenAICreateSpeechRequest(input="Hello")
+
+        response = await moss_tts_server.create_speech(request)
+
+        assert response.status_code == 200
+        assert moss_tts_server._generate_audio_bytes.await_count == 2
+        first_call, retry_call = moss_tts_server._generate_audio_bytes.await_args_list
+        assert first_call.args[0] is request
+        assert first_call.kwargs["request_id"] != retry_call.kwargs["request_id"]
+        assert retry_call.args[0].seed is not None
+        assert request.seed is None
+
+    @pytest.mark.asyncio
+    async def test_moss_tts_nonstream_does_not_retry_nonretryable_error(
+        self, moss_tts_server, mocker: MockerFixture
+    ) -> None:
+        moss_tts_server._check_model = mocker.AsyncMock(return_value=None)
+        moss_tts_server._generate_audio_bytes = mocker.AsyncMock(side_effect=TTSGenerationError("invalid generation"))
+
+        response = await moss_tts_server.create_speech(OpenAICreateSpeechRequest(input="Hello"))
+
+        assert response.status_code == 500
+        moss_tts_server._generate_audio_bytes.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("request_kwargs", [{"seed": 100423}, {"max_new_tokens": 192}])
+    async def test_moss_tts_nonstream_does_not_retry_explicit_sampling_controls(
+        self,
+        moss_tts_server,
+        mocker: MockerFixture,
+        request_kwargs: dict[str, int],
+    ) -> None:
+        """An explicit seed (reproducibility) or max_new_tokens (caller budget)
+        opts out of the retry: the error surfaces as a 500 on the first attempt."""
+        moss_tts_server._check_model = mocker.AsyncMock(return_value=None)
+        moss_tts_server._generate_audio_bytes = mocker.AsyncMock(side_effect=MossTTSCodecLimitError("codec limit"))
+
+        response = await moss_tts_server.create_speech(OpenAICreateSpeechRequest(input="Hello", **request_kwargs))
+
+        assert response.status_code == 500
+        moss_tts_server._generate_audio_bytes.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_generate_audio_chunks_propagates_generator_error(self, qwen3_tts_server):
