@@ -21,6 +21,7 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 
+from vllm_omni.diffusion.utils.pipeline_utils import CustomPipelineConfigError, validate_custom_pipeline_config
 from vllm_omni.diffusion.worker.diffusion_worker import (
     CustomPipelineWorkerExtension,
     DiffusionWorker,
@@ -69,6 +70,27 @@ class MockCustomPipeline:
 
     def __call__(self, *args, **kwargs):
         return "pipeline_output"
+
+
+class MissingOdConfigPipeline:
+    """Pipeline whose constructor cannot accept the loader's keyword."""
+
+    def __init__(self, required):
+        self.required = required
+
+
+class ExtraRequiredPipeline:
+    """Pipeline with an additional required constructor field."""
+
+    def __init__(self, *, od_config, required):
+        self.od_config = od_config
+        self.required = required
+
+
+class ExtensionWithoutPipelineHook:
+    """Worker extension that cannot initialize a custom pipeline."""
+
+    pass
 
 
 # -------------------------------------------------------------------------
@@ -189,16 +211,91 @@ class TestWorkerWrapperBaseInitialization:
 
         mocker.patch.object(WorkerWrapperBase, "_prepare_worker_class", return_value=FailingWorker)
 
-        with pytest.raises(RuntimeError, match="failed to load test.Pipeline"):
+        with pytest.raises(
+            RuntimeError,
+            match="failed to load tests.diffusion.test_worker_wrapper_base.MockCustomPipeline",
+        ):
             WorkerWrapperBase(
                 gpu_id=0,
                 od_config=mock_od_config,
                 base_worker_class=DiffusionWorker,
-                custom_pipeline_args={"pipeline_class": "test.Pipeline"},
+                custom_pipeline_args={"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"},
             )
 
         assert len(instances) == 1
         assert instances[0].shutdown_calls == 1
+
+    @pytest.mark.parametrize(
+        ("pipeline_cls", "missing_field"),
+        [
+            (MissingOdConfigPipeline, "constructor.od_config"),
+            (ExtraRequiredPipeline, "constructor.required"),
+        ],
+    )
+    def test_custom_pipeline_validation_reports_constructor_contract(self, pipeline_cls, missing_field):
+        with pytest.raises(CustomPipelineConfigError, match=missing_field):
+            validate_custom_pipeline_config({"pipeline_class": pipeline_cls})
+
+    def test_custom_pipeline_validation_reports_missing_extension_hook(self):
+        with pytest.raises(CustomPipelineConfigError, match="worker_extension.re_init_pipeline"):
+            validate_custom_pipeline_config(
+                {"pipeline_class": MockCustomPipeline},
+                ExtensionWithoutPipelineHook,
+            )
+
+    def test_custom_pipeline_validation_rejects_non_class_import(self, mocker: MockerFixture):
+        mocker.patch(
+            "vllm_omni.diffusion.utils.pipeline_utils.resolve_obj_by_qualname",
+            return_value=lambda: None,
+        )
+
+        with pytest.raises(CustomPipelineConfigError, match=r"pipeline_class \(class\)"):
+            validate_custom_pipeline_config({"pipeline_class": "private.module.factory"})
+
+    def test_custom_pipeline_validation_sanitizes_import_failure(self, mocker: MockerFixture):
+        mocker.patch(
+            "vllm_omni.diffusion.utils.pipeline_utils.resolve_obj_by_qualname",
+            side_effect=RuntimeError("private token and path must not escape"),
+        )
+
+        with pytest.raises(CustomPipelineConfigError) as exc_info:
+            validate_custom_pipeline_config({"pipeline_class": "private.module.CustomPipeline"})
+
+        message = str(exc_info.value)
+        assert "CustomPipeline" in message
+        assert "private.module" in message
+        assert "private token" not in message
+
+    def test_custom_pipeline_validation_happens_before_worker_class_preparation(
+        self, mocker: MockerFixture, mock_od_config
+    ):
+        prepare_worker_class = mocker.patch.object(WorkerWrapperBase, "_prepare_worker_class")
+
+        with pytest.raises(CustomPipelineConfigError, match="constructor.od_config"):
+            WorkerWrapperBase(
+                gpu_id=0,
+                od_config=mock_od_config,
+                base_worker_class=DiffusionWorker,
+                custom_pipeline_args={"pipeline_class": MissingOdConfigPipeline},
+            )
+
+        prepare_worker_class.assert_not_called()
+
+    def test_wrapper_rejects_extension_without_hook_before_worker_class_preparation(
+        self, mocker: MockerFixture, mock_od_config
+    ):
+        prepare_worker_class = mocker.patch.object(WorkerWrapperBase, "_prepare_worker_class")
+
+        with pytest.raises(CustomPipelineConfigError, match="worker_extension.re_init_pipeline"):
+            WorkerWrapperBase(
+                gpu_id=0,
+                od_config=mock_od_config,
+                base_worker_class=DiffusionWorker,
+                worker_extension_cls=ExtensionWithoutPipelineHook,
+                custom_pipeline_args={"pipeline_class": MockCustomPipeline},
+            )
+
+        prepare_worker_class.assert_not_called()
 
 
 # -------------------------------------------------------------------------
@@ -834,7 +931,7 @@ class TestCustomPipelineWorkerExtension:
             WorkerWrapperBase(
                 gpu_id=0,
                 od_config=mock_od_config,
-                custom_pipeline_args={"pipeline_class": "unused"},
+                custom_pipeline_args={"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"},
             )
 
         worker.shutdown.assert_called_once_with()

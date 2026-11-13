@@ -76,6 +76,7 @@ from vllm_omni.diffusion.utils.pipeline_utils import (
     pipeline_supports,
     resolve_custom_pipeline_cls,
     supports_pre_tokenized_prompt_ids,
+    validate_custom_pipeline_config,
 )
 from vllm_omni.diffusion.utils.prompt_utils import pre_tokenized_prompt_keys
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
@@ -304,6 +305,10 @@ class DiffusionEngine:
                 from the resolved execution mode.
         """
         self.od_config = od_config
+        validate_custom_pipeline_config(
+            getattr(od_config, "custom_pipeline_args", None),
+            getattr(od_config, "worker_extension_cls", None),
+        )
         # Whether admitted requests may carry OmniCustomPrompt.prompt_ids. Read
         # once from the pipeline class so admission does not touch the registry.
         self._supports_pre_tokenized_prompt_ids: bool | None = supports_pre_tokenized_prompt_ids(od_config)

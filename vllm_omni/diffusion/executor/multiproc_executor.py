@@ -35,6 +35,7 @@ from vllm_omni.diffusion.offloader.config import (
 )
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
+from vllm_omni.diffusion.utils.pipeline_utils import validate_custom_pipeline_config
 from vllm_omni.diffusion.worker import WorkerProc
 
 if TYPE_CHECKING:
@@ -184,6 +185,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._rpc_wave_id: int = 0
 
         num_workers = cast(int, self.od_config.num_gpus)
+        validate_custom_pipeline_config(
+            getattr(self.od_config, "custom_pipeline_args", None),
+            getattr(self.od_config, "worker_extension_cls", None),
+        )
         self.wake_events = [mp.Event() for _ in range(num_workers)]
 
         self._broadcast_mq = self._init_broadcast_queue(num_workers)

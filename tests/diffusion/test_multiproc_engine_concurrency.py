@@ -104,6 +104,25 @@ def _make_engine(num_gpus: int = 1):
     return engine, executor, req_q, res_q
 
 
+def test_invalid_custom_pipeline_fails_before_multiproc_queue(mocker):
+    class _InvalidPipeline:
+        def __init__(self, required):
+            self.required = required
+
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor.od_config = SimpleNamespace(
+        num_gpus=1,
+        custom_pipeline_args={"pipeline_class": _InvalidPipeline},
+        worker_extension_cls=None,
+    )
+    init_broadcast_queue = mocker.patch.object(executor, "_init_broadcast_queue")
+
+    with pytest.raises(ValueError, match="constructor.od_config"):
+        executor._init_executor()
+
+    init_broadcast_queue.assert_not_called()
+
+
 def _start_worker(req_q, res_q, count=2):
     """Simulate workers: read *count* requests from *req_q* and put
     tagged ``DiffusionOutput``s on *res_q* (FIFO order).

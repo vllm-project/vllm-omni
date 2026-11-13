@@ -220,6 +220,22 @@ def test_request_started_output_is_emitted_only_for_opted_in_requests() -> None:
 class TestRequestBatchCapability:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
+    def test_engine_validates_custom_pipeline_before_executor(self, mocker: MockerFixture) -> None:
+        class _InvalidPipeline:
+            def __init__(self, required):
+                self.required = required
+
+        od_config = SimpleNamespace(
+            custom_pipeline_args={"pipeline_class": _InvalidPipeline},
+            worker_extension_cls=None,
+        )
+        init_executor = mocker.patch.object(DiffusionEngine, "_init_executor")
+
+        with pytest.raises(pipeline_utils_module.CustomPipelineConfigError, match="constructor.od_config"):
+            DiffusionEngine(od_config)
+
+        init_executor.assert_not_called()
+
     @pytest.mark.parametrize("custom_pipeline_args", [None, {}, {"components_path": "/tmp/anima-components"}])
     def test_supports_request_batch_uses_registered_model_class(
         self, monkeypatch: pytest.MonkeyPatch, custom_pipeline_args: dict[str, Any] | None
@@ -377,7 +393,7 @@ class TestRequestBatchCapability:
             registry_load,
         )
 
-        with pytest.raises(ValueError, match="Failed to resolve custom diffusion pipeline class"):
+        with pytest.raises(pipeline_utils_module.CustomPipelineConfigError, match="missing_fields=import"):
             diffusion_engine_module.supports_request_batch(od_config)
         registry_load.assert_not_called()
 
