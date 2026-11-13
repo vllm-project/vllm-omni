@@ -167,7 +167,7 @@ platforms:
       - stage_id: 0
         enforce_eager: false
         compilation_config:
-          cudagraph_mode: PIECEWISE
+          cudagraph_mode: FULL_AND_PIECEWISE
       - stage_id: 1
         compilation_config:
           cudagraph_mode: PIECEWISE

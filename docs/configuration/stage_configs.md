@@ -610,7 +610,10 @@ Qwen3-TTS selects Model Runner V2 by default on CUDA and NPU. MRV2 remains
 experimental for this model; its scheduler and delivery paths are still being
 qualified. Set `model_runner: v1` in a copy of the deploy config
 to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on XPU,
-ROCm and MUSA. Select one of these deployment profiles:
+ROCm and MUSA. On NPU, the V2 Talker uses `FULL_AND_PIECEWISE`; Code2Wav
+retains `PIECEWISE`. If opting out to V1 on NPU, also set stage 0 to `PIECEWISE`
+in the NPU platform section of the copied configuration. Select one of these
+deployment profiles:
 
 | Profile | Runner | Code2Wav graph batches | Intended use |
 | --- | --- | --- | --- |

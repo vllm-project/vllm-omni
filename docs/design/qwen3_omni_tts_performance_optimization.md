@@ -784,72 +784,28 @@ would require a separate semantic and service comparison.
 
 ### NPU Talker decode graph mode
 
-The measurements in this subsection are historical results from the original
-Talker graph change. They do not requalify later upstream integration or the
-additional predictor/dual-stream options described above.
+The standard NPU Model Runner V2 profile uses `FULL_AND_PIECEWISE` for the
+Talker: prefill retains piecewise graphs and decode replays a complete backbone
+graph. Ascend's V2 graph manager owns attention metadata updates. Code2Wav
+retains its `PIECEWISE` setting and its incremental decoder graphs.
 
-In the vLLM 0.33 integration smoke on Ascend 910B1, enabling the native predictor
-options and two codec streams with `FULL_DECODE_ONLY` exhausted the generation
-limit for all five short inputs. Setting stage 0 `enforce_eager: true`, with the
-same options and inputs, produced normal stop completions and nonempty WAVs.
-A further graph-enabled control with all three new options disabled also hit
-the limit on the same English input. These observations concern
-`FULL_DECODE_ONLY`, not the existing `PIECEWISE` default. The shipped NPU
-stage-0 settings retain `enforce_eager: false` and `PIECEWISE`. Experiments
-using eager Talker must record that override explicitly; these historical
-observations do not justify changing the deployment default.
-This is a functional observation, not a speech-quality or performance result;
-the underlying outer-graph interaction still needs investigation. Shutdown also
-used the framework's forced worker cleanup, so graceful shutdown is unqualified.
+The predictor frame graph remains independent of the backbone graph. Its
+outer MTP wrapper stays disabled on NPU to avoid nested graph replay. Enabling
+a complete MTP wrapper under a piecewise backbone did not improve the measured
+service throughput and is not part of this configuration.
 
-The Talker emits one codec frame per step, so a step is a few thousand small
-device kernels wrapped in per-step scheduler, sampling and IPC work. vLLM-Omni
-wraps `talker_mtp` in a device-graph wrapper only when the stage's
-`cudagraph_mode` reports full graphs (`_init_talker_mtp` in
-`worker/gpu_model_runner.py`), so under `PIECEWISE` that wrapper is never
-built and the per-step host work stays on the critical path. A `torch_npu`
-profile of a concurrency-1 decode measured **20.8 ms of host gap inside every
-45.3 ms step (46%)** across 2646 kernels; device-side time was 24.5 ms.
+`FULL_DECODE_ONLY` also captures decode, but leaves prefill eager; the matched
+CustomVoice experiment found higher first-audio latency than the combined mode.
+Graph modes can change sampled codec tokens through numerical differences.
+Validate normal termination, ASR error and speaker similarity for the deployed
+model and workload rather than assuming byte-identical audio.
 
-`FULL_DECODE_ONLY` on stage 0 builds the wrapper. Measured on one Ascend
-910B1 with `Qwen3-TTS-12Hz-1.7B-CustomVoice`, BF16, a fixed 32-request
-English workload, warmup `max(2, concurrency)`, four runs per configuration:
-
-| Stage-0 `cudagraph_mode` | c1 throughput | c32 throughput | c32 TTFA p50 |
-| --- | ---: | ---: | ---: |
-| `PIECEWISE` | 23.5 ± 0.3 frames/s | 232.3 ± 3.6 frames/s | 923 ms |
-| `FULL_DECODE_ONLY` | 29.6 ± 0.1 frames/s | 247.3 ± 0.4 frames/s | 853 ms |
-
-All 256 timed requests succeeded and every server exited 0.
-
-**This changes the sampled codec tokens.** Graph replay and the eager path do
-not produce bit-identical logits, so the autoregressive draw diverges and the
-emitted audio differs; per-request audio length moves in both directions
-(measured: 10 of 32 requests changed length, 6 shorter and 4 longer). Output
-is deterministic for a fixed configuration — four `PIECEWISE` runs and four
-`FULL_DECODE_ONLY` runs were each byte-identical within their configuration.
-
-Independent Whisper-large-v3 FP32 scoring of the same 32 English utterances
-(353 reference words) across four configurations:
-
-| Stage-0 mode | Code2Wav NPU options | WER | Failing utterances |
-| --- | --- | ---: | --- |
-| `PIECEWISE` | shipped defaults | 1.70% (6 errors) | 10, 19, 22 |
-| `PIECEWISE` | incremental codec + frame graph + predictor KV | 1.70% (6 errors) | 10, 19, 22 |
-| `FULL_DECODE_ONLY` | shipped defaults | 2.55% (9 errors) | 4, 10, 19, 22 |
-| `FULL_DECODE_ONLY` | incremental codec + frame graph + predictor KV | 1.70% (6 errors) | 10, 19, 22 |
-
-Three of the four configurations fail on the same three utterances. The fourth
-adds one garbled ending on utterance 4, and that configuration is *not* the one
-with the most changed numerics — the other full-graph configuration matches the
-baseline exactly. So the extra failure tracks which draw a given numerical path
-lands on rather than the graph mode, and that utterance sits close enough to a
-decision boundary that any perturbation can flip it.
-
-This is **not** a demonstrated quality regression, and it is **not** a
-demonstrated equivalence: 32 utterances in one language, with no speaker
-similarity scoring, cannot certify either. Run the quality gate for the target
-workload before relying on this mode.
+This combination was exercised with Qwen3-TTS 1.7B CustomVoice and Base on
+Ascend 910B1. It does not qualify other Ascend SKUs or Model Runner V1. To use
+V1 on NPU, also set stage 0 `cudagraph_mode: PIECEWISE` in the NPU platform
+section of a copied deployment configuration. Earlier integration smoke tests
+with `FULL_DECODE_ONLY` exhausted generation limits; those historical results
+neither qualify nor describe the current V2 combination.
 
 ### NPU Model Runner V2 sampling inputs
 
