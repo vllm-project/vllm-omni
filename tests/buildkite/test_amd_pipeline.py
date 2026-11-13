@@ -2434,6 +2434,10 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
     for path, expected_count in marker_counts.items():
         assert Path(path).read_text(encoding="utf-8").count('"rocm": "MI325"') == expected_count
 
+    breeze_source = Path("tests/e2e/online_serving/test_breeze_tts_2.py").read_text(encoding="utf-8")
+    assert '"transcript_escalation_model": "large-v3"' in breeze_source
+    assert '"transcript_model":' not in breeze_source
+
     cosy_source = Path("tests/e2e/offline_inference/test_cosyvoice3_expansion.py").read_text(encoding="utf-8")
     assert 'id="sync"' in cosy_source
     assert 'id="async_chunk"' in cosy_source

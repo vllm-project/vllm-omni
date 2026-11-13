@@ -32,9 +32,9 @@ def test_chinese_voice_design(omni_server, online_client, run_level) -> None:
             "extra_params": {"guidance_scale": 4.0},
             "transcript_language": "zh",
             # Whisper-small transcribes "合成" as "和程" on this fixed clip.
-            # Use the stronger primary ASR without changing the expected text
+            # Escalate to the stronger ASR without changing the expected text
             # or similarity threshold, or retrying after a failed assertion.
-            "transcript_model": "large-v3",
+            "transcript_escalation_model": "large-v3",
             "response_format": "wav",
             "sample_rate": 24000,
             "min_audio_bytes": 24000,
