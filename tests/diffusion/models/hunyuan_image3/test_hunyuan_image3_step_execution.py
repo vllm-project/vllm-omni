@@ -1289,7 +1289,9 @@ def test_forward_request_batch_returns_list_and_keeps_single_output(monkeypatch)
     assert [output.output["payload"]["image"].tolist() for output in outputs] == [[0, 1], [2, 3]]
     assert captured["paged_request_ids"] == ["req-0", "req-1"]
     assert captured["prepared_rows"] == 2
-    assert captured["prepare"]["paged_request_ids"] == ["req-0", "req-1"]
+    prepared_inputs = captured["prepare"]
+    assert isinstance(prepared_inputs, dict)
+    assert prepared_inputs["paged_request_ids"] == ["req-0", "req-1"]
 
     single = pipeline.forward(DiffusionRequestBatch(requests=matching[:1]))
     assert not isinstance(single, list)

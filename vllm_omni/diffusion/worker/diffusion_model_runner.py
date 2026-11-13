@@ -1606,7 +1606,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             kv_backend = getattr(self, "diffusion_kv_backend", None)
             paged_kv_runtime = None
             paged_kv_context: AbstractContextManager[Any] = nullcontext()
-            if not in_diffusion_kv_memory_profile and getattr(kv_backend, "paged_attention_adapter", None) is not None:
+            if (
+                not in_diffusion_kv_memory_profile
+                and kv_backend is not None
+                and getattr(kv_backend, "paged_attention_adapter", None) is not None
+            ):
                 store = getattr(self, "_diffusion_kv_metadata_by_request", None) or {}
                 metadatas = []
                 for state in states:

@@ -361,6 +361,7 @@ def test_request_batch_binds_whether_its_requests_sent_their_schedule(explicit, 
         record_output_peak_memory=False,
     )
 
+    assert runner.pipeline.bound is not None
     schedule, from_request = runner.pipeline.bound
     assert schedule == runner.od_config.diffusion_attention_schedule.default
     assert from_request is explicit
