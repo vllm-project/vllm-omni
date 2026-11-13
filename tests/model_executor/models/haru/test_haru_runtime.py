@@ -99,13 +99,9 @@ def _step(runtime: HaruRuntime, rows: list[tuple[str, int, dict]], token: int = 
     logits = runtime.adjust_logits(hidden, torch.zeros(len(rows), VOCAB))
     assert logits.dtype == torch.float32
     runtime.record_sampled([[token] for _ in rows])
-    # The engine discards the token of a row whose prompt has not reached its end yet.
-    invalid = [
-        i
-        for i, (_, span, info) in enumerate(rows)
-        if info["_omni_num_computed_tokens"] + span < info["_omni_prompt_len"]
-    ]
-    return runtime.finish_step([request_id for request_id, _, _ in rows], invalid)
+    # Haru runs with synchronous scheduling, where vLLM passes no invalid indices and drops a
+    # partial-prefill token itself.
+    return runtime.finish_step([request_id for request_id, _, _ in rows], [])
 
 
 def test_prompt_then_live_frames_each_return_one_audio_frame(runtime: HaruRuntime) -> None:
@@ -175,5 +171,15 @@ def test_a_sampling_row_the_engine_discards_fails_loudly(runtime: HaruRuntime) -
     embeds = runtime.add_row(torch.zeros(PROMPT_LEN, dtype=torch.long), None, _info("r1", 0, PROMPT_LEN, first=True))
     runtime.adjust_logits(embeds[-1:], torch.zeros(1, VOCAB))
     runtime.record_sampled([[3]])
-    with pytest.raises(RuntimeError, match="disagree on whether it sampled"):
+    with pytest.raises(RuntimeError, match="discarded the sampled frame"):
         runtime.finish_step(["r1"], [0])
+
+
+def test_a_chunked_prompt_emits_audio_only_after_its_last_chunk(runtime: HaruRuntime) -> None:
+    first_chunk = PROMPT_LEN - 1
+    out = _step(runtime, [("r1", first_chunk, _info("r1", 0, PROMPT_LEN, first=True))])
+    assert out["model_outputs"] == []
+    out = _step(runtime, [("r1", 1, _info("r1", first_chunk, PROMPT_LEN))])
+    assert [a.shape[0] for a in out["model_outputs"]] == [TINY_SPEC.frame_samples]
+    out = _step(runtime, [("r1", 1, _info("r1", PROMPT_LEN, PROMPT_LEN + 1))])
+    assert [a.shape[0] for a in out["model_outputs"]] == [TINY_SPEC.frame_samples]

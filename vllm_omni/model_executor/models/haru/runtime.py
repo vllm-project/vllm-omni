@@ -225,12 +225,13 @@ class HaruRuntime:
         self.begin_step()
         if request_ids != [row.request_id for row in rows] or sampled is None or hidden is None:
             raise RuntimeError("post-sample rows do not match the scheduled requests")
-        # The engine discards the token of a row that has not reached the end of its prompt; a conversation
-        # advances its stateful codec here, so both views must agree (state cannot be recomputed).
+        # A conversation advances its stateful codec below, and its state cannot be recomputed, so a row the
+        # engine discards must not have sampled. (Under synchronous scheduling vLLM leaves this list empty and
+        # drops a partial-prefill token itself; such a row has ``samples`` False and never reaches the codec.)
         invalid = set(invalid_req_indices)
         for index, row in enumerate(rows):
-            if row.conversation is not None and row.samples == (index in invalid):
-                raise RuntimeError(f"the engine and conversation {row.request_id!r} disagree on whether it sampled")
+            if row.conversation is not None and row.samples and index in invalid:
+                raise RuntimeError(f"the engine discarded the sampled frame of conversation {row.request_id!r}")
         active = [
             index for index, row in enumerate(rows) if row.conversation is not None and row.samples and sampled[index]
         ]
