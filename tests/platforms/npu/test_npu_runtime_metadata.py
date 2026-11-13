@@ -107,8 +107,10 @@ def test_npu_preserves_mammoth_t2i_grid_constraints(source_methods, nested, gene
 
     # Gathering again during decoding must not change the metadata layout.
     runner.requests["image-request"].output_token_ids.append(0)
-    assert runner._gather_runtime_additional_information()[0]["generated_len"] == generated_len + 1
-    assert source_methods._runtime_meta(infos[0])["omni_task"] == ["t2i"]
+    next_infos = runner._gather_runtime_additional_information()
+    assert next_infos[0]["generated_len"] == generated_len + 1
+    assert source_methods._runtime_meta(next_infos[0])["omni_task"] == ["t2i"]
+    assert ("meta" in next_infos[0]) == nested
 
 
 def test_npu_preserves_request_ids_and_batch_order(source_methods):
