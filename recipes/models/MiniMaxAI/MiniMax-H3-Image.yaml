@@ -17,7 +17,7 @@ meta:
   # picker.
   hardware:
     h200: verified
-    # DLO: public image mirrored unchanged to a private registry.
+    # Single-GPU DLO: public image mirrored unchanged to a private registry.
     rtx_4090: verified
     rtx_pro_6000_2x: verified
     rtx_pro_6000_4x: verified
