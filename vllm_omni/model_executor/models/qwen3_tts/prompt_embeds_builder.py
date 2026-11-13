@@ -84,7 +84,7 @@ _ASSISTANT_TEXT_IDS = slice(3, -5)
 
 def assistant_text_ids(ids: Any) -> Any:
     """The text's own ids in tokenized :func:`build_assistant_text` output (a sequence, or ``[batch, n]`` ids)."""
-    if isinstance(ids, torch.Tensor) and ids.ndim > 1:
+    if getattr(ids, "ndim", 1) > 1:
         return ids[..., _ASSISTANT_TEXT_IDS]
     return ids[_ASSISTANT_TEXT_IDS]
 
@@ -1870,7 +1870,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         # A text lead the prompt cannot lay out is a client error here, before the request reaches the worker.
         # A streamed text has no length yet: the stage's text_stream_policy bounds its lead at admission.
         num_text_ids = None if declares_text_stream(info) else num_assistant_text_ids(assistant_len)
-        if (lead_error := text_lead_error(info, num_text_ids)) is not None:
+        if (lead_error := text_lead_error(info, num_text_ids, task_type=task_type)) is not None:
             raise TextLeadError(lead_error)
 
         if task_type in ("CustomVoice", "VoiceDesign"):

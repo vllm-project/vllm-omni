@@ -4,7 +4,9 @@
 
 import asyncio
 
+import numpy as np
 import pytest
+import torch
 from pydantic import ValidationError
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -87,6 +89,31 @@ def test_the_text_lead_cannot_pass_the_end_of_the_tokenized_text(lead, message):
         assert error is None
     else:
         assert message in error
+
+
+@pytest.mark.parametrize(
+    "ids",
+    [list(range(11)), np.arange(11), torch.arange(11), np.arange(22).reshape(2, 11), torch.arange(22).reshape(2, 11)],
+)
+def test_the_text_id_slice_reads_the_last_axis(ids):
+    assert np.array_equal(np.asarray(assistant_text_ids(ids)), np.asarray(ids)[..., 3:-5])
+
+
+def test_the_estimate_checks_a_lead_against_the_task_type_it_lays_out():
+    # The estimate counts the layout of its task_type argument, whatever the request's own entry says.
+    with pytest.raises(TextLeadError, match="only valid for CustomVoice"):
+        Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
+            additional_information={
+                "text": ["three word text"],
+                "instruct": ["calm"],
+                "non_streaming_mode": [False],
+                TEXT_LEAD_KEY: [2],
+            },
+            task_type="VoiceDesign",
+            tokenize_prompt=lambda text: _TEXT_IDS,
+            codec_language_id=None,
+            spk_is_dialect=None,
+        )
 
 
 def _estimate(**info):

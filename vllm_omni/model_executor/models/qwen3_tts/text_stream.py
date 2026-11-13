@@ -57,12 +57,15 @@ class TextLeadError(ValueError):
     """A request's ``text_lead`` that its prompt cannot lay out: a client error, raised before the request runs."""
 
 
-def text_lead_error(info: Mapping[str, Any] | None, num_text_ids: int | None = None) -> str | None:
+def text_lead_error(
+    info: Mapping[str, Any] | None, num_text_ids: int | None = None, *, task_type: str | None = None
+) -> str | None:
     """Why the request's ``text_lead`` cannot be laid out, or ``None``.
 
     A lead applies to the CustomVoice prompt in streaming mode only, where it is
     otherwise ignored. With ``num_text_ids`` (a whole text's token count) it is
     also bounded: the lead rows may hold every id and the text END, no more.
+    ``task_type`` is the caller's resolved task type (default: the request's own).
     """
     try:
         lead = text_lead(info)
@@ -70,7 +73,7 @@ def text_lead_error(info: Mapping[str, Any] | None, num_text_ids: int | None = N
         return str(exc)
     if lead == 0 or info is None:
         return None
-    task_type = first_value(info.get("task_type")) or "CustomVoice"
+    task_type = task_type or first_value(info.get("task_type")) or "CustomVoice"
     if task_type != "CustomVoice":
         return "'text_lead' is only valid for CustomVoice task"
     if non_streaming_mode(info, task_type):

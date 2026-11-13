@@ -382,10 +382,10 @@ class Qwen3TTSAdapter(ARTTSAdapter):
     def _validate_text_lead(self, request: "OpenAICreateSpeechRequest", task_type: str) -> str | None:
         """A text lead lays out the streaming CustomVoice prompt only; the prompt length estimate in ``build``
         bounds it by the text, off the event loop."""
-        info: dict[str, Any] = {TEXT_LEAD_KEY: [getattr(request, "text_lead", None)], "task_type": [task_type]}
+        info: dict[str, Any] = {TEXT_LEAD_KEY: [getattr(request, "text_lead", None)]}
         if request.non_streaming_mode is not None:
             info["non_streaming_mode"] = [request.non_streaming_mode]
-        return text_lead_error(info)
+        return text_lead_error(info, task_type=task_type)
 
     def _build_tts_params(self, request: "OpenAICreateSpeechRequest") -> dict[str, Any]:
         """Build TTS parameters from request.
