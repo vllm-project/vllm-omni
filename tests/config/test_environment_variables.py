@@ -166,7 +166,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
     assert category_counts == {
         EnvironmentVariableCategory.PUBLIC_OMNI: 39,
         EnvironmentVariableCategory.INHERITED_VLLM: 22,
-        EnvironmentVariableCategory.PLATFORM_EXTERNAL: 34,
+        EnvironmentVariableCategory.PLATFORM_EXTERNAL: 35,
         EnvironmentVariableCategory.MODEL_SPECIFIC: 102,
         EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 22,
         EnvironmentVariableCategory.INTERNAL: 8,
