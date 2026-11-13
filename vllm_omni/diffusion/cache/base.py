@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Base cache backend interface for diffusion models.
@@ -108,6 +108,9 @@ class CachedTransformer(nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
         self.do_true_cfg = False
+        # Branch of the current call ("positive" / "negative"), stamped by
+        # CFGParallelMixin; None outside its calls.
+        self.cfg_branch: str | None = None
 
     def __init_subclass__(cls, enable_separate_cfg: bool = True, **kwargs):
         cls.enable_separate_cfg = enable_separate_cfg

@@ -30,7 +30,7 @@ from vllm.v1.engine.utils import (
     CoreEngineLaunch,
     CoreEngineProcManager,
     EngineZmqAddresses,
-    get_engine_zmq_addresses,
+    get_engine_zmq_bind_addresses,
     wait_for_engine_startup,
 )
 from vllm.v1.executor import Executor
@@ -1196,7 +1196,14 @@ def launch_stage_replica(
             outputs=[get_open_zmq_ipc_path() for _ in range(num_api_servers)],
         )
     else:
-        addresses = get_engine_zmq_addresses(vllm_config)
+        # Upstream replaced get_engine_zmq_addresses() with bind-address
+        # templates (f226af0e11); the resolved EngineZmqAddresses keep the
+        # same inputs/outputs placeholder semantics for the stage frontend.
+        bind_addresses = get_engine_zmq_bind_addresses(vllm_config)
+        addresses = EngineZmqAddresses(
+            inputs=bind_addresses.inputs,
+            outputs=bind_addresses.outputs,
+        )
     handshake_address = get_open_zmq_ipc_path()
     engines_to_handshake = [CoreEngine(index=0, local=True)]
     with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock, stage_id=stage_id, replica_id=replica_id):

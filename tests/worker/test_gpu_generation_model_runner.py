@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import contextlib
+import inspect
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -133,6 +134,10 @@ class _StubSchedulerOutput:
         self.scheduled_encoder_inputs = {}
         self.scheduled_spec_decode_tokens = {}
         self.num_common_prefix_blocks = 0
+        self.scheduled_new_reqs = []
+        self.scheduled_cached_reqs = SimpleNamespace(req_ids=[])
+        self.free_encoder_mm_hashes = []
+        self.new_block_ids_to_zero = None
 
 
 def _make_guard_runner():
@@ -153,6 +158,7 @@ def _make_guard_runner():
     runner.parallel_config = SimpleNamespace(
         distributed_executor_backend=None,
         data_parallel_size=1,
+        pipeline_parallel_size=1,
     )
     runner._dummy_run_calls = []
     runner._dummy_run = lambda n: runner._dummy_run_calls.append(n)
@@ -160,6 +166,92 @@ def _make_guard_runner():
     runner.synchronize_input_prep = contextlib.nullcontext
     runner.attach_omni_connector_output = lambda result: result
     return runner
+
+
+def _make_idle_poll(monkeypatch):
+    monkeypatch.setattr(gen_runner_module, "has_ec_transfer", lambda: False)
+    monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
+    runner = _make_guard_runner()
+    runner.model_config.async_chunk = True
+    runner._prev_step_idle = True
+    runner.input_batch = _DummyInputBatch(0)
+    runner._update_states = Mock(return_value=None)
+    runner.synchronize_input_prep = Mock(side_effect=contextlib.nullcontext)
+    runner.model = SimpleNamespace(run_idle_prefetch=Mock(), on_requests_added=Mock(), on_requests_finished=Mock())
+    scheduler_output = _StubSchedulerOutput(0)
+    scheduler_output.num_scheduled_tokens = {}
+    return runner, scheduler_output
+
+
+def test_unchanged_idle_poll_preserves_connector_and_prefetch_work(monkeypatch):
+    runner, scheduled = _make_idle_poll(monkeypatch)
+    runner._omni_connector = object()
+    runner.register_chunk_recv = Mock()
+    runner.recv_full_payload_inputs = Mock()
+    runner._pending_full_payload_send = {}
+    scheduled.pending_input_registrations = ["new-input"]
+    scheduled.pending_request_prewarms = ["new-input"]
+
+    assert runner.execute_model(scheduled) is EMPTY_MODEL_RUNNER_OUTPUT
+    runner._update_states.assert_not_called()
+    runner.synchronize_input_prep.assert_not_called()
+    runner.register_chunk_recv.assert_called_once_with("new-input")
+    runner.recv_full_payload_inputs.assert_called_once_with(scheduled)
+    runner.model.on_requests_added.assert_called_once_with(["new-input"])
+    runner.model.run_idle_prefetch.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "first_idle",
+        "batch",
+        "new",
+        "cached",
+        "finished",
+        "encoder_free",
+        "zero_blocks",
+        "block_copies",
+        "encoder_input",
+        "spec",
+        "dp",
+        "pp",
+    ],
+)
+def test_idle_input_updates_are_not_skipped_on_state_changes(monkeypatch, change):
+    runner, scheduled = _make_idle_poll(monkeypatch)
+    if change == "first_idle":
+        runner._prev_step_idle = False
+    elif change == "batch":
+        runner.input_batch = _DummyInputBatch(1)
+    elif change == "new":
+        scheduled.scheduled_new_reqs = [object()]
+    elif change == "cached":
+        scheduled.scheduled_cached_reqs.req_ids = ["req-1"]
+    elif change == "finished":
+        scheduled.finished_req_ids = {"req-1"}
+    elif change == "encoder_free":
+        scheduled.free_encoder_mm_hashes = ["image"]
+    elif change == "zero_blocks":
+        scheduled.new_block_ids_to_zero = [0]
+    elif change == "block_copies":
+        scheduled.kv_cache_block_copies = [(0, 1)]
+    elif change == "encoder_input":
+        scheduled.scheduled_encoder_inputs = {"req-1": [0]}
+    elif change == "spec":
+        scheduled.scheduled_spec_decode_tokens = {"req-1": [1]}
+    elif change == "dp":
+        runner.parallel_config.data_parallel_size = 2
+    elif change == "pp":
+        runner.parallel_config.pipeline_parallel_size = 2
+
+    assert runner.execute_model(scheduled) is EMPTY_MODEL_RUNNER_OUTPUT
+    runner._update_states.assert_called_once_with(scheduled)
+    runner.synchronize_input_prep.assert_called_once_with()
+    if change == "finished":
+        runner.model.on_requests_finished.assert_called_once_with({"req-1"})
+    if change == "first_idle":
+        runner.model.run_idle_prefetch.assert_not_called()
 
 
 @pytest.mark.parametrize("total", [-1, -512, 0])
@@ -296,7 +388,6 @@ def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape,
         requires_request_ids=False,
         requires_exact_input_shape=exact_shape,
     )
-    runner.cascade_attn_enabled = False
     runner.num_prompt_logprobs = None
     runner.vllm_config = None
     runner.parallel_config = SimpleNamespace(
@@ -319,7 +410,15 @@ def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape,
         ),
     )
     monkeypatch.setattr(GPUGenerationModelRunner, "_get_slot_mappings", lambda self, **kw: (None, None))
-    monkeypatch.setattr(GPUGenerationModelRunner, "_build_attention_metadata", lambda self, **kw: (None, None))
+    # Use the installed upstream contract: a permissive **kwargs stub would
+    # hide removed runner arguments such as cascade_attn_prefix_lens.
+    metadata_signature = inspect.signature(GPUGenerationModelRunner._build_attention_metadata)
+
+    def _build_attention_metadata(self, **kwargs):
+        metadata_signature.bind(self, **kwargs)
+        return None, None
+
+    monkeypatch.setattr(GPUGenerationModelRunner, "_build_attention_metadata", _build_attention_metadata)
     monkeypatch.setattr(
         GPUGenerationModelRunner,
         "_maybe_attach_attention_metadata_extensions",
@@ -348,3 +447,32 @@ def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape,
     assert seen["counts"] == [3]
     if exact_shape:
         assert sum(seen["counts"]) == seen["input_ids"].numel()
+
+
+@pytest.mark.parametrize("num_warmups", [0, 3], ids=["zero", "nonzero"])
+def test_generation_runner_warmup_capture_drops_moe_kwarg(monkeypatch, num_warmups):
+    """#9911 P1: generation ``_warmup_and_capture`` (upstream / non-Mammoth)
+    must not pass ``force_moe_routing_key`` to ``GPUGenerationModelRunner._dummy_run``,
+    which accepts neither that keyword nor ``**kwargs``.
+    """
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    runner = object.__new__(GPUGenerationModelRunner)
+    runner.compilation_config = SimpleNamespace(cudagraph_specialize_moe_routing=False)
+    calls: list[tuple[int, dict]] = []
+    dummy_run_signature = inspect.signature(GPUGenerationModelRunner._dummy_run)
+
+    def _dummy_run(num_tokens, **kwargs):
+        # Bind every call against the real generation-runner signature; an
+        # unexpected keyword (e.g. force_moe_routing_key) raises TypeError.
+        dummy_run_signature.bind(runner, num_tokens, **kwargs)
+        calls.append((num_tokens, kwargs))
+        return torch.zeros(1), None
+
+    runner._dummy_run = _dummy_run
+    desc = SimpleNamespace(num_tokens=4, uniform=False, num_active_loras=0)
+
+    GPUGenerationModelRunner._warmup_and_capture(runner, desc, CUDAGraphMode.FULL, num_warmups=num_warmups)
+
+    assert len(calls) == num_warmups + 1
+    for _, kwargs in calls:
+        assert "force_moe_routing_key" not in kwargs

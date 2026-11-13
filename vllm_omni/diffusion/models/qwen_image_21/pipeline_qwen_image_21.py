@@ -28,7 +28,13 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage21 import (
     DistributedAutoencoderKLQwenImage21,
 )
+from vllm_omni.diffusion.distributed.text_encoder_tp import maybe_shard_text_encoder
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+    set_forward_context_denoise_step_idx,
+)
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -376,8 +382,14 @@ class QwenImage21Pipeline(
                 subfolder="text_encoder",
                 prefetch_list=qwen_subfolders,
                 local_files_only=local_files_only,
-            ).to(self.device)
+            )
+            # Shard on CPU (no-op unless text_encoder_tp_size > 1) before moving to device.
+            self.text_encoder = maybe_shard_text_encoder(self.text_encoder, od_config).to(self.device)
         else:
+            if od_config.parallel_config.text_encoder_tp_size > 1:
+                raise ValueError(
+                    "Qwen-Image-2.1: --text-encoder-tp-size > 1 is not supported with a quantized text encoder"
+                )
             # Quantized path: build the HF model on meta, swap its nn.Linear
             # modules for vLLM quantizable linears, and stream the weights
             # through the pipeline loader (same integration as Z-Image). The
@@ -1293,6 +1305,26 @@ class QwenImage21Pipeline(
         first = kv_cache[0]
         return "decode" if any("key" in branch for branch in first.values()) else "prefill"
 
+    def _release_idle_decode_graphs(self) -> None:
+        """Free finished requests' static prefix copies before the next prefill allocates."""
+        manager = getattr(self.transformer, "_decode_graph_manager", None)
+        if manager is None:
+            return
+        manager.release_idle_entries()
+
+    def release_step_request(self, state: "StepRequestState") -> None:
+        """Drop this request's prefix KV and geometry when the runner retires it.
+
+        The graph table is left alone here. The owner weakref dies with this
+        cache, and the next prefill drops that dead entry before it allocates.
+        """
+        extra = getattr(state, "extra", None)
+        if isinstance(extra, dict):
+            extra["kv_cache"] = None
+        release_geometry = getattr(self.transformer, "release_request_geometry", None)
+        if release_geometry is not None:
+            release_geometry()
+
     @staticmethod
     def _assemble_kv_cache(
         states: list["StepRequestState"],
@@ -1487,6 +1519,18 @@ class QwenImage21Pipeline(
         states = list(input_batch.states)
         if not states:
             raise ValueError("QwenImage21Pipeline.denoise_step requires per-request states on the InputBatch.")
+        # ForwardContext carries one index for this entire transformer forward.
+        # Before allowing mixed steps, check every step-dependent consumer:
+        # Attention treats an unknown index as a skip with an active skip selector,
+        # and W4A8 Linear fallback requires a known index. A representative row's
+        # index could select the wrong precision for the other rows.
+        step_indices = {state.step_index for state in states}
+        if len(step_indices) != 1:
+            raise ValueError(f"Qwen-Image-2.1 requires a common denoise step per forward, got {sorted(step_indices)}.")
+        step_idx = states[0].step_index
+
+        if self._kv_cache_phase(states[0].extra.get("kv_cache")) == "prefill":
+            self._release_idle_decode_graphs()
 
         latents = input_batch.latents
         timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
@@ -1573,14 +1617,22 @@ class QwenImage21Pipeline(
         else:
             negative_kwargs = None
 
-        noise_pred = self.predict_noise_maybe_with_cfg(
-            input_batch.do_true_cfg,
-            input_batch.true_cfg_scale,
-            positive_kwargs,
-            negative_kwargs,
-            input_batch.cfg_normalize,
-            output_slice=latents.size(1),
-        )
+        forward_context = get_forward_context() if is_forward_context_available() else None
+        previous_step = forward_context.denoise_step_idx if forward_context is not None else None
+        try:
+            set_forward_context_denoise_step_idx(step_idx)
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                input_batch.do_true_cfg,
+                input_batch.true_cfg_scale,
+                positive_kwargs,
+                negative_kwargs,
+                input_batch.cfg_normalize,
+                output_slice=latents.size(1),
+            )
+        finally:
+            if forward_context is not None:
+                # Do not reactivate paged KV (or mask an error) while restoring.
+                forward_context.denoise_step_idx = previous_step
 
         if take_ownership:
             # Remember the padded VLM length baked into the per-request KV so a

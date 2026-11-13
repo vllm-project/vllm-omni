@@ -7,11 +7,22 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import numpy as np
 import torch
 
 from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
+
+
+class StreamingAudioSnapshot(Protocol):
+    """Audio output copied asynchronously, then materialized per request on the host."""
+
+    def to_cpu(
+        self, copy_stream: torch.cuda.Stream, copy_tensor: Callable[[torch.Tensor], torch.Tensor]
+    ) -> StreamingAudioSnapshot: ...
+
+    def get_output(self) -> list[dict[str, torch.Tensor] | None]: ...
 
 
 @dataclass

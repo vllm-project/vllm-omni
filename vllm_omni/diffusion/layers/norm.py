@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.layers.custom_op import CustomOp
 
 logger = init_logger(__name__)
@@ -54,9 +55,11 @@ class LayerNorm(nn.LayerNorm, CustomOp):
 
                 return fast_layernorm(self, x)
             except ImportError as e:
+                # warning_once caches its arguments; pass a string so the cache
+                # does not retain the traceback frame holding ``x``.
                 logger.warning_once(
                     "mindiesd.fast_layernorm import failed, falling back to FP32 layer_norm: %s",
-                    e,
+                    str(e),
                 )
 
         return self.forward_native(x)
@@ -108,6 +111,18 @@ class RMSNorm(CustomOp):
             return self._forward_fused(x)
         except Exception:
             return self.forward_native(x)
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Opt-in: select the reference before launching a potentially
+        # incompatible prebuilt kernel, since an invalid HIP image can poison
+        # later operations (no try/except fallback is possible).
+        if envs.VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS:
+            return self.forward_native(x, residual)
+        return self.forward_cuda(x, residual)
 
     def forward_musa(
         self,

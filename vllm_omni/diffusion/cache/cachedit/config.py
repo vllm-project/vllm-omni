@@ -20,6 +20,9 @@ from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 logger = init_logger(__name__)
 
+# Cache window validated for TaylorSeer order 2 on MiniMax-H3 Ref2VA (#8805).
+VALIDATED_TAYLORSEER_MAX_CONTINUOUS_CACHED_STEPS = 4
+
 
 @dataclass
 class CacheDiTAdapterConfig:
@@ -90,7 +93,34 @@ class CacheDiTConfig:
             return None
 
         logger.info("TaylorSeer enabled with order=%s", self.taylorseer_order)
+        if self.taylorseer_order > 2:
+            logger.warning(
+                "TaylorSeer order=%s has no validated cache window (#8805 "
+                "validated order 2 with max_continuous_cached_steps<=%s); "
+                "disable enable_taylorseer unless this configuration has "
+                "been validated.",
+                self.taylorseer_order,
+                VALIDATED_TAYLORSEER_MAX_CONTINUOUS_CACHED_STEPS,
+            )
+        elif (
+            self.taylorseer_order == 2
+            and self.max_continuous_cached_steps > VALIDATED_TAYLORSEER_MAX_CONTINUOUS_CACHED_STEPS
+        ):
+            logger.warning(
+                "TaylorSeer order=2 with max_continuous_cached_steps=%s "
+                "exceeds the validated cache window (order=2 with "
+                "max_continuous_cached_steps=%s): order-2 extrapolation error "
+                "grows quadratically with consecutive cached steps and can "
+                "produce localized artifacts on Ref2VA videos (#8805). "
+                "Disable enable_taylorseer for longer cache windows.",
+                self.max_continuous_cached_steps,
+                VALIDATED_TAYLORSEER_MAX_CONTINUOUS_CACHED_STEPS,
+            )
         return TaylorSeerCalibratorConfig(taylorseer_order=self.taylorseer_order)
 
 
-__all__ = ["CacheDiTAdapterConfig", "CacheDiTConfig"]
+__all__ = [
+    "CacheDiTAdapterConfig",
+    "CacheDiTConfig",
+    "VALIDATED_TAYLORSEER_MAX_CONTINUOUS_CACHED_STEPS",
+]

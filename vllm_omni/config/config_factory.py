@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -377,6 +377,19 @@ class StageConfigFactory:
             raise FileNotFoundError(f"Deploy config not found: {deploy_path}")
         return load_deploy_config(deploy_path)
 
+    @staticmethod
+    def _resolve_lance_checkpoint_output(pipeline_cfg: PipelineConfig, model: str) -> PipelineConfig:
+        """Label the Lance video checkpoint as video without changing image Lance."""
+        if pipeline_cfg.model_type != "lance" or _name_match_candidate(model) != "Lance_3B_Video":
+            return pipeline_cfg
+        return replace(
+            pipeline_cfg,
+            stages=tuple(
+                replace(stage, final_output_type="video") if stage.final_output else stage
+                for stage in pipeline_cfg.stages
+            ),
+        )
+
     @classmethod
     def create_from_model(
         cls,
@@ -399,6 +412,7 @@ class StageConfigFactory:
         )
         if pipeline_cfg is None:
             return None
+        pipeline_cfg = cls._resolve_lance_checkpoint_output(pipeline_cfg, model)
 
         # Keep the typed representation's topology in lockstep with the
         # compatibility launch representation. The aligner is a real extra
@@ -454,6 +468,7 @@ class StageConfigFactory:
         )
         if pipeline_cfg is None:
             return None, None
+        pipeline_cfg = cls._resolve_lance_checkpoint_output(pipeline_cfg, model)
 
         legacy_cli_overrides = with_trust_remote_code_override(cli_overrides, trust_remote_code)
         return cls._create_legacy_from_registry(
@@ -657,11 +672,7 @@ class StageConfigFactory:
         kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
         raw_sampling_params = kwargs.get("default_sampling_params")
         if isinstance(raw_sampling_params, str):
-            try:
-                raw_sampling_params = json.loads(raw_sampling_params)
-            except json.JSONDecodeError:
-                logger.warning("Invalid default_sampling_params JSON, ignoring stage defaults.")
-                raw_sampling_params = None
+            raw_sampling_params = json.loads(raw_sampling_params)
         if not isinstance(raw_sampling_params, Mapping):
             raw_sampling_params = None
         default_sampling_params = dict(raw_sampling_params.get("0", {})) if raw_sampling_params else {}
@@ -792,16 +803,15 @@ class StageConfigFactory:
                 stage_overrides[f"stage_0_{name}"] = kwargs[name]
         # Caller defaults belong to deployment, not immutable pipeline constraints:
         # explicit request sampling parameters must still be able to override them.
-        if default_sampling_params:
-            stage_deploy.default_sampling_params = {
-                **(stage_deploy.default_sampling_params or {}),
-                **default_sampling_params,
-            }
         return VllmOmniConfig.from_pipeline_config(
             pipeline,
             user_deploy_config=deploy,
             deploy_config_path=deploy_config_path,
-            cli_overrides={"model": model, **stage_overrides},
+            cli_overrides={
+                "model": model,
+                **stage_overrides,
+                "default_sampling_params": {"0": default_sampling_params},
+            },
         )
 
     @classmethod

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Several codec frames inside one stage-1 ``execute_model``.
 
 One MiniCPM-o Talker decode step is almost all vLLM host work wrapped around a
@@ -350,7 +353,7 @@ def begin_narrow_step(
     try:
         from vllm_omni.platforms.npu.attention import static_shape_decode
     except Exception:
-        static_shape_decode = None
+        static_shape_decode = None  # type: ignore[assignment]
 
     if static_shape_decode is None:
         return _decline("the static-shape decode backend is not present in this build")
@@ -430,7 +433,7 @@ def end_narrow_step(forward_context: Any, narrow: NarrowStep | None) -> None:
         forward_context.cudagraph_runtime_mode = narrow.saved_runtime_mode
 
 
-def _decline(reason: str) -> None:
+def _decline(reason: str) -> NarrowStep | None:
     """Say each distinct decline reason once; silence is the worse failure.
 
     A set, not a single slot: the narrow path is re-decided every step, and one
@@ -472,6 +475,27 @@ def run(
     spans = model_kwargs_extra["request_token_spans"]
     infos = model_kwargs_extra["model_intermediate_buffer"]
 
+    if narrow is not None and hasattr(narrow, "run_fused") and narrow.inputs_embeds.is_cuda:
+        from vllm_omni.worker.talker_cuda_graph import run_cuda_fused_step
+
+        fused = run_cuda_fused_step(
+            narrow,  # type: ignore[arg-type]
+            model=model,
+            model_kwargs={**model_kwargs, **model_kwargs_extra},
+            intermediate_tensors=model_kwargs.get("intermediate_tensors"),
+        )
+        if fused is not None:
+            output, stops = fused
+            model.set_batch_stop_logits(stops.reshape(-1, stops.shape[-1]))
+            after_forward()
+            return output
+        # The fused graph declined: staying inside the narrow context would run
+        # every frame eagerly under CUDAGraphMode.NONE (2.2x slower than the
+        # dispatcher graph the plain path replays). Restore the original
+        # context and fall through to the plain frame loop.
+        narrow.restore()  # type: ignore[attr-defined]
+        narrow = None
+
     frame_outputs = []
     frame_stop_logits = []
     frame_hidden = []
@@ -483,12 +507,17 @@ def run(
             # order never overwrites a row it has still to read.
             narrow.select(frame)
             if frame == 0:
-                _compact_frame_zero_embeddings(inputs_embeds, spans)
+                if not getattr(narrow, "frame_zero_prepared", False):
+                    _compact_frame_zero_embeddings(inputs_embeds, spans)
             else:
-                _write_frame_embeddings(model, inputs_embeds, input_ids, spans, infos, frame, narrow=narrow)
+                target_embeds = getattr(narrow, "inputs_embeds", inputs_embeds)
+                _write_frame_embeddings(model, target_embeds, input_ids, spans, infos, frame, narrow=narrow)
         elif frame > 0:
             _write_frame_embeddings(model, inputs_embeds, input_ids, spans, infos, frame)
-        hidden = run_model()
+        if narrow is not None and hasattr(narrow, "run_model"):
+            hidden = narrow.run_model(run_model, capture=False)
+        else:
+            hidden = run_model()
         after_forward()
         frame_kwargs = dict(model_kwargs_extra)
         frame_kwargs["request_token_spans"] = (
@@ -650,8 +679,6 @@ def constant_drafts(
     When ``scheduled_draft_counts`` is None the caller predates the scheduler
     split and every row is assumed to sit on a drafted step.
     """
-    saw_drafted = False
-    saw_undrafted = False
     for index in range(num_reqs):
         sampled = None
         if isinstance(valid_sampled_token_ids, list) and index < len(valid_sampled_token_ids):
@@ -673,12 +700,10 @@ def constant_drafts(
             if fold_short_rows and isinstance(sampled, list) and len(sampled) < scheduled + 1:
                 _log_fold_once("a request stopped mid-step, short of its drafts; no drafts this step")
                 return [[] for _ in range(num_reqs)]
-            saw_drafted = True
-        else:
-            saw_undrafted = True
-    if scheduled_draft_counts is not None and saw_drafted and saw_undrafted:
-        _log_fold_once("a batch mixed drafted and undrafted requests; no drafts this step")
-        return [[] for _ in range(num_reqs)]
+    # Draft every row instead of folding the batch: a folded step still pays
+    # the K-position reservation while emitting one frame, and the batch
+    # re-drafts next step, so it alternates forever. A row without a draft
+    # slot this step gets one next step, converging on uniform spans.
     return [[CONTINUE_TOKEN_ID] * (frames - 1) for _ in range(num_reqs)]
 
 

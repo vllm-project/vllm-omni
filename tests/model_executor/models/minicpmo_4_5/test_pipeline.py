@@ -152,6 +152,15 @@ class TestPipelineTopology:
 
 
 class TestDeployTopology:
+    @pytest.mark.parametrize("filename", sorted(path.name for path in _DEPLOY_DIR.glob("minicpmo_4_5*.yaml")))
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    def test_default_thinker_backend_is_scoped_to_cuda(self, filename: str, platform: str) -> None:
+        deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / filename), platform=platform)
+        stages = {stage.stage_id: stage for stage in deploy.stages}
+        assert stages[0].attention_backend == ("TRITON_ATTN" if platform == "cuda" else None)
+        assert stages[1].attention_backend is None
+        assert stages[2].attention_backend is None
+
     @pytest.mark.parametrize(("filename", "devices"), _DEPLOY_LAYOUTS.items())
     def test_deploy_resolves_three_stage_pipeline(self, filename: str, devices: list[str]) -> None:
         deploy = load_deploy_config(_DEPLOY_DIR / filename)
@@ -214,21 +223,25 @@ class TestDeployTopology:
             "minicpmo_4_5_3gpu.yaml",
         ],
     )
-    def test_npu_graph_configuration_is_stage_scoped(self, filename: str) -> None:
+    def test_npu_graph_configuration_is_stage_scoped(self, filename: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Let the production merge select NPU once, independently of the host.
+        # Applying NPU first would let merge_pipeline_deploy overlay CUDA again.
+        monkeypatch.setattr(current_omni_platform, "device_name", "npu")
+        monkeypatch.setattr(current_omni_platform, "device_type", "npu")
         deploy = load_deploy_config(_DEPLOY_DIR / filename)
         connector_extra = deploy.connectors["connector_of_shared_memory"]["extra"]
         assert "code2wav_enable_npu_graph" not in connector_extra
         assert "code2wav_max_npu_graphs" not in connector_extra
 
-        deploy = _apply_platform_overrides(deploy, platform="npu")
         stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
-        # vLLM 0.30.0 cannot run FULL_DECODE_ONLY on the NPU stage-0 engine,
-        # so every variant pins PIECEWISE there. The single-card deploy keeps
-        # the Talker (stage 1) on a full decode graph, which preserves
-        # in-graph sampling and multi-frame expansion; multi-card variants
-        # keep the base mode.
-        assert stages[0].yaml_engine_args["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
+        # The single-card deploy runs a whole-decode graph on both language
+        # stages. Stage 0 carries no K-step, so nearly every post-prefill step
+        # is a uniform decode batch (910B1 three-tier: -8.6% RTF at 32@1, inside
+        # the scatter at 64@4/128@8); stage 1 keeps a full decode graph for
+        # in-graph sampling and multi-frame expansion. Multi-card variants keep
+        # the base PIECEWISE mode on both stages.
         expected_graph_mode = "FULL_DECODE_ONLY" if filename == "minicpmo_4_5.yaml" else "PIECEWISE"
+        assert stages[0].yaml_engine_args["compilation_config"]["cudagraph_mode"] == expected_graph_mode
         assert stages[1].yaml_engine_args["compilation_config"]["cudagraph_mode"] == expected_graph_mode
         assert stages[2].yaml_engine_args["enforce_eager"] is True
         # Every variant keeps the Code2Wav graph pool at 32: a larger pool OOMs
@@ -237,7 +250,7 @@ class TestDeployTopology:
         # deploy is the only one that rounds batches up to a capture bucket, so
         # 32 entries cover its shape space; the multi-card variants leave the
         # buckets unset.
-        expected_graph_config = {
+        expected_graph_config: dict[str, object] = {
             "code2wav_enable_npu_graph": True,
             "code2wav_max_npu_graphs": 32,
         }

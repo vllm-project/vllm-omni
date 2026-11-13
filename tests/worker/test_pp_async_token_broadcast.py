@@ -77,6 +77,7 @@ def _last_rank_runner(
     num_reqs = sampled.shape[0]
     hidden = torch.ones(num_reqs, 8)
     runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace()
     runner.use_async_scheduling = async_scheduling
     runner.broadcast_pp_output = broadcast_pp_output
     runner.speculative_config = None

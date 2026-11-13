@@ -1,5 +1,7 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
+# Keep MRv1 on other platforms; CUDA selects MRv2 below.
+model_runner: v1
 async_chunk: true
 # Use minicpmo_4_5_turn.yaml to select the ordinary turn-based serving engine.
 session_mode: duplex
@@ -16,6 +18,11 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
+      # Talker codec prelude: one Triton kernel for the rep-penalty and
+      # temperature steps on NPU. Defaults to on; set false to force the eager
+      # chain for accuracy triage (e.g. after a CANN/torch_npu upgrade). It is
+      # a no-op off NPU or without Triton.
+      # talker_codec_fused_prelude: false
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
@@ -30,14 +37,35 @@ connectors:
       # HiFT capture buckets are derived from codec_chunk_frames and
       # codec_left_context_frames. (#5869)
       enable_hift_graph: true
+      # Merge the ragged K-step CFM shapes into one solve per step, otherwise
+      # every ragged bucket captures its own graph.
+      cfm_cross_bucket_merge: true
       # Capture batch-1 continuation/tail shapes without padding: with the
-      # 8-frame mel cache these codec widths cover 16-64 mel frames.
-      hift_graph_continuation_frames: [4, 28]
-      hift_graph_exact_batch_sizes: [1]
+      # 8-frame mel cache these codec widths cover 14-76 mel frames. The lower
+      # end (3) is a short tail chunk and the upper end (29-34) is a tail chunk
+      # merged with a small backlog; both used to miss every bucket and run
+      # eager HiFT (32 of 798 decode calls in the 2026-10-30 c8 round, and the
+      # last 7 of 1088 prompts on CUDA seed-tts EN, all (1, 76, 3840) =
+      # codec width 34, one past the previous 33 cap).
+      hift_graph_continuation_frames: [3, 34]
+      # Batch 2 was the last eager residue: every batch-2 continuation shape
+      # missed both the buckets (only 1/2/4/8 x 50/58 are captured) and the
+      # batch-1 exact graphs (2026-10-30: 5 of 798 decode calls).
+      hift_graph_exact_batch_sizes: [1, 2]
       enable_cfm_graph: true
       # Fused CFM DiT body: CUDA via TF32, NPU via packed QKV + ACLNN
       # AddLayerNorm + im2col-GEMM convolutions and a single cache transpose.
       cfm_fused_body: true
+      # Enable NPU cross-reference CFM batching for same-shape and ragged
+      # requests, including different token/query, reference prompt and
+      # conformer/CFM attention-history lengths and mixed final-chunk flags.
+      # Requires FP32 fused Whole-Euler, FP32 attention caches, no slot pool
+      # and code2wav_min_batch_size=1; otherwise warn and retain existing dispatch.
+      # Encoder/HiFT run in compatible subgroups; CFM uses per-request masks,
+      # noise offsets and cache trimming. CNN/HiFT cache shapes, dtypes,
+      # devices and the cache-epoch policy still constrain batching.
+      # Enabled in this profile; set false to disable. No effect off NPU.
+      cfm_npu_cross_reference_batching: true
       # Small exact encoder batches share one startup arena; larger batches
       # replay in groups, preserving cache lengths without batch padding.
       enable_code2wav_encoder_graph: true
@@ -50,6 +78,24 @@ connectors:
       micro_batch_size: 4
       cfm_precapture_empty_cache: true
       cfm_max_graphs: 32
+      # Capture the HiFT / default-voice Euler / flow-encoder graphs from the
+      # worker warmup hook instead of on the first request. Stage 2 has no
+      # warmup forward of its own, so the deferred sweep otherwise lands on the
+      # first real request and blocks the engine for ~1-2 s per graph.
+      #
+      # These graphs still sit outside the profiled KV budget, exactly as on the
+      # lazy path (the sweep runs after profiling), so keep headroom in
+      # gpu_memory_utilization here. The move only changes when an OOM surfaces:
+      # startup instead of the first request. Overlays that still set
+      # cfm_graph_precapture_after_load get a warning; it no longer has any effect.
+      cfm_graph_precapture_at_init: true
+      # Default CUDA speaker path: CPU-reference TensorRT, not full DiT TensorRT.
+      # Missing TensorRT falls back to the Torch speaker. Non-CUDA ignores the
+      # flag. Set false in an overlay to keep Torch. token2wav_trt /
+      # MINICPMO_TOKEN2WAV_TRT and token2wav_device_spk: false win when both
+      # are set.
+      token2wav_spk_cpu_reference: true
+      token2wav_n_timesteps: 5
 
 stages:
   - stage_id: 0
@@ -58,11 +104,12 @@ stages:
     # The NPU block below overrides this with measured single-card budgets.
     gpu_memory_utilization: 0.55
     enforce_eager: false
-    # Stage-level prefix caching is NPU-only (see platforms.npu below): in the
-    # platform-shared block it killed the stage-1 replica on CUDA (empty tts
-    # handoff, then an indexSelectSmallIndex device assert). Stage-0 n-gram
+    # Thinker prefix caching stays off here: this profile serves duplex, whose
+    # KV window refuses the cache (duplex/window_kv.py). minicpmo_4_5_turn.yaml
+    # enables it for CUDA turn serving on both runners. Stage-0 n-gram
     # speculation stays off either way -- the omni prefix cache refuses it next
     # to enable_prefix_caching.
+    enable_prefix_caching: false
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
@@ -137,16 +184,73 @@ stages:
 
 platforms:
   cuda:
+    model_runner: v2
+    # Private MPS for colocated CUDA stages. NPU does not read this block.
+    # A missing or failing nvidia-cuda-mps-control daemon, parallel stage
+    # init, or a stage that is not one numeric GPU disables MPS and continues. Set false
+    # in an overlay to disable it explicitly.
+    cuda_mps: true
     stages:
+      - stage_id: 0
+        # Use native normalization for the CUDA duplex accuracy profile.
+        # Keep Q/K normalization on this path by disabling its RoPE fusion.
+        kernel_config:
+          ir_op_priority:
+            rms_norm: [native]
+            fused_add_rms_norm: [native]
+        compilation_config:
+          custom_ops: [none, +silu_and_mul, +rotary_embedding]
+          pass_config:
+            fuse_norm_quant: false
+            fuse_act_quant: false
+            enable_qk_norm_rope_fusion: false
+        # Match the CUDA Thinker backend used for Transformers accuracy validation.
+        # Keep this scoped to stage 0; Talker retains its own backend selection.
+        attention_backend: TRITON_ATTN
       - stage_id: 1
+        # Talker multi-frame decode below runs only on V1; Thinker and Code2Wav
+        # use MRv2.
+        model_runner: v1
         # Full-attention occupancy is bounded by max_num_seqs * max_model_len
         # (16 * 4096 = 65536 tokens). Keep the reported CUDA KV token capacity
         # above that bound because physical-preemption replay is unsupported
         # (2 GiB holds ~35k tokens). The explicit cap leaves device headroom
         # for concurrent Stage 2.
         kv_cache_memory_bytes: 4294967296  # 4 GiB
+        # Multi-frame decode: 8 codec frames per step, mirroring the NPU block.
+        # The CUDA runner intercepts the step and injects the constant continue
+        # drafts; stop_token_ids is the two-wide continue/stop id.
+        #
+        # async_scheduling: false is part of the contract, not a tuning knob:
+        # K-step and async scheduling cannot be used together. Async books the
+        # spec span one step ahead, while the multi-frame loop only executes
+        # steps whose decode spans are uniform and whose booked positions stay
+        # inside the prompt. Measured at c16/256: the booking first outruns the
+        # prompt ("prefill span exceeds condition"), and once those slots are
+        # padded the step still arrives with non-uniform spans ("multi-frame
+        # Talker decode not engaged: request token spans are not uniform"),
+        # which kills the stage-1 replica and fails every in-flight request.
+        speculative_config:
+          method: ngram
+          num_speculative_tokens: 7
+          prompt_lookup_min: 1
+          prompt_lookup_max: 1
+        async_scheduling: false
+        default_sampling_params:
+          stop_token_ids: [1]
 
   npu:
+    # All three stages run MRv2. Same-card A/B (910B3 card 7, 2026-11-10,
+    # HEAD 59a85c105, seed-tts en, warm tiers 32@1/64@4/128@8): mean audio
+    # RTF 0.3181/0.5762/0.8795 (MRv2) vs 0.3199/0.5675/0.8764 (v1) --
+    # -0.6%/+1.5%/+0.4%, within run-to-run noise (a second MRv2 run on the
+    # same card differed by -0.4%/-4.4%/-1.6%). The c8 p99 audio-TTFP tail
+    # (2419.6 ms vs v1 2267.0 ms, +6.7%) likewise overlaps the noise band
+    # (second MRv2 run: 2274.8 ms). Runner-class selection on NPU is made
+    # by vllm-ascend (env VLLM_USE_V2_MODEL_RUNNER overrides, MRv2 by
+    # default); this key is validated but not consulted there -- pin v1
+    # via the env var.
+    model_runner: v2
     stages:
       - stage_id: 0
         # Keep the three stages' concurrency caps aligned so the top tier is
@@ -171,15 +275,20 @@ platforms:
         # Duplex KV window (window_kv.py) requires prefix caching disabled.
         enable_prefix_caching: false
         compilation_config:
-          # A full decode-step graph keeps in-graph sampling and multi-frame
-          # expansion. The static-shape builder gates its runtime buckets on
-          # the decode graph mode, so PIECEWISE also runs here (K included,
-          # verified on 910B1). This is stage 0 and it ships PIECEWISE; the
-          # K-step's measured RTF win is FULL-only on stage 1, which ships
-          # FULL_DECODE_ONLY below. Stage-0 data point for scale (910B1):
-          # PIECEWISE without K is +75% RTF at 32/1 versus FULL_DECODE_ONLY
-          # with K=8.
-          cudagraph_mode: PIECEWISE
+          # Stage 0 carries no K-step, so nearly every step after prefill is a
+          # uniform decode batch; one whole-step graph replays it without the
+          # per-segment launch/sync cost of piecewise splitting. The static-shape
+          # builder gates its runtime buckets on the decode graph mode, so
+          # FULL_DECODE_ONLY covers those steps. Measured on 910B1 with the
+          # three-stage co-located profile, seed-tts en, mean audio RTF at
+          # 32@1 / 64@4 / 128@8: FULL_DECODE_ONLY 0.2749 / 0.5332 / 0.8346
+          # versus PIECEWISE 0.3008 / 0.5428 / 0.8267, i.e. -8.6% at 32@1,
+          # -1.8% at 64@4 and +0.9% at 128@8, inside this tier's ~2% run-to-run
+          # scatter. FULL_AND_PIECEWISE was measured as well (0.2800 / 0.5354 /
+          # 0.8337): no tier beats this mode and startup grows 20-70 s for the
+          # second graph set, so stage 0 keeps the decode-only graph. Stage 1
+          # below already ships FULL_DECODE_ONLY with the K-step.
+          cudagraph_mode: FULL_DECODE_ONLY
       - stage_id: 1
         # Concurrency cap raised from 4 to 8; the override block only covered
         # stages 0 and 2, so stage 1 kept the base value of 4.

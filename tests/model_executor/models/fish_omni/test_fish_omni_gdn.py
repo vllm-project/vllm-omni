@@ -12,7 +12,7 @@ import types
 import pytest
 import torch
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import hardware_marks, hardware_test
 
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "H100"}, num_cards=1)]
 
@@ -163,6 +163,7 @@ def test_drama3_gdn_core_matches_standard_path(monkeypatch, prefill_backend, dec
             assert torch.equal(new_ssm[row], ssm_pool[row])
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_zero_fresh_state_rows_only_touches_fresh_slots():
     from vllm_omni.model_executor.models.fish_omni.gdn import zero_fresh_state_rows_
@@ -182,6 +183,7 @@ def test_zero_fresh_state_rows_only_touches_fresh_slots():
             assert torch.equal(target[row], before[row])
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("backend", ["flashinfer", "triton"])
 def test_metadata_builder_skips_fla_chunk_metadata_only_for_flashinfer(backend):

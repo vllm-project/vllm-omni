@@ -215,6 +215,66 @@ def test_a_first_append_decodes_the_base_frame_once(monkeypatch: pytest.MonkeyPa
     assert len(prompt["prompt_token_ids"]) == 5 + 12 - 1 + 4 * TOKENS_PER_BLOCK
 
 
+@pytest.mark.parametrize("payload_audio", [None, ""], ids=["no audio key", "empty audio"])
+def test_a_vision_only_unit_reserves_exactly_its_tokens(payload_audio: str | None) -> None:
+    """Surplus slots become </unit> pad embeddings in the KV, so VISION units reserve exactly."""
+    payload: dict[str, object] = {"format": "pcm_f32le", "video_frames": [_frame((448, 448))]}
+    if payload_audio is not None:
+        payload["audio"] = payload_audio
+    runtime_config = {"duplex_first_append_context_tokens": 5, "duplex_vision_tile_pixels": TILE_448}
+
+    def budget(seq: int) -> int:
+        prompt = build_duplex_data_plane_prompt(
+            request_id="vision-only",
+            fence=DuplexFence("sid", turn_id=1),
+            session_config={},
+            runtime_config=runtime_config,
+            seq=seq,
+            turn_seq=seq,
+            payload=payload,
+            final=False,
+        )
+        return len(prompt["prompt_token_ids"])
+
+    # Context, <unit>, one frame block.
+    assert budget(1) == 5 + 1 + TOKENS_PER_BLOCK
+    # Previous terminator + </unit>, <unit>, one frame block.
+    assert budget(2) == 2 + 1 + TOKENS_PER_BLOCK
+
+
+def test_the_first_audio_window_after_a_vision_unit_is_not_the_append_sequence() -> None:
+    """Stage0's mel window is still the first one after VISION units.
+
+    Two buffered seconds then produce one unit: the previous terminator,
+    ``</unit>``, ``<unit>`` and ten audio tokens. Budgeting it as two later
+    chunks reserves 25 and leaves twelve ``</unit>`` pads in the KV.
+    """
+    two_seconds = base64.b64encode(b"\x00" * 4 * 32000).decode()
+    three_seconds = base64.b64encode(b"\x00" * 4 * 48000).decode()
+    runtime_config = {"duplex_first_append_context_tokens": 5}
+
+    def budget(audio: str, *, seq: int, first_window: bool) -> int:
+        payload: dict[str, object] = {"audio": audio, "format": "pcm_f32le"}
+        if first_window:
+            payload["first_audio_window"] = True
+        prompt = build_duplex_data_plane_prompt(
+            request_id="vision-then-audio",
+            fence=DuplexFence("sid", turn_id=1),
+            session_config={},
+            runtime_config=runtime_config,
+            seq=seq,
+            turn_seq=seq,
+            payload=payload,
+            final=True,
+        )
+        assert "first_audio_window" not in prompt["model_intermediate_buffer"]["duplex"]["payload"]
+        return len(prompt["prompt_token_ids"])
+
+    assert budget(two_seconds, seq=2, first_window=True) == 13
+    assert budget(three_seconds, seq=2, first_window=True) == 25
+    assert budget(two_seconds, seq=2, first_window=False) == 25
+
+
 # ---- where the tile comes from ----
 
 

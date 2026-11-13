@@ -27,6 +27,7 @@ from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
+from vllm_omni.diffusion.model_metadata import REQUEST_IDENTITY_EXTRA_ARGS
 from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
     any_selected_component_uses_allgather,
@@ -94,6 +95,12 @@ def _text_encoder_input_signature(prompt: object) -> tuple[bool, bool]:
 def _uses_text_encoder_allgather(config: object) -> bool:
     resolved = resolve_offload(config)
     return resolved.offloads(TEXT_ENCODER_COMPONENT) and resolved.uses_allgather(TEXT_ENCODER_COMPONENT)
+
+
+def _schedule_extra_args_signature(extra_args: dict | None) -> str | None:
+    """``extra_args`` as far as they can change the forward schedule; request identities are left out."""
+    schedule = {key: value for key, value in (extra_args or {}).items() if key not in REQUEST_IDENTITY_EXTRA_ARGS}
+    return json.dumps(schedule, sort_keys=True, default=repr) if schedule else None
 
 
 @dataclass
@@ -172,12 +179,20 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._closed = False
         self._is_failed = False
         self._failure_callbacks: list[Callable[[], None]] = []
+        # The executor pins a spawn context instead of relying on the global
+        # start method: wake_events below are created here, in _init_executor,
+        # while _launch_workers only switches the global start method to spawn
+        # later. mp.Event() would therefore come from the default (fork)
+        # context and then be pickled into spawn-Process args, which is
+        # unsupported — sync primitives must come from the same context as the
+        # processes that consume them.
+        self._mp_context = mp.get_context("spawn")
         self._result_mq: MessageQueue | None = None
         self._result_mqs: list[MessageQueue] = []
         self._rpc_wave_id: int = 0
 
         num_workers = cast(int, self.od_config.num_gpus)
-        self.wake_events = [mp.Event() for _ in range(num_workers)]
+        self.wake_events = [self._mp_context.Event() for _ in range(num_workers)]
 
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
@@ -369,6 +384,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         wake_events: list[Event],
     ) -> tuple[list[mp.Process], list[Handle]]:
         od_config = self.od_config
+        # The shared registry is only valid as a spawn argument. Request RPCs
+        # serialize od_config with ordinary pickle, which cannot carry it.
+        sharing_registry = vars(od_config).pop("_sharing_worker_registry", None)
         logger.info("Starting server...")
 
         num_gpus = cast(int, od_config.num_gpus)
@@ -377,6 +395,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # user-provided OMP_NUM_THREADS.
         set_multiprocessing_worker_envs()
         mp.set_start_method("spawn", force=True)
+        mp_context = getattr(self, "_mp_context", mp.get_context("spawn"))
         processes = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
@@ -388,9 +407,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         scheduler_pipe_writers = []
 
         for i in range(num_gpus):
-            reader, writer = mp.Pipe(duplex=False)
+            reader, writer = mp_context.Pipe(duplex=False)
             scheduler_pipe_writers.append(writer)
-            process = mp.Process(
+            process = mp_context.Process(
                 target=WorkerProc.worker_main,
                 args=(
                     i,  # rank
@@ -401,6 +420,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),
+                kwargs={"sharing_registry": sharing_registry},
                 name=f"DiffusionWorker-{i}",
                 daemon=True,
             )
@@ -551,18 +571,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             # Reuse the request scheduler's complete compatibility key. DLO
             # AllGather requires every DP rank to execute the same collective
             # schedule, including shape, CFG, denoise steps, output count,
-            # and LoRA settings.
-            compatibility_keys = [build_request_batch_sampling_params_key(nr.req) for nr in new_reqs]
+            # and LoRA settings. Building the keys below cannot raise:
+            # add_request() already resolved each schedule against this service
+            # config and rejected an invalid one as that request's client error.
+            attention_schedule_config = self.od_config.diffusion_attention_schedule
+            compatibility_keys = [
+                build_request_batch_sampling_params_key(nr.req, attention_schedule_config) for nr in new_reqs
+            ]
             if any(key != compatibility_keys[0] for key in compatibility_keys[1:]):
                 raise ValueError(
                     "DLO DP multi-concurrency requires compatible shape, CFG, "
                     "denoise schedule, output count, and LoRA settings for all "
                     "requests in one collective wave."
                 )
-            extra_args_signatures: set = set()
-            for nr in new_reqs:
-                ea = getattr(nr.req.sampling_params, "extra_args", None)
-                extra_args_signatures.add(json.dumps(ea, sort_keys=True, default=repr) if ea is not None else None)
+            extra_args_signatures = {
+                _schedule_extra_args_signature(getattr(nr.req.sampling_params, "extra_args", None)) for nr in new_reqs
+            }
             if len(extra_args_signatures) > 1:
                 raise ValueError(
                     "DP multi-concurrency requires all concurrent requests to "

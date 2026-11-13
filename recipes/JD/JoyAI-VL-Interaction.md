@@ -32,7 +32,18 @@ framework internals and how to add another full-duplex model, see
 ## Unified Realtime Session (text/video)
 
 An opt-in profile connects JoyAI to the shared Session runtime and Realtime
-client. It uses the existing JoyAI → Qwen3-TTS CustomVoice → Code2Wav pipeline:
+client. It uses the existing JoyAI → Qwen3-TTS CustomVoice → Code2Wav pipeline.
+
+The native turn and duplex profiles use Model Runner V2 for every stage on CUDA,
+including Qwen3-ASR in the speech-input profile. Other platforms retain Model
+Runner V1. Text/video duplex streams Talker codec chunks into Code2Wav; the ASR
+profiles pass complete stage outputs. Session memory and tool delegation use the
+same JoyAI plugin with either runner. To compare against V1 on CUDA, set
+`model_runner: v1` on each stage in a deploy override.
+
+The Talker follows Qwen3-TTS's `recompute_preemption: fail` policy: a request
+whose KV is preempted fails explicitly, since replaying its codec IDs cannot
+reconstruct the MTP embeddings used to generate the speech.
 
 ```bash
 vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \
@@ -57,14 +68,15 @@ camera frame. A silent decision completes the response with empty output. A spok
 decision produces text and audio, followed by `response.done`. Playback acknowledgements,
 `response.cancel`, `session.close`, and reconnect use the shared Session lifecycle.
 
-This first profile runs observations sequentially through the all-sync pipeline.
-Incoming frames can be buffered while an answer is being generated; speech audio
-is delivered after synthesis finishes. Prompts retain up to four recent camera
-frames (thumbnail size at most 448×448) and eight recent text messages. Older
-history/frames are evicted when the expanded visual-token count plus the generation
-budget would exceed the configured JoyAI-stage context limit. The active instruction
-and newest frame are retained; an oversized instruction is reported as an error.
-These bounds provide a small working context, with summary memory planned in
+This first profile runs observations sequentially. Incoming frames can be buffered
+while an answer is being generated. The Talker streams codec frames to Code2Wav,
+so speech audio is delivered chunk by chunk while synthesis continues. Prompts
+retain up to four recent camera frames (thumbnail size at most 448×448) and eight
+recent text messages. Older history/frames are evicted when the expanded
+visual-token count plus the generation budget would exceed the configured
+JoyAI-stage context limit. The active instruction and newest frame are retained;
+an oversized instruction is reported as an error. These bounds provide a small
+working context, with summary memory planned in
 [RFC #8803](https://github.com/vllm-project/vllm-omni/issues/8803).
 
 The current profile accepts
@@ -92,8 +104,55 @@ added to the matching user history item, so later camera observations retain the
 spoken task. Text/video-only turns bypass ASR on this deployment. The final
 expanded prompt is checked against JoyAI's context budget after transcription.
 
-Speech output remains all-sync. Summary memory and tool delegation are separate
-follow-ups tracked by [RFC #8803](https://github.com/vllm-project/vllm-omni/issues/8803).
+Speech output on this profile remains all-sync. Summary memory is a separate follow-up tracked by
+[RFC #8803](https://github.com/vllm-project/vllm-omni/issues/8803).
+
+### Tool delegation
+
+The duplex profile can hand a hard question to the client instead of answering it.
+Declare the one supported function with a `session.update`; the `tools` field is a
+top-level session key:
+
+```json
+{"type":"session.update","session":{"tools":[{
+  "type":"function","name":"delegate",
+  "description":"Ask a background helper to answer one question the current view cannot answer reliably.",
+  "parameters":{"type":"object","properties":{
+    "question":{"type":"string"},"note":{"type":"string"}},
+    "required":["question"],"additionalProperties":false}}]}}
+```
+
+Any other declaration is refused. With the tool declared, JoyAI may answer with
+`</response> <note> </delegation> <question>`; the session then publishes a standard
+function call instead of failing the observation:
+
+```json
+{"type":"response.function_call_arguments.done","call_id":"call_…",
+ "arguments":"{\"note\":\"Checking the pot.\",\"question\":\"Is the pot overheated?\"}"}
+```
+
+The client executes the question however it likes and returns the digest:
+
+```json
+{"type":"conversation.item.create","item":{
+  "type":"function_call_output","call_id":"call_…","output":"It is smoking."}}
+```
+
+The session ledger admits that result once; a duplicate, unknown or cancelled
+`call_id` is refused with `invalid_function_call_output`. An accepted result does not
+enter the conversation history — it becomes a `[Delegated Results]` block in later
+JoyAI prompts, so the model can answer it in a following observation.
+
+Two behaviours to plan for in a client:
+
+- A delegating observation publishes **two** terminal responses: the synthesised
+  function-call response and the spoken one. The note's audio belongs to the spoken
+  response, so its playback acknowledgement must name that `response_id`; acking the
+  function-call response is refused with `playback_item_not_found`.
+- The duplex profile is serial: the next camera commit is admitted only after the
+  note's playback is acknowledged in full. Ask the model to answer once the helper has
+  replied (a short user turn such as "Answer now with the result you received."), which
+  is what makes a delegated answer spoken.
 
 ### Browser client
 

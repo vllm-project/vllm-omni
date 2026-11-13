@@ -52,6 +52,24 @@ def test_identity_mapping_reuses_cached_device_and_host_mappings(mocker):
     assert refreshed.states[1] is states[1]
 
 
+@pytest.mark.parametrize("initial_mode", [False, True])
+def test_cached_batch_rebuilds_when_mixfusion_mode_changes(initial_mode):
+    states = [_make_state(f"req-{index}", float(index)) for index in range(2)]
+    batch = InputBatch.make_batch(states, use_mixfusion=initial_mode)
+
+    refreshed = InputBatch.make_batch(states, cached_batch=batch, use_mixfusion=not initial_mode)
+
+    assert refreshed is not batch
+    assert refreshed.use_mixfusion is not initial_mode
+    if refreshed.use_mixfusion:
+        assert isinstance(refreshed.latents, list)
+        latents = torch.cat(refreshed.latents)
+    else:
+        assert isinstance(refreshed.latents, torch.Tensor)
+        latents = refreshed.latents
+    torch.testing.assert_close(latents, torch.cat([state.latents for state in states]))
+
+
 def test_identity_mapping_does_not_reuse_cached_explicit_reordering():
     states = [_make_state(f"req-{index}", float(index)) for index in range(2)]
     batch = InputBatch.make_batch(

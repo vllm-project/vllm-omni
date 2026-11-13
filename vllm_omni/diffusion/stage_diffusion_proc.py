@@ -15,6 +15,7 @@ import multiprocessing.connection
 import signal
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -73,6 +74,8 @@ class StageDiffusionProc:
     """
 
     DIFFUSION_PROC_DEAD = b"DIFFUSION_PROC_DEAD"
+    _DEAD_SENTINEL_SEND_TIMEOUT_S = 5.0
+    _sharing_quiesced = False
 
     def __init__(self, model: str, od_config: OmniDiffusionConfig) -> None:
         self._model = model
@@ -80,15 +83,18 @@ class StageDiffusionProc:
         self._engine: DiffusionEngine | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._closed = False
-        # Set by ``run_loop`` to the live dispatch task dict so
+        self._sharing_quiesced = False
+        # Set by ``_run_loop`` to the live dispatch task dict so
         # :attr:`queue_length` can report in-flight requests for the
         # OmniCoordinator heartbeat hook.
         self._active_tasks: dict[str, asyncio.Task] | None = None
         # Set when a request-handler detects that the engine's multiproc
         # executor has died (e.g. a worker process crashed and the executor's
-        # monitor thread closed it). Once set, ``run_loop`` breaks out so the
-        # outer ``except``/``finally`` can send ``DIFFUSION_PROC_DEAD`` and
-        # ``ReplicaStatus.DOWN``, then the subprocess exits non-zero. Without
+        # monitor thread closed it). Once set, ``_run_loop`` raises and its
+        # ``except`` sends ``DIFFUSION_PROC_DEAD`` *before* its ``finally``
+        # drains ``rpc_task`` (which may wait on a blocked executor RPC
+        # thread); ``run_loop`` then releases the sockets and the subprocess
+        # exits non-zero. Keep that notify-before-drain order. Without
         # this, the run_loop would swallow per-request errors and keep
         # serving 500s indefinitely while heartbeats still report UP.
         self._fatal_event: asyncio.Event | None = None
@@ -168,17 +174,6 @@ class StageDiffusionProc:
     # Request processing
     # ------------------------------------------------------------------
 
-    def _reconstruct_sampling_params(self, sampling_params_dict: dict) -> OmniDiffusionSamplingParams:
-        """Reconstruct OmniDiffusionSamplingParams from a dict, handling LoRA."""
-        lora_req = sampling_params_dict.get("lora_request")
-        if lora_req is not None:
-            from vllm.lora.request import LoRARequest
-
-            if not isinstance(lora_req, LoRARequest):
-                sampling_params_dict["lora_request"] = msgspec.convert(lora_req, LoRARequest)
-
-        return OmniDiffusionSamplingParams(**sampling_params_dict)
-
     async def _process_request(
         self,
         request_id: str,
@@ -190,7 +185,7 @@ class StageDiffusionProc:
         payload_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
         """Build a diffusion request and consume DiffusionEngine.step_streaming() to completion."""
-        sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
+        sampling_params = OmniDiffusionSamplingParams.from_dict(sampling_params_dict)
 
         request = OmniDiffusionRequest(
             prompt=prompt,
@@ -228,7 +223,7 @@ class StageDiffusionProc:
         payload_sender_info: dict[str, Any] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Process a streaming diffusion request and yield the results from DiffusionEngine.step_streaming()."""
-        sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
+        sampling_params = OmniDiffusionSamplingParams.from_dict(sampling_params_dict)
 
         request = OmniDiffusionRequest(
             prompt=prompt,
@@ -261,6 +256,17 @@ class StageDiffusionProc:
         LoRA methods remap arguments and post-process results to match
         the contract that ``AsyncOmni`` provides.
         """
+        if method in ("weight_sharing_quiesce", "weight_sharing_drain"):
+            if method == "weight_sharing_quiesce":
+                self._sharing_quiesced = True
+            else:
+                assert self._engine is not None
+                for request_id in list(self._active_tasks or {}):
+                    self._engine.abort(request_id)
+            active = list((self._active_tasks or {}).values())
+            if active:
+                await asyncio.gather(*active)
+            return True
         # Feedback only changes condition-protected host state and must not
         # wait behind an executor RPC for the current GPU chunk.
         if method in ("update_streaming_playback", "track_streaming_interaction", "release_streaming_output"):
@@ -285,9 +291,10 @@ class StageDiffusionProc:
                 raise
 
         if method == "profile":
+            assert self._engine is not None
             is_start = args[0] if args else True
             profile_prefix = args[1] if len(args) > 1 else None
-            return await run_executor(self._engine.profile, is_start, profile_prefix)
+            return await run_executor(partial(self._engine.profile, is_start, profile_prefix, **(kwargs or {})))
 
         if method == "add_lora":
             # Reconstruct LoRARequest after IPC if needed.
@@ -368,12 +375,63 @@ class StageDiffusionProc:
     ) -> None:
         """Async event loop handling ZMQ messages from StageDiffusionClient."""
         ctx = zmq.asyncio.Context()
+        request_socket: zmq.asyncio.Socket | None = None
+        response_socket: zmq.asyncio.Socket | None = None
+        response_connected = False
+        dead_notified = False
 
-        request_socket = ctx.socket(zmq.PULL)
-        request_socket.connect(request_address)
+        async def notify_client_dead() -> None:
+            # Send the death sentinel so the client can detect the fatal
+            # failure promptly (mirrors EngineCoreProc._send_engine_dead).
+            # A PUSH socket without a connected peer blocks on send, so skip
+            # the sentinel in that case and bound the send so a stuck client
+            # cannot hang teardown.
+            nonlocal dead_notified
+            if dead_notified or not response_connected or response_socket is None:
+                return
+            dead_notified = True
+            try:
+                response_socket.setsockopt(zmq.LINGER, 4000)
+                await asyncio.wait_for(
+                    response_socket.send(StageDiffusionProc.DIFFUSION_PROC_DEAD),
+                    timeout=StageDiffusionProc._DEAD_SENTINEL_SEND_TIMEOUT_S,
+                )
+            except Exception:
+                logger.warning("Failed to send DIFFUSION_PROC_DEAD sentinel to client.")
+                # The client is not draining responses; do not let close()
+                # linger flushing queued messages past the send timeout.
+                response_socket.setsockopt(zmq.LINGER, 0)
 
-        response_socket = ctx.socket(zmq.PUSH)
-        response_socket.connect(response_address)
+        try:
+            request_socket = ctx.socket(zmq.PULL)
+            response_socket = ctx.socket(zmq.PUSH)
+            # Connect the response side first so a request-side connect
+            # failure can still be reported to the client.
+            response_socket.connect(response_address)
+            response_connected = True
+            request_socket.connect(request_address)
+            await self._run_loop(request_socket, response_socket, notify_client_dead)
+        except Exception:
+            # Covers connect and loop initialization failures; dispatch
+            # failures have already notified the client inside _run_loop.
+            await notify_client_dead()
+            raise
+        finally:
+            self._active_tasks = None
+            self._fatal_event = None
+            if request_socket is not None:
+                request_socket.close()
+            if response_socket is not None:
+                response_socket.close()
+            ctx.term()
+
+    async def _run_loop(
+        self,
+        request_socket: zmq.asyncio.Socket,
+        response_socket: zmq.asyncio.Socket,
+        notify_client_dead: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Initialize and dispatch requests within the transport lifetime."""
 
         encoder = OmniMsgpackEncoder()
         decoder = OmniMsgpackDecoder()
@@ -539,6 +597,8 @@ class StageDiffusionProc:
                 msg_type = msg.get("type")
 
                 if msg_type == "add_request":
+                    if self._sharing_quiesced:
+                        raise RuntimeError("request received after sharing stage quiescence")
                     request_id = msg["request_id"]
                     task = asyncio.create_task(
                         _dispatch_request(
@@ -583,13 +643,9 @@ class StageDiffusionProc:
                     break
 
         except Exception:
-            # Send the death sentinel so the client can detect the
-            # fatal failure promptly (mirrors EngineCoreProc._send_engine_dead).
-            try:
-                response_socket.setsockopt(zmq.LINGER, 4000)
-                await response_socket.send(StageDiffusionProc.DIFFUSION_PROC_DEAD)
-            except Exception:
-                logger.warning("Failed to send DIFFUSION_PROC_DEAD sentinel to client.")
+            # Notify before draining rpc_task: cancelling it waits for any
+            # in-flight executor RPC thread, which may block for a long time.
+            await notify_client_dead()
             raise
 
         finally:
@@ -597,12 +653,6 @@ class StageDiffusionProc:
             for task in tasks.values():
                 task.cancel()
             await asyncio.gather(rpc_task, *tasks.values(), return_exceptions=True)
-
-            self._active_tasks = None
-            self._fatal_event = None
-            request_socket.close()
-            response_socket.close()
-            ctx.term()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -805,6 +855,12 @@ class StageDiffusionProcManager:
         )
 
         ctx = get_mp_context()
+        from vllm_omni.distributed.weight_sharing.runtime import CONFIG_KEY
+        from vllm_omni.distributed.weight_sharing.worker_registry import ConsumerWorkerRegistry
+
+        self.sharing_workers = getattr(od_config, "_sharing_worker_registry", None)
+        if CONFIG_KEY in od_config.additional_config and not isinstance(self.sharing_workers, ConsumerWorkerRegistry):
+            raise RuntimeError("shared consumer startup requires the owner's worker registry")
         proc = ctx.Process(
             target=StageDiffusionProc.run_diffusion_proc,
             name="StageDiffusionProc",
@@ -819,14 +875,25 @@ class StageDiffusionProcManager:
                 "omni_replica_id": omni_replica_id,
             },
         )
-        proc.start()
         self.proc = proc
         self.distributed_executor_backend = od_config.distributed_executor_backend
         self.addresses = addresses
         self.manager_stopped = False
         self.failed_proc_name: str | None = None
 
-        self._wait_until_started(handshake_address, stage_init_timeout)
+        try:
+            proc.start()
+            self._wait_until_started(handshake_address, stage_init_timeout)
+        except Exception as exc:
+            if self.sharing_workers is None:
+                raise
+            from vllm_omni.distributed.weight_sharing.worker_registry import ConsumerStartupError
+
+            try:
+                self.sharing_workers.terminate(timeout=10.0)
+            except Exception:
+                logger.exception("Shared consumer startup cleanup is unconfirmed")
+            raise ConsumerStartupError(str(exc), registry=self.sharing_workers) from exc
 
     @classmethod
     def launch_headless(

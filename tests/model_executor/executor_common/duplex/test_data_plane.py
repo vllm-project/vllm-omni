@@ -58,6 +58,54 @@ def test_is_a_duplex_data_plane_and_projects_cumulative_output_as_deltas() -> No
     assert projected[0]["audio_format"] == "wav"
 
 
+class _DeltaDataPlane(CumulativeAudioTextDataPlane):
+    audio_output_is_delta = True
+
+
+def test_delta_audio_passes_through_unsliced() -> None:
+    plane = _DeltaDataPlane(_encode_audio)
+    plane.begin_request("req")
+    context = DuplexDataPlaneContext(response_format="wav", modalities=("audio", "text"))
+
+    projected = list(
+        plane.project(
+            {
+                "data_plane_outputs": [
+                    _output("req", text="he", samples=4),
+                    _output("req", text="hello", samples=2),
+                    _output("req", text="hello", samples=0),
+                    _output("req", text="hello", samples=3),
+                ]
+            },
+            context=context,
+        )
+    )
+
+    # Each delta chunk is encoded whole, even when shorter than earlier chunks;
+    # an empty chunk with no new text yields nothing. Text stays cumulative.
+    assert [item["audio_data"] for item in projected] == ["audio-4", "audio-2", "audio-3"]
+    assert [item["text"] for item in projected] == ["he", "llo", ""]
+
+
+@pytest.mark.parametrize("as_tensor", [False, True])
+def test_delta_audio_chunks_that_arrive_together_are_joined(as_tensor: bool) -> None:
+    import torch
+
+    plane = _DeltaDataPlane(_encode_audio)
+    plane.begin_request("req")
+    context = DuplexDataPlaneContext(response_format="wav", modalities=("audio", "text"))
+    chunks = [np.arange(4, dtype=np.float32), np.arange(3, dtype=np.float32)]
+    if as_tensor:
+        chunks = [torch.from_numpy(chunk) for chunk in chunks]
+    output = _output("req", text="", samples=0)
+    output.multimodal_output["model_outputs"] = chunks
+
+    projected = list(plane.project({"data_plane_outputs": [output]}, context=context))
+
+    # Ragged chunks from several steps reach the encoder as one flat waveform.
+    assert [item["audio_data"] for item in projected] == ["audio-7"]
+
+
 def test_subclass_constants_and_default_sample_rate_reach_the_projection() -> None:
     plane = _TestDataPlane(_encode_audio)
     output = SimpleNamespace(

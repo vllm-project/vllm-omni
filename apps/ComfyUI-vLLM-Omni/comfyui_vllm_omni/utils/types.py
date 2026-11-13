@@ -48,6 +48,21 @@ class LatentMaskEditing(dict):
     pass
 
 
+# MiniMax-H3 timeline guides: limits of the /v1/videos multipart contract.
+MAX_TIMELINE_GUIDES = 8
+MAX_TIMELINE_GUIDE_BYTES = {"image": 30 * 2**20, "video": 50 * 2**20, "audio": 15 * 2**20}
+TIMELINE_GUIDE_FPS = 24
+
+
+class H3TimelineGuides(list):
+    """Ordered MiniMax-H3 timeline guides built by chained Add Guide nodes.
+
+    Each entry is a dict with an integer ``frame_index`` and at least one of
+    ``image`` (IMAGE), ``video`` (VIDEO) and ``audio`` (AUDIO). Nodes copy the
+    chain before appending, so forked graphs never share entries.
+    """
+
+
 class FastH3Deployment(dict):
     """Descriptor for a server that fused FastH3 at startup."""
 

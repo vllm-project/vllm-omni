@@ -153,7 +153,8 @@ class DuplexSessionTasks:
         return task is not None and task in self.runner_cancelled
 
     def has_response_bound_append_tasks(self) -> bool:
-        return any(meta.response_bound for meta in self.append_tasks.values())
+        # A finished task can remain tracked until its done callback runs.
+        return any(meta.response_bound and not task.done() for task, meta in self.append_tasks.items())
 
     async def cancel_append_tasks(self, timeout_s: float = 0.25, *, response_bound_only: bool = False) -> bool:
         """Cancel the tracked appends; the caller owns their responses from here on.
