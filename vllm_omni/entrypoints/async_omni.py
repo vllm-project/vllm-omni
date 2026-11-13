@@ -1208,6 +1208,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         async with self._pause_cond:
             return self._paused
 
+    async def is_idle_for_sleep(self) -> bool:
+        """Return whether automatic sleep may close admission."""
+        async with self._pause_cond:
+            return self._admitting == 0 and not self._paused and not self._sleeping_tags and not self.request_states
+
     # EngineClient exposes async operations; OmniBase implements the sync API.
     async def start_profile(  # type: ignore[override]
         self,

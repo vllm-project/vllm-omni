@@ -29,6 +29,7 @@ from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     DuplexSessionRuntimeConfig,
+    IdleSleepRuntimeConfig,
     PipelineConfig,
     load_deploy_config,
 )
@@ -663,12 +664,16 @@ class OmniEngineBase:
         # here: the pre-framework wiring they named is gone, and design rule 3
         # in docs/design/fullduplex.md keeps duplex vocabulary out of the base.
         self.duplex_session_config = DuplexSessionRuntimeConfig()
+        self.idle_sleep_config = IdleSleepRuntimeConfig()
         if config_path is not None:
             if self.deploy_config is not None and self._deploy_config_source == str(config_path):
                 # Already parsed in __init__; the same yaml twice is pure cost.
                 self.duplex_session_config = self.deploy_config.duplex_session
+                self.idle_sleep_config = self.deploy_config.idle_sleep
             else:
-                self.duplex_session_config = load_deploy_config(config_path).duplex_session
+                deploy_config = load_deploy_config(config_path)
+                self.duplex_session_config = deploy_config.duplex_session
+                self.idle_sleep_config = deploy_config.idle_sleep
 
     def _resolve_stage_configs(
         self,

@@ -112,6 +112,7 @@ class AsyncOmniBase(OmniBase):
         self.config_path = self.engine.config_path
         self.input_processor = self.engine.input_processor
         self.endpoint_restrictions = self.engine.endpoint_restrictions
+        self.idle_sleep_config = getattr(self.engine, "idle_sleep_config", None)
 
         stage_index = self._get_comprehension_stage_index()
         if stage_index is None:
