@@ -10,6 +10,10 @@ via :func:`make_sample_rate_tensors`; consumers read with
 (removed in 0.36). :func:`find_sample_rate` is the separate lenient,
 warning-free scan for config objects. Deliberately a leaf module
 (stdlib + torch only) to avoid import cycles.
+Payload *construction* additionally guards the producer side: a
+``MultimodalPayload`` that ships audio samples without any rate warns
+(:class:`MissingSampleRateAtConstructionWarning`); construction raises
+:class:`MissingSampleRateError` from version 0.36.
 """
 
 from __future__ import annotations
@@ -47,6 +51,18 @@ _THIS_FILENAME = __file__
 
 class DeprecatedSampleRateKeyWarning(DeprecationWarning):
     """A legacy sampling-rate key was read from a model output payload."""
+
+
+class MissingSampleRateAtConstructionWarning(UserWarning):
+    """An audio payload carrying samples was constructed without a sample rate.
+
+    Emitted by multimodal-payload construction when the payload will ship
+    audio samples but carries no sampling-rate key. Construction warns during
+    the transition release and raises :class:`MissingSampleRateError` from
+    version 0.36. Unlike the deprecation warnings this is a ``UserWarning``:
+    an unlabeled payload is about to become a hard error, so model authors
+    should see it without opting in.
+    """
 
 
 class SampleRateError(ValueError):
@@ -280,8 +296,8 @@ def make_sample_rate_tensors(sample_rate: int, num_requests: int = 1) -> list[to
 _warned_callsites: set[tuple[str, str, int]] = set()
 
 
-def _warn_deprecated(callsite_key: str, message: str) -> None:
-    """Emit a deprecation warning once per (spelling, callsite).
+def _warn_once(callsite_key: str, message: str, category: type[Warning], stacklevel: int) -> None:
+    """Emit a warning once per (spelling, callsite).
 
     Streaming reads hit the same callsite many times per second; dedup
     keeps the log usable.
@@ -294,5 +310,32 @@ def _warn_deprecated(callsite_key: str, message: str) -> None:
     if callsite in _warned_callsites:
         return
     _warned_callsites.add(callsite)
-    # stacklevel 4 attributes the warning to the caller of the public getter.
-    warnings.warn(message, DeprecatedSampleRateKeyWarning, stacklevel=4)
+    warnings.warn(message, category, stacklevel=stacklevel)
+
+
+def _warn_deprecated(callsite_key: str, message: str) -> None:
+    # stacklevel 1 attributes to _warn_once, 2 to _warn_deprecated,
+    # 3 to _resolve_payload, 4 to the public getter, 5 to the caller the
+    # warning is attributed to.
+    _warn_once(callsite_key, message, DeprecatedSampleRateKeyWarning, stacklevel=5)
+
+
+def warn_missing_rate_at_construction() -> None:
+    """Warn that an audio payload carrying samples was built with no rate.
+
+    Called from multimodal-payload construction (:meth:`MultimodalPayload.from_raw`)
+    when the payload ships audio samples but carries no sampling-rate key.
+    Warns once per callsite during the transition; from vLLM-Omni
+    ``SAMPLE_RATE_REMOVAL_VERSION`` construction raises
+    :class:`MissingSampleRateError` instead.
+    """
+    _warn_once(
+        "sample-rate-missing-at-construction",
+        f"multimodal audio payload carries samples without a sample rate; audio-emitting "
+        f"models must emit {SAMPLE_RATE_KEY!r} alongside the waveform. This warns during "
+        f"migration and raises MissingSampleRateError from vLLM-Omni {SAMPLE_RATE_REMOVAL_VERSION}.",
+        MissingSampleRateAtConstructionWarning,
+        # 1 → _warn_once, 2 → warn_missing_rate_at_construction,
+        # 3 → the payload-construction caller the warning is attributed to.
+        stacklevel=3,
+    )

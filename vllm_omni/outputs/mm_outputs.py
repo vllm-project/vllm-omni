@@ -23,7 +23,7 @@ from vllm_omni.outputs.output_modality import (
     get_accumulation_strategy,
 )
 from vllm_omni.outputs.utils import _is_tensor_list, _to_cpu
-from vllm_omni.sample_rate import ALL_SAMPLE_RATE_KEYS
+from vllm_omni.sample_rate import ALL_SAMPLE_RATE_KEYS, find_sample_rate, warn_missing_rate_at_construction
 
 logger = init_logger(__name__)
 
@@ -44,6 +44,44 @@ _METADATA_TENSOR_KEYS: frozenset[str] = frozenset(
         "meta.committed_token_count",
     )
 )
+
+
+def _carries_audio_samples(value: Any) -> bool:
+    """Whether an audio payload value will actually ship samples.
+
+    Sparse streaming steps legally emit no audio (``None``, empty lists, or
+    empty tensors); only a payload that ships samples requires a rate.
+    """
+    if value is None:
+        return False
+    if isinstance(value, torch.Tensor):
+        return value.numel() > 0
+    if isinstance(value, (list, tuple)):
+        return any(_carries_audio_samples(item) for item in value)
+    size = getattr(value, "size", None)
+    if isinstance(size, int):
+        # numpy arrays and array-likes expose an integer .size
+        return size > 0
+    return True
+
+
+def _warn_unlabeled_audio(remapped: dict[str, Any], modality_key: str) -> None:
+    """Require a sample rate on audio payloads that ship samples.
+
+    Construction-time enforcement of the producer contract: a payload whose
+    audio tensor will reach a consumer must carry a rate under some accepted
+    spelling. Warns during the transition release (deduplicated per
+    callsite); raises from vLLM-Omni 0.36. Zero-audio sparse steps stay
+    legal without a rate, matching the strict-where-audio-ships posture of
+    the serving consumers.
+    """
+    if modality_key != "audio":
+        return
+    if not _carries_audio_samples(remapped.get(modality_key)):
+        return
+    if find_sample_rate(remapped) is not None:
+        return
+    warn_missing_rate_at_construction()
 
 
 def _cat_tensors(
@@ -264,17 +302,21 @@ class MultimodalPayload(Mapping):
         Producer-specific dict keys are remapped to the semantic modality
         key (e.g. "audio", "latent"): AR runners produce {"hidden": ...}
         and generation runners produce {"model_outputs": ...}.
+
+        Audio payloads that ship samples without any sample-rate key warn
+        here (see :func:`vllm_omni.sample_rate.warn_missing_rate_at_construction`).
         """
         if isinstance(payload, MultimodalPayload):
             return payload
 
         if not isinstance(payload, dict):
-            return cls.from_dict({modality_key: _to_cpu(payload)})
-
-        remapped: dict[str, Any] = {}
-        for key, value in payload.items():
-            is_producer_key = key == "model_outputs" or (key == "hidden" and modality_key != "hidden")
-            remapped[modality_key if is_producer_key else key] = _to_cpu(value)
+            remapped: dict[str, Any] = {modality_key: _to_cpu(payload)}
+        else:
+            remapped = {}
+            for key, value in payload.items():
+                is_producer_key = key == "model_outputs" or (key == "hidden" and modality_key != "hidden")
+                remapped[modality_key if is_producer_key else key] = _to_cpu(value)
+        _warn_unlabeled_audio(remapped, modality_key)
         return cls.from_dict(remapped)
 
 
