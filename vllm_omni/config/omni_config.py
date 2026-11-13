@@ -11,6 +11,7 @@ later PRs cut consumers over to these classes.
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Mapping
 from dataclasses import InitVar, dataclass, field, fields
 from functools import wraps
@@ -25,6 +26,7 @@ from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
 from vllm.config import KernelConfig, KVTransferConfig
 from vllm.config import LoadConfig as VllmLoadConfig
+from vllm.config import LoRAConfig as VllmLoRAConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
@@ -63,6 +65,7 @@ from vllm_omni.config.stage_config import (
     update_deploy_config_async_chunk_enabled,
     validate_native_mrv2_session,
 )
+from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
 logger = init_logger(__name__)
@@ -85,6 +88,8 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "model_tag",
         "omni",
         "output_modalities",
+        "reasoning_parser",
+        "reasoning_parser_plugin",
         "stage_id",
         "subparser",
         "tokenizer",
@@ -246,7 +251,13 @@ class _SchedulerEngineOverrides(TypedDict, total=False):
     async_scheduling: bool
 
 
+class _LoRAEngineOverrides(TypedDict, total=False):
+    # Upstream LoRAConfig inputs join through _LORA_CONFIG_ENGINE_FIELD_MAP.
+    enable_lora: bool
+
+
 class _RuntimeEngineOverrides(TypedDict, total=False):
+    shutdown_timeout: float
     additional_config: dict[str, Any]
     distributed_executor_backend: Any
     worker_cls: str
@@ -301,8 +312,10 @@ class _StageEngineValues:
     connector: _ConnectorEngineOverrides
     runtime: _RuntimeEngineOverrides
     parallel: _ParallelEngineOverrides
+    lora: _LoRAEngineOverrides
     diffusion: _DiffusionEngineOverrides
     compilation_config: Mapping[str, Any] | VllmCompilationConfig | None
+    kernel_config: Mapping[str, Any] | KernelConfig | None
     profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
     speculative_config: Mapping[str, Any] | VllmSpeculativeConfig | None
     weight_transfer_config: Mapping[str, Any] | VllmWeightTransferConfig | None
@@ -363,6 +376,7 @@ def _stage_cli_overrides(
     cli_overrides: Mapping[str, Any],
     *,
     execution_type: StageExecutionType | None = None,
+    stage_scoped_lora: bool = False,
 ) -> dict[str, Any]:
     if execution_type == StageExecutionType.DIFFUSION:
         stage_override_pattern = re.compile(r"^stage_\d+_")
@@ -377,6 +391,10 @@ def _stage_cli_overrides(
             ),
             **stage_scoped,
         }
+    elif stage_scoped_lora and execution_type is not None:
+        # Filter global LoRA inputs before merging stage-scoped values so a
+        # diffusion cache size cannot overwrite an LLM stage's explicit value.
+        cli_overrides = {name: value for name, value in cli_overrides.items() if name not in _LLM_LORA_ENGINE_FIELDS}
     runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
     global_stage_fields = _global_stage_cli_fields() | _OWNER_ONLY_GLOBAL_STAGE_CLI_FIELDS
     owned_fields = None if execution_type is None else _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
@@ -433,6 +451,24 @@ def _validate_global_stage_cli_ownership(
         names = ", ".join(sorted(unowned_fields))
         raise ValueError(
             f"Pipeline {pipeline.model_type!r} has explicit engine argument(s) with no structured config owner: {names}"
+        )
+
+    # vLLM LoRA is configured per LLM engine. Broadcasting it would also enable
+    # LoRA on talker/codec stages, while request LoRA only reaches stage 0.
+    global_lora_fields = explicit_global_fields & _LLM_LORA_ENGINE_FIELDS
+    if any(stage.execution_type == StageExecutionType.DIFFUSION for stage in pipeline.stages):
+        # A global max_cpu_loras sizes only the diffusion LoRA cache.
+        global_lora_fields -= _DIFFUSION_STAGE_ENGINE_FIELDS
+    if global_lora_fields and len(pipeline.stages) > 1:
+        names = ", ".join(sorted(global_lora_fields))
+        llm_stage_ids = [
+            stage.stage_id for stage in pipeline.stages if stage.execution_type != StageExecutionType.DIFFUSION
+        ]
+        raise ValueError(
+            f"Pipeline {pipeline.model_type!r} has {len(pipeline.stages)} stages; set vLLM LoRA argument(s) "
+            f"{names} on a specific LLM stage (LLM stages: {llm_stage_ids}), e.g. "
+            f'--stage-overrides \'{{"{llm_stage_ids[0]}": {{"enable_lora": true}}}}\' or the stage\'s '
+            "deploy YAML entry."
         )
 
 
@@ -614,6 +650,25 @@ class OmniStageSchedulerConfig(_TrackExplicitConfigFields, VllmSchedulerConfig):
             )
 
 
+@_enforce_keyword_only_init
+@config(kw_only=True, config=ConfigDict(arbitrary_types_allowed=True))
+class OmniStageLoRAConfig(_TrackExplicitConfigFields, VllmLoRAConfig):
+    """Per-stage vLLM LoRA behavior for AR and generation stages.
+
+    Like ``VllmConfig.lora_config``, a stage carries this only when
+    ``enable_lora`` is set. Diffusion LoRA stays in the diffusion config.
+    """
+
+    @model_validator(mode="after")
+    def _validate_lora_config(self) -> Self:
+        # Keep construction transport-safe: max_cpu_loras stays deferred and
+        # platform-dependent checks run in the engine process. EngineArgs
+        # treats a non-positive max_cpu_loras as unset.
+        if self.max_cpu_loras is not None and 0 < self.max_cpu_loras < self.max_loras:
+            raise ValueError(f"max_cpu_loras ({self.max_cpu_loras}) must be >= max_loras ({self.max_loras}).")
+        return self
+
+
 @config
 class OmniStageConnectorConfig:
     """Per-stage connector wiring and resolved transfer mode."""
@@ -634,6 +689,8 @@ class OmniStageConnectorConfig:
 @config
 class OmniStageRuntimeConfig:
     """Per-stage process placement and backend runtime behavior."""
+
+    shutdown_timeout: float | None = Field(default=None, ge=0)
 
     cuda_mps: bool = False
 
@@ -832,6 +889,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     model_config: dict[str, Any] = field(default_factory=dict)
     tf_model_config: Any = None
     diffusion_attention_config: Any = None
+    diffusion_attention_schedule: Any = None
     cache_strategy: str = "none"
     cache_backend: str = "none"
     cache_config: Any = field(default_factory=dict)
@@ -848,9 +906,12 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None
+    controlnet_model_path: str | None = None
+    """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: str | list[str] | None = None
     lora_scale: float = 1.0
     lora_backend: str = "peft"
+    lora_application: Literal["runtime", "merged"] = "runtime"
     max_cpu_loras: int | None = None
     output_type: str = "pil"
     diffusion_offload_config: dict[str, Any] | None = None
@@ -873,7 +934,11 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     # model (Qwen-Image-2.1) together with enforce_eager, which lives in the
     # shared engine config.
     enable_cuda_graph_decode: bool = True
+    diffusion_use_graph: bool = False
+    diffusion_graph_release_after_denoise: bool = False
     fa_deterministic: bool = False
+    # Mirrors OmniDiffusionConfig.enable_cfg_batching.
+    enable_cfg_batching: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     vae_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
@@ -978,6 +1043,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             TransformerConfig,
             VideoOutputTransportConfig,
             build_attention_config,
+            parse_attention_schedule_config,
             parse_kv_cache_skip_selector,
             validate_dlo_host_registration_options,
             validate_host_weight_runtime_options,
@@ -1055,7 +1121,10 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
                 "diffusion_attention_config must be an AttentionConfig, mapping, or None, "
                 f"got {type(self.diffusion_attention_config)!r}"
             )
-        validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
+        self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
+        validate_kv_cache_dtype_vs_attention_specs(
+            self.diffusion_kv_cache_dtype, self.diffusion_attention_config, self.diffusion_attention_schedule
+        )
 
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
@@ -1271,6 +1340,10 @@ _PARALLEL_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
         }
     ),
 )
+_LORA_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
+    VllmLoRAConfig,
+    aliases={"target_modules": "lora_target_modules"},
+)
 
 _QUANTIZATION_ENGINE_FIELDS = frozenset(_QuantizationEngineOverrides.__annotations__)
 _MODEL_ENGINE_FIELDS = frozenset(_ModelEngineOverrides.__annotations__)
@@ -1280,14 +1353,24 @@ _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
 _POOLING_ENGINE_FIELDS = frozenset(_PoolingEngineOverrides.__annotations__)
 _CONNECTOR_ENGINE_FIELDS = frozenset(_ConnectorEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
-# These vLLM config inputs pass through without being unpacked into stage sub-configs.
+_LORA_ENGINE_FIELDS = frozenset(_LoRAEngineOverrides.__annotations__)
+# The following fields are vLLM config objects passed through verbatim
+# instead of being unpacked structurally. speculative_config was missing from
+# this list, so a stage-1 multi-frame setup failed to load: stage_config.py
+# injects a speculative_config into stage 1 (vLLM uses spec_token_ids to
+# advance K tokens per request) and the ownership check here rejected the whole
+# stage-1 override block with a startup ValueError ("Stage 1 (llm_ar) has
+# explicit engine argument(s) with no structured config owner"). It joins the
+# other pass-through fields already listed.
 _DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset(
-    {"compilation_config", "profiler_config", "speculative_config", "weight_transfer_config"}
+    {"compilation_config", "kernel_config", "profiler_config", "speculative_config", "weight_transfer_config"}
 )
 _LLM_LOAD_ENGINE_FIELDS = _LOAD_ENGINE_FIELDS | frozenset(_LOAD_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_CACHE_ENGINE_FIELDS = _CACHE_ENGINE_FIELDS | frozenset(_CACHE_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_SCHEDULER_ENGINE_FIELDS = _SCHEDULER_ENGINE_FIELDS | frozenset(_SCHEDULER_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(_PARALLEL_CONFIG_ENGINE_FIELD_MAP.values())
+# vLLM LoRA inputs are LLM-only; diffusion keeps its own LoRA fields.
+_LLM_LORA_ENGINE_FIELDS = _LORA_ENGINE_FIELDS | frozenset(_LORA_CONFIG_ENGINE_FIELD_MAP.values())
 _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(
     f.name for f in fields(OmniStageDiffusionParallelConfig)
 ) & frozenset(_ParallelConfigEngineOverrides.__annotations__)
@@ -1312,6 +1395,7 @@ _LLM_STAGE_ENGINE_FIELDS = (
     | _LLM_SCHEDULER_ENGINE_FIELDS
     | _LLM_PARALLEL_CONFIG_ENGINE_FIELDS
     | _POOLING_ENGINE_FIELDS
+    | _LLM_LORA_ENGINE_FIELDS
     | {"parallel_config"}
 )
 _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS = (
@@ -1425,7 +1509,7 @@ _DIFFUSION_DEFAULT_FACTORY_FIELDS = frozenset({"default_sampling_params", "devic
 
 def _frontend_cli_fields() -> frozenset[str]:
     """Return vLLM server fields that are consumed before stage startup."""
-    from vllm.entrypoints.launchers.cli_args import FrontendArgs
+    from vllm.entrypoints.common.cli_args import FrontendArgs
 
     return frozenset(config_field.name for config_field in fields(FrontendArgs))
 
@@ -1617,11 +1701,13 @@ def _stage_engine_values(
         cache_engine_fields = _LLM_CACHE_ENGINE_FIELDS
         scheduler_engine_fields = _LLM_SCHEDULER_ENGINE_FIELDS
         runtime_engine_fields = _RUNTIME_ENGINE_FIELDS
+        lora_engine_fields = _LLM_LORA_ENGINE_FIELDS
     else:
         load_engine_fields = _LOAD_ENGINE_FIELDS
         cache_engine_fields = _CACHE_ENGINE_FIELDS
         scheduler_engine_fields = _SCHEDULER_ENGINE_FIELDS
         runtime_engine_fields = _RUNTIME_ENGINE_FIELDS - {"additional_config"}
+        lora_engine_fields = frozenset()
     return _StageEngineValues(
         quantization=cast(
             _QuantizationEngineOverrides,
@@ -1644,10 +1730,12 @@ def _stage_engine_values(
         ),
         runtime=cast(_RuntimeEngineOverrides, _select_engine_overrides(engine, runtime_engine_fields)),
         parallel=cast(_ParallelEngineOverrides, _select_engine_overrides(engine, _PARALLEL_ENGINE_FIELDS)),
+        lora=cast(_LoRAEngineOverrides, _select_engine_overrides(engine, lora_engine_fields)),
         diffusion=_DiffusionEngineOverrides(_select_engine_overrides(diffusion_kwargs, _DIFFUSION_STAGE_ENGINE_FIELDS)),
         compilation_config=_copy_value(engine.get("compilation_config")),
+        kernel_config=_copy_value(engine.get("kernel_config")),
         profiler_config=_copy_value(engine.get("profiler_config")),
-        # Same category as the two above: a vLLM config object passed through
+        # Same category as the other vLLM config objects above: pass it through
         # verbatim. Without it, a speculative_config in the deploy config
         # silently disappears (no error) and speculative decoding loses effect
         # (engine logs show speculative_config=None).
@@ -1714,7 +1802,10 @@ class BaseVllmOmniStageConfig:
     pooling_config: OmniStagePoolingConfig = field(default_factory=OmniStagePoolingConfig)
     runtime_config: OmniStageRuntimeConfig = field(default_factory=OmniStageRuntimeConfig)
     parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
+    # Set on LLM stages with enable_lora; diffusion LoRA uses diffusion_config.
+    lora_config: OmniStageLoRAConfig | None = None
     compilation_config: VllmCompilationConfig | None = None
+    kernel_config: KernelConfig | None = None
     profiler_config: VllmProfilerConfig | None = None
     # Shape matters: vLLM's create_speculative_config consumes this value as a
     # dict (it calls .items() / .update() before building SpeculativeConfig).
@@ -1893,13 +1984,16 @@ def _build_common_stage_config_kwargs(
                 parallel_config,
             ),
             "parallel_config": parallel_config,
+            "lora_config": _build_lora_config(engine.lora),
             "compilation_config": _copy_value(engine.compilation_config),
+            "kernel_config": _copy_value(engine.kernel_config),
             "profiler_config": _copy_value(engine.profiler_config),
             "speculative_config": _copy_value(engine.speculative_config),
             "weight_transfer_config": _copy_value(
                 _first_defined(engine.weight_transfer_config, deploy.weight_transfer_config)
             ),
             "quantization_config": _copy_value(quantization_config),
+            "weight_transfer_config": _first_defined(engine.weight_transfer_config, deploy.weight_transfer_config),
         },
         input_proc,
         next_stage_proc,
@@ -2196,6 +2290,13 @@ def _build_scheduler_config(
     return OmniStageSchedulerConfig(**kwargs)
 
 
+def _build_lora_config(engine: _LoRAEngineOverrides) -> OmniStageLoRAConfig | None:
+    # Mirror EngineArgs: LoRA options take effect only when enable_lora is set.
+    if not engine.get("enable_lora"):
+        return None
+    return OmniStageLoRAConfig(**_config_kwargs_from_engine_args(engine, _LORA_CONFIG_ENGINE_FIELD_MAP))
+
+
 def _build_connector_config(
     deploy: DeployConfig,
     stage_deploy: StageDeployConfig | None,
@@ -2311,6 +2412,7 @@ class VllmOmniConfig:
     pipeline_config: PipelineConfig
     stage_configs: tuple[StageConfigType, ...]
     orchestrator_config: VllmOmniOrchestratorConfig = field(default_factory=VllmOmniOrchestratorConfig)
+    weight_sharing: WeightSharingConfig | None = None
     # Keep strategy provenance separate from the effective orchestrator value:
     # an explicit CLI policy may be present even when the strategy declares no
     # stage-replica axis.
@@ -2410,6 +2512,33 @@ class VllmOmniConfig:
                 cli_overrides["omni_lb_policy"] = strategy_result.omni_lb_policy
 
         deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
+        pipeline_stage_ids = {stage.stage_id for stage in pipeline_cfg.stages}
+        sampling_defaults = cli_overrides.get("default_sampling_params")
+        if isinstance(sampling_defaults, str):
+            sampling_defaults = json.loads(sampling_defaults)
+        for stage_key, overrides in (sampling_defaults or {}).items():
+            try:
+                stage_id = int(stage_key)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid default_sampling_params stage key {stage_key!r}: expected an integer stage ID"
+                ) from exc
+            if stage_id not in pipeline_stage_ids:
+                logger.warning(
+                    f"Ignoring default_sampling_params for unknown stage ID {stage_id}; "
+                    f"pipeline stages are {sorted(pipeline_stage_ids)}"
+                )
+                continue
+            if stage_id not in deploy_by_id:
+                stage_deploy = StageDeployConfig(stage_id=stage_id)
+                deploy.stages.append(stage_deploy)
+                deploy_by_id[stage_id] = stage_deploy
+            stage_deploy = deploy_by_id[stage_id]
+            defaults = stage_deploy.default_sampling_params or {}
+            merged = {**defaults, **overrides}
+            if "extra_args" in overrides:
+                merged["extra_args"] = {**defaults.get("extra_args", {}), **overrides["extra_args"]}
+            stage_deploy.default_sampling_params = merged
         update_deploy_config_async_chunk_enabled(pipeline_cfg, deploy)
         model = cli_overrides.get("model")
 
@@ -2426,6 +2555,7 @@ class VllmOmniConfig:
                         topology.stage_id,
                         cli_overrides,
                         execution_type=topology.execution_type,
+                        stage_scoped_lora=len(pipeline_cfg.stages) > 1,
                     ),
                 ),
                 model=model,
@@ -2455,6 +2585,7 @@ class VllmOmniConfig:
             pipeline_config=pipeline_cfg,
             stage_configs=stage_configs,
             orchestrator_config=orchestrator_config,
+            weight_sharing=deploy.weight_sharing,
             strategy_omni_lb_policy=(strategy_result.omni_lb_policy if strategy_result is not None else None),
         )
 
@@ -2464,6 +2595,7 @@ __all__ = [
     "OmniStageConnectorConfig",
     "BaseVllmOmniStageConfig",
     "OmniStageLoadConfig",
+    "OmniStageLoRAConfig",
     "OmniStageModelConfig",
     "VllmOmniOrchestratorConfig",
     "OmniStageDiffusionParallelConfig",

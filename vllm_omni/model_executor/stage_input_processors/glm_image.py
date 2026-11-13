@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Stage input processor for GLM-Image: AR → Diffusion transition."""
 
-import math
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -12,6 +11,7 @@ from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.glm_image.prompt import DEFAULT_TARGET_SIZE, grid_token_layout
 
 logger = init_logger(__name__)
 
@@ -57,7 +57,7 @@ def _first_source_image(mm_data: Any) -> Any:
     return images
 
 
-def compute_max_tokens(height: int, width: int, factor: int = 32, is_i2i: bool = False) -> int:
+def compute_max_tokens(height: int | None, width: int | None, factor: int = 32, is_i2i: bool = False) -> int:
     """
     Compute max_new_tokens for GLM-Image AR generation.
 
@@ -66,34 +66,28 @@ def compute_max_tokens(height: int, width: int, factor: int = 32, is_i2i: bool =
     - text-to-image (t2i): small preview + large target + EOS
     - image-to-image (i2i): large target + EOS
 
+    This is the generation budget the reference implementation truncates at;
+    the online serving path sets it as the AR stage's per-request
+    ``max_tokens`` so requests stop at the grid's exact token count instead of
+    the deploy-YAML ceiling.
+
     Args:
-        height: Target image height in pixels
-        width: Target image width in pixels
+        height: Target image height in pixels; ``None`` resolves to the
+            processor's ``DEFAULT_TARGET_SIZE`` grid (the builder owns that
+            default so the serving layer stays model-agnostic).
+        width: Target image width in pixels; ``None`` as above.
         factor: Downsampling factor (32 for GLM-Image AR output)
         is_i2i: Whether the request is image-to-image mode
 
     Returns:
         Total number of tokens to generate for the specified mode
     """
-    # Large image tokens (target resolution)
-    token_h = height // factor
-    token_w = width // factor
-    large_tokens = token_h * token_w
-
-    # Small preview tokens (half resolution in each dimension)
-    import math
-
-    ratio = token_h / token_w if token_w > 0 else 1.0
-    small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
-    small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
-    small_tokens = small_token_h * small_token_w
-
-    # Mode-dependent totals:
-    # - t2i: small + large + EOS
-    # - i2i: large + EOS
+    height = DEFAULT_TARGET_SIZE if height is None else height
+    width = DEFAULT_TARGET_SIZE if width is None else width
+    layout = grid_token_layout(height, width, factor)
     if is_i2i:
-        return large_tokens + 1
-    return small_tokens + large_tokens + 1
+        return layout.large_tokens + 1
+    return layout.small_tokens + layout.large_tokens + 1
 
 
 def _upsample_token_ids(token_ids: torch.Tensor, token_h: int, token_w: int) -> torch.Tensor:
@@ -134,15 +128,13 @@ def _parse_generated_tokens(
                 generates only large image tokens (no small preview tokens).
     """
     # Calculate token dimensions for target image
-    token_h = height // factor
-    token_w = width // factor
-    large_image_tokens = token_h * token_w
-
-    # Calculate small preview image dimensions (used in text-to-image)
-    ratio = token_h / token_w if token_w > 0 else 1.0
-    small_token_h = max(1, int(math.sqrt(ratio) * (factor // 2)))
-    small_token_w = max(1, int(math.sqrt(1 / ratio) * (factor // 2)))
-    small_image_tokens = small_token_h * small_token_w
+    layout = grid_token_layout(height, width, factor)
+    small_image_tokens, large_image_tokens, token_h, token_w = (
+        layout.small_tokens,
+        layout.large_tokens,
+        layout.token_h,
+        layout.token_w,
+    )
 
     token_tensor = torch.tensor(token_ids, dtype=torch.long)
 
@@ -264,11 +256,11 @@ def ar2diffusion(
     # then fall back to top-level fields for backward compatibility.
     height = _coerce_dim(
         mm_processor_kwargs.get("target_h") if isinstance(mm_processor_kwargs, dict) else None,
-        _coerce_dim(original_prompt.get("height"), 1024),
+        _coerce_dim(original_prompt.get("height"), DEFAULT_TARGET_SIZE),
     )
     width = _coerce_dim(
         mm_processor_kwargs.get("target_w") if isinstance(mm_processor_kwargs, dict) else None,
-        _coerce_dim(original_prompt.get("width"), 1024),
+        _coerce_dim(original_prompt.get("width"), DEFAULT_TARGET_SIZE),
     )
     text_prompt = original_prompt.get("prompt", "")
 

@@ -97,6 +97,7 @@ def scheduler(monkeypatch, initial=(), delayed=()):
         requests_with_ready_chunks=set(), finished_requests=set(), input_terminal_req_ids=set()
     )
     s._latest_omni_connector_output = None
+    s._outputs_awaiting_stage_payload = {}
     s._omni_connector_output_inbox = Inbox(clock, initial, delayed)
     return s, clock
 

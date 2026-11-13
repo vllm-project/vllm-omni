@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
@@ -51,6 +52,7 @@ class _StagePort:
 
 class _Manager:
     stage_request_id = staticmethod(DuplexSessionManager.stage_request_id)
+    runtime_config = DuplexSessionRuntimeConfig()
 
     def ensure_stage_request(self, session, *, stage_id: int, fence, final_stage_id: int | None = None):
         request_id = self.stage_request_id(
@@ -77,6 +79,7 @@ def _channel(session: DuplexEngineSession, port: _StagePort, run: DuplexRunState
         draining_stage_ids=lambda *, stage_count: frozenset({2, 3}) if stage_count >= 4 else frozenset(),
         input_stage_id=lambda payload: 0,
         prepare_prompt_config=lambda config, **kwargs: config,
+        context_view_policy=lambda **kwargs: None,
         extra_prompt_config=lambda runtime_config: {},
         runtime_patch_for_submitted_prompt=lambda prompt: None,
         commit_append_plan=lambda request_id: None,

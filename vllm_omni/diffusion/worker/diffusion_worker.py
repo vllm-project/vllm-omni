@@ -27,9 +27,10 @@ import torch
 import torch.distributed as dist
 import zmq
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.logging import LoggingConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.parallel_state import get_ep_group, get_tp_group
-from vllm.logger import init_logger
+from vllm.logger import configure_logging, init_logger
 from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes, MemorySnapshot, format_gib, memory_profiling
@@ -94,7 +95,10 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 if TYPE_CHECKING:
     from multiprocessing.synchronize import Event
 
+    from vllm.config.logging import LogLevel
     from vllm.distributed.weight_transfer.base import WeightTransferEngine
+
+    from vllm_omni.distributed.weight_sharing.worker_registry import ConsumerWorkerRegistry
 
 logger = init_logger(__name__)
 
@@ -262,6 +266,11 @@ class DiffusionWorker:
     delegated to DiffusionModelRunner.
     """
 
+    def weight_sharing_control(self, operation: str, messages: tuple[bytes, ...] = ()) -> dict[str, object]:
+        from vllm_omni.distributed.weight_sharing.worker_session import control_runner
+
+        return control_runner(self.model_runner, operation, messages)
+
     def __init__(
         self,
         local_rank: int,
@@ -354,12 +363,25 @@ class DiffusionWorker:
             return
         from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
 
+        if wt_config.backend == "omni_lora_ipc":
+            from vllm_omni.lora.weight_transfer import MergedLoRAIPCWeightTransferEngine
+
+            with set_current_vllm_config(self.vllm_config):
+                self.init_lora_manager()
         pipeline = cast(DiffusionModelRunner, self.model_runner).pipeline
         if not getattr(pipeline, "_omni_weight_reload_prepared", False):
             raise RuntimeError("The active diffusion pipeline has no weight-reload metadata")
         self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
             wt_config, self.vllm_config, self.device, pipeline
         )
+        if wt_config.backend == "omni_lora_ipc":
+            assert isinstance(self.weight_transfer_engine, MergedLoRAIPCWeightTransferEngine)
+            assert self.lora_manager is not None
+            self.weight_transfer_engine.lora_manager = self.lora_manager
+            if torch.distributed.is_initialized():
+                from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+
+                self.weight_transfer_engine.cpu_group = get_world_group().cpu_group
 
     def init_device(self) -> None:
         """Initialize the device and distributed environment."""
@@ -424,6 +446,16 @@ class DiffusionWorker:
                 hsdp_replicate_size=parallel_config.hsdp_replicate_size,
                 set_proc_title=self.set_proc_title,
             )
+            from vllm_omni.distributed.weight_sharing.worker_session import (
+                resolve_worker_sharing,
+                sharing_memory_request,
+            )
+
+            sharing = resolve_worker_sharing(self.od_config, role="consumer", rank=self.rank)
+            sharing_budget = sharing[1] if sharing else None
+            if sharing is not None:
+                # The diffusion loader consumes this rank-local configuration.
+                self.od_config.weight_sharing = sharing[0]
             if (
                 getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
                 is DiffusionKVCacheMode.PAGED_SCHEDULER
@@ -431,10 +463,15 @@ class DiffusionWorker:
                 gc.collect()
                 current_omni_platform.empty_cache()
                 self.init_snapshot = MemorySnapshot(device=self.device)
-                self.requested_memory = request_memory(
-                    self.init_snapshot,
-                    vllm_config.cache_config,
+                self.requested_memory = sharing_memory_request(
+                    sharing_budget,
+                    role="consumer",
+                    rank=self.rank,
+                    kv_cache_bytes=vllm_config.cache_config.kv_cache_memory_bytes,
+                    free_bytes=self.init_snapshot.free_memory,
                 )
+                if self.requested_memory is None:
+                    self.requested_memory = request_memory(self.init_snapshot, vllm_config.cache_config)
                 logger.debug(
                     "Worker %d: Diffusion KV initial memory snapshot: %r; requested=%s GiB",
                     self.rank,
@@ -442,6 +479,14 @@ class DiffusionWorker:
                     format_gib(self.requested_memory),
                 )
             init_workspace_manager(self.device)
+            if (
+                parallel_config.ulysses_a2a_permute
+                and parallel_config.ulysses_degree > 1
+                and parallel_config.ulysses_mode == "strict"
+            ):
+                from vllm_omni.diffusion.distributed.a2a_permute import ensure_a2a_permute_available
+
+                ensure_a2a_permute_available()
 
     def _create_profiler(self) -> WorkerProfiler | None:
         profiler_config = self.od_config.profiler_config
@@ -463,6 +508,11 @@ class DiffusionWorker:
 
     def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None, **kwargs) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
+        from vllm_omni.distributed.weight_sharing.worker_session import (
+            detach_diffusion_runner,
+            install_runner_session,
+        )
+
         assert self.model_runner is not None, "Model runner not initialized"
         load_format = kwargs.get("load_format", load_format)
         custom_pipeline_name = kwargs.get("custom_pipeline_name", custom_pipeline_name)
@@ -495,6 +545,23 @@ class DiffusionWorker:
         # When load_format is "dummy", pipeline will init with custom pipeline later
         if load_format != "dummy":
             assert self.model_runner.pipeline is not None
+
+        def detach_shared_model() -> None:
+            # Even without an adapter, the default manager owns the pipeline.
+            # close() unbinds its consumers but retains its pipeline reference.
+            if self.lora_manager is not None:
+                self.lora_manager.close()
+                self.lora_manager = None
+            detach_diffusion_runner(self.model_runner)
+
+        install_runner_session(
+            self.model_runner,
+            self.od_config,
+            role="consumer",
+            rank=self.rank,
+            device_index=current_omni_platform.current_device(),
+            detach=detach_shared_model,
+        )
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Return native rank-local specs for every diffusion Worker."""
@@ -653,10 +720,11 @@ class DiffusionWorker:
             max_num_batched_tokens = None
             if getattr(self.od_config, "is_moe", False) is True:
                 assert self.vllm_config is not None
-                max_num_batched_tokens = resolve_diffusion_moe_lora_token_capacity(
-                    self.od_config,
-                    self.vllm_config,
-                )
+                if self.vllm_config.lora_config is not None:
+                    max_num_batched_tokens = resolve_diffusion_moe_lora_token_capacity(
+                        self.od_config,
+                        self.vllm_config,
+                    )
             self.lora_manager = DiffusionLoRAManager(
                 pipeline=pipeline,
                 device=self.device,
@@ -665,6 +733,7 @@ class DiffusionWorker:
                 lora_path=lora_path,
                 lora_scale=lora_scale,
                 max_num_batched_tokens=max_num_batched_tokens,
+                lora_application=self.od_config.lora_application,
             )
         elif lora_backend == LoRABackend.DISTILL:
             if hasattr(pipeline, "load_lora_weights"):
@@ -685,6 +754,7 @@ class DiffusionWorker:
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ) -> None:
         """Start or stop profiling for this GPU worker.
 
@@ -693,6 +763,7 @@ class DiffusionWorker:
             profile_prefix: Optional prefix for trace filename.
             delay_iterations: Per-session worker steps before profiling starts.
             max_iterations: Per-session limit on profiled worker steps.
+            profiler_kwargs: Per-session profiler constructor overrides.
         """
         profiler = self._get_profiler()
         if profiler is None:
@@ -704,6 +775,7 @@ class DiffusionWorker:
 
                 filename = profile_prefix or f"diffusion_rank{self.rank}_{int(time.time())}"
                 profiler.set_trace_filename(filename)
+            profiler.set_profiler_kwargs(profiler_kwargs)
             kwargs: dict[str, int] = {}
             if delay_iterations is not None:
                 kwargs["delay_iterations"] = delay_iterations
@@ -783,9 +855,11 @@ class DiffusionWorker:
         engine = self._get_weight_transfer_engine()
         if not self._weight_update_active:
             raise RuntimeError("finish_weight_update called without a matching start_weight_update.")
-        engine.finish_weight_update()
-        engine.reset_weight_update_target()
-        self._weight_update_active = False
+        try:
+            engine.finish_weight_update()
+        finally:
+            engine.reset_weight_update_target()
+            self._weight_update_active = False
 
     def execute_model(
         self,
@@ -1660,8 +1734,14 @@ class WorkerProc:
             status["bool_result"] = result
 
         if collect_rank_status:
+            from vllm_omni.distributed.weight_sharing.runtime import CONTROL_METHOD, RANK_RESULTS_KEY
+
+            if method == CONTROL_METHOD:
+                status[RANK_RESULTS_KEY] = result
             rank_statuses = self._gather_rpc_rank_statuses(status)
             if should_reply:
+                if method == CONTROL_METHOD:
+                    result = {RANK_RESULTS_KEY: [item[RANK_RESULTS_KEY] for item in rank_statuses]}
                 return (
                     {
                         "type": DIFFUSION_RPC_RESULT_ENVELOPE,
@@ -1816,9 +1896,19 @@ class WorkerProc:
         wake_event: Event,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        *,
+        sharing_registry: ConsumerWorkerRegistry | None = None,
     ) -> None:
         """Worker initialization and execution loops."""
+        if sharing_registry is not None and not sharing_registry.register(rank):
+            return  # Parent sealed the sharing group before this worker started.
         from vllm_omni.plugins import load_omni_general_plugins
+
+        # Spawned workers do not inherit the API server's logging setup.
+        # Preserve the vLLM environment's logging switch and custom config;
+        # an explicit environment level takes precedence over the stage level.
+        log_level = os.environ.get("VLLM_LOGGING_LEVEL", od_config.log_level).upper()
+        configure_logging(LoggingConfig(log_level=cast("LogLevel", log_level)))
 
         shutdown_triggered = False
 
@@ -1831,7 +1921,12 @@ class WorkerProc:
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
-        set_death_signal(signal.SIGTERM)
+        # Normal executor shutdown still reaches the handlers above and cleans
+        # up gracefully. If the API-server parent is already gone, however, no
+        # manager remains to escalate a worker that stalls during cleanup. Use
+        # a hard parent-death signal so an abrupt parent exit cannot orphan a
+        # GPU-owning diffusion worker.
+        set_death_signal(signal.SIGKILL)
 
         _setup_diffusion_worker_proc_title_and_log_prefix(
             enable_ep=od_config.parallel_config.enable_expert_parallel,

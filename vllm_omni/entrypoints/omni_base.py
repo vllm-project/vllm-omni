@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import huggingface_hub
 import vllm.envs as envs
 from omegaconf import OmegaConf
+from vllm.config.profiler import validate_profile_iteration_bounds
 from vllm.exceptions import RetryableRequestError
 from vllm.logger import init_logger
 from vllm.transformers_utils.repo_utils import file_or_path_exists
@@ -38,6 +39,7 @@ from vllm_omni.metrics.stats import OrchestratorAggregator
 from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.metrics.utils import (
     extract_queue_wait_s,
+    iter_request_output_items,
     normalize_failure_reason,
     observe_stage_workload_metrics,
 )
@@ -521,7 +523,7 @@ class OmniBase(PDDisaggregationMixin):
             self._raise_nonfatal_error_message(msg)
 
         if not isinstance(msg, OutputMessage):
-            logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, msg.type)
+            logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, getattr(msg, "type"))
             return True, None, None, None
 
         req_id = msg.request_id
@@ -701,7 +703,7 @@ class OmniBase(PDDisaggregationMixin):
                 e2e_seconds = now - req_start_ts.get(req_id, wall_start_ts)
                 # Extract finished_reason from upstream CompletionOutput so
                 # the per-reason completion Counter is labelled correctly.
-                completion_outputs = getattr(engine_outputs, "outputs", None) or []
+                completion_outputs = iter_request_output_items(engine_outputs)
                 fr = (getattr(completion_outputs[0], "finish_reason", None) if completion_outputs else None) or "stop"
                 self.prom_metrics.request_succeeded(
                     e2e_seconds,
@@ -794,6 +796,10 @@ class OmniBase(PDDisaggregationMixin):
         self,
         profile_prefix: str | None = None,
         stages: list[int] | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+        profiler_kwargs: dict[str, Any] | None = None,
     ) -> list[Any]:
         """Start profiling specified stages.
 
@@ -802,11 +808,34 @@ class OmniBase(PDDisaggregationMixin):
         Args:
             profile_prefix: Optional prefix for the trace file names.
             stages: List of stage IDs to profile. If None, profiles all stages.
+            delay_iterations: Optional per-session delayed start (vLLM compat).
+            max_iterations: Optional per-session iteration cap (vLLM compat).
+            profiler_kwargs: Optional per-session profiler constructor overrides.
 
         Returns:
             List of results from each stage.
         """
-        return self.engine.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
+        validate_profile_iteration_bounds(delay_iterations, max_iterations)
+        kwargs: dict[str, Any] = {}
+        if delay_iterations is not None:
+            kwargs["delay_iterations"] = delay_iterations
+        if max_iterations is not None:
+            kwargs["max_iterations"] = max_iterations
+        if profiler_kwargs is not None:
+            kwargs["profiler_kwargs"] = profiler_kwargs
+        # Omit kwargs when unset so existing profile RPC call shapes stay stable.
+        if kwargs:
+            return self.engine.collective_rpc(
+                method="profile",
+                args=(True, profile_prefix),
+                kwargs=kwargs,
+                stage_ids=stages,
+            )
+        return self.engine.collective_rpc(
+            method="profile",
+            args=(True, profile_prefix),
+            stage_ids=stages,
+        )
 
     def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
         """Stop profiling specified stages.

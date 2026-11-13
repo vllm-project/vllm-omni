@@ -4,15 +4,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import math
+import threading
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
 import regex as re
 import torch
 from transformers import AutoTokenizer
 from vllm.inputs import tokens_input
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
@@ -30,9 +35,59 @@ from vllm_omni.model_executor.models.ming3_tts.prompt_assembly import (
     normalize_target_language,
     resolve_podcast_decode_window,
 )
+from vllm_omni.model_executor.models.ming_tts.audio_prep import coerce_speaker_embeddings
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+
+logger = init_logger(__name__)
+
+# Without CUDA, extract CAM++ speaker embeddings in the API process (on a
+# worker thread) instead of inside the Stage-0 engine step, where the CPU
+# inference stalls every active stream. On CUDA, Stage 0 embeds the reference
+# clips of a step's new requests together on the GPU (batched_campplus).
+_SPEAKER_CACHE_SIZE = 256
+_speaker_lock = threading.Lock()
+_speaker_slots = threading.BoundedSemaphore(4)
+_speaker_extractors: dict[str, Any] = {}
+_speaker_embeddings: OrderedDict[tuple[str, str], torch.Tensor] = OrderedDict()
+
+
+def _extract_speaker_embeddings(
+    model: str,
+    waveforms: list[torch.Tensor],
+    sample_rates: list[int],
+    audio_keys: list[str | None],
+) -> torch.Tensor:
+    from vllm_omni.model_executor.models.common.ming.speaker_extractor import SpeakerEmbeddingExtractor
+
+    with _speaker_lock:
+        extractor = _speaker_extractors.get(model)
+        if extractor is None:
+            extractor = SpeakerEmbeddingExtractor(model, target_sr=16000)
+            _speaker_extractors[model] = extractor
+    rows = []
+    for waveform, sample_rate, audio_key in zip(waveforms, sample_rates, audio_keys, strict=True):
+        cache_key = (model, audio_key) if audio_key else None
+        with _speaker_lock:
+            embedding = _speaker_embeddings.get(cache_key) if cache_key is not None else None
+            if embedding is not None and cache_key is not None:
+                _speaker_embeddings.move_to_end(cache_key)
+        if embedding is None:
+            # The ONNX session runs concurrent calls; a few slots keep the CPU
+            # work bounded beside the server without serializing requests.
+            with _speaker_slots:
+                extracted = coerce_speaker_embeddings(extractor.extract_from_waveform(waveform, sample_rate))
+                if extracted is None:
+                    raise ValueError("Speaker extractor returned no embedding")
+                [embedding] = extracted
+            if cache_key is not None:
+                with _speaker_lock:
+                    _speaker_embeddings[cache_key] = embedding
+                    if len(_speaker_embeddings) > _SPEAKER_CACHE_SIZE:
+                        _speaker_embeddings.popitem(last=False)
+        rows.append(embedding)
+    return torch.stack(rows)
 
 
 @register_tts_adapter
@@ -190,13 +245,7 @@ class Ming3TTSAdapter(ARTTSAdapter):
         text = re.sub(r"\[[^\]\n]{1,128}\]|\([A-Za-z][A-Za-z _-]{0,127}\)", "", request.input)
         return "Chinese" if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", text) else "English"
 
-    async def build(
-        self,
-        request: OpenAICreateSpeechRequest,
-        sampling_params_list: list,
-        has_inline_ref_audio: bool,
-    ) -> PreparedRequest:
-        del sampling_params_list
+    def _tokenizer(self) -> Any:
         server = self.ctx.server
         if server._tts_tokenizer is None:
             model_name = server.engine_client.model_config.model
@@ -206,26 +255,70 @@ class Ming3TTSAdapter(ARTTSAdapter):
                 trust_remote_code=trust_remote_code,
                 fix_mistral_regex=True,
             )
+        return server._tts_tokenizer
+
+    async def warmup(self) -> None:
+        """Load the tokenizer (and the CPU CAM++ session) in each API process at startup.
+
+        On first use they take about 0.7 s and 0.5 s; the tokenizer load also
+        blocks the event loop, so the first requests of every API process
+        would queue behind both.
+        """
+        await asyncio.to_thread(self._tokenizer)
+        if current_platform.is_cuda():
+            return
+        try:
+            await asyncio.to_thread(
+                _extract_speaker_embeddings,
+                self.ctx.server.engine_client.model_config.model,
+                [torch.zeros(1, 16000)],
+                [16000],
+                [None],
+            )
+        except Exception:  # noqa: BLE001 - requests still load the extractor on demand
+            logger.warning("Ming3 speaker extractor warmup failed", exc_info=True)
+
+    async def build(
+        self,
+        request: OpenAICreateSpeechRequest,
+        sampling_params_list: list,
+        has_inline_ref_audio: bool,
+    ) -> PreparedRequest:
+        del sampling_params_list
+        server = self.ctx.server
+        tokenizer = self._tokenizer()
         speaker_audio_keys = []
         waveform, sample_rate = None, None
         if request.ref_audio is not None:
             waveform, sample_rate = [], []
             references = request.ref_audio if isinstance(request.ref_audio, list) else [request.ref_audio]
             for source in references:
-                samples, rate, resolved_key = await server._resolve_ref_audio(source)
-                waveform.append(torch.as_tensor(samples, dtype=torch.float32).reshape(1, -1))
+                # The array resolver skips the per-sample Python list of the list-based one;
+                # the array may be shared with its cache, so it is copied, not wrapped.
+                samples, rate, resolved_key = await server._resolve_ref_audio_array(source)
+                waveform.append(torch.tensor(samples, dtype=torch.float32).reshape(1, -1))
                 sample_rate.append(int(rate))
                 speaker_audio_keys.append(server._get_resolved_ref_audio_artifact_key(resolved_key))
+        speaker_embedding = None
+        if waveform and not current_platform.is_cuda():
+            speaker_embedding = await asyncio.to_thread(
+                _extract_speaker_embeddings,
+                server.engine_client.model_config.model,
+                waveform,
+                sample_rate,
+                speaker_audio_keys,
+            )
         max_steps = request.max_new_tokens
         if max_steps is None and len(speaker_audio_keys) <= 1:
             max_steps = int(self.tts_config.get("maximum_decode_steps", MAX_DECODE_STEPS))
         prompt_dict = build_ming3_prompt(
-            server._tts_tokenizer,
+            tokenizer,
             target_text=request.input,
             reference_waveform=waveform,
             reference_sample_rate=sample_rate,
             target_language=self._target_language(request),
             prompt_text=request.ref_text,
+            speaker_embedding=speaker_embedding,
             instruction=create_ming3_instruction(self._instruction(request.instructions)),
             max_decode_steps=max_steps,
             speaker_slot=not self._is_emergent(request),

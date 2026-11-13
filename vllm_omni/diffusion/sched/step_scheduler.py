@@ -175,8 +175,8 @@ class StepScheduler(BaseScheduler):
                 state.error = None
                 wait = req_output.wait_for_interaction
                 if wait is not None:
-                    # RPCs are drained before this update. Latch successful
-                    # interactions even when the wait was not installed yet.
+                    # Latch interactions accepted since this step was scheduled,
+                    # including controls delivered before the wait was installed.
                     if progress.interaction_generation != progress.scheduled_interaction_generation:
                         progress.resume = "interaction"
                     else:

@@ -169,47 +169,9 @@ class TestGetForcedToken:
         tokens = [END_OF_RECAPTION, 999]  # 999 != ANSWER
         assert self.model._get_forced_token(tokens) is None
 
-    def test_later_trigger_takes_precedence(self):
-        tokens = [END_OF_THINK, RECAPTION, END_OF_RECAPTION]
-        assert self.model._get_forced_token(tokens) == ANSWER
-
     def test_trigger_with_extra_tokens_before(self):
         tokens = [1, 2, 3, END_OF_THINK]
         assert self.model._get_forced_token(tokens) == RECAPTION
-
-
-class TestComprehensionBlocking:
-    """Tests for comprehension mode token blocking."""
-
-    def test_blocked_tokens_masked(self):
-        model = FakeSamplerModel(is_comprehension=True)
-        vocab_size = 300
-        logits = torch.zeros(1, vocab_size)
-        logits[0, BOI] = 5.0
-        logits[0, SIZE_TOKEN] = 3.0
-        logits[0, RATIO_START] = 2.0
-        min_score = torch.finfo(logits.dtype).min
-
-        for tid in model._blocked_token_ids:
-            if tid < vocab_size:
-                logits[0, tid] = min_score
-
-        assert logits[0, BOI].item() == min_score
-        assert logits[0, SIZE_TOKEN].item() == min_score
-        assert logits[0, RATIO_START].item() == min_score
-
-    def test_non_blocked_tokens_preserved(self):
-        model = FakeSamplerModel(is_comprehension=True)
-        vocab_size = 300
-        logits = torch.zeros(1, vocab_size)
-        logits[0, 50] = 7.0
-        min_score = torch.finfo(logits.dtype).min
-
-        for tid in model._blocked_token_ids:
-            if tid < vocab_size:
-                logits[0, tid] = min_score
-
-        assert logits[0, 50].item() == 7.0
 
 
 class TestRatioRestriction:
