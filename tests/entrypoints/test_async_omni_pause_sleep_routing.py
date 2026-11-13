@@ -16,7 +16,11 @@ from vllm.v1.engine.input_processor import InputProcessor
 
 from tests.engine.test_orchestrator import FakeStageClient, _build_harness
 from vllm_omni.diffusion.data import CuMemTag, OmniACK
-from vllm_omni.engine.messages import ErrorMessage, ShutdownRequestMessage
+from vllm_omni.engine.messages import (
+    AddCompanionRequestMessage,
+    ErrorMessage,
+    ShutdownRequestMessage,
+)
 from vllm_omni.engine.omni_engine_base import OmniEngineBase
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.entrypoints.async_omni import CACHE_RESET_TIMEOUT_S, AsyncOmni
@@ -1946,7 +1950,12 @@ def test_cancelled_submit_with_landed_parent_keeps_mm_cache(mocker):
                 sampling_params_list=[object()],
             )
             mocker.patch.object(engine, "_build_add_request_message", return_value=parent)
-            mocker.patch.object(engine, "_build_cfg_companions", return_value=[object()])
+            companion = mocker.Mock(
+                spec=AddCompanionRequestMessage,
+                role="cfg_text",
+                companion_id="parent-1__cfg_text",
+            )
+            mocker.patch.object(engine, "_build_cfg_companions", return_value=[companion])
 
             await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(queue.async_q.join(), orch_loop))
             queue.sync_q.put_nowait(object())  # leave room for exactly the parent

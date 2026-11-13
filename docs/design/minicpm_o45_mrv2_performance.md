@@ -13,9 +13,12 @@ because their mutable KV window cannot reuse prefix blocks.
 
 The MRv2 output-cache opt-in requires an explicit `session_mode: turn` on
 the Thinker model config. A missing mode does not advertise output-cache
-support. Stage-0 speculative decoding, including n-gram, is refused while
-the output cache is enabled; CUDA turn overlays using speculation must set
-stage 0 `enable_prefix_caching: false` under `platforms.cuda`.
+support. The output cache refuses stage-0 speculative decoding, so an MRv2
+Thinker with a `speculative_config` reuses native KV only and keeps prefix
+caching on (see "Thinker prefix cache with drafts" below). A V1 Thinker with
+speculation, including n-gram, is still refused while the cache is enabled;
+such overlays must set stage 0 `enable_prefix_caching: false` under
+`platforms.cuda`.
 
 Turn mode uses the stage-level MRv2 contracts from #8184. Thinker emits live
 latent metadata outside graph replay; Talker keeps codec history and EOS
@@ -162,6 +165,58 @@ Duplex sessions keep their own sampler and are not covered, and platforms
 whose profiles fall back to V1 (NPU, XPU, ROCm, MUSA) do not run this path.
 Greedy text can differ from decoding without drafts at near-tied tokens.
 
+## Thinker prefix cache with drafts
+
+With a stage-0 `speculative_config` the MRv2 Thinker does not set
+`supports_mrv2_prefix_cache_outputs`, so it reuses native KV alone: no output
+rows are saved or merged and no host cache is allocated. `llm2tts` picks the
+Talker's rows from the row ledger (`latent_input_ids`, `latent_positions`).
+The reply starts after `<|tts_bos|>`, the last prompt token, and the prompt's
+last token is always forwarded, so a new request's hit never covers a reply
+row. A request resumed after preemption can hit on its earlier reply tokens,
+whose rows are already in the ledger. A template that opens the reply earlier
+in the prompt has no rows for the cached part of it: on a hit the request logs
+the "Thinker rows stop" warning and produces no audio, so with such a template
+a draft overlay also sets stage 0 `enable_prefix_caching: false`.
+
+A hit changes which tokens share a prefill step, so greedy text on a hit can
+differ from a miss at near-tied tokens in BF16, as it does without drafts.
+
+## Talker speculative decoding
+
+The MRv2 Talker also accepts a stage-1 `speculative_config` with a DSpark
+drafter that reads Talker layers. Draft codes are verified against the
+Talker's own sampling: each row's 16-code repetition window includes the
+drafts before it, and codec EOS decisions (empty condition, length cap)
+apply per row. Only rows of accepted codes reach Code2Wav. The CUDA platform
+block sets stage 1's `speculative_config`, and platform blocks override stage
+fields, so the draft goes there:
+
+```yaml
+base_config: minicpmo_4_5_turn_mrv2.yaml
+platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        speculative_config:
+          method: dspark
+          model: <DSpark draft trained on the MiniCPM-o 4.5 Talker>
+          num_speculative_tokens: 7
+          draft_sample_method: probabilistic
+```
+
+The Talker samples its codes (temperature, top-k, top-p), so the drafts should
+be sampled too: with vLLM's default argmax drafts, far fewer are accepted.
+Rejection sampling keeps the Talker's output distribution either way.
+
+The draft checkpoint must include the codec embedding (`embed_tokens.weight`)
+and head (`lm_head.weight`). The Talker stage's config reports the text
+vocabulary, so vLLM does not share the Talker's with a codec-vocabulary
+draft. vLLM's `Qwen3DSparkModel` also reads `markov_rank` and the
+confidence-head fields from the top level of the draft config. Talker drafters
+cover turn sessions only; duplex sessions and the K-step Talker reject them at
+load.
+
 ## Code2Wav batching across reference audio
 
 With CUDA ragged Whole-Euler enabled, ready requests with different reference
@@ -182,6 +237,8 @@ checkpoint's `campplus.onnx`. On CUDA, reference preparation follows the
 stage's matmul policy (`token2wav_allow_tf32`, enabled by default); cuDNN's
 convolution TF32 policy is independent. FP32 tensors therefore do not imply
 strict FP32 arithmetic.
+On other Torch accelerators, enable this path with
+`token2wav_device_spk: true` in connector `extra`.
 The CUDA path does not require TensorRT. Set `token2wav_device_spk: false`
 in connector `extra` to use CPU ONNX Runtime for accuracy triage; explicitly
 enabling `token2wav_trt` retains its TensorRT speaker embedding path.

@@ -681,9 +681,17 @@ DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
     ("diffusion_attention_backend", "SDPA"),
     ("fastvideo_vsa_topk", 96),
     ("diffusion_attention_config", '{"default": {"backend": "SDPA"}}'),
+    (
+        "diffusion_attention_schedule",
+        {
+            "profiles": {"sparse": {"default": {"backend": "SDPA"}}},
+            "default": [{"start": 2, "end": None, "profile": "sparse"}],
+        },
+    ),
     ("diffusion_compile_granularity", "whole"),
     ("diffusion_compile_dynamic", False),
     ("enable_cuda_graph_decode", False),
+    ("enable_cfg_batching", True),
     ("cache_backend", "tea_cache"),
     ("cache_config", '{"steps": [1, 2]}'),
     ("video_output_transport", {"backend": "zmq"}),
@@ -748,6 +756,7 @@ def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
         "flow_shift": 12.0,
         "num_gpus": 2,
         "enable_cuda_graph_decode": False,
+        "enable_cfg_batching": True,
         "vae_encode_fast_path": "off",
     }
     engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**overrides))
@@ -761,6 +770,7 @@ def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
     assert resolved["flow_shift"] == 12.0
     assert resolved["parallel_config"]["data_parallel_size"] == 2
     assert resolved["enable_cuda_graph_decode"] is False
+    assert resolved["enable_cfg_batching"] is True
     assert resolved["vae_encode_fast_path"] == "off"
 
 

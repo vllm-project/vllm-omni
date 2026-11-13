@@ -5,6 +5,7 @@ Unit tests for StageConfigFactory and related classes.
 """
 
 import importlib
+import json
 import warnings
 from dataclasses import fields
 from pathlib import Path
@@ -542,23 +543,29 @@ class TestStageConfigFactory:
 class TestStageResolutionHelpers:
     """Tests for shared stage override / filtering helpers."""
 
-    def test_build_stage_runtime_overrides_ignores_other_stage_and_internal_keys(self):
+    @pytest.mark.parametrize("global_first", [True, False], ids=["global-first", "stage-first"])
+    def test_build_stage_runtime_overrides_ignores_other_stage_and_internal_keys(self, global_first):
         # Pass the same filter set the function uses by default
         # (orchestrator-only fields plus SHARED_FIELDS so ``model`` is
         # treated as not-per-stage-overridable).
+        cli_overrides = {
+            "gpu_memory_utilization": 0.5,
+            "stage_0_gpu_memory_utilization": 0.9,
+            "stage_1_gpu_memory_utilization": 0.1,
+            "stage_0_model": "should_be_ignored",
+            "parallel_config": {"world_size": 2},
+            "seed": 42,
+            "stage_0_seed": None,
+        }
+        if not global_first:
+            cli_overrides = dict(reversed(cli_overrides.items()))
+
         overrides = build_stage_runtime_overrides(
-            0,
-            {
-                "gpu_memory_utilization": 0.5,
-                "stage_0_gpu_memory_utilization": 0.9,
-                "stage_1_gpu_memory_utilization": 0.1,
-                "stage_0_model": "should_be_ignored",
-                "parallel_config": {"world_size": 2},
-            },
-            internal_keys=internal_blacklist_keys() | SHARED_FIELDS,
+            0, cli_overrides, internal_keys=internal_blacklist_keys() | SHARED_FIELDS
         )
 
         assert overrides["gpu_memory_utilization"] == 0.9
+        assert overrides["seed"] == 42
         assert "model" not in overrides
         assert "parallel_config" not in overrides
 
@@ -1702,7 +1709,10 @@ stages:
         assert deploy.model_runner == "v2"
 
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_qwen3_omni_default_runner_is_v2_on_cuda_only(self, platform):
+    def test_qwen3_omni_default_runner_is_v2_on_cuda_and_npu(self, platform, monkeypatch):
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
         pipeline = resolve_pipeline_config("qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
         assert isinstance(pipeline, PipelineConfig)
         deploy = _apply_platform_overrides(
@@ -1710,10 +1720,14 @@ stages:
             platform=platform,
         )
         stages = merge_pipeline_deploy(pipeline, deploy)
-        expect_v2 = platform == "cuda"
+        expect_v2 = platform in {"cuda", "npu"}
         assert deploy.model_runner == ("v2" if expect_v2 else "v1")
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [expect_v2] * 3
-        assert stages[0].yaml_engine_args["enable_prefix_caching"] is expect_v2
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [
+            expect_v2,
+            expect_v2,
+            expect_v2,
+        ]
+        assert stages[0].yaml_engine_args["enable_prefix_caching"] is (platform == "cuda")
 
         duplex = _apply_platform_overrides(
             load_deploy_config(Path(get_deploy_config_path("qwen3_omni_duplex.yaml"))),
@@ -3290,13 +3304,32 @@ class TestPlatformOverrides:
     ):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        assert deploy.model_runner == (cuda_default_runner if platform == "cuda" else "v1")
+        # PR #10062 turns on full-MRv2 three-stage serving on NPU by default
+        # for the three MiniCPM-o deploy profiles it touches; every other
+        # platform/profile keeps the v1 data plane.
+        npu_full_mrv2 = platform == "npu" and filename in (
+            "minicpmo_4_5.yaml",
+            "minicpmo_4_5_turn.yaml",
+            "minicpmo_4_5_duplex_h200.yaml",
+        )
+        if platform == "cuda":
+            expected_runner = cuda_default_runner
+        elif npu_full_mrv2:
+            expected_runner = "v2"
+        else:
+            expected_runner = "v1"
+        assert deploy.model_runner == expected_runner
 
         # The selection must reach the live worker-dispatch consumer, not just
         # the transport-level DeployConfig field.
         pipeline = resolve_pipeline_config(pipeline_key)
         stages = merge_pipeline_deploy(pipeline, deploy)
-        expected = [platform == "cuda" and stage.stage_id not in cuda_v1_stages for stage in stages]
+        if platform == "cuda":
+            expected = [stage.stage_id not in cuda_v1_stages for stage in stages]
+        elif npu_full_mrv2:
+            expected = [True for _ in stages]
+        else:
+            expected = [False for _ in stages]
         assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == expected
         expect_v2 = all(expected)
 
@@ -4305,3 +4338,14 @@ stages:
 
         merge_pipeline_deploy(pipeline, deploy)
         assert not deploy.async_chunk
+
+
+@pytest.mark.parametrize("registered", [False, True], ids=["generic-diffusion", "registered-pipeline"])
+def test_invalid_cli_sampling_json_fails_startup(registered: bool) -> None:
+    with pytest.raises(json.JSONDecodeError):
+        if registered:
+            VllmOmniConfig.from_pipeline_config(
+                OMNI_PIPELINES["moss_image"], cli_overrides={"default_sampling_params": "{"}
+            )
+        else:
+            StageConfigFactory._normalize_default_diffusion({"default_sampling_params": "{"})
