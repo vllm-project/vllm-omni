@@ -444,17 +444,16 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     def _publish_shared_backbone_if_configured(self) -> None:
         """Publish finalized AR backbone weights when this rank is a provider.
 
-        The startup layer attaches a ``SharedWeightGroupConfig`` to
-        ``self.vllm_config`` as ``weight_sharing`` before model load.  This hook
-        runs after the model and all post-load transforms are complete and keeps
-        both the backend and the ``ExportSession`` alive for step-3 lifecycle.
-
-        Provider publishing is wired only on the Model Runner V2 path
-        (:class:`OmniGPUModelRunner`); an AR stage must run on MRv2 to publish.
+        Read this TP rank's bootstrap from additional_config after the model
+        and all post-load transforms are complete. Keep the backend and export
+        session alive until sharing-group teardown.
         """
-        group = getattr(self.vllm_config, "weight_sharing", None)
-        if group is None or getattr(group, "role", None) != "provider":
+        from vllm_omni.distributed.weight_sharing.worker_session import resolve_worker_sharing
+
+        sharing = resolve_worker_sharing(self.vllm_config, role="provider")
+        if sharing is None:
             return
+        group, _ = sharing
         if getattr(self, "_weight_share_session", None) is not None:
             return  # Already published; step-3 owns teardown, do not re-export.
         if getattr(self, "_weight_share_backend", None) is not None:
@@ -997,7 +996,13 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     self.model._last_captured_layers = self._last_aux_output
             else:
                 hidden_states = model_output
-        if not dummy_run and isinstance(hidden_states, torch.Tensor):
+        if (
+            not dummy_run
+            and isinstance(hidden_states, torch.Tensor)
+            # These outputs are materialized by make_omni_output() in the AR
+            # sampling phase, so their state update must wait for that phase.
+            and not getattr(self.model, "postprocess_requires_multimodal_outputs", False)
+        ):
             self.model_state.run_postprocess(hidden_states, input_batch)
 
         self.execute_model_state = ExecuteModelState(

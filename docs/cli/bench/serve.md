@@ -89,6 +89,14 @@ Print per-stage benchmark metrics for --omni serving when stage metrics are retu
 - `--save-result`
 Specify to save benchmark results to a json file
 
+  Omni results include `benchmark_end_time`, a local ISO 8601 timestamp captured
+  at the end of the timed run, before metric computation and optional accuracy
+  evaluation. Subtract `duration` (seconds) to locate the measured window when
+  aligning device-utilization samples. The legacy `date` records result creation
+  after postprocessing and is not the measurement boundary. Client and sampler
+  clocks and timezones must agree. Older result files without `benchmark_end_time`
+  cannot establish a sampling window from `date` alone.
+
 - `--save-detailed`
 "When saving the results, whether to include per request "
         "information such as response, error, ttfs, tpots, etc."
@@ -297,7 +305,18 @@ P99 AUDIO_RTF:                           0.48
 ```
 
 Notes:
-We use audio generation time / audio duration to calculate RTF.
+For the HTTP chat-omni and audio-speech backends, audio RTF uses client request
+start to receipt of the last non-empty audio payload, divided by generated audio
+duration. Trailing usage events (chat) or delayed stream EOF (speech) remain in
+E2EL but do not increase audio RTF. Mean RTF averages the individual request ratios; aggregate
+RTF divides summed audio-completion latencies by summed audio durations.
+
+Saved results include `request_audio_metrics` in input request order. Each
+successful audio request carries `audio_latency_s` and `audio_duration_s`;
+failed, non-audio or unsupported measurements are `null`. This metadata is
+independent of server stage metrics and remains present without `--save-detailed`.
+Duplex backends keep their per-response/session clocks described below and do
+not synthesize a request audio-completion latency from their mean RTF.
 
 </details>
 
