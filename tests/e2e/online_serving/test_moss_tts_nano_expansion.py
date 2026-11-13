@@ -68,11 +68,9 @@ def get_prompt(prompt_type="text"):
     """
     prompts = {
         "text": "Hello, this is a short voice cloning demo for testing.",
-        # Avoid the short-sample near-homophone "语音"/"语言": Whisper-small
-        # consistently transcribes the Nano output as the latter on MI325.
-        # Keep a natural Chinese content check and the shared 0.9 transcript
-        # threshold instead of weakening semantic validation for this model.
-        "chinese": "你好，这是一段简单的语言合成测试。",
+        # Avoid the short-sample near-homophone "语音"/"语言" while keeping a
+        # natural Chinese content check and the shared 0.9 transcript threshold.
+        "chinese": "你好，这是一段简单的中文朗读测试。",
     }
     return prompts.get(prompt_type, prompts["text"])
 

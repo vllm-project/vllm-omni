@@ -166,6 +166,10 @@ class TestHiggsAudioV2OnlineVoiceClone:
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
+                # whisper-small can mishear this short clip; only after a weak
+                # match, re-verify it with the stronger ASR before failing.
+                # Local-only key (not forwarded to the server).
+                "transcript_escalation_model": "large-v3",
             }
         )
 
