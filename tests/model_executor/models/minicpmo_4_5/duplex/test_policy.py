@@ -10,6 +10,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize(
+    "text,complete",
+    [("", False), ("   ", False), ("未完", False), ("完成。", True), ('"Done!"  ', True), ("“未完”", False)],
+)
+def test_turn_text_ends_sentence(text, complete):
+    assert MiniCPMO45DuplexPolicy.turn_text_ends_sentence(text) is complete
+
+
+@pytest.mark.parametrize(
     ("samples", "tokens"),
     [(0, 0), (1280, 0), (1281, 1), (1599, 1), (1600, 1), (2880, 1), (2881, 2), (96256, 60), (97281, 61)],
 )

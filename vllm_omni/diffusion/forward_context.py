@@ -28,6 +28,24 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class MixFusionStep:
+    """Record of one packed MixFusion denoise step.
+
+    The MixFusionDriver arms this context around the packed forward and
+    restores the previous one afterwards; the root hook fills ``plan`` and
+    ``packed`` for the boundary hooks and the packed attention to read.
+
+    Fields are opaque (``Any``): the common context module must not import
+    the MixFusion layout or adapter types.
+    """
+
+    # ``PackedExecutionPlan`` of the running call (carries its AttentionLayout).
+    plan: Any = None
+    # ``PackedInputs`` from the adapter: rewritten call and boundary outputs.
+    packed: Any = None
+
+
+@dataclass
 class ForwardContext:
     """
     set forward context for diffusion models
@@ -95,6 +113,11 @@ class ForwardContext:
     # every rank's shard the same length and lets attention collectives skip a
     # runtime length all-gather. Pushed on split, popped on gather.
     _sp_equal_pad_stack: list[bool] = field(default_factory=list)
+
+    # MixFusion packed-layout state (see MixFusionStep above). ``mixfusion_step``
+    # is armed by the pipeline for exactly one packed transformer call; the
+    # MixFusion module hooks are inert while it is None.
+    mixfusion_step: MixFusionStep | None = None
 
     @property
     def sp_active(self) -> bool:

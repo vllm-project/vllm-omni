@@ -111,6 +111,7 @@ nav:
         - Attention Schedules: user_guide/diffusion/attention_backends/schedules.md
       - Regional Compilation: user_guide/diffusion/regional_compilation.md
       - MiniMax-H3 LiteVAE Decoder: user_guide/diffusion/light_vae.md
+      - Denoise Step Graphs: user_guide/diffusion/denoise_graph.md
       - Wan VAE Decoder Fast Path: user_guide/diffusion/vae_fast_path.md
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
       - Startup and Loading: user_guide/diffusion/startup_and_loading.md
@@ -132,6 +133,7 @@ nav:
     - contributing/model/adding_omni_model.md
     - contributing/model/adding_tts_model.md
     - contributing/model/adding_diffusion_model.md
+    - contributing/model/adding_rl_rollout_model.md
   - CI: contributing/ci
   - Design Documents:
     - design/index.md
@@ -157,6 +159,7 @@ nav:
           - Yuanrong Store Connector: design/feature/omni_connectors/yuanrong_connector.md
           - Yuanrong Transfer Engine Connector: design/feature/omni_connectors/yuanrong_transfer_engine_connector.md
       - Quantization: design/feature/quantization.md
+      - LoRA: design/feature/lora.md
       - Diffusion Acceleration:
         - Parallelism:
           - CFG-Parallel: design/feature/cfg_parallel.md

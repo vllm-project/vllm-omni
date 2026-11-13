@@ -121,6 +121,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
         self._async_mm_snapshot_cursor = 0
         self._last_multimodal_snapshot_slot: int | None = None
 
+    def load_model(self, *args: Any, **kwargs: Any) -> None:
+        super().load_model(*args, **kwargs)
+        if self.num_speculative_steps > 0 and self.is_last_pp_rank and self.rejection_sampler is None:
+            raise ValueError(
+                "MRv2 AR speculative decoding requires a rejection sampler; check the model's custom sampler"
+            )
+
     def _ensure_kv_transfer_manager(self) -> OmniKVTransferManager:
         if self.kv_transfer_manager is None:
             self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
@@ -220,6 +227,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
         text_hidden, multimodal_outputs = self.model_state.postprocess_model_output(
             raw_output, input_batch, self.req_states
         )
+        if getattr(self.model, "postprocess_requires_multimodal_outputs", False):
+            # The raw forward cannot publish this state: make_omni_output()
+            # above creates the current feedback frame.
+            self.model_state.run_postprocess(text_hidden, input_batch, multimodal_outputs)
         prefix_cache_rewrite = self._prefix_cache_save_mrv2(input_batch, text_hidden, multimodal_outputs)
         if bool(getattr(self.model_config, "async_chunk", False)) and multimodal_outputs:
             multimodal_outputs = self._retain_multimodal_outputs(multimodal_outputs)
