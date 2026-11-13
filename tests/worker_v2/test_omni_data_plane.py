@@ -136,8 +136,65 @@ def test_full_payload_abort_discards_partial_and_late_outputs(plane):
 
 
 @pytest.mark.parametrize("async_chunk", [False, True])
+def test_resume_preserves_queued_outputs_before_terminal(plane, monkeypatch, async_chunk):
+    plane._async_chunk = async_chunk
+    plane._full_payload_replace_keys_cached = frozenset()
+    queued = threading.Event()
+    release = threading.Event()
+    complete = plane.complete_outputs
+
+    def complete_after_resume(**kwargs):
+        if not queued.is_set():
+            queued.set()
+            assert release.wait(5)
+        return complete(**kwargs)
+
+    monkeypatch.setattr(plane, "complete_outputs", complete_after_resume)
+    plane._start_output_worker(max_pending_batches=2)
+    request = _new_request()
+    request.resumable = False
+    plane.register_request(request)
+    plane.reserve_outputs(["internal"])
+    plane.enqueue_outputs(
+        req_ids=["internal"],
+        inter_stage_outputs=[{"codes.audio": torch.tensor([[1]])}],
+        sampled_token_ids=[[21]],
+    )
+    try:
+        assert queued.wait(5)
+        # Recompute resume re-enters scheduled_new_reqs while an accepted
+        # output can still be waiting in the native transport queue.
+        resumed = _new_request()
+        resumed.resumable = False
+        resumed.prefill_token_ids = [10, 11, 21]
+        resumed.num_computed_tokens = 3
+        plane.register_request(resumed)
+        plane.reserve_outputs(["internal"])
+        plane.enqueue_outputs(
+            req_ids=["internal"],
+            inter_stage_outputs=[{"codes.audio": torch.tensor([[2]])}],
+            sampled_token_ids=[[22]],
+        )
+        assert plane.request_terminal({"internal"}) == 0
+    finally:
+        release.set()
+    plane.drain_outputs()
+
+    payloads = [
+        payload["codes"]["audio"] if async_chunk else payload["codes.audio"]
+        for batch in plane.record.batches
+        for _, payload in batch
+        if payload
+    ]
+    assert torch.cat(payloads).flatten().tolist() == [1, 2]
+    assert plane.record.cleaned == ["internal"]
+    assert not plane._native_outputs_in_flight and not plane._native_terminal_pending
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
 @pytest.mark.parametrize("stop", ["token", "length"])
-def test_non_resumable_output_stops_before_scheduler_terminal(plane, async_chunk, stop):
+@pytest.mark.parametrize("resume", [False, True])
+def test_non_resumable_output_stops_before_scheduler_terminal(plane, async_chunk, stop, resume):
     plane._async_chunk = async_chunk
     plane._full_payload_replace_keys_cached = frozenset()
     request = _new_request()
@@ -147,6 +204,13 @@ def test_non_resumable_output_stops_before_scheduler_terminal(plane, async_chunk
     first, last, stale = (torch.tensor([[value]]) for value in (1, 2, 99))
     plane.reserve_outputs(["internal"])
     _complete(plane, [{"codes.audio": first}], token=21)
+    if resume:
+        resumed = _new_request()
+        resumed.resumable = False
+        resumed.prefill_token_ids = [10, 11, 21]
+        resumed.num_computed_tokens = 3
+        resumed.sampling_params = request.sampling_params
+        plane.register_request(resumed)
     plane.reserve_outputs(["internal"])
     _complete(plane, [{"codes.audio": last}], token=2150 if stop == "token" else 22)
     plane.reserve_outputs(["internal"])

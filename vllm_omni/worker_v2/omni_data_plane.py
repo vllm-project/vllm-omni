@@ -298,19 +298,26 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._raise_output_error()
         req_id = str(request_data.req_id)
         external_req_id = str(getattr(request_data, "external_req_id", None) or req_id)
+        prompt_token_ids = list(getattr(request_data, "prompt_token_ids", None) or [])
         with self._native_output_lock:
-            self._native_outputs_in_flight.pop(req_id, None)
+            # Recompute resume refreshes model context, not the downstream
+            # lifecycle. Keep queued reservations, token history and stop state.
+            state = self._native_requests.get(req_id)
+            if state is None:
+                state = _NativeRequestState(
+                    request_id=req_id,
+                    external_req_id=external_req_id,
+                    prompt_token_ids=prompt_token_ids,
+                )
+                self._native_requests[req_id] = state
             self._native_terminal_pending.discard(req_id)
-            self._native_requests[req_id] = _NativeRequestState(
-                request_id=req_id,
-                external_req_id=external_req_id,
-                prompt_token_ids=list(getattr(request_data, "prompt_token_ids", None) or []),
-                additional_information=getattr(request_data, "additional_information", None),
-                model_intermediate_buffer=getattr(request_data, "model_intermediate_buffer", None),
-                sampling_params=getattr(request_data, "sampling_params", None),
-                num_computed_tokens=int(getattr(request_data, "num_computed_tokens", 0) or 0),
-                resumable=bool(getattr(request_data, "resumable", False)),
-            )
+            state.external_req_id = external_req_id
+            state.prompt_token_ids = prompt_token_ids
+            state.additional_information = getattr(request_data, "additional_information", None)
+            state.model_intermediate_buffer = getattr(request_data, "model_intermediate_buffer", None)
+            state.sampling_params = getattr(request_data, "sampling_params", None)
+            state.num_computed_tokens = int(getattr(request_data, "num_computed_tokens", 0) or 0)
+            state.resumable = bool(getattr(request_data, "resumable", False))
 
     def reserve_outputs(self, req_ids: list[str]) -> None:
         """Keep request state alive until deferred runner outputs are consumed."""
