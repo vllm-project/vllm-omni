@@ -293,6 +293,24 @@ def _decode(model, info):
     return text_step[0]
 
 
+def test_batched_decode_takes_a_streamed_request_without_trailing_text_as_the_single_path_does():
+    # preprocess() lets a streamed request through before it has any text conditioning; the batched decode path
+    # mirrors its decode branch, so it must too, and read the request's next rows from its stream.
+    builder = _builder()
+    model = _talker(builder)
+    model.append_streamed_text({"r": _delivery(0, [20, 21])})
+    model._streamed_texts.prompt_text("r", torch.device("cpu"))  # the prefill takes ids 0 and 1
+    model.append_streamed_text({"r": _delivery(2, [22])})
+    info = {
+        "req_id": "r",
+        "text": [""],
+        "task_type": ["CustomVoice"],
+        "hidden_states": {"last": torch.zeros(HIDDEN)},
+        "meta": {"talker_text_offset": 0},
+    }
+    torch.testing.assert_close(_decode(model, info), _project(builder, [22])[0])
+
+
 def test_the_talker_reads_streamed_text_in_order_across_appends_then_its_end():
     builder = _builder()
     model = _talker(builder)

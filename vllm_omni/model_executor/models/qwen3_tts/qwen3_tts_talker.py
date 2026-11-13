@@ -1109,7 +1109,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             hs = payload.get("hidden_states", {})
             meta = payload.get("meta", {})
 
-            if not _has_tts_text_conditioning(info_dict, hs):
+            req_id = _request_id(info_dict)
+            if not _has_tts_text_conditioning(info_dict, hs) and req_id not in self._streamed_texts:
                 raise ValueError("Missing Qwen3-TTS text conditioning: provide `text` or precomputed text token ids.")
 
             task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
@@ -1142,7 +1143,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                             trailing_text_update = tail[next_text_offset:].contiguous()
                         next_text_offset = 0
                 else:
-                    if self._streamed_texts.is_open(_request_id(info_dict)):
+                    if self._streamed_texts.is_open(req_id):
                         logger.warning_once("Qwen3-TTS: a streamed request read PAD before its text END")
                     text_step = tts_pad_embed
                     next_text_offset = 0
