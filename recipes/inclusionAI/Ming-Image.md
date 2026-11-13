@@ -39,11 +39,6 @@ vllm serve "$MODEL" --omni --deploy-config vllm_omni/deploy/ming_image.yaml --po
 
 For layer decomposition, set `MODEL` to `inclusionAI/Ming-Image-0.1-Design-Layer`.
 
-The deployment's `pipeline: ming_image` also selects the frontend request
-contract, including `num_layers`. Checkpoints can share root Bailing metadata
-with Ming-Flash-Omni; worker enrichment preserves this explicit pipeline and
-loads the configuration from `transformer/config.json`.
-
 ## Text-to-image
 
 Note that a prompt refiner is expected to describe the prompts with details; we will refine with more example inputs soon.
@@ -99,12 +94,6 @@ curl -sS http://127.0.0.1:8091/v1/chat/completions \
 Use the Design-Layer checkpoint and set `INPUT_IMAGE` to a local flattened design image.
 Note that the prompt should better depict each layer to be decomposed, we will refine with more example inputs soon.
 
-For a reproducible regression check, use Design-Layer revision
-`ff1b22d2bdd0ae6597c0024a42cac7923b24cf92`, which includes the shared root
-`config.json`. The older `9fabca8b62a67f1f53a957d46389c00451c11e52` revision
-does not contain that file and exercises the component-only configuration path.
-Pass `--revision ff1b22d2bdd0ae6597c0024a42cac7923b24cf92` when serving the Hub model.
-
 ```bash
 MODEL=inclusionAI/Ming-Image-0.1-Design-Layer
 INPUT_IMAGE=/path/to/input.png
@@ -130,9 +119,6 @@ jq -n \
 curl -sS http://127.0.0.1:8091/v1/chat/completions \
   -H "Content-Type: application/json" \
   --data-binary @- > response.json
-
-# One reconstructed composite plus the six requested layers.
-jq -e '[.choices[0].message.content[] | select(.type == "image_url")] | length == 7' response.json
 
 jq -r '.choices[0].message.content[].image_url.url | split(",")[1]' response.json |
   nl -v 0 |

@@ -799,7 +799,7 @@ def resolve_model_class_name(
     ):
         try:
             transformer_config = get_hf_file_to_dict("transformer/config.json", model, revision=revision)
-        except (OSError, ValueError, TypeError) as exc:
+        except (OSError, ValueError) as exc:
             logger.warning("Could not read Ming transformer metadata for %s: %s", model, exc)
             transformer_config = None
         if isinstance(transformer_config, Mapping) and transformer_config.get("_class_name") == "DiffusionTransformer":
