@@ -420,6 +420,7 @@ class LingBotVideoPipeline(
             if not offload_enabled(self.od_config):
                 self.device = torch.device(device)
         if dtype is not None:
+            # Only the transformer follows a dtype cast; the text encoder and VAE keep their load dtypes.
             self.transformer.to(dtype=dtype, non_blocking=non_blocking)
         return self
 

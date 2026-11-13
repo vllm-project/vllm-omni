@@ -102,13 +102,13 @@ class SequentialOffloadHook(ModelHook):
         refer to
         https://github.com/vipshop/cache-dit/blob/v1.2.3/src/cache_dit/caching/cache_blocks/__init__.py#L83
         """
-        if pin_memory and target_device.type == "cpu" and current_omni_platform.is_rocm():
+        pin = pin_memory and target_device.type == "cpu" and is_pin_memory_available()
+        if pin and current_omni_platform.is_rocm():
             moved = _move_module_to_packed_pinned_cpu(module, non_blocking=non_blocking)
             if moved is not None:
                 return moved
 
         moved = False
-        pin = pin_memory and target_device.type == "cpu" and is_pin_memory_available()
         for tensor in (*module.parameters(), *module.buffers()):
             # Modules built on host start pageable; pin them on the first offload
             # so later loads do not stage the whole module through pageable memory.

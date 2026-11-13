@@ -525,7 +525,23 @@ class TestMoveParamsPinMemory:
         assert all(t.is_pinned() for t in (*module.parameters(), *module.buffers()))
         assert not SequentialOffloadHook._move_params(module, torch.device("cpu"), pin_memory=True)
 
-    def test_host_module_stays_pageable_without_pin_support(self, monkeypatch: pytest.MonkeyPatch):
+    def test_rocm_packs_host_built_module_on_first_offload(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
+        """On ROCm a host-built module is packed into shared pinned slabs on its first offload."""
+        monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: True)
+        module = nn.Module()
+        for index in range(3):
+            module.register_buffer(f"state_{index}", torch.full((1_100_000,), index, dtype=torch.uint8))
+
+        assert SequentialOffloadHook._move_params(module, torch.device("cpu"), pin_memory=True)
+
+        buffers = list(module.buffers())
+        assert all(buffer.is_pinned() for buffer in buffers)
+        assert len({buffer.untyped_storage().data_ptr() for buffer in buffers}) == 1
+        assert [buffer[0].item() for buffer in buffers] == [0, 1, 2]
+        assert not SequentialOffloadHook._move_params(module, torch.device("cpu"), pin_memory=True)
+
+    @pytest.mark.parametrize("rocm", [False, True], ids=["default", "rocm"])
+    def test_host_module_stays_pageable_without_pin_support(self, monkeypatch: pytest.MonkeyPatch, rocm: bool):
         """Hosts without pinned memory must not try to re-pin a host-built module."""
         from vllm_omni.diffusion.offloader import sequential_backend
 
@@ -533,6 +549,8 @@ class TestMoveParamsPinMemory:
         tracker, mock_pin = _track_pin_memory_calls()
         monkeypatch.setattr(torch.Tensor, "pin_memory", mock_pin)
         monkeypatch.setattr(sequential_backend, "is_pin_memory_available", lambda: False)
+        monkeypatch.setattr(current_omni_platform, "is_rocm", lambda: rocm)
 
         assert not SequentialOffloadHook._move_params(module, torch.device("cpu"), pin_memory=True)
         assert not tracker["called"]
+        assert not any(t.is_pinned() for t in (*module.parameters(), *module.buffers()))
