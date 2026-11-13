@@ -446,6 +446,7 @@ class DuplexSessionRunner:
         if response_id is None:
             return
         playback = session.playback_for_response(response_id).as_dict()
+        done_metadata: dict[str, object] = {}
         if draining_response_id is not None:
             session.clear_draining_for_response(draining_response_id)
             if session.finalize_response_playback(
@@ -455,6 +456,7 @@ class DuplexSessionRunner:
             if isinstance(request_id, str):
                 session.request_resources.pop((stage_id, request_id), None)
         elif response_id == session.active_response_id:
+            done_metadata = helpers.text_output_done_metadata(session)
             session.end_response(commit_text=False)
             settle_response_runtime(self.plugin, session, committed=False, response_id=response_id, release_owner=True)
         self.emit(
@@ -467,6 +469,7 @@ class DuplexSessionRunner:
                 "status": "failed",
                 "status_details": {"type": "failed", "reason": "runtime_data_plane_stream_failed"},
                 "playback": playback,
+                **done_metadata,
             }
         )
 
@@ -2195,6 +2198,7 @@ class DuplexSessionRunner:
         # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.
         self.run.concurrent_turn_requests_released = False
         should_commit = self.model.should_commit_response_to_history(session, old_response_id)
+        done_metadata = helpers.text_output_done_metadata(session) if old_response_id is not None else {}
         committed_message = session.end_response(
             commit_text=should_commit,
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
@@ -2282,6 +2286,7 @@ class DuplexSessionRunner:
                     "epoch": new_epoch,
                     "committed_ms": committed_ms,
                     "playback": old_playback,
+                    **done_metadata,
                 }
             )
             for response_id, drain_committed_ms, drain_playback in draining_cancels:

@@ -25,6 +25,9 @@ EncodeAudio = Callable[[object, int, str, float | None], str | None]
 class MiniCPMO45DataPlaneContext(DuplexDataPlaneContext):
     """Serving state needed to project one MiniCPM data-plane output (the framework fields)."""
 
+    #: The deployment ends at Stage0, so its output is projected as text.
+    text_output: bool = False
+
 
 @dataclass(slots=True)
 class _TurnState:
@@ -44,6 +47,11 @@ class _RequestState:
     pending_audio_without_text: list[dict[str, object]] = field(default_factory=list)
     terminal: bool = False
     turns: dict[int | None, _TurnState] = field(default_factory=dict)
+    #: Text-path cursors into the cumulative Stage0 snapshot (request scoped).
+    stage0_sent_chars: int = 0
+    stage0_unit_end: int = 0
+    #: MRv2 may omit the special token ids on a row whose append built no unit.
+    stage0_special_token_ids: dict[str, int] = field(default_factory=dict)
 
     def turn(self, turn_id: int | None) -> _TurnState:
         return self.turns.setdefault(turn_id, _TurnState())
@@ -175,6 +183,20 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             stale_turn = output_turn_id < context.turn_id
         stale_epoch = output_epoch is not None and output_epoch != context.epoch
         if context.auto_responds and (stale_turn or stale_epoch):
+            return
+
+        if context.text_output:
+            # No TTS stage reports segment or turn ends, and the latent is not audio.
+            yield from self._project_final_stage0_text(
+                request_id=request_id,
+                request_state=request_state if request_state is not None else _RequestState(),
+                completion=completion,
+                text=text,
+                mm_output=mm_output,
+                finished=bool(getattr(output, "finished", False)),
+                context=context,
+                runtime_result=runtime_result,
+            )
             return
 
         mm_text = _llm_output_text(mm_output)
@@ -445,6 +467,130 @@ class MiniCPMO45DataPlaneSession(DuplexDataPlane):
             end_of_turn=unit_end_of_turn,
         )
 
+    def _project_final_stage0_text(
+        self,
+        *,
+        request_id: str | None,
+        request_state: _RequestState,
+        completion: object,
+        text: object,
+        mm_output: dict[str, object],
+        finished: bool,
+        context: MiniCPMO45DataPlaneContext,
+        runtime_result: Callable[..., dict[str, object]],
+    ) -> Iterator[dict[str, object]]:
+        """Project a final Stage0 snapshot as text deltas, then one boundary per terminated unit."""
+        if request_state.terminal:
+            return
+        metrics_attached = False
+
+        def result_once(**values: object) -> dict[str, object]:
+            # The session sums stage metrics per result; count a snapshot once.
+            nonlocal metrics_attached
+            result = runtime_result(**values)
+            if metrics_attached:
+                result.pop("stage_metrics", None)
+            metrics_attached = True
+            return result
+
+        start = request_state.stage0_unit_end
+        total, new_token_ids = _completion_token_ids_from(completion, start)
+        turn_id = context.active_response_turn_id if context.active_response_turn_id is not None else context.turn_id
+        special_token_ids = _special_token_ids(mm_output)
+        if special_token_ids:
+            request_state.stage0_special_token_ids.update(special_token_ids)
+        special_token_ids = request_state.stage0_special_token_ids
+        listen_id = special_token_ids.get("listen_token_id")
+        turn_eos_id = special_token_ids.get("turn_eos_token_id")
+        if total > start and (listen_id is None or turn_eos_id is None):
+            # No unit could ever end; fail before any text opens a response.
+            yield result_once(
+                stage_role="llm",
+                error_code="runtime_data_plane_missing_control_tokens",
+                error="MiniCPM-o Stage0 text output is missing its listen/turn_eos token ids.",
+                data_plane_request_id=request_id,
+                close_session=True,
+            )
+            request_state.terminal = True
+            return
+        if isinstance(text, str) and len(text) > request_state.stage0_sent_chars:
+            delta_text = text[request_state.stage0_sent_chars :]
+            request_state.stage0_sent_chars = len(text)
+            yield result_once(
+                stage_role="llm",
+                is_listen=False,
+                data_plane_request_id=request_id,
+                text=delta_text,
+                end_of_turn=False,
+                model_turn_id=turn_id,
+            )
+
+        if total <= start:
+            return
+        assert listen_id is not None and turn_eos_id is not None
+        terminators = {
+            token_id
+            for token_id in (
+                listen_id,
+                special_token_ids.get("chunk_eos_token_id"),
+                special_token_ids.get("chunk_tts_eos_token_id"),
+            )
+            if token_id is not None
+        }
+        unit_start = 0
+        for index, token_id in enumerate(new_token_ids):
+            if token_id not in terminators:
+                continue
+            unit = new_token_ids[unit_start : index + 1]
+            unit_start = index + 1
+            if unit[-1] == listen_id:
+                ends_turn = MiniCPMO45DuplexPolicy.speech_unit_closed_by_listen(unit, special_token_ids)
+            else:
+                ends_turn = turn_eos_id in unit
+            if ends_turn:
+                yield result_once(
+                    stage_role="llm",
+                    is_listen=False,
+                    data_plane_request_id=request_id,
+                    text="",
+                    end_of_turn=True,
+                    model_turn_id=turn_id,
+                )
+                turn_id += 1
+            elif unit[-1] == listen_id:
+                yield result_once(
+                    stage_role="llm",
+                    is_listen=True,
+                    model_listen=True,
+                    listen_source="model_listen",
+                    data_plane_request_id=request_id,
+                    end_of_turn=False,
+                )
+            else:
+                yield result_once(
+                    stage_role="llm",
+                    is_listen=False,
+                    data_plane_request_id=request_id,
+                    text="",
+                    end_of_turn=False,
+                    segment_complete=True,
+                    model_turn_id=turn_id,
+                )
+        # A resumable stop leaves ``finished`` false and sets finish_reason. An
+        # unterminated tail (e.g. a length cap) fails, even if it holds turn_eos.
+        if (finished or getattr(completion, "finish_reason", None) is not None) and unit_start < len(new_token_ids):
+            unit_start = len(new_token_ids)
+            yield result_once(
+                stage_role="llm",
+                error_code="runtime_data_plane_unterminated_unit",
+                error=(
+                    "MiniCPM-o Stage0 stopped without a unit terminator "
+                    f"(finish_reason={getattr(completion, 'finish_reason', None)!r})."
+                ),
+                data_plane_request_id=request_id,
+            )
+        request_state.stage0_unit_end = start + unit_start
+
     def segment_text_delta(self, request_id: str | None, text: object, *, turn_id: int | None = None) -> str:
         if not isinstance(text, str) or not text:
             return ""
@@ -678,6 +824,26 @@ def _completion_token_ids(completion: object) -> list[int]:
         if token_ids:
             return token_ids
     return []
+
+
+def _completion_token_ids_from(completion: object, start: int) -> tuple[int, list[int]]:
+    """Length of the completion's token ids and the ids from ``start`` on."""
+    if completion is None:
+        return 0, []
+    for name in ("token_ids", "cumulative_token_ids"):
+        candidate = getattr(completion, name, None)
+        if candidate is None:
+            continue
+        try:
+            total = len(candidate)
+        except TypeError:
+            continue
+        if total == 0:
+            continue
+        if total <= start:
+            return total, []
+        return total, _coerce_int_list(candidate[start:])
+    return 0, []
 
 
 def _coerce_int_list(value: object) -> list[int]:

@@ -1046,8 +1046,11 @@ alone does not implement per-request TTS skipping.
 Targeted playback ACKs for text-only items
 and audio truncation on text-only deployments fail with `unsupported_operation`
 without modifying history. The default MiniCPM three-stage deployment continues
-to advertise text and audio. This negotiation does not by itself register a
-Thinker-only MiniCPM deployment profile.
+to advertise text and audio. `minicpmo_4_5_duplex_thinker_only.yaml`
+advertises text only. Text arrives as `response.output_text.delta` events while
+the model generates it. A delta can carry any amount of text, so it does not
+mark the end of a model unit or of the reply. `response.done` reports the
+response's engine metrics under `metadata.vllm_omni.stage_metrics`.
 
 The event vocabulary is uniform, but several surfaces are gated by the
 `capabilities` object the server returns in `session.created`; a client must

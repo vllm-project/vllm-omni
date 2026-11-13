@@ -215,3 +215,11 @@ def audio_committed_payload(
     if isinstance(realtime_item_id, str) and realtime_item_id:
         payload["realtime_item_id"] = realtime_item_id
     return payload
+
+
+def text_output_done_metadata(session: DuplexEngineSession) -> dict[str, object]:
+    """A text-only response's stage metrics for its ``response.done``; call before ``end_response``."""
+    if session.capabilities.emits_audio:
+        return {}
+    stage_metrics = session.accumulate_response_stage_metrics(None)
+    return {"vllm_omni": {"stage_metrics": stage_metrics}} if stage_metrics else {}

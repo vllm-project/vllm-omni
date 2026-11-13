@@ -338,13 +338,14 @@ class RealtimeDuplexClient:
         turn_detection: dict[str, object] | None = None,
         idle_timeout_s: float | None = None,
         timeout_s: float = 20.0,
+        modalities: Sequence[str] | None = ("audio", "text"),
     ) -> None:
+        """Send ``session.update`` and wait for ``session.created``; ``modalities=None`` uses the server default."""
         session_extra_body = dict(extra_body or {})
         session_extra_body.pop("native_duplex", None)
         session_extra_body.update(auto_response=auto_response, force_listen_count=0)
         session: dict[str, object] = {
             "model": model,
-            "modalities": ["audio", "text"],
             "input_audio_format": "pcm16",
             "output_audio_format": output_audio_format,
             "turn_detection": dict(turn_detection) if turn_detection is not None else None,
@@ -356,6 +357,8 @@ class RealtimeDuplexClient:
             "playback_commit_policy": "ack_only",
             "extra_body": session_extra_body,
         }
+        if modalities is not None:
+            session["modalities"] = list(modalities)
         if temperature is not None:
             session["temperature"] = float(temperature)
         if ref_audio is not None:

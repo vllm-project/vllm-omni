@@ -918,6 +918,8 @@ class ModelChannel:
         )
         if self._ctx.run.closing or response_id is None:
             return
+        self._keep_text_output_stage_metrics(model_result)
+        done_metadata = helpers.text_output_done_metadata(session)
         session.end_response(commit_text=False)
         settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=response_id, release_owner=True)
         self._out.emit(
@@ -930,6 +932,7 @@ class ModelChannel:
                 "status": "failed",
                 "status_details": {"type": "failed", "reason": model_result.get("error_code")},
                 "playback": session.playback.as_dict(),
+                **done_metadata,
             }
         )
 
@@ -1050,6 +1053,8 @@ class ModelChannel:
         ):
             return close_reason, emitted_response
         active_response_id = session.active_response_id
+        if active_response_id is not None:
+            self._keep_text_output_stage_metrics(model_result)
         auto_continuations_remaining = active_response_id is None or self.response_continuations_remaining(
             active_response_id
         )
@@ -1063,6 +1068,28 @@ class ModelChannel:
         if non_terminal_auto_listen:
             self._ctx.services.spawn(
                 self.maybe_continue_response(expected_epoch=expected_epoch), name="duplex-continue"
+            )
+            return close_reason, emitted_response
+        # A resident request never finishes: clearing it here would leave an
+        # explicit text response open forever, so continue it instead.
+        explicit_resident_listen = (
+            not auto_response
+            and not session.capabilities.emits_audio
+            and session.capabilities.supports_core_resumable_request
+            and active_response_id is not None
+            and isinstance(data_plane_request_id, str)
+            and data_plane_request_id == session.active_request_id
+            and model_result.get("end_of_turn") is not True
+        )
+        if explicit_resident_listen:
+            self._ctx.services.spawn(
+                self.maybe_continue_response(
+                    expected_epoch=expected_epoch,
+                    expected_response_id=active_response_id,
+                    finished_segment=True,
+                    finished_request_id=data_plane_request_id,
+                ),
+                name="duplex-continue",
             )
             return close_reason, emitted_response
         if not auto_response and data_plane_request_id == session.active_request_id:
@@ -1121,18 +1148,23 @@ class ModelChannel:
                         completed_turn_id = session.active_response_turn_id
                     if completed_turn_id is not None:
                         session.complete_model_turn(completed_turn_id)
+            done_metadata = helpers.text_output_done_metadata(session)
             session.end_response(commit_text=False, preserve_request=auto_response)
             settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=response_id)
-            self._out.emit(
-                {
-                    "type": "response.done",
-                    "session_id": session.session_id,
-                    "response_id": response_id,
-                    "epoch": session.epoch,
-                    "committed": False,
-                    "playback": session.playback.as_dict(),
-                }
-            )
+            done: dict[str, object] = {
+                "type": "response.done",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": session.epoch,
+                "committed": False,
+                "playback": session.playback.as_dict(),
+                **done_metadata,
+            }
+            if auto_response and ended_turn_id is None and not auto_continuations_remaining:
+                # The budget ran out before the model ended the turn.
+                done["status"] = "incomplete"
+                done["status_details"] = {"type": "incomplete", "reason": "continuation_limit"}
+            self._out.emit(done)
         await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
         return close_reason, emitted_response
 
@@ -1231,6 +1263,9 @@ class ModelChannel:
             return close_reason, emitted_response
         if isinstance(model_result.get("error_code"), str):
             self._fail_response_from_model_error(model_result)
+            if model_result.get("close_session") is True:
+                # Closing aborts the request instead of reopening a response on its next output.
+                return str(model_result["error_code"]), True
             if model_result.get("end_of_turn") is True and not session.capabilities.supports_core_resumable_request:
                 # A failed ephemeral turn owns the same stage resources as a
                 # successful one. Release them before accepting another turn.
@@ -1301,13 +1336,15 @@ class ModelChannel:
         has_text = isinstance(text, str) and bool(text)
         has_audio = isinstance(audio, str) and bool(audio)
         if not has_text and not has_audio and not end_of_turn:
+            self._keep_text_output_stage_metrics(model_result)
             tts_segment_ended = (
                 model_result.get("stage_role") == "tts" and model_result.get("abort_data_plane_request") is True
             )
-            if (
-                tts_segment_ended
-                and auto_response
-                and (model_turn_id is not None or session.active_response_id is not None)
+            text_unit_ended = model_result.get("segment_complete") is True
+            auto_continues = auto_response and (model_turn_id is not None or session.active_response_id is not None)
+            # Without a TTS stage, unit ends are the only thing that continues an explicit response.
+            if (tts_segment_ended and auto_continues) or (
+                text_unit_ended and (auto_continues or session.active_response_id is not None)
             ):
                 request_key = data_plane_request_id if isinstance(data_plane_request_id, str) else None
                 draining_response_id = (
@@ -1573,6 +1610,7 @@ class ModelChannel:
                 if not auto_response:
                     data_plane.mark_terminal(data_plane_request_id)
             should_commit = self.should_commit_response_to_history(session, response_id)
+            done_metadata = helpers.text_output_done_metadata(session)
             committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
             committed = self._settle_finished_response(
                 session,
@@ -1591,6 +1629,7 @@ class ModelChannel:
                     "epoch": session.epoch,
                     "committed": committed,
                     "playback": session.playback.as_dict(),
+                    **done_metadata,
                 }
             )
             await self._release_ephemeral_request(
@@ -1636,6 +1675,7 @@ class ModelChannel:
             return
         session.complete_model_turn(int(model_turn_id) - 1)
         should_commit = self.should_commit_response_to_history(session, response_id)
+        done_metadata = helpers.text_output_done_metadata(session)
         committed_message = session.end_response(commit_text=should_commit, preserve_request=True)
         committed = self._settle_finished_response(
             session,
@@ -1651,8 +1691,17 @@ class ModelChannel:
                 "epoch": session.epoch,
                 "committed": committed,
                 "playback": session.playback.as_dict(),
+                **done_metadata,
             }
         )
+
+    def _keep_text_output_stage_metrics(self, model_result: Mapping[str, object]) -> None:
+        """Keep Stage0 metrics from a text-only unit end that carries no text."""
+        if self._ctx.session.capabilities.emits_audio:
+            return
+        stage_metrics = model_result.get("stage_metrics")
+        if isinstance(stage_metrics, Mapping):
+            self._ctx.session.stash_stage_metrics(stage_metrics)
 
     @staticmethod
     def _normalize_audio_text_marks(
@@ -1737,6 +1786,7 @@ class ModelChannel:
         *,
         expected_epoch: int | None,
         model_turn_id: int | None = None,
+        truncated: bool = False,
     ) -> None:
         session = self._ctx.session
         model_state = self._ctx.model_state
@@ -1766,18 +1816,22 @@ class ModelChannel:
             return
         if response_turn_id is not None:
             session.complete_model_turn(response_turn_id)
-        session.end_response(commit_text=False, preserve_request=True)
+        done_metadata = helpers.text_output_done_metadata(session)
+        session.end_response(commit_text=False, preserve_request=self._out.auto_responds())
         settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=response_id, release_owner=True)
-        self._out.emit(
-            {
-                "type": "response.done",
-                "session_id": session.session_id,
-                "response_id": response_id,
-                "epoch": response_epoch,
-                "committed": False,
-                "playback": session.playback.as_dict(),
-            }
-        )
+        done: dict[str, object] = {
+            "type": "response.done",
+            "session_id": session.session_id,
+            "response_id": response_id,
+            "epoch": response_epoch,
+            "committed": False,
+            "playback": session.playback.as_dict(),
+            **done_metadata,
+        }
+        if truncated:
+            done["status"] = "incomplete"
+            done["status_details"] = {"type": "incomplete", "reason": "continuation_limit"}
+        self._out.emit(done)
 
     def silence_continuation_is_stale(
         self,
@@ -1898,10 +1952,11 @@ class ModelChannel:
             self._AUTO_RESPONSE_MAX_CONTINUATION_UNITS if auto_response else self._RESPONSE_MAX_CONTINUATION_UNITS
         )
         if count >= continuation_limit:
-            if auto_response:
+            if auto_response or (finished_segment and response_owned):
                 await self._finish_bounded_auto_response(
                     expected_epoch=expected_epoch,
                     model_turn_id=payload_turn_id_value,
+                    truncated=not auto_response,
                 )
             return
         payload = self.silence_unit_payload()

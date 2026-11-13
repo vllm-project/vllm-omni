@@ -949,3 +949,54 @@ def test_video_without_soundtrack_uses_video_duration(monkeypatch, tmp_path):
     )
     assert wav is None
     assert len(frames) == 3
+
+
+class _ConfigCapturedError(Exception):
+    pass
+
+
+def _session_config_for(demo, monkeypatch, tmp_path, **extra):
+    """Run run_demo up to the client constructor and return its session config."""
+    captured = {}
+
+    def fake_client(url, *, config, **kwargs):
+        captured["config"] = config
+        raise _ConfigCapturedError
+
+    monkeypatch.setattr(demo, "_resolve_duplex_av_inputs", lambda **kwargs: (None, [], []))
+    monkeypatch.setattr(demo, "_TimedInputClient", fake_client)
+    # Like the recognition E2E's hand-built Namespace, which has no ``modalities``.
+    args = demo.argparse.Namespace(
+        output_dir=str(tmp_path),
+        input_wav=None,
+        input_video=None,
+        video_fps=1,
+        frame_max_side=0,
+        stack_frames=1,
+        url="ws://127.0.0.1:1/v1/realtime",
+        model="minicpmo",
+        ref_audio=None,
+        temperature=0.0,
+        instructions="",
+        sliding_window_mode="off",
+        basic_window_high_tokens=8000,
+        basic_window_low_tokens=6000,
+        context_max_units=24,
+        context_previous_max_tokens=500,
+        timeout_s=1,
+        **extra,
+    )
+    with pytest.raises(_ConfigCapturedError):
+        asyncio.run(demo.run_demo(args))
+    return captured["config"]
+
+
+def test_run_demo_leaves_modalities_to_the_deployment(monkeypatch, tmp_path):
+    config = _session_config_for(_load_demo_module(), monkeypatch, tmp_path)
+    assert config.modalities is None
+    assert "modalities" not in config.to_session_payload(model="minicpmo")
+
+
+def test_run_demo_forwards_text_modalities(monkeypatch, tmp_path):
+    config = _session_config_for(_load_demo_module(), monkeypatch, tmp_path, modalities="text")
+    assert config.modalities == ("text",)

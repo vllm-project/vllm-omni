@@ -70,6 +70,8 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
     from vllm.config import ModelConfig
 
+    from vllm_omni.config.stage_config import PipelineConfig
+
 _DUPLEX_CHUNK_SAMPLES = 16000
 _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
 # <image> + 64 resampler embeddings + </image> per frame (max_slice_nums=1),
@@ -616,6 +618,8 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     plugin_id = "minicpmo45"
     private_runtime_config_keys = PRIVATE_RUNTIME_CONFIG_KEYS
     silence_continuation_samples = 16000
+    # Thinker-only deployment: Stage0 output is projected as text.
+    _text_output: bool = False
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
@@ -750,6 +754,10 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
 
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
         return minicpmo45_native_capabilities(max_sessions=max_sessions)
+
+    def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
+        super().configure_pipeline(pipeline_config)
+        self._text_output = not self.deployment_capabilities(max_sessions=1).emits_audio
 
     def validate_client_extra_body(self, extra_body: object) -> None:
         reject_private_runtime_keys(
@@ -916,6 +924,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             response_format=response_format,
             speed=speed,
             modalities=modalities,
+            text_output=self._text_output,
         )
 
 

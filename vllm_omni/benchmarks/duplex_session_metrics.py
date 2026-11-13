@@ -283,6 +283,9 @@ def collect_duplex_session_metrics(
             "request_index": request_index,
             "response_id": response_id,
         }
+        if timing.get("output_modality") == "text":
+            # Classify the turn even when it ended before any text arrived.
+            metric["output_modality"] = "text"
         if isinstance(raw_metric, dict):
             metric.update(raw_metric)
             metric["rtf"] = audio_rtf_from_raw_metric(raw_metric)

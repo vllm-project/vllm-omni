@@ -319,3 +319,42 @@ def test_collect_attaches_session_stats_and_flattens_busy_rtf(capsys) -> None:
     printed = capsys.readouterr().out
     assert "Mean busy RTF:" in printed
     assert "Mean stall ratio:" in printed
+
+
+def _cancelled_before_output(*, modalities: list[str] | None) -> EventCollector:
+    # A response cancelled before any text or audio, as after an initial LISTEN.
+    collector = EventCollector()
+    response: dict[str, object] = {"id": "resp-a"}
+    if modalities is not None:
+        response["modalities"] = modalities
+    collector.add({"type": "response.created", "response": response}, received_at_s=10.1)
+    collector.add(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp-a",
+                "status": "cancelled",
+                "metadata": {"vllm_omni": {"stage_metrics": {"0": {"num_tokens_out": 1}}}},
+            },
+        },
+        received_at_s=10.4,
+    )
+    return collector
+
+
+def test_text_response_without_any_output_is_a_text_turn():
+    bundle = collect_duplex_session_metrics(
+        _cancelled_before_output(modalities=["text"]), stream_start=10.0, session_id="sess-1"
+    )
+
+    assert bundle.session_metrics["text_turn_count"] == 1
+    assert bundle.session_metrics["audio_turn_count"] == 0
+
+
+def test_response_without_declared_modalities_keeps_the_audio_default():
+    bundle = collect_duplex_session_metrics(
+        _cancelled_before_output(modalities=None), stream_start=10.0, session_id="sess-1"
+    )
+
+    assert bundle.session_metrics["audio_turn_count"] == 1
+    assert "text_turn_count" not in bundle.session_metrics

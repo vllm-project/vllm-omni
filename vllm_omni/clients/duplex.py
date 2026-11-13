@@ -233,7 +233,7 @@ class SessionConfig:
     model-neutral.
     """
 
-    modalities: tuple[str, ...] = ("audio", "text")
+    modalities: tuple[str, ...] | None = ("audio", "text")
     input_audio: AudioFormat = AudioFormat("pcm16", 16_000)
     output_audio: AudioFormat = AudioFormat("pcm16", 24_000)
     instructions: str | None = None
@@ -253,7 +253,6 @@ class SessionConfig:
     def to_session_payload(self, *, model: str) -> dict[str, object]:
         payload: dict[str, object] = {
             "model": model,
-            "modalities": list(self.modalities),
             "input_audio_format": self.input_audio.encoding,
             "output_audio_format": self.output_audio.encoding,
             # The encodings alone do not pin the rates (presets differ from the
@@ -267,6 +266,8 @@ class SessionConfig:
             },
             "turn_detection": self.turn_detection,
         }
+        if self.modalities is not None:
+            payload["modalities"] = list(self.modalities)
         if self.instructions is not None:
             payload["instructions"] = self.instructions
         if self.ref_audio is not None:
@@ -1450,6 +1451,17 @@ class DuplexClient(DuplexClientBase):
 # Test/benchmark collector
 
 
+def _response_created_modalities(event: dict[str, object]) -> frozenset[str] | None:
+    """Output modalities a ``response.created`` event declares, if any."""
+    response = event.get("response")
+    for source in (response if isinstance(response, dict) else {}, event):
+        for key in ("output_modalities", "modalities"):
+            value = source.get(key)
+            if isinstance(value, list | tuple) and value:
+                return frozenset(str(modality) for modality in value)
+    return None
+
+
 def _event_stage_metrics(event: dict[str, object]) -> dict[str, object] | None:
     candidates: list[object] = [event.get("vllm_omni")]
     metadata = event.get("metadata")
@@ -1746,6 +1758,7 @@ class EventCollector:
         first_text_received_at_s: float | None = None
         audio_received_at_s: list[float] = []
         cumulative_audio_ms: list[float] = []
+        created_modalities: frozenset[str] | None = None
         for event, received_at_s in zip(self.events, self.event_received_at_s, strict=True):
             if received_at_s < after_s:
                 continue
@@ -1754,6 +1767,7 @@ class EventCollector:
                 continue
             if event.get("type") == "response.created" and response_created_at_s is None:
                 response_created_at_s = received_at_s
+                created_modalities = _response_created_modalities(event)
             if (
                 event.get("type")
                 in {
@@ -1789,6 +1803,12 @@ class EventCollector:
                 cumulative_audio_ms.append(max(0.0, float(duration_ms)))
 
         result: dict[str, object] = {}
+        if not audio_received_at_s and (
+            first_text_received_at_s is not None
+            or (created_modalities is not None and "audio" not in created_modalities)
+        ):
+            # Still a text turn if it ended before its first text delta.
+            result["output_modality"] = "text"
         stage0_metrics = observed_stage_metrics.get("0")
         if observed_stage_metrics:
             stages = {
@@ -1802,6 +1822,16 @@ class EventCollector:
             if "0" in stages:
                 result["stage0_tokens"] = stages["0"]
 
+        if not audio_received_at_s and first_text_received_at_s is not None:
+            result["request_metrics"] = self._text_only_request_metrics(
+                response_request_metrics,
+                stage0_metrics=stage0_metrics,
+                request_started_at_s=(
+                    input_committed_at_s if input_committed_at_s is not None else response_created_at_s
+                ),
+                committed=input_committed_at_s is not None,
+                first_text_received_at_s=first_text_received_at_s,
+            )
         if audio_received_at_s:
             intervals_ms = [
                 (current - previous) * 1000.0 for previous, current in zip(audio_received_at_s, audio_received_at_s[1:])
@@ -1935,6 +1965,48 @@ class EventCollector:
                         "rtf": _CLIENT_APPEND_RTF_ORIGIN,
                     }
         return result
+
+    @staticmethod
+    def _text_only_request_metrics(
+        response_request_metrics: dict[str, object],
+        *,
+        stage0_metrics: dict[str, object] | None,
+        request_started_at_s: float | None,
+        committed: bool,
+        first_text_received_at_s: float,
+    ) -> dict[str, object]:
+        """Request metrics for a text-only response; audio fields stay absent rather than 0 ms."""
+        server_ttft_ms = _finite_number(response_request_metrics.get("ttft_ms"), nonnegative=True)
+        if server_ttft_ms is not None:
+            origin = "native request start to first text output"
+            server_origins = response_request_metrics.get("measurement_origin")
+            if isinstance(server_origins, dict) and isinstance(server_origins.get("ttft"), str):
+                origin = server_origins["ttft"]
+            ttft_ms: float | None = server_ttft_ms
+        else:
+            origin = (
+                "input_audio_buffer.commit client send to first non-empty text delta"
+                if committed
+                else "response.created client receive to first non-empty text delta"
+            )
+            ttft_ms = (
+                _rounded_ms((first_text_received_at_s - request_started_at_s) * 1000.0)
+                if request_started_at_s is not None
+                else None
+            )
+        resolved_origin = {"ttft": origin}
+        metrics: dict[str, object] = {
+            "source": (
+                "server_request_start_and_client_receive" if server_ttft_ms is not None else "client_monotonic_receive"
+            ),
+            "output_modality": "text",
+            "measurement_origin": resolved_origin,
+            "ttft_ms": ttft_ms,
+        }
+        if stage0_metrics is not None:
+            resolved_origin["tpot"] = "Stage-0 engine mean time per output token"
+            metrics["tpot_ms"] = _finite_number(stage0_metrics.get("vllm_tpot_ms"), nonnegative=True)
+        return metrics
 
     def _format_for_bytes(self) -> AudioFormat:
         return AudioFormat("pcm16", self.output_sample_rate_hz)
@@ -2072,11 +2144,13 @@ def summarize_session_request_metrics(
     """
     summary: dict[str, object] = {
         "session_id": session_id,
-        "audio_turn_count": len(request_metrics),
+        "audio_turn_count": sum(1 for metrics in request_metrics if metrics.get("output_modality") != "text"),
         "ttft_ms": distribution_summary(_finite_metric_values(request_metrics, "ttft_ms")),
         "ttfp_ms": distribution_summary(_finite_metric_values(request_metrics, "ttfp_ms")),
         "rtf": distribution_summary(_finite_metric_values(request_metrics, "rtf"), digits=6),
     }
+    if text_turn_count := sum(1 for metrics in request_metrics if metrics.get("output_modality") == "text"):
+        summary["text_turn_count"] = text_turn_count
     if (client_ttfp := distribution_summary(_finite_metric_values(request_metrics, "client_ttfp_ms"))) is not None:
         summary["client_ttfp_ms"] = client_ttfp
     if (client_rtf := distribution_summary(_finite_metric_values(request_metrics, "client_rtf"), digits=6)) is not None:
@@ -2103,7 +2177,12 @@ async def acknowledge_collected_playback(client: DuplexClientBase, collector: Ev
     A response that has produced no audio yet is still acked (0 ms) unless it
     already finished: the ack checkpoints the response's history position on
     the server, so a user input committed later cannot displace it.
+
+    A deployment with ``supports_playback_ack=False`` rejects ACKs, so none is sent.
     """
+    capabilities = getattr(client, "session_info", {}).get("capabilities")
+    if isinstance(capabilities, dict) and capabilities.get("supports_playback_ack") is False:
+        return
     output_format = AudioFormat("pcm16", collector.output_sample_rate_hz)
     for response_id in collector.response_ids:
         pcm16 = collector.audio_bytes(response_id)

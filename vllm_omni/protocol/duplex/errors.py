@@ -35,6 +35,8 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "runtime_abort_failed": "server_error",
     "runtime_data_plane_stream_failed": "server_error",
     "runtime_data_plane_text_without_audio": "server_error",
+    "runtime_data_plane_missing_control_tokens": "server_error",
+    "runtime_data_plane_unterminated_unit": "server_error",
     "resource_exhausted": "rate_limit_error",
     "session_exists": "invalid_request_error",
     "session_closed": "invalid_request_error",

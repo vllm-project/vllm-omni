@@ -268,6 +268,7 @@ class AppendAttempt:
     def _fail_precreated_response(self, reason: str) -> None:
         session = self.ctx.session
         failed_response_id = session.active_response_id
+        done_metadata = helpers.text_output_done_metadata(session)
         session.end_response(commit_text=False)
         settle_response_runtime(
             self.ctx.plugin, session, committed=False, response_id=failed_response_id, release_owner=True
@@ -282,5 +283,6 @@ class AppendAttempt:
                 "status": "failed",
                 "status_details": {"type": "failed", "reason": reason},
                 "playback": session.playback.as_dict(),
+                **done_metadata,
             }
         )

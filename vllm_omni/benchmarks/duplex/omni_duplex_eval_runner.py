@@ -762,8 +762,13 @@ async def generate_sample(
             extra_body=extra_body,
             auto_response=not server_turns,
             turn_detection=session_turn_detection(turn_detection),
+            # Use the deployment default; a text-only deployment rejects audio.
+            modalities=None,
         )
-        frame_transport = select_frame_transport(_session_capabilities(client))
+        capabilities = _session_capabilities(client)
+        # A text-only deployment has no playback to acknowledge and rejects ACKs.
+        acks_playback = capabilities.get("supports_playback_ack", True) is not False
+        frame_transport = select_frame_transport(capabilities)
         if not server_turns:
             from vllm_omni.clients.duplex import chunk_period_ms, has_residual_model_unit
 
@@ -783,7 +788,7 @@ async def generate_sample(
             if frame_transport == FRAME_TRANSPORT_IMAGE_ITEMS
             else None
         )
-        ack_task = asyncio.create_task(_ack_playback(client))
+        ack_task = asyncio.create_task(_ack_playback(client)) if acks_playback else None
         try:
             stream_start = time.monotonic()
             # The input rides the session socket: bound it over the clip's own
@@ -887,12 +892,14 @@ async def generate_sample(
                         # looking like a drain timeout.
                         pass
         finally:
-            ack_task.cancel()
-            await _bounded_ack_join(ack_task)
+            if ack_task is not None:
+                ack_task.cancel()
+                await _bounded_ack_join(ack_task)
         try:
-            ack_probe = asyncio.ensure_future(client.acknowledge_playback())
-            ack_probe.add_done_callback(_consume_task_exception)
-            await asyncio.wait_for(asyncio.shield(ack_probe), timeout=_FINAL_ACK_TIMEOUT_S)
+            if acks_playback:
+                ack_probe = asyncio.ensure_future(client.acknowledge_playback())
+                ack_probe.add_done_callback(_consume_task_exception)
+                await asyncio.wait_for(asyncio.shield(ack_probe), timeout=_FINAL_ACK_TIMEOUT_S)
         except TimeoutError as exc:
             # The ack rides the session socket: a stuck write must not cost the
             # sample its artifacts, so the probe is shielded and abandoned

@@ -34,7 +34,7 @@ from vllm_omni.engine.duplex.realtime_events import (
     discard_pending_input_audio,
     project_internal_event,
 )
-from vllm_omni.engine.duplex.session import overlap_policy
+from vllm_omni.engine.duplex.session import helpers, overlap_policy
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 
 
@@ -105,9 +105,11 @@ class SessionEmitter:
         """Fail undelivered output, returning recovery events without sending them again."""
         session = self._ctx.session
         self._ctx.manager.invalidate_output(session.session_id, response_id, through_epoch=session.epoch)
+        done_metadata: dict[str, object] = {}
         if session.active_response_id is not None:
             # Close still needs the request binding to abort the real engine work.
             failed_response_id = session.active_response_id
+            done_metadata = helpers.text_output_done_metadata(session)
             session.end_response(commit_text=False, preserve_request=True)
             settle_response_runtime(
                 self._ctx.plugin, session, committed=False, response_id=failed_response_id, release_owner=True
@@ -127,6 +129,7 @@ class SessionEmitter:
             "status": "failed",
             "status_details": {"type": "failed", "reason": "output_backpressure"},
             "playback": session.playback.as_dict(),
+            **done_metadata,
         }
         if terminal is None:
             projected = project_internal_event(self.require_projector(), payload)

@@ -68,9 +68,14 @@ text depends on complete audio still follow alignment and playback checks.
 Selecting text output alone does not implement per-request TTS skipping.
 Cancellation rejects old-epoch results
 through the existing fence. Audio calibration is not started for deployments
-without audio output. These contracts do not register a Thinker-only model
-pipeline or provide MiniCPM Stage 0 token projection; those remain separate
-parts of RFC #10143.
+without audio output.
+
+MiniCPM-o 4.5 registers `minicpmo_4_5_thinker_only`, a Stage 0-only pipeline
+selected by a deploy config's `pipeline` key. Its data plane sends Stage 0
+output as text and ends a unit at LISTEN, `chunk_eos` or `chunk_tts_eos`; a
+unit with `<|turn_eos|>` ends the turn, and any other unit continues the
+response. Stage 0 metrics are reported once on the response's
+`response.done` under `metadata.vllm_omni.stage_metrics`.
 
 `DuplexEngineSession` owns response snapshots and playback cursors. Output
 completion and a client's full `playback.ack` can arrive in either order.

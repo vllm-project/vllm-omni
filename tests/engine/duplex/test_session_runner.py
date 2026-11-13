@@ -2731,6 +2731,44 @@ async def test_tts_segment_end_schedules_a_silence_continuation_unit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_explicit_speech_response_still_reports_a_stage0_listen() -> None:
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        request_id = h.stage0_request_id()
+        submissions = len(h.port.submissions)
+
+        events = await h.deliver_and_settle(listen_output(request_id))
+
+        assert "response.listen" in types(events)
+        assert len(h.port.submissions) == submissions
+        assert h.session.active_request_id is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_explicit_response_does_not_continue_on_an_empty_tts_segment_end() -> None:
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        request_id = h.stage0_request_id()
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
+        submissions = len(h.port.submissions)
+
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="", tts_is_last_chunk=True))
+
+        assert len(h.port.submissions) == submissions
+        assert h.runner.model_state.continuation_units == 0
+        assert h.session.active_response_id == response_id
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_speech_after_silence_continuation_is_not_the_first_audio_window() -> None:
     """VISION then generated silence consumes the 1035 ms window.
 
