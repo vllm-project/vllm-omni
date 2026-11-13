@@ -13,7 +13,7 @@ import websockets
 from tests.entrypoints.duplex.test_multi_frontend_warmup import _app, _Handle, _Omni
 from vllm_omni.engine.duplex.config import DuplexCapabilities
 from vllm_omni.entrypoints.duplex import warmup
-from vllm_omni.protocol.duplex.events import ResponseDone
+from vllm_omni.protocol.duplex.events import Listen, ResponseDone
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -36,6 +36,8 @@ async def test_local_text_warmup_seeds_primes_and_releases_session(monkeypatch):
     async def append_text(handle, audio, **kwargs):
         handle.appends.append((audio, kwargs))
         if len(handle.appends) == 3:
+            # A listen unit before the reply must not end the text probe.
+            handle.events_queue.put_nowait(Listen())
             handle.events_queue.put_nowait(
                 ResponseDone(
                     response={
@@ -91,6 +93,7 @@ async def test_websocket_text_warmup_seeds_before_open_and_closes_normally(monke
     socket = _Socket(
         [
             {"type": "session.created"},
+            {"type": "response.listen"},
             {"type": "response.output_text.delta", "delta": "ready"},
             {"type": "response.output_text.done", "text": "ready"},
             {
