@@ -143,15 +143,16 @@ talker_dspark_params = [
             stage_config_path=modify_stage_config(
                 get_deploy_config_path("minicpmo_4_5_turn.yaml"),
                 updates={
-                    # The temporary overlay lives outside deploy/, so anchor its parent.
-                    "base_config": get_deploy_config_path("minicpmo_4_5.yaml"),
-                    "platforms.cuda.stages.1.async_scheduling": True,
-                    "platforms.cuda.stages.1.default_sampling_params.stop_token_ids": [],
-                    "platforms.cuda.stages.1.speculative_config": {
-                        "method": "dspark",
-                        "model": str(_TALKER_DRAFT_DIR),
-                        "num_speculative_tokens": 7,
-                        "draft_sample_method": "probabilistic",
+                    "platforms.cuda.stages.1": {
+                        "stage_id": 1,
+                        "async_scheduling": True,
+                        "default_sampling_params": {"stop_token_ids": []},
+                        "speculative_config": {
+                            "method": "dspark",
+                            "model": str(_TALKER_DRAFT_DIR),
+                            "num_speculative_tokens": 7,
+                            "draft_sample_method": "probabilistic",
+                        },
                     },
                     "stages": {0: {"default_sampling_params.max_tokens": 64}},
                 },

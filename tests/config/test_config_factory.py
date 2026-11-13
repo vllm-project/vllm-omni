@@ -2114,15 +2114,7 @@ stages:
             ("qwen3_omni_duplex.yaml", "cuda", False),
             ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
             ("minicpmo_4_5_turn.yaml", "cuda", True),
-            *(
-                (yaml_name, platform, False)
-                for yaml_name in (
-                    "minicpmo_4_5_turn.yaml",
-                    "minicpmo_4_5_turn_mrv2_h200.yaml",
-                )
-                for platform in ("npu", "rocm", "xpu", "musa")
-            ),
-            ("minicpmo_4_5_turn_mrv2_h200.yaml", "cuda", True),
+            *(("minicpmo_4_5_turn.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("minicpmo_4_5.yaml", "cuda", False),
             ("minicpmo_4_5_duplex_h200.yaml", "cuda", False),
         ],
@@ -3287,7 +3279,6 @@ class TestPlatformOverrides:
             ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", ()),
             ("minicpmo_4_5_turn.yaml", "minicpmo_4_5", "v2", ()),
             ("minicpmo_4_5_duplex_h200.yaml", "minicpmo_4_5", "v2", ()),
-            ("minicpmo_4_5_turn_mrv2_h200.yaml", "minicpmo_4_5", "v2", ()),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])

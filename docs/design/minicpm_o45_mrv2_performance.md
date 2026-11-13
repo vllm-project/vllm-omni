@@ -26,11 +26,6 @@ control on device. Code2Wav reuses mainline Whole-Euler Flow graphs and shared
 prompt state. The previous experimental block compilation, tiled attention,
 channels-last and merged-CFM implementations are removed.
 
-`minicpmo_4_5_turn_mrv2_h200.yaml` selects Talker capacity 16 and 4 GiB KV;
-the standard turn profile selects capacity 8 and 2 GiB KV. These configurations
-require new end-to-end performance measurements after the mainline integration.
-Previously reported numbers do not describe this revised codec backend.
-
 ## Turn prefix-cache memory
 
 The persistent stage-output cache is a pageable CPU mirror, not a second
@@ -38,7 +33,7 @@ GPU KV pool. `stage_prefix_cache_config` takes its `num_blocks` from the
 Thinker KV configuration. `PrefixBlockPool` allocates one tensor per cached
 key, shaped `[num_blocks, block_size, width]`; recycled KV slots overwrite
 the corresponding output rows. There is no independent output-cache block
-budget or deploy knob, including in the H200 profile.
+budget or deploy knob.
 
 The Thinker caches hidden states and `latent` separately, plus
 `latent_input_ids` and `latent_positions`. Mirror tensor storage is therefore
@@ -54,11 +49,7 @@ MRv2 uses depth at least `max(4, 2 * max_concurrent_batches + 1)`.
 `PrefixCacheConfig.gpu_staging_bytes` defaults to 512 MiB for device rows
 awaiting a host copy. Budget pressure flushes pending copies; it is not a
 hard peak-memory bound, since one reservation can exceed it when no tasks
-remain pending. This is distinct from the H200 profile's 4 GiB Talker KV
-reservation. Neither value proves that model weights, graph caches and
-concurrent buffers fit together. No H200 peak-memory measurement with the
-enabled output cache is available here; validate host RAM and device peaks
-on the target workload, or disable stage-0 prefix caching in the CUDA overlay.
+remain pending. The Talker reserves its own 4 GiB CUDA KV cache.
 
 ## Runner and codec behavior
 
@@ -224,7 +215,6 @@ Use `minicpmo_4_5_turn.yaml` for CUDA turn serving. It inherits FlashAttention,
 synchronous scheduling, seven continuation drafts and the control stop ID from
 `minicpmo_4_5.yaml`. The MRv2 Talker uses one FlashAttention query per codec
 frame, advances the position and KV slot, and re-embeds the confirmed codec.
-The turn profile sets the shared-GPU capacity and Code2Wav tuning.
 For a single-frame control, override CUDA stage 1 with
 `speculative_config: null` and `default_sampling_params.stop_token_ids: []`.
 
