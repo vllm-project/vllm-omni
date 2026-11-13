@@ -45,6 +45,7 @@ from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
 from vllm_omni.worker_v2.streaming_audio import StreamingAudioSnapshot
+from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
@@ -176,9 +177,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
         # An explicitly declared model-state hook may return already determined
         # tokens. Unsupported sampling features retain the upstream path.
         sample_determined = getattr(type(self.model_state), "sample_determined_tokens", None)
+        determined_warmup = bool(
+            grammar_output is not None
+            and getattr(type(self.model_state), "sample_determined_tokens_during_warmup", False)
+            and input_batch.num_reqs > 0
+            and all(is_warmup_request(req_id) for req_id in input_batch.req_ids)
+        )
         if (
             sample_determined is not None
-            and grammar_output is None
+            and (grammar_output is None or determined_warmup)
             and self.batch_sharder is None
             and self.pp_handler is None
             and input_batch.num_draft_tokens == 0

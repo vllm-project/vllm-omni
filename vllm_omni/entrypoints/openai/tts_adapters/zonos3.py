@@ -16,8 +16,6 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     SpeechServingContext,
 )
 from vllm_omni.model_executor.models.zonos3.ar_config import (
-    ZONOS3_PROMPT_KEY,
-    ZONOS3_SAMPLING_KEY,
     Zonos3Architecture,
 )
 from vllm_omni.model_executor.models.zonos3.prompt import Zonos3PromptBuilder, condition_ids
@@ -185,7 +183,7 @@ class Zonos3TTSAdapter(ARTTSAdapter):
         )
         chunking = {key: extra[key] for key in ("chunk_size", "chunk_ramp", "first_chunk_codebooks") if key in extra}
         if chunking:
-            prompt["additional_information"][ZONOS3_PROMPT_KEY]["codec_chunking"] = chunking
+            prompt["additional_information"]["codec_chunking"] = chunking
         return prompt
 
     async def build(
@@ -197,7 +195,7 @@ class Zonos3TTSAdapter(ARTTSAdapter):
             waveform = torch.as_tensor(samples, dtype=torch.float32, device="cpu")
         prompt = await asyncio.to_thread(self._build_prompt, request, waveform is not None)
         if waveform is not None:
-            metadata = prompt["additional_information"][ZONOS3_PROMPT_KEY]
+            metadata = prompt["additional_information"]
             metadata.pop("speaker_embedding")
             metadata.update(reference_waveform=waveform, reference_sample_rate=sample_rate)
         return PreparedRequest(
@@ -227,7 +225,7 @@ class Zonos3TTSAdapter(ARTTSAdapter):
             raise ValueError("Zonos3 prompt leaves no generation context")
         result[0].max_tokens = min(request.max_new_tokens or result[0].max_tokens or 1024, left)
         result[0].top_p = result[0].top_p or 1.0
-        result[0].extra_args = {ZONOS3_SAMPLING_KEY: options}
+        result[0].extra_args = options
         result[0].stop_token_ids = [2]
         result[0].detokenize = False
         return result

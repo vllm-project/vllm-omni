@@ -20,7 +20,7 @@ from tokenizers import Tokenizer
 
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
-from .ar_config import ZONOS3_PROMPT_KEY, Zonos3Architecture
+from .ar_config import Zonos3Architecture
 
 SILENCE_FRAME = (1918, 746, 3544, 234, 1267, 2914, 3944, 2849, 326, 1337)
 NV_TAGS = ("laugh", "breath", "sigh", "cough", "panting", "shouting", "crying")
@@ -225,4 +225,4 @@ class Zonos3PromptBuilder:
         }
         if speaker_embedding is not None:
             metadata.update(speaker_embedding=speaker_embedding, speaker_row=0)
-        return {"prompt_token_ids": [0] * len(frames), "additional_information": {ZONOS3_PROMPT_KEY: metadata}}
+        return {"prompt_token_ids": [0] * len(frames), "additional_information": metadata}

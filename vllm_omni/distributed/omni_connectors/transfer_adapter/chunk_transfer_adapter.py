@@ -967,18 +967,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         processor_controls_codec_lifetime = payload_data.meta.finished is not None and self._is_truthy_scalar(
             payload_data.meta.codec_streaming
         )
-        preserve_finished = processor_controls_codec_lifetime and (
-            not is_finished or self._is_truthy_scalar(payload_data.meta.finished)
-        )
-        if not preserve_finished:
+        if not processor_controls_codec_lifetime:
             payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
-            if is_finished:
-                payload_data.meta.transport_terminal = True
-                if payload_data.meta.override_keys is None:
-                    payload_data.meta.override_keys = []
-                for key in (("meta", "finished"), ("meta", "transport_terminal")):
-                    if key not in payload_data.meta.override_keys:
-                        payload_data.meta.override_keys.append(key)
         if payload_data.meta.is_segment_finished is None:
             payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
         perf_chunk = task.get("duplex_perf_chunk")

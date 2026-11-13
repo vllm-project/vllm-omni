@@ -49,18 +49,17 @@ def test_raw_speaker_adapter_reserves_one_row_and_serializes_waveform(tmp_path):
     # can appear to round-trip in memory but loses its tensor type over IPC.
     import msgspec
 
-    assert serialized.entries["zonos3_prompt.frame_ids"].tensor_data is not None
+    assert serialized.entries["frame_ids"].tensor_data is not None
     serialized = msgspec.msgpack.decode(msgspec.msgpack.encode(serialized), type=type(serialized))
     restored = deserialize_additional_information(serialized)
-    # Serialization flattens nested metadata keys at the EngineCore boundary.
-    from vllm_omni.data_entry_keys import unflatten_payload
-
-    metadata = unflatten_payload(restored)["zonos3_prompt"]
-    torch.testing.assert_close(metadata["frame_ids"], prompt["additional_information"]["zonos3_prompt"]["frame_ids"])
-    assert metadata["condition_start"] == 1 and metadata["speaker_row"] == 0
-    assert "speaker_embedding" not in metadata
-    assert metadata["reference_sample_rate"] == 16000
-    torch.testing.assert_close(metadata["reference_waveform"], waveform, rtol=0, atol=0)
+    torch.testing.assert_close(
+        restored["frame_ids"], prompt["additional_information"]["frame_ids"]
+    )
+    assert restored["condition_start"] == 1
+    assert restored["speaker_row"] == 0
+    assert "speaker_embedding" not in restored
+    assert restored["reference_sample_rate"] == 16000
+    torch.testing.assert_close(restored["reference_waveform"], waveform, rtol=0, atol=0)
     server._resolve_ref_audio_array.assert_awaited_once_with(request.ref_audio)
 
 
@@ -93,8 +92,11 @@ def test_speaker_embedding_validation_and_request_chunk_settings(tmp_path):
     )
     assert adapter.validate(request) is None
     prompt = adapter._build_prompt(request)
-    metadata = prompt["additional_information"]["zonos3_prompt"]
-    assert metadata["codec_chunking"] == {"chunk_size": 7, "chunk_ramp": [1, 3], "first_chunk_codebooks": 6}
+    assert prompt["additional_information"]["codec_chunking"] == {
+        "chunk_size": 7,
+        "chunk_ramp": [1, 3],
+        "first_chunk_codebooks": 6,
+    }
 
     invalid = OpenAICreateSpeechRequest(input="hello", extra_params={"chunk_ramp": [0], "text_normalization": False})
     assert "chunk_ramp" in adapter.validate(invalid)
@@ -125,7 +127,7 @@ def test_reference_codes_and_raw_waveform_are_distinct_clone_modes(tmp_path):
     )
     assert adapter.validate(request) is None
     prompt = adapter._build_prompt(request)
-    metadata = prompt["additional_information"]["zonos3_prompt"]
+    metadata = prompt["additional_information"]
     assert prompt["prompt_token_ids"] == [0] * len(metadata["frame_ids"])
     assert metadata["frame_ids"][:11, 10].tolist() == [448] * 11
 
@@ -200,7 +202,7 @@ def test_release_parser_roundtrip_and_conditioning_prompt_lengths(tmp_path):
             options["reference_codes"] = torch.arange(20).reshape(2, 10)
             prefix_length = 11
         prompt = builder.build("你好", normalize=False, silence_frames=3, **options)
-        metadata = prompt["additional_information"]["zonos3_prompt"]
+        metadata = prompt["additional_information"]
         frames = metadata["frame_ids"]
         assert len(prompt["prompt_token_ids"]) == len(frames) == prefix_length + 3 + len(tokens) + 3
         assert metadata["condition_start"] == prefix_length

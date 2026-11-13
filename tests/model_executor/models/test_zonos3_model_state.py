@@ -19,7 +19,6 @@ from vllm.v1.worker.gpu.states import RequestState
 from tests.model_executor.models.test_zonos3_modeling import CPUAttentionOracle, small_ar_config, valid_runtime
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.engine.serialization import serialize_additional_information
-from vllm_omni.model_executor.models.zonos3.ar_config import ZONOS3_PROMPT_KEY
 from vllm_omni.model_executor.models.zonos3.model_state import Zonos3ARModelState
 from vllm_omni.model_executor.models.zonos3.modeling_zonos3_mini import Zonos3Backbone
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
@@ -106,7 +105,7 @@ def add(owner, req_id, slot, length):
         block_ids=(),
         num_computed_tokens=0,
         lora_request=None,
-        model_intermediate_buffer={ZONOS3_PROMPT_KEY: payload},
+        model_intermediate_buffer=payload,
     )
     state.add_request(slot, request)
     requests.index_to_req_id[slot] = req_id
@@ -199,7 +198,7 @@ def test_raw_speaker_encoding_once_across_prefill_chunks_and_cleanup(owner):
     encoder = Mock(return_value=vector[None])
     state.model.speaker_encoder = encoder
     add(owner, "raw", 0, 6)
-    payload = state.intermediate_buffer.buffers[0][ZONOS3_PROMPT_KEY]
+    payload = state.intermediate_buffer.buffers[0]
     payload.pop("speaker_embedding")
     waveform = torch.zeros(16000)
     payload.update(reference_waveform=waveform, reference_sample_rate=16000)
@@ -216,7 +215,7 @@ def test_raw_speaker_reference_enforces_checkpoint_duration_limit(owner):
     state, _, _ = owner
     state.model.speaker_encoder = Mock()
     add(owner, "long-reference", 0, 6)
-    payload = state.intermediate_buffer.buffers[0][ZONOS3_PROMPT_KEY]
+    payload = state.intermediate_buffer.buffers[0]
     payload.pop("speaker_embedding")
     payload.update(reference_waveform=torch.zeros(30 * 16000 + 1), reference_sample_rate=16000)
     with pytest.raises(ValueError, match="no longer than 30 seconds"):
@@ -240,7 +239,7 @@ def test_one_token_prefill_graph_keeps_frontier_for_later_chunk(owner):
 def test_native_state_rejects_length_mismatch_preemption_and_decode_fallback(owner):
     state, _, _ = owner
     add(owner, "a", 0, 6)
-    state.intermediate_buffer.buffers[0][ZONOS3_PROMPT_KEY]["frame_ids"] = torch.zeros((5, 11), dtype=torch.int64)
+    state.intermediate_buffer.buffers[0]["frame_ids"] = torch.zeros((5, 11), dtype=torch.int64)
     with pytest.raises(ValueError, match="placeholder length"):
         step(owner, batch(owner, [("a", 0, 2, 0, True)]))
     with pytest.raises(RuntimeError, match="preemption"):
@@ -254,8 +253,8 @@ def test_native_state_rejects_length_mismatch_preemption_and_decode_fallback(own
 def test_prompt_conditioning_survives_engine_core_metadata_serialization(owner):
     state, sampler, _ = owner
     original = add(owner, "before", 0, 6)
-    payload = state.intermediate_buffer.buffers[0][ZONOS3_PROMPT_KEY]
-    serialized = serialize_additional_information({ZONOS3_PROMPT_KEY: payload})
+    payload = state.intermediate_buffer.buffers[0]
+    serialized = serialize_additional_information(payload)
     state.on_requests_finished({"before"})
     state.remove_request(0)
     request = replace(original, req_id="serialized", model_intermediate_buffer=None, additional_information=serialized)
@@ -287,8 +286,9 @@ def test_request_owned_codes_survive_mixed_prefill_partition_and_later_steps(own
     outputs, _ = OmniARModelRunner._build_async_chunk_outputs_from_mm(
         cpu, data.query_start_loc_np, data.num_scheduled_tokens, 2, 7
     )
-    assert [p["codes.audio"].shape for p in outputs] == [(1, 10), (1, 10)]
-    assert [p["meta.codec_frame_valid"].item() for p in outputs] == [0, 1]
+    assert outputs[0]["codes.audio"].shape == (1, 10)
+    assert outputs[0]["codes.audio"].eq(state.model.config.audio_pad_id).all()
+    assert outputs[1]["codes.audio"].shape == (1, 10)
     saved = outputs[1]["codes.audio"].clone()
     step(owner, batch(owner, [("partial", 0, 4, 2, True), ("complete", 1, 1, 5, False)]))
     assert torch.equal(materialize_codes(snapshot)[1]["codes"]["audio"], saved)
@@ -305,3 +305,22 @@ def test_native_startup_decode_warmup_can_run_before_full_graph_capture(owner, m
     data.req_ids = ["_warmup_0_"]
     assert state.prepare_attn(data, CUDAGraphMode.NONE, (), torch.empty(0), [], None) == {}
     assert upstream.call_count == 1
+
+
+def test_zonos3_warmup_sampling_params_drop_text_logprobs(owner):
+    from vllm.v1.core.sched.output import NewRequestData
+
+    state, _, _ = owner
+    warmup = NewRequestData(
+        req_id="_warmup_0_",
+        prompt_token_ids=[0],
+        mm_features=[],
+        sampling_params=SamplingParams(logprobs=20, prompt_logprobs=20, seed=0),
+        pooling_params=None,
+        block_ids=(),
+        num_computed_tokens=0,
+        lora_request=None,
+    )
+    state.add_request(0, warmup)
+    assert state.options[0] is not None
+    assert state.options[0].temperature == pytest.approx(0.9)

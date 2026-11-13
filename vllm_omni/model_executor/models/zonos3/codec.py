@@ -1123,7 +1123,6 @@ class Zonos3CodecModel(nn.Module):
         pending: list[ZACCodecChunk] = []
         indices: list[int] = []
         bindings: list[tuple[str, str]] = []
-        terminal_indices: list[int] = []
         for i, (internal_id, info) in enumerate(zip(request_ids, infos, strict=True)):
             if is_warmup_request(internal_id):
                 continue
@@ -1136,19 +1135,6 @@ class Zonos3CodecModel(nn.Module):
                 or self._external_to_internal.get(external_id, internal_id) != internal_id
             ):
                 raise ValueError("Zonos3 Codec request identity changed without lifecycle cleanup")
-            if meta.get("aborted") is True:
-                if self._manager is not None:
-                    self._manager.release(external_id)
-                self._internal_to_external.pop(internal_id, None)
-                self._external_to_internal.pop(external_id, None)
-                continue
-            if meta.get("transport_terminal") is True and not _host_integer(meta.get("finished", False), "finished"):
-                if self._manager is not None:
-                    self._manager.release(external_id)
-                self._internal_to_external.pop(internal_id, None)
-                self._external_to_internal.pop(external_id, None)
-                terminal_indices.append(i)
-                continue
             namespace = info.get("codes")
             codes = namespace.get("audio") if isinstance(namespace, Mapping) else None
             if not isinstance(codes, torch.Tensor):
@@ -1177,8 +1163,6 @@ class Zonos3CodecModel(nn.Module):
             for internal_id, external_id in bindings:
                 self._internal_to_external[internal_id] = external_id
                 self._external_to_internal[external_id] = internal_id
-        for i in terminal_indices:
-            audio[i] = torch.empty(0, device=device, dtype=torch.float32)
         payload = cast(
             OmniPayload, {"model_outputs": audio, "sr": [torch.tensor(44100, dtype=torch.int32)] * len(audio)}
         )

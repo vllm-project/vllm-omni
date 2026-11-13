@@ -75,7 +75,7 @@ class _NativeRequestState:
     def snapshot(self, *, include_token_history: bool, sampled_token_ids: list[int] | None = None) -> SimpleNamespace:
         prompt = list(self.prompt_token_ids) if include_token_history else []
         output = list(self.output_token_ids) if include_token_history else []
-        finished = self.finished or self.aborted
+        finished = self.finished
         request = SimpleNamespace(
             request_id=self.request_id,
             req_id=self.request_id,
@@ -96,7 +96,6 @@ class _NativeRequestState:
             aborted=self.aborted,
         )
         request.is_finished = lambda: finished
-        request.output_stopped = self.output_stopped
         return request
 
 
@@ -360,7 +359,6 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 return 0
             for req_id in active_req_ids:
                 self._native_requests[req_id].aborted = True
-                self._native_requests[req_id].output_stopped = False
                 self._native_outputs_in_flight.pop(req_id, None)
                 self._native_terminal_pending.discard(req_id)
                 # Cancellation must not flush a partially accumulated utterance.
@@ -564,8 +562,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             state = self._native_requests.get(req_id)
             if state is None:
                 continue
-            terminal = req_id in terminal_req_ids
-            state.finished = terminal
+            state.finished = req_id in terminal_req_ids
             # Native transport runs ahead of scheduler consumption. Its
             # terminal notification fences resource cleanup, not the sampled
             # token boundary: a later in-flight frame must not reach the codec.
@@ -580,7 +577,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 # and retain the final token history for codec-row cropping.
                 if isinstance(payload, dict):
                     self.accumulate_full_payload_output(req_id, flatten_payload(payload), state)
-                if not terminal:
+                if not state.finished:
                     continue
                 accumulated = self._pending_full_payload_send.pop(req_id, None)
                 payload = self._materialize_full_payload_entry(accumulated)[0] if accumulated is not None else None
@@ -589,7 +586,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             token_only_producer = bool(
                 getattr(getattr(self, "_custom_process_func", None), "_requires_full_token_history", False)
             )
-            if payload is None and not terminal and not token_only_producer:
+            if payload is None and not state.finished and not token_only_producer:
                 continue
             include_token_history = bool(
                 token_only_producer
@@ -601,12 +598,12 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 (
                     state.snapshot(
                         include_token_history=include_token_history,
-                        sampled_token_ids=sampled_by_req.get(req_id) if not terminal else None,
+                        sampled_token_ids=sampled_by_req.get(req_id) if not state.finished else None,
                     ),
                     payload,
                 )
             )
-            if terminal:
+            if state.finished:
                 finished_req_ids.append(req_id)
         return entries, finished_req_ids
 

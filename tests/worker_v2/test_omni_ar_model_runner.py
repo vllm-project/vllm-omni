@@ -50,6 +50,29 @@ def _async_output(req_ids=("req-0",), **overrides) -> OmniAsyncOutput:
     return OmniAsyncOutput(**(kwargs | overrides))
 
 
+def test_determined_sampler_can_handle_grammar_on_synthetic_warmup() -> None:
+    determined = SamplerOutput(torch.tensor([[1]]), None, None, torch.tensor([1]), torch.tensor([0]))
+
+    class WarmupModelState:
+        sample_determined_tokens_during_warmup = True
+
+        def sample_determined_tokens(self, batch, sampler):
+            return determined
+
+    runner = object.__new__(OmniARModelRunner)
+    runner.model_state = WarmupModelState()
+    runner.sampler = object()
+    runner.batch_sharder = None
+    runner.pp_handler = None
+    batch = SimpleNamespace(num_reqs=1, req_ids=["_warmup_0_"], num_draft_tokens=0)
+
+    output, sampled, rejected = runner.sample(torch.empty((1, 2)), batch, grammar_output=object())
+
+    assert output is determined
+    assert sampled is determined.num_sampled
+    assert rejected is determined.num_rejected
+
+
 @pytest.mark.parametrize("compact_width", [1, 2])
 @pytest.mark.cpu
 def test_async_output_blocking_event_preserves_masks_and_aux_output(monkeypatch, compact_width) -> None:

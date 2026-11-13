@@ -16,7 +16,6 @@ import torch
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct, unflatten_payload
 from vllm_omni.engine.serialization import deserialize_additional_information
-from vllm_omni.model_executor.models.zonos3.ar_config import ZONOS3_PROMPT_KEY
 
 
 @dataclass(frozen=True)
@@ -59,7 +58,6 @@ class Zonos3RVQStageInputProcessor:
     eoa_frame: int | None = None
     done: bool = False
     prefill_frames: int = 0
-    ar_drain_complete: bool = False
 
     def prime(self, rows: torch.Tensor) -> None:
         if self.received or self.chunk_seq or self.done:
@@ -83,7 +81,6 @@ class Zonos3RVQStageInputProcessor:
         *,
         finished: bool = False,
         cancelled: bool = False,
-        drain_complete: bool = False,
     ) -> OmniPayloadStruct | None:
         if self.done:
             raise RuntimeError("Zonos3 RVQ stream already closed")
@@ -92,7 +89,7 @@ class Zonos3RVQStageInputProcessor:
             self.done = True
             return None
         cfg = self.config
-        if codes is not None:
+        if codes is not None and codes.numel() > 0:
             # This is a CPU materialization boundary, never a new D2H copy.
             if codes.device.type != "cpu":
                 raise ValueError("Zonos3 producer hook requires CPU-materialized RVQ codes")
@@ -119,16 +116,6 @@ class Zonos3RVQStageInputProcessor:
             return None
         end = max(self.emitted, ready)
         output = torch.full((end - self.emitted, 10), -1, dtype=torch.int64)
-        # A claimed completed GPU Tail Drain must include its ten tail
-        # markers. Token-limit truncation may end sooner and flushes only
-        # fully arrived frames without claiming a completed drain.
-        if drain_complete and self.eoa_frame is not None:
-            required = self.eoa_frame + 10
-            if self.received < required:
-                raise ValueError(
-                    f"Zonos3 final output ended before AR Tail Drain: received {self.received} rows, "
-                    f"expected at least {required}"
-                )
         for f in range(self.emitted, end):
             for j, size in enumerate(cfg.codebook_sizes):
                 raw_index = f + j
@@ -145,13 +132,12 @@ class Zonos3RVQStageInputProcessor:
                 request_id=request_id,
                 chunk_seq=self.chunk_seq,
                 num_processed_tokens=self.emitted,
-                codec_chunk_frames=output.shape[0],
                 ref_context_size=self.prefill_frames if self.chunk_seq == 0 else None,
                 next_stage_prompt_len=1,
                 next_stage_prompt_ids=[0],
                 finished=torch.tensor(finished),
                 codec_streaming=torch.tensor(True),
-                override_keys=[("meta", "codec_chunk_frames"), ("meta", "finished")],
+                override_keys=[("meta", "finished")],
             ),
         )
         self.emitted = end
@@ -185,11 +171,11 @@ class _Request(Protocol):
     @property
     def additional_information(self) -> object: ...
 
-    @property
-    def output_stopped(self) -> bool: ...
-
-
 _STATE_KEY = "_zonos3_rvq_state"
+
+
+def _zonos3_conditioning(metadata: Mapping[str, object]) -> dict[str, object]:
+    return dict(metadata)
 
 
 def zonos3_rvq_async_chunk(
@@ -203,22 +189,7 @@ def zonos3_rvq_async_chunk(
     is_transport_terminal = bool(is_finished or request.is_finished())
     if getattr(request, "aborted", False):
         transfer_manager.request_payload.pop(request_id, None)
-        # A terminal wake-up is still needed by a waiting downstream request.
-        # Make cancellation explicit so Codec releases history without an
-        # iSTFT/resampler tail flush or allocating a new decoder slot.
-        return OmniPayloadStruct(
-            codes=CodesStruct(audio=torch.empty((0, 10), dtype=torch.int64)),
-            meta=MetaStruct(
-                request_id=request_id,
-                finished=torch.tensor(False),
-                transport_terminal=True,
-                aborted=True,
-                codec_streaming=True,
-                override_keys=[("meta", "transport_terminal")],
-                next_stage_prompt_len=1,
-                next_stage_prompt_ids=[0],
-            ),
-        )
+        return None
     root = transfer_manager.request_payload.setdefault(request_id, {})
     state = root.get(_STATE_KEY)
     if not isinstance(state, Zonos3RVQStageInputProcessor):
@@ -240,7 +211,7 @@ def zonos3_rvq_async_chunk(
             metadata = deserialize_additional_information(original)
             if any("." in key for key in metadata):
                 metadata = unflatten_payload(metadata)
-            conditioning = metadata.get(ZONOS3_PROMPT_KEY, {})
+            conditioning = _zonos3_conditioning(metadata)
             count = conditioning.get("silence_prefill_frames", 0)
             frames = conditioning.get("frame_ids")
             if not isinstance(count, int) or count < 0:
@@ -279,7 +250,7 @@ def zonos3_rvq_async_chunk(
             metadata = deserialize_additional_information(original)
             if any("." in key for key in metadata):
                 metadata = unflatten_payload(metadata)
-            conditioning = metadata.get(ZONOS3_PROMPT_KEY, {})
+            conditioning = _zonos3_conditioning(metadata)
             overrides = conditioning.get("codec_chunking", {})
             if overrides and (
                 state.config.chunk_size != overrides.get("chunk_size", state.config.chunk_size)
@@ -289,7 +260,6 @@ def zonos3_rvq_async_chunk(
             ):
                 raise ValueError("Zonos3 per-request Codec chunk settings changed during the request")
     codes = None
-    eos_complete = False
     if pooling_output is not None:
         namespace = pooling_output.get("codes", {})
         if not isinstance(namespace, Mapping):
@@ -297,25 +267,15 @@ def zonos3_rvq_async_chunk(
         value = namespace.get("audio")
         if value is not None and not isinstance(value, torch.Tensor):
             raise ValueError("Expected a materialized audio-code tensor")
-        meta = pooling_output.get("meta", {})
-        valid = meta.get("codec_frame_valid") if isinstance(meta, Mapping) else None
-        # Partial prefills and post-EOS in-flight steps carry no new RVQ row.
-        # These flags share the runner's existing D2H boundary with the codes.
-        if valid is None or bool(torch.as_tensor(valid).any()):
-            codes = cast(torch.Tensor | None, value)
-        eos = meta.get("codec_eos_valid") if isinstance(meta, Mapping) else None
-        if isinstance(eos, torch.Tensor):
-            eos_complete = bool(eos.any())
-    state.ar_drain_complete = state.ar_drain_complete or eos_complete
-    # The materialized EOS row precedes the scheduler's terminal ACK. Keep
-    # decoding ordinary chunks, but publish exactly one final Codec chunk only
-    # after all in-flight outputs have drained. Length truncation follows the
-    # same final flush path without claiming an EOA Tail Drain completed.
+        codes = cast(torch.Tensor | None, value)
+    # The sampler owns EOA detection and tail drain on device. Its logical EOS
+    # stops further sampling; the ordered transport terminal arrives only
+    # after all in-flight raw-code outputs have been delivered, so it is the
+    # processor's sole signal to flush the remaining delayed rows.
     result = state.push(
         request_id,
         codes,
         finished=is_transport_terminal,
-        drain_complete=state.ar_drain_complete and is_transport_terminal,
     )
     if is_transport_terminal:
         transfer_manager.request_payload.pop(request_id, None)

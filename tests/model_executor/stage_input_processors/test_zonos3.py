@@ -124,21 +124,11 @@ def test_partial_first_chunk_followed_by_immediate_truncation():
     assert p.meta.finished and state.emitted == 1
 
 
-def test_terminal_eoa_requires_completed_ar_tail_drain():
-    frames = torch.arange(30).reshape(3, 10)
-    rows = delayed(frames)
-    state = Zonos3RVQStageInputProcessor(CONFIG)
-    # EOA is first seen at row three (book zero), but terminal arrives before
-    # the ten delayed tail markers that the GPU sampler promises to emit.
-    with pytest.raises(ValueError, match="Tail Drain"):
-        state.push("r", rows[:4], finished=True, drain_complete=True)
-
-
 def test_non_terminal_exact_boundary_is_followed_by_transport_terminal():
     frames = torch.arange(20).reshape(2, 10)
     state = Zonos3RVQStageInputProcessor(CONFIG)
     rows = delayed(frames)
-    result = state.push("r", rows, finished=True, drain_complete=True)
+    result = state.push("r", rows, finished=True)
     assert result is not None and result.meta.codec_streaming and result.meta.finished
 
 
@@ -214,7 +204,6 @@ class Request:
     aborted: bool = False
     finished: bool = False
     output_stopped: bool = False
-    terminal_output: bool = False
 
     def is_finished(self) -> bool:
         return self.finished
@@ -233,12 +222,11 @@ def test_native_hook_independent_requests_terminal_cancel_and_identity_reuse(fla
         assert zonos3_rvq_async_chunk(manager, {"codes": {"audio": rows[:9]}}, request) is None
     a.aborted = True
     aborted = zonos3_rvq_async_chunk(manager, None, a, True)
-    assert aborted.meta.aborted is True and aborted.meta.transport_terminal
-    assert aborted.codes.audio.shape == (0, 10)
+    assert aborted is None
     assert a.external_req_id not in manager.request_payload
     p = zonos3_rvq_async_chunk(
         manager,
-        {"codes": {"audio": rows[9:]}, "meta": {"codec_eos_valid": torch.tensor([True])}},
+        {"codes": {"audio": rows[9:]}},
         b,
         True,
     )
@@ -247,19 +235,18 @@ def test_native_hook_independent_requests_terminal_cancel_and_identity_reuse(fla
     assert b.external_req_id not in manager.request_payload
 
 
-def test_native_hook_ignores_inactive_prefill_and_post_eos_rows():
+def test_native_hook_accumulates_raw_rows_until_terminal():
     manager = Manager()
-    request = Request("inactive")
-    invalid = {
-        "codes": {"audio": torch.full((1, 10), -999)},
-        "meta": {"codec_frame_valid": torch.tensor([False])},
-    }
-    assert zonos3_rvq_async_chunk(manager, invalid, request) is None
-    assert manager.request_payload[request.external_req_id]["_zonos3_rvq_state"].received == 0
+    request = Request("raw")
     frames = torch.arange(100).reshape(10, 10)
     rows = delayed(frames)
-    zonos3_rvq_async_chunk(manager, {"codes": {"audio": rows}}, request)
+    assert zonos3_rvq_async_chunk(manager, {"codes": {"audio": rows[:5]}}, request) is None
     state = manager.request_payload[request.external_req_id]["_zonos3_rvq_state"]
-    before = state.received, state.emitted
-    assert zonos3_rvq_async_chunk(manager, invalid, request) is None
-    assert (state.received, state.emitted) == before
+    assert state.received == 5
+    zonos3_rvq_async_chunk(manager, {"codes": {"audio": rows[5:]}}, request)
+    request.finished = True
+    final = zonos3_rvq_async_chunk(manager, None, request, True)
+    assert final.meta.finished
+    # The processor emitted every complete frame before terminal; terminal
+    # flush contains only the delayed tail (empty for this row-aligned fixture).
+    assert final.codes.audio.shape == (0, 10)
