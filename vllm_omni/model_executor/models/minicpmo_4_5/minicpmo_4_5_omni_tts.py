@@ -1794,6 +1794,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codec_inputs = getattr(self, "_request_codec_device_inputs", None)
                 if isinstance(codec_inputs, dict):
                     codec_inputs.pop(request_id, None)
+                # The host-side sampler caches the same per-request liveness
+                # (hstate["finished"]) the device states own: a finished
+                # segment would otherwise leave active=False and drop every
+                # frame of the next condition as a no-emit terminal row.
+                # Popping rebuilds the draw state from this condition's
+                # codes/step, same contract as the two caches above.
+                host_states = getattr(self, "_request_host_codec_states", None)
+                if isinstance(host_states, dict):
+                    host_states.pop(request_id, None)
             empty_codes = torch.empty(0, dtype=torch.long, device="cpu")
             return (
                 input_ids,
