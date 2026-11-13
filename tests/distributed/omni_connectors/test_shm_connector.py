@@ -664,3 +664,31 @@ def test_reaping_keeps_consumed_records_bounded_behind_unread_keys(connector):
         assert not connector._pending_keys
     finally:
         receiver.close()
+
+
+def test_put_waits_then_fails_when_shm_capacity_exhausted(connector, monkeypatch):
+    """Low /dev/shm must fail the put instead of killing the worker (#10296)."""
+    free_values = iter([0, 0, 0])
+
+    def fake_free() -> int:
+        try:
+            return next(free_values)
+        except StopIteration:
+            return 0
+
+    monkeypatch.setattr(connector, "_shm_free_bytes", fake_free)
+    monkeypatch.setattr(connector, "_ensure_shm_capacity", lambda nbytes, attempts=3: False)
+    ok, size, meta = connector.put("s0", "s1", "capacity_gate_" + uuid.uuid4().hex[:8], {"x": 1})
+    assert ok is False
+    assert size == 0
+    assert meta is None
+
+
+def test_ensure_shm_capacity_recovers_when_space_frees(connector, monkeypatch):
+    frees = [0, 0, 1 << 30]
+
+    def fake_free() -> int:
+        return frees.pop(0) if frees else 1 << 30
+
+    monkeypatch.setattr(connector, "_shm_free_bytes", fake_free)
+    assert connector._ensure_shm_capacity(1024, attempts=5) is True

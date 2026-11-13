@@ -77,6 +77,49 @@ class SharedMemoryConnector(OmniConnectorBase):
         seg.close()
         seg.unlink()
 
+    def _shm_free_bytes(self) -> int:
+        """Best-effort free space under ``shm_directory`` (usually ``/dev/shm``)."""
+        try:
+            st = os.statvfs(self.shm_directory)
+        except OSError:
+            return 1 << 62
+        return int(st.f_bavail) * int(st.f_frsize)
+
+    def _capacity_lock_path(self) -> str:
+        # Serialize capacity check + segment create across TP ranks / processes
+        # so concurrent puts cannot race past a free-space check (#10296).
+        return f"{self.shm_directory}/omni_shm_cap_{os.getuid()}.lock"
+
+    def _ensure_shm_capacity(self, nbytes: int, *, attempts: int = 80) -> bool:
+        """Wait for enough free SHM, reaping consumed keys between polls.
+
+        Concurrent AR→DiT KV puts (~hundreds of MB each) can fill ``/dev/shm``
+        before the consumer drains them. Creating a new POSIX segment (or even
+        a SemLock) then fails with ``ENOSPC`` / silent worker death (#10296).
+        Block briefly so the consumer can catch up instead of OOMing the host.
+        """
+        # Headroom covers lockfiles, wake FIFOs, SemLock objects, and a sibling
+        # TP rank that may already be past its own capacity check.
+        need = int(nbytes) + (512 << 20)
+        if need <= 0:
+            return True
+        for attempt in range(max(1, attempts)):
+            if self._shm_free_bytes() >= need:
+                return True
+            # Receivers unlink in another process; sweep our pending bookkeeping
+            # so we notice freed keys quickly.
+            self.reap_consumed(max_keys=256)
+            time.sleep(min(0.5, 0.02 * (1 + attempt // 4)))
+        free = self._shm_free_bytes()
+        if free >= need:
+            return True
+        logger.error(
+            "SharedMemoryConnector: /dev/shm low (%s MiB free, need %s MiB); giving up on put",
+            free // (1 << 20),
+            need // (1 << 20),
+        )
+        return False
+
     def get_with_deadline(self, from_stage, to_stage, get_key, metadata=None, *, deadline):
         if time.monotonic() >= deadline:
             return None
@@ -251,10 +294,16 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             name = self._shm_name(put_key)
             lock_file = self._lock_file(name)
-            with open(lock_file, "wb+") as lockf:
-                fcntl.flock(lockf, fcntl.LOCK_EX)
-                meta = self._write_bytes(payload, name)
-                fcntl.flock(lockf, fcntl.LOCK_UN)
+            # Hold the uid-scoped capacity lock across the free-space check and
+            # segment create so TP ranks cannot collectively overrun /dev/shm.
+            with open(self._capacity_lock_path(), "wb+") as capf:
+                fcntl.flock(capf, fcntl.LOCK_EX)
+                if not self._ensure_shm_capacity(size):
+                    return False, 0, None
+                with open(lock_file, "wb+") as lockf:
+                    fcntl.flock(lockf, fcntl.LOCK_EX)
+                    meta = self._write_bytes(payload, name)
+                    fcntl.flock(lockf, fcntl.LOCK_UN)
 
             # meta contains {'name': ..., 'size': ...}
             metadata = {"shm": meta, "size": size}
@@ -267,6 +316,11 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             return True, size, metadata
 
+        except OSError as e:
+            # ENOSPC / EMFILE on SemLock or segment create: fail the put rather
+            # than letting the worker die with exit code None (#10296).
+            logger.error(f"SharedMemoryConnector put OSError for req {put_key}: {e}")
+            return False, 0, None
         except Exception as e:
             logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
             return False, 0, None
