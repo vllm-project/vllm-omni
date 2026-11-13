@@ -672,7 +672,6 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         attempt = save.attempt
         store = self.connector_worker.store
         try:
-            deadline = time.monotonic() + self.settings.load_timeout_seconds
             commits: list[tuple[str, str, bytes]] = []
             complete = True
             # Indexing leaves no tensor reference in this frame for the KV wait.
@@ -686,6 +685,8 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
                     break
                 commits.append(written)
             self._release_staging(save)
+            # HS serialization and Store writes must not consume the KV wait.
+            deadline = time.monotonic() + self.settings.load_timeout_seconds
             # Preserve successful leading blocks even if a later write failed.
             while commits and not attempt.cancelled and time.monotonic() < deadline:
                 exists = store.batch_is_exist([kv_key for kv_key, _, _ in commits])

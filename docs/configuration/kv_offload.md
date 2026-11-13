@@ -122,10 +122,9 @@ similarly named inter-stage `MooncakeStoreConnector`, which transports stage
 outputs and does not add prefix reuse.
 
 This is the M1 implementation of [RFC #9908](https://github.com/vllm-project/vllm-omni/issues/9908).
-M0 validated waiting and recovery with a sequential Thinker-only probe. Those
-results do not establish full text/audio serving correctness or performance
-for this backend. Full-pipeline GPU acceptance, duplex evaluation, and
-performance measurements must be recorded separately before claiming support.
+The [validation report](https://github.com/vllm-project/vllm-omni/blob/main/benchmarks/qwen3_omni/README.md)
+records full-pipeline text/image/audio acceptance and turn-serving performance
+for the tested revisions and deployment. Duplex serving is unsupported.
 M1 is a Mooncake-only external cache: local Thinker prefix caching is disabled,
 so the two caches do not cooperate. The
 [design document](../design/feature/mooncake_kv_hs_cache.md) describes the
@@ -174,7 +173,9 @@ cache deployment. Never reuse a checkpoint identifier for different weights.
 store capacity. `max_pending_transfers` bounds queued HS reads and, separately,
 queued HS writes. Reads and writes also use separate worker threads, so a write
 waiting for its KV object cannot delay a load. `load_timeout_seconds` bounds
-each prefix lookup and each HS load. Lookups run asynchronously; one that
+each prefix lookup and each HS load, and sets the KV-readiness polling budget
+after HS writes finish. It does not bound the duration of blocking Store calls.
+Lookups run asynchronously; one that
 exceeds the deadline is treated as a miss, and later requests skip lookup until
 the stalled reply returns. Account for GPU KV, temporary worker buffers, and
 Mooncake KV/HS/metadata storage separately.

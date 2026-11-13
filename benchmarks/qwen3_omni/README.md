@@ -4,6 +4,8 @@ Measured 2026-11-12 at source `83b8c3102`. Mooncake retains full-prefix hits aft
 
 The initial performance and quality measurements precede the change that submits a successor to the save executor only after its predecessor finishes. The Store fault test and cold concurrency-2 benchmark were rerun at `a67b7a721` on 2026-11-13 and are reported separately below; the earlier measurements remain evidence for their recorded revision.
 
+Both measured revisions started the save deadline before HS writes. The implementation gives KV-readiness polling a separate budget after those writes, as described below. These measurements do not evaluate that later deadline behavior.
+
 ## Configuration and workload
 
 - Model: `Qwen/Qwen3-Omni-30B-A3B-Instruct`, checkpoint `26291f793822fb6be9555850f06dfe95f2d7e695`, loaded from a local copy.
@@ -63,7 +65,9 @@ At `a67b7a721`, four fresh processes ran in A/D/D/A order with the same checkpoi
 | A: cache off | 237.6 ± 53.8 | 921.6 ± 19.6 | 2.1266 ± 0.0023 |
 | D: Mooncake | 253.4 ± 82.8 | 957.5 ± 26.6 | 2.0344 ± 0.0030 |
 
-Mooncake's measured cold overhead was 6.67% in TTFT, 3.90% in E2E latency, and 4.33% lower throughput. The E2E/throughput cost remains around 4%, close to the earlier 3.7%/4.2% measurements; this bounded recheck does not establish zero overhead or a production tail-latency bound. All four processes exited cleanly. Reports and commands are under `results/mooncake_m1_review_20261113/performance/`.
+Mooncake's measured cold overhead was 6.67% in TTFT, 3.90% in E2E latency, and 4.33% lower throughput. The E2E/throughput cost remains around 4%, close to the earlier 3.7%/4.2% measurements; this bounded recheck does not establish zero overhead or a production tail-latency bound. All four processes exited cleanly. Commands are in [Reproduction](#reproduction).
+
+The callback submission path is shared by text, image, and audio prompts. The text recheck exercises that path under concurrent saves; different media prompt lengths can change save batching and queue pressure. Image/audio performance remains measured only at `83b8c3102`, before the scheduling change. The nine-scenario acceptance rerun establishes correctness, not updated media performance.
 
 Matched inputs had identical token IDs and audio sample counts across all 168 observations. One input had varying waveform hashes between cache-off runs; no cached output differed from its selected baseline. Universal waveform-hash equality is therefore not established.
 
@@ -91,6 +95,10 @@ All other request counters, including all controls and lookup trials, were zero.
 Ongoing and healthy requests retained identical token IDs against their controls. Each cold peer computed 550 prompt tokens, restored zero rows, and generated 48 tokens. Its prompt contains a distinct control/delay case prefix, so paired peers are not an output-parity comparison. Healthy requests produced text before each five-second delay ended; ongoing decode progressed during lookup delays, and cached HS reads completed during KV-write delays. The lookup deadline changes the healthy request from a cache hit to recomputation. These small-sample timing differences are not speedup claims. Delays occur at Store API entry and do not reproduce Store-internal transport or mutex stalls.
 
 A supplemental run at the same source in a separate Python 3.12.16 environment also passed all 12 trials. Cold-peer mean HS-save start was 152.8/136.2 ms, TTFT 280.0/248.8 ms, and E2E 1377.2/1362.5 ms (control/delay). KV-write counters were the same; delayed lookup repeats 0 and 1 each additionally had 18 skipped blocks and one failed batch for the healthy request (36/2 total), with zero in repeat 2. Admission drops and pending batches remained zero. These environments are reported separately, not pooled.
+
+Those two failed HS batches ran for 2.095 s and 2.320 s with a one-second save deadline; their queued successors contained 16 + 2 blocks each. No HS-save exception was logged. The trace records batch start/end but not HS-write durations, readiness checks, or failure reasons, so it cannot establish the cause or attribute it to the environment. The successful third repeat and primary run also saved while lookup was stalled; the injected lookup delay alone does not explain the failures.
+
+The measured implementation started its deadline before HS serialization, Store writes, and read-back. If that work exhausted the budget, saving skipped its first KV-readiness check even when KV was already present. The readiness timer starts after HS writes and staging release in the corrected implementation. The CPU regression `test_slow_hs_write_preserves_kv_readiness_budget` in [the connector tests](../../tests/distributed/test_mooncake_connector.py) covers existing and missing KV with a simulated two-second HS write and one-second readiness budget. Both cases failed before the correction and pass afterward. This establishes the deadline bug but does not identify the cause of the two historical GPU failures; their cause remains unresolved.
 
 For comparison, the earlier `bb18ac89a` run passed 12 trials without a cold peer or save counters. Healthy TTFT/E2E means were 221.1/1152.6 ms (lookup control), 230.9/1269.8 ms (lookup delay), 332.4/1356.5 ms (KV-write control), and 301.7/1328.2 ms (KV-write delay). Those results established serving/read progress only.
 
@@ -121,7 +129,7 @@ Every process reported first-image inference JIT for `matmul_kernel_persistent` 
 
 ## Correctness and limitations
 
-The exact GPU acceptance test was rerun at `a67b7a721` and passed all nine text/image/audio scenarios: cold/full/partial text hits and unchanged/changed media. Restored embeddings, hidden states, packed Talker inputs, token IDs, and audio matched two independent cache-off engines exactly. This is a separate correctness run; its tensor dumps and save barriers do not contribute timing results. Evidence is under `results/mooncake_m1_review_20261113/acceptance/`.
+The exact GPU acceptance test was rerun at `a67b7a721` and passed all nine text/image/audio scenarios: cold/full/partial text hits and unchanged/changed media. Restored embeddings, hidden states, packed Talker inputs, token IDs, and audio matched two independent cache-off engines exactly. This is a separate correctness run; its tensor dumps and save barriers do not contribute timing results.
 
 In the original `83b8c3102` comparison, all 432 requests completed. Matched text token IDs and audio sample counts agree; all eight image/audio changed-media checks pass. Strict waveform-SHA equality is **not established**: the two cache-off processes show five input digests with multiple hashes, and cached arms have four observations differing from the first baseline hash, all on the same concurrent overflow cache miss. Every cached waveform hash occurs among cache-off observations for that input. Strict per-observation hash equality therefore remains qualified by baseline variability.
 
@@ -129,13 +137,13 @@ Separate quality-only runs saved client waveforms after each wave. Two independe
 
 All 144 cached quality requests passed those fixed limits with exact tokens and sample counts. Each mode matched its first baseline waveform bit-for-bit in 69 of 72 cases. Local/Mooncake maximum RMSE was `4.8679e-5` / `4.3211e-5`, minimum finite SNR 59.75 / 61.23 dB, and maximum absolute difference `0.001953125` for both—within the observed baseline maxima. These checks establish numeric waveform agreement; no perceptual-quality claim or timing result is taken from the diagnostic runs.
 
-The audio full-hit workload exposed a pre-existing PIECEWISE capture bug: flattening auxiliary outputs for FULL-graph buffers also changed the PIECEWISE replay payload from a dictionary to a list. The measured source preserves the original auxiliary pytree for PIECEWISE and retains flattening for NONE warmup/FULL. Earlier failed local/Mooncake audio runs are retained as diagnostic artifacts and excluded from these tables.
+The audio full-hit workload exposed a pre-existing PIECEWISE capture bug: flattening auxiliary outputs for FULL-graph buffers also changed the PIECEWISE replay payload from a dictionary to a list. The measured source preserves the original auxiliary pytree for PIECEWISE and retains flattening for NONE warmup/FULL. Earlier failed local/Mooncake audio runs are excluded from these tables.
 
-Exact source-embedding, hidden-state, and Talker-input checks use the separate [acceptance test](../../tests/engine/test_mooncake_turn_consistency_qwen3.py). Fault injection uses [mooncake_faults.py](mooncake_faults.py); the primary raw report is `results/mooncake_m1_review_20261113/fault-local/fault-data/report.json`, the supplemental run is `results/mooncake_m1_review_20261113/fault-data/report.json`, and the earlier run is `results/mooncake_m1_review_20261112/fault-final-data/report.json`. CPU failure coverage and feature constraints are documented in the [feature contract](../../docs/design/feature/mooncake_kv_hs_cache.md).
+Exact source-embedding, hidden-state, and Talker-input checks use the separate [acceptance test](../../tests/engine/test_mooncake_turn_consistency_qwen3.py). Fault injection uses [mooncake_faults.py](mooncake_faults.py). CPU failure coverage and feature constraints are documented in the [feature contract](../../docs/design/feature/mooncake_kv_hs_cache.md).
 
 ## Reproduction
 
-Run from the repository root with the pinned environment, local checkpoint, and a running Store configured above. `MOONCAKE_METRICS_URL` names its Prometheus endpoint. Reports, logs, source manifests, per-process statistics, and failed diagnostics are local artifacts under ignored `results/mooncake_m1_review_20261112/` and `results/mooncake_m1_review_20261113/`; no public artifact URL is provided.
+Run from the repository root with the pinned environment, local checkpoint, and a running Store configured above. `MOONCAKE_METRICS_URL` names its Prometheus endpoint. The commands generate JSON reports in the selected output paths. Historical raw reports are not published; the measurements and limitations above are the retained record.
 
 ```bash
 export VLLM_TARGET_DEVICE=cuda VLLM_WORKER_MULTIPROC_METHOD=spawn

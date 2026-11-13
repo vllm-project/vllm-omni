@@ -597,6 +597,37 @@ def test_save_publishes_commit_after_kv_and_hs_exist(connector):
     assert store.objects[key + ":ready"] == hashlib.sha256(store.objects[key]).digest()
 
 
+@pytest.mark.parametrize("kv_ready", [False, True])
+def test_slow_hs_write_preserves_kv_readiness_budget(connector, monkeypatch, kv_ready):
+    attempt = install_attempt(connector)
+    connector.settings = replace(connector.settings, load_timeout_seconds=1)
+    store = connector.connector_worker.store
+    key = hs_key(connector.namespace, attempt.hashes[0])
+    if kv_ready:
+        store.objects["kv:" + attempt.hashes[0].hex()] = b"kv"
+    now = 0.0
+    put = store.put
+
+    def slow_put(name, payload):
+        nonlocal now
+        if name == key:
+            now += 2
+        return put(name, payload)
+
+    def sleep(seconds):
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(store, "put", slow_put)
+    monkeypatch.setattr(connector_module, "time", SimpleNamespace(monotonic=lambda: now, sleep=sleep))
+    monkeypatch.setattr(connector_module, "_KV_POLL_SECONDS", 1)
+    saved = connector._save_hs(PendingSave(attempt, [(0, 4, captures(0, 4))], 0))
+
+    assert saved is kv_ready
+    assert (key + ":ready" in store.objects) is kv_ready
+    assert now == (2 if kv_ready else 3)
+
+
 def test_failed_save_cannot_publish_completion(connector):
     attempt = install_attempt(connector)
     key = hs_key(connector.namespace, attempt.hashes[0])

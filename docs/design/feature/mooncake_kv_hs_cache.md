@@ -106,8 +106,10 @@ finishes, so waiting for that predecessor never occupies another save worker.
 A failed write or expired KV wait also stops later saves while
 preserving any successfully saved leading blocks. A save worker writes each HS object
 and reads back the stored winner, because a put to an existing key keeps the
-first value. It then releases the staging reservation and polls for the
-blocks' KV objects until `load_timeout_seconds`. Completion records are
+first value. It then releases the staging reservation and starts a fresh
+`load_timeout_seconds` budget for polling the blocks' KV objects. HS encoding
+and Store writes do not consume that readiness budget; it is not an overall
+save-duration limit and cannot interrupt a blocking Store call. Completion records are
 published in block order, stopping at the first block whose KV object is still
 missing. If a KV object never appears, no record is written for it or for
 later blocks, and normal Store eviction removes the orphaned HS objects.
@@ -161,6 +163,11 @@ can delay other saves but never a load.
 | HS write or read-back failure | Save worker | No completion record; response unchanged |
 | KV object never written for a saved block | Save deadline | No completion record |
 | Invalid fresh capture | Runner rewrite | Error for that request only |
+
+The pinned native connector has one KV send thread. A stalled write can make
+unrelated requests' saves miss the deadline even when their HS workers are free.
+`load_timeout_seconds` (1 s in the fault tests) sets a deadline; cache population
+remains best effort.
 
 ## Deferred two-level cache cooperation
 
@@ -231,7 +238,8 @@ runner rewrite (`tests/worker_v2/test_mooncake.py`), and configuration
 (`tests/engine/test_map_offload_config.py`). The connector tests include a
 stalled lookup driven through the production AR scheduler and the pinned
 lookup client, saves waiting for KV on real worker threads, completion records
-published in block order, cancellation during an HS read, and a rejected reset
+published in block order, slow HS writes retaining the full KV-readiness budget,
+cancellation during an HS read, and a rejected reset
 reaching the scheduler's caller.
 
 Opt-in tests need a running Mooncake master and `MOONCAKE_CONFIG_PATH`:
@@ -261,30 +269,7 @@ sampling. They contain no source-tensor dumps or save barriers. Output hashes
 and memory snapshots are collected between timed waves. Two-level cache
 cooperation and duplex sessions remain outside this validation.
 
-The `a67b7a721` GPU fault rerun passed 12 trials with 42 requests. During a
-five-second KV-write stall, the cold peer started its HS save in all three
-trials while the writer still had an unfinished save and a queued successor.
-In the original Python 3.12.15 environment, its mean HS-save start latency was
-156.4 ms (152.1 ms in controls), with TTFT/E2E of 263.5/1364.6 ms
-(293.9/1409.5 ms in controls).
-
-Admission drops and final pending batches were zero for every request. In each
-delayed KV-write trial, both writer and peer skipped 19 blocks and failed one
-started batch: 114 skipped blocks and 6 failed batches in total. All other
-request counters, including lookup trials, were zero. The pinned native KV
-sender is a single thread, so its five-second stall delays queued KV writes
-beyond the test's one-second HS readiness deadline. Freeing an HS worker does
-not guarantee successful cache population while that KV writer is stalled.
-These measurements do not justify a per-attempt queue cap: no admission drops
-were observed. A separate Python 3.12.16 run also passed all 12 trials, with
-the same KV-write counters but 36 skipped blocks and 2 failed batches across
-two healthy requests during lookup delays. It is reported separately from
-the original environment. The earlier `bb18ac89a` run measured serving/read
-progress only, without the cold peer or save counters.
-
-A matched concurrency-2 cold-path recheck at `a67b7a721` retained the roughly
-4% cost: Mooncake E2E was 3.90% higher and throughput 4.33% lower than cache
-off, compared with 3.7% and 4.2% in the earlier run.
-
 See the [controlled M1 measurements and reproduction commands](https://github.com/vllm-project/vllm-omni/blob/main/benchmarks/qwen3_omni/README.md)
-for variability, fault timing, and the limits of the recorded evidence.
+for measured revisions, variability, fault timing, and the limits of the
+recorded evidence. The report distinguishes media correctness from performance
+coverage and records cache-population failures separately from serving progress.
