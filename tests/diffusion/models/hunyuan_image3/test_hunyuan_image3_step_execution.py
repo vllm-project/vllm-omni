@@ -1557,3 +1557,40 @@ def test_rotary_uses_current_group_on_later_steps(second_batch):
     actual = rope._prepare_cos_sin(new, False, torch.device("cpu"))
     torch.testing.assert_close(actual[0], new[0])
     torch.testing.assert_close(actual[1], new[1])
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_request_group_preserves_ar_token_ids_after_main_merge(monkeypatch, prepared):
+    pipeline = _pipeline()
+    requests = [
+        _omni_request(f"req-{idx}", _layout_rows([[idx + 1] * 21], image_start=5), guidance_scale=1.0)
+        for idx in range(2)
+    ]
+    expected = [([10, 11], [12]), ([20, 21], [22])]
+    for request, (prompt_ids, generated_ids) in zip(requests, expected):
+        request.prompt = {
+            "prompt": request.prompt,
+            "extra": {
+                hy3_layout_module.HUNYUAN_AR_PROMPT_TOKEN_IDS_KEY: prompt_ids,
+                hy3_layout_module.HUNYUAN_AR_GENERATED_TOKEN_IDS_KEY: generated_ids,
+            },
+        }
+        if not prepared:
+            request.prepared_layout = None
+
+    def capture_inputs(**kwargs):
+        assert kwargs["batch_ar_token_ids"] == (None if prepared else expected)
+        raise RuntimeError("captured original AR token identities")
+
+    monkeypatch.setattr(pipeline, "prepare_model_inputs", capture_inputs)
+    with pytest.raises(RuntimeError, match="captured original AR token identities"):
+        pipeline._forward_request_group(
+            requests,
+            prompt="unused",
+            height=512,
+            width=512,
+            num_inference_steps=2,
+            guidance_scale=1.0,
+            generator=None,
+            kwargs={},
+        )
