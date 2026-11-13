@@ -85,7 +85,8 @@ def test_text_to_text(omni_runner, offline_client) -> None:
     request_config = {"prompts": get_prompt("text"), "modalities": ["text"]}
 
     # Test single completion
-    offline_client.send_omni_request(request_config)
+    response = offline_client.send_omni_request(request_config)
+    assert response.text_content is not None
 
 
 @pytest.mark.advanced_model
@@ -97,7 +98,8 @@ def test_text_to_audio(omni_runner, offline_client) -> None:
     request_config = {"prompts": get_prompt("text"), "modalities": ["audio"]}
 
     # Test single completion
-    offline_client.send_omni_request(request_config)
+    response = offline_client.send_omni_request(request_config)
+    assert response.audio_content is not None
 
 
 @pytest.mark.advanced_model
@@ -111,7 +113,8 @@ def test_image_to_text(omni_runner, offline_client) -> None:
     request_config = {"prompts": get_prompt("image"), "images": image, "modalities": ["text"]}
 
     # Test single completion
-    offline_client.send_omni_request(request_config)
+    response = offline_client.send_omni_request(request_config)
+    assert response.text_content is not None
 
 
 @pytest.mark.advanced_model
@@ -125,7 +128,8 @@ def test_image_to_audio(omni_runner, offline_client) -> None:
     request_config = {"prompts": get_prompt("image"), "images": image, "modalities": ["audio"]}
 
     # Test single completion
-    offline_client.send_omni_request(request_config)
+    response = offline_client.send_omni_request(request_config)
+    assert response.audio_content is not None
 
 
 @pytest.mark.advanced_model
@@ -139,7 +143,8 @@ def test_video_to_text(omni_runner, offline_client) -> None:
     request_config = {"prompts": get_prompt("video"), "videos": video, "modalities": ["text"]}
 
     # Test single completion
-    offline_client.send_omni_request(request_config)
+    response = offline_client.send_omni_request(request_config)
+    assert response.text_content is not None
 
 
 @pytest.mark.advanced_model
@@ -153,7 +158,8 @@ def test_video_to_audio(omni_runner, offline_client) -> None:
     request_config = {"prompts": get_prompt("video"), "videos": video, "modalities": ["audio"]}
 
     # Test single completion
-    offline_client.send_omni_request(request_config)
+    response = offline_client.send_omni_request(request_config)
+    assert response.audio_content is not None
 
 
 @pytest.mark.advanced_model
@@ -169,7 +175,8 @@ def test_audio_to_text(omni_runner, offline_client) -> None:
     request_config = {"prompts": get_prompt("audio"), "audios": audio, "modalities": ["text"]}
 
     # Test single completion
-    offline_client.send_omni_request(request_config)
+    response = offline_client.send_omni_request(request_config)
+    assert response.text_content is not None
 
 
 @pytest.mark.advanced_model
@@ -185,7 +192,8 @@ def test_audio_to_audio(omni_runner, offline_client) -> None:
     request_config = {"prompts": get_prompt("audio"), "audios": audio, "modalities": ["audio"]}
 
     # Test single completion
-    offline_client.send_omni_request(request_config)
+    response = offline_client.send_omni_request(request_config)
+    assert response.audio_content is not None
 
 
 @pytest.mark.advanced_model
@@ -197,4 +205,5 @@ def test_thinker_only_model_request(omni_runner, offline_client) -> None:
     request_config = {"prompts": "what color is the sky?", "modalities": ["text"]}
 
     # Test single completion
-    offline_client.send_omni_request(request_config)
+    response = offline_client.send_omni_request(request_config)
+    assert response.text_content is not None
