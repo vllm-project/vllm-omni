@@ -19,6 +19,7 @@ from vllm.benchmarks.serve import main_async
 import vllm_omni.benchmarks.patch.patch  # noqa: F401
 from vllm_omni.benchmarks.omniinteract import omniinteract_output_lock
 from vllm_omni.benchmarks.patch.patch import (
+    CAPTURE_AUDIO_STREAM_DETAILS,
     maybe_enable_stage_metrics,
     set_duplex_metric_aggregation,
     set_fail_fast_on_timeout,
@@ -99,5 +100,9 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         if getattr(args, "dataset_name", None) == "omniinteract"
         else contextlib.nullcontext()
     )
-    with lock:
-        return asyncio.run(main_async(args))
+    token = CAPTURE_AUDIO_STREAM_DETAILS.set(bool(getattr(args, "save_detailed", False)))
+    try:
+        with lock:
+            return asyncio.run(main_async(args))
+    finally:
+        CAPTURE_AUDIO_STREAM_DETAILS.reset(token)
