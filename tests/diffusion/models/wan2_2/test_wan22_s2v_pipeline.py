@@ -779,10 +779,15 @@ def test_s2v_preencode_returns_playable_mp4_bytes_per_request(monkeypatch, batch
 
     decoded = []
     for request_output in outputs:
-        # Two outputs per prompt, each already a complete container.
-        assert isinstance(request_output.output, list)
-        assert len(request_output.output) == 2
-        for data in request_output.output:
+        # Two outputs per prompt, each already a complete container; the muxed
+        # path rides the audio sample rate alongside as the third tuple element
+        # (the same (video, audio, rate) hand-off the non-muxed path uses).
+        containers, muxed_audio, sample_rate = request_output.output
+        assert isinstance(containers, list)
+        assert len(containers) == 2
+        assert muxed_audio is None
+        assert sample_rate == 16000
+        for data in containers:
             assert isinstance(data, bytes)
             frames, samples = _decode_mp4(data)
             assert frames > 0
@@ -868,7 +873,7 @@ def test_s2v_preencode_skips_encoding_on_a_vae_patch_parallel_peer(monkeypatch) 
     # Once for the initial motion latents, once more from the peer's broadcast clip.
     assert pipeline.prepare_motion_latents.call_count == 2, "the motion loop still consumes the peer's frames"
     assert sessions[0]._encoders == []
-    assert [request_output.output for request_output in outputs] == [[], []]
+    assert [request_output.output for request_output in outputs] == [([], None, 16000), ([], None, 16000)]
 
 
 @pytest.mark.parametrize("output_type", ["pil", "pt", "latent"])

@@ -558,9 +558,10 @@ class TestAudioResponseFormat:
 
     @pytest.mark.asyncio
     async def test_legacy_audio_sample_rate_key_resolves_with_warning(self):
-        # Diffusion formatters still surface the rate under the legacy
-        # "audio_sample_rate" spelling (until the formatter PR normalizes
-        # it); the serving layer resolves it instead of defaulting.
+        # The diffusion formatter emits the canonical "sr" spelling now, but a
+        # payload carrying only the legacy "audio_sample_rate" (older model
+        # builds, third-party emitters) must still resolve — with the
+        # deprecation warning — instead of defaulting.
         engine = MagicMock()
         engine.errored = False
         engine.model_type = "LTX2TextToAudioPipeline"

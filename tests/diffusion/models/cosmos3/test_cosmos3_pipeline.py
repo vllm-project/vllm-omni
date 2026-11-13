@@ -1645,13 +1645,13 @@ def test_postprocess_handles_image_video_audio_and_validation() -> None:
     # Video-only postprocess returns the bare processed video (not a dict),
     # matching the image/latent branches and peer audio-capable pipelines.
     assert not isinstance(func({"video": video}), dict)
-    assert (
-        func(
-            {"video": video, "audio": torch.ones(1, 2, 16), "audio_sample_rate": 48000},
-            sampling_params=SimpleNamespace(extra_args={"resolved_frame_rate": 12}),
-        )["audio_sample_rate"]
-        == 48000
+    audio_result = func(
+        {"video": video, "audio": torch.ones(1, 2, 16), "audio_sample_rate": 48000},
+        sampling_params=SimpleNamespace(extra_args={"resolved_frame_rate": 12}),
     )
+    # Audio-bearing postprocess always returns the envelope form.
+    assert audio_result["metadata"]["audio"]["sample_rate"] == 48000
+    assert audio_result["metadata"]["video"]["fps"] == 12
 
     with pytest.raises(ValueError, match="text-to-image postprocess expects"):
         func({"image": torch.zeros(1, 3, 2, 4, 4)})

@@ -1015,13 +1015,13 @@ def test_joint_postprocess_is_multiprocessing_picklable():
 
     result = postprocess((video, audio), output_type="np")
 
-    assert isinstance(result["video"], list)
-    assert result["video"][0].dtype == np.uint8
-    assert result["video"][0].shape == (2, 4, 5, 3)
-    np.testing.assert_array_equal(result["video"][0], video[0].numpy())
-    np.testing.assert_array_equal(result["audio"], audio.numpy())
-    assert result["audio_sample_rate"] == 32000
-    assert result["fps"] == 24
+    assert isinstance(result["payload"]["video"], list)
+    assert result["payload"]["video"][0].dtype == np.uint8
+    assert result["payload"]["video"][0].shape == (2, 4, 5, 3)
+    np.testing.assert_array_equal(result["payload"]["video"][0], video[0].numpy())
+    np.testing.assert_array_equal(result["payload"]["audio"], audio.numpy())
+    assert result["metadata"]["audio"]["sample_rate"] == 32000
+    assert result["metadata"]["video"]["fps"] == 24
 
 
 def test_preencoded_output_survives_process_queue_pickling():
@@ -1060,7 +1060,7 @@ def test_preencoded_frame_counts_survive_registered_postprocess():
 
 
 @pytest.mark.parametrize("frame_counts", [[], [7, 9], [0], [-1], [True], ["7"], 7])
-def test_invalid_preencoded_counts_preserve_the_legacy_video_result(frame_counts):
+def test_invalid_preencoded_counts_drop_frame_counts_only(frame_counts):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _minimax_h3_post_process,
         _MiniMaxH3EncodedOutput,
@@ -1068,10 +1068,10 @@ def test_invalid_preencoded_counts_preserve_the_legacy_video_result(frame_counts
 
     result = _minimax_h3_post_process(_MiniMaxH3EncodedOutput(video=[b"encoded-video"], frame_counts=frame_counts))
 
-    assert result["video"] == [b"encoded-video"]
-    assert result["audio"] == [None]
-    assert result["fps"] == 24
-    assert "metadata" not in result
+    assert result["payload"]["video"] == [b"encoded-video"]
+    assert result["payload"]["audio"] == [None]
+    assert result["metadata"]["video"] == {"fps": 24}
+    assert result["metadata"]["audio"] == {"sample_rate": 32000}
 
 
 def test_untyped_four_tuple_is_not_treated_as_encoded_frame_counts():
@@ -1129,8 +1129,8 @@ def test_joint_video_output_is_quantized_before_transfer():
     torch.testing.assert_close(prepared, expected, rtol=0, atol=0)
 
     result = _minimax_h3_post_process((prepared, torch.zeros(1, 2, 6)))
-    assert result["video"][0].dtype == np.uint8
-    np.testing.assert_array_equal(result["video"][0], expected[0].numpy())
+    assert result["payload"]["video"][0].dtype == np.uint8
+    np.testing.assert_array_equal(result["payload"]["video"][0], expected[0].numpy())
 
 
 def test_cfg_parallel_is_rejected_for_distilled_checkpoint():
@@ -4217,7 +4217,7 @@ def test_peer_vae_rank_post_decode_reaches_post_processing(monkeypatch):
     output = pipeline.post_decode(state)
 
     assert output.output == (b"", None)
-    assert mod._minimax_h3_post_process(output.output)["video"] == [b""]
+    assert mod._minimax_h3_post_process(output.output)["payload"]["video"] == [b""]
 
 
 @pytest.mark.parametrize("duration", [60, 75])

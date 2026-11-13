@@ -108,10 +108,10 @@ async def test_non_streaming_without_rate_fails_loudly(mocker: MockerFixture) ->
 async def test_diffusion_payload_legacy_key_labels_the_waveform(
     mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The diffusion formatter surfaces the rate under its legacy
-    # ``audio_sample_rate`` spelling (until the formatter PR normalizes it);
-    # the serving layer must resolve it instead of silently defaulting to
-    # 24000 and mislabeling the waveform.
+    # The diffusion formatter emits the canonical ``sr`` spelling now, but a
+    # payload carrying only the legacy ``audio_sample_rate`` (older model
+    # builds, third-party emitters) must still resolve instead of silently
+    # defaulting to 24000 and mislabeling the waveform.
     server = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
     server._adapter = SimpleNamespace()
 

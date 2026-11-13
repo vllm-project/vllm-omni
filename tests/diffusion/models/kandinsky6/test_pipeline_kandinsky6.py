@@ -144,10 +144,10 @@ class _FakeAudioVAE:
 def test_kandinsky6_post_process_func_packages_video_and_audio():
     """Pure-function test: no model/weights needed. Confirms the post-process
     payload shape matches what io_support.py -> output_formatter.py ->
-    media_utils.py's PyAV muxing expects (the same flat {"video", "audio",
-    "audio_sample_rate", "fps"} shape MiniMax H3's own post-process function
-    produces), and that int16 PCM from ``postprocess_audio`` is rescaled to
-    the float32 [-1, 1] waveform the muxer consumes."""
+    media_utils.py's PyAV muxing expects (the historical flat {"video",
+    "audio", "audio_sample_rate", "fps"} shape — the formatter lifts both flat
+    spellings into metadata), and that int16 PCM from ``postprocess_audio``
+    is rescaled to the float32 [-1, 1] waveform the muxer consumes."""
     from vllm_omni.diffusion.models.kandinsky6 import get_kandinsky6_post_process_func
 
     post_process = get_kandinsky6_post_process_func(od_config=None)

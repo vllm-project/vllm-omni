@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """OmniVoice diffusion output carries the audio sample rate."""
 
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -18,7 +19,7 @@ from vllm_omni.diffusion.output_formatter import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.sample_rate import DeprecatedSampleRateKeyWarning, get_sampling_rate
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, DeprecatedSampleRateKeyWarning, get_sampling_rate
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -64,9 +65,10 @@ def test_postprocess_output_carries_rate() -> None:
     multimodal_output = result.multimodal_output
     assert result.final_output_type == "audio"
     assert "audio" in multimodal_output
-    # The formatter still emits the legacy diffusion spelling; PR 10 moves it
-    # to SAMPLE_RATE_KEY. Until then the rate resolves through the shared
-    # reader, with the deprecation warning the migration contract requires.
-    assert multimodal_output["audio_sample_rate"] == OmniVoicePipeline.audio_sample_rate
-    with pytest.warns(DeprecatedSampleRateKeyWarning):
+    # The formatter emits the canonical key; the shared reader resolves it with
+    # no deprecation warning (the migration contract's steady state).
+    assert multimodal_output[SAMPLE_RATE_KEY] == OmniVoicePipeline.audio_sample_rate
+    assert "audio_sample_rate" not in multimodal_output
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecatedSampleRateKeyWarning)
         assert get_sampling_rate(multimodal_output) == OmniVoicePipeline.audio_sample_rate

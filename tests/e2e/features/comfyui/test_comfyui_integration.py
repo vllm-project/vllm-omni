@@ -444,7 +444,7 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                 multimodal_output={
                     "fps": float(source.fps),
                     "audio": source.audio,
-                    "audio_sample_rate": source.audio_sample_rate,
+                    "sr": source.audio_sample_rate,
                 },
                 final_output_type="video",
             )

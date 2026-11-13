@@ -25,6 +25,7 @@ from vllm_omni.outputs.output_metadata import (
     validate_diffusion_metadata,
     validate_public_diffusion_metadata,
 )
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,39 @@ def _is_output_envelope(outputs: DiffusionPostprocessRawOutput) -> TypeGuard[Dif
     return isinstance(outputs, dict) and isinstance(outputs.get("payload"), dict)
 
 
+# Flat media keys a pipeline may leave on a payload instead of using the
+# metadata groups; normalize_* lifts them into ``metadata`` and strips them
+# from the payload either way.
+_FLAT_MEDIA_METADATA_KEYS = frozenset({"audio_sample_rate", SAMPLE_RATE_KEY, "fps"})
+
+
+def _lift_flat_media_metadata(payload: DiffusionPayload, metadata: DiffusionMetadata) -> DiffusionMetadata:
+    """Fold flat media rates left on an envelope payload into the metadata groups.
+
+    Envelope metadata wins: a flat key only fills a field the envelope did not
+    provide. Without this lift, a pipeline returning an envelope with a flat
+    rate on the payload (kandinsky6) would ship unlabeled audio — muxers would
+    then fall back to their default rate.
+    """
+    rate = payload.get(SAMPLE_RATE_KEY)
+    if rate is None:
+        rate = payload.get("audio_sample_rate")
+    if rate is not None:
+        audio_metadata = metadata.get("audio")
+        audio_metadata = dict(audio_metadata) if isinstance(audio_metadata, dict) else {}
+        if "sample_rate" not in audio_metadata:
+            audio_metadata["sample_rate"] = rate
+            metadata = {**metadata, "audio": audio_metadata}
+    fps = payload.get("fps")
+    if fps is not None:
+        video_metadata = metadata.get("video")
+        video_metadata = dict(video_metadata) if isinstance(video_metadata, dict) else {}
+        if "fps" not in video_metadata:
+            video_metadata["fps"] = fps
+            metadata = {**metadata, "video": video_metadata}
+    return metadata
+
+
 def normalize_diffusion_postprocess_output(
     outputs: DiffusionPostprocessRawOutput,
 ) -> DiffusionPostprocessOutput:
@@ -48,6 +82,8 @@ def normalize_diffusion_postprocess_output(
         metadata = outputs.get("metadata") or {}
         if not isinstance(metadata, dict):
             metadata = {}
+        metadata = _lift_flat_media_metadata(payload, metadata)
+        payload = {key: value for key, value in payload.items() if key not in _FLAT_MEDIA_METADATA_KEYS}
         validate_diffusion_metadata(metadata)
 
         public_metadata = strip_internal_metadata(metadata)
@@ -62,7 +98,7 @@ def normalize_diffusion_postprocess_output(
         )
 
     if isinstance(outputs, dict):
-        payload = {key: value for key, value in outputs.items() if key not in {"audio_sample_rate", "fps"}}
+        payload = {key: value for key, value in outputs.items() if key not in _FLAT_MEDIA_METADATA_KEYS}
         metadata = _metadata_from_legacy_payload(outputs)
         if "text" in payload and "text" not in metadata:
             metadata["text"] = {}
@@ -82,7 +118,9 @@ def normalize_diffusion_postprocess_output(
 
 def _metadata_from_legacy_payload(payload: dict[str, DiffusionPayloadValue]) -> DiffusionMetadata:
     metadata: DiffusionMetadata = {}
-    audio_sample_rate = payload.get("audio_sample_rate")
+    audio_sample_rate = payload.get(SAMPLE_RATE_KEY)
+    if audio_sample_rate is None:
+        audio_sample_rate = payload.get("audio_sample_rate")
     if audio_sample_rate is not None:
         metadata["audio"] = {"sample_rate": audio_sample_rate}
     fps = payload.get("fps")
@@ -254,7 +292,7 @@ def _format_audio_multimodal_output(
     if metadata:
         mm_output["metadata"] = metadata
     if audio_sample_rate is not None:
-        mm_output["audio_sample_rate"] = audio_sample_rate
+        mm_output[SAMPLE_RATE_KEY] = audio_sample_rate
     return mm_output
 
 
@@ -279,7 +317,7 @@ def _build_multimodal_output(
         if key == "audio" or key in STRUCTURED_PAYLOAD_KEYS:
             mm_output[key] = value
     if audio_sample_rate is not None:
-        mm_output["audio_sample_rate"] = audio_sample_rate
+        mm_output[SAMPLE_RATE_KEY] = audio_sample_rate
     if (fps := _metadata_video_fps(postprocess_output.metadata)) is not None:
         mm_output["fps"] = fps
     return mm_output
