@@ -32,6 +32,41 @@ last_reviewed: 2026-07-16
 The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
 
+After applying sampled output, the AR scheduler publishes only completed KV
+blocks to upstream prefix caching, including on its plain-decode path. Async
+placeholders and speculative steps use `num_computed_tokens - num_in_flight_tokens`
+as the materialized frontier. Stale output and requests that were not running
+before the update do not publish blocks. Publication precedes stop cleanup so
+the last completed blocks remain reusable after a request finishes.
+
+For Bagel image editing, the vLLM 0.33 prefix-range helper receives shallow
+`image` views of the custom `img2img` features so both VAE and ViT embedding
+spans retain bidirectional attention. The original features keep their modality,
+encoder data, cache identifiers and placeholder masks. Upstream still computes
+the ranges and applies sliding-window and padding rules. This adapter is installed
+from `vllm_omni.patch` for both upstream runner implementations; it is unnecessary
+with vLLM versions that build the ranges inline.
+
+MOSS Local's fused and separate depth-attention paths share an explicitly
+rounded initial weighted value and the same FMA accumulation order. This
+preserves bitwise parity when the compiler inlines attention into sampling,
+including SM89 code generation affected by LLVM SLP reduction reordering.
+
+## Qwen3-Omni Talker sampling
+
+The MRv2 Talker adapter follows the selected vLLM sampler's dispatch contract,
+including its `has_topp_only_rows` predicate. Seeded rows pass that predicate to
+top-k/top-p masking before drawing from their request-local V1 generators.
+Unseeded and greedy rows keep upstream sampling. When mixed rows have already
+been masked, their upstream call disables repeated masking and fused sampling.
+
+Custom samplers register their selected JIT kernels while the runner's startup
+registry is active. The Talker's seeded V1 stream uses native top-k/top-p
+masking even when unseeded sampling selects FlashInfer, so it registers those
+native kernels explicitly. AR workers also warm the existing fused-MoE prefill
+batch sizes on both runner implementations before CUDA graph capture and JIT
+monitoring. These startup passes leave EPLB load recording disabled.
+
 ## Full-payload input scheduling
 
 For a downstream, non-async stage with `requires_full_payload_input`,

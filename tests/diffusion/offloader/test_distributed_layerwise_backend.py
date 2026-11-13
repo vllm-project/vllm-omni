@@ -93,7 +93,7 @@ class TestDistributedLayerwiseOffloadHook:
         hook.offload_layer()
         assert not hook.is_materialized
 
-    def test_initialize_failure_keeps_next_block_materialized(self, monkeypatch):
+    def test_initialize_failure_keeps_next_block_materialized(self, monkeypatch, patched_offload_runtime):
         current_block = nn.Linear(2, 2)
         next_block = nn.Linear(2, 2)
         expected = {name: tensor.detach().clone() for name, tensor in next_block.state_dict().items()}
@@ -2931,7 +2931,9 @@ class TestDistributedComponentSelection:
             assert registry is None or registry.get_hook("distributed_layerwise_offload") is None
             torch.testing.assert_close(block.weight, expected)
 
-    def test_multirank_enable_failure_cleanup_skips_restore_collective(self, monkeypatch, mocker):
+    def test_multirank_enable_failure_cleanup_skips_restore_collective(
+        self, monkeypatch, mocker, patched_offload_runtime
+    ):
         backend = DistributedLayerwiseOffloadBackend(
             OffloadConfig(
                 strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,

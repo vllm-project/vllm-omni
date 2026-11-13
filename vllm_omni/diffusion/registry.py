@@ -7,6 +7,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
+from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig, uses_diffusers_adapter
@@ -35,6 +36,8 @@ def resolve_native_single_file(model_class_name: str | None) -> str | None:
 
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
+    "HyNomasPipeline": ("hy_nomas", "pipeline_hy_nomas", "HyNomasPipeline"),
+    "HyNomasModularPipeline": ("hy_nomas", "pipeline_hy_nomas", "HyNomasPipeline"),
     "SeedVR2Pipeline": ("seedvr2", "pipeline_seedvr2", "SeedVR2Pipeline"),
     "QwenImagePipeline": (
         "qwen_image",
@@ -156,6 +159,11 @@ _DIFFUSION_MODELS = {
         "pipeline_minimax_h3_decoder",
         "MiniMaxH3DecoderPipeline",
     ),
+    "MiniMaxH3ImagePipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3_image",
+        "MiniMaxH3ImagePipeline",
+    ),
     "AuKPipeline": (
         "auk",
         "pipeline_auk",
@@ -165,6 +173,11 @@ _DIFFUSION_MODELS = {
         "stable_audio",
         "pipeline_stable_audio",
         "StableAudioPipeline",
+    ),
+    "StableAudio3Pipeline": (
+        "stable_audio_3",
+        "pipeline_stable_audio_3",
+        "StableAudio3Pipeline",
     ),
     "WanImageToVideoPipeline": (
         "wan2_2",
@@ -250,6 +263,11 @@ _DIFFUSION_MODELS = {
         "internvla_a1",
         "pipeline_internvla_a1",
         "InternVLAA1Pipeline",
+    ),
+    "Alpamayo2SuperPipeline": (
+        "alpamayo2_super",
+        "pipeline_alpamayo2_super",
+        "Alpamayo2SuperPipeline",
     ),
     "Gr00tN1d7Pipeline": (
         "gr00t",
@@ -355,6 +373,11 @@ _DIFFUSION_MODELS = {
         "pipeline_flux2",
         "Flux2Pipeline",
     ),
+    "Flux3Pipeline": (
+        "flux3",
+        "pipeline_flux3",
+        "Flux3Pipeline",
+    ),
     "SenseNovaU1Pipeline": (
         "sensenova_u1",
         "pipeline_sensenova_u1",
@@ -369,6 +392,12 @@ _DIFFUSION_MODELS = {
         "hunyuan_video",
         "pipeline_hunyuan_video_1_5_i2v",
         "HunyuanVideo15I2VPipeline",
+    ),
+    # PAN 2 checkpoints are Modular Diffusers repositories: `modular_model_index.json` declares this class.
+    "PAN2ModularPipeline": (
+        "pan2",
+        "pipeline_pan2",
+        "PAN2Pipeline",
     ),
     "LingBotVideoPipeline": (
         "lingbot_video",
@@ -430,6 +459,9 @@ _DIFFUSION_MODELS = {
         "pipeline_anima",
         "AnimaPipeline",
     ),
+    "PhysisH3Pipeline": ("physis.h3", "pipeline_physis_h3", "PhysisH3Pipeline"),
+    "PhysisLTXPipeline": ("physis.ltx", "pipeline_physis_ltx", "PhysisLTXPipeline"),
+    "PhysisWanPipeline": ("physis.wan", "pipeline_physis_wan", "PhysisWanPipeline"),
     "CausVidWanPipeline": (
         "causvid_wan",
         "pipeline_causvid_wan",
@@ -458,7 +490,6 @@ _DIFFUSION_MODELS = {
 }
 _DIFFUSION_MODELS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_MODELS["MingImageDiffusionPipeline"]
 
-
 DiffusionModelRegistry = _ModelRegistry(
     {
         model_arch: _LazyRegisteredModel(
@@ -468,6 +499,47 @@ DiffusionModelRegistry = _ModelRegistry(
         for model_arch, (mod_folder, mod_relname, cls_name) in _DIFFUSION_MODELS.items()
     }
 )
+
+
+def resolve_diffusion_pipeline_cls(od_config: OmniDiffusionConfig) -> type | None:
+    """Resolve the pipeline class ``od_config`` selects, without instantiating it.
+
+    Resolution order mirrors model-load time: an explicit
+    ``custom_pipeline_args['pipeline_class']``, then the diffusers adapter,
+    then the native registry lookup by ``model_class_name``. Returns ``None``
+    when no class can be resolved.
+    """
+    custom_pipeline_args = getattr(od_config, "custom_pipeline_args", None)
+    if custom_pipeline_args and "pipeline_class" in custom_pipeline_args:
+        pipeline_cls = custom_pipeline_args["pipeline_class"]
+        if isinstance(pipeline_cls, type):
+            return pipeline_cls
+        if isinstance(pipeline_cls, str):
+            try:
+                return resolve_obj_by_qualname(pipeline_cls)
+            except (AttributeError, ImportError, ValueError) as exc:
+                raise ValueError(f"Failed to resolve custom diffusion pipeline class {pipeline_cls!r}.") from exc
+        raise TypeError(
+            "custom_pipeline_args['pipeline_class'] must be a qualified name string or a class, "
+            f"got {type(pipeline_cls).__name__}"
+        )
+
+    if uses_diffusers_adapter(od_config):
+        return DiffusionModelRegistry._try_load_model_cls("DiffusersAdapterPipeline")
+
+    return DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
+
+
+def supports_mixfusion(od_config: OmniDiffusionConfig) -> bool:
+    """Return whether the resolved pipeline opts into MixFusion packed batching.
+
+    Pipelines declare the capability with the optional class attribute
+    ``supports_mixfusion = True``; anything without it (or unresolvable) is
+    treated as unsupported.
+    """
+    model_cls = resolve_diffusion_pipeline_cls(od_config)
+    return model_cls is not None and bool(getattr(model_cls, "supports_mixfusion", False))
+
 
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
@@ -480,12 +552,20 @@ _NO_CACHE_ACCELERATION = {
     # instead of erroring.
     "Pi0Pipeline",
     "Pi05Pipeline",
+    # Alpamayo 2 Super's action expert likewise runs its own Euler loop over a
+    # transferred KV prefix, with no DiT block list.
+    "Alpamayo2SuperPipeline",
     # SAM3 is a single forward pass with no denoising steps to cache.
     "Sam3Model",
     "Sam3VideoModel",
     "LingBotWorldCausalDMDPipeline",
     "TaoMateH3Pipeline",
+    # PDD release: one fused output head per step, nothing to cache or skip.
+    "MiniMaxH3ImagePipeline",
     "CausVidWanPipeline",
+    "PhysisWanPipeline",
+    "PhysisH3Pipeline",
+    "PhysisLTXPipeline",
     "ABotWorldCausalPipeline",
     # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
     # branch) across denoising steps, which conflicts with cache_dit / tea_cache
@@ -512,6 +592,7 @@ def _prepare_diffusion_quant_config(
 
 def initialize_model(
     od_config: OmniDiffusionConfig,
+    model_init_kwargs: dict | None = None,
 ) -> nn.Module:
     """Initialize a diffusion model from the registry.
 
@@ -534,7 +615,7 @@ def initialize_model(
     if model_class is not None:
         _prepare_diffusion_quant_config(od_config, model_class)
         with set_current_diffusion_config(od_config):
-            model = model_class(od_config=od_config)
+            model = model_class(od_config=od_config, **(model_init_kwargs or {}))
 
         vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
         vae_mode = od_config.parallel_config.vae_parallel_mode
@@ -571,10 +652,17 @@ def initialize_model(
         # at model loading time, not inside individual model files
         _apply_sequence_parallel_if_enabled(model, od_config)
 
+        # Apply the MixFusion packed-layout hooks declared by _mixfusion_plan.
+        # They are the MixFusion counterpart of _sp_plan and stay inert unless
+        # the MixFusionDriver arms a MixFusionStep on the forward context.
+        _apply_mixfusion_if_enabled(model, od_config)
+
         # Install the Wan VAE decoder fast path once the VAE parallel mode is
         # known. This runs inside the weight-loading memory pool, so any weight
         # re-layout it performs stays offloadable by sleep mode.
         _apply_wan_vae_fastpath_if_enabled(model, od_config)
+
+        current_omni_platform.apply_diffusion_model_patches(model, od_config)
 
         return model
     else:
@@ -714,7 +802,17 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
         logger.warning(f"Failed to apply sequence parallelism: {e}. Continuing without SP hooks.")
 
 
+def _apply_mixfusion_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
+    """Mount MixFusion (hooks + driver) on a capable pipeline; see ``mixfusion.setup``."""
+    from vllm_omni.diffusion.mixfusion.setup import mount_mixfusion
+
+    mount_mixfusion(model, od_config, supported=supports_mixfusion(od_config))
+
+
 _DIFFUSION_POST_PROCESS_FUNCS = {
+    "PhysisWanPipeline": "get_wan22_post_process_func",
+    "PhysisH3Pipeline": "get_wan22_post_process_func",
+    "PhysisLTXPipeline": "get_wan22_post_process_func",
     # arch: post_process_func
     # `post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
@@ -744,8 +842,10 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3DecoderPipeline": "get_minimax_h3_post_process_func",
+    "MiniMaxH3ImagePipeline": "get_minimax_h3_image_post_process_func",
     "AuKPipeline": "get_auk_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "StableAudio3Pipeline": "get_stable_audio_3_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
@@ -777,6 +877,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Flux2Pipeline": "get_flux2_post_process_func",
     "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
+    "PAN2ModularPipeline": "get_pan2_post_process_func",
     "HunyuanImage3Pipeline": "get_hunyuan_image3_post_process_func",
     "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
     "SanaVideoPipeline": "get_sana_video_post_process_func",
@@ -790,6 +891,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
+    "Flux3Pipeline": "get_flux3_post_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_post_process_func",
     "MOSSImagePipeline": "get_mossimage_post_process_func",
@@ -844,6 +946,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "MammothModa2DiTPipeline": "get_mammoth_moda2_pre_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_pre_process_func",
+    "Flux3Pipeline": "get_flux3_pre_process_func",
+    "PAN2ModularPipeline": "get_pan2_pre_process_func",
 }
 
 
