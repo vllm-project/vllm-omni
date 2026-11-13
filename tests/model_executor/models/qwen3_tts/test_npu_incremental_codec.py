@@ -41,10 +41,10 @@ def test_partial_chunks_do_not_capture_and_slots_reset(monkeypatch, explicit_hea
 
     monkeypatch.setattr(_ShapeGraph, "capture", unexpected_capture)
     try:
-        # Both requests span a captured full chunk and an uncaptured tail.
+        # Both requests span a full chunk and an eager tail.
         first = arena.decode_requests(codes, [7, 7], caches)
         retained = [wave.clone() for wave in first]
-        assert set(arena.graphs) == {(1, 1, 0), (1, 4, 0), (2, 1, 0), (2, 4, 0)}
+        assert set(arena.graphs) == {(batch, length, 0) for batch in (1, 2) for length in (1, 4)}
         assert [cache["npu_produced"] for cache in caches] == [7, 7]
         for row in range(2):
             assert first[row].numel() == 7 * decoder.total_upsample
@@ -107,6 +107,9 @@ def test_dual_stream_matches_serial_state_and_owned_audio(monkeypatch):
     monkeypatch.setattr(_ShapeGraph, "capture", no_capture)
     try:
         assert len(parallel.graphs) == 2 * len(serial.graphs)
+        pools = [{graph.graph.pool() for key, graph in parallel.graphs.items() if key[2] == lane} for lane in (0, 1)]
+        assert len(pools[0]) == len(pools[1]) == 1
+        assert pools[0].isdisjoint(pools[1])
         # More groups than lanes, ragged tails, zero-length input, and
         # lane -> owner -> lane reuse of the same graph storage.
         for lengths in ([7, 7, 3, 4, 1], [1], [4, 3, 7, 0, 4]):
@@ -345,3 +348,74 @@ def test_explicit_dual_stream_conflict_fails_before_capture(monkeypatch, has_tri
     with pytest.raises(ValueError, match="npu_codec_streams=2 requires"):
         qwen3_tts._patched_load_weights(model, [])
     capture.assert_not_called()
+
+
+@torch.inference_mode()
+def test_tail_row_scatter_does_not_compile_for_new_strides(monkeypatch):
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("NPU required")
+    from vllm.triton_utils import triton
+
+    from vllm_omni.platforms.npu.layers.codec_row_scatter import scatter_rows
+
+    target = torch.zeros(8, 3, 7, device="npu", dtype=torch.bfloat16)
+    indices = torch.tensor([6, 1, 4], device="npu")
+    first = torch.randn(3, 3, 8, device="npu", dtype=torch.bfloat16)[:, :, -7:]
+    scatter_rows(target, indices, first)
+    torch.npu.synchronize()
+
+    def no_compile(*args, **kwargs):
+        pytest.fail("a new tail stride must reuse the warmed scatter kernel")
+
+    monkeypatch.setattr(triton.runtime.jit.JITFunction, "_do_compile", no_compile)
+    for length in range(2, 26):
+        source = torch.randn(3, 3, 7 + length, device="npu", dtype=torch.bfloat16)[:, :, -7:]
+        expected = target.clone().index_copy_(0, indices, source)
+        scatter_rows(target, indices, source)
+        torch.testing.assert_close(target, expected, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_all_tail_lengths_match_eager_state(monkeypatch):
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("NPU required")
+    from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
+    from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec, _ShapeGraph
+    from vllm_omni.platforms.npu.models.qwen3_tts import _prepare_npu_code2wav_runtime
+
+    _prepare_npu_code2wav_runtime()
+    decoder = _make_decoder().to(device="npu", dtype=torch.bfloat16).eval()
+    for module in decoder.modules():
+        if hasattr(module, "precompute_embedding"):
+            module.embedding_sum.normal_()
+            module.precompute_embedding()
+    decoder.precompute_snake_caches()
+    arena = NPUIncrementalCodec(decoder, slots=2, max_batch=2, chunk_frames=25)
+    with monkeypatch.context() as patch:
+        patch.setattr(NPUIncrementalCodec, "prewarm", lambda self: None)
+        reference = NPUIncrementalCodec(decoder, slots=2, max_batch=2, chunk_frames=25)
+    caches = [{}, {}]
+    ref_slots = [reference.alloc(), reference.alloc()]
+    indices = torch.tensor(ref_slots, device="npu")
+    run = _ShapeGraph.run
+
+    def checked_run(graph, indices, codes, *, replay):
+        if graph.arena is arena:
+            assert replay
+            assert (graph.graph is not None) == (graph.length in (1, 25))
+        return run(graph, indices, codes, replay=replay)
+
+    monkeypatch.setattr(_ShapeGraph, "run", checked_run)
+    try:
+        for length in range(1, 26):
+            codes = torch.randint(0, 32, (2, 2, length), device="npu")
+            expected = _ShapeGraph(reference, 2, length).run(indices, codes, replay=False)
+            actual = arena.decode_requests(codes, [length, length], caches)
+            for row in range(2):
+                torch.testing.assert_close(actual[row], expected[row, 0], atol=0.015, rtol=0.03)
+            torch.testing.assert_close(arena.frames, reference.frames)
+    finally:
+        arena.close()
+        reference.close()

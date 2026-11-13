@@ -165,3 +165,171 @@ def test_native_swiglu_matches_packed_mlp_and_replays():
     finally:
         torch.npu.synchronize()
         graph.reset()
+
+
+@pytest.mark.parametrize("batch", [1, 4, 8])
+@pytest.mark.parametrize("native_gqa", [False, True])
+@torch.inference_mode()
+def test_cached_predictor_matches_prefill_and_resets_each_frame(batch, native_gqa):
+    require_npu()
+    from vllm_omni.model_executor.models.common.qwen3_code_predictor import CodePredictorBaseModel
+    from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig
+
+    torch.manual_seed(123)
+    config = Qwen3TTSTalkerCodePredictorConfig(
+        hidden_size=512,
+        intermediate_size=1024,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=128,
+        num_code_groups=16,
+        vocab_size=64,
+    )
+    model = CodePredictorBaseModel(config).to(device="npu", dtype=torch.bfloat16).eval()
+    for layer in model.layers:
+        layer.self_attn.use_npu_native_gqa = native_gqa
+    inputs = torch.randn(batch, 16, 512, device="npu", dtype=torch.bfloat16)
+    positions = torch.arange(16, device="npu").expand(batch, -1)
+    caches = [
+        (
+            torch.zeros(batch, 2, 16, 128, device="npu", dtype=torch.bfloat16),
+            torch.zeros(batch, 2, 16, 128, device="npu", dtype=torch.bfloat16),
+        )
+        for _ in model.layers
+    ]
+    steps = []
+    for step in range(1, 16):
+        begin = 0 if step == 1 else step
+        writes = torch.arange(begin, step + 1, device="npu")
+        mask = (torch.arange(16, device="npu")[None, :] <= writes[:, None])[None, None]
+        steps.append((begin, step + 1, writes, mask))
+
+    def compute():
+        outputs = []
+        for begin, end, writes, mask in steps:
+            hidden = model.forward_cached(inputs[:, begin:end], positions[:, begin:end], caches, writes, mask)
+            outputs.append(hidden[:, -1:])
+        return torch.cat(outputs, dim=1)
+
+    stream = torch.npu.Stream()
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        for _ in range(3):
+            compute()
+    torch.npu.current_stream().wait_stream(stream)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    try:
+        with torch.npu.graph(graph, stream=stream):
+            output = compute()
+        for _ in range(2):
+            inputs.normal_()
+            for keys, values in caches:
+                keys.fill_(100)
+                values.fill_(100)
+            graph.replay()
+            expected = model(inputs, positions)[:, 1:]
+            torch.testing.assert_close(output, expected, atol=0.06, rtol=0.06)
+    finally:
+        torch.npu.synchronize()
+        graph.reset()
+
+
+@pytest.mark.parametrize("batch", [1, 4, 8])
+@torch.inference_mode()
+def test_frame_graph_fused_sampling_matches_reference(batch):
+    require_npu()
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.common.qwen3_code_predictor import CodePredictorBaseModel
+    from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig
+    from vllm_omni.platforms.npu.layers.predictor_frame_graph import PredictorFrameGraph
+
+    torch.manual_seed(719)
+    config = Qwen3TTSTalkerCodePredictorConfig(
+        hidden_size=512,
+        intermediate_size=1024,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=128,
+        num_code_groups=16,
+        vocab_size=64,
+    )
+    model = CodePredictorBaseModel(config).to(device="npu", dtype=torch.bfloat16).eval()
+    for layer in model.layers:
+        layer.self_attn.use_npu_native_gqa = True
+    predictor = SimpleNamespace(
+        _num_groups=16,
+        model=model,
+        config=config,
+        _proj_buf=torch.zeros(batch, 17, 512, device="npu", dtype=torch.bfloat16),
+        _bucket_pos_ids={batch: torch.arange(17, device="npu").expand(batch, -1)},
+        _compiled_model_fwd=model,
+        _lm_heads_list=[torch.nn.Linear(512, 64, bias=False, device="npu", dtype=torch.bfloat16) for _ in range(15)],
+        _codec_embeds_list=[torch.nn.Embedding(64, 512, device="npu", dtype=torch.bfloat16) for _ in range(15)],
+        small_to_mtp_projection=torch.nn.Identity(),
+        _kv_requested=True,
+        _fused_sampling=False,
+    )
+    graphs = []
+    try:
+        for fused in (False, True):
+            predictor._fused_sampling = fused
+            graph = PredictorFrameGraph(predictor, batch, 50, 1 / 0.9)
+            graph.uniforms.fill_(0.5)
+            graph.codes[:, 0] = 0
+            graph.capture()
+            graphs.append(graph)
+        for _ in range(3):
+            inputs = torch.randn(batch, 2, 512, device="npu", dtype=torch.bfloat16)
+            draws = torch.rand(batch, 15, 64, device="npu").clamp_min_(1e-20)
+            outputs = []
+            for graph in graphs:
+                predictor._proj_buf[:, :2].copy_(inputs)
+                outputs.append(graph.run(draws).clone())
+            torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+    finally:
+        torch.npu.synchronize()
+        for graph in graphs:
+            graph.graph.reset()
+
+
+@pytest.mark.parametrize("batch", [1, 4, 8])
+@pytest.mark.parametrize("steps", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@torch.inference_mode()
+def test_rope_cache_preserves_eager_rounding_and_unwritten_slots(batch, steps, dtype):
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("NPU required")
+    from vllm_omni.model_executor.models.common.qwen3_code_predictor import _rotate_half
+    from vllm_omni.platforms.npu.layers.predictor_rope_cache import rope_cache
+
+    q = torch.randn(batch, steps, 16, 128, device="npu", dtype=dtype).transpose(1, 2)
+    k = torch.randn(batch, steps, 8, 128, device="npu", dtype=dtype).transpose(1, 2)
+    v = torch.randn_like(k)
+    cos = torch.randn(batch, steps, 128, device="npu", dtype=dtype)
+    sin = torch.randn_like(cos)
+    positions = torch.arange(steps, device="npu") + 3
+    kc = torch.randn(batch, 8, 16, 128, device="npu", dtype=dtype)
+    vc = torch.randn_like(kc)
+    # Warm before capture, then change inputs to verify that replay reads them.
+    rope_cache(q, k, v, cos, sin, positions, kc, vc)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        actual = rope_cache(q, k, v, cos, sin, positions, kc, vc)
+    for _ in range(2):
+        q.normal_()
+        k.normal_()
+        v.normal_()
+        expected = q * cos[:, None] + _rotate_half(q) * sin[:, None]
+        ek, ev = kc.clone(), vc.clone()
+        ek.index_copy_(2, positions, k * cos[:, None] + _rotate_half(k) * sin[:, None])
+        ev.index_copy_(2, positions, v)
+        graph.replay()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        torch.testing.assert_close(kc, ek, atol=0, rtol=0)
+        torch.testing.assert_close(vc, ev, atol=0, rtol=0)
+    graph.reset()

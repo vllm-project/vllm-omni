@@ -659,8 +659,15 @@ to avoid nested replay; reload or module conversion releases the inner graphs.
 This is a stateless convolution graph optimization, not a replacement of the
 streaming cache with fixed request slots.
 
-On NPU BF16, `code_predictor_kv_cache: true` currently retains graphed
-re-prefill: the eager incremental KV path was slower in the measured workload.
+On NPU BF16, `code_predictor_kv_cache: true` reuses per-layer K/V buffers
+inside the predictor frame graph. It prefills the first two positions, then
+computes only the new position for each remaining residual codebook. Fixed
+capacity buffers are local to each graph batch size; causal masks exclude
+unwritten positions, and the next frame overwrites its prefix. They do not
+retain state across audio frames or requests. Qwen3-TTS enables this option
+by default when NPU frame graphs are enabled. Set it to false to use full
+re-prefill frame graphs. Disabling frame graphs also disables the implicit
+KV default; unsupported calls still use the existing re-prefill fallback.
 `code_predictor_fused_sampling: true` enables a separate sampling kernel and is
 enabled by default only for Qwen3-TTS on NPU. CUDA and other models retain
 their existing defaults; missing Triton uses reference sampling. Sampling retains the original per-request uniform
@@ -673,14 +680,25 @@ Unsupported input shapes/dtypes use the reference.
 steps together and disables the outer MTP graph only on NPU. Other platforms
 retain their outer graph when this option is set. It defaults to true on NPU
 and requires matching temperature/top-k, top-p of 1, and supplied uniforms.
-Unsupported calls retain the re-prefill fallback. Frame graphs capture reference
-Gumbel sampling; the per-call fused sampler is used on the per-step fallback path.
+Unsupported calls retain the re-prefill fallback. Frame graphs also use the NPU fused sampler when enabled and supported, retaining
+the same uniforms, ATen logarithms and top-k Gumbel semantics. Explicit false
+uses reference sampling in both frame graphs and the per-step fallback.
+
+The cached Predictor path combines RoPE and KV writes in a Triton kernel.
+It preserves the eager BF16/FP16 multiply rounding before addition, with
+floating-point contraction disabled. FP32 and environments without Triton
+retain the eager path. Only the current frame's selected cache positions are
+written; future positions remain masked by attention.
 
 `npu_incremental_codec: true` retains convolution tails and
 sliding-window KV in per-request slots. It is enabled by default on NPU.
-Only full chunks and single frames are captured at startup for batches up to
-`decode_batch_max_size`; other lengths run eagerly without capturing on live
-requests. Request completion releases and resets the slot; loading weights or
+Startup captures full chunks and single frames. Final partial chunks execute
+without live graph capture. Graphs on the same sequential lane share a scratch
+pool; the two concurrent lanes
+keep independent pools, and outputs are copied before the next replay.
+This avoids one expandable memory pool per shape. Selected-row
+state stores use runtime source strides and alignment-independent kernels so
+new tail views do not trigger Triton recompilation. Request completion releases and resets the slot; loading weights or
 converting the decoder releases its graphs. This path changes the streaming
 execution strategy and needs paired audio validation for the target workload.
 Its additive attention mask selects eager attention only for incremental calls;
@@ -699,7 +717,7 @@ defaults to two with incremental decode and Triton, otherwise one. An explicit
 only the implicit default adapts to missing prerequisites. By contrast,
 `enforce_eager=true` deliberately skips stateless convolution graph capture,
 including explicitly requested shapes, as the documented graph opt-out.
-Predictor frame-local KV has no routed NPU implementation and remains disabled.
+Predictor frame-local KV is enabled with NPU frame graphs; explicit false retains re-prefill.
 
 Compare actual graph coverage, startup cost, memory, latency and audio quality
 on the deployed model before changing these settings; synthetic tests alone do

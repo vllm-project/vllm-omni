@@ -18,6 +18,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 PREDICTOR_OPTIONS = (
     "code_predictor_fused_sampling",
     "code_predictor_frame_graph",
+    "code_predictor_kv_cache",
     "code_predictor_npu_native_gqa",
     "code_predictor_npu_fused_swiglu",
 )
@@ -34,7 +35,6 @@ def test_resolved_defaults_are_npu_only(monkeypatch, platform):
     )
     options = Predictor._stage_connector_extra_config(config)
     assert all(options.get(key, False) is (platform == "npu") for key in PREDICTOR_OPTIONS)
-    assert options.get("code_predictor_kv_cache", False) is False
     # Defaults belong to the model/loader. A YAML copy could mask a change
     # to those defaults and give custom deployments different behavior.
     npu_options = {
@@ -61,3 +61,13 @@ def test_npu_predictor_defaults_preserve_explicit_opt_out(monkeypatch, source):
         config.model_config.stage_connector_config["extra"] = dict.fromkeys(PREDICTOR_OPTIONS, False)
     options = Predictor._stage_connector_extra_config(config)
     assert all(options[key] is (source == "implicit") for key in PREDICTOR_OPTIONS)
+
+
+def test_disabling_frame_graph_disables_implicit_npu_kv(monkeypatch):
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(stage_connector_config={"extra": {"code_predictor_frame_graph": False}}),
+        additional_config={},
+    )
+    options = Predictor._stage_connector_extra_config(config)
+    assert options["code_predictor_kv_cache"] is False

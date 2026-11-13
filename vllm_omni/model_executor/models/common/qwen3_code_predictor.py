@@ -28,6 +28,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
 from vllm_omni.platforms import current_omni_platform
@@ -358,13 +359,48 @@ class CodePredictorAttention(nn.Module):
         v = v_raw.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = position_embeddings
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-        q = (q * cos) + (_rotate_half(q) * sin)
-        k = (k * cos) + (_rotate_half(k) * sin)
-        k_cache.index_copy_(2, write_positions, k.to(k_cache.dtype))
-        v_cache.index_copy_(2, write_positions, v.to(v_cache.dtype))
-        if getattr(self, "use_short_kv_attention", False):
+        if current_omni_platform.is_npu() and HAS_TRITON and q.dtype in (torch.bfloat16, torch.float16):
+            from vllm_omni.platforms.npu.layers.predictor_rope_cache import rope_cache
+
+            q = rope_cache(q, k, v, cos, sin, write_positions, k_cache, v_cache)
+        else:
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
+            q = (q * cos) + (_rotate_half(q) * sin)
+            k = (k * cos) + (_rotate_half(k) * sin)
+            k_cache.index_copy_(2, write_positions, k.to(k_cache.dtype))
+            v_cache.index_copy_(2, write_positions, v.to(v_cache.dtype))
+        if current_omni_platform.is_npu() and self.use_npu_native_gqa and q.dtype in (torch.bfloat16, torch.float16):
+            # The cache has fixed capacity; masked future slots are never read.
+            attn_out = torch_npu.npu_fused_infer_attention_score(
+                q.contiguous(),
+                k_cache,
+                v_cache,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="BNSD",
+                atten_mask=~key_mask,
+                scale=float(self.scaling),
+                sparse_mode=0,
+            )[0]
+        elif current_omni_platform.is_npu():
+            k_full, v_full = k_cache, v_cache
+            if self.is_gqa:
+                k_full = k_full.repeat_interleave(self.num_queries_per_kv, dim=1)
+                v_full = v_full.repeat_interleave(self.num_queries_per_kv, dim=1)
+            attn_out = torch_npu.npu_fusion_attention(
+                q.contiguous(),
+                k_full.contiguous(),
+                v_full.contiguous(),
+                self.num_heads,
+                "BNSD",
+                atten_mask=(~key_mask).contiguous(),
+                scale=float(self.scaling),
+                keep_prob=1.0,
+                sparse_mode=0,
+                sync=True,
+            )[0]
+        elif getattr(self, "use_short_kv_attention", False):
             from .short_kv_attention import short_kv_attention
 
             attn_out = short_kv_attention(q, k_cache, v_cache, write_positions, self.scaling)

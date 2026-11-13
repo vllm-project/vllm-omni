@@ -45,6 +45,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         return {
             "code_predictor_fused_sampling": True,
             "code_predictor_frame_graph": True,
+            "code_predictor_kv_cache": extra.get("code_predictor_frame_graph", True),
             "code_predictor_npu_native_gqa": True,
             "code_predictor_npu_fused_swiglu": True,
             **extra,
@@ -158,7 +159,11 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
             return
         if not current_omni_platform.is_cuda():
             super()._setup_compile()
-            if self._kv_requested and not self._kv_cache_enabled:
+            if (
+                self._kv_requested
+                and not self._kv_cache_enabled
+                and not (current_omni_platform.is_npu() and self._frame_graph_requested)
+            ):
                 logger.warning_once(
                     "Qwen3-TTS: code_predictor_kv_cache=True is unsupported on this execution path; using re-prefill"
                 )

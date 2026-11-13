@@ -112,9 +112,10 @@ class _ShapeGraph:
         return hidden.clamp(min=-1, max=1)
 
     @torch.inference_mode()
-    def capture(self) -> None:
+    def capture(self, *, pool=None, stream=None) -> None:
         saved = [buffer.index_select(0, self.indices).clone() for buffer in self.arena.buffers]
-        stream = torch.npu.Stream(device=self.codes.device)
+        if stream is None:
+            stream = torch.npu.Stream(device=self.codes.device)
         stream.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(stream):
             for _ in range(3):
@@ -123,7 +124,7 @@ class _ShapeGraph:
         torch.npu.synchronize()
         self.graph = torch.npu.NPUGraph()
         try:
-            with torch.npu.graph(self.graph, stream=stream):
+            with torch.npu.graph(self.graph, stream=stream, pool=pool):
                 self.output = self.compute()
         finally:
             torch.npu.current_stream().wait_stream(stream)
@@ -191,6 +192,11 @@ class NPUIncrementalCodec:
         self.free = list(range(slots))
         self.graphs: dict[tuple[int, int, int], _ShapeGraph] = {}
         self.streams = [torch.npu.Stream(device=self.device) for _ in range(2)] if streams == 2 else []
+        # Only one graph per lane runs at a time and outputs are cloned before
+        # the next replay. Share scratch pools within a lane, never across the
+        # two concurrently executing lanes.
+        self.capture_streams = self.streams or [torch.npu.Stream(device=self.device)]  # type: ignore[attr-defined]
+        self.capture_pools = [torch.npu.graph_pool_handle() for _ in range(streams)]  # type: ignore[attr-defined]
         # Runtime formats are prepared by the NPU Code2Wav loader. Attention
         # selection is local to each incremental call; preserve the shared config.
         self.prewarm()
@@ -217,7 +223,7 @@ class NPUIncrementalCodec:
             # Only prewarm captures graphs. A final partial chunk must not
             # synchronize the device and run several warmups on a live request.
             if capture:
-                graph.capture()
+                graph.capture(pool=self.capture_pools[lane], stream=self.capture_streams[lane])
                 self.graphs[key] = graph
         return graph
 
