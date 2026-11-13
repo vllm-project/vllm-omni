@@ -7,7 +7,7 @@ steps:
       build.pull_request.labels includes "nightly-test"
     steps:
       - label: ":full_moon: Omni · Perf Test · No Async Chunk"
-        source_file_dependencies: [omni_qwen3_omni_perf, ci_npu]
+        source_file_dependencies: [omni_qwen3_omni_perf, ci_npu, omni_npu_workers]
         key: nightly-omni-performance-no-async-chunk
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
@@ -24,7 +24,7 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Omni · Perf Test · Async Chunk"
-        source_file_dependencies: [omni_qwen3_omni_perf, ci_npu]
+        source_file_dependencies: [omni_qwen3_omni_perf, ci_npu, omni_npu_workers]
         key: nightly-omni-performance-async-chunk
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
@@ -70,7 +70,7 @@ steps:
             -m "full_model and npu and A3 and omni"
             --run-level full_model
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Accuracy Test"
-        source_file_dependencies: omni_minicpmo_4_5_accuracy
+        source_file_dependencies: [omni_minicpmo_4_5_accuracy, ci_npu, omni_npu_workers, omni_v2_runtime, npu_omni_v2_worker]
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_2
         env:
@@ -97,7 +97,7 @@ steps:
             buildkite-agent artifact upload "tests/e2e/accuracy/minicpmo_4_5/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Omni · Qwen3-Omni · Accuracy Test"
-        source_file_dependencies: [omni_qwen3_omni_accuracy, ci_npu]
+        source_file_dependencies: [omni_qwen3_omni_accuracy, ci_npu, omni_npu_workers]
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
         artifact_paths:
@@ -119,7 +119,7 @@ steps:
           # MOS floor on NPU. Re-enable both once the asset is cached.
           - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and npu and A3" --run-level full_model
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
-        source_file_dependencies: omni_minicpmo_4_5_perf
+        source_file_dependencies: [omni_minicpmo_4_5_perf, ci_npu, omni_npu_workers, omni_v2_runtime, npu_omni_v2_worker]
         key: nightly-omni-performance-minicpmo-4-5-npu
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_2
@@ -136,7 +136,7 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test (A2)"
-        source_file_dependencies: omni_minicpmo_4_5_perf
+        source_file_dependencies: [omni_minicpmo_4_5_perf, ci_npu, omni_npu_workers, omni_v2_runtime, npu_omni_v2_worker]
         key: nightly-omni-performance-minicpmo-4-5-npu-a2
         timeout_in_minutes: 180
         mirror_hardwares: a2b3_npu_1
@@ -159,7 +159,7 @@ steps:
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
       - label: ":full_moon: TTS · Perf Test"
-        source_file_dependencies: tts_qwen3_tts_perf
+        source_file_dependencies: [tts_qwen3_tts_perf, ci_npu, omni_npu_workers]
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_2
         env:
@@ -183,7 +183,7 @@ steps:
       build.pull_request.labels includes "nightly-test"
     steps:
       - label: ":full_moon: Diffusion X2I(&A&T) · Qwen-Image 2.1 Accuracy Test"
-        source_file_dependencies: diffusion_qwen_image_21_accuracy
+        source_file_dependencies: [diffusion_qwen_image_21_accuracy, ci_npu]
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_2
         env:
@@ -201,7 +201,7 @@ steps:
             --run-level full_model
             --junitxml=tests/e2e/accuracy/artifacts/qwen_image_21/pytest.xml'
       - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
-        source_file_dependencies: diffusion_hunyuan_image3_accuracy
+        source_file_dependencies: [diffusion_hunyuan_image3_accuracy, ci_npu]
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
         env:
@@ -212,7 +212,7 @@ steps:
         commands:
           - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py -m "full_model and A3" --run-level full_model
       - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=2 CFGP=2"
-        source_file_dependencies: diffusion_hunyuan_image3_perf
+        source_file_dependencies: [diffusion_hunyuan_image3_perf, ci_npu]
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
         env:
@@ -229,7 +229,7 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$EXIT
       - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=2 SP=2"
-        source_file_dependencies: diffusion_hunyuan_image3_perf
+        source_file_dependencies: [diffusion_hunyuan_image3_perf, ci_npu]
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
         env:
@@ -246,7 +246,7 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$EXIT
       - label: ":full_moon: Diffusion Perf · HunyuanImage3 TP=4"
-        source_file_dependencies: diffusion_hunyuan_image3_perf
+        source_file_dependencies: [diffusion_hunyuan_image3_perf, ci_npu]
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
         env:
@@ -263,7 +263,7 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$EXIT
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-2.1 · Single-NPU"
-        source_file_dependencies: diffusion_qwen_image_21_perf
+        source_file_dependencies: [diffusion_qwen_image_21_perf, ci_npu]
         key: nightly-diffusion-x2iat-performance-qwen-image-21-single-npu
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_2
@@ -280,7 +280,7 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-2.1 · 4-NPU"
-        source_file_dependencies: diffusion_qwen_image_21_perf
+        source_file_dependencies: [diffusion_qwen_image_21_perf, ci_npu]
         key: nightly-diffusion-x2iat-performance-qwen-image-21-4npu
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4
@@ -305,7 +305,7 @@ steps:
     steps:
       - label: ":full_moon: Diffusion X2V · MiniMax-H3 DLO Perf Test"
         key: nightly-diffusion-x2v-performance-minimax-h3
-        source_file_dependencies: diffusion_minimax_h3_perf
+        source_file_dependencies: [diffusion_minimax_h3_perf, ci_npu]
         timeout_in_minutes: 90
         mirror_hardwares: a3_npu_4
         env:
@@ -325,9 +325,7 @@ steps:
             exit $$?
       - label: ":full_moon: Diffusion X2V · MiniMax-H3 Ref2VA RainFusion Laser Test"
         key: nightly-diffusion-x2v-minimax-h3-ref2va-rainfusion
-        source_file_dependencies:
-          - diffusion_minimax_h3_perf
-          - diffusion_minimax_h3_rainfusion
+        source_file_dependencies: [diffusion_minimax_h3_perf, diffusion_minimax_h3_rainfusion, ci_npu]
         timeout_in_minutes: 300
         mirror_hardwares: a3_npu_4
         env:
@@ -349,7 +347,7 @@ steps:
             '
       - label: ":full_moon: Diffusion X2V · MiniMax-H3 Timeline Guide Accuracy Test"
         key: nightly-diffusion-x2v-timeline-minimax-h3
-        source_file_dependencies: diffusion_minimax_h3_accuracy
+        source_file_dependencies: [diffusion_minimax_h3_accuracy, ci_npu]
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_2
         env:
@@ -373,7 +371,7 @@ steps:
         commands:
           - pytest -s -v tests/e2e/online_serving/test_hunyuan_video_15_expansion.py -m "npu and A2" --run-level "full_model"
       - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Accuracy Test"
-        source_file_dependencies: diffusion_hunyuan_video_accuracy
+        source_file_dependencies: [diffusion_hunyuan_video_accuracy, ci_npu]
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_2
         env:
@@ -386,7 +384,7 @@ steps:
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py -m "full_model and diffusion and npu and A3 and cards_1" --run-level full_model
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py -m "full_model and diffusion and npu and A3 and cards_1" --run-level full_model
       - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Perf Test"
-        source_file_dependencies: diffusion_hunyuan_video_perf
+        source_file_dependencies: [diffusion_hunyuan_video_perf, ci_npu]
         key: nightly-diffusion-x2v-performance-hunyuanvideo15
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_2
@@ -415,7 +413,7 @@ steps:
         commands:
           - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k npu_i2v --run-level "full_model"
       - label: ":full_moon: Diffusion X2V · Wan 2.2 Perf Test"
-        source_file_dependencies: diffusion_wan22_perf
+        source_file_dependencies: [diffusion_wan22_perf, ci_npu]
         key: nightly-diffusion-x2v-performance
         timeout_in_minutes: 180
         mirror_hardwares: a3_npu_4

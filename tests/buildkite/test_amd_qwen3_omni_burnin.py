@@ -40,7 +40,7 @@ JOB_SPECS = {
     "Qwen3-Omni No-Async-Chunk Perf": {
         "pool": "mi300_2",
         "timeout": 300,
-        "source_group": ["omni_qwen3_omni_perf", "ci_rocm"],
+        "source_group": ["omni_qwen3_omni_perf", "ci_rocm", "omni_gpu_v1_runtime"],
         "artifact": "artifacts/rocm-qwen3-omni-no-async-chunk-perf/**/*",
         "gpus": "2",
         "tests": "4",
@@ -53,7 +53,7 @@ JOB_SPECS = {
     "Qwen3-Omni Async-Chunk Perf": {
         "pool": "mi300_2",
         "timeout": 180,
-        "source_group": ["omni_qwen3_omni_perf", "ci_rocm"],
+        "source_group": ["omni_qwen3_omni_perf", "ci_rocm", "omni_gpu_v1_runtime"],
         "artifact": "artifacts/rocm-qwen3-omni-async-chunk-perf/**/*",
         "gpus": "2",
         "tests": "6",

@@ -1195,7 +1195,7 @@ def test_qwen_image_21_accuracy_shared_helper_routing(monkeypatch: pytest.Monkey
     qwen_label = next(
         step["label"]
         for step in _iter_steps(doc)
-        if step.get("source_file_dependencies") == "diffusion_qwen_image_21_accuracy"
+        if "diffusion_qwen_image_21_accuracy" in step.get("source_file_dependencies", [])
     )
 
     def selected_labels(changed_files: list[str] | None) -> set[str]:
@@ -1222,8 +1222,8 @@ def test_qwen_image_21_accuracy_shared_helper_routing(monkeypatch: pytest.Monkey
         ("vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage21.py", True),
         ("vllm_omni/model_extras/qwen_image_21.py", True),
         ("tests/e2e/accuracy/qwen_image_21/thresholds.json", True),
-        ("vllm_omni/diffusion/attention/backends/sdpa.py", False),
-        ("vllm_omni/diffusion/worker/diffusion_worker.py", False),
+        ("vllm_omni/diffusion/attention/backends/sdpa.py", True),
+        ("vllm_omni/diffusion/worker/diffusion_worker.py", True),
     ],
 )
 @pytest.mark.parametrize(

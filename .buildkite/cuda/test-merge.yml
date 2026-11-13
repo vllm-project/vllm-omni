@@ -75,7 +75,7 @@ steps:
     depends_on: upload-merge-pipeline
     steps:
       - label: "TTS · Qwen3-TTS CustomVoice Test"
-        source_file_dependencies: tts_qwen3_tts_function
+        source_file_dependencies: [tts_qwen3_tts_function, omni_v2_runtime]
         commands:
           - |
             timeout 40m bash -c "
@@ -94,7 +94,7 @@ steps:
         mirror_hardwares: l4_1
 
       - label: "TTS · Qwen3-TTS Base Test"
-        source_file_dependencies: tts_qwen3_tts_cov
+        source_file_dependencies: [tts_qwen3_tts_cov, omni_v2_runtime]
         # 40 -> 60: the coverage split runs the model twice.
         timeout_in_minutes: 60
         commands:
