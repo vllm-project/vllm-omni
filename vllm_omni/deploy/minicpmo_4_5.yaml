@@ -107,8 +107,9 @@ stages:
     # Thinker prefix caching stays off here: this profile serves duplex, whose
     # KV window refuses the cache (duplex/window_kv.py). minicpmo_4_5_turn.yaml
     # enables it for CUDA turn serving on both runners. Stage-0 n-gram
-    # speculation stays off either way -- the omni prefix cache refuses it next
-    # to enable_prefix_caching.
+    # speculation is enabled for NPU in the platform block below; the omni
+    # prefix cache refuses ngram next to enable_prefix_caching, so profiles
+    # that turn the cache on (turn serving) keep it off.
     enable_prefix_caching: false
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
@@ -289,6 +290,20 @@ platforms:
           # second graph set, so stage 0 keeps the decode-only graph. Stage 1
           # below already ships FULL_DECODE_ONLY with the K-step.
           cudagraph_mode: FULL_DECODE_ONLY
+        # Stage-0 n-gram speculation: MRv2 does not serve ngram on NPU, so the
+        # engine-args gate resolves this stage back to the V1 model runner and
+        # the draft actually runs. async_scheduling is pinned false --
+        # speculation and async scheduling are mutually exclusive (same
+        # contract as stage 1's K-step below). Measured on 910B3, seed-tts en,
+        # mean audio RTF at 32@1 / 64@4 / 128@8: 0.2239 / 0.4762 / 0.7238
+        # without the draft -> 0.1850 / 0.4134 / 0.6363 with it (audio TTFP
+        # -27.4% / -16.6% / -22.5%).
+        async_scheduling: false
+        speculative_config:
+          method: ngram
+          num_speculative_tokens: 7
+          prompt_lookup_min: 1
+          prompt_lookup_max: 1
       - stage_id: 1
         # Concurrency cap raised from 4 to 8; the override block only covered
         # stages 0 and 2, so stage 1 kept the base value of 4.

@@ -85,6 +85,48 @@ def test_session_mode_reaches_omni_model_config():
     assert OmniEngineArgs(session_mode="duplex").create_model_config().session_mode == "duplex"
 
 
+def test_npu_speculative_stage_runner_gate(monkeypatch, tmp_path):
+    """Non-K-step speculation resolves to the V1 runner on NPU; DSpark stays V2."""
+    # A local model directory keeps engine-args resolution offline: vllm's
+    # get_model_path returns local dirs as-is, and the tokenizer subfolder
+    # lookup only fetches for remote repo ids.
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    ngram = {
+        "method": "ngram",
+        "num_speculative_tokens": 7,
+        "prompt_lookup_min": 1,
+        "prompt_lookup_max": 1,
+    }
+    # A stage outside the K-step contract: MRv2 does not serve ngram on NPU,
+    # so the stage resolves back to the V1 model runner.
+    flipped = OmniEngineArgs(
+        model=str(tmp_path),
+        use_v2_model_runner=True,
+        speculative_config=dict(ngram),
+    ).create_model_config()
+    assert flipped.use_v2_model_runner is False
+    # The MiniCPM-o talker's K-step config is servable and stays on V2.
+    kstep = OmniEngineArgs(
+        model=str(tmp_path),
+        model_stage="tts",
+        use_v2_model_runner=True,
+        speculative_config=dict(ngram),
+    ).create_model_config()
+    assert kstep.use_v2_model_runner is True
+    # DSpark is served by the V2 runner through the model's own draft loop
+    # (cosyvoice3.py), so it must not be flipped to V1.
+    dspark = OmniEngineArgs(
+        model=str(tmp_path),
+        use_v2_model_runner=True,
+        speculative_config={"method": "dspark"},
+    ).create_model_config()
+    assert dspark.use_v2_model_runner is True
+
+
 def test_default_stage_id_is_concrete_int():
     """Ensure `stage_id` stays safe for downstream arithmetic/indexing."""
     engine_args = OmniEngineArgs()

@@ -634,18 +634,19 @@ class OmniEngineArgs(EngineArgs):
         # through the Talker K-step contract, so a stage whose speculative
         # config is not a K-step config (e.g. the thinker stage's ngram
         # drafting) must resolve back to the V1 runner here, at the single
-        # point where every consumer reads the same field.
+        # point where every consumer reads the same field. DSpark is the
+        # exception: the model serves it on the V2 runner through its own
+        # draft loop (cosyvoice3.py rejects a V1 runner for it), so a dspark
+        # config must keep the V2 runner.
         use_v2_model_runner = self.use_v2_model_runner
-        if (
-            use_v2_model_runner
-            and current_omni_platform.is_npu()
-            and self.speculative_config is not None
-        ):
+        if use_v2_model_runner and current_omni_platform.is_npu() and self.speculative_config is not None:
             from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
                 talker_kstep_frames,
             )
 
-            if talker_kstep_frames(self.model_stage, self.speculative_config) == 0:
+            spec = self.speculative_config
+            spec_method = spec.get("method") if isinstance(spec, dict) else getattr(spec, "method", None)
+            if talker_kstep_frames(self.model_stage, spec) == 0 and spec_method != "dspark":
                 use_v2_model_runner = False
                 logger.info(
                     "Stage %s: speculative config %r is not servable by the V2 model "
