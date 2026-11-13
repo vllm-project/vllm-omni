@@ -750,6 +750,16 @@ class TestFluxExtractor(BaseExtractorTest):
         assert context is not None
         assert context.temb is not None
 
+    def test_passed_rotary_table_skips_position_embedding(self, flux_module, sample_inputs):
+        """A pipeline-computed RoPE table is used as is; pos_embed is not evaluated."""
+        table = flux_module.rotary_emb(sample_inputs["txt_ids"], sample_inputs["img_ids"])
+
+        with patch.object(flux_module.pos_embed, "forward", side_effect=AssertionError("pos_embed evaluated")):
+            context = extract_flux_context(flux_module, **sample_inputs, image_rotary_emb=table)
+
+        batch_size, img_seq_len, _ = sample_inputs["hidden_states"].shape
+        assert context.modulated_input.shape == (batch_size, img_seq_len, flux_module.inner_dim)
+
     def test_invalid_module_raises_error(self):
         """Test that invalid module without transformer_blocks raises ValueError."""
         invalid_module = Mock()

@@ -133,6 +133,8 @@ def _flux(kontext: bool, ids_collide: bool = False):
             img_ids = torch.rand(n_img, 3, generator=g, device=g.device).mul(4).floor()
             out = []
             for _ in range(2):
+                # Built per branch from that branch's prompt length, like encode_prompt does.
+                txt_ids = torch.zeros(8, 3, device=g.device)
                 out.append(
                     {
                         "hidden_states": latents,
@@ -140,11 +142,12 @@ def _flux(kontext: bool, ids_collide: bool = False):
                         "guidance": None,
                         "pooled_projections": _randn(g, batch, 64),
                         "encoder_hidden_states": _randn(g, batch, 8, 64),
-                        # Built per branch from that branch's prompt length, like encode_prompt does.
-                        "txt_ids": torch.zeros(8, 3, device=g.device),
+                        "txt_ids": txt_ids,
                         "img_ids": img_ids,
                         "joint_attention_kwargs": None,
                         "return_dict": False,
+                        # Computed once per request and branch, like the pipelines' diffuse.
+                        "image_rotary_emb": model.rotary_emb(txt_ids, img_ids),
                     }
                 )
             return out

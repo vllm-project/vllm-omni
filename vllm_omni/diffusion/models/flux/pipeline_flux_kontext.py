@@ -90,7 +90,7 @@ class FluxKontextPipeline(
     # so they are shared rather than concatenated (their length can coincide
     # with the branch batch size, e.g. one image token at batch 1).
     supports_cfg_batching = True
-    cfg_batching_shared_kwargs = frozenset({"txt_ids", "img_ids"})
+    cfg_batching_shared_kwargs = frozenset({"txt_ids", "img_ids", "image_rotary_emb"})
     support_image_input = True
 
     def __init__(
@@ -489,6 +489,7 @@ class FluxKontextPipeline(
         img_ids: torch.Tensor,
         joint_attention_kwargs: dict[str, Any] | None,
         return_dict: bool = False,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         return self.transformer(
             hidden_states=hidden_states,
@@ -500,6 +501,7 @@ class FluxKontextPipeline(
             img_ids=img_ids,
             joint_attention_kwargs=joint_attention_kwargs,
             return_dict=return_dict,
+            image_rotary_emb=image_rotary_emb,
         )[0]
 
     def diffuse(
@@ -521,6 +523,13 @@ class FluxKontextPipeline(
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
     ) -> torch.Tensor:
         self.scheduler.set_begin_index(0)
+        # The RoPE tables depend only on the position ids: once per request, not per step.
+        image_rotary_emb = self.transformer.rotary_emb(text_ids, latent_ids, dtype=latents.dtype)
+        negative_image_rotary_emb = (
+            self.transformer.rotary_emb(negative_text_ids, latent_ids, dtype=latents.dtype)
+            if do_true_cfg and negative_text_ids is not None
+            else None
+        )
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -542,6 +551,7 @@ class FluxKontextPipeline(
                     "img_ids": latent_ids,
                     "joint_attention_kwargs": self.joint_attention_kwargs,
                     "return_dict": False,
+                    "image_rotary_emb": image_rotary_emb,
                 }
                 negative_kwargs = None
                 if do_true_cfg:
@@ -555,6 +565,7 @@ class FluxKontextPipeline(
                         "img_ids": latent_ids,
                         "joint_attention_kwargs": self.joint_attention_kwargs,
                         "return_dict": False,
+                        "image_rotary_emb": negative_image_rotary_emb,
                     }
 
                 noise_pred = self.predict_noise_maybe_with_cfg(
