@@ -608,13 +608,17 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         """
         if not getattr(self, "recompute_preemption_fails", False) or getattr(self, "_resetting_prefix_cache", False):
             return super()._preempt_request(request, timestamp, drop_stale_output=drop_stale_output)
-        if request.is_finished():
-            return
-        reason = (
+        self._fail_preempted_request(
+            request,
             "Request was preempted and this stage cannot replay its decode state; "
             "the output generated so far is truncated. Raise the stage's "
-            "gpu_memory_utilization or lower max_num_seqs to avoid preemption."
+            "gpu_memory_utilization or lower max_num_seqs to avoid preemption.",
         )
+
+    def _fail_preempted_request(self, request: Request, reason: str) -> None:
+        """End a request the caller has preempted (and popped from ``running``) with one terminal error."""
+        if request.is_finished():
+            return
         logger.warning(
             "Preempting request %s after %d computed token(s): %s",
             request.request_id,

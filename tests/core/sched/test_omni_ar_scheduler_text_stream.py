@@ -68,11 +68,13 @@ def _scheduler(
     policy: str | None = POLICY,
     test_clock: bool = True,
     scheduler_cls: type[OmniARScheduler] = OmniARScheduler,
+    recompute_preemption: str = "allow",
 ):
     config = VllmConfig()
     config.model_config = _ModelConfig(  # type: ignore[assignment]
         text_stream_policy=policy,
         hf_config=Qwen3TTSConfig(talker_config={"text_vocab_size": TEXT_VOCAB}),
+        recompute_preemption=recompute_preemption,
     )
     config.scheduler_config = SchedulerConfig(
         max_model_len=64,
@@ -389,6 +391,48 @@ def test_an_aborted_held_request_frees_its_blocks_and_its_stream():
     scheduler.finish_requests("r", RequestStatus.FINISHED_ABORTED)
     assert "r" not in scheduler._text_streams
     assert _free_blocks(scheduler) > free
+
+
+@pytest.mark.parametrize("scheduler_cls", [OmniARScheduler, OmniARAsyncScheduler])
+@pytest.mark.parametrize("recompute_preemption", ["allow", "fail"])
+def test_a_preempted_streamed_request_ends_with_an_error_instead_of_replaying(recompute_preemption, scheduler_cls):
+    # One usable block: the request's decode outgrows it mid-stream and the scheduler preempts it. A replay would
+    # restart from the token stream, which holds none of the streamed text rows.
+    scheduler, _ = _scheduler(
+        max_num_seqs=1, num_blocks=2, recompute_preemption=recompute_preemption, scheduler_cls=scheduler_cls
+    )
+    request = _request("r")
+    scheduler.add_request(request)
+    scheduler.append_text("r", list(range(1, 30)), final=False)
+    outputs: dict = {}
+    for _ in range(20):
+        _, outputs = _step(scheduler)
+        if request.is_finished() or request in scheduler.waiting:
+            break
+    assert request.status == RequestStatus.FINISHED_ERROR
+    assert request not in scheduler.waiting and "r" not in scheduler.requests
+    assert "r" not in scheduler._text_streams
+    assert _free_blocks(scheduler) == 1
+    [terminal] = outputs[0].outputs
+    assert terminal.finish_reason == FinishReason.ERROR
+    assert "streamed text cannot be replayed" in terminal.stop_reason
+
+
+def test_a_prefix_cache_reset_ends_a_running_streamed_request_instead_of_replaying_it():
+    # The Qwen3-TTS Talker sets recompute_preemption="fail", but a reset of running requests replays them anyway.
+    scheduler, _ = _scheduler(max_num_seqs=1, recompute_preemption="fail")
+    request = _request("r")
+    scheduler.add_request(request)
+    scheduler.append_text("r", [5, 6, 7], final=False)
+    _step(scheduler)
+    _step(scheduler)
+    assert request.status == RequestStatus.RUNNING
+    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert request.status == RequestStatus.FINISHED_ERROR
+    assert request not in scheduler.waiting and "r" not in scheduler._text_streams
+    _, outputs = _step(scheduler)
+    [terminal] = outputs[0].outputs
+    assert terminal.finish_reason == FinishReason.ERROR and "streamed text cannot be replayed" in terminal.stop_reason
 
 
 def test_requests_without_a_stream_never_reach_the_text_stream_rules(monkeypatch):

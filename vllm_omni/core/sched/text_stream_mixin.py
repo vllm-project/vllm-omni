@@ -164,12 +164,32 @@ class TextStreamMixin(_SchedulerBase):
             logger.warning("Failing %d request(s) on their text stream: %s", len(present), present)
             finish_requests_with_error(self, present)
 
+    def _preempt_request(self, request: Request, timestamp: float, drop_stale_output: bool = False) -> None:
+        """End a streamed request instead of replaying it, whatever the stage's preemption mode.
+
+        A replay (recompute preemption, or a prefix-cache reset of running
+        requests) rebuilds the request from its token stream, which holds none
+        of the streamed text rows the Talker has already read. Requests without
+        a stream preempt as before.
+        """
+        streams = getattr(self, "_text_streams", None)
+        if streams is not None and request.request_id in streams:
+            self._fail_preempted_request(
+                request,
+                "Request was preempted and its streamed text cannot be replayed; "
+                "the output generated so far is truncated.",
+            )
+            return
+        super()._preempt_request(request, timestamp, drop_stale_output=drop_stale_output)
+
     def _text_stream_frame(self, request: Request) -> int:
         """The codec frame the request's next step samples (0 before and during its prefill).
 
         ``num_computed_tokens`` counts every scheduled token, so under async
         scheduling it includes the steps still in flight (the confirmed tokens
-        alone would lag one frame per step in flight).
+        alone would lag one frame per step in flight). A streamed request is
+        never replayed (see ``_preempt_request``), so ``num_computed_tokens``
+        below the prompt means its first prefill.
         """
         prompt_len = request.num_prompt_tokens
         if request.num_computed_tokens < prompt_len:
