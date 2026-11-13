@@ -553,8 +553,7 @@ def _expand_activation_edges_for_geometry(
             continue
         include_hidden = not topology.is_layer_group_last(src)
         geos = [
-            _member_pack_geometry(members.get(req, fallback), include_hidden=include_hidden)
-            for req, _cell in src_tasks
+            _member_pack_geometry(members.get(req, fallback), include_hidden=include_hidden) for req, _cell in src_tasks
         ]
         if all(geo == geos[0] for geo in geos[1:]):
             expanded.append((src, dst, src_tasks))
