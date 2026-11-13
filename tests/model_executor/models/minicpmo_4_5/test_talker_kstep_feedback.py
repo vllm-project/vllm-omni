@@ -649,7 +649,7 @@ def test_talker_stop_token_ids_match_the_multi_frame_head():
     assert talker_multiframe.STOP_TOKEN_ID == 1
     # The pipeline default cannot depend on the platform: the block that
     # collapses the head is a deploy-config decision, so the marker is added
-    # there (test_minicpmo_talker_multi_frame_is_npu_scoped pins the merge).
+    # there (test_minicpmo_talker_multi_frame_is_platform_scoped pins the merge).
     assert mcp_pipeline._talker_stop_token_ids() == [mcp_pipeline._CODEC_EOS_TOKEN_ID]
 
 

@@ -95,12 +95,12 @@ turn_test_params = [
             model=_MODEL,
             stage_config_path=modify_stage_config(
                 _CI_DEPLOY,
-                updates={"session_mode": "turn"},
-                # The K-step frames are booked by the duplex frame loop only;
-                # the Talker fails closed at load otherwise ("remove the
-                # stage-1 speculative_config from turn sessions"), so a turn
-                # session must not inherit the platform blocks' stage-1
-                # speculative_config.
+                updates={
+                    "session_mode": "turn",
+                    # This smoke test uses the single-frame Talker.
+                    "platforms.npu.stages.1.default_sampling_params.stop_token_ids": [],
+                    "platforms.cuda.stages.1.default_sampling_params.stop_token_ids": [],
+                },
                 deletes={
                     "platforms.npu.stages.1.speculative_config": None,
                     "platforms.cuda.stages.1.speculative_config": None,
