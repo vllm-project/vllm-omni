@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     from vllm.config.logging import LogLevel
     from vllm.distributed.weight_transfer.base import WeightTransferEngine
 
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability
     from vllm_omni.distributed.weight_sharing.worker_registry import ConsumerWorkerRegistry
 
 logger = init_logger(__name__)
@@ -561,6 +562,15 @@ class DiffusionWorker:
             rank=self.rank,
             device_index=current_omni_platform.current_device(),
             detach=detach_shared_model,
+        )
+
+    def get_mixfusion_capabilities(self) -> list[MixFusionCapability]:
+        from vllm_omni.diffusion.mixfusion.setup import inspect_mixfusion_capability
+
+        assert self.model_runner is not None and self.model_runner.pipeline is not None
+        pipeline = self.model_runner.pipeline
+        return _run_and_gather_rank_values(
+            "MixFusion capability discovery", lambda: inspect_mixfusion_capability(pipeline)
         )
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
