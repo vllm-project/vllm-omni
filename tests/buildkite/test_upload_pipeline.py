@@ -807,6 +807,77 @@ def test_sensenova_accuracy_uses_weekly_mark(mode: str) -> None:
     assert not marks & {"pytest.mark.core_model", "pytest.mark.advanced_model", "pytest.mark.full_model"}
 
 
+def test_voxcpm2_voxtral_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    pipeline_path = Path(".buildkite/cuda/test-weekly.yml")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    label = "TTS · VoxCPM2 · Voxtral · L4"
+    matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
+    assert len(matching_steps) == 1
+    step = matching_steps[0]
+    assert step["source_file_dependencies"] == [
+        "tts_voxcpm2_weekly",
+        "tts_voxtral_weekly",
+    ]
+    assert step["env"]["VLLM_OMNI_CI_MODEL_RUNNER"] == "v2"
+    command = "\n".join(step["commands"])
+    assert "env VLLM_OMNI_CI_MODEL_RUNNER" not in command
+    assert "env -u VLLM_OMNI_CI_MODEL_RUNNER" not in command
+
+    group = next(step for step in doc["steps"] if "VoxCPM2 and Voxtral Weekly" in step.get("group", ""))
+    assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
+
+    for changed_file in (
+        "tests/e2e/offline_inference/test_voxcpm2_tts.py",
+        "tests/e2e/online_serving/test_voxtral_tts_expansion.py",
+    ):
+        assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
+    assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
+
+
+def test_moss_higgs_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    pipeline_path = Path(".buildkite/cuda/test-weekly.yml")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    expected_dependencies = {
+        "TTS · Moss · L4": [
+            "tts_moss_tts_expansion",
+            "tts_moss_tts_extended_weekly",
+            "tts_moss_tts_nano_weekly",
+        ],
+        "TTS · Higgs · L4": [
+            "tts_higgs_audio_v2_weekly",
+            "tts_higgs_audio_v3_weekly",
+        ],
+    }
+    expected_env = {
+        "TTS · Moss · L4": {
+            "VLLM_OMNI_CI_MODEL_RUNNER": "v2",
+            "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE": "cpu",
+        },
+        "TTS · Higgs · L4": {"VLLM_OMNI_CI_MODEL_RUNNER": "v1"},
+    }
+    for label, dependencies in expected_dependencies.items():
+        matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
+        assert len(matching_steps) == 1
+        step = matching_steps[0]
+        assert step["source_file_dependencies"] == dependencies
+        assert step["env"] == expected_env[label]
+
+    group = next(step for step in doc["steps"] if "Moss and Higgs Weekly" in step.get("group", ""))
+    assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
+
+    changed_files = {
+        "tests/e2e/offline_inference/test_moss_tts_realtime.py": "TTS · Moss · L4",
+        "tests/e2e/online_serving/test_higgs_audio_v3.py": "TTS · Higgs · L4",
+    }
+    for changed_file, label in changed_files.items():
+        assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
+    assert not set(expected_dependencies) & set(
+        _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
+    )
+
+
 @pytest.mark.parametrize(
     ("smoke_exit", "text2img_exit", "img2img_exit", "expected_exit"),
     [(0, 0, 0, 0), (17, 0, 0, 17), (0, 23, 0, 23), (0, 0, 31, 31), (17, 23, 31, 17)],

@@ -121,7 +121,7 @@ Canonical layout (prefer these paths for new changes):
 
     - **`depends_on`:** leaf jobs depend on `upload-ready-pipeline`, `upload-merge-pipeline`, etc.
     - **`group` / `label`:** `:card_index_dividers:` groups; labels like `Diffusion · Qwen Image Test`.
-    - **`commands`:** `timeout … pytest …` with markers and `--run-level` for the pipeline level.
+    - **`commands`:** pytest with markers and `--run-level` for the pipeline level. Bound the step with `timeout_in_minutes`. A CUDA ready or merge directory sweep that should split from measured durations sets `automatic_shard: true` and does not use a command-level `timeout`.
     - **`source_file_dependencies`:** required on **E2E Test** leaf jobs in L2/L3, and on L4/L5 leaf jobs that should be diff-gated on PR labels; name a job key from `ci_source_file_dependencies.yml` (see [Step filtering](#step-filtering)). The key must list every script the step runs; `commands` is not scanned.
 
     **Adding a job**
@@ -610,6 +610,18 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 | --- | ------- |
 | `source_file_dependencies` | Named preset (or list of presets) from [`ci_source_file_dependencies.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/ci_source_file_dependencies.yml). The uploader expands only that key; it does **not** scan `commands`. If any changed file equals a listed prefix or starts with `prefix/`, keep the step (or group); otherwise omit it. Inline path-prefix lists are still accepted. |
 | `mirror_hardwares` | Expand to `agents` + `plugins` (+ optional `image`) from `ci_mirror_hardwares.yml`. |
+| `automatic_shard` | CUDA ready/merge directory sweep. The uploader strips the key and may set `parallelism` from that step's timing profile. With no usable timings it uses the smaller of `MAX_AUTOMATIC_SHARDS` and the files whose marks satisfy the command's `-m`. See [Automatic shard planning](#automatic-shard-planning). |
+
+#### Automatic shard planning {#automatic-shard-planning}
+
+The pipeline YAML does not set parallelism. The uploader does, from that step's timing profile or the fallback below.
+
+- **Fallback:** no usable timings means `min(MAX_AUTOMATIC_SHARDS, marker-matching files)` jobs. The file count is files with a static mark set that satisfies the command's `-m` (`pytest.mark`, `pytestmark`, and `hardware_test` / `hardware_marks`, one item per variant). A file that cannot be checked, or whose static marks do not show a match, is dealt across bins that already hold a matching file and does not open a bin on its own. The command's `-m` still drops it there when the static read was right. If no file is a confirmed match, the step stays one job so pytest cannot exit with no tests collected. `MAX_AUTOMATIC_SHARDS` is the same cap the measured packing uses. One confirmed file stays one job. A timed-out build is not a passed build, so it never becomes the next profile; this cap is what keeps that suite from staying one job. The step still writes `timings/jobs/<job>-<pid>.json`. Two pytest processes in one job keep both files; durations for the same file are summed. Shards of one build sum their slices of a file, and a retry of the same shard index keeps the max.
+- **Profile:** planning reads raw `timings/jobs` from up to 20 `passed` or `finished` builds. Ready history is every non-`main` passed build of this pipeline. Those builds are other pull requests, so a step's durations include whatever that pull request changed. Merge history stays on `main`. The builds API is requested at `per_page=100` (its cap) and the next page comes from the `Link` header. The artifact lookup stops after 20 builds that contain job files, after 10 consecutive builds with none, or after 90 seconds. Each job records its agent queue; a step ignores a profile recorded on a different queue. Only raw `timings/jobs` files are observations. Failed and running builds are excluded. The label key drops a `· Shard N/M` suffix, so one step does not use another step's time for the same path.
+- **Plan:** a greedy longest-processing-time packing of measured files into at most `MAX_AUTOMATIC_SHARDS` jobs. A bin must fit 80% of `timeout_in_minutes`; the other 20% is left for checkout, collection, and process startup, which are not included in the file durations. A faster suite still uses fewer jobs when its file time fits that smaller budget. Each bin is uploaded as `timings/file-shards/<step>/<index>.txt`. Shard N keeps the original directory targets so each directory `conftest.py` loads, then runs only the files in that list. One file already over the budget does not add shards. A file with no measurement adds no weight, so it does not by itself open another job; when the step does split, that file is still placed in the lightest bin and runs.
+- **Overrides:** `VLLM_OMNI_SHARD_TIMINGS` selects a local profile. `VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD=1` skips the history download. `VLLM_OMNI_SKIP_SHARD_FILE_WRITE=1` still plans the jobs but does not write `timings/file-shards`. The Buildkite schema hook sets both.
+
+E2E model jobs stay one job. A hung command is bounded only by `timeout_in_minutes`.
 
 ### Policy
 

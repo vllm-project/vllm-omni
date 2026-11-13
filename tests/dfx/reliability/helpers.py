@@ -173,7 +173,10 @@ def extract_openai_error_contract_from_payload(payload: Any) -> dict[str, Any] |
 
 
 _ALLOC_ATTEMPT_TIMEOUT_SEC = 2.0
-_OOM_RESIDUAL_SLACK_BYTES = 4 * 1024 * 1024
+# ``torch.cuda.mem_get_info`` can report a few MiB more free memory after the
+# exact ceiling allocation than it reported before it. Keep this allowance
+# absolute and small so the pressure gate remains fail-closed.
+_OOM_RESIDUAL_SLACK_BYTES = 8 * 1024 * 1024
 
 
 def reliability_scenarios_for_eager_oom(
