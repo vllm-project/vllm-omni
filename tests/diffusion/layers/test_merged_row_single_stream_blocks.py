@@ -24,6 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import ForwardContext
+from vllm_omni.diffusion.layers import linear as omni_linear
 from vllm_omni.diffusion.layers.linear import MergedRowParallelLinear
 from vllm_omni.diffusion.models.flux import flux_transformer as flux
 from vllm_omni.diffusion.models.flux2 import flux2_transformer as flux2
@@ -57,7 +58,7 @@ class _Case:
     module: Any
     proj: str  # attribute path of the MergedRowParallelLinear on the built module
 
-    def build(self, heads):
+    def build(self, heads, mlp_ratio=4.0):
         raise NotImplementedError
 
     def run(self, block, heads):
@@ -65,9 +66,12 @@ class _Case:
 
 
 class _Flux1(_Case):
-    def build(self, heads):
+    def build(self, heads, mlp_ratio=4.0):
         return flux.FluxSingleTransformerBlock(
-            dim=heads * _HEAD_DIM, num_attention_heads=heads, attention_head_dim=_HEAD_DIM
+            dim=heads * _HEAD_DIM,
+            num_attention_heads=heads,
+            attention_head_dim=_HEAD_DIM,
+            mlp_ratio=mlp_ratio,
         )
 
     def run(self, block, heads):
@@ -83,12 +87,13 @@ class _Flux1(_Case):
 
 
 class _LongCat(_Case):
-    def build(self, heads):
+    def build(self, heads, mlp_ratio=4.0):
         return longcat.LongCatImageSingleTransformerBlock(
             parallel_config=DiffusionParallelConfig(),
             dim=heads * _HEAD_DIM,
             num_attention_heads=heads,
             attention_head_dim=_HEAD_DIM,
+            mlp_ratio=mlp_ratio,
         )
 
     def run(self, block, heads):
@@ -106,13 +111,13 @@ class _LongCat(_Case):
 class _Flux2(_Case):
     local_tp = True
 
-    def build(self, heads):
+    def build(self, heads, mlp_ratio=3.0):
         return flux2.Flux2ParallelSelfAttention(
             parallel_config=DiffusionParallelConfig(),
             query_dim=heads * _HEAD_DIM,
             heads=heads,
             dim_head=_HEAD_DIM,
-            mlp_ratio=3,
+            mlp_ratio=mlp_ratio,
             bias=True,
             local_tp=self.local_tp,
         )
@@ -134,6 +139,8 @@ def _set_tp(monkeypatch, case, tp, rank):
     for module in (linear, parameter):
         monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: tp)
         monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank)
+    # omni_linear is where merged_row_parallel_supported reads the TP size from.
+    monkeypatch.setattr(omni_linear, "get_tensor_model_parallel_world_size", lambda: tp)
     monkeypatch.setattr(case.module, "get_tensor_model_parallel_world_size", lambda: tp)
 
 
@@ -214,9 +221,25 @@ def test_tp1_keeps_unsharded_projection(monkeypatch, case_name):
 
 
 def test_flux1_unsupported_quantization_keeps_replicated_projections(monkeypatch):
-    monkeypatch.setattr(flux, "merged_row_parallel_supported", lambda quant_config, prefix="": False)
+    monkeypatch.setattr(flux, "merged_row_parallel_supported", lambda *args, **kwargs: False)
     _set_tp(monkeypatch, _CASES["flux1"], 4, 1)
     block = _CASES["flux1"].build(8)
+    assert block.proj_mlp.tp_size == 1 and block.proj_out.tp_size == 1
+    assert block.attn.gather_output
+
+
+@pytest.mark.parametrize("case_name", ["flux1", "longcat_image"])
+def test_indivisible_segment_falls_back_instead_of_raising(monkeypatch, case_name):
+    """An MLP width of 35 over 4 ranks: keep the replicated projections, do not raise.
+
+    Heads that do not divide the TP size already fail in the attention QKV layer, so
+    the segment widths are what this gate has to catch (see ``test_geometry_gate`` in
+    ``test_merged_row_parallel_linear.py`` for the gate itself).
+    """
+    case = _CASES[case_name]
+    _set_tp(monkeypatch, case, 4, 1)
+    block = case.build(4, mlp_ratio=1.1)
+    assert block.mlp_hidden_dim % 4 != 0
     assert block.proj_mlp.tp_size == 1 and block.proj_out.tp_size == 1
     assert block.attn.gather_output
 

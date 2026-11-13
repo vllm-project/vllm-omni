@@ -160,6 +160,19 @@ def test_quantization_gate(monkeypatch):
     assert merged_row_parallel_supported(routed, "vae.proj_out")
 
 
+def test_geometry_gate():
+    """An unsupported TP size is refused here so callers keep their replicated layout."""
+    assert merged_row_parallel_supported(None, num_heads=8, input_sizes=[64, 256], tp_size=4)
+    # Attention heads do not divide across the ranks.
+    assert not merged_row_parallel_supported(None, num_heads=6, input_sizes=[48, 192], tp_size=4)
+    # A concatenated segment (here the MLP width) does not divide across the ranks.
+    assert not merged_row_parallel_supported(None, num_heads=8, input_sizes=[64, 34], tp_size=4)
+    # tp_size=1 needs no sharding at all, and the gate stays quantization-only
+    # when no geometry is passed.
+    assert merged_row_parallel_supported(None, num_heads=6, input_sizes=[48, 34], tp_size=1)
+    assert merged_row_parallel_supported(None)
+
+
 def test_positional_input_params_are_rejected(monkeypatch):
     """GPTQ/AWQ act-order indices hold input positions; re-ordering would corrupt them."""
 

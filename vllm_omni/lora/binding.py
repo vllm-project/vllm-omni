@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 from vllm.config.lora import LoRAConfig
+from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.lora.layers.fused_moe import FusedMoEWithLoRA
 from vllm.model_executor.layers.fused_moe import MoERunner
 from vllm.platforms import current_platform
@@ -155,7 +156,7 @@ def _expand_expected_modules_for_packed_layers(
     return expanded
 
 
-def _diffusion_lora_classes() -> list[type]:
+def _diffusion_lora_classes() -> list[type[BaseLayerWithLoRA]]:
     """Wrappers for base layers that live in the diffusion tree.
 
     ``MergedRowParallelLinear`` subclasses ``RowParallelLinear``, whose upstream
@@ -262,7 +263,9 @@ def from_layer(
         instance.resume_lora = _resume_lora  # type: ignore[method-assign]
         return instance
 
-    lora_classes = [
+    # Annotated: the join of the lazily imported diffusion wrappers and the literals
+    # below would otherwise widen to bare ``type``.
+    lora_classes: list[type[BaseLayerWithLoRA]] = [
         *_diffusion_lora_classes(),
         OmniMergedQKVParallelLinearWithLoRA,
         OmniQKVParallelLinearWithLoRA,
