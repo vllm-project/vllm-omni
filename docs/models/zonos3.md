@@ -1,17 +1,16 @@
 # ZONOS3-Mini implementation report
 
-Implementation is in progress. The complete two-stage service is not yet
-available. Reference-prefix audio encoding, service integration validation, GPU acceptance
-and benchmarks remain outstanding. Pipeline registration, deployment YAML and
-the text/precomputed-conditioning adapter are implemented, but have not passed
-an end-to-end GPU serving run.
+The two-stage Speech API has passed a single-GPU online smoke on RTX 3090,
+including complete Codec graph capture and an ASR content check. Reference-prefix
+audio encoding and broader hardware, concurrency and benchmark qualification
+remain outstanding.
 
 ## Implemented paths
 
 Source organization follows the integration's model boundaries:
 
 - `modeling_zonos3_mini.py`: Backbone, embeddings, FFNs, routing and head.
-- `gdn.py`: GDN kernels and persistent windows, kept separate for file size.
+- GDN kernels and persistent windows are in `modeling_zonos3_mini.py`.
 - `codec.py`: Codec neural layers, decoder definition and release tensor mapping.
 - `model_state.py`: native request ModelState implementations.
 - `sampler.py`: the native ten-codebook sampling interface.
@@ -22,8 +21,8 @@ adapter remain focused companion modules. `pipeline.py` defines the two stages;
 configuration resolver is tested to preserve both stages' custom release parser,
 native data-plane flags, disabled prefix caching and AR FULL decode graph mode.
 `cuda_graph_wrapper.py` captures the complete Codec neural/synthesis path;
-`codec_synthesis.py` owns its batched fixed-buffer arithmetic. Actual CUDA
-capture/replay acceptance remains pending an NVIDIA GPU run.
+`codec.py` owns its batched fixed-buffer arithmetic. The default 30 graph keys
+have been captured during the online smoke on RTX 3090.
 
 The AR core implements MultiEmbedding, Full AttnRes with a reusable source
 workspace, nine GDN layers, two native vLLM global Attention bindings, dense
@@ -31,7 +30,7 @@ and latent MoE FFNs, and MultiOutputHead. Backbone forward returns hidden states
 and never invokes the head. CPU comparison of the entire eleven-layer stack
 covers hidden states and logits, chunked/mixed prefill and decode, batch reorder,
 and speaker/condition row substitution, using a test-only CPU KV backend.
-Native paged-KV execution has not been validated on CUDA.
+The online smoke also exercises native paged-KV execution on CUDA.
 
 `Zonos3ForCausalLM` is registered and loads the flat release checkpoint through
 the native loader. Its custom ModelState constructs/caches conditioned embeddings
@@ -115,10 +114,18 @@ path is batched inside one graph, including final flush.
 
 ### Complete Codec graph
 
-Stage 1 `additional_config` accepts `zonos3_codec_cuda_graph` (default false),
-`zonos3_codec_graph_batch_sizes` and `zonos3_codec_graph_frame_sizes`. The supplied
-deploy YAML enables it with B=1/2/4/8/16/32 and RVQ frames=1/2/4/8/15. The native
-Generation runner remains eager: the model owns these graphs independently.
+Stage 1 `enforce_eager` controls the complete Codec graph: `true` disables
+capture/replay; `false` enables it. The native Generation runner always dispatches
+the model eagerly; its outer `compilation_config.cudagraph_mode` is `NONE`, while
+the Codec owns its internal graphs. There are no separate Codec graph settings
+under `additional_config`.
+
+Batch buckets are powers of two up to `max_num_seqs`, including `max_num_seqs`
+itself when it is not a power of two. Frame buckets are the sorted union of
+`1`, connector `codec_chunk_frames` and connector `codec_chunk_ramp`. The supplied
+deploy therefore captures B=1/2/4/8/16/32 × RVQ frames=1/2/4/8/15. Empty final
+chunks use the one-frame bucket with zero valid length. Dynamic per-request
+chunk sizes or priming prefixes beyond the largest frame bucket run eagerly.
 
 Keys are `(batch_bucket, RVQ_frame_bucket)`. Both axes round upward. Per-row
 valid frame counts govern KV/conv commits, spectral envelopes and PCM coverage;
@@ -133,7 +140,7 @@ replay can overwrite bucket storage.
 Capture/warmup touches scratch slots only and runs during model loading. Capture
 failure aborts startup. Shapes beyond configured buckets execute the same
 complete stateful arithmetic eagerly; `replay_count` and `eager_count` expose
-which path ran. Disable the option to use the original eager implementation.
+which path ran. Set Stage 1 `enforce_eager: true` to use the original eager implementation.
 
 CPU tests compare the complete padded arithmetic against the original stream
 at B=1/4/8/16/32, including mixed lengths/final rows, partial codebooks, empty
@@ -143,6 +150,23 @@ results. Run actual capture/replay on NVIDIA hardware with:
 ```bash
 python -m pytest tests/model_executor/models/test_zonos3_codec_graph_cuda.py -q
 ```
+
+## Memory budgets
+
+The default Stage 0 configuration limits KV cache to 128 MiB via
+`kv_cache_memory_bytes`. At BF16, the release's two global-attention layers
+(four KV heads, head dimension 32) need 64 MiB of KV data for the configured
+32 requests × 2048 tokens. The remaining budget covers block rounding and the
+null block. Increase the explicit budget when increasing concurrency or context
+length; `gpu_memory_utilization` does not size the KV pool when this byte limit
+is set.
+
+GDN state is separate from paged KV and is allocated before serving. Each GDN
+layer reserves conv history, FP32 recurrent state, and a 64-token unfinished
+window for every live and scratch slot. Recurrent state and window sizes depend
+on head dimensions and the GDN chunk size, not `max_model_len`; they are reused
+as the stream advances. Current allocation uses `2 * max_num_seqs` slots to
+cover the live cohort and the largest decode graph's padding/capture cohort.
 
 ## State and lifecycle
 
@@ -192,10 +216,9 @@ comparison. These are not official release-weight, CUDA or audio-quality results
 
 ### Server validation commands
 
-The following commands are provided for GPU validation; they have not been
-executed against the complete service. Install the `zonos3` optional dependencies
-in the server environment first. Keep the full release bundle, including the
-speaker encoder and autoencoder directories, when using a local model path.
+Install the `zonos3` optional dependencies in the server environment first.
+Keep the required LM, speaker encoder and selected autoencoder decoder files
+when using a local model path.
 
 ```bash
 FLA_TILELANG=0 vllm serve Zyphra/ZONOS3-Mini --omni \
@@ -210,6 +233,19 @@ curl --fail-with-body http://localhost:8000/v1/audio/speech \
   -d '{"model":"Zyphra/ZONOS3-Mini","input":"Hello from Zonos3.","response_format":"wav"}' \
   --output zonos3.wav
 ```
+
+The single online e2e case starts the default deploy with real release weights
+and checks the returned WAV and spoken content through the shared ASR assertions:
+
+```bash
+FLA_TILELANG=0 python -m pytest -sv tests/e2e/online_serving/test_zonos3_mini.py \
+  -m 'advanced_model and cuda' --run-level advanced_model
+```
+
+Set `ZONOS3_MODEL_PATH` to a local release snapshot to reuse an existing download.
+The test needs the repository's ASR test dependencies/cache as well as the model
+files. It uses `advanced_model` because the `core_model` harness substitutes dummy
+weights, which this model's strict companion loaders do not support.
 
 Use the existing universal TTS driver for the concurrency matrix. `default_voice`
 means unconditioned synthesis here; Zonos3 has no built-in preset voice. For
