@@ -2324,7 +2324,7 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         "GLM TTS · 1-GPU": {
             "timeout": 240,
             "test_timeout": 210,
-            "count": 4,
+            "count": 5,
             "artifact_name": "rocm-glm-tts-weekly",
             "dependency": "tts_glm_weekly",
             "files": (
@@ -2346,7 +2346,7 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         "Breeze TTS 2 · 1-GPU": {
             "timeout": 210,
             "test_timeout": 180,
-            "count": 4,
+            "count": 5,
             "artifact_name": "rocm-breeze-tts2-weekly",
             "dependency": "tts_breeze_tts2_weekly",
             "files": ("tests/e2e/online_serving/test_breeze_tts_2.py",),
