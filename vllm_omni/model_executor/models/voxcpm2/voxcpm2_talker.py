@@ -1132,7 +1132,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # implementation and covers the longest VAE decoder receptive field.
         self._n_decode_pad_frames = 12
         use_cuda_graph = omni_platform.current_omni_platform.is_cuda()
-        self._enable_torch_compile = omni_platform.current_omni_platform.supports_torch_inductor()
+        self._enable_torch_compile = (
+            self._runtime_config.enable_torch_compile and omni_platform.current_omni_platform.supports_torch_inductor()
+        )
         self._compile_vae = self._enable_torch_compile
         self._max_decode_steps = 2000
         self._max_batch_size = getattr(vllm_config.scheduler_config, "max_num_seqs", 4)
