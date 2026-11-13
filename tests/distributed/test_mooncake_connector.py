@@ -389,6 +389,22 @@ def test_invalid_hs_reports_failure_and_waits_for_native_copy(connector, damage)
     assert not connector._reads
 
 
+def test_hs_load_past_the_prompt_recomputes_instead_of_raising(connector):
+    # Valid stored rows that extend past the prompt cannot be restored; the
+    # load fails and the request recomputes, as for any invalid HS.
+    attempt = install_attempt(connector, prompt_len=8)
+    save_prefix(connector, attempt, 3)
+    begin_read(connector, attempt, tokens=12)
+    connector.native_result = KVConnectorTransferResults(finished_recving={attempt.token})
+    connector._read_executor.run()
+    result = connector.get_transfer_results(set())
+    assert result.failed_recving == {attempt.req_id}
+    assert result.finished_recving == {attempt.req_id}
+    assert attempt.rows is None
+    assert connector._reserved_bytes == 0
+    assert not connector._reads
+
+
 def test_timeout_drains_gpu_before_retry_and_keeps_live_cpu_reservation(connector):
     attempt = install_attempt(connector)
     save_prefix(connector, attempt, 2)
@@ -1186,12 +1202,13 @@ class LookupRpcGate:
     def __init__(self) -> None:
         self.release = threading.Event()
         self.rpcs: list[int] = []
+        self.result = MooncakeLookupResult(0)
 
     def __call__(self, num_tokens, block_hashes):
         self.rpcs.append(num_tokens)
         # Bounded so that a failing test cannot leave the client's worker blocked.
         self.release.wait(timeout=10)
-        return MooncakeLookupResult(0)
+        return self.result
 
 
 def lookup_scheduler(vllm_config, kv_cache_config):
@@ -1286,6 +1303,22 @@ def wait_for_lookup(connector, request, timeout=5.0):
         assert time.monotonic() < deadline, "the lookup did not finish"
         time.sleep(0.001)
     return result
+
+
+def test_resumed_request_hit_stops_at_its_prompt(lookup_connector):
+    # A preempted request resumes with its generated tokens, which the pinned
+    # lookup also covers. A longer stored prefix can then match past the
+    # prompt, but restored HS covers prompt rows only.
+    connector, gate = lookup_connector
+    gate.result = MooncakeLookupResult(48, (TailKeyBoundary(0, 48),))
+    gate.release.set()
+    resumed = Request("resumed", list(range(32)), SamplingParams(max_tokens=32), None)
+    resumed.append_output_token_ids(list(range(100, 117)))
+    assert (resumed.num_prompt_tokens, resumed.num_tokens) == (32, 49)
+    assert wait_for_lookup(connector, resumed) == (32, True)
+    spec = connector.connector_scheduler.load_specs["resumed"]
+    assert spec.kvpool_cached_tokens == 32
+    assert spec.tail_key_boundaries == (TailKeyBoundary(0, 32),)
 
 
 def test_lookup_timeout_is_a_miss_until_the_lookup_queue_drains(lookup_connector):

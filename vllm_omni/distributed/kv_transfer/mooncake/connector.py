@@ -331,7 +331,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         matched, load_async = super().get_num_new_matched_tokens(request, num_computed_tokens)
         if matched is not None:
             self._lookup_started.pop(req_id, None)
-            return matched, load_async
+            return self._cap_at_prompt(request, num_computed_tokens, matched, load_async)
         if time.monotonic() - started < self.settings.load_timeout_seconds:
             return None, False
         logger.warning(
@@ -358,6 +358,27 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         self.connector_scheduler.client.discard(req_id)
         self.connector_scheduler.load_specs.pop(req_id, None)
         self._lookup_started.pop(req_id, None)
+
+    def _cap_at_prompt(
+        self, request: Request, num_computed_tokens: int, matched: int, load_async: bool
+    ) -> tuple[int, bool]:
+        """Keep an admitted hit within the prompt blocks whose HS can be restored.
+
+        A preempted request resumes with its generated tokens, and the pinned
+        lookup covers those too, so a longer stored prefix can match past the
+        prompt. Those positions are recomputed instead.
+        """
+        assert self.connector_scheduler is not None
+        spec = self.connector_scheduler.load_specs.get(request.request_id)
+        limit = request.num_prompt_tokens - request.num_prompt_tokens % self.block_size
+        if spec is None or spec.kvpool_cached_tokens <= limit:
+            return matched, load_async
+        if limit <= num_computed_tokens:
+            del self.connector_scheduler.load_specs[request.request_id]
+            return 0, False
+        spec.kvpool_cached_tokens = limit
+        spec.tail_key_boundaries = tuple(replace(boundary, num_tokens=limit) for boundary in spec.tail_key_boundaries)
+        return limit - num_computed_tokens, load_async
 
     def reset_cache(self) -> bool | None:
         if self.role != KVConnectorRole.SCHEDULER:
@@ -467,6 +488,10 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
     def _read_hs(self, attempt: Attempt, tokens: int) -> dict[str, torch.Tensor]:
         assert self.connector_worker is not None
         store = self.connector_worker.store
+        if tokens > attempt.prompt_len:
+            # Restored rows must fit the prompt. Failing the read here makes
+            # the request recompute instead of failing its restore later.
+            raise ValueError("HS prefix extends past the prompt")
         hashes = attempt.hashes[: tokens // self.block_size]
         if not hashes or len(hashes) * self.block_size != tokens:
             raise ValueError("incomplete HS prefix")

@@ -65,7 +65,10 @@ The scheduler queries Mooncake asynchronously (native `lookup_async`): a
 request whose lookup is in flight stays waiting while other requests are
 scheduled. Worker rank 0 answers with the longest contiguous prefix whose KV
 object, HS object, and completion record all exist, in whole blocks, capped so
-that the read fits `max_hs_bytes`.
+that the read fits `max_hs_bytes`. The scheduler then caps the admitted hit at
+the request's whole prompt blocks. A preempted request resumes with its
+generated tokens, which the lookup also covers, but restored HS covers prompt
+rows only; the generated positions are recomputed.
 
 A lookup that exceeds `load_timeout_seconds` is treated as a miss. That request
 computes its whole prompt without another lookup. The native client
@@ -83,8 +86,8 @@ records on dedicated read workers, in Store calls of up to 16 MiB. Receive
 completion is reported only after both finish and validate; the restored rows
 then belong to that request attempt.
 
-A read that finds a missing or invalid object, misses `load_timeout_seconds`,
-or is not admitted reports a failed receive. vLLM's `recompute` policy then
+A read that finds a missing or invalid object, extends past the prompt, misses
+`load_timeout_seconds`, or is not admitted reports a failed receive. vLLM's `recompute` policy then
 recomputes the prefix without another lookup.
 
 ### Row assembly
