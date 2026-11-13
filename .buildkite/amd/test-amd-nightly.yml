@@ -15,7 +15,7 @@ steps:
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 120
         source_file_dependencies: tts_qwen3_tts_function
         env:
@@ -33,7 +33,7 @@ steps:
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 120
         source_file_dependencies: diffusion_wan22_accuracy
         env:
@@ -75,7 +75,7 @@ steps:
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 120
         source_file_dependencies: omni_minicpmo_4_5_function
         artifact_paths:
@@ -87,7 +87,7 @@ steps:
         agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
-        grade: NonBlocking
+        grade: Blocking
         timeout_in_minutes: 120
         source_file_dependencies: omni_minicpmo_4_5_function
         artifact_paths:
