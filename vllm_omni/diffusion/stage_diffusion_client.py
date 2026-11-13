@@ -545,7 +545,7 @@ class StageDiffusionClient(StageClientBase):
                         10.0,
                     )
                     self._proc_manager.shutdown(timeout=10.0)
-            elif current_omni_platform.is_npu():
+            elif current_omni_platform.is_npu() and self._proc_manager.uses_multiproc:
                 # Allow the executor's 60s worker grace, its two 5s escalation
                 # windows, and stage finalization before signalling the tree.
                 stopped = shutdown_requested and self._proc_manager.wait_for_shutdown(timeout=80.0)

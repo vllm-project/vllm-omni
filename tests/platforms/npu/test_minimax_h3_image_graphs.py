@@ -151,3 +151,19 @@ def test_graph_off_control_can_match_internal_format(monkeypatch):
 def test_internal_format_flag_requires_boolean():
     with pytest.raises(ValueError, match="npu_disable_internal_format must be a bool"):
         adapter.apply_minimax_h3_image_graphs(_model(), _config(npu_disable_internal_format="true"))
+
+
+def test_graph_off_control_can_match_jit_mode(mocker, monkeypatch):
+    """Matching the worker JIT mode must leave the eager VAE decoder intact."""
+    set_compile_mode = mocker.Mock()
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(set_compile_mode=set_compile_mode), raising=False)
+    model = _model()
+    original = model.vae._decode_tile
+    adapter.apply_minimax_h3_image_graphs(model, _config(npu_disable_jit_compile=True))
+    set_compile_mode.assert_called_once_with(jit_compile=False)
+    assert model.vae._decode_tile == original
+
+
+def test_graph_off_jit_control_requires_boolean():
+    with pytest.raises(ValueError, match="npu_disable_jit_compile must be a bool"):
+        adapter.apply_minimax_h3_image_graphs(_model(), _config(npu_disable_jit_compile="true"))

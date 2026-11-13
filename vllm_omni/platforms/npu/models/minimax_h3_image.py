@@ -49,6 +49,11 @@ def apply_minimax_h3_image_graphs(model: nn.Module, od_config: OmniDiffusionConf
     if disable_internal_format:
         # Expose the same worker setting to graph-off integration controls.
         torch.npu.config.allow_internal_format = False
+    disable_jit_compile = (od_config.additional_config or {}).get("npu_disable_jit_compile", False)
+    if type(disable_jit_compile) is not bool:
+        raise ValueError("npu_disable_jit_compile must be a bool")
+    if disable_jit_compile:
+        torch.npu.set_compile_mode(jit_compile=False)
     if not enabled or od_config.enforce_eager or not od_config.enable_cuda_graph_decode:
         return
     if not NPUExactGraphRunner.is_supported():

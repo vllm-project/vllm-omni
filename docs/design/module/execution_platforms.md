@@ -84,5 +84,7 @@ H3 deterministic execution restores the caller's enabled and warn-only modes
 when forward returns or raises, so inline engine setup and teardown leave no
 persistent deterministic-mode change. VAE graphs disable NPU internal formats;
 `npu_disable_internal_format` exposes that worker setting independently for
-matched graph-off controls. Graph replica outputs are copied on the producer
+matched graph-off controls. `npu_disable_jit_compile` independently matches the
+graph path's disabled JIT compilation mode. Both options default to false and
+apply to the worker, including the DiT. Graph replica outputs are copied on the producer
 stream before reuse, then joined to the consumer stream.

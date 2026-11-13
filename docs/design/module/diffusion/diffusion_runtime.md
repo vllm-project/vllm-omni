@@ -546,3 +546,6 @@ The out-of-process NPU `mp` stage client waits up to 80 seconds for a sent
 shutdown request: the worker grace plus both escalation windows and stage
 finalization. It then falls back to the bounded signal-based shutdown. This
 prevents the outer process manager from cutting short the worker deadline.
+This grace is gated on the resolved executor's `uses_multiproc` capability,
+including default and custom executors. Single-device default `uni` stages
+retain the normal bounded signal-based shutdown without the 80-second wait.

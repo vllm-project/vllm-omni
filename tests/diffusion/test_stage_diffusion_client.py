@@ -153,7 +153,7 @@ def test_mp_shutdown_preserves_npu_worker_grace(monkeypatch, npu, exits):
     client._response_socket = Mock()
     client._encoder = OmniMsgpackEncoder()
     client._zmq_ctx = Mock()
-    manager = Mock(distributed_executor_backend="mp")
+    manager = Mock(distributed_executor_backend="mp", uses_multiproc=True)
     manager.proc.is_alive.return_value = True
     manager.wait_for_shutdown.return_value = exits
     client._proc_manager = manager
@@ -168,3 +168,73 @@ def test_mp_shutdown_preserves_npu_worker_grace(monkeypatch, npu, exits):
     else:
         manager.shutdown.assert_called_once_with(timeout=10.0)
     client._zmq_ctx.term.assert_called_once()
+
+
+@pytest.mark.parametrize("headless", [False, True])
+@pytest.mark.parametrize(
+    "backend,num_gpus,uses_multiproc",
+    [
+        (None, 1, False),
+        (None, 4, True),
+        ("uni", 1, False),
+        ("mp", 1, True),
+        ("vllm_omni.diffusion.executor.multiproc_executor.MultiprocDiffusionExecutor", 1, True),
+    ],
+)
+def test_shutdown_grace_uses_resolved_executor(mocker, backend, num_gpus, uses_multiproc, headless):
+    """Only an executor with child workers needs the extended NPU grace."""
+    from vllm_omni.diffusion import stage_diffusion_client as client_module
+    from vllm_omni.diffusion import stage_diffusion_proc as proc_module
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    process = mocker.Mock()
+    process.is_alive.return_value = True
+    mocker.patch.object(proc_module, "get_mp_context").return_value.Process.return_value = process
+    mocker.patch.object(proc_module.StageDiffusionProcManager, "_wait_until_started")
+    config = OmniDiffusionConfig(num_gpus=num_gpus, distributed_executor_backend=backend)
+    kwargs = dict(
+        model="test-model",
+        od_config=config,
+        handshake_address="inproc://shutdown-test",
+        addresses=proc_module.EngineZmqAddresses(inputs=["input"], outputs=["output"]),
+    )
+    if headless:
+        manager = proc_module.StageDiffusionProcManager.launch_headless(
+            **kwargs, omni_coordinator_address=None, omni_stage_id=0, omni_replica_id=0
+        )
+    else:
+        manager = proc_module.StageDiffusionProcManager(**kwargs, stage_init_timeout=1)
+    mocker.patch.object(manager, "wait_for_shutdown", return_value=False)
+    mocker.patch.object(manager, "shutdown")
+    mocker.patch.object(client_module.current_omni_platform, "is_npu", return_value=True)
+    client = object.__new__(StageDiffusionClient)
+    client._request_socket = mocker.Mock()
+    client._response_socket = mocker.Mock()
+    client._encoder = OmniMsgpackEncoder()
+    client._zmq_ctx = mocker.Mock()
+    client._proc_manager = manager
+    client.shutdown()
+    if uses_multiproc:
+        manager.wait_for_shutdown.assert_called_once_with(timeout=80.0)
+    else:
+        manager.wait_for_shutdown.assert_not_called()
+    manager.shutdown.assert_called_once_with(timeout=10.0)
+
+
+def test_npu_mp_shutdown_does_not_wait_if_request_cannot_be_sent(mocker):
+    """A failed shutdown send must fall back directly to bounded termination."""
+    from vllm_omni.diffusion import stage_diffusion_client as module
+
+    client = object.__new__(StageDiffusionClient)
+    client._request_socket = mocker.Mock()
+    client._request_socket.send.side_effect = zmq.Again()
+    client._response_socket = mocker.Mock()
+    client._encoder = OmniMsgpackEncoder()
+    client._zmq_ctx = mocker.Mock()
+    manager = mocker.Mock(distributed_executor_backend="mp", uses_multiproc=True)
+    manager.proc.is_alive.return_value = True
+    client._proc_manager = manager
+    mocker.patch.object(module.current_omni_platform, "is_npu", return_value=True)
+    client.shutdown()
+    manager.wait_for_shutdown.assert_not_called()
+    manager.shutdown.assert_called_once_with(timeout=10.0)
