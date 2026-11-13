@@ -1337,3 +1337,103 @@ def test_stream_history_allocates_only_for_scheduled_requests():
     torch.testing.assert_close(history.embeds[:1], embeds)
     state.finish_audio({"request"})
     assert not state._talker_inputs
+
+
+def test_full_payload_fallback_codes_accumulate_once(monkeypatch):
+    """The full-payload fallback must partition, not mirror.
+
+    pooler_output and multimodal_output are accumulated independently by
+    MultimodalOutputProcessor, so mirroring the flat payload into both
+    channels doubles every per-step row in the request ledger.
+    """
+    from tests.engine.test_output_processor_mrv2_text import (
+        _Detokenizer,
+        _make_processor,
+        _rehydrated_output,
+    )
+    from vllm_omni.outputs.output_modality import OutputModality
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = SimpleNamespace(
+        query_start_loc_np=np.array([0, 1]),
+        num_scheduled_tokens=np.array([1]),
+        num_reqs=1,
+        num_tokens_after_padding=1,
+    )
+    row = torch.full((1, 8), 7, dtype=torch.int32)
+    output = _async_output(
+        req_ids=["r"],
+        text_hidden=torch.ones(1, 4),
+        multimodal_outputs={"codes": {"audio": row.clone()}},
+        input_batch=batch,
+        async_chunk=False,
+    ).get_output()
+    # ``codes`` is not a client root key. It must remain on the inter-stage
+    # payload, while the client channel stays empty.
+    assert output.multimodal_outputs is None
+    assert output.pooler_output is output.inter_stage_outputs
+    assert output.inter_stage_outputs is not None
+    torch.testing.assert_close(output.inter_stage_outputs[0]["codes.audio"], row)
+    engine_output = _rehydrated_output(pooling_output=(output.pooler_output or [None])[0])
+    processor, _ = _make_processor(OutputModality.LATENT, _Detokenizer())
+    processed = processor.process_outputs([engine_output])
+    payload = processed.request_outputs[0].outputs[0].multimodal_output
+    audio = payload.get("codes", {}).get("audio")
+    assert audio is not None and audio.shape[0] == 1, (
+        f"codes accumulated more than once: {audio.shape if audio is not None else None}"
+    )
+
+
+@pytest.mark.cpu
+def test_full_payload_fallback_codes_have_explicit_inter_stage_ownership(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = SimpleNamespace(
+        query_start_loc_np=np.array([0, 1]),
+        num_scheduled_tokens=np.array([1]),
+        num_reqs=1,
+        num_tokens_after_padding=1,
+    )
+    row = torch.full((1, 8), 7, dtype=torch.int32)
+    output = _async_output(
+        req_ids=["r"],
+        text_hidden=torch.ones(1, 4),
+        multimodal_outputs={"codes": {"audio": row.clone()}},
+        input_batch=batch,
+        async_chunk=False,
+    ).get_output()
+
+    assert output.multimodal_outputs is None
+    assert output.pooler_output is output.inter_stage_outputs
+    assert output.inter_stage_outputs is not None
+    torch.testing.assert_close(output.inter_stage_outputs[0]["codes.audio"], row)
+
+
+@pytest.mark.cpu
+def test_full_payload_fallback_splits_client_root_keys(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = SimpleNamespace(
+        query_start_loc_np=np.array([0, 1]),
+        num_scheduled_tokens=np.array([1]),
+        num_reqs=1,
+        num_tokens_after_padding=1,
+    )
+    codes = torch.full((1, 8), 7, dtype=torch.int32)
+    audio = torch.arange(4, dtype=torch.float32)
+    sample_rate = torch.tensor(24000, dtype=torch.int32)
+    output = _async_output(
+        req_ids=["r"],
+        text_hidden=torch.ones(1, 4),
+        multimodal_outputs={"codes": {"audio": codes.clone()}, "audio": audio, "sr": sample_rate},
+        input_batch=batch,
+        async_chunk=False,
+    ).get_output()
+
+    assert output.pooler_output is output.inter_stage_outputs
+    assert output.inter_stage_outputs is not None
+    assert output.multimodal_outputs is not None
+    assert "codes.audio" in output.inter_stage_outputs[0]
+    assert "audio" not in output.inter_stage_outputs[0]
+    assert "sr" not in output.inter_stage_outputs[0]
+    torch.testing.assert_close(output.inter_stage_outputs[0]["codes.audio"], codes)
+    torch.testing.assert_close(output.multimodal_outputs[0]["audio"], audio)
+    torch.testing.assert_close(output.multimodal_outputs[0]["sr"], sample_rate)

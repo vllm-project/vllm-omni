@@ -58,6 +58,22 @@
       },
       {
         "task": "default_voice",
+        "eval_phase": "latency",
+        "dataset_name": "seed-tts-text",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "benchmarks/build_dataset/seed_tts_smoke",
+        "num_prompts": [
+          100
+        ],
+        "max_concurrency": [
+          4
+        ],
+        "seed_tts_locale": "en",
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration"
+      },
+      {
+        "task": "default_voice",
         "eval_phase": "throughput",
         "dataset_name": "seed-tts-text",
         "backend": "openai-audio-speech",

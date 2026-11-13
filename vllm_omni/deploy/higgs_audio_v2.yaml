@@ -1,5 +1,13 @@
 # Higgs-audio v2 deploy: Stage 0 (talker) -> Stage 1 (code2wav) via shared memory.
 #
+# The talker (stage 0) runs on model_runner v2; the codec stage (stage 1)
+# stays on v1, so the talker's outputs ride the legacy transport. Under v2
+# the talker delegates LM token sampling to the native staged sampler, so
+# the full request surface including penalties keeps working. Non-CUDA
+# platforms fall back to v1 through the platforms section below. To run the
+# talker on v1 on CUDA use higgs_audio_v2_v1.yaml; higgs_audio_v2_mrv2.yaml
+# pins the v2 selection explicitly.
+#
 # Phase-1 scope is plain text -> 24 kHz speech only; voice cloning, multi-speaker,
 # ChatML rich messages, and music/sound-event prompts are rejected by the
 # request validator with explicit 4xx (see
@@ -27,6 +35,7 @@ connectors:
 
 stages:
   - stage_id: 0
+    model_runner: v2
     max_num_seqs: 4
     gpu_memory_utilization: 0.6
     # Disable cudagraph capture: the live audio-sampler dispatch is still
@@ -80,3 +89,17 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
+
+platforms:
+  # MRV2 is CUDA-only for this model; every other platform falls back to the
+  # v1 runner for both stages. XPU rejects v2 stages at deploy load, and NPU
+  # generation workers reject v2 at init. The stage-0 shape is unchanged, so
+  # only the runner flips.
+  rocm:
+    model_runner: v1
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  musa:
+    model_runner: v1

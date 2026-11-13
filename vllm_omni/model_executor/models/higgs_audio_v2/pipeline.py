@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """higgs-audio v2 pipeline: Talker (text -> 8-codebook codec) -> Code2Wav (codec -> 24 kHz PCM)."""
 
 from vllm_omni.config.stage_config import (
@@ -23,6 +23,11 @@ HIGGS_AUDIO_V2_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
+            # The v2 talker rides the legacy transport to stage 1; the
+            # combination is e2e-validated in
+            # tests/e2e/online_serving/test_higgs_audio_v2_expansion.py, so
+            # skip the generic unvalidated-integration warning at default boot.
+            mrv2_legacy_transport_validated=True,
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
             sampling_constraints={
                 "detokenize": False,
