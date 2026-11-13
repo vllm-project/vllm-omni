@@ -141,22 +141,32 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             self.config = hf_config
         else:
             self.config = HiggsAudioV3Config(**hf_config.to_dict())
-        self._sample_graph_enabled, _ = self.config.resolve_graph_defaults(
-            use_v2_model_runner=bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
-        )
-        self.use_async_omni_output = getattr(self.config, "audio_async_payload", False) is True
+        use_v2_runner = bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
+        self.mrv2_options = self.config.resolve_mrv2_defaults(use_v2_model_runner=use_v2_runner)
+        self._sample_graph_enabled, _ = self.config.resolve_graph_defaults(use_v2_model_runner=use_v2_runner)
+        self.use_async_omni_output = self.mrv2_options.audio_async_payload
         self.supports_async_whole_payload = self.use_async_omni_output
-        if self.use_async_omni_output:
-            if not vllm_config.scheduler_config.async_scheduling:
-                raise ValueError("audio_async_payload requires async scheduling")
-            if getattr(self.config, "audio_async_prompt_mode", False) is not True:
-                raise ValueError("audio_async_payload requires audio prompt mode classification")
+        if self.use_async_omni_output and not vllm_config.scheduler_config.async_scheduling:
+            raise ValueError(
+                "Higgs Audio v3 model_runner: v2 requires async_scheduling: true on the talker stage; "
+                "enable it in the deploy profile or run this stage with model_runner: v1"
+            )
+        if not use_v2_runner and vllm_config.scheduler_config.async_scheduling:
+            logger.warning_once(
+                "Higgs Audio v3: model_runner: v1 with async_scheduling: true is not an "
+                "exercised combination; set async_scheduling: false or use the V1 "
+                "profiles (_high_throughput / _low_latency)."
+            )
         self._async_audio_gpu_staging = None
         model_config = getattr(vllm_config, "model_config", None)
         compilation_config = getattr(vllm_config, "compilation_config", None)
         cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
         mode_name = getattr(cudagraph_mode, "name", str(cudagraph_mode)).upper()
-        self._use_external_decode_cudagraph = (
+        # v2 owns the decode step regardless of eager mode; on v1 the
+        # external decode CUDA graph follows the capture config. Decide
+        # before the MRV2 state exists, keep the MLP-graph disarm and
+        # the mutual-exclusion assert in one place.
+        self._use_external_decode_cudagraph = use_v2_runner or (
             not bool(getattr(model_config, "enforce_eager", True))
             and cudagraph_mode is not None
             and "NONE" not in mode_name
@@ -381,9 +391,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
     ) -> None:
         """Update per-step metadata before runner forward or CUDA graph replay."""
         _ = positions, inputs_embeds
-        self._step_audio_mode_rows = (
-            audio_prompt_mode_rows if getattr(self.config, "audio_async_prompt_mode", False) is True else 0
-        )
+        self._step_audio_mode_rows = audio_prompt_mode_rows if self.mrv2_options.audio_async_prompt_mode else 0
         self._step_audio_tail_rows = 0
         if cpu_input_tail_ids:
             self._resolve_token_ids()
@@ -440,7 +448,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         # A fresh pinned allocation is owned by PyTorch's host allocator until
         # its asynchronous copy completes; never overwrite a shared CPU staging
         # buffer while the previous decode step may still be reading it.
-        if device.type == "cuda" and getattr(self.config, "audio_mrv2_async_state_indices", False):
+        if device.type == "cuda" and self.mrv2_options.audio_mrv2_async_state_indices:
             return torch.tensor(rows, dtype=torch.long, pin_memory=True).to(device, non_blocking=True)
         return torch.tensor(rows, dtype=torch.long, device=device)
 
@@ -451,7 +459,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
         if (
             device.type == "cuda"
-            and getattr(self.config, "audio_mrv2_fused_state", False)
+            and self.mrv2_options.audio_mrv2_fused_state
             and (previous_req_ids != req_ids or any(r not in self._state_pool_indices for r in req_ids))
         ):
             from .mrv2_state_kernels import sync_state
