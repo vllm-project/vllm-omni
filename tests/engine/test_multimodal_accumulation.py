@@ -101,8 +101,9 @@ def test_replace_nemotron_snapshot_keys_detects_nested_meta_marker():
     assert "codes.audio" not in accumulated
 
 
-def test_meta_finished_is_replaced_per_chunk_not_appended():
-    """The per-step end-of-stream flag is a snapshot, like segment_end.
+@pytest.mark.parametrize("key", ["finished", "duplex_audio_cache_epoch", "duplex_audio_chunk_seq"])
+def test_chunk_metadata_is_replaced_per_chunk_not_appended(key):
+    """Per-step flags and chunk identities are snapshots, like segment_end.
 
     Accumulating the 0-d per-step tensors into a list makes the final
     torch.cat raise ("zero-dimensional tensor cannot be concatenated"),
@@ -112,13 +113,13 @@ def test_meta_finished_is_replaced_per_chunk_not_appended():
     accumulated = MultimodalPayload.from_dict(
         {
             "audio": torch.zeros(4),
-            "meta.finished": torch.tensor(False),
+            f"meta.{key}": torch.tensor(0),
         }
     )
     incoming = MultimodalPayload.from_dict(
         {
             "audio": torch.ones(2),
-            "meta.finished": torch.tensor(True),
+            f"meta.{key}": torch.tensor(1),
         }
     )
     assert accumulated is not None
@@ -127,9 +128,11 @@ def test_meta_finished_is_replaced_per_chunk_not_appended():
     replace_snapshot_keys(accumulated, incoming)
     merged = accumulated.merged_with(incoming)
 
-    flag = merged["meta.finished"]
+    flag = merged[f"meta.{key}"]
     assert not isinstance(flag, list)
     assert bool(flag.reshape(())) is True
+    drain_delta_payload(merged)
+    assert f"meta.{key}" not in merged
 
 
 def test_meta_finished_consolidates_to_latest_flag_without_cat():
