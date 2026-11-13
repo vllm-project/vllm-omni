@@ -264,7 +264,7 @@ def test_incremental_attention_does_not_change_stateless_backend(monkeypatch):
 
 
 @pytest.mark.parametrize("has_triton", [False, True])
-@pytest.mark.parametrize("source", ["implicit", "additional", "connector"])
+@pytest.mark.parametrize("source", ["implicit", "additional", "connector", "opt_in"])
 def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, source):
     pytest.importorskip("torch_npu")
     import vllm.triton_utils
@@ -275,7 +275,7 @@ def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, source):
     from vllm_omni.platforms.npu.models import qwen3_tts
 
     decoder = _make_decoder()
-    disabled = source != "implicit"
+    disabled = source in ("additional", "connector")
     explicit = {"npu_fused_snake": False, "npu_incremental_codec": False, "npu_conv_graph_shapes": []}
     model = SimpleNamespace(
         decoder=decoder,
@@ -287,6 +287,8 @@ def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, source):
             additional_config=(
                 {"npu_fused_snake": True, "npu_incremental_codec": True}
                 if source == "connector"
+                else {"npu_fused_snake": True}
+                if source == "opt_in"
                 else explicit
                 if source == "additional"
                 else {}
@@ -309,7 +311,9 @@ def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, source):
         assert incremental.call_args.kwargs["streams"] == (2 if has_triton else 1)
         assert decoder._npu_incremental is incremental.return_value
     conv.assert_not_called()
-    assert all(m.npu_fused is (has_triton and not disabled) for m in decoder.modules() if isinstance(m, SnakeBeta))
+    assert all(
+        m.npu_fused is (has_triton and source == "opt_in") for m in decoder.modules() if isinstance(m, SnakeBeta)
+    )
 
 
 @pytest.mark.parametrize("has_triton,incremental", [(False, True), (True, False), (False, False)])

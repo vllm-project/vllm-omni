@@ -516,6 +516,7 @@ def test_seed_independence_resolve_once_and_sampling_kwargs():
         state._mtp_state._prepare_mtp_sample_uniforms([torch.Generator().manual_seed(11)], 1).clone(),
         state._mtp_state._prepare_mtp_sample_uniforms([torch.Generator().manual_seed(11)], 1),
     )
+    state._mtp_state._mtp_sample_uniforms = None
     # Per-request generators are resolved once per step and ride sampling kwargs.
     state.model.mtp_sampling_params = {"do_sample": True, "temperature": 0.7}
     state.model.mtp_accepts_per_row_generators = True
@@ -536,6 +537,31 @@ def test_seed_independence_resolve_once_and_sampling_kwargs():
     )
     assert resolver.call_count == 2
     assert torch.equal(codes, torch.tensor([[1, 2, 3], [4, 5, 6]]))
+
+
+@pytest.mark.parametrize("order", [[0, 1], [1, 0]])
+def test_eager_mtp_prepares_request_local_uniforms_without_outer_graph(order):
+    state = _make_state(max_num_reqs=2)
+    _init_static(state, 2)
+    mtp_state = state._mtp_state
+    mtp_state._mtp_sample_uniforms = torch.empty((2, 2, 4), dtype=torch.float32)
+    mtp_state._is_mtp_graph_runner = MagicMock(return_value=False)
+    for slot, seed in enumerate([11, 22]):
+        state.intermediate_buffer.buffers[slot] = {"req_id": f"r{slot}", "sampling_params": _seeded(seed)}
+    expected_generators = [torch.Generator().manual_seed(seed) for seed in [11, 22]]
+
+    def mtp(ids, embeds, hidden, step, **kwargs):
+        uniforms = kwargs["sample_uniforms"]
+        assert uniforms.is_contiguous() and uniforms.dtype == torch.float32
+        assert uniforms.shape == (2, 2, 4)
+        for row, slot in enumerate(order):
+            expected = torch.empty((1, 2, 4)).uniform_(1e-20, 1.0 - 1e-20, generator=expected_generators[slot])
+            torch.testing.assert_close(uniforms[row : row + 1], expected, rtol=0, atol=0)
+        return embeds, ids.reshape(-1, 1)
+
+    state.model.mtp = mtp
+    for _ in range(2):
+        mtp_state._mtp_forward(order, torch.tensor([101, 202]), torch.zeros(2, 3), torch.zeros(2, 3), torch.zeros(2, 3))
 
 
 def test_seeded_mtp_bypasses_outer_graph_runner():

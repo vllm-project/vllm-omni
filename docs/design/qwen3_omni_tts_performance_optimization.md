@@ -620,12 +620,12 @@ calls bypass the cache. Other in-place weight mutations must explicitly refresh
 `precompute_embedding()` before inference. Such mutations are not supported
 while a captured graph is active.
 
-Qwen3-TTS enables its Ascend SnakeBeta kernel by default for contiguous, nonempty NCT
+Qwen3-TTS keeps its Ascend SnakeBeta kernel disabled by default. It supports contiguous, nonempty NCT
 BF16 inference tensors within its validated grid size. The kernel preserves
 BF16 rounding between multiply, sine, square, scale and addition. Unsupported
 dtypes/layouts and training or gradient-enabled calls retain the existing path;
-other models do not use this default. Set `npu_fused_snake: false` in the
-NPU Code2Wav stage `additional_config` or connector `extra` to disable it.
+other models retain their existing behavior. Set `npu_fused_snake: true` in the
+NPU Code2Wav stage `additional_config` or connector `extra` to opt in.
 This deployment policy is not a performance conclusion:
 shape-dependent JIT compilation and eager dispatch can outweigh reduced device
 work. Shape dimensions are now runtime arguments without specialization; the
@@ -832,3 +832,13 @@ This is **not** a demonstrated quality regression, and it is **not** a
 demonstrated equivalence: 32 utterances in one language, with no speaker
 similarity scoring, cannot certify either. Run the quality gate for the target
 workload before relying on this mode.
+
+### NPU Model Runner V2 sampling inputs
+
+The standard Qwen3-TTS NPU profile selects Model Runner V2. Sampling uniforms
+are prepared from request-local generators independently of the outer MTP graph
+wrapper. This lets predictor-owned frame graphs and fused sampling consume them
+under PIECEWISE or when nested outer graphs are disabled. Graph padding retains
+its own rows; seeded active rows keep request-local random streams. The changed
+random draw granularity requires fresh end-to-end quality and performance
+qualification; older V1 or V2 results do not qualify this combination.

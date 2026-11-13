@@ -96,7 +96,7 @@ def _patched_load_weights(self, weights):
     additional = getattr(self.vllm_config, "additional_config", None)
     if isinstance(additional, dict):
         extra = {**additional, **extra}
-    fused_snake = extra.get("npu_fused_snake", True)
+    fused_snake = extra.get("npu_fused_snake", False)
     if not isinstance(fused_snake, bool):
         raise ValueError("npu_fused_snake must be a boolean")
     for module in self.decoder.modules():

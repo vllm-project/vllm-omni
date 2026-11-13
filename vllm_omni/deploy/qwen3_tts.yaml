@@ -73,7 +73,6 @@ connectors:
       # decode_cudagraph_batch_sizes: [1, 2, 4]
       # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.
       decode_batch_max_size: 4
-      npu_fused_snake: false
       # Qwen3-TTS NPU optimization defaults are owned by the model and loader.
       # Set explicit overrides here or in stage additional_config; CUDA keeps
       # its existing defaults when these options are omitted.
