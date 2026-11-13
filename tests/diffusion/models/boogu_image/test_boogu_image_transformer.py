@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -847,7 +848,7 @@ _FUSED_EPS = 1e-5
 
 
 def _fused_rotary_pair(tokens: int):
-    theta = torch.randn(1, tokens, _FUSED_HEAD_DIM // 2, device="cuda", dtype=torch.float32)
+    theta = torch.randn(1, tokens, _FUSED_HEAD_DIM // 2, device=DEVICE_TYPE, dtype=torch.float32)
     return (
         torch.cos(theta).repeat_interleave(2, dim=-1),
         torch.sin(theta).repeat_interleave(2, dim=-1),
@@ -859,8 +860,8 @@ def _fused_norms():
     from vllm.model_executor.layers.layernorm import RMSNorm
 
     with set_current_vllm_config(VllmConfig()):
-        norm_q = RMSNorm(_FUSED_HEAD_DIM, eps=_FUSED_EPS).cuda().to(torch.bfloat16)
-        norm_k = RMSNorm(_FUSED_HEAD_DIM, eps=_FUSED_EPS).cuda().to(torch.bfloat16)
+        norm_q = RMSNorm(_FUSED_HEAD_DIM, eps=_FUSED_EPS).to(DEVICE_TYPE).to(torch.bfloat16)
+        norm_k = RMSNorm(_FUSED_HEAD_DIM, eps=_FUSED_EPS).to(DEVICE_TYPE).to(torch.bfloat16)
     with torch.no_grad():
         norm_q.weight.copy_(torch.randn(_FUSED_HEAD_DIM))
         norm_k.weight.copy_(torch.randn(_FUSED_HEAD_DIM))
@@ -879,8 +880,8 @@ def _operand_ulp_bound(x, weight, cos, sin):
     return 2.0**-6 * torch.stack((even_mag, odd_mag), dim=-1).flatten(-2) + 1e-6
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
 def test_packed_rope_table_layout(monkeypatch):
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         _with_packed_rope_table,
@@ -905,8 +906,8 @@ def test_packed_rope_table_layout(monkeypatch):
     assert len(short) == 2
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
 def test_fused_qk_norm_rope_matches_eager_chain():
     """The fused path vs the previous eager chain at real Boogu shapes.
 
@@ -925,8 +926,8 @@ def test_fused_qk_norm_rope_matches_eager_chain():
 
     torch.manual_seed(0)
     norm_q, norm_k = _fused_norms()
-    q = torch.randn(1, 4139, _FUSED_Q_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(1, 4139, _FUSED_KV_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(1, 4139, _FUSED_Q_HEADS, _FUSED_HEAD_DIM, device=DEVICE_TYPE, dtype=torch.bfloat16)
+    k = torch.randn(1, 4139, _FUSED_KV_HEADS, _FUSED_HEAD_DIM, device=DEVICE_TYPE, dtype=torch.bfloat16)
     cos, sin = _fused_rotary_pair(4139)
     with_table = _with_packed_rope_table((cos, sin))
 
@@ -938,8 +939,8 @@ def test_fused_qk_norm_rope_matches_eager_chain():
         assert (diff <= bound).all(), "fused path beyond one operand ulp of the eager chain"
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
 def test_fallback_with_no_packed_table():
     """Without a packed table the helper is bit-exact to the old chain."""
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
@@ -949,8 +950,8 @@ def test_fallback_with_no_packed_table():
 
     torch.manual_seed(0)
     norm_q, norm_k = _fused_norms()
-    q = torch.randn(1, 64, _FUSED_Q_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(1, 64, _FUSED_KV_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(1, 64, _FUSED_Q_HEADS, _FUSED_HEAD_DIM, device=DEVICE_TYPE, dtype=torch.bfloat16)
+    k = torch.randn(1, 64, _FUSED_KV_HEADS, _FUSED_HEAD_DIM, device=DEVICE_TYPE, dtype=torch.bfloat16)
     cos, sin = _fused_rotary_pair(64)
 
     out_q, out_k = _qk_norm_rope(q, k, norm_q, norm_k, (cos, sin), torch.bfloat16)

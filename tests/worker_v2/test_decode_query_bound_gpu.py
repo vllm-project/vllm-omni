@@ -28,7 +28,7 @@ class _AttentionScales:
     _v_scale: torch.Tensor
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("graph_mode", [CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL_DECODE_ONLY])
 def test_full_decode_graph_matches_fa3_aot_schedule(graph_mode, tmp_path):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:

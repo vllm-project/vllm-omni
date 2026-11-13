@@ -19,7 +19,7 @@ from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 pytestmark = [pytest.mark.core_model]
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "xpu": "B60"}, num_cards=1)
 def test_full_graph_prefill_uses_real_flash_attention_backend():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("requires FA3 on Hopper or newer")

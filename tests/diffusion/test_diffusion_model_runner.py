@@ -941,7 +941,7 @@ def test_execute_stepwise_streaming_decodes_final_only_pipeline(monkeypatch):
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_execute_model_skips_cache_summary_without_active_cache_backend(monkeypatch):
     """Guard cache diagnostics with runtime backend state to avoid stale-config crashes."""
     runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")
@@ -966,7 +966,7 @@ def test_execute_model_skips_cache_summary_without_active_cache_backend(monkeypa
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeypatch):
     cache_backend = _EnabledCacheBackend()
     runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
@@ -992,7 +992,7 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("cache_dit_enabled", [False, True])
 def test_execute_model_cache_summary_follows_pipeline_owned_cache_dit_state(monkeypatch, cache_dit_enabled):
     runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")

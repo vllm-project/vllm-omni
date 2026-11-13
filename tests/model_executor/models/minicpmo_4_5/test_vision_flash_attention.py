@@ -11,6 +11,7 @@ import torch
 from pytest_mock import MockerFixture
 from transformers.utils import is_flash_attn_2_available
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni_llm as minicpmo_model
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
@@ -234,7 +235,7 @@ def test_encoder_recomputes_unpadding_metadata_for_new_mask(mocker: MockerFixtur
 
 
 def _require_flash_attention() -> None:
-    if not torch.cuda.is_available():
+    if not DEVICE_MODULE.is_available():
         pytest.skip("CUDA is required for FlashAttention execution")
     if not is_flash_attn_2_available():
         pytest.skip("Transformers reports that FlashAttention 2 is unavailable")
@@ -246,22 +247,22 @@ def _make_cuda_attention_pair() -> tuple[SiglipAttention, SiglipFlashAttention2]
         num_heads=_VISION_NUM_HEADS,
     )
     torch.manual_seed(0)
-    eager_attention = SiglipAttention(config).eval().to(device="cuda", dtype=_DTYPE)
-    flash_attention = SiglipFlashAttention2(config).eval().to(device="cuda", dtype=_DTYPE)
+    eager_attention = SiglipAttention(config).eval().to(device=DEVICE_TYPE, dtype=_DTYPE)
+    flash_attention = SiglipFlashAttention2(config).eval().to(device=DEVICE_TYPE, dtype=_DTYPE)
     flash_attention.load_state_dict(eager_attention.state_dict())
     return eager_attention, flash_attention
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
 def test_encoder_metadata_reuse_matches_per_layer_recomputation() -> None:
     _require_flash_attention()
-    encoder = SiglipEncoder(_encoder_config()).eval().to(device="cuda", dtype=_DTYPE)
+    encoder = SiglipEncoder(_encoder_config()).eval().to(device=DEVICE_TYPE, dtype=_DTYPE)
     torch.manual_seed(3)
-    hidden_states = torch.randn(2, 64, 32, device="cuda", dtype=_DTYPE)
-    attention_mask = torch.arange(64, device="cuda").unsqueeze(0) < torch.tensor(
+    hidden_states = torch.randn(2, 64, 32, device=DEVICE_TYPE, dtype=_DTYPE)
+    attention_mask = torch.arange(64, device=DEVICE_TYPE).unsqueeze(0) < torch.tensor(
         (64, 43),
-        device="cuda",
+        device=DEVICE_TYPE,
     ).unsqueeze(1)
 
     with torch.inference_mode():
@@ -285,7 +286,7 @@ def test_encoder_metadata_reuse_matches_per_layer_recomputation() -> None:
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
 def test_flash_attention_unpadded_matches_eager_reference() -> None:
     _require_flash_attention()
     eager_attention, flash_attention = _make_cuda_attention_pair()
@@ -294,7 +295,7 @@ def test_flash_attention_unpadded_matches_eager_reference() -> None:
         2,
         64,
         _VISION_HIDDEN_SIZE,
-        device="cuda",
+        device=DEVICE_TYPE,
         dtype=_DTYPE,
     )
 
@@ -306,7 +307,7 @@ def test_flash_attention_unpadded_matches_eager_reference() -> None:
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
 @pytest.mark.parametrize(
     "valid_lengths",
     [
@@ -326,12 +327,12 @@ def test_flash_attention_padded_matches_per_sample_unpadded(
         batch_size,
         seq_len,
         _VISION_HIDDEN_SIZE,
-        device="cuda",
+        device=DEVICE_TYPE,
         dtype=_DTYPE,
     )
-    attention_mask = torch.arange(seq_len, device="cuda").unsqueeze(0) < torch.tensor(
+    attention_mask = torch.arange(seq_len, device=DEVICE_TYPE).unsqueeze(0) < torch.tensor(
         valid_lengths,
-        device="cuda",
+        device=DEVICE_TYPE,
     ).unsqueeze(1)
 
     with torch.inference_mode():
