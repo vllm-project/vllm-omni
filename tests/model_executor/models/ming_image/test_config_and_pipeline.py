@@ -257,9 +257,9 @@ def test_multimodal_processor_applies_generation_template(monkeypatch: pytest.Mo
     ("pipeline_config", "expected_class_name"),
     ((MING_IMAGE_PIPELINE, "MingImageDiffusionPipeline"), (None, None)),
 )
-def test_engine_od_config_falls_back_to_registered_pipeline_class(monkeypatch, pipeline_config, expected_class_name):
-    # Ming-Image ships neither a root config.json nor model_index.json for now,
-    # so class-name resolution returns None; serving must still find the extras (e.g. num_layers).
+def test_engine_od_config_with_unavailable_checkpoint_metadata(monkeypatch, pipeline_config, expected_class_name):
+    # Older revisions have no root config or pipeline index. An explicitly
+    # selected topology must still supply the request contract.
     monkeypatch.setattr("vllm_omni.diffusion.data.resolve_model_class_name", lambda model, **kwargs: None)
     engine = object.__new__(AsyncOmniEngine)
     engine.model = "inclusionAI/Ming-Image-0.1-Design-Layer"

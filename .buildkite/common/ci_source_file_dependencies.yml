@@ -726,6 +726,19 @@ source_file_dependencies:
     - vllm_omni/model_executor/models/covo_audio/
     - vllm_omni/model_executor/stage_input_processors/covo_audio.py
 
+  diffusion_ming_image_function:
+    - tests/e2e/online_serving/test_ming_image.py
+    - tests/diffusion/test_ming_layer_request_contract.py
+    - tests/model_executor/models/ming_image/
+    - vllm_omni/deploy/ming_image.yaml
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/diffusion/models/ming_image/
+    - vllm_omni/engine/omni_engine_base.py
+    - vllm_omni/model_executor/models/ming_image/
+    - vllm_omni/model_executor/stage_input_processors/ming_image.py
+    - vllm_omni/model_extras/ming_image.py
+    - vllm_omni/entrypoints/openai/
+
   omni_ming_flash_omni_function:
     - tests/e2e/offline_inference/test_ming_flash_omni_expansion.py
     - tests/helpers/stage_config.py

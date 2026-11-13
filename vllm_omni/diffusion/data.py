@@ -797,8 +797,12 @@ def resolve_model_class_name(
         "ming_flash_omni",
         "ming_flash_omni_thinker",
     ):
-        transformer_config = get_hf_file_to_dict("transformer/config.json", model, revision=revision) or {}
-        if transformer_config.get("_class_name") == "DiffusionTransformer":
+        try:
+            transformer_config = get_hf_file_to_dict("transformer/config.json", model, revision=revision)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("Could not read Ming transformer metadata for %s: %s", model, exc)
+            transformer_config = None
+        if isinstance(transformer_config, Mapping) and transformer_config.get("_class_name") == "DiffusionTransformer":
             return "MingImageDiffusionPipeline"
         return "MingImagePipeline"
     if model_type == "nextstep":

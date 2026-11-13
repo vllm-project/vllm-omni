@@ -372,8 +372,10 @@ class OmniEngineBase:
     def get_diffusion_od_config(self) -> Any:
         """Expose the diffusion ``model_class_name`` to client-side model-extras.
 
-        The worker holds the full config; here we just resolve the pipeline class
-        name from the model config (cached). ``model_class_name`` may be ``None``.
+        The worker holds the full config. Prefer the resolved topology's class
+        so serving uses its request contract; discover checkpoint metadata only
+        when the topology has no diffusion class. The result is cached and
+        ``model_class_name`` may be ``None``.
         """
         if self._diffusion_od_config_view is None:
             from types import SimpleNamespace
@@ -381,10 +383,9 @@ class OmniEngineBase:
             from vllm_omni.diffusion.data import resolve_model_class_name
             from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
-            model_class_name = resolve_model_class_name(self.model)
+            model_class_name = getattr(self.pipeline_config, "diffusers_class_name", None)
             if model_class_name is None:
-                # use registered diffusers cls name as fallback
-                model_class_name = getattr(self.pipeline_config, "diffusers_class_name", None)
+                model_class_name = resolve_model_class_name(self.model)
             metadata = get_diffusion_model_metadata(model_class_name)
             self._diffusion_od_config_view = SimpleNamespace(
                 model_class_name=model_class_name,
