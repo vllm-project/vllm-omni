@@ -113,8 +113,10 @@ preempted; this is the documented difference from upstream scheduling that
 AR-INV-001 asks for. A streamed request is never replayed: when the KV cache
 runs out, or a prefix-cache reset takes running requests, it ends with an ERROR
 output whatever the stage's `recompute_preemption`, because a replay rebuilds it
-from the token stream, which holds none of its streamed text rows. Requests
-without a stream reach none of these rules.
+from the token stream, which holds none of its streamed text rows. For the same
+reason a streaming input session (a resumable request, whose updates re-prefill
+it) cannot declare a text stream. Requests without a stream reach none of these
+rules.
 
 ## Candidate invariants
 

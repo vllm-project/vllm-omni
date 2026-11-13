@@ -345,6 +345,18 @@ def test_multi_frame_talker_decode_refuses_streamed_text(monkeypatch):
     assert "multi-frame" in _terminal_errors(outputs)["r"]
 
 
+def test_a_streaming_input_session_cannot_stream_its_text():
+    # Each session update re-prefills the request, which a streamed text cannot replay (see _preempt_request).
+    scheduler, _ = _scheduler()
+    request = _request("r")
+    request.resumable = True
+    scheduler.add_request(request)
+    scheduled, outputs = _step(scheduler)
+    assert scheduled.num_scheduled_tokens == {}
+    assert "streaming input session" in _terminal_errors(outputs)["r"]
+    assert "r" not in scheduler.requests and "r" not in scheduler._text_streams
+
+
 def test_a_text_that_ends_shorter_than_its_lead_allows_fails_before_its_prefill():
     scheduler, _ = _scheduler()
     scheduler.add_request(_request("r", lead=4))  # the lead rows hold at least 3 ids and the END
@@ -418,9 +430,10 @@ def test_a_preempted_streamed_request_ends_with_an_error_instead_of_replaying(re
     assert "streamed text cannot be replayed" in terminal.stop_reason
 
 
-def test_a_prefix_cache_reset_ends_a_running_streamed_request_instead_of_replaying_it():
+@pytest.mark.parametrize("scheduler_cls", [OmniARScheduler, OmniARAsyncScheduler])
+def test_a_prefix_cache_reset_ends_a_running_streamed_request_instead_of_replaying_it(scheduler_cls):
     # The Qwen3-TTS Talker sets recompute_preemption="fail", but a reset of running requests replays them anyway.
-    scheduler, _ = _scheduler(max_num_seqs=1, recompute_preemption="fail")
+    scheduler, _ = _scheduler(max_num_seqs=1, recompute_preemption="fail", scheduler_cls=scheduler_cls)
     request = _request("r")
     scheduler.add_request(request)
     scheduler.append_text("r", [5, 6, 7], final=False)

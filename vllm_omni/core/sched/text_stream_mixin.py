@@ -131,6 +131,9 @@ class TextStreamMixin(_SchedulerBase):
             return
         if self._talker_kstep_armed():
             reason = "Streamed text is not supported with multi-frame Talker decode."
+        elif request.resumable:
+            # Each session update re-prefills the request, which a streamed text cannot replay.
+            reason = "Streamed text is not supported in a streaming input session."
         else:
             reason = streams.register(request.request_id, info)
         if reason is not None:
