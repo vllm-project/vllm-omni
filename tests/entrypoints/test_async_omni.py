@@ -8,6 +8,7 @@ from typing import Any
 
 import anyio
 import pytest
+import torch
 from vllm.engine.protocol import StreamingInput
 from vllm.lora.request import LoRARequest
 from vllm.pooling_params import PoolingParams
@@ -18,14 +19,19 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import AsyncOmniParams
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import ErrorMessage, NextStageInputMessage, OutputMessage
+from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.entrypoints import async_omni as async_omni_mod
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.omni_base import OmniBase
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
+from vllm_omni.model_executor.stage_input_processors.forced_aligner import code2wav2aligner
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 
 pytestmark = [pytest.mark.core_model]
 
@@ -97,6 +103,82 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     omni._process_orchestrator_results = fake_process_results
     omni._log_summary_and_cleanup = lambda request_id: omni.request_states.pop(request_id, None)
     return omni
+
+
+@pytest.mark.cpu
+@pytest.mark.asyncio
+async def test_generate_delta_audio_aligns_complete_waveform(mocker):
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.async_chunk = True
+    orchestrator._pd_pair = None
+    orchestrator._cfg_tracker = CfgCompanionTracker()
+    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator.stage_pools = [
+        SimpleNamespace(final_output=True),
+        SimpleNamespace(
+            final_output=True,
+            stage_vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(model_stage="forced_aligner", async_chunk=False)
+            ),
+        ),
+    ]
+    aligner_inputs = []
+    deltas = [torch.tensor([0.1, 0.2]), torch.tensor([0.3])]
+
+    async def add_request(request_id, prompt, sampling_params_list, final_stage_id, final_output_stage_ids, **kwargs):
+        assert sampling_params_list[0].output_kind == RequestOutputKind.DELTA
+        state = OrchestratorRequestState(
+            request_id=request_id,
+            final_stage_id=final_stage_id,
+            final_output_stage_ids=set(final_output_stage_ids),
+            sampling_params_list=sampling_params_list,
+        )
+        for index, delta in enumerate(deltas):
+            output = OmniRequestOutput(
+                request_id=request_id,
+                finished=index == len(deltas) - 1,
+                outputs=[
+                    MultimodalCompletionOutput(
+                        index=0,
+                        text="",
+                        token_ids=[],
+                        cumulative_logprob=None,
+                        logprobs=None,
+                        multimodal_output=MultimodalPayload.from_dict({"audio": delta, "sr": 24000}),
+                    )
+                ],
+            )
+            await orchestrator._route_output(0, 0, output, state, None)
+
+    async def forward(request_id, stage_id, output, state, **kwargs):
+        aligner_inputs.extend(code2wav2aligner([output], prompt))
+
+    async def process_results(*args):
+        while not orchestrator.output_async_queue.empty():
+            yield orchestrator.output_async_queue.get_nowait().engine_outputs
+
+    orchestrator._forward_to_next_stage = mocker.AsyncMock(side_effect=forward)
+    omni = get_async_omni_instance(fake_add_request=add_request)
+    omni.engine.num_stages = 2
+    omni.default_sampling_params_list = [SamplingParams(), PoolingParams()]
+    omni.sampling_constraints_list = [{}, {}]
+    omni.resolve_sampling_params_list = OmniBase.resolve_sampling_params_list.__get__(omni)
+    omni._compute_final_stage_id = lambda _: 1
+    omni._compute_final_output_stage_ids = lambda _: [0, 1]
+    omni._process_orchestrator_results = process_results
+    prompt = {"prompt": "Hello", "additional_information": {"text": ["Hello"]}}
+
+    outputs = [
+        output
+        async for output in omni.generate(prompt=prompt, request_id="audio", output_modalities=["audio", "timestamps"])
+    ]
+    assert len(outputs) == len(deltas)
+    for output, delta in zip(outputs, deltas, strict=True):
+        torch.testing.assert_close(output.outputs[0].multimodal_output["audio"], delta)
+    assert len(aligner_inputs) == 1
+    waveform, rate = aligner_inputs[0]["multi_modal_data"]["audio"]
+    torch.testing.assert_close(torch.from_numpy(waveform), torch.cat(deltas))
+    assert rate == 24000
 
 
 @pytest.mark.cpu
