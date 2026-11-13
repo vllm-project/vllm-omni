@@ -23,7 +23,7 @@ steps:
         commands:
           - bash .buildkite/intel/scripts/run-xpu-test.sh core_model
         agents:
-          queue: intel-gpu-omni
+          queue: intel-gpu-k8s
 
       - label: "Intel XPU: MXFP8 quantization"
         source_file_dependencies: diffusion_quantization
@@ -31,7 +31,7 @@ steps:
         commands:
           - bash .buildkite/intel/scripts/run-xpu-test.sh quantization
         agents:
-          queue: intel-gpu-omni
+          queue: intel-gpu-k8s
 
       - label: "Intel XPU: Advanced model"
         source_file_dependencies:
@@ -44,7 +44,7 @@ steps:
         commands:
           - bash .buildkite/intel/scripts/run-xpu-test.sh advanced_model
         agents:
-          queue: intel-gpu-omni
+          queue: intel-gpu-k8s
 
       - label: "Intel XPU: Omni"
         source_file_dependencies: intel_xpu_omni_tts_function
@@ -52,4 +52,4 @@ steps:
         commands:
           - bash .buildkite/intel/scripts/run-xpu-test.sh omni
         agents:
-          queue: intel-gpu-omni
+          queue: intel-gpu-k8s
