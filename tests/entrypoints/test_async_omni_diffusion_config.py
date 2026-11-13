@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -1039,6 +1040,59 @@ def test_generic_diffusion_deploy_survives_typed_resolution(
     assert stage.diffusion_config.step_execution is True
     assert stage.diffusion_config.flow_shift == 5.0
     assert stage.model_config.default_sampling_params == {"guidance_scale": 4.0}
+
+
+@pytest.mark.parametrize("devices", ["0,1,2,3", "4,5,6,7"])
+def test_minimax_h3_image_replica_template_resolves_four_sp1_workers(mocker, tmp_path, devices):
+    """Replica count must not become four-way parallelism inside each worker."""
+    mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.config.resolver._resolve_generic_diffusion_model_class",
+        return_value=(True, "MiniMaxH3ImagePipeline"),
+    )
+    template = (
+        Path(__file__).resolve().parents[2] / "examples/online_serving/replica_data_parallel/minimax_h3_image_dp.yaml"
+    )
+    deploy_path = tmp_path / "h3-image-replicas.yaml"
+    deploy_path.write_text(template.read_text().replace("__NUM_REPLICAS__", "4").replace("__DEVICES__", devices))
+    resolved = resolve_omni_config(
+        "generic-diffusion",
+        trust_remote_code=False,
+        deploy_config_path=str(deploy_path),
+        cli_overrides={},
+        stage_overrides=None,
+        strategy_config_path=None,
+    )
+
+    assert len(resolved.stage_configs) == 1
+    stage = resolved.stage_configs[0]
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.final_output_type == "image"
+    assert stage.runtime_config.num_replicas == 4
+    assert stage.runtime_config.devices == devices
+    assert stage.parallel_config.world_size == 1
+    for degree in (
+        "tensor_parallel_size",
+        "data_parallel_size",
+        "pipeline_parallel_size",
+        "sequence_parallel_size",
+        "ulysses_degree",
+        "ring_degree",
+        "allgather_degree",
+        "cfg_parallel_size",
+        "vae_patch_parallel_size",
+        "text_encoder_tp_size",
+    ):
+        assert getattr(stage.parallel_config, degree) == 1
+    assert stage.scheduler_config.max_num_seqs == 1
+    assert stage.model_config.enforce_eager is True
+    assert stage.diffusion_config.enable_cuda_graph_decode is False
+    attention = stage.diffusion_config.diffusion_attention_config
+    assert attention.default is not None
+    assert attention.default.backend == "FLASH_ATTN"
+    assert stage.diffusion_config.additional_config["text_encoder_cudnn_sdp"] is False
+    assert stage.model_config.default_sampling_params == {"seed": 42, "num_inference_steps": 6}
+    assert stage_init_utils.compute_replica_layout(resolved.stage_configs) == ([4], {0: devices.split(",")})
 
 
 def test_default_stage_config_preserves_pre_sharded_hsdp_weight_load() -> None:
