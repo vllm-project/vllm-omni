@@ -261,6 +261,7 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False) -> dict:
                 cosmos_performance_job(benchmark),
                 video_performance_job(benchmark, "hunyuanvideo15"),
                 video_performance_job(benchmark, "minimax-h3"),
+                video_performance_job(benchmark, "wan22-i2v"),
             ]
         )
     for case in cases:

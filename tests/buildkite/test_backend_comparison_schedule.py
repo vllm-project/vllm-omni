@@ -89,6 +89,7 @@ def test_schedule_uploads_only_validated_sglang_workloads(comparison_runner, tmp
         "perf-sglang-cosmos3-t2i",
         "perf-sglang-hunyuanvideo15",
         "perf-sglang-minimax-h3",
+        "perf-sglang-wan22-i2v",
     }
     for key, cards in (
         ("nightly-sglang-omni-qwen3-omni", 2),
@@ -98,6 +99,7 @@ def test_schedule_uploads_only_validated_sglang_workloads(comparison_runner, tmp
         ("perf-sglang-cosmos3-t2i", 2),
         ("perf-sglang-hunyuanvideo15", 1),
         ("perf-sglang-minimax-h3", 4),
+        ("perf-sglang-wan22-i2v", 1),
     ):
         job = jobs[key]
         assert job["agents"] == {"queue": "mithril-h100-pool"}
@@ -110,6 +112,7 @@ def test_schedule_uploads_only_validated_sglang_workloads(comparison_runner, tmp
             "perf-sglang-cosmos3-t2i",
             "perf-sglang-hunyuanvideo15",
             "perf-sglang-minimax-h3",
+            "perf-sglang-wan22-i2v",
         }:
             assert "depends_on" not in job
             assert container["image"].endswith("@" + job["env"]["COMPARISON_IMAGE_DIGEST"])
