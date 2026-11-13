@@ -153,15 +153,15 @@ def get_audio_to_audio_query(
 def get_system_prompt(query_type: str, custom_prompt: str | None = None) -> dict:
     """Get system prompt based on query type."""
     if query_type == "audio_to_text":
-        system_text = custom_prompt or "请记录下你所听到的语音内容。"
+        system_text = "请记录下你所听到的语音内容。"
     elif query_type == "text_to_audio":
         system_text = "以自然的语速读出下面的文字。"
     else:  # audio_to_audio
-        system_text = custom_prompt or "You are an audio processing assistant. Listen and repeat the audio content."
+        system_text = "You are an audio processing assistant. Listen and repeat the audio content."
 
     return {
         "role": "system",
-        "content": [{"type": "text", "text": system_text}],
+        "content": [{"type": "text", "text": custom_prompt or system_text}],
     }
 
 
