@@ -271,6 +271,95 @@ def test_async_chunk_resumable_stop_rearms_connector_polling() -> None:
     assert sched.num_waiting_for_streaming_input == 0
 
 
+def test_native_input_terminal_finishes_resumable_code2wav() -> None:
+    """MRv2 last-chunk hang: input_terminal must request-finish, not park.
+
+    V1 ChunkTransferAdapter recv set ``request.resumable = False`` on
+    ``meta.finished``. Native MRv2 only stamps ``input_terminal``; without
+    dropping resumable, ``_handle_stopped_request`` parks Code2Wav as
+    WAITING_FOR_STREAMING_REQ and the client times out with ``done=False``.
+    """
+    session = _make_request(request_id="req-native-code2wav-terminal")
+    session.status = RequestStatus.RUNNING
+    session.resumable = True
+    session.num_computed_tokens = len(session.prompt_token_ids)
+    session.num_in_flight_tokens = 1
+
+    sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
+    sched._first_chunk_express = False
+    sched._express_min_slack_s = 0.0
+    sched.requests = {session.request_id: session}
+    sched.perf_metrics = None
+    sched.chunk_transfer_adapter = None
+    sched._native_data_plane = True
+    sched._async_chunk_transport_enabled.return_value = True
+    sched._input_execution_is_terminal.return_value = True
+    sched._pending_data_plane_terminal_req_ids = set()
+    sched._pending_finish_reqs = []
+    sched._pending_chunk_error_outputs = []
+    sched.aux_output_connector = None
+    sched.connector = None
+    sched.ec_connector = None
+    sched.recompute_kv_load_failures = False
+
+    def finish_if_not_resumable(request: Request) -> bool:
+        if request.resumable:
+            request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+            return False
+        return True
+
+    sched._handle_stopped_request.side_effect = finish_if_not_resumable
+    sched._free_request.return_value = (None, None)
+    sched.running = [session]
+    sched._remove_stopped_requests_from_queues.side_effect = lambda running, preempted: (
+        OmniSchedulerMixin._remove_stopped_requests_from_queues(sched, running, preempted)
+    )
+    sched.waiting = MagicMock()
+    sched.kv_holding_waiting = MagicMock()
+    sched.deferred_waiting = set()
+    sched.structured_output_manager.accept_tokens.return_value = True
+    sched._maybe_decode_pooling_output.return_value = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
+    sched.finished_req_ids_dict = {}
+    sched.make_stats.return_value = None
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {session.request_id: 1}
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+    scheduler_output.total_num_scheduled_tokens = 1
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[]]
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.multimodal_outputs = None
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.pending_generation_req_ids = set()
+    model_runner_output.req_id_to_index = {session.request_id: 0}
+    model_runner_output.routed_experts = None
+
+    outputs = OmniGenerationScheduler.update_from_output(
+        sched,
+        scheduler_output,
+        model_runner_output,
+    )
+
+    output = outputs[session.client_index].outputs[0]
+    assert session.resumable is False
+    assert output.is_segment_finished is False
+    assert output.finish_reason is not None
+    sched._handle_stopped_request.assert_called_once_with(session)
+    sched._free_request.assert_called_once_with(session)
+    assert session.request_id in sched._pending_data_plane_terminal_req_ids
+    assert session not in sched.running
+
+
 class TestReplaceSessionWithStreamingUpdate:
     def test_resets_tokens_and_prompt_from_update(self) -> None:
         sched = _SchedulerStub()
