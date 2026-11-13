@@ -179,12 +179,20 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._closed = False
         self._is_failed = False
         self._failure_callbacks: list[Callable[[], None]] = []
+        # The executor pins a spawn context instead of relying on the global
+        # start method: wake_events below are created here, in _init_executor,
+        # while _launch_workers only switches the global start method to spawn
+        # later. mp.Event() would therefore come from the default (fork)
+        # context and then be pickled into spawn-Process args, which is
+        # unsupported — sync primitives must come from the same context as the
+        # processes that consume them.
+        self._mp_context = mp.get_context("spawn")
         self._result_mq: MessageQueue | None = None
         self._result_mqs: list[MessageQueue] = []
         self._rpc_wave_id: int = 0
 
         num_workers = cast(int, self.od_config.num_gpus)
-        self.wake_events = [mp.Event() for _ in range(num_workers)]
+        self.wake_events = [self._mp_context.Event() for _ in range(num_workers)]
 
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
@@ -376,6 +384,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         wake_events: list[Event],
     ) -> tuple[list[mp.Process], list[Handle]]:
         od_config = self.od_config
+        # The shared registry is only valid as a spawn argument. Request RPCs
+        # serialize od_config with ordinary pickle, which cannot carry it.
+        sharing_registry = vars(od_config).pop("_sharing_worker_registry", None)
         logger.info("Starting server...")
 
         num_gpus = cast(int, od_config.num_gpus)
@@ -384,6 +395,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # user-provided OMP_NUM_THREADS.
         set_multiprocessing_worker_envs()
         mp.set_start_method("spawn", force=True)
+        mp_context = getattr(self, "_mp_context", mp.get_context("spawn"))
         processes = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
@@ -395,9 +407,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         scheduler_pipe_writers = []
 
         for i in range(num_gpus):
-            reader, writer = mp.Pipe(duplex=False)
+            reader, writer = mp_context.Pipe(duplex=False)
             scheduler_pipe_writers.append(writer)
-            process = mp.Process(
+            process = mp_context.Process(
                 target=WorkerProc.worker_main,
                 args=(
                     i,  # rank
@@ -408,6 +420,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),
+                kwargs={"sharing_registry": sharing_registry},
                 name=f"DiffusionWorker-{i}",
                 daemon=True,
             )

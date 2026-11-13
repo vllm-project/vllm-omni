@@ -164,12 +164,12 @@ def test_inventory_matches_reviewed_snapshot_counts():
     """Make an inventory expansion an explicit review decision."""
     category_counts = Counter(item.category for item in ENVIRONMENT_VARIABLE_INVENTORY.values())
     assert category_counts == {
-        EnvironmentVariableCategory.PUBLIC_OMNI: 37,
+        EnvironmentVariableCategory.PUBLIC_OMNI: 39,
         EnvironmentVariableCategory.INHERITED_VLLM: 22,
         EnvironmentVariableCategory.PLATFORM_EXTERNAL: 34,
-        EnvironmentVariableCategory.MODEL_SPECIFIC: 98,
+        EnvironmentVariableCategory.MODEL_SPECIFIC: 102,
         EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 22,
-        EnvironmentVariableCategory.INTERNAL: 7,
+        EnvironmentVariableCategory.INTERNAL: 8,
     }
 
     disposition_counts = Counter(
@@ -178,7 +178,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
         if item.category is EnvironmentVariableCategory.MODEL_SPECIFIC
     )
     assert {disposition: disposition_counts[disposition] for disposition in ModelEnvironmentVariableDisposition} == {
-        ModelEnvironmentVariableDisposition.PROMOTE: 71,
+        ModelEnvironmentVariableDisposition.PROMOTE: 74,
         ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 5,
         ModelEnvironmentVariableDisposition.EXTERNAL: 0,
         ModelEnvironmentVariableDisposition.INTERNALIZE: 16,

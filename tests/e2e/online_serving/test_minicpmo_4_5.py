@@ -93,7 +93,19 @@ turn_test_params = [
     pytest.param(
         OmniServerParams(
             model=_MODEL,
-            stage_config_path=modify_stage_config(_CI_DEPLOY, updates={"session_mode": "turn"}),
+            stage_config_path=modify_stage_config(
+                _CI_DEPLOY,
+                updates={"session_mode": "turn"},
+                # The K-step frames are booked by the duplex frame loop only;
+                # the Talker fails closed at load otherwise ("remove the
+                # stage-1 speculative_config from turn sessions"), so a turn
+                # session must not inherit the platform blocks' stage-1
+                # speculative_config.
+                deletes={
+                    "platforms.npu.stages.1.speculative_config": None,
+                    "platforms.cuda.stages.1.speculative_config": None,
+                },
+            ),
             use_stage_cli=False,
             server_args=[
                 "--trust-remote-code",
@@ -263,32 +275,6 @@ def _read_prompt_selection_log(offset: int) -> str:
         return log_file.read().decode("utf-8")
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params + turn_test_params, indirect=True)
-def test_text_to_text_001(omni_server, openai_client) -> None:
-    """
-    Test text-only input generating text output via OpenAI API.
-    Deploy Setting: default single GPU
-    Input Modal: text
-    Output Modal: text
-    Input Setting: stream=False
-    """
-    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
-
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "stream": False,
-        "modalities": ["text"],
-        "key_words": {"text": ["Beijing"]},
-    }
-
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
-
-
 @pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
@@ -313,6 +299,14 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
     }
 
     openai_client.send_omni_request(request_config)
+
+
+# Merge selection (`-m 'advanced_model and cuda'`) reuses module-scoped
+# ``omni_server`` only while the next collected item's param value matches.
+# Keep every ``test_params`` case (id ``async_chunk``) in one contiguous block
+# before Talker DSpark. ``turn_async_chunk`` is a different deploy
+# (``session_mode: turn``); it stays the second parameter of
+# ``test_text_to_text_001``, after this block.
 
 
 @pytest.mark.advanced_model
@@ -358,6 +352,73 @@ def test_text_to_audio_with_default_reference(omni_server, openai_client) -> Non
 
     assert responses[0].success
     assert responses[0].audio_bytes
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
+    """
+    Test multi-modal input (text + audio + video + image) generating text + audio output.
+    Deploy Setting: default single GPU
+    Input Modal: text + audio + video + image
+    Output Modal: text + audio
+    Input Setting: stream=True
+    """
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(24, 24, 20)['base64']}"
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(24, 24)['base64']}"
+    # A loop of the default single word "test" can make the answer repeat
+    # to the token limit, leaving TTS/ASR to count a long run of identical words
+    # (#7630). Exercise speech perception with a meaningful phrase instead.
+    audio = generate_synthetic_audio(5, 1, phrase_text="The weather is sunny today.")
+    audio_data_url = f"data:audio/wav;base64,{audio['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        image_data_url=image_data_url,
+        audio_data_url=audio_data_url,
+        content_text=(
+            "Briefly describe the image and video, and summarize what the voice says. "
+            "Answer in one short sentence without repeating the spoken phrase."
+        ),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "extra_body": _TTS_EXTRA_BODY,
+    }
+
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", test_params + turn_test_params, indirect=True)
+def test_text_to_text_001(omni_server, openai_client) -> None:
+    """
+    Test text-only input generating text output via OpenAI API.
+    Deploy Setting: default single GPU
+    Input Modal: text
+    Output Modal: text
+    Input Setting: stream=False
+    """
+    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "modalities": ["text"],
+        "key_words": {"text": ["Beijing"]},
+    }
+
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @pytest.mark.advanced_model
@@ -473,47 +534,6 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
         system_prompt=get_system_prompt(),
         video_data_url=video_data_url,
         content_text=get_prompt("mix"),
-    )
-
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "stream": True,
-        "extra_body": _TTS_EXTRA_BODY,
-    }
-
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
-
-
-@pytest.mark.core_model
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
-    """
-    Test multi-modal input (text + audio + video + image) generating text + audio output.
-    Deploy Setting: default single GPU
-    Input Modal: text + audio + video + image
-    Output Modal: text + audio
-    Input Setting: stream=True
-    """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(24, 24, 20)['base64']}"
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(24, 24)['base64']}"
-    # A loop of the default single word "test" can make the answer repeat
-    # to the token limit, leaving TTS/ASR to count a long run of identical words
-    # (#7630). Exercise speech perception with a meaningful phrase instead.
-    audio = generate_synthetic_audio(5, 1, phrase_text="The weather is sunny today.")
-    audio_data_url = f"data:audio/wav;base64,{audio['base64']}"
-    messages = dummy_messages_from_mix_data(
-        system_prompt=get_system_prompt(),
-        video_data_url=video_data_url,
-        image_data_url=image_data_url,
-        audio_data_url=audio_data_url,
-        content_text=(
-            "Briefly describe the image and video, and summarize what the voice says. "
-            "Answer in one short sentence without repeating the spoken phrase."
-        ),
     )
 
     request_config = {

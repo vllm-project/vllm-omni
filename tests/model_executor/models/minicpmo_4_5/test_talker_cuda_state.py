@@ -295,6 +295,7 @@ def test_commit_cuda_kstep_invalidates_width1_sampler_caches():
         _codec_seed=7,
         _codec_eos_id=VOCAB_SIZE - 1,
         _codec_fused_prelude=True,
+        _codec_fused_tail=True,
         _merge_request_codec_params=lambda *args, **kwargs: None,
     )
     hidden = torch.zeros(2, 4)
@@ -354,6 +355,7 @@ def test_model_binding_commit_and_batch_compaction():
         _codec_seed=7,
         _codec_eos_id=VOCAB_SIZE - 1,
         _codec_fused_prelude=True,
+        _codec_fused_tail=True,
         _merge_request_codec_params=lambda *args, **kwargs: None,
     )
     hidden = torch.zeros(2, 4)
@@ -430,6 +432,7 @@ def test_native_model_graph_eos_restores_request_rng(eos_frame):
         _codec_eos_id=VOCAB_SIZE - 1,
         _codec_seed=7,
         _codec_fused_prelude=True,
+        _codec_fused_tail=True,
         audio_bos_token_id=VOCAB_SIZE - 2,
         _control_logits_dtype=torch.float32,
         head_code=[lambda hidden: hidden],

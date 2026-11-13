@@ -295,11 +295,12 @@ class DiffusionParallelConfig:
     """
 
     ulysses_a2a_permute: bool = False
-    """Use fused permute-free all-to-all for eligible strict Ulysses exchanges.
+    """Use platform symmetric memory for eligible strict Ulysses exchanges.
 
-    Uses platform symmetric memory on CUDA and NPU. NPU currently requires
-    eager inference and pure Ulysses over WORLD in one HCCS domain, with
-    TorchNPU's NPUSHMEM allocator, Triton-Ascend and a symmetric-memory runtime.
+    On CUDA, enables CE (copy engines) on a single NVLink-connected node;
+    when disabled, Ulysses uses NCCL. NPU retains its eager, pure Ulysses
+    implementation over WORLD in one HCCS domain, using TorchNPU's NPUSHMEM
+    allocator, Triton-Ascend and a symmetric-memory runtime.
     """
 
     cfg_parallel_size: int = 1
@@ -873,6 +874,11 @@ class OmniDiffusionConfig:
     diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
     diffusion_attention_schedule: "AttentionScheduleConfig | None" = None
     fa_deterministic: bool = False
+    # Run the positive and negative CFG branches as one batched denoiser call
+    # when CFG is not split across ranks. Only pipelines that declare
+    # ``supports_cfg_batching`` use it; it halves the denoiser calls per step.
+    # Off by default: opt in with ``--enable-cfg-batching``.
+    enable_cfg_batching: bool = False
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE
@@ -1178,6 +1184,13 @@ class OmniDiffusionConfig:
 
     # Diffusion pipeline Profiling config
     enable_diffusion_pipeline_profiler: bool = False
+
+    # Mixed-resolution batch packing (MixFusion). Server-level default for the
+    # scheduler shape-relaxation and the pipeline ragged-latent pass; requests
+    # can still opt in/out per-request via extra_args.
+    enable_mixfusion: bool = False
+    mixfusion_min_chunk_tokens: int = 256
+    mixfusion_max_chunks: int = 128
 
     # Step mode settings
     step_execution: bool = False

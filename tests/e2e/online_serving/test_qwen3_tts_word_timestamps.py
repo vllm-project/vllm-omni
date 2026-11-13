@@ -53,7 +53,7 @@ _PARAMS = [
 ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", _PARAMS, indirect=True)
 def test_async_chunk_word_timestamps(omni_server, online_client):
     online_client.send_audio_speech_request(
@@ -71,7 +71,7 @@ def test_async_chunk_word_timestamps(omni_server, online_client):
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", _PARAMS, indirect=True)
 def test_async_chunk_speech_without_timestamps(omni_server, online_client):
     online_client.send_audio_speech_request(
@@ -89,7 +89,7 @@ def test_async_chunk_speech_without_timestamps(omni_server, online_client):
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", _PARAMS, indirect=True)
 def test_async_chunk_streaming_word_timestamps(omni_server):
     text = "The weather is nice today, perfect for a walk in the park."

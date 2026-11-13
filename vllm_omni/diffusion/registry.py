@@ -7,6 +7,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
+from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig, uses_diffusers_adapter
@@ -157,6 +158,11 @@ _DIFFUSION_MODELS = {
         "minimax_h3",
         "pipeline_minimax_h3_decoder",
         "MiniMaxH3DecoderPipeline",
+    ),
+    "MiniMaxH3ImagePipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3_image",
+        "MiniMaxH3ImagePipeline",
     ),
     "AuKPipeline": (
         "auk",
@@ -494,6 +500,47 @@ DiffusionModelRegistry = _ModelRegistry(
     }
 )
 
+
+def resolve_diffusion_pipeline_cls(od_config: OmniDiffusionConfig) -> type | None:
+    """Resolve the pipeline class ``od_config`` selects, without instantiating it.
+
+    Resolution order mirrors model-load time: an explicit
+    ``custom_pipeline_args['pipeline_class']``, then the diffusers adapter,
+    then the native registry lookup by ``model_class_name``. Returns ``None``
+    when no class can be resolved.
+    """
+    custom_pipeline_args = getattr(od_config, "custom_pipeline_args", None)
+    if custom_pipeline_args and "pipeline_class" in custom_pipeline_args:
+        pipeline_cls = custom_pipeline_args["pipeline_class"]
+        if isinstance(pipeline_cls, type):
+            return pipeline_cls
+        if isinstance(pipeline_cls, str):
+            try:
+                return resolve_obj_by_qualname(pipeline_cls)
+            except (AttributeError, ImportError, ValueError) as exc:
+                raise ValueError(f"Failed to resolve custom diffusion pipeline class {pipeline_cls!r}.") from exc
+        raise TypeError(
+            "custom_pipeline_args['pipeline_class'] must be a qualified name string or a class, "
+            f"got {type(pipeline_cls).__name__}"
+        )
+
+    if uses_diffusers_adapter(od_config):
+        return DiffusionModelRegistry._try_load_model_cls("DiffusersAdapterPipeline")
+
+    return DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
+
+
+def supports_mixfusion(od_config: OmniDiffusionConfig) -> bool:
+    """Return whether the resolved pipeline opts into MixFusion packed batching.
+
+    Pipelines declare the capability with the optional class attribute
+    ``supports_mixfusion = True``; anything without it (or unresolvable) is
+    treated as unsupported.
+    """
+    model_cls = resolve_diffusion_pipeline_cls(od_config)
+    return model_cls is not None and bool(getattr(model_cls, "supports_mixfusion", False))
+
+
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
@@ -513,6 +560,8 @@ _NO_CACHE_ACCELERATION = {
     "Sam3VideoModel",
     "LingBotWorldCausalDMDPipeline",
     "TaoMateH3Pipeline",
+    # PDD release: one fused output head per step, nothing to cache or skip.
+    "MiniMaxH3ImagePipeline",
     "CausVidWanPipeline",
     "PhysisWanPipeline",
     "PhysisH3Pipeline",
@@ -602,6 +651,11 @@ def initialize_model(
         # This follows diffusers' pattern where enable_parallelism() is called
         # at model loading time, not inside individual model files
         _apply_sequence_parallel_if_enabled(model, od_config)
+
+        # Apply the MixFusion packed-layout hooks declared by _mixfusion_plan.
+        # They are the MixFusion counterpart of _sp_plan and stay inert unless
+        # the MixFusionDriver arms a MixFusionStep on the forward context.
+        _apply_mixfusion_if_enabled(model, od_config)
 
         # Install the Wan VAE decoder fast path once the VAE parallel mode is
         # known. This runs inside the weight-loading memory pool, so any weight
@@ -748,6 +802,13 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
         logger.warning(f"Failed to apply sequence parallelism: {e}. Continuing without SP hooks.")
 
 
+def _apply_mixfusion_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
+    """Mount MixFusion (hooks + driver) on a capable pipeline; see ``mixfusion.setup``."""
+    from vllm_omni.diffusion.mixfusion.setup import mount_mixfusion
+
+    mount_mixfusion(model, od_config, supported=supports_mixfusion(od_config))
+
+
 _DIFFUSION_POST_PROCESS_FUNCS = {
     "PhysisWanPipeline": "get_wan22_post_process_func",
     "PhysisH3Pipeline": "get_wan22_post_process_func",
@@ -781,6 +842,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3DecoderPipeline": "get_minimax_h3_post_process_func",
+    "MiniMaxH3ImagePipeline": "get_minimax_h3_image_post_process_func",
     "AuKPipeline": "get_auk_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "StableAudio3Pipeline": "get_stable_audio_3_post_process_func",

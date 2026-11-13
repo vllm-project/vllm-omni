@@ -47,7 +47,7 @@ def _first_request_images(outputs) -> list:
     return req_out.images
 
 
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": ["L4", "B200"]})
 def test_qwen_image_autoround_w4a16_load():
@@ -69,7 +69,7 @@ def test_qwen_image_autoround_w4a16_load():
         assert arr.std() > 1.0, "Generated image appears blank (std ≈ 0)"
 
 
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": ["L4", "B200"]})
 def test_qwen_image_autoround_w4a16_generate():
