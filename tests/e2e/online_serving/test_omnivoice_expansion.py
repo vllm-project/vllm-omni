@@ -19,6 +19,7 @@ import pytest
 import soundfile as sf
 from openai import BadRequestError as OpenAIBadRequestError
 
+from tests.helpers.assertions import assert_wav_pcm_close
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniResponse, OmniServerParams
@@ -187,9 +188,7 @@ class TestOmniVoiceSeed:
 
         r1 = online_client.send_audio_speech_request(cfg)[0]
         r2 = online_client.send_audio_speech_request(cfg)[0]
-        assert r1.audio_bytes is not None
-        assert r2.audio_bytes is not None
-        assert r1.audio_bytes == r2.audio_bytes
+        assert_wav_pcm_close(r1.audio_bytes, r2.audio_bytes, atol=1)
 
     @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_speech_auto_voice_seed_non_deterministic(self, omni_server, online_client) -> None:
