@@ -596,6 +596,8 @@ class OmniPrefixCacheManager:
         the store's references, while these views keep the segments alive
         until the step is consumed. Rows appended after publish (an earlier
         step's queued append) are picked up by materialize's live fallback.
+        Materialize still applies the epoch gate first: a superseded
+        generation ignores these views and falls back to the pool hit.
         """
         if not ctx.session_for_req or not ctx.hits:
             return
@@ -914,6 +916,15 @@ class OmniPrefixCacheManager:
                     session_id = session_for_req.get(req_id)
                     if not hit or session_id is None:
                         continue
+                    if self._session_epoch_mismatch(ctx, req_id, session_id):
+                        # The step belongs to a superseded generation: serve
+                        # no session rows at all — including the publish-time
+                        # views, which were frozen before the epoch advanced.
+                        # Fall back to the pool hit (planned below), as the
+                        # epoch gate requires. The views still matter for an
+                        # unchanged epoch when the session was dropped, where
+                        # the fallback pool blocks may already be reused.
+                        continue
                     hit_upto, _, read_start = hit
                     for key in hit_keys:
                         # Serve exactly the requested range: a replay
@@ -922,12 +933,6 @@ class OmniPrefixCacheManager:
                         # already has (A5/B1).
                         parts = ctx.session_parts.get((req_id, key))
                         if parts is None:
-                            if self._session_epoch_mismatch(ctx, req_id, session_id):
-                                # The step belongs to a superseded generation:
-                                # the store's rows now describe the new
-                                # history, so skip the session serve and fall
-                                # back to the pool hit.
-                                continue
                             parts = self._session_store.snapshot_range(session_id, key, read_start, hit_upto)
                         if parts is not None:
                             session_parts[(req_id, key)] = parts
