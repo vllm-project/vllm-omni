@@ -211,7 +211,8 @@ def test_accuracy_has_one_candidate_server_and_three_shared_serving_calls(tmp_pa
     def server(model_path, arguments, *, env_dict, startup_timeout):
         starts.append(model_path)
         assert env_dict["PYTHONPATH"] == f"{runner.ROOT}:/fixture/backend"
-        assert startup_timeout == 1200
+        # A2 hosts under NFS contention load the 8 shards serially in up to ~17 min.
+        assert startup_timeout == (2400 if platform == "npu" else 1200)
         if platform == "npu":
             assert env_dict["OMP_NUM_THREADS"] == env_dict["MKL_NUM_THREADS"] == "1"
         yield CapturedServer(model_path)
