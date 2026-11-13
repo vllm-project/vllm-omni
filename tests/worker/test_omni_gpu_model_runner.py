@@ -612,7 +612,7 @@ def test_filter_mrope_kwargs_preserves_flexible_model_kwargs():
 )
 def test_load_model_caches_prefill_token_mask_capability(mocker, model, expected):
     runner = object.__new__(OmniGPUModelRunner)
-    runner.vllm_config = SimpleNamespace()
+    runner.vllm_config = SimpleNamespace(additional_config={})
     runner.model = model
     runner._maybe_enable_output_token_ids_for_model_sampler = mocker.Mock()
     runner._init_talker_mtp = mocker.Mock()

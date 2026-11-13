@@ -57,6 +57,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     make_device_state,
     prepare_codec_logits,
     warmup_fused_prelude,
+    warmup_fused_tail,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     VOCAB_SIZE as _CODEC_VOCAB_SIZE,
@@ -303,18 +304,23 @@ def _native_duplex_row_meta(info_dict: Mapping[str, Any]) -> tuple[bool, int, in
     turn_eos_id = meta_info.get("turn_eos_token_id")
     ids_info = info_dict.get("ids")
     tts_ids = ids_info.get("tts") if native_duplex and isinstance(ids_info, dict) else None
+    # streaming_generate keeps decoding after turn_eos until a unit boundary.
+    # Any later text/speak token reopens the turn; an earlier EOS must not
+    # close the public response or reset Code2Wav's stream.
     if isinstance(tts_ids, torch.Tensor):
-        contains_turn_eos = isinstance(turn_eos_id, int) and bool(torch.any(tts_ids.reshape(-1) == turn_eos_id).item())
+        ends_turn = (
+            isinstance(turn_eos_id, int) and tts_ids.numel() > 0 and tts_ids.reshape(-1)[-1].item() == turn_eos_id
+        )
     elif isinstance(tts_ids, (list, tuple)):
-        contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
+        ends_turn = isinstance(turn_eos_id, int) and bool(tts_ids) and tts_ids[-1] == turn_eos_id
     else:
-        contains_turn_eos = False
+        ends_turn = False
     return (
         native_duplex,
         epoch if isinstance(epoch, int) else -1,
         turn_id if isinstance(turn_id, int) else -1,
         segment_text,
-        native_duplex and contains_turn_eos,
+        native_duplex and ends_turn,
     )
 
 
@@ -1302,6 +1308,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._codec_fused_prelude = _bool_flag(
             self._extra_config().get("talker_codec_fused_prelude", True),
             "talker_codec_fused_prelude",
+        )
+        # Same contract for the fused top-k/top-p tail of the stochastic
+        # codec-sampling chain; default true, runtime latch covers failures.
+        self._codec_fused_tail = _bool_flag(
+            self._extra_config().get("talker_codec_fused_tail", True),
+            "talker_codec_fused_tail",
         )
 
         # Multi-frame decode: K codec frames per Talker decode step. A value
@@ -3320,6 +3332,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # CANN/torch_npu upgrade a broken kernel may fault the device instead
         # of raising, which would defeat the switch.
         warmup_fused_prelude(hidden_state.device, enabled=self._codec_fused_prelude)
+        warmup_fused_tail(hidden_state.device, enabled=self._codec_fused_tail)
         return device_state, device_inputs, device_states
 
     def _sample_audio_code(
@@ -3365,6 +3378,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             presence_penalty=_codec_float_param(request_state, "codec_presence_penalty", 0.0),
             eos_window_masked=eos_window_masked,
             fused_prelude=self._codec_fused_prelude,
+            fused_tail=self._codec_fused_tail,
         )
         probabilities = torch.softmax(logits, dim=-1)
         sampled = torch.multinomial(
