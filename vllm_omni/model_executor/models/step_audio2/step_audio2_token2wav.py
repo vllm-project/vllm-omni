@@ -4,7 +4,7 @@
 import io
 import os
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -201,6 +201,7 @@ class StepAudio2Token2WavCore(nn.Module):
         self._s3_failed: set = set()
         self._s3_graph_lock = threading.Lock()
         self._s3_graph_done = None
+        self._s3_cuda_graph: Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]] | None = None
         # Replay/eager counters, logged on capture and at milestones so a
         # benchmark log shows the realized replay rate per run.
         self._s3_replay_calls = 0
@@ -414,6 +415,8 @@ class StepAudio2Token2WavCore(nn.Module):
         Graph replay is ~6ms with bit-identical tokens.  Eager fallback
         off-NPU / on capture failure / bucket overflow.
         """
+        if self._s3_cuda_graph is not None:
+            return self._s3_cuda_graph(mels, mels_lens)
         tok = self.audio_tokenizer
         frames = int(mels.shape[2])
         with self._s3_graph_lock:

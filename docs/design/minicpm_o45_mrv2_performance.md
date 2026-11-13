@@ -113,6 +113,15 @@ Autocast or a changed precision policy also uses the eager path. Each replay
 returns an owned embedding. This option is off by default and does not expand
 the reference-audio cache or batch reference extraction.
 
+`token2wav_s3_cuda_graph: true` opts CUDA Code2Wav into exact-shape replay
+of the S3 reference tokenizer. It requires the S3 `AudioEncoderV2` and keeps
+the pinned `s3tokenizer==0.3.0` encoder and quantizer without reimplementing
+their arithmetic. Up to two repeated shapes are
+captured; additional shapes run eagerly. Long references retain the library's
+sliding-window path. Replay owns its returned codes and lengths, and a changed
+precision policy uses the original eager encoder. This option is off by
+default; end-to-end performance and speech-quality qualification are pending.
+
 ## Turn-mode conditioning transport
 
 Ordinary turn-mode `llm2tts` packs reference audio and thinker hidden states
