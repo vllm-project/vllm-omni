@@ -13,13 +13,17 @@ from typing import Any
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.request import Request, RequestStatus
 
+from tests.core.sched.test_omni_recompute_preemption import _scheduler
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker_v2.delivery import DeliveryCancelledError, DeliveryState, OmniDeliveryManager
 from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
+from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -188,6 +192,84 @@ def test_resume_preserves_queued_outputs_before_terminal(plane, monkeypatch, asy
     ]
     assert torch.cat(payloads).flatten().tolist() == [1, 2]
     assert plane.record.cleaned == ["internal"]
+    assert not plane._native_outputs_in_flight and not plane._native_terminal_pending
+
+
+def test_capacity_preemption_preserves_queued_native_output(plane, monkeypatch):
+    scheduler = _scheduler("allow", block_size=4, num_blocks=4)
+    scheduler.use_v2_model_runner = True
+    leader = Request("leader", [10] * 4, SamplingParams(max_tokens=2), None)
+    victim = Request("victim", [11] * 5, SamplingParams(max_tokens=2), None)
+    for request in (leader, victim):
+        scheduler.add_request(request)
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._omni_data_plane = plane
+    runner.model_config = scheduler.vllm_config.model_config
+    runner.model_config.async_chunk = True
+    queued, release = threading.Event(), threading.Event()
+    complete = plane.complete_outputs
+
+    def complete_after_resume(**kwargs):
+        if not queued.is_set():
+            queued.set()
+            assert release.wait(5)
+        return complete(**kwargs)
+
+    monkeypatch.setattr(plane, "complete_outputs", complete_after_resume)
+    plane._start_output_worker(max_pending_batches=2)
+
+    def publish(scheduled, token, row):
+        req_ids = list(scheduled.num_scheduled_tokens)
+        output = ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+            sampled_token_ids=[[token] for _ in req_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+        plane.reserve_outputs(req_ids)
+        plane.enqueue_outputs(
+            req_ids=req_ids,
+            inter_stage_outputs=[{"codes.audio": torch.tensor([[row]])} if r == "victim" else None for r in req_ids],
+            sampled_token_ids=output.sampled_token_ids,
+        )
+        scheduler.update_from_output(scheduled, output)
+
+    try:
+        first = scheduler.schedule()
+        assert first.num_scheduled_tokens == {"leader": 4, "victim": 5}
+        runner._prepare_native_data_plane(first)
+        publish(first, token=21, row=1)
+        assert queued.wait(5)
+
+        # The leader's next token needs another block; the real allocator
+        # preempts the later request, then the leader finishes and frees KV.
+        preempted = scheduler.schedule()
+        assert "victim" in preempted.preempted_req_ids
+        assert victim.status == RequestStatus.PREEMPTED
+        runner._prepare_native_data_plane(preempted)
+        publish(preempted, token=22, row=0)
+        assert leader.is_finished()
+
+        resumed = scheduler.schedule()
+        assert [r.req_id for r in resumed.scheduled_new_reqs] == ["victim"]
+        runner._prepare_native_data_plane(resumed)
+        publish(resumed, token=22, row=2)
+        assert victim.is_finished()
+        terminal = scheduler.schedule()
+        assert terminal.finished_req_ids == {"victim"}
+        assert plane.request_terminal(terminal.finished_req_ids) == 0
+    finally:
+        release.set()
+    plane.drain_outputs()
+
+    entries = [entry for batch in plane.record.batches for entry in batch if entry[0].req_id == "victim"]
+    rows = [payload["codes"]["audio"] for _, payload in entries if payload]
+    assert torch.cat(rows).flatten().tolist() == [1, 2]
+    [terminal] = [request for request, _ in entries if request.is_finished()]
+    assert terminal.output_token_ids == [21, 22]
+    assert plane.record.cleaned.count("victim") == 1
     assert not plane._native_outputs_in_flight and not plane._native_terminal_pending
 
 
