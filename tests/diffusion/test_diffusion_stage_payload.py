@@ -91,6 +91,7 @@ def _make_request(prompt, *, request_id="req-7", kv_sender_info=None, payload_se
         request_id=request_id,
         kv_sender_info=kv_sender_info,
         payload_sender_info=payload_sender_info,
+        mixfusion_info=None,
     )
 
 
