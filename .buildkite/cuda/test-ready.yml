@@ -25,17 +25,7 @@ steps:
       - label: "Simple · Engine&Entrypoints&Diffusion Test"
         timeout_in_minutes: 25
         commands:
-          - "pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu' --deselect='tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]'"
-        mirror_hardwares: l4_1
-
-      # bf16 exact is the only torch.equal check with param cast and sharded
-      # halo / persistent buffers both active. Run it beside the 25-minute job
-      # so that cell stays off the Ready critical path. CUDA Merge does not
-      # collect L1 CPU simple tests.
-      - label: "Simple · Diffusion Slow CPU Test"
-        timeout_in_minutes: 15
-        commands:
-          - "pytest -sv 'tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]' -m 'core_model and cpu'"
+          - "pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
       - label: "Simple · Other Test"

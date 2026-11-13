@@ -208,7 +208,7 @@ def _sharded_worker(
 @pytest.mark.cpu
 # (False, "fused") stays in the in-process matrix. Sharded keeps fp32 exact,
 # bf16 exact (the torch.equal check with param cast, halo exchange, and
-# persistent buffers; pinned to Slow CPU), and fused-under-bf16.
+# persistent buffers), and fused-under-bf16.
 @pytest.mark.parametrize(
     "autocast,level",
     [(False, "exact"), (True, "exact"), (True, "fused")],

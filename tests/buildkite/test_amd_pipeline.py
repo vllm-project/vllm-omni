@@ -645,18 +645,7 @@ def test_cuda_ready_engine_entrypoints_diffusion_has_cleanup_headroom() -> None:
         "--ignore=tests/diffusion/models",
         "-m",
         "core_model and cpu",
-        "--deselect=tests/diffusion/distributed/test_wan_decoder_fast_path.py"
-        "::test_sharded_fast_path_on_every_rank[True-exact]",
     ]
-
-
-def test_cuda_ready_wan_bf16_exact_is_on_slow_cpu() -> None:
-    node = "tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]"
-    step = _find_step("Simple · Diffusion Slow CPU Test", CUDA_READY_PIPELINE)
-    assert step["timeout_in_minutes"] == 15
-    assert step["mirror_hardwares"] == "l4_1"
-    argv = split(next(command for command in step["commands"] if "pytest" in command))
-    assert argv == ["pytest", "-sv", node, "-m", "core_model and cpu"]
 
 
 def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
