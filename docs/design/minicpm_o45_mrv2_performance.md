@@ -1,8 +1,8 @@
 # MiniCPM-o 4.5 MRv2 profiles
 
 The default `minicpmo_4_5.yaml` selects MRv2 for the CUDA Thinker and Code2Wav.
-The CUDA Talker stays on MRv1 for multi-frame decode, and other platforms
-retain MRv1. All three stages keep `async_chunk: true`.
+The default CUDA duplex Talker uses MRv1 for multi-frame decode. All three
+duplex stages keep `async_chunk: true`.
 The ordinary and explicit MRv2 turn profiles enable Thinker prefix caching on
 CUDA. Both V1 and MRv2 restore cached Thinker outputs for the Talker. MRv2 uses
 the shared stage-output prefix cache to restore `latent`, `latent_input_ids`
@@ -69,8 +69,7 @@ ordinary TF32 for CFM DiT GEMMs within Code2Wav forward/capture only
 The previous process matmul policy is restored afterwards. cuDNN's TF32 policy
 is independent. HiFT stays IEEE FP32. TF32 changes rounding.
 Duplex defaults to an MRv2 Thinker and Code2Wav on CUDA through
-`minicpmo_4_5.yaml`, with the multi-frame Talker on V1. Other platforms keep V1. Turn results
-do not establish duplex performance or interruption correctness.
+`minicpmo_4_5.yaml`, with the multi-frame Talker on V1.
 
 The shared Code2Wav backend defaults to the fused CFM body on both CUDA and
 NPU, subject to architecture and attention-cache eligibility. CUDA accepts
@@ -189,8 +188,8 @@ drafter that reads Talker layers. Draft codes are verified against the
 Talker's own sampling: each row's 16-code repetition window includes the
 drafts before it, and codec EOS decisions (empty condition, length cap)
 apply per row. Only rows of accepted codes reach Code2Wav. The CUDA platform
-block sets stage 1's `speculative_config`, and platform blocks override stage
-fields, so the draft goes there:
+block selects the draft method. Set the DSpark config there and clear the
+inherited K-step control stop ID. The pipeline supplies the codec EOS.
 
 ```yaml
 base_config: minicpmo_4_5_turn_mrv2.yaml
@@ -198,6 +197,9 @@ platforms:
   cuda:
     stages:
       - stage_id: 1
+        async_scheduling: true
+        default_sampling_params:
+          stop_token_ids: []
         speculative_config:
           method: dspark
           model: <DSpark draft trained on the MiniCPM-o 4.5 Talker>
@@ -219,11 +221,12 @@ load.
 
 ### CUDA MRv2 Talker K-step
 
-Use the opt-in `minicpmo_4_5_turn_mrv2_kstep.yaml` deployment for single-GPU
-CUDA turn serving. The Talker uses FlashAttention, synchronous scheduling and
-seven continuation drafts to reserve eight query positions per request. The
-drafts reserve KV slots for sequential codec frames. The Talker samples the
-codec and re-embeds each confirmed frame before advancing to the next position.
+Use `minicpmo_4_5_turn_mrv2.yaml` for single-GPU CUDA turn serving. It inherits
+synchronous scheduling, seven continuation drafts and the control stop ID from
+`minicpmo_4_5.yaml`. The MRv2 Talker uses FlashAttention to advance one position
+and KV slot at a time, re-embedding each confirmed codec before the next frame.
+For a single-frame control, override CUDA stage 1 with
+`speculative_config: null` and `default_sampling_params.stop_token_ids: []`.
 
 Mixed prefill and decode steps use the single-frame codec path. A K-step batch
 replays a CUDA graph when its sampling settings are supported, and falls back
@@ -274,8 +277,8 @@ or reference normalization policy.
 ## Full-duplex MRv2
 
 `minicpmo_4_5.yaml` selects MRv2 for the CUDA Thinker and Code2Wav; the Talker
-keeps V1 for multi-frame decode, and non-CUDA platforms keep V1. The Thinker has no async producer: as on V1, the orchestrator hands
-each finished segment to `llm2tts`.
+keeps V1 for CUDA duplex multi-frame decode. The Thinker has no async producer,
+so the orchestrator hands each finished segment to `llm2tts`.
 The Talker reuses the streaming prompt recipe (full attention extends its KV
 prefix until capacity; sliding recompute rebuilds the previous condition,
 confirmed codec ids and current condition) and keeps the 16-frame codec

@@ -146,6 +146,8 @@ talker_dspark_params = [
                     # The temporary overlay lives outside deploy/, so anchor its parent.
                     "base_config": get_deploy_config_path("minicpmo_4_5_turn.yaml"),
                     # The CUDA block owns stage 1's speculative_config (index 0 is stage 1).
+                    "platforms.cuda.stages.0.async_scheduling": True,
+                    "platforms.cuda.stages.0.default_sampling_params.stop_token_ids": [],
                     "platforms.cuda.stages.0.speculative_config": {
                         "method": "dspark",
                         "model": str(_TALKER_DRAFT_DIR),

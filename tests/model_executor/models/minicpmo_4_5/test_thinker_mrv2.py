@@ -39,9 +39,17 @@ def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, 
     assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == capacities
     assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == kv_gib * 1024**3
     assert stages[0].yaml_engine_args["enable_prefix_caching"] is True
-    # The base profile's V1 Talker multi-frame block must not reach the MRv2 Talker.
-    assert stages[1].yaml_engine_args.get("speculative_config") is None
-    assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
+    talker = stages[1]
+    assert talker.yaml_engine_args["attention_backend"] == "FLASH_ATTN"
+    assert talker.yaml_engine_args["speculative_config"] == {
+        "method": "ngram",
+        "num_speculative_tokens": 7,
+        "prompt_lookup_min": 1,
+        "prompt_lookup_max": 1,
+    }
+    assert talker.yaml_engine_args["async_scheduling"] is False
+    assert talker.yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
+    assert talker.yaml_runtime["cuda_mps"] is True
 
 
 def _model(mocker, *, v2=True, session="turn", async_chunk=False, speculative_config=None):

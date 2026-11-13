@@ -32,7 +32,7 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext, LogitsProcessor
 from vllm.v1.worker.gpu.sample.output import SamplerOutput as Mrv2SamplerOutput
@@ -1085,7 +1085,7 @@ class MiniCPMO45TalkerSampler(OmniSampler):
         active_mask = torch.tensor(active, dtype=torch.bool, device=sampled.device)
         return rows, active_mask
 
-    def _sample_kstep_controls(self, logits: torch.Tensor, input_batch: Any) -> Any:
+    def _sample_kstep_controls(self, logits: torch.Tensor, input_batch: InputBatch) -> Mrv2SamplerOutput:
         width = int(self.talker._k_step_frames)
         starts = input_batch.cu_num_logits[:-1].long()
         lengths = input_batch.cu_num_logits[1:] - input_batch.cu_num_logits[:-1]
@@ -1105,35 +1105,27 @@ class MiniCPMO45TalkerSampler(OmniSampler):
             self.req_states.prefill_len.gpu,
         )
         packed = packed.masked_fill(positions[None, :] >= num_sampled[:, None], -1)
-        output_kwargs = {
-            "sampled_token_ids": packed.to(torch.int32),
-            "logprobs_tensors": None,
-            "num_nans": None,
-            "num_sampled": num_sampled,
-            "num_rejected": num_rejected,
-        }
-        if "sampling_mask_tensors" in getattr(Mrv2SamplerOutput, "__dataclass_fields__", {}):
-            output_kwargs["sampling_mask_tensors"] = None
-        return Mrv2SamplerOutput(**output_kwargs)
+        return Mrv2SamplerOutput(
+            sampled_token_ids=packed.to(torch.int32),
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
 
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> Any:
-        if logits.is_cuda and int(getattr(self.talker, "_k_step_frames", 0) or 0) > 0 and logits.shape[-1] == 2:
+        if logits.is_cuda and self.talker._k_step_frames > 0 and logits.shape[-1] == 2:
             return self._sample_kstep_controls(logits, input_batch)
         if logits.shape[-1] <= 2:
-            # K-step control rows are two-wide; sampling already ran per frame,
-            # so take the set bit and skip the codec-vocab pipeline.
-            sampled = logits.argmax(dim=-1)
-            sampled, num_sampled, num_rejected = self._control_rows_output(sampled, input_batch)
-            output_kwargs: dict[str, Any] = {
-                "sampled_token_ids": sampled,
-                "logprobs_tensors": None,
-                "num_nans": None,
-                "num_sampled": num_sampled,
-                "num_rejected": num_rejected,
-            }
-            if "sampling_mask_tensors" in getattr(Mrv2SamplerOutput, "__dataclass_fields__", {}):
-                output_kwargs["sampling_mask_tensors"] = None
-            return Mrv2SamplerOutput(**output_kwargs)
+            # K-step already sampled the codecs. Only pack the control rows.
+            sampled, num_sampled, num_rejected = self._control_rows_output(logits.argmax(dim=-1), input_batch)
+            return Mrv2SamplerOutput(
+                sampled_token_ids=sampled,
+                logprobs_tensors=None,
+                num_nans=None,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+            )
         forced = self.talker.take_mrv2_forced_eos(input_batch, self.req_states, logits.shape[0])
         masked = getattr(self.talker, "_mrv2_masked_eos", None)
         self.talker._mrv2_masked_eos = None
@@ -1517,21 +1509,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             getattr(vllm_config, "speculative_config", None),
         )
         if frames > 0:
-            if bool(getattr(model_cfg, "use_v2_model_runner", False)):
-                # MRv2 runs the same multi-frame loop through the runner's
-                # ``talker_multiframe`` orchestration (narrow graph replay, or
-                # the eager frame loop when the graph declines). That loop
-                # re-embeds the real previous codec frame through
-                # ``model.preprocess`` per frame, so the identity decode
-                # preprocess of the single-frame MRv2 path is never asked to
-                # condition on a placeholder continue id.
-                logger.info(
-                    "[minicpmo] Talker multi-frame decode armed on Model Runner V2 "
-                    "(runner multi-frame loop): %d codec frames per step",
-                    frames,
-                )
-            else:
-                logger.info("[minicpmo] Talker multi-frame decode armed: %d codec frames per step", frames)
+            logger.info("[minicpmo] Talker multi-frame decode armed: %d codec frames per step", frames)
         return frames
 
     @staticmethod
@@ -2218,8 +2196,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         every stage), the same field the MiniCPM-o model picks its duplex path
         from.
         """
-        session_mode = getattr(self.vllm_config.model_config, "session_mode", "turn")
-        return session_mode != "duplex" and self._k_step_frames == 0
+        return not self._mrv2_duplex_session() and self._k_step_frames == 0
 
     def get_language_model(self) -> Any:
         """The Talker's codec table, where drafter loading looks for a target's embedding.
@@ -2330,11 +2307,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if not native_duplex_batch:
             limit = torch.clamp(remaining, min=1, max=_OFFLINE_CODEC_MAX_NEW_TOKENS) - 1
             self._mrv2_forced_eos = empty | eos_input | (step >= limit)
-            # Keep a copy: the sampler consumes (and clears) the live tensor
-            # before the K-frame loop runs, and the loop has no engine layer to
-            # enforce this stop signal -- that is why K-step audio only ended
-            # at the codec ceiling (31-83 s) while the single-frame path stops
-            # at ``limit`` (~53 frames / 2.1 s). One frame of lag is fine.
             self._mrv2_masked_eos = None
         else:
             if num_rows != num_reqs:
@@ -3321,13 +3293,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     # the engine-side list stays untouched.
                     stop_ids = [token_id for token_id in stop_ids if token_id not in _SCHEDULER_CONTROL_STOP_IDS]
             else:
-                # The request carried no stop ids (e.g. the native MRv2 data
-                # plane clones stage defaults without the codec EOS the legacy
-                # engine metadata attached). Fall back to the resolved codec
-                # EOS: the sampler has no separate eos slot, so
-                # ``codec_stop_token_ids`` is the ONLY stop channel -- without
-                # it the K-step stop_mask stays all-False and the request can
-                # never finish on the merged codec EOS (6561).
+                # Native MRv2 defaults can omit codec EOS. Use the model EOS.
                 _eos_id = getattr(self, "_codec_eos_id", None)
                 stop_ids = [int(_eos_id)] if _eos_id is not None else []
             if stop_ids:

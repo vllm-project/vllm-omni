@@ -208,28 +208,13 @@ platforms:
         # Keep this scoped to stage 0; Talker retains its own backend selection.
         attention_backend: TRITON_ATTN
       - stage_id: 1
-        # Talker multi-frame decode below runs only on V1; Thinker and Code2Wav
-        # use MRv2.
+        # The default duplex Talker uses MRv1. The turn MRv2 profile
+        # overrides the runner and inherits the K-step settings below.
         model_runner: v1
-        # Full-attention occupancy is bounded by max_num_seqs * max_model_len
-        # (16 * 4096 = 65536 tokens). Keep the reported CUDA KV token capacity
-        # above that bound because physical-preemption replay is unsupported
-        # (2 GiB holds ~35k tokens). The explicit cap leaves device headroom
-        # for concurrent Stage 2.
+        # Cover 16 full 4096-token requests while leaving room for Code2Wav.
         kv_cache_memory_bytes: 4294967296  # 4 GiB
-        # Multi-frame decode: 8 codec frames per step, mirroring the NPU block.
-        # The CUDA runner intercepts the step and injects the constant continue
-        # drafts; stop_token_ids is the two-wide continue/stop id.
-        #
-        # async_scheduling: false is part of the contract, not a tuning knob:
-        # K-step and async scheduling cannot be used together. Async books the
-        # spec span one step ahead, while the multi-frame loop only executes
-        # steps whose decode spans are uniform and whose booked positions stay
-        # inside the prompt. Measured at c16/256: the booking first outruns the
-        # prompt ("prefill span exceeds condition"), and once those slots are
-        # padded the step still arrives with non-uniform spans ("multi-frame
-        # Talker decode not engaged: request token spans are not uniform"),
-        # which kills the stage-1 replica and fails every in-flight request.
+        # Seven continuation drafts reserve eight codec positions per step.
+        # K-step requires synchronous scheduling and the control stop ID.
         speculative_config:
           method: ngram
           num_speculative_tokens: 7
@@ -305,11 +290,7 @@ platforms:
         kv_cache_memory_bytes: 4294967296  # 4 GiB
         gpu_memory_utilization: 0.10
         max_num_batched_tokens: 8192
-        # Multi-frame decode: 8 codec frames per step. NPU-only -- only the NPU
-        # worker intercepts the step and injects the constant continue drafts,
-        # so the block stays in this section. stop_token_ids below is the
-        # two-wide continue/stop id that head emits; drop the block (or set it
-        # to null) for one frame per step, and drop that id with it.
+        # NPU also reserves eight codec positions with synchronous scheduling.
         speculative_config:
           method: ngram
           num_speculative_tokens: 7
