@@ -10,7 +10,7 @@ import os
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -36,7 +36,11 @@ from vllm_omni.platforms import current_omni_platform
 from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .vae_mxfp8 import install_h3_vae_mxfp8, resolve_h3_vae_mxfp8
 from .vae_temporal import install_temporal_stream_patches
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
@@ -365,6 +369,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         trust_remote_code: bool = False,
         decoder_source: str | Mapping[str, str] | None = None,
         lightvae_decoder_path: str | None = None,
+        quantization_config: QuantizationConfig | None = None,
         allow_decoder_compile: bool = False,
     ) -> None:
         super().__init__()
@@ -385,6 +390,9 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self._pixel_transform = released_decoder_pixels if decoder_path is not None else None
         if self.encode_only and decoder_path is not None:
             raise ValueError("An encode-only VAE cannot load a replacement video decoder")
+        decoder_quant = resolve_h3_vae_mxfp8(quantization_config, device)
+        if decoder_quant is not None and (self.encode_only or decoder_path is not None or lightvae_decoder_path):
+            raise ValueError("video_vae MXFP8 requires the native MiniMax H3 video decoder")
         self.config_dict = _load_component_config(component_path)
         _check_trust_remote_code(component_path, self.config_dict, trust_remote_code)
         if self.encode_only:
@@ -410,7 +418,9 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # weights may be materialized in FP16 because reference decode casts
         # those same tensors through CUDA autocast on every tile.
         initial_device = load_device or device
-        weight_device = torch.device("cpu") if decoder_path is not None else initial_device
+        weight_device = (
+            torch.device("cpu") if decoder_path is not None or decoder_quant is not None else initial_device
+        )
         self.remote.eval().to(device=weight_device, dtype=torch.float32)
         if decoder_path is not None:
             install_nvfp4_video_decoder(self.remote.model, decoder_path)
@@ -422,6 +432,9 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 decoder,
                 device=device,
             )
+        if decoder_quant is not None:
+            install_h3_vae_mxfp8(decoder, decoder_quant, device=device, load_device=initial_device)
+            self.remote.to(device=initial_device)
         install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
         # The three decoder fast paths below are XPU-only: they were written
         # against the XPU kernels/compile stack and validated there. CUDA keeps
