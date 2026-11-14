@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 guardrail hooks for vllm-omni.
 
 Thin adapter around the ``cosmos_guardrail`` package's ``CosmosSafetyChecker``
@@ -41,8 +41,11 @@ _original_torch_load = torch.load
 
 
 def _patched_torch_load(*args, **kwargs):
+    # torch.load accepts map_location as its second positional argument too.
+    # Preserve explicit locations (including None) in either calling form.
     if (
-        "map_location" not in kwargs
+        len(args) < 2
+        and "map_location" not in kwargs
         and not torch.cuda.is_available()
         and (current_omni_platform.is_npu() or current_omni_platform.is_xpu())
     ):
