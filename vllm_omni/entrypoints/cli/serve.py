@@ -388,6 +388,13 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable vLLM-Omni mode for multi-modal and diffusion models",
         )
+        omni_config_group.add_argument(
+            "--disable-websocket-compression",
+            action="store_true",
+            default=False,
+            help="Disable per-message deflate for all WebSocket routes on this server. "
+            "Useful for already-compressed video streams, including browser clients.",
+        )
         serve_parser.maybe_override_argument(
             omni_config_group,
             "--watermark-config",

@@ -9,14 +9,17 @@ checks on real multi-GPU NCCL/RCCL collectives.
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 from typing import Literal
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from tests.helpers.distributed import configure_cpu_collective_worker, start_collective_workers
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import get_open_port
+from vllm_omni.diffusion.distributed import comm
 from vllm_omni.diffusion.distributed.comm import RingComm, SeqAllToAll4D, SeqAllToAll5D
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -331,6 +334,80 @@ def _require_gpus(world_size: int) -> None:
 # ---------------------------------------------------------------------------
 # CPU: gloo collectives on CPU tensors (no GPU)
 # ---------------------------------------------------------------------------
+
+
+def _run_reverse_token_layout(local_rank: int, world_size: int, init_method: str) -> None:
+    dist.init_process_group(
+        "gloo", init_method=init_method, rank=local_rank, world_size=world_size, timeout=timedelta(seconds=30)
+    )
+    try:
+        for enabled in (False, True):
+            for batch_size in (1, 2):
+                for noncontiguous in (False, True):
+                    for use_sync in (False, True):
+                        tokens, heads, width = 3, 2, 4
+                        canonical = torch.arange(
+                            batch_size * tokens * world_size * heads * world_size * width, dtype=torch.float32
+                        ).reshape(batch_size, tokens * world_size, heads * world_size, width)
+                        local = canonical[:, :, local_rank * heads : (local_rank + 1) * heads].contiguous()
+                        if noncontiguous:
+                            storage = torch.empty(*local.shape[:-1], width * 2)
+                            storage[..., ::2].copy_(local)
+                            local = storage[..., ::2]
+                            assert not local.is_contiguous()
+                        expected = canonical[:, local_rank * tokens : (local_rank + 1) * tokens]
+                        sync_calls = []
+                        wire_shapes = []
+                        collective = dist.all_to_all_single
+
+                        def exchange(output, input, **kwargs):
+                            wire_shapes.append(tuple(input.shape))
+                            return collective(output, input, **kwargs)
+
+                        with pytest.MonkeyPatch.context() as patch:
+                            patch.setenv("VLLM_OMNI_REVERSE_A2A_TOKEN_LAYOUT", "1" if enabled else "0")
+                            patch.setattr(comm.current_omni_platform, "synchronize", lambda: sync_calls.append(True))
+                            patch.setattr(dist, "all_to_all_single", exchange)
+                            result = comm.all_to_all_4D(local, 1, 2, use_sync=use_sync)
+                            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                            assert result.is_contiguous()
+                            assert len(sync_calls) == int(world_size > 1 and use_sync)
+                            if world_size > 1:
+                                expected_wire_shape = (
+                                    (world_size, tokens, heads, width)
+                                    if enabled and batch_size == 1
+                                    else (world_size, heads, tokens, batch_size, width)
+                                )
+                                assert wire_shapes == [expected_wire_shape]
+                            else:
+                                assert not wire_shapes
+                            if batch_size == 1:
+                                destination = torch.empty_like(expected).contiguous()
+                                owned = comm.all_to_all_4D(
+                                    local, 1, 2, use_sync=use_sync, _output_destination=destination
+                                )
+                                assert owned is destination
+                                torch.testing.assert_close(owned, expected, rtol=0, atol=0)
+                                assert len(sync_calls) == 2 * int(world_size > 1 and use_sync)
+                                if world_size > 1:
+                                    assert wire_shapes[-1] == (world_size, heads, tokens, batch_size, width)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size", [1, 2])
+def test_reverse_token_layout_matches_canonical_shards(world_size: int, tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_REVERSE_A2A_TOKEN_LAYOUT", raising=False)
+    assert comm.envs.VLLM_OMNI_REVERSE_A2A_TOKEN_LAYOUT is False
+    start_collective_workers(
+        _run_reverse_token_layout,
+        args=(world_size, (tmp_path / "gloo-init").as_uri()),
+        nprocs=world_size,
+        device_kind="cpu",
+    )
 
 
 @pytest.mark.core_model

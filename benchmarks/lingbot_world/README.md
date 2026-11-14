@@ -25,6 +25,10 @@ finished video" and reports request throughput. LingBot-World has neither shape:
 Serve the model, then point the benchmark at it. The benchmark never starts a
 server.
 
+The benchmark disables WebSocket compression to avoid recompressing MP4 chunks
+on the delivery path. Record this transport setting when comparing results
+with older benchmark versions or browser clients.
+
 ```bash
 # Terminal 1 — one GPU, eager (portable smoke configuration)
 vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
@@ -222,3 +226,37 @@ handling against a scripted WebSocket server. It needs no GPU:
 ```bash
 pytest tests/benchmarks/test_lingbot_world_realtime.py
 ```
+
+## H200 SP2 optimization candidates
+
+`configs/h200_sp2_gather.yaml` reproduces the two-H200 FP8/SP2 gather setup.
+Start the server with `VLLM_OMNI_AR_DIFFUSION_KV_GATHER=1` and this deploy config;
+set the environment variable to `0` for the default paged-attention comparison.
+The preset enables `reuse_history_staging` to reuse unchanged contiguous K/V.
+
+This option increases memory use and can change floating-point results. The
+preset also retains the measured baseline's approximate last-step KV reuse and
+fused VAE; it is not a full-precision reference. Compare output quality as well
+as cadence, with identical warmup, prompt, image and seed.
+
+For the alternative H200/FA3 superpage path, set
+`VLLM_OMNI_AR_DIFFUSION_KV_GATHER=0` and change the preset's
+`model_config.ar_diffusion_kv_config` to `reuse_history_staging: false` and
+`superpage_tokens: 160`. This is mutually exclusive with gather/staging and
+requires no action/state scratch KV; keep `reset_at_boundary: false`.
+The default `superpage_tokens: 0` preserves normal paging. Superpages retain
+the visible K/V tokens but can change attention reduction numerics.
+
+To test short-prompt encoding independently, set
+`stages[0].model_config.lingbot_trim_text_padding: true` in the deploy config.
+It skips UMT5 padding computation and restores the fixed embedding width.
+It defaults to false, requires right padding, and can change generated pixels;
+compare unseen prompts separately from prompt-cache hits.
+
+Set `VLLM_OMNI_REVERSE_A2A_TOKEN_LAYOUT=1` on every rank to test the batch-one
+reverse all-to-all layout. It defaults to off; larger batches and calls with an
+owned output destination retain their existing paths.
+
+Set `VLLM_OMNI_VIDEO_OUTPUT_PREFETCH=on` to overlap the next generation-output
+read with encoding and sending the current output. It defaults to `off` and
+keeps at most one additional output in flight, increasing buffer memory use.

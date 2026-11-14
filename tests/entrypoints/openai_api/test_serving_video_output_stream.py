@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import queue
+import threading
 from collections.abc import AsyncGenerator, Callable
 from http import HTTPStatus
 from types import SimpleNamespace
@@ -21,8 +22,9 @@ from pytest_mock import MockerFixture
 from starlette.testclient import TestClient
 
 from tests.helpers.media import generate_synthetic_image
+from vllm_omni.entrypoints.openai import video_stream_envs
 from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
-from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
+from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler, _bounded_prefetch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -61,6 +63,103 @@ def test_extract_audio_keeps_missing_rate_unspecified():
         request_id="audio-rate", images=[], multimodal_output={"audio": np.zeros((1000, 2), dtype=np.float32)}
     )
     assert OmniStreamingVideoOutputHandler._extract_audio_output(result)[1] is None
+
+
+def test_video_output_prefetch_env_defaults_off_and_accepts_on(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("VLLM_OMNI_VIDEO_OUTPUT_PREFETCH", raising=False)
+    assert video_stream_envs.VLLM_OMNI_VIDEO_OUTPUT_PREFETCH == "off"
+    monkeypatch.setenv("VLLM_OMNI_VIDEO_OUTPUT_PREFETCH", " ON ")
+    assert video_stream_envs.VLLM_OMNI_VIDEO_OUTPUT_PREFETCH == "on"
+
+
+@pytest.mark.asyncio
+async def test_bounded_prefetch_preserves_order_with_at_most_one_read_ahead():
+    started = []
+    allow_next = asyncio.Event()
+
+    async def source():
+        for value in range(3):
+            started.append(value)
+            if value == 1:
+                await allow_next.wait()
+            yield value
+
+    stream = _bounded_prefetch(source())
+    assert await anext(stream) == 0
+    await asyncio.sleep(0)
+    assert started == [0, 1]
+    next_item = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+    assert started == [0, 1]
+    allow_next.set()
+    assert await next_item == 1
+    assert [item async for item in stream] == [2]
+
+
+@pytest.mark.asyncio
+async def test_bounded_prefetch_propagates_source_error_identity():
+    error = LookupError("generation failed")
+
+    async def source():
+        yield "first"
+        raise error
+
+    stream = _bounded_prefetch(source())
+    assert await anext(stream) == "first"
+    with pytest.raises(LookupError) as raised:
+        await anext(stream)
+    assert raised.value is error
+
+
+@pytest.mark.asyncio
+async def test_bounded_prefetch_early_close_cancels_pending_and_closes_source():
+    pending = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def source():
+        try:
+            yield "first"
+            pending.set()
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    stream = _bounded_prefetch(source())
+    assert await anext(stream) == "first"
+    await pending.wait()
+    await stream.aclose()
+    assert closed.is_set()
+    assert not [
+        task for task in asyncio.all_tasks() if task.get_name() == "video-output-prefetch-next" and not task.done()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bounded_prefetch_consumer_cancellation_closes_source_without_orphan_task():
+    waiting = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def source():
+        try:
+            yield "first"
+            waiting.set()
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    stream = _bounded_prefetch(source())
+    assert await anext(stream) == "first"
+    await waiting.wait()
+    consumer = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    await stream.aclose()
+    assert closed.is_set()
+    assert not [
+        task for task in asyncio.all_tasks() if task.get_name() == "video-output-prefetch-next" and not task.done()
+    ]
 
 
 def _fake_video_frames(num_frames: int = 2) -> list[np.ndarray]:
@@ -1332,6 +1431,119 @@ class TestStreamingVideoOutputExtraParams:
         _, gen_params, _ = await self._handler()._build_prompt_and_sampling_params(request)
 
         assert gen_params.extra_args["flow_shift"] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_blocked_encoder_allows_controls_and_serializes_cancel_cleanup(mocker: MockerFixture):
+    """Stop remains responsive and close never races a cancelled encode."""
+    encoding = asyncio.Event()
+    closed = asyncio.Event()
+    aborted = asyncio.Event()
+    release_encode = threading.Event()
+    operations = []
+    threads = []
+    loop = asyncio.get_running_loop()
+
+    class BlockingEncoder:
+        def encode(self, video, audio=None, *, audio_sample_rate=None):
+            operations.append("encode.start")
+            threads.append(threading.get_ident())
+            loop.call_soon_threadsafe(encoding.set)
+            assert release_encode.wait(5), "test did not release encoder"
+            operations.append("encode.end")
+            return b"media"
+
+        def close(self):
+            operations.append("close")
+            threads.append(threading.get_ident())
+            loop.call_soon_threadsafe(closed.set)
+            return b""
+
+    async def generate(*_args, **_kwargs):
+        yield OmniRequestOutput.from_diffusion(
+            request_id="req-ws", images=[_fake_video_frames(2)], final_output_type="image", finished=True
+        )
+
+    handler, engine, ws = _build_handler_for_async_tests(mocker, mock_generate=generate)
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video_output_stream.create_streaming_video_encoder",
+        return_value=BlockingEncoder(),
+    )
+    engine.update_streaming_playback = mocker.AsyncMock()
+    engine.abort = mocker.AsyncMock(side_effect=lambda *_, **__: aborted.set())
+    session = asyncio.create_task(handler.handle_session(ws))
+    try:
+        await asyncio.wait_for(encoding.wait(), 1)
+        ws.enqueue(json.dumps({"type": "session.ping"}))
+        ws.enqueue(json.dumps({"type": "session.playback", "position_seconds": 0.25}))
+        ws.enqueue(json.dumps({"type": "session.stop"}))
+        await asyncio.wait_for(aborted.wait(), 1)
+        engine.update_streaming_playback.assert_awaited_once()
+        assert not release_encode.is_set()
+        session.cancel()
+        await asyncio.wait_for(asyncio.gather(session, return_exceptions=True), 1)
+        assert operations == ["encode.start"]
+    finally:
+        session.cancel()
+        release_encode.set()
+        await asyncio.gather(session, return_exceptions=True)
+        await asyncio.wait_for(closed.wait(), 1)
+    assert operations == ["encode.start", "encode.end", "close"]
+    assert len(set(threads)) == 1
+    assert threads[0] != threading.get_ident()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_encoder_close_preserves_cleanup_and_observes_failure(mocker: MockerFixture):
+    closing = asyncio.Event()
+    closed = asyncio.Event()
+    failure_logged = asyncio.Event()
+    release_close = threading.Event()
+    close_calls = []
+    loop = asyncio.get_running_loop()
+    logged = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video_output_stream.logger.exception",
+        side_effect=lambda *_args, **_kwargs: loop.call_soon_threadsafe(failure_logged.set),
+    )
+
+    class BlockingCloseEncoder:
+        def encode(self, video, audio=None, *, audio_sample_rate=None):
+            return b"media"
+
+        def close(self):
+            close_calls.append(threading.get_ident())
+            loop.call_soon_threadsafe(closing.set)
+            try:
+                assert release_close.wait(5), "test did not release close"
+                raise RuntimeError("close failed")
+            finally:
+                loop.call_soon_threadsafe(closed.set)
+
+    async def generate(*_args, **_kwargs):
+        yield OmniRequestOutput.from_diffusion(
+            request_id="req-ws", images=[_fake_video_frames(2)], final_output_type="image", finished=True
+        )
+
+    handler, _, ws = _build_handler_for_async_tests(mocker, mock_generate=generate)
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video_output_stream.create_streaming_video_encoder",
+        return_value=BlockingCloseEncoder(),
+    )
+    session = asyncio.create_task(handler.handle_session(ws))
+    try:
+        await asyncio.wait_for(closing.wait(), 1)
+        session.cancel()
+        await asyncio.wait_for(asyncio.gather(session, return_exceptions=True), 1)
+        assert not release_close.is_set()
+    finally:
+        session.cancel()
+        release_close.set()
+        await asyncio.gather(session, return_exceptions=True)
+        await asyncio.wait_for(closed.wait(), 1)
+        await asyncio.wait_for(failure_logged.wait(), 1)
+    assert len(close_calls) == 1
+    assert close_calls[0] != threading.get_ident()
+    logged.assert_called_once()
 
 
 @pytest.mark.asyncio

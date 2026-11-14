@@ -34,9 +34,11 @@ import json
 import math
 import time
 import uuid
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, AsyncIterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
 from http import HTTPStatus
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import anyio
 import numpy as np
@@ -48,6 +50,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S
+from vllm_omni.entrypoints.openai import video_stream_envs
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest, VideoParams
 from vllm_omni.entrypoints.openai.stage_params import (
@@ -73,6 +76,7 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_metadata import DiffusionPayloadValue
 
 logger = init_logger(__name__)
+_T = TypeVar("_T")
 
 _DEFAULT_STALL_TIMEOUT = 60.0
 _DEFAULT_START_TIMEOUT = 10.0
@@ -82,6 +86,37 @@ _MAX_CONTROL_MESSAGE_SIZE = 128 * 1024
 _MAX_INTERACTION_QUEUE_SIZE = 64
 _MAX_INTERACTION_HISTORY_SIZE = 4096
 _MAX_CONTROL_RESPONSE_QUEUE_SIZE = 64
+
+
+async def _bounded_prefetch(source: AsyncIterable[_T]) -> AsyncGenerator[_T, None]:
+    """Keep one next async-iterator read in flight while the caller owns an item."""
+    iterator = source.__aiter__()
+
+    async def read_next() -> _T:
+        return await anext(iterator)
+
+    pending: asyncio.Task[_T] | None = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.create_task(read_next(), name="video-output-prefetch-next")
+            current = pending
+            pending = None
+            try:
+                item = await current
+            except StopAsyncIteration:
+                return
+            pending = asyncio.create_task(read_next(), name="video-output-prefetch-next")
+            yield item
+    finally:
+        if pending is not None:
+            if not pending.done():
+                pending.cancel()
+            with suppress(BaseException):
+                await pending
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            await close()
 
 
 class _SessionProgress:
@@ -851,18 +886,41 @@ class OmniStreamingVideoOutputHandler:
         )
         pacing = request.streaming_pacing
         max_output_bytes = pacing.max_output_bytes if pacing is not None and pacing.enabled else None
-        completed = False
+        # Encoding must not block playback feedback, interactions, or stop.
+        # One worker also serializes close behind an encode that is still
+        # running when its asyncio waiter is cancelled.
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-stream-encoder")
+        loop = asyncio.get_running_loop()
+        close_future: Future[bytes] | None = None
+
+        def close_encoder() -> bytes:
+            try:
+                return encoder.close()
+            except Exception:
+                logger.exception("Failed to close streaming video encoder for %s", request_id)
+                raise
+
+        generation_outputs = self._iter_generation_outputs(prompt, gen_params, request_id, progress)
+        if video_stream_envs.VLLM_OMNI_VIDEO_OUTPUT_PREFETCH == "on":
+            generation_outputs = _bounded_prefetch(generation_outputs)
         try:
-            async for result in self._iter_generation_outputs(prompt, gen_params, request_id, progress):
+            async for result in generation_outputs:
                 if result.error:
                     raise RuntimeError(str(result.error))
-                for chunk, metadata in self._encode_generation_result(result, request_id, encoder):
+                encoded_chunks = await loop.run_in_executor(
+                    executor, lambda: list(self._encode_generation_result(result, request_id, encoder))
+                )
+                for chunk, metadata in encoded_chunks:
                     if max_output_bytes is not None and len(chunk) > max_output_bytes:
                         raise ValueError("encoded streaming chunk exceeds streaming_pacing.max_output_bytes")
                     yield (chunk, metadata)
 
-            completed = True
-            final_chunk = encoder.close()
+            close_future = executor.submit(close_encoder)
+            # Shield the queued close: cancelling the session must not cancel
+            # the cleanup operation before the encoder thread gets to it.
+            close_waiter = asyncio.wrap_future(close_future)
+            close_waiter.add_done_callback(lambda future: None if future.cancelled() else future.exception())
+            final_chunk = await asyncio.shield(close_waiter)
             if max_output_bytes is not None and len(final_chunk or b"") > max_output_bytes:
                 raise ValueError("encoded streaming trailer exceeds streaming_pacing.max_output_bytes")
             if final_chunk:
@@ -877,8 +935,14 @@ class OmniStreamingVideoOutputHandler:
                     ),
                 )
         finally:
-            if not completed:
-                encoder.close()
+            try:
+                await generation_outputs.aclose()
+            finally:
+                if close_future is None:
+                    executor.submit(close_encoder)
+                # Do not join a running encode on the event-loop thread. The
+                # executor drains its queued close and then releases its worker.
+                executor.shutdown(wait=False)
 
     def _encode_generation_result(
         self,

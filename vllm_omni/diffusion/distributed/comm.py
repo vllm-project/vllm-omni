@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from vllm_omni.diffusion import envs
 from vllm_omni.platforms import current_omni_platform
 
 __all__ = ["all_to_all_4D", "all_to_all_5D", "SeqAllToAll4D", "SeqAllToAll5D", "RingComm"]
@@ -89,6 +90,19 @@ def all_to_all_4D(
         hc = shard_hc * seq_world_size
         shard_seqlen = seqlen // seq_world_size
         seq_world_size = dist.get_world_size(group)
+
+        if bs == 1 and envs.VLLM_OMNI_REVERSE_A2A_TOKEN_LAYOUT:
+            # Batch-one input already groups tokens by destination rank;
+            # exchange these ranges directly, then combine received heads.
+            input_t = input.contiguous().reshape(seq_world_size, shard_seqlen, shard_hc, hs)
+            output = torch.empty_like(input_t)
+            if seq_world_size > 1:
+                dist.all_to_all_single(output, input_t, group=group)
+                if use_sync:
+                    current_omni_platform.synchronize()
+            else:
+                output = input_t
+            return output.permute(1, 0, 2, 3).reshape(bs, shard_seqlen, hc, hs)
 
         # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
         # (bs, seqlen, hc/P, hs) -reshape-> (bs, P, seq_len/P, hc/P, hs) -transpose(0, 3)->

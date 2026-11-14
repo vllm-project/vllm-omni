@@ -198,6 +198,9 @@ ADD or update, not while waiting for the next client chunk. Frontend abort
 keeps `request_states` until `generate()` consumes the terminal output.
 Video output sessions shield final task cleanup and unfinished-request abort
 from ASGI cancellation, including disconnects immediately after `session.done`.
+Video encoding and encoder close run on one worker per stream so encoding does
+not block control handling. Cancellation queues close after any running encode;
+the event loop does not join that worker while it drains cleanup.
 Abort cleanup bounds both its coroutine and the engine acknowledgement wait
 with `ABORT_TIMEOUT_S`; an unresponsive orchestrator must not hold the shield
 indefinitely.

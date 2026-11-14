@@ -1732,6 +1732,69 @@ def test_encode_prompt_zeroes_padded_umt5_states_to_exactly_512_tokens() -> None
     torch.testing.assert_close(encoded[:, 3:], torch.zeros_like(encoded[:, 3:]))
 
 
+@pytest.mark.parametrize("trim", [None, False, True])
+@pytest.mark.parametrize("max_length,valid_length", [(8, 3), (8, 8), (512, 3)])
+def test_trim_text_padding_preserves_output_contract_and_prompt_cache(
+    monkeypatch: pytest.MonkeyPatch, trim: bool | None, max_length: int, valid_length: int
+) -> None:
+    monkeypatch.setattr(_FakePretrained, "padding_side", "right", raising=False)
+    config = _od_config()
+    if trim is not None:
+        config.model_config["lingbot_trim_text_padding"] = trim
+    pipeline = _pipeline(_load_pipeline_module(), od_config=config)
+    del pipeline.encode_prompt
+    calls = []
+
+    def tokenizer(texts, **kwargs):
+        assert texts == ["move through the room"]
+        assert kwargs == {
+            "padding": False if trim else "max_length",
+            "max_length": max_length,
+            "truncation": True,
+            "add_special_tokens": True,
+            "return_attention_mask": True,
+            "return_tensors": "pt",
+        }
+        width = valid_length if trim else max_length
+        mask = torch.zeros(1, width, dtype=torch.long)
+        mask[:, :valid_length] = 1
+        return SimpleNamespace(input_ids=torch.arange(width).view(1, width), attention_mask=mask)
+
+    def text_encoder(input_ids, attention_mask):
+        calls.append(input_ids.shape[1])
+        assert attention_mask.shape == input_ids.shape
+        return SimpleNamespace(last_hidden_state=(input_ids + 1).unsqueeze(-1).expand(-1, -1, 8).float())
+
+    pipeline.tokenizer = tokenizer
+    pipeline.text_encoder = text_encoder
+    encoded = pipeline.encode_prompt("  move   through the room ", max_sequence_length=max_length, dtype=torch.float16)
+    expected = torch.zeros(1, max_length, 8, dtype=torch.float16)
+    expected[:, :valid_length] = torch.arange(1, valid_length + 1).view(1, -1, 1)
+    torch.testing.assert_close(encoded, expected)
+    assert (
+        pipeline.encode_prompt("move through the room", max_sequence_length=max_length, dtype=torch.float16) is encoded
+    )
+    assert calls == [valid_length if trim else max_length]
+
+
+@pytest.mark.parametrize("value", ["true", "false", 0, 1, None])
+def test_trim_text_padding_rejects_non_boolean_config(value: object) -> None:
+    config = _od_config()
+    config.model_config["lingbot_trim_text_padding"] = value
+    with pytest.raises(ValueError, match="lingbot_trim_text_padding must be a bool"):
+        _pipeline(_load_pipeline_module(), od_config=config)
+
+
+def test_trim_text_padding_requires_right_padding(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_FakePretrained, "padding_side", "left", raising=False)
+    config = _od_config()
+    config.model_config["lingbot_trim_text_padding"] = True
+    with pytest.raises(ValueError, match="lingbot_trim_text_padding requires.*right"):
+        _pipeline(_load_pipeline_module(), od_config=config)
+    config.model_config["lingbot_trim_text_padding"] = False
+    _pipeline(_load_pipeline_module(), od_config=config)
+
+
 def test_multi_chunk_generation_uses_one_request_local_cache_and_decodes_accumulated_latents(monkeypatch) -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
@@ -3139,9 +3202,13 @@ def test_the_text_encoder_runs_once_per_distinct_prompt() -> None:
     ]
 
 
-def test_the_prompt_encode_cache_is_bounded() -> None:
+@pytest.mark.parametrize("trim_text_padding", [False, True])
+def test_the_prompt_encode_cache_is_bounded(monkeypatch: pytest.MonkeyPatch, trim_text_padding: bool) -> None:
+    monkeypatch.setattr(_FakePretrained, "padding_side", "right", raising=False)
     module = _load_pipeline_module()
-    pipeline = _pipeline(module)
+    config = _od_config()
+    config.model_config["lingbot_trim_text_padding"] = trim_text_padding
+    pipeline = _pipeline(module, od_config=config)
     encoded = _counting_text_encoder(pipeline)
     size = module._PROMPT_EMBEDS_CACHE_SIZE
 

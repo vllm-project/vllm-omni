@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     LOCAL_RANK: int = 0
     VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS: str | None = None
     VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS: bool = False
+    VLLM_OMNI_REVERSE_A2A_TOKEN_LAYOUT: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Runtime Env Vars ==================
@@ -30,6 +31,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
     "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
+    # Use token-major communication for batch-one reverse All-to-All.
+    # All ranks in a process group must select the same layout.
+    "VLLM_OMNI_REVERSE_A2A_TOKEN_LAYOUT": lambda: os.environ.get("VLLM_OMNI_REVERSE_A2A_TOKEN_LAYOUT", "0") == "1",
     # Minimum rotary-table span (B*S positions) at which consumers of the shared
     # fused_qk_norm_rope op take the fused path instead of their eager chain;
     # "0" = always fuse; unset = each consumer's own measured default. Raw
