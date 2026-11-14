@@ -48,6 +48,10 @@ class OffloadPlan:
             block tensors are identical across the DiT DLO group. Only these
             encoders may use multi-rank AllGather transfer; this must not be
             declared for encoder-TP shards.
+        independently_managed_submodules: Pipeline-relative CPU module roots
+            whose model-owned staging must remain outside rank-local DLO.
+        retain_resident_storage: Explicit local policy to retain resident-core
+            device backing between denoise scopes. Defaults to stage-local.
     """
 
     on_demand_component_paths: frozenset[str] = field(default_factory=frozenset)
@@ -58,6 +62,8 @@ class OffloadPlan:
     encoder_component_types: dict[str, str] = field(default_factory=dict)
     encoder_block_attrs: dict[str, tuple[str, ...]] = field(default_factory=dict)
     encoder_dlo_weight_replication: frozenset[str] = field(default_factory=frozenset)
+    independently_managed_submodules: frozenset[str] = field(default_factory=frozenset)
+    retain_resident_storage: bool = False
 
 
 def get_offload_plan(pipeline: nn.Module) -> OffloadPlan | None:

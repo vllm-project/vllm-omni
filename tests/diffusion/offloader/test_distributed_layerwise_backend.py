@@ -6,6 +6,7 @@
 import gc
 import json
 import weakref
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -71,6 +72,257 @@ class TinyBlock(nn.Module):
 
 def _make_values(start: float) -> torch.Tensor:
     return torch.arange(start, start + 4, dtype=torch.float32)
+
+
+def _independent_projection_pipeline():
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.projection = nn.Linear(2, 2, bias=False)
+            self.core = nn.Linear(2, 2, bias=False)
+
+        def forward(self, x):
+            return self.core(x) + self.projection(x)
+
+    class Refiner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList([nn.Linear(2, 2) for _ in range(2)])
+
+        def forward(self, x):
+            for block in self.blocks:
+                x = block(x)
+            return x
+
+    class Transformer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList([Block() for _ in range(5)])
+            self.token_refiner = Refiner()
+            self.final_projection = nn.Linear(2, 2, bias=False)
+
+        def forward(self, x):
+            x = self.token_refiner(x)
+            for block in self.blocks:
+                x = block(x)
+            return self.final_projection(x)
+
+    class Pipeline(nn.Module):
+        _dit_modules = ["transformer"]
+
+        def __init__(self):
+            super().__init__()
+            self.transformer = Transformer()
+            paths = {f"transformer.blocks.{i}.projection" for i in range(5)}
+            paths.add("transformer.final_projection")
+            self._offload_plan = OffloadPlan(
+                block_attrs={"transformer": ("blocks",)},
+                offload_submodules={"token_refiner": "blocks"},
+                resident_dit_paths=frozenset({"transformer"}),
+                independently_managed_submodules=frozenset(paths),
+            )
+
+    return Pipeline()
+
+
+def test_non_block_placement_preserves_independent_cpu_storage(patched_offload_runtime):
+    pipeline = _independent_projection_pipeline()
+    transformer = pipeline.transformer
+    weight = transformer.final_projection.weight
+    pointer = weight.data_ptr()
+    transformer.final_projection = nn.Sequential(transformer.final_projection)
+    pipeline._offload_plan = replace(
+        pipeline._offload_plan,
+        independently_managed_submodules=frozenset({"transformer.final_projection.0"}),
+        offload_submodules={},
+    )
+    backend = DistributedLayerwiseOffloadBackend(
+        OffloadConfig(
+            strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            dlo_use_allgather=False,
+            pin_cpu_memory=False,
+            dlo_resident_layers=len(transformer.blocks),
+        ),
+        torch.device("meta"),
+    )
+
+    backend.enable(pipeline)
+
+    assert transformer.token_refiner.blocks[0].weight.is_meta
+    assert transformer.final_projection[0].weight is weight
+    assert weight.device.type == "cpu" and weight.data_ptr() == pointer
+    backend.disable()
+
+
+@pytest.mark.parametrize("stackless_owner", ["transformer", "transformer.token_refiner", "encoder", "vae", "resident"])
+def test_independent_root_in_whole_module_placement_rejected(patched_offload_runtime, stackless_owner):
+    pipeline = _independent_projection_pipeline()
+    if stackless_owner == "transformer":
+        pipeline.transformer.blocks = nn.ModuleList()
+        root = "transformer.final_projection"
+    elif stackless_owner == "transformer.token_refiner":
+        pipeline.transformer.token_refiner = _StagedVAE()
+        root = "transformer.token_refiner.proj"
+    else:
+        pipeline._encoder_modules = []
+        pipeline._vae_modules = []
+        pipeline._resident_modules = []
+        setattr(pipeline, f"_{stackless_owner}_modules", ["transformer.final_projection"])
+        root = "transformer.final_projection"
+    pipeline._offload_plan = replace(pipeline._offload_plan, independently_managed_submodules=frozenset({root}))
+    backend = DistributedLayerwiseOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE, dlo_use_allgather=False, pin_cpu_memory=False),
+        torch.device("cpu"),
+    )
+
+    with pytest.raises(ValueError, match="Independent.*whole-module placement"):
+        backend.enable(pipeline)
+    if stackless_owner == "transformer.token_refiner":
+        assert pipeline.transformer.token_refiner.offload_calls == 0
+
+
+@pytest.mark.parametrize(
+    "resident_layers,retain",
+    [(0, False), (2, False), (5, False), (2, True), (5, True)],
+)
+def test_independent_cpu_weights_survive_dlo_and_reenable(
+    patched_offload_runtime,
+    resident_layers,
+    retain,
+):
+    pipeline = _independent_projection_pipeline()
+    pipeline._offload_plan = replace(
+        pipeline._offload_plan,
+        retain_resident_storage=retain,
+    )
+    backend = DistributedLayerwiseOffloadBackend(
+        OffloadConfig(
+            strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            pin_cpu_memory=False,
+            dlo_use_allgather=False,
+            dlo_resident_layers=resident_layers,
+            components=frozenset({"dit"}),
+        ),
+        torch.device("cpu"),
+    )
+    x = torch.tensor([[0.25, -0.5], [0.75, 1.0]])
+    with torch.no_grad():
+        for cycle in range(2):
+            projection = pipeline.transformer.blocks[0].projection
+            if cycle:
+                projection.weight = nn.Parameter(projection.weight + 0.125)
+            expected = pipeline.transformer(x)
+            original = pipeline.state_dict()
+            state = {name: value.clone() for name, value in original.items()}
+            independent = {
+                name: (value, value.data_ptr(), value.clone())
+                for name, value in pipeline.named_parameters()
+                if "projection" in name
+            }
+            backend.enable(pipeline)
+            for group in backend._all_hook_groups:
+                assert all(not hook.is_materialized for hook in group)
+            backend.load_resident_layers()
+            for _ in range(3):
+                actual = pipeline.transformer(x)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                for value, pointer, original in independent.values():
+                    assert value.device.type == "cpu"
+                    assert value.data_ptr() == pointer
+                    torch.testing.assert_close(value, original, atol=0, rtol=0)
+            backend.offload_resident_layers()
+            backend.disable()
+            restored = pipeline.state_dict()
+            assert restored.keys() == state.keys()
+            for name, value in state.items():
+                torch.testing.assert_close(restored[name], value, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shared_storage", [False, True])
+def test_independent_alias_rejected_before_dlo_mutation(
+    patched_offload_runtime,
+    shared_storage,
+):
+    pipeline = _independent_projection_pipeline()
+    block = pipeline.transformer.blocks[0]
+    if shared_storage:
+        block.core.weight = nn.Parameter(block.projection.weight.detach())
+    else:
+        block.core.weight = block.projection.weight
+    expected = {name: value.clone() for name, value in pipeline.state_dict().items()}
+    backend = DistributedLayerwiseOffloadBackend(
+        OffloadConfig(
+            strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            pin_cpu_memory=False,
+            dlo_use_allgather=False,
+        ),
+        torch.device("cpu"),
+    )
+    with pytest.raises(ValueError, match="owners"):
+        backend.enable(pipeline)
+    for name, value in pipeline.state_dict().items():
+        torch.testing.assert_close(value, expected[name], atol=0, rtol=0)
+
+
+def test_independent_weights_survive_failed_dlo_enable(
+    patched_offload_runtime,
+    monkeypatch,
+):
+    pipeline = _independent_projection_pipeline()
+    original = pipeline.state_dict()
+    expected = {name: value.clone() for name, value in original.items()}
+    backend = DistributedLayerwiseOffloadBackend(
+        OffloadConfig(
+            strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            pin_cpu_memory=False,
+            dlo_use_allgather=False,
+            dlo_resident_layers=2,
+        ),
+        torch.device("cpu"),
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            backend,
+            "_allocate_shared_buffers",
+            Mock(side_effect=RuntimeError("injected allocation failure")),
+        )
+        with pytest.raises(RuntimeError, match="injected allocation"):
+            backend.enable(pipeline)
+    for name, value in pipeline.state_dict().items():
+        torch.testing.assert_close(value, expected[name], atol=0, rtol=0)
+    backend.enable(pipeline)
+    backend.disable()
+    for name, value in pipeline.state_dict().items():
+        torch.testing.assert_close(value, expected[name], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        "transformer.blocks",
+        "transformer.blocks.0",
+        "transformer.token_refiner.blocks.0",
+    ],
+)
+def test_independent_root_cannot_capture_a_streamed_block(
+    patched_offload_runtime,
+    root,
+):
+    pipeline = _independent_projection_pipeline()
+    pipeline._offload_plan = replace(
+        pipeline._offload_plan,
+        independently_managed_submodules=frozenset({root}),
+    )
+    backend = DistributedLayerwiseOffloadBackend(
+        OffloadConfig(
+            strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            pin_cpu_memory=False,
+            dlo_use_allgather=False,
+        ),
+        torch.device("cpu"),
+    )
+    with pytest.raises(ValueError, match="whole block"):
+        backend.enable(pipeline)
 
 
 class TestDistributedLayerwiseOffloadHook:
@@ -860,6 +1112,129 @@ class TestDistributedLayerwiseOffloadHook:
 
 
 class TestPinnedResidentLayerGroup:
+    @pytest.mark.parametrize("retain", [False, True])
+    def test_backing_policy_preserves_outputs_and_releases_unbound_storage(
+        self,
+        patched_offload_runtime,
+        mocker,
+        retain,
+    ):
+        blocks = [nn.Linear(2, 2), nn.Linear(2, 2)]
+        x = torch.tensor([[0.5, -0.25]])
+        with torch.no_grad():
+            expected = blocks[1](blocks[0](x))
+            group = PinnedResidentLayerGroup(
+                blocks,
+                device=torch.device("cpu"),
+                copy_stream=DummyStream(),
+                pin_memory=False,
+                retain_device_storage=retain,
+            )
+            copies = mocker.spy(group, "_load_once")
+            for _ in range(2):
+                group.load()
+                actual = blocks[1](blocks[0](x))
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                group.offload()
+                assert all(block.weight.numel() == 0 for block in blocks)
+            assert copies.call_count == (1 if retain else 2)
+            backing = [weakref.ref(t) for b in group._gpu_buffers for t in b.values()]
+            group.restore_to_cpu()
+            assert all(reference() is None for reference in backing)
+            actual = blocks[1](blocks[0](x))
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("failure", ["allocation", "copy", "binding"])
+    def test_failed_load_cannot_reuse_partial_backing(
+        self,
+        patched_offload_runtime,
+        monkeypatch,
+        failure,
+    ):
+        blocks = [nn.Linear(2, 2), nn.Linear(2, 2)]
+        expected = [block.weight.detach().clone() for block in blocks]
+        group = PinnedResidentLayerGroup(
+            blocks,
+            device=torch.device("cpu"),
+            copy_stream=DummyStream(),
+            pin_memory=False,
+            retain_device_storage=True,
+        )
+        if failure == "allocation":
+            target, method = torch, "empty"
+        elif failure == "copy":
+            target, method = torch.Tensor, "copy_"
+        else:
+            target, method = dist_backend_module, "set_tensor_storage"
+        original = getattr(target, method)
+        calls = 0
+
+        def fail_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected resident load failure")
+            return original(*args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(target, method, fail_second)
+            with pytest.raises(RuntimeError, match="injected resident load"):
+                group.load()
+            with pytest.raises(RuntimeError, match="restore CPU"):
+                group.load()
+        group.restore_to_cpu()
+        group.load()
+        for block, weight in zip(blocks, expected, strict=True):
+            torch.testing.assert_close(block.weight, weight, atol=0, rtol=0)
+        group.restore_to_cpu()
+
+    @pytest.mark.parametrize("failure", ["drain", "restore"])
+    @torch.no_grad()
+    def test_failed_cleanup_retains_backing_for_retry(
+        self,
+        patched_offload_runtime,
+        monkeypatch,
+        failure,
+    ):
+        group = PinnedResidentLayerGroup(
+            [nn.Linear(2, 2)],
+            device=torch.device("cpu"),
+            copy_stream=DummyStream(),
+            pin_memory=False,
+            retain_device_storage=True,
+        )
+        if failure == "drain":
+
+            def fail_bind(_buffers):
+                raise RuntimeError("injected load failure")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    group,
+                    "_bind_device_buffers",
+                    fail_bind,
+                )
+                with pytest.raises(RuntimeError, match="injected load"):
+                    group.load()
+            target, method = current_omni_platform, "synchronize"
+        else:
+            group.load()
+            group.offload()
+            target, method = dist_backend_module, "restore_tensor_storage"
+        backing = weakref.ref(group._gpu_buffers[0][torch.float32])
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                target,
+                method,
+                Mock(side_effect=RuntimeError("injected cleanup failure")),
+            )
+            with pytest.raises(RuntimeError, match="injected cleanup"):
+                group.restore_to_cpu()
+            assert backing() is not None
+        group.restore_to_cpu()
+        gc.collect()
+        assert backing() is None
+
     def test_constructor_failure_leaves_every_block_materialized(self, monkeypatch):
         blocks = [nn.Linear(2, 2), nn.Linear(2, 2)]
         expected = [block.weight.detach().clone() for block in blocks]
@@ -1604,6 +1979,15 @@ class TestMmapWeightLoading:
         assert not backend.enabled
         assert not backend._blocks
         assert not backend._all_hook_groups
+
+    def test_independent_root_rejection_releases_hwr_lease(self, patched_offload_runtime):
+        _, backend, carrier, lease = _hwr_backend()
+
+        with pytest.raises(ValueError, match="Independent CPU roots"):
+            backend.enable(_independent_projection_pipeline())
+
+        assert not carrier.taken
+        assert lease.closed
 
 
 class TestCrossGroupSharedBuffer:

@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from bisect import bisect_left
 from collections.abc import Iterable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -68,6 +68,13 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import MiniMaxH3ReferenceKVTier2State
 
 logger = init_logger(__name__)
+
+
+@dataclass(slots=True, eq=False)
+class MiniMaxH3RefinedText:
+    """Full refined text rows owned by one image denoise invocation."""
+
+    rows: torch.Tensor | None = field(default=None, init=False)
 
 
 # Packed multi-request forwards require the attention backend to actually
@@ -834,8 +841,29 @@ class MiniMaxH3DiTModel(nn.Module):
                 raise ValueError("MiniMax H3 AdaLN offload requires CUDA")
             if quant_config is not None:
                 raise ValueError("MiniMax H3 AdaLN offload requires unquantized BF16 weights")
-            if conflicting_offload:
-                raise ValueError("MiniMax H3 AdaLN offload cannot be combined with DiT offload or HSDP")
+            parallel = od_config.parallel_config
+            hwr_mode = getattr(od_config, "host_weight_runtime_mode", "disabled")
+            compatible_dlo = (
+                getattr(od_config, "model_class_name", None) == "MiniMaxH3ImagePipeline"
+                and not self._diffusers_weights
+                and not arch.audio_enabled
+                and enabled
+                and offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+                and offload.offloads(DIT_COMPONENT)
+                and not offload.any_allgather
+                and not getattr(parallel, "use_hsdp", False)
+                and get_tensor_model_parallel_world_size() == 2
+                and getattr(parallel, "sequence_parallel_size", 1) == 1
+                and getattr(parallel, "data_parallel_size", 1) == 1
+                and hwr_mode == "disabled"
+            )
+            if conflicting_offload and not compatible_dlo:
+                raise ValueError(
+                    "MiniMax H3 AdaLN offload cannot be combined with DiT offload "
+                    "or HSDP outside native H3-Image CUDA TP2 rank-local DLO "
+                    "with exact caching "
+                    "and host_weight_runtime_mode='disabled'"
+                )
             logger.info("MiniMax H3 AdaLN weights remain on CPU; projections stage on cache misses only")
         self.adaln_cache = MiniMaxH3RuntimeAdalnCache(
             max_bytes=256 * 1024**2 if enabled else 0, offload_weights=offload_adaln
@@ -963,6 +991,21 @@ class MiniMaxH3DiTModel(nn.Module):
                 for parameter in block.attn.to_gate_compress.parameters():
                     parameter.missing_param_init = "error"
         self.vsa_gates_enabled = True
+
+    def independently_managed_offload_paths(self) -> frozenset[str]:
+        """Declare CPU projections that retain their own staging under DLO."""
+        offload = resolve_offload(self.od_config)
+        if not (
+            self.adaln_cache.offload_weights
+            and offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+            and offload.offloads(DIT_COMPONENT)
+        ):
+            return frozenset()
+        return frozenset(
+            name
+            for name, module in self.named_modules()
+            if isinstance(module, MiniMaxH3AdalnProj) and module._offload_weights
+        )
 
     def enable_vdn(self, config: VDNConfig) -> None:
         """Convert every DiT block to VDN-H3 hybrid attention before loading.
@@ -1244,6 +1287,7 @@ class MiniMaxH3DiTModel(nn.Module):
         local_span: tuple[int, int],
         num_requests: int = 1,
         global_positions: torch.Tensor | None = None,
+        refined_text: MiniMaxH3RefinedText | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build this rank's packed multimodal embedding rows.
 
@@ -1300,14 +1344,18 @@ class MiniMaxH3DiTModel(nn.Module):
         else:
             audio_embed, _ = self.audio_patch_proj(audio_rows)
 
-        text_rows = text_embeddings_selected.to(device=device, dtype=_BF16_DTYPE)
-        text_embed, _ = self.condition_proj(text_rows)
-        text_embed = self.token_refiner(
-            text_embed,
-            cu_seqlens=refiner_cu_seqlens,
-            max_seqlen=refiner_max_seqlen,
-            num_requests=num_requests,
-        )
+        text_embed = None if refined_text is None else refined_text.rows
+        if text_embed is None:
+            text_rows = text_embeddings_selected.to(device=device, dtype=_BF16_DTYPE)
+            text_embed, _ = self.condition_proj(text_rows)
+            text_embed = self.token_refiner(
+                text_embed,
+                cu_seqlens=refiner_cu_seqlens,
+                max_seqlen=refiner_max_seqlen,
+                num_requests=num_requests,
+            )
+            if refined_text is not None:
+                refined_text.rows = text_embed
         if text_local_indices is not None:
             text_embed = text_embed.index_select(0, text_local_indices)
 
@@ -1363,7 +1411,13 @@ class MiniMaxH3DiTModel(nn.Module):
             device=device,
         )
 
-    def forward(self, *, pdd_step: int | None = None, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        *,
+        pdd_step: int | None = None,
+        refined_text: MiniMaxH3RefinedText | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Packed inference forward.
 
         Keyword names follow the checkpoint's serving contract.
@@ -1503,6 +1557,7 @@ class MiniMaxH3DiTModel(nn.Module):
             device=device,
             local_span=local_span,
             global_positions=(compact_local_positions if compact_reference and local_len != seq_len else None),
+            refined_text=refined_text,
         )
 
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
