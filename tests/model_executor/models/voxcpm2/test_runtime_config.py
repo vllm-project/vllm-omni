@@ -190,10 +190,18 @@ def test_generation_config(key: str, value: object, expected: int | float) -> No
 def test_generation_config_defaults() -> None:
     config = _VoxCPM2RuntimeConfig()
 
+    assert config.enable_torch_compile
     assert config.inference_timesteps == 10
     assert config.cfg_value == 2.0
     assert config.cfg_cutoff_ratio == 1.0
     assert config.mixed_graph_cache_limit == 0
+
+
+@pytest.mark.parametrize(("value", "expected"), [(False, False), (True, True), ("false", False), ("true", True)])
+def test_torch_compile_switch_is_configurable(value: object, expected: bool) -> None:
+    config = _VoxCPM2RuntimeConfig.from_vllm_config(_VllmConfig(_ModelConfig({"enable_torch_compile": value})))
+
+    assert config.enable_torch_compile is expected
 
 
 def test_mixed_graph_cache_limit_rejects_negative():

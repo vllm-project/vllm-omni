@@ -71,11 +71,15 @@ def _schedule(**kwargs) -> CellSchedule:
 
 
 class _CountingAdapter(CellAdapter):
-    def forward(self, tasks, kv_contexts, *, hidden):
-        return torch.zeros(1, 4, 8)
+    def compatibility_key(self, cell):
+        return cell
+
+    def forward(self, batch, members, *, member_inputs):
+        del members, member_inputs
+        return {"hidden_states": torch.zeros(batch.size, 4, 8)}
 
     def pack_activation(self, output):
-        return {"hidden_states": output}
+        return output if isinstance(output, dict) else {"hidden_states": output}
 
     def unpack_activation(self, payload):
         return payload["hidden_states"]
@@ -159,7 +163,8 @@ def test_prior_handoff_runs_before_first_prepare():
         kv=kv,
     )
     ctx.enqueue("world", plan, chunk_tokens=4, retain=clean_history_cells(schedule, num_blocks=1))
-    run_cell_pipeline(ctx=ctx, adapter=_CountingAdapter())
+    adapter = _CountingAdapter()
+    run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
     assert order.index("prior") < order.index("prepare")
 
 
@@ -193,7 +198,8 @@ def test_session_continuation_and_nonlocking_retain():
     cache.bind_session_structure("world", first.structural_key())
     retain = clean_history_cells(first, num_blocks=1)
     ctx.enqueue("world", build_cell_plan(first), chunk_tokens=4, retain=retain)
-    run_cell_pipeline(ctx=ctx, adapter=_CountingAdapter())
+    adapter = _CountingAdapter()
+    run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
     kv.end_request("world", retain=retain)
     assert cache.pool.has(("world", 1, 1, 0)) and not cache.pool.has(("world", 0, 1, 0))
 
@@ -203,7 +209,8 @@ def test_session_continuation_and_nonlocking_retain():
     retain2 = clean_history_cells(second, num_blocks=1)
     assert prior.isdisjoint(retain2)
     ctx.enqueue("world", build_cell_plan(second, prior_history=prior), chunk_tokens=4, retain=retain2)
-    run_cell_pipeline(ctx=ctx, adapter=_CountingAdapter())
+    adapter = _CountingAdapter()
+    run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
     kv.end_request("world", retain=retain2)
     assert cache.pool.has(("world", 2, 1, 0)) and not cache.pool.has(("world", 1, 1, 0))
 

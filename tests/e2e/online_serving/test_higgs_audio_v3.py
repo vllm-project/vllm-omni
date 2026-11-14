@@ -19,6 +19,7 @@ os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
 os.environ.setdefault("VLLM_MOE_USE_DEEP_GEMM", "0")
 
 import pytest
+from vllm.platforms import current_platform
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
@@ -47,6 +48,7 @@ DEFAULT_SPEECH_TIMEOUT_S = 180.0
 # A WAV header adds 44 bytes; conservative floor catches truncated /
 # silence-only outputs without flagging short legitimate clips.
 _MIN_AUDIO_BYTES = 20_000
+_SINGLE_STREAM_HNR_DB = -2.0 if current_platform.is_rocm() else 0.0
 
 # Reuse the shared TTS reference clip (clean ~5 s 24 kHz mono human speech)
 # vendored under tests/assets/qwen3_tts/. Keeps a single WAV across TTS
@@ -107,6 +109,11 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "stream": False,
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                # A concurrent sample can be misheard by whisper-small. As in
+                # the single-request case, confirm a failed match with the
+                # stronger ASR model before treating the generated speech as
+                # a semantic regression.
+                "transcript_escalation_model": "large-v3",
             },
             request_num=3,
         )
@@ -123,12 +130,10 @@ class TestHiggsAudioV3OnlineHappyPath:
         windows stitch into a coherent PCM stream. The byte-count gate is the same as
         the sync paths; per-chunk audio content is verified offline against Whisper.
 
-        NOTE: ``min_hnr_db=0.0`` sit below the typical speech-noise floor so the
-        check still catches catastrophic codec failure (silence, white noise, sample
-        scramble all give HNR << 0) while allowing for the sliding-window codec's
-        slightly-noisier-than-sync output. The default 1.0 dB threshold has only
-        ~0.16 dB margin over measured single-request output (1.16 dB on L4), so
-        flake risk is too high there.
+        NOTE: CUDA retains its measured 0.0 dB floor. ROCm uses the same -2.0 dB
+        catastrophic-codec floor as the concurrent streaming case, covering
+        the measured -0.82 dB on MI325 while silence, white noise, and sample
+        scramble remain well below the floor.
         """
         online_client.send_audio_speech_request(
             {
@@ -138,7 +143,7 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "stream_format": "audio",
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "min_hnr_db": 0.0,
+                "min_hnr_db": _SINGLE_STREAM_HNR_DB,
             }
         )
 
