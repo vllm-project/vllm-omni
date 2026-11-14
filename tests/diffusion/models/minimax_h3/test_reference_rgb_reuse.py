@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
-import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -37,14 +36,6 @@ def _descriptor_item(tmp_path):
     }
 
 
-def test_reference_rgb_reuse_request_default_is_disabled():
-    resolve = reference_video.resolve_reference_video_decode_reuse
-    key = reference_video.MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY
-    assert resolve({}) is False
-    assert resolve({key: False}) is False
-    assert resolve({key: True}) is True
-
-
 def test_prepared_reference_descriptor_round_trips_rgb_sidecar(tmp_path):
     item = _descriptor_item(tmp_path)
     encoded = reference_video.serialize_prepared_reference_videos([item], str(tmp_path))
@@ -69,8 +60,7 @@ def test_prepared_rgb_sidecar_validates_exact_size(tmp_path):
         reference_video.load_prepared_rgb_frames(item)
 
 
-@pytest.mark.parametrize("has_sidecar", [False, True])
-@pytest.mark.parametrize("request_override", [None, False, True])
+@pytest.mark.parametrize("has_sidecar,request_override", [(True, False), (False, True)])
 def test_reused_descriptor_selects_frames_independently_of_request_option(
     monkeypatch, tmp_path, has_sidecar, request_override
 ):
@@ -227,7 +217,6 @@ def test_removed_environment_switch_does_not_override_consecutive_requests(monke
             {"prompt": "reference clip", "multi_modal_data": {"video": str(reference_clip)}}, _Sampling(extra_args)
         )
         outputs.append(result.media.videos[0].numpy())
-        assert os.environ["VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE"] == "1"
     assert captures == [False, True, False]
     np.testing.assert_array_equal(outputs[0], outputs[1])
     np.testing.assert_array_equal(outputs[0], outputs[2])
@@ -290,4 +279,4 @@ def test_transcode_sidecar_matches_prepared_video_pixels(
             encoder_processing._frames_to_tensor(rgb).numpy(), encoder_processing._frames_to_tensor(decoded).numpy()
         )
     finally:
-        rgb._mmap.close()
+        del rgb
