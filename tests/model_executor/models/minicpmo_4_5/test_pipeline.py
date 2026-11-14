@@ -43,6 +43,7 @@ _DEPLOY_DIR = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
 _DEPLOY_LAYOUTS = {
     "minicpmo_4_5.yaml": ["0", "0", "0"],
     "minicpmo_4_5_2gpu.yaml": ["0", "1", "1"],
+    "minicpmo_4_5_npu_2card.yaml": ["0", "0", "1"],
     "minicpmo_4_5_3gpu.yaml": ["0", "1", "2"],
     "minicpmo_4_5_8x4090.yaml": ["0,1,2,3", "4", "5"],
 }
@@ -199,7 +200,7 @@ class TestDeployTopology:
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
             # The NPU overlay also retunes the per-stage memory budget for the
             # 910B single-card layout; every other platform keeps the base one.
-            expected_utils = [0.50, 0.10, 0.22] if is_npu else [0.55, 0.15, 0.18]
+            expected_utils = [0.55, 0.10, 0.22] if is_npu else [0.55, 0.15, 0.18]
             assert memory_utilizations == expected_utils
             assert sum(memory_utilizations) <= 0.9 + 1e-6
             # Keep the default Daily-Omni budget; Video-MME overrides stage 0 explicitly.

@@ -150,12 +150,24 @@ NGRAM = {"method": "ngram", "num_speculative_tokens": 7}
             ),
             False,
         ),
-        # Non-ngram speculative methods keep the original fallback.
+        # Only the Ngram family participates in the fallback.
         (
             dict(
                 use_v2_model_runner=True,
                 is_npu=True,
                 speculative_config={"method": "eagle"},
+                kstep_frames=0,
+                supports_scheduler_ngram=True,
+                ngram_enabled=True,
+                ngram_available=True,
+            ),
+            True,
+        ),
+        (
+            dict(
+                use_v2_model_runner=True,
+                is_npu=True,
+                speculative_config={"method": "ngram_gpu"},
                 kstep_frames=0,
                 supports_scheduler_ngram=True,
                 ngram_enabled=True,
@@ -195,7 +207,7 @@ class FakeNgramGPUSpeculator:
 
 @pytest.fixture
 def fake_vllm(monkeypatch, adapter):
-    adapter._SpeculatorCls = None
+    adapter._speculator_cls = None
     names = [
         "vllm",
         "vllm.v1",
@@ -213,7 +225,7 @@ def fake_vllm(monkeypatch, adapter):
     fake_modules[speculator_mod.__name__] = speculator_mod
     _install_fake_modules(monkeypatch, fake_modules)
     yield adapter
-    adapter._SpeculatorCls = None
+    adapter._speculator_cls = None
 
 
 def test_speculator_resolves_live_req_states(fake_vllm):
@@ -233,7 +245,7 @@ def test_build_speculator_raises_without_upstream_support(monkeypatch, adapter):
         adapter.build_ngram_speculator("cfg", "device", object())
 
 
-def test_ascend_blacklist_filters_only_ngram(monkeypatch, fake_vllm):
+def test_ascend_blacklist_filters_only_supported_thinker_ngram(monkeypatch, fake_vllm):
     names = ["vllm_ascend"]
     fake_modules = {name: types.ModuleType(name) for name in names}
     mrv2 = types.ModuleType("vllm_ascend.mrv2_utils")
@@ -245,8 +257,11 @@ def test_ascend_blacklist_filters_only_ngram(monkeypatch, fake_vllm):
     fake_modules[mrv2.__name__] = mrv2
     _install_fake_modules(monkeypatch, fake_modules)
     fake_vllm._patch_ascend_v2_blacklist()
-    cfg = types.SimpleNamespace(speculative_config=types.SimpleNamespace(method="ngram"))
+    monkeypatch.setenv(fake_vllm.MRV2_NGRAM_ENV, "1")
+    cfg = _thinker_config()
     assert getattr(mrv2, "_v2_blacklist")(cfg) == ["draft_model speculative decoding"]
+    cfg.model_config.model_stage = "tts"
+    assert getattr(mrv2, "_v2_blacklist")(cfg) == _original(cfg)
     other = types.SimpleNamespace(speculative_config=types.SimpleNamespace(method="eagle"))
     assert getattr(mrv2, "_v2_blacklist")(other) == _original(other)
 
@@ -267,6 +282,9 @@ def test_ascend_init_speculator_routes_ngram(monkeypatch, fake_vllm):
 
     setattr(leaf, "init_speculator", _original)
     fake_modules[leaf.__name__] = leaf
+    runner_module = types.ModuleType("vllm_ascend.worker.v2.model_runner")
+    vars(runner_module)["init_speculator"] = _original
+    fake_modules[runner_module.__name__] = runner_module
     _install_fake_modules(monkeypatch, fake_modules)
     monkeypatch.setenv(fake_vllm.MRV2_NGRAM_ENV, "1")
     built = []
@@ -279,31 +297,37 @@ def test_ascend_init_speculator_routes_ngram(monkeypatch, fake_vllm):
     runner = object()
     with fake_vllm.ngram_runner_scope(runner):
         fake_vllm._patch_ascend_init_speculator()
-        cfg = types.SimpleNamespace(speculative_config=types.SimpleNamespace(method="ngram"))
+        cfg = _thinker_config()
         # vllm-ascend 0.33 passes req_states as a third positional argument.
         assert getattr(leaf, "init_speculator")(cfg, "device", "req_states") == "ngram"
+        assert vars(runner_module)["init_speculator"] is getattr(leaf, "init_speculator")
         assert built == [runner]
         other = types.SimpleNamespace(speculative_config=types.SimpleNamespace(method="eagle"))
         assert getattr(leaf, "init_speculator")(other, "device", "req_states") == "eagle"
         # Keyword form and the older two-argument form must still work.
         assert getattr(leaf, "init_speculator")(vllm_config=other, device="device") == "eagle"
-    assert calls == [("original", "req_states"), ("original", None)]
+        cfg.model_config.model_stage = "tts"
+        assert getattr(leaf, "init_speculator")(cfg, "device", "talker_state") == "eagle"
+    assert calls == [("original", "req_states"), ("original", None), ("original", "talker_state")]
 
 
 def test_vllm_unsupported_features_filters_ngram(monkeypatch, fake_vllm):
     vllm_config_mod = types.ModuleType("vllm.config")
 
     class VllmConfig:
-        def __init__(self):
-            self.speculative_config = types.SimpleNamespace(method="ngram")
-
         def _get_v2_model_runner_unsupported_features(self):
             return ["ngram/ngram_gpu speculative decoding", "another reason"]
 
     setattr(vllm_config_mod, "VllmConfig", VllmConfig)
     _install_fake_modules(monkeypatch, {"vllm.config": vllm_config_mod})
+    monkeypatch.setenv(fake_vllm.MRV2_NGRAM_ENV, "1")
     fake_vllm._patch_vllm_v2_unsupported_features()
-    assert VllmConfig()._get_v2_model_runner_unsupported_features() == ["another reason"]
+    thinker = _thinker_config()
+    cfg = VllmConfig()
+    vars(cfg).update(vars(thinker))
+    assert cfg._get_v2_model_runner_unsupported_features() == ["another reason"]
+    thinker.device_config.device_type = "cuda"
+    assert cfg._get_v2_model_runner_unsupported_features() == ["ngram/ngram_gpu speculative decoding", "another reason"]
 
 
 @pytest.mark.parametrize(
@@ -321,18 +345,27 @@ def test_scheduler_ngram_requires_synchronous_npu_mrv2_thinker(
     adapter, monkeypatch, device, stage, method, runner_v2, async_scheduling, expected
 ):
     monkeypatch.setenv(adapter.MRV2_NGRAM_ENV, "1")
-    config = types.SimpleNamespace(
+    config = _thinker_config()
+    config.device_config.device_type = device
+    config.model_config.model_stage = stage
+    config.model_config.use_v2_model_runner = runner_v2
+    config.speculative_config.method = method
+    config.scheduler_config.async_scheduling = async_scheduling
+    assert adapter.use_scheduler_ngram(config) is expected
+
+
+def _thinker_config():
+    return types.SimpleNamespace(
         model_config=types.SimpleNamespace(
             architecture="MiniCPMO45OmniForConditionalGeneration",
-            model_stage=stage,
-            use_v2_model_runner=runner_v2,
+            model_stage="llm",
+            use_v2_model_runner=True,
         ),
-        device_config=types.SimpleNamespace(device_type=device),
-        scheduler_config=types.SimpleNamespace(async_scheduling=async_scheduling),
-        speculative_config=types.SimpleNamespace(method=method),
+        device_config=types.SimpleNamespace(device_type="npu"),
+        scheduler_config=types.SimpleNamespace(async_scheduling=False),
+        speculative_config=types.SimpleNamespace(method="ngram"),
         parallel_config=types.SimpleNamespace(
             pipeline_parallel_size=1, prefill_context_parallel_size=1, decode_context_parallel_size=1
         ),
         kv_transfer_config=None,
     )
-    assert adapter.use_scheduler_ngram(config) is expected

@@ -172,6 +172,15 @@ runner verifies the drafts. Batches containing native duplex requests use
 ordinary decoding so the duplex sampling policy receives one logit per request.
 The default runner selection still uses MRv1 for Thinker Ngram when the opt-in
 is unset or the installed vLLM lacks the MRv2 Ngram interface.
+An explicit stage-0 `model_runner: v1` also selects MRv1. The Ngram
+fallback applies to `ngram` and `ngram_gpu` on NPU. The Talker K-step
+contract keeps its configured runner.
+
+The Ascend `minicpmo_4_5_npu_2card.yaml` profile colocates Thinker and
+Talker and gives Code2Wav its own NPU. The `minicpmo_4_5_2gpu.yaml`
+profile gives Thinker its own device and colocates Talker and Code2Wav.
+The `minicpmo_4_5_stage2_replicas.yaml` profile is for single-card
+profiling with two colocated Code2Wav replicas.
 
 ## Thinker prefix cache with drafts
 

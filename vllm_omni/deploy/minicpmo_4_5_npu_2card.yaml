@@ -2,7 +2,8 @@
 # (stage 1) share the first card, Code2Wav (stage 2) owns the second. Stage-0
 # n-gram speculation, sizing and graph modes are inherited from
 # minicpmo_4_5.yaml. Launch with ASCEND_RT_VISIBLE_DEVICES listing exactly two
-# cards.
+# cards. minicpmo_4_5_2gpu.yaml instead keeps the Thinker on its own
+# device and colocates Talker and Code2Wav.
 base_config: minicpmo_4_5.yaml
 pipeline: minicpmo_4_5
 

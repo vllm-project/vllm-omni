@@ -86,7 +86,7 @@ def test_session_mode_reaches_omni_model_config():
 
 
 def test_npu_speculative_stage_runner_gate(monkeypatch, tmp_path):
-    """Non-K-step speculation resolves to the V1 runner on NPU; DSpark stays V2."""
+    """Only Ngram outside the K-step contract falls back to MRv1."""
     # A local model directory keeps engine-args resolution offline: vllm's
     # get_model_path returns local dirs as-is, and the tokenizer subfolder
     # lookup only fetches for remote repo ids.
@@ -117,14 +117,13 @@ def test_npu_speculative_stage_runner_gate(monkeypatch, tmp_path):
         speculative_config=dict(ngram),
     ).create_model_config()
     assert kstep.use_v2_model_runner is True
-    # DSpark is served by the V2 runner through the model's own draft loop
-    # (cosyvoice3.py), so it must not be flipped to V1.
-    dspark = OmniEngineArgs(
-        model=str(tmp_path),
-        use_v2_model_runner=True,
-        speculative_config={"method": "dspark"},
-    ).create_model_config()
-    assert dspark.use_v2_model_runner is True
+    for method in ("dspark", "eagle"):
+        configured = OmniEngineArgs(
+            model=str(tmp_path),
+            use_v2_model_runner=True,
+            speculative_config={"method": method},
+        ).create_model_config()
+        assert configured.use_v2_model_runner is True
 
 
 def test_npu_ngram_keeps_mrv2_when_enabled(monkeypatch, tmp_path):
@@ -144,17 +143,18 @@ def test_npu_ngram_keeps_mrv2_when_enabled(monkeypatch, tmp_path):
         "prompt_lookup_max": 1,
     }
 
-    def build():
+    def build(use_v2_model_runner=True):
         return OmniEngineArgs(
             model=str(tmp_path),
             model_stage="llm",
             model_arch="MiniCPMO45OmniForConditionalGeneration",
-            use_v2_model_runner=True,
+            use_v2_model_runner=use_v2_model_runner,
             async_scheduling=False,
             speculative_config=dict(ngram),
         ).create_model_config()
 
     assert build().use_v2_model_runner is True
+    assert build(use_v2_model_runner=False).use_v2_model_runner is False
     # A vLLM build without the Triton V2 ngram speculator must still fall back.
     monkeypatch.setattr(availability, lambda: False)
     assert build().use_v2_model_runner is False

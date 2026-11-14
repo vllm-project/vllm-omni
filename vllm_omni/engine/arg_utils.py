@@ -627,30 +627,22 @@ class OmniEngineArgs(EngineArgs):
                 shutil.rmtree(self._temp_config_dir, ignore_errors=True)
                 del self._temp_config_dir
 
-        # On NPU, the vllm-ascend engine layer (mrv2_utils) falls back to the
-        # V1 model runner for ngram speculative decoding, but the per-stage
-        # Omni override in patch.py shadows that verdict with the deploy
-        # config's use_v2_model_runner field. MRv2 only serves speculation
-        # through the Talker K-step contract, so a stage whose speculative
-        # config is not a K-step config (e.g. the thinker stage's ngram
-        # drafting) normally resolves back to V1 here, at the single point
-        # where every consumer reads the same field. DSpark is the exception:
-        # the model serves it on V2 through its own draft loop.
-        #
-        # VLLM_OMNI_MRV2_NGRAM opts those ngram stages into the MRv2 adapter
-        # (vllm_omni.worker_v2.ngram_adapter): vLLM 0.32+ has a V2 ngram
-        # speculator, and the adapter wires it into vllm-ascend. The flag is
-        # off by default; if the speculator is unavailable the V1 fallback
-        # below still applies.
+        # The per-stage runner override bypasses Ascend's Ngram fallback.
+        # Resolve only those two methods here. Other speculative methods keep
+        # the runner from the deploy config.
+        from vllm_omni.worker_v2.ngram_adapter import NGRAM_METHODS, spec_method
+
         use_v2_model_runner = self.use_v2_model_runner
-        if use_v2_model_runner and current_omni_platform.is_npu() and self.speculative_config is not None:
+        if (
+            use_v2_model_runner
+            and current_omni_platform.is_npu()
+            and spec_method(self.speculative_config) in NGRAM_METHODS
+        ):
             from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
                 talker_kstep_frames,
             )
             from vllm_omni.worker_v2.ngram_adapter import (
                 MINICPMO_THINKER_ARCH,
-                is_ngram_spec,
-                mrv2_ngram_enabled,
                 resolve_use_v2_model_runner,
             )
 
@@ -672,13 +664,12 @@ class OmniEngineArgs(EngineArgs):
                 ),
             )
             if not use_v2_model_runner:
-                logger.info(
-                    "Stage %s: speculative config %r is not servable by the V2 model "
-                    "runner on NPU; using the V1 model runner.",
+                logger.warning(
+                    "Stage %s: %s speculation on NPU requires MRv1 for this configuration.",
                     self.stage_id,
-                    self.speculative_config,
+                    spec_method(spec),
                 )
-            elif not kstep_frames and is_ngram_spec(spec) and mrv2_ngram_enabled():
+            elif not kstep_frames:
                 logger.info(
                     "Stage %s: keeping the MRv2 runner for ngram speculation via the V2 ngram speculator adapter.",
                     self.stage_id,
