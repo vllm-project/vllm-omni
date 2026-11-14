@@ -253,6 +253,7 @@ class MiniMaxH3Attention(nn.Module):
         self.vdn: VDNH3HybridAttention | None = None
         self._prefix = prefix
         from .attention.fastvideo_h3 import MiniMaxH3VSAImpl
+        from .attention.flash_h3 import MiniMaxH3FlashAttentionImpl
 
         self.attention = Attention(
             num_heads=self.num_heads,
@@ -266,7 +267,7 @@ class MiniMaxH3Attention(nn.Module):
             role_category=role_category,
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
-            impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl},
+            impl_overrides={"FASTVIDEO_VSA": MiniMaxH3VSAImpl, "FLASH_ATTN": MiniMaxH3FlashAttentionImpl},
         )
 
     def enable_vsa_gate(self) -> None:
