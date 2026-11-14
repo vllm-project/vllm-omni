@@ -1,6 +1,7 @@
 # Copyright (c) 2024 Black Forest Labs.
 # Copyright (c) 2025 Bytedance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # This file has been modified by ByteDance Ltd. and/or its affiliates. on 2025-05-20.
 #
@@ -22,6 +23,7 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     GridSpec,
     TileTask,
 )
+from vllm_omni.diffusion.models.bagel.tile_blend import try_blend
 
 logger = init_logger(__name__)
 
@@ -350,6 +352,8 @@ class DistributedAutoEncoder(AutoEncoder, DistributedVaeMixin):
         blend_extent = min(above.shape[-2], current.shape[-2], blend_extent)
         if blend_extent <= 0:
             return current
+        if try_blend(above, current, blend_extent, axis=2):
+            return current
 
         for y in range(blend_extent):
             alpha = y / blend_extent
@@ -359,6 +363,8 @@ class DistributedAutoEncoder(AutoEncoder, DistributedVaeMixin):
     def blend_h(self, left: Tensor, current: Tensor, blend_extent: int) -> Tensor:
         blend_extent = min(left.shape[-1], current.shape[-1], blend_extent)
         if blend_extent <= 0:
+            return current
+        if try_blend(left, current, blend_extent, axis=3):
             return current
 
         for x in range(blend_extent):
