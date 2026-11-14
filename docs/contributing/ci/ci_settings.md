@@ -121,7 +121,7 @@ Canonical layout (prefer these paths for new changes):
 
     - **`depends_on`:** leaf jobs depend on `upload-ready-pipeline`, `upload-merge-pipeline`, etc.
     - **`group` / `label`:** `:card_index_dividers:` groups; labels like `Diffusion · Qwen Image Test`.
-    - **`commands`:** `timeout … pytest …` with markers and `--run-level` for the pipeline level.
+    - **`commands`:** pytest with markers and `--run-level` for the pipeline level. Bound the step with `timeout_in_minutes`. A CUDA ready or merge directory sweep that should split from measured durations sets `automatic_shard: true` and does not use a command-level `timeout`.
     - **`source_file_dependencies`:** required on **E2E Test** leaf jobs in L2/L3, and on L4/L5 leaf jobs that should be diff-gated on PR labels; name a job key from `ci_source_file_dependencies.yml` (see [Step filtering](#step-filtering)). The key must list every script the step runs; `commands` is not scanned.
 
     **Adding a job**
@@ -129,7 +129,7 @@ Canonical layout (prefer these paths for new changes):
     1. Pick the level file (`test-ready.yml` / `test-merge.yml` / `test-nightly.yml` / `test-weekly.yml`).
     2. Add a step under the right **group** (usually **E2E Test** for model pytest).
     3. Set `label`, `commands`, `mirror_hardwares`, `depends_on: upload-<level>-pipeline`.
-    4. For L2–L5 jobs that should be diff-gated, add a job key in `common/ci_source_file_dependencies.yml` and set `source_file_dependencies: <key>` on the step. YAML anchors hold model business-code paths only. The job key (`{model}_function` / `_perf` / `_accuracy` / `_reliability` / `_doc` / `_cov`) aliases that anchor and lists the pytest / example / benchmark scripts the step actually runs. The uploader does **not** parse `commands` for path filters—omitting a script from the key means editing that script will not select the job.
+    4. For L2–L5 jobs that should be diff-gated, add a job key in `common/ci_source_file_dependencies.yml` and set `source_file_dependencies: <key>` on the step. YAML anchors hold model and shared runtime dependencies. The job key (`{model}_function` / `_perf` / `_accuracy` / `_reliability` / `_doc` / `_cov`) aliases the relevant anchors and lists the pytest / example / benchmark scripts the step actually runs. The uploader does **not** parse `commands` for path filters—omitting a script from the key means editing that script will not select the job.
     5. Dry-run:
 
     ```bash
@@ -177,7 +177,7 @@ Canonical layout (prefer these paths for new changes):
 
     **Bootstrap:** [`amd/scripts/bootstrap-amd-omni.sh`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/scripts/bootstrap-amd-omni.sh)—skip-ci, diff filtering, Jinja render, then `buildkite-agent pipeline upload`.
 
-    **Test YAML (data):** `amd/test-amd-ready.yml` (L2 / `ready`), `test-amd-merge.yml` (L3 / `merge-test` and an ordinary release line, `main` or `release/vX.Y.Z`), experimental `test-amd-nightly.yml` (`full_model` / `nightly-test` or a release line with `NIGHTLY=1`), and `test-amd-weekly.yml` (`reliability` / `weekly-test` or a release line with `WEEKLY=1`). Multiple PR tier labels combine their suites behind one image build. A later suite's step is dropped only when its complete parsed definition equals a step in an earlier suite; distinct definitions and repeated steps within one suite are preserved. The bootstrap logs how many duplicate step definitions and physical jobs were dropped. PR builds that reach the bootstrap without a tier label retain the legacy ready-suite fallback. `DEBUG_TEST_YAML` accepts `ready`, `merge`, `nightly`, and `weekly` as an explicit override. During nightly burn-in every AMD nightly leaf is non-blocking.
+    **Test YAML (data):** `amd/test-amd-ready.yml` (L2 / `ready`), `test-amd-merge.yml` (L3 / `merge-test` and an ordinary release line, `main` or `release/vX.Y.Z`), experimental `test-amd-nightly.yml` (`full_model` / `nightly-test` or a release line with `NIGHTLY=1`), and `test-amd-weekly.yml` (`reliability` / `weekly-test` or a release line with `WEEKLY=1`). Multiple PR tier labels combine their suites behind one image build. A later suite's step is dropped only when its complete parsed definition equals a step in an earlier suite; distinct definitions and repeated steps within one suite are preserved. The bootstrap logs how many duplicate step definitions and physical jobs were dropped. PR builds that reach the bootstrap without a tier label retain the legacy ready-suite fallback. `DEBUG_TEST_YAML` accepts `ready`, `merge`, `nightly`, and `weekly` as an explicit override. AMD nightly leaves remain non-blocking during burn-in and are promoted individually only after stable runtime evidence.
 
     **Trigger boundary:** AMD label handling has two layers. First, the external `vllm-omni-amd-ci` Buildkite pipeline condition decides whether a GitHub label event creates a build. Only after that build starts does this repository's bootstrap inspect all current PR labels and select the ready, merge, nightly, weekly, or combined suites. Repository-side selection therefore cannot start AMD CI by itself. AMD-only nightly validation uses both `amd-test` and `nightly-test`: the external condition should accept an event for either label only when the complete PR label set contains both. `amd-test` admits the AMD pipeline, while `nightly-test` makes the bootstrap select `NIGHTLY_TESTS:test-amd-nightly.yml`. Existing `ready` / `merge-test` behavior and non-PR release-line (`main` or `release/vX.Y.Z`) / scheduled builds remain separate. For PR builds without a `DEBUG_TEST_YAML` override, an unreadable label set fails the bootstrap instead of silently selecting the wrong tier. Debug overrides skip label lookup and are validated directly; invalid values, including whitespace-only values, fail the bootstrap. Until the paired-label condition is configured, use an authorized manual Buildkite build with `DEBUG_TEST_YAML=nightly` and verify that the bootstrap reports only the nightly suite.
 
@@ -277,6 +277,93 @@ This is a thread-count comparison, not a measured full-build speedup.
 Software: PyTorch `2.13.0+rocm10.0.0`, vLLM `0.33.0+rocm100`, Python 3.12.15,
 pytest 9.1.1; image digest
 `sha256:921f117d536431ea91bd2fbf08a74821af5738fb909aa48d557dd0bc5a564e14`.
+
+### Diffusion CPU: five-shard rebalance and bounded threads
+
+The five regular Diffusion shards use `diffusion-v1.json`, with 11,609 node
+timings from all five successful instrumented artifacts in
+[build #15658](https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15658), merge
+commit `fb25dd4336fb2098e5a4de1d3fc90cf1b72ad4f4`. The first bounded-thread
+trial selected every live node exactly once, with no failures, incomplete tests,
+collection errors or artifact errors. Its legacy profile had 204 unknown and
+116 stale nodes; the regular job walls ranged from 4m42s to 7m42s. Repacking
+the measured setup + call + teardown totals estimates 255.19 seconds per shard
+before collection/overhead, with zero unknown or stale nodes. Exact refreshed-
+profile CI remains the qualification gate. Keep five shards; trial six only if
+future measured p95 rises above 20 minutes and queue capacity allows it.
+
+Regular and Slow CPU jobs bound OMP/MKL/OpenBLAS/NumExpr to two threads per
+process, allowing two gloo ranks to fit the observed four-CPU quota. Four unchanged
+reference cases (Wan fused/exact decode, long LingBot metadata rollout, and real
+causal-VAE continuation) passed at 1/2/4 threads. In the same image and host
+configuration documented above, three measured runs after a warmup averaged
+46.30s, 46.34s and 47.14s respectively (ranges 44.58–48.50s, 45.64–46.99s and
+46.03–48.20s). These results do not establish a meaningful advantage of two over
+one thread; two is a quota-bounded trial setting, including for spawned ranks.
+
+No network shape, rollout length, tolerance or assertion is reduced. Slow CPU
+retains exactly its six reference cases, blocking grade, 40-minute timeout and
+exit-134 retry rule. Regular shards retain their marker expression, both ignored
+files, six deselections, 60-minute timeout and retry rule. Whole modules retain
+fixture locality. Both jobs now emit phase, selection, CPU pressure and cgroup
+memory current/peak/limit/events artifacts under `artifacts/amd-cpu-suites/`.
+JUnit lives in each fresh run directory as `pytest.xml`.
+
+The π0 remapping fixture constructs the real full model hierarchy on `meta`,
+then allocates only the original vision/embedding target parameters on CPU,
+preserving tied aliases. The three remapping tests retain their original tensor
+shapes, payloads and assertions. They do not execute the unused backbone; the
+separate checkpoint/inference parity coverage is unchanged. Their shared mutable
+targets remain order-independent because each test loads a distinct constant.
+This avoids initializing unrelated full-network weights without shrinking the
+property under test. Reproduce the fixture check with the same dependencies as
+the reference benchmark:
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2 \
+  python -m pytest -q tests/diffusion/models/pi0/test_pi0_units.py \
+  -k 'remap' --durations=10
+```
+
+In paired fresh containers on the reference host/image above, with four CPUs,
+two threads and a 32 GiB memory limit, one warmup plus three measured runs per
+variant passed all three original tests. Mean process wall time fell from
+61.62s (61.11–62.18s) to 31.62s (31.52–31.83s). Peak pytest process RSS was
+26.33 GiB before and 15.24 GiB after. This measures the fixture change only;
+it does not establish the full shard p95 or a target-agent memory limit.
+
+Reproduce the initial profile from the original artifact filenames:
+
+```bash
+python .buildkite/amd/scripts/cpu_shard_plan.py --suite diffusion \
+  --junit downloaded/pytest-*-of-5.xml \
+  --source-build-url https://buildkite.com/vllm/vllm-omni-amd-ci/builds/15582 \
+  --source-commit 438155621484248827a30256e679cb4c84f544fb \
+  --output diffusion-v2.json
+```
+
+The importer rejects missing/duplicate shards, failures, unresolved modules and
+overlapping node IDs. Zero-duration collection skips are not executable node IDs.
+Only use legacy JUnit produced with pytest's total-duration setting. For new
+profiles, use the instrumented artifact builder below and provide the five
+regular job directories separately from Slow CPU.
+
+```bash
+python tests/helpers/benchmark_cpu_threads.py --output /tmp/diffusion-thread-trial -- \
+  -q 'tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-fused]' \
+  'tests/diffusion/ar_diffusion/test_kv_orchestration.py::test_rollout_keeps_metadata_bounded[2-False-lingbot-two-minutes]' \
+  'tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]' \
+  'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]'
+```
+
+The refreshed profile must pass exact-head target CI with the bounded thread
+setting. Compare the exact executed node union and skip outcomes, and retain the
+original numerical checks. Measure concurrent five-shard plus Slow CPU memory
+peaks, CPU throttling, queue latency, summed agent-minutes and paired READY/MERGE
+wall time. The planning target remains p95 below 18 minutes for every regular
+shard and Slow CPU. Revert the pipeline thread export and timing-profile option
+to roll back; do not move Slow CPU cases or weaken their assertions to meet the
+target.
 
 ### Prepare a shared profile
 
@@ -523,11 +610,42 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`), **L3** (`.buildkite/cuda/test-me
 | --- | ------- |
 | `source_file_dependencies` | Named preset (or list of presets) from [`ci_source_file_dependencies.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/ci_source_file_dependencies.yml). The uploader expands only that key; it does **not** scan `commands`. If any changed file equals a listed prefix or starts with `prefix/`, keep the step (or group); otherwise omit it. Inline path-prefix lists are still accepted. |
 | `mirror_hardwares` | Expand to `agents` + `plugins` (+ optional `image`) from `ci_mirror_hardwares.yml`. |
+| `automatic_shard` | CUDA ready/merge directory sweep. The uploader strips the key and may set `parallelism` from that step's timing profile. With no usable timings it uses the smaller of `MAX_AUTOMATIC_SHARDS` and the files whose marks satisfy the command's `-m`. See [Automatic shard planning](#automatic-shard-planning). |
+
+#### Automatic shard planning {#automatic-shard-planning}
+
+The pipeline YAML does not set parallelism. The uploader does, from that step's timing profile or the fallback below.
+
+- **Fallback:** no usable timings means `min(MAX_AUTOMATIC_SHARDS, marker-matching files)` jobs. The file count is files with a static mark set that satisfies the command's `-m` (`pytest.mark`, `pytestmark`, and `hardware_test` / `hardware_marks`, one item per variant). A file that cannot be checked, or whose static marks do not show a match, is dealt across bins that already hold a matching file and does not open a bin on its own. The command's `-m` still drops it there when the static read was right. If no file is a confirmed match, the step stays one job so pytest cannot exit with no tests collected. `MAX_AUTOMATIC_SHARDS` is the same cap the measured packing uses. One confirmed file stays one job. A timed-out build is not a passed build, so it never becomes the next profile; this cap is what keeps that suite from staying one job. The step still writes `timings/jobs/<job>-<pid>.json`. Two pytest processes in one job keep both files; durations for the same file are summed. Shards of one build sum their slices of a file, and a retry of the same shard index keeps the max.
+- **Profile:** planning reads raw `timings/jobs` from up to 20 `passed` or `finished` builds. Ready history is every non-`main` passed build of this pipeline. Those builds are other pull requests, so a step's durations include whatever that pull request changed. Merge history stays on `main`. The builds API is requested at `per_page=100` (its cap) and the next page comes from the `Link` header. The artifact lookup stops after 20 builds that contain job files, after 10 consecutive builds with none, or after 90 seconds. Each job records its agent queue; a step ignores a profile recorded on a different queue. Only raw `timings/jobs` files are observations. Failed and running builds are excluded. The label key drops a `· Shard N/M` suffix, so one step does not use another step's time for the same path.
+- **Plan:** a greedy longest-processing-time packing of measured files into at most `MAX_AUTOMATIC_SHARDS` jobs. A bin must fit 80% of `timeout_in_minutes`; the other 20% is left for checkout, collection, and process startup, which are not included in the file durations. A faster suite still uses fewer jobs when its file time fits that smaller budget. Each bin is uploaded as `timings/file-shards/<step>/<index>.txt`. Shard N keeps the original directory targets so each directory `conftest.py` loads, then runs only the files in that list. One file already over the budget does not add shards. A file with no measurement adds no weight, so it does not by itself open another job; when the step does split, that file is still placed in the lightest bin and runs.
+- **Overrides:** `VLLM_OMNI_SHARD_TIMINGS` selects a local profile. `VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD=1` skips the history download. `VLLM_OMNI_SKIP_SHARD_FILE_WRITE=1` still plans the jobs but does not write `timings/file-shards`. The Buildkite schema hook sets both.
+
+E2E model jobs stay one job. A hung command is bounded only by `timeout_in_minutes`.
 
 ### Policy
 
 - **Always uploaded** (no key): L2 **Simple Test** except **Simple · ROCm R2-01 Collection Count**, plus L2/L3 groups outside **E2E Test** (Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints on L2, LoRA / Entrypoints on L3).
-- **Diff-gated**: every **E2E Test** leaf job in L2/L3, the L2 **Simple · ROCm R2-01 Collection Count** check (it runs the exact collection guard of the non-blocking AMD READY R2-01 job), L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors are model business code only (`vllm_omni/model_executor/models/`, `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable). Job keys alias the anchor and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
+- **Diff-gated**: every **E2E Test** leaf job in L2/L3, the L2 **Simple · ROCm R2-01 Collection Count** check (it runs the exact collection guard of the non-blocking AMD READY R2-01 job), L4 nightly leaf jobs (CUDA and NPU), and L5 weekly jobs whose `if` includes the `weekly-test` label (Reliability / Perf). Jobs gated only by `WEEKLY=1`, `NON_CRITICAL=1`, or the nightly **Simple · CPU Coverage Test** (`NIGHTLY=1`) have no `source_file_dependencies`. Registry layout: YAML anchors group model code and shared runtime dependencies. Job keys alias the relevant anchors and **also** list the scripts that job runs (pytest files, `run_cov_split.sh --offline` / `--online` targets, example README runners). Feature keys stay cross-cutting. A **group** may define the key instead; the whole group drops if no prefix matches.
+
+Qwen3-Omni nightly accuracy and performance jobs compose their evaluation key
+with the reusable platform key `ci_cuda`, `ci_npu`, or `ci_rocm`. CUDA jobs also
+compose `omni_v2_runtime` for their V2 and prefix-cache dependencies.
+Other models can opt into a platform key without inheriting these runtime choices.
+Shared scheduling, engine, SHM transport, data contracts, serving, configuration,
+benchmark infrastructure, and test fixtures select both accuracy and performance
+on all three platforms, including the existing CUDA Duplex performance jobs.
+Platform workers, CI images, requirements, build scripts,
+and nightly YAML select the corresponding platform. Accuracy datasets/evaluators
+and performance runners also have their own dependencies; Duplex helpers select
+the existing CUDA Duplex jobs.
+
+These are direct dependencies, so a diff containing both `tests/helpers/runtime.py`
+and MiniCPM model code retains Qwen3 accuracy/performance even when another job
+matches. CUDA V2 and prefix-cache dependencies select the existing CUDA jobs;
+selection alone does not add a cache-hit workload or exercise every deploy
+override. Scheduled full uploads still keep every job. Routing regressions live
+in `tests/buildkite/test_qwen3_omni_source_dependencies.py`.
 
 ### YAML examples
 
