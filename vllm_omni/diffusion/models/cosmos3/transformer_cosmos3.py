@@ -40,6 +40,7 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cuda_graph import GraphedForward
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
@@ -1539,6 +1540,9 @@ class Cosmos3VFMTransformer(nn.Module):
         self.gen_sp_gather = nn.Identity()
 
         # Cached state (populated on first forward, reused across denoising steps)
+        self._und_graph: GraphedForward | None = None
+        self._gen_graph: GraphedForward | None = None
+        self._embed_graph: GraphedForward | None = None
         self.cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         self.cached_freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None
 
@@ -1930,11 +1934,55 @@ class Cosmos3VFMTransformer(nn.Module):
             embedding = self.time_embedder((timestep * self.timestep_scale).float())
         return embedding.to(dtype)
 
+    def enable_cuda_graphs(self, device: torch.device) -> None:
+        """Capture UND, packed GEN, and vision embedding for a resident single-GPU model."""
+        graph_cls = current_omni_platform.get_graphed_forward_cls()
+        self._und_graph = graph_cls(self.language_model, device=device, name="Cosmos3 UND")
+        self._gen_graph = graph_cls(
+            self._graph_gen_forward,
+            device=device,
+            name="Cosmos3 GEN",
+            max_entries=8,
+            batch_input_copies=True,
+        )
+        self._embed_graph = graph_cls(self._graph_embed_forward, device=device, name="Cosmos3 embedding")
+
+    def _graph_gen_forward(
+        self,
+        *,
+        hidden: torch.Tensor,
+        kv: list[tuple[torch.Tensor, torch.Tensor]],
+        freqs: tuple[torch.Tensor, torch.Tensor],
+        control_token_sizes: tuple[int, ...] | None = None,
+        control_weights: tuple[float, ...] | None = None,
+        gather_output: bool = True,
+    ) -> torch.Tensor:
+        # Conditioning and control metadata are explicit graph inputs so replay
+        # cannot reuse another CFG branch's K/V or another request's controls.
+        return self.norm_moe_gen(
+            self._run_gen_layers(
+                hidden,
+                cached_kv=kv,
+                freqs_gen=freqs,
+                control_token_sizes=control_token_sizes,
+                control_weights=control_weights,
+                gather_output=gather_output,
+            )
+        )
+
+    def _graph_embed_forward(
+        self, *, hidden: torch.Tensor, step: torch.Tensor, shape: tuple[int, int, int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        video = self.proj_in(self.patchify(hidden, *shape))
+        time_embed = self._embed_timestep(step, hidden.dtype)
+        return torch.cat([video + time_embed.unsqueeze(1)], dim=1), time_embed
+
     def _run_gen_layers(
         self,
         hidden_gen: torch.Tensor,
         *,
         freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         gather_output: bool = True,
         control_token_sizes: tuple[int, ...] | None = None,
         control_weights: tuple[float, ...] | None = None,
@@ -1948,7 +1996,9 @@ class Cosmos3VFMTransformer(nn.Module):
         """
         # UND K/V stay replicated; Cosmos3CrossAttention supplies them as
         # joint_key/value for Ulysses head-slicing in the attention backend.
-        if self.cached_kv is None:
+        if cached_kv is None:
+            cached_kv = self.cached_kv
+        if cached_kv is None:
             raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
         if freqs_gen is None:
             hidden_gen, freqs_gen = self._shard_gen_inputs(hidden_gen)
@@ -1957,17 +2007,17 @@ class Cosmos3VFMTransformer(nn.Module):
             "control_token_sizes": control_token_sizes,
             "control_weights": control_weights,
         }
-        if len(self.gen_layers) == len(self.cached_kv):
+        if len(self.gen_layers) == len(cached_kv):
             # Under PP, gen_layers carries make_layers' PPMissingLayer padding so
             # indices stay global and each rank runs only [start_layer, end_layer).
             # Without PP, zip the full lists (they may even be replaced at runtime,
             # e.g. by tests or cache wrappers).
             if _pp_parallel_active():
                 own_layers = self.gen_layers[self.start_layer : self.end_layer]
-                own_kv = self.cached_kv[self.start_layer : self.end_layer]
+                own_kv = cached_kv[self.start_layer : self.end_layer]
             else:
                 own_layers = self.gen_layers
-                own_kv = self.cached_kv
+                own_kv = cached_kv
             for layer, (k_und, v_und) in zip(own_layers, own_kv, strict=True):
                 hidden_gen = layer(
                     hidden_gen,
@@ -1983,14 +2033,12 @@ class Cosmos3VFMTransformer(nn.Module):
         else:
             # Cache-dit patches gen_layers to a grouped wrapper holding every
             # layer, so a PP rank would run foreign stages' layers.
-            if _pp_parallel_active() and (self.start_layer, self.end_layer) != (0, len(self.cached_kv)):
+            if _pp_parallel_active() and (self.start_layer, self.end_layer) != (0, len(cached_kv)):
                 raise NotImplementedError(
                     "Cosmos3 Cache-Dit is not supported together with pipeline parallelism; disable one of them."
                 )
             for layer in self.gen_layers:
-                hidden_gen = layer(
-                    hidden_gen, cached_kv=self.cached_kv, freqs_gen=(freqs_cos, freqs_sin), **layer_kwargs
-                )
+                hidden_gen = layer(hidden_gen, cached_kv=cached_kv, freqs_gen=(freqs_cos, freqs_sin), **layer_kwargs)
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
         return self.gen_sp_gather(hidden_gen) if gather_output else hidden_gen
@@ -2062,6 +2110,9 @@ class Cosmos3VFMTransformer(nn.Module):
             )
             prep = self._shard_gen_prep(prep)
 
+        if self._gen_graph is not None and is_pp_first and is_pp_last:
+            hidden_gen = self._run_gen_stack(prep)
+            return self._gen_postprocess(hidden_gen, prep)
         hidden_gen = self._run_gen_layers_from_prep(prep)
         if not is_pp_last:
             # First / middle PP ranks stop before the final norm and head, and
@@ -2204,6 +2255,46 @@ class Cosmos3VFMTransformer(nn.Module):
         """
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
+        if (
+            self._embed_graph is not None
+            and self.cached_kv is not None
+            and self.cached_freqs_gen is not None
+            and hidden_states.shape[0] == 1
+            and all(
+                value is None
+                for value in (
+                    action_latents,
+                    action_domain_ids,
+                    action_noisy_mask,
+                    sound_latents,
+                    noisy_frame_mask,
+                    control_latents,
+                    control_weights,
+                )
+            )
+        ):
+            # Each CFG branch's first forward builds K/V and validates text
+            # lengths below. Subsequent steps reuse that conditioning unchanged.
+            hidden_gen, time_embed = self._embed_graph(hidden=hidden_states, step=timestep, shape=video_shape)
+            return _GenPrepared(
+                hidden_gen=hidden_gen,
+                time_embed=time_embed,
+                t=t,
+                h=h,
+                w=w,
+                s_video=hidden_gen.shape[1],
+                s_control=0,
+                s_action=0,
+                s_sound=0,
+                has_control=False,
+                has_action=False,
+                has_sound=False,
+                action_domain_ids=None,
+                ulysses_size=1,
+                use_multi_control_attention=False,
+                multi_control_token_sizes=None,
+                multi_control_weights=None,
+            )
         text_lengths = text_mask.sum(dim=1)
         min_real_len = int(text_lengths.min().item())
         max_real_len = int(text_lengths.max().item())
@@ -2322,7 +2413,10 @@ class Cosmos3VFMTransformer(nn.Module):
 
             if need_kv:
                 with self._offload_context("reasoner"):
-                    cached_kv_full = self.language_model(text_ids, freqs_und)
+                    if self._und_graph is None:
+                        cached_kv_full = self.language_model(text_ids, freqs_und)
+                    else:
+                        cached_kv_full = self._und_graph(text_ids=text_ids, freqs=freqs_und)
                 # Trim to real text length (remove padding).  K/V stay replicated;
                 # the framework Attention layer head-slices them via joint_key/value.
                 self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
@@ -2442,7 +2536,23 @@ class Cosmos3VFMTransformer(nn.Module):
         )
 
     def _run_gen_stack(self, prep: _GenPrepared) -> torch.Tensor:
-        """Execute the cacheable GEN stack, including final norm."""
+        """Execute the cacheable GEN stack, including final norm.
+
+        Cache hooks call this boundary only on full executions. Keeping graph
+        dispatch here lets cache hits skip GEN without capturing cache decisions
+        or residual history inside the graph.
+        """
+        if self._gen_graph is not None:
+            if prep.freqs_gen is None:
+                raise RuntimeError("Cosmos3 GEN inputs must go through _shard_gen_prep before the stack.")
+            return self._gen_graph(
+                hidden=prep.hidden_gen,
+                kv=self.cached_kv,
+                freqs=prep.freqs_gen,
+                control_token_sizes=prep.multi_control_token_sizes,
+                control_weights=prep.multi_control_weights,
+                gather_output=not prep.use_multi_control_attention and not prep.defer_gen_gather,
+            )
         return self.norm_moe_gen(self._run_gen_layers_from_prep(prep))
 
     def _gen_postprocess(

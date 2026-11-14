@@ -807,7 +807,8 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
 
 
-def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("use_graphs", [False, True])
+def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.MonkeyPatch, use_graphs: bool) -> None:
     from vllm_omni.diffusion.cache.teacache.extractors import extract_cosmos3_context
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 
@@ -834,6 +835,11 @@ def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.Monke
         return hidden_gen + 2.0
 
     monkeypatch.setattr(model, "_run_gen_layers", run_gen_layers)
+    if use_graphs:
+        from vllm_omni.diffusion.cuda_graph import GraphedForward
+
+        monkeypatch.setattr(current_omni_platform, "get_graphed_forward_cls", lambda: GraphedForward)
+        model.enable_cuda_graphs(torch.device("cpu"))
     forward_kwargs = {
         "hidden_states": torch.zeros(1, 2, 1, 2, 2),
         "timestep": torch.tensor([1.0]),
@@ -871,6 +877,8 @@ def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.Monke
     cached_output = cached_ctx.postprocess(cached_ctx.hidden_states + residual)
 
     assert norm.calls == 0
+    if use_graphs:
+        assert model._gen_graph.eager_calls == 2
     assert torch.equal(cached_output, full_output)
     for name in ("_seacache_skip", "_seacache_record", "_seacache_residual", "_seacache_last_residual"):
         assert not hasattr(model, name)
@@ -1784,3 +1792,207 @@ def test_shared_gen_stack_preserves_control_metadata_sharding_and_wrapped_output
     output = model._run_gen_layers(inputs, gather_output=False, **kwargs)
     torch.testing.assert_close(output, torch.full_like(inputs, 4 if already_sharded else 5))
     assert len(gathered) == 1
+
+
+@pytest.mark.parametrize("latent_frames", [1, 3])
+@pytest.mark.parametrize("latent_height", [2, 3])
+@torch.no_grad()
+def test_graph_regions_preserve_pure_vision_embedding(
+    monkeypatch: pytest.MonkeyPatch, latent_frames: int, latent_height: int
+) -> None:
+    from vllm_omni.diffusion.cuda_graph import GraphedForward
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    monkeypatch.setattr(current_omni_platform, "get_graphed_forward_cls", lambda: GraphedForward)
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        OmniDiffusionConfig(tf_model_config=TransformerConfig.from_dict(_tiny_cosmos3_config()), dtype=torch.float32)
+    ).eval()
+    # vLLM's test linear parameters are deliberately uninitialized.
+    for parameter in model.parameters():
+        parameter.fill_(0.1)
+    kwargs = dict(
+        hidden_states=torch.ones(1, 2, latent_frames, latent_height, 2),
+        timestep=torch.tensor([1.0]),
+        text_ids=torch.tensor([[1, 2]]),
+        text_mask=torch.ones(1, 2, dtype=torch.long),
+        video_shape=(latent_frames, latent_height, 2),
+    )
+    expected = model(**kwargs)
+    model.reset_cache()
+    model.enable_cuda_graphs(torch.device("cpu"))
+    # CPU passthrough exercises the same explicit-input region boundaries.
+    first = model(**kwargs)
+    second = model(**kwargs)
+    assert torch.equal(expected, first) and torch.equal(expected, second)
+    assert model._und_graph.eager_calls == 1
+    assert model._gen_graph.eager_calls == 2
+    assert model._embed_graph.eager_calls == 1
+
+
+def test_gen_graph_uses_supplied_kv_instead_of_mutable_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    class ReadConditioning(nn.Module):
+        def forward(self, hidden, *, k_und, v_und, freqs_cos, freqs_sin, **kwargs):
+            return hidden + k_und + v_und + freqs_cos + freqs_sin
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        OmniDiffusionConfig(tf_model_config=TransformerConfig.from_dict(_tiny_cosmos3_config()), dtype=torch.float32)
+    )
+    model.gen_layers = nn.ModuleList([ReadConditioning()])
+    model.norm_moe_gen = nn.Identity()
+    stale = torch.tensor([100.0])
+    model.cached_kv = [(stale, stale)]
+    fresh = torch.tensor([2.0])
+    result = model._graph_gen_forward(
+        hidden=torch.tensor([1.0]), kv=[(fresh, fresh)], freqs=(torch.tensor([3.0]), torch.tensor([4.0]))
+    )
+    assert result.item() == 12
+    assert model.cached_kv[0][0] is stale
+
+
+@pytest.mark.parametrize("mode", ["action", "sound", "control", "multi_control", "conditioned_video"])
+@torch.no_grad()
+def test_graph_regions_preserve_packed_modalities(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    from vllm_omni.diffusion.cuda_graph import GraphedForward
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    monkeypatch.setattr(current_omni_platform, "get_graphed_forward_cls", lambda: GraphedForward)
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        OmniDiffusionConfig(
+            tf_model_config=TransformerConfig.from_dict(
+                _tiny_cosmos3_config(action_gen=True, max_action_dim=3, num_embodiment_domains=4)
+            ),
+            dtype=torch.float32,
+        ),
+        sound_gen=True,
+        sound_dim=3,
+        sound_latent_fps=24.0,
+    ).eval()
+    for parameter in model.parameters():
+        parameter.fill_(0.1)
+    kwargs = dict(
+        hidden_states=torch.ones(1, 2, 1, 2, 2),
+        timestep=torch.tensor([1.0]),
+        text_ids=torch.tensor([[1, 2]]),
+        text_mask=torch.ones(1, 2, dtype=torch.long),
+        video_shape=(1, 2, 2),
+    )
+    if mode == "action":
+        kwargs.update(
+            action_latents=torch.ones(1, 5, 3),
+            action_domain_ids=torch.tensor([2]),
+            action_noisy_mask=torch.tensor([[[0.0], [1.0], [1.0], [1.0], [1.0]]]),
+        )
+    elif mode == "sound":
+        kwargs["sound_latents"] = torch.ones(1, 3, 4)
+    elif mode in ("control", "multi_control"):
+        count = 2 if mode == "multi_control" else 1
+        kwargs["control_latents"] = [kwargs["hidden_states"] * (i + 2) for i in range(count)]
+        kwargs["control_weights"] = [1.0, 3.0][:count]
+    else:
+        kwargs["noisy_frame_mask"] = torch.zeros(1, 1, 1, 1, 1)
+
+    expected = model(**kwargs)
+    model.reset_cache()
+    model.enable_cuda_graphs(torch.device("cpu"))
+    first = model(**kwargs)
+    second = model(**kwargs)
+    torch.testing.assert_close(first, expected, rtol=0, atol=0)
+    torch.testing.assert_close(second, expected, rtol=0, atol=0)
+    assert model._und_graph.eager_calls == 1
+    assert model._gen_graph.eager_calls == 2
+    assert model._embed_graph.eager_calls == 0
+
+
+@torch.no_grad()
+def test_gen_graph_forwards_control_weights_and_gather_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        OmniDiffusionConfig(tf_model_config=TransformerConfig.from_dict(_tiny_cosmos3_config()), dtype=torch.float32)
+    )
+    model.norm_moe_gen = nn.Identity()
+    calls = []
+
+    def run(hidden, **kwargs):
+        calls.append(kwargs)
+        return hidden * kwargs["control_weights"][0]
+
+    monkeypatch.setattr(model, "_run_gen_layers", run)
+    for weights in ((0.25, 0.75), (0.75, 0.25)):
+        result = model._graph_gen_forward(
+            hidden=torch.ones(1),
+            kv=[],
+            freqs=(torch.zeros(1), torch.zeros(1)),
+            control_token_sizes=(4, 4),
+            control_weights=weights,
+            gather_output=False,
+        )
+        assert result.item() == weights[0]
+        assert calls[-1]["control_token_sizes"] == (4, 4)
+        assert calls[-1]["control_weights"] == weights
+        assert calls[-1]["gather_output"] is False
+
+
+@pytest.mark.parametrize("use_graphs", [False, True])
+@torch.inference_mode()
+def test_seacache_hits_skip_graph_and_refresh_preserves_graphs(monkeypatch, use_graphs) -> None:
+    from vllm_omni.diffusion.cache.seacache import SeaCacheConfig, apply_sea_cache_hook
+    from vllm_omni.diffusion.cuda_graph import GraphedForward
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    monkeypatch.setattr(current_omni_platform, "get_graphed_forward_cls", lambda: GraphedForward)
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        OmniDiffusionConfig(tf_model_config=TransformerConfig.from_dict(_tiny_cosmos3_config()), dtype=torch.float32)
+    ).eval()
+    for parameter in model.parameters():
+        parameter.fill_(0.1)
+    if use_graphs:
+        model.enable_cuda_graphs(torch.device("cpu"))
+    metadata = SimpleNamespace(step=0)
+    hook = apply_sea_cache_hook(
+        model,
+        SeaCacheConfig(threshold=100.0, residual_order=0),
+        current_step_callback=lambda: metadata.step,
+        current_sigma_callback=lambda: 1.0,
+        num_inference_steps_callback=lambda: 4,
+    )
+    stack_outputs = []
+    handle = model.norm_moe_gen.register_forward_hook(
+        lambda module, args, output: stack_outputs.append(output.detach().clone())
+    )
+    for request in range(2):
+        model.reset_cache()
+        hook.reset_state(model)
+        hook.state_manager.set_context("cond")
+        kwargs = dict(
+            hidden_states=torch.full((1, 2, 1, 2, 2), float(request + 1)),
+            timestep=torch.ones(1),
+            text_ids=torch.tensor([[1, request + 2]]),
+            text_mask=torch.ones(1, 2, dtype=torch.long),
+            video_shape=(1, 2, 2),
+        )
+        outputs = []
+        for step in range(4):
+            metadata.step = step
+            outputs.append(model(**kwargs).clone())
+            assert len(stack_outputs) == request * 2 + (2 if step == 3 else 1)
+        assert hook.full_count == hook.skip_count == 2
+        # Reconstructing a cached residual introduces subtraction/addition
+        # rounding even for identical inputs; this checks hit dispatch, not
+        # exact parity between SeaCache and an uncached forward.
+        for output in outputs[1:]:
+            torch.testing.assert_close(output, outputs[0])
+        if use_graphs:
+            assert model._gen_graph.eager_calls == (request + 1) * 2
+            assert model._und_graph.eager_calls == request + 1
+    handle.remove()
