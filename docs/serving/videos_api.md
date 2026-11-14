@@ -512,6 +512,73 @@ curl -s http://localhost:8091/v1/videos \
   it). They are lost on restart and not shared across data-parallel replicas.
   A missing or evicted source returns 400; regenerate it or start a new chain.
 
+### MiniMax H3 Early-Only Video Conditioning (`keep_steps`)
+
+MiniMax H3 Ref2VA requests can drop the video reference after the leading
+denoise steps and finish from the image + text presentation. This follows the
+[CodeVideoModel](https://github.com/code-video-model/CodeVideoModel)
+[tech report](https://code-video-model.github.io/tech_report.pdf), whose
+text → proxy video → high-fidelity video pipeline introduced the mechanism and
+the `keep_steps` parameter; this port applies it to H3's packed layouts inside
+vLLM-Omni. The reference video's rows dominate the packed sequence, but its
+structural influence — layout and motion timing — is absorbed early in the
+schedule, so later steps only need the remaining conditions to finish
+appearance and detail. Requests opt in per call with `keep_steps` in
+`extra_params`:
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F "prompt=A photorealistic scene of the tabby cat from Picture 1 walking the sunlit forest path of Picture 1. Follow Video 1 for structure: ..." \
+  -F "short_edge=768" \
+  -F "aspect_ratio=16:9" \
+  -F "fps=24" \
+  -F "num_inference_steps=20" \
+  -F 'extra_params={"task":"ref2va","duration":5.17,"keep_steps":5}' \
+  -F "input_references=@structure.mp4;type=video/mp4" \
+  -F "input_references=@appearance.png;type=image/png" \
+  -o keep_steps.mp4
+```
+
+- `keep_steps` is the number of leading steps that keep the video reference;
+  it must be an integer in `[1, num_inference_steps]`. The remaining steps run
+  on an image-only packed layout (the running rows transfer by index copy, so
+  both layouts share the target geometry). Requests without `keep_steps` keep
+  the video reference for every step — the historical behaviour, unchanged —
+  and `keep_steps == num_inference_steps` also degrades to full-video
+  conditioning. `keep_steps=0` is rejected: the video would never condition a
+  step while the request still pays for its VAE encode and the
+  full-presentation encoder pass (an interface choice for serving;
+  CodeVideoModel's reference implementation permits 0). Checkpoints with a
+  pinned distilled sigma schedule (including FastH3) are rejected as well.
+- Interleaving images and videos in the upload list does not change the
+  internal type-grouped order: the server splits `input_references` by media
+  kind and the encoder packs all image references before the video reference.
+  References of the same kind keep their upload order, which is what
+  `Picture 1`/`Video 1` in the prompt refer to.
+- Measured on Atlas 800I A2 (910B3, TP4), a 20-step Ref2VA request with one
+  image and one proxy video finished in 981.9 s instead of 1176.4 s (-16.5%)
+  with an identical per-card memory profile; per-step time drops ≈24% after
+  the switch.
+- `keep_steps=5` is the validated value for 20-step Ref2VA. Smaller values
+  still follow the macro timeline but can lose fine contact details: at
+  `keep_steps=3` the same benchmark kept the walk → stop → sit → groom
+  structure yet misplaced the tongue during the paw-lick close-up. The two
+  measured points (keep_steps=3 and keep_steps=5) differ by only 4.3% in
+  engine time, so there is little reason to go below 5.
+- Requires task `ref2va` with image reference(s) plus exactly one silent video
+  reference. Rejected with explicit client errors when combined with audio
+  references (`audio_mode=lock_source` included), latent-mask editing, control
+  media, `continue_from`/continuation, timeline guides, latent
+  refine/upscale, `pad_seq_len`, reference-KV offload, pinned distilled sigma
+  schedules, attention schedules, Cache-DiT quality profiles, the AdaLN sidecar cache, turbo/native
+  LoRA, FastH3, or step execution. Deployments that split the encoder into
+  its own stage reject `keep_steps` requests that would switch at intake
+  (HTTP 400) until the second encoder pass is wired there; the
+  `keep_steps == num_inference_steps` no-op passes through unchanged. Intake
+  judges by the requested (or default) step count, so on checkpoints with a
+  pinned distilled schedule a value the diffusion stage would treat as a
+  no-op can be conservatively rejected at intake.
+
 ### Speech-to-Video
 
 For models that support audio-driven generation (e.g., Wan2.2-S2V), pass both

@@ -314,6 +314,33 @@ def minimax_h3_prepare_denoise_rows(
     return video_rows, audio_rows
 
 
+def minimax_h3_switch_denoise_branch(
+    *,
+    base: MiniMaxH3DenoiseBranch,
+    video_rows: torch.Tensor,
+    update: torch.Tensor,
+    base_cond_rows: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Move the running target rows onto the image-only condition branch.
+
+    CodeVideoModel-style early-only video conditioning: after the leading
+    ``keep_steps`` steps, the packed sequence switches from the full layout
+    (image + video references) to an image-only layout. Both layouts share the
+    same target span geometry and row order, so the transfer is a direct index
+    copy of the update rows. The base branch's condition rows receive the
+    image-only anchor; the loop then re-pins them every step like any other
+    condition anchor.
+    """
+    if int(base.update_mask.sum()) != int(update.sum()):
+        raise ValueError("base branch target row count differs from the active branch")
+    switched = torch.zeros(int(base.img_pos.shape[0]), MINIMAX_H3_VIDEO_ROW_WIDTH, dtype=torch.float32, device=device)
+    switched[base.update_mask_dev] = video_rows[update]
+    anchor = base_cond_rows.to(device=device, dtype=torch.float32)
+    switched[~base.update_mask_dev] = anchor
+    return switched, base.update_mask_dev, anchor
+
+
 def minimax_h3_denoise_loop(
     *,
     model: Any,
@@ -332,6 +359,9 @@ def minimax_h3_denoise_loop(
     update_progress: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
     sampler: str = "euler",
+    base: MiniMaxH3DenoiseBranch | None = None,
+    keep_steps: int | None = None,
+    base_cond_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -339,6 +369,13 @@ def minimax_h3_denoise_loop(
     conditional task, pass ``keyframe_cond_rows`` and/or ``audio_ref_rows`` to
     pin those rows across every step. The model's raw positive velocity is the
     update signal; MiniMax H3 only supports cfg-distilled checkpoints.
+
+    ``base``/``keep_steps``/``base_cond_rows`` implement the CodeVideoModel
+    early-only video reference: the first ``keep_steps`` steps denoise with the
+    full presentation (image + video references), then the loop transfers the
+    running target rows onto the image-only ``base`` branch and continues with
+    the image-only presentation for the remaining steps. ``None`` disables the
+    switch and reproduces the historical full-video behaviour.
     """
     if len(sigmas_video) != len(sigmas_audio):
         raise ValueError("video/audio sigma schedules must have equal length")
@@ -372,6 +409,20 @@ def minimax_h3_denoise_loop(
     # from step 0. The pipeline checks the schedule against the main num_steps
     # before the first call and rejects a schedule together with latent_refine,
     # so a request with a schedule runs only calls with the main num_steps.
+    num_steps = len(sigmas_video) - 1
+    if base is not None:
+        if type(keep_steps) is not int or not 1 <= keep_steps < num_steps:
+            raise ValueError(f"keep_steps must be an integer in [1, {num_steps}) when a base branch is supplied")
+        if base_cond_rows is None:
+            raise ValueError("keep_steps requires base_cond_rows (image-only condition anchor rows)")
+        if int(base.update_mask.sum()) != int(update.sum()):
+            raise ValueError("base branch target row count differs from the full branch")
+        if int(base.audio_pos.shape[0]) != int(positive.audio_pos.shape[0]) or int(base.audio_update_mask.sum()) != int(
+            audio_update.sum()
+        ):
+            raise ValueError("keep_steps branches must share the same audio row layout")
+        if current_omni_platform.is_npu():
+            base.prepare_rope_table(model)
     reference_kv_state = None
     create_reference_kv_state = getattr(model, "create_reference_kv_state", None)
     if callable(create_reference_kv_state):
@@ -380,6 +431,10 @@ def minimax_h3_denoise_loop(
             device=device,
         )
     if reference_kv_state is not None:
+        if base is not None:
+            # The Tier-2 reference KV state is sized for the branch it was built
+            # from; the mid-loop layout switch changes the reference row count.
+            raise ValueError("keep_steps does not support the reference-KV offload state")
         positive.static_kwargs["reference_kv_state"] = reference_kv_state
 
     adapter = MiniMaxH3Model(
@@ -392,9 +447,29 @@ def minimax_h3_denoise_loop(
     state = SamplingState((video_rows[update], audio_rows[audio_update]), (sigmas_video, sigmas_audio))
 
     def write_back_and_update_progress(state):
-        nonlocal video_rows, audio_rows
+        nonlocal video_rows, audio_rows, positive
         adapter.validate_write_back(state)
         video_rows, audio_rows = adapter.write_back(state)
+        if base is not None and state.step_index - 1 == keep_steps - 1 and positive is not base:
+            # CodeVideoModel-style early-only video conditioning: after the
+            # leading keep_steps steps, transfer the running target rows onto
+            # the image-only layout before the sampler prepares its next
+            # evaluation. The switch preserves the target rows' order, so the
+            # state's latents stay valid for the new branch unchanged; the
+            # swapped adapter branch/masks point validate/write_back at the
+            # base layout from here on.
+            switched, _, _ = minimax_h3_switch_denoise_branch(
+                base=base,
+                video_rows=video_rows,
+                update=update,
+                base_cond_rows=base_cond_rows,
+                device=device,
+            )
+            positive = base
+            video_rows = switched
+            adapter.branch = base
+            adapter.rows = (switched, audio_rows)
+            adapter.model_rows = (switched.clone(), adapter.model_rows[1])
         if update_progress is not None:
             update_progress(state.step_index - 1, video_rows, audio_rows)
         check_request_cancellation(synchronize=True)
@@ -428,4 +503,5 @@ __all__ = [
     "minimax_h3_denoise_loop",
     "minimax_h3_prepare_denoise_rows",
     "minimax_h3_publish_denoise_progress",
+    "minimax_h3_switch_denoise_branch",
 ]
