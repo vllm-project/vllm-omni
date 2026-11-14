@@ -1,0 +1,108 @@
+# Duo 1.0 on vLLM-Omni
+
+[Duo](https://github.com/inclusionAI/Duo) is a *reciprocal world model*: it
+perceives audio and video continuously and answers in the same medium, instead of
+finishing one turn before it starts listening again. This page covers the
+`inclusionAI/Duo-1.0-causal-base` checkpoint.
+
+## What this integration is
+
+Duo is not a new diffusion backbone. Its **Realization** module is the
+MiniMax-H3 DiT (`MiniMaxH3DiTModel`, 50 layers, hidden size 5376), so the
+Realization and Codec stages run on the existing H3 blocks, attention
+backends, VAE fast paths and LoRA plumbing in this repository. What Duo adds on
+top is:
+
+| Piece | Role |
+| --- | --- |
+| **Intent** (`DuoIntentForConditionalGeneration`) | Qwen3-VL 8B prompted once per chunk; emits `<speak>` + text or `<wait>`, and its selected hidden states condition Realization. |
+| **Realization** (`DuoPipeline`) | H3 DiT denoising the assistant media latents, conditioned on Intent states and the committed (clean) history. |
+| **Codec** (`DuoCodecPipeline`) | Streaming video VAE + audio VAE turning latents into publishable 24 fps / 32 kHz chunks. |
+| **ASR** (`DuoASRForConditionalGeneration`) | Optional Qwen3-ASR front stage for the `duo_asr` topology. |
+
+The three stages are separate pipelines over one checkpoint so each can be
+placed, tensor-parallelized and budgeted independently.
+
+## Chunk timeline
+
+An interaction is cut into fixed chunks: **17 video frames at 24 fps**
+(≈708 ms), mapping to **5 video latents** and **29 stereo audio latents**.
+At chunk `k`, Intent only sees evidence available before the chunk's causal
+boundary. See the upstream [architecture note](https://github.com/inclusionAI/Duo/blob/main/docs/architecture.md)
+for the visibility contract.
+
+## Execution and configuration
+
+The `duo` topology runs Intent, Realization and Codec in that order; the `codec`
+stage is the only `final_output` because a chunk publishes an MP4 carrying both
+tracks. Online serving is opt-in through a deploy config that selects
+`session_mode: duplex` — `vllm_omni/deploy/duo_dmd.yaml` (4 DMD evaluations,
+flow shift 5) and `vllm_omni/deploy/duo_tp8_shared.yaml` (ASR + Intent TP4 +
+Realization TP8 + four codec tile lanes). Check the device assignments and
+memory budgets against your own system before using them.
+
+The default offline sampler for the causal-base checkpoint is Euler, 50 steps,
+flow shift 1.0 — that is what `realization/complete.json` records.
+
+## Required artifacts
+
+The checkpoint is a *bundle*, not a single model directory:
+
+```text
+Duo-1.0-causal-base/
+├── realization/            # H3-format backbone shards + released LoRA DCP
+│   ├── backbone/           # config.json + model-0000*-of-00013.safetensors
+│   ├── dcp/                # released Realization LoRA (torch distributed checkpoint)
+│   └── complete.json       # release manifest: identity hashes, sampler defaults
+├── intent/                 # Qwen3-VL weights, tokenizer, preprocessors
+├── intent_adapter/         # Intent tokenizer + LoRA adapter + protocol manifest
+├── codec/                  # video VAE + audio VAE (weights only)
+└── speech/                 # Qwen3-ASR recognizer + forced aligner
+```
+
+**The released bundle is not directly servable.** `realization/complete.json`
+declares `storage.format: dcp` and `release.realization_storage: dcp`, so the
+only Realization adapter in the download is `realization/dcp/*.distcp`. The
+Realization stage loads `adapter_path` (a `.safetensors` with
+`layout`/`rank`/`alpha` metadata, validated strictly by
+`diffusion/models/duo/checkpoint.py`), so the DCP has to be exported first with
+upstream's `apps/duo/duo_dcp.py` before a deploy config can start. The loader
+does not read `complete.json`; nothing is auto-detected from it.
+
+The released manifest also pins the validated sampler defaults, which the deploy
+configs follow: `stage: causal` with 50 Euler steps and flow shift 1.0 for this
+causal-base checkpoint. The Realization weights are H3-initialized and carry
+their own license — check the model provider's terms separately from this
+integration's Apache-2.0 code. The codec directories ship VAE weights without a
+`config.json`, so point `codec:` at a layout that also provides the component
+configs.
+
+## Client protocol
+
+Duplex clients use `WS /v1/realtime?duplex=1` (or `WS /v1/duplex`) with the
+`vllm_omni.clients.duo` preset. Input is 16 kHz float32 PCM plus `video_frames`;
+output is 32 kHz PCM16 stereo with a duplex `video` extension carrying JPEG
+frames. The payload is not a standard Realtime video-output event; audio and
+video share one playback acknowledgement.
+
+## Validation and limitations
+
+- The upstream `inference/vllm-omni-duo` branch ships ~250 lines of scheduler and
+  output-processor hooks that are **not** part of this integration (bounded
+  Realization-window trimming around `scheduler_trim`, and the
+  `DUO_SEGMENT_H50` / `DUO_INCREMENTAL_H50` scheduled-row handoff). Neither hook
+  exists on `main` and none of the ported model code imports them. Two
+  consequences to be explicit about:
+  - the plugin's `stage_is_resumable`, `model_state_stage_ids`,
+    `start_transcription_preparation` and `record_stage_timing` overrides are
+    inert here, because the engine on `main` has no call site for them;
+  - upstream's `abort_requests` closes the Realization session through
+    `close_ar_diffusion_session`, which neither the upstream nor this ported
+    DuoTransformer implements. Duo session state is therefore released through
+    `close_session` only, and interrupted sessions are not torn down early.
+  Long online sessions depend on the untaken paths above; treat this as a
+  preview port of the model, not of the full streaming scheduler.
+- Online duplex serving requires the duplex plugin and a deploy config; the
+  plain generation APIs do not expose reply-boundary decisions.
+- Direct user-audiovisual conditioning of Realization is not enabled by the
+  Duo 1.0 offline checkpoint; user input reaches Realization through Intent.

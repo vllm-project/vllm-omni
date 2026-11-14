@@ -9,6 +9,9 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    ## duo (Reciprocal World Model; ASR + Intent stages on H3 Realization)
+    "DuoASRForConditionalGeneration": ("duo", "asr", "DuoASRForConditionalGeneration"),
+    "DuoIntentForConditionalGeneration": ("duo", "intent", "DuoIntentForConditionalGeneration"),
     "Alpamayo2SuperPolicy": ("alpamayo2_super", "alpamayo2_super", "Alpamayo2SuperPolicyForConditionalGeneration"),
     "Lfm3OmniForConditionalGeneration": ("lfm3_omni", "model", "Lfm3OmniForConditionalGeneration"),
     "Lfm3OmniCode2Wav": ("lfm3_omni", "code2wav", "Lfm3OmniCode2Wav"),

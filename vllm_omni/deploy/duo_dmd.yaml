@@ -1,0 +1,142 @@
+# Duo deployment with Intent, Realization, Codec, and ASR stages.
+pipeline: duo_asr
+async_chunk: false
+trust_remote_code: true
+distributed_executor_backend: mp
+stages:
+- stage_id: 0
+  model: /target/models/Qwen3-ASR-1.7B
+  devices: '7'
+  gpu_memory_utilization: 0.1
+  max_model_len: 8192
+  max_num_seqs: 1
+  enable_prefix_caching: false
+  default_sampling_params:
+    temperature: 0.0
+    max_tokens: 256
+- stage_id: 1
+  model: /target/models/MiniMax-Realization/FL2VA/text_encoder
+  tokenizer: /target/models/intent_adapter
+  devices: '6'
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.55
+  dtype: bfloat16
+  max_model_len: 8192
+  max_num_batched_tokens: 32
+  max_num_seqs: 1
+  enable_prefix_caching: false
+  enforce_eager: false
+  compilation_config:
+    mode: 0
+    cudagraph_mode: FULL
+    cudagraph_capture_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 24
+    - 32
+    max_cudagraph_capture_size: 32
+  limit_mm_per_prompt:
+    image: 0
+    video: 1
+  hf_overrides:
+    architectures:
+    - DuoIntentForConditionalGeneration
+    text_config:
+      vocab_size: 151685
+    duo_forbidden_token_ids:
+    - 151643
+    - 151644
+    - 151646
+    - 151647
+    - 151648
+    - 151649
+    - 151650
+    - 151651
+    - 151652
+    - 151653
+    - 151654
+    - 151655
+    - 151656
+    - 151669
+    - 151670
+    - 151671
+    - 151672
+    - 151673
+    - 151674
+    - 151675
+    - 151677
+    - 151678
+    intent_adapter_path: /target/models/intent_adapter
+  default_sampling_params:
+    temperature: 0.0
+    max_tokens: 128
+    detokenize: false
+  async_scheduling: false
+- stage_id: 2
+  model: /target/models/MiniMax-Realization/Ref2VA
+  devices: 0,1,2,3
+  dtype: bfloat16
+  step_execution: true
+  streaming_output: true
+  diffusion_model_runner_cls: vllm_omni.diffusion.models.duo.model_runner.DuoModelRunner
+  parallel_config:
+    tensor_parallel_size: 4
+    sequence_parallel_size: 1
+  model_config:
+    duo:
+      adapter_path: /target/models/realization_adapter.safetensors
+      adapter_format: torchtitan_split_qkv
+      rank: 128
+      alpha: 128
+      role_embedding: false
+      compact_padding: true
+      fused_denoise: true
+      reuse_static_text: true
+      merge_fixed_adapter: true
+      reuse_time_conditioning: true
+      kv_capacity: 131072
+      num_blocks: 3031
+      page_size: 32
+      # KV context includes fixed prefix, retained history and current query.
+      kv_token_budget: 65536
+      max_graphs: 8
+      max_sessions: 1
+      sampling_stage: dmd
+      flow_shift: 5.0
+      fp8_gemm: true
+      fp8_cache_layout: workspace
+      joint_execution: true
+      joint_early_clean_ack: true
+      prefix_capacity: 0
+  default_sampling_params:
+    num_inference_steps: 4
+    seed: 42
+    extra_args:
+      realization_early_codec_dispatch: true
+  max_num_seqs: 2
+- stage_id: 3
+  model: /target/models/MiniMax-Realization/FL2VA
+  devices: 4,5
+  dtype: float32
+  step_execution: false
+  streaming_output: false
+  diffusion_model_runner_cls: vllm_omni.diffusion.models.duo.model_runner.DuoModelRunner
+  parallel_config:
+    tensor_parallel_size: 2
+    sequence_parallel_size: 1
+  default_sampling_params:
+    num_inference_steps: 1
+  model_config:
+    duo_codec:
+      stack_tiling: true
+      codec_mode: duo_5_17
+      next_block_lookahead: false
+session_mode: duplex
+duplex_session:
+  # A 17-frame JPEG AV packet is about 1 MB.
+  max_pending_output_bytes_per_session: 8388608
+  max_sessions: 1
+  warmup_frames: -1

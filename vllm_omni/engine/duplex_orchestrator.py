@@ -16,7 +16,7 @@ import time as _time
 from collections.abc import Coroutine
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine import FinishReason
@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
     from vllm.outputs import RequestOutput
 
+    from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
     from vllm_omni.metrics.stats import StageRequestStats
 
 logger = init_logger(__name__)
@@ -67,6 +68,9 @@ class DuplexOrchestratorRequestState(OrchestratorRequestState):
     fence: DuplexFence | None = None
     stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     config_generation: int = -1
+    #: Set when the H50 scheduled-row handoff forked this request from another,
+    #: so cleanup can keep a parent alive until its children are gone.
+    parent_request_id: str | None = None
     # Session stats (RFC #8325): per stage, the chunks with spans since its last
     # session output, and the chunk of its latest producing step.
     pending_perf_chunks: dict[int, set[tuple[int, int]]] = field(default_factory=dict)
@@ -541,6 +545,35 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         self._sync_bridge_state(request_state, context)
         self.session_manager.register_request(context.request_id, context.session_id)
 
+    def fork_stage_request(self, parent_request_id: str, request_id: str, stage_id: int):
+        """Reserve an independently scheduled child under the same session fence.
+
+        Duo's H50 scheduled-row handoff runs the next Intent block as its own
+        request so the Realization window can be trimmed while the child is
+        still streaming. The child inherits the parent's fence, config
+        generation and sampling params, so it cannot outlive or outvote the
+        session it belongs to.
+        """
+        parent = cast(DuplexOrchestratorRequestState, self.request_states[parent_request_id])
+        bridge = parent.streaming.bridge_states["duplex"]
+        context = DuplexStageRequestContext(
+            request_id=request_id,
+            session_id=parent.session_id,
+            fence=cast(DuplexFence, parent.fence),
+            stage_id=stage_id,
+            final_stage_id=parent.final_stage_id,
+            config_generation=parent.config_generation,
+            sampling_params=tuple(parent.sampling_params_list),
+            session_config=bridge["session_config"],
+            runtime_config=bridge["runtime_config"],
+        )
+        self.ensure_request(context)
+        child = cast(DuplexOrchestratorRequestState, self.request_states[request_id])
+        child.parent_request_id = parent_request_id
+        runner = cast("DuplexSessionRunner", self.session_manager.runner_for_request_id(request_id))
+        runner.session.reserve_stage_request(stage_id, request_id, fence=context.fence)
+        return child
+
     def _upgrade_processed_stage_request(self, request, raw_prompt):
         request = super()._upgrade_processed_stage_request(request, raw_prompt)
         if not self.plugin.capabilities(
@@ -662,15 +695,17 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if plan is not None:
             # A text-bearing final is not itself the end sentinel. Submit the
             # sentence resumable first; the follow-up, if any, closes the stream.
-            await self._forward_to_next_stage(
-                req_state.request_id,
-                stage_id,
-                plan.output,
-                req_state,
-                src_replica_id=replica_id,
-                is_streaming_session=True,
-                is_final_update=plan.is_final_update and not plan.queue_close_after,
-            )
+            # ``forward=False`` means the update only settles model state.
+            if plan.forward:
+                await self._forward_to_next_stage(
+                    req_state.request_id,
+                    stage_id,
+                    plan.output,
+                    req_state,
+                    src_replica_id=replica_id,
+                    is_streaming_session=True,
+                    is_final_update=plan.is_final_update and not plan.queue_close_after,
+                )
             followup = self.plugin.partial_stage_followup(plan, req_state)
             if followup is not None:
                 await self._forward_to_next_stage(
