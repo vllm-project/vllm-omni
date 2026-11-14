@@ -244,3 +244,24 @@ def test_single_stage_pcm_requires_reset_capability_declaration(single_stage_tts
     single_stage_tts_config.model_config.supports_running_prefix_cache_reset = True
     with pytest.raises(ValueError, match="must disable running prefix-cache reset"):
         talker_stream_decode_enabled(single_stage_tts_config)
+
+
+def test_qwen3_tts_high_concurrency_npu_enables_graphs():
+    """The NPU override must not force eager on either stage (#7993).
+
+    Forcing eager on NPU halved throughput and broke the 100 ms streaming
+    SLO at concurrency 8+ (910B4: RTF 1.079 as shipped with 733/782 samples
+    over SLO, vs RTF 0.604 with none once graphs were enabled). The NPU
+    override aligns with the base qwen3_tts.yaml recipe instead; stage 1's
+    CUDA-tuned eager default in its own definition stays untouched.
+    """
+    from tests.helpers.stage_config import get_deploy_config_path
+    from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
+
+    deploy = load_deploy_config(get_deploy_config_path("qwen3_tts_high_concurrency.yaml"))
+    deploy = _apply_platform_overrides(deploy, platform="npu")
+    by_id = {stage.stage_id: stage for stage in deploy.stages}
+    for stage_id in (0, 1):
+        stage = by_id[stage_id]
+        assert stage.enforce_eager is False, f"stage {stage_id} must keep graphs enabled on NPU"
+        assert (stage.compilation_config or {}).get("cudagraph_mode") == "PIECEWISE"
