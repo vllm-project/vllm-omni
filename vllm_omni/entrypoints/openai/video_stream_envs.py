@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Environment variables for the streaming video OpenAI entrypoint."""
 
 import logging
@@ -10,11 +10,13 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     VLLM_VIDEO_AUDIO_DELTA_MODE: Literal["fast", "slow"] = "fast"
     VLLM_VIDEO_ASYNC_CHUNK: Literal["on", "off"] = "on"
+    VLLM_OMNI_VIDEO_OUTPUT_PREFETCH: Literal["on", "off"] = "off"
 
 logger = logging.getLogger(__name__)
 _warned_invalid_envs: set[tuple[str, str]] = set()
 _VIDEO_AUDIO_DELTA_MODE = "VLLM_VIDEO_AUDIO_DELTA_MODE"
 _VIDEO_ASYNC_CHUNK = "VLLM_VIDEO_ASYNC_CHUNK"
+_VIDEO_OUTPUT_PREFETCH = "VLLM_OMNI_VIDEO_OUTPUT_PREFETCH"
 
 
 def _choice_env(
@@ -41,6 +43,11 @@ environment_variables: dict[str, Callable[[], str]] = {
     _VIDEO_ASYNC_CHUNK: lambda: _choice_env(
         _VIDEO_ASYNC_CHUNK,
         "on",
+        ("on", "off"),
+    ),
+    _VIDEO_OUTPUT_PREFETCH: lambda: _choice_env(
+        _VIDEO_OUTPUT_PREFETCH,
+        "off",
         ("on", "off"),
     ),
 }

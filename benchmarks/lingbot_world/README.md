@@ -256,3 +256,7 @@ compare unseen prompts separately from prompt-cache hits.
 Set `VLLM_OMNI_REVERSE_A2A_TOKEN_LAYOUT=1` on every rank to test the batch-one
 reverse all-to-all layout. It defaults to off; larger batches and calls with an
 owned output destination retain their existing paths.
+
+Set `VLLM_OMNI_VIDEO_OUTPUT_PREFETCH=on` to overlap the next generation-output
+read with encoding and sending the current output. It defaults to `off` and
+keeps at most one additional output in flight, increasing buffer memory use.

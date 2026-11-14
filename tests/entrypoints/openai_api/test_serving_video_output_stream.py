@@ -22,8 +22,9 @@ from pytest_mock import MockerFixture
 from starlette.testclient import TestClient
 
 from tests.helpers.media import generate_synthetic_image
+from vllm_omni.entrypoints.openai import video_stream_envs
 from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
-from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
+from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler, _bounded_prefetch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -62,6 +63,103 @@ def test_extract_audio_keeps_missing_rate_unspecified():
         request_id="audio-rate", images=[], multimodal_output={"audio": np.zeros((1000, 2), dtype=np.float32)}
     )
     assert OmniStreamingVideoOutputHandler._extract_audio_output(result)[1] is None
+
+
+def test_video_output_prefetch_env_defaults_off_and_accepts_on(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("VLLM_OMNI_VIDEO_OUTPUT_PREFETCH", raising=False)
+    assert video_stream_envs.VLLM_OMNI_VIDEO_OUTPUT_PREFETCH == "off"
+    monkeypatch.setenv("VLLM_OMNI_VIDEO_OUTPUT_PREFETCH", " ON ")
+    assert video_stream_envs.VLLM_OMNI_VIDEO_OUTPUT_PREFETCH == "on"
+
+
+@pytest.mark.asyncio
+async def test_bounded_prefetch_preserves_order_with_at_most_one_read_ahead():
+    started = []
+    allow_next = asyncio.Event()
+
+    async def source():
+        for value in range(3):
+            started.append(value)
+            if value == 1:
+                await allow_next.wait()
+            yield value
+
+    stream = _bounded_prefetch(source())
+    assert await anext(stream) == 0
+    await asyncio.sleep(0)
+    assert started == [0, 1]
+    next_item = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+    assert started == [0, 1]
+    allow_next.set()
+    assert await next_item == 1
+    assert [item async for item in stream] == [2]
+
+
+@pytest.mark.asyncio
+async def test_bounded_prefetch_propagates_source_error_identity():
+    error = LookupError("generation failed")
+
+    async def source():
+        yield "first"
+        raise error
+
+    stream = _bounded_prefetch(source())
+    assert await anext(stream) == "first"
+    with pytest.raises(LookupError) as raised:
+        await anext(stream)
+    assert raised.value is error
+
+
+@pytest.mark.asyncio
+async def test_bounded_prefetch_early_close_cancels_pending_and_closes_source():
+    pending = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def source():
+        try:
+            yield "first"
+            pending.set()
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    stream = _bounded_prefetch(source())
+    assert await anext(stream) == "first"
+    await pending.wait()
+    await stream.aclose()
+    assert closed.is_set()
+    assert not [
+        task for task in asyncio.all_tasks() if task.get_name() == "video-output-prefetch-next" and not task.done()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bounded_prefetch_consumer_cancellation_closes_source_without_orphan_task():
+    waiting = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def source():
+        try:
+            yield "first"
+            waiting.set()
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    stream = _bounded_prefetch(source())
+    assert await anext(stream) == "first"
+    await waiting.wait()
+    consumer = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0)
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    await stream.aclose()
+    assert closed.is_set()
+    assert not [
+        task for task in asyncio.all_tasks() if task.get_name() == "video-output-prefetch-next" and not task.done()
+    ]
 
 
 def _fake_video_frames(num_frames: int = 2) -> list[np.ndarray]:
