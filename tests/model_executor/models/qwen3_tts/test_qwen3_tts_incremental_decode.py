@@ -350,9 +350,16 @@ def test_incremental_request_audio_matches_full_decode(mode):
     caches: dict[str, Any] = {"prefix_frames": prefix_frames}
 
     with torch.no_grad():
-        first = decoder(codes[..., : prefix_frames + 1], caches=caches)
-        second = decoder(suffix_codes[..., 1:26], caches=caches)
-        third = decoder(suffix_codes[..., 26:51], caches=caches)
+        audio_chunks = []
+        for chunk in (codes[..., : prefix_frames + 1], suffix_codes[..., 1:26], suffix_codes[..., 26:51]):
+            audio_chunks.append(decoder(chunk, caches=caches))
+            # The suffix shortcut relies on matching caches after initialization
+            # and every update, for both reference and prefixless requests.
+            ref_hidden = caches["ref_hidden"]
+            suffix_quantized = caches["suffix_quantized"]
+            assert ref_hidden.dtype == suffix_quantized.dtype
+            assert ref_hidden.device == suffix_quantized.device
+        first, second, third = audio_chunks
         incremental = torch.cat(
             [first[..., -decoder.total_upsample :], second, third],
             dim=-1,
@@ -1260,3 +1267,83 @@ def test_stateful_eager_partial_final_chunk_is_right_trimmed():
     assert [output.shape[-1] for output in batched] == [full_samples, partial_samples]
     torch.testing.assert_close(batched[0], per_request[0][0], atol=1e-5, rtol=1e-4)
     torch.testing.assert_close(batched[1], per_request[1][0], atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "ref_frames,old_frames,batch_size,dtype,noncontiguous",
+    [
+        (ref_frames, old_frames, batch_size, torch.float32, False)
+        for ref_frames in [0, 1, 72]
+        for old_frames in [0, 1, 2, 25, 72]
+        for batch_size in [1, 4]
+    ]
+    + [pytest.param(1, 25, 1, torch.bfloat16, True, id="strided-bf16")],
+)
+def test_suffix_pre_conv_context_avoids_full_history_cat(
+    monkeypatch, ref_frames, old_frames, batch_size, dtype, noncontiguous
+):
+    """Exercise the real suffix method through its first convolution input.
+
+    The sentinel stops before the transformer/vocoder: existing integration
+    tests cover the full decoder. Count cat calls as well as checking values,
+    so the previous implementation fails on the fast-path cases.
+    """
+    channels = 4
+    stride = 2 if noncontiguous else 1
+
+    def history(frames, offset):
+        values = torch.arange(batch_size * channels * frames * stride, dtype=torch.float32)
+        return (values.reshape(batch_size, channels, frames * stride) + offset).to(dtype)[..., ::stride]
+
+    ref_hidden = history(ref_frames, 0)
+    old_quantized = history(old_frames, 100)
+    new_quantized = history(3, 200)
+    if noncontiguous:
+        assert not ref_hidden.is_contiguous()
+        assert not old_quantized.is_contiguous()
+        assert not new_quantized.is_contiguous()
+    ref_before = ref_hidden.clone()
+    old_before = old_quantized.clone()
+    expected_context = torch.cat([ref_hidden, old_quantized], dim=-1)[:, :, -_CONV_CONTEXT_FRAME:]
+    expected = torch.cat([expected_context, new_quantized], dim=-1)
+    actual_cat = torch.cat
+    calls = []
+    captured = []
+
+    def record_cat(*args, **kwargs):
+        calls.append(tuple(tensor.shape for tensor in args[0]))
+        return actual_cat(*args, **kwargs)
+
+    class StopAfterPreConvError(Exception):
+        pass
+
+    def capture_pre_conv(value):
+        captured.append(value)
+        raise StopAfterPreConvError
+
+    decoder = SimpleNamespace(
+        config=SimpleNamespace(sliding_window=72),
+        quantizer=SimpleNamespace(decode=lambda codes: new_quantized),
+        pre_conv=capture_pre_conv,
+    )
+    monkeypatch.setattr(torch, "cat", record_cat)
+    with pytest.raises(StopAfterPreConvError):
+        Qwen3TTSTokenizerV2Decoder._decode_suffix(
+            decoder,
+            new_codes=new_quantized,
+            old_quantized=old_quantized,
+            old_conv=None,
+            caches={"ref_hidden": ref_hidden},
+            prefix_frames=ref_frames,
+            new_frames=3,
+            rolling=False,
+        )
+
+    assert len(captured) == 1
+    assert captured[0].dtype == dtype
+    assert captured[0].device == old_quantized.device
+    torch.testing.assert_close(captured[0], expected, rtol=0, atol=0)
+    torch.testing.assert_close(ref_hidden, ref_before, rtol=0, atol=0)
+    torch.testing.assert_close(old_quantized, old_before, rtol=0, atol=0)
+    # Counting pre-conv cats guards against reintroducing the full-history copy.
+    assert len(calls) == (1 if old_frames >= _CONV_CONTEXT_FRAME else 2)
