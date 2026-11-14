@@ -1048,6 +1048,11 @@ Voice cloning uses the supplied or automatically transcribed reference text and 
 | ------- | ------------- |
 | `openbmb/VoxCPM2` | TTS + voice cloning with built-in speaker presets and uploaded-voice support. Accepts `voice` (preset or uploaded) or `ref_audio` + optional `ref_text`. |
 
+VoxCPM2 accepts a single `ref_audio` URI using `http`, `https`, `data`, or
+`file`. Nonempty reference lists and unsupported URI schemes return HTTP 400
+before reference-audio resolution; the shared request schema still supports
+lists for models with multi-reference conditioning.
+
 #### Startup LoRA adapter
 
 To serve a fine-tuned VoxCPM2 voice, set

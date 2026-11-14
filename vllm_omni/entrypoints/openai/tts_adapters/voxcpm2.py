@@ -94,6 +94,11 @@ class VoxCPM2Adapter(ARTTSAdapter):
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 
+        if request.ref_audio is not None:
+            fmt_err = server._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
+
         if request.voice is not None:
             request.voice = request.voice.lower()
             available_voices = server._get_available_speakers()
