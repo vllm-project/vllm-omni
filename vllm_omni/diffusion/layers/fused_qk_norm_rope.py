@@ -765,7 +765,7 @@ def fused_qk_norm_rope_available(
     """Whether the fused CUDA kernels would run for activations of this
     device/dtype/geometry. Consumers gate their per-forward rope-table packing
     on it so CPU, NPU, ROCm and non-bf16 paths pay no allocation or copy."""
-    if not (HAS_TRITON and current_platform.is_cuda() and device.type == "cuda" and dtype == torch.bfloat16):
+    if not (HAS_TRITON and current_platform.is_cuda_alike() and device.type == "cuda" and dtype == torch.bfloat16):
         return False
     if interleaved:
         return rotary_dim % 2 == 0 and 2 <= rotary_dim <= head_dim <= _FUSED_MAX_HEAD_DIM
@@ -783,7 +783,7 @@ def _fused_cuda_supported(
         return False
     if interleaved:
         return fused_qk_norm_rope_available(q.device, q.dtype, head_dim, rotary_dim, interleaved=True)
-    if not (HAS_TRITON and current_platform.is_cuda() and q.dtype == torch.bfloat16):
+    if not (HAS_TRITON and current_platform.is_cuda_alike() and q.dtype == torch.bfloat16):
         return False
     # Half-split traffic keeps the pre-existing per-tensor kernel and its
     # exact MiniMax-H3 geometry contract (that kernel is untouched by the
@@ -1343,7 +1343,8 @@ def pack_qk_norm_rope_table(
     head_dim = rotary_dim if head_dim is None else head_dim
     if not fused_qk_norm_rope_available(cos.device, activation_dtype or dtype, head_dim, rotary_dim):
         return None
-    if cuda_rms_norm and not head_dim == rotary_dim == 128:
+    # The CUDA-RMSNorm-matching reduction is only bit-identical against CUDA builds.
+    if cuda_rms_norm and not (current_platform.is_cuda() and head_dim == rotary_dim == 128):
         return None
     tokens = batch_size * (cos.shape[0] + identity_rows)
     table = torch.cat((cos, sin), dim=-1).to(dtype)

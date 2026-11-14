@@ -361,7 +361,12 @@ def test_fused_joint_qkv_norm_rope_matches_flux2_eager_chain(cuda_rms_norm):
         rope = RotaryEmbedding(is_neox_style=False)
 
         # The production provider of the eager chain; the CUDA-matching mode reproduces it.
-        assert ir.ops.rms_norm.dispatch(q1, norm_q.weight, 1e-6, None).provider == "vllm_c"
+        # ROCm dispatches rms_norm to the native provider instead.
+        provider = ir.ops.rms_norm.dispatch(q1, norm_q.weight, 1e-6, None).provider
+        if current_omni_platform.is_cuda():
+            assert provider == "vllm_c"
+        if cuda_rms_norm and provider != "vllm_c":
+            pytest.skip("the CUDA-matching mode reproduces vllm_c, not this platform's rms_norm provider")
         exp_q = torch.cat([norm_added_q(q0), norm_q(q1)], dim=1)
         exp_k = torch.cat([norm_added_k(k0), norm_k(k1)], dim=1)
         exp_v = torch.cat([v0, v1], dim=1)
