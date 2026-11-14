@@ -1294,7 +1294,10 @@ class MossTTSCodecDecoder(nn.Module):
             num_quantizers=self._n_vq,
             attention_backend=getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa"),
         )
+        # Reference encoding belongs to the API process.
+        codec.encoder = None
         if device.type in ("cuda", "npu"):
+            torch.accelerator.empty_cache()
             from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerTransformer
 
             shared = 0
