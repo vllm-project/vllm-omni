@@ -474,6 +474,12 @@ retain their existing payload layout; there is no generic embedding fallback.
 Invalid sampled rows are excluded from speculative spans, but their routing is
 preserved: unfinished chunked-prefill requests still need to send prompt rows.
 
+On the first non-resumable MRv1 decode span, the Talker removes the already
+consumed prefix of its indexed decode cache before treating it as a pending
+queue. Its request-local `decode_span_queue_started` marker keeps subsequent
+chunks on the queue path without trimming again. The marker lives only in
+the Talker's runtime payload and is cleared with that request's state.
+
 The model implements `SupportsEagle3.set_aux_hidden_state_layers` to receive
 upstream's already converted capture IDs. Capture execution may sort the union
 with Talker layers, while `extract_aux_hidden_states` returns draft features in
@@ -482,8 +488,11 @@ layer continue to request no captures and return a bare tensor.
 Qwen3-Omni auxiliary hidden-state speculation currently supports only DFlash
 with explicit, non-empty checkpoint `dflash_config.target_layer_ids`.
 EAGLE3, `extract_hidden_states`, and missing DFlash layer IDs fail at model load.
+DFlash also requires `pipeline_parallel_size=1` and rejects larger values
+before loading Thinker weights: upstream only configures its auxiliary captures
+on the last pipeline rank, so earlier ranks cannot supply the required tensors.
 DFlash speech support is limited to MRv1 with an eager Thinker and drafter;
-the service validation uses TP=2 on CUDA. CUDA Graph DFlash speech is outside
+the service validation uses TP=2 and PP=1 on CUDA. CUDA Graph DFlash speech is outside
 the supported scope because the graph experiment has an unresolved speech
 ASR regression, even with custom all-reduce disabled. Default custom-all-reduce
 graph startup also failed in the pinned upstream runtime. See the

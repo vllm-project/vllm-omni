@@ -404,6 +404,9 @@ ordinary, non-speculative Talker and Code2Wav. The default deployment above
 uses MRv2 and is not the validated DFlash configuration. When configuring
 DFlash, explicitly select `model_runner: v1`, disable Thinker prefix caching
 (`enable_prefix_caching: false` on stage 0), and use non-resumable requests.
+Set stage 0 `pipeline_parallel_size: 1`: DFlash with pipeline parallelism is
+rejected before loading the Thinker weights because auxiliary captures are
+not configured on every pipeline rank. Tensor parallelism remains supported.
 
 For DFlash speech output, set stage 0 `enforce_eager: true` and
 `speculative_config.enforce_eager: true` so both the target Thinker and the

@@ -767,8 +767,13 @@ def test_runner_aligns_prefill_mask_with_flattened_scheduled_tokens(mocker):
 
 
 @pytest.mark.parametrize("correct_previous_drafts", [False, True])
-def test_real_prepare_inputs_keeps_linear_positions_separate_from_async_corrected_mrope(correct_previous_drafts):
+def test_real_prepare_inputs_keeps_linear_positions_separate_from_async_corrected_mrope(
+    monkeypatch, correct_previous_drafts
+):
     """Run upstream position preparation, including MRoPE and async drift."""
+    # All buffers are on CPU; pinned allocation would unnecessarily require a
+    # visible GPU when the installed vLLM build selects the CUDA platform.
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
     runner = object.__new__(OmniGPUModelRunner)
     runner.model = SimpleNamespace()
     batch = PrefillMaskInputBatch()

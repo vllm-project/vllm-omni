@@ -97,7 +97,7 @@ def _config(stage="thinker", *, embeds=False):
             encoder_cudagraph_max_vision_items_per_batch=2,
             encoder_cudagraph_max_frames_per_batch=None,
         ),
-        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
         device_config=SimpleNamespace(device="cpu"),
         speculative_config=None,
     )
@@ -471,9 +471,24 @@ def test_thinker_rejects_missing_dflash_layers_before_loading(monkeypatch, dflas
         outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
 
 
-@pytest.mark.parametrize("method", ["dflash", "ngram"])
-def test_thinker_supported_speculation_reaches_model_loading(monkeypatch, method):
+def test_thinker_rejects_dflash_pipeline_parallel_before_loading(monkeypatch):
     cfg = _config()
+    cfg.parallel_config.pipeline_parallel_size = 2
+    cfg.speculative_config = SimpleNamespace(
+        method="dflash",
+        use_dflash=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config={"target_layer_ids": [3, 31]})),
+    )
+    monkeypatch.setattr(outer_module, "init_vllm_registered_model", lambda **kwargs: pytest.fail("loaded model"))
+    with pytest.raises(ValueError, match="DFlash requires pipeline_parallel_size=1"):
+        outer_module.Qwen3OmniMoeForConditionalGeneration(vllm_config=cfg)
+
+
+@pytest.mark.parametrize("method, tp, pp", [("dflash", 2, 1), ("ngram", 1, 2)])
+def test_thinker_supported_speculation_reaches_model_loading(monkeypatch, method, tp, pp):
+    cfg = _config()
+    cfg.parallel_config.tensor_parallel_size = tp
+    cfg.parallel_config.pipeline_parallel_size = pp
     cfg.speculative_config = SimpleNamespace(
         method=method,
         use_dflash=lambda: method == "dflash",

@@ -272,6 +272,11 @@ class Qwen3OmniMoeForConditionalGeneration(
                 if spec_config.method in ("eagle3", "extract_hidden_states"):
                     raise ValueError("Qwen3-Omni auxiliary hidden-state speculation only supports DFlash")
                 if spec_config.use_dflash():
+                    if vllm_config.parallel_config.pipeline_parallel_size > 1:
+                        raise ValueError(
+                            "Qwen3-Omni DFlash requires pipeline_parallel_size=1; "
+                            "pipeline-parallel auxiliary captures are not supported"
+                        )
                     draft_config = spec_config.draft_model_config
                     dflash_config = getattr(draft_config.hf_config, "dflash_config", None) if draft_config else None
                     if not isinstance(dflash_config, dict) or not dflash_config.get("target_layer_ids"):
@@ -1492,10 +1497,20 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         cached_thinker_decode_embeds = embed.get("cached_decode", None)
         thinker_decode_embed = embed.get("decode", None)
-        queued_decode = meta.get("decode_span", False) or getattr(
-            self.vllm_config.model_config, "use_v2_model_runner", False
-        )
+        use_v2_model_runner = getattr(self.vllm_config.model_config, "use_v2_model_runner", False)
+        queue_started = meta.get("decode_span_queue_started", False)
+        queued_decode = use_v2_model_runner or meta.get("decode_span", False) or queue_started
         if queued_decode and not meta.get("resumable", False):
+            if not use_v2_model_runner and not queue_started:
+                # MRv1's indexed cache retains consumed rows. Convert it to a
+                # pending-only queue once, when the first speculative span
+                # arrives; later chunks must not trim the pending rows again.
+                consumed = payload["_omni_num_computed_tokens"] - payload["_omni_prompt_len"]
+                if consumed < 0:
+                    raise ValueError(f"Talker decode requires a non-negative generation offset, got {consumed}")
+                if cached_thinker_decode_embeds is not None:
+                    cached_thinker_decode_embeds = cached_thinker_decode_embeds[consumed:]
+                update_dict.setdefault("meta", {})["decode_span_queue_started"] = True
             return self._next_thinker_decode_text_step(
                 cached_thinker_decode_embeds, thinker_decode_embed, meta, device, update_dict
             )

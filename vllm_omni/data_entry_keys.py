@@ -135,6 +135,8 @@ class OmniPayloadMeta(TypedDict, total=False):
     token_role_ids: torch.Tensor
     minimax_h3_prepared_reference_videos: str
     decode_span: bool
+    # Talker runtime state only: MRv1's indexed cache has become a pending queue.
+    decode_span_queue_started: bool
     committed_token_count: int
     consumed_input_span: bool
 
