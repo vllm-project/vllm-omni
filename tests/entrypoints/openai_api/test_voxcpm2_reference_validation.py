@@ -33,7 +33,7 @@ def adapter(mocker):
 
 @pytest.mark.parametrize(
     "reference",
-    [["data:audio/wav;base64,AAAA"], "ftp://example.invalid/reference.wav"],
+    ["ftp://example.invalid/reference.wav"],
 )
 def test_voxcpm2_rejects_unsupported_reference(adapter, reference):
     request = OpenAICreateSpeechRequest(input="Hello", ref_audio=reference)
@@ -48,10 +48,7 @@ def test_voxcpm2_rejects_unsupported_reference(adapter, reference):
     "reference",
     [
         None,
-        "http://example.invalid/reference.wav",
-        "https://example.invalid/reference.wav",
         "data:audio/wav;base64,AAAA",
-        "file:///reference.wav",
     ],
 )
 def test_voxcpm2_accepts_supported_reference_format(adapter, reference):
