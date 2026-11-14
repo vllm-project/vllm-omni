@@ -766,26 +766,24 @@ def test_talker_verifies_drafts_with_its_codec_sampler(mocker, monkeypatch):
     # The stock sampler carries the codec window penalty installed above.
     assert rejection.sampler._sampler is sampler
     assert rejection.talker is talker
-    # Any draft method is refused at load where draft codes can't be verified.
-    monkeypatch.setattr(module.current_omni_platform, "is_cuda", lambda: False)
-    for session, k_step, pattern in (
-        ("duplex", 0, "turn sessions only"),
-        ("turn", 2, "K-step frames require session_mode: duplex"),
-    ):
-        talker.vllm_config = SimpleNamespace(
-            speculative_config=spec_config, model_config=SimpleNamespace(session_mode=session)
-        )
-        talker._k_step_frames = k_step
-        with pytest.raises(NotImplementedError, match=pattern):
-            talker.mrv2_custom_sampler(sampler)
-    # K-step frames on a turn session sample inside the runner's frame
-    # orchestration, so no draft-code verification sampler is built.
+    # A duplex session without the K-step frame loop has no draft-code
+    # verification path: fail closed like the V1 runner's _check_v1_draft_method.
     talker.vllm_config = SimpleNamespace(
-        speculative_config=spec_config, model_config=SimpleNamespace(session_mode="turn")
+        speculative_config=spec_config, model_config=SimpleNamespace(session_mode="duplex")
     )
-    talker._k_step_frames = 2
-    monkeypatch.setattr(module.current_omni_platform, "is_cuda", lambda: True)
-    assert talker.mrv2_custom_sampler(sampler) == ("talker-sampler", None)
+    talker._k_step_frames = 0
+    with pytest.raises(NotImplementedError, match="turn sessions only"):
+        talker.mrv2_custom_sampler(sampler)
+    # K-step frames sample inside the runner's frame orchestration in either
+    # session mode (the draft booking lives in _propose_draft_tokens and the
+    # codec frames are sampled device-side), so no draft-code verification
+    # sampler is built -- turn sessions included, on any platform.
+    for session_mode in ("turn", "duplex"):
+        talker.vllm_config = SimpleNamespace(
+            speculative_config=spec_config, model_config=SimpleNamespace(session_mode=session_mode)
+        )
+        talker._k_step_frames = 2
+        assert talker.mrv2_custom_sampler(sampler) == ("talker-sampler", None)
 
 
 def test_drafter_loading_finds_the_codec_table_and_no_head(mocker):
