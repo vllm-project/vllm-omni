@@ -103,18 +103,19 @@ mkdir -p "${HF_CACHE}"
 HF_MOUNT="/root/.cache/huggingface"
 
 # Test budget inside the container; the pipeline gives the broad scope more.
-# Each stage also has its own cap, summing to 42m in the pr scope and 67m in the
+# Each stage also has its own cap, summing to 57m in the pr scope and 72m in the
 # broad scope, so one runaway stage cannot eat the whole budget. Measured in the
-# pr scope on one card: 3m02s dispatch + 23m29s core_model + <1m mxfp8 = ~27m.
+# pr scope on one card: 3m02s dispatch + 23m29s core_model + <1m mxfp8 +
+# 8m41s omni = ~35m.
 # timeout_in_minutes on the step has to cover the budget plus the image build
 # (check the "time docker build" line above when tuning either).
 XPU_TEST_BUDGET="${XPU_TEST_BUDGET:-60m}"
 
-# pr    = the no-card XPU-dispatch stage plus every core_model case, including
-#         the two that start an engine (tiny-random/Qwen-Image 30MB and
-#         riverclouds/qwen_image_random 9.9GB must be in the mounted HF cache).
-# broad = also advanced_model and omni, which load Qwen3-TTS, Z-Image, Wan2.1
-#         and Voxtral (~20m more).
+# pr    = the no-card XPU-dispatch stage, every core_model case and the omni
+#         models. Needs tiny-random/Qwen-Image (30MB),
+#         riverclouds/qwen_image_random (9.9GB), Qwen2.5-Omni-3B (12GB) and
+#         Qwen2.5-Omni-7B (21GB) in the mounted HF cache.
+# broad = also advanced_model: Qwen3-TTS, Z-Image, Wan2.1, Voxtral (~13m more).
 # Set XPU_TEST_SCOPE=broad on the nightly or a manually triggered build.
 export XPU_TEST_SCOPE="${XPU_TEST_SCOPE:-pr}"
 
@@ -196,23 +197,22 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
         -m "core_model and not omni and xpu and B60 and cards_1" --run-level core_model
     stage "mxfp8 config" 2m tests/diffusion/quantization/test_mxfp8_config.py
 
-    # Everything past this point loads a full checkpoint (Qwen3-TTS, Z-Image,
-    # Wan2.1, Voxtral) from the mounted HF cache and costs about 20 minutes, so
-    # it is off on PRs and runs on the nightly or a manually triggered build
-    # (XPU_TEST_SCOPE=broad).
+    # The omni models run in both scopes. This stage has to come last and get
+    # its own process: the async-omni engine leaves worker VRAM mapped in the
+    # pytest parent, so a 16 GiB thinker started after the other tests in the
+    # same process fails to initialise. CUDA splits the same test out for this
+    # reason.
+    stage "omni" 15m "${paths[@]}" "${ignore[@]}" \
+        -m "omni and xpu and B60 and cards_1" --run-level core_model
+
+    # advanced_model loads the larger checkpoints (Qwen3-TTS, Z-Image, Wan2.1,
+    # Voxtral), so it waits for the nightly or a manually triggered build.
+    # full_model stays out of both until the cache is seeded: tens of GB a case.
     if [ "${XPU_TEST_SCOPE:-pr}" = "broad" ]; then
-        # full_model stays out until the cache is seeded: those cases pull tens
-        # of GB of weights.
         stage "advanced_model" 15m "${paths[@]}" "${ignore[@]}" \
             -m "advanced_model and not full_model and xpu and B60 and cards_1" --run-level core_model
-        # The async-omni engine leaves worker VRAM mapped in the pytest parent,
-        # so a 16 GiB thinker started after the other tests in the same process
-        # fails to initialise. CUDA splits this test out for the same reason;
-        # keep it last and alone.
-        stage "omni" 10m "${paths[@]}" "${ignore[@]}" \
-            -m "omni and xpu and B60 and cards_1" --run-level core_model
     else
-        echo "--- :pytest: skipping advanced_model and omni (XPU_TEST_SCOPE=pr)"
+        echo "--- :pytest: skipping advanced_model (XPU_TEST_SCOPE=pr)"
     fi
 
     exit "${rc}"

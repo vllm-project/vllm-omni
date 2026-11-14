@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import os
 from contextlib import ExitStack
@@ -62,7 +65,7 @@ async def generate(
 
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_abort():
     with ExitStack() as after:
