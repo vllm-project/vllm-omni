@@ -51,6 +51,7 @@ def sized_preprocess(tmp_path, monkeypatch):
     return get_qwen_image_21_pre_process_func(SimpleNamespace(model=str(tmp_path)))
 
 
+# Keep scheduler regressions on the shared B1/B2 baseline (1024², 50 steps, seed 42, CFG 1).
 def make_request(request_id, sizes, color="red"):
     return OmniDiffusionRequest(
         request_id=request_id,
@@ -59,7 +60,7 @@ def make_request(request_id, sizes, color="red"):
             "multi_modal_data": {"image": [Image.new("RGB", size, color) for size in sizes]},
         },
         sampling_params=OmniDiffusionSamplingParams(
-            height=1024, width=1024, num_inference_steps=2, true_cfg_scale=1.0, seed=42
+            height=1024, width=1024, num_inference_steps=50, true_cfg_scale=1.0, seed=42
         ),
     )
 
@@ -382,7 +383,7 @@ def test_omitted_and_empty_negative_prompts_do_not_share_a_wave(sized_preprocess
     assert omitted.batch_compatibility_key[3] != empty.batch_compatibility_key[3]
     assert empty.batch_compatibility_key[3] == (
         True,
-        len(qwen_image_21_prompt_text(" ", num_images=0)),
+        len(qwen_image_21_prompt_text(" ", num_images=1)),
     )
 
     scheduler = scheduler_class()
