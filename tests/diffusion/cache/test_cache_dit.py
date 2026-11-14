@@ -806,3 +806,33 @@ def test_set_separate_cfg_does_nothing_without_cache_dit(request: pytest.Fixture
         set_separate_cfg(_TinyPattern3Transformer(), True)
 
     mock_refresh_context.assert_not_called()
+
+
+@pytest.mark.parametrize("cfg_world_size", [None, 1, 2])
+@pytest.mark.parametrize("runs_cfg", [True, False])
+def test_set_separate_cfg_follows_resolve_has_separate_cfg(request: pytest.FixtureRequest, runs_cfg, cfg_world_size):
+    """The per-request flag and the per-model flag use one rule for "both CFG branches on this rank"."""
+    model, pipeline, backend = _enable_cache_dit_on_tiny_transformer(request)
+    backend.refresh(pipeline, 6, verbose=False)
+
+    with _cfg_parallel(cfg_world_size):
+        set_separate_cfg(model, runs_cfg)
+        expected = cd_backend.backend.resolve_has_separate_cfg(runs_cfg)
+
+    assert _cache_context(model).cache_config.enable_separate_cfg is expected
+
+
+def test_set_separate_cfg_refreshes_quietly(request: pytest.FixtureRequest):
+    """It runs for every request, so the context rebuild must not be logged each time."""
+    model, pipeline, backend = _enable_cache_dit_on_tiny_transformer(request)
+    backend.refresh(pipeline, 6, verbose=False)
+    refresh_context = cd_backend.backend.cache_dit.refresh_context
+
+    with patch(
+        "vllm_omni.diffusion.cache.cachedit.backend.cache_dit.refresh_context", wraps=refresh_context
+    ) as mock_refresh_context:
+        set_separate_cfg(model, True)
+
+    mock_refresh_context.assert_called_once()
+    assert mock_refresh_context.call_args.kwargs["verbose"] is False
+    assert _cache_context(model).cache_config.enable_separate_cfg is True
