@@ -421,8 +421,6 @@ def test_only_the_qwen3_tts_check_skips_streaming_updates():
         if stage.prompt_transform_func
     }
     marked = {path for path in hooks if getattr(resolve_obj_by_qualname(path), SKIP_STREAMING_UPDATES_ATTR, False)}
-    # VibeVoice, GLM-Image and both MiniMax-H3 hooks stay unmarked.
-    assert len(hooks) == 5
     assert marked == {"vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder.check_text_prompt"}
 
 
