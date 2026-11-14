@@ -106,6 +106,8 @@ class PipelineWithCPUComponents(HyNomasPipeline):
         self.fail_clean = False
         self.device = torch.device("cpu")
         self.sp_size = 1
+        self._sp_error_status = torch.empty(1, dtype=torch.int32)
+        self.decoder_parallel_mode = "none"
         self._cpu_offload = False
 
     def _encode_prompt(self, text, *args, **kwargs):
@@ -126,7 +128,7 @@ class PipelineWithCPUComponents(HyNomasPipeline):
     def transformer_forward(self, **kwargs):
         hidden = kwargs["hidden_states"]
         start = kwargs["cache_valid_len"]
-        image = hidden.shape[2]
+        image = hidden.shape[2] * hidden.shape[3] * hidden.shape[4]
         count = image + (kwargs["text_states"].shape[1] if kwargs["cache_txt"] else 0)
         history = None
         for layer in range(self.num_double_blocks):
@@ -535,7 +537,10 @@ def test_empty_decoder_chunk_preserves_tick_metadata(runner):
     assert len(execute(runner, batch(index=1, close=True)).output["payload"]["video"]) == 18
 
 
-def test_public_deploy_resolution_preserves_ar_configuration(tmp_path):
+@pytest.mark.parametrize(
+    ("decoder_mode", "sp_size"), [(None, 2), ("window", 2), ("window", 4), ("window", 8), ("window", 16)]
+)
+def test_public_deploy_resolution_preserves_ar_configuration(tmp_path, decoder_mode, sp_size):
     for relative in REQUIRED_FILES:
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -547,18 +552,29 @@ def test_public_deploy_resolution_preserves_ar_configuration(tmp_path):
         str(tmp_path),
         trust_remote_code=None,
         deploy_config_path=str(deployment),
-        cli_overrides={},
-        stage_overrides=None,
+        cli_overrides=(
+            {}
+            if decoder_mode is None
+            else {"ulysses_degree": sp_size, "custom_pipeline_args": {"decoder_parallel_mode": decoder_mode}}
+        ),
+        stage_overrides=None
+        if decoder_mode is None
+        else {"0": {"devices": ",".join(str(rank) for rank in range(sp_size))}},
         strategy_config_path=None,
     )
     [stage] = resolution.stage_configs
     assert stage.diffusion_config.engine_backend == "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
     assert stage.diffusion_config.step_execution and stage.diffusion_config.streaming_output
-    assert stage.parallel_config.ulysses_degree == 2
+    assert stage.parallel_config.ulysses_degree == sp_size
+    assert stage.parallel_config.sequence_parallel_size == sp_size
+    if decoder_mode is not None:
+        assert stage.runtime_config.devices == ",".join(str(rank) for rank in range(sp_size))
+        assert stage.diffusion_config.custom_pipeline_args["decoder_parallel_mode"] == decoder_mode
     assert stage.diffusion_config.custom_pipeline_args["ar_max_latent_frames"] == 120
 
 
-def test_offline_deploy_selects_isolated_executor(tmp_path):
+@pytest.mark.parametrize("sp_size", [1, 2, 4, 8, 16])
+def test_offline_deploy_selects_isolated_executor(tmp_path, sp_size):
     for relative in REQUIRED_FILES:
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -570,14 +586,22 @@ def test_offline_deploy_selects_isolated_executor(tmp_path):
         str(tmp_path),
         trust_remote_code=None,
         deploy_config_path=str(deployment),
-        cli_overrides={},
-        stage_overrides=None,
+        cli_overrides=(
+            {}
+            if sp_size == 1
+            else {"ulysses_degree": sp_size, "custom_pipeline_args": {"decoder_parallel_mode": "window"}}
+        ),
+        stage_overrides=None if sp_size == 1 else {"0": {"devices": ",".join(str(rank) for rank in range(sp_size))}},
         strategy_config_path=None,
     )
     [stage] = resolution.stage_configs
     assert stage.diffusion_config.distributed_executor_backend == "mp"
     assert stage.model_config.enforce_eager
     assert not stage.diffusion_config.step_execution
+    assert stage.parallel_config.ulysses_degree == sp_size
+    if sp_size > 1:
+        assert stage.runtime_config.devices == ",".join(str(rank) for rank in range(sp_size))
+        assert stage.diffusion_config.custom_pipeline_args["decoder_parallel_mode"] == "window"
 
 
 @pytest.mark.parametrize("local_failure", [False, True])
