@@ -31,6 +31,7 @@ from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 
 # Max tokens per audio: Whisper 30s → 3000 mel frames → encoder 2x + adapter 8x = 16x → 188
 MAX_AUDIO_TOKENS = 188
@@ -406,16 +407,22 @@ class CovoAudioForConditionalGeneration(
             # token.  Skip BigVGAN inference and return a short silence so the
             # serving layer produces a valid WAV instead of noise.
             if code.numel() == 1 and int(code.flatten()[0]) == -1:
-                # 0.1s of silence at 24 kHz
+                sample_rate = self.code2wav.sample_rate
+                # 0.1s of silence at the emitted sample rate
                 return OmniOutput(
                     text_hidden_states=None,
-                    multimodal_outputs={"model_outputs": torch.zeros(1, 2400, device=code.device)},
+                    multimodal_outputs={
+                        "model_outputs": torch.zeros(1, sample_rate // 10, device=code.device),
+                        SAMPLE_RATE_KEY: make_sample_rate_tensors(sample_rate),
+                    },
                 )
 
             audio_tensor = self.generate_audio(code)
+            sample_rate = self.code2wav.sample_rate
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
-                    "model_outputs": audio_tensor.reshape(1, -1) if audio_tensor is not None else audio_tensor
+                    "model_outputs": audio_tensor.reshape(1, -1) if audio_tensor is not None else audio_tensor,
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(sample_rate),
                 },
             )

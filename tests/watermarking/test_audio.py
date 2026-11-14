@@ -11,7 +11,14 @@ from vllm.utils.import_utils import PlaceholderModule
 
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_modality import OutputModalityNames
-from vllm_omni.watermarking import AudioSealWatermarker, AudioTensor, AudioWatermarkerBase, audio_seal
+from vllm_omni.sample_rate import DeprecatedSampleRateKeyWarning, SampleRateError
+from vllm_omni.watermarking import (
+    AudioSealWatermarker,
+    AudioTensor,
+    AudioWatermarkerBase,
+    WatermarkFailureError,
+    audio_seal,
+)
 from vllm_omni.watermarking.utils import watermark_outputs, watermark_payload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -26,6 +33,7 @@ class _RecordingAudioWatermarker(AudioWatermarkerBase[object]):
     def __init__(self) -> None:
         super().__init__()
         self.to_wm_shapes: list[torch.Size] = []
+        self.to_wm_rates: list[int] = []
         self.verify_wm_shapes: list[torch.Size] = []
         self.watermarked: set[int] = set()
 
@@ -34,6 +42,7 @@ class _RecordingAudioWatermarker(AudioWatermarkerBase[object]):
 
     def _watermark_audio(self, data: AudioTensor, state: object) -> AudioTensor:
         self.to_wm_shapes.append(data.samples.shape)
+        self.to_wm_rates.append(data.sample_rate)
         watermarked = data.samples.clone()
         self.watermarked.add(self._tensor_hash(watermarked))
         return AudioTensor(watermarked, data.sample_rate)
@@ -77,13 +86,65 @@ def test_audio_base_round_trips_common_layouts(
     watermarker.close()
 
 
-@pytest.mark.parametrize("bad_sampling_rate", [None, 24_000.0])
+# Only the surfaced error type matters here; the invalid-value taxonomy
+# (bools, non-integral floats, negatives, conflicting tensors) is the
+# helper's contract, covered by tests/outputs/test_get_sampling_rate.py.
+@pytest.mark.parametrize("bad_sampling_rate", [None, "24000"])
 def test_audio_output_requires_integer_sample_rate(bad_sampling_rate: object) -> None:
-    """Ensure audio output rejects missing or non-integer sample rates."""
+    """Ensure audio output rejects missing or invalid sample rates."""
     watermarker = _RecordingAudioWatermarker()
 
-    with pytest.raises(TypeError, match="integer 'sr'"):
+    with pytest.raises(SampleRateError, match="sample rate"):
         watermarker.watermark_output("request", torch.zeros(100), {"sr": bad_sampling_rate})
+
+
+def test_audio_output_accepts_per_request_rate_list() -> None:
+    """Rate resolution is delegated to the helper (a shape the old reader rejected)."""
+    watermarker = _RecordingAudioWatermarker()
+    try:
+        watermarked = watermarker.watermark_output(
+            "request", torch.zeros(100), {"sr": [torch.tensor(TEST_SAMPLE_RATE)]}
+        )
+    finally:
+        watermarker.close()
+
+    assert watermarked.shape == (100,)
+    assert watermarker.to_wm_rates == [TEST_SAMPLE_RATE]
+
+
+def test_watermarker_accepts_alias_keys_with_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Legacy flat keys still watermark, warning on the way through.
+
+    The deleted rename bridge in ``watermarking/utils.py`` used to map
+    ``audio_sample_rate`` to ``sr``; the shared helper now owns that.
+    """
+    # All watermarking reads share one callsite (_from_output); reset the
+    # per-callsite warning dedup so this test is order-independent.
+    from vllm_omni import sample_rate as sr_module
+
+    monkeypatch.setattr(sr_module, "_warned_callsites", set())
+    watermarker = _RecordingAudioWatermarker()
+    payload: dict[str, object] = {"audio": np.zeros(100, dtype=np.float32), "audio_sample_rate": TEST_SAMPLE_RATE}
+
+    with pytest.warns(DeprecatedSampleRateKeyWarning, match="audio_sample_rate"):
+        try:
+            watermark_payload("request", OutputModalityNames.AUDIO, watermarker, payload)
+        finally:
+            watermarker.close()
+
+    assert watermarker.to_wm_rates == [TEST_SAMPLE_RATE]
+
+
+def test_missing_sr_raises_watermark_failure() -> None:
+    """A payload with no rate anywhere fails loudly; no default is substituted."""
+    watermarker = _RecordingAudioWatermarker()
+    payload: dict[str, object] = {"audio": np.zeros(100, dtype=np.float32)}
+
+    with pytest.raises(WatermarkFailureError, match="invalid audio output"):
+        watermark_payload("request", OutputModalityNames.AUDIO, watermarker, payload)
+
+    assert watermarker.to_wm_shapes == []
+    watermarker.close()
 
 
 def test_watermark_payload_preserves_numpy_audio_output() -> None:
