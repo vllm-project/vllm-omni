@@ -4,7 +4,7 @@
 """Unit tests for vllm_omni.entrypoints.utils module."""
 
 import logging
-from collections import Counter
+from collections import Counter, UserDict
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -12,6 +12,7 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.v1.sample.logits_processor import _load_logitsprocs_by_fqcns
 
 from vllm_omni.config.composable_parallel import (
     Broadcast,
@@ -31,10 +32,13 @@ from vllm_omni.config.resolver import (
 from vllm_omni.config.stage_config import PipelineConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 from vllm_omni.entrypoints.utils import (
     coerce_param_message_types,
     filter_dataclass_kwargs,
 )
+from vllm_omni.model_executor.models.audex.cfg import AudexCFGLogitsProcessor
+from vllm_omni.model_executor.models.audex.tta import TTARVQPhaseMaskLogitsProcessor
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -224,6 +228,75 @@ class TestConvertDataclassesToDict:
         assert "normal" in result
         assert "callable" not in result
 
+    @pytest.mark.parametrize("container_type", [list, tuple])
+    def test_sequence_filters_classes_and_other_callables(self, container_type, caplog):
+        processor_path = "vllm_omni.model_executor.models.audex.tta:TTARVQPhaseMaskLogitsProcessor"
+
+        class LocalProcessor(TTARVQPhaseMaskLogitsProcessor):
+            pass
+
+        def callback():
+            return None
+
+        values = container_type(
+            [LocalProcessor, TTARVQPhaseMaskLogitsProcessor, callback, PipelineConfig, dict, processor_path]
+        )
+
+        with caplog.at_level(logging.WARNING, logger="vllm_omni.config.resolver"):
+            result = _convert_dataclasses_to_dict({"nested": {"values": values}})
+
+        assert result["nested"]["values"] == container_type([processor_path])
+        assert values[0] is LocalProcessor
+        assert values[2] is callback
+        assert sum("Filtered callable" in record.message for record in caplog.records) == 5
+
+    @pytest.mark.parametrize("mapping_type", [dict, UserDict])
+    def test_mapping_filters_classes_without_guessing_import_paths(self, mapping_type, caplog):
+        @dataclass
+        class LocalConfig:
+            value: int = 1
+
+        pipeline_path = "custom_pipeline.CustomPipeline"
+        values = mapping_type(
+            {
+                "local_class": LocalConfig,
+                "module_class": PipelineConfig,
+                "builtin_class": dict,
+                "pipeline_class": pipeline_path,
+                "config": LocalConfig(),
+            }
+        )
+
+        with caplog.at_level(logging.WARNING, logger="vllm_omni.config.resolver"):
+            result = _convert_dataclasses_to_dict({"nested": values})
+
+        assert result == {"nested": {"pipeline_class": pipeline_path, "config": {"value": 1}}}
+        assert values["local_class"] is LocalConfig
+        assert "Filtered out 3 callable object(s)" in caplog.text
+
+    def test_set_filters_class_objects(self):
+        class LocalClass:
+            pass
+
+        assert _convert_dataclasses_to_dict({LocalClass, "custom_pipeline.CustomPipeline"}) == [
+            "custom_pipeline.CustomPipeline"
+        ]
+
+    def test_direct_class_is_rejected_instead_of_converted_to_an_import_path(self):
+        class LocalClass:
+            pass
+
+        with pytest.raises(TypeError, match="not an OmegaConf-compatible value"):
+            _convert_dataclasses_to_dict(LocalClass)
+
+    def test_dataclass_class_field_is_rejected_like_other_callables(self):
+        @dataclass
+        class LocalConfig:
+            factory: type = dict
+
+        with pytest.raises(TypeError, match="not an OmegaConf-compatible value"):
+            _convert_dataclasses_to_dict(LocalConfig())
+
 
 class TestFilterDataclassKwargs:
     """Test basic functionality of filter_dataclass_kwargs."""
@@ -303,6 +376,43 @@ class TestFilterDataclassKwargs:
 
 
 class TestResolveOmniConfig:
+    @pytest.mark.parametrize("override_name", ["logits_processors", "stage_0_logits_processors"])
+    @pytest.mark.parametrize("processor_form", ["classes", "mixed", "strings"])
+    def test_logits_processor_paths_reach_engine_loader(self, mocker: MockerFixture, override_name, processor_form):
+        class LocalProcessor(TTARVQPhaseMaskLogitsProcessor):
+            pass
+
+        processor_classes = [AudexCFGLogitsProcessor, TTARVQPhaseMaskLogitsProcessor]
+        processor_paths = [
+            "vllm_omni.model_executor.models.audex.cfg:AudexCFGLogitsProcessor",
+            "vllm_omni.model_executor.models.audex.tta:TTARVQPhaseMaskLogitsProcessor",
+        ]
+        processors = {
+            "classes": [AudexCFGLogitsProcessor, LocalProcessor],
+            "mixed": [LocalProcessor, processor_paths[0], TTARVQPhaseMaskLogitsProcessor, processor_paths[1]],
+            "strings": processor_paths,
+        }[processor_form]
+        expected_paths = [] if processor_form == "classes" else processor_paths
+        expected_classes = [] if processor_form == "classes" else processor_classes
+        mocker.patch(
+            "vllm_omni.config.config_factory.StageConfigFactory.get_pipeline_config",
+            return_value=QWEN3_OMNI_PIPELINE,
+        )
+        mocker.patch("vllm_omni.engine.stage_init_utils.resolve_worker_cls")
+
+        resolved = resolve_omni_config(
+            "dummy-model",
+            trust_remote_code=False,
+            deploy_config_path=None,
+            cli_overrides={override_name: processors},
+            stage_overrides=None,
+            strategy_config_path=None,
+        )
+        engine_args = build_engine_args_dict_from_omni_stage_config(resolved.stage_by_id(0), "dummy-model")
+
+        assert engine_args["logits_processors"] == expected_paths
+        assert _load_logitsprocs_by_fqcns(engine_args["logits_processors"]) == expected_classes
+
     @pytest.mark.parametrize("model_class_name", ["AnimaPipeline", "AnimaModularPipeline"])
     def test_native_anima_checkpoint_uses_default_diffusion_stage_without_model_config(
         self, tmp_path, mocker: MockerFixture, model_class_name: str
