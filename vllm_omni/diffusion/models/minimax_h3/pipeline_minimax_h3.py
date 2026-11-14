@@ -147,6 +147,7 @@ from .denoise_loop import (
     minimax_h3_publish_denoise_progress,
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
+from .encoder_config import EncoderWeightTransfer, encoder_weight_transfer
 from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
 from .fasth3_checkpoint import FastH3CheckpointSpec, FastH3OmniCheckpointSpec
 from .latent_cache import (
@@ -1013,6 +1014,7 @@ class MiniMaxH3Pipeline(
         # _prepare_encoder_conditioning_inputs rejects; fail here instead of on every such request.
         service_schedule = getattr(od_config, "diffusion_attention_schedule", None)
         additional_config = getattr(od_config, "additional_config", None) or {}
+        self._encoder_weight_transfer = encoder_weight_transfer(additional_config)
         if (
             service_schedule is not None
             and service_schedule.default
@@ -1025,6 +1027,18 @@ class MiniMaxH3Pipeline(
             )
         self.device = get_local_device()
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
+        if self._encoder_weight_transfer is not EncoderWeightTransfer.OFF and (
+            self.device.type != "npu"
+            or not self.load_text_encoder
+            or not offload_streams_blocks(od_config)
+            or (
+                od_config.diffusion_offload_config is not None
+                and not should_offload_component(od_config, TEXT_ENCODER_COMPONENT)
+            )
+        ):
+            raise ValueError(
+                "encoder_weight_transfer requires a local MiniMax-H3 NPU text encoder selected for layer offload"
+            )
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
         self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
         if not self.load_vae_decoder and self.load_vae_encoder:
@@ -1765,9 +1779,7 @@ class MiniMaxH3Pipeline(
         *,
         encoder_staged: bool = False,
     ) -> torch.Tensor:
-        encode_kwargs: dict[str, Any] = vision_kwargs
-        if os.environ.get("VLLM_OMNI_H3_HIDDEN_DEVICE", "0") == "1":
-            encode_kwargs = {**vision_kwargs, "return_on_device": True}
+        encode_kwargs = {**vision_kwargs, "return_on_device": True}
         if getattr(self, "_model_cpu_offload_modules", None):
             # Invoke nn.Module.__call__ so the generic model-level offloader
             # swaps the resident DiT and encoder.
@@ -1777,7 +1789,9 @@ class MiniMaxH3Pipeline(
             return self.text_encoder.encode_ids(input_ids, **encode_kwargs)
 
         if self._uses_manual_component_offload(self.text_encoder):
-            if isinstance(self.text_encoder, MiniMaxH3Qwen3VLEncoder):
+            if self._encoder_weight_transfer is not EncoderWeightTransfer.OFF and isinstance(
+                self.text_encoder, MiniMaxH3Qwen3VLEncoder
+            ):
                 self.text_encoder.prepare_packed_offload()
             with self._component_on_device(self.text_encoder):
                 return self.text_encoder.encode_ids(input_ids, **encode_kwargs)
@@ -2891,7 +2905,7 @@ class MiniMaxH3Pipeline(
         _, rank, _ = _dit_rank_world()
         scope = (
             self._encoder_non_block_prefetch_scope(rank)
-            if os.environ.get("VLLM_OMNI_H3_NONBLOCK_PREFETCH", "0") == "1"
+            if self._encoder_weight_transfer is EncoderWeightTransfer.PACKED_PREFETCH
             else nullcontext(False)
         )
         with scope as encoder_staged:

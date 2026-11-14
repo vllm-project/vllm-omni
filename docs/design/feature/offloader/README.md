@@ -52,6 +52,13 @@ that worker is safely discarded after local resource cleanup.
 Hooks are registered through `HookRegistry` and `ModelHook`; offload backends
 must use distinct hook names and remove only hooks they own.
 
+The MiniMax-H3 video pipeline resolves its NPU encoder weight-transfer mode
+from `additional_config.encoder_weight_transfer` at construction. `packed`
+uses module/dtype host packs; `packed_prefetch` also owns encoder residency
+from before CPU preprocessing through result broadcast. Both require encoder
+layer offload. `off` preserves the existing weight-transfer path. Hidden
+activations remain device-owned for broadcast independently of weight mode.
+
 ## Discovery and topology
 
 `resolve_offload_plan(pipeline, config)` is the single topology entry point.

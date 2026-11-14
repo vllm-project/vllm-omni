@@ -36,6 +36,32 @@ higher-priority strategy is selected.
   when a multi-rank deployment also needs bounded device residency and,
   optionally, sharded host weights.
 
+## MiniMax-H3 encoder weight transfer
+
+For the MiniMax-H3 video pipeline on Ascend NPU,
+`additional_config.encoder_weight_transfer` selects the encoder transfer
+optimization at deployment time:
+
+| Mode | Behavior |
+| --- | --- |
+| `off` (default) | Uses the existing weight-transfer path. |
+| `packed` | Packs CPU master weights by module and dtype for fewer H2D copies; unloading restores CPU bindings without weight D2H. |
+| `packed_prefetch` | Uses packed transfers and starts loading before CPU image/video preprocessing; encoder residency ends after result broadcast. |
+
+For example:
+
+```bash
+vllm serve /path/to/MiniMax-H3 --omni \
+  --diffusion-offload-config '{"mode":"layer","components":["dit","text_encoder"]}' \
+  --additional-config '{"encoder_weight_transfer":"packed_prefetch"}'
+```
+
+Non-`off` modes require a local NPU encoder selected for layerwise or
+distributed layerwise offload. Unsupported configurations and invalid mode
+values fail at startup. `off` disables this optimization, not CPU offloading.
+The video pipeline keeps encoder hidden states on the device for broadcast
+in every mode; standalone encoder calls still return CPU tensors by default.
+
 ## Supported models
 
 | Architecture | Example models | DiT class | Model-level | Layerwise | Distributed layerwise | Layerwise block attributes |

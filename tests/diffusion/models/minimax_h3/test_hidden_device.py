@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import ast
-import os
 from contextlib import contextmanager
 from pathlib import Path
 from types import MethodType
 
 import pytest
 import torch
+
+from vllm_omni.diffusion.models.minimax_h3.encoder_config import EncoderWeightTransfer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 ROOT = Path(__file__).resolve().parents[4]
@@ -27,7 +28,7 @@ def method(file, owner, name):
     module = ast.Module(body=ast.parse("from __future__ import annotations").body + [fn], type_ignores=[])
     scope = {
         "torch": torch,
-        "os": os,
+        "EncoderWeightTransfer": EncoderWeightTransfer,
         "contextmanager": contextmanager,
         "MiniMaxH3Qwen3VLEncoder": MiniMaxH3Qwen3VLEncoder,
     }
@@ -80,11 +81,9 @@ def test_forward_keeps_default_call_and_forwards_opt_in(mocker):
 
 
 @pytest.mark.parametrize("branch", ["resident", "manual", "sequential"])
-@pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("fail", [False, True])
-def test_pipeline_routing_lifetime_and_input_ownership(mocker, monkeypatch, branch, enabled, fail):
+def test_pipeline_routing_lifetime_and_input_ownership(mocker, branch, fail):
     call = method("pipeline_minimax_h3.py", "MiniMaxH3Pipeline", "_encode_text_hidden")
-    monkeypatch.setenv("VLLM_OMNI_H3_HIDDEN_DEVICE", "1" if enabled else "0")
     events: list[object] = []
     hidden = torch.arange(12).reshape(3, 4).to(torch.bfloat16)
 
@@ -110,6 +109,7 @@ def test_pipeline_routing_lifetime_and_input_ownership(mocker, monkeypatch, bran
         _model_cpu_offload_modules=["module"] if branch == "sequential" else [],
         _uses_manual_component_offload=lambda c: branch == "manual",
         _component_on_device=scope,
+        _encoder_weight_transfer=EncoderWeightTransfer.OFF,
     )
     kwargs = {"pixel_values": torch.zeros(1)}
     if fail:
@@ -119,7 +119,7 @@ def test_pipeline_routing_lifetime_and_input_ownership(mocker, monkeypatch, bran
         assert call(obj, torch.tensor([1]), kwargs) is hidden
         assert torch.equal(hidden, torch.arange(12).reshape(3, 4).to(torch.bfloat16))
     passed = next(e[1] for e in events if isinstance(e, tuple))
-    assert passed.get("return_on_device", False) == enabled
+    assert passed["return_on_device"] is True
     assert set(kwargs) == {"pixel_values"}
     if branch == "manual":
         assert events[0] == "load" and events[-1] == "offload"
@@ -130,11 +130,9 @@ def test_pipeline_routing_lifetime_and_input_ownership(mocker, monkeypatch, bran
         encoder.load_to_device.assert_called_once()
 
 
-@pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("branch", ["manual", "sequential"])
 @pytest.mark.parametrize("fail", [False, True])
-def test_real_module_hooks_and_component_cleanup(mocker, monkeypatch, enabled, branch, fail):
-    monkeypatch.setenv("VLLM_OMNI_H3_HIDDEN_DEVICE", "1" if enabled else "0")
+def test_real_module_hooks_and_component_cleanup(mocker, branch, fail):
     events = []
 
     class Encoder(torch.nn.Module):
@@ -166,6 +164,7 @@ def test_real_module_hooks_and_component_cleanup(mocker, monkeypatch, enabled, b
         text_encoder=enc,
         _model_cpu_offload_modules=[enc] if branch == "sequential" else [],
         _uses_manual_component_offload=lambda c: True,
+        _encoder_weight_transfer=EncoderWeightTransfer.OFF,
     )
     obj._component_on_device = MethodType(
         method("pipeline_minimax_h3.py", "MiniMaxH3Pipeline", "_component_on_device"), obj

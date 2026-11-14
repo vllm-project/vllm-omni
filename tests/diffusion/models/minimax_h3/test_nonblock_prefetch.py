@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import ast
-import os
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from types import MethodType
 
 import pytest
 import torch
+
+from vllm_omni.diffusion.models.minimax_h3.encoder_config import EncoderWeightTransfer
 
 pytestmark = [pytest.mark.cpu, pytest.mark.core_model, pytest.mark.diffusion]
 SOURCE = Path(__file__).resolve().parents[4] / "vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3.py"
@@ -24,7 +25,17 @@ def load(name, scope):
     return scope[name]
 
 
-def make_fixture(mocker, rank=0, world=2, manual=True, dlo=True, sequential=False, load_error=None, remote_error=None):
+def make_fixture(
+    mocker,
+    rank=0,
+    world=2,
+    manual=True,
+    dlo=True,
+    sequential=False,
+    load_error=None,
+    remote_error=None,
+    transfer=EncoderWeightTransfer.PACKED_PREFETCH,
+):
     events = []
 
     class MiniMaxH3Qwen3VLEncoder:
@@ -66,7 +77,7 @@ def make_fixture(mocker, rank=0, world=2, manual=True, dlo=True, sequential=Fals
     dist = mocker.Mock(all_reduce=reduce, all_gather_object=gather, ReduceOp=mocker.Mock(MIN="min"))
     scope = {
         "torch": torch,
-        "os": os,
+        "EncoderWeightTransfer": EncoderWeightTransfer,
         "ExitStack": ExitStack,
         "contextmanager": contextmanager,
         "nullcontext": nullcontext,
@@ -83,6 +94,7 @@ def make_fixture(mocker, rank=0, world=2, manual=True, dlo=True, sequential=Fals
         _model_cpu_offload_modules=[encoder] if sequential else [],
         _uses_manual_component_offload=lambda c: manual,
         _component_on_device=component_scope,
+        _encoder_weight_transfer=transfer,
     )
     owner._encoder_non_block_prefetch_scope = MethodType(load("_encoder_non_block_prefetch_scope", scope), owner)
     return owner, events, scope
@@ -149,24 +161,22 @@ def test_body_failure_is_not_hidden_and_scope_released(mocker, failure):
     assert events[-1] == "cleanup"
 
 
-def test_already_staged_encode_does_not_reload_or_release(mocker, monkeypatch):
+def test_already_staged_encode_does_not_reload_or_release(mocker):
     owner, events, scope = make_fixture(mocker)
     owner.text_encoder.encode_ids = mocker.Mock(return_value=torch.ones(1))
-    monkeypatch.setenv("VLLM_OMNI_H3_HIDDEN_DEVICE", "0")
     call = load("_encode_text_hidden", scope)
     with owner._encoder_non_block_prefetch_scope(0) as staged:
         call(owner, torch.tensor([1]), {}, encoder_staged=staged)
         assert events == ["load", "cpu status"]
     assert events == ["load", "cpu status", "cleanup"]
-    owner.text_encoder.encode_ids.assert_called_once_with(torch.tensor([1]))
+    owner.text_encoder.encode_ids.assert_called_once_with(torch.tensor([1]), return_on_device=True)
 
 
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("transfer", list(EncoderWeightTransfer))
 @pytest.mark.parametrize("bad_input", [False, True])
-def test_encode_prompt_order_and_prepare_failure_cleanup(mocker, monkeypatch, enabled, bad_input):
-    owner, events, scope = make_fixture(mocker)
-    monkeypatch.setenv("VLLM_OMNI_H3_NONBLOCK_PREFETCH", "1" if enabled else "0")
-    monkeypatch.setenv("VLLM_OMNI_H3_HIDDEN_DEVICE", "0")
+def test_encode_prompt_order_and_prepare_failure_cleanup(mocker, transfer, bad_input):
+    owner, events, scope = make_fixture(mocker, transfer=transfer)
+    enabled = transfer is EncoderWeightTransfer.PACKED_PREFETCH
 
     def preprocess_impl(*args, **kwargs):
         events.append("prepare")
@@ -224,6 +234,7 @@ def test_encode_prompt_order_and_prepare_failure_cleanup(mocker, monkeypatch, en
         if not enabled:
             expected = ["prepare", "distribute", "load", "encode", "cleanup", "broadcast", "broadcast"]
         assert events == expected
+        assert owner.text_encoder.prepare_packed_offload.call_count == (transfer is not EncoderWeightTransfer.OFF)
 
 
 def test_eligibility_failure_is_also_coordinated(mocker):
