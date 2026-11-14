@@ -2146,6 +2146,8 @@ def test_bagel_weekly_covers_shared_offline_rocm_nodes() -> None:
         source = source_path.read_text(encoding="utf-8")
         marks = source.split(f"def {test_name}", maxsplit=1)[0].rsplit("\n\n", maxsplit=1)[-1]
         assert '@hardware_test(res={"cuda": "H100", "rocm": "MI325"})' in marks
+        assert '"stage_init_timeout": 1800' in source
+        assert '"init_timeout": 2100' in source
 
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
         assert "Bagel offline shared · 1-GPU" not in pipeline_path.read_text(encoding="utf-8")
