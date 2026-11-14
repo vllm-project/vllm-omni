@@ -102,6 +102,10 @@ platforms:
         quantization: fp8
         enable_expert_parallel: true
         worker_cls: vllm_omni.platforms.xpu.worker.xpu_ar_worker.XPUARWorker
+        # Both stages run on one node, and mooncake (RDMA) is not a
+        # dependency on XPU, so hand off the AR->DiT KV cache via shared memory.
+        output_connectors:
+          to_stage_1: shared_memory_connector
         default_sampling_params:
           max_tokens: 2048
           seed: 42
@@ -110,6 +114,8 @@ platforms:
         gpu_memory_utilization: 0.9
         devices: "4,5,6,7"
         quantization: fp8
+        input_connectors:
+          from_stage_0: shared_memory_connector
         parallel_config:
           pipeline_parallel_size: 1
           data_parallel_size: 1
