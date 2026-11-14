@@ -652,6 +652,7 @@ def test_async_output_routes_sparse_audio_by_request_id(monkeypatch, mocker, asy
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     audio = torch.arange(10 * 1024, dtype=torch.float32)
     sample_rate = torch.tensor(22050, dtype=torch.int32)
     batch = mocker.Mock(spec=InputBatch)
@@ -670,6 +671,7 @@ def test_async_output_routes_sparse_audio_by_request_id(monkeypatch, mocker, asy
             torch.zeros(2, dtype=torch.long),
         ),
         num_sampled_tokens=torch.ones(2, dtype=torch.long),
+        text_hidden=hidden,
         multimodal_outputs={
             "model_outputs": [audio],
             "sr": [sample_rate],
@@ -681,12 +683,47 @@ def test_async_output_routes_sparse_audio_by_request_id(monkeypatch, mocker, asy
 
     payloads = output.multimodal_outputs if async_chunk else output.inter_stage_outputs
     assert payloads is not None
-    assert payloads[0] in ({}, None)
+    if async_chunk:
+        assert payloads[0] in ({}, None)
+        expected_keys = {"model_outputs", "sr"}
+    else:
+        assert payloads[0] is not None
+        assert set(payloads[0]) == {"hidden"}
+        torch.testing.assert_close(payloads[0]["hidden"], hidden[0:1])
+        expected_keys = {"hidden", "model_outputs", "sr"}
     assert payloads[1] is not None
-    assert set(payloads[1]) == {"model_outputs", "sr"}
+    assert set(payloads[1]) == expected_keys
+    if not async_chunk:
+        torch.testing.assert_close(payloads[1]["hidden"], hidden[1:2])
     torch.testing.assert_close(payloads[1]["model_outputs"], audio)
     torch.testing.assert_close(payloads[1]["sr"], sample_rate)
     assert not any(key.startswith("meta.") for payload in payloads if payload for key in payload)
+
+
+@pytest.mark.cpu
+def test_non_audio_pooler_ignores_invalid_sparse_audio_declaration() -> None:
+    """Non-audio stages keep dense routing even if audio metadata is malformed."""
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    codes = torch.arange(32, dtype=torch.long).reshape(2, 16)
+
+    payloads = OmniARModelRunner._build_pooler_output_from_cpu(
+        hidden,
+        {
+            "codes": {"audio": codes},
+            "meta": {"req_id": ["req-b"], "sparse_audio": 1},
+        },
+        np.array([0, 1, 2]),
+        np.array([1, 1]),
+        2,
+        req_ids=["req-a", "req-b"],
+        engine_output_type="latent",
+    )
+
+    assert len(payloads) == 2
+    for i, payload in enumerate(payloads):
+        assert set(payload) == {"hidden", "codes.audio"}
+        torch.testing.assert_close(payload["hidden"], hidden[i : i + 1])
+        torch.testing.assert_close(payload["codes.audio"], codes[i : i + 1])
 
 
 @pytest.mark.parametrize("async_chunk", [False, True])
