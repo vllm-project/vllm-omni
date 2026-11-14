@@ -1,0 +1,21 @@
+# Wan2.1-T2V-1.3B, one RTX 5060 Laptop 8 GB, layerwise text encoder and DiT offload.
+pipeline: wan2_2
+async_chunk: false
+dtype: bfloat16
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    gpu_memory_utilization: 0.9
+    flow_shift: 8.0
+    diffusion_offload_config:
+      mode: layer
+      components: [text_encoder, dit]
+      pin_memory: false
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 20
+      guidance_scale: 6.0

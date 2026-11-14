@@ -126,6 +126,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`OpenBMB/VoxCPM2.md`](./OpenBMB/VoxCPM2.md) | Online + offline TTS with native AR pipeline (48 kHz, 30+ languages) | 1x RTX 4090 24GB / 1x Ascend 910B3 64GB |
 | [`OpenMOSS/MOSS-TTS.md`](./OpenMOSS/MOSS-TTS.md) | Online + offline multilingual TTS (MOSS-TTS family, 8B) | 1x H100 80GB |
 | [`OpenMOSS/MOSS-TTS-Nano-NPU.md`](./OpenMOSS/MOSS-TTS-Nano-NPU.md) | Online multilingual voice-cloned TTS | 1x Ascend 910B3 64GB |
+| [`OpenMOSS/MOSS-TTS-Nano-RTX5060-8GB.md`](./OpenMOSS/MOSS-TTS-Nano-RTX5060-8GB.md) | Online text-to-speech (MOSS-TTS-Nano-100M) | 1x RTX 5060 Laptop 8GB |
 | [`Physis-AI/CausVid-Wan.md`](./Physis-AI/CausVid-Wan.md) | Experimental offline Noisy PP / Chunk PP on CausVid Wan 2.1 1.3B | Multi-GPU CUDA (SF: S=1; Latest-KV: S=D+1) |
 | [`Physis-AI/Physis-Same-Step.md`](./Physis-AI/Physis-Same-Step.md) | Experimental Same-Step video on five Physis checkpoints | Multi-GPU CUDA |
 | [`NVIDIA/Nemotron-Labs-Audex.md`](./NVIDIA/Nemotron-Labs-Audex.md) | TTS / text-to-audio / audio understanding / cascaded S2S (Audex 2B + 30B-A3B) | 1x H100 80GB |
@@ -154,10 +155,12 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`Wan-AI/Wan2.2-I2V.md`](./Wan-AI/Wan2.2-I2V.md) | Image-to-video serving (Wan2.2 14B) | 8x Ascend NPU (A2/A3) |
 | [`Wan-AI/Wan2.2-S2V.md`](./Wan-AI/Wan2.2-S2V.md) | Speech-to-video serving (Wan2.2 14B) | 2x A100/H100 80GB |
 | [`Wan-AI/Wan2.1-VACE.md`](./Wan-AI/Wan2.1-VACE.md) | Unified T2V, I2V, V2LF, FLF2V, inpaint, and R2V | 1x RTX 5090 (1.3B) / 1x L40S 48GB with layerwise offload (14B) |
+| [`Wan-AI/Wan2.1-T2V-1.3B-RTX5060-8GB.md`](./Wan-AI/Wan2.1-T2V-1.3B-RTX5060-8GB.md) | Text-to-video serving (Wan2.1 1.3B) with layerwise offload | 1x RTX 5060 Laptop 8GB |
 | [`XiaomiMiMo/MiMo-Audio.md`](./XiaomiMiMo/MiMo-Audio.md) | Offline + online omni audio (TTS, ASR, dialogue) | 1x RTX 5090 / 5090D 32GB |
 | [`LiquidAI/LFM3-Audio-2B.md`](./LiquidAI/LFM3-Audio-2B.md) | ASR, audio understanding, TTS, and interleaved text/audio | 1x RTX 4090 24GB |
 | [`LiquidAI/LFM3-Omni-2B.md`](./LiquidAI/LFM3-Omni-2B.md) | Multimodal understanding, TTS, and interleaved text/audio | 1x Ascend 910B1 64GB, 1x RTX 4090 24GB |
 | [`StabilityAI/Stable-Diffusion-3.5.md`](./StabilityAI/Stable-Diffusion-3.5.md) | Text-to-image serving (SD 3.5-medium and SD 3.5-large) | 1x RTX A6000 48GB / 1x Intel Arc Pro B70 32GB |
+| [`StabilityAI/Stable-Diffusion-3.5-RTX5060-8GB.md`](./StabilityAI/Stable-Diffusion-3.5-RTX5060-8GB.md) | Text-to-image serving (SD 3.5-medium) with layerwise offload and VAE tiling | 1x RTX 5060 Laptop 8GB |
 | [`zai-org/GLM-TTS.md`](./zai-org/GLM-TTS.md) | Online serving for Chinese/English zero-shot voice-cloned TTS | 1x A40 48GB / 2x non-standard RTX 4090 48GB (49,140 MiB each) |
 | [`GLM/GLM-Image.md`](./GLM/GLM-Image.md) | Online serving for image generation | 1x A800 80GB / 2x A800 80GB |
 | [`JD/JoyAI-VL-Interaction.md`](./JD/JoyAI-VL-Interaction.md) | Real-time streaming video-language interaction (proactive speak/silence/delegate) | 1x GPU 24GB+ |

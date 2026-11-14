@@ -66,6 +66,7 @@ from vllm_omni.diffusion.models.wan2_2.conditioning import (
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention, WanTransformer3DModel
 from vllm_omni.diffusion.offloader import OffloadPlan
+from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -436,6 +437,18 @@ _WAN_TEXT_ENCODER_OFFLOAD_PLAN = OffloadPlan(
 )
 
 
+def _text_encoder_load_device(od_config: OmniDiffusionConfig, device: torch.device) -> torch.device | str:
+    """Where the text encoder lands before its layerwise hooks exist.
+
+    The UMT5 checkpoint is larger than an 8 GB card. Moving it onto the device
+    here happens before the offload hooks are installed, so a layerwise text
+    encoder must stay on CPU until those hooks stream it.
+    """
+    if resolve_offload(od_config).offloads(TEXT_ENCODER_COMPONENT):
+        return "cpu"
+    return device
+
+
 class Wan22Pipeline(
     nn.Module,
     PipelineParallelMixin,
@@ -596,7 +609,7 @@ class Wan22Pipeline(
                 prefetch_list=component_subfolders,
                 local_files_only=local_files_only,
                 torch_dtype=dtype,
-            ).to(self.device)
+            ).to(_text_encoder_load_device(od_config, self.device))
         else:
             self.tokenizer = None
             self.text_encoder = None
