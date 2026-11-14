@@ -470,15 +470,49 @@ def test_reserve_pending_shares_the_byte_budget():
     assert store.append("S", "hidden", rows)
 
 
-def test_append_beyond_with_reserved_bytes_releases_and_appends_atomically():
-    """The release and the append share one lock hold, so the reservation
-    guarantees the append even if other work could use the budget."""
-    store = SessionPrefixStore(max_bytes=32)
+def test_append_beyond_with_reserved_bytes_is_atomic(monkeypatch):
+    """The reserved release and the append share one lock hold.
+
+    This test discriminates atomicity: a racing ``release_pending``
+    (another session appending the moment the budget is freed) makes
+    the split sequence fail, while the single ``append_beyond`` call
+    never exposes that window — it releases the reservation without
+    calling ``release_pending`` at all, so the competitor never runs.
+    A single-threaded test without the racer would pass for the split
+    version too.
+    """
     rows = _rows(0, 2)  # 32 bytes
     reserved = rows.numel() * rows.element_size()
+
+    def racing_release(store):
+        real_release = SessionPrefixStore.release_pending
+
+        def _release(nbytes):
+            real_release(store, nbytes)
+            # Another session takes the freed budget before the append.
+            store.append("T", "hidden", _rows(0, 1))
+
+        return _release
+
+    # Split sequence: release, then append. The competitor lands first
+    # (16 bytes) and the 32-byte append no longer fits.
+    store = SessionPrefixStore(max_bytes=32)
     assert store.reserve_pending("S", reserved)
     assert not store.append("S", "hidden", _rows(0, 1))
+    monkeypatch.setattr(store, "release_pending", racing_release(store))
+    store.release_pending(reserved)
+    assert store.stored_tokens("T", "hidden") == 1
+    assert not store.append_beyond("S", "hidden", 0, rows)
+    assert store.stored_tokens("S", "hidden") == 0
+
+    # Single call: the reservation is released and the rows append under
+    # one lock hold, so the competitor never gets a turn.
+    store = SessionPrefixStore(max_bytes=32)
+    assert store.reserve_pending("S", reserved)
+    assert not store.append("S", "hidden", _rows(0, 1))
+    monkeypatch.setattr(store, "release_pending", racing_release(store))
     assert store.append_beyond("S", "hidden", 0, rows, reserved_bytes=reserved)
+    assert store.stored_tokens("T", "hidden") == 0
     assert store.pending_bytes() == 0
     assert store.stored_tokens("S", "hidden") == 2
 
