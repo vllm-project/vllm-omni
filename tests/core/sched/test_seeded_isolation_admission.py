@@ -26,7 +26,6 @@ from vllm.v1.request import RequestStatus
 
 import vllm_omni.core.sched.omni_ar_scheduler as ar_sched_mod
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
-from vllm_omni.core.sched.seeded_isolation import ENV_VAR
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -55,7 +54,9 @@ class _StubRequest:
         return (self.priority, self.arrival_time) < (other.priority, other.arrival_time)
 
 
-def _make_scheduler(*, parked: int, waiting, reserved_slots: int = 0, adapter_parked_running=()) -> OmniARScheduler:
+def _make_scheduler(
+    *, parked: int, waiting, kv_holding=(), reserved_slots: int = 0, adapter_parked_running=()
+) -> OmniARScheduler:
     """Real scheduler wrapper with the surface ``schedule()`` reads."""
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler.policy = SchedulingPolicy.FCFS
@@ -63,9 +64,11 @@ def _make_scheduler(*, parked: int, waiting, reserved_slots: int = 0, adapter_pa
     for request in waiting:
         scheduler.waiting.add_request(request)
     scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    for request in kv_holding:
+        scheduler.kv_holding_waiting.add_request(request)
     scheduler.deferred_waiting = set()
     scheduler.running = []
-    scheduler.requests = {request.request_id: request for request in waiting}
+    scheduler.requests = {request.request_id: request for request in (*waiting, *kv_holding)}
     scheduler.num_waiting_for_streaming_input = parked
     scheduler.max_num_active_reqs = 8
     scheduler.max_num_running_reqs = 8
@@ -97,10 +100,12 @@ def _make_scheduler(*, parked: int, waiting, reserved_slots: int = 0, adapter_pa
 
 def _run_schedule(scheduler: OmniARScheduler, monkeypatch: pytest.MonkeyPatch) -> dict:
     """Run ``OmniARScheduler.schedule`` with the upstream admission condition."""
-    seen: dict = {"limit": None, "admitted": None}
+    seen: dict = {"limit": None, "admitted": None, "waiting_len": None, "kv_len": None}
 
     def upstream_schedule(_self, _throttle_prefills: bool = False):
         seen["limit"] = scheduler.max_num_active_reqs
+        seen["waiting_len"] = len(scheduler.waiting)
+        seen["kv_len"] = len(scheduler.kv_holding_waiting)
         # The ``not len(scheduler.waiting)`` guard is a test-only divergence: the
         # real upstream breaks out of its admission loop when the queue is empty,
         # while this stub has to return before popping. Keep it when editing.
@@ -114,7 +119,6 @@ def _run_schedule(scheduler: OmniARScheduler, monkeypatch: pytest.MonkeyPatch) -
         return seen
 
     monkeypatch.setattr(ar_sched_mod.VLLMScheduler, "schedule", upstream_schedule)
-    monkeypatch.setenv(ENV_VAR, "1")
     OmniARScheduler.schedule(scheduler)
     return seen
 
@@ -270,3 +274,34 @@ def test_unseeded_traffic_keeps_the_original_limit(monkeypatch) -> None:
 
     assert seen["admitted"] == "plain"
     assert seen["limit"] == 8
+
+
+def test_kv_holding_seeded_request_is_promoted_before_a_fresh_one() -> None:
+    """Review P2: upstream drains KV-holding requests first, so must the policy."""
+    fresh = _StubRequest("seeded-fresh", seed=7)
+    resumed = _StubRequest("seeded-kv", seed=9)
+    scheduler = _make_scheduler(parked=0, waiting=[fresh], kv_holding=[resumed])
+
+    assert scheduler._promote_seeded_request() == "kv_holding"
+    assert scheduler.kv_holding_waiting.peek_request() is resumed
+    assert scheduler.waiting.peek_request() is fresh
+
+
+def test_solo_step_hides_the_waiting_queue_when_promoting_kv_holding(monkeypatch) -> None:
+    """A fresh request that cannot allocate must not hide a runnable KV-holding one.
+
+    The promoted KV-holding request keeps its queue; the fresh ``waiting`` queue
+    is the one emptied for the solo step, so the engine cannot livelock on a
+    request whose prefill allocation keeps failing.
+    """
+    fresh = _StubRequest("seeded-fresh", seed=7)
+    resumed = _StubRequest("seeded-kv", seed=9)
+    scheduler = _make_scheduler(parked=0, waiting=[fresh], kv_holding=[resumed])
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    assert seen["waiting_len"] == 0
+    assert seen["kv_len"] == 1
+    # The stub only admits from ``waiting``; the point is that the fresh queue
+    # is hidden and the KV-holding request stays eligible.
+    assert seen["admitted"] is None

@@ -894,7 +894,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         Returns the queue that was promoted (``"waiting"`` or
         ``"kv_holding"``), or ``None`` when no seeded request is waiting.
         """
-        for name, queue in (("waiting", self.waiting), ("kv_holding", self.kv_holding_waiting)):
+        # Upstream drains KV-holding requests first: their blocks are already
+        # allocated, so they can finish and release memory for the requests that
+        # still need a prefill allocation. Promoting a fresh ``waiting`` request
+        # ahead of them hides that queue for the solo step, and a fresh request
+        # that cannot allocate would livelock the engine while a runnable
+        # KV-holding request waits behind it (review P2 on #9937).
+        for name, queue in (("kv_holding", self.kv_holding_waiting), ("waiting", self.waiting)):
             target = next(
                 (
                     r
