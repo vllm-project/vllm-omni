@@ -957,6 +957,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     moe_backend: str = "auto"
     linear_backend: str = "auto"
     force_cutlass_fp8: bool = False
+    diffusion_flashinfer_autotune: bool | None = None
     enable_diffusion_pipeline_profiler: bool = False
     enable_mixfusion: bool = False
     mixfusion_min_chunk_tokens: int = 256
