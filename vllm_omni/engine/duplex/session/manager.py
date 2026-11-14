@@ -29,7 +29,7 @@ from opentelemetry import trace
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.commands import AppendAudio, Commit, DuplexCommand
-from vllm_omni.engine.duplex.config import apply_session_stats_capability
+from vllm_omni.engine.duplex.config import DuplexConfigError, apply_session_stats_capability
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexStagePort,
@@ -490,7 +490,7 @@ class DuplexSessionManager:
         if isinstance(error, DuplexSessionError):
             code = error.code
             retryable = error.retryable
-        elif isinstance(error, DuplexRuntimeConfigError):
+        elif isinstance(error, DuplexRuntimeConfigError | DuplexConfigError):
             code = error.code
         elif isinstance(error, DuplexFenceMismatchError):
             code = "stale_fence"
@@ -597,6 +597,11 @@ class DuplexSessionManager:
             if session_id in self.runners or session_id in self._closing or session_id in self._admitting:
                 raise DuplexSessionError(f"Duplex session already exists: {session_id}", code="session_exists")
             max_sessions = self.admission_limit
+            collect_stats = bool(getattr(self.runtime_config, "collect_stats", False))
+            capabilities = apply_session_stats_capability(
+                self.plugin.deployment_capabilities(max_sessions=max_sessions), collect_stats
+            )
+            config = message.session_config.with_output_capabilities(capabilities)
             if self._admission_count() >= max_sessions:
                 self.stage_port.reject_session("global_capacity_exhausted")
                 raise DuplexSessionError(
@@ -612,7 +617,6 @@ class DuplexSessionManager:
                 self.session_traces[session_id] = SessionTrace(self.tracer, session_id, message.trace_headers)
             self.stage_port.reserve_session(session_id)
             holds_replica_reservation = True
-            config = message.session_config
             self.plugin.validate_client_extra_body(config.extra_body)
             try:
                 runtime_config = await self.plugin.prepare_runtime_config(config, model_config=self.model_config)
@@ -620,10 +624,6 @@ class DuplexSessionManager:
                 raise
             except ValueError as exc:
                 raise DuplexRuntimeConfigError(str(exc)) from exc
-            collect_stats = bool(getattr(self.runtime_config, "collect_stats", False))
-            capabilities = apply_session_stats_capability(
-                self.plugin.capabilities(max_sessions=max_sessions), collect_stats
-            )
             session = DuplexEngineSession(
                 session_id=session_id,
                 config=config,

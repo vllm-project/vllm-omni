@@ -267,7 +267,7 @@ class DuplexSessionRunner:
         )
         self.out = SessionEmitter(self.ctx, promote_deferred_overlap=self._promote_deferred_overlap_later)
         self.memory = SessionMemoryRuntime(self.ctx, post=self._post_memory_event, wake=self._wake_memory)
-        calibration = plugin.history_calibrator(manager.runtime_config)
+        calibration = plugin.history_calibrator(manager.runtime_config) if session.capabilities.emits_audio else None
         if calibration is not None:
             self.ctx.history_calibration = HistoryCalibration(
                 session,
@@ -868,6 +868,8 @@ class DuplexSessionRunner:
             if control.payloads:
                 self.memory.forget_user_item(command.item_id)
         elif isinstance(command, TruncateItem):
+            if not self.control.check_audio_truncate_support(event_id=command.event_id):
+                return
             control = resolve_truncate_item(
                 projector, command, has_audio=self.session.history_item_has_audio(command.item_id)
             )
@@ -2327,19 +2329,22 @@ class DuplexSessionRunner:
     # Commit / response.create                                           #
     # ------------------------------------------------------------------ #
 
-    def _apply_response_create_options(self, response_payload: dict[str, object]) -> str | None:
+    def _apply_response_create_options(self, response_payload: dict[str, object]) -> DuplexConfigError | None:
         session = self.session
         try:
             options = ResponseCreateOptions.from_realtime(
                 response_payload,
                 private_runtime_config_keys=self.plugin.private_runtime_config_keys,
+                capabilities=session.capabilities,
             )
         except DuplexConfigError as exc:
-            return exc.code
+            return exc
         try:
             session.reserve_response_options(options)
-        except Exception:
-            return "response_already_active"
+        except DuplexConfigError as exc:
+            return exc
+        except RuntimeError as exc:
+            return DuplexConfigError(str(exc), code="response_already_active")
         return None
 
     def _reserve_commit_prefixes(self) -> list[PcmAppendReservation]:
@@ -2883,14 +2888,11 @@ class DuplexSessionRunner:
             if isinstance(response_payload, dict):
                 response_options_error = self._apply_response_create_options(response_payload)
                 if response_options_error is not None:
-                    error_message = (
-                        "The selected native duplex runtime does not support generation "
-                        "overrides for instructions, voice, temperature, max tokens, tools, or "
-                        "tool_choice."
-                        if response_options_error == "unsupported_native_response_options"
-                        else "response.create cannot reserve options while another response is active."
+                    self._emit_error(
+                        response_options_error.code,
+                        str(response_options_error),
+                        event_id=event.get("realtime_event_id"),
                     )
-                    self._emit_error(response_options_error, error_message, event_id=event.get("realtime_event_id"))
                     return
         if event_type == "input_audio_buffer.commit":
             has_pending_audio = (

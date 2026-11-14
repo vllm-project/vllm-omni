@@ -2080,7 +2080,8 @@ async def test_each_open_failure_releases_its_replica_reservation(failure_point,
 
                 patch.setattr(harness.manager, "_put_result", fail_success_result)
             assert not (await harness.open("failed")).ok
-        assert port.release_calls == ["failed"]
+        # Capability validation now precedes reservation entirely.
+        assert port.release_calls == ([] if failure_point == "capabilities" else ["failed"])
         assert port.placement.snapshot()["sessions"] == {}
         assert harness.manager.get("failed") is None
         assert (await harness.open("replacement")).ok

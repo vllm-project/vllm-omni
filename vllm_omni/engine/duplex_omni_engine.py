@@ -107,7 +107,9 @@ class DuplexOmniEngine(AsyncOmniEngine):
         assert self.plugin is not None, "_validate_deployment() must run before the orchestrator is created"
         # Match the frontend's comprehension-stage selection. An optional ASR
         # stage does not own the served model's tokenizer or prompt policy.
-        model_stage_id = next((stage.stage_id for stage in self.pipeline_config.stages if stage.owns_tokenizer), 0)
+        pipeline_config = self.pipeline_config
+        assert pipeline_config is not None, "_validate_deployment() must resolve a pipeline before startup"
+        model_stage_id = next((stage.stage_id for stage in pipeline_config.stages if stage.owns_tokenizer), 0)
         stage_vllm_config = self.stage_pools[model_stage_id].stage_vllm_config if self.stage_pools else None
         model_config = getattr(stage_vllm_config, "model_config", None)
         client_config = self._client_config or {}
@@ -131,7 +133,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
         if self.plugin is None:
             raise RuntimeError("duplex plugin is not loaded")
         return apply_session_stats_capability(
-            self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions),
+            self.plugin.deployment_capabilities(max_sessions=self.duplex_session_config.max_sessions),
             bool(getattr(self.duplex_session_config, "collect_stats", False)),
         )
 

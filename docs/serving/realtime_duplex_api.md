@@ -1019,6 +1019,36 @@ with no OpenAI counterpart.
 
 ### Capability negotiation by model
 
+Output availability is deployment-specific. `capabilities` includes
+`supported_output_modalities` and `default_output_modalities`. Omitting both
+`modalities` and `output_modalities` uses the deployment defaults. Explicit
+lists must be nonempty and contain `text` and/or `audio`. Names are
+case-insensitive and normalized to lowercase, so `["Audio", "Text"]` remains
+accepted by speech deployments. Duplicate entries after normalization and
+non-list values are rejected explicitly. If both aliases are supplied they
+must agree after normalization. A request for unavailable output fails with
+`unsupported_output_modality` at session open, `session.update`, or
+`response.create`, including the inline Python API. Rejected updates preserve
+the current configuration and rejected output requests allocate no model work.
+
+A deployment with one final text stage defaults to `text` and disables playback
+ACKs, audio truncation, and inter-stage handoff. Synthesis-only `voice` and
+non-default `speed` fail with `unsupported_parameter`; audio format defaults
+remain accepted for client compatibility. Text replies commit the emitted text
+without playback ACKs even under `ack_only`; cancellation retains the emitted
+prefix and discards stale output. Whitespace-only replies are not stored as
+assistant turns; meaningful text retains its emitted whitespace verbatim.
+The unconditional playback-policy bypass applies to deployments without audio
+output. On speech deployments, text replies with zero generated/sent audio and
+no audio-completion dependency commit without an ACK. Text that depends on
+complete audio follows alignment and playback checks. A text modality override
+alone does not implement per-request TTS skipping.
+Targeted playback ACKs for text-only items
+and audio truncation on text-only deployments fail with `unsupported_operation`
+without modifying history. The default MiniCPM three-stage deployment continues
+to advertise text and audio. This negotiation does not by itself register a
+Thinker-only MiniCPM deployment profile.
+
 The event vocabulary is uniform, but several surfaces are gated by the
 `capabilities` object the server returns in `session.created`; a client must
 branch on those flags rather than on the model name. MiniCPM-o 4.5 and

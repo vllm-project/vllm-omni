@@ -35,6 +35,43 @@ the model plugins.
 
 ## Playback completion ownership
 
+Deployment output capabilities are resolved after `configure_pipeline` using
+`deployment_capabilities`. A topology consisting of one final text stage
+advertises text output only and no playback ACK, audio truncation, or stage
+handoff. Other topologies retain their model plugin's output contract.
+`DuplexCapabilities.emits_audio` is the shared deployment predicate for output
+projection, history, synthesis parameters and calibration. Both typed and
+native truncation commands use one control-layer check of
+`supports_audio_truncate`, including audio-capable models that disable it.
+The engine capability property and session admission share this resolution.
+Startup warmup uses the engine's output defaults and, for text output, seeds
+an opening user turn and waits for a completed response containing text.
+
+`DuplexSessionConfig.modalities=None` preserves omission until admission.
+Both wire aliases are validated before defaults; unavailable output is rejected
+before reserving a session replica or creating a stage request. Live updates
+and response overrides validate a candidate before adopting configuration or
+reserving response options. Modality names are normalized to lowercase before
+validation. Explicit empty lists, normalized duplicates and conflicting aliases
+fail.
+
+A text-only deployment projects model results through existing text events.
+Its data plane still owns native unit and turn boundaries. Text responses
+reserve their history position before continued input, commit emitted text
+on completion or cancellation regardless of playback policy, and release
+playback bookkeeping without ACKs. Whitespace-only output creates no assistant
+history item or snapshot; meaningful emitted text is preserved verbatim.
+The unconditional bypass is deployment-scoped. On audio-capable deployments,
+a reply with zero generated/sent audio and no audio-completion dependency
+commits text without an ACK through the zero-audio fallback. Replies whose
+text depends on complete audio still follow alignment and playback checks.
+Selecting text output alone does not implement per-request TTS skipping.
+Cancellation rejects old-epoch results
+through the existing fence. Audio calibration is not started for deployments
+without audio output. These contracts do not register a Thinker-only model
+pipeline or provide MiniCPM Stage 0 token projection; those remain separate
+parts of RFC #10143.
+
 `DuplexEngineSession` owns response snapshots and playback cursors. Output
 completion and a client's full `playback.ack` can arrive in either order.
 `finalize_response_playback` is the shared check used by ACK processing,

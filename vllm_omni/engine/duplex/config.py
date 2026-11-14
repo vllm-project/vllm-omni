@@ -39,6 +39,28 @@ class DuplexConfigError(ValueError):
         self.param = param
 
 
+def _output_modalities(payload: Mapping[str, object]) -> tuple[str, ...] | None:
+    """Preserve omission and validate both spellings before applying defaults."""
+    resolved: tuple[str, ...] | None = None
+    for name in ("modalities", "output_modalities"):
+        if name not in payload:
+            continue
+        value = payload[name]
+        if (
+            not isinstance(value, list | tuple)
+            or not value
+            or any(not isinstance(item, str) or item.lower() not in {"text", "audio"} for item in value)
+        ):
+            raise DuplexConfigError("Output modalities must be a nonempty list of text and/or audio", param=name)
+        current = tuple(item.lower() for item in value)
+        if len(set(current)) != len(current):
+            raise DuplexConfigError("Output modalities must not contain duplicates", param=name)
+        if resolved is not None and set(resolved) != set(current):
+            raise DuplexConfigError("modalities and output_modalities disagree", param=name)
+        resolved = current
+    return resolved
+
+
 class DuplexOverlapPolicy(str, Enum):
     LISTEN_ONLY = "listen_only"
     BARGE_IN_ON_SPEECH = "barge_in_on_speech"
@@ -91,6 +113,8 @@ class DuplexCapabilities:
     """
 
     supports_session_adapter: bool = True
+    supported_output_modalities: frozenset[str] = field(default_factory=lambda: frozenset({"text", "audio"}))
+    default_output_modalities: tuple[str, ...] = ("text", "audio")
     supports_model_native_turn_policy: bool = False
     supports_external_turn_signal: bool = True
     supports_client_commit: bool = True
@@ -147,8 +171,15 @@ class DuplexCapabilities:
     #: a plugin; see :func:`apply_session_stats_capability`.
     supports_session_stats: bool = False
 
+    @property
+    def emits_audio(self) -> bool:
+        """Whether the bound deployment can generate audio output."""
+        return "audio" in self.supported_output_modalities
+
     def as_dict(self) -> dict[str, object]:
         return {
+            "supported_output_modalities": sorted(self.supported_output_modalities),
+            "default_output_modalities": list(self.default_output_modalities),
             "supports_session_adapter": self.supports_session_adapter,
             "supports_model_native_turn_policy": self.supports_model_native_turn_policy,
             "supports_external_turn_signal": self.supports_external_turn_signal,
@@ -196,6 +227,18 @@ class DuplexCapabilities:
 
     def accepts_input_modality(self, modality: str) -> bool:
         return modality in self.required_input_modalities or modality in self.optional_input_modalities
+
+    def resolve_output_modalities(self, modalities: list[str] | None) -> list[str]:
+        requested = _output_modalities({"modalities": modalities}) if modalities is not None else None
+        resolved = requested if requested is not None else self.default_output_modalities
+        unsupported = set(resolved) - self.supported_output_modalities
+        if unsupported:
+            raise DuplexConfigError(
+                f"Deployment does not support output modalities: {', '.join(sorted(unsupported))}",
+                code="unsupported_output_modality",
+                param="modalities",
+            )
+        return list(resolved)
 
     def allows_video_without_audio(self) -> bool:
         """Whether video without speech/audio is legal turn content (AURA video-compulsory)."""
@@ -339,7 +382,8 @@ def resolve_tool_result_timeout_s(extra_body: Mapping[str, object] | None) -> fl
 @dataclass
 class DuplexSessionConfig:
     model: str | None = None
-    modalities: list[str] = field(default_factory=lambda: ["text", "audio"])
+    # Defaults are deployment facts, resolved by session admission before model work.
+    modalities: list[str] | None = None
     instructions: str | None = None
     #: Text the session treats as the user's opening turn. A caller that cannot
     #: reach the model by speech (an HTTP request, a batch job) puts its prompt
@@ -370,7 +414,7 @@ class DuplexSessionConfig:
     def as_dict(self) -> dict[str, object]:
         return {
             "model": self.model,
-            "modalities": list(self.modalities),
+            **({"modalities": list(self.modalities)} if self.modalities is not None else {}),
             "instructions": self.instructions,
             "initial_user_text": self.initial_user_text,
             "voice": self.voice,
@@ -393,6 +437,17 @@ class DuplexSessionConfig:
     def normalized(self) -> DuplexSessionConfig:
         """Apply the clamps / defaults ``from_event`` applies to a wire object (typed configs skip them)."""
         return DuplexSessionConfig.from_event({"session": self.as_dict()})
+
+    def with_output_capabilities(self, capabilities: DuplexCapabilities) -> DuplexSessionConfig:
+        modalities = capabilities.resolve_output_modalities(self.modalities)
+        if not capabilities.emits_audio:
+            for name, unsupported in (
+                ("voice", bool(_normalized_voice(self.voice))),
+                ("speed", self.speed not in (None, 1)),
+            ):
+                if unsupported:
+                    raise DuplexConfigError(f"{name} requires audio output", code="unsupported_parameter", param=name)
+        return replace(self, modalities=modalities)
 
     @classmethod
     def from_event(cls, event: dict[str, object]) -> DuplexSessionConfig:
@@ -437,8 +492,8 @@ class DuplexSessionConfig:
             config.playback_commit_policy = cls._normalize_playback_commit_policy(source["playback_commit_policy"])
         if isinstance(source.get("watermarking"), bool):
             config.watermarking = source["watermarking"]
-        if isinstance(source.get("modalities"), list) and all(isinstance(x, str) for x in source["modalities"]):
-            config.modalities = list(source["modalities"])
+        modalities = _output_modalities(source)
+        config.modalities = list(modalities) if modalities is not None else None
         if isinstance(source.get("extra_body"), dict):
             config.extra_body = dict(source["extra_body"])
             extra = config.extra_body
@@ -551,7 +606,7 @@ class DuplexSessionConfig:
         resolved_model = payload.get("model") if isinstance(payload.get("model"), str) else model
         session: dict[str, object] = {
             "model": resolved_model,
-            "modalities": payload.get("modalities") or payload.get("output_modalities") or ["text", "audio"],
+            **({"modalities": list(modalities)} if (modalities := _output_modalities(payload)) is not None else {}),
             "instructions": payload.get("instructions"),
             # Not a Realtime field, but a session one: a client that cannot
             # reach the model by speech seeds its opening turn here. Without
@@ -602,6 +657,7 @@ class DuplexSessionConfig:
         # Any: the patch is read with ``isinstance(payload.get(...))`` guards and consumed
         # through ``payload[...]``; typing the values ``object`` would need a cast per read.
         payload: dict[str, Any] = dict(patch)
+        modalities = _output_modalities(payload)
         model = payload.get("model")
         audio_config = payload.get("audio")
         audio_input = audio_config.get("input") if isinstance(audio_config, dict) else None
@@ -696,8 +752,7 @@ class DuplexSessionConfig:
             self.overlap_silence_rms = max(0.0, float(payload["overlap_silence_rms"]))
         if isinstance(payload.get("playback_commit_policy"), str):
             self.playback_commit_policy = self._normalize_playback_commit_policy(str(payload["playback_commit_policy"]))
-        modalities = payload.get("modalities") or payload.get("output_modalities")
-        if isinstance(modalities, list) and all(isinstance(item, str) for item in modalities):
+        if modalities is not None:
             self.modalities = list(modalities)
         # A realtime client resends the whole session. Resolve the deadline the
         # same way ``from_realtime`` does: a top-level key wins over ``extra_body``.
@@ -825,6 +880,7 @@ class ResponseCreateOptions:
         response_payload: Mapping[str, object],
         *,
         private_runtime_config_keys: frozenset[str] = frozenset(),
+        capabilities: DuplexCapabilities | None = None,
     ) -> ResponseCreateOptions:
         """Parse an OpenAI Realtime ``response`` object into response-scoped options.
 
@@ -839,6 +895,7 @@ class ResponseCreateOptions:
         )
 
         payload: dict[str, object] = dict(response_payload)
+        modalities = _output_modalities(payload)
         audio_config = payload.get("audio")
         audio_output = audio_config.get("output") if isinstance(audio_config, dict) else None
         nested_voice = audio_output.get("voice") if isinstance(audio_output, dict) else None
@@ -854,11 +911,6 @@ class ResponseCreateOptions:
             or payload.get("tools") is not None
             or payload.get("tool_choice") is not None
         )
-        if unsupported:
-            raise DuplexConfigError(
-                "response.create options are not supported by a model-native duplex session",
-                code="unsupported_native_response_options",
-            )
         instructions = str(payload["instructions"]) if isinstance(payload.get("instructions"), str) else None
         voice = payload.get("voice")
         if not isinstance(voice, str) and isinstance(audio_output, dict):
@@ -882,6 +934,17 @@ class ResponseCreateOptions:
         if not isinstance(speed, int | float) and isinstance(audio_output, dict):
             speed = audio_output.get("speed")
         speed = float(speed) if isinstance(speed, int | float) else None
+        if capabilities is not None:
+            DuplexSessionConfig(
+                modalities=list(modalities) if modalities is not None else None,
+                voice=voice,
+                speed=speed,
+            ).with_output_capabilities(capabilities)
+        if unsupported:
+            raise DuplexConfigError(
+                "response.create options are not supported by a model-native duplex session",
+                code="unsupported_native_response_options",
+            )
         max_tokens = (
             payload.get("max_response_output_tokens")
             if "max_response_output_tokens" in payload
@@ -893,11 +956,6 @@ class ResponseCreateOptions:
             token_limit = realtime_max_output_tokens(max_tokens)
         else:
             token_limit = None
-        modalities = payload.get("modalities") or payload.get("output_modalities")
-        if isinstance(modalities, list) and all(isinstance(item, str) for item in modalities):
-            modalities = tuple(modalities)
-        else:
-            modalities = None
         response_extra: dict[str, object] = {}
         conversation = payload.get("conversation")
         if isinstance(conversation, str):

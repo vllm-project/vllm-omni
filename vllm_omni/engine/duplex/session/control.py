@@ -186,6 +186,15 @@ class SessionControl:
     # Control events                                                     #
     # ------------------------------------------------------------------ #
 
+    def check_audio_truncate_support(self, *, event_id: object | None = None) -> bool:
+        """Use the same capability gate for native and typed truncation commands."""
+        if self._ctx.session.capabilities.supports_audio_truncate:
+            return True
+        self._out.emit_error(
+            "unsupported_operation", "This deployment does not support audio truncation", event_id=event_id
+        )
+        return False
+
     async def on_turn_signal(self, event: dict[str, object]) -> None:
         session = self._ctx.session
         turn_event = event.get("event")
@@ -225,6 +234,8 @@ class SessionControl:
             )
             return
         if turn_event == "conversation.item.truncate":
+            if not self.check_audio_truncate_support(event_id=realtime_event_id):
+                return
             payload = event.get("payload")
             item_id = payload.get("item_id") if isinstance(payload, dict) else None
             audio_end_ms = payload.get("audio_end_ms") if isinstance(payload, dict) else None
@@ -315,6 +326,7 @@ class SessionControl:
                 session_id=session.session_id,
                 audio_started=audio_started,
             )
+            candidate_config = candidate_config.with_output_capabilities(session.capabilities)
         except DuplexConfigError as exc:
             self._out.emit_error(exc.code, str(exc) or "session.update was rejected", event_id=realtime_event_id)
             return
@@ -338,7 +350,7 @@ class SessionControl:
                 event_id=realtime_event_id,
             )
             return
-        requests_audio = any(str(modality).lower() == "audio" for modality in candidate_config.modalities)
+        requests_audio = "audio" in (candidate_config.modalities or ())
         if (
             requests_audio
             and "ref_audio_data" not in session.runtime_config

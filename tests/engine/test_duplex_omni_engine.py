@@ -197,7 +197,7 @@ def test_duplex_capabilities_come_from_the_loaded_plugin() -> None:
     with pytest.raises(RuntimeError, match="not loaded"):
         engine.duplex_capabilities
     capabilities = DuplexCapabilities(supports_barge_in=False)
-    engine.plugin = SimpleNamespace(capabilities=lambda *, max_sessions: capabilities)
+    engine.plugin = SimpleNamespace(deployment_capabilities=lambda *, max_sessions: capabilities)
     engine.duplex_session_config = SimpleNamespace(max_sessions=3)
     assert engine.duplex_capabilities is capabilities
 
