@@ -71,6 +71,15 @@ def _looks_like_magi2(model_name: str) -> bool:
     )
 
 
+def _looks_like_praxis1(model_name: str) -> bool:
+    """Recognize a native Praxis-1 checkpoint (``model_type: praxis``) without importing its runtime."""
+    try:
+        cfg = get_hf_file_to_dict("config.json", model_name)
+    except (OSError, ValueError):
+        return False
+    return isinstance(cfg, Mapping) and cfg.get("model_type") == "praxis"
+
+
 def _looks_like_flux3(model_name: str, config: Mapping | None = None) -> bool:
     """Detect the Flux3 package schema."""
     from vllm_omni.diffusion.utils.flux3_package import _is_flux3_package_config
@@ -199,4 +208,9 @@ def is_diffusion_model(model_name: str) -> bool:
     except Exception as e:
         logger.debug("Failed to load diffusers config via DiffusionPipeline: %s", e)
 
-    return _looks_like_bagel(model_name) or _looks_like_dreamzero(model_name) or _looks_like_hidream_o1(model_name)
+    return (
+        _looks_like_praxis1(model_name)
+        or _looks_like_bagel(model_name)
+        or _looks_like_dreamzero(model_name)
+        or _looks_like_hidream_o1(model_name)
+    )

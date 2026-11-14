@@ -459,6 +459,11 @@ _DIFFUSION_MODELS = {
         "pipeline_anima",
         "AnimaPipeline",
     ),
+    "Praxis1Pipeline": (
+        "praxis1",
+        "pipeline_praxis1",
+        "Praxis1Pipeline",
+    ),
     "PhysisH3Pipeline": ("physis.h3", "pipeline_physis_h3", "PhysisH3Pipeline"),
     "PhysisLTXPipeline": ("physis.ltx", "pipeline_physis_ltx", "PhysisLTXPipeline"),
     "PhysisWanPipeline": ("physis.wan", "pipeline_physis_wan", "PhysisWanPipeline"),
@@ -542,6 +547,8 @@ def supports_mixfusion(od_config: OmniDiffusionConfig) -> bool:
 
 
 _NO_CACHE_ACCELERATION = {
+    # Praxis-1 jointly denoises video and actions in its own Euler window loop.
+    "Praxis1Pipeline",
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AnimaPipeline",
