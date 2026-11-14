@@ -227,7 +227,7 @@ handling against a scripted WebSocket server. It needs no GPU:
 pytest tests/benchmarks/test_lingbot_world_realtime.py
 ```
 
-## H200 SP2 KV-layout candidates
+## H200 SP2 optimization candidates
 
 `configs/h200_sp2_gather.yaml` reproduces the two-H200 FP8/SP2 gather setup.
 Start the server with `VLLM_OMNI_AR_DIFFUSION_KV_GATHER=1` and this deploy config;
@@ -252,3 +252,7 @@ To test short-prompt encoding independently, set
 It skips UMT5 padding computation and restores the fixed embedding width.
 It defaults to false, requires right padding, and can change generated pixels;
 compare unseen prompts separately from prompt-cache hits.
+
+Set `VLLM_OMNI_REVERSE_A2A_TOKEN_LAYOUT=1` on every rank to test the batch-one
+reverse all-to-all layout. It defaults to off; larger batches and calls with an
+owned output destination retain their existing paths.
