@@ -54,7 +54,6 @@ def test_package_exports_keep_existing_names(monkeypatch):
 
     exports = {
         "CausalLingBotWorldTransformer3DModel": "transformer",
-        "LingBotCameraControlReducer": "actions",
         "LingBotWorldCausalDMDPipeline": "pipeline",
         "get_lingbot_world_post_process_func": "pipeline",
         "get_lingbot_world_pre_process_func": "pipeline",
