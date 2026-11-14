@@ -41,6 +41,7 @@ def test_return_placement_and_sdp_restore(mocker, device_output):
     raw = mocker.Mock(cpu=mocker.Mock(return_value="host result"))
     obj = mocker.Mock(
         is_loaded=True,
+        cudnn_sdp=True,
         device_target=torch.device("cpu"),
         parameters=lambda: iter([torch.zeros(1)]),
         _encode=mocker.Mock(return_value=raw),
@@ -57,6 +58,7 @@ def test_exception_restores_sdp(mocker, device_output):
     encode = method("encoder.py", "MiniMaxH3Qwen3VLEncoder", "encode_ids")
     obj = mocker.Mock(
         is_loaded=True,
+        cudnn_sdp=True,
         device_target=torch.device("cpu"),
         parameters=lambda: iter([torch.zeros(1)]),
         _encode=mocker.Mock(side_effect=RuntimeError("failure")),

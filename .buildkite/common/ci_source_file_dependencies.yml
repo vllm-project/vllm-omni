@@ -690,6 +690,22 @@ source_file_dependencies:
     - vllm_omni/model_executor/models/mimo_audio/
     - vllm_omni/model_executor/stage_input_processors/mimo_audio.py
 
+  omni_covo_audio_function:
+    - examples/offline_inference/covo_audio/
+    - examples/online_serving/covo_audio/
+    - tests/e2e/offline_inference/test_covo_audio_expansion.py
+    - tests/e2e/online_serving/test_covo_audio_expansion.py
+    - tests/conftest.py
+    - tests/helpers/client.py
+    - tests/helpers/fixtures/runtime.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/deploy/covo_audio.yaml
+    - vllm_omni/entrypoints/openai/tts_adapters/covo_audio.py
+    - vllm_omni/model_executor/models/covo_audio/
+    - vllm_omni/model_executor/stage_input_processors/covo_audio.py
+
   omni_ming_flash_omni_function:
     - tests/e2e/offline_inference/test_ming_flash_omni_expansion.py
     - tests/helpers/stage_config.py

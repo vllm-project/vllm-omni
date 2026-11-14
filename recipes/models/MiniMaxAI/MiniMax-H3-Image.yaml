@@ -3,7 +3,7 @@ meta:
   title: "MiniMax-H3-Image"
   slug: "minimax-h3-image"
   provider: "MiniMax"
-  description: "Open-weight text-to-image and reference-image editing on the MiniMax-H3 DiT — six CFG-distilled steps per image, up to nine reference images, 2K-class canvases, served via vLLM-Omni"
+  description: "Open-weight text-to-image and reference-image editing on the MiniMax-H3 DiT — six CFG-distilled steps per image, up to 16 reference images, 2K-class canvases, served via vLLM-Omni"
   date_added: 2026-11-10
   date_updated: 2026-11-10
   tasks:
@@ -74,7 +74,7 @@ omni:
             "response_format": "b64_json"
           }' | jq -r '.data[0].b64_json' | base64 -d > t2i.png
     - id: i2i
-      description: "Reference-image editing. One to nine references, presented to the model as Picture 1, Picture 2, … in upload order. 1.35 s for a 2048² edit on 4×H200."
+      description: "Reference-image editing. One to 16 references, presented to the model as Picture 1, Picture 2, … in upload order. 1.35 s for a 2048² edit on 4×H200."
       curl: |
         curl -s http://localhost:8000/v1/images/edits \
           -F model=MiniMaxAI/MiniMax-H3-Image \
