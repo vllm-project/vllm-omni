@@ -1,0 +1,67 @@
+[
+  {
+    "test_name": "test_minicpmo_4_5_a3_2card",
+    "description": "Five-tier Seed-TTS EN sweep for the A3 two-card deployment with MRv2 Thinker Ngram. Collect metrics before setting a two-card A3 baseline.",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A3"
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5_npu_2card.yaml",
+        "--trust-remote-code",
+        "--stage-init-timeout",
+        "1200",
+        "--init-timeout",
+        "1500"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [
+          32,
+          64,
+          128,
+          256,
+          512
+        ],
+        "max_concurrency": [
+          1,
+          4,
+          8,
+          16,
+          32
+        ],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "modalities": [
+            "text",
+            "audio"
+          ],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+      }
+    ]
+  }
+]

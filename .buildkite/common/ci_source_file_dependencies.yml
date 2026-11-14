@@ -785,6 +785,18 @@ source_file_dependencies:
     - tests/dfx/perf/tests/test_minicpmo_4_5_ready.json
     - tests/dfx/perf/tests/test_minicpmo_4_5.json
 
+  omni_minicpmo_4_5_a3_2card_perf:
+    - *minicpmo_4_5
+    - tests/dfx/conftest.py
+    - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/perf/tests/test_minicpmo_4_5_a3_2card.json
+    - vllm_omni/core/sched/omni_ar_scheduler.py
+    - vllm_omni/deploy/minicpmo_4_5_npu_2card.yaml
+    - vllm_omni/engine/arg_utils.py
+    - vllm_omni/patch.py
+    - vllm_omni/platforms/npu/worker/npu_omni_v2_model_runner.py
+    - vllm_omni/worker_v2/ngram_adapter.py
+
   omni_minicpmo_4_5_doc:
     - *minicpmo_4_5
     - examples/online_serving/minicpmo/realtime_web/
