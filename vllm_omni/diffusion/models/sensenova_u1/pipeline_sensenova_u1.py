@@ -10,8 +10,8 @@ the text encoder (via KV cache) and the denoising backbone (via MoT branches).
 Key integration points:
 - Transformer layers ported with TP support (QKVParallelLinear,
   MergedColumnParallelLinear, RowParallelLinear) in sensenova_u1_transformer.py.
-- Vision model (NEOVisionModel) and FM modules kept as standard nn.Module
-  since they are lightweight (no transformer blocks).
+- Vision model (NEOVisionModel) and other FM modules use standard PyTorch layers;
+  the non-pixel FM head uses vLLM ReplicatedLinear for dynamic LoRA support.
 - Weight loading uses stacked_params_mapping for fused QKV and gate_up.
 """
 
@@ -31,6 +31,7 @@ import torchvision.transforms as T
 from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -127,6 +128,33 @@ def _ceil_by_factor(number: float, factor: int) -> int:
 
 def _floor_by_factor(number: float, factor: int) -> int:
     return math.floor(number / factor) * factor
+
+
+def _build_fm_head(
+    input_dim: int,
+    intermediate_dim: int,
+    output_dim: int,
+    prefix: str = "fm_modules.fm_head",
+) -> nn.Sequential:
+    return nn.Sequential(
+        ReplicatedLinear(
+            input_dim,
+            intermediate_dim,
+            bias=True,
+            return_bias=False,
+            disable_tp=True,
+            prefix=f"{prefix}.0",
+        ),
+        nn.GELU(),
+        ReplicatedLinear(
+            intermediate_dim,
+            output_dim,
+            bias=True,
+            return_bias=False,
+            disable_tp=True,
+            prefix=f"{prefix}.2",
+        ),
+    )
 
 
 def _smart_resize(
@@ -508,7 +536,7 @@ class SenseNovaU1Pipeline(
 
     # Top-level module(s) the diffusion LoRA manager scans (both MoT branches).
     # TODO: promote to a shared LoRA contract/mixin instead of per-pipeline opt-in.
-    _lora_components: ClassVar[list[str]] = ["language_model"]
+    _lora_components: ClassVar[list[str]] = ["language_model", "fm_modules"]
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -560,10 +588,10 @@ class SenseNovaU1Pipeline(
             # (those fields are unused in the released checkpoint). The deeper variant
             # has not been ported yet.
             fm_intermediate_dim = 4096
-            fm_head = nn.Sequential(
-                nn.Linear(llm_hidden_size, fm_intermediate_dim, bias=True),
-                nn.GELU(),
-                nn.Linear(fm_intermediate_dim, output_dim, bias=True),
+            fm_head = _build_fm_head(
+                input_dim=llm_hidden_size,
+                intermediate_dim=fm_intermediate_dim,
+                output_dim=output_dim,
             )
 
         self.fm_modules = nn.ModuleDict(
