@@ -247,7 +247,8 @@ class _DecodeModel:
 
 @pytest.mark.parametrize("token_drop,frame_overlap", [(0, 0), (1, 1)])
 @pytest.mark.parametrize("temporal_cat_dtype", [None, torch.float16, torch.bfloat16])
-def test_decode_fork_matches_legacy_chain_bitwise(token_drop, frame_overlap, temporal_cat_dtype):
+@pytest.mark.parametrize("window", [False, True])
+def test_decode_fork_matches_legacy_chain_bitwise(token_drop, frame_overlap, temporal_cat_dtype, window):
     # The quantizer must see FP32 no matter the cat dtype: the legacy adapter
     # returned frames.float() before the pipeline multiplied and rounded, so
     # an fp16/bf16 cat dtype only narrows denormalization, never the rounding.
@@ -258,10 +259,44 @@ def test_decode_fork_matches_legacy_chain_bitwise(token_drop, frame_overlap, tem
     expected = legacy.legacy_streaming(z.clone(), None, None, 2, 0, temporal_cat_dtype)
 
     fork = _DecodeModel(token_drop=token_drop, frame_overlap=frame_overlap)
-    out = _decode_temporal_streaming_uint8(fork, z.clone(), None, None, 2, 0, temporal_cat_dtype)
+    window_decode = (lambda clips, **kwargs: [fork._adaptive_decode(clip) for clip in clips]) if window else None
+    out = _decode_temporal_streaming_uint8(
+        fork,
+        z.clone(),
+        None,
+        None,
+        2,
+        0,
+        temporal_cat_dtype,
+        window_decode=window_decode,
+        window_plan=lambda *args: 2,
+    )
     assert out.dtype == torch.uint8
     assert out.shape == expected.shape
     assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_installed_streaming_decode_uses_request_window_policy(enabled):
+    model = _DecodeModel()
+    setattr(model, "_decode_temporal_streaming", model.legacy_streaming)
+    decisions, windows = [], []
+
+    def policy(model, z, head, tail, count):
+        decisions.append(tuple(z.shape))
+        return 2 if enabled else 1
+
+    def window(clips, **kwargs):
+        windows.append(len(clips))
+        return [model._adaptive_decode(clip) for clip in clips]
+
+    install_temporal_stream_patches(model, window_decode=window, window_plan=policy)
+    z = torch.arange(12).reshape(1, 3, 4, 1, 1).float() / 12
+    expected = _DecodeModel().legacy_streaming(z.clone(), None, None, 2, 0, None)
+    actual = getattr(model, "_decode_temporal_streaming")(z.clone(), None, None, 2, 0, None)
+    assert torch.equal(actual, expected)
+    assert decisions == [tuple(z.shape)]
+    assert windows == ([2] if enabled else [1, 1])
 
 
 def test_decode_fork_rejects_empty_plan():
