@@ -494,7 +494,16 @@ class PinnedModuleStager:
                 binding = group.bindings[0]
                 key = (module_indices[id(binding.target)], binding.dtype)
                 packs.setdefault(key, []).append(group)
-            return [PinnedModuleStager._pack_groups(pack, pin_memory) for pack in packs.values()]
+            try:
+                return [PinnedModuleStager._pack_groups(pack, pin_memory) for pack in packs.values()]
+            except _PinnedSlabAllocationError:
+                logger.debug("Module pinned-host allocation failed; using separate pinned masters", exc_info=True)
+                return _copy_groups_to_cpu(
+                    source_groups,
+                    pin_memory=pin_memory,
+                    pack_pinned=False,
+                    non_blocking=False,
+                )
         try:
             return _copy_groups_to_cpu(
                 source_groups,
@@ -518,7 +527,12 @@ class PinnedModuleStager:
         alignment = 512
         lengths = [group.master.numel() for group in groups]
         spans = [(length + alignment - 1) // alignment * alignment for length in lengths]
-        master = torch.empty(sum(spans), dtype=torch.uint8, device="cpu", pin_memory=pin_memory)
+        try:
+            master = torch.empty(sum(spans), dtype=torch.uint8, device="cpu", pin_memory=pin_memory)
+        except (RuntimeError, MemoryError) as exc:
+            if not pin_memory:
+                raise
+            raise _PinnedSlabAllocationError("Module pinned-host allocation failed") from exc
         bindings = []
         offset = 0
         for group, length, span in zip(groups, lengths, spans, strict=True):

@@ -63,6 +63,42 @@ def _aliased_modules() -> tuple[nn.Module, nn.Module]:
     return left, right
 
 
+@pytest.mark.parametrize(
+    "allocation_error", [RuntimeError("pinned slab exhausted"), MemoryError("pinned slab exhausted")]
+)
+def test_packed_allocation_failure_uses_separate_pinned_masters(monkeypatch, patched_runtime, mocker, allocation_error):
+    left, right = _aliased_modules()
+    expected = [tensor.detach().clone() for tensor in (left.weight, right.weight, left.state, right.state)]
+    original_empty = torch.empty
+    pinned_sizes = []
+
+    def fail_packed_allocation(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            raise allocation_error
+        return original_empty(*args, **kwargs)
+
+    def pin_separate_master(tensor):
+        pinned_sizes.append(tensor.numel())
+        return tensor.clone()
+
+    monkeypatch.setattr(torch, "empty", fail_packed_allocation)
+    monkeypatch.setattr(torch.Tensor, "pin_memory", pin_separate_master)
+    stager = PinnedModuleStager(
+        [left, right],
+        torch.device("cpu"),
+        pin_memory=True,
+        pack_by_dtype=True,
+        cache_retention=mocker.Mock(spec=BoundedAllocatorCache),
+    )
+    assert pinned_sizes == [48, 64]
+    for transition in (stager.load, stager.offload):
+        transition()
+        assert left.weight.untyped_storage().data_ptr() == right.weight.untyped_storage().data_ptr()
+        assert left.state.untyped_storage().data_ptr() == right.state.untyped_storage().data_ptr()
+        for actual, reference in zip((left.weight, right.weight, left.state, right.state), expected, strict=True):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("inference_parameter", [False, True])
 def test_inference_staging_preserves_parameter_version_tracking(patched_runtime, mocker, inference_parameter):
     with torch.inference_mode(inference_parameter):
