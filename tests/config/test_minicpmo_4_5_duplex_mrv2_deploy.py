@@ -33,11 +33,11 @@ def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [True, True, True]
     assert stages[0].yaml_engine_args["async_scheduling"] is True
     # K-step books its span with the synchronous runner contract.
-    assert stages[1].yaml_engine_args["speculative_config"]["num_speculative_tokens"] == 7
+    assert stages[1].yaml_engine_args["speculative_config"]["num_speculative_tokens"] == 15
     assert stages[1].yaml_engine_args["async_scheduling"] is False
     assert stages[2].yaml_engine_args.get("async_scheduling") is not False
     # Retain the base profile capacity and Talker KV budget.
-    assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == [16, 16, 16]
+    assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == [16, 16, 8]
     assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
 
 
