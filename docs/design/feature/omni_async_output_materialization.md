@@ -196,6 +196,12 @@ Independent pooling results, client-facing `multimodal_outputs`, and inline
 payloads for stages without a native send path remain available. Terminal
 ordering and payload delivery stay owned by the native data plane.
 
+MRv2 recompute resume re-registers the same request through
+`scheduled_new_reqs`. Registration refreshes request context while preserving
+the native request-state identity, token history, sampled stop boundary and
+outstanding output reservations. Terminal cleanup waits for both older queued
+batches and resumed outputs; retiring a request releases its native state.
+
 `OmniAsyncOutput.get_output()` assigns the same list to `pooler_output` and
 `inter_stage_outputs` in both full-payload branches, including model-owned
 snapshots. Producer tests protect this identity contract. Async-chunk output
