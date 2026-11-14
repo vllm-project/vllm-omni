@@ -27,6 +27,7 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     TileTask,
 )
 
+_PAD_TIME_EDGES_MAX_NUMEL = 2**31
 _WAN22_LATENT_MEAN = (
     -0.2289,
     -0.0052,
@@ -183,15 +184,31 @@ class _CausalConv3d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         temporal_pad = (self.kernel_size[0] - 1) // 2
         if temporal_pad:
-            x = torch.cat(
-                [
-                    x[:, :, :1].repeat(1, 1, temporal_pad, 1, 1),
-                    x,
-                    x[:, :, -1:].repeat(1, 1, temporal_pad, 1, 1),
-                ],
-                dim=2,
-            )
+            x = _pad_time_edges(x, temporal_pad)
         return self.conv(x)
+
+
+def _pad_time_edges(x: torch.Tensor, pad: int) -> torch.Tensor:
+    """Repeat the first and last frame ``pad`` times along dim 2, exactly as ``torch.cat`` of the three parts.
+
+    MUSA: ``torch.cat`` fails or writes wrong values past 2**31 output elements, so an output that large
+    (the 1080p decode) is filled with one copy per channel.
+    """
+
+    batch, channels, frames, height, width = x.shape
+    if batch * channels * (frames + 2 * pad) * height * width < _PAD_TIME_EDGES_MAX_NUMEL:
+        return torch.cat(
+            [x[:, :, :1].repeat(1, 1, pad, 1, 1), x, x[:, :, -1:].repeat(1, 1, pad, 1, 1)],
+            dim=2,
+        )
+    output = x.new_empty((batch, channels, frames + 2 * pad, height, width))
+    for b in range(batch):
+        for c in range(channels):
+            source, target = x[b, c], output[b, c]
+            target[pad : pad + frames].copy_(source)
+            target[:pad].copy_(source[:1].expand(pad, height, width))
+            target[pad + frames :].copy_(source[-1:].expand(pad, height, width))
+    return output
 
 
 class _ResNetBlock3d(nn.Module):
