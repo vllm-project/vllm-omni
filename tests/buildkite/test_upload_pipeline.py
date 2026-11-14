@@ -1040,6 +1040,8 @@ def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatc
         "tests/e2e/offline_inference/test_audex_s2s.py",
         "tests/e2e/online_serving/test_audex_tta.py",
         "tests/e2e/online_serving/test_audex_tts.py",
+        "tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py",
+        "tests/e2e/online_serving/test_higgs_audio_v3.py",
         "tests/e2e/online_serving/test_minimax_music3.py",
         "tests/e2e/online_serving/test_yue2.py",
     )

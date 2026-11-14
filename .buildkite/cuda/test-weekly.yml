@@ -369,8 +369,9 @@ steps:
 
   # Run the aggregate CUDA H100 owner on parity PRs that touch one of the
   # executable H100 TTS workloads now represented on AMD. Audex's custom
-  # processors and the AMD MiniMax Music3/YuE2 owners use V1; retain V2 for
-  # the remaining H100 paths instead of forcing one runner across the suite.
+  # processors and the supported CosyVoice3, Higgs V3, MiniMax Music3, and
+  # YuE2 paths use V1; retain V2 for the remaining H100 paths instead of
+  # forcing one runner across the suite.
   - group: ":microphone: H100 TTS Weekly Test"
     depends_on: upload-weekly-pipeline
     if: build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"
@@ -397,6 +398,8 @@ steps:
               tests/e2e/offline_inference/test_audex_s2s.py \
               tests/e2e/online_serving/test_audex_tta.py \
               tests/e2e/online_serving/test_audex_tts.py \
+              tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py \
+              tests/e2e/online_serving/test_higgs_audio_v3.py \
               tests/e2e/online_serving/test_minimax_music3.py \
               tests/e2e/online_serving/test_yue2.py \
               -m "slow and H100 and tts" \
@@ -406,7 +409,9 @@ steps:
               --ignore=tests/e2e/offline_inference/test_audex_s2s.py \
               --ignore=tests/e2e/online_serving/test_audex_tta.py \
               --ignore=tests/e2e/online_serving/test_audex_tts.py \
+              --ignore=tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py \
               --ignore=tests/e2e/online_serving/test_drama_3.py \
+              --ignore=tests/e2e/online_serving/test_higgs_audio_v3.py \
               --ignore=tests/e2e/online_serving/test_minimax_music3.py \
               --ignore=tests/e2e/online_serving/test_yue2.py \
               --run-level "full_model" || failed=1
