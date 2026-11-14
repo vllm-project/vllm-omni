@@ -80,6 +80,8 @@ def prepare_speculative_payload(
     else:
         # Fixed-size padded lookup avoids a GPU->CPU count synchronization.
         # All TP ranks submit exactly one embedding collective per step.
+        # Prefill padding is intentionally included: is_decode depends on
+        # GPU-corrected positions; filtering it here would require a host sync.
         safe_ids = torch.where((ids >= 0) & (ids < vocab_size), ids, 0)
         embeddings = embed_input_ids(safe_ids).reshape(ids.numel(), -1)
     return {

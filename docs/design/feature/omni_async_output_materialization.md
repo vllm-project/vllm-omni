@@ -482,9 +482,15 @@ layer continue to request no captures and return a bare tensor.
 Qwen3-Omni auxiliary hidden-state speculation currently supports only DFlash
 with explicit, non-empty checkpoint `dflash_config.target_layer_ids`.
 EAGLE3, `extract_hidden_states`, and missing DFlash layer IDs fail at model load.
-DFlash-specific service validation currently covers MRv1 with an eager Thinker
-and TP=2 on CUDA; this is not evidence for MRv2, CUDA graph replay, or other
-hardware backends.
+DFlash speech support is limited to MRv1 with an eager Thinker and drafter;
+the service validation uses TP=2 on CUDA. CUDA Graph DFlash speech is outside
+the supported scope because the graph experiment has an unresolved speech
+ASR regression, even with custom all-reduce disabled. Default custom-all-reduce
+graph startup also failed in the pinned upstream runtime. See the
+[user-facing configuration requirements](../../user_guide/examples/online_serving/qwen3_omni.md#experimental-dflash-thinker-decoding)
+and [validation evidence](../qwen3_omni_dflash_validation.md). Neither eager nor
+graph results establish strict greedy equivalence, MRv2 support, or support
+for other hardware backends.
 
 When the output processor accumulates full payloads, `meta.decode_span`,
 `meta.consumed_input_span`, and `meta.committed_token_count` retain the latest
