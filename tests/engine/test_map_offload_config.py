@@ -53,6 +53,34 @@ class TestBuildLmcacheConnectorConfig:
         entry["kv_connector_extra_config"]["extra_key"] = "value"
         assert "extra_key" not in lmcache_config
 
+    def test_mp_mode_selects_the_mp_connector(self):
+        entry = _build_lmcache_connector_config({"mode": "mp", "chunk_size": 256})
+
+        assert entry["kv_connector"] == "LMCacheMPConnector"
+        assert entry["kv_connector_extra_config"]["lmcache.chunk_size"] == 256
+
+    def test_mode_is_consumed_rather_than_forwarded(self):
+        entry = _build_lmcache_connector_config({"mode": "mp"})
+
+        # LMCache parses nothing called "mode"; it selects vLLM's connector.
+        assert "lmcache.mode" not in entry["kv_connector_extra_config"]
+
+    def test_mp_mode_does_not_set_the_in_process_pool_flag(self):
+        entry = _build_lmcache_connector_config({"mode": "mp"})
+
+        # The MP server holds the hidden states; there is no in-process pool.
+        assert "lmcache.enable_hidden_state_cache" not in entry["kv_connector_extra_config"]
+
+    def test_default_mode_stays_in_process(self):
+        entry = _build_lmcache_connector_config({"config_file": "/tmp/lmcache.yaml"})
+
+        assert entry["kv_connector"] == "LMCacheConnectorV1"
+        assert entry["kv_connector_extra_config"]["lmcache.enable_hidden_state_cache"] is True
+
+    def test_an_unknown_mode_is_rejected(self):
+        with pytest.raises(ValueError, match="lmcache_config.mode"):
+            _build_lmcache_connector_config({"mode": "remote"})
+
 
 class TestMapOffloadConfig:
     """Test the full _map_offload_config()."""
