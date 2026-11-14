@@ -374,6 +374,7 @@ class OmniEngineArgs(EngineArgs):
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
     enable_cuda_graph_decode: bool | None = None
+    cuda_graph_persistent_decode: bool | None = None
     enable_cfg_batching: bool | None = None
     cache_backend: str | None = None
     cache_config: str | None = None
@@ -801,6 +802,10 @@ class OrchestratorArgs:
     # today). None defers to the OmniDiffusionConfig default (enabled);
     # --enforce-eager also disables it.
     enable_cuda_graph_decode: bool | None = None
+    # Opt-in retention of captured decode-graph entries across requests
+    # (Qwen-Image-2.1). None defers to the transformer default (disabled);
+    # enabling trades VRAM for recapture latency.
+    cuda_graph_persistent_decode: bool | None = None
     diffusion_use_graph: bool = False
     diffusion_graph_release_after_denoise: bool = False
     # Run both CFG branches as one batched denoiser call on pipelines that
@@ -888,6 +893,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "diffusion_compile_granularity",
         "diffusion_compile_dynamic",
         "enable_cuda_graph_decode",
+        "cuda_graph_persistent_decode",
         "enable_cfg_batching",
         "cache_backend",
         "cache_config",

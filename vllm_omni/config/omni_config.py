@@ -934,6 +934,9 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     # model (Qwen-Image-2.1) together with enforce_eager, which lives in the
     # shared engine config.
     enable_cuda_graph_decode: bool = True
+    # Mirrors OmniDiffusionConfig.cuda_graph_persistent_decode; None defers to
+    # the transformer constructor / checkpoint default (opt-in retention off).
+    cuda_graph_persistent_decode: bool | None = None
     diffusion_use_graph: bool = False
     diffusion_graph_release_after_denoise: bool = False
     fa_deterministic: bool = False

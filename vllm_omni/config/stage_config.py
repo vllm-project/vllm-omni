@@ -646,6 +646,10 @@ class StageDeployConfig:
     # today). Independent of compilation_config.cudagraph_mode;
     # enforce_eager=True also disables it.
     enable_cuda_graph_decode: bool | None = None
+    # Opt-in retention of captured decode-graph entries across requests
+    # (Qwen-Image-2.1). None defers to the transformer default (disabled);
+    # enabling trades VRAM for recapture latency.
+    cuda_graph_persistent_decode: bool | None = None
     diffusion_use_graph: bool | None = None
     diffusion_graph_release_after_denoise: bool | None = None
     fa_deterministic: bool | None = None
