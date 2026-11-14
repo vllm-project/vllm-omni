@@ -26,6 +26,7 @@ Per request:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import Iterable, Sequence
@@ -43,6 +44,7 @@ from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
 
+from vllm_omni.diffusion.cache.prompt_embed_cache import PromptEmbedCache
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -511,6 +513,12 @@ class MiniMaxH3ImagePipeline(
     # -- weights --------------------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Clear before loading: a failed reload must not retain stale conditions.
+        cache: PromptEmbedCache | None = getattr(self, "_prompt_embed_cache", None)
+        if cache is not None:
+            cache.clear()
+        self._h3_prompt_cache_epoch = getattr(self, "_h3_prompt_cache_epoch", 0) + 1
+
         def component_of(item: tuple[str, torch.Tensor]) -> str:
             component = item[0].partition(".")[0]
             if component not in ("transformer", "text_encoder"):
@@ -631,6 +639,90 @@ class MiniMaxH3ImagePipeline(
         return minimax_h3_patchify_video_latent(noise.cpu(), patch_size=list(_PATCH))
 
     def _encode_text(self, prompt: str, references: list[Image.Image]) -> tuple[torch.Tensor, torch.Tensor]:
+        cache: PromptEmbedCache | None = getattr(self, "_prompt_embed_cache", None)
+        if cache is None or not cache.enabled:
+            return self._encode_text_uncached(prompt, references)
+
+        # Rank-local hits must not skip encoder/broadcast collectives. References
+        # also bypass: prompt text alone does not identify an editing condition.
+        if (
+            references
+            or self.text_encoder_tp_size != 1
+            or self._dit_rank != 0
+            or (torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1)
+        ):
+            with cache._lock:
+                cache.bypassed += 1
+            return self._encode_text_uncached(prompt, references)
+
+        context = self._text_encoder_cache_context()
+        if getattr(self, "_h3_prompt_cache_context", None) != context:
+            cache.clear()
+            self._h3_prompt_cache_context = context
+        condition = self.encode_prompt(prompt, references, encoder_context=context)
+        # The generic cache treats encode_prompt results as read-only. Give the
+        # H3 consumer an owned copy on both miss and hit to protect stored values.
+        return self._copy_text_condition_cpu(condition)
+
+    @staticmethod
+    def _copy_text_condition_cpu(
+        condition: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden, tags = condition
+        with torch.inference_mode(False), torch.no_grad():
+            return hidden.detach().to(device="cpu", copy=True), tags.detach().to(device="cpu", copy=True)
+
+    def _text_encoder_cache_context(self) -> str:
+        """Invalidate for reload/replacement/config changes, without hashing weights.
+
+        Loaded weights and the base tokenizer vocabulary are immutable during
+        serving. Direct in-place edits outside load_weights require the runner's
+        clear_prompt_embed_cache(); added/special token changes are keyed below.
+        """
+        encoder, tokenizer = self.text_encoder, self.tokenizer
+        text_model = getattr(encoder, "text_model", None)
+
+        def config_value(value: object) -> object:
+            return value.to_dict() if hasattr(value, "to_dict") else value
+
+        context = {
+            "model": str(self.od_config.model),
+            "revision": self.od_config.revision,
+            "epoch": getattr(self, "_h3_prompt_cache_epoch", 0),
+            "encoder_id": id(encoder),
+            "text_model_id": id(text_model),
+            "tokenizer_id": id(tokenizer),
+            "tokenizer_length": len(tokenizer),
+            "tokenizer_init": getattr(tokenizer, "init_kwargs", {}),
+            "special_tokens": getattr(tokenizer, "special_tokens_map", {}),
+            "added_vocab": tokenizer.get_added_vocab(),
+            # Text/ID identity omits AddedToken matching flags such as lstrip.
+            "added_tokens_decoder": {
+                token_id: token.__getstate__()
+                for token_id, token in getattr(tokenizer, "added_tokens_decoder", {}).items()
+            },
+            "text_config": config_value(getattr(text_model, "config", None)),
+            "cudnn_sdp": getattr(encoder, "cudnn_sdp", None),
+        }
+        encoded = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def encode_prompt(
+        self,
+        prompt: str,
+        references: list[Image.Image],
+        *,
+        encoder_context: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Entry point for the runner's opt-in, process-local prompt cache.
+
+        encoder_context participates in its bound-argument key. Store owned CPU
+        tensors rather than retaining GPU storage or encoder-output aliases.
+        """
+        del encoder_context
+        return self._copy_text_condition_cpu(self._encode_text_uncached(prompt, references))
+
+    def _encode_text_uncached(self, prompt: str, references: list[Image.Image]) -> tuple[torch.Tensor, torch.Tensor]:
         """Layer-50 Qwen states of the positive presentation, on every DiT rank."""
         vision: dict[str, torch.Tensor] = {}
         counts: list[int] = []
