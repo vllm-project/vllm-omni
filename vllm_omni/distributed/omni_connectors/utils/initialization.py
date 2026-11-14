@@ -547,6 +547,45 @@ def build_stage_connectors(
     return connectors
 
 
+def validate_stage_payload_connectors(transfer_cfg: OmniTransferConfig | None, stage_id: int | str) -> None:
+    """Check payload input edges against the stage's single resolved connector.
+
+    Call only for diffusion stages declaring input payload keys. This neither
+    changes edge resolution nor enables mixed-backend or multi-input routing.
+    """
+    if transfer_cfg is None:
+        return
+    stage_id_str = str(stage_id)
+    # The runtime merges extras into the connector dict. Keep the backend name
+    # unambiguous on both sides of a payload receiver before resolving its edge.
+    for (source, target), spec in transfer_cfg.connectors.items():
+        if stage_id_str not in (source, target):
+            continue
+        extra_type = (spec.extra or {}).get("type", spec.name)
+        if extra_type != spec.name:
+            direction = "input" if target == stage_id_str else "output"
+            raise ValueError(
+                f"Stage {stage_id}: {direction} edge {source}→{target}: connector extra.type={extra_type!r} "
+                f"conflicts with name={spec.name!r}. Select the backend with name; extra.type must not override it."
+            )
+    connector, resolved_from, resolved_to = resolve_omni_kv_config_for_stage(transfer_cfg, stage_id)
+    for (source, target), spec in transfer_cfg.connectors.items():
+        if target != stage_id_str:
+            continue
+        context = f"Stage {stage_id}: input edge {source}→{target}"
+        OmniConnectorFactory.validate_deadline_receive(spec.name, context=context)
+        if connector is not None:
+            resolved_name = connector["type"]
+            # The backward-compatible Store alias denotes the same backend.
+            aliases = {"MooncakeConnector": "MooncakeStoreConnector"}
+            if aliases.get(spec.name, spec.name) != aliases.get(resolved_name, resolved_name):
+                raise ValueError(
+                    f"{context} uses {spec.name}, but resolved edge {resolved_from}→{resolved_to} "
+                    f"uses {resolved_name}. Mixed connector types are not supported by the single-connector "
+                    "diffusion stage payload path; use the same connector type on these edges."
+                )
+
+
 def resolve_omni_kv_config_for_stage(
     transfer_cfg: OmniTransferConfig | None, stage_id: int | str
 ) -> tuple[dict[str, Any] | None, str | None, str | None]:
