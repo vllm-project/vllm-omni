@@ -25,7 +25,11 @@ from vllm.multimodal.image import open_image
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexContextViewPolicy, DuplexSessionConfig
-from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_resource_request_belongs_to_session
+from vllm_omni.engine.duplex.contracts import (
+    DuplexAppendPlan,
+    ToolCallAbandonReason,
+    duplex_resource_request_belongs_to_session,
+)
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexModelPlugin, DuplexRuntimeConfigError
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
@@ -39,6 +43,7 @@ from vllm_omni.utils.speakers import (
 
 if TYPE_CHECKING:
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+    from vllm_omni.engine.duplex.session.tool_calls import ToolCallAbandonment
 
 logger = init_logger(__name__)
 
@@ -50,6 +55,26 @@ MAX_PROMPT_IMAGES = 8
 # Same window ``prepare_prompt_config`` keeps. Anchors older than this cannot
 # still point at a message the next prompt will retain.
 _TOOL_ANCHOR_WINDOW = 16
+
+
+def _tool_turn(history_len: int, call_id: str, name: str, arguments: str, output: str) -> dict[str, object]:
+    """One call and its tool message, spliced after ``history_len`` messages."""
+    return {
+        "history_len": history_len,
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": call_id, "content": output},
+        ],
+    }
 
 
 def _anchored_history_len(
@@ -337,6 +362,15 @@ class QwenDataPlane(DuplexDataPlane):
 
 
 class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
+    #: A suppressed repeat follows a call that already got its notice here.
+    abandoned_tool_call_reasons = frozenset(
+        {
+            ToolCallAbandonReason.TIMEOUT,
+            ToolCallAbandonReason.EPOCH_CANCELLED,
+            ToolCallAbandonReason.CLIENT_CANCELLED,
+            ToolCallAbandonReason.CLIENT_FAILED,
+        }
+    )
     plugin_id = "qwen3-omni"
     projects_intermediate_outputs = True
 
@@ -394,6 +428,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             supports_reencode_context=True,
             supports_turn_commit_only=True,
             supports_core_resumable_request=False,
+            tool_mode="declared",
+            function_call_output_continuation="client_response_create",
+            max_tools=None,
+            clears_function_call_block_on_user_commit=True,
             supports_independent_io_streams=True,
             supports_realtime_endpoint=True,
             supports_multi_session=max_sessions > 1,
@@ -514,8 +552,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         return updated
 
     def has_pending_tool_followup(self, runtime_config: Mapping[str, object]) -> bool:
-        turns = runtime_config.get("qwen_tool_turns")
-        return isinstance(turns, list) and bool(turns)
+        # A notice waits for the next user turn; it is not an answer to speak.
+        return any(not turn.get("notice") for turn in _tool_turns(runtime_config, "qwen_tool_turns"))
 
     def extra_prompt_config(self, runtime_config: Mapping[str, object]) -> Mapping[str, object]:
         extra: dict[str, object] = {}
@@ -829,24 +867,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         history_len = _anchored_history_len(current, item, history_len)
         updated = dict(current)
         turns = [turn for turn in updated.get("qwen_tool_turns", []) if isinstance(turn, dict)]
-        turns.append(
-            {
-                "history_len": history_len,
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "id": call_id,
-                                "type": "function",
-                                "function": {"name": name, "arguments": arguments},
-                            }
-                        ],
-                    },
-                    {"role": "tool", "tool_call_id": call_id, "content": output},
-                ],
-            }
-        )
+        turns.append(_tool_turn(history_len, call_id, name, arguments, output))
         updated["qwen_tool_turns"] = turns
         anchors = updated.get("qwen_call_anchors")
         if isinstance(anchors, Mapping):
@@ -863,6 +884,30 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 updated["qwen_call_anchors"] = kept
             else:
                 updated.pop("qwen_call_anchors", None)
+        return updated
+
+    def runtime_config_for_abandoned_tool_call(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+        abandonment: ToolCallAbandonment,
+        *,
+        history_len: int,
+    ) -> dict[str, object] | None:
+        """Mark the notice pair, so it waits for the next user turn.
+
+        The pair otherwise matches an accepted result, so it shares that
+        result's window and response bookkeeping and is dropped once one
+        response stores its text. The mark is set here, never from a client item.
+        """
+        updated = super().runtime_config_for_abandoned_tool_call(config, current, abandonment, history_len=history_len)
+        if updated is None:
+            return None
+        call_id = abandonment.origin.call_id
+        updated["qwen_tool_turns"] = [
+            {**turn, "notice": True} if _tool_call_id(turn) == call_id else turn
+            for turn in _tool_turns(updated, "qwen_tool_turns")
+        ]
         return updated
 
     def configure_sampling_params(self, *, runtime_config, defaults):
@@ -1093,6 +1138,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             if not isinstance(history_len, int) or not isinstance(pair, list):
                 continue
             item: dict[str, object] = {"history_len": history_len, "messages": pair}
+            if turn.get("notice"):
+                item["notice"] = True
             response_id = turn.get("response_id")
             if isinstance(response_id, str) and response_id:
                 item["response_id"] = response_id

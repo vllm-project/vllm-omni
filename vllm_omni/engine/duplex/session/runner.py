@@ -38,6 +38,7 @@ from vllm_omni.engine.duplex.commands import (
     AppendAudio,
     AppendText,
     BargeIn,
+    CancelFunctionCall,
     CancelInput,
     CancelResponse,
     ClearInput,
@@ -55,11 +56,14 @@ from vllm_omni.engine.duplex.commands import (
     UpdateSession,
 )
 from vllm_omni.engine.duplex.config import (
+    FUNCTION_CALL_INTERRUPT_POLICY_KEY,
     DuplexConfigError,
     DuplexOverlapPolicy,
     DuplexPlaybackCommitPolicy,
     DuplexSessionState,
     ResponseCreateOptions,
+    effective_function_call_retry_policy,
+    resolve_function_call_policy,
     resolve_tool_result_timeout_s,
 )
 from vllm_omni.engine.duplex.contracts import (
@@ -114,6 +118,7 @@ from vllm_omni.engine.duplex.session.memory_runtime import SessionMemoryRuntime
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.engine.duplex.session.tool_calls import (
     LoopTimerScheduler,
+    ToolCallAbandonment,
     ToolCallLedger,
     ToolCallSettlement,
     ToolCallState,
@@ -253,6 +258,14 @@ class DuplexSessionRunner:
             timeout_s=resolve_tool_result_timeout_s(session.config.extra_body),
             on_expire=self._enqueue_tool_call_expiry,
             on_settle=self._enqueue_tool_call_settlement,
+            keep_on_epoch_advance=(
+                resolve_function_call_policy(session.config.extra_body, FUNCTION_CALL_INTERRUPT_POLICY_KEY) == "keep"
+            ),
+            user_turn_seq=(
+                session.user_turn_seq
+                if effective_function_call_retry_policy(session.capabilities, session.config.extra_body) == "user_turn"
+                else None
+            ),
         )
         self.ctx = DuplexSessionContext(
             session=session,
@@ -802,6 +815,8 @@ class DuplexSessionRunner:
                 await self._on_cancel(payload)
         elif isinstance(command, CancelInput | BargeIn):
             await self._on_cancel(command.payload())
+        elif isinstance(command, CancelFunctionCall):
+            self.control.on_function_call_cancel(command)
         elif isinstance(command, SignalTurn):
             if command.event == "conversation.item.retrieve":
                 self._emit_events(
@@ -1065,7 +1080,7 @@ class DuplexSessionRunner:
         call = self.tool_calls.record(call_id)
         if call is None or not call.is_terminal or call.settled_epoch is None:
             return False
-        return self._finalize_tool_call(ToolCallSettlement(call.origin, call.state, call.settled_epoch))
+        return self._finalize_tool_call(ToolCallSettlement(call.origin, call.state, call.settled_epoch, call.reason))
 
     def _finalize_tool_call(self, settlement: ToolCallSettlement) -> bool:
         call_id = settlement.origin.call_id
@@ -1102,12 +1117,23 @@ class DuplexSessionRunner:
                 f"no function_call_output for {call_id} arrived before tool_result_timeout_s; "
                 "the call expired in the session ledger and a late result is refused",
             )
+        reason = settlement.reason
+        if reason is not None and call_id not in self._applied_tool_call_settlements:
+            self.emit(
+                {
+                    "type": "function_call.settled",
+                    "session_id": session.session_id,
+                    "epoch": settlement.settled_epoch,
+                    "call_id": call_id,
+                    "state": settlement.state.value,
+                    "reason": reason.value,
+                }
+            )
         if not self._finalize_tool_call(settlement):
             return
-        # Acceptance installs only its prepared candidate; cancellation already
-        # has an epoch-wide retirement path. Neither can reconfigure through
-        # the deferred timeout-recovery hook after an acknowledgement.
-        if settlement.state is not ToolCallState.TIMED_OUT:
+        # Acceptance installs only its prepared candidate, so it cannot
+        # reconfigure through the deferred recovery hook after an acknowledgement.
+        if reason is None:
             return
         if call_id in self._applied_tool_call_settlements:
             return
@@ -1116,8 +1142,11 @@ class DuplexSessionRunner:
             if settlement.settled_epoch != session.epoch:
                 # Finalize old metadata, but never change the new epoch's input.
                 return
-            candidate = self.plugin.runtime_config_for_tool_call_timeout(
-                session.config, deepcopy(dict(session.runtime_config)), settlement
+            candidate = self.plugin.runtime_config_for_abandoned_tool_call(
+                session.config,
+                deepcopy(dict(session.runtime_config)),
+                ToolCallAbandonment(settlement.origin, reason),
+                history_len=len(session.history),
             )
             if candidate is not None:
                 session.replace_runtime_config(deepcopy(candidate))

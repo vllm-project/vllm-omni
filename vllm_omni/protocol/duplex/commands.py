@@ -107,6 +107,15 @@ class BargeIn(RealtimeCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class CancelFunctionCall(RealtimeCommand):
+    """End one pending function call: the client gave up on it, or it failed."""
+
+    wire_type: ClassVar[str] = "function_call.cancel"
+    call_id: str
+    reason: str = "cancelled"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SignalTurn(RealtimeCommand):
     """Generic ``turn.signal`` (local turn transitions such as ``user_started``)."""
 
@@ -148,7 +157,7 @@ class CloseSession(RealtimeCommand):
 
 #: The complete command vocabulary a duplex client may send: the eight Tier 1
 #: classes re-exported unchanged, the two Tier 2 classes defined above, and the
-#: eight Tier 3 ones. A duplex consumer imports from here and never reaches
+#: nine Tier 3 ones. A duplex consumer imports from here and never reaches
 #: past this module into ``vllm_omni.protocol.realtime``, so a command that
 #: later grows a duplex extension changes only this file.
 __all__ = [
@@ -170,6 +179,7 @@ __all__ = [
     "AppendText",
     "BargeIn",
     "CancelInput",
+    "CancelFunctionCall",
     "CloseSession",
     "GetSessionStats",
     "Heartbeat",

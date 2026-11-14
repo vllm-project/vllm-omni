@@ -202,6 +202,49 @@ async def test_cancelled_call_refuses_its_late_result():
 
 
 @pytest.mark.asyncio
+async def test_a_repeat_of_a_cancelled_delegation_tells_the_model():
+    """A cancelled turn stays quiet, and the repeat is where the model finds out."""
+    h = await delegating_session()
+    try:
+        request_id = await observe(h)
+        events = await h.deliver_and_settle(
+            tts_output(request_id, text=DELEGATED, finished=True), stage_id=0, segment_finished=True
+        )
+        [call] = function_calls(h, events)
+        h.session.barge_in()
+        h.runner.tool_calls.invalidate_epoch(h.session.epoch)
+        await h.settle()
+        assert not h.session.runtime_config.get("joyai_delegation_results")
+
+        request_id = await observe(h)
+        events = await h.deliver_and_settle(
+            tts_output(request_id, text=DELEGATED, finished=True), stage_id=0, segment_finished=True
+        )
+
+        assert function_calls(h, events) == []
+        suppressed = [
+            event for event in realtime_events(h, events) if event["type"] == "duplex.function_call.suppressed"
+        ]
+        assert len(suppressed) == 1
+        assert str(call["call_id"]) in json.dumps(suppressed)
+        results = h.session.runtime_config["joyai_delegation_results"]
+        assert '\\"reason\\":\\"suppressed\\"' in json.dumps(results)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_top_level_tools_cannot_declare_more_than_the_delegate():
+    h = await delegating_session()
+    try:
+        declared = {"type": "function", "name": "get_weather"}
+        events = await h.run(UpdateSession(patch={"tools": [delegation_tool_definition(), declared]}))
+        assert "invalid_duplex_runtime_config" in error_codes(events), realtime_events(h, events)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_delegation_without_declared_tool_fails_fast():
     h = await open_joyai()
     try:

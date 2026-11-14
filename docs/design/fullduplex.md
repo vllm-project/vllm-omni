@@ -522,11 +522,12 @@ for queue updates and the final validity check before delivery.
   `function_call_output` is admitted only against that record:
   `pending -> accepted | timed_out | cancelled`, one transition, no rebinding
   of a call id, and terminal records kept as tombstones until the session
-  closes. Conversation history is not admission authority -- it is history-wide
+  closes. A client can also settle one call with `function_call.cancel`. Conversation history is not admission authority -- it is history-wide
   and epoch-blind, so a result arriving after a barge-in could otherwise be
   admitted against a call the session had already moved past. The epoch
   consequences hang off the single epoch-advance path: pending calls from older
-  epochs are cancelled, and a result the model accepted but never consumed is
+  epochs are cancelled (or, with `function_call_interrupt_policy: keep`, move to the new
+  epoch and stay answerable), and a result the model accepted but never consumed is
   retired from the runtime so the new epoch cannot speak it. A retired or
   already-consumed generation stays *named* in the worker-facing runtime config
   (model-owned state is per resumable stage request, and a cancel moves the
@@ -909,16 +910,30 @@ required to retire such a call.
 
 `on_tool_call_settled` handles metadata-only terminal cleanup, including old
 epochs; `on_tool_calls_closed` disposes registered call metadata during teardown.
-Model recovery uses the mailbox-ordered `runtime_config_for_tool_call_timeout`
-only for a timeout in the current epoch. These hooks default to no-ops: a model
-adapter must implement and validate its recovery behavior. Native Nemotron does
-not override the timeout hook: ledger expiry and late-result rejection do not
-establish native call abandonment or guarantee a subsequent model call. Qwen
-tool-result delivery is separate model-adapter work in
-[#8493](https://github.com/vllm-project/vllm-omni/pull/8493); session lifecycle
-support alone is not Qwen tool-call end-to-end support. Accepted results use
-their prepared candidate, while effective epoch cancellation uses
+Model recovery uses the mailbox-ordered `runtime_config_for_abandoned_tool_call`
+for a call that timed out or was cancelled in the current epoch, and for a repeat
+the session refused to expose. The hook shows a fixed status, never client text.
+It defaults to a no-op, and each model adapter decides which reasons it can
+deliver. Qwen, Nemotron and JoyAI implement it. Showing a notice does not
+establish how a model behaves afterwards; validate that per model. Accepted
+results use their prepared candidate, while effective epoch cancellation uses
 `retire_pending_function_output` for queued work according to model policy.
+
+The ledger keeps a fingerprint (name plus canonical JSON arguments) of each
+pending, timed-out or cancelled call. A pending call needs this too: Qwen keeps
+tool pairs out of history until a result arrives, so the model sees an unanswered
+question on the next turn and asks again.
+`model_channel._expose_function_call` refuses a matching call before registering
+it, so a suppressed repeat uses no call budget and arms no timer. A repeat of a
+pending call gets no notice, because its result may still arrive. The ledger takes the session's `user_turn_seq` only when
+`function_call_retry_policy` is `user_turn` and the model declares
+`clears_function_call_block_on_user_commit`, because a commit is not always a user turn:
+JoyAI commits are camera observations and native models free-run. An entry stays
+blocking until that counter moves past the turn it was abandoned in.
+
+`function_call_interrupt_policy: keep` gives each record a mutable `admission_epoch`;
+`ToolCallOrigin` stays immutable. An epoch advance moves the epoch forward instead
+of settling the call, and admission and timeouts read it.
 
 JoyAI-VL-Interaction uses the same call book for a different decision shape. Its
 model emits an action token (`</response> <note> </delegation> <question>`), so

@@ -237,8 +237,8 @@ def modify_stage_config(
 
     # The copy lives in a temporary directory; keep inheritance anchored to
     # the source deploy rather than resolving its relative base under /tmp.
-    if base_config := config.get("base_config"):
-        config["base_config"] = str((path.parent / base_config).resolve())
+    if isinstance(config.get("base_config"), str):
+        config["base_config"] = str((path.parent / config["base_config"]).resolve())
 
     # Unique suffix: multiple modify_stage_config calls in one process often run
     # within the same second (e.g. test_qwen3_omni_expansion imports both

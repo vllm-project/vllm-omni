@@ -22,7 +22,13 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.config.stage_config import PipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
-from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, DuplexFence, DuplexOutputAction, DuplexOutputDecision
+from vllm_omni.engine.duplex.contracts import (
+    DuplexAppendPlan,
+    DuplexFence,
+    DuplexOutputAction,
+    DuplexOutputDecision,
+    ToolCallAbandonReason,
+)
 from vllm_omni.engine.duplex.plugin import (
     DuplexAuxiliaryPolicy,
     DuplexAuxiliaryRequest,
@@ -88,6 +94,16 @@ if TYPE_CHECKING:
 
 
 class JoyAIDuplexPlugin(DuplexModelPlugin):
+    #: A cancelled turn's question must not resurface on its own. If the model
+    #: asks it again, that repeat is current, and the refusal is the notice.
+    abandoned_tool_call_reasons = frozenset(
+        {
+            ToolCallAbandonReason.TIMEOUT,
+            ToolCallAbandonReason.CLIENT_CANCELLED,
+            ToolCallAbandonReason.CLIENT_FAILED,
+            ToolCallAbandonReason.SUPPRESSED,
+        }
+    )
     plugin_id = "joyai-vl-interaction"
     supports_auxiliary_requests = True
     joyai_stage_id = 0
@@ -156,6 +172,9 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             supports_reencode_context=True,
             supports_turn_commit_only=True,
             supports_core_resumable_request=False,
+            tool_mode="delegate_only",
+            function_call_output_continuation="next_observation",
+            max_tools=1,
             required_input_modalities=frozenset(),
             optional_input_modalities=frozenset({"video", "audio"} if self.asr_stage_id is not None else {"video"}),
             supports_independent_io_streams=True,
