@@ -7,18 +7,17 @@
 
 import contextlib
 import math
-from collections import namedtuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.utils import weight_norm
 
 from vllm_omni.model_executor.models.common.alias_free_activation import AliasFreeActivation1d
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
-from vllm_omni.platforms import current_omni_platform
 
 # --------------- Utilities ---------------
 
@@ -99,7 +98,7 @@ def apply_rotary_pos_emb(pos, t):
         return t * pos.cos() + rotate_half(t) * pos.sin()
 
 
-# sinc, kaiser_sinc_filter1d removed — now in common.alias_free_activation
+# sinc, kaiser_sinc_filter1d removed, now in common.alias_free_activation
 
 
 # --------------- Basic Layers ---------------
@@ -292,19 +291,17 @@ class ConvPositionEmbed(nn.Module):
 # --------------- Anti-aliasing (BigVGAN) ---------------
 
 
-# LowPassFilter1d, UpSample1d, DownSample1d, Activation1d removed —
+# LowPassFilter1d, UpSample1d, DownSample1d, Activation1d removed,
 # now provided by common.alias_free_activation.AliasFreeActivation1d
 
 
 # --------------- Activations ---------------
 
 
-# SnakeBeta removed — now in common.snake_activation (with alpha_logscale support)
+# SnakeBeta removed, now in common.snake_activation (with alpha_logscale support)
 
 
 # --------------- Attention ---------------
-
-AttentionConfig = namedtuple("AttentionConfig", ["enable_flash", "enable_math", "enable_mem_efficient"])
 
 
 class RotaryEmbedding(nn.Module):
@@ -359,12 +356,10 @@ class MultiHeadAttention(nn.Module):
         self.o_proj = Linear(hidden_size, hidden_size)
         self.o_dropout = Dropout(dropout)
 
-        self.cpu_config = AttentionConfig(True, True, True)
-        self.cuda_config = AttentionConfig(False, True, True)
-        if current_omni_platform.is_cuda():
-            device_properties = torch.cuda.get_device_properties(torch.accelerator.current_device_index())
-            if device_properties.major == 8 and device_properties.minor == 0:
-                self.cuda_config = AttentionConfig(True, True, True)
+        # SDPA backends allowed in forward() when the inputs are on CUDA; unused on other devices.
+        # FlashAttention is excluded because forward() always passes a dense attn_bias tensor,
+        # which FA2 does not accept as an arbitrary attn_mask.
+        self.cuda_backends = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH, SDPBackend.CUDNN_ATTENTION]
 
         if self.rotary_bias:
             self.rotary = RotaryEmbedding(self.head_dim)
@@ -389,7 +384,6 @@ class MultiHeadAttention(nn.Module):
         v = rearrange(v, "b n (h d) -> b h n d", h=self.num_heads)
         q, k = self.q_norm(q), self.k_norm(k)
 
-        config = self.cuda_config if q.is_cuda else self.cpu_config
         attn_bias = torch.zeros(B, self.num_heads, L, S, dtype=q.dtype, device=q.device)
 
         if self.rotary_bias:
@@ -405,7 +399,7 @@ class MultiHeadAttention(nn.Module):
         if mask is not None:
             attn_bias.masked_fill_(mask.logical_not(), float("-inf"))
 
-        sdp_ctx = torch.backends.cuda.sdp_kernel(**config._asdict()) if q.is_cuda else contextlib.nullcontext()
+        sdp_ctx = sdpa_kernel(self.cuda_backends) if q.is_cuda else contextlib.nullcontext()
         with sdp_ctx:
             out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_bias, dropout_p=self.attn_drop.p if self.training else 0.0
