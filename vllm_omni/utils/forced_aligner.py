@@ -195,8 +195,14 @@ def _decode_timestamps(
         )
         return []
 
-    marker_logits = arr[timestamp_positions, :]
-    bin_idx = marker_logits.argmax(axis=-1)
+    if arr.strides[1] == arr.itemsize and arr.shape[1] * arr.itemsize >= 16 * 1024:
+        # Read wide, contiguous rows directly to avoid a large logits copy.
+        bin_idx = np.fromiter(
+            (arr[pos].argmax() for pos in timestamp_positions), dtype=np.intp, count=len(timestamp_positions)
+        )
+    else:
+        marker_logits = arr[timestamp_positions, :]
+        bin_idx = marker_logits.argmax(axis=-1)
     bin_size_ms = (
         float(timestamp_segment_time_ms)
         if timestamp_segment_time_ms is not None
