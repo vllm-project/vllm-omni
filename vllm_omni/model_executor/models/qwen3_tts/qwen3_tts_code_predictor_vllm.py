@@ -43,10 +43,10 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         # Model-local NPU defaults: do not change Qwen3-Omni or CUDA defaults.
         # Explicit connector/stage options, including false, remain authoritative.
         return {
-            "code_predictor_fused_sampling": True,
+            "code_predictor_fused_sampling": False,
             "code_predictor_frame_graph": True,
             "code_predictor_kv_cache": extra.get("code_predictor_frame_graph", True),
-            "code_predictor_npu_native_gqa": True,
+            "code_predictor_npu_native_gqa": False,
             "code_predictor_npu_fused_swiglu": True,
             **extra,
         }

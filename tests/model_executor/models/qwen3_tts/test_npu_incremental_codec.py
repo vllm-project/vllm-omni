@@ -108,7 +108,7 @@ def test_dual_stream_matches_serial_state_and_owned_audio(monkeypatch):
     try:
         assert len(parallel.graphs) == 2 * len(serial.graphs)
         pools = [{graph.graph.pool() for key, graph in parallel.graphs.items() if key[2] == lane} for lane in (0, 1)]
-        assert len(pools[0]) == len(pools[1]) == 1
+        assert len(pools[0]) == len(pools[1]) == len(serial.graphs)
         assert pools[0].isdisjoint(pools[1])
         # More groups than lanes, ragged tails, zero-length input, and
         # lane -> owner -> lane reuse of the same graph storage.
@@ -267,7 +267,7 @@ def test_incremental_attention_does_not_change_stateless_backend(monkeypatch):
 
 
 @pytest.mark.parametrize("has_triton", [False, True])
-@pytest.mark.parametrize("source", ["implicit", "additional", "connector", "opt_in"])
+@pytest.mark.parametrize("source", ["implicit", "additional", "connector", "opt_in", "legacy"])
 def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, source):
     pytest.importorskip("torch_npu")
     import vllm.triton_utils
@@ -278,7 +278,7 @@ def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, source):
     from vllm_omni.platforms.npu.models import qwen3_tts
 
     decoder = _make_decoder()
-    disabled = source in ("additional", "connector")
+    disabled = source in ("additional", "connector", "legacy")
     explicit = {"npu_fused_snake": False, "npu_incremental_codec": False, "npu_conv_graph_shapes": []}
     model = SimpleNamespace(
         decoder=decoder,
@@ -290,6 +290,8 @@ def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, source):
             additional_config=(
                 {"npu_fused_snake": True, "npu_incremental_codec": True}
                 if source == "connector"
+                else {"npu_incremental_codec": False}
+                if source == "legacy"
                 else {"npu_fused_snake": True}
                 if source == "opt_in"
                 else explicit
@@ -307,11 +309,16 @@ def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, source):
     conv = Mock(side_effect=AssertionError("incremental or explicit [] must skip stateless capture"))
     monkeypatch.setattr(incremental_codec, "NPUIncrementalCodec", incremental)
     monkeypatch.setattr(codec_graph, "NPUCodecGraphs", conv)
+    codebooks = [module for module in decoder.modules() if hasattr(module, "precompute_embedding")]
+    assert codebooks
+    for module in codebooks:
+        module.precompute_embedding()
     qwen3_tts._patched_load_weights(model, [])
+    assert all(module._normalized_embedding is None for module in codebooks)
     if disabled:
         incremental.assert_not_called()
     else:
-        assert incremental.call_args.kwargs["streams"] == (2 if has_triton else 1)
+        assert incremental.call_args.kwargs["streams"] == 1
         assert decoder._npu_incremental is incremental.return_value
     conv.assert_not_called()
     assert all(

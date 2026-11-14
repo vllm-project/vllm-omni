@@ -15,13 +15,14 @@ from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-PREDICTOR_OPTIONS = (
-    "code_predictor_fused_sampling",
-    "code_predictor_frame_graph",
-    "code_predictor_kv_cache",
-    "code_predictor_npu_native_gqa",
-    "code_predictor_npu_fused_swiglu",
-)
+PREDICTOR_DEFAULTS = {
+    "code_predictor_fused_sampling": False,
+    "code_predictor_frame_graph": True,
+    "code_predictor_kv_cache": True,
+    "code_predictor_npu_native_gqa": False,
+    "code_predictor_npu_fused_swiglu": True,
+}
+PREDICTOR_OPTIONS = tuple(PREDICTOR_DEFAULTS)
 
 
 @pytest.mark.parametrize("platform", ["npu", "cuda", "rocm", "xpu"])
@@ -34,7 +35,9 @@ def test_resolved_defaults_are_npu_only(monkeypatch, platform):
         additional_config=deploy.stages[0].engine_extras.get("additional_config", {}),
     )
     options = Predictor._stage_connector_extra_config(config)
-    assert all(options.get(key, False) is (platform == "npu") for key in PREDICTOR_OPTIONS)
+    assert all(
+        options.get(key, False) is (enabled and platform == "npu") for key, enabled in PREDICTOR_DEFAULTS.items()
+    )
     # Defaults belong to the model/loader. A YAML copy could mask a change
     # to those defaults and give custom deployments different behavior.
     npu_options = {
@@ -50,7 +53,7 @@ def test_resolved_defaults_are_npu_only(monkeypatch, platform):
         assert npu_options.isdisjoint(stage.engine_extras.get("additional_config", {}))
 
 
-@pytest.mark.parametrize("source", ["implicit", "additional", "connector"])
+@pytest.mark.parametrize("source", ["implicit", "additional", "connector", "opt_in"])
 def test_npu_predictor_defaults_preserve_explicit_opt_out(monkeypatch, source):
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
     config = SimpleNamespace(model_config=SimpleNamespace(stage_connector_config={"extra": {}}), additional_config={})
@@ -59,8 +62,13 @@ def test_npu_predictor_defaults_preserve_explicit_opt_out(monkeypatch, source):
     elif source == "connector":
         config.additional_config = dict.fromkeys(PREDICTOR_OPTIONS, True)
         config.model_config.stage_connector_config["extra"] = dict.fromkeys(PREDICTOR_OPTIONS, False)
+    elif source == "opt_in":
+        config.additional_config = dict.fromkeys(PREDICTOR_OPTIONS, True)
     options = Predictor._stage_connector_extra_config(config)
-    assert all(options[key] is (source == "implicit") for key in PREDICTOR_OPTIONS)
+    assert all(
+        options[key] is (source == "opt_in" or (enabled and source == "implicit"))
+        for key, enabled in PREDICTOR_DEFAULTS.items()
+    )
 
 
 def test_disabling_frame_graph_disables_implicit_npu_kv(monkeypatch):

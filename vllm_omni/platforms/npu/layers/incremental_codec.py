@@ -196,7 +196,6 @@ class NPUIncrementalCodec:
         # the next replay. Share scratch pools within a lane, never across the
         # two concurrently executing lanes.
         self.capture_streams = self.streams or [torch.npu.Stream(device=self.device)]  # type: ignore[attr-defined]
-        self.capture_pools = [torch.npu.graph_pool_handle() for _ in range(streams)]  # type: ignore[attr-defined]
         # Runtime formats are prepared by the NPU Code2Wav loader. Attention
         # selection is local to each incremental call; preserve the shared config.
         self.prewarm()
@@ -223,7 +222,7 @@ class NPUIncrementalCodec:
             # Only prewarm captures graphs. A final partial chunk must not
             # synchronize the device and run several warmups on a live request.
             if capture:
-                graph.capture(pool=self.capture_pools[lane], stream=self.capture_streams[lane])
+                graph.capture(pool=torch.npu.graph_pool_handle(), stream=self.capture_streams[lane])
                 self.graphs[key] = graph
         return graph
 

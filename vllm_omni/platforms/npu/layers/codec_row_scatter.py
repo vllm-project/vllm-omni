@@ -7,12 +7,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-# Tail slices have different strides and pointer alignment at each chunk length.
-# Keep them runtime values so a live tail cannot trigger a new compilation.
-@triton.jit(
-    do_not_specialize=["s0", "s1", "s2", "s3"],
-    do_not_specialize_on_alignment=["source"],
-)
+@triton.jit
 def _scatter(
     source,
     indices,

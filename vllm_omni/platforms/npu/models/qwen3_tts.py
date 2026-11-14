@@ -82,8 +82,8 @@ def _patched_load_weights(self, weights):
         if hasattr(self.decoder, "precompute_snake_caches"):
             self.decoder.precompute_snake_caches()
     _prepare_npu_decoder_weights(self.decoder)
-    # Weight loaders can update parameters in place: rebuild after every load,
-    # including the 310P dtype override above, and before graph capture.
+    # Clear optional codebook caches after every load, including the 310P
+    # dtype override above, before capturing graphs with reference lookup.
     from vllm.triton_utils import HAS_TRITON
 
     from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
@@ -101,13 +101,13 @@ def _patched_load_weights(self, weights):
         raise ValueError("npu_fused_snake must be a boolean")
     for module in self.decoder.modules():
         if isinstance(module, EuclideanCodebook):
-            module.precompute_embedding()
+            module._normalized_embedding = None
         elif isinstance(module, SnakeBeta):
             module.npu_fused = fused_snake and HAS_TRITON
     incremental = extra.get("npu_incremental_codec", True)
     if not isinstance(incremental, bool):
         raise ValueError("npu_incremental_codec must be a boolean")
-    streams = extra.get("npu_codec_streams", 2 if incremental and HAS_TRITON else 1)
+    streams = extra.get("npu_codec_streams", 1)
     if type(streams) is not int or streams not in (1, 2):
         raise ValueError("npu_codec_streams must be 1 or 2")
     if streams == 2 and (not incremental or not HAS_TRITON):
@@ -127,11 +127,7 @@ def _patched_load_weights(self, weights):
                 chunk_frames=chunk_frames,
                 streams=streams,
             )
-    shapes = (
-        []
-        if incremental
-        else extra.get("npu_conv_graph_shapes", [[batch, frames] for batch in (1, 2, 4) for frames in (1, 26, 37, 73)])
-    )
+    shapes = [] if incremental else extra.get("npu_conv_graph_shapes", [])
     if shapes:
         if not isinstance(shapes, list) or any(
             not isinstance(pair, (list, tuple))
