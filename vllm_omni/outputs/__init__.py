@@ -11,6 +11,7 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_omni.inputs.data import OmniPromptType
+from vllm_omni.metrics.utils import iter_request_output_items
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,8 @@ class SchedulingMetadataUpdate:
     prompt_token_ids: tuple[int, ...] | None = None
     resize_prompt_to: int | None = None
     input_terminal: bool = False
+    # Native MRv2 receive: the producing step's duplex chunk id from payload meta.
+    duplex_perf_chunk: tuple[int, int] | None = None
 
 
 @dataclass
@@ -215,7 +218,7 @@ class OmniRequestOutput(RequestOutput):
     error_status_code: int | None = None
     error_type: str | None = None
 
-    def _copy_content_from(self, source: RequestOutput) -> None:
+    def _copy_content_from(self, source: object) -> None:
         """Copy generation content from a stage output into this object.
 
         *source* should be a vLLM ``RequestOutput`` or a subclass such as
@@ -223,13 +226,22 @@ class OmniRequestOutput(RequestOutput):
         ``final_output_type``, ``stage_durations``, ``peak_memory_mb``,
         ``error``, ...) are intentionally not copied.
         """
-        # RequestOutput attributes — guaranteed on any RequestOutput.
-        # Only copy attributes that actually exist on the source, so that
-        # duck-typed mocks can omit optional fields without overwriting the
-        # dataclass defaults (e.g. ``outputs=[]``, ``finished=True``).
+        # RequestOutput attributes — guaranteed on generation outputs and
+        # duck-typed on PoolingRequestOutput. Only copy attributes that
+        # actually exist on the source, so mocks can omit optional fields
+        # without overwriting the dataclass defaults.
         for name in _REQUEST_OUTPUT_CONTENT_ATTRS:
             if hasattr(source, name):
-                setattr(self, name, getattr(source, name))
+                value = getattr(source, name)
+                if name == "outputs":
+                    # RequestOutput carries a list of CompletionOutput values,
+                    # while PoolingRequestOutput carries one scalar
+                    # PoolingOutput. OmniRequestOutput is consumed by serving
+                    # paths that require list semantics, so normalize at the
+                    # wrapping boundary instead of making every consumer
+                    # special-case pooling output.
+                    value = list(iter_request_output_items(source))
+                setattr(self, name, value)
 
         # Omni-specific fields — only present when the source is itself an
         # OmniRequestOutput (e.g. a diffusion stage inside a pipeline).
@@ -246,7 +258,7 @@ class OmniRequestOutput(RequestOutput):
                 self._multimodal_output = src_mm
 
     @classmethod
-    def from_stage_output(cls, source: RequestOutput, **kwargs: Any) -> "OmniRequestOutput":
+    def from_stage_output(cls, source: object, **kwargs: Any) -> "OmniRequestOutput":
         """Create an OmniRequestOutput from a stage's raw output.
 
         Copies generation content (``outputs``, ``prompt``, ``prompt_token_ids``,
@@ -258,7 +270,8 @@ class OmniRequestOutput(RequestOutput):
         that wraps a stage result.
 
         Args:
-            source: The stage output whose content is copied onto the new object.
+            source: The generation or pooling stage output whose content is
+                copied onto the new object.
             **kwargs: Passed through to the dataclass constructor (``request_id``,
                 ``stage_id``, ``final_output_type``, ``metrics``,
                 ``stage_durations``, ``peak_memory_mb``, ``finished``, etc.).

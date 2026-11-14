@@ -709,6 +709,16 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--enable-cfg-batching",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Run the positive and negative classifier-free-guidance branches as one batched "
+                "denoiser call when CFG is not split across ranks, on pipelines that support it. "
+                "Off by default. Not used with cfg-parallel or a cache backend."
+            ),
+        )
+        omni_config_group.add_argument(
             "--fa-deterministic",
             dest="fa_deterministic",
             action="store_true",
@@ -775,8 +785,8 @@ class OmniServeCommand(CLISubcommand):
             action=argparse.BooleanOptionalAction,
             default=None,
             help=(
-                "Enable fused permute-free Ulysses all-to-all using platform-specific symmetric memory "
-                "(NCCL on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
+                "Enable Ulysses all-to-all over platform symmetric memory "
+                "(CUDA copy engines on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
                 "NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
                 "TorchNPU NPUSHMEM and Triton-Ascend, "
                 "with libshmem.so on LD_LIBRARY_PATH. Defaults to disabled."
@@ -816,6 +826,17 @@ class OmniServeCommand(CLISubcommand):
                 "Diffusion-only runtime override for ModelOpt FP8 checkpoints: "
                 "force CUTLASS FP8 linear kernels on CUDA SM89+ devices. "
                 "Ignored for BF16, non-ModelOpt FP8, ROCm, and older CUDA GPUs."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusion-flashinfer-autotune",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Diffusion-only: autotune FlashInfer GEMMs (on SM100+: MXFP8 and per-tensor FP8 linears) so they use "
+                "tuned tactics instead of heuristics. Default: on for CUDA SM100+ with FlashInfer, off elsewhere; "
+                "--no-diffusion-flashinfer-autotune disables it. The first request of each new shape pays the tuning; "
+                "tactics are cached per rank under VLLM_CACHE_ROOT and reused after a restart."
             ),
         )
 
@@ -931,6 +952,39 @@ class OmniServeCommand(CLISubcommand):
             help="Request-mode batch admission: max milliseconds to wait for compatible "
             "requests to accumulate before scheduling a fused forward wave. "
             "0 disables admission (default).",
+        )
+        # Server-level MixFusion defaults. Unset flags leave the deploy YAML's
+        # per-stage ``enable_mixfusion`` / ``mixfusion_min_chunk_tokens`` /
+        # ``mixfusion_max_chunks`` values in force; per-request extra_args still
+        # take precedence over this server default.
+        omni_config_group.add_argument(
+            "--enable-mixfusion",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Enable mixed-resolution batch packing (MixFusion) in the diffusion scheduler "
+                "as the server-level default (default: disabled). MixFusion requires step "
+                "execution, which is enabled automatically when this flag is set. "
+                "--no-enable-mixfusion overrides a deploy YAML stage enabled with enable_mixfusion."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--mixfusion-min-chunk-tokens",
+            type=int,
+            default=None,
+            help=(
+                "MixFusion packing: minimum token budget per ragged-latent chunk (default: 256). "
+                "Unset leaves the deploy YAML value in force."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--mixfusion-max-chunks",
+            type=int,
+            default=None,
+            help=(
+                "MixFusion packing: maximum number of chunks packed into one fused forward "
+                "(default: 128). Unset leaves the deploy YAML value in force."
+            ),
         )
 
         # VAE memory optimization parameters
@@ -1197,13 +1251,13 @@ class OmniServeCommand(CLISubcommand):
             help="Maximum length for TTS voice style instructions (overrides the pipeline default, default: 500).",
         )
 
-        # Disable safety guardrails for this server (currently only applicable for Cosmos3)
+        # Disable safety guardrails for this server (currently only applicable for Cosmos3 and PAN2)
         # TODO: drop once --model-config-override lands (3/N config refactor)
         omni_config_group.add_argument(
             "--no-guardrails",
             dest="no_guardrails",
             action="store_true",
-            help="Disable Cosmos3 text/video safety guardrails for this server.",
+            help="Disable Cosmos3 and PAN2 text/video safety guardrails for this server.",
         )
         omni_config_group.add_argument(
             "--robot-openpi-idle-timeout",
@@ -1269,6 +1323,9 @@ def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int
 
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
+
+    if resolved.weight_sharing is not None:
+        raise ValueError("weight sharing requires one API server with local stage ownership")
 
     sleep_stages = [
         int(getattr(stage_config, "stage_id", stage_index))
@@ -1522,6 +1579,9 @@ def run_headless(args: TrackingNamespace) -> None:
     )
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
+
+    if resolved.weight_sharing is not None:
+        raise ValueError("weight sharing does not support headless stages; launch both stages in one local server")
 
     try:
         stage_cfg = resolved.stage_by_id(stage_id)
