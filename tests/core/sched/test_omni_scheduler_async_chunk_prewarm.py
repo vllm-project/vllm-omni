@@ -10,7 +10,6 @@ once, only for ids that are still live. A malformed payload must never raise.
 from __future__ import annotations
 
 from collections import defaultdict
-from types import SimpleNamespace
 
 import msgspec
 import pytest
@@ -25,6 +24,9 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.data_entry_keys import ASYNC_CHUNK_PREWARM_NS
+from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
+    OmniChunkTransferAdapter,
+)
 from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 
@@ -179,20 +181,25 @@ def test_readd_of_live_id_takes_no_prewarm(scheduler_cls, base_scheduler, status
     assert scheduler._pending_request_prewarms["req-1"] is first_prewarm
 
 
-def _producer_adapter(*, active_sender: bool) -> SimpleNamespace:
-    return SimpleNamespace(
-        receives_chunks=False,
-        custom_process_next_stage_input_func=object(),
-        has_active_sender=lambda _id: active_sender,
-    )
+def _chunk_adapter(
+    *,
+    receives_chunks: bool,
+    active_sender: bool = False,
+    sends: bool = True,
+) -> OmniChunkTransferAdapter:
+    adapter = OmniChunkTransferAdapter.__new__(OmniChunkTransferAdapter)
+    adapter.receives_chunks = receives_chunks
+    adapter.custom_process_next_stage_input_func = object() if sends else None
+    adapter.has_active_sender = lambda _id: active_sender
+    return adapter
 
 
-def _receiver_only_adapter() -> SimpleNamespace:
-    return SimpleNamespace(
-        receives_chunks=True,
-        custom_process_next_stage_input_func=None,
-        has_active_sender=lambda _id: False,
-    )
+def _producer_adapter(*, active_sender: bool) -> OmniChunkTransferAdapter:
+    return _chunk_adapter(receives_chunks=False, active_sender=active_sender, sends=True)
+
+
+def _receiver_only_adapter() -> OmniChunkTransferAdapter:
+    return _chunk_adapter(receives_chunks=True, active_sender=False, sends=False)
 
 
 @_SCHEDULERS
