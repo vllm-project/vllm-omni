@@ -21,6 +21,8 @@ from vllm_omni.diffusion.ipc import (
     _SHM_TENSOR_THRESHOLD,
     DIFFUSION_RPC_RESULT_ENVELOPE,
     _pack_value_if_large,
+    _tensor_from_shm,
+    _tensor_to_shm,
     _unpack_if_shm_handle,
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
@@ -456,3 +458,68 @@ def test_pack_value_packs_non_contiguous_large_tensor_values() -> None:
         torch.testing.assert_close(unpacked, tensor)
     finally:
         _cleanup_shm_handle(packed)
+
+
+def _drive_d2h(monkeypatch: pytest.MonkeyPatch, *, pin_error: str | None = None):
+    """Run _tensor_to_shm's d2h branch with the accelerator stream faked out.
+
+    Returns (attempts, fake_stream) where attempts records every pinned
+    staging allocation the branch made.
+    """
+
+    class FakeStream:
+        def synchronize(self) -> None:
+            pass
+
+    attempts: list[bool] = []
+    real_empty = torch.empty
+
+    def fake_empty(shape, dtype=None, pin_memory=False, **kwargs):
+        if pin_memory:
+            attempts.append(True)
+            if pin_error is not None:
+                raise RuntimeError(pin_error)
+        return real_empty(shape, dtype=dtype)
+
+    monkeypatch.setattr(torch.accelerator, "current_stream", lambda *a, **k: None)
+    monkeypatch.setattr(torch.accelerator, "set_stream", lambda *a, **k: None)
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    return attempts, FakeStream()
+
+
+def test_d2h_pinned_failure_falls_back_to_pageable(monkeypatch):
+    """A MallocHost failure on the pinned staging buffer degrades to a pageable
+    copy with identical bytes (the #9957 fallback)."""
+    x = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+    attempts, stream = _drive_d2h(monkeypatch, pin_error="aclrtMallocHostWithCfg failed: MallocHost out of memory")
+
+    handle = _tensor_to_shm(x, stream, created=[])
+
+    assert attempts == [True]
+    # _tensor_from_shm consumes the segment (opens, reads and unlinks it), so
+    # no separate unlink is needed here.
+    restored = _tensor_from_shm(handle)
+    assert torch.equal(restored, x.float())
+
+
+def test_d2h_re_raises_unrelated_pinned_allocation_errors(monkeypatch):
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    attempts, stream = _drive_d2h(monkeypatch, pin_error="nvme controller wedged")
+
+    with pytest.raises(RuntimeError, match="nvme controller wedged"):
+        _tensor_to_shm(x, stream, created=[])
+
+    assert attempts == [True]
+
+
+def test_d2h_uses_pinned_buffer_when_available(monkeypatch):
+    x = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+    attempts, stream = _drive_d2h(monkeypatch)
+
+    handle = _tensor_to_shm(x, stream, created=[])
+
+    assert attempts == [True]
+    # _tensor_from_shm consumes the segment (opens, reads and unlinks it), so
+    # no separate unlink is needed here.
+    restored = _tensor_from_shm(handle)
+    assert torch.equal(restored, x.float())
