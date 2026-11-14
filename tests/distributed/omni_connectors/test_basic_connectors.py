@@ -157,37 +157,24 @@ def test_put_get_small_payload_uses_shm(shm_connector):
     assert size == ret_size
 
 
-def test_put_get_shm(mocker: MockerFixture, shm_connector, monkeypatch: pytest.MonkeyPatch):
-    """Test SHM transfer logic for large data (Mocked)."""
-    # Create data larger than 100 bytes
+def test_put_get_shm(mocker: MockerFixture, shm_connector):
+    """Verify that the real SHM handle is passed unchanged to the reader."""
     data = {"large": "x" * 200}
-
-    # Mock SHM return values
-    mock_handle = {"name": "req_2", "size": 200}
-    mock_write = mocker.MagicMock(return_value=mock_handle)
-    monkeypatch.setattr("vllm_omni.distributed.omni_connectors.connectors.shm_connector.shm_write_bytes", mock_write)
-
-    # When reading, return the serialized bytes of the data
-    serialized_data = shm_connector.serialize_obj(data)
-    mock_read = mocker.MagicMock(return_value=serialized_data)
-    monkeypatch.setattr("vllm_omni.distributed.omni_connectors.connectors.shm_connector.shm_read_bytes", mock_read)
-
-    # Put
+    write = mocker.spy(shm_connector, "_write_bytes")
+    read = mocker.spy(shm_connector, "_read_bytes")
     success, size, metadata = shm_connector.put("stage_0", "stage_1", "req_2", data)
 
     assert success is True
-    # Should use SHM because data > threshold
-    assert "shm" in metadata
-    assert metadata["shm"] == mock_handle
+    assert metadata["shm"] == write.spy_return
     assert "inline_bytes" not in metadata
+    assert isinstance(write.call_args.args[0], memoryview)
+    write.assert_called_once()
 
-    mock_write.assert_called_once()
-
-    # Get
     retrieved_data, ret_size = shm_connector.get("stage_0", "stage_1", "req_2", metadata)
 
     assert data == retrieved_data
-    mock_read.assert_called_once_with(mock_handle)
+    assert ret_size == size
+    read.assert_called_once_with(metadata["shm"])
 
 
 def test_get_invalid_metadata(shm_connector):
