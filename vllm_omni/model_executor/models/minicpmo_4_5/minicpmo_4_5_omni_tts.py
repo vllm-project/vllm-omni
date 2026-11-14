@@ -2172,13 +2172,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if self._mrv2_turn_drafts():
             return talker_sampler, MiniCPMO45TalkerRejectionSampler(sampler, spec_config, self)
         if self._k_step_frames > 0:
-            if self._mrv2_duplex_session() or current_omni_platform.is_cuda():
-                return talker_sampler, None
-            raise NotImplementedError(
-                "MiniCPM-o 4.5 Talker (model_runner: v2) K-step frames require "
-                "session_mode: duplex; remove the stage-1 speculative_config "
-                "from turn sessions"
-            )
+            # A stage-1 speculative_config is how the K-step count reaches the
+            # Talker (K > 0) in any session mode or platform: the MRv2 frame
+            # loop is session-mode agnostic -- the runner's
+            # _propose_draft_tokens books the K-1 extra KV rows as CONTINUE
+            # placeholders and multiframe.run samples each codec frame
+            # device-side, so no draft speculator is installed here and this
+            # combination must not raise.
+            return talker_sampler, None
         # Any other stage-1 draft method would verify draft rows without the
         # Talker's codec-window penalty and forced EOS (the same hazard
         # _check_v1_draft_method guards for the V1 runner): fail closed.
