@@ -205,6 +205,7 @@ class RingParallelAttention:
             "torch_sdpa",
         }
         _non_ring_prefs = {
+            "aiter_quant_attn",
             "cudnn_attn",
             "flashinfer_attn",
             "trtllm_attn",
