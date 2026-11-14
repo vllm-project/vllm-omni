@@ -9,10 +9,11 @@ The loaded policy model owns dataset transforms inside its pipeline.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
-from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -20,10 +21,12 @@ from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
     from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+_cleanup_tasks: set[asyncio.Task] = set()
 
 ActionOutput: TypeAlias = np.ndarray | dict[str, np.ndarray]
 
@@ -182,6 +185,35 @@ class ServingRealtimeRobotOpenPI:
                 close(session_id)
                 return
 
+    def has_single_worker(self) -> bool:
+        stages = getattr(self.engine_client, "stage_configs", None)
+        return (
+            stages is not None
+            and len(stages) <= 1
+            and all(getattr(getattr(stage, "runtime_config", None), "num_replicas", 1) == 1 for stage in stages)
+        )
+
+    async def close_sessions(self, session_ids: list[str]) -> None:
+        """Keep worker cleanup alive if a disconnected caller is cancelled."""
+
+        async def release() -> None:
+            for session_id in session_ids:
+                try:
+                    if self.policy_server_config.values.get("supports_close_session", False):
+                        request = self.build_request({}, session_id=session_id, reset=False)
+                        request.sampling_params.extra_args["close_session"] = True
+                        await self.generate_result(request)
+                    else:
+                        self.drop_session(session_id)
+                except Exception:
+                    logger.exception("Failed to release robot worker session %s", session_id)
+
+        if session_ids:
+            task = asyncio.create_task(release())
+            _cleanup_tasks.add(task)
+            task.add_done_callback(_cleanup_tasks.discard)
+            await asyncio.shield(task)
+
     def _pipeline(self) -> Any:
         engine = self.engine_client
         for attr in ("model_runner", "runner", "diffusion_model_runner"):
@@ -196,6 +228,14 @@ class ServingRealtimeRobotOpenPI:
         # Build request, run inference through AsyncOmni
         num_samples = _num_samples(obs)
         request = self.build_request(obs, session_id=session_id, reset=reset)
+        return self._extract_actions(await self.generate_result(request, num_samples))
+
+    async def generate_result(self, request: OmniDiffusionRequest, num_samples: int = 1) -> OmniRequestOutput:
+        """Run a robot request while preserving model-owned structured outputs.
+
+        ``num_samples`` is the observation's ``sampling_params.n`` (OpenPI); session
+        transports that never sample more than once leave it at 1.
+        """
         result = None
         # OpenPI policy serving is one request -> one action reply. AsyncOmni
         # exposes an async iterator, so consume it to completion and use the
@@ -212,7 +252,7 @@ class ServingRealtimeRobotOpenPI:
         if result is None:
             raise RuntimeError("Robot OpenPI request produced no output.")
 
-        return self._extract_actions(result)
+        return result
 
     def _stage_sampling_params_list(
         self, diffusion_params: OmniDiffusionSamplingParams, num_samples: int = 1
@@ -280,7 +320,7 @@ class ServingRealtimeRobotOpenPI:
         sampling_params = OmniDiffusionSamplingParams()
         for default_params in get_default_sampling_params_list(self.engine_client):
             if isinstance(default_params, OmniDiffusionSamplingParams):
-                sampling_params = clone_sampling_params(default_params)
+                sampling_params = cast(OmniDiffusionSamplingParams, clone_sampling_params(default_params))
                 break
 
         extra_args = sampling_params.extra_args or {}

@@ -234,6 +234,7 @@ from vllm_omni.entrypoints.openai.video.segmentation.helpers import (
     supports_video_segmentation,
 )
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
+from vllm_omni.entrypoints.positronic import router as positronic_router
 from vllm_omni.entrypoints.serve import weight_transfer_api
 from vllm_omni.entrypoints.serve.omni_control.protocol import OmniSleepRequest, OmniWakeupRequest
 from vllm_omni.entrypoints.serve.profile.protocol import ProfileRequest
@@ -254,6 +255,7 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingName
 
 logger = init_logger(__name__)
 router = APIRouter()
+router.include_router(positronic_router)
 
 VIDEO_ABORT_TIMEOUT_S = ABORT_TIMEOUT_S
 
@@ -579,6 +581,12 @@ async def omni_run_server_worker(
             # One frontend retries a self-connect; multiple frontends warm
             # their owned replica groups through the local engine.
             warmup_task = asyncio.create_task(_warmup_duplex_realtime(app, args, duplex_warmup_frames))
+
+        if getattr(app.state, "openai_serving_realtime_robot", None) is not None:
+            from vllm_omni.protocol.numpy_msgpack import MAX_PAYLOAD_BYTES
+
+            # Camera histories must reach the handler's own payload check.
+            uvicorn_kwargs.setdefault("ws_max_size", MAX_PAYLOAD_BYTES)
 
         shutdown_task = await serve_http(
             _TimestampMiddleware(app),
