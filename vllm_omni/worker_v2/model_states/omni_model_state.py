@@ -16,7 +16,7 @@ from __future__ import annotations
 import inspect
 import threading
 import types
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any, cast
 
@@ -35,6 +35,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_omni.model_executor.models.interfaces import requires_request_sample_eligibility
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
@@ -1019,6 +1020,51 @@ class OmniModelState(DefaultModelState):
             if updates:
                 self.intermediate_buffer.update(req_idx, updates, gpu_keys)
 
+    def _request_sample_eligible(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        buffer_list: Sequence[Any],
+    ) -> list[bool]:
+        """Per-request sample eligibility for models that opt into the runner contract.
+
+        Warmup dummy requests are never eligible: they do not pass through
+        stage input processors, so request metadata such as the MiniMax H3
+        encoder payload is absent. Real requests follow the V1 rule and
+        become eligible once this step reaches the end of the request's
+        currently known tokens. If those counts are unavailable, keep the
+        historical default (eligible) so a finished real request is not
+        silently skipped.
+        """
+        eligible: list[bool] = []
+        for batch_idx, info in enumerate(buffer_list):
+            req_id = info.get("req_id") if isinstance(info, Mapping) else None
+            if isinstance(req_id, str) and is_warmup_request(req_id):
+                eligible.append(False)
+                continue
+            try:
+                req_idx = int(input_batch.idx_mapping_np[batch_idx])
+            except Exception:
+                req_idx = batch_idx
+            try:
+                scheduled = int(input_batch.num_scheduled_tokens[batch_idx])
+            except Exception:
+                eligible.append(True)
+                continue
+            computed = self._get_req_state_value(getattr(req_states, "num_computed_tokens_np", None), req_idx)
+            if computed is None:
+                computed = self._get_req_state_value(getattr(req_states, "num_computed_tokens", None), req_idx)
+            if computed is None:
+                computed = self._get_input_batch_num_computed(input_batch, req_idx, batch_idx)
+            num_tokens = self._get_req_state_value(getattr(req_states, "total_len", None), req_idx)
+            if num_tokens is None:
+                num_tokens = self._get_req_state_value(getattr(req_states, "prefill_len", None), req_idx)
+            if computed is None or num_tokens is None:
+                eligible.append(True)
+                continue
+            eligible.append(computed + scheduled >= num_tokens)
+        return eligible
+
     # ------------------------------------------------------------------
     # Output post-processing
     # ------------------------------------------------------------------
@@ -1059,6 +1105,10 @@ class OmniModelState(DefaultModelState):
                     "model_intermediate_buffer": buffer_list,
                     "request_token_spans": self._request_token_spans(input_batch),
                 }
+                if requires_request_sample_eligibility(self.model):
+                    make_output_kwargs["request_sample_eligible"] = self._request_sample_eligible(
+                        input_batch, req_states, buffer_list
+                    )
                 make_output_kwargs["runtime_additional_information"] = buffer_list
                 model_output = self.model.make_omni_output(model_output, **make_output_kwargs)
 

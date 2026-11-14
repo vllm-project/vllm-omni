@@ -74,6 +74,8 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
     model.postprocess_batch_mrv2 = None
     model.eager_decode_settled = None
     model.eager_frames_need_postprocess = True
+    # Explicit False so MagicMock does not look truthy to the eligibility helper.
+    model.requires_request_sample_eligibility = False
     state.model = model
     state.scheduler_config = SimpleNamespace(max_num_seqs=max_num_reqs)
     state.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
@@ -222,6 +224,78 @@ def test_output_spans_follow_reordered_mixed_batch():
     state.postprocess_model_output(torch.zeros(4, 2), batch, SimpleNamespace())
     assert seen["request_token_spans"] == [(0, 3), (3, 4)]
     assert [info["req_id"] for info in seen["model_intermediate_buffer"]] == ["prefill", "decode"]
+
+    assert "request_sample_eligible" not in seen
+
+
+@pytest.mark.parametrize("req_id", ["_warmup_0_", "_v2_mixed_warmup_decode_", "_v2_mixed_warmup_prefill_"])
+def test_postprocess_marks_warmup_ineligible_when_model_requires_eligibility(req_id):
+    # A finished dummy sequence would look sample-eligible under the token rule;
+    # warmup IDs must still be skipped so missing stage metadata does not raise.
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.requires_request_sample_eligibility = True
+    batch = _DummyInputBatch([0])
+    batch.req_ids = [req_id]
+    batch.num_scheduled_tokens = [4]
+    batch.query_start_loc_np = [0]
+    state.intermediate_buffer.buffers[0] = {"req_id": req_id}
+    seen = {}
+    state.model.make_omni_output = lambda hidden, **kwargs: (
+        seen.update(kwargs) or OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+    )
+    req_states = SimpleNamespace(
+        num_computed_tokens_np=np.array([0], dtype=np.int32),
+        prompt_len=np.array([4], dtype=np.int32),
+        prefill_len=np.array([4], dtype=np.int32),
+        total_len=np.array([4], dtype=np.int32),
+    )
+    state.postprocess_model_output(torch.zeros(4, 2), batch, req_states)
+    assert seen["request_sample_eligible"] == [False]
+
+
+def test_postprocess_eligibility_follows_finished_tokens_for_real_requests():
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.requires_request_sample_eligibility = True
+    batch = _DummyInputBatch([2, 0])
+    batch.req_ids = ["prefill", "decode"]
+    batch.num_scheduled_tokens = [3, 1]
+    batch.query_start_loc_np = [0, 3]
+    state.intermediate_buffer.buffers[2] = {"req_id": "prefill"}
+    state.intermediate_buffer.buffers[0] = {"req_id": "decode"}
+    seen = {}
+    state.model.make_omni_output = lambda hidden, **kwargs: (
+        seen.update(kwargs) or OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+    )
+    # Slot 2 prefill: computed 0 + scheduled 3 >= total 3 -> eligible.
+    # Slot 0 decode: computed 5 + scheduled 1 < total 8 -> not yet eligible.
+    req_states = SimpleNamespace(
+        num_computed_tokens_np=np.array([5, 0, 0], dtype=np.int32),
+        total_len=np.array([8, 0, 3], dtype=np.int32),
+    )
+    state.postprocess_model_output(torch.zeros(4, 2), batch, req_states)
+    assert seen["request_sample_eligible"] == [True, False]
+    assert [info["req_id"] for info in seen["model_intermediate_buffer"]] == ["prefill", "decode"]
+
+
+def test_postprocess_mixed_warmup_and_real_request_eligibility():
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.requires_request_sample_eligibility = True
+    batch = _DummyInputBatch([0, 1])
+    batch.req_ids = ["_warmup_0_", "request-1"]
+    batch.num_scheduled_tokens = [4, 4]
+    batch.query_start_loc_np = [0, 4]
+    state.intermediate_buffer.buffers[0] = {"req_id": "_warmup_0_"}
+    state.intermediate_buffer.buffers[1] = {"req_id": "request-1"}
+    seen = {}
+    state.model.make_omni_output = lambda hidden, **kwargs: (
+        seen.update(kwargs) or OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+    )
+    req_states = SimpleNamespace(
+        num_computed_tokens_np=np.array([0, 0], dtype=np.int32),
+        total_len=np.array([4, 4], dtype=np.int32),
+    )
+    state.postprocess_model_output(torch.zeros(8, 2), batch, req_states)
+    assert seen["request_sample_eligible"] == [False, True]
 
 
 @pytest.mark.parametrize("hook_name", ["preprocess_decode_batch_mrv2", "preprocess_decode_batch", "legacy"])
