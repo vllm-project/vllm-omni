@@ -1,13 +1,14 @@
 # Praxis-1
 
-Praxis-1 is Runway's closed-loop robot policy. From the camera views, the
-arm's recent poses and a task string it jointly predicts future video and
+Praxis-1 is Runway's closed-loop robot policy. From two or three camera views,
+the arm's recent poses and a task string it jointly predicts future video and
 Cartesian pose/gripper targets at 15 Hz. vLLM-Omni runs it natively as the
-`Praxis1Pipeline` diffusion pipeline:
+`Praxis1Pipeline` diffusion pipeline with two embodiments:
 
 | Checkpoint | Rig | Views | Targets per row |
 | --- | --- | --- | --- |
 | `runwayml/praxis-1-droid` | DROID single arm (Franka) | exterior, wrist | 13: xyz, row-major 3x3 rotation, gripper |
+| `runwayml/praxis-1-yam` | YAM two arms | exterior, left wrist, right wrist | 26: left then right |
 
 The architecture is adapted from [runwayml/praxis-1-oss](https://github.com/runwayml/praxis-1-oss):
 a chunk-causal video backbone (two MoE transformer towers over Wan2.2 latents),
@@ -31,7 +32,8 @@ the paths.
 ```
 
 Pass the local directory to Omni with a deployment that selects the
-pipeline. A minimal deployment runs one stage on one GPU:
+pipeline. A minimal deployment runs one stage on one GPU; the same file works
+for the DROID and the YAM checkpoint:
 
 ```yaml
 # praxis1-deploy.yaml
@@ -52,7 +54,9 @@ vllm serve /path/to/praxis-1-droid --omni --served-model-name praxis-1 \
   --deploy-config praxis1-deploy.yaml --stage-init-timeout 1800
 ```
 
-Offline requests pass `robot_obs` and a nonempty `session_id` in
+The
+[recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Runway/Praxis-1-H100.md)
+has a runnable `Omni.generate` example. Offline requests pass `robot_obs` and a nonempty `session_id` in
 `OmniDiffusionSamplingParams.extra_args`; reuse the id for continuation,
 `reset` starts an episode and `end_session` releases it.
 
@@ -83,13 +87,21 @@ flange forward-kinematics check can catch pose-frame mismatches.
 Views are centre-cropped to the native 720x1280 aspect, antialiased to 234x416
 (unless already that size), centre-trimmed to 224x416 and tiled to 224x832.
 
+YAM observations use `image.exterior`, `image.wrist_left`, `image.wrist_right`,
+`robot_state.left.ee_pose`, `robot_state.right.ee_pose`, `grip.left`,
+`grip.right` and `task`. Each pose is `[xyz3, quat_wxyz4]` in the rig world
+frame. Views keep their native 16:10 aspect; 260x416 frames are trimmed to three
+256x416 tiles. The checkpoint was trained on window captions such as
+"Pick up the pen from the center of the table, then place the pen in the bag"
+(no closing period); send the task in that form.
+
 Continuation needs the executed frames and poses since the previous call plus
 the current row; insufficient history restarts the context. Cold starts return
 21 targets (1.4 s), later calls 24 (1.6 s). The episode seed advances with the
 chunk index, so a reset reproduces the first call.
 
-`multimodal_output["actions"]` is float32 `(T, 13)`: absolute
-client-frame `[xyz3, R_flat9, gripper]`. `return_diagnostics` adds the
+`multimodal_output["actions"]` is float32 `(T, 13)` or `(T, 26)`: absolute
+client-frame `[xyz3, R_flat9, gripper]` per arm. `return_diagnostics` adds the
 command dictionaries, normalized/relative actions, video latent, depth and seed
 under `trajectory`; `decode_video` adds command-aligned uint8 `(T, 3, H, W)`
 predicted frames.
@@ -100,12 +112,12 @@ Set these under `model_config` in a copy of the deployment:
 
 | Setting | Default |
 | --- | --- |
-| `num_steps`, `cfg_scale`, `cfg_video_scale`, `t_shift` | 2 Euler steps, action/video guidance 1/4, shift 12.5 |
+| `num_steps`, `cfg_scale`, `cfg_video_scale`, `t_shift` | DROID: 2 Euler steps, action/video guidance 1/4, shift 12.5. YAM: 2 steps, guidance 1/1, shift 1 |
 | `attention_impl` | `flex` (block-sparse FlexAttention) or `backend` (dense masks through the Omni-selected attention backend; backends without dense-mask support fall back to SDPA) |
 | `max_prompt_tokens` | 512 including special tokens; task text is capped at 64 KiB before tokenization |
 | `max_num_steps` | 16; worker-enforced cap on every API |
 | `max_sessions`, `max_context_chunks`, `exec_horizon` | 4 sessions, 1 context chunk (0 to 3), 24-row horizon (1 to 24); `context_mode=stateless` disables history |
-| `control_mode` | `droid_impedance` or `none` |
+| `control_mode` | DROID `droid_impedance` or `none`; YAM requires `none` |
 | `session_idle_timeout` | 300 s for offline and OpenPI sessions; a transport that reserves a session keeps it alive |
 | `warmup` | true; runs valid observations at the configured context depths before the server is ready |
 | `text_cache_max_entries`, `text_cache_max_bytes` | 128 entries, 64 MiB; zero disables the prompt-embedding cache |
@@ -132,7 +144,8 @@ kernels. Prompt embeddings are cached per task string.
 
 ## Validation
 
-The port is checked at three levels.
+The port is checked at three levels. Commands are in the
+[recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Runway/Praxis-1-H100.md#verification).
 
 1. **Oracle parity on random weights.** A tiny transformer built by both the
    reference implementation and this port from the same random weights agrees
@@ -150,7 +163,7 @@ The port is checked at three levels.
 3. **Task success in simulation.** The reference repository's MuJoCo task
    suites, driven unchanged against this server over its robot-policy
    WebSocket API, are the qualification that matters. Results are recorded in
-   the recipe that accompanies the checkpoint-gated tests.
+   the recipe.
 
 Weight-free CPU and GPU tests cover the config contract, masks,
 rotary tables, the sampler, weight mapping, observation processing and the

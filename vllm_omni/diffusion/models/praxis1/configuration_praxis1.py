@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Validate the supported DROID checkpoint's mathematical and robot-I/O contract.
+"""Validate the supported DROID and YAM checkpoints' mathematical and robot-I/O contract.
 
 Dimensions used to construct the native modules stay in the checkpoint dict.
 Reference kernel/backend tuning is metadata; Omni selects its own execution.
@@ -80,12 +80,15 @@ class CheckpointError(ValueError):
 def validate_config(config: Mapping) -> None:
     """Reject incompatible mathematical conventions before allocating weights."""
     embodiment = config.get("embodiment")
-    if embodiment != "single_arm":
+    if embodiment not in ("single_arm", "bimanual"):
         raise CheckpointError(f"Unsupported Praxis embodiment: {embodiment!r}")
-    dim, height, views = 10, 224, ["exterior", "wrist"]
+    bimanual = embodiment == "bimanual"
+    dim, height, views = (
+        (20, 256, ["top_left", "wrist_left", "wrist_right"]) if bimanual else (10, 224, ["exterior", "wrist"])
+    )
     rig_values = {
         "embodiment": embodiment,
-        "pose_frame": "flange",
+        "pose_frame": "rig" if bimanual else "flange",
         "video.width": 416 * len(views),
         "video.height": height,
         "video.tile_height": height,
