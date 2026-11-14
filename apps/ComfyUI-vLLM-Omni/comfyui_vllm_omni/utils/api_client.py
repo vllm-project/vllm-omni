@@ -442,7 +442,10 @@ class VLLMOmniClient:
             if latent_edit is not None:
                 raise ValueError("timeline_guides cannot be combined with latent_edit; disconnect one of them.")
             # The server treats a missing scale as active and a zero scale as inactive.
-            if lora is not None and (lora.get("scale") is None or float(lora["scale"]) != 0.0):
+            if lora is not None and any(
+                adapter.get("scale") is None or float(adapter["scale"]) != 0.0
+                for adapter in lora.get("adapters", [lora])
+            ):
                 raise ValueError(
                     "timeline_guides require base MiniMax-H3 weights; disconnect the request-level LoRA "
                     "(or set its scale to 0)."

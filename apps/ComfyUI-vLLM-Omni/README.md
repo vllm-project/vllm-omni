@@ -364,7 +364,7 @@ A guided request:
 - keeps the usual routing: guides alone are T2VA, with `first_frame` /
   `last_frame` FL2VA, with **Video References** Ref2VA. References keep their
   `<Picture N>` / `<Video N>` / `<Audio N>` numbering;
-- rejects active request-level LoRA with timeline guides before upload; set its scale to zero or disconnect it. FastH3 Omni may forward guides without an active request-level LoRA. Server-side restrictions remain authoritative.
+- requires base H3 weights and rejects FastH3 (Preview and Omni) or active request-level LoRA before upload; set every LoRA scale to zero or disconnect it. Server-side restrictions remain authoritative.
 
 Use a vLLM-Omni server that includes timeline guides
 ([#8838](https://github.com/vllm-project/vllm-omni/pull/8838)). Older servers
@@ -375,7 +375,7 @@ The served model name must match the H3 model spec (for example, start the
 server with `--served-model-name MiniMaxAI/MiniMax-H3`); otherwise the node
 refuses to send guides, for example to a server named only by its model path.
 
-The [Character Replacement](example_workflows/vLLM-Omni%20MiniMax-H3%20Character%20Replacement.json) example uses two boundary images at frames 0 and 21, ordinary Generate Video requests, and native crop/concatenation nodes. **Reverse Image Batch** reverses the frame order of any `IMAGE` batch; it has no model, VAE, request, or queue logic. The supplied segment lengths reproduce a 27-second example; another source needs matching contexts, prompts, and cut values. Loader filenames are placeholders. The FastH3 + Swap + guides combination requires the compatible experimental backend described above.
+The [Agentic Continuation](example_workflows/vLLM-Omni%20MiniMax-H3%20Character%20Replacement%20Continuation%20(Agentic).json) example uses two boundary images at frames 0 and 21, ordinary Generate Video requests, and native crop/concatenation nodes. **Reverse Image Batch** reverses the frame order of any `IMAGE` batch; it has no model, VAE, request, or queue logic. The supplied segment lengths reproduce a 27-second example; another source needs matching contexts, prompts, and cut values. Loader filenames are placeholders. Guided segments require base H3 weights with all request-level LoRAs disabled; FastH3 + Swap + guides is unsupported.
 
 Validate the node and the request contract locally with:
 

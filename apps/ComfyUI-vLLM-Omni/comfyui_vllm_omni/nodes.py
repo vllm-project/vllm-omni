@@ -42,7 +42,9 @@ FASTH3_FPS = 24
 # A FastH3 deployment may expose H3 under any --served-model-name, so the payload
 # spec has to be named outright rather than recovered from that alias.
 FASTH3_SPEC_MODEL = "MiniMax-H3"
-_FASTH3_GUIDES_ERROR = "timeline_guides are not supported by FastH3 Preview; select Omni with a compatible backend."
+_FASTH3_GUIDES_ERROR = (
+    "timeline_guides require base MiniMax-H3 weights, not FastH3; disconnect fast_h3 or timeline_guides."
+)
 
 
 def _resolve_fast_h3_deployment(deployment: dict) -> tuple[str, str]:
@@ -253,7 +255,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             return "Provide either frame or first_frame/last_frame, not both."
         if references is not None and (first_frame is not None or last_frame is not None):
             return "Provide either first_frame/last_frame or references, not both."
-        if fast_h3 is not None and fast_h3.get("variant", "Preview") == "Preview" and timeline_guides is not None:
+        if fast_h3 is not None and timeline_guides is not None:
             return _FASTH3_GUIDES_ERROR
         if (
             fast_h3 is not None
@@ -297,7 +299,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         spec_model = model
 
         if fast_h3 is not None:
-            if fast_h3.get("variant", "Preview") == "Preview" and timeline_guides is not None:
+            if timeline_guides is not None:
                 raise ValueError(_FASTH3_GUIDES_ERROR)
             if fast_h3.get("variant", "Preview") == "Preview" and any(
                 value is not None for value in (frame, first_frame, last_frame, references)

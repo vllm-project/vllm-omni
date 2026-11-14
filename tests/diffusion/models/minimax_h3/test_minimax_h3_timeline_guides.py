@@ -275,7 +275,7 @@ def test_unguided_context_is_unchanged():
     assert context["visual_condition_shapes"] == [(1, 4, 2)]
 
 
-def test_fast_omni_accepts_timeline_guides():
+def test_fast_omni_rejects_timeline_guides():
     from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import FastH3OmniCheckpointSpec
     from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 
@@ -295,10 +295,8 @@ def test_fast_omni_accepts_timeline_guides():
     sampling.num_inference_steps = 8
     sampling.guidance_scale = 1.0
     sampling.guidance_scale_2 = 1.0
-    context = pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
-
-    assert context["guide_blocks"] == [dict(block) for block in conditioning.guide_blocks]
-    assert context["visual_condition_shapes"] == [(1, 4, 6), (1, 4, 6)]
+    with pytest.raises(OmniClientError, match="timeline guides require base H3 weights, not FastH3"):
+        pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
 
 
 def test_guides_are_rejected_across_a_separate_encoder_stage():
