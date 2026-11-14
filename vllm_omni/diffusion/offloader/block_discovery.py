@@ -38,8 +38,16 @@ def set_blocks_attr_names(model: nn.Module, names: list[str]) -> None:
 def get_blocks_from_dit(
     model: nn.Module,
     block_attrs: tuple[str, ...] | None = None,
+    *,
+    unwrap_cached_blocks: bool = False,
 ) -> tuple[list[str], list[nn.Module]]:
-    """Retrieve blocks from an explicit plan or the DiT class metadata."""
+    """Retrieve blocks from an explicit plan or the DiT class metadata.
+
+    Cache-DiT can replace a block list with a wrapper. Submodule offload needs
+    the physical layers inside that wrapper; other strategies intentionally keep
+    the wrapper as the streamed block so their existing hook lifecycle is
+    unchanged.
+    """
     explicit_attrs = block_attrs is not None
     blocks_attr_names = list(block_attrs) if explicit_attrs else get_blocks_attr_names(model)
     if not blocks_attr_names:
@@ -86,4 +94,17 @@ def get_blocks_from_dit(
         )
         return [], []
 
-    return blocks_attr_names, blocks
+    if not unwrap_cached_blocks:
+        return blocks_attr_names, blocks
+
+    # Cache-DiT replaces a block list with a wrapper. Discover physical layers
+    # while leaving the wrapper forward in control of execution and cache hits.
+    def physical_layers(items):
+        for block in items:
+            wrapped = getattr(block, "transformer_blocks", None)
+            if isinstance(wrapped, (nn.ModuleList, list, tuple)):
+                yield from physical_layers(wrapped)
+            else:
+                yield block
+
+    return blocks_attr_names, list(physical_layers(blocks))

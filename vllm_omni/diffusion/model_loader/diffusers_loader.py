@@ -795,7 +795,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=False)
 
                 resolved_offload = resolve_offload(self.od_config)
-                distributed_offload = resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+                distributed_offload = resolved_offload.strategy in (
+                    OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                    OffloadStrategy.SUBMODULE,
+                )
                 dit_distributed_offload = distributed_offload and resolved_offload.offloads(DIT_COMPONENT)
                 dit_uses_allgather = dit_distributed_offload and resolved_offload.uses_allgather(DIT_COMPONENT)
                 tensor_parallel_size = int(getattr(self.parallel_config, "tensor_parallel_size", 1))

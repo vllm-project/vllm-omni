@@ -942,7 +942,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames, sa
 
 
 def test_prepare_encode_rejects_request_mode_only_features():
-    """Multi-output and DLO have no representation in the step contract."""
+    """Multi-output and distributed/submodule offload have no representation
+    in the step contract."""
     from vllm_omni.diffusion.worker.utils import StepRequestState
     from vllm_omni.errors import OmniClientError
 
@@ -965,6 +966,17 @@ def test_prepare_encode_rejects_request_mode_only_features():
     dlo_pipeline._dlo_residency_controller = object()
     with pytest.raises(ValueError, match="distributed layerwise offload"):
         dlo_pipeline.prepare_encode(single_output)
+
+    # SUBMODULE is rejected from the resolved strategy even when no resident
+    # layers were requested and the backend therefore published no controller.
+    submodule_pipeline = _step_pipeline(_SegmentMeanModel())
+    submodule_pipeline.od_config = SimpleNamespace(
+        enable_submodule_offload=True,
+        dlo_resident_layers=0,
+    )
+    assert getattr(submodule_pipeline, "_dlo_residency_controller", None) is None
+    with pytest.raises(ValueError, match="submodule offload"):
+        submodule_pipeline.prepare_encode(single_output)
 
 
 def test_prepare_encode_rejects_high_quality_cache_dit():

@@ -1087,6 +1087,16 @@ class OmniServeCommand(CLISubcommand):
             "New integrations should use mode=layer and configure weight transfer per component.",
         )
         omni_config_group.add_argument(
+            "--enable-submodule-offload",
+            action="store_true",
+            help="Enable sub-module level weight offload for DiT blocks. "
+            "Streams attn/mlp/adaln weights independently within each block, "
+            "overlapping H2D transfer with sub-module compute. "
+            "Uses finer-grained weight staging than block-level DLO. "
+            "Reuses DLO infrastructure (AllGather, mmap, pin_memory, copy/comm streams). "
+            "Token Refiner blocks keep DLO block-level hooks.",
+        )
+        omni_config_group.add_argument(
             "--dlo-use-allgather",
             dest="dlo_use_allgather",
             action="store_true",
