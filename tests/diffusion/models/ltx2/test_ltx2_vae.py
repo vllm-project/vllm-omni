@@ -37,6 +37,13 @@ def test_ltx_vocoder_deterministic_context(monkeypatch, initial_deterministic, f
     assert {name: getattr(torch.backends.cudnn, name) for name in settings} == settings
 
 
+@dataclass
+class _DistributedExecutorProbe:
+    parallel_size: int
+    world_size: int
+    group: object | None = None
+
+
 @dataclass(frozen=True)
 class _OperatorSetProbe:
     fna: Callable[..., torch.Tensor] | None
@@ -120,6 +127,199 @@ def test_ltx_bwe_resampler_filter_is_rebuilt_only_after_a_cast():
 
 
 class TestLTXDiffusionDecoder:
+    @pytest.mark.parametrize(
+        ("height", "width", "parallel_size", "expected_grid"),
+        [
+            (60, 34, 1, (1, 1)),
+            (60, 34, 2, (2, 1)),
+            (60, 34, 3, (3, 1)),
+            (60, 34, 4, (2, 2)),
+            (60, 34, 8, (4, 2)),
+            (34, 60, 8, (2, 4)),
+            (60, 60, 8, (2, 4)),
+            (60, 34, 16, (4, 4)),
+        ],
+    )
+    def test_distributed_diffusion_tile_planner_uses_shape_aware_spatial_grid(
+        self,
+        height,
+        width,
+        parallel_size,
+        expected_grid,
+    ):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            _shape_aware_spatial_grid,
+        )
+
+        assert (
+            _shape_aware_spatial_grid(
+                height=height,
+                width=width,
+                tile_count=parallel_size,
+                overlap=4,
+                min_tile_height=7,
+                min_tile_width=7,
+            )
+            == expected_grid
+        )
+
+    def test_distributed_diffusion_tile_planner_matches_production_latent_geometry(self):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+        )
+
+        with torch.device("meta"):
+            model = DistributedLTX2VideoDiffusionDecoderModel()
+            latent = torch.empty(1, 128, 16, 60, 34)
+        model.distributed_executor = _DistributedExecutorProbe(parallel_size=8, world_size=8)
+
+        plan = model._build_tiled_decode_plan(latent)
+
+        assert plan.height_tiles == ((0, 18), (14, 32), (28, 46), (42, 60))
+        assert plan.width_tiles == ((0, 19), (15, 34))
+        assert plan.output_shape == (121, 1920, 1088)
+
+    @pytest.mark.parametrize(
+        ("parallel_size", "expected_height", "expected_width"),
+        [
+            (4, ((0, 32), (28, 60)), ((0, 19), (15, 34))),
+            (8, ((0, 18), (14, 32), (28, 46), (42, 60)), ((0, 19), (15, 34))),
+        ],
+    )
+    def test_distributed_diffusion_tile_planner_uses_one_raw_latent_tile_per_rank(
+        self,
+        parallel_size,
+        expected_height,
+        expected_width,
+    ):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+        )
+
+        with torch.device("meta"):
+            model = DistributedLTX2VideoDiffusionDecoderModel()
+            latent = torch.empty(1, 128, 16, 60, 34)
+        model.distributed_executor = _DistributedExecutorProbe(
+            parallel_size=parallel_size,
+            world_size=parallel_size,
+        )
+
+        plan = model._build_tiled_decode_plan(latent)
+
+        assert plan.height_tiles == expected_height
+        assert plan.width_tiles == expected_width
+        assert len(plan.height_tiles) * len(plan.width_tiles) == parallel_size
+
+    def test_distributed_diffusion_tile_planner_rejects_impossible_overlap(self):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            _split_axis_by_count,
+        )
+
+        with pytest.raises(ValueError, match="not larger than the overlap"):
+            _split_axis_by_count(length=5, tile_count=2, overlap=4)
+
+    def test_distributed_diffusion_tile_planner_rejects_triple_blend_overlap(self):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            _split_axis_by_count,
+        )
+
+        with pytest.raises(ValueError, match="minimum tile size 8"):
+            _split_axis_by_count(length=10, tile_count=3, overlap=4, min_tile_size=8)
+
+        with pytest.raises(ValueError, match="complete axis is too short"):
+            _split_axis_by_count(length=6, tile_count=1, overlap=0, min_tile_size=7)
+
+    def test_distributed_diffusion_tile_planner_derives_natten_size_floor(self):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            _minimum_raw_latent_tile_shape,
+        )
+
+        minimum = _minimum_raw_latent_tile_shape(
+            ((3, 7, 7), (3, 7, 7), (3, 5, 5), (3, 5, 5)),
+            (11, 11, 11),
+            ((1, 2, 2), (2, 1, 1), (2, 2, 2), (2, 2, 2)),
+        )
+
+        assert minimum == (3, 7, 7)
+
+    @pytest.mark.parametrize("height,width,parallel_size", [(7, 20, 8), (20, 7, 8), (7, 7, 2)])
+    def test_distributed_diffusion_tile_planner_rejects_illegal_natten_tiles(self, height, width, parallel_size):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import _shape_aware_spatial_grid
+
+        with pytest.raises(ValueError, match="legal spatial tiles"):
+            _shape_aware_spatial_grid(
+                height=height,
+                width=width,
+                tile_count=parallel_size,
+                overlap=4,
+                min_tile_height=7,
+                min_tile_width=7,
+            )
+
+    @pytest.mark.parametrize("height,width,parallel_size", [(61, 35, 8), (35, 61, 8), (13, 13, 4), (7, 60, 4)])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_shape_aware_tiles_reconstruct_batched_video_without_seams(self, height, width, parallel_size, dtype):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import DistributedLTX2VideoDiffusionDecoderModel
+
+        with torch.device("meta"):
+            model = DistributedLTX2VideoDiffusionDecoderModel()
+        model.distributed_executor = _DistributedExecutorProbe(parallel_size=parallel_size, world_size=parallel_size)
+        # Use small output scales to exercise all overlap pixels without
+        # allocating a production-resolution RGB video in a CPU test.
+        model.spatial_compression_ratio = 2
+        model.temporal_compression_ratio = 2
+        plan = model._build_tiled_decode_plan(torch.empty(2, 128, 3, height, width))
+        expected = torch.randn(2, 3, *plan.output_shape).to(dtype)
+        tiles = {
+            (hi, wi): expected[..., h0 * 2 : h1 * 2, w0 * 2 : w1 * 2]
+            for hi, (h0, h1) in enumerate(plan.height_tiles)
+            for wi, (w0, w1) in enumerate(plan.width_tiles)
+        }
+
+        actual = model._merge_tiled_decode(tiles, plan)
+
+        assert actual.dtype == dtype
+        torch.testing.assert_close(actual, expected)
+
+    def test_distributed_diffusion_tile_merge_uses_complementary_spatial_masks(self):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+            LTX2VideoDiffusionTilePlan,
+        )
+
+        plan = LTX2VideoDiffusionTilePlan(
+            height_tiles=((0, 5), (3, 8), (7, 12)),
+            width_tiles=((0, 5), (3, 8), (7, 12)),
+            latent_frames=2,
+            latent_height=12,
+            latent_width=12,
+            scale_t=2,
+            scale_h=2,
+            scale_w=2,
+        )
+        expected = torch.arange(3 * 24 * 24, dtype=torch.float32).reshape(1, 1, 3, 24, 24)
+        tiles = {
+            (h_idx, w_idx): expected[
+                :,
+                :,
+                :,
+                h0 * 2 : h1 * 2,
+                w0 * 2 : w1 * 2,
+            ]
+            for h_idx in range(3)
+            for h0, h1 in (plan.height_tiles[h_idx],)
+            for w_idx in range(3)
+            for w0, w1 in (plan.width_tiles[w_idx],)
+        }
+
+        result = DistributedLTX2VideoDiffusionDecoderModel._merge_tiled_decode(
+            object.__new__(DistributedLTX2VideoDiffusionDecoderModel),
+            tiles,
+            plan,
+        )
+
+        torch.testing.assert_close(result, expected)
+
     def test_diffusion_decoder_reuses_diffusers_with_scoped_overrides(self, monkeypatch):
         from diffusers.models.autoencoders.ltx2_diffusion_decoder import (
             LTX2VideoDiffusionDecoderModel as DiffusersModel,
@@ -310,16 +510,18 @@ class TestLTXDiffusionDecoder:
             LTX2VideoDiffusionDecoderModel,
         )
 
-        class IdentityAttention:
-            def build_block_mask(self, _hidden_states):
-                return None
-
         class IdentityBlock(torch.nn.Module):
             def __init__(self):
                 super().__init__()
+
+                class IdentityAttention:
+                    @staticmethod
+                    def build_block_mask(_hidden_states: torch.Tensor) -> None:
+                        return None
+
                 self.attn = IdentityAttention()
 
-            def forward(self, hidden_states, _block_mask):
+            def forward(self, hidden_states, block_mask):
                 return hidden_states
 
         class IdentityUpsample(torch.nn.Module):
@@ -658,9 +860,7 @@ class TestLTXDiffusionDecoder:
         assert seen["generator"] is generator
         assert seen["num_inference_steps"] == 1
 
-    def test_distributed_diffusion_tiles_preserve_serial_noise_order(self, monkeypatch):
-        from diffusers.utils.torch_utils import randn_tensor
-
+    def test_distributed_diffusion_tiles_keep_time_intact_and_share_rank0_rng(self, monkeypatch):
         from vllm_omni.diffusion.models.ltx2.vae.distributed import (
             DistributedLTX2VideoDiffusionDecoderModel,
         )
@@ -679,34 +879,67 @@ class TestLTXDiffusionDecoder:
             spatial_compression_ratio=1,
             temporal_compression_ratio=1,
         )
-        model.tile_sample_min_num_frames = 2
-        model.tile_sample_stride_num_frames = 1
-        model.tile_sample_min_height = 2
-        model.tile_sample_stride_height = 1
-        model.tile_sample_min_width = 2
-        model.tile_sample_stride_width = 1
-        model.distributed_executor = SimpleNamespace(group=None)
-        model.decoder.forward_stages_1_to_3 = lambda z: z.permute(0, 2, 3, 4, 1)
+        model.distributed_executor = _DistributedExecutorProbe(group=None, parallel_size=2, world_size=2)
         monkeypatch.setattr(torch.distributed, "broadcast", lambda *_args, **_kwargs: None)
 
-        z = torch.zeros(1, 1, 2, 3, 3)
+        z = torch.zeros(1, 1, 2, 10, 12)
         distributed_generator = torch.Generator().manual_seed(123)
-        reference_generator = torch.Generator().manual_seed(123)
-        tasks, grid_spec = model._distributed_tile_split(z, distributed_generator, num_inference_steps=1)
+        initial_state = distributed_generator.get_state().clone()
+        tasks, grid_spec = model._distributed_tile_split(z, distributed_generator)
 
-        assert grid_spec.grid_shape == (1, 3, 3)
-        assert grid_spec.split_dims == (2, 3, 4)
+        assert grid_spec.grid_shape == (1, 2)
+        assert grid_spec.split_dims == (3, 4)
+        assert len(tasks) == 2
         for task in tasks:
-            tile_shape = model._tiled_pixel_shape_from_features(
-                task.tensor,
-                drop_leading_frame=task.drop_leading_frame,
-                crop_trailing_ghost=task.crop_trailing_ghost,
-            )
-            expected = randn_tensor(tile_shape, generator=reference_generator, device=z.device, dtype=z.dtype)
-            actual = randn_tensor(tile_shape, generator=task.noise_generator, device=z.device, dtype=z.dtype)
-            torch.testing.assert_close(actual, expected)
+            assert task.tensor.shape[:3] == z.shape[:3]
+            assert task.noise_generator is distributed_generator
+        assert torch.equal(distributed_generator.get_state(), initial_state)
 
-        assert torch.equal(distributed_generator.get_state(), reference_generator.get_state())
+    def test_distributed_diffusion_tile_exec_runs_full_decoder_and_crops_output(self):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+            LTX2VideoDiffusionTileTask,
+        )
+
+        seen = {}
+
+        class FakeDecoder(torch.nn.Module):
+            out_channels = 3
+
+            def forward(self, latent, generator=None, num_inference_steps=None):
+                seen["latent"] = latent
+                seen["generator"] = generator
+                seen["num_inference_steps"] = num_inference_steps
+                return torch.ones(
+                    latent.shape[0],
+                    3,
+                    (latent.shape[2] - 1) * 2 + 2,
+                    latent.shape[3] * 4 + 1,
+                    latent.shape[4] * 4 + 1,
+                )
+
+        model = object.__new__(DistributedLTX2VideoDiffusionDecoderModel)
+        torch.nn.Module.__init__(model)
+        model.decoder = FakeDecoder()
+        model.temporal_compression_ratio = 2
+        model.spatial_compression_ratio = 4
+        latent = torch.zeros(1, 1, 3, 5, 6)
+        generator = torch.Generator().manual_seed(123)
+        task = LTX2VideoDiffusionTileTask(
+            tile_id=0,
+            grid_coord=(0, 0),
+            tensor=latent,
+            noise_generator=generator,
+        )
+
+        output = model._distributed_tile_exec(task, num_inference_steps=3)
+
+        assert seen == {
+            "latent": latent,
+            "generator": generator,
+            "num_inference_steps": 3,
+        }
+        assert output.shape == (1, 3, 5, 20, 24)
 
 
 class TestLTXOutputRank:
