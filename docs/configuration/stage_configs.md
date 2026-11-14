@@ -606,12 +606,16 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 ## Qwen3-TTS with Model Runner V2
 
-Qwen3-TTS runs the native CUDA Model Runner V2 pipeline by default on vLLM
-0.29.0. MRV2 is an experimental feature for this model: the bundled default
-profile selects it on CUDA only, and its scheduler and delivery paths are
-still being qualified. Set `model_runner: v1` in a copy of the deploy config
-to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on NPU, XPU,
-ROCm and MUSA. Select one of these deployment profiles:
+Qwen3-TTS selects Model Runner V2 by default on CUDA and NPU. MRV2 remains
+experimental for this model; its scheduler and delivery paths are still being
+qualified. Set `model_runner: v1` in a copy of the deploy config
+to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on XPU,
+ROCm and MUSA. On NPU, the V2 Talker uses `FULL_AND_PIECEWISE`; Code2Wav
+retains `PIECEWISE`. If opting out to V1 on NPU, also set stage 0 to `PIECEWISE`
+in the NPU platform section of the copied configuration. The NPU Talker rejects
+V1 with full decode graphs before loading weights; use `PIECEWISE`, `NONE` or
+eager execution for V1. Select one of these
+deployment profiles:
 
 | Profile | Runner | Code2Wav graph batches | Intended use |
 | --- | --- | --- | --- |
@@ -634,7 +638,7 @@ Talker AR runner and the Code2Wav generation
 runner together. Native inter-stage delivery carries codec payloads directly;
 request-owned snapshots preserve buffers through asynchronous completion and
 CUDA graph reuse. Terminal completion waits for upstream stage metrics before
-releasing request state. Platform sections retain V1 on NPU, XPU, ROCm and MUSA;
+releasing request state. Platform sections retain V1 on XPU, ROCm and MUSA;
 this change does not qualify MRV2 on those backends or enable other model families.
 Selecting V2 for a stage without `supports_native_mrv2_data_plane` emits a warning
 when pipeline and deployment settings are merged. That stage retains the legacy

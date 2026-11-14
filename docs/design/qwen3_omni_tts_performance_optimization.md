@@ -608,3 +608,167 @@ bash benchmarks/qwen3-tts/vllm_omni/run_stacked_benchmark.sh
 ```
 
 This cycles through four configs (Baseline -> + Batch -> + CUDA Graph -> + Async Chunk + Streaming), benchmarks each at the specified concurrency levels, and generates all comparison figures automatically.
+
+## Qwen3-TTS NPU codec kernels
+
+The codec uses reference codebook normalization directly from the loaded weights.
+There is no normalized-embedding cache or cache-preparation helper.
+
+NPU SnakeBeta uses the existing eager implementation. Codec request groups run
+serially on the worker's stream, and each incremental graph owns a private
+scratch pool. The experimental dual-stream executor, stateless convolution
+graphs, fused NPU Snake and their configuration options have been removed.
+The dual-stream-only selected-row Triton store is also removed; state updates
+use the existing `index_copy_` operation.
+
+These changes reduce repeated codec work; they do not establish an end-to-end
+throughput gain without matched model-level measurements and audio validation.
+
+### NPU optimization defaults and overrides
+
+The default NPU profile enables seven paths: Model Runner V2 with sampling
+uniforms, Talker full decode graphs, Predictor frame graphs, frame-local KV,
+fused RoPE/KV writes, incremental Codec, and fused SwiGLU. Fused sampling and
+native GQA require explicit opt-in. Codebook lookup uses reference
+normalization, incremental graphs use separate scratch pools, and Codec decode
+uses one stream. Existing non-NPU defaults are unchanged.
+
+On NPU BF16, `code_predictor_kv_cache: true` reuses per-layer K/V buffers
+inside the predictor frame graph. It prefills the first two positions, then
+computes only the new position for each remaining residual codebook. Fixed
+capacity buffers are local to each graph batch size; causal masks exclude
+unwritten positions, and the next frame overwrites its prefix. They do not
+retain state across audio frames or requests. Qwen3-TTS enables this option
+by default when NPU frame graphs are enabled. Set it to false to use full
+re-prefill frame graphs. Disabling frame graphs also disables the implicit
+KV default; unsupported calls still use the existing re-prefill fallback.
+If frame capture fails or is skipped and no shared KV path is active, predictor setup
+warns that the requested KV cache is unavailable. The warning follows capture
+results, not just the requested graph flag.
+`code_predictor_fused_sampling: true` opts in to a separate sampling kernel.
+Qwen3-TTS leaves it disabled by default on NPU. CUDA and other models retain
+their existing defaults; missing Triton uses reference sampling. Sampling retains the original per-request uniform
+tensor, ATen scaling and logarithms, and top-k threshold. The NPU kernel combines
+threshold masking, score subtraction and first-index argmax. It reads the top-k
+threshold directly from its strided column without materializing a copy.
+Unsupported input shapes/dtypes use the reference.
+
+`code_predictor_frame_graph: true` captures all residual codebook
+steps together and disables the outer MTP graph only on NPU. Other platforms
+retain their outer graph when this option is set. It defaults to true on NPU
+and requires matching temperature/top-k, top-p of 1, and supplied uniforms.
+Unsupported calls retain the re-prefill fallback. Frame graphs also use the NPU fused sampler when enabled and supported, retaining
+the same uniforms, ATen logarithms and top-k Gumbel semantics. Explicit false
+uses reference sampling in both frame graphs and the per-step fallback.
+
+The cached Predictor path combines RoPE and KV writes in a Triton kernel.
+It preserves the eager BF16/FP16 multiply rounding before addition, with
+floating-point contraction disabled. FP32 and environments without Triton
+retain the eager path. Only the current frame's selected cache positions are
+written; future positions remain masked by attention.
+
+`npu_incremental_codec: true` retains convolution tails and
+sliding-window KV in per-request slots. It is enabled by default on NPU.
+Startup captures full chunks and single frames. Final partial chunks execute
+without live graph capture. Each captured graph owns its scratch pool, and
+outputs are copied before the next replay. Per-request state is updated with
+`index_copy_` on the worker's stream.
+Request completion releases and resets the slot; loading weights or
+converting the decoder releases its graphs. This path changes the streaming
+execution strategy and needs paired audio validation for the target workload.
+Its additive attention mask selects eager attention only for incremental calls;
+stateless requests retain their configured attention backend. The existing NPU
+Code2Wav loader owns process-wide format and compile-mode setup; constructing
+an incremental arena does not change those settings.
+
+The Qwen3-TTS predictor and NPU codec loader own their respective defaults;
+`qwen3_tts.yaml` does not duplicate these model options. Omitting an option uses
+its code default. Override it via stage `additional_config` or connector `extra`.
+Explicit connector values override stage values, and explicit false/empty values
+remain authoritative. `code_predictor_npu_native_gqa` defaults to false and
+`code_predictor_npu_fused_swiglu` defaults to true on NPU. Codec decode runs
+serially; `npu_incremental_codec: false` selects the existing stateless decoder.
+Predictor frame-local KV is enabled with NPU frame graphs; explicit false retains re-prefill.
+
+Compare actual graph coverage, startup cost, memory, latency and audio quality
+on the deployed model before changing these settings; synthetic tests alone do
+not establish a service-level improvement.
+
+### Independent Ascend engine migration
+
+The [independent engine](https://github.com/InferMatrixLab/qwen3-tts-rsi-npu-engine)
+uses its own scheduler and request arenas. Its performance results are evidence
+for that engine and workload, not vLLM-Omni speedup claims. The integration uses
+these existing Omni owners:
+
+| Independent engine mechanism | vLLM-Omni integration |
+| --- | --- |
+| Packed QKV / gate-up projections, native normalization / rotary | Already provided by the shared code predictor and the Talker backend |
+| Fixed predictor rotary coefficients (U002) | Predictor already uses precomputed cos/sin tables on NPU; no request-position cache or module replacement is needed |
+| Model-fixed prompt embeddings | Existing prompt builder caches projected special tokens and CustomVoice speaker/language prefixes |
+| Cached codec codebooks and fused Snake | Not integrated; reference normalization and eager NPU Snake |
+| Prefill/decode graphs and continuous batching | Existing vLLM scheduler, paged KV and Talker graph runner |
+| Incremental codec | NPU-default `npu_incremental_codec` |
+| Native grouped-query predictor attention | Opt-in `code_predictor_npu_native_gqa` |
+| Fused predictor SwiGLU | NPU-default `code_predictor_npu_fused_swiglu` |
+| Overlapping disjoint codec groups (U005) | Not integrated; Codec groups run serially |
+
+Override these defaults in stage `additional_config` or connector `extra`.
+On NPU fused SwiGLU defaults to `true`, native GQA defaults to `false`, and
+codec decoding uses one stream. Native predictor attention
+passes the original grouped K/V heads to Ascend inference attention instead of
+materializing repeated heads, with an explicit causal mask. The supported path
+uses FP16/BF16; unsupported inputs retain the existing attention path. Native SwiGLU
+uses the existing packed gate/up projection for BF16 NPU inputs and retains the
+ordinary SiLU/multiply path on other devices or dtypes. These native operators
+can change floating-point rounding and therefore sampled codec tokens. Qualify
+paired audio quality for the deployment; operator tolerances are not a
+waveform-equivalence guarantee. CUDA behavior and shared predictor defaults
+are unchanged.
+
+The independent engine's packed prefill-KV admission and single-request borrowed
+views belong to its contiguous arena and request loop. They are not copied over
+vLLM's paged-KV/input-batch owners. Similarly, inverse-CDF sampling is not
+substituted for Omni's Gumbel sampling: the latter retains its per-request
+uniforms and existing token-selection semantics. A scheduler or sampler redesign
+would require a separate semantic and service comparison.
+
+### NPU Talker decode graph mode
+
+The standard NPU Model Runner V2 profile uses `FULL_AND_PIECEWISE` for the
+Talker: prefill retains piecewise graphs and decode replays a complete backbone
+graph. Ascend's V2 graph manager owns attention metadata updates. Code2Wav
+retains its `PIECEWISE` setting and its incremental decoder graphs.
+
+The predictor frame graph remains independent of the backbone graph. Its
+outer MTP wrapper stays disabled on NPU to avoid nested graph replay. Enabling
+a complete MTP wrapper under a piecewise backbone did not improve the measured
+service throughput and is not part of this configuration.
+
+`FULL_DECODE_ONLY` also captures decode, but leaves prefill eager; the matched
+CustomVoice experiment found higher first-audio latency than the combined mode.
+Graph modes can change sampled codec tokens through numerical differences.
+Validate normal termination, ASR error and speaker similarity for the deployed
+model and workload rather than assuming byte-identical audio.
+
+This combination was exercised with Qwen3-TTS 1.7B CustomVoice and Base on
+Ascend 910B1. It does not qualify other Ascend SKUs or Model Runner V1. To use
+V1 on NPU, also set stage 0 `cudagraph_mode: PIECEWISE` in the NPU platform
+section of a copied deployment configuration. V1 full decode graphs can start
+and replay but exhaust generation limits: a matched short-input smoke test
+with `FULL_AND_PIECEWISE` reached the token ceiling, while `PIECEWISE` completed
+normally. The Talker now rejects NPU V1 full decode modes before loading
+weights. V1 `PIECEWISE`, `NONE` and eager execution remain available. This
+configuration check does not qualify V1 performance or audio quality.
+
+### NPU Model Runner V2 sampling inputs
+
+The standard Qwen3-TTS NPU profile selects Model Runner V2. Sampling uniforms
+are prepared from request-local generators independently of the outer MTP graph
+wrapper on NPU. Other backends keep request-local per-step generators when
+the outer MTP wrapper is absent; their graph paths still prepare uniform
+tensors. This lets NPU predictor-owned frame graphs and fused sampling consume them
+under PIECEWISE or when nested outer graphs are disabled. Graph padding retains
+its own rows; seeded active rows keep request-local random streams. The changed
+random draw granularity requires fresh end-to-end quality and performance
+qualification; older V1 or V2 results do not qualify this combination.

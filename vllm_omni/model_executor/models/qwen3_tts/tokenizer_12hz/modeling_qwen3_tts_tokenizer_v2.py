@@ -353,6 +353,7 @@ class Qwen3TTSTokenizerV2DecoderAttention(nn.Module):
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
         cache_position: torch.LongTensor | None = None,
+        force_eager_attention: bool = False,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -371,7 +372,7 @@ class Qwen3TTSTokenizerV2DecoderAttention(nn.Module):
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
+        if not force_eager_attention and self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
@@ -915,6 +916,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self.post_init()
 
         # CUDA Graph support
+        self._npu_incremental = None
         self._cudagraph_enabled = False
         self._cudagraph_wrapper = None
 
@@ -1010,6 +1012,12 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
         self._time_major_stack = TimeMajorConvStack(self)
         logger.info("Qwen3-TTS decoder: time-major (GEMM) conv stack enabled")
+
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True):
+        if self._npu_incremental is not None:
+            self._npu_incremental.close()
+            self._npu_incremental = None
+        return super()._apply(fn, recurse=recurse)
 
     def _conv_decode(self, hidden: torch.Tensor) -> torch.Tensor:
         """Pre-transformer output ``[B, T, latent]`` -> unclamped waveform ``[B, 1, T * total_upsample]``."""
@@ -1666,6 +1674,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                 left_context_size=left_context_size,
                 max_batch_size=max_batch_size,
             )
+
+        if caches is not None and self._npu_incremental is not None:
+            return self._npu_incremental.decode_requests(codes, lengths, caches)
 
         if caches is not None:
             prefix_length = int(getattr(self.config, "sliding_window", 0) or 0)

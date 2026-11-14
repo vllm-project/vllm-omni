@@ -12,6 +12,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.vllm import set_current_vllm_config
 from vllm.logger import init_logger
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
     CodePredictorBaseModel,
@@ -33,6 +34,22 @@ Qwen3TTSTalkerCodePredictorModelVLLM = CodePredictorBaseModel
 
 class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapper):
     """Qwen3-TTS code predictor (per-call sampling, projection)."""
+
+    @staticmethod
+    def _stage_connector_extra_config(vllm_config: VllmConfig) -> dict:
+        extra = CodePredictorWrapper._stage_connector_extra_config(vllm_config)
+        if not current_omni_platform.is_npu():
+            return extra
+        # Model-local NPU defaults: do not change Qwen3-Omni or CUDA defaults.
+        # Explicit connector/stage options, including false, remain authoritative.
+        return {
+            "code_predictor_fused_sampling": False,
+            "code_predictor_frame_graph": True,
+            "code_predictor_kv_cache": extra.get("code_predictor_frame_graph", True),
+            "code_predictor_npu_native_gqa": False,
+            "code_predictor_npu_fused_swiglu": True,
+            **extra,
+        }
 
     def __init__(
         self,
@@ -64,16 +81,86 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         extra = self._stage_connector_extra_config(vllm_config)
         self._kv_requested = self._parse_bool_config(extra.get("code_predictor_kv_cache"))
         self._fused_sampling = self._parse_bool_config(extra.get("code_predictor_fused_sampling"))
+        self._frame_graph_requested = self._parse_bool_config(extra.get("code_predictor_frame_graph"))
+        self._frame_graphs: dict = {}
+        self._frame_graph_top_k = int(self._subtalker_top_k(vllm_config))
+        self._frame_graph_temperature = float(self._subtalker_temperature(vllm_config))
         self._frame_cache: FrameLocalKVCache | None = None
         self._fused_requested = self._parse_bool_config(extra.get("code_predictor_fused"))
         self._fused = None
+
+    @staticmethod
+    def _subtalker_top_k(vllm_config: VllmConfig) -> int:
+        params = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
+        if isinstance(params, dict) and params.get("top_k") is not None:
+            return int(params["top_k"])
+        return 50
+
+    @staticmethod
+    def _subtalker_temperature(vllm_config: VllmConfig) -> float:
+        params = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
+        if isinstance(params, dict) and params.get("temperature") is not None:
+            return float(params["temperature"])
+        return 0.9
+
+    def _capture_frame_graphs(self) -> None:
+        if not self._frame_graph_requested or not current_omni_platform.is_npu():
+            return
+        if self._compiled_model_fwd is None or not self._bucket_sizes:
+            return
+        from vllm_omni.platforms.npu.layers.predictor_frame_graph import capture_predictor_frame_graphs
+
+        self._frame_graphs = capture_predictor_frame_graphs(
+            self, self._frame_graph_top_k, self._frame_graph_temperature
+        )
+
+    def _run_frame_graph(
+        self,
+        layer0_code: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        *,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        sample_uniforms: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if not self._frame_graph_requested or sample_uniforms is None:
+            return None
+        if not do_sample or temperature <= 0 or top_p != 1.0:
+            return None
+        if int(top_k) != self._frame_graph_top_k or float(temperature) != self._frame_graph_temperature:
+            return None
+        if current_omni_platform.is_npu() and torch.npu.is_current_stream_capturing():
+            return None
+        self._setup_compile()
+        bsz = int(layer0_code.shape[0])
+        padded = self._padded_bsz(bsz)
+        graph = self._frame_graphs.get(padded)
+        if graph is None or sample_uniforms.dtype != torch.float32 or not sample_uniforms.is_contiguous():
+            return None
+        dtype = self._model_dtype
+        device = layer0_code.device
+        self._ensure_buffers(device, dtype, padded)
+        proj = self._proj_buf
+        proj[:padded].zero_()
+        projection = self.small_to_mtp_projection
+        proj[:bsz, 0, :] = projection(last_talker_hidden.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
+        proj[:bsz, 1, :] = projection(layer0_embed.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
+        graph.codes[:, 0] = 0
+        graph.codes[:bsz, 0] = layer0_code.reshape(bsz).to(dtype=torch.long)
+        if padded != bsz:
+            graph.uniforms[bsz:].fill_(0.5)
+        return graph.run(sample_uniforms)[:bsz].clone()
 
     def _setup_compile(self) -> None:
         if self._compiled_model_fwd is not None:
             return
         if not current_omni_platform.is_cuda():
             super()._setup_compile()
-            if self._kv_requested and not self._kv_cache_enabled:
+            self._capture_frame_graphs()
+            if self._kv_requested and not self._kv_cache_enabled and not self._frame_graphs:
                 logger.warning_once(
                     "Qwen3-TTS: code_predictor_kv_cache=True is unsupported on this execution path; using re-prefill"
                 )
@@ -88,7 +175,9 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         if not self._kv_requested or not supported:
             if self._kv_requested:
                 logger.warning("Qwen3-TTS frame-local KV requires CUDA BF16; using re-prefill")
-            return super()._setup_compile()
+            super()._setup_compile()
+            self._capture_frame_graphs()
+            return
 
         # Import CUDA-only kernels only when this model explicitly opts in.
         from .cached_code_predictor import FrameLocalKVCache
@@ -144,6 +233,18 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         sample_uniforms: torch.Tensor | None = None,
     ):
         self._validate_sampling_inputs(int(layer0_code.shape[0]), generators, sample_uniforms)
+        framed = self._run_frame_graph(
+            layer0_code,
+            layer0_embed,
+            last_talker_hidden,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            sample_uniforms=sample_uniforms,
+        )
+        if framed is not None:
+            return framed
         if self._fused_requested:
             self._setup_compile()
         if (
@@ -197,6 +298,22 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         generator: torch.Generator | Sequence[torch.Generator | None] | None,
         uniforms: torch.Tensor | None,
     ) -> torch.Tensor:
+        if (
+            self._fused_sampling
+            and current_omni_platform.is_npu()
+            and HAS_TRITON
+            and logits.device.type == "npu"
+            and uniforms is not None
+            and uniforms.dtype == torch.float32
+            and logits.dtype in (torch.float32, torch.bfloat16)
+            and logits.ndim == 2
+            and logits.shape[0] > 0
+            and 0 < logits.shape[1] <= 4096
+            and 0 <= top_k <= logits.shape[1]
+        ):
+            from vllm_omni.platforms.npu.layers.code_predictor_sampling import sample_topk_gumbel
+
+            return sample_topk_gumbel(logits, uniforms, top_k, inv_temperature)
         if (
             self._fused_sampling
             and current_omni_platform.is_cuda()

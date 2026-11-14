@@ -516,6 +516,7 @@ def test_seed_independence_resolve_once_and_sampling_kwargs():
         state._mtp_state._prepare_mtp_sample_uniforms([torch.Generator().manual_seed(11)], 1).clone(),
         state._mtp_state._prepare_mtp_sample_uniforms([torch.Generator().manual_seed(11)], 1),
     )
+    state._mtp_state._mtp_sample_uniforms = None
     # Per-request generators are resolved once per step and ride sampling kwargs.
     state.model.mtp_sampling_params = {"do_sample": True, "temperature": 0.7}
     state.model.mtp_accepts_per_row_generators = True
@@ -536,6 +537,33 @@ def test_seed_independence_resolve_once_and_sampling_kwargs():
     )
     assert resolver.call_count == 2
     assert torch.equal(codes, torch.tensor([[1, 2, 3], [4, 5, 6]]))
+
+
+@pytest.mark.parametrize("order", [[0, 1], [1, 0]])
+@pytest.mark.parametrize("is_npu,graph_runner", [(True, False), (False, True)])
+def test_mtp_prepares_request_local_uniforms_for_graph_paths(order, is_npu, graph_runner, monkeypatch):
+    monkeypatch.setattr("vllm_omni.worker_v2.model_states.mtp_model_state.current_omni_platform.is_npu", lambda: is_npu)
+    state = _make_state(max_num_reqs=2)
+    _init_static(state, 2)
+    mtp_state = state._mtp_state
+    mtp_state._mtp_sample_uniforms = torch.empty((2, 2, 4), dtype=torch.float32)
+    mtp_state._is_mtp_graph_runner = MagicMock(return_value=graph_runner)
+    for slot, seed in enumerate([11, 22]):
+        state.intermediate_buffer.buffers[slot] = {"req_id": f"r{slot}", "sampling_params": _seeded(seed)}
+    expected_generators = [torch.Generator().manual_seed(seed) for seed in [11, 22]]
+
+    def mtp(ids, embeds, hidden, step, **kwargs):
+        uniforms = kwargs["sample_uniforms"]
+        assert uniforms.is_contiguous() and uniforms.dtype == torch.float32
+        assert uniforms.shape == (2, 2, 4)
+        for row, slot in enumerate(order):
+            expected = torch.empty((1, 2, 4)).uniform_(1e-20, 1.0 - 1e-20, generator=expected_generators[slot])
+            torch.testing.assert_close(uniforms[row : row + 1], expected, rtol=0, atol=0)
+        return embeds, ids.reshape(-1, 1)
+
+    state.model.mtp = mtp
+    for _ in range(2):
+        mtp_state._mtp_forward(order, torch.tensor([101, 202]), torch.zeros(2, 3), torch.zeros(2, 3), torch.zeros(2, 3))
 
 
 def test_seeded_mtp_bypasses_outer_graph_runner():
@@ -1407,3 +1435,41 @@ def test_qwen3_tts_current_step_output_uses_current_spans_and_isolates_requests(
             torch.testing.assert_close(row["codes"]["ref"], refs[i])
     assert [info["codes"]["audio"].shape[0] for info in infos] == [3, 4]
     torch.testing.assert_close(prefill["codes"]["audio"], prefill_snapshot)
+
+
+@pytest.mark.parametrize("seeded", [False, True])
+def test_non_npu_eager_mtp_keeps_per_step_generators_with_uniform_buffer(monkeypatch, seeded):
+    monkeypatch.setattr("vllm_omni.worker_v2.model_states.mtp_model_state.current_omni_platform.is_npu", lambda: False)
+    state = _make_state(max_num_reqs=2)
+    _init_static(state, 2)
+    state.model.mtp_accepts_per_row_generators = True
+    mtp_state = state._mtp_state
+    mtp_state._mtp_sample_uniforms = torch.full((2, 2, 4), 0.25)
+    mtp_state._is_mtp_graph_runner = MagicMock(return_value=False)
+    mtp_state._prepare_mtp_sample_uniforms = MagicMock(side_effect=AssertionError("eager path must not draw a span"))
+    seeds = [11, 22]
+    order = [1, 0]
+    expected_generators = [torch.Generator().manual_seed(seed) for seed in seeds]
+    for slot, seed in enumerate(seeds):
+        state.intermediate_buffer.buffers[slot] = {
+            "req_id": f"r{slot}",
+            "sampling_params": _seeded(seed) if seeded else None,
+        }
+
+    def mtp(ids, embeds, hidden, step, **kwargs):
+        assert "sample_uniforms" not in kwargs
+        if seeded:
+            for generator, slot in zip(kwargs["generators"], order, strict=True):
+                # Request streams must reach the model without an earlier span draw.
+                actual = torch.rand((1, 4), generator=generator)
+                expected = torch.rand((1, 4), generator=expected_generators[slot])
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        else:
+            assert kwargs.get("generator") is None and kwargs.get("generators") is None
+        return embeds, ids.reshape(-1, 1)
+
+    state.model.mtp = mtp
+    for _ in range(2):
+        mtp_state._mtp_forward(order, torch.tensor([101, 202]), torch.zeros(2, 3), torch.zeros(2, 3), torch.zeros(2, 3))
+    mtp_state._prepare_mtp_sample_uniforms.assert_not_called()
+    torch.testing.assert_close(mtp_state._mtp_sample_uniforms, torch.full((2, 2, 4), 0.25))

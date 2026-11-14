@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import multiprocessing as mp
-import socket
 import time
 from dataclasses import fields
+from queue import Empty
 from typing import Any
 
 import pytest
@@ -23,12 +23,6 @@ def _native_nixl_available() -> bool:
     except ImportError:
         return False
     return NixlWrapper is not None and torch.cuda.is_available() and torch.accelerator.device_count() >= 2
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _h3_conditioning(payload_kind: str, device: str = "cpu"):
@@ -105,21 +99,20 @@ def _assert_h3_roundtrip(payload: dict[str, Any], payload_kind: str) -> tuple:
     return (payload_kind, tensors)
 
 
-def _producer(
-    port: int, ready: Any, consumed: Any, result: Any, claimed: Any, proceed: Any, wire: Any, payload_kind: str
-) -> None:
+def _producer(ready: Any, consumed: Any, result: Any, claimed: Any, proceed: Any, wire: Any, payload_kind: str) -> None:
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
 
-    current_omni_platform.set_device(0)
-    connector = NixlConnector(
-        {
-            "role": "sender",
-            "host": "127.0.0.1",
-            "zmq_port": port,
-            "agent_name": "native-smoke-producer",
-        }
-    )
+    connector = None
     try:
+        current_omni_platform.set_device(0)
+        connector = NixlConnector(
+            {
+                "role": "sender",
+                "host": "127.0.0.1",
+                "zmq_port": 0,
+                "agent_name": "native-smoke-producer",
+            }
+        )
         payload = OmniPayloadStruct(
             hidden_states=HiddenStatesStruct(output=torch.arange(8, dtype=torch.float32, device="cuda:0")),
             meta=MetaStruct(token_role_ids=torch.tensor([1, 2, 3], dtype=torch.int64, device="cpu")),
@@ -130,7 +123,9 @@ def _producer(
             payload = _h3_structured_payload(payload_kind)
         success, size, metadata = connector.put("0", "1", "native-smoke", payload)
         result.put(("put", success, size, metadata["kind"] if metadata else None))
-        wire.put(metadata)
+        # Publish the endpoint while the listener still owns the port. Probing
+        # a free port in the parent leaves a race before this process binds it.
+        wire.put((connector.get_connection_info(), metadata))
         ready.set()
         if not claimed.wait(timeout=30):
             raise TimeoutError("consumer did not claim source")
@@ -152,11 +147,11 @@ def _producer(
         result.put(("producer_error", repr(error)))
         raise
     finally:
-        connector.close()
+        if connector is not None:
+            connector.close()
 
 
 def _consumer(
-    port: int,
     ready: Any,
     consumed: Any,
     result: Any,
@@ -171,32 +166,36 @@ def _consumer(
         OmniKVTransferManager,
     )
 
-    if not ready.wait(timeout=30):
-        raise TimeoutError("producer did not publish native NIXL metadata")
-    current_omni_platform.set_device(1)
-    manager = OmniKVTransferManager(
-        OmniKVCacheConfig(
-            connector_config={
-                "type": "NixlConnector",
-                "role": "receiver",
-                "host": "127.0.0.1",
-                "zmq_port": port,  # Shared deployment edge: already bound by producer.
-                "backends": ["UCX"],
-                "receive_device": "cuda",
-                "agent_name": "native-smoke-consumer",
-            },
-            from_stage="0",
-            to_stage="1",
-            stage_id=1,
-            need_recv_cache=direct,  # Exercise both payload-only and KV receiver setup.
-        )
-    )
-    manager.update_sender_info({"host": "127.0.0.1", "zmq_port": port})
-    connector = manager.connector
-    assert connector is not None, "Receiver must not bind the producer's occupied port"
-    assert connector._zmq_port is None and not connector._serving_handshake
-    assert connector._backends == ["UCX"]
+    connector = None
     try:
+        if not ready.wait(timeout=30):
+            raise TimeoutError("producer did not publish native NIXL metadata")
+        sender_info, metadata = wire.get(timeout=5)
+        port = sender_info["zmq_port"]
+        assert port > 0
+        current_omni_platform.set_device(1)
+        manager = OmniKVTransferManager(
+            OmniKVCacheConfig(
+                connector_config={
+                    "type": "NixlConnector",
+                    "role": "receiver",
+                    "host": sender_info["host"],
+                    "zmq_port": port,  # Shared deployment edge: already bound by producer.
+                    "backends": ["UCX"],
+                    "receive_device": "cuda",
+                    "agent_name": "native-smoke-consumer",
+                },
+                from_stage="0",
+                to_stage="1",
+                stage_id=1,
+                need_recv_cache=direct,  # Exercise both payload-only and KV receiver setup.
+            )
+        )
+        manager.update_sender_info(sender_info)
+        connector = manager.connector
+        assert connector is not None, "Receiver must not bind the producer's occupied port"
+        assert connector._zmq_port is None and not connector._serving_handshake
+        assert connector._backends == ["UCX"]
         original_wait = connector._wait_for_transfer
         states = []
 
@@ -208,7 +207,6 @@ def _consumer(
             original_wait(handle, key)
 
         connector._wait_for_transfer = wait
-        metadata = wire.get(timeout=5)
         received = None
         deadline = time.monotonic() + 30
         while received is None and time.monotonic() < deadline:
@@ -216,7 +214,7 @@ def _consumer(
                 "0",
                 "1",
                 "native-smoke",
-                metadata if direct else {"source_host": "127.0.0.1", "source_port": port},
+                metadata if direct else {"source_host": sender_info["host"], "source_port": port},
             )
         if received is None:
             raise TimeoutError("native NIXL transfer did not complete")
@@ -249,7 +247,8 @@ def _consumer(
         result.put(("consumer_error", repr(error)))
         raise
     finally:
-        connector.close()
+        if connector is not None:
+            connector.close()
 
 
 @pytest.mark.skipif(not _native_nixl_available(), reason="requires NIXL and at least two CUDA devices")
@@ -263,12 +262,9 @@ def test_native_two_process_structured_mixed_device_transfer(direct, payload_kin
     proceed = context.Event()
     wire = context.Queue()
     result = context.Queue()
-    port = _free_port()
-    producer = context.Process(
-        target=_producer, args=(port, ready, consumed, result, claimed, proceed, wire, payload_kind)
-    )
+    producer = context.Process(target=_producer, args=(ready, consumed, result, claimed, proceed, wire, payload_kind))
     consumer = context.Process(
-        target=_consumer, args=(port, ready, consumed, result, claimed, proceed, wire, direct, payload_kind)
+        target=_consumer, args=(ready, consumed, result, claimed, proceed, wire, direct, payload_kind)
     )
 
     producer.start()
@@ -282,10 +278,16 @@ def test_native_two_process_structured_mixed_device_transfer(direct, payload_kin
         consumer.terminate()
         consumer.join(timeout=10)
 
-    records = [result.get(timeout=5) for _ in range(5)]
+    records = []
+    for _ in range(5):
+        try:
+            records.append(result.get(timeout=5))
+        except Empty:
+            break  # Report child exit codes and any startup error records below.
     print("Native ownership records:", records)
     assert producer.exitcode == 0, records
     assert consumer.exitcode == 0, records
+    assert len(records) == 5, records
     assert records[0][0] == "put"
     assert records[0][1] is True
     assert records[0][2] >= 56

@@ -66,6 +66,9 @@ def _prepare_npu_decoder_weights(decoder: nn.Module) -> None:
 
 def _patched_load_weights(self, weights):
     assert _original_load_weights is not None
+    if self.decoder._npu_incremental is not None:
+        self.decoder._npu_incremental.close()
+        self.decoder._npu_incremental = None
     loaded = _original_load_weights(self, weights)
     device = self.vllm_config.device_config.device
     platform_dtype_override = getattr(self, "_npu_decoder_runtime_dtype", None)
@@ -76,6 +79,27 @@ def _patched_load_weights(self, weights):
         if hasattr(self.decoder, "precompute_snake_caches"):
             self.decoder.precompute_snake_caches()
     _prepare_npu_decoder_weights(self.decoder)
+    connector = getattr(self.vllm_config.model_config, "stage_connector_config", None)
+    extra = connector.get("extra", connector) if isinstance(connector, dict) else {}
+    additional = getattr(self.vllm_config, "additional_config", None)
+    if isinstance(additional, dict):
+        extra = {**additional, **extra}
+    incremental = extra.get("npu_incremental_codec", True)
+    if not isinstance(incremental, bool):
+        raise ValueError("npu_incremental_codec must be a boolean")
+    if incremental:
+        from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec
+
+        slots = int(self.vllm_config.scheduler_config.max_num_seqs)
+        chunk_frames = int(extra.get("codec_chunk_frames") or 25)
+        max_batch = int(extra.get("decode_batch_max_size") or 1)
+        with torch.inference_mode():
+            self.decoder._npu_incremental = NPUIncrementalCodec(
+                self.decoder,
+                slots=slots,
+                max_batch=max(1, min(max_batch, slots)),
+                chunk_frames=chunk_frames,
+            )
     actual_dtype = next(self.decoder.parameters()).dtype
     logger.info("Prepared NPU Code2Wav decoder with runtime dtype %s", actual_dtype)
     return loaded

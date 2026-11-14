@@ -1329,8 +1329,9 @@ def test_qwen3_tts_default_profile_is_experimental_mrv2_with_v1_platform_fallbac
     stages = merge_pipeline_deploy(pipeline, load_deploy_config(deploy_path))
     assert all(stage.yaml_engine_args["use_v2_model_runner"] is True for stage in stages)
 
-    assert _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda").model_runner == "v2"
-    for platform in ("npu", "xpu", "rocm", "musa"):
+    for platform in ("cuda", "npu"):
+        assert _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform).model_runner == "v2"
+    for platform in ("xpu", "rocm", "musa"):
         assert _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform).model_runner == "v1"
 
     # The explicit MRV2 profile resolves to the same runner selection.

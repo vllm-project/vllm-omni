@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for A5 (Ascend 950 PR) patch wiring.
 
 The A5 logic lives in the shared NPU platform files (``npu/__init__.py`` for
@@ -203,16 +203,16 @@ def test_qwen3_tts_code2wav_patch_skips_fractal_z_conv_cast_on_a5(
     linear_weights = []
     conv_weights = []
 
-    monkeypatch.setattr(
-        module,
-        "maybe_trans_nz",
-        lambda weight: linear_weights.append(weight) or weight,
-    )
-    monkeypatch.setattr(
-        module.torch_npu,
-        "npu_format_cast",
-        lambda weight, fmt: conv_weights.append((weight, fmt)) or weight,
-    )
+    def prepare_linear(weight):
+        linear_weights.append(weight)
+        return weight
+
+    def format_conv(weight, fmt):
+        conv_weights.append((weight, fmt))
+        return weight
+
+    monkeypatch.setattr(module, "maybe_trans_nz", prepare_linear)
+    monkeypatch.setattr(module.torch_npu, "npu_format_cast", format_conv)
 
     class FakeDecoder(torch.nn.Module):
         def __init__(self):
@@ -222,6 +222,7 @@ def test_qwen3_tts_code2wav_patch_skips_fractal_z_conv_cast_on_a5(
             self.deconv = torch.nn.ConvTranspose1d(4, 4, 4)
             self.grouped_conv = torch.nn.Conv1d(4, 4, 3, groups=2)
             self.cache_precompute_calls = 0
+            self._npu_incremental = None
 
         def precompute_snake_caches(self):
             self.cache_precompute_calls += 1
@@ -247,7 +248,11 @@ def test_qwen3_tts_code2wav_patch_skips_fractal_z_conv_cast_on_a5(
     module.apply_qwen3_tts_code2wav_patch()
 
     model = target.Qwen3TTSCode2Wav(
-        vllm_config=SimpleNamespace(device_config=SimpleNamespace(device=torch.device("cpu"))),
+        vllm_config=SimpleNamespace(
+            device_config=SimpleNamespace(device=torch.device("cpu")),
+            model_config=SimpleNamespace(),
+            additional_config={"npu_incremental_codec": False},
+        ),
         prefix="stage1",
     )
     assert model.load_weights(iter(())) == {"loaded"}

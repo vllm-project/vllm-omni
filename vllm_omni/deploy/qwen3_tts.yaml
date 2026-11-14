@@ -2,9 +2,9 @@
 # Verified on 1x H100.
 #
 # Runner selection:
-#   Model Runner V2 (MRV2) is EXPERIMENTAL and is the default runner on CUDA
+#   Model Runner V2 (MRV2) is EXPERIMENTAL and is the default runner on CUDA and NPU
 #   for this model. Set `model_runner: v1` to opt out. The `platforms:`
-#   sections at the end of this file keep V1 on NPU, XPU, ROCm and MUSA.
+#   sections at the end of this file keep V1 on XPU, ROCm and MUSA.
 #   See docs/configuration/stage_configs.md ("Qwen3-TTS with Model Runner V2").
 #
 # Fields omitted from a stage fall back to StageDeployConfig defaults (see
@@ -14,7 +14,7 @@
 #     first-chunk latency low, and the MRV2 profiles rely on that bound.
 #   * Stage 1 (code2wav) sets max_num_batched_tokens=65536 for correctness:
 #     codec prefill length (Q * num_frames) exceeds the 32k default.
-#   * Stage 0 does not set enforce_eager — talker runs cudagraph by default.
+#   * Stage 0 uses the existing platform graph defaults.
 #     Stage 1 defaults to false so Code2Wav can use its inner cudagraph;
 #     set true to disable that path in eager mode.
 model_runner: v2
@@ -73,6 +73,9 @@ connectors:
       # decode_cudagraph_batch_sizes: [1, 2, 4]
       # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.
       decode_batch_max_size: 4
+      # Qwen3-TTS NPU optimization defaults are owned by the model and loader.
+      # Set explicit overrides here or in stage additional_config; CUDA keeps
+      # its existing defaults when these options are omitted.
 
 stages:
   - stage_id: 0
@@ -159,12 +162,16 @@ platforms:
         # Stage 1 eager on ROCm so decoder convolutions execute normally.
         enforce_eager: true
   npu:
-    model_runner: v1
+    # V1 opt-out also requires stage 0 cudagraph_mode: PIECEWISE (or NONE).
+    # V1 full decode graphs can exhaust the generation budget; the Talker
+    # rejects that combination before loading weights.
+    model_runner: v2
     stages:
       - stage_id: 0
         enforce_eager: false
         compilation_config:
-          cudagraph_mode: PIECEWISE
+          # Full decode graphs require Model Runner V2 on NPU.
+          cudagraph_mode: FULL_AND_PIECEWISE
       - stage_id: 1
         compilation_config:
           cudagraph_mode: PIECEWISE

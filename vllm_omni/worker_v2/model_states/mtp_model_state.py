@@ -961,12 +961,13 @@ class MTPState:
             batch_emb = self._mtp_input_embeds[:num_tokens]
             batch_hidden = self._mtp_hidden[:num_tokens]
             batch_step = self._mtp_text_step[:num_tokens]
-            if sample_uniform_buffer is not None:
-                sample_uniforms = self._prepare_mtp_sample_uniforms(generators, num_tokens)
         elif can_use_graph:
             cudagraph_mode = CUDAGraphMode.FULL
-            if sample_uniform_buffer is not None:
-                sample_uniforms = self._prepare_mtp_sample_uniforms(generators, bsz)
+        # NPU predictor-owned graphs and fused sampling need random inputs
+        # even without the outer MTP wrapper. Other eager backends retain
+        # per-step generator draws instead of switching to a whole-span draw.
+        if sample_uniform_buffer is not None and (use_graph_runner or current_omni_platform.is_npu()):
+            sample_uniforms = self._prepare_mtp_sample_uniforms(generators, num_tokens)
         with set_forward_context(
             None,
             self.owner.vllm_config,
