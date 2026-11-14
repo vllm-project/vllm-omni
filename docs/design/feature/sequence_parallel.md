@@ -7,6 +7,7 @@ This section describes how to add Sequence Parallel (SP) to a diffusion transfor
 ## Table of Contents
 
 - [Overview](#overview)
+    - [ROCm packed QKV exchanges](#rocm-packed-qkv-exchanges)
 - [UAA Mode (Experimental)](#uaa-mode-experimental)
 - [Approach 1: Non-Intrusive `_sp_plan` (Recommended)](#approach-1-non-intrusive-_sp_plan-recommended)
 - [Approach 2: Intrusive Modification (For Complex Cases)](#approach-2-intrusive-modification-for-complex-cases)
@@ -18,7 +19,6 @@ This section describes how to add Sequence Parallel (SP) to a diffusion transfor
 ---
 
 ## Overview
-
 
 ### What is Sequence Parallel?
 
@@ -39,7 +39,7 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 ```
 
 | Method/Class | Purpose | Behavior |
-|--------------|---------|----------|
+| --- | --- | --- |
 | `SequenceParallelInput` | Declare input sharding in `_sp_plan` | Auto-shards tensors at module input |
 | `SequenceParallelOutput` | Declare output gathering in `_sp_plan` | Auto-gathers tensors at module output |
 | `sp_shard()` | Manual tensor sharding | Splits tensor across SP workers |
@@ -64,6 +64,100 @@ the process group.
 The NPU attention factory rejects Ulysses × AllGather-KV when this option is
 enabled: its Ulysses subgroup cannot use the runtime's WORLD-wide barriers.
 The same topology remains available through the standard communication path.
+
+### ROCm packed QKV exchanges
+
+Set `VLLM_OMNI_ROCM_PACKED_QKV=1` before worker startup to opt into a packed
+Q/K/V exchange on ROCm. The default is off. All ranks in each Ulysses group
+must use the same setting; changing it requires rebuilding the attention
+strategies, normally by restarting the workers.
+
+In strict Ulysses, eligible `[B, S_local, H, D]` Q/K/V tensors copy directly
+into a destination-major `[world_size, B, S_local, H_local, 3, D]` wire
+buffer. One ordinary `torch.distributed.all_to_all_single` exchanges Q/K/V;
+the receive buffer is unpacked into three contiguous attention inputs.
+The reverse output exchange restores `[B, S_local, H, D]` in one collective.
+This changes three forward plus one reverse exchanges into one forward plus
+one reverse exchange. The logical payload is unchanged.
+
+The path requires all of the following:
+
+- ROCm, `ulysses_degree > 1`, and the standard head-to-sequence layout
+  (`scatter_idx=2`, `gather_idx=1`).
+- Strict Ulysses mode, equal positive Q/K/V shapes, matching dtypes and devices,
+  and a head count divisible by `ulysses_degree`.
+- Inference tensors without gradients and no `gate_compress` tensor.
+
+The existing strict-mode requirement for equally sized local sequence shards
+still applies. Strided producers, batch sizes greater than one, masked padding,
+and replicated joint Q/K/V in either the front or rear position preserve their
+existing ordering and metadata. Each call owns its staging and output storage;
+later calls cannot overwrite a previous result. The implementation uses the
+process group's normal collective backend, including RCCL on ROCm, without
+peer-memory mappings or a persistent workspace.
+
+Advanced UAA, unequal Q/K/V shapes (including GQA), gradients, and compressed
+gates retain their existing exchanges. An explicitly selected
+`--ulysses-a2a-permute` backend keeps precedence. Other platforms retain their
+existing paths even when the environment variable is set.
+
+Benchmark with the flag off and on using the same model, precision, topology,
+sequence shape, concurrency, and warmup. Larger messages and staging copies can
+offset the reduction in collective launches; fewer collectives alone do not
+guarantee lower end-to-end latency or peak memory. Collect profiler-disabled
+serving measurements separately from traces, and include packing/unpacking
+copies when comparing communication costs.
+
+`tests/diffusion/distributed/test_comm.py` checks exact forward and reverse
+ordering against separate exchanges and a rank-ordered gather oracle on two
+and four CPU/Gloo ranks. Its GPU counterpart uses the same cases, including a
+production-sized BF16 projection layout, on the platform's collective backend.
+Both exercise joint tensors, masks, strided inputs, output lifetime, and the
+one-forward/one-reverse collective count.
+
+#### Experimental fused packing and unpacking
+
+With the packed exchange enabled, set `VLLM_OMNI_ROCM_FUSED_QKV_PACK=1`
+before starting every worker to replace its staging copies with two Triton
+kernels. Both flags default to off:
+
+```bash
+export VLLM_OMNI_ROCM_PACKED_QKV=1
+export VLLM_OMNI_ROCM_FUSED_QKV_PACK=1
+```
+
+For each `[B, T, H, D]` input and `W` Ulysses ranks, one pack kernel reads
+Q, K and V using their independent strides and writes the destination-major
+`[W, B, T, H/W, 3, D]` buffer. Head `h` belongs to destination `h // (H/W)`;
+its Q/K/V values occupy the three adjacent `D`-element slots. After the same
+ordinary `all_to_all_single`, one unpack kernel places source rank `r`'s rows
+at tokens `[r*T, (r+1)*T)` in three independent contiguous
+`[B, W*T, H/W, D]` outputs. This replaces three input copies and three output
+materializations with one pack and one unpack launch. It does not fuse the
+projection GEMMs, change the reverse output exchange, or reduce collective
+count or payload relative to the existing packed path.
+
+The fused kernels additionally require BF16, FP16, FP32 or int32 ROCm tensors,
+strictly positive strides, and no lazy negative or conjugate views. Q/K/V may
+have different strides and storage offsets. The three-tensor wire element
+count and each producer's maximum relative element offset must fit signed
+32-bit indexing. Inputs that fail these checks retain the existing packed
+implementation. The inference-only, positive-shape and divisible-head checks
+above still apply. Every call owns its send, receive and output buffers;
+there is no persistent scratch allocation.
+
+Historical four-MI350X (`gfx950`) measurements for MiniMax-H3-Image used BF16
+inputs `[1, 1032, 56, 128]`. Packing plus unpacking median fell from
+82.260 to 80.839 microseconds (1.73%); the complete QKV plus reverse-output
+cycle median fell from 478.087 to 476.407 microseconds (0.35%). Each variant
+retained 300 samples across alternating-order rounds, with a barrier before
+each sample and allocation, launches and synchronization included. These
+isolated measurements remove serving arrival skew. A separate 100-request
+fused serving trial did **not** establish a consistent image-latency gain
+against default controls. These are measurements of the experimental
+candidate, not qualification of every upstream revision or other GPU models.
+Keep the fusion flag unset for ordinary serving; evaluate it with matched,
+profiler-disabled controls before adopting it.
 
 ---
 
@@ -109,6 +203,7 @@ Use it when plain Ulysses-SP would otherwise fail because:
 The `_sp_plan` mechanism allows SP **without modifying `forward()` logic**. The framework automatically registers hooks to shard inputs and gather outputs at module boundaries.
 
 **When to use:**
+
 - Standard transformer architectures
 - Tensor operations happen at `nn.Module` boundaries
 - Predictable sharding/gathering patterns
@@ -118,6 +213,7 @@ This is the ideal approach for integrating sequence parallelism into new models,
 MixFusion's packed-layout hooks reuse this mechanism: a model declares `_mixfusion_plan` instead of `_sp_plan`, and the framework applies the hooks at initialization in the same way (see [MixFusion layout abstraction](diffusion_continuous_batching.md#layout-abstraction)).
 
 **How it works:**
+
 1. Declare `_sp_plan` dict in your transformer class
 2. Framework automatically applies hooks when `sequence_parallel_size > 1`
 3. Hooks shard/gather tensors at specified module boundaries
@@ -138,6 +234,7 @@ class StandardTransformer(nn.Module):
 `StandardTransformer` has a transformer blocks list `self.blocks = nn.ModuleList([...])`, and a projection output layer `self.proj_out`. The `_sp_plan` above defines that when SP is enabled, sharding the input tensor to the first transformer block, and gathering the sharded tensor at the final output projection layer.
 
 **Requirements:**
+
 - Tensor operations that need sharding/gathering must happen at **`nn.Module` boundaries**
 - Inline Python operations (e.g., `torch.cat`, `pad_sequence`) **cannot be hooked**
 
@@ -170,7 +267,7 @@ class MyTransformer(nn.Module):
 
 If your `forward()` contains inline tensor operations, **extract them into submodules**.
 
-**Example: Z-Image concatenates image + text features inline**
+#### Example: Z-Image concatenates image + text features inline
 
 ```python
 # ❌ BAD: Inline operation - hooks cannot intercept
@@ -207,6 +304,7 @@ class ZImageTransformer(nn.Module):
 ```
 
 **Other common cases:**
+
 - `pad_sequence()` → `PadSequenceModule`
 - `torch.cat()` → `ConcatModule`
 - `tensor.reshape()` → `ReshapeModule`
@@ -218,7 +316,7 @@ Create a class-level `_sp_plan` dictionary specifying where to shard/gather tens
 
 Typically, there are two patterns for diffusion models:
 
-**Pattern 1: Shard at first block, gather at output projection**
+#### Pattern 1: Shard at first block, gather at output projection
 
 Most common pattern for standard transformers:
 
@@ -238,7 +336,7 @@ class StandardTransformer(nn.Module):
     }
 ```
 
-**Pattern 2: Shard RoPE embeddings separately**
+#### Pattern 2: Shard RoPE embeddings separately
 
 When RoPE is computed in a separate module:
 
@@ -298,7 +396,7 @@ NOTE: be careful to test adequately when refactoring classes that take this styl
 **SequenceParallelInput Parameters:**
 
 | Parameter | Type | Description |
-|-----------|------|-------------|
+| --- | --- | --- |
 | `split_dim` | int | Dimension to split (usually `1` for sequence) |
 | `expected_dims` | int \| None | Expected tensor rank for validation (optional) |
 | `split_output` | bool | `False`: shard **input** params; `True`: shard **output** tensors |
@@ -311,14 +409,14 @@ Other references to the same storage also keep the full allocation alive.
 **SequenceParallelOutput Parameters:**
 
 | Parameter | Type | Description |
-|-----------|------|-------------|
+| --- | --- | --- |
 | `gather_dim` | int | Dimension to gather (usually `1` for sequence) |
 | `expected_dims` | int \| None | Expected tensor rank for validation (optional) |
 
 **Module Naming Conventions:**
 
 | Key | Meaning | Python equivalent |
-|-----|---------|-------------------|
+| --- | --- | --- |
 | `""` | Root model | `model` |
 | `"blocks.0"` | First element of ModuleList | `model.blocks[0]` |
 | `"blocks.*"` | All elements of ModuleList | `for b in model.blocks` |
@@ -328,7 +426,7 @@ Other references to the same storage also keep the full allocation alive.
 **Dictionary Value Types:**
 
 | Key type | `split_output` | Description |
-|----------|----------------|-------------|
+| --- | --- | --- |
 | `"param_name"` (str) | `False` | Shard **input parameter** by name |
 | `0`, `1`, ... (int) | `True` | Shard **output tuple** by index |
 
@@ -338,8 +436,8 @@ Other references to the same storage also keep the full allocation alive.
 
 For models with dynamic sharding logic that cannot be expressed via `_sp_plan`, manually insert shard/gather calls.
 
-
 **When to use:**
+
 - Dynamic/conditional sharding logic
 - Complex tensor manipulations that can't be encapsulated
 - Temporary workaround during development
@@ -416,6 +514,7 @@ python text_to_image.py \
 **Problem:** RoPE embeddings not sharded, but hidden_states is sharded.
 
 **Solution:** Shard RoPE outputs in `_sp_plan`:
+
 ```python
 _sp_plan = {
     "rope": {
@@ -436,17 +535,18 @@ _sp_plan = {
 2. If the model already uses `_sp_plan` token padding and the attention backend supports `attention_mask`, set `auto_pad=True` and add attention-mask plumbing.
 
 > **Experimental Feature:** `ulysses_mode="advanced_uaa"` is experimental. It is intended to relax Ulysses divisibility constraints, but hybrid Ulysses + Ring still requires equal post-Ulysses sequence lengths inside each ring group.
-
+>
 > **Experimental Feature:** `auto_pad=True` is an experimental feature and may be changed in the future. We plan to improve this solution to involve minimal changes to model files. More details are [here](https://github.com/vllm-project/vllm-omni/issues/1324).
 
 **Constraints of auto_pad:**
 
 | Constraint | Description |
-|------------|-------------|
+| --- | --- |
 | **Attention Backend Compatibility** | The attention backends must support `attention_mask`. Currently only `TORCH_SDPA` and `FLASH_ATTN` (default for diffusion models) are supported. |
 | **Ring Attention Limitation** | Ring attention does not support arbitrary `attention_mask` values, so `auto_pad=True` remains incompatible. Contiguous suffix padding is supported when the model publishes the global `valid_kv_length` prefix. |
 
 1. Enable `auto_pad=True` for all sequence-dimension inputs in `_sp_plan`:
+
 ```python
 _sp_plan = {
     "rope": {
@@ -460,7 +560,8 @@ _sp_plan = {
 }
 ```
 
-2. Create attention mask dynamically when padding is applied:
+1. Create attention mask dynamically when padding is applied:
+
 ```python
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -484,11 +585,12 @@ output = self.attn(query, key, value, attn_metadata)
 While `auto_pad` enables generation for irregular resolutions, be aware of potential quality impacts:
 
 | Aspect | Impact |
-|--------|--------|
+| --- | --- |
 | **Training Distribution** | Models perform best on aspect ratios seen during training (e.g., 1:1, 16:9, 4:3). Unusual ratios like 700x400 (1.75:1) may produce lower quality results. |
 | **Padding Overhead** | Padded positions consume compute even when masked. For best efficiency, prefer resolutions divisible by `sp_size`. |
 
 **Recommendations for users:**
+
 - Use standard aspect ratios when possible (e.g., 768x432 for 16:9 instead of 700x400)
 - Ensure post-patch dimensions are divisible by `sp_size` for optimal quality
 - Test generation quality when using unusual resolutions
@@ -502,6 +604,7 @@ While `auto_pad` enables generation for irregular resolutions, be aware of poten
 - **Operations happen inline in `forward()`, not at module boundaries:**
 
 **Problem:**
+
 ```python
 def forward(self, x, cap):
     unified = torch.cat([x, cap], dim=1)  # ← Inline operation!
@@ -509,6 +612,7 @@ def forward(self, x, cap):
 ```
 
 **Solution:** Extract into submodule:
+
 ```python
 class ConcatModule(nn.Module):
     def forward(self, x, cap):
@@ -536,7 +640,7 @@ class MyModel(nn.Module):
 Complete examples in the codebase:
 
 | Model | Path | Pattern | Notes |
-|-------|------|---------|-------|
+| --- | --- | --- | --- |
 | **LongCat** | `vllm_omni/diffusion/models/longcat_image/longcat_image_transformer.py` | Dual-stream | Text components replicated, image components sharded |
 | **Qwen-Image** | `vllm_omni/diffusion/models/qwen_image/qwen_image_transformer.py` | Dual-stream + preprocessing | auto_pad, separate RoPE |
 | **Wan2.2** | `vllm_omni/diffusion/models/wan2_2/wan2_2_transformer.py` | Dual-Transformer + RoPE | Video transformer |

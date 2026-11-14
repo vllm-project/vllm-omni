@@ -10,10 +10,16 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
+from vllm_omni.diffusion.distributed.packed_qkv import (
+    packed_output_all_to_all,
+    packed_qkv_all_to_all,
+    packed_qkv_eligible,
+)
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     get_ulysses_mode,
@@ -224,6 +230,7 @@ class _UlyssesCtx(ParallelAttentionContext):
     uaa_local_seq_len: int = 0
     orig_head_cnt: int = 0
     joint_orig_head_cnt: int = 0
+    use_packed_qkv: bool = False
 
 
 class UlyssesParallelAttention:
@@ -251,6 +258,11 @@ class UlyssesParallelAttention:
         self._gather_idx = gather_idx
         self._use_sync = use_sync
         self._ulysses_a2a_permute = ulysses_a2a_permute
+        # Every rank must use the same setting. Unsupported platforms/layouts
+        # keep their existing exchange, including explicit symmetric memory.
+        self._rocm_packed_qkv = (
+            not ulysses_a2a_permute and envs.VLLM_OMNI_ROCM_PACKED_QKV and current_omni_platform.is_rocm()
+        )
         if ulysses_a2a_permute:
             from vllm_omni.diffusion.distributed.a2a_permute import (
                 ensure_a2a_permute_available,
@@ -299,6 +311,7 @@ class UlyssesParallelAttention:
 
             validate_a2a_permute_config(ulysses_mode=mode)
         ulysses_world_size = self._sp_group.ulysses_world_size
+        use_packed_qkv = False
         gate_compress = None
         if attn_metadata is not None:
             candidate = attn_metadata.extra.get("gate_compress")
@@ -559,6 +572,15 @@ class UlyssesParallelAttention:
                     gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
                 if self._use_sync:
                     current_omni_platform.synchronize()
+            elif (
+                self._rocm_packed_qkv
+                and self._scatter_idx == 2
+                and self._gather_idx == 1
+                and gate_compress is None
+                and packed_qkv_eligible(query, key, value, ulysses_world_size)
+            ):
+                query, key, value = packed_qkv_all_to_all(self._ulysses_pg, query, key, value, self._use_sync)
+                use_packed_qkv = True
             else:
                 query = SeqAllToAll4D.apply(
                     self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync
@@ -617,6 +639,7 @@ class UlyssesParallelAttention:
             uaa_local_seq_len=local_seq_len if mode == "advanced_uaa" else 0,
             orig_head_cnt=int(orig_head_cnt) if mode == "advanced_uaa" else 0,
             joint_orig_head_cnt=int(joint_orig_head_cnt) if mode == "advanced_uaa" else 0,
+            use_packed_qkv=use_packed_qkv,
         )
         use_2d_mask = False
         if attn_metadata is not None:
@@ -685,6 +708,8 @@ class UlyssesParallelAttention:
                     orig_head_cnt=ctx.orig_head_cnt,
                     use_sync=ctx.use_sync,
                 )
+            elif ctx.use_packed_qkv:
+                output_img = packed_output_all_to_all(ctx.ulysses_pg, output_img, ctx.use_sync)
             elif _a2a_permute_enabled(
                 self._ulysses_a2a_permute,
                 ctx.scatter_idx,
@@ -732,6 +757,8 @@ class UlyssesParallelAttention:
                 orig_head_cnt=ctx.orig_head_cnt,
                 use_sync=ctx.use_sync,
             )
+        if ctx.use_packed_qkv:
+            return packed_output_all_to_all(ctx.ulysses_pg, attn_output, ctx.use_sync)
         if _a2a_permute_enabled(
             self._ulysses_a2a_permute,
             ctx.scatter_idx,

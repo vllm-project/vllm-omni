@@ -1394,6 +1394,7 @@ source_file_dependencies:
     - vllm_omni/platforms/
     - vllm_omni/config/
     - tests/diffusion/distributed/test_comm.py
+    - tests/diffusion/distributed/test_fused_qkv_pack.py
     - tests/diffusion/distributed/test_cfg_parallel.py
     - tests/helpers/distributed.py
     - tests/helpers/mark.py
