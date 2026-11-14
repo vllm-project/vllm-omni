@@ -132,11 +132,20 @@ def _patch_encoder_constructors(monkeypatch, *, rank: int):
     group = SimpleNamespace(rank_in_group=rank, world_size=2, device_group=object())
 
     class FakeVideoVAE(torch.nn.Module):
-        def __init__(self, path, *, device, encode_only, trust_remote_code):
+        def __init__(
+            self,
+            path,
+            *,
+            device,
+            encode_only,
+            trust_remote_code,
+            encode_tile_balance_max_tasks=None,
+        ):
             super().__init__()
             self.path = path
             self.parallel_args = None
             self.trust_remote_code = trust_remote_code
+            self.encode_tile_balance_max_tasks = encode_tile_balance_max_tasks
 
         def set_parallel_size(self, size, *, process_group):
             self.parallel_args = (size, process_group)
@@ -165,7 +174,14 @@ def _component_root(tmp_path):
     return root
 
 
-def _encoder_config(root, *, video_mode="patch", roles=None, trust_remote_code=True):
+def _encoder_config(
+    root,
+    *,
+    video_mode="patch",
+    roles=None,
+    trust_remote_code=True,
+    tile_balance_max_tasks=None,
+):
     components = (
         {
             "text_encoder": {"parallel_mode": "tp"},
@@ -175,12 +191,16 @@ def _encoder_config(root, *, video_mode="patch", roles=None, trust_remote_code=T
         if roles is None
         else roles
     )
+    additional_config = {}
+    if tile_balance_max_tasks is not None:
+        additional_config["h3_vae_encode_tile_balance_max_tasks"] = tile_balance_max_tasks
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model=str(root / "text_encoder"),
             hf_config=SimpleNamespace(minimax_h3_encoder_components=components),
             trust_remote_code=trust_remote_code,
-        )
+        ),
+        additional_config=additional_config,
     )
 
 
@@ -215,9 +235,20 @@ def test_encoder_uses_tp_patch_and_leader_on_the_same_rank_set(
     assert model.component_config.audio_parallel_mode == "leader"
     assert model.video_vae.parallel_args == (2, group.device_group)
     assert model.video_vae.trust_remote_code is trust_remote_code
+    assert model.video_vae.encode_tile_balance_max_tasks is None
     assert (model.audio_vae is not None) is has_audio_vae
     if has_audio_vae:
         assert model.audio_vae.trust_remote_code is trust_remote_code
+
+
+def test_encoder_routes_tile_balance_config_to_encode_only_vae(monkeypatch, tmp_path) -> None:
+    encoder_module, _ = _patch_encoder_constructors(monkeypatch, rank=0)
+    root = _component_root(tmp_path)
+    config = _encoder_config(root, tile_balance_max_tasks=168)
+
+    model = encoder_module.MiniMaxH3Encoder(vllm_config=config)
+
+    assert model.video_vae.encode_tile_balance_max_tasks == 168
 
 
 @pytest.mark.parametrize("component", ["video", "audio"])
