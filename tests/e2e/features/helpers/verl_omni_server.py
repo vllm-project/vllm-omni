@@ -20,7 +20,7 @@ import psutil
 import torchvision.transforms as T
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
-from vllm.entrypoints.openai.api_server import build_app
+from vllm.entrypoints.launchers.app import build_app
 
 import vllm_omni.entrypoints.cli.serve
 from vllm_omni.entrypoints.async_omni import AsyncOmni
