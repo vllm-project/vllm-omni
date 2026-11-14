@@ -18,6 +18,7 @@ MOSS-Image-Base combines a Qwen3.5-9B text encoder, a 42-block dense joint image
 | CFG parallelism | `--cfg-parallel-size 2` |
 | Request batching | `--max-num-seqs 4` |
 | Continuous batching | `--step-execution --max-num-seqs 4` |
+| INT8 quantization | `--quantization int8` for main DiT attention and FFN projections |
 | DLO | Stream DiT, text-refinement and text-encoder blocks using the config below |
 | SLG | Two-pass unconditional skipping or three-pass positive SLG via `extra_params` |
 
@@ -28,6 +29,16 @@ DLO works on one GPU and supports AllGather across DP/SP groups. SLG layer IDs a
 ## Kernel fusion
 
 The eager CUDA path fuses RMSNorm/AdaLN, Q/K RMSNorm with RoPE, SiTU and gated residual additions while preserving BF16 rounding boundaries. Full-forward requests reuse immutable text conditioning and RoPE. Matched reductions target PyTorch 2.13; unsupported cases use Torch reductions, unfused kernels or eager operators.
+
+## INT8 quantization
+
+```bash
+vllm serve OpenMOSS-Team/MOSS-Image-Base --omni --enforce-eager --quantization int8 --port 8091
+```
+
+INT8 uses W8A8 for the main DiT projections. Text refinement, the text encoder, embedders and modulation layers retain BF16; the VAE retains FP32. Keeping text refinement in BF16 limits conditioning drift. Quantized outputs can still differ from BF16.
+
+Validated on one A800 with eager execution and FlashAttention. Use complete fused layer names such as `layers.0.proj.qkv` with `ignored_layers` to retain selected projections in BF16. See the [INT8 guide](../../docs/user_guide/quantization/int8.md) for configuration.
 
 ## Environment
 

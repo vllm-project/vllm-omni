@@ -15,7 +15,7 @@ Ported from the training repository's finalized standalone modeling file
     optional key-padding mask (video tokens attend everything; padded text
     tokens are masked out), matching the reference per-sample true-length
     semantics under batched execution.
-  * **Precision contract** (unchanged): bf16 learned weights, fp32 RoPE
+  * **Precision contract**: bf16 activations and unquantized learned weights, fp32 RoPE
     frequencies/phases (cast to activation dtype at the end), fp32 CFG and
     Euler updates (handled by the pipeline), float64 sinusoid time embedding
     fed to the MLP as fp32.
@@ -39,6 +39,8 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -56,6 +58,7 @@ from vllm_omni.diffusion.models.mossimage.ops import (
     try_rotate_qk,
     try_situ,
 )
+from vllm_omni.quantization import resolve_component_quant_config
 
 # (fused_param_stem, checkpoint_stem, shard_id) mappings for stacked loads.
 _MOSSIMAGE_STACKED_PARAMS_MAPPING = (
@@ -235,7 +238,14 @@ class MOSSImageTextProjection(nn.Module):
 class MOSSImageBlock(nn.Module):
     """Main DiT block: shared AdaLN modulation, self-attention + gated SiTU FFN. TP-sharded."""
 
-    def __init__(self, dim: int, ffn_dim: int, heads: int, prefix: str = ""):
+    def __init__(
+        self,
+        dim: int,
+        ffn_dim: int,
+        heads: int,
+        prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         head_dim = dim // heads
         self.norm1 = MOSSImageRMSNorm(dim)
@@ -251,6 +261,7 @@ class MOSSImageBlock(nn.Module):
                     head_size=head_dim,
                     total_num_heads=heads,
                     bias=False,
+                    quant_config=quant_config,
                     prefix=f"{prefix}.proj.qkv" if prefix else "",
                 ),
                 "o": RowParallelLinear(
@@ -259,12 +270,14 @@ class MOSSImageBlock(nn.Module):
                     bias=False,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
                     prefix=f"{prefix}.proj.o" if prefix else "",
                 ),
                 "ffn_up_gate": MergedColumnParallelLinear(
                     dim,
                     [ffn_dim, ffn_dim],
                     bias=False,
+                    quant_config=quant_config,
                     prefix=f"{prefix}.proj.ffn_up_gate" if prefix else "",
                 ),
                 "ffn_down": RowParallelLinear(
@@ -273,6 +286,7 @@ class MOSSImageBlock(nn.Module):
                     bias=False,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
                     prefix=f"{prefix}.proj.ffn_down" if prefix else "",
                 ),
             }
@@ -289,7 +303,8 @@ class MOSSImageBlock(nn.Module):
     ) -> torch.Tensor:
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
         y = self.norm1(x, scale_a, shift_a)
-        dtype = self.proj["qkv"].weight.dtype
+        # Quantized weight storage is INT8; activations still use the model dtype.
+        dtype = self.norm1.weight.dtype
         y = y.to(dtype)
         qkv, _ = self.proj["qkv"](y)
         q, k, v = qkv.chunk(3, -1)
@@ -424,6 +439,7 @@ class MOSSImageTransformer(nn.Module):
     """
 
     supports_skip_layer_guidance = True
+    packed_modules_mapping = {"qkv": ["q", "k", "v"]}
     _repeated_blocks = ["MOSSImageBlock"]
     _layerwise_offload_blocks_attrs = ["layers"]
     # Ulysses: shard the joint [video | text] sequence and the RoPE table at
@@ -459,17 +475,25 @@ class MOSSImageTransformer(nn.Module):
         self.num_heads = num_heads
         self.freq_dim = freq_dim
         self.latent_channels = latent_channels
-        self.quant_config = getattr(od_config, "quantization_config", None) if od_config else None
+        self.quant_config = (
+            resolve_component_quant_config(od_config.quantization_config, "transformer") if od_config else None
+        )
+        if self.quant_config is not None:
+            configure_quant_config(self.quant_config, type(self))
         self.stacked_params_mapping = list(_MOSSIMAGE_STACKED_PARAMS_MAPPING)
 
         # Replicated (non-TP) small layers: embedders, time/modulation, head.
         self.video_embedder = nn.Linear(latent_channels, dim)
+        # Conditioning refinement stays in BF16 to limit quantization drift.
         self.text_embedder = MOSSImageTextProjection(text_dim, dim, ffn_dim, num_heads, prefix="text_embedder")
         self.rope = MOSSImageRoPE(dim // num_heads, rope_base)
         self.time_embedding = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.shared_block_modulation = nn.Linear(dim, 6 * dim)
         self.layers = nn.ModuleList(
-            [MOSSImageBlock(dim, ffn_dim, num_heads, prefix=f"layers.{i}") for i in range(num_layers)]
+            [
+                MOSSImageBlock(dim, ffn_dim, num_heads, prefix=f"layers.{i}", quant_config=self.quant_config)
+                for i in range(num_layers)
+            ]
         )
         self.final_norm_video = MOSSImageRMSNorm(dim)
         self.final_linear_video = nn.Linear(dim, latent_channels, bias=False)
