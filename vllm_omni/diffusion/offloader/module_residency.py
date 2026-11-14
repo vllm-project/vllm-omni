@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import chain
 from typing import Any
 
@@ -448,6 +448,7 @@ class PinnedModuleStager:
         copy_stream: Any | None = None,
         cache_retention: BoundedAllocatorCache | None = None,
         retain_device_storage: bool = False,
+        pack_by_dtype: bool = False,
     ) -> None:
         modules = (module,) if isinstance(module, nn.Module) else tuple(module)
         if not modules or not all(isinstance(item, nn.Module) for item in modules):
@@ -463,6 +464,7 @@ class PinnedModuleStager:
             modules,
             pin_memory=pin_memory,
             pack_pinned=pin_memory and current_omni_platform.is_rocm(),
+            pack_by_dtype=pack_by_dtype,
         )
         self._device_storages: list[torch.Tensor] = []
         self._restore_masters()
@@ -473,8 +475,35 @@ class PinnedModuleStager:
         *,
         pin_memory: bool,
         pack_pinned: bool = False,
+        pack_by_dtype: bool = False,
     ) -> list[_StorageGroup]:
         source_groups = _collect_source_groups(modules)
+        if pack_by_dtype:
+            groups = _copy_groups_to_cpu(
+                source_groups,
+                pin_memory=False,
+                pack_pinned=False,
+                non_blocking=False,
+            )
+            module_indices: dict[int, int] = {}
+            for index, module in enumerate(modules):
+                for target in chain(module.parameters(), module.buffers()):
+                    module_indices.setdefault(id(target), index)
+            packs: dict[tuple[int, torch.dtype], list[_StorageGroup]] = {}
+            for group in groups:
+                binding = group.bindings[0]
+                key = (module_indices[id(binding.target)], binding.dtype)
+                packs.setdefault(key, []).append(group)
+            try:
+                return [PinnedModuleStager._pack_groups(pack, pin_memory) for pack in packs.values()]
+            except _PinnedSlabAllocationError:
+                logger.debug("Module pinned-host allocation failed; using separate pinned masters", exc_info=True)
+                return _copy_groups_to_cpu(
+                    source_groups,
+                    pin_memory=pin_memory,
+                    pack_pinned=False,
+                    non_blocking=False,
+                )
         try:
             return _copy_groups_to_cpu(
                 source_groups,
@@ -490,6 +519,29 @@ class PinnedModuleStager:
                 pack_pinned=False,
                 non_blocking=False,
             )
+
+    @staticmethod
+    def _pack_groups(groups: list[_StorageGroup], pin_memory: bool) -> _StorageGroup:
+        # Keep each backing storage aligned and preserve aliases by moving
+        # all bindings of that storage together.
+        alignment = 512
+        lengths = [group.master.numel() for group in groups]
+        spans = [(length + alignment - 1) // alignment * alignment for length in lengths]
+        try:
+            master = torch.empty(sum(spans), dtype=torch.uint8, device="cpu", pin_memory=pin_memory)
+        except (RuntimeError, MemoryError) as exc:
+            if not pin_memory:
+                raise
+            raise _PinnedSlabAllocationError("Module pinned-host allocation failed") from exc
+        bindings = []
+        offset = 0
+        for group, length, span in zip(groups, lengths, spans, strict=True):
+            master[offset : offset + length].copy_(group.master)
+            for binding in group.bindings:
+                element_size = binding.target.element_size()
+                bindings.append(replace(binding, storage_offset=binding.storage_offset + offset // element_size))
+            offset += span
+        return _StorageGroup(master, bindings)
 
     @staticmethod
     def _view(backing: torch.Tensor, binding: _TensorBinding) -> torch.Tensor:

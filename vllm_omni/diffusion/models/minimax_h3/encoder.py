@@ -1284,21 +1284,43 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             raise RuntimeError(f"MiniMax H3 text encoder weights not loaded: {len(missing)} params: {missing}")
         return loaded
 
+    def prepare_packed_offload(self) -> None:
+        """Build reusable host packs for the manually staged NPU encoder."""
+        if not self.is_loaded or self.device_target.type != "npu":
+            return
+        if getattr(self, "_omni_non_block_stager", None) is not None:
+            return
+
+        modules = self._omni_non_block_modules()
+        hooks = getattr(self, "_omni_layerwise_hooks", ())
+        if not getattr(self, "_omni_layerwise_enabled", False):
+            modules.extend(self.vision.blocks)
+            modules.extend(self.text_model.layers)
+        self._omni_non_block_stager = PinnedModuleStager(
+            modules,
+            self.device_target,
+            pin_memory=hooks[0].pin_memory if hooks else True,
+            cache_retention=getattr(self, "_omni_component_cache", None),
+            pack_by_dtype=True,
+        )
+
     def load_to_device(self) -> None:
         if not self.is_loaded:
             return
+        stager = getattr(self, "_omni_non_block_stager", None)
+        if stager is not None:
+            stager.load()
+            return
         if getattr(self, "_omni_layerwise_enabled", False):
-            stager = getattr(self, "_omni_non_block_stager", None)
-            if stager is None:
-                hooks = getattr(self, "_omni_layerwise_hooks", ())
-                pin_memory = bool(getattr(hooks[0], "pin_memory", True)) if hooks else True
-                stager = PinnedModuleStager(
-                    self._omni_non_block_modules(),
-                    self.device_target,
-                    pin_memory=pin_memory,
-                    cache_retention=getattr(self, "_omni_component_cache", None),
-                )
-                self._omni_non_block_stager = stager
+            hooks = getattr(self, "_omni_layerwise_hooks", ())
+            pin_memory = bool(getattr(hooks[0], "pin_memory", True)) if hooks else True
+            stager = PinnedModuleStager(
+                self._omni_non_block_modules(),
+                self.device_target,
+                pin_memory=pin_memory,
+                cache_retention=getattr(self, "_omni_component_cache", None),
+            )
+            self._omni_non_block_stager = stager
             stager.load()
             return
         self.vision.to(self.device_target)
@@ -1320,6 +1342,10 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 for child in self._omni_non_block_modules():
                     child.to("cpu")
                 self._release_omni_component_cache()
+            return
+        stager = getattr(self, "_omni_non_block_stager", None)
+        if stager is not None:
+            stager.offload()
             return
         self.vision.to("cpu")
         self.text_model.to("cpu")
@@ -1471,6 +1497,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         image_grid_thw: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
+        return_on_device: bool = False,
     ) -> torch.Tensor:
         if not self.is_loaded:
             raise RuntimeError("MiniMax H3 text encoder is only loaded on the encoder TP ranks")
@@ -1493,7 +1520,9 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
             )
-            return hidden.cpu()
+            # The pipeline can broadcast directly from the activation device.
+            # Keep the standalone encoder's CPU-return contract by default.
+            return hidden if return_on_device else hidden.cpu()
         finally:
             torch.backends.cuda.enable_cudnn_sdp(cudnn_sdp_enabled)
 
@@ -1505,9 +1534,10 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         image_grid_thw: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
+        return_on_device: bool = False,
     ) -> torch.Tensor:
         """Hook-compatible entry point for model-level CPU offloading."""
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
         }
@@ -1516,6 +1546,8 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
             )
+        if return_on_device:
+            kwargs["return_on_device"] = True
         return self.encode_ids(input_ids, **kwargs)
 
 
