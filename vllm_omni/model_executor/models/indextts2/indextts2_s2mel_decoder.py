@@ -622,12 +622,10 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 wav.max().item() if isinstance(wav, torch.Tensor) else max(w.max().item() for w in wav),
             )
 
-        audio_cpu = [w.cpu() for w in wav] if isinstance(wav, list) else wav.cpu()
-
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={
-                "audio": audio_cpu,
+                "audio": wav,
                 "sr": torch.tensor(22050, dtype=torch.int32),
             },
         )

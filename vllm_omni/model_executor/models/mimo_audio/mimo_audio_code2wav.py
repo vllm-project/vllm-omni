@@ -311,8 +311,8 @@ class MiMoAudioTokenizerWorker:
             with torch.no_grad():
                 decoded_audio = self.audio_tokenizer.decode(tokens)
 
-        decoded_audio = decoded_audio.float().reshape(-1).detach().cpu()
-        return decoded_audio  # [samples] cpu
+        decoded_audio = decoded_audio.float().reshape(-1).detach()
+        return decoded_audio  # [samples]
 
 
 @dataclass
