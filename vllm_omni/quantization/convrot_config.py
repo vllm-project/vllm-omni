@@ -210,16 +210,15 @@ class DiffusionConvRotConfig(QuantizationConfig):
         if self._matches(prefix, self.ignored_layers):
             return UnquantizedLinearMethod()
         if self.weight_bits == 8 or self._matches(prefix, self.int8_layers):
-            # Rotated INT8 uses the same kernels as plain INT8; only the rotation is
-            # device agnostic, so pick the NPU or CUDA INT8 base accordingly.
+            # Rotated INT8 reuses the shared INT8 kernels, so each platform keeps the
+            # method that binds the rotation to its own kernel implementation.
+            if current_omni_platform.is_cuda():
+                return ConvRotInt8OnlineLinearMethod(self)
             if current_omni_platform.is_npu():
                 return NPUConvRotInt8OnlineLinearMethod(self)
-            return ConvRotInt8OnlineLinearMethod(self)
+            raise NotImplementedError("ConvRot INT8 quantization runs on CUDA and Ascend NPU only.")
         if not current_omni_platform.is_cuda():
-            raise NotImplementedError(
-                "ConvRot INT4 quantization currently runs on CUDA only; "
-                "convrot_int8 is available on CUDA and Ascend NPU."
-            )
+            raise NotImplementedError("ConvRot INT4 quantization currently runs on CUDA only.")
         return ConvRotInt4OnlineLinearMethod(self)
 
 
