@@ -95,6 +95,7 @@ EXPECTED_MODEL_TYPES = {
     "indextts2_5",
     "auk",
     "gepard",
+    "kimi_audio",
 }
 
 

@@ -158,6 +158,8 @@ _PIPELINE_STAGES = [
     "indextts2_5_talker",
     "indextts2_s2mel_decoder",
     "indextts2_talker",
+    "kimi_audio_ar",
+    "kimi_audio_decoder",
     "kokoro",
     "latent_generator",
     "lfm3_code2wav",
@@ -369,7 +371,7 @@ def test_audex_omni_requires_speech_decoder():
 def test_default_stage_serves_speech_is_unconditional():
     for name, cls in TTS_ADAPTER_REGISTRY.items():
         # Speech-capable only when their codec stage is deployed.
-        if name in ("audex", "lfm3_omni"):
+        if name in ("audex", "kimi_audio", "lfm3_omni"):
             continue
         for key in cls.stage_keys:
             assert cls.stage_serves_speech(key, frozenset({key})) is True

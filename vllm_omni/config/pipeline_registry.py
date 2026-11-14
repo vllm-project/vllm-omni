@@ -85,6 +85,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
     JOYAI_VL_INTERACTION_ASR_PIPELINE,
     JOYAI_VL_INTERACTION_PIPELINE,
 )
+from vllm_omni.model_executor.models.kimi_audio.pipeline import KIMI_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.kokoro.pipeline import KOKORO_PIPELINE
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.lfm3_audio.pipeline import LFM3_AUDIO_PIPELINE, LFM3_AUDIO_TEXT_PIPELINE
@@ -197,6 +198,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "indextts2_5": INDEXTTS25_PIPELINE,
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
     "joyai_vl_interaction_asr": JOYAI_VL_INTERACTION_ASR_PIPELINE,
+    "kimi_audio": KIMI_AUDIO_PIPELINE,
     "kokoro": KOKORO_PIPELINE,
     "lance": LANCE_PIPELINE,
     "lfm3_audio": LFM3_AUDIO_PIPELINE,
