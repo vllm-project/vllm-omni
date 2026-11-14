@@ -1,3 +1,4 @@
 -r common.txt
-onnxruntime-cann>=1.23.2
+onnxruntime>=1.23.2
 torchaudio==2.10.0
+cann-shmem>=1.7.0

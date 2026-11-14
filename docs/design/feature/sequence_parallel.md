@@ -49,9 +49,10 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 
 On NPU, `--ulysses-a2a-permute` uses Python and Triton-Ascend to read peer
 symmetric memory directly into the final attention layout. It requires
-TorchNPU's NPUSHMEM allocator and an installed `libshmem.so` on the loader
-search path. This backend does not build a repository C++/AscendC extension;
-Triton uses its normal JIT toolchain.
+TorchNPU's NPUSHMEM allocator and the native SHMEM runtime. The backend
+loads the runtime from the installed `cann-shmem` wheel, or from the loader
+search path for a separately installed `libshmem.so`. Triton uses its normal
+JIT toolchain; no repository C++/AscendC extension is built.
 
 The backend requires eager execution, strict Ulysses, `ulysses_degree > 1`,
 `ring_degree = 1`, `allgather_degree = 1`, and a Ulysses group containing all
