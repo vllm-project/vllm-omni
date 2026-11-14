@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import copy
 from collections.abc import Iterable
+from dataclasses import replace
 from functools import cached_property
 
 import torch
@@ -9,6 +11,7 @@ import torch.nn as nn
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniTalkerConfig
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -20,6 +23,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 
 class Qwen2_5OmniTalkerForConditionalGeneration(
@@ -43,16 +48,31 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config: Qwen2_5OmniTalkerConfig = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
-        self.vllm_config = vllm_config
-        self.prefix = prefix
-        self.quant_config = quant_config
-
         if hasattr(config, "talker_config"):
             self.config = config.talker_config
             vllm_config.model_config.hf_text_config = vllm_config.model_config.hf_config.talker_config
         else:
             self.config = config
+
+        quant_config = vllm_config.quant_config
+        if isinstance(quant_config, ComponentQuantizationConfig):
+            quant_config = quant_config.resolve("talker")
+        elif isinstance(quant_config, OnlineQuantizationConfig):
+            # Online quantization targets the thinker LM only. Serialized
+            # checkpoint configs are kept so the talker's scales still load.
+            quant_config = None
+        if quant_config is not vllm_config.quant_config:
+            model_config = vllm_config.model_config
+            if quant_config is None:
+                # Unless this is a with_hf_config() view (the staged pipeline),
+                # VllmConfig rebuilds a missing quant_config from
+                # model_config.quantization on replace(), so clear it too.
+                model_config = copy.copy(model_config)
+                model_config.quantization = None
+            vllm_config = replace(vllm_config, model_config=model_config, quant_config=quant_config)
+        self.vllm_config = vllm_config
+        self.prefix = prefix
+        self.quant_config = quant_config
 
         self.thinker_to_talker_proj = nn.Linear(
             self.config.embedding_size,

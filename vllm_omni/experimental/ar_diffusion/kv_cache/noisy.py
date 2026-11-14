@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Noisy KV: (req, chunk, step, block) cells, last-use eviction, column P2P."""
+"""Noisy PP versioned KV: (req, chunk, step, block) cells, last-use eviction, column P2P."""
 
 from __future__ import annotations
 
+from collections.abc import Collection, Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -11,9 +12,11 @@ from typing import Any, ClassVar
 import torch
 import torch.distributed as dist
 
-from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
+    PRIOR_HANDOFF_SLOT,
     Cell,
     CellPlan,
+    CellSchedule,
     Inflight,
     Ordering,
     RequestKVTransfer,
@@ -509,16 +512,71 @@ class NoisyKVCache:
         self.resident_peak = 0
         self.bytes_per_version = bytes_per_version
         self.reserved_bytes = self.capacity * bytes_all_layers
+        # First-request schedule fingerprint per outer session_id / pool key.
+        self._session_structural_keys: dict[str, tuple[object, ...]] = {}
+
+    def bind_session_structure(self, kv_id: str, key: tuple[object, ...]) -> None:
+        """Record or check the schedule fingerprint for a persistent session pool key."""
+        existing = self._session_structural_keys.get(kv_id)
+        if existing is None:
+            self._session_structural_keys[kv_id] = key
+            return
+        if existing != key:
+            raise ValueError(
+                f"session {kv_id!r} schedule structural_key mismatch: "
+                f"retained={existing!r} request={key!r}; "
+                "release_noisy_kv and restart, or keep D/S/ordering/H/blocks fixed"
+            )
+
+    def clear_session_structure(self, kv_id: str) -> None:
+        self._session_structural_keys.pop(kv_id, None)
+
+
+def clean_history_cells(schedule: CellSchedule, *, num_blocks: int) -> set[Cell]:
+    """Clean cells to retain across requests for ``schedule``.
+
+    Always keeps the trailing ``H`` window ``[chunk_end-H, chunk_end)``.
+    Same-Step additionally keeps absolute chunk-0 clean sink cells for the
+    whole session — later plans still demand ``(0, D, *)`` even after the
+    trailing window has moved past chunk 0.
+    """
+    if num_blocks < 1:
+        return set()
+    t_clean = schedule.num_denoise_steps
+    cells: set[Cell] = set()
+    h = schedule.kv_history_chunks
+    if h >= 1:
+        end = schedule.chunk_end
+        start = max(0, end - h)
+        cells |= {(chunk, t_clean, block) for chunk in range(start, end) for block in range(num_blocks)}
+    if schedule.ordering is Ordering.SAME_STEP:
+        cells |= {(0, t_clean, block) for block in range(num_blocks)}
+    return cells
+
+
+def prior_history_in_pool(
+    cache: NoisyKVCache,
+    kv_id: str,
+    *,
+    chunk_base: int,
+) -> frozenset[Cell]:
+    """Resident cells for ``kv_id`` with ``chunk < chunk_base`` (outer session supplies base)."""
+    if chunk_base <= 0:
+        return frozenset()
+    return frozenset(
+        (chunk, step, block) for sid, chunk, step, block in cache.pool.keys if sid == kv_id and chunk < chunk_base
+    )
 
 
 class NoisyKVState:
-    """Per-request bridge used by the chunk executor."""
+    """Per-invocation bridge used by the chunk executor over a shared pool."""
 
     def __init__(self, cache: NoisyKVCache) -> None:
         self.cache = cache
         self._plans: dict[str, CellPlan] = {}
         self._chunk_tokens: dict[str, int] = {}
         self._last_use_global: dict[str, dict[Cell, int]] = {}
+        self._retain: dict[str, set[Cell]] = {}
         self.bytes_sent = 0
         self.bytes_received = 0
         self.transfers_deduped = 0
@@ -548,7 +606,20 @@ class NoisyKVState:
     def wait_sends(self) -> None:
         self.cache.transport.wait_sends()
 
-    def begin_request(self, req: str, plan: CellPlan, *, chunk_tokens: int, t0: int = 0) -> None:
+    def protect(self, req: str, cells: Iterable[Cell]) -> None:
+        """Keep ``cells`` for ``req`` out of last-use eviction and end_request release."""
+        bucket = self._retain.setdefault(req, set())
+        bucket.update(cells)
+
+    def begin_request(
+        self,
+        req: str,
+        plan: CellPlan,
+        *,
+        chunk_tokens: int,
+        t0: int = 0,
+        retain: Collection[Cell] | None = None,
+    ) -> None:
         if chunk_tokens <= 0 or chunk_tokens % self.cache.spec.block_size != 0:
             raise ValueError("chunk_tokens must be a positive multiple of block_size")
         if chunk_tokens > self.cache.spec.max_chunk_tokens:
@@ -557,13 +628,30 @@ class NoisyKVState:
         self._chunk_tokens[req] = chunk_tokens
         mapped = {version: t0 + slot for version, slot in plan.last_use(self._rank).items()}
         self._last_use_global[req] = mapped
+        if retain:
+            self.protect(req, retain)
+
+    def chunk_tokens(self, req: str) -> int:
+        """Public read for mainline ``SupportsNoisyPPKV`` (admit token-uniformity)."""
+        return self._chunk_tokens[req]
 
     def set_inflight(self, inflight: tuple[Inflight, ...]) -> None:
         self._inflight = inflight
 
-    def end_request(self, req: str) -> None:
+    def _is_retained(self, req: str, version: Cell) -> bool:
+        return version in self._retain.get(req, ())
+
+    def end_request(self, req: str, *, retain: Collection[Cell] | None = None) -> None:
+        """Finish one admitted request.
+
+        ``retain is None`` keeps the existing protect set (normal plan
+        completion). ``retain=()`` clears retained versions for ``req``.
+        """
         self.cache.transport.wait_sends()
-        drop = [key for key in self.cache.pool.keys if key[0] == req]
+        if retain is not None:
+            self._retain[req] = set(retain)
+        keep = {_version_key(req, cell) for cell in self._retain.get(req, ())}
+        drop = [key for key in self.cache.pool.keys if key[0] == req and key not in keep]
         for key in drop:
             self.cache.transport.discard(key)
         for key in drop:
@@ -571,10 +659,22 @@ class NoisyKVState:
         self._plans.pop(req, None)
         self._chunk_tokens.pop(req, None)
         self._last_use_global.pop(req, None)
+        if not keep:
+            self._retain.pop(req, None)
+
+    def release_session(self, session_id: str) -> None:
+        """Drop every pool version and bookkeeping for one session id."""
+        self.end_request(session_id, retain=())
+        leftover = [key for key in self.cache.pool.keys if key[0] == session_id]
+        for key in leftover:
+            self.cache.transport.discard(key)
+            self.cache.pool.release(key)
+        self._retain.pop(session_id, None)
+        self.cache.clear_session_structure(session_id)
 
     def reset_all(self) -> None:
-        for req in list(self._plans):
-            self.end_request(req)
+        for req in list(set(self._plans) | set(self._retain)):
+            self.end_request(req, retain=())
         leftover = list(self.cache.pool.keys)
         for key in leftover:
             self.cache.transport.discard(key)
@@ -582,6 +682,8 @@ class NoisyKVState:
         self._plans.clear()
         self._chunk_tokens.clear()
         self._last_use_global.clear()
+        self._retain.clear()
+        self.cache._session_structural_keys.clear()
         self._inflight = ()
         self._clear_prepare_caches()
 
@@ -728,13 +830,47 @@ class NoisyKVState:
         self.bytes_received = self.cache.transport.bytes_received
         return handles
 
+    def exchange_and_await_prior_handoffs(self, global_slot: int) -> list[Any]:
+        """Exchange prior-history KV for requests whose first cell is ``global_slot``.
+
+        Must run before ``prepare`` of that first cell: the normal per-slot
+        ``exchange`` happens after forward, which is too late for continuation
+        history that is only resident on the owner rank.
+        """
+        transfers: list[RequestKVTransfer] = []
+        wanted: set[VersionKey] = set()
+        for item in self._inflight:
+            if global_slot != item.t0:
+                continue
+            for xfer in item.plan.transfers(PRIOR_HANDOFF_SLOT):
+                transfers.append(RequestKVTransfer(req=item.req, version=xfer.version, src=xfer.src, dst=xfer.dst))
+                if xfer.dst == self._rank:
+                    wanted.add(_version_key(item.req, xfer.version))
+        if not transfers:
+            return []
+        ordered = tuple(sorted(transfers, key=lambda x: (x.src, x.dst, x.req, x.version)))
+        handles = self.cache.transport.exchange(
+            ordered, rank=self._rank, pp_group=self._pp_group, chunk_tokens_by_request=self._chunk_tokens
+        )
+        self.bytes_sent = self.cache.transport.bytes_sent
+        self.bytes_received = self.cache.transport.bytes_received
+        for handle in handles:
+            if handle is not None:
+                handle.wait()
+        if self.uses_comm_stream:
+            self.cache.transport.wait_sends()
+        if wanted:
+            self.cache.transport.await_ready(frozenset(wanted))
+            self.bytes_received = self.cache.transport.bytes_received
+        return handles
+
     def evict(self, slot: int) -> None:
         if self.uses_comm_stream:
             self.cache.transport.wait_sends()
         drop: list[VersionKey] = []
         for req, used in self._last_use_global.items():
             for version, last in used.items():
-                if last == slot:
+                if last == slot and not self._is_retained(req, version):
                     drop.append(_version_key(req, version))
         for key in drop:
             self.cache.transport.discard(key)

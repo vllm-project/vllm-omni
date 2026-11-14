@@ -10,7 +10,13 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
-from vllm_omni.experimental.ar_diffusion.cell_schedule import Cell, CellSchedule, Inflight, Ordering, build_cell_plan
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
+    Cell,
+    CellSchedule,
+    Inflight,
+    Ordering,
+    build_cell_plan,
+)
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
     NoisyKVCache,
@@ -125,7 +131,9 @@ def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind
     torch.distributed.destroy_process_group()
 
 
-@pytest.mark.parametrize("chunk_tokens", [4, 8, 12])
+# chunk_tokens={4,12}: 4 covers padding beyond the chunk; 12 covers full
+# max_chunk_tokens. The mid value 8 repeated the same asserts.
+@pytest.mark.parametrize("chunk_tokens", [4, 12])
 @pytest.mark.parametrize("mode", ["immediate", "delayed"])
 def test_noisy_kv_transfer_uses_valid_blocks(chunk_tokens: int, mode: str) -> None:
     torch.multiprocessing.spawn(
@@ -153,8 +161,8 @@ def _sink_pipeline_worker(
     fixed_shape: bool = False,
     device_kind: str = "cpu",
 ) -> None:
-    from vllm_omni.experimental.ar_diffusion import cell_executor
-    from vllm_omni.experimental.ar_diffusion.cell_executor import (
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel import noisy_pp_executor as cell_executor
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
         ARDiffusionCellContext,
         CellAdapter,
         CellRunSpec,
@@ -236,8 +244,10 @@ def _sink_pipeline_worker(
             def __init__(self):
                 self.device = device
                 self.clean_calls = 0
-                self.stash = {}
                 self.completed = {}
+
+            def compatibility_key(self, cell):
+                return cell
 
             def activation_spec(self, *, batch, include_hidden):
                 if not fixed_shape:
@@ -247,14 +257,13 @@ def _sink_pipeline_worker(
                     schema.append(("hidden_states", (batch,), torch.float32))
                 return schema
 
-            def stash_activation(self, payload, *, handles=None, meta=None):
-                self.stash[meta[1:]] = payload
-
-            def forward(self, tasks, kv_contexts, *, hidden):
-                _req, cell = tasks[0]
+            def forward(self, batch, members, *, member_inputs):
+                del members
+                m0 = batch.members[0]
+                cell = (m0.chunk, m0.step, m0.block)
                 chunk, step, block = cell
                 self.clean_calls += int(step == steps)
-                payload = hidden if isinstance(hidden, dict) else self.stash.pop((chunk, step), None)
+                payload = member_inputs[0] if member_inputs else None
                 if block == 0:
                     if step > 0:
                         assert payload is not None, "step input must come from the executor or transport"
@@ -265,7 +274,7 @@ def _sink_pipeline_worker(
                     assert payload is not None
                     value = payload["hidden_states"]
                 torch.testing.assert_close(value, torch.tensor([inputs[cell]], device=device), rtol=1e-5, atol=1e-5)
-                context = kv_contexts[0][0]
+                context = batch.kv_views[0]
                 n = context.seq_len - 1
                 table = context.block_table[0, :n].long()
                 past = context.key_pool[table].sum() if n else torch.tensor(0.0, device=device)
@@ -291,7 +300,7 @@ def _sink_pipeline_worker(
             spec=CellRunSpec(topology=CellTopology(steps, groups), rank=rank, pp_group=pp), kv=state
         )
         ctx.enqueue("A", plan, chunk_tokens=1)
-        run_cell_pipeline(ctx=ctx, adapter=adapter)
+        run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
         assert state.resident_versions == 0
         assert bool(fixed_calls) == fixed_shape
         expected_clean = sum(
@@ -317,8 +326,9 @@ def _sink_pipeline_worker(
         cell_executor._post_activations_ws = original_post
 
 
-# Ready-lane budget: Simple · Engine&Entrypoints&Diffusion is 20 minutes and
-# each Gloo spawn re-imports the stack (~30–60s wall). One scalar + one
+# Ready-lane budget: Simple Test is 15 minutes. The uploader adds shards only
+# when measured durations exceed that budget. Each Gloo spawn re-imports the
+# stack (~30–60s wall). One scalar + one
 # fixed-shape case here; the CUDA harness only varies chunks×history at
 # fixed S=2,G=2 fixed-shape (no scalar NCCL twin).
 @pytest.mark.parametrize("steps,groups,chunks", [(2, 1, 6)])

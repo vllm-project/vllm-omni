@@ -230,7 +230,7 @@ class VLLMOmniClient:
         if sampling_params is not None:
             payload.update(sampling_params)
         if lora is not None:
-            payload["lora"] = lora
+            payload["lora"] = lora.get("adapters", lora)
         logger.debug("img gen payload: %s", payload)
 
         url = self.base_url + "/images/generations"
@@ -306,7 +306,7 @@ class VLLMOmniClient:
             for k, v in sampling_params.items():
                 form.add_field(k, str(v))
         if lora is not None:
-            form.add_field("lora", json.dumps(lora, ensure_ascii=False))
+            form.add_field("lora", json.dumps(lora.get("adapters", lora), ensure_ascii=False))
         if mask is not None:
             mask_filename = "mask.png"
             form.add_field(
@@ -371,7 +371,7 @@ class VLLMOmniClient:
             sampling_params=sampling_params,
             modalities=["image"],
             # === below are additional `extra_body` fields, handled by **kwargs ===
-            lora=lora,
+            lora=lora.get("adapters", lora) if lora is not None else None,
         )
         choices = await self._generate_base_chat_completion(model, payload)
 
@@ -442,7 +442,10 @@ class VLLMOmniClient:
             if latent_edit is not None:
                 raise ValueError("timeline_guides cannot be combined with latent_edit; disconnect one of them.")
             # The server treats a missing scale as active and a zero scale as inactive.
-            if lora is not None and (lora.get("scale") is None or float(lora["scale"]) != 0.0):
+            if lora is not None and any(
+                adapter.get("scale") is None or float(adapter["scale"]) != 0.0
+                for adapter in lora.get("adapters", [lora])
+            ):
                 raise ValueError(
                     "timeline_guides require base MiniMax-H3 weights; disconnect the request-level LoRA "
                     "(or set its scale to 0)."
@@ -468,7 +471,7 @@ class VLLMOmniClient:
             # Guides need cache-free execution; only guided requests carry this field.
             form.add_field("quality", "lossless")
         if lora is not None:
-            form.add_field("lora", json.dumps(lora, ensure_ascii=False))
+            form.add_field("lora", json.dumps(lora.get("adapters", lora), ensure_ascii=False))
 
         # === multimodal inputs (first-last-frames, references, etc.) ===
         input_reference_image: torch.Tensor | None = None

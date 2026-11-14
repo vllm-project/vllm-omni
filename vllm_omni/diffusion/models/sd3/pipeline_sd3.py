@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import inspect
 import json
 import logging
@@ -15,6 +18,7 @@ from torch import nn
 from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel, T5Tokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.cache.cachedit import set_separate_cfg
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -132,6 +136,8 @@ def retrieve_timesteps(
 
 
 class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
+    # Both CFG branches share latents and timestep; CLIP (77) and T5 prompts are padded to fixed lengths.
+    supports_cfg_batching = True
     supports_request_batch = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
@@ -736,6 +742,11 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
         timesteps, num_inference_steps = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])
         self._num_timesteps = len(timesteps)
+
+        # Cache-DiT tells the conditional and unconditional passes apart by
+        # transformer-forward parity, so it has to know whether this request
+        # runs CFG.
+        set_separate_cfg(self.transformer, do_cfg)
 
         # Denoising loop using diffuse method
         latents = self.diffuse(
