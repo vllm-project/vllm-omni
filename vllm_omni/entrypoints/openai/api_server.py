@@ -117,6 +117,7 @@ from vllm_omni.entrypoints.openai.app_state import (
     Omnichat,
     Omnispeech,
     _get_engine_and_model,
+    _is_served_model,
 )
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
 from vllm_omni.entrypoints.openai.chat_template import _load_model_chat_template_json
@@ -1027,10 +1028,12 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
             enable_force_include_usage=args.enable_force_include_usage,
+            served_model_names=served_model_names,
         )
         state.openai_serving_chat_batch = OmniOpenAIServingChatBatch.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
+            served_model_names=served_model_names,
         )
 
         # audio related
@@ -2301,7 +2304,7 @@ async def generate_images(
     if request.model == "auto":
         request.model = None
 
-    if request.model is not None and request.model != model_name:
+    if request.model is not None and not _is_served_model(raw_request, request.model, model_name):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=(f"Model mismatch: request specifies '{request.model}' but server is running '{model_name}'."),
@@ -2567,7 +2570,7 @@ async def edit_images(
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
     if model == "auto":
         model = None
-    if model is not None and model != model_name:
+    if model is not None and not _is_served_model(raw_request, model, model_name):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=(f"Model mismatch: request specifies '{model}' but server is running '{model_name}'."),

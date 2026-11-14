@@ -41,6 +41,19 @@ Use `http://localhost:8091/v1` as the `base_url` for an OpenAI SDK client. If
 the server was started with `--api-key`, include an `Authorization` header with
 `Bearer <api-key>` in requests.
 
+### Served model aliases
+
+Use `--served-model-name primary-name alternate-name` to expose multiple names
+for the same model. `GET /v1/models` lists these names. Chat, image generation,
+image editing, and video generation accept any configured name in their
+`model` field; generated-video WebSocket sessions use the same names. Omitting
+an optional `model` field retains the default model. Image requests also retain
+the `model: "auto"` shorthand.
+
+An unconfigured name is rejected before generation. In particular, pure
+diffusion Chat Completions return a model-not-found error (HTTP 404), matching
+the other Chat Completions serving paths.
+
 ## Choose a Core HTTP Endpoint
 
 Prefer a task-specific endpoint when one matches your workload. Use Chat

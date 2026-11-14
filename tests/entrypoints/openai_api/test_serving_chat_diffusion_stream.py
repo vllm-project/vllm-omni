@@ -61,6 +61,23 @@ def _request(modalities: list[str], **kwargs) -> ChatCompletionRequest:
     )
 
 
+def test_diffusion_chat_rejects_unknown_model_before_generation():
+    serving_chat, engine = _serving_chat(_image_result())
+    request = _request(["image"]).model_copy(update={"model": "missing-model"})
+    response = asyncio.run(serving_chat._create_chat_completion(request))
+    assert response.error.code == 404
+    assert engine.prompts == []
+
+
+@pytest.mark.parametrize("model", ["sensenova", "image-alias"])
+def test_diffusion_chat_accepts_all_served_model_names(model):
+    serving_chat, engine = _serving_chat(_image_result(), served_model_names=["sensenova", "image-alias"])
+    request = _request(["image"]).model_copy(update={"model": model})
+    response = asyncio.run(serving_chat._create_chat_completion(request))
+    assert response.choices[0].message.content
+    assert len(engine.prompts) == 1
+
+
 async def _collect(generator) -> list:
     events = [event async for event in generator]
     assert events[-1] == "data: [DONE]\n\n"

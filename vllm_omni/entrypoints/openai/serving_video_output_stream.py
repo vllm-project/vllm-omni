@@ -48,6 +48,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S
+from vllm_omni.entrypoints.openai.app_state import _is_served_model
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest, VideoParams
 from vllm_omni.entrypoints.openai.stage_params import (
@@ -341,7 +342,11 @@ class OmniStreamingVideoOutputHandler:
             return None
 
         configured_model = self._model_name
-        if request.model is not None and configured_model is not None and request.model != configured_model:
+        if (
+            request.model is not None
+            and configured_model is not None
+            and not _is_served_model(websocket, request.model, configured_model)
+        ):
             await self._send_error(
                 websocket,
                 f"Model mismatch: request specifies '{request.model}' but server is running '{configured_model}'.",
