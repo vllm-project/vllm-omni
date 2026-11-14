@@ -28,6 +28,7 @@ from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.attention.schedule import (
     InvalidAttentionScheduleError,
     require_request_attention_schedule_fits,
+    resolve_request_attention_sigma_schedule,
 )
 from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
@@ -945,8 +946,9 @@ class MiniMaxH3Pipeline(
         self.parallel_config = od_config.parallel_config
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
-        # A request that omits attention_schedule and latent_refine inherits both defaults, a pair
-        # _prepare_encoder_conditioning_inputs rejects; fail here instead of on every such request.
+        # A request that omits attention_schedule, attention_sigma_schedule and latent_refine inherits the
+        # default step ranges and the latent_refine default, a pair _prepare_encoder_conditioning_inputs
+        # rejects; fail here instead of on every such request.
         service_schedule = getattr(od_config, "diffusion_attention_schedule", None)
         additional_config = getattr(od_config, "additional_config", None) or {}
         if (
@@ -956,8 +958,9 @@ class MiniMaxH3Pipeline(
         ):
             raise ValueError(
                 "MiniMax H3 cannot combine default diffusion_attention_schedule ranges with a latent_refine "
-                "default in --additional-config: every request that omits attention_schedule and latent_refine "
-                "would be rejected. Remove the default ranges or the latent_refine default."
+                "default in --additional-config: every request that omits attention_schedule, "
+                "attention_sigma_schedule and latent_refine would be rejected. Remove the default ranges or the "
+                "latent_refine default."
             )
         self.device = get_local_device()
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
@@ -3370,13 +3373,13 @@ class MiniMaxH3Pipeline(
             )
         # num_steps is the length of the sequence this request denoises; FastH3 and pinned distilled
         # schedules can differ from num_inference_steps. A latent_refine pass has its own step count, which
-        # this check does not cover, so a schedule together with latent_refine is rejected below. Both
-        # execution modes reach this point before any denoise forward. Step mode runs it outside the forward
-        # context, so the request's own schedule is resolved against the service default; in request mode
-        # that is the schedule the runner bound.
-        attention_schedule = require_request_attention_schedule_fits(
-            sampling, getattr(self.od_config, "diffusion_attention_schedule", None), num_steps
-        )
+        # this check does not cover, so step ranges together with latent_refine are rejected below; sigma
+        # windows do not depend on the step count. Both execution modes reach this point before any denoise
+        # forward. Step mode runs it outside the forward context, so the request's own schedule is resolved
+        # against the service default; in request mode that is the schedule the runner bound.
+        service = getattr(self.od_config, "diffusion_attention_schedule", None)
+        attention_schedule = require_request_attention_schedule_fits(sampling, service, num_steps)
+        sigma_schedule = resolve_request_attention_sigma_schedule(sampling, service)
         transformer = getattr(
             self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None
         )
@@ -3403,12 +3406,14 @@ class MiniMaxH3Pipeline(
         )
         if continuation is not None and quality_plan.cache_dit is not None:
             raise OmniClientError("MiniMax H3 continuation requires uncached denoising; set quality=lossless")
-        if attention_schedule and quality_plan.cache_dit is not None:
+        if (attention_schedule or sigma_schedule) and quality_plan.cache_dit is not None:
             # Cache-DiT reuses transformer outputs across steps, so a cached residual can come from a step
-            # that ran a different attention profile. Reject before its hooks are installed.
+            # that ran a different attention profile. Reject before its hooks are installed. An empty list
+            # of one kind keeps the service default of the other, so the message names both fields.
+            field = "attention_sigma_schedule" if sigma_schedule else "attention_schedule"
             raise InvalidAttentionScheduleError(
-                "attention_schedule cannot be combined with MiniMax H3 Cache-DiT (quality=high); "
-                "send quality=lossless or attention_schedule=[]"
+                f"{field} cannot be combined with MiniMax H3 Cache-DiT (quality=high); send quality=lossless, "
+                "or attention_schedule=[] and attention_sigma_schedule=[]"
             )
         if attention_schedule and self._resolve_latent_refine(extra) is not None:
             # latent_refine runs a second denoise sequence over the tail of the sigma list. It publishes step
@@ -4230,6 +4235,7 @@ class MiniMaxH3Pipeline(
                         (request.extra.get(_STEP_VIDEO_EDIT), request.extra.get(_STEP_AUDIO_EDIT)),
                         model_rows=request.extra.get(_STEP_MODEL_ROWS),
                         attention_schedule=request.attention_schedule,
+                        attention_sigma_schedule=request.attention_sigma_schedule,
                     )
                     request.extra[_STEP_MODEL_ROWS] = adapter.model_rows
                     models[sample] = adapter

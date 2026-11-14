@@ -36,6 +36,7 @@ from vllm_omni.diffusion.sched import (
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData, SchedulerRequestState
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_COUNT_KEY
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -2492,14 +2493,27 @@ def test_decode_only_stage_drops_the_request_schedule_copied_to_it(model_class_n
         ),
         request_id="req",
     )
+    sigma_request = OmniDiffusionRequest(
+        prompt="prompt",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=1,
+            extra_args={"attention_sigma_schedule": [{"low": 0.0, "high": 1.0, "profile": "sparse"}]},
+        ),
+        request_id="sigma-req",
+    )
 
     if admitted:
         scheduler.add_request(request)
         assert request.sampling_params.attention_schedule is None
         assert "attention_schedule" not in request.sampling_params.extra_args
+        scheduler.add_request(sigma_request)
+        assert sigma_request.sampling_params.attention_sigma_schedule is None
+        assert "attention_sigma_schedule" not in sigma_request.sampling_params.extra_args
     else:
         with pytest.raises(ValueError, match="unknown profile"):
             scheduler.add_request(request)
+        with pytest.raises(ValueError, match="unknown profile"):
+            scheduler.add_request(sigma_request)
 
 
 # (stage_role, model_stage) of the Wan2.2 topology stages, plus deploy configs that set only the
@@ -2571,3 +2585,21 @@ def test_denoising_wan_stage_keeps_and_validates_the_request_schedule(stage_role
     assert known.sampling_params.attention_schedule == (AttentionScheduleRange(start=0, end=None, profile="sparse"),)
     with pytest.raises(InvalidAttentionScheduleError, match="unknown profile"):
         scheduler.add_request(unknown)
+
+
+@pytest.mark.parametrize(("count", "prefetched"), [(1, True), (3, False)])
+def test_per_sample_kv_request_is_not_prefetched(count: int, prefetched: bool) -> None:
+    scheduler = RequestScheduler()
+    scheduler.initialize(
+        SimpleNamespace(request_batch_max_wait_ms=0.0, omni_kv_config={"enable_kv_async_prefetch": True})
+    )
+    for req_id in ("first", "next"):
+        request = _make_request(req_id)
+        request.kv_sender_info = {0: {"host": "127.0.0.1"}}
+        request.sampling_params.extra_args = {PER_SAMPLE_KV_COUNT_KEY: count}
+        scheduler.add_request(request)
+
+    job = scheduler.schedule().kv_prefetch_job
+
+    # Per-sample KV is received in the forward, one transfer per sample.
+    assert (job is not None and job["request_id"] == "next") is prefetched

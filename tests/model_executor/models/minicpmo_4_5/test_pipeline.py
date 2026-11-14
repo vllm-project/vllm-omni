@@ -115,7 +115,7 @@ class TestPipelineTopology:
         # deploy config that arms the multi-frame row (stage 1's
         # speculative_config, under platforms.npu) adds that row's stop marker
         # (1) through its default_sampling_params; see
-        # test_minicpmo_talker_multi_frame_is_npu_scoped for the merged list.
+        # test_minicpmo_talker_multi_frame_is_platform_scoped for the merged list.
         assert talker.sampling_constraints == {
             "detokenize": False,
             "stop_token_ids": [_CODEC_EOS_TOKEN_ID],
@@ -155,11 +155,20 @@ class TestPipelineTopology:
 class TestDeployTopology:
     @pytest.mark.parametrize("filename", sorted(path.name for path in _DEPLOY_DIR.glob("minicpmo_4_5*.yaml")))
     @pytest.mark.parametrize("platform", ["cuda", "npu"])
-    def test_default_thinker_backend_is_scoped_to_cuda(self, filename: str, platform: str) -> None:
+    def test_cuda_attention_backends_are_stage_scoped(self, filename: str, platform: str) -> None:
         deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / filename), platform=platform)
         stages = {stage.stage_id: stage for stage in deploy.stages}
         assert stages[0].attention_backend == ("TRITON_ATTN" if platform == "cuda" else None)
-        assert stages[1].attention_backend is None
+        cuda_flash_talker_profiles = {
+            "minicpmo_4_5.yaml",
+            "minicpmo_4_5_3gpu_stage1_replicas.yaml",
+            "minicpmo_4_5_4gpu_stage1_replicas.yaml",
+            "minicpmo_4_5_npu_2card.yaml",
+            "minicpmo_4_5_turn.yaml",
+            "minicpmo_4_5_duplex_h200.yaml",
+        }
+        talker_backend = "FLASH_ATTN" if platform == "cuda" and filename in cuda_flash_talker_profiles else None
+        assert stages[1].attention_backend == talker_backend
         assert stages[2].attention_backend is None
 
     @pytest.mark.parametrize(("filename", "devices"), _DEPLOY_LAYOUTS.items())

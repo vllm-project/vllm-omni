@@ -288,6 +288,8 @@ class TalkerCudaKStepState:
             prelude_scores=torch.zeros((rows, VOCAB_SIZE), dtype=torch.float32, device=device),
         )
 
+    exponential_noise: torch.Tensor | None = None
+
     def __post_init__(self) -> None:
         # EOS id the native prelude was compiled/lauched for; None means eager.
         self._native_prelude_eos: int | None = None
@@ -385,6 +387,8 @@ class TalkerCudaKStepState:
         eos_token_id: int,
         sampling: tuple,
         generators: tuple,
+        *,
+        batched_noise: bool = False,
     ) -> torch.Tensor:
         fused_scores = None
         if (
@@ -449,6 +453,12 @@ class TalkerCudaKStepState:
                 )
             for local_row, row in enumerate(rows):
                 filtered[row] = scores[local_row : local_row + 1]
+
+        if batched_noise:
+            assert self.exponential_noise is not None
+            scores = scores if len(groups) == 1 else torch.cat(filtered)
+            sampled_ids = (scores.softmax(dim=-1) / self.exponential_noise[frame]).argmax(dim=-1)
+            return self.advance(sampled_ids, frame, eos_token_id)
 
         sampled = []
         for row, (config, generator) in enumerate(zip(sampling, generators)):

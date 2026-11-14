@@ -2114,17 +2114,7 @@ stages:
             ("qwen3_omni_duplex.yaml", "cuda", False),
             ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
             ("minicpmo_4_5_turn.yaml", "cuda", True),
-            *(
-                (yaml_name, platform, False)
-                for yaml_name in (
-                    "minicpmo_4_5_turn.yaml",
-                    "minicpmo_4_5_turn_mrv2.yaml",
-                    "minicpmo_4_5_turn_mrv2_h200.yaml",
-                )
-                for platform in ("npu", "rocm", "xpu", "musa")
-            ),
-            ("minicpmo_4_5_turn_mrv2.yaml", "cuda", True),
-            ("minicpmo_4_5_turn_mrv2_h200.yaml", "cuda", True),
+            *(("minicpmo_4_5_turn.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("minicpmo_4_5.yaml", "cuda", False),
             ("minicpmo_4_5_duplex_h200.yaml", "cuda", False),
         ],
@@ -2171,12 +2161,7 @@ stages:
         )
         deploy = _apply_platform_overrides(load_deploy_config(overlay), platform="cuda")
         stages = merge_pipeline_deploy(resolve_pipeline_config(deploy.pipeline), deploy)
-        # The inherited CUDA Talker entry keeps V1 for multi-frame decode.
-        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [
-            runner == "v2",
-            False,
-            runner == "v2",
-        ]
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [runner == "v2"] * 3
         assert stages[0].yaml_engine_args["enable_prefix_caching"] is (not disable_prefix_cache)
 
     def test_step_audio2_online_ci_deploy_is_single_thinker(self):
@@ -3291,11 +3276,9 @@ class TestPlatformOverrides:
         [
             ("qwen3_tts_mrv2.yaml", "qwen3_tts", "v2", ()),
             ("moss_tts_local.yaml", "moss_tts_local", "v2", ()),
-            # The CUDA Talker keeps V1 for multi-frame decode.
-            ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", (1,)),
-            ("minicpmo_4_5_turn.yaml", "minicpmo_4_5", "v2", (1,)),
-            ("minicpmo_4_5_duplex_h200.yaml", "minicpmo_4_5", "v1", (0, 1, 2)),
-            ("minicpmo_4_5_turn_mrv2.yaml", "minicpmo_4_5", "v2", ()),
+            ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", ()),
+            ("minicpmo_4_5_turn.yaml", "minicpmo_4_5", "v2", ()),
+            ("minicpmo_4_5_duplex_h200.yaml", "minicpmo_4_5", "v2", ()),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
@@ -3388,6 +3371,22 @@ class TestPlatformOverrides:
         stages, _ = StageConfigFactory._create_legacy_from_registry(pipeline, {})
         assert all(not stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
         assert all(not stage.yaml_runtime.get("cuda_mps", False) for stage in stages)
+
+    def test_moss_local_npu_mrv2_profile_runs_both_stages_on_v2_with_codec_graphs(self, monkeypatch):
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "device_name", "npu")
+        path = get_deploy_config_path("moss_tts_local_npu_mrv2.yaml")
+        pipeline = resolve_pipeline_config("moss_tts_local")
+        config = VllmOmniConfig.from_pipeline_config(pipeline, deploy_config_path=path)
+        talker, codec = config.stage_configs
+        assert talker.model_config.use_v2_model_runner
+        assert codec.model_config.use_v2_model_runner
+        assert not codec.model_config.enforce_eager
+        assert codec.compilation_config.cudagraph_capture_sizes == [1, 2, 4, 8, 16, 32, 64]
+        stages, _ = StageConfigFactory._create_legacy_from_registry(pipeline, {}, deploy_config_path=path)
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True]
+        assert stages[1].yaml_engine_args["enforce_eager"] is False
 
     def test_moss_local_custom_deploy_overrides_default(self, monkeypatch, tmp_path):
         from vllm_omni.platforms import current_omni_platform
