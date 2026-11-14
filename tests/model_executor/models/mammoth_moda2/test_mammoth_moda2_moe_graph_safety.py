@@ -90,7 +90,7 @@ def test_moe_forward_capturing_none_mask_fails_closed(monkeypatch: pytest.Monkey
 def test_moe_forward_capturing_all_false_mask_still_runs_both_experts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Dummy capture uses an all-false mask; both experts must still be graphed."""
+    """Default BLEND specialty: dummy all-false mask still records both experts."""
     monkeypatch.setattr(m, "_is_graph_capturing", lambda device: True)
     hidden = torch.randn(4, 2)
     calls: list[str] = []
@@ -107,6 +107,62 @@ def test_moe_forward_capturing_all_false_mask_still_runs_both_experts(
 
     assert calls == ["und", "gen"]
     torch.testing.assert_close(out, hidden * 2.0)
+
+
+@pytest.mark.parametrize(
+    ("key", "expected_calls", "scale"),
+    [
+        ("ALL_UND", ["und"], 2.0),
+        ("ALL_GEN", ["gen"], 3.0),
+        ("BLEND", ["und", "gen"], 2.0),
+    ],
+)
+def test_moe_forward_capturing_respects_routing_specialty(
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    expected_calls: list[str],
+    scale: float,
+) -> None:
+    """#9865: capture specialty selects which experts are recorded."""
+    from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph import (
+        MoERoutingKey,
+        moe_routing_key_scope,
+    )
+
+    specialty = MoERoutingKey[key]
+
+    monkeypatch.setattr(m, "_is_graph_capturing", lambda device: True)
+    hidden = torch.randn(4, 2)
+    calls: list[str] = []
+
+    def und(x: torch.Tensor) -> torch.Tensor:
+        calls.append("und")
+        return x * 2.0
+
+    def gen(x: torch.Tensor) -> torch.Tensor:
+        calls.append("gen")
+        return x * 3.0
+
+    # BLEND with all-false mask still yields und outputs; ALL_* ignore mask.
+    mask = torch.zeros(4, dtype=torch.bool)
+    with moe_routing_key_scope(specialty):
+        out = m.moe_forward(hidden, und, gen, mask)
+
+    assert calls == expected_calls
+    torch.testing.assert_close(out, hidden * scale)
+
+
+def test_moe_routing_key_from_mask_classifies_batches() -> None:
+    from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph import (
+        MoERoutingKey,
+        moe_routing_key_from_mask,
+    )
+
+    assert moe_routing_key_from_mask(None) is MoERoutingKey.BLEND
+    assert moe_routing_key_from_mask(torch.zeros(0, dtype=torch.bool)) is MoERoutingKey.BLEND
+    assert moe_routing_key_from_mask(torch.zeros(4, dtype=torch.bool)) is MoERoutingKey.ALL_UND
+    assert moe_routing_key_from_mask(torch.ones(4, dtype=torch.bool)) is MoERoutingKey.ALL_GEN
+    assert moe_routing_key_from_mask(torch.tensor([False, True, False])) is MoERoutingKey.BLEND
 
 
 def test_ar_wrappers_keep_raw_input_tokens() -> None:
