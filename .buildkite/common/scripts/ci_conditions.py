@@ -20,6 +20,7 @@ L2_YAML_FILES: dict[str, str] = {
     ".buildkite/npu/test-npu-ready.yml": "npu",
     ".buildkite/amd/test-amd-ready.yml": "amd",
     ".buildkite/intel/pipeline-intel.yml": "intel",
+    ".buildkite/intel/test-ready.yml": "intel",
 }
 
 L3_YAML_FILES: dict[str, str] = {
@@ -39,6 +40,7 @@ BOOTSTRAP_STEPS_FILENAME = "bootstrap-upload-steps.yml"
 BOOTSTRAP_IMAGE_BUILD_KEYS = frozenset(
     {
         "image-build",
+        "intel-xpu-image-build",
         "image-build-a2",
         "image-build-a3",
         "image-build-a5",
@@ -47,6 +49,7 @@ BOOTSTRAP_IMAGE_BUILD_KEYS = frozenset(
 )
 BOOTSTRAP_UPLOAD_IF_KEYS = {
     "upload-ready-pipeline": "ready",
+    "upload-intel-xpu-ready-pipeline": "ready",
     "upload-merge-pipeline": "merge",
     "upload-nightly-pipeline": "nightly",
     "upload-weekly-pipeline": "weekly",
@@ -60,6 +63,7 @@ CI_SOURCE_FILE_DEPENDENCIES_PATH = ROOT / ".buildkite/common/ci_source_file_depe
 SOURCE_FILTER_FALLBACK_KEY = "source_filter_fallback"
 CUDA_HF_TOKEN_ENV = "VLLM_CI_HF_TOKEN"
 CUDA_HF_TOKEN_EXPORT = f'if [ -n "$${{{CUDA_HF_TOKEN_ENV}:-}}" ]; then export HF_TOKEN="$${{{CUDA_HF_TOKEN_ENV}}}"; fi'
+INTEL_XPU_READY_IF = 'build.env("INTEL_XPU_READY") == "1"'
 
 # Release lines run the same post-merge / scheduled pipelines as main.
 # Branch name is exactly release/vX.Y.Z (for example release/v0.30.0). Keep this

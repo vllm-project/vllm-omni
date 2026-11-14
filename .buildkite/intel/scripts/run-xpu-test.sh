@@ -13,7 +13,9 @@ omni_source_dir=$(git rev-parse --show-toplevel)
 # builds below, so pulling it is equivalent to building the fallback base.
 upstream_base_image="vllm/vllm-openai-xpu:${VLLM_VERSION}"
 local_base_image="xpu/vllm-omni-ci-base:${VLLM_VERSION}"
-image_name="xpu/vllm-omni-ci:${BUILDKITE_COMMIT:?BUILDKITE_COMMIT must be set}"
+commit="${BUILDKITE_COMMIT:?BUILDKITE_COMMIT must be set}"
+test_suite="${1:-all}"
+image_name="${VLLM_OMNI_IMAGE:-xpu/vllm-omni-ci:${commit}}"
 container_name="xpu_${BUILDKITE_COMMIT}_$(
     tr -dc A-Za-z0-9 </dev/urandom | head -c 10
     echo
@@ -85,10 +87,14 @@ resolve_vllm_base() {
     fi
 }
 
-resolve_vllm_base
+if [ -n "${VLLM_OMNI_IMAGE:-}" ]; then
+    docker pull "${image_name}"
+else
+    resolve_vllm_base
 
-# Try building the docker image
-docker_build "${image_name}" --build-arg "VLLM_BASE=${base_image_name}" --build-arg "VLLM_VERSION=${VLLM_VERSION}"
+    # Try building the docker image
+    docker_build "${image_name}" --build-arg "VLLM_BASE=${base_image_name}" --build-arg "VLLM_VERSION=${VLLM_VERSION}"
+fi
 
 # Setup cleanup
 remove_docker_container() {
@@ -116,6 +122,7 @@ time timeout -k 30 30m docker run \
     -e VLLM_OMNI_LOGGING_LEVEL \
     -e HF_TOKEN \
     -e ZE_AFFINITY_MASK \
+    -e XPU_TEST_SUITE="${test_suite}" \
     --name "${container_name}" \
     "${image_name}" \
     bash -c '
@@ -124,8 +131,28 @@ time timeout -k 30 30m docker run \
     pip install tblib==3.1.0
     cd /workspace/vllm-omni
     XPU_TEST_PATHS="tests/diffusion tests/dfx tests/e2e tests/platforms"
-    pytest -v -s $XPU_TEST_PATHS -m "core_model and xpu and B60"
-    pytest -v -s tests/diffusion/quantization/test_mxfp8_config.py
-    pytest -v -s $XPU_TEST_PATHS -m "advanced_model and xpu and B60"
-    pytest -v -s $XPU_TEST_PATHS -m "omni and xpu and B60"
+        case "$XPU_TEST_SUITE" in
+            all)
+                pytest -v -s $XPU_TEST_PATHS -m "core_model and xpu and B60"
+                pytest -v -s tests/diffusion/quantization/test_mxfp8_config.py
+                pytest -v -s $XPU_TEST_PATHS -m "advanced_model and xpu and B60"
+                pytest -v -s $XPU_TEST_PATHS -m "omni and xpu and B60"
+                ;;
+            core_model)
+                pytest -v -s $XPU_TEST_PATHS -m "core_model and xpu and B60"
+                ;;
+            advanced_model)
+                pytest -v -s $XPU_TEST_PATHS -m "advanced_model and xpu and B60"
+                ;;
+            omni)
+                pytest -v -s $XPU_TEST_PATHS -m "omni and xpu and B60"
+                ;;
+            quantization)
+                pytest -v -s tests/diffusion/quantization/test_mxfp8_config.py
+                ;;
+            *)
+                echo "Unknown XPU_TEST_SUITE: $XPU_TEST_SUITE" >&2
+                exit 2
+                ;;
+        esac
 '

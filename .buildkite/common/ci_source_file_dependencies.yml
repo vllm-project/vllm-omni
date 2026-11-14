@@ -425,7 +425,37 @@ source_file_dependencies:
   # path. Mixed diffs use normal job dependencies when any job-key prefix matches.
   source_filter_fallback:
     - .buildkite/common/ci_mirror_hardwares.yml
+    - .buildkite/common/ci_source_file_dependencies.yml
     - tests/helpers/
+
+  # Optional Intel XPU Ready pipeline. Reuse shared CUDA scopes where source
+  # dependencies match; keep scopes here for XPU/B60-only coverage.
+  intel_xpu_diffusion_function:
+    - tests/diffusion/attention/test_sparge_attn_xpu.py
+    - tests/diffusion/batching/test_diffusion_batching.py
+    - tests/diffusion/cache/test_teacache.py
+    - tests/diffusion/lora/test_images_generations_lora.py
+    - tests/e2e/offline_inference/test_stable_audio_expansion.py
+    - tests/e2e/offline_inference/test_wan21_autoround_mxfp4.py
+    - tests/e2e/offline_inference/test_z_image.py
+    - tests/e2e/online_serving/test_nextstep_expansion.py
+    - vllm_omni/diffusion/
+    - vllm_omni/inputs/data.py
+
+  intel_xpu_omni_tts_function:
+    - *qwen2_5_omni
+    - *qwen3_tts
+    - tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py
+    - tests/e2e/offline_inference/test_qwen3_tts_base.py
+    - tests/e2e/offline_inference/test_voxtral_tts_expansion.py
+    - tests/e2e/online_serving/test_voxtral_tts_expansion.py
+    - vllm_omni/model_executor/models/voxtral_tts/
+    - vllm_omni/model_executor/stage_input_processors/voxtral_tts.py
+    - vllm_omni/entrypoints/openai/tts_adapters/voxtral.py
+
+  intel_xpu_platform_function:
+    - tests/platforms/test_record_device_event.py
+    - vllm_omni/platforms/xpu/
 
   # --- features ---
   diffusion_distributed_attention:

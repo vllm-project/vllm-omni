@@ -1,0 +1,20 @@
+# Uploaded by upload_pipeline.py --upload when INTEL_XPU_READY=1.
+# This shared image step can be reused by future Intel Ready/Merge/Weekly uploads.
+env:
+  VLLM_VERSION: "v0.33.0"
+
+steps:
+  - label: "Intel XPU: Build shared CI image"
+    key: intel-xpu-image-build
+    commands:
+      - bash .buildkite/intel/scripts/build-xpu-ci-image.sh
+    agents:
+      queue: medium_cpu_queue_premerge
+
+  - label: "Upload Intel XPU Ready tests"
+    key: upload-intel-xpu-ready-pipeline
+    depends_on: intel-xpu-image-build
+    commands:
+      - python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/intel/test-ready.yml
+    agents:
+      queue: medium_cpu_queue_premerge
