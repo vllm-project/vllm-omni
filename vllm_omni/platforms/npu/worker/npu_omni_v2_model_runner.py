@@ -297,7 +297,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
     def _run_kstep_frames(self, model_inputs, input_batch, run_model=None):
         """Replay the talker K-step frame loop on the MRv2 runner.
 
-        V1's ``talker_multiframe.run`` owns the per-frame codec feedback: each
+        The shared ``talker_multiframe.run`` owns the per-frame codec feedback: each
         frame writes the previously sampled codec embedding into the persistent
         inputs_embeds row, re-runs the K-row forward, samples one codec frame
         from that row's hidden state, and finally merges the K frame outputs.
@@ -310,7 +310,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         replay turns the loop into per-frame replays of the K-row decode graph.
         """
         from vllm_omni.model_executor.models.output_templates import OmniOutput
-        from vllm_omni.platforms.npu.worker import talker_multiframe as multiframe
+        from vllm_omni.worker import talker_multiframe as multiframe
 
         cfg = getattr(self, "vllm_config", None)
         stage = getattr(getattr(cfg, "model_config", None), "model_stage", None)
@@ -384,7 +384,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         # stages, the duplex K-step dispatch installs no rejection speculator
         # (minicpmo_4_5_omni_tts.py:2041 returns no speculator for K > 0), and
         # the only consumer that needs a wider row, ``ensure_stop_token_vocab``
-        # (talker_multiframe.py:710), is called only from the v1 NPU runner
+        # is called only from the V1 NPU runner
         # (npu_model_runner.py:566) and the GPU runner (gpu_model_runner.py:2444)
         # -- never from this runner or from multiframe.run.
         # Setting the field here would only create an attribute no one reads,

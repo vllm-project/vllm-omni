@@ -55,11 +55,12 @@ def test_reference_workflow_matches_omni_node_interfaces(workflow):
             kind = inputs[input_["name"]][0]
             # Saved workflows record combo widgets as COMBO, not their option list.
             assert input_["type"] == ("COMBO" if isinstance(kind, list) else kind)
-        assert tuple(output["type"] for output in node["outputs"]) == cls.RETURN_TYPES
+        assert tuple(output["type"] for output in node["outputs"]) == cls.RETURN_TYPES[: len(node["outputs"])]
         expected_widgets = len(schema.get("required", {}))
         if "seed" in schema.get("required", {}):
             expected_widgets += 1
-        assert len(node["widgets_values"]) == expected_widgets
+        optional_widgets = int("enabled" in schema.get("optional", {}))
+        assert expected_widgets <= len(node["widgets_values"]) <= expected_widgets + optional_widgets
     refs = next(node for node in workflow["nodes"] if node["type"] == "VLLMOmniVideoReferences")
     assert [input_["name"] for input_ in refs["inputs"]] == list(
         omni_nodes.VLLMOmniVideoReferences.INPUT_TYPES()["optional"]

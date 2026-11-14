@@ -450,7 +450,7 @@ class GPUARModelRunner(
         `update_async_spec_token_ids` reads the CPU copy), so sharing it is
         safe.
         """
-        from vllm_omni.platforms.npu.worker import talker_multiframe
+        from vllm_omni.worker import talker_multiframe
 
         key = (rows, drafts)
         cached = getattr(self, "_kstep_constant_draft_cache", None)
@@ -480,7 +480,7 @@ class GPUARModelRunner(
         plain Python -- the loop they feed (``talker_multiframe.run``) is the
         same one the CUDA runner calls.
         """
-        from vllm_omni.platforms.npu.worker import talker_multiframe
+        from vllm_omni.worker import talker_multiframe
 
         frames = talker_multiframe.drafts_this_step(self)
         if frames > 1:
@@ -2361,7 +2361,7 @@ class GPUARModelRunner(
                 logits.shape[-1],
             )
 
-        from vllm_omni.platforms.npu.worker import talker_multiframe
+        from vllm_omni.worker import talker_multiframe
 
         if talker_multiframe.drafts_this_step(self) > 0:
             talker_multiframe.neutralize_kstep_min_tokens(self.input_batch.sampling_metadata.logitsprocs)
