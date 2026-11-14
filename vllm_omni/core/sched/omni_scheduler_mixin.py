@@ -176,6 +176,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
 
     # Provided by the concrete vLLM scheduler.
     vllm_config: VllmConfig
+    max_num_running_reqs: int
     requests: dict[str, Request]
     waiting: RequestQueue
     kv_holding_waiting: RequestQueue
@@ -475,6 +476,85 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         session.update_block_hashes()
         session.num_prompt_tokens = len(new_prompt)
         self._finish_streaming_session_update(session, update)
+
+    def _get_scheduler_extra_config(self) -> dict[str, Any]:
+        """Resolve stage settings, with legacy connector values taking precedence."""
+        connector_config = getattr(self.vllm_config.model_config, "stage_connector_config", None)
+        extra = (
+            connector_config.get("extra", connector_config)
+            if isinstance(connector_config, dict)
+            else getattr(connector_config, "extra", None)
+        ) or {}
+        additional = getattr(self.vllm_config, "additional_config", None)
+        return {**(additional if isinstance(additional, dict) else {}), **extra}
+
+    def _init_generation_coalescing(self, extra: Mapping[str, Any]) -> None:
+        """Initialize shared batch settings from scheduler-resolved config.
+
+        Runner, topology and scheduling-policy checks belong to each scheduler.
+        """
+        self._generation_min_batch_size = int(extra.get("generation_min_batch_size", 1))
+        self._generation_max_wait_s = float(extra.get("generation_max_wait_ms", 0)) / 1000
+        self._generation_always_wait_target_batch = extra.get("generation_always_wait_target_batch", False)
+        self._generation_batch_deadline: float | None = None
+        if not 1 <= self._generation_min_batch_size <= self.max_num_running_reqs:
+            raise ValueError("generation_min_batch_size must be in [1, max_num_seqs]")
+        if not math.isfinite(self._generation_max_wait_s) or self._generation_max_wait_s < 0:
+            raise ValueError("generation_max_wait_ms must be finite and nonnegative")
+        if not isinstance(self._generation_always_wait_target_batch, bool):
+            raise ValueError("generation_always_wait_target_batch must be a boolean")
+
+    def _generation_batch_ready(self, runnable: set[str]) -> bool:
+        """Optionally cap the target at the registered request population."""
+        target = self._generation_min_batch_size
+        if getattr(self, "_generation_always_wait_target_batch", False):
+            target = min(target, len(self.requests))
+            return len(runnable) >= target
+        return len(runnable) >= target or len(self.requests) < target
+
+    def _get_coalescing_ready_request_ids(
+        self, connector_outputs: Iterable[OmniConnectorOutput] = ()
+    ) -> set[str] | None:
+        """Snapshot input-ready IDs without consuming input or notifications.
+
+        Return None for an unsupported input source, or an empty set for a
+        supported source with no ready input. Orchestrator-fed stage zero uses
+        queued request state; subclasses can override other input sources.
+        It is also queried during coalescing policy initialization, before
+        requests are registered.
+
+        Native notifications may not yet be applied to the coordinator, so
+        include the supplied outputs. Terminal signals allow final work to
+        participate in coalescing. Callers retain responsibility for filtering
+        stale, finished or in-flight requests and deciding execution eligibility.
+        """
+        # V1: readiness is tracked by the legacy chunk-transfer adapter.
+        adapter = self.chunk_transfer_adapter
+        if adapter is not None and adapter.receives_chunks:
+            return set(adapter.requests_with_ready_chunks)
+        # Check for native connector input before using the shared fallback.
+        coordinator = self.input_coordinator
+        if not self._native_data_plane or coordinator is None or not coordinator.receives_chunks:
+            # V1 and V2: Stage zero receives prompts/appends from the orchestrator.
+            # Parked streams stay excluded until an append resumes admission.
+            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+            if getattr(model_config, "stage_id", None) == 0:
+                return {
+                    request.request_id
+                    for queue_name in ("waiting", "kv_holding_waiting")
+                    for request in getattr(self, queue_name, ())
+                    if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                }
+            return None
+        # V2: combine native coordinator state with unapplied notifications.
+        ready = set(coordinator.requests_with_ready_chunks)
+        ready.update(coordinator.finished_requests)
+        ready.update(coordinator.input_terminal_req_ids)
+        for output in connector_outputs:
+            ready.update(output.chunk_ready_req_ids)
+            ready.update(output.chunk_finished_req_ids)
+            ready.update(req_id for req_id, update in output.request_metadata.items() if update.input_terminal)
+        return ready
 
     def _async_chunk_transport_enabled(self) -> bool:
         return getattr(self, "chunk_transfer_adapter", None) is not None or bool(
@@ -882,6 +962,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         pending_input_registrations: list[OmniChunkRecvHandle] | None = None,
         data_plane_terminal_req_ids: set[str] | None = None,
         input_terminal_req_ids: set[str] | None = None,
+        preserve_v1_batch: bool = False,
     ) -> OmniSchedulerOutput:
         """Wrap a base ``SchedulerOutput`` in ``OmniSchedulerOutput``.
 
@@ -927,6 +1008,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             data_plane_terminal_req_ids=data_plane_terminal_req_ids,
             input_terminal_req_ids=input_terminal_req_ids or set(),
             pending_request_prewarms=request_prewarms,
+            preserve_v1_batch=preserve_v1_batch,
         )
         OmniSchedulerMixin._duplex_stage_work_recorder(self).step_begin(scheduler_output, getattr(self, "requests", {}))
         return scheduler_output
