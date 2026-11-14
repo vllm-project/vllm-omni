@@ -118,9 +118,9 @@ The spatial-shard configuration uses `tensor_parallel_size: 1`,
 parallel size must equal the VAE executor process-group size (two ranks here),
 and distributed initialization is required for multiple ranks. Invalid
 configurations raise an error without falling back to tile decoding. To shard
-along width, copy this YAML and change `vae_parallel_mode` from
-`spatial_shard_height` to `spatial_shard_width`; keep the same GPU layout and
-parallel sizes. A VAE instance is bound to its spatial-shard direction, process
+along width, use the shipped
+`vllm_omni/deploy/ming_image_layer_spatial_shard_width.yaml`, which uses the
+same GPU layout and parallel sizes. A VAE instance is bound to its spatial-shard direction, process
 group, and parallel size after its first multi-rank spatial-shard decode;
 restart with a fresh instance to change them or return to tile mode.
 
@@ -144,8 +144,19 @@ between the two deployments; report untiled differences separately because
 tile-boundary blending can change individual pixels. Compare spatial-shard and
 full decoding using the same latent when checking decode equivalence.
 `vae_patch_parallel_size` controls the VAE parallel size for both distributed
-tile and spatial-shard modes. Large-model spatial-shard performance and image
-quality have not yet been evaluated; multi-GPU speedup has not been measured.
+tile and spatial-shard modes. The Ming-Image validation reported in
+[PR #8397](https://github.com/vllm-project/vllm-omni/pull/8397) includes
+VAE-decode microbenchmarks and timed serving requests. For one 1024x1024 image
+in bf16 on two RTX PRO 6000 Blackwell GPUs, height/width sharding measured
+58.4/59.0 ms versus 110.6 ms for full decode (1.89x/1.87x). These historical
+measurements used one warmup and two timed iterations; they are not an
+end-to-end speedup guarantee.
+
+Spatial sharding is intentionally available to all pipelines using
+`DistributedAutoencoderKLQwenImage`, including Qwen-Image, Krea2, and Anima,
+when explicitly selected. Checkpoint quality and performance on those sibling
+pipelines have not been validated by the Ming-Image results. The same strict
+configuration checks and instance binding described above apply to them.
 Set `enable_diffusion_pipeline_profiler: true` under Stage 1 in a temporary
 copy of each deployment config when collecting decode durations.
 
