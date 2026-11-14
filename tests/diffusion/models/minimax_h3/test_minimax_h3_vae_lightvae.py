@@ -321,6 +321,32 @@ def test_invalid_teacher_indices_are_rejected(lite_checkpoint_factory, kept):
         _api().read_h3_lite_decoder_checkpoint(lite_checkpoint_factory(changes={"kept_layers": kept}))
 
 
+@pytest.mark.parametrize("kept", [[0], [3], [0, 3]])
+def test_kept_layers_accept_boundary_indices(lite_checkpoint_factory, kept):
+    state = {f"decoder.transformer_blocks.{index}.scale1": torch.ones(4) for index in range(len(kept))}
+    state["post_quant_conv.weight"] = torch.ones(2, 2, 1, 1, 1)
+    checkpoint = _api().read_h3_lite_decoder_checkpoint(
+        lite_checkpoint_factory(changes={"kept_layers": kept}, state=state)
+    )
+    assert checkpoint.kept_layers == tuple(kept)
+
+
+@pytest.mark.parametrize("depth", [0, -1, True, 1])
+def test_compact_decoder_depth_boundaries(lite_checkpoint_factory, depth):
+    state = {
+        "decoder.transformer_blocks.0.scale1": torch.ones(4),
+        "post_quant_conv.weight": torch.ones(2, 2, 1, 1, 1),
+    }
+    changes = {"decoder_num_layers": depth}
+    if type(depth) is int and depth == 1:
+        changes["kept_layers"] = [0]
+        checkpoint = _api().read_h3_lite_decoder_checkpoint(lite_checkpoint_factory(changes=changes, state=state))
+        assert checkpoint.kept_layers == (0,)
+    else:
+        with pytest.raises(ValueError, match="decoder_num_layers"):
+            _api().read_h3_lite_decoder_checkpoint(lite_checkpoint_factory(changes=changes))
+
+
 @pytest.mark.parametrize("metadata", [{}, {"architecture": "invalid"}, {"architecture": "[]"}])
 def test_missing_or_invalid_architecture_is_rejected(lite_checkpoint_factory, metadata):
     with pytest.raises(ValueError, match="architecture"):
@@ -334,6 +360,10 @@ def test_missing_or_invalid_architecture_is_rejected(lite_checkpoint_factory, me
         ({"latents_std": [1.0, 0.0]}, "latents_std"),
         ({"latents_mean": [0.0]}, "latents_mean"),
         ({"clip_length": 9}, "clip_length"),
+        ({"clip_length": 16}, "clip_length"),
+        ({"clip_length": 18}, "clip_length"),
+        ({"token_drop": 0}, "token_drop"),
+        ({"token_drop": 4}, "token_drop"),
     ],
 )
 def test_incompatible_architecture_is_rejected(lite_checkpoint_factory, changes, field):
@@ -344,6 +374,17 @@ def test_incompatible_architecture_is_rejected(lite_checkpoint_factory, changes,
 def test_quantized_weights_are_rejected(lite_checkpoint_factory):
     path = lite_checkpoint_factory(state={"decoder.proj_in.weight": torch.ones(2, 2, dtype=torch.int8)})
     with pytest.raises(ValueError, match="decoder.proj_in.weight"):
+        _api().read_h3_lite_decoder_checkpoint(path)
+
+
+def test_unknown_compact_checkpoint_tensor_is_rejected(lite_checkpoint_factory):
+    path = lite_checkpoint_factory(
+        state={
+            "decoder.transformer_blocks.0.scale1": torch.ones(4),
+            "encoder.conv_in.weight": torch.ones(1, 1, 1, 1, 1),
+        }
+    )
+    with pytest.raises(ValueError, match="unsupported checkpoint tensor"):
         _api().read_h3_lite_decoder_checkpoint(path)
 
 
@@ -364,6 +405,7 @@ def test_unknown_decoder_parameter_is_not_silently_dropped():
 def test_optional_path_and_explicit_invalid_values(tmp_path):
     api = _api()
     assert api.resolve_h3_lightvae_decoder_path({}) is None
+    assert api.resolve_h3_lightvae_decoder_path(None) is None
     path = str(tmp_path / "lite.safetensors")
     assert api.resolve_h3_lightvae_decoder_path({"lightvae_decoder_path": path}) == path
     for value in (None, "", "  ", 1, True):
@@ -377,3 +419,492 @@ def test_lightvae_rejects_conflicting_decoder_selection(decoder_source):
         _api().resolve_h3_lightvae_decoder_path(
             {"lightvae_decoder_path": "lite.safetensors", "video_vae_decoder": decoder_source}
         )
+
+
+@pytest.fixture
+def lite_directory_factory(tmp_path):
+    def create(
+        *,
+        student_layers=26,
+        latents=24,
+        decode_config=None,
+        config_changes=None,
+        state=None,
+        shards=1,
+    ):
+        component = tmp_path / "lite26"
+        component.mkdir()
+        config = {
+            "_class_name": "AutoencoderKLMiniMaxH3",
+            "latent_channels": latents,
+            "decoder_num_layers": student_layers,
+            "decoder_num_attention_heads": 2,
+            "decoder_attention_head_dim": 2,
+            "decoder_norm_eps": 1e-5,
+            "decoder_rope_theta": 100.0,
+            "decoder_rope_dim_ratio": 0.75,
+            "latents_mean": [0.0] * latents,
+            "latents_std": [1.0] * latents,
+            "clip_length": 17,
+            "token_drop": 3,
+        }
+        config.update(config_changes or {})
+        (component / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        if state is None:
+            state = {f"decoder.transformer_blocks.{index}.scale1": torch.ones(2) for index in range(student_layers)}
+            state["post_quant_conv.weight"] = torch.ones(1)
+        if shards == 1:
+            save_file(state, component / "diffusion_pytorch_model.safetensors")
+        else:
+            weight_map = {}
+            keys = list(state)
+            for shard_index in range(shards):
+                shard_keys = keys[shard_index::shards]
+                shard_name = f"diffusion_pytorch_model-{shard_index + 1:05d}.safetensors"
+                save_file({key: state[key] for key in shard_keys}, component / shard_name)
+                weight_map.update({key: shard_name for key in shard_keys})
+            (component / "diffusion_pytorch_model.safetensors.index.json").write_text(
+                json.dumps({"metadata": {}, "weight_map": weight_map}), encoding="utf-8"
+            )
+        if decode_config is not None:
+            (component / "decode_config.json").write_text(json.dumps(decode_config), encoding="utf-8")
+        return component
+
+    return create
+
+
+def test_diffusers_directory_maps_student_to_teacher_depth(lite_directory_factory):
+    path = lite_directory_factory(
+        shards=2,
+        decode_config={
+            "student_tile_size": 272,
+            "student_long_axis_tile": 208,
+            "student_tile_overlap": 64,
+            "student_short_axis_overlap": 0,
+            "student_long_axis_overlap": 16,
+            "image_context_tokens": 5,
+            "temporal_decode_protocol": "released-segment-prepadding-v3",
+            "tile_layout": "native",
+        },
+    )
+    checkpoint = _api().read_h3_lite_decoder_checkpoint(path, teacher_num_layers=36)
+    assert checkpoint.config["decoder_num_layers"] == 36
+    assert checkpoint.kept_layers == tuple(range(26))
+    assert len(checkpoint.state_dict) == 27
+    assert checkpoint.decode_profile.tile_size == 272
+    assert checkpoint.decode_profile.long_axis_tile == 208
+    assert checkpoint.decode_profile.short_axis_overlap == 0
+    assert checkpoint.decode_profile.long_axis_overlap == 16
+    assert checkpoint.decode_profile.image_context_tokens == 5
+    assert checkpoint.decode_profile.temporal_decode_protocol == "released-segment-prepadding-v3"
+
+
+def test_diffusers_directory_uses_official_vae_config_as_fallback(lite_directory_factory):
+    path = lite_directory_factory(
+        decode_config={"student_tile_size": 272},
+        config_changes={"vae_tile_size": 256, "vae_tile_overlap_min": 64},
+    )
+    checkpoint = _api().read_h3_lite_decoder_checkpoint(path, teacher_num_layers=36)
+    profile = checkpoint.decode_profile
+    assert profile.tile_size == 272
+    assert profile.tile_overlap == 64
+    assert profile.long_axis_tile == 256
+    assert profile.short_axis_overlap == 64
+    assert profile.long_axis_overlap == 64
+    assert profile.image_tile_size == 256
+    assert profile.image_long_axis_tile == 256
+
+
+def test_lightvae_geometry_is_anisotropic_and_frame_aware():
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = torch.nn.Linear(2, 2)
+            self.vae_ratio = 16
+            self.tokens_chunk_size = 5
+            self.decoder_tile_size = 256
+            self.decoder_tile_overlap_min = 64
+
+    model = _Model()
+    profile = _api().H3LiteDecodeProfile(
+        tile_size=272,
+        tile_overlap=64,
+        long_axis_tile=208,
+        short_axis_overlap=0,
+        long_axis_overlap=16,
+        image_tile_size=256,
+        image_long_axis_tile=256,
+    )
+    native = _api("native")
+    assert native._lightvae_geometry(model, profile, 5, 768, 1344) == (272, 208, 0, 16)
+    assert native._lightvae_geometry(model, profile, 5, 1344, 768) == (208, 272, 16, 0)
+    assert native._lightvae_geometry(model, profile, 5, 768, 768) == (272, 272, 16, 16)
+    assert native._lightvae_geometry(model, profile, 1, 768, 1344) == (256, 256, 64, 64)
+
+
+def test_lightvae_decoder_tile_count_uses_release_geometry():
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = torch.nn.Linear(2, 2)
+            self.vae_ratio = 16
+            self.tokens_chunk_size = 5
+            self.decoder_tile_size = 256
+            self.decoder_tile_overlap_min = 64
+            self._h3_lite_decode_profile = _api().H3LiteDecodeProfile(
+                tile_size=272,
+                tile_overlap=64,
+                long_axis_tile=208,
+                short_axis_overlap=0,
+                long_axis_overlap=16,
+                tile_layout="native",
+            )
+
+    latent = torch.zeros(1, 24, 9, 48, 84)
+    native = _api("native")
+    assert native.lightvae_decoder_tile_count(_Model(), latent) == 21
+
+
+def test_decode_latent_preserves_image_tiling_through_context_padding(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.lightvae import native as native_module
+    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = torch.nn.Linear(2, 2)
+            self.vae_ratio = 16
+            self.tokens_chunk_size = 5
+            self.decoder_tile_size = 256
+            self.decoder_tile_overlap_min = 64
+            self.parallel_tiling = False
+            self.processor = types.SimpleNamespace(revert_tensor=lambda decoded: decoded)
+
+        def tiled_decode(self, z):
+            raise AssertionError("apply_h3_lite_decode_profile must install the release decode path")
+
+    model = _Model()
+    profile = native_module.H3LiteDecodeProfile(
+        tile_size=272,
+        tile_overlap=64,
+        long_axis_tile=208,
+        short_axis_overlap=0,
+        long_axis_overlap=16,
+        image_tile_size=256,
+        image_long_axis_tile=256,
+        image_context_tokens=5,
+        image_context_output_phase=3,
+        tile_layout="native",
+    )
+    native_module.apply_h3_lite_decode_profile(model, profile)
+
+    vae = object.__new__(MiniMaxH3VideoVAE)
+    torch.nn.Module.__init__(vae)
+    vae.model = model
+    vae.parallel_size = 1
+    vae.config_dict = {
+        "latent_channels": 24,
+        "latents_mean": [0.0] * 24,
+        "latents_std": [1.0] * 24,
+    }
+    latent = torch.zeros(1, 24, 1, 48, 84)
+
+    planning = {}
+    real_count = native_module.lightvae_decoder_tile_count
+
+    def counted_tile_count(model_arg, latent_arg):
+        planning["frames"] = int(latent_arg.shape[2])
+        planning["count"] = real_count(model_arg, latent_arg)
+        return planning["count"]
+
+    monkeypatch.setattr(native_module, "lightvae_decoder_tile_count", counted_tile_count)
+
+    decoded = {}
+
+    def fake_tiled_decode(model_arg, profile_arg, z, *, is_image=False):
+        decoded["frames"] = int(z.shape[2])
+        decoded["is_image"] = is_image
+        return torch.ones(1, 3, 5, 768, 1344)
+
+    monkeypatch.setattr(native_module, "_tiled_decode_lightvae", fake_tiled_decode)
+
+    frames = MiniMaxH3VideoVAE.decode_latent(vae, latent)
+
+    assert planning == {"frames": 1, "count": 28}
+    assert decoded == {"frames": 5, "is_image": True}
+    assert frames.shape == (1, 3, 1, 768, 1344)
+
+
+def test_diffusers_directory_requires_teacher_depth(lite_directory_factory):
+    path = lite_directory_factory()
+    with pytest.raises(ValueError, match="teacher_num_layers"):
+        _api().read_h3_lite_decoder_checkpoint(path)
+
+
+def test_diffusers_directory_rejects_student_deeper_than_teacher(lite_directory_factory):
+    path = lite_directory_factory(student_layers=26)
+    with pytest.raises(ValueError, match="exceeds teacher depth"):
+        _api().read_h3_lite_decoder_checkpoint(path, teacher_num_layers=12)
+
+
+@pytest.mark.parametrize("teacher", [0, -1, True])
+def test_diffusers_directory_rejects_invalid_teacher_depth(lite_directory_factory, teacher):
+    path = lite_directory_factory(student_layers=2)
+    with pytest.raises(ValueError, match="teacher_num_layers"):
+        _api().read_h3_lite_decoder_checkpoint(path, teacher_num_layers=teacher)
+
+
+def test_diffusers_directory_accepts_student_equal_to_teacher(lite_directory_factory):
+    path = lite_directory_factory(student_layers=2)
+    checkpoint = _api().read_h3_lite_decoder_checkpoint(path, teacher_num_layers=2)
+    assert checkpoint.kept_layers == (0, 1)
+    assert checkpoint.config["decoder_num_layers"] == 2
+
+
+def test_diffusers_directory_uses_explicit_kept_layer_mapping(lite_directory_factory):
+    path = lite_directory_factory(student_layers=2, config_changes={"kept_layers": [0, 2]})
+    checkpoint = _api().read_h3_lite_decoder_checkpoint(path, teacher_num_layers=36)
+    assert checkpoint.kept_layers == (0, 2)
+
+
+def test_diffusers_directory_rejects_missing_or_bad_config(lite_directory_factory):
+    path = lite_directory_factory()
+    (path / "config.json").unlink()
+    with pytest.raises(ValueError, match="config.json"):
+        _api().read_h3_lite_decoder_checkpoint(path, teacher_num_layers=36)
+
+
+@pytest.mark.parametrize(
+    "decode_config,field",
+    [
+        ({"student_tile_size": 0}, "student_tile_size"),
+        ({"student_tile_overlap": -1}, "student_tile_overlap"),
+        ({"student_long_axis_tile": 0}, "student_long_axis_tile"),
+        ({"student_short_axis_overlap": -1}, "student_short_axis_overlap"),
+        ({"student_long_axis_overlap": -1}, "student_long_axis_overlap"),
+        ({"student_tile_size": 256, "student_short_axis_overlap": 256}, "student_short_axis_overlap"),
+        ({"student_tile_size": 256, "student_short_axis_overlap": 264}, "student_short_axis_overlap"),
+        ({"student_long_axis_tile": 256, "student_long_axis_overlap": 256}, "student_long_axis_overlap"),
+        ({"student_tile_overlap": 256, "image_tile_size": 256}, "student_tile_overlap"),
+        ({"image_context_tokens": 0}, "image_context_tokens"),
+        ({"temporal_decode_protocol": "unknown"}, "temporal_decode_protocol"),
+        ({"tile_layout": "unknown"}, "tile_layout"),
+        ({"tile_layout": ""}, "tile_layout"),
+    ],
+)
+def test_diffusers_directory_rejects_bad_decode_profile(lite_directory_factory, decode_config, field):
+    path = lite_directory_factory(decode_config=decode_config)
+    with pytest.raises(ValueError, match=field):
+        _api().read_h3_lite_decoder_checkpoint(path, teacher_num_layers=36)
+
+
+def test_decode_profile_accepts_minimum_positive_values(lite_directory_factory):
+    path = lite_directory_factory(
+        decode_config={
+            "student_tile_size": 1,
+            "student_long_axis_tile": 1,
+            "student_tile_overlap": 0,
+            "student_short_axis_overlap": 0,
+            "student_long_axis_overlap": 0,
+            "image_context_tokens": 1,
+            "temporal_decode_protocol": "released-segment-prepadding-v3",
+            "tile_layout": "native",
+        }
+    )
+    checkpoint = _api().read_h3_lite_decoder_checkpoint(path, teacher_num_layers=36)
+    assert checkpoint.decode_profile.tile_size == 1
+    assert checkpoint.decode_profile.long_axis_tile == 1
+    assert checkpoint.decode_profile.tile_overlap == 0
+
+
+def test_apply_decode_profile_is_scoped_to_the_native_vae():
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = torch.nn.Linear(2, 2)
+            self.vae_ratio = 8
+            self.tokens_chunk_size = 5
+            self.decoder_tile_size = 256
+            self.decoder_tile_overlap_min = 64
+
+    model = _Model()
+    profile = _api().H3LiteDecodeProfile(
+        tile_size=272,
+        tile_overlap=64,
+        long_axis_tile=208,
+        short_axis_overlap=0,
+        long_axis_overlap=16,
+        image_context_tokens=5,
+        temporal_decode_protocol="released-segment-prepadding-v3",
+    )
+    _api("native").apply_h3_lite_decode_profile(model, profile)
+    assert model._h3_lite_decode_profile is profile
+    assert model.decoder_tile_size == 272
+    assert model.decoder_tile_overlap_min == 0
+    assert model.decoder_long_axis_tile == 208
+    assert model.decoder_short_axis_overlap == 0
+    assert model.decoder_long_axis_overlap == 16
+    assert model.decoder_image_overlap == 64
+    assert not hasattr(model, "official_vae_tile_size")
+
+
+def test_apply_decode_profile_is_atomic_on_failure():
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = torch.nn.Linear(2, 2)
+            self.vae_ratio = 8
+            self.tokens_chunk_size = 5
+            self.decoder_tile_size = 256
+            self.decoder_tile_overlap_min = 64
+
+    model = _Model()
+    profile = _api().H3LiteDecodeProfile(tile_size=272, tile_overlap=65)
+    with pytest.raises(ValueError, match="decoder_tile_overlap_min"):
+        _api("native").apply_h3_lite_decode_profile(model, profile)
+    assert model.decoder_tile_size == 256
+    assert model.decoder_tile_overlap_min == 64
+    assert not hasattr(model, "_h3_lite_decode_profile")
+
+
+def test_apply_decode_profile_accepts_minimum_ratio_tile():
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = torch.nn.Linear(2, 2)
+            self.vae_ratio = 8
+            self.tokens_chunk_size = 5
+            self.decoder_tile_size = 256
+            self.decoder_tile_overlap_min = 64
+
+    model = _Model()
+    profile = _api().H3LiteDecodeProfile(tile_size=8, tile_overlap=0)
+    _api("native").apply_h3_lite_decode_profile(model, profile)
+    assert model.decoder_tile_size == 8
+    assert model.decoder_tile_overlap_min == 0
+
+
+@pytest.mark.parametrize(
+    "profile_kwargs,field",
+    [
+        (
+            {
+                "tile_size": 256,
+                "tile_overlap": 0,
+                "long_axis_tile": 256,
+                "long_axis_overlap": 0,
+                "short_axis_overlap": 256,
+                "image_tile_size": 256,
+                "image_long_axis_tile": 256,
+            },
+            "decoder_short_axis_overlap",
+        ),
+        (
+            {
+                "tile_size": 256,
+                "tile_overlap": 0,
+                "long_axis_tile": 256,
+                "long_axis_overlap": 0,
+                "short_axis_overlap": 264,
+                "image_tile_size": 256,
+                "image_long_axis_tile": 256,
+            },
+            "decoder_short_axis_overlap",
+        ),
+        (
+            {
+                "tile_size": 256,
+                "tile_overlap": 0,
+                "long_axis_tile": 256,
+                "long_axis_overlap": 256,
+                "short_axis_overlap": 0,
+                "image_tile_size": 256,
+                "image_long_axis_tile": 256,
+            },
+            "decoder_long_axis_overlap",
+        ),
+        (
+            {
+                "tile_size": 208,
+                "tile_overlap": 0,
+                "long_axis_tile": 272,
+                "long_axis_overlap": 264,
+                "short_axis_overlap": 0,
+                "image_tile_size": 208,
+                "image_long_axis_tile": 208,
+            },
+            "decoder_square_axis_overlap",
+        ),
+        (
+            {
+                "tile_size": 272,
+                "tile_overlap": 256,
+                "long_axis_tile": 208,
+                "long_axis_overlap": 16,
+                "short_axis_overlap": 0,
+                "image_tile_size": 256,
+                "image_long_axis_tile": 256,
+            },
+            "decoder_image_overlap",
+        ),
+    ],
+)
+def test_apply_decode_profile_rejects_overlap_at_or_above_tile(profile_kwargs, field):
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = torch.nn.Linear(2, 2)
+            self.vae_ratio = 8
+            self.tokens_chunk_size = 5
+            self.decoder_tile_size = 256
+            self.decoder_tile_overlap_min = 64
+
+    model = _Model()
+    with pytest.raises(ValueError, match=field):
+        _api("native").apply_h3_lite_decode_profile(model, _api().H3LiteDecodeProfile(**profile_kwargs))
+    assert model.decoder_tile_size == 256
+    assert model.decoder_tile_overlap_min == 64
+    assert not hasattr(model, "_h3_lite_decode_profile")
+
+
+def test_apply_decode_profile_rejects_non_multiple_tile():
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = torch.nn.Linear(2, 2)
+            self.vae_ratio = 8
+            self.tokens_chunk_size = 5
+            self.decoder_tile_size = 256
+            self.decoder_tile_overlap_min = 64
+
+    with pytest.raises(ValueError, match="multiple of the spatial ratio"):
+        _api("native").apply_h3_lite_decode_profile(_Model(), _api().H3LiteDecodeProfile(tile_size=7, tile_overlap=0))
+
+
+def test_apply_decode_profile_rejects_token_window_mismatch():
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = torch.nn.Linear(2, 2)
+            self.vae_ratio = 8
+            self.tokens_chunk_size = 4
+            self.decoder_tile_size = 256
+            self.decoder_tile_overlap_min = 64
+
+    profile = _api().H3LiteDecodeProfile(
+        tile_size=272,
+        tile_overlap=64,
+        image_context_tokens=5,
+        temporal_decode_protocol="released-segment-prepadding-v3",
+    )
+    with pytest.raises(ValueError, match="token window"):
+        _api("native").apply_h3_lite_decode_profile(_Model(), profile)
+
+
+def test_path_aliases_are_mutually_exclusive(tmp_path):
+    api = _api()
+    path = str(tmp_path / "lite")
+    assert api.resolve_h3_lightvae_decoder_path({"vae_path": path}) == path
+    assert api.resolve_h3_lightvae_decoder_path({"vae_decoder_path": path}) == path
+    with pytest.raises(ValueError, match="use only one"):
+        api.resolve_h3_lightvae_decoder_path({"vae_path": path, "lightvae_decoder_path": path})

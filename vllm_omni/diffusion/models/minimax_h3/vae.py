@@ -375,6 +375,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             raise ValueError("MiniMax H3 video VAE cannot be both encode-only and decode-only")
         if lightvae_decoder_path is not None and decoder_source is not None:
             raise ValueError("lightvae_decoder_path cannot be combined with video_vae_decoder")
+        if self.encode_only and lightvae_decoder_path is not None:
+            raise ValueError("An encode-only VAE cannot load a replacement video decoder")
         from .vae_nvfp4 import (
             install_nvfp4_video_decoder,
             released_decoder_pixels,
@@ -396,12 +398,17 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             if lightvae_decoder_path is not None:
                 from .lightvae import install_h3_lite_decoder, read_h3_lite_decoder_checkpoint
 
-                checkpoint = read_h3_lite_decoder_checkpoint(lightvae_decoder_path)
+                teacher_num_layers = len(self.remote.model.decoder.transformer_blocks)
+                checkpoint = read_h3_lite_decoder_checkpoint(
+                    lightvae_decoder_path,
+                    teacher_num_layers=teacher_num_layers,
+                )
                 install_h3_lite_decoder(self.remote.model, checkpoint, native_config=self.config_dict)
                 logger.info(
-                    "Loaded H3 Lite video decoder: path=%s layers=%d device=%s",
+                    "Loaded H3 Lite video decoder: path=%s student_layers=%d teacher_layers=%d device=%s",
                     lightvae_decoder_path,
                     len(checkpoint.kept_layers),
+                    teacher_num_layers,
                     device,
                 )
                 del checkpoint
@@ -823,6 +830,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         resolves identically on every rank.
         """
 
+        from .lightvae.native import lightvae_decoder_tile_count
+
+        release_count = lightvae_decoder_tile_count(self.model, latent)
+        if release_count is not None:
+            return release_count
         ratio = int(self.model.vae_ratio)
         rows, _, _ = self.model.split_tiles(int(latent.shape[-2]) * ratio, True)
         cols, _, _ = self.model.split_tiles(int(latent.shape[-1]) * ratio, True)
@@ -1251,8 +1263,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # is dispatched. It comes from the grid geometry alone, so every rank
         # records the same value and the gather never has to choose a
         # collective from rank-local tile shapes.
-        with self._tile_gather_protocol(latent), self._decode_tiling_context(latent):
-            decoded = self.model.decode_base(self._denormalize_latent(latent))
+        profile = getattr(self.model, "_h3_lite_decode_profile", None)
+        if profile is not None and int(latent.shape[2]) == 1 and profile.image_context_tokens is not None:
+            context = self._denormalize_latent(latent.expand(-1, -1, profile.image_context_tokens, -1, -1).contiguous())
+            with self._tile_gather_protocol(latent), self._decode_tiling_context(latent):
+                decoded = self.model.tiled_decode(context, is_image=True)
+            phase = profile.image_context_output_phase or 0
+            decoded = decoded[:, :, phase : phase + 1]
+        else:
+            with self._tile_gather_protocol(latent), self._decode_tiling_context(latent):
+                decoded = self.model.decode_base(self._denormalize_latent(latent))
         if decoded.dtype == torch.uint8:
             # The streaming uint8 write-back already ran the revert and the
             # output quantizer inside write_part; nothing remains but the
