@@ -40,9 +40,12 @@ prompt positions: the input embeddings and the hidden states of
 - **Namespace digest.** SHA-256 of the configured `namespace` and
   `model_revision`, the stage, format version, capture layer, model
   configuration, HS dtype, KV cache spec, and the resolved physical KV layout
-  from `KVCacheConfig.kv_cache_layout`. Native KV transfers copy raw block bytes,
-  so layouts such as `LBHNC` and `LBNHC` must have different namespaces even
-  when their block sizes and specs match. The model configuration excludes
+  from `KVCacheConfig.kv_cache_layout`. The engine resolves the layout before
+  constructing either connector role; the connector rejects an unresolved
+  (`None`) layout at startup, before creating a namespace or Store resources.
+  Native KV transfers copy raw block bytes, so layouts such as `LBHNC` and
+  `LBNHC` must have different namespaces even when their block sizes and specs
+  match. The model configuration excludes
   `_name_or_path` and `transformers_version`, so replicas that load the same
   revision from different paths share entries. The digest is the native KV
   `cache_prefix` and part of every HS key.

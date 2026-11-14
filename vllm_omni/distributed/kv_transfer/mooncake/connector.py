@@ -78,7 +78,7 @@ def cache_namespace(
     hidden_layer: int,
     dtype: torch.dtype,
     kv_spec: FullAttentionSpec,
-    kv_cache_layout: str | None,
+    kv_cache_layout: str,
 ) -> str:
     """Digest every setting that can change stored KV or HS values."""
     identity = {
@@ -219,6 +219,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         self.settings = MooncakeConfig.from_vllm_config(vllm_config)
         self._validate_supported(vllm_config, kv_cache_config)
         assert kv_cache_config is not None
+        assert kv_cache_config.kv_cache_layout is not None
         assert vllm_config.kv_transfer_config is not None
         model = vllm_config.model_config
         self.hidden_layer = model.hf_config.talker_config.accept_hidden_layer
@@ -324,6 +325,8 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
             raise ValueError("Mooncake KV/HS requires one full-attention KV group")
         if type(kv_config.kv_cache_groups[0].kv_cache_spec) is not FullAttentionSpec:
             raise ValueError("Mooncake KV/HS requires ordinary full attention")
+        if kv_config.kv_cache_layout is None:
+            raise ValueError("Mooncake KV/HS requires a resolved physical KV cache layout")
 
     def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int | None, bool]:
         assert self.connector_scheduler is not None

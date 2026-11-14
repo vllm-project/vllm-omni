@@ -957,7 +957,7 @@ def supported_config(monkeypatch):
     )
     spec = FullAttentionSpec(block_size=4, num_kv_heads=1, head_size=3, dtype=torch.float32)
     return config, KVCacheConfig(
-        num_blocks=16, kv_cache_tensors=[], kv_cache_groups=[KVCacheGroupSpec(["layer"], spec)]
+        num_blocks=16, kv_cache_tensors=[], kv_cache_groups=[KVCacheGroupSpec(["layer"], spec)], kv_cache_layout="LBHNC"
     )
 
 
@@ -1190,6 +1190,7 @@ def test_namespace_ignores_load_path_and_transformers_version(monkeypatch):
 BLOCK16_KV_CONFIG = KVCacheConfig(
     num_blocks=16,
     kv_cache_tensors=[],
+    kv_cache_layout="LBHNC",
     kv_cache_groups=[
         KVCacheGroupSpec(["layer"], FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float16))
     ],
@@ -1292,6 +1293,20 @@ def test_namespace_isolates_resolved_physical_kv_layouts(scheduler_role):
     assert namespaces[0] != namespaces[2]
     block_hash = b"same-prompt-block"
     assert hs_key(namespaces[0], block_hash) != hs_key(namespaces[2], block_hash)
+
+
+def test_unresolved_kv_layout_is_rejected_before_namespace_creation(scheduler_role):
+    namespace = Mock(side_effect=AssertionError("must reject unresolved layout before creating its namespace"))
+    worker = Mock()
+    scheduler_role.setattr(connector_module, "cache_namespace", namespace)
+    scheduler_role.setattr(connector_module, "JointStoreWorker", worker)
+    config = scheduler_role_config()
+    kv_config = replace(BLOCK16_KV_CONFIG, kv_cache_layout=None)
+    with pytest.raises(ValueError, match="resolved physical KV cache layout"):
+        OmniMooncakeStoreConnector(config, KVConnectorRole.WORKER, kv_config)
+    namespace.assert_not_called()
+    worker.assert_not_called()
+    assert "cache_prefix" not in config.kv_transfer_config.kv_connector_extra_config
 
 
 @pytest.mark.parametrize("change", ["two_lookup_workers", "synchronous_lookup"])
