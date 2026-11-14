@@ -5,8 +5,10 @@
 Text-to-image generation was reported successful on one NVIDIA GeForce RTX
 4090 (24 GB), using GPUStack and layerwise offload of both the DiT and text
 encoder. Requests for `1024x1024` and `6272x2688` (21:9) completed successfully.
+A subsequent `1024x1024` image-editing request with two reference images also
+returned HTTP 200 and a decoded image of the requested dimensions.
 This is a community deployment report, not a benchmark or an image-quality
-comparison. Image editing and concurrent requests were not tested.
+comparison. Concurrent requests were not tested.
 
 | Item | Reported environment |
 | --- | --- |
@@ -17,10 +19,11 @@ comparison. Image editing and concurrent requests were not tested.
 | Model | Local ModelScope download of `MiniMax/MiniMax-H3-Image` |
 | Offload | Layerwise, both `dit` and `text_encoder` |
 
-The private image's digest was not recorded. The public image used by the
-[H200 recipe](./MiniMax-H3-Image-H200.md) is
-`vllm/vllm-omni:minimax-h3-image`; equivalence with the private image was not
-verified. Driver, PyTorch, host RAM capacity, peak VRAM and peak host memory
+The contributor confirmed that the tested private-registry image was
+`vllm/vllm-omni:minimax-h3-image`, downloaded, retagged and pushed without
+modification. The public image is therefore covered by this DLO deployment
+report. The image digest was not recorded. Driver, PyTorch, host RAM capacity,
+peak VRAM and peak host memory
 were not recorded for this run. Plan sufficient host memory for offloading:
 the existing DLO profile keeps about 124 GiB of DiT and text-encoder weights
 in pinned host memory, in addition to runtime overhead. That is a weight-size
