@@ -168,8 +168,9 @@ Greedy text can differ from decoding without drafts at near-tied tokens.
 On Ascend, the default MiniCPM-o deployment can run its stage-0 `ngram`
 configuration on MRv2 with `VLLM_OMNI_MRV2_NGRAM=1`. The synchronous scheduler
 proposes from committed token history for greedy chat requests, and the NPU
-runner verifies the drafts. Batches containing native duplex requests use
-ordinary decoding so the duplex sampling policy receives one logit per request.
+runner verifies the drafts. On Ascend, Thinker batches containing native
+duplex requests use ordinary decoding on either runner so the duplex
+sampling policy receives one logit per request.
 The default runner selection still uses MRv1 for Thinker Ngram when the opt-in
 is unset or the installed vLLM lacks the MRv2 Ngram interface.
 An explicit stage-0 `model_runner: v1` also selects MRv1. The Ngram

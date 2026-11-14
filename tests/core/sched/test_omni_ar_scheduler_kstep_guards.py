@@ -36,9 +36,13 @@ def test_async_scheduler_allows_unarmed_stage():
     _reject_kstep_async_scheduling(_Scheduler())
 
 
-@pytest.mark.parametrize(("native_duplex", "draft_limit", "expected"), [(False, 2, [1, 2]), (True, 3, [])])
-def test_scheduler_ngram_trims_drafts_before_accounting(native_duplex, draft_limit, expected):
+@pytest.mark.parametrize(
+    ("scheduler_ngram", "native_duplex", "expected"),
+    [(True, False, [1, 2]), (True, True, []), (False, False, [1, 2, 3]), (False, True, [])],
+)
+def test_scheduler_ngram_trims_drafts_before_accounting(scheduler_ngram, native_duplex, expected):
     scheduler = object.__new__(OmniARScheduler)
+    scheduler._scheduler_ngram = object() if scheduler_ngram else None
     scheduler.requests = {
         "chat": SimpleNamespace(resumable=False),
         "duplex": SimpleNamespace(
@@ -50,7 +54,7 @@ def test_scheduler_ngram_trims_drafts_before_accounting(native_duplex, draft_lim
         num_scheduled_tokens={"chat": 4, "duplex": 1},
         total_num_scheduled_tokens=5,
         scheduled_spec_decode_tokens={"chat": [1, 2, 3]},
-        num_spec_tokens_to_schedule=draft_limit,
+        num_spec_tokens_to_schedule=2,
     )
 
     scheduler._limit_thinker_drafts(output)
