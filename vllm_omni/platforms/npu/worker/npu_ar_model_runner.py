@@ -1061,7 +1061,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self.kv_extracted_req_ids = None
         combined_hidden_states = None
         combined_multimodal_outputs = None
-        mm_cpu = {}
+        mm_cpu = None
         #  -------------------------------------- Omni-new -------------------------------------------------
 
 
@@ -1377,6 +1377,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         for mm_key in combined_multimodal_outputs.keys():
                             mm_payload[mm_key] = _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
                     else:
+                        assert mm_cpu is not None
                         for mm_key, mm_val in mm_cpu.items():
                             if mm_key in {"meta.req_id", "meta.sparse_audio"}:
                                 continue

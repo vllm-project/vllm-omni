@@ -1,10 +1,18 @@
-# Opt-in CUDA Model Runner V2 profile. The base profile retains V1.
+# CUDA MRv2 throughput profile; NPU also selects MRv2 for both stages.
 base_config: qwen3_tts_high_concurrency.yaml
 model_runner: v2
 
 platforms:
   npu:
-    model_runner: v1
+    model_runner: v2
+    stages:
+      - stage_id: 0
+        enforce_eager: true
+      - stage_id: 1
+        # The NPU MRv2 generation runner uses eager outer dispatch.
+        enforce_eager: true
+        compilation_config:
+          cudagraph_mode: NONE
   xpu:
     model_runner: v1
   rocm:

@@ -274,3 +274,47 @@ def test_high_half_device_addresses_keep_their_bits():
     for ptr in (0x1000, (1 << 63) - 64, 1 << 63, 0xFF00_0000_1234_5000):
         meta = _as_int64_address(ptr) + np.array([0, 16, 4096], dtype=np.int64)
         assert [int(v) for v in meta.view(np.uint64)] == [ptr, ptr + 16, ptr + 4096]
+
+
+@pytest.mark.cpu
+def test_install_normalizes_staged_write_buffer_for_numpy_and_scalars(monkeypatch):
+    from vllm.utils import platform_utils
+    from vllm.v1.worker.gpu import buffer_utils
+    from vllm.v1.worker.gpu.mm import rope
+
+    from vllm_omni.worker_v2 import staged_writes
+
+    class FakeUvaBufferPool:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    swt = buffer_utils.StagedWriteTensor
+    fused = buffer_utils.FusedStagedWriter
+    # Track every class method install() patches so the global monkeypatch is
+    # restored after this CPU-only isolation test.
+    for name in ("__init__", "stage_write", "stage_write_elem", "apply_write", "clear_staged_writes"):
+        monkeypatch.setattr(swt, name, getattr(swt, name))
+    for name in ("__init__", "apply"):
+        monkeypatch.setattr(fused, name, getattr(fused, name))
+    monkeypatch.setattr(
+        rope.RopeState,
+        "init_prefill_positions",
+        rope.RopeState.__dict__["init_prefill_positions"],
+    )
+    monkeypatch.setattr(platform_utils, "is_uva_available", lambda: True)
+    monkeypatch.setattr(buffer_utils, "UvaBufferPool", FakeUvaBufferPool)
+    monkeypatch.setattr(staged_writes, "_install_staged_h2d", lambda: None)
+    monkeypatch.setattr(staged_writes, "_install_fused_bincount", lambda: None)
+    monkeypatch.setattr(staged_writes, "_installed", False)
+
+    staged_writes.install()
+    tensor = swt((2, 8), dtype=torch.int32, device=torch.device("cpu"))
+    assert isinstance(tensor._staged_write_contents, list)
+
+    tensor.stage_write(0, 0, np.array([1, 2], dtype=np.int32))
+    tensor.stage_write_elem(1, 3)
+    tensor.stage_write_elem(1, 4)
+    np.testing.assert_array_equal(
+        staged_writes._concat(tensor._staged_write_contents, tensor._np_dtype),
+        np.array([1, 2, 3, 4], dtype=np.int32),
+    )

@@ -3274,6 +3274,8 @@ class TestPlatformOverrides:
     @pytest.mark.parametrize(
         "filename,pipeline_key,cuda_default_runner,cuda_v1_stages",
         [
+            ("qwen3_tts.yaml", "qwen3_tts", "v2", ()),
+            ("qwen3_tts_high_concurrency.yaml", "qwen3_tts", "v1", (0, 1)),
             ("qwen3_tts_mrv2.yaml", "qwen3_tts", "v2", ()),
             ("moss_tts_local.yaml", "moss_tts_local", "v2", ()),
             ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", ()),
@@ -3287,13 +3289,15 @@ class TestPlatformOverrides:
     ):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        # PR #10062 turns on full-MRv2 three-stage serving on NPU by default
-        # for the three MiniCPM-o deploy profiles it touches; every other
-        # platform/profile keeps the v1 data plane.
+        # These MiniCPM-o and Qwen3-TTS profiles select full MRv2 on NPU;
+        # other NPU profiles use V1. CUDA expectations are profile-specific.
         npu_full_mrv2 = platform == "npu" and filename in (
             "minicpmo_4_5.yaml",
             "minicpmo_4_5_turn.yaml",
             "minicpmo_4_5_duplex_h200.yaml",
+            "qwen3_tts.yaml",
+            "qwen3_tts_high_concurrency.yaml",
+            "qwen3_tts_mrv2.yaml",
         )
         if platform == "cuda":
             expected_runner = cuda_default_runner

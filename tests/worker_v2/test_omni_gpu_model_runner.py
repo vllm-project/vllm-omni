@@ -670,6 +670,13 @@ def test_dummy_forward_uses_upstream_execution_state(
 
     monkeypatch.setattr(torch.Tensor, "random_", randomize)
     monkeypatch.setattr("vllm_omni.worker_v2.omni_model_runner.build_slot_mappings_by_layer", lambda *args: {})
+    monkeypatch.setattr(
+        "vllm_omni.worker_v2.omni_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm_omni.worker_v2.omni_generation_model_runner.OmniGenerationModelRunner._forward_context",
+        lambda *args, **kwargs: nullcontext(),
+    )
     platform_context = MagicMock(return_value=nullcontext())
     monkeypatch.setattr(runner, "_forward_context", platform_context)
     scheduled = SchedulerOutput.make_empty()

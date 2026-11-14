@@ -117,6 +117,13 @@ stages:
 
 platforms:
   npu:
+    model_runner: v2
     stages:
       - stage_id: 0
+        # Keep the high-concurrency Talker eager profile on NPU.
         enforce_eager: true
+      - stage_id: 1
+        # Code2Wav runs through the NPU MRv2 generation runner eagerly.
+        enforce_eager: true
+        compilation_config:
+          cudagraph_mode: NONE
