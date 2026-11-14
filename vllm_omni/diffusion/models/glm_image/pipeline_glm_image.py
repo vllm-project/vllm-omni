@@ -34,6 +34,7 @@ from transformers import (
     T5EncoderModel,
 )
 
+from vllm_omni.diffusion.cache.cachedit import set_separate_cfg
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
@@ -507,6 +508,11 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         Returns:
             Denoised latents ready for VAE decode
         """
+        # Cache-DiT needs to know whether this request makes one or two
+        # transformer calls per denoising step. This belongs here, after any
+        # image-edit preprocessing forwards and before the denoising loop.
+        set_separate_cfg(self.transformer, do_classifier_free_guidance)
+
         # Prepare conditional/unconditional drop flags
         prior_token_drop_cond = torch.full_like(prior_token_id, False, dtype=torch.bool)
         prior_token_drop_uncond = torch.full_like(prior_token_id, True, dtype=torch.bool)
