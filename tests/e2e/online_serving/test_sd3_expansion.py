@@ -17,6 +17,7 @@ from tests.helpers.runtime import (
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=1)
 FOUR_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=4)
 POSITIVE_PROMPT = "A serene mountain landscape at sunset"
 NEGATIVE_PROMPT = "blurry, low quality, distorted"
@@ -55,6 +56,15 @@ def _get_diffusion_feature_cases(model: str):
                 ],
             ),
             marks=FOUR_CARD_FEATURE_MARKS,
+        ),
+        # TeaCache on a single card
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=["--cache-backend", "tea_cache"],
+            ),
+            id="cache_tea_cache",
+            marks=SINGLE_CARD_FEATURE_MARKS,
         ),
     ]
 
