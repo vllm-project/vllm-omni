@@ -47,6 +47,7 @@ from .configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Config,
     Qwen3TTSTokenizerV2DecoderConfig,
 )
+from .mimi_conv import use_integer_padding
 
 logger = logging.get_logger(__name__)
 
@@ -1751,6 +1752,7 @@ class Qwen3TTSTokenizerV2Encoder(MimiModel):
         self.decoder = None
 
         self.post_init()
+        use_integer_padding(self)
 
 
 @auto_docstring
