@@ -1898,7 +1898,7 @@ class TestSupportedPipelines:
 
 
 @hardware_test(
-    res={"cuda": "L4"},
+    res={"cuda": "L4", "xpu": "B60"},
     num_cards=2,
 )
 def test_execute_stepwise_with_ulysses_parallel():
@@ -1914,7 +1914,7 @@ def test_execute_stepwise_with_ulysses_parallel():
 
 
 @hardware_test(
-    res={"cuda": "L4"},
+    res={"cuda": "L4", "xpu": "B60"},
     num_cards=2,
 )
 def test_execute_stepwise_with_ring_parallel():
@@ -1930,7 +1930,7 @@ def test_execute_stepwise_with_ring_parallel():
 
 
 @hardware_test(
-    res={"cuda": "L4"},
+    res={"cuda": "L4", "xpu": "B60"},
     num_cards=2,
 )
 def test_execute_stepwise_with_cfg_parallel():
