@@ -6,8 +6,12 @@ from typing import Any
 
 import numpy as np
 import pytest
+import torch
+from torch import nn
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.gr00t import pipeline_gr00t
+from vllm_omni.diffusion.models.gr00t.modeling.modules.dit import BasicTransformerBlock, DiT
 from vllm_omni.diffusion.models.gr00t.pipeline_gr00t import Gr00tN1d7Pipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -144,3 +148,117 @@ def test_reset_delegates_to_policy():
 
     assert pipeline.reset() == {"reset": True}
     assert FakeGr00tPolicy.instances[0].reset_calls == 1
+
+
+class _TinyActionHead(nn.Module):
+    """Real action-head modules at toy size; no checkpoint needed."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = DiT(num_attention_heads=2, attention_head_dim=8, output_dim=16, num_layers=2)
+        self.action_encoder = nn.Linear(4, 16)
+        self.action_decoder = nn.Linear(16, 4)
+
+
+class _TinyPolicyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.action_head = _TinyActionHead()
+
+
+def _compile_pipeline(monkeypatch, granularity):
+    od_config = OmniDiffusionConfig(
+        model="nvidia/GR00T-N1.7-3B",
+        model_config={"embodiment_tag": "LIBERO_PANDA", "strict": False},
+        diffusion_compile_granularity=granularity,
+    )
+    pipeline = Gr00tN1d7Pipeline(od_config=od_config)
+    pipeline.policy.model = _TinyPolicyModel()
+    infos: list[str] = []
+    warnings: list[str] = []
+    monkeypatch.setattr(pipeline_gr00t.logger, "info", lambda msg, *args: infos.append(msg % args))
+    monkeypatch.setattr(pipeline_gr00t.logger, "warning", lambda msg, *args: warnings.append(msg % args))
+    return pipeline, pipeline.policy.model.action_head, infos, warnings
+
+
+def _is_compiled(module: nn.Module) -> bool:
+    return module._compiled_call_impl is not None
+
+
+def test_setup_compile_full_compiles_each_action_head_module(monkeypatch):
+    pipeline, head, infos, warnings = _compile_pipeline(monkeypatch, "full")
+
+    pipeline.setup_compile()
+
+    assert all(_is_compiled(getattr(head, name)) for name in ("model", "action_encoder", "action_decoder"))
+    assert warnings == []
+    assert infos == [
+        "GR00T: compiled action_head model, action_encoder, action_decoder (granularity=full, dynamic=True)."
+    ]
+
+
+def test_setup_compile_regional_compiles_only_dit_blocks(monkeypatch):
+    pipeline, head, infos, warnings = _compile_pipeline(monkeypatch, "regional")
+    blocks = [m for m in head.model.modules() if isinstance(m, BasicTransformerBlock)]
+    eager_forwards = [block.forward for block in blocks]
+
+    pipeline.setup_compile()
+
+    assert len(blocks) == 2
+    assert all(block.forward is not eager for block, eager in zip(blocks, eager_forwards))
+    assert not _is_compiled(head.action_encoder)
+    assert not _is_compiled(head.action_decoder)
+    assert warnings == []
+    assert any("model (2 blocks)" in msg for msg in infos)
+
+
+def test_setup_compile_keeps_a_failing_module_eager_and_names_it(monkeypatch):
+    pipeline, head, infos, warnings = _compile_pipeline(monkeypatch, "full")
+
+    def _fail(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(head.action_encoder, "compile", _fail)
+
+    pipeline.setup_compile()
+
+    assert not _is_compiled(head.action_encoder)
+    assert _is_compiled(head.model)
+    assert _is_compiled(head.action_decoder)
+    assert warnings == ["GR00T: torch.compile of action_head.action_encoder failed (boom); it stays eager."]
+    assert infos == ["GR00T: compiled action_head model, action_decoder (granularity=full, dynamic=True)."]
+
+
+def test_setup_compile_does_not_report_success_when_nothing_compiled(monkeypatch):
+    pipeline, head, infos, warnings = _compile_pipeline(monkeypatch, "full")
+
+    def _fail(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    for name in ("model", "action_encoder", "action_decoder"):
+        monkeypatch.setattr(getattr(head, name), "compile", _fail)
+
+    pipeline.setup_compile()
+
+    assert infos == []
+    assert warnings[-1] == "GR00T: no action-head module was compiled; the policy runs eager."
+
+
+def test_compiled_action_head_matches_eager(monkeypatch):
+    """Full compile must not change the action-head numerics on CPU."""
+    torch.manual_seed(0)
+    pipeline, head, _, _ = _compile_pipeline(monkeypatch, "full")
+    head.eval()
+    hidden = torch.randn(1, 6, 16)
+    context = torch.randn(1, 5, 16)
+    timestep = torch.tensor([3])
+    with torch.inference_mode():
+        eager = head.action_decoder(head.model(hidden_states=hidden, encoder_hidden_states=context, timestep=timestep))
+
+    pipeline.setup_compile()
+
+    with torch.inference_mode():
+        compiled = head.action_decoder(
+            head.model(hidden_states=hidden, encoder_hidden_states=context, timestep=timestep)
+        )
+    torch.testing.assert_close(compiled, eager, rtol=1e-4, atol=1e-5)

@@ -792,6 +792,49 @@ def test_compile_transformer_uses_full_granularity(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_compile_pipeline_transformers_logs_when_nothing_to_compile(monkeypatch):
+    class NoCompileTargetsPipeline(torch.nn.Module):
+        pass
+
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = NoCompileTargetsPipeline()
+    compiled: list[str] = []
+    debug: list[str] = []
+    monkeypatch.setattr(DiffusionModelRunner, "_compile_transformer", lambda self, name: compiled.append(name))
+    monkeypatch.setattr(model_runner_module.logger, "debug", lambda msg, *args: debug.append(msg % args))
+
+    DiffusionModelRunner._compile_pipeline_transformers(runner)
+
+    assert compiled == []
+    assert len(debug) == 1
+    assert "NoCompileTargetsPipeline has no setup_compile()" in debug[0]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_pipeline_transformers_compiles_declared_targets_without_logging(monkeypatch):
+    class DitModulesPipeline(torch.nn.Module):
+        _dit_modules = ("dit",)
+
+        def __init__(self):
+            super().__init__()
+            self.dit = torch.nn.Linear(2, 2)
+
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = DitModulesPipeline()
+    compiled: list[str] = []
+    debug: list[str] = []
+    monkeypatch.setattr(DiffusionModelRunner, "_compile_transformer", lambda self, name: compiled.append(name))
+    monkeypatch.setattr(model_runner_module.logger, "debug", lambda msg, *args: debug.append(msg % args))
+
+    DiffusionModelRunner._compile_pipeline_transformers(runner)
+
+    assert compiled == ["dit"]
+    assert debug == []
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_compile_transformer_falls_back_after_synchronous_setup_failure(monkeypatch):
     model = _CompileTrackingModel()
     runner = _make_compile_runner(model)

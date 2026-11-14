@@ -55,12 +55,26 @@ Notes:
   (un)batching inside `get_action` and is not integrated with vLLM's
   continuous batching path.
 - This pipeline is a thin wrapper around the upstream HF policy
-  (`AutoModel.from_pretrained` + `enforce_eager`, `tensor_parallel_size=1`,
+  (`AutoModel.from_pretrained`, `tensor_parallel_size=1`,
   pipeline `load_weights` is a no-op). The standard diffusion accelerators
   (SP, CFG, TeaCache, VAE tiling) do not transfer to a flow-matching action
   policy at batch size 1, so a native-kernel port is intentionally out of
   scope for this recipe — the value is the OpenPI serving integration, not
   kernel-level acceleration.
+- The bundled deploy YAML keeps `enforce_eager: true`. To compile the action
+  head with `torch.compile` (the Qwen3-VL backbone stays eager), set these on
+  the stage:
+
+  ```yaml
+  enforce_eager: false
+  diffusion_compile_granularity: full
+  diffusion_compile_dynamic: false
+  ```
+
+  On one RTX PRO 6000 Blackwell (batch size 1, 4 denoising steps), this lowered
+  warm p50 latency from 99 ms to 67 ms and added about 22 s of compile time at
+  startup. The default `regional` granularity compiles only the DiT transformer
+  blocks (85 ms).
 - The WebSocket endpoint is `ws://127.0.0.1:8000/v1/realtime/robot/openpi`.
   The server handshake message (first frame after connect) is a msgpack-encoded
   dict with `action_horizon`, `action_keys`, `embodiment_tag`, and
