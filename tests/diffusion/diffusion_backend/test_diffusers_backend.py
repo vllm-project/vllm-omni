@@ -229,18 +229,12 @@ class TestPipelineArgumentsHandling:
         from vllm.platforms.interface import DeviceCapability
 
         import vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter as adapter_module
+        from vllm_omni.platforms.interface import OmniPlatformEnum
 
-        monkeypatch.setattr(
-            adapter_module,
-            "current_omni_platform",
-            SimpleNamespace(
-                is_rocm=lambda: rocm,
-                is_cuda=lambda: not rocm,
-                is_xpu=lambda: False,
-                is_musa=lambda: False,
-                get_device_capability=lambda: DeviceCapability(major, minor),
-            ),
-        )
+        # Patch the real platform object so is_cuda()/is_rocm() keep their real implementation.
+        platform = adapter_module.current_omni_platform
+        monkeypatch.setattr(platform, "_omni_enum", OmniPlatformEnum.ROCM if rocm else OmniPlatformEnum.CUDA)
+        monkeypatch.setattr(platform, "get_device_capability", lambda *_: DeviceCapability(major, minor))
 
     def test_rocm_rdna_is_not_blackwell(self, monkeypatch):
         self._patch_platform(monkeypatch, rocm=True, major=12, minor=0)
