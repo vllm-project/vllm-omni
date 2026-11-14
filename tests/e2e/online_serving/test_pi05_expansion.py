@@ -46,7 +46,6 @@ test_params = [
         server_args=[
             "--deploy-config",
             "vllm_omni/deploy/pi05.yaml",
-            "--enforce-eager",
             "--disable-log-stats",
         ],
         env_dict={
