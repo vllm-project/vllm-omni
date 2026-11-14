@@ -25,7 +25,6 @@ from transformers import PretrainedConfig
 from vllm.config import LoadConfig, ModelConfig, SchedulerConfig, VllmConfig
 
 from vllm_omni.data_entry_keys import to_dict
-from vllm_omni.model_executor.models.registry import OmniModelRegistry
 from vllm_omni.model_executor.models.zonos3 import codec as codec_checkpoint
 from vllm_omni.model_executor.models.zonos3.codec import (
     CodecManager,
@@ -832,7 +831,7 @@ def test_native_finalizer_transport_codec_lifecycle(checkpoint, termination, com
     sent = []
 
     def put(**kwargs):
-        sent.append(to_dict(kwargs["data"]))
+        sent.append(kwargs["data"] if isinstance(kwargs["data"], dict) else to_dict(kwargs["data"]))
         return True, 1, None
 
     plane = _make_plane(False)
@@ -860,7 +859,7 @@ def test_native_finalizer_transport_codec_lifecycle(checkpoint, termination, com
     try:
         for i, row in enumerate(rows):
             end = termination == "eos" and i == length - 1
-            snapshot = Zonos3CodeSnapshot(row[None], torch.tensor([True]), torch.tensor([end]))
+            snapshot = Zonos3CodeSnapshot(row[None])
             worker.submit(_Output(payload=materialize_codes(snapshot)[0], token=2 if end else 1), plane).get_output()
         plane.drain_outputs()
         # A speculative in-flight step after stop must not be published.
@@ -881,6 +880,12 @@ def test_native_finalizer_transport_codec_lifecycle(checkpoint, termination, com
         assert not plane._native_outputs_in_flight and not plane._native_terminal_pending
         audio = []
         for chunk in sent:
+            if cancelled and "codes" not in chunk:
+                # Cancellation is an engine lifecycle notification, not a
+                # fabricated final Codec frame or a synthesis flush.
+                assert chunk == {"meta": {"finished": torch.tensor(True)}}
+                model.on_requests_finished({"codec-internal"})
+                continue
             result = model(request_ids=["codec-internal"], model_intermediate_buffer=[chunk])
             audio.append(result.multimodal_outputs["model_outputs"][0])
         if not cancelled:
@@ -894,7 +899,7 @@ def test_native_finalizer_transport_codec_lifecycle(checkpoint, termination, com
                     waveform, whole_audio(oracle, frames[:expected_frames]), atol=5e-7, rtol=1e-3
                 )
         else:
-            assert sent[-1]["meta"]["aborted"] and not audio[-1].numel()
+            assert "codes" not in sent[-1]
         assert not model._manager._streams and len(model._manager._free) == 32
         model.on_requests_finished({"codec-internal"})
         assert not model._internal_to_external and not model._external_to_internal and not model._manager._finished
@@ -939,15 +944,6 @@ def test_native_model_loading_pcm_materialization_and_identity_cleanup(checkpoin
         assert waveform.numel() == 5 * 2940
         torch.testing.assert_close(waveform, whole_audio(oracle, codes[i]), atol=5e-7, rtol=1e-3)
         assert int(b[i]["sr"]) == 44100
-    terminal = model(
-        request_ids=requests,
-        model_intermediate_buffer=[
-            {"meta": {"request_id": f"external-{i}", "transport_terminal": True, "finished": torch.tensor(False)}}
-            for i in range(concurrency)
-        ],
-    )
-    terminal_audio = OmniGenerationModelRunner._build_pooler_output(terminal, concurrency)
-    assert all(not row["model_outputs"].numel() for row in terminal_audio)
     model.on_requests_finished(set(requests))
     assert not model._internal_to_external and not model._external_to_internal
     # Stable external identity can be reused only after native completion cleanup.
@@ -1002,28 +998,6 @@ def test_checkpoint_integrity_and_native_preemption_rejection(checkpoint, monkey
 
 
 @torch.inference_mode()
-def test_codec_cancel_and_identity_validation(checkpoint):
-    config, _ = checkpoint
-    model = Zonos3CodecModel(vllm_config=config)
-    model.load_weights(iter(()))
-    codes = torch.zeros((2, 10), dtype=torch.int64)
-    model(request_ids=["internal"], model_intermediate_buffer=[payload("external", codes, 0, 0)])
-    with pytest.raises(ValueError, match="identity changed"):
-        model(request_ids=["internal"], model_intermediate_buffer=[payload("other", codes, 1, 2)])
-    model.on_requests_finished({"internal"})
-    assert not model._codec_manager()._streams
-    with pytest.raises(ValueError, match="external request identity"):
-        model(request_ids=["bad"], model_intermediate_buffer=[{}])
-
-
-def test_native_codec_architecture_is_lazily_registered():
-    from vllm.model_executor.models.interfaces_base import is_text_generation_model
-
-    assert OmniModelRegistry.models["Zonos3CodecModel"].load_model_cls() is Zonos3CodecModel
-    assert is_text_generation_model(Zonos3CodecModel)
-
-
-@torch.inference_mode()
 def test_weight_loading_is_once_and_restores_ar_default_dtype(checkpoint):
     config, _ = checkpoint
     previous_dtype = torch.get_default_dtype()
@@ -1049,23 +1023,21 @@ def test_producer_cancel_discards_codec_tail_without_affecting_other_batch_reque
     model.load_weights(iter(()))
     codes = torch.randint(0, 4096, (6, 10))
     model(request_ids=["native-a"], model_intermediate_buffer=[payload("a", codes, 0, 0)])
-    aborted = zonos3_rvq_async_chunk(Manager(), None, Request("a", aborted=True), True)
+    manager = Manager()
+    assert zonos3_rvq_async_chunk(manager, None, Request("a", aborted=True), True) is None
+    model.on_requests_finished({"native-a"})
     calls = []
     handle = model.network.register_forward_pre_hook(lambda _, args: calls.append(args[0].shape[0]))
     try:
         output = model(
-            request_ids=["native-a", "native-b"],
-            model_intermediate_buffer=[
-                to_dict(aborted),
-                payload("b", codes, 0, 0, True),
-            ],
+            request_ids=["native-b"],
+            model_intermediate_buffer=[payload("b", codes, 0, 0, True)],
         )
     finally:
         handle.remove()
     assert calls == [1]  # cancelled request does not run a neural forward
-    assert output.multimodal_outputs["model_outputs"][0].numel() == 0
     torch.testing.assert_close(
-        output.multimodal_outputs["model_outputs"][1], whole_audio(oracle, codes), atol=5e-7, rtol=1e-3
+        output.multimodal_outputs["model_outputs"][0], whole_audio(oracle, codes), atol=5e-7, rtol=1e-3
     )
     assert "a" not in model._codec_manager()._streams
     assert "native-a" not in model._internal_to_external

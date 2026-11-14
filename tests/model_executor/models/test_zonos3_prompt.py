@@ -52,9 +52,7 @@ def test_raw_speaker_adapter_reserves_one_row_and_serializes_waveform(tmp_path):
     assert serialized.entries["frame_ids"].tensor_data is not None
     serialized = msgspec.msgpack.decode(msgspec.msgpack.encode(serialized), type=type(serialized))
     restored = deserialize_additional_information(serialized)
-    torch.testing.assert_close(
-        restored["frame_ids"], prompt["additional_information"]["frame_ids"]
-    )
+    torch.testing.assert_close(restored["frame_ids"], prompt["additional_information"]["frame_ids"])
     assert restored["condition_start"] == 1
     assert restored["speaker_row"] == 0
     assert "speaker_embedding" not in restored

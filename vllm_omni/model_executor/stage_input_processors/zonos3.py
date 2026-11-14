@@ -171,6 +171,7 @@ class _Request(Protocol):
     @property
     def additional_information(self) -> object: ...
 
+
 _STATE_KEY = "_zonos3_rvq_state"
 
 
