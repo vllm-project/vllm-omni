@@ -1339,8 +1339,14 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         return finished
 
     def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
+        if not self.log_stats:
+            return None
         now = time.monotonic()
-        if now - getattr(self, "_last_stats_time", 0.0) < _STATS_INTERVAL_S:
+        # EngineCore steps again only while has_requests() is True. Once it is
+        # False this may be the stage's last report until new work arrives, so it
+        # must not be throttled, or the running / waiting / KV-usage gauges keep
+        # their last busy values. Callers must invoke this after the step's frees.
+        if now - getattr(self, "_last_stats_time", 0.0) < _STATS_INTERVAL_S and self.has_requests():
             return None
         self._last_stats_time = now
         return super().make_stats(*args, **kwargs)
