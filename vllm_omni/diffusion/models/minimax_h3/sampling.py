@@ -35,9 +35,11 @@ class MiniMaxH3Model:
         cond_timesteps: tuple[float, float] = (0.999, 1.0),
         model_rows: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_schedule=None,
+        attention_sigma_schedule=(),
     ):
         self.transformer, self.branch, self.rows = transformer, branch, rows
         self.attention_schedule = attention_schedule
+        self.attention_sigma_schedule = attention_sigma_schedule
         self.edits, self.cond_timesteps = edits, cond_timesteps
         # Fixed condition rows stay in this buffer; each prediction replaces
         # the target rows. Keep it for the entire request, including retries.
@@ -118,8 +120,15 @@ class MiniMaxH3ModelBatch:
         if any("reference_kv_state" in m.branch.static_kwargs for m in models):
             # Packed kwargs carry no per-request reference-KV state.
             return logger.debug, "MiniMax H3 reference-KV requests run separately."
-        if scheduled and (not uniform_progress or len({m.attention_schedule for m in models}) > 1):
+        if scheduled and (
+            not uniform_progress
+            or len({m.attention_schedule for m in models}) > 1
+            or len({m.attention_sigma_schedule for m in models}) > 1
+        ):
             # A packed forward selects one attention profile from the published progress.
+            # Sigma windows split like step ranges. The resolved windows are in the step batch key, and
+            # the runner's batch_attention_sigma_schedule() rejects differing ones before denoise_step,
+            # so differing windows cannot reach one batch; the check mirrors the step-range one.
             return (
                 logger.info_once,
                 "MiniMax H3 runs a scheduled step batch whose requests differ in progress or schedule "
@@ -165,7 +174,9 @@ class MiniMaxH3ModelBatch:
         try:
             pdd = getattr(getattr(models[0].transformer, "arch", None), "pdd_steps", None) is not None
             if len(models) > 1:
-                scheduled = context is not None and bool(getattr(context, "attention_schedule", None))
+                scheduled = context is not None and bool(
+                    getattr(context, "attention_schedule", None) or getattr(context, "attention_sigma_schedule", None)
+                )
                 reason = self._unpacked_reason(models, pdd=pdd, scheduled=scheduled, uniform_progress=uniform_progress)
                 if reason is not None:
                     level, message = reason

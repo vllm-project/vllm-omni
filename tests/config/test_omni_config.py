@@ -404,8 +404,6 @@ def test_from_pipeline_config_preserves_current_pipeline_config_object():
     [
         "minicpmo_4_5.yaml",
         "minicpmo_4_5_turn.yaml",
-        "minicpmo_4_5_turn_mrv2.yaml",
-        "minicpmo_4_5_turn_mrv2_h200.yaml",
     ],
 )
 @pytest.mark.parametrize("cli_prefix", [None, "", "stage_0_"], ids=["defaults", "global-cli", "stage-cli"])

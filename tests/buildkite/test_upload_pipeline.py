@@ -902,6 +902,95 @@ def test_omnivoice_step_audio_weekly_pr_validation_is_focused(monkeypatch: pytes
     assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
 
 
+def test_ming_glm_indextts_breeze_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    pipeline_path = Path(".buildkite/cuda/test-weekly.yml")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    expected = {
+        "TTS · Ming · L4": {
+            "dependency": "tts_ming_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_ming_tts_expansion.py",
+                "tests/e2e/online_serving/test_ming_tts_expansion.py",
+            ),
+        },
+        "TTS · GLM · L4": {
+            "dependency": "tts_glm_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_glm_tts_expansion.py",
+                "tests/e2e/online_serving/test_glm_tts_expansion.py",
+            ),
+        },
+        "TTS · IndexTTS2 · L4": {
+            "dependency": "tts_indextts2_weekly",
+            "files": (
+                "tests/e2e/offline_inference/test_indextts2_expansion.py",
+                "tests/e2e/online_serving/test_indextts2_expansion.py",
+            ),
+        },
+        "TTS · Breeze TTS 2 · L4": {
+            "dependency": "tts_breeze_tts2_weekly",
+            "files": ("tests/e2e/online_serving/test_breeze_tts_2.py",),
+        },
+    }
+    all_files = {path for item in expected.values() for path in item["files"]}
+    for label, item in expected.items():
+        matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
+        assert len(matching_steps) == 1
+        step = matching_steps[0]
+        assert step["source_file_dependencies"] == [item["dependency"]]
+        assert step["timeout_in_minutes"] == 90
+        assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v1"}
+        assert step["mirror_hardwares"] == "l4_1"
+        command = "\n".join(step["commands"])
+        assert set(item["files"]) <= {path for path in all_files if path in command}
+        assert not ({path for path in all_files if path in command} - set(item["files"]))
+        assert "VLLM_ALLOW_LONG_MAX_MODEL_LEN" in command
+        assert "VLLM_USE_DEEP_GEMM" in command
+        assert "VLLM_MOE_USE_DEEP_GEMM" in command
+
+    group = next(step for step in doc["steps"] if "Ming GLM IndexTTS and Breeze Weekly" in step.get("group", ""))
+    assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
+
+    for label, item in expected.items():
+        for changed_file in item["files"]:
+            assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
+    labels = set(expected)
+    assert not labels & set(_surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path))
+    assert "TTS · Ming · GLM · IndexTTS · Breeze · L4" not in {step.get("label") for step in _iter_steps(doc)}
+
+
+def test_audex_cosyvoice_qwen3_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    pipeline_path = Path(".buildkite/cuda/test-weekly.yml")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    label = "TTS · Audex · CosyVoice · Qwen3-TTS · L4"
+    matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
+    assert len(matching_steps) == 1
+    step = matching_steps[0]
+    assert step["source_file_dependencies"] == [
+        "tts_audex_weekly",
+        "tts_cosyvoice3_function",
+        "tts_qwen3_tts_function",
+    ]
+    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"}
+    command = "\n".join(step["commands"])
+    assert "tests/e2e/offline_inference/test_audex_*) runner=v1" in command
+    assert "tests/e2e/offline_inference/test_cosyvoice3_expansion.py) runner=v1" in command
+    assert 'VLLM_OMNI_CI_MODEL_RUNNER="$$runner"' in command
+
+    group = next(step for step in doc["steps"] if "Audex CosyVoice and Qwen3-TTS Weekly" in step.get("group", ""))
+    assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
+
+    for changed_file in (
+        "tests/e2e/offline_inference/test_audex_tts.py",
+        "tests/e2e/offline_inference/test_cosyvoice3_expansion.py",
+        "tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py",
+    ):
+        assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
+    assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
+
+
 @pytest.mark.parametrize(
     ("smoke_exit", "text2img_exit", "img2img_exit", "expected_exit"),
     [(0, 0, 0, 0), (17, 0, 0, 17), (0, 23, 0, 23), (0, 0, 31, 31), (17, 23, 31, 17)],
