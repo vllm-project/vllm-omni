@@ -517,7 +517,8 @@ def test_ragged_npu_inputs_match_independent_streams(batch):
 def test_ragged_npu_groups_allow_lengths_but_keep_hift_boundary():
     items, states, features = _prepared_rows()
     states[1].flow_cache["conformer_att_cache"] = torch.cat([states[1].flow_cache["conformer_att_cache"]] * 2, dim=3)
-    states[1].flow_cache["estimator_att_cache"] = torch.cat([states[1].flow_cache["estimator_att_cache"]] * 2, dim=4)
+    # Split K/V estimator cache: (n_t, depth, 2, rows, heads, frames, head_dim).
+    states[1].flow_cache["estimator_att_cache"] = torch.cat([states[1].flow_cache["estimator_att_cache"]] * 2, dim=5)
     features[1] = replace(
         features[1],
         speech_tokens=torch.cat([features[1].speech_tokens] * 2, dim=1),

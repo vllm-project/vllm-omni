@@ -8,7 +8,7 @@
 - Vendor: NVIDIA
 - Model: `nvidia/Alpamayo2-Super`
 - Task: Ego trajectory prediction with chain-of-thought reasoning
-- Mode: Offline inference (`Omni`)
+- Mode: Offline inference (`Omni`) and online serving (OpenPI WebSocket)
 - Hardware: 1x NVIDIA H200 141 GB
 - Maintainer: Community
 
@@ -30,7 +30,7 @@ reach stage 1 together share one expert batch.
 | --- | --- |
 | Images | Up to 7 cameras x 4 frames, camera-major, cameras sorted by index (0 cross left, 1 front wide, 2 cross right, 3 rear left, 4 rear tele, 5 rear right, 6 front tele); resized to the checkpoint's 163,840–196,608 pixel budget |
 | Ego history | 16 poses at 10 Hz ending at t0, in the ego frame at t0: `ego_history_xyz` `(16, 3)`, `ego_history_rot` `(16, 3, 3)` |
-| Output | Stage 0: the reasoning tokens. Stage 1: `actions`, `(64, 3)` ego positions at 10 Hz in the same frame |
+| Output | Stage 0: the reasoning tokens. Stage 1: `actions`, `(64, 3)` ego positions at 10 Hz in the same frame; `(n, 64, 3)` with `n > 1` |
 | Deployment | BF16, TP=1, both stages on one GPU, eager ([`alpamayo2_super.yaml`](../../vllm_omni/deploy/alpamayo2_super.yaml)) |
 
 ## References
@@ -146,9 +146,72 @@ if __name__ == "__main__":
     main()
 ```
 
-Each request returns one trajectory. To sample K trajectories, submit K
-requests with different seeds; requests in flight decode together and share
-expert batches.
+By default a request returns one trajectory. To sample several from one
+request, set `n` on the reasoning params; each reasoning sample gets its own
+trajectory:
+
+```python
+    reasoning_params.n = 6  # before omni.generate
+    ...
+    for sample in outputs[0].outputs:
+        print(sample.index, tokenizer.decode(sample.token_ids, skip_special_tokens=True))
+    trajectories = outputs[1].multimodal_output["actions"]  # trajectories[i] follows sample i
+    assert trajectories.shape == (6, 64, 3) and trajectories.isfinite().all()
+```
+
+Sample i uses seed `seed + i` on both stages, like six separate requests with
+seeds 42 to 47.
+
+### Online serving
+
+Serve the policy over the [OpenPI API](../../docs/serving/openpi_api.md)
+WebSocket:
+
+```bash
+vllm serve nvidia/Alpamayo2-Super --omni --port 8091
+```
+
+A client sends the same observation as the offline script. A message is
+limited to 64 MiB, so the frames are sent at the model's resolution;
+`"sampling_params": {"n": 6}` returns six trajectories (omit it for one):
+
+```python
+import torch
+from alpamayo2_super.load_physical_aiavdataset import load_physical_aiavdataset
+from openpi_client.websocket_client_policy import WebsocketClientPolicy
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+
+from vllm_omni.model_executor.models.alpamayo2_super import Alpamayo2SuperConfig
+
+scene = load_physical_aiavdataset("030c760c-ae38-49aa-9ad8-f5650a545d26", t0_us=5_100_000)
+frames = scene["image_frames"]  # (cameras, 4, 3, H, W) uint8
+config = Alpamayo2SuperConfig.from_pretrained("nvidia/Alpamayo2-Super")
+height, width = smart_resize(
+    *frames.shape[-2:], factor=32, min_pixels=config.min_pixels, max_pixels=config.max_pixels
+)
+frames = (
+    torch.nn.functional.interpolate(frames.flatten(0, 1).float(), size=(height, width), mode="bicubic", antialias=True)
+    .round()
+    .clamp(0, 255)
+    .to(torch.uint8)
+    .unflatten(0, frames.shape[:2])
+)
+
+policy = WebsocketClientPolicy(host="ws://localhost:8091/v1/realtime/robot/openpi")
+trajectories = policy.infer(
+    {
+        "image_frames": frames.numpy(),
+        "camera_indices": scene["camera_indices"].numpy(),
+        "ego_history_xyz": scene["ego_history_xyz"].reshape(16, 3).numpy(),
+        "ego_history_rot": scene["ego_history_rot"].reshape(16, 3, 3).numpy(),
+        "seed": 42,
+        "sampling_params": {"n": 6},
+    }
+)
+assert trajectories.shape == (6, 64, 3)
+```
+
+The client needs `pip install openpi-client`.
 
 ## Verification
 
@@ -209,7 +272,7 @@ One bounded run, not a benchmark:
 | Feature | Status | Guide |
 | --- | --- | --- |
 | Offline inference | Supported | This recipe |
-| Online serving | Not supported | [OpenPI API](../../docs/serving/openpi_api.md) |
+| Online serving | Supported (OpenPI WebSocket) | This recipe, [OpenPI API](../../docs/serving/openpi_api.md) |
 | Tensor parallelism | Not supported (TP=1) | [Stage configs](../../docs/configuration/stage_configs.md) |
 | CUDA graphs | Not supported (eager) | [Stage configs](../../docs/configuration/stage_configs.md) |
 | Quantization | Not supported (BF16) | [Quantization](../../docs/user_guide/quantization/overview.md) |

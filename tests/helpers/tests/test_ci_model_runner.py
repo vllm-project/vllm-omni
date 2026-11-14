@@ -9,7 +9,10 @@ import pytest
 import yaml
 
 from tests.helpers.runtime import _resolve_server_deploy_args
-from tests.helpers.stage_config import stage_config_path_for_run_level
+from tests.helpers.stage_config import (
+    get_deploy_config_path,
+    stage_config_path_for_run_level,
+)
 from vllm_omni.config.stage_config import (
     _apply_platform_overrides,
     load_deploy_config,
@@ -78,6 +81,17 @@ def test_ci_model_runner_env_overrides_inherited_cuda_platform(tmp_path: Path, m
     deploy = _apply_platform_overrides(load_deploy_config(rewritten), "cuda")
     assert resolve_stage_model_runner(deploy, deploy.stages[0]) == "v2"
     assert deploy.stages[0].max_num_seqs == 2
+
+
+def test_voxtral_direct_async_ci_config_selects_v2(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_CI_MODEL_RUNNER", "v2")
+
+    rewritten = stage_config_path_for_run_level(get_deploy_config_path("voxtral_tts.yaml"), "full_model")
+    assert rewritten is not None
+    deploy = load_deploy_config(rewritten)
+
+    assert deploy.model_runner == "v2"
+    assert all(resolve_stage_model_runner(deploy, stage) == "v2" for stage in deploy.stages)
 
 
 def test_ci_model_runner_env_unset_keeps_the_launch_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
