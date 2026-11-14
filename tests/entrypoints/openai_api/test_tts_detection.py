@@ -178,6 +178,7 @@ _PIPELINE_STAGES = [
     # exactly as it was in the deleted ladder; kept here so detection is still
     # exercised on it.
     "omnivoice_generator",
+    "phonon",
     "qwen3_tts",
     "step_audio2_thinker",
     "talker",
@@ -373,3 +374,8 @@ def test_default_stage_serves_speech_is_unconditional():
             continue
         for key in cls.stage_keys:
             assert cls.stage_serves_speech(key, frozenset({key})) is True
+
+
+@pytest.mark.parametrize("stage,arch", [("phonon", None), (None, "PhononTalkerForConditionalGeneration")])
+def test_phonon_detection(stage, arch):
+    assert detect_tts_model_type(stage, arch) == "phonon"

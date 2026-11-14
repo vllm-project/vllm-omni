@@ -126,6 +126,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.pipeline import (
 )
 from vllm_omni.model_executor.models.omnivoice.pipeline import OMNIVOICE_PIPELINE
 from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
+from vllm_omni.model_executor.models.phonon.pipeline import resolve_phonon_pipeline
 from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
     QWEN2_5_OMNI_PIPELINE,
     QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
@@ -157,6 +158,7 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
+    "gradium_phonon_tts": resolve_phonon_pipeline,
     "alpamayo2_super": ALPAMAYO2_SUPER_PIPELINE,
     "arktts": AUDIO8_TTS_PIPELINE,
     "audex_s2s": AUDEX_S2S_PIPELINE,
