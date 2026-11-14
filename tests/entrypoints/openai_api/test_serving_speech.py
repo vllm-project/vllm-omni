@@ -1406,6 +1406,7 @@ class TestSpeechAPI:
         # Regression: StepScheduler.add_request() used to receive
         # num_inference_steps=None and fail while converting it to int.
         scheduler = StepScheduler()
+        scheduler.od_config = SimpleNamespace(diffusion_attention_schedule=None)
         scheduler.add_request(
             OmniDiffusionRequest(
                 prompt="Hello",
@@ -1447,7 +1448,7 @@ class TestSpeechAPI:
             assert response.status_code == 200
 
         scheduler = RequestScheduler()
-        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2, diffusion_attention_schedule=None))
         for index, sampling_params in enumerate(passed_sampling_params):
             scheduler.add_request(
                 OmniDiffusionRequest(

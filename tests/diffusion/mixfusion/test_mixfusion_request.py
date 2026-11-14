@@ -24,6 +24,7 @@ class _Config:
     mixfusion_max_chunks: int = 128
     max_num_seqs: int = 4
     model_class_name: str = "QwenImagePipeline"
+    diffusion_attention_schedule: None = None
 
 
 @dataclass

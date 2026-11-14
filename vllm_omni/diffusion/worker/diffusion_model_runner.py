@@ -523,7 +523,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         are accepted; a custom pipeline is not. A stage that runs no denoising, such as the encode
         stage of a disaggregated deployment, is also rejected: its schedule would never apply.
         """
-        if getattr(self.od_config, "diffusion_attention_schedule", None) is None:
+        if self.od_config.diffusion_attention_schedule is None:
             return
         model_class_name = self.od_config.model_class_name
         pipeline_class_name = None
@@ -547,7 +547,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         scheduled step would not run the attention it selects. Runs after the cache backend is
         final, because a model without cache acceleration clears ``od_config.cache_backend``.
         """
-        service = getattr(self.od_config, "diffusion_attention_schedule", None)
+        service = self.od_config.diffusion_attention_schedule
         if service is None:
             return
         cache_backend = self.od_config.cache_backend
@@ -889,7 +889,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 raise ValueError("Cannot execute model with empty prompt")
         if require_request_batch_support and not getattr(self.pipeline, "supports_request_batch", False):
             raise RuntimeError(f"{type(self.pipeline).__name__} does not support request-batch forward.")
-        service = getattr(od_config, "diffusion_attention_schedule", None)
+        service = od_config.diffusion_attention_schedule
         sampling_params = [req.sampling_params for req in reqs]
         attention_schedule = resolve_batch_attention_schedule(sampling_params, service)
         sigma_schedule = resolve_batch_attention_sigma_schedule(sampling_params, service)
@@ -1263,10 +1263,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     external_req_id=getattr(sched_new_req.req, "external_req_id", None),
                     mixfusion_info=sched_new_req.req.mixfusion_info,
                     attention_schedule=resolve_request_attention_schedule(
-                        sched_new_req.req.sampling_params, getattr(self.od_config, "diffusion_attention_schedule", None)
+                        sched_new_req.req.sampling_params, self.od_config.diffusion_attention_schedule
                     ),
                     attention_sigma_schedule=resolve_request_attention_sigma_schedule(
-                        sched_new_req.req.sampling_params, getattr(self.od_config, "diffusion_attention_schedule", None)
+                        sched_new_req.req.sampling_params, self.od_config.diffusion_attention_schedule
                     ),
                 )
                 if (

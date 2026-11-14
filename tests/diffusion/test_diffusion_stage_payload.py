@@ -61,7 +61,10 @@ class _FakeKVTransferManager:
 def _make_runner(connector, *, payload_keys=("text_encoder_output",), optional_keys=(), recv_stages=("0", "1")):
     runner = object.__new__(DiffusionModelRunner)
     runner.od_config = SimpleNamespace(
-        stage_input_payload_keys=payload_keys, stage_input_optional_payload_keys=optional_keys, stage_id=1
+        stage_input_payload_keys=payload_keys,
+        stage_input_optional_payload_keys=optional_keys,
+        stage_id=1,
+        diffusion_attention_schedule=None,
     )
     runner.device = torch.device("cpu")
     runner._local_rank = 0

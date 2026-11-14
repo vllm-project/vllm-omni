@@ -65,6 +65,7 @@ def _od_config(**overrides):
         diffusion_use_graph=True,
         enforce_eager=False,
         diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+        diffusion_attention_schedule=None,
         cache_backend="none",
         enable_cpu_offload=False,
         enable_layerwise_offload=False,

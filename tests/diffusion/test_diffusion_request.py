@@ -68,7 +68,7 @@ def test_non_dummy_request_is_not_identified_as_dummy_run():
 
 def test_step_scheduler_separates_full_forward_fallback_from_step_requests():
     scheduler = StepScheduler()
-    scheduler.initialize(SimpleNamespace())
+    scheduler.initialize(SimpleNamespace(diffusion_attention_schedule=None))
     scheduler.max_num_running_reqs = 2
     text_request = _make_request()
     text_request.use_step_execution = False

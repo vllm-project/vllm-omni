@@ -78,6 +78,7 @@ def control_startup(tmp_path, monkeypatch):
         controlnet_model_path=str(path),
         diffusion_offload_config=None,
         revision=None,
+        diffusion_attention_schedule=None,
     )
     return pipeline_module, config
 
@@ -675,6 +676,7 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
     pipeline.od_config = SimpleNamespace(
         controlnet_model_path="/control.safetensors",
         step_execution=False,
+        diffusion_attention_schedule=None,
     )
     pipeline.load_vae_encoder = True
     pipeline.video_vae = nn.Module()

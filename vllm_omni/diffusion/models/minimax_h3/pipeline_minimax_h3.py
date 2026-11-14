@@ -962,7 +962,7 @@ class MiniMaxH3Pipeline(
         # A request that omits attention_schedule, attention_sigma_schedule and latent_refine inherits the
         # default step ranges and the latent_refine default, a pair _prepare_encoder_conditioning_inputs
         # rejects; fail here instead of on every such request.
-        service_schedule = getattr(od_config, "diffusion_attention_schedule", None)
+        service_schedule = od_config.diffusion_attention_schedule
         additional_config = getattr(od_config, "additional_config", None) or {}
         if (
             service_schedule is not None
@@ -3396,7 +3396,7 @@ class MiniMaxH3Pipeline(
         # windows do not depend on the step count. Both execution modes reach this point before any denoise
         # forward. Step mode runs it outside the forward context, so the request's own schedule is resolved
         # against the service default; in request mode that is the schedule the runner bound.
-        service = getattr(self.od_config, "diffusion_attention_schedule", None)
+        service = self.od_config.diffusion_attention_schedule
         attention_schedule = require_request_attention_schedule_fits(sampling, service, num_steps)
         sigma_schedule = resolve_request_attention_sigma_schedule(sampling, service)
         transformer = getattr(

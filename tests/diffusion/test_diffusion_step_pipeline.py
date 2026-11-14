@@ -512,6 +512,7 @@ def _make_runner(
         diffusion_kv_mode=diffusion_kv_mode,
         parallel_config=SimpleNamespace(use_hsdp=False),
         streaming_output=False,
+        diffusion_attention_schedule=None,
     )
     runner.device = torch.device("cpu")
     runner.pipeline = _StepPipeline()
@@ -532,6 +533,7 @@ def _make_distributed_runner(mode: str, device: torch.device):
         diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
         parallel_config=SimpleNamespace(use_hsdp=False),
         streaming_output=False,
+        diffusion_attention_schedule=None,
     )
     runner.device = device
     runner.pipeline = _DistributedStepPipeline(mode=mode, device=device)
@@ -1526,6 +1528,7 @@ class TestRunner:
             model_class_name="RequestOnlyPipeline",
             parallel_config=SimpleNamespace(use_hsdp=False),
             streaming_output=False,
+            diffusion_attention_schedule=None,
         )
         runner.device = torch.device("cpu")
         runner.pipeline = None
@@ -1752,7 +1755,7 @@ class TestEngine:
     )
     def test_step_engine_returns_error(self, execute_fn, expected_error, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace())
+        scheduler.initialize(SimpleNamespace(diffusion_attention_schedule=None))
         engine = _make_engine(scheduler, execute_fn=execute_fn)
 
         output = engine.add_req_and_wait_for_response(_make_engine_request("req-error", num_inference_steps=2))
@@ -1762,7 +1765,7 @@ class TestEngine:
 
     def test_step_execution_completes(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace())
+        scheduler.initialize(SimpleNamespace(diffusion_attention_schedule=None))
         engine = _make_engine(scheduler)
         request = _make_engine_request("req-step", num_inference_steps=2)
 
@@ -1788,7 +1791,7 @@ class TestEngine:
 
     def test_step_abort_stops_rescheduling_after_first_step(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace())
+        scheduler.initialize(SimpleNamespace(diffusion_attention_schedule=None))
         engine = _make_engine(scheduler)
         request = _make_engine_request("req-stop", num_inference_steps=4)
 
@@ -1813,7 +1816,7 @@ class TestEngine:
 
     def test_step_abort_after_reschedule_returns_aborted_output(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace())
+        scheduler.initialize(SimpleNamespace(diffusion_attention_schedule=None))
         engine = _make_engine(scheduler)
         request = _make_engine_request("req-mid", num_inference_steps=4)
 
@@ -1840,7 +1843,7 @@ class TestEngine:
 
     def test_finished_step_without_result_returns_error(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace())
+        scheduler.initialize(SimpleNamespace(diffusion_attention_schedule=None))
         engine = _make_engine(
             scheduler,
             execute_fn=lambda _: RunnerOutput(

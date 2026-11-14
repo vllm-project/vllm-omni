@@ -38,7 +38,7 @@ def _make_engine() -> DiffusionEngine:
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine.od_config = SimpleNamespace(distributed_executor_backend=None)
     engine.scheduler = RequestScheduler()
-    engine.scheduler.initialize(SimpleNamespace())
+    engine.scheduler.initialize(SimpleNamespace(diffusion_attention_schedule=None))
     engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
     engine.executor = SimpleNamespace(
         collective_rpc=Mock(),
