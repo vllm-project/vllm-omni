@@ -7,7 +7,6 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -38,14 +37,12 @@ def _descriptor_item(tmp_path):
     }
 
 
-def test_reference_rgb_reuse_gate_is_strict(monkeypatch):
-    monkeypatch.delenv("VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE", raising=False)
-    assert not reference_video.reference_video_transcode_rgb_reuse_enabled()
-    monkeypatch.setenv("VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE", "1")
-    assert reference_video.reference_video_transcode_rgb_reuse_enabled()
-    monkeypatch.setenv("VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE", "true")
-    with pytest.raises(ValueError, match="must be 0 or 1"):
-        reference_video.reference_video_transcode_rgb_reuse_enabled()
+def test_reference_rgb_reuse_request_default_is_disabled():
+    resolve = reference_video.resolve_reference_video_decode_reuse
+    key = reference_video.MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY
+    assert resolve({}) is False
+    assert resolve({key: False}) is False
+    assert resolve({key: True}) is True
 
 
 def test_prepared_reference_descriptor_round_trips_rgb_sidecar(tmp_path):
@@ -72,14 +69,12 @@ def test_prepared_rgb_sidecar_validates_exact_size(tmp_path):
         reference_video.load_prepared_rgb_frames(item)
 
 
-@pytest.mark.parametrize("enabled", ["0", "1", "true"])
 @pytest.mark.parametrize("has_sidecar", [False, True])
 @pytest.mark.parametrize("request_override", [None, False, True])
-def test_reused_descriptor_selects_frames_independently_of_consumer_env(
-    monkeypatch, tmp_path, enabled, has_sidecar, request_override
+def test_reused_descriptor_selects_frames_independently_of_request_option(
+    monkeypatch, tmp_path, has_sidecar, request_override
 ):
     """Old descriptors remain usable; an existing sidecar is always consumed."""
-    monkeypatch.setenv("VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE", enabled)
     item = _descriptor_item(tmp_path)
     item["prepared_path"] = str(tmp_path / "prepared.mp4")
     Path(item["prepared_path"]).touch()
@@ -105,9 +100,7 @@ def test_reused_descriptor_selects_frames_independently_of_consumer_env(
     assert result.video_timestamps == [[0.0]]
 
 
-@pytest.mark.parametrize("enabled", ["0", "1"])
-def test_reused_descriptor_does_not_fall_back_from_a_truncated_sidecar(monkeypatch, tmp_path, enabled):
-    monkeypatch.setenv("VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE", enabled)
+def test_reused_descriptor_does_not_fall_back_from_a_truncated_sidecar(monkeypatch, tmp_path):
     item = _descriptor_item(tmp_path)
     item["prepared_path"] = str(tmp_path / "prepared.mp4")
     Path(item["prepared_path"]).touch()
@@ -117,7 +110,7 @@ def test_reused_descriptor_does_not_fall_back_from_a_truncated_sidecar(monkeypat
     with pytest.raises(OmniClientError, match="expected 24"):
         encoder_processing.prepare_encoder_inputs(
             {"prompt": "reference clip", "multi_modal_data": {"video": "source.mp4"}},
-            SimpleNamespace(extra_args={"task": "ref2va"}),
+            _Sampling({"task": "ref2va"}),
             prepared_reference_videos=[item],
         )
 
@@ -138,8 +131,7 @@ def ffmpeg_rgb_encoder():
 
 
 @pytest.mark.parametrize("value", [None, 0, 1, "true", "false", "1", [], {}])
-def test_request_reuse_option_rejects_non_booleans(monkeypatch, value):
-    monkeypatch.setenv("VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE", "1")
+def test_request_reuse_option_rejects_non_booleans(value):
     with pytest.raises(OmniClientError, match="reference_video_decode_reuse must be a boolean"):
         encoder_processing.prepare_encoder_inputs(
             {"prompt": "reference clip", "multi_modal_data": {"video": "not-decoded.mp4"}},
@@ -184,24 +176,15 @@ def reference_clip(tmp_path_factory, ffmpeg_rgb_encoder):
 
 
 @pytest.mark.parametrize(
-    ("environment", "request_override", "expected_reuse"),
+    ("request_override", "expected_reuse"),
     [
-        (None, None, False),
-        ("1", None, True),
-        ("1", False, False),
-        ("0", True, True),
-        ("true", True, True),
-        ("true", False, False),
+        (None, False),
+        (False, False),
+        (True, True),
     ],
 )
-def test_request_option_reaches_real_rgb_producer(
-    monkeypatch, reference_clip, environment, request_override, expected_reuse
-):
+def test_request_option_reaches_real_rgb_producer(monkeypatch, reference_clip, request_override, expected_reuse):
     """Exercise request resolution, real ffmpeg output, and both live consumers."""
-    if environment is None:
-        monkeypatch.delenv("VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE", environment)
     monkeypatch.setattr(encoder_processing, "resolve_minimax_h3_shape", lambda *args: (256, 256, 52, 13, 160))
     original_transcode = reference_video._transcode_reference_video
     captures = []
@@ -224,7 +207,7 @@ def test_request_option_reaches_real_rgb_producer(
     assert result.video_timestamps == [[0.25, 1.25, 2.0]]
 
 
-def test_consecutive_request_overrides_do_not_change_process_default(monkeypatch, reference_clip):
+def test_removed_environment_switch_does_not_override_consecutive_requests(monkeypatch, reference_clip):
     monkeypatch.setenv("VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE", "1")
     monkeypatch.setattr(encoder_processing, "resolve_minimax_h3_shape", lambda *args: (256, 256, 52, 13, 160))
     original_transcode = reference_video._transcode_reference_video
@@ -245,7 +228,7 @@ def test_consecutive_request_overrides_do_not_change_process_default(monkeypatch
         )
         outputs.append(result.media.videos[0].numpy())
         assert os.environ["VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE"] == "1"
-    assert captures == [False, True, True]
+    assert captures == [False, True, False]
     np.testing.assert_array_equal(outputs[0], outputs[1])
     np.testing.assert_array_equal(outputs[0], outputs[2])
 

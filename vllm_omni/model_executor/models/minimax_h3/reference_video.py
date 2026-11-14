@@ -19,22 +19,11 @@ from vllm_omni.errors import OmniClientError
 
 MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY = "minimax_h3_prepared_reference_videos"
 MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY = "reference_video_decode_reuse"
-_REFERENCE_VIDEO_DECODE_REUSE_ENV = "VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE"
 
 
-def reference_video_transcode_rgb_reuse_enabled() -> bool:
-    """Legacy process default, used only when the request omits its option."""
-    value = os.environ.get(_REFERENCE_VIDEO_DECODE_REUSE_ENV, "0")
-    if value not in {"0", "1"}:
-        raise ValueError(f"{_REFERENCE_VIDEO_DECODE_REUSE_ENV} must be 0 or 1, got {value!r}")
-    return value == "1"
-
-
-def resolve_reference_video_decode_reuse(extra_args: Mapping[str, object]) -> bool | None:
-    """Validate the request override while distinguishing omission from false."""
-    if MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY not in extra_args:
-        return None
-    value = extra_args[MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY]
+def resolve_reference_video_decode_reuse(extra_args: Mapping[str, object]) -> bool:
+    """Resolve the boolean request option, disabled when omitted."""
+    value = extra_args.get(MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY, False)
     if not isinstance(value, bool):
         raise OmniClientError(f"MiniMax H3 {MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY} must be a boolean")
     return value
@@ -504,7 +493,7 @@ def prepare_reference_videos(
     target_frame_count: int,
     workdir: str,
     start_time_seconds: Any = None,
-    decode_reuse: bool | None = None,
+    decode_reuse: bool = False,
 ) -> list[dict[str, Any]]:
     if isinstance(values, (str, os.PathLike)):
         values = [values]
@@ -518,7 +507,7 @@ def prepare_reference_videos(
         raise OmniClientError("start_time_seconds must contain one value per reference video")
 
     prepared: list[dict[str, Any]] = []
-    capture_rgb = reference_video_transcode_rgb_reuse_enabled() if decode_reuse is None else decode_reuse
+    capture_rgb = decode_reuse
     total_duration = 0.0
     for index, value in enumerate(values):
         item_start = start_times[index]
@@ -860,7 +849,8 @@ __all__ = [
     "prepare_edit_video",
     "prepare_reference_videos",
     "sample_reference_video_frames",
-    "reference_video_transcode_rgb_reuse_enabled",
+    "MINIMAX_H3_REFERENCE_VIDEO_DECODE_REUSE_KEY",
+    "resolve_reference_video_decode_reuse",
     "validate_reference_audio_files",
     "validate_reference_audio_waveforms",
 ]

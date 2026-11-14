@@ -471,10 +471,8 @@ references perform no extra work.
 
 The option is evaluated once per request at the preparation producer. Requests
 with different values can share a server without changing process environment.
-An explicit `true` or `false` overrides the legacy experimental
-`VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE` environment variable. When the request
-omits the option, that variable remains a compatibility fallback (`0`/`1` only);
-with neither set, reuse is disabled.
+This request field is the only configuration entry point. When omitted, reuse
+is disabled; process environment does not change its value.
 
 The sidecar needs `frame_count × height × width × 3` bytes, using the prepared
 reference's dimensions and frame count, not the generated video's dimensions.

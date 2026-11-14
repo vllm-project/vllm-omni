@@ -125,14 +125,13 @@ curl -s http://localhost:8091/v1/videos/sync \
   -o output.mp4
 ```
 
-The default is off. Set the request field to `false` to opt out, including when
-the legacy `VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE=1` environment fallback is set.
+The default is off. Set the request field to `false` or omit it to opt out.
 Offline sampling uses `extra_args` with the same key. This setting creates
 temporary raw RGB storage: 52 prepared frames at 704×1280 need about 134 MiB.
 Size local temporary storage for the actual reference dimensions and concurrent
 requests; local preprocessing gains do not imply an end-to-end speedup.
 See [the Videos API contract](../../docs/serving/videos_api.md#minimax-h3-reference-video-rgb-reuse)
-for validation, legacy-environment precedence and already-prepared descriptors.
+for validation and already-prepared descriptors.
 
 ## Start a server
 
