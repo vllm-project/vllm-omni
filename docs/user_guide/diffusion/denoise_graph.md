@@ -132,6 +132,10 @@ omni = Omni(
 ## Related options
 
 `enable_cuda_graph_decode` captures the KV-cache decode steps of Qwen-Image-2.1
-and is independent of this option. When `diffusion_use_graph` is on, the
+and is independent of this option. On graph-eligible serves, Qwen-Image-2.1
+groups requests by positive and, when true CFG is active, negative prompt token
+length to avoid padding that would disable decode capture. When the tokenizer
+is unavailable or decode graphs are disabled, grouping remains length-agnostic.
+When `diffusion_use_graph` is on, the
 regional `torch.compile` path disables Inductor's own CUDA graphs so the two
 graph layers do not stack.
