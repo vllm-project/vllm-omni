@@ -162,9 +162,23 @@ hold their slots, and closing sessions release them after cleanup completes.
 When no group has capacity, opening a session fails with the retryable
 `resource_exhausted` error containing `replica_capacity_exhausted`.
 
-`least_sessions` supports local single-host deployments only; coordinator or
-distributed routing is rejected at startup. A per-replica cap above `1` also
-requires the model plugin to support concurrent sessions on one replica; use
+`least_sessions` supports replicas attached through distributed runtimes,
+including multiple runtimes serving the same stage across hosts. Declare the
+cluster-wide total with `stages[].num_replicas` and each runtime's local count
+with `--omni-dp-size-local`. On the head, the local count is also the minimum
+total, preserving the CLI override when the configured count defaults to `1`.
+Any stage runtime can be the head by omitting `--headless`; the others connect
+to its master address and port. Use a connector that supports the deployed
+cross-host transport. Equal replica counts can derive groups by replica index;
+unequal counts require explicit `replica_groups`, as in local deployments.
+Groups refer to registration-assigned replica IDs, not host identities.
+The group topology is fixed at startup; attaching more replicas does not add
+duplex groups or migrate existing sessions. See the
+[multi-runtime design](../design/fullduplex.md#multiple-runtimes-and-hosts)
+for a split-stage topology, ownership boundaries and validation scope.
+
+A per-replica cap above `1` also requires the model plugin to support concurrent
+sessions on one replica; use
 `1` for plugins without that capability, including VoiceChat. A failed replica
 closes all sessions assigned to it, including idle sessions. Those sessions
 are not migrated, and other groups continue serving. Under `least_sessions`,

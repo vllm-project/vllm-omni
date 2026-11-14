@@ -1565,6 +1565,41 @@ async def test_replica_failure_closes_active_and_idle_owners_only() -> None:
 
 
 @pytest.mark.asyncio
+async def test_membership_detach_fails_the_sessions_reserved_on_the_replica() -> None:
+    """A hub-reported detach reaches the same policy as an in-process engine death."""
+    orchestrator, _, rpc_q, _ = _build(stages=2, replicas=2, runtime_config=_placement_config())
+    buffers = {}
+    try:
+        for session_id in (SESSION_ID, "healthy", "idle"):
+            buffers[session_id] = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+            assert (await _open(orchestrator, rpc_q, session_id=session_id, output_buffer=buffers[session_id])).ok
+        await _submit(orchestrator, _append_audio())
+        await orchestrator._on_replica_removed(1, 0)
+        await _settle(orchestrator)
+        manager = orchestrator.session_manager
+        await asyncio.wait_for(asyncio.gather(*tuple(manager._dispatched_control_tasks)), timeout=1)
+        await asyncio.wait_for(manager.reap_expired(), timeout=1)
+        assert orchestrator.replica_placement.snapshot()["sessions"] == {"healthy": 1}
+        assert set(manager.runners) == {"healthy"}
+        assert not orchestrator.stage_pools[1].is_replica_available(0)
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_replica_death_is_tolerated_without_a_placement_lookup() -> None:
+    """A replica attached after startup has no group; its death must not raise."""
+    orchestrator, _, rpc_q, _ = _build(stages=1, replicas=1, runtime_config=_placement_config())
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        await orchestrator._on_replica_removed(0, 7)
+        await _settle(orchestrator)
+        assert orchestrator.replica_placement.snapshot()["sessions"] == {SESSION_ID: 0}
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_legacy_session_open_keeps_request_round_robin_and_has_no_placement() -> None:
     orchestrator, _, rpc_q, _ = _build(replicas=2)
     try:
@@ -1580,26 +1615,61 @@ async def test_legacy_session_open_keeps_request_round_robin_and_has_no_placemen
         await orchestrator.session_manager.shutdown()
 
 
-@pytest.mark.parametrize("distributed_hook", ["hub", "lb", "membership"])
-def test_least_sessions_rejects_distributed_startup(distributed_hook) -> None:
-    pools = _build_stage_pools([[FakeStageClient()]], stage_vllm_configs=_stage_configs(1))
-    kwargs = {}
-    if distributed_hook == "hub":
+def _distributed_pools(*, replicas: int, hook: str):
+    pools = _build_stage_pools(
+        [[FakeStageClient() for _ in range(replicas)]],
+        stage_vllm_configs=_stage_configs(1),
+    )
+    kwargs: dict[str, object] = {}
+    if hook == "hub":
         pools[0].attach_hub(SimpleNamespace())
-    elif distributed_hook == "lb":
+    elif hook == "lb":
         pools[0].attach_load_balancer(SimpleNamespace())
     else:
         kwargs["membership_controller"] = SimpleNamespace()
-    with pytest.raises(ValueError, match="does not support distributed"):
-        DuplexOrchestrator(
-            request_async_queue=asyncio.Queue(),
-            output_async_queue=asyncio.Queue(),
-            rpc_async_queue=asyncio.Queue(),
-            stage_pools=pools,
-            plugin=MiniCPMO45DuplexPlugin(_encode_audio),
-            duplex_session_config=_placement_config(),
-            **kwargs,
-        )
+    return pools, kwargs
+
+
+def _make_distributed_orchestrator(pools, kwargs, runtime_config):
+    return DuplexOrchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+        plugin=MiniCPMO45DuplexPlugin(_encode_audio),
+        duplex_session_config=runtime_config,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("distributed_hook", ["hub", "lb", "membership"])
+def test_least_sessions_accepts_distributed_single_replica_without_groups(distributed_hook) -> None:
+    """One replica per stage: every id is 0, so the derived group map is stable."""
+    pools, kwargs = _distributed_pools(replicas=1, hook=distributed_hook)
+    orchestrator = _make_distributed_orchestrator(pools, kwargs, _placement_config())
+    assert orchestrator.replica_placement is not None
+    assert orchestrator.replica_placement.owned_group_count == 1
+
+
+@pytest.mark.parametrize("distributed_hook", ["hub", "lb", "membership"])
+def test_least_sessions_accepts_distributed_multi_replica_without_groups(distributed_hook) -> None:
+    """Equal-count stages can derive groups in distributed mode too."""
+    pools, kwargs = _distributed_pools(replicas=2, hook=distributed_hook)
+    orchestrator = _make_distributed_orchestrator(pools, kwargs, _placement_config())
+    assert orchestrator.replica_placement is not None
+    assert orchestrator.replica_placement.owned_group_count == 2
+
+
+@pytest.mark.parametrize("distributed_hook", ["hub", "lb", "membership"])
+def test_least_sessions_accepts_distributed_multi_replica_with_groups(distributed_hook) -> None:
+    pools, kwargs = _distributed_pools(replicas=2, hook=distributed_hook)
+    orchestrator = _make_distributed_orchestrator(
+        pools,
+        kwargs,
+        _placement_config(replica_groups=[{0: 0}, {0: 1}]),
+    )
+    assert orchestrator.replica_placement is not None
+    assert orchestrator.replica_placement.owned_group_count == 2
 
 
 def test_orchestrator_validates_groups_against_actual_stage_pools() -> None:

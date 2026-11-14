@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import socket
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -719,6 +720,49 @@ class TestSingleStageInitialization:
 
         assert [plan.replicas[0].launch_mode for plan in stage_plans] == ["local", "remote"]
 
+    def test_build_logical_stage_init_plans_keeps_total_and_launches_only_local_share(self, mocker: MockerFixture):
+        import vllm_omni.engine.stage_runtime as runtime_mod
+
+        stage_cfgs = [_make_stage_cfg(0), _make_stage_cfg(1)]
+        stage_cfgs[0].runtime.num_replicas = 3
+        stage_cfgs[1].runtime.num_replicas = 1
+        runtime = DistStageRuntime(
+            stage_configs=stage_cfgs,
+            model="fake-model",
+            config_path="/fake/stages.yaml",
+            stage_init_timeout=60,
+            async_chunk=False,
+            single_stage_id_filter=0,
+            omni_master_address="127.0.0.1",
+            omni_master_port=26000,
+            omni_dp_size_local=2,
+        )
+        runtime._validate_single_stage_mode_replica_constraints()
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(
+            runtime_mod,
+            "extract_legacy_stage_metadata",
+            lambda cfg: SimpleNamespace(
+                stage_id=cfg.stage_id,
+                stage_type=getattr(cfg, "stage_type", "llm"),
+                prompt_expand_func=None,
+                runtime_cfg={},
+            ),
+        )
+        monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
+        monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
+        monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
+        monkeypatch.setattr(runtime_mod, "build_vllm_config", lambda *_, **__: (SimpleNamespace(), object))
+        try:
+            stage_plans = runtime._build_logical_stage_init_plans(None, [3, 1], {})
+        finally:
+            monkeypatch.undo()
+
+        assert [plan.replicas[0].num_replicas for plan in stage_plans] == [3, 1]
+        assert [replica.launch_mode for replica in stage_plans[0].replicas] == ["local", "local", "remote"]
+        assert [replica.launch_mode for replica in stage_plans[1].replicas] == ["remote"]
+
     def test_build_logical_stage_init_plans_rejects_non_contiguous_stage_ids(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod
 
@@ -773,6 +817,38 @@ class TestSingleStageInitialization:
         assert call_kwargs["head_local_replicas"] == {0: [0]}
         mock_oms.start.assert_called_once()
 
+    def test_start_omni_master_server_preallocates_total_and_head_local_subset(self, mocker: MockerFixture):
+        import vllm_omni.engine.stage_runtime as runtime_mod
+        from vllm_omni.distributed import omni_coordinator as omni_coord_mod
+
+        runtime = self._build_runtime([], stage_id_filter=0)
+        runtime._omni_dp_size_local = 2
+        mock_oms = mocker.Mock(spec=OmniMasterServer)
+        mocker.patch.object(runtime_mod, "OmniMasterServer", return_value=mock_oms)
+        mocker.patch.object(
+            omni_coord_mod,
+            "OmniCoordinatorRuntime",
+            return_value=mocker.Mock(router_address="tcp://127.0.0.1:9999"),
+        )
+
+        template = _make_llm_plan(0, stage_id=0, launch_mode="local").replicas[0]
+        replicas = [
+            replace(
+                template,
+                replica_id=replica_id,
+                num_replicas=3,
+                launch_mode="local" if replica_id < 2 else "remote",
+            )
+            for replica_id in range(3)
+        ]
+        stage_plans = [LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=replicas)]
+
+        runtime._start_omni_master_server(stage_plans)
+
+        call_kwargs = runtime_mod.OmniMasterServer.call_args.kwargs
+        assert call_kwargs["stage_replica_counts"] == {0: 3}
+        assert call_kwargs["head_local_replicas"] == {0: [0, 1]}
+
     def test_start_omni_master_server_duplicate_stage_ids_raise(self):
         runtime = self._build_runtime([], stage_id_filter=0)
         stage_plans = [
@@ -823,28 +899,53 @@ class TestSingleStageInitialization:
 
         assert stage_plans[0].replicas[0].metadata.runtime_cfg == {"devices": "0"}
 
-    def test_validate_single_stage_mode_allows_diffusion_replicas(self):
+    def test_validate_single_stage_mode_preserves_diffusion_total(self):
         stage_cfg = _make_stage_cfg(0, stage_type="diffusion")
         stage_cfg.runtime.num_replicas = 2
         runtime = self._build_runtime([stage_cfg], stage_id_filter=0)
 
         runtime._validate_single_stage_mode_replica_constraints()
 
-    def test_validate_single_stage_mode_does_not_swallow_num_replica_validation_errors(self):
-        class RuntimeConfig:
-            @property
-            def num_replicas(self):
-                return 1
+        assert stage_cfg.runtime.num_replicas == 2
+        assert runtime._get_replica_launch_mode(0, 0) == "local"
+        assert runtime._get_replica_launch_mode(0, 1) == "remote"
 
-            @num_replicas.setter
-            def num_replicas(self, value):
-                raise ValueError("invalid num_replicas")
+    @pytest.mark.parametrize("total, local", [(1, 2), (2, 3), (3, 2)])
+    @pytest.mark.parametrize("stage_type", ["llm", "diffusion"])
+    def test_validate_single_stage_mode_local_count_is_minimum_total(self, total, local, stage_type):
+        stage_cfg = _make_stage_cfg(0, stage_type=stage_type)
+        stage_cfg.runtime.num_replicas = total
+        runtime = DistStageRuntime(
+            stage_configs=[stage_cfg],
+            model="fake-model",
+            config_path="/fake/stages.yaml",
+            stage_init_timeout=60,
+            async_chunk=False,
+            single_stage_id_filter=0,
+            omni_master_address="127.0.0.1",
+            omni_master_port=26000,
+            omni_dp_size_local=local,
+        )
 
-        stage_cfg = _make_stage_cfg(0, stage_type="llm")
-        stage_cfg.runtime = RuntimeConfig()
-        runtime = self._build_runtime([stage_cfg], stage_id_filter=0)
+        runtime._validate_single_stage_mode_replica_constraints()
 
-        with pytest.raises(ValueError, match="invalid num_replicas"):
+        assert stage_cfg.runtime.num_replicas == max(total, local)
+        assert [runtime._get_replica_launch_mode(0, i) for i in range(max(total, local))] == [
+            "local" if i < local else "remote" for i in range(max(total, local))
+        ]
+
+    def test_single_stage_mode_without_stage_filter_keeps_all_replicas_local(self):
+        stage_cfgs = [_make_stage_cfg(0), _make_stage_cfg(1)]
+        runtime = self._build_runtime(stage_cfgs, stage_id_filter=None)
+        runtime._validate_single_stage_mode_replica_constraints()
+        assert [runtime._get_replica_launch_mode(stage, replica) for stage in range(2) for replica in range(3)] == [
+            "local"
+        ] * 6
+
+    def test_validate_single_stage_mode_rejects_missing_target_stage(self):
+        runtime = self._build_runtime([_make_stage_cfg(0)], stage_id_filter=1)
+
+        with pytest.raises(ValueError, match="not present in the resolved stage configs"):
             runtime._validate_single_stage_mode_replica_constraints()
 
     def test_build_logical_stage_init_plans_preserves_diffusion_runtime_cfg_in_single_stage_mode(

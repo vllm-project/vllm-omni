@@ -102,8 +102,9 @@ def test_reservations_and_snapshots_do_not_expose_mutable_placement_state() -> N
     with pytest.raises(DuplexSessionError) as exc:
         placement.route("a", 0)
     assert exc.value.code == "unknown_session"
-    with pytest.raises(ValueError, match="Unknown stage replica"):
-        placement.mark_unavailable(0, 9)
+    # A replica that registered after startup has a fresh id outside the declared
+    # counts. Its death must not raise out of the orchestration loop.
+    assert placement.mark_unavailable(0, 9) == set()
 
 
 @pytest.mark.parametrize(

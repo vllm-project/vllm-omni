@@ -917,7 +917,6 @@ class StageRuntime:
             )
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
             num_replicas = replicas_per_stage[stage_idx]
-            launch_mode = self._get_launch_mode(stage_id)
 
             replicas: list[ReplicaInitPlan] = []
             stage_vllm_config = None
@@ -960,6 +959,7 @@ class StageRuntime:
                 )
 
             for replica_id in range(num_replicas):
+                launch_mode = self._get_replica_launch_mode(stage_id, replica_id)
                 replica_cfg, native_kv = self._prepare_replica_stage_config(
                     stage_cfg,
                     stage_id=stage_id,
@@ -1015,6 +1015,14 @@ class StageRuntime:
     def _get_launch_mode(self, stage_id: int) -> str:
         """Determine launch mode for a stage. Overridden by DistStageRuntime."""
         return "local"
+
+    def _get_replica_launch_mode(self, stage_id: int, replica_id: int) -> str:
+        """Determine launch mode for one replica of a stage.
+
+        The distributed runtime overrides this to keep a head-owned stage's
+        cluster total while launching only its local share.
+        """
+        return self._get_launch_mode(stage_id)
 
     def _initialize_stage_replicas(
         self,
@@ -1580,28 +1588,57 @@ class DistStageRuntime(StageRuntime):
         return stage_plans
 
     def _validate_single_stage_mode_replica_constraints(self) -> None:
-        """Apply --omni-dp-size-local to the local stage's runtime.num_replicas."""
+        """Keep the configured total, with the CLI local count as its minimum.
+
+        ``stages[].num_replicas`` is the cluster-wide total. The head may launch
+        only a subset of that stage (the rest register from headless runtimes), so
+        the total must survive into the master pre-allocation. As before, a local
+        count above the configured default expands the total. The local count is
+        applied per replica by :meth:`_get_replica_launch_mode`.
+        """
         target_stage_id = self._single_stage_id_filter
         if target_stage_id is None or is_frontend_only(target_stage_id):
             return
 
+        local_replicas = int(self._omni_dp_size_local)
+        if local_replicas < 1:
+            raise ValueError(f"--omni-dp-size-local must be >= 1, got {local_replicas}")
+
         for idx, stage_cfg in enumerate(self._stage_configs):
             stage_id = int(getattr(stage_cfg, "stage_id", idx))
+            if stage_id != target_stage_id:
+                continue
             runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", None))
             if runtime_cfg is None:
-                continue
-            if stage_id == target_stage_id:
-                try:
-                    runtime_cfg.num_replicas = self._omni_dp_size_local
-                except (AttributeError, TypeError):
-                    if hasattr(runtime_cfg, "__setitem__"):
-                        runtime_cfg["num_replicas"] = self._omni_dp_size_local
-                        continue
-                    logger.warning(
-                        "[DistStageRuntime] Failed to apply omni_dp_size_local=%s to stage %s runtime config",
-                        self._omni_dp_size_local,
-                        stage_id,
-                    )
+                raise ValueError(f"stage {target_stage_id} has no runtime config for --omni-dp-size-local")
+            total_replicas = int(
+                runtime_cfg.get("num_replicas", 1)
+                if hasattr(runtime_cfg, "get")
+                else getattr(runtime_cfg, "num_replicas", 1)
+            )
+            if total_replicas < 1:
+                raise ValueError(
+                    f"stage {target_stage_id} must declare at least one replica, got num_replicas={total_replicas}"
+                )
+            if local_replicas > total_replicas:
+                total_replicas = local_replicas
+                if hasattr(runtime_cfg, "get"):
+                    runtime_cfg["num_replicas"] = total_replicas
+                else:
+                    runtime_cfg.num_replicas = total_replicas
+            logger.info(
+                "[DistStageRuntime] stage %s replicas: total=%s local=%s remote=%s",
+                target_stage_id,
+                total_replicas,
+                local_replicas,
+                total_replicas - local_replicas,
+            )
+            return
+
+        raise ValueError(
+            f"--stage-id={target_stage_id} is not present in the resolved stage configs; "
+            "cannot apply --omni-dp-size-local"
+        )
 
     def _before_initialize_stage_replicas(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         self._start_omni_master_server(stage_plans)
@@ -1636,6 +1673,14 @@ class DistStageRuntime(StageRuntime):
         if is_frontend_only(stage_id_filter) or (stage_id_filter is not None and stage_id != stage_id_filter):
             return "remote"
         return "local"
+
+    def _get_replica_launch_mode(self, stage_id: int, replica_id: int) -> str:
+        """Target stage: first ``--omni-dp-size-local`` replicas are local."""
+        if self._get_launch_mode(stage_id) == "remote":
+            return "remote"
+        if self._single_stage_id_filter is None:
+            return "local"
+        return "local" if replica_id < self._omni_dp_size_local else "remote"
 
     def _get_coordinator_address(self) -> str | None:
         if self._coordinator_runtime is not None:

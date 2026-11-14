@@ -203,7 +203,10 @@ class DuplexReplicaPlacement:
     def mark_unavailable(self, stage_id: int, replica_id: int) -> set[str]:
         replica = (stage_id, replica_id)
         if replica not in self._all_replicas:
-            raise ValueError(f"Unknown stage replica {replica}")
+            # A dynamically attached replica can die at an id the startup topology
+            # never declared. It owns no reservation, so there is nothing to fail
+            # here; the caller still evicts it and fails its ordinary requests.
+            return set()
         if replica not in self._owners:
             return set()
         self._unavailable.add(replica)
