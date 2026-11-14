@@ -369,9 +369,9 @@ steps:
 
   # Run the aggregate CUDA H100 owner on parity PRs that touch one of the
   # executable H100 TTS workloads now represented on AMD. Audex's custom
-  # processors and the supported CosyVoice3, Higgs V3, MiniMax Music3, and
-  # YuE2 paths use V1; retain V2 for the remaining H100 paths instead of
-  # forcing one runner across the suite.
+  # processors and the CosyVoice3, Higgs V3, MiniMax Music3, and YuE2 paths
+  # not yet supported by the V2 model runner use V1; retain V2 for the
+  # remaining H100 paths instead of forcing one runner across the suite.
   - group: ":microphone: H100 TTS Weekly Test"
     depends_on: upload-weekly-pipeline
     if: build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"
