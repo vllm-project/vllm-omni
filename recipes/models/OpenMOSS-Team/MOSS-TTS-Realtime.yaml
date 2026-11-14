@@ -4,7 +4,7 @@ meta:
   provider: "OpenMOSS"
   description: "OpenMOSS's 1.7B real-time streaming TTS for low-latency voice agents (TTFB ~180 ms) — multi-turn context-aware incremental synthesis — served via vLLM-Omni through the OpenAI /v1/audio/speech API (24 kHz mono)."
   date_added: 2026-06-17
-  date_updated: 2026-06-15
+  date_updated: 2026-11-12
   tasks:
     - omni
   related_recipes:
@@ -114,6 +114,9 @@ guide: |
   ## Known limitations
 
   - Output is **24 kHz mono**.
+  - RTX 5060 Ti 16 GB qualification requires the
+    [hardware profile](https://github.com/vllm-project/vllm-omni/blob/main/recipes/OpenMOSS/MOSS-TTS-Realtime-RTX5060Ti-16GB.md).
+    The stock deployment ran out of memory in that qualification.
   - Shares the `OpenMOSS-Team/MOSS-Audio-Tokenizer` codec (~7 GB, auto-downloaded;
     override with `MOSS_TTS_CODEC_PATH`).
 
