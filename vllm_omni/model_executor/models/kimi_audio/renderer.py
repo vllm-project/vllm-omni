@@ -5,10 +5,10 @@
 from functools import cached_property
 
 import numpy as np
-from vllm.entrypoints.chat_utils import parse_chat_messages, parse_chat_messages_async
 from vllm.exceptions import VLLMClientError
 from vllm.multimodal.audio import resample_audio_pyav
 from vllm.renderers import BaseRenderer
+from vllm.renderers.chat_utils import parse_chat_messages, parse_chat_messages_async
 from vllm.utils.async_utils import make_async
 
 from vllm_omni.errors import OmniClientError
@@ -32,19 +32,10 @@ class KimiAudioRenderer(BaseRenderer):
         output_type = kwargs.get("output_type", "both")
         if output_type not in ("text", "both"):
             raise ValueError("Kimi-Audio chat_template_kwargs.output_type must be 'text' or 'both'")
-        supported_kwargs = {
-            "output_type",
-            "add_generation_prompt",
-            "continue_final_message",
-            "add_special_tokens",
-            "tokenize",
-            "tools",
-            "documents",
-            "reasoning_effort",
-            "enable_thinking",
-        }
-        if unknown := kwargs.keys() - supported_kwargs:
-            raise ValueError(f"Unsupported Kimi-Audio chat_template_kwargs: {', '.join(sorted(unknown))}")
+        # Kimi builds its native prompt without a Jinja template. Like vLLM's
+        # template renderers, ignore keys it does not use: the server merges
+        # its own defaults (e.g. cohere_format) into every request. Keys that
+        # would change the conversation are still rejected below.
         if params.chat_template is not None:
             raise ValueError("Kimi-Audio uses its native prompt format; custom chat templates are not supported")
         if params.mm_processor_kwargs:
@@ -66,7 +57,6 @@ class KimiAudioRenderer(BaseRenderer):
             or kwargs.get("continue_final_message")
             or kwargs.get("add_special_tokens")
             or not kwargs.get("add_generation_prompt", True)
-            or params.return_assistant_tokens_mask
             or params.tool_choice not in (None, "none")
         ):
             raise ValueError("Kimi-Audio requires an ordinary conversation followed by a new assistant response")
@@ -193,17 +183,18 @@ class KimiAudioRenderer(BaseRenderer):
         # length validation without changing the aligned input layout.
         return self.tokenize_prompts(prompts, params)
 
-    def process_for_engine(self, prompt, arrival_time, *, skip_mm_cache=False):
+    # Forward the base options unchanged (skip_mm_cache, tok_params, ...).
+    def process_for_engine(self, prompt, arrival_time, **kwargs):
         try:
-            result = super().process_for_engine(prompt, arrival_time, skip_mm_cache=skip_mm_cache)
+            result = super().process_for_engine(prompt, arrival_time, **kwargs)
         except VLLMClientError as exc:
             raise OmniClientError(str(exc)) from None
         result["model_intermediate_buffer"] = prompt["model_intermediate_buffer"]
         return result
 
-    async def process_for_engine_async(self, prompt, arrival_time, *, skip_mm_cache=False):
+    async def process_for_engine_async(self, prompt, arrival_time, **kwargs):
         try:
-            result = await super().process_for_engine_async(prompt, arrival_time, skip_mm_cache=skip_mm_cache)
+            result = await super().process_for_engine_async(prompt, arrival_time, **kwargs)
         except VLLMClientError as exc:
             raise OmniClientError(str(exc)) from None
         result["model_intermediate_buffer"] = prompt["model_intermediate_buffer"]

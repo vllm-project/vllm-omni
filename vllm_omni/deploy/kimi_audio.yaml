@@ -32,13 +32,14 @@ stages:
 
   - stage_id: 1
     devices: "0"
+    # vLLM builds the model's multimodal processor on every stage, and it
+    # needs a tokenizer; use the same Kimi tokenizer as stage 0.
+    tokenizer_mode: kimi_audio_omni
     enforce_eager: true
     async_scheduling: false
     max_num_seqs: 1
     max_model_len: 8192
     max_num_batched_tokens: 8192
     gpu_memory_utilization: 0.15
-    engine_extras:
-      skip_tokenizer_init: true
     default_sampling_params:
       temperature: 0.0

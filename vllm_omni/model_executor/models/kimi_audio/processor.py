@@ -10,14 +10,11 @@ import numpy as np
 import torch
 from transformers import BatchFeature
 from vllm.multimodal.inputs import MultiModalFieldConfig
-from vllm.multimodal.parse import MultiModalDataParser, ProcessorBatchItems
-from vllm.multimodal.processing import (
-    BaseDummyInputsBuilder,
-    BaseMultiModalProcessor,
-    BaseProcessingInfo,
-    ProcessorInputs,
-    PromptReplacement,
-)
+from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser, ProcessorBatchItems
+from vllm.multimodal.processing import BaseProcessingInfo, ProcessorInputs, PromptReplacement
+from vllm.multimodal.processing.processor import MultiModalProcessingResult, PlaceholderFeaturesInfo
+
+from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
 
 from .audio_processing import SAMPLE_RATE, SAMPLES_PER_TOKEN, prepare_whisper_inputs
 
@@ -54,7 +51,7 @@ class KimiAudioProcessingInfo(BaseProcessingInfo):
         return {"audio": seq_len} if "audio" in self.supported_mm_limits else {}
 
 
-class KimiAudioDummyInputsBuilder(BaseDummyInputsBuilder[KimiAudioProcessingInfo]):
+class KimiAudioDummyInputsBuilder(OmniDummyInputsBuilder[KimiAudioProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         return ""
 
@@ -85,22 +82,21 @@ class KimiAudioDummyInputsBuilder(BaseDummyInputsBuilder[KimiAudioProcessingInfo
         )
 
 
-class KimiAudioMultiModalProcessor(BaseMultiModalProcessor[KimiAudioProcessingInfo]):
-    def _apply_hf_processor_main(
-        self, prompt, mm_items, hf_processor_mm_kwargs, tokenization_kwargs, *, enable_hf_prompt_update
-    ) -> tuple[list[int], BatchFeature, bool]:
-        if not isinstance(prompt, list):
-            raise ValueError("Kimi-Audio requires token prompts from prepare_kimi_audio_inputs")
-        ids, data, _ = super()._apply_hf_processor_main(
-            prompt,
-            mm_items,
-            hf_processor_mm_kwargs,
-            tokenization_kwargs,
-            enable_hf_prompt_update=enable_hf_prompt_update,
-        )
-        # Native token prompts normally need expansion. Ours already contain
-        # full aligned spans, so only discover/validate their placeholder ranges.
-        return ids, data, True
+class KimiAudioMultiModalProcessor(OmniMultiModalProcessor[KimiAudioProcessingInfo]):
+    def _maybe_apply_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        mm_res: MultiModalProcessingResult,
+    ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
+        # prepare_kimi_audio_inputs already reserved each full, aligned audio
+        # span. Locate the spans in item order; rewriting would desynchronize
+        # the scheduled audio stream from the separate text stream.
+        mm_item_counts = mm_items.get_all_counts()
+        self._validate_mm_kwargs(mm_res.kwargs, mm_item_counts)
+        self._validate_mm_updates(mm_res.prompt_updates, mm_item_counts)
+        mm_placeholders = self._find_mm_placeholders(mm_res.prompt_ids, mm_res.prompt_updates)
+        self._validate_mm_placeholders(mm_placeholders, mm_item_counts)
+        return mm_res.prompt_ids, mm_placeholders
 
     def _call_hf_processor(
         self,
@@ -111,9 +107,10 @@ class KimiAudioMultiModalProcessor(BaseMultiModalProcessor[KimiAudioProcessingIn
     ) -> BatchFeature:
         # With processor caching enabled, audios contains only cache misses.
         # Each item is self-contained; its index need not match the conversation.
+        # The prepared prompt is already tokenized, so only audio is processed.
         if mm_kwargs:
             raise ValueError("Kimi-Audio does not support multimodal processor overrides")
-        data: dict[str, Any] = {"input_ids": [self.info.get_tokenizer().encode(prompt, **tok_kwargs)]}
+        data: dict[str, Any] = {}
         audios = cast(list[dict[str, Any]], mm_data.get("audios", []))
         if audios:
             data.update(
@@ -157,5 +154,5 @@ class KimiAudioMultiModalProcessor(BaseMultiModalProcessor[KimiAudioProcessingIn
             return [offset] * count
 
         # The builder has ALREADY reserved these exact spans. The framework
-        # discovers them in item order without rewriting either stream.
+        # discovers them in item order (see _maybe_apply_prompt_updates).
         return [PromptReplacement(modality="audio", target=[offset], replacement=audio_span)]

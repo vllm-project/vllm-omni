@@ -176,6 +176,11 @@ def scheduler_token_id(
     detokenization skips, and the last step reports msg_end, the stop token.
     Text IDs that would stop the request are also replaced by the blank: the
     text stream ends with kimia_text_eos, never with the scheduler's stop IDs.
+
+    One step reports one ID. If audio ends on a step that also samples visible
+    text, that text token is not reported; the official loop would keep it.
+    The audio end has already cut that text short, and keeping the token would
+    need an extra forward step after the model has finished.
     """
     if sample.finished:
         return special_tokens.msg_end
