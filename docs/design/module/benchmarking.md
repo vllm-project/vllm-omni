@@ -84,6 +84,9 @@ CUDA generation uses two H100 GPUs and SP=2. NPU uses its existing four-device A
 profile, followed by CUDA evaluation; result metadata distinguishes generation
 and evaluator hardware. Every accuracy leaf has a timeout of at most 120
 minutes, expressing a configured bound rather than a measured duration. There
-is no long-stability, cohort, held-out or external calibration-delivery workflow.
+is no cohort, held-out or external calibration-delivery workflow. These accuracy
+and performance workflows add no stability lane. Existing DFX stability cases
+retain their legacy benchmark entry and deploy configs; the entry delegates to
+the shared serving benchmark.
 CPU tests/rendering establish implementation contracts; matching-source native
 runs are still needed to establish actual accuracy, performance and capacity.

@@ -3,10 +3,9 @@
 """Unit tests for the LingBot-World realtime streaming benchmark.
 
 The arithmetic is tested against the server's own formulas rather than against
-hand-copied expectations, and the protocol handling runs against a real
-WebSocket server that replays ``/v1/realtime/video`` with scripted delays -- so
-a benchmark number can be wrong only if the server itself is, not because the
-client parsed incorrectly an event or timed the wrong edge.
+hand-copied expectations. Protocol handling uses a real WebSocket server that
+replays ``/v1/realtime/video`` with scripted delays, plus deterministic sockets
+for terminal races, to check event parsing and timing at the client boundary.
 """
 
 from __future__ import annotations
@@ -807,6 +806,135 @@ def test_keepalive_pings_reach_the_server_during_a_slow_first_chunk() -> None:
             await server.__aexit__(None, None, None)
         assert len(result.records) == 1
         assert "session.ping" in seen
+
+    _run(scenario())
+
+
+class _ClosedPingWebSocket:
+    """Deliver buffered terminal frames only after the actual ping task fails."""
+
+    def __init__(self, messages: list[str | bytes]) -> None:
+        self.messages = messages
+        self.ping_sent = asyncio.Event()
+        self.ping_task: asyncio.Task[None] | None = None
+
+    async def send(self, message: str) -> None:
+        from websockets.exceptions import ConnectionClosedError
+
+        if json.loads(message)["type"] == "session.ping":
+            self.ping_task = asyncio.current_task()
+            self.ping_sent.set()
+            raise ConnectionClosedError(None, None)
+
+    async def recv(self) -> str | bytes:
+        await self.ping_sent.wait()
+        assert self.ping_task is not None
+        while not self.ping_task.done():
+            await asyncio.sleep(0)
+        return self.messages.pop(0)
+
+    async def __aenter__(self) -> _ClosedPingWebSocket:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        pass
+
+
+def test_failed_keepalive_preserves_server_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ping failure must not replace the server's actionable rejection."""
+    socket = _ClosedPingWebSocket([json.dumps({"type": "error", "message": "resolution mismatch"})])
+    monkeypatch.setattr("websockets.asyncio.client.connect", lambda *args, **kwargs: socket)
+
+    async def scenario() -> None:
+        with pytest.raises(BenchmarkError, match="resolution mismatch.*requested 2 chunks"):
+            await run_session(
+                "ws://scripted.invalid/v1/realtime/video",
+                "model",
+                _workload(num_chunks=2),
+                first_chunk_timeout=5,
+                chunk_timeout=5,
+                ping_interval=0.001,
+                collect_media=False,
+                print_chunks=False,
+            )
+
+    _run(scenario())
+
+
+def test_failed_keepalive_preserves_completed_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A buffered complete rollout remains successful after the socket closes."""
+    socket = _ClosedPingWebSocket(
+        [
+            json.dumps({"type": "video.start", "request_id": "req-1"}),
+            json.dumps({"type": "video.chunk_metadata", "kind": "media", "generation_chunk_index": 0, "num_frames": 9}),
+            b"complete-media",
+            json.dumps({"type": "session.done", "stopped": False, "chunks": 1}),
+        ]
+    )
+    monkeypatch.setattr("websockets.asyncio.client.connect", lambda *args, **kwargs: socket)
+
+    async def scenario() -> None:
+        result = await run_session(
+            "ws://scripted.invalid/v1/realtime/video",
+            "model",
+            _workload(num_chunks=1),
+            first_chunk_timeout=5,
+            chunk_timeout=5,
+            ping_interval=0.001,
+            collect_media=True,
+            print_chunks=False,
+        )
+        assert result.request_id == "req-1"
+        assert len(result.records) == 1
+        assert result.media == b"complete-media"
+        assert result.done_event["type"] == "session.done"
+
+    _run(scenario())
+
+
+def test_caller_cancellation_propagates_during_keepalive_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Consuming child cancellation must not consume cancellation of the caller."""
+
+    async def scenario() -> None:
+        keepalive_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+
+        async def draining_keepalive(websocket, send_lock, interval) -> None:
+            keepalive_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await asyncio.Future()
+
+        monkeypatch.setattr("vllm_omni.benchmarks.realtime_video.client._keepalive", draining_keepalive)
+
+        async def script(websocket, payload) -> None:
+            await keepalive_started.wait()
+            await _emit_rollout(websocket, payload, trailer=False)
+
+        async with _serve(script) as url:
+            task = asyncio.create_task(
+                run_session(
+                    url,
+                    "model",
+                    _workload(num_chunks=1),
+                    first_chunk_timeout=5,
+                    chunk_timeout=5,
+                    ping_interval=0.001,
+                    collect_media=False,
+                    print_chunks=False,
+                )
+            )
+            try:
+                await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     _run(scenario())
 
