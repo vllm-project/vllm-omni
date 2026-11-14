@@ -532,6 +532,21 @@ Per-sample scores and `evaluation_summary.json` are saved under the run's
 `evaluation/` directory. `--duplex-eval-eval-workers` controls scoring concurrency
 (default 1), and `--duplex-eval-judge-timeout-s` bounds each judge request (default 600).
 
+The judge samples its replies, so a single call per measurement can move a score by a
+full point on contested samples. `--duplex-eval-judge-samples N` (`--judge-samples N`
+for the standalone `evaluate` command; default 1, which keeps single-call scoring)
+sends every judge measurement N times: each temporal sentence, the content judgment,
+and each PR event. Each score field takes the lower median of the N replies, which
+equals the majority value whenever one exists; without a majority it is the middle
+reply, and an even-N tie resolves to the lower score. The result is always a score
+the judge returned, and `content_score` is not rounded. The per-sample reductions
+(`avg_temporal_score`, `all_success`) are unchanged. With N > 1, each measurement
+keeps the aggregated fields and lists every reply in `judge_votes`, the score file
+records `judge_samples`, and each `<sample>.judge.jsonl` line carries its
+`judge_draw` index. All N calls must succeed before the score is published; a content
+judgment that falls back to frame-sample repeats all N calls in that mode. Judge time
+grows linearly with N, and the accuracy summary reports `judge_samples`.
+
 The independent scoring commands remain available to retry scoring or change
 judges without repeating inference. The `--limit 3` example below matches the
 serving command above when `--disable-shuffle` is used and all three measured

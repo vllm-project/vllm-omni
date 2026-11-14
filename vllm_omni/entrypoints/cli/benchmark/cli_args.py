@@ -225,6 +225,15 @@ def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--duplex-eval-judge-fps", type=_positive_int, default=2)
     group.add_argument("--duplex-eval-window-size", type=_positive_finite_float, default=10.0)
     group.add_argument("--duplex-eval-eval-workers", type=_positive_int, default=1)
+    group.add_argument(
+        "--duplex-eval-judge-samples",
+        type=_positive_int,
+        default=1,
+        help=(
+            "Judge calls per measurement (temporal sentence, content, PR event). Each score field takes the "
+            "lower median of the calls, i.e. the majority value when one exists. 1 keeps single-call scoring."
+        ),
+    )
 
 
 def add_duplex_cli_args(parser: argparse.ArgumentParser) -> None:
