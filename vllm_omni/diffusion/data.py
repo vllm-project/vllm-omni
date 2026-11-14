@@ -127,6 +127,11 @@ def normalize_omni_diffusion_kwargs(
             fastvideo_vsa_topk=fastvideo_vsa_topk,
         )
 
+    if apply_defaults:
+        from vllm_omni.diffusion.low_vram import expand_low_vram_preset
+
+        config_kwargs = expand_low_vram_preset(config_kwargs)
+
     # Check environment variable as fallback for cache_backend.
     # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND.
     if "cache_backend" not in config_kwargs and apply_defaults:
@@ -974,6 +979,7 @@ class OmniDiffusionConfig:
     # CPU offload parameters. Keep the public mapping raw so stage configs can
     # serialize it across processes; __post_init__ validates it once and caches
     # the internal typed resolution used at runtime.
+    low_vram_preset: str | None = None
     diffusion_offload_config: dict[str, Any] | None = None
     kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases. Some model-specific legacy stage lifecycles are
@@ -1434,6 +1440,21 @@ class OmniDiffusionConfig:
                 self.num_gpus = 1
 
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
+        if self.low_vram_preset is not None:
+            from vllm_omni.diffusion.low_vram import expand_low_vram_preset
+
+            preset_kwargs = expand_low_vram_preset({f.name: getattr(self, f.name) for f in fields(self) if f.init})
+            self.quantization_config = preset_kwargs["quantization_config"]
+            self.diffusion_offload_config = preset_kwargs["diffusion_offload_config"]
+            self.cache_config = preset_kwargs["cache_config"]
+            if (
+                self.num_gpus != 1
+                or self.parallel_config.world_size != 1
+                or self.parallel_config.vae_patch_parallel_size != 1
+                or self.parallel_config.text_encoder_tp_size != 1
+                or self.parallel_config.use_hsdp
+            ):
+                raise ValueError("low_vram_preset requires a single GPU with all parallel degrees set to 1")
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)
@@ -1658,6 +1679,10 @@ class OmniDiffusionConfig:
         propagate_skip_softmax_calibration(specs, self.model, tf_config)
 
     def update_multimodal_support(self) -> None:
+        if self.low_vram_preset is not None:
+            from vllm_omni.diffusion.low_vram import validate_low_vram_pipeline
+
+            validate_low_vram_pipeline(self.model_class_name)
         # Resolve serving-visible multimodal behavior from shared metadata
         # instead of importing concrete pipeline modules into the config layer.
         metadata = get_diffusion_model_metadata(self.model_class_name)

@@ -61,6 +61,13 @@ The model layer receives either a method implementation or `None`. Returning
 
 ## Configuration resolution
 
+The optional diffusion `low_vram_preset="fp8"` fills an unset quantization
+configuration after source merging and passes it through this same factory.
+It introduces no quantization backend. Explicit non-FP8 methods are rejected
+while the preset is enabled; FP8 options retain normal override precedence.
+See the [low-VRAM guide](../../configuration/low_vram.md) for the composition
+contract and its unqualified hardware/quality limits.
+
 `build_quant_config()` accepts the following forms:
 
 | Input | Resolution |

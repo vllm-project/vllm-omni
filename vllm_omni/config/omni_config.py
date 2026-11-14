@@ -914,6 +914,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     lora_application: Literal["runtime", "merged"] = "runtime"
     max_cpu_loras: int | None = None
     output_type: str = "pil"
+    low_vram_preset: str | None = None
     diffusion_offload_config: dict[str, Any] | None = None
     kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
@@ -1600,13 +1601,13 @@ def extract_diffusion_stage_config_kwargs(
     # the compatibility adapter without treating it as a deprecated alias.
     mixed_kwargs = {name: _copy_value(value) for name, value in kwargs.items()}
     engine_quantization = mixed_kwargs.pop("quantization", None)
-    normalized = normalize_omni_diffusion_kwargs(mixed_kwargs)
     if engine_quantization is not None:
-        if normalized.get("quantization_config") is not None:
+        if mixed_kwargs.get("quantization_config") is not None:
             raise ValueError(
                 "Diffusion config fields 'quantization' and 'quantization_config' cannot both be provided."
             )
-        normalized["quantization_config"] = engine_quantization
+        mixed_kwargs["quantization_config"] = engine_quantization
+    normalized = normalize_omni_diffusion_kwargs(mixed_kwargs)
 
     validate_omni_diffusion_kwargs(
         normalized,
@@ -1932,6 +1933,24 @@ class VllmOmniDiffusionStageConfig(BaseVllmOmniStageConfig):
     parallel_config: OmniStageDiffusionParallelConfig = field(default_factory=OmniStageDiffusionParallelConfig)
     diffusion_config: _DiffusionConfigProjection = field(default_factory=_DiffusionConfigProjection)
 
+    @model_validator(mode="after")
+    def _validate_low_vram_preset(self) -> Self:
+        if self.diffusion_config.low_vram_preset is not None:
+            parallel = self.parallel_config
+            if (
+                parallel.world_size != 1
+                or parallel.sequence_parallel_size != 1
+                or parallel.cfg_parallel_size != 1
+                or parallel.vae_patch_parallel_size != 1
+                or parallel.text_encoder_tp_size != 1
+                or parallel.use_hsdp
+                or self.runtime_config.num_replicas != 1
+            ):
+                raise ValueError("low_vram_preset requires a single GPU with all parallel degrees set to 1")
+            if self.model_config.enable_sleep_mode:
+                raise ValueError("low_vram_preset with sleep mode is not qualified; disable sleep mode")
+        return self
+
 
 StageConfigType: TypeAlias = VllmOmniARStageConfig | VllmOmniGenerationStageConfig | VllmOmniDiffusionStageConfig
 
@@ -2094,6 +2113,8 @@ def _build_diffusion_stage_config(
         quantization_config=common_kwargs["quantization_config"],
         enable_prefix_caching=bool(common_kwargs["cache_config"].enable_prefix_caching),
     )
+    if common_kwargs["diffusion_config"].low_vram_preset is not None:
+        common_kwargs["quantization_config"] = common_kwargs["diffusion_config"].quantization_config
     return cast(
         VllmOmniDiffusionStageConfig,
         _with_resolved_processors(
