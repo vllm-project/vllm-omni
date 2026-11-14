@@ -622,6 +622,10 @@ class LingBotWorldCausalDMDPipeline(
         if not isinstance(reuse_last_step_kv, bool):
             raise ValueError("model_config.lingbot_reuse_last_step_kv must be a bool.")
         self._reuse_last_step_kv = reuse_last_step_kv
+        trim_text_padding = model_config.get("lingbot_trim_text_padding", False)
+        if not isinstance(trim_text_padding, bool):
+            raise ValueError("model_config.lingbot_trim_text_padding must be a bool.")
+        self._trim_text_padding = trim_text_padding
         share_first_block = model_config.get("lingbot_share_first_block_kv", False)
         if not isinstance(share_first_block, bool):
             raise ValueError("model_config.lingbot_share_first_block_kv must be a bool.")
@@ -660,6 +664,8 @@ class LingBotWorldCausalDMDPipeline(
             prefetch_list=subfolders,
             local_files_only=local_files_only,
         )
+        if self._trim_text_padding and self.tokenizer.padding_side != "right":
+            raise ValueError("model_config.lingbot_trim_text_padding requires tokenizer.padding_side='right'.")
         self.text_encoder = from_pretrained_with_prefetch(
             UMT5EncoderModel.from_pretrained,
             model,
@@ -1537,6 +1543,10 @@ class LingBotWorldCausalDMDPipeline(
         A hit returns the stored tensor itself. Callers only read it: the
         cross-attention projection and the DMD transformer both work out of
         place, so a shared encode is never changed under another session.
+
+        Optional padding trimming runs UMT5 on only the tokenized text, then
+        restores the fixed output width. It can change floating-point results
+        and is disabled by default; the option is fixed for this instance.
         """
         text = " ".join(prompt.strip().split())
         key = (text, int(max_sequence_length), dtype)
@@ -1546,7 +1556,7 @@ class LingBotWorldCausalDMDPipeline(
             return cached
         text_inputs = self.tokenizer(
             [text],
-            padding="max_length",
+            padding=False if self._trim_text_padding else "max_length",
             max_length=max_sequence_length,
             truncation=True,
             add_special_tokens=True,
@@ -1558,6 +1568,12 @@ class LingBotWorldCausalDMDPipeline(
         prompt_embeds = self.text_encoder(input_ids, attention_mask).last_hidden_state
         prompt_embeds = prompt_embeds.to(device=self.device, dtype=dtype)
         prompt_embeds = prompt_embeds * attention_mask.unsqueeze(-1).to(dtype=prompt_embeds.dtype)
+        if self._trim_text_padding:
+            # The tokenizer's CPU tensor shape avoids a device-to-host length
+            # read. Truncation still bounds the text by max_sequence_length.
+            padding = max_sequence_length - text_inputs.input_ids.shape[1]
+            if padding:
+                prompt_embeds = F.pad(prompt_embeds, (0, 0, 0, padding))
         self._prompt_embeds_cache[key] = prompt_embeds
         if len(self._prompt_embeds_cache) > _PROMPT_EMBEDS_CACHE_SIZE:
             self._prompt_embeds_cache.popitem(last=False)

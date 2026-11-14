@@ -238,3 +238,17 @@ This option increases memory use and can change floating-point results. The
 preset also retains the measured baseline's approximate last-step KV reuse and
 fused VAE; it is not a full-precision reference. Compare output quality as well
 as cadence, with identical warmup, prompt, image and seed.
+
+For the alternative H200/FA3 superpage path, set
+`VLLM_OMNI_AR_DIFFUSION_KV_GATHER=0` and change the preset's
+`model_config.ar_diffusion_kv_config` to `reuse_history_staging: false` and
+`superpage_tokens: 160`. This is mutually exclusive with gather/staging and
+requires no action/state scratch KV; keep `reset_at_boundary: false`.
+The default `superpage_tokens: 0` preserves normal paging. Superpages retain
+the visible K/V tokens but can change attention reduction numerics.
+
+To test short-prompt encoding independently, set
+`stages[0].model_config.lingbot_trim_text_padding: true` in the deploy config.
+It skips UMT5 padding computation and restores the fixed embedding width.
+It defaults to false, requires right padding, and can change generated pixels;
+compare unseen prompts separately from prompt-cache hits.
