@@ -44,6 +44,7 @@ def varlen_attention_with_sink(
     max_seqlen_k: int | None = None,
     softcap: float = -1.0,
     sink: torch.Tensor | None = None,
+    sink_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Preserve the CUDA FlashAttention/LSE contract; fall back for host inputs."""
 
@@ -73,7 +74,7 @@ def varlen_attention_with_sink(
         deterministic=os.environ.get("MAGI2_DETERMINISTIC", "0") == "1",
         fa_version=_resolve_flash_attn_version(),
     )
-    return correct_out_lse_with_sink(out, lse, sink)[0]
+    return correct_out_lse_with_sink(out, lse, sink, sink_lse=sink_lse)[0]
 
 
 __all__ = ["varlen_attention_with_sink"]

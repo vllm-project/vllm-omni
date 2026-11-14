@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass
 
 import torch
@@ -14,6 +15,7 @@ import torch.nn as nn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 
 from .layers import varlen_attention_with_sink
+from .layers.native.attention_ops import _sink_lse
 from .parallel import (
     Magi2ParallelGroup,
     get_magi2_ulysses_group,
@@ -49,6 +51,59 @@ class VarlenHandler:
         return cu_q, cu_k, max_q, max_k
 
 
+def _rank_sink(sink: torch.Tensor, group: Magi2ParallelGroup) -> torch.Tensor:
+    """Select this rank's sink heads after the Ulysses head exchange."""
+
+    if group.world_size == 1:
+        return sink
+    if sink.shape[-1] % group.world_size:
+        raise ValueError("attention sink heads must divide across Ulysses ranks")
+    return torch.chunk(sink, group.world_size, dim=-1)[group.rank].contiguous()
+
+
+class _SinkLseCache:
+    """One layer's rank-local sink log-sum-exp, reused across forward calls.
+
+    The entry is reused only for the same sink tensor with an unchanged version
+    counter, storage, layout, device and Ulysses rank. It holds a weak reference
+    to the sink. Inference tensors have no version counter, so for them the
+    storage stands in for it. Writes that bypass the version counter, through
+    ``.data`` or in place on an inference tensor, are not detected. ``get``
+    returns ``None`` (compute per call) while compiling, for tensor subclasses
+    and while grad mode is enabled.
+    """
+
+    def __init__(self) -> None:
+        self._sink: weakref.ReferenceType[torch.Tensor] | None = None
+        self._key: tuple | None = None
+        self._sink_lse: torch.Tensor | None = None
+
+    def get(self, sink: torch.Tensor | None, group: Magi2ParallelGroup) -> torch.Tensor | None:
+        if (
+            sink is None
+            or sink.numel() == 0
+            or torch.compiler.is_compiling()
+            or type(sink) not in (torch.Tensor, nn.Parameter)
+            or torch.is_grad_enabled()
+        ):
+            return None
+        key = (
+            None if sink.is_inference() else sink._version,
+            sink.data_ptr(),
+            sink.device,
+            sink.dtype,
+            tuple(sink.shape),
+            sink.stride(),
+            group.rank,
+            group.world_size,
+        )
+        if self._sink is None or self._sink() is not sink or self._key != key:
+            self._sink_lse = _sink_lse(_rank_sink(sink, group))
+            self._sink = weakref.ref(sink)
+            self._key = key
+        return self._sink_lse
+
+
 def packed_attention_with_sink(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -57,8 +112,12 @@ def packed_attention_with_sink(
     *,
     softcap: float = -1.0,
     sink: torch.Tensor | None = None,
+    sink_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run the selected platform layer after Ulysses head exchange."""
+    """Run the selected platform layer after Ulysses head exchange.
+
+    ``sink_lse`` optionally carries this rank's ``_sink_lse`` of ``sink``.
+    """
 
     bounds_q, bounds_k, max_q, max_k = varlen.resolved(q.shape[0], k.shape[0])
     return varlen_attention_with_sink(
@@ -71,6 +130,7 @@ def packed_attention_with_sink(
         max_seqlen_k=max_k,
         softcap=softcap,
         sink=sink,
+        sink_lse=sink_lse,
     )
 
 
@@ -84,8 +144,12 @@ def ulysses_packed_attention_with_sink(
     softcap: float = -1.0,
     sink: torch.Tensor | None = None,
     group: Magi2ParallelGroup | None = None,
+    sink_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """MAGI-2 attention with overlapping Ulysses CP/head exchange."""
+    """MAGI-2 attention with overlapping Ulysses CP/head exchange.
+
+    ``sink_lse`` optionally carries this rank's ``_sink_lse`` of ``sink``.
+    """
 
     group = group or get_magi2_ulysses_group()
     if isinstance(split_sizes, torch.Tensor):
@@ -93,10 +157,8 @@ def ulysses_packed_attention_with_sink(
     if group.world_size > 1:
         q, k, v = scatter_heads_gather_seqlen((q, k, v), split_sizes, group)
         if sink is not None:
-            if sink.shape[-1] % group.world_size:
-                raise ValueError("attention sink heads must divide across Ulysses ranks")
-            sink = torch.chunk(sink, group.world_size, dim=-1)[group.rank].contiguous()
-    output = packed_attention_with_sink(q, k, v, varlen, softcap=softcap, sink=sink)
+            sink = _rank_sink(sink, group)
+    output = packed_attention_with_sink(q, k, v, varlen, softcap=softcap, sink=sink, sink_lse=sink_lse)
     if group.world_size > 1:
         output = scatter_seqlen_gather_heads(output.contiguous(), split_sizes, group)
         assert isinstance(output, torch.Tensor)
@@ -109,6 +171,7 @@ class Magi2PackedAttentionKernel(nn.Module):
     def __init__(self, softcap: float) -> None:
         super().__init__()
         self.softcap = softcap
+        self._sink_lse_cache = _SinkLseCache()
 
     def forward(
         self,
@@ -128,6 +191,7 @@ class Magi2PackedAttentionKernel(nn.Module):
             raise TypeError("magi2_split_sizes must be a list or tensor")
         if sink is not None and not isinstance(sink, torch.Tensor):
             raise TypeError("magi2_sink must be a tensor or None")
+        group = get_magi2_ulysses_group()
         return ulysses_packed_attention_with_sink(
             query,
             key,
@@ -136,6 +200,8 @@ class Magi2PackedAttentionKernel(nn.Module):
             split_sizes,
             softcap=self.softcap,
             sink=sink,
+            group=group,
+            sink_lse=self._sink_lse_cache.get(sink, group),
         )
 
 
