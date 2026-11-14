@@ -319,6 +319,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_request_ids = ids
             cleanup_ids = tuple(ids)
 
+        if getattr(self, "_minicpmo45_carry", None) is not None:
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                MiniCPMO45DuplexSchedulerHelper,
+            )
+
+            # Exists once a duplex Stage-0 append arrived here: an abort keeps its window.
+            MiniCPMO45DuplexSchedulerHelper.release_windows(
+                self, cleanup_ids, aborted=finished_status == RequestStatus.FINISHED_ABORTED
+            )
         finished = super().finish_requests(finish_request_ids, finished_status)
         self._clear_kv_wait_starts(cleanup_ids)
         return finished
@@ -691,6 +700,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         without booking, where there is no accounting to settle.
         """
         self._enforce_kstep_span_uniformity(scheduler_output)
+        carry = getattr(self, "_minicpmo45_carry", None)
+        if carry is not None and carry.snapshot_ids:
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                MiniCPMO45DuplexSchedulerHelper,
+            )
+
+            MiniCPMO45DuplexSchedulerHelper.commit_window_snapshots(self, scheduler_output)
         super()._update_after_schedule(scheduler_output)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
@@ -733,6 +749,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
 
+        if getattr(self, "_minicpmo45_carry", None) is not None:
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                MiniCPMO45DuplexSchedulerHelper,
+            )
+
+            # Change the kept barge-in windows as the worker will when it runs this step.
+            MiniCPMO45DuplexSchedulerHelper.on_schedule(self, scheduler_output)
+
         # Backstop: a step built without ``_update_after_schedule`` (nothing
         # booked, so nothing to reconcile) still leaves here uniform. On the
         # booking paths the rewrite already ran ahead of the booking and this
@@ -745,10 +769,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finished_reqs = self.get_finished_requests_needing_kv_transfer()
 
         # Wrap in omni scheduler output to carry transfer metadata.
-        return self._wrap_omni_scheduler_output(
+        omni_output = self._wrap_omni_scheduler_output(
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+        if getattr(self, "_minicpmo45_carry", None) is not None:
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                MiniCPMO45DuplexSchedulerHelper,
+            )
+
+            omni_output.duplex_carry_ops = MiniCPMO45DuplexSchedulerHelper.take_carry_ops(self)
+        return omni_output
 
     def update_from_output(
         self,
@@ -1534,8 +1565,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 MiniCPMO45DuplexSchedulerHelper,
             )
 
+            MiniCPMO45DuplexSchedulerHelper.snapshot_window(self, session)
             reanchored = False
-            if MiniCPMO45DuplexSchedulerHelper.find_duplex_window_manager(self) is not None:
+            # A carried window is placed by a prompt replacement, never an in-place trim.
+            if (
+                MiniCPMO45DuplexSchedulerHelper.find_duplex_window_manager(self) is not None
+                and getattr(session, "_minicpmo45_carried_window", None) is None
+            ):
                 plan = self._maybe_reanchor_streaming_window(
                     session,
                     update,
@@ -1543,6 +1579,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     completed_terminator=completed_terminator,
                 )
                 reanchored = plan is not None
+            duplex_info = (getattr(update, "model_intermediate_buffer", None) or {}).get("duplex")
+            if isinstance(duplex_info, dict) and isinstance(duplex_info.get("stage0_window"), dict):
+                # The worker drops its carried units at the first window plan it gets, an in-place trim's included.
+                session._minicpmo45_window_planned = True
             if not reanchored and self._prepare_minicpmo45_stage0_window(
                 session,
                 update,
@@ -1722,6 +1762,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
         window = runtime_config.get("duplex_window_config")
         mode = window.get("sliding_window_mode", "off") if isinstance(window, dict) else "off"
+        if mode not in {"basic", "context"}:
+            # Without a window the worker keeps no unit history to carry.
+            session._minicpmo45_carried_window = None
 
         try:
             seq = int(duplex.get("seq", 0) or 0)
@@ -1741,6 +1784,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         duplex["stage0_window"] = {"completed_token_ids": list(generated_ids)}
         if completed_terminator is not None:
             duplex["stage0_window"]["completed_terminator_token_id"] = int(completed_terminator)
+        # The worker drops its carried units at the first plan it gets, placed or
+        # not, so the carry is taken here, before any return below, and none is
+        # handed to this request afterwards.
+        carry = getattr(session, "_minicpmo45_carried_window", None)
+        session._minicpmo45_carried_window = None
+        session._minicpmo45_window_planned = True
         # Boundary reconciliation is required even with an unbounded context:
         # async lookahead can overwrite the worker's pending terminator after
         # the scheduler accepted the segment stop. Window retention is optional.
@@ -1769,6 +1818,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             }
         )
         projected_len = base_len + len(update.prompt_token_ids)
+        carried_units: list[dict[str, Any]] = []
+        if carry is not None:
+            # This request replaced one a barge-in aborted. Its first plan puts
+            # that request's completed units back ahead of this one's own, with
+            # the text the context window had already moved out of them.
+            carried_units = [dict(unit) for unit in carry.get("units", ())]
+            units = [*carried_units, *units]
+            projected_len += sum(int(unit["length"]) for unit in carried_units)
+            if mode == "context":
+                session._minicpmo45_window_previous_token_ids = list(carry.get("previous", ()))
         drop_count = 0
         dropped_len = 0
 
@@ -1810,7 +1869,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         retained_units = units[drop_count:]
         session._minicpmo45_window_units = retained_units
-        if drop_count == 0:
+        if drop_count == 0 and not carried_units:
             session._minicpmo45_window_open_start = boundary
             return False
 
@@ -1845,6 +1904,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             "previous_marker_token_ids": marker_ids,
             "replacement_prompt_len": replacement_len,
         }
+        if carried_units:
+            duplex["stage0_window"]["carried_units"] = len(carried_units)
+            duplex["stage0_window"]["carried_unit_lengths"] = [int(unit["length"]) for unit in carried_units]
         if completed_terminator is not None:
             duplex["stage0_window"]["completed_terminator_token_id"] = int(completed_terminator)
         recorded_prefix_len = runtime_config.get("duplex_window_prefix_tokens")

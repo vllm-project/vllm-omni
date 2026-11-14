@@ -500,6 +500,25 @@ def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch)
     assert sorted(c.args[0] for c in runner.model_state.remove_request.call_args_list) == [0]
 
 
+def test_finish_requests_passes_scheduler_decisions_before_freeing_finished_requests(monkeypatch):
+    """The model reads the step's scheduler decisions while finished requests' state still exists."""
+    runner = _make_runner()
+    calls = []
+    runner.model = SimpleNamespace(
+        on_scheduler_output=lambda output: calls.append(("decisions", output.duplex_carry_ops)),
+        on_requests_finished=lambda ids: calls.append(("finished", set(ids))),
+    )
+    runner.model_state = MagicMock()
+    monkeypatch.setattr(GPUModelRunner, "finish_requests", lambda *args: None)
+
+    runner.finish_requests(
+        SimpleNamespace(finished_req_ids={"r"}, preempted_req_ids=set(), duplex_carry_ops=[("keep", "s", "r")])
+    )
+    runner.finish_requests(SimpleNamespace(finished_req_ids=set(), preempted_req_ids=set(), duplex_carry_ops=[]))
+
+    assert calls == [("decisions", [("keep", "s", "r")]), ("finished", {"r"}), ("decisions", [])]
+
+
 @pytest.mark.parametrize("stage,declared", [("thinker", False), ("custom_ar", True)])
 def test_capture_contract_uses_model_declaration(stage, declared):
     runner = _make_runner()

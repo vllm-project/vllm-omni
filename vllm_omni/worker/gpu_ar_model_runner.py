@@ -1264,6 +1264,9 @@ class GPUARModelRunner(
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
 
+            # Scheduler decisions the model follows this step, before it frees finished requests' state.
+            if hasattr(self.model, "on_scheduler_output"):
+                self.model.on_scheduler_output(scheduler_output)
             # Notify model of finished requests for state cleanup
             if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
                 self.model.on_requests_finished(scheduler_output.finished_req_ids)

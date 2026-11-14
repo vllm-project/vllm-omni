@@ -62,6 +62,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Barge-in carry: a Stage-0 request a barge-in or cancel aborted leaves its
+# completed window units to the session's next Stage-0 request. The scheduler
+# (MiniCPMO45DuplexSchedulerHelper) decides which windows are kept, for how long
+# and which new request gets one, and sends each step's decisions to the worker
+# in ``OmniSchedulerOutput.duplex_carry_ops``; the worker
+# (MiniCPMO45Stage0DuplexRuntime) only follows them, so the two never disagree.
+
+#: Sessions whose aborted window the scheduler keeps at once; the oldest is
+#: dropped first. The worker keeps the same windows in pinned host memory
+#: (about 64 MB each at the ``basic`` limit), so this also bounds that.
+CARRIED_WINDOW_MAX_SESSIONS = 32
+#: Seconds the scheduler offers an aborted request's window to the session's
+#: next Stage-0 request. The next append normally follows within a second.
+CARRIED_WINDOW_OFFER_TTL_S = 10.0
+
 
 def align_up(value: int, unit: int) -> int:
     if unit <= 0:

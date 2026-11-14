@@ -139,3 +139,6 @@ class OmniSchedulerOutput(SchedulerOutput):
     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
     input_terminal_req_ids: set[str] = field(default_factory=set)
     pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)
+    #: MiniCPM-o duplex barge-in carry decisions the worker applies in order at the start of the step
+    #: (``(op, session_id, request_id)``; see ``MiniCPMO45DuplexSchedulerHelper.on_schedule``).
+    duplex_carry_ops: list[tuple[str, str, str]] = field(default_factory=list)
