@@ -42,6 +42,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
+from vllm_omni.core.transfer_types import ChunkMeta, TransferPayload
 from vllm_omni.data_entry_keys import (
     ASYNC_CHUNK_PREWARM_NS,
     FIRST_AUDIO_KEY,
@@ -2928,6 +2929,105 @@ class OrchestratorBase:
                 exc_info=True,
             )
 
+    # ── Typed transfer-payload helpers (Issue #2336) ────────────────
+
+    def _build_chunk_meta(
+        self,
+        req_id: str,
+        src_stage_id: int,
+        is_final_update: bool = False,
+    ) -> ChunkMeta | None:
+        """Best-effort :class:`ChunkMeta` for an inter-stage forward.
+
+        The orchestrator does not own the authoritative chunk counter — that
+        lives in the runtime connector (``put_req_chunk``).  This helper
+        therefore falls back to ``None`` when it cannot infer phase semantics
+        from what it *does* know (the streaming / final-update flags and any
+        hint stashed on ``req_state``).  Downstream consumers should treat
+        ``None`` as "unknown — fall back to legacy integer counters".
+
+        If :attr:`OrchestratorRequestState.streaming.enabled` is ``False``
+        then the transfer is a single-shot prefill and we return
+        ``ChunkMeta.prefill(is_final=is_final_update)``.  For streaming
+        requests we **return None** — the orchestrator cannot distinguish
+        PREFILL from DECODE in that case, and fabricating PREFILL with
+        ``chunk_index=0`` on every streaming update would cause consumers
+        to re-run prefill handling repeatedly.
+        """
+        req_state = self.request_states.get(req_id)
+        if req_state is None:
+            return None
+        streaming = getattr(req_state.streaming, "enabled", False)
+        if not streaming:
+            return ChunkMeta.prefill(is_final=is_final_update)
+        # Streaming — orchestrator cannot authoritatively infer phase.
+        # Downstream consumers will fall back to the legacy chunk counter.
+        return None
+
+    def _build_transfer_payload(
+        self,
+        req_id: str,
+        src_stage_id: int,
+        output: Any,
+        *,
+        target_stage_id: int,
+        is_final_update: bool = False,
+    ) -> TransferPayload:
+        """Wrap ``output`` in a typed :class:`TransferPayload`.
+
+        Handles three input shapes: a plain ``torch.Tensor``, an ``OmniPayload``-
+        style ``dict``, or an ``OmniPayloadStruct`` (has ``__struct_fields__``).
+        Non-tensor content lands in ``TransferPayload.metadata``, tensors
+        land in ``TransferPayload.tensors``.  Nested dicts are flattened to
+        dotted keys (``{"embed": {"prefill": tensor}}`` →
+        ``tensors["embed.prefill"]``).
+        """
+        chunk = self._build_chunk_meta(req_id, src_stage_id, is_final_update)
+
+        if isinstance(output, torch.Tensor):
+            return TransferPayload(
+                tensors={"output": output},
+                source_stage=src_stage_id,
+                target_stage=target_stage_id,
+                chunk=chunk,
+                request_id=req_id,
+            )
+
+        # Optional local import to keep orchestrator decoupled from data_entry_keys.
+        if hasattr(output, "__struct_fields__"):
+            from vllm_omni.data_entry_keys import to_dict  # noqa: PLC0415
+
+            raw: Any = to_dict(output)
+        else:
+            raw = output
+
+        if isinstance(raw, dict):
+            return TransferPayload.from_dict(
+                raw,
+                source_stage=src_stage_id,
+                target_stage=target_stage_id,
+                chunk=chunk,
+                request_id=req_id,
+            )
+
+        # Unknown shape — wrap as a single generic tensor (if tensor-like) or
+        # tuck into metadata.
+        if hasattr(raw, "detach") and isinstance(raw, torch.Tensor):
+            return TransferPayload(
+                tensors={"output": raw},
+                source_stage=src_stage_id,
+                target_stage=target_stage_id,
+                chunk=chunk,
+                request_id=req_id,
+            )
+        return TransferPayload(
+            metadata={"raw_output": raw},
+            source_stage=src_stage_id,
+            target_stage=target_stage_id,
+            chunk=chunk,
+            request_id=req_id,
+        )
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -3039,11 +3139,32 @@ class OrchestratorBase:
                 _t_ar2d = _time.perf_counter()
                 _fn = next_client.custom_process_input_func
                 _extra_kwargs: dict[str, Any] = {}
-                # TODO: replace signature probe with explicit kwarg contract.
+                # Issue #2336: inject typed ``transfer_payload`` / ``chunk_meta``
+                # only when the processor signature opts in.
+                #
+                # Fix (amy-why-3459): probe the signature **first**, then build
+                # the TransferPayload lazily — the recursive flatten + from_dict
+                # walk is non-trivial and was running on every forward even when
+                # no consumer accepted the new kwargs.
                 try:
                     import inspect as _inspect
 
-                    if "sampling_params" in _inspect.signature(_fn).parameters:
+                    _sig = _inspect.signature(_fn)
+                    _has_transfer_payload = "transfer_payload" in _sig.parameters
+                    _has_chunk_meta = "chunk_meta" in _sig.parameters
+                    if _has_transfer_payload or _has_chunk_meta:
+                        _typed_payload = self._build_transfer_payload(
+                            req_id,
+                            src_stage_id,
+                            output,
+                            target_stage_id=next_logical,
+                            is_final_update=is_final_update,
+                        )
+                        if _has_transfer_payload:
+                            _extra_kwargs["transfer_payload"] = _typed_payload
+                        if _has_chunk_meta:
+                            _extra_kwargs["chunk_meta"] = _typed_payload.chunk
+                    if "sampling_params" in _sig.parameters:
                         _extra_kwargs["sampling_params"] = params
                 except (TypeError, ValueError):
                     pass
@@ -3204,10 +3325,38 @@ class OrchestratorBase:
         try:
             assert next_client is not None
             process_inputs = getattr(next_client, "process_engine_inputs")
+            _engine_extra_kwargs: dict[str, Any] = {}
+            # Issue #2336: inject typed ``transfer_payload`` / ``chunk_meta``
+            # only when the ``process_engine_inputs`` signature opts in.
+            #
+            # Fix (amy-why-3459): build lazily — the current ``process_engine_inputs``
+            # signature does not declare either kwarg, so we were doing the
+            # recursive flatten + from_dict work for free on every non-diffusion forward.
+            try:
+                import inspect as _inspect
+
+                _sig = _inspect.signature(process_inputs)
+                _has_transfer_payload = "transfer_payload" in _sig.parameters
+                _has_chunk_meta = "chunk_meta" in _sig.parameters
+                if _has_transfer_payload or _has_chunk_meta:
+                    _typed_payload = self._build_transfer_payload(
+                        req_id,
+                        src_stage_id,
+                        output,
+                        target_stage_id=next_logical,
+                        is_final_update=is_final_update,
+                    )
+                    if _has_transfer_payload:
+                        _engine_extra_kwargs["transfer_payload"] = _typed_payload
+                    if _has_chunk_meta:
+                        _engine_extra_kwargs["chunk_meta"] = _typed_payload.chunk
+            except (TypeError, ValueError):
+                pass
             next_inputs = process_inputs(
                 source_outputs,
                 req_state.prompt,
                 streaming_context=req_state.streaming,
+                **_engine_extra_kwargs,
             )
         except OmniClientError as exc:
             await self._fail_request_client_error(
