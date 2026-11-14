@@ -205,6 +205,46 @@ Important settings for this profile:
   at every GPU count; TP uses less memory per GPU. One GPU needs no parallel
   flags and holds the full model (about 112 GiB of weights).
 
+### VAE graph decoding with independent SP1 workers
+
+The image pipeline keeps the DiT eager and enables VAE tile graphs by
+default. To select this explicitly, use
+`--enable-cuda-graph-decode --no-enforce-eager`; compare with
+`--no-enable-cuda-graph-decode --no-enforce-eager` for an eager VAE control.
+ROCm uses one graph replica per tile shape, captured on its own replay
+stream. Older images must include these runtime fixes before enabling graphs.
+
+A 2026-11-13 experiment used four independent SP1/encoder-TP1 workers behind
+an external router on 4 × MI350X (`gfx950`). The runtime was
+`haihub007/minimax-h3-image:perf-1113`, image ID
+`sha256:6f89ea36dd542234aa8b7118b8b7204232cd58dd355f17ab4a85fe9dd8be7869`,
+with vLLM `0.33.0+rocm100`, PyTorch `2.13.0+rocm10.0.0`, AITER `0.1.26`,
+Transformers `5.19.0` and Diffusers `0.40.0`. Its tuned AITER GEMM table
+was held identical in both variants. Both used
+the same VAE source overlay backporting the current single-replica and
+capture-stream behavior; only the graph-decode flag changed.
+
+| Concurrency | Eager mean HTTP s | Graph mean HTTP s | Eager images/s | Graph images/s | Throughput gain |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 2.5832 | 2.0752 | 0.3809 | 0.4723 | +24.02% |
+| 8 | 4.7277 | 3.8305 | 1.5910 | 1.9883 | +24.97% |
+
+Four separate server starts ran in eager → graph → graph → eager order,
+with one ascending and one descending C1/C8 sweep per variant. Each phase
+used four excluded warmups and 64 measured requests: 512 measured requests
+passed. Requests used the same 20-prompt/seed corpus, six steps, BF16,
+FLASH_ATTN, disabled prompt-embedding cache and encoder cuDNN SDP,
+1344×768 output, and a 2720×1536 internal canvas. HTTP latency ends at full
+body receipt; throughput includes client PNG validation and persistence.
+The two graph blocks reached 1.9776 and 1.9990 images/s at C8.
+
+Separately, 28 fixed-latent decoder comparisons at 2720×1536 and 4096²
+matched eager decoded floats and quantized uint8 values exactly. This is a
+decoder-equivalence check, not a full-model image-quality certification.
+These historical graph-on/off results do not measure the recipe change
+against current `main`, the default SP4 profile, native replica routing, or
+native-4K HTTP serving. MI355X was not measured.
+
 ## Generate an image
 
 Submit six inference steps or omit the step count to use the checkpoint's
