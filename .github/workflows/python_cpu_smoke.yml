@@ -1,0 +1,53 @@
+name: Python CPU Smoke Tests
+
+on:
+  pull_request:
+    branches: [main, "release/v*"]
+    paths:
+      - "vllm_omni/**"
+      - "tests/**"
+      - "docs/mkdocs/hooks/generate_argparse.py"
+      - "pyproject.toml"
+      - ".github/workflows/python_cpu_smoke.yml"
+  push:
+    branches: [main, "release/v*"]
+    paths:
+      - "vllm_omni/**"
+      - "tests/**"
+      - "docs/mkdocs/hooks/generate_argparse.py"
+      - "pyproject.toml"
+      - ".github/workflows/python_cpu_smoke.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  cpu-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install lightweight test dependencies
+        run: python -m pip install pytest==9.1.1 pytest-asyncio==1.4.0 pydantic-core
+      - name: Check package syntax on this interpreter
+        run: python -m compileall -q vllm_omni
+      - name: Run dependency-light CPU unit tests
+        # These tests already load their leaf modules without vLLM. Skip the
+        # shared GPU fixtures and clear the default pytest-xdist option.
+        run: >-
+          python -m pytest --noconftest -o addopts=
+          --strict-markers --strict-config -q
+          tests/docs/test_generate_argparse.py
+          tests/model_executor/models/minicpmo_4_5/duplex/test_window_plan.py
