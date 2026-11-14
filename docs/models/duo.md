@@ -87,11 +87,21 @@ video share one playback acknowledgement.
 
 ## Validation and limitations
 
-- The upstream `inference/vllm-omni-duo` branch ships additional scheduler and
-  output-processor hooks (bounded Realization window trimming, H50 scheduled-row
-  handoff) that are **not** part of this integration yet. Long sessions depend on
-  those windows; treat this as a preview port of the model, not of the full
-  streaming scheduler.
+- The upstream `inference/vllm-omni-duo` branch ships ~250 lines of scheduler and
+  output-processor hooks that are **not** part of this integration (bounded
+  Realization-window trimming around `scheduler_trim`, and the
+  `DUO_SEGMENT_H50` / `DUO_INCREMENTAL_H50` scheduled-row handoff). Neither hook
+  exists on `main` and none of the ported model code imports them. Two
+  consequences to be explicit about:
+  - the plugin's `stage_is_resumable`, `model_state_stage_ids`,
+    `start_transcription_preparation` and `record_stage_timing` overrides are
+    inert here, because the engine on `main` has no call site for them;
+  - upstream's `abort_requests` closes the Realization session through
+    `close_ar_diffusion_session`, which neither the upstream nor this ported
+    DuoTransformer implements. Duo session state is therefore released through
+    `close_session` only, and interrupted sessions are not torn down early.
+  Long online sessions depend on the untaken paths above; treat this as a
+  preview port of the model, not of the full streaming scheduler.
 - Online duplex serving requires the duplex plugin and a deploy config; the
   plain generation APIs do not expose reply-boundary decisions.
 - Direct user-audiovisual conditioning of Realization is not enabled by the
