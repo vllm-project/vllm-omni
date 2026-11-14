@@ -630,13 +630,10 @@ def test_mamba_prefix_cache_align_order_and_native_arguments(monkeypatch, postpr
         assert events[-1][0] == "sync"
         events.append("stage")
 
-    native = ModuleType("vllm.v1.worker.mamba_utils")
-    setattr(native, "preprocess_mamba", preprocess)
-    setattr(native, "stage_postprocess_inputs_to_gpu", stage)
-    worker = ModuleType("vllm.v1.worker")
-    setattr(worker, "mamba_utils", native)
-    monkeypatch.setitem(sys.modules, "vllm.v1.worker", worker)
-    monkeypatch.setitem(sys.modules, "vllm.v1.worker.mamba_utils", native)
+    from vllm_omni.worker.v1_compat import mamba_utils
+
+    monkeypatch.setattr(mamba_utils, "preprocess_mamba", preprocess)
+    monkeypatch.setattr(mamba_utils, "stage_postprocess_inputs_to_gpu", stage)
     callback = (lambda: events.append("deferred")) if deferred else None
     assert prepare_mamba_prefix_cache(runner, scheduler, 2, callback) is None
     sync = events[-2] if postprocess else events[-1]

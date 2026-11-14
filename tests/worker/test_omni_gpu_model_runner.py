@@ -8,7 +8,9 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
-from vllm.config.compilation import CUDAGraphMode
+from vllm.config.compilation import CompilationConfig, CompilationMode, CUDAGraphMode
+from vllm.lora.layers import LoRAMapping, LoRAMappingType
+from vllm.lora.request import LoRARequest
 from vllm.model_executor.warmup.kernel_warmup import _outside_kv_cache_transient_window
 from vllm.utils.torch_utils import weak_ref_tensors
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
@@ -26,7 +28,9 @@ from vllm_omni.worker.gpu_model_runner import (
 from vllm_omni.worker.lmcache_model_runner_mixin import LMCacheHiddenStateMixin
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.v1_compat import gpu_model_runner as v1_runner
+from vllm_omni.worker.v1_compat.cudagraph_dispatcher import CudagraphDispatcher
 from vllm_omni.worker.v1_compat.gpu_model_runner import V1GPUModelRunnerMixin as GPUModelRunner
+from vllm_omni.worker.v1_compat.input_batch import InputBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -2377,3 +2381,141 @@ def test_warmup_capture_forces_moe_routing_key_when_specializing(monkeypatch, ke
     assert len(calls) == 2  # one warmup + one capture
     for _, kwargs in calls:
         assert kwargs["force_moe_routing_key"] == int(key)
+
+
+@pytest.mark.parametrize(
+    ("lora_ids", "scheduled", "sampled", "mapping_type", "expected_prompt", "expected_tokens"),
+    [
+        ([11, 0, 22], [2, 1, 3], None, None, (11, 0, 22), (11, 11, 0, 22, 22, 22)),
+        ([11, 0, 22], [2, 1, 3], [0, 2, 1], LoRAMappingType.TOWER, (0, 0, 22), (11, 11, 0, 22, 22, 22)),
+        ([0, 0, 0], [1, 0, 2], [1, 0, 2], LoRAMappingType.CONNECTOR, (0, 0, 0), (0, 0, 0)),
+    ],
+    ids=["default-sampling-counts", "distinct-sampled-and-scheduled-counts", "no-active-adapters"],
+)
+def test_v1_set_active_loras_preserves_real_batch_mapping(
+    lora_ids, scheduled, sampled, mapping_type, expected_prompt, expected_tokens
+):
+    batch = object.__new__(InputBatch)
+    batch._req_ids = ["first", "second", "third"]
+    batch.req_id_to_index = {req_id: index for index, req_id in enumerate(batch._req_ids)}
+    # A padded entry must not enter mappings for the three live requests.
+    batch.request_lora_mapping = np.array([*lora_ids, 99], dtype=np.int32)
+    batch.lora_id_to_lora_request = {
+        value: LoRARequest(f"adapter-{value}", value, f"/unused/adapter-{value}") for value in lora_ids if value
+    }
+    scheduled = np.array(scheduled, dtype=np.int32)
+    sampled = None if sampled is None else np.array(sampled, dtype=np.int32)
+    scheduled_before = scheduled.copy()
+    sampled_before = None if sampled is None else sampled.copy()
+    runner = object.__new__(GPUModelRunner)
+    runner.lora_manager = Mock()
+
+    if mapping_type is None:
+        runner.set_active_loras(batch, scheduled, sampled)
+    else:
+        runner.set_active_loras(batch, scheduled, sampled, mapping_type=mapping_type)
+
+    runner.lora_manager.set_active_adapters.assert_called_once()
+    requests, mapping = runner.lora_manager.set_active_adapters.call_args.args
+    assert requests == set(batch.lora_id_to_lora_request.values())
+    assert isinstance(mapping, LoRAMapping)
+    assert mapping.prompt_mapping == expected_prompt
+    assert mapping.index_mapping == expected_tokens
+    assert mapping.type == (LoRAMappingType.LANGUAGE if mapping_type is None else mapping_type)
+    assert mapping.is_prefill is True
+    np.testing.assert_array_equal(scheduled, scheduled_before)
+    if sampled is not None:
+        np.testing.assert_array_equal(sampled, sampled_before)
+
+
+def _make_v1_cudagraph_runner(mode, sizes, query_len, compile_sizes=None):
+    compilation = CompilationConfig(
+        mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=mode,
+        cudagraph_capture_sizes=list(sizes),
+        max_cudagraph_capture_size=max(sizes),
+        compile_sizes=compile_sizes,
+    )
+    compilation.set_splitting_ops_for_v1(all2all_backend="allgather_reducescatter")
+    compilation.post_init_cudagraph_sizes()
+    config = SimpleNamespace(
+        compilation_config=compilation,
+        num_speculative_tokens=query_len - 1,
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        lora_config=None,
+    )
+    runner = object.__new__(GPUModelRunner)
+    runner.vllm_config = config
+    runner.compilation_config = compilation
+    runner.uniform_decode_query_len = query_len
+    runner.kv_cache_config = None
+    runner.max_num_reqs = 8
+    runner.speculative_config = None
+    runner.cudagraph_dispatcher = CudagraphDispatcher(config)
+    return runner
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL_DECODE_ONLY])
+def test_v1_speculative_cudagraph_rounds_real_capture_grid(mode):
+    runner = _make_v1_cudagraph_runner(mode, [1, 2, 4, 8], 3)
+
+    runner._check_and_update_cudagraph_mode([], [])
+
+    assert runner.compilation_config.cudagraph_capture_sizes == [3, 6]
+    assert runner.compilation_config.max_cudagraph_capture_size == 6
+    descriptors = runner.cudagraph_dispatcher.cudagraph_keys[CUDAGraphMode.FULL]
+    assert {(desc.num_tokens, desc.num_reqs, desc.uniform) for desc in descriptors} == {(3, 1, True), (6, 2, True)}
+
+
+def test_v1_speculative_cudagraph_dispatch_preserves_padding_and_upper_bound():
+    runner = _make_v1_cudagraph_runner(CUDAGraphMode.FULL_AND_PIECEWISE, [1, 4, 10, 16], 3)
+    runner._check_and_update_cudagraph_mode([], [])
+    assert runner.compilation_config.cudagraph_capture_sizes == [3, 6, 12]
+    assert runner.compilation_config.max_cudagraph_capture_size == 12
+
+    mode, descriptor = runner.cudagraph_dispatcher.dispatch(9, uniform_decode=True)
+    assert mode == CUDAGraphMode.FULL
+    assert (descriptor.num_tokens, descriptor.num_reqs, descriptor.uniform) == (12, 4, True)
+    mode, descriptor = runner.cudagraph_dispatcher.dispatch(4)
+    assert mode == CUDAGraphMode.PIECEWISE
+    assert (descriptor.num_tokens, descriptor.num_reqs, descriptor.uniform) == (6, None, False)
+    mode, descriptor = runner.cudagraph_dispatcher.dispatch(13, uniform_decode=True)
+    assert mode == CUDAGraphMode.NONE
+    assert descriptor.num_tokens == 13
+
+
+@pytest.mark.parametrize(
+    ("mode", "query_len"),
+    [(CUDAGraphMode.FULL_AND_PIECEWISE, 1), (CUDAGraphMode.PIECEWISE, 3)],
+)
+def test_v1_speculative_cudagraph_leaves_other_modes_and_no_spec_unchanged(mode, query_len):
+    runner = _make_v1_cudagraph_runner(mode, [1, 2, 4, 8], query_len)
+    runner._check_and_update_cudagraph_mode([], [])
+    assert runner.compilation_config.cudagraph_capture_sizes == [1, 2, 4, 8]
+    assert runner.compilation_config.max_cudagraph_capture_size == 8
+    if mode == CUDAGraphMode.PIECEWISE:
+        actual_mode, descriptor = runner.cudagraph_dispatcher.dispatch(3, uniform_decode=True)
+        assert actual_mode == CUDAGraphMode.PIECEWISE
+        assert (descriptor.num_tokens, descriptor.uniform) == (4, False)
+
+
+def test_v1_speculative_cudagraph_keeps_smallest_valid_grid_when_ceil_exceeds_max():
+    runner = _make_v1_cudagraph_runner(CUDAGraphMode.FULL_DECODE_ONLY, [8], 3)
+    runner._check_and_update_cudagraph_mode([], [])
+    assert runner.compilation_config.cudagraph_capture_sizes == [3]
+    assert runner.compilation_config.max_cudagraph_capture_size == 3
+    mode, descriptor = runner.cudagraph_dispatcher.dispatch(3, uniform_decode=True)
+    assert mode == CUDAGraphMode.FULL
+    assert (descriptor.num_tokens, descriptor.num_reqs) == (3, 1)
+
+
+def test_v1_speculative_cudagraph_reports_no_valid_grid():
+    runner = _make_v1_cudagraph_runner(CUDAGraphMode.FULL_DECODE_ONLY, [1, 2], 3)
+    with pytest.raises(ValueError, match="No valid cudagraph sizes after rounding to multiple of 3"):
+        runner._check_and_update_cudagraph_mode([], [])
+
+
+def test_v1_speculative_cudagraph_retains_compile_size_validation():
+    runner = _make_v1_cudagraph_runner(CUDAGraphMode.FULL_AND_PIECEWISE, [1, 2, 4, 8], 3, compile_sizes=[4])
+    with pytest.raises(ValueError, match="compile_sizes contains 4 which would be padded to 6"):
+        runner._check_and_update_cudagraph_mode([], [])

@@ -334,15 +334,15 @@ class SpecDecodeBaseProposer:
             self.parallel_drafting_token_id = model_hf_config.mask_token_id
         elif hasattr(model_hf_config, "dspark_noise_token_id"):
             self.parallel_drafting_token_id = model_hf_config.dspark_noise_token_id
-        elif hasattr(model_hf_config, "part_token"):
-            self.parallel_drafting_token_id = model_hf_config.part_token
-        elif hasattr(model_hf_config, "pdf_token_id"):
-            self.parallel_drafting_token_id = model_hf_config.pdf_token_id
+        elif hasattr(model_hf_config, "pard_token"):
+            self.parallel_drafting_token_id = model_hf_config.pard_token
+        elif hasattr(model_hf_config, "ptd_token_id"):
+            self.parallel_drafting_token_id = model_hf_config.ptd_token_id
         else:
             raise ValueError(
                 "For parallel drafting, the draft model config must have "
                 "`dflash_config.mask_token_id`, `mask_token_id`, "
-                "`dspark_noise_token_id`, `part_token`, or `pdf_token_id` "
+                "`dspark_noise_token_id`, `pard_token`, or `ptd_token_id` "
                 "specified in its config.json."
             )
 

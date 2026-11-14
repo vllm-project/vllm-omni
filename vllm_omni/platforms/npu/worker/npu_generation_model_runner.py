@@ -12,7 +12,6 @@ from dataclasses import replace
 
 import numpy as np
 import torch
-import vllm.v1.worker.mamba_utils as mamba_utils
 from vllm.config import CUDAGraphMode
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
@@ -48,6 +47,7 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
 )
+from vllm_omni.worker.v1_compat import mamba_utils
 from vllm_omni.worker.v1_compat.misc import PerLayerAttnMetadata
 
 

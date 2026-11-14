@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from transformers import PretrainedConfig
 from vllm.config import CUDAGraphMode, SpeculativeConfig, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionBackend
@@ -306,3 +307,63 @@ def test_cache_only_extraction_uses_real_native_builder_and_keeps_sampled_column
     assert result.tolist() == [[7], [9]]
     torch.testing.assert_close(observed["hidden"], torch.stack(hidden, dim=1))
     assert observed["metadata"].slot_mapping is metadata.slot_mapping
+
+
+@pytest.mark.parametrize("pass_hidden_states", [False, True])
+@pytest.mark.parametrize(
+    ("config_fields", "expected"),
+    [
+        ({"pard_token": 41}, 41),
+        ({"ptd_token_id": 42}, 42),
+        ({"pard_token": 0, "ptd_token_id": 42}, 0),
+        ({"dspark_noise_token_id": 7, "pard_token": 41, "ptd_token_id": 42}, 7),
+        ({"mask_token_id": 0, "dspark_noise_token_id": 7, "pard_token": 41, "ptd_token_id": 42}, 0),
+        (
+            {
+                "dflash_config": {"mask_token_id": 0},
+                "mask_token_id": 5,
+                "dspark_noise_token_id": 7,
+                "pard_token": 41,
+                "ptd_token_id": 42,
+            },
+            0,
+        ),
+    ],
+    ids=[
+        "parallel-token",
+        "parallel-token-id",
+        "parallel-priority",
+        "noise-priority",
+        "mask-priority",
+        "dflash-priority",
+    ],
+)
+def test_parallel_drafting_config_token_fields(config_fields, expected, pass_hidden_states):
+    proposer = object.__new__(SpecDecodeBaseProposer)
+    proposer.draft_model_config = SimpleNamespace(hf_config=PretrainedConfig(**config_fields))
+    proposer.pass_hidden_states_to_model = pass_hidden_states
+    proposer.parallel_drafting_hidden_state_tensor = None
+    proposer.hidden_size = 4
+    proposer.dtype = torch.float32
+    proposer.device = torch.device("cpu")
+
+    proposer._init_parallel_drafting_params()
+
+    assert proposer.parallel_drafting_token_id == expected
+    if pass_hidden_states:
+        hidden = proposer.parallel_drafting_hidden_state_tensor
+        assert isinstance(hidden, torch.Tensor)
+        assert hidden.shape == (4,)
+        assert hidden.dtype == torch.float32
+        assert hidden.device == torch.device("cpu")
+    else:
+        assert proposer.parallel_drafting_hidden_state_tensor is None
+
+
+def test_parallel_drafting_config_error_names_supported_fields():
+    proposer = object.__new__(SpecDecodeBaseProposer)
+    proposer.draft_model_config = SimpleNamespace(hf_config=PretrainedConfig())
+    proposer.pass_hidden_states_to_model = False
+
+    with pytest.raises(ValueError, match="pard_token.*ptd_token_id"):
+        proposer._init_parallel_drafting_params()

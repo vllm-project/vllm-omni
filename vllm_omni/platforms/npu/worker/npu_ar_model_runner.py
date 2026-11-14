@@ -29,7 +29,6 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.utils import record_function_or_nullcontext
-from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -55,6 +54,7 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
     needs_omni_connector,
 )
 from vllm_omni.worker.sampling_utils import call_model_sampler, sanitize_min_tokens_stop_ids
+from vllm_omni.worker.v1_compat import mamba_utils
 from vllm_omni.worker.v1_compat.async_output import AsyncGPUModelRunnerOutput
 from vllm_omni.worker.v1_compat.misc import PerLayerAttnMetadata, apply_grammar_bitmask
 from vllm_omni.worker.v1_compat.spec_decode import SpecDecodeMetadata

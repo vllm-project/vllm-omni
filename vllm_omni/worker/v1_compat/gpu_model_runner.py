@@ -140,7 +140,7 @@ from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import (
     PIN_MEMORY,
@@ -196,7 +196,6 @@ from vllm.v1.outputs import (
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
-from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.gpu.eplb_utils import (
@@ -229,6 +228,7 @@ from vllm.v1.worker.workspace import lock_workspace
 from vllm_omni.outputs import (
     OmniModelRunnerOutput as ModelRunnerOutput,  # noqa: F811  # [OMNI DEVIATION] omni output type replaces the pin's ModelRunnerOutput
 )
+from vllm_omni.worker.v1_compat import mamba_utils
 from vllm_omni.worker.v1_compat.block_table import SlotMappingMode
 from vllm_omni.worker.v1_compat.cudagraph_dispatcher import CudagraphDispatcher
 from vllm_omni.worker.v1_compat.dflash import DFlashProposer
@@ -952,6 +952,21 @@ class V1GPUModelRunnerMixin(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, E
         self.eplb = EPLBController(self.parallel_config, self.device)
         self.speculator = None
         self.jit_warmup_registry = JitWarmupRegistry(vllm_config)
+
+    def set_active_loras(
+        self,
+        input_batch: InputBatch,
+        num_scheduled_tokens: np.ndarray,
+        num_sampled_tokens: np.ndarray | None = None,
+        mapping_type: LoRAMappingType = LoRAMappingType.LANGUAGE,
+    ) -> None:
+        """Build legacy batch mappings for the native LoRA manager."""
+        if num_sampled_tokens is None:
+            num_sampled_tokens = np.ones_like(num_scheduled_tokens, dtype=np.int32)
+        prompt_mapping, token_mapping, lora_requests = input_batch.make_lora_inputs(
+            num_scheduled_tokens, num_sampled_tokens
+        )
+        return self._set_active_loras(prompt_mapping, token_mapping, lora_requests, mapping_type)
 
     def _init_speculative_decoding(self) -> None:
         """Build the baseline V1 proposer used by this runner's V1 batches."""
@@ -6341,6 +6356,27 @@ class V1GPUModelRunnerMixin(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, E
             max_num_reqs=self.max_num_reqs,
             is_profiling=is_profiling,
         )
+        # Native V2 uses separate request/query grids. The retained V1 full
+        # decode dispatcher instead requires token sizes divisible by query len.
+        if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL and self.uniform_decode_query_len > 1:
+            query_len = self.uniform_decode_query_len
+            capture_sizes = self.compilation_config.cudagraph_capture_sizes
+            if capture_sizes:
+                max_size = self.compilation_config.max_cudagraph_capture_size
+                assert max_size is not None
+                rounded_sizes = sorted(
+                    {round_up(size, query_len) for size in capture_sizes if round_up(size, query_len) <= max_size}
+                )
+                if not rounded_sizes and query_len <= max_size:
+                    rounded_sizes = [query_len]
+                if not rounded_sizes:
+                    raise ValueError(
+                        f"No valid cudagraph sizes after rounding to multiple of {query_len} "
+                        "(num_speculative_tokens + 1); adjust num_speculative_tokens, "
+                        "max_cudagraph_capture_size, or cudagraph_capture_sizes."
+                    )
+                self.compilation_config.cudagraph_capture_sizes = rounded_sizes
+                self.compilation_config.max_cudagraph_capture_size = rounded_sizes[-1]
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
         self.cudagraph_dispatcher.initialize_cudagraph_keys(cudagraph_mode, self.uniform_decode_query_len)
