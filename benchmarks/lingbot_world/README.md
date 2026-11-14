@@ -226,3 +226,15 @@ handling against a scripted WebSocket server. It needs no GPU:
 ```bash
 pytest tests/benchmarks/test_lingbot_world_realtime.py
 ```
+
+## H200 SP2 KV-layout candidates
+
+`configs/h200_sp2_gather.yaml` reproduces the two-H200 FP8/SP2 gather setup.
+Start the server with `VLLM_OMNI_AR_DIFFUSION_KV_GATHER=1` and this deploy config;
+set the environment variable to `0` for the default paged-attention comparison.
+The preset enables `reuse_history_staging` to reuse unchanged contiguous K/V.
+
+This option increases memory use and can change floating-point results. The
+preset also retains the measured baseline's approximate last-step KV reuse and
+fused VAE; it is not a full-precision reference. Compare output quality as well
+as cadence, with identical warmup, prompt, image and seed.
