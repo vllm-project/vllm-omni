@@ -1029,6 +1029,9 @@ steps:
           OMP_NUM_THREADS: "1"
           MKL_NUM_THREADS: "1"
           NUMEXPR_NUM_THREADS: "1"
+          # Audex's CFG/RVQ processors implement the V1 logits-processor
+          # contract. Keep CUDA and ROCm on the same runner explicitly.
+          VLLM_OMNI_CI_MODEL_RUNNER: "v1"
         artifact_paths:
           - artifacts/rocm-audex-weekly/**/*
         commands:

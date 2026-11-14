@@ -2189,6 +2189,9 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
             "count": 15,
             "artifact_name": "rocm-audex-weekly",
             "dependency": "tts_audex_weekly",
+            "env": {
+                "VLLM_OMNI_CI_MODEL_RUNNER": "v1",
+            },
             "files": (
                 "tests/e2e/offline_inference/test_audex_tts.py",
                 "tests/e2e/offline_inference/test_audex_s2s.py",
@@ -2404,6 +2407,8 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         assert "vllm_omni/entrypoints/omni_base.py" in dependency_paths
         assert "vllm_omni/metrics/utils.py" in dependency_paths
         assert "vllm_omni/outputs/" in dependency_paths
+        if dependency == "tts_audex_weekly":
+            assert "tests/assets/" not in dependency_paths
 
         for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
             assert label not in pipeline_path.read_text(encoding="utf-8")

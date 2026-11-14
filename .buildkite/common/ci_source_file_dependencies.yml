@@ -868,7 +868,6 @@ source_file_dependencies:
 
   tts_audex_weekly:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
-    - tests/assets/
     - tests/e2e/offline_inference/test_audex_s2s.py
     - tests/e2e/offline_inference/test_audex_s2t.py
     - tests/e2e/offline_inference/test_audex_tta.py
