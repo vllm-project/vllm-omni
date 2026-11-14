@@ -90,11 +90,11 @@ _ASR_ESCALATION_MODEL = "small"
 # speech. The pairwise waveform comparison covers all four.
 _TRANSCRIBED_CLIPS = 2
 
-# No level marker at module scope: each test carries the one matching how often
-# its claim needs re-checking, though the weekly step collects the file whole.
-# There is deliberately no core_model row -- under dummy weights the stop head is
-# random, so every request would run to gepard.yaml's max_tokens.
+# Weekly tier only. The Gepard step collects ``-m "slow and tts and cuda"``
+# after installing NeMo; a core_model row is deliberately absent -- under dummy
+# weights the stop head is random, so every request would run to max_tokens.
 pytestmark = [
+    pytest.mark.slow,
     pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]
@@ -238,7 +238,6 @@ def _transcribe_for(wav: torch.Tensor, tmp_dir: str, name: str, accepts) -> str:
         pytest.param(
             "Hello, this is Gepard speaking.",
             "hello",
-            marks=pytest.mark.advanced_model,
             id="canonical",
         ),
         # No keyword: this row carries the structural and stopping checks over a
@@ -246,7 +245,6 @@ def _transcribe_for(wav: torch.Tensor, tmp_dir: str, name: str, accepts) -> str:
         pytest.param(
             "The quick brown fox jumps over the lazy dog.",
             None,
-            marks=pytest.mark.slow,
             id="second_text",
         ),
     ],
@@ -274,7 +272,6 @@ def test_gepard_offline_zero_shot(omni_runner, run_level: str, text: str, keywor
     assert keyword in transcript, f"expected {keyword!r} in transcript, got {transcript!r}"
 
 
-@pytest.mark.slow
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_gepard_offline_long_text_skips_repetition(omni_runner, run_level: str) -> None:
     """The other branch of the prompt layout, end to end.
@@ -299,7 +296,6 @@ def test_gepard_offline_long_text_skips_repetition(omni_runner, run_level: str) 
     assert "river" in transcript, f"expected 'river' in transcript, got {transcript!r}"
 
 
-@pytest.mark.slow
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_gepard_offline_concurrent_requests_stay_isolated(omni_runner, run_level: str) -> None:
     """Four requests in one batch, each holding its own generation state.
