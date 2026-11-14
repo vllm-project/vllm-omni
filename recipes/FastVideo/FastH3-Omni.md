@@ -34,7 +34,7 @@ request. To change the default port, add `--port 8001`.
 
 ## Request-level LoRA adapters
 
-Add `--lora-backend peft` to enable ordinary H3 adapters, including Character Swap, with the DLO configuration above. Keep the checkpoint's eight-step sampling settings and disable Turbo adapters.
+For a distributed-layerwise-offload deployment, add `--lora-backend peft` to enable ordinary H3 adapters, including Character Swap. Keep the checkpoint's eight-step sampling settings and disable Turbo adapters.
 
 In ComfyUI, chain existing LoRA nodes through their `lora` input and set each node's strength independently. The HTTP API accepts the corresponding `lora` list; see [stacking multiple LoRAs](../../docs/user_guide/diffusion/lora.md#peft-backend-stacking-multiple-loras-in-one-request). This support applies to FastH3 Omni, not FastH3 Preview or V2.
 
