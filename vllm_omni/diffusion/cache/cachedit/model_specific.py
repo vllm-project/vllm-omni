@@ -993,6 +993,12 @@ def enable_cache_for_kandinsky6(pipeline: Any, cache_config: Any) -> RefreshCach
         return _refresh
 
 
+def enable_cache_for_qwen_image21(pipeline, cache_config) -> CacheDiTEnableResult:
+    from vllm_omni.diffusion.models.qwen_image_21.cache_dit import enable_qwen_image21_cache
+
+    return enable_qwen_image21_cache(pipeline, cache_config)
+
+
 def register_custom_dit_enablers() -> None:
     """Register model-specific Cache-DiT enablers.
 
@@ -1002,6 +1008,7 @@ def register_custom_dit_enablers() -> None:
     """
     CUSTOM_DIT_ENABLERS.update(
         {
+            "QwenImage21Pipeline": enable_cache_for_qwen_image21,
             "Wan22Pipeline": enable_cache_for_wan22,
             "Wan22I2VPipeline": enable_cache_for_wan22,
             "Wan22TI2VPipeline": enable_cache_for_wan22,
