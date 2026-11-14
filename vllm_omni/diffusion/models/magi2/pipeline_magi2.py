@@ -63,7 +63,7 @@ from .configuration_magi2 import (
     MAGI2_GENERATION_CONFIG,
     MAGI2_PREVIEW_CONFIG,
 )
-from .parallel import get_magi2_replica_group
+from .parallel import get_magi2_replica_group, validate_magi2_expert_parallel
 from .preview_data_proxy import Magi2DataProxy
 from .sampler_magi2 import (
     CFGConfig,
@@ -247,6 +247,7 @@ def _resolve_checkpoint_root(model: str, revision: str | None) -> str:
 
 def _validate_native_topology(od_config: OmniDiffusionConfig) -> None:
     parallel = od_config.parallel_config
+    validate_magi2_expert_parallel(parallel)
     unsupported: list[str] = []
     for name in (
         "pipeline_parallel_size",
@@ -257,8 +258,6 @@ def _validate_native_topology(od_config: OmniDiffusionConfig) -> None:
         value = getattr(parallel, name, 1)
         if value not in (None, 1):
             unsupported.append(f"{name}={value}")
-    if getattr(parallel, "enable_expert_parallel", False):
-        unsupported.append("enable_expert_parallel")
     if od_config.quantization_config is not None:
         unsupported.append("quantization")
     if unsupported:
