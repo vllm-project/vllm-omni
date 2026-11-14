@@ -2233,7 +2233,12 @@ class WorkerProc:
                 shutdown_triggered = True
                 raise SystemExit(128 + signum)
 
-        signal.signal(signal.SIGTERM, signal_handler)
+        # Direct SIGTERM is an abnormal worker failure. Let the OS terminate
+        # immediately, even during native execution: Python/distributed cleanup
+        # can block while peer ranks are in collectives, preventing the parent's
+        # sentinel monitor from detecting the failure and stopping those peers.
+        # Normal shutdown still uses SHUTDOWN_MESSAGE and the finally block.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
         signal.signal(signal.SIGINT, signal_handler)
 
         # Normal executor shutdown still reaches the handlers above and cleans
