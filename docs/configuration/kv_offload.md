@@ -164,8 +164,12 @@ selected vLLM/CUDA environment. `namespace` separates cache populations;
 `model_revision` must identify the exact checkpoint actually loaded, including
 when loading a local directory. The load path and transformers version are not
 part of the cache identity, so replicas that load the same revision from
-different directories share entries. Change the namespace for an incompatible
-cache deployment. Never reuse a checkpoint identifier for different weights.
+different directories share entries when their model and cache configurations
+match. The resolved physical KV layout is part of the identity: `LBHNC` and
+`LBNHC` deployments cannot reuse each other's raw KV bytes. Entries written
+before layout was included in the identity become cold misses after upgrading.
+Change the namespace for an incompatible cache deployment. Never reuse a
+checkpoint identifier for different weights.
 
 `max_hs_bytes` bounds temporary HS data, independently of Mooncake's configured
 store capacity. `max_pending_transfers` bounds queued HS reads and, separately,

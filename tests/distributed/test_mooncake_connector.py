@@ -1164,7 +1164,7 @@ def namespace_for(monkeypatch, config, *, version="5.19.0", revision="pinned-mod
     monkeypatch.setattr(transformers.configuration_utils, "__version__", version)
     settings = MooncakeConfig(config_file="unused.json", namespace="qwen-test", model_revision=revision)
     spec = FullAttentionSpec(block_size=16, num_kv_heads=4, head_size=128, dtype=torch.bfloat16)
-    return cache_namespace(settings, config, config.talker_config.accept_hidden_layer, torch.bfloat16, spec)
+    return cache_namespace(settings, config, config.talker_config.accept_hidden_layer, torch.bfloat16, spec, "LBHNC")
 
 
 def loaded_from(path):
@@ -1274,6 +1274,26 @@ def test_scheduler_role_uses_the_pinned_async_lookup_client(lookup_connector):
     assert type(connector.connector_scheduler.client) is LookupKeyClient
 
 
+def test_namespace_isolates_resolved_physical_kv_layouts(scheduler_role):
+    scheduler_role.setattr(connector_module, "MooncakeStoreScheduler", lookup_scheduler)
+    # Use the resolved config, not the environment that selected it.
+    scheduler_role.setenv("VLLM_KV_CACHE_LAYOUT", "LBHNC")
+    namespaces = []
+    for layout in ("LBHNC", "LBHNC", "LBNHC"):
+        kv_config = replace(BLOCK16_KV_CONFIG, kv_cache_layout=layout)
+        connector = OmniMooncakeStoreConnector(scheduler_role_config(), KVConnectorRole.SCHEDULER, kv_config)
+        try:
+            namespaces.append(connector.namespace)
+            # Native KV and the captures must use the same identity.
+            assert connector._kv_transfer_config.kv_connector_extra_config["cache_prefix"] == connector.namespace
+        finally:
+            connector.connector_scheduler.client.close()
+    assert namespaces[0] == namespaces[1]
+    assert namespaces[0] != namespaces[2]
+    block_hash = b"same-prompt-block"
+    assert hs_key(namespaces[0], block_hash) != hs_key(namespaces[2], block_hash)
+
+
 @pytest.mark.parametrize("change", ["two_lookup_workers", "synchronous_lookup"])
 def test_constructor_rejects_lookup_clients_that_break_the_stall_guard(scheduler_role, change):
     clients = []
@@ -1319,6 +1339,16 @@ def test_resumed_request_hit_stops_at_its_prompt(lookup_connector):
     spec = connector.connector_scheduler.load_specs["resumed"]
     assert spec.kvpool_cached_tokens == 32
     assert spec.tail_key_boundaries == (TailKeyBoundary(0, 32),)
+
+
+def test_resumed_request_without_a_whole_prompt_block_drops_hit(lookup_connector):
+    connector, gate = lookup_connector
+    gate.result = MooncakeLookupResult(16, (TailKeyBoundary(0, 16),))
+    gate.release.set()
+    resumed = Request("resumed", list(range(10)), SamplingParams(max_tokens=32), None)
+    resumed.append_output_token_ids(list(range(100, 117)))
+    assert wait_for_lookup(connector, resumed) == (0, False)
+    assert resumed.request_id not in connector.connector_scheduler.load_specs
 
 
 def test_lookup_timeout_is_a_miss_until_the_lookup_queue_drains(lookup_connector):

@@ -78,6 +78,7 @@ def cache_namespace(
     hidden_layer: int,
     dtype: torch.dtype,
     kv_spec: FullAttentionSpec,
+    kv_cache_layout: str | None,
 ) -> str:
     """Digest every setting that can change stored KV or HS values."""
     identity = {
@@ -89,6 +90,7 @@ def cache_namespace(
         "config": _stable_config(hf_config.to_dict()),
         "dtype": str(dtype),
         "kv_spec": repr(kv_spec),
+        "kv_cache_layout": kv_cache_layout,
     }
     return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -225,7 +227,9 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = spec.block_size
         self._row_bytes = 2 * self.hidden_size * torch.empty((), dtype=self.hs_dtype).element_size()
-        self.namespace = cache_namespace(self.settings, model.hf_config, self.hidden_layer, self.hs_dtype, spec)
+        self.namespace = cache_namespace(
+            self.settings, model.hf_config, self.hidden_layer, self.hs_dtype, spec, kv_cache_config.kv_cache_layout
+        )
         # Isolate native KV as well as HS across incompatible checkpoints.
         # Asynchronous lookup keeps a slow Store off the scheduling path.
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config
