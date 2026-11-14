@@ -53,7 +53,7 @@ variants:
   default:
     precision: bf16
     vram_minimum_gb: 24
-    description: "BF16 weights — single 24 GB GPU (~22 GiB resident with the default config on an RTX 4090); no tensor parallelism needed"
+    description: "Historical 24 GB BF16 reference profile; see the guide for a separately measured, version-pinned RTX 5060 Ti 16 GB baseline"
 
 compatible_strategies: []
 
@@ -71,12 +71,21 @@ guide: |
   (`MiniCPM4 base LM → FSQ → MiniCPM4 residual LM → LocDiT CFM solver →
   AudioVAE`), so a single 24 GB consumer GPU is sufficient.
 
+  This catalog entry retains the historical 24 GB reference profile. A
+  [separate RTX 5060 Ti 16 GB Linux baseline](https://github.com/vllm-project/vllm-omni/blob/main/recipes/OpenBMB/VoxCPM2-RTX5060Ti-16GB.md)
+  compares version-pinned 6 GiB and 2 GiB KV profiles with measured memory,
+  latency, quality and workload limits.
+  It does not establish a universal 16 GB minimum for every source
+  version, GPU architecture or input/concurrency setting.
+
   ## Prerequisites
 
   - **Hardware**: one CUDA GPU with **≥ 24 GB** VRAM. Reference run: 1x RTX 4090
-    24 GB — ~4.9 GiB weights + ~15.2 GiB KV cache + ~2 GiB talker buffers ≈
-    **22 GiB / 24 GiB** with the default `voxcpm2.yaml`
+    24 GB. The historical vLLM 0.21.0 run reported ~4.9 GiB weights +
+    ~15.2 GiB KV cache + ~2 GiB talker buffers ≈ **22 GiB / 24 GiB**
     (`gpu_memory_utilization: 0.9`, `max_num_seqs: 4`, `enforce_eager: true`).
+    Those are not the current bundled deploy settings: `voxcpm2.yaml` now
+    sets an explicit 6 GiB KV budget and `max_num_seqs: 8`.
   - **vLLM-Omni** targeting vLLM >= 0.21.
   - **`voxcpm >= 2.0`**, `soundfile`, `httpx`, and **`ninja`** on `PATH`.
 
