@@ -419,19 +419,13 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.thinker.make_empty_intermediate_tensors if self.model_stage == "thinker" else lambda: None
         )
         if self.model_stage == "thinker":
-            self._configure_thinker_intermediate_tensors()
-
-    def _configure_thinker_intermediate_tensors(self) -> None:
-        capture_indices = self._thinker_capture_layer_indices()
-        start_layer = self.thinker.language_model.model.start_layer
-        incoming_captures = [f"{PP_CAPTURE_PREFIX}{index}" for index in capture_indices if index < start_layer]
-        self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states", "residual", *incoming_captures], self.thinker_config.text_config.hidden_size
-            )
-            if incoming_captures
-            else self.thinker.make_empty_intermediate_tensors
-        )
+            capture_indices = self._thinker_capture_layer_indices()
+            start_layer = self.thinker.language_model.model.start_layer
+            incoming_captures = [f"{PP_CAPTURE_PREFIX}{index}" for index in capture_indices if index < start_layer]
+            if incoming_captures:
+                self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+                    ["hidden_states", "residual", *incoming_captures], thinker_config.text_config.hidden_size
+                )
 
     @staticmethod
     def _build_first_frame_decoder(
@@ -610,9 +604,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         # Qwen3's capture forward uses explicit layer IDs instead of the
         # decoder's EagleModelMixin state. Upstream already converted IDs.
         self._aux_hidden_state_layers = tuple(layers)
-        # Upstream configures aux layers after model construction. Refresh PP
-        # receive buffers now, so captures from earlier ranks are not omitted.
-        self._configure_thinker_intermediate_tensors()
 
     def extract_aux_hidden_states(self, model_output: OmniOutput) -> tuple[torch.Tensor, list[torch.Tensor]]:
         layers = (model_output.multimodal_outputs or {})["hidden_states"]["layers"]
@@ -633,6 +624,21 @@ class Qwen3OmniMoeForConditionalGeneration(
         vocab_size: int,
         consumed_input_span: bool,
     ) -> dict:
+        aux_layers = getattr(self, "_aux_hidden_state_layers", ())
+        if aux_layers:
+            # Drafting already holds the captured tensors. Exclude drafter-only
+            # layers from speech snapshots without changing those references.
+            aux_only_layers = set(aux_layers) - {0, getattr(self.talker_config, "accept_hidden_layer", None)}
+            hidden_states = multimodal_outputs["hidden_states"]
+            multimodal_outputs = {
+                **multimodal_outputs,
+                "hidden_states": {
+                    **hidden_states,
+                    "layers": {
+                        key: value for key, value in hidden_states["layers"].items() if key not in aux_only_layers
+                    },
+                },
+            }
         return prepare_speculative_payload(
             multimodal_outputs=multimodal_outputs,
             req_ids=req_ids,

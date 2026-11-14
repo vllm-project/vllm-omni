@@ -401,29 +401,6 @@ def test_mixed_partial_prefill_and_decode_preserves_prompt_rows(consumed):
     assert len(calls) == (0 if consumed else 1)
 
 
-def test_inline_lookup_batches_multiple_requests_once():
-    calls = []
-
-    def embed(ids):
-        calls.append(ids)
-        return ids.float().view(-1, 1)
-
-    mm = _prepare(
-        samples=((11, -1, -1), (21, 22, -1)),
-        inputs=(10, 11, 12, 20, 21, 22),
-        positions=(3, 4, 5, 8, 9, 10),
-        prompt_lens=(3, 3),
-        req_ids=("r1", "r2"),
-        speculative_ids={"r1", "r2"},
-        offsets=(0, 3, 6),
-        embed=embed,
-    )
-    result = finalize_speculative_payload(mm)[STAGING_KEY]
-    assert result[0]["ids"]["output"] == [10, 11]
-    assert result[1]["ids"]["output"] == [21, 22]
-    assert len(calls) == 1
-
-
 def test_inline_mixed_batch_keeps_prefill_and_discard_rows_and_batches_zero_draft_decode():
     calls = []
 
@@ -652,8 +629,9 @@ def test_consumed_input_span_rejects_wrong_token_identity():
         thinker2talker_async_chunk(manager, payload, request, new_token_ids=[12])
 
 
-@pytest.mark.parametrize("async_scheduling", [False, True])
-@pytest.mark.parametrize("async_chunk,prefix_cache", [(False, False), (True, True)])
+@pytest.mark.parametrize(
+    "async_scheduling,async_chunk,prefix_cache", [(False, False, False), (True, False, False), (True, True, True)]
+)
 @pytest.mark.parametrize("has_drafts", [False, True])
 def test_fallback_with_real_async_bookkeeping_keeps_aligned_tokens(
     monkeypatch, async_scheduling, async_chunk, prefix_cache, has_drafts

@@ -114,22 +114,3 @@ def test_factory_declares_only_captures_from_earlier_ranks(monkeypatch, start, e
     buffers = model.make_empty_intermediate_tensors(4, dtype=torch.float32, device="cpu")
     assert set(buffers.tensors) == {"hidden_states", "residual"} | (expected if staged else set())
     assert all(value.shape == (4, 8) for value in buffers.tensors.values())
-
-
-def test_aux_layer_configuration_refreshes_pipeline_receive_buffers():
-    model = object.__new__(combined_module.Qwen3OmniMoeForConditionalGeneration)
-    nn.Module.__init__(model)
-    model.model_stage = "thinker"
-    model.is_staged_run = True
-    model.talker_config = SimpleNamespace(accept_hidden_layer=24)
-    model.thinker_config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=8))
-    model.thinker = nn.Module()
-    model.thinker.language_model = SimpleNamespace(model=SimpleNamespace(start_layer=16))
-    model.thinker.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-        ["hidden_states", "residual"], 8
-    )
-    model._configure_thinker_intermediate_tensors()
-    model.set_aux_hidden_state_layers((32, 4))
-    buffers = model.make_empty_intermediate_tensors(4, dtype=torch.float32, device="cpu")
-    assert set(buffers.tensors) == {"hidden_states", "residual", "capture_0", "capture_4"}
-    assert model._aux_hidden_state_layers == (32, 4)

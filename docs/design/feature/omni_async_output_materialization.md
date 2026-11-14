@@ -483,8 +483,12 @@ the Talker's runtime payload and is cleared with that request's state.
 The model implements `SupportsEagle3.set_aux_hidden_state_layers` to receive
 upstream's already converted capture IDs. Capture execution may sort the union
 with Talker layers, while `extract_aux_hidden_states` returns draft features in
-the original configured order. Non-speculative staged runs without an accept
-layer continue to request no captures and return a bare tensor.
+the original configured order. Before speech snapshotting, the model removes
+drafter-only layers from a separate payload mapping. Layer 0 and the Talker's
+configured accept layer remain available for prefill and ordinary rows, even
+when drafting also uses them; the drafter keeps its original tensor references.
+Non-speculative staged runs without an accept layer continue to request no
+captures and return a bare tensor.
 Qwen3-Omni auxiliary hidden-state speculation currently supports only DFlash
 with explicit, non-empty checkpoint `dflash_config.target_layer_ids`.
 EAGLE3, `extract_hidden_states`, and missing DFlash layer IDs fail at model load.

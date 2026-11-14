@@ -36,6 +36,7 @@ import torch
 from torch import nn
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
     Qwen3OmniMoeForConditionalGeneration,
@@ -228,11 +229,7 @@ def _make_combined(*, is_staged_run: bool, accept_hidden_layer=6) -> Qwen3OmniMo
     model.model_stage = "thinker"
     model.is_staged_run = is_staged_run
     model.talker_config = SimpleNamespace(accept_hidden_layer=accept_hidden_layer)
-    model.vllm_config = SimpleNamespace(speculative_config=None)
     model.thinker = _ThinkerStub()
-    model.thinker.language_model = SimpleNamespace(model=SimpleNamespace(start_layer=0))
-    model.thinker.make_empty_intermediate_tensors = lambda: None
-    model.thinker_config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=_HIDDEN))
     return model
 
 
@@ -261,10 +258,6 @@ def test_combined_forward_staged_run_without_accept_layer_returns_tensor():
 @pytest.mark.parametrize("accept_layer, expected", [(None, [0, 2, 4]), (6, [0, 2, 4, 6])])
 def test_combined_forward_dflash_captures_embeddings_and_aux_layers(accept_layer, expected):
     model = _make_combined(is_staged_run=True, accept_hidden_layer=accept_layer)
-    model.vllm_config.speculative_config = SimpleNamespace(
-        use_dflash=lambda: True,
-        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace(dflash_config={"target_layer_ids": [1, 3]})),
-    )
     model.set_aux_hidden_state_layers((2, 4))
     out = model.forward(**_forward_args())
     assert model.thinker.received["capture_layer_indices"] == expected
@@ -288,10 +281,39 @@ def test_make_omni_output_accepts_capture_tuple():
     assert out.multimodal_outputs == captured
 
 
-def test_aux_hidden_state_order_follows_upstream_configuration():
+@pytest.mark.parametrize("consumed", [False, True])
+def test_aux_hidden_states_keep_drafter_order_outside_speech_snapshot(consumed):
+    from vllm_omni.worker.gpu_ar_model_runner import _clone_cuda_tensor_payload
+
     model = _make_combined(is_staged_run=True)
-    model.set_aux_hidden_state_layers((4, 2))
-    layers = {0: torch.tensor([0.0]), 2: torch.tensor([2.0]), 4: torch.tensor([4.0]), 6: torch.tensor([6.0])}
+    model.set_aux_hidden_state_layers((4, 6, 2))
+    model.thinker.embed_input_ids = lambda input_ids: input_ids.float().view(-1, 1)
+    layers = {index: torch.full((_TOKENS, 1), float(index)) for index in (0, 2, 4, 6)}
+    layers[0] = torch.tensor([[1.0], [2.0], [10.0], [11.0]])
+    captured: OmniPayload = {"hidden_states": {"layers": layers, "last": _hidden_states()}}
+    output = OmniOutput(_hidden_states(), captured)
+    hidden, aux = model.extract_aux_hidden_states(output)
     assert model._thinker_capture_layer_indices() == [0, 2, 4, 6]
-    hidden, aux = model.extract_aux_hidden_states(OmniOutput(_hidden_states(), {"hidden_states": {"layers": layers}}))
-    assert [row.item() for row in aux] == [4.0, 2.0]
+    prepared = model.prepare_speculative_multimodal_outputs(
+        multimodal_outputs=captured,
+        req_ids=["prefill", "decode"],
+        speculative_request_ids={"decode"},
+        invalid_req_indices=[],
+        sampled_token_ids=torch.tensor([[3, -1], [11, 12]]),
+        input_token_ids=torch.tensor([1, 2, 10, 11]),
+        input_positions=torch.tensor([0, 1, 3, 4]),
+        query_start_loc=[0, 2, 4],
+        prompt_lens=[2, 3],
+        vocab_size=100,
+        consumed_input_span=consumed,
+    )
+    assert hidden is output.text_hidden_states
+    assert len(aux) == 3
+    assert all(value is layers[index] for value, index in zip(aux, (4, 6, 2)))
+    assert set(captured["hidden_states"]["layers"]) == {0, 2, 4, 6}
+    assert prepared["hidden_states"]["last"] is captured["hidden_states"]["last"]
+    assert all(prepared["hidden_states"]["layers"][index] is layers[index] for index in (0, 6))
+    snapshot = _clone_cuda_tensor_payload(prepared, [])
+    assert set(snapshot["hidden_states"]["layers"]) == {0, 6}
+    for index in (0, 6):
+        torch.testing.assert_close(snapshot["hidden_states"]["layers"][index], layers[index])
