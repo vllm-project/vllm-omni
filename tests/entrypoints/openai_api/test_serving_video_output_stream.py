@@ -114,39 +114,64 @@ def test_offloaded_encoder_produces_identical_mp4_bytes() -> None:
     assert asyncio.run(encode_off_loop()) == direct
 
 
+class _CancellableEncoder:
+    """Encoder whose encode/close block on events and record their outcome."""
+
+    def __init__(self) -> None:
+        self.encoding = threading.Event()
+        self.release_encode = threading.Event()
+        self.close_entered = threading.Event()
+        self.release_close = threading.Event()
+        self.events: list[str] = []
+        self.closed = False
+
+    def encode(self, video, audio=None, *, audio_sample_rate=None):
+        del audio, audio_sample_rate
+        self.encoding.set()
+        self.release_encode.wait(10)
+        self.events.append("encode-returned")
+        return b"chunk"
+
+    def close(self):
+        self.close_entered.set()
+        self.release_close.wait(10)
+        self.events.append("close")
+        self.closed = True
+        return b""
+
+
 @pytest.mark.asyncio
-async def test_cancellation_drains_the_running_worker_before_closing() -> None:
-    """A cancelled host task leaves its worker running, so cleanup must drain it first."""
+async def test_cancellation_keeps_the_worker_and_closes_after_it() -> None:
+    """Cancellation must not close an encoder a worker still owns.
+
+    `_stream_video_bytes` relies on this ordering: the worker handle is recorded
+    so cleanup can wait for it before the muxer is finalized.
+    """
     encoding = threading.Event()
     release = threading.Event()
     order: list[str] = []
 
     def encode() -> bytes:
         encoding.set()
-        release.wait(5)
+        release.wait(10)
         order.append("encode-returned")
         return b"chunk"
 
     handler = object.__new__(OmniStreamingVideoOutputHandler)
     track: list = []
+    task = asyncio.create_task(handler._run_encoder_call(encode, track=track))
+    await asyncio.wait_for(asyncio.to_thread(encoding.wait), 5)
+    assert len(track) == 1, "the worker handle must be recorded for cleanup"
 
-    async def run_encode() -> None:
-        await handler._run_encoder_call(encode, track=track)
-
-    task = asyncio.create_task(run_encode())
-    await asyncio.to_thread(encoding.wait)
-    assert len(track) == 1
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
-    # The host task has returned while the worker is still inside encode().
-    assert order == []
+        await asyncio.wait_for(task, 5)
+    # The host task is gone while the worker is still inside encode().
+    assert order == [], order
 
     release.set()
-    for worker in track:
-        await OmniStreamingVideoOutputHandler._drain_encoder_call(worker)
+    await asyncio.wait_for(OmniStreamingVideoOutputHandler._drain_encoder_calls(track), 10)
     order.append("close")
-
     assert order == ["encode-returned", "close"], order
 
 

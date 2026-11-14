@@ -30,12 +30,13 @@ Protocol:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import math
 import time
 import uuid
 import weakref
-from collections.abc import AsyncGenerator, Callable, Iterator
+from collections.abc import AsyncGenerator, Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from http import HTTPStatus
 from typing import Any, cast
@@ -55,13 +56,10 @@ from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest,
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
-    resolve_diffusion_sampling_params,
 )
 from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
-    FragmentedMP4VideoEncoder,
     StreamingVideoFormat,
-    _resolve_audio_sample_rate,
     create_streaming_video_encoder,
     decode_input_reference,
 )
@@ -91,12 +89,11 @@ _encoder_pools: weakref.WeakKeyDictionary[Any, ThreadPoolExecutor] = weakref.Wea
 
 
 def _encoder_pool() -> ThreadPoolExecutor:
-    """Return the encode pool for the running event loop.
+    """Return the bounded encode pool for the running event loop.
 
-    PyAV already splits a single encode across threads, so letting every
-    streaming session start its own encode oversubscribes the host. One bounded
-    pool per loop keeps a ceiling without serializing a single session, and the
-    futures it returns are the handles a cancelling session needs to drain.
+    PyAV already splits one encode across threads, so a per-session pool would
+    oversubscribe the host. A shared pool also returns the future, which is the
+    handle a cancelling session needs to drain before it closes the muxer.
     """
     loop = asyncio.get_running_loop()
     pool = _encoder_pools.get(loop)
@@ -856,9 +853,8 @@ class OmniStreamingVideoOutputHandler:
         """Run blocking codec work on the encoder pool, recording the worker.
 
         ``anyio.to_thread`` abandons its worker on cancellation without handing
-        back a handle, which is exactly the case that let ``close()`` race an
-        in-flight encode. Submitting to a dedicated executor keeps the future,
-        so a caller that may still touch the encoder can drain it first.
+        back a handle, which is how ``close()`` could race an in-flight encode.
+        The returned future is that handle.
         """
         worker = _encoder_pool().submit(call)
         if track is not None:
@@ -866,10 +862,16 @@ class OmniStreamingVideoOutputHandler:
         return await asyncio.wrap_future(worker)
 
     @staticmethod
-    async def _drain_encoder_call(worker: Future[Any] | None) -> None:
-        """Wait for a recorded worker so cleanup cannot race an in-flight encode."""
-        if worker is not None:
-            await asyncio.shield(asyncio.wrap_future(worker))
+    async def _drain_encoder_calls(workers: list[Future[Any]]) -> None:
+        """Wait until every recorded worker is quiescent, surviving cancellation."""
+        for worker in workers:
+            while not worker.done():
+                try:
+                    await asyncio.shield(asyncio.wrap_future(worker))
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:  # noqa: BLE001 - reported by the caller
+                    break
 
     async def _stream_video_bytes(
         self,
@@ -892,24 +894,50 @@ class OmniStreamingVideoOutputHandler:
         )
         pacing = request.streaming_pacing
         max_output_bytes = pacing.max_output_bytes if pacing is not None and pacing.enabled else None
-        completed = False
+        closed = False
+        failed = False
         workers: list[Future[Any]] = []
+
+        async def shutdown() -> None:
+            """Drain started workers, then finalize the muxer exactly once."""
+            nonlocal closed
+            for worker in list(workers):
+                while not worker.done():
+                    try:
+                        await asyncio.shield(asyncio.wrap_future(worker))
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:  # noqa: BLE001 - reported by the caller
+                        break
+            if not closed:
+                encoder.close()
+                closed = True
+
         try:
             async for result in self._iter_generation_outputs(prompt, gen_params, request_id, progress):
                 if result.error:
                     raise RuntimeError(str(result.error))
-                del workers[:]
-                encoded = await self._run_encoder_call(
-                    lambda: list(self._encode_generation_result(result, request_id, encoder)), track=workers
-                )
-                for chunk, metadata in encoded:
-                    if max_output_bytes is not None and len(chunk) > max_output_bytes:
+                videos = self._extract_video_outputs(result)
+                for video in videos:
+                    del workers[:]
+                    chunk = await self._run_encoder_call(lambda: encoder.encode(video), track=workers)
+                    if max_output_bytes is not None and len(chunk or b"") > max_output_bytes:
                         raise ValueError("encoded streaming chunk exceeds streaming_pacing.max_output_bytes")
-                    yield (chunk, metadata)
+                    if chunk or self._num_video_frames(video) == 0:
+                        yield (
+                            chunk or b"",
+                            self._build_chunk_metadata(
+                                request_id=request_id,
+                                kind="media",
+                                byte_length=len(chunk or b""),
+                                num_frames=self._num_video_frames(video),
+                                stream_metadata=self._extract_stream_metadata(result),
+                            ),
+                        )
 
-            completed = True
             del workers[:]
             final_chunk = await self._run_encoder_call(encoder.close, track=workers)
+            closed = True
             if max_output_bytes is not None and len(final_chunk or b"") > max_output_bytes:
                 raise ValueError("encoded streaming trailer exceeds streaming_pacing.max_output_bytes")
             if final_chunk:
@@ -923,54 +951,31 @@ class OmniStreamingVideoOutputHandler:
                         stream_metadata={},
                     ),
                 )
-        except asyncio.CancelledError:
-            # A cancelled host task leaves its worker running, so the encoder
-            # must not be touched until every recorded worker has returned.
-            for worker in workers:
-                await OmniStreamingVideoOutputHandler._drain_encoder_call(worker)
+        except BaseException:
+            failed = True
             raise
         finally:
-            if not completed:
-                # Synchronous: an abandoned session finalizes this generator
-                # outside any awaited scope, so it must not schedule work.
-                encoder.close()
-
-    def _encode_generation_result(
-        self,
-        result: OmniRequestOutput,
-        request_id: str,
-        encoder: FragmentedMP4VideoEncoder,
-    ) -> Iterator[tuple[bytes, dict[str, Any]]]:
-        """Encode one result, preserving metadata even when the muxer buffers all bytes."""
-        videos = self._extract_video_outputs(result)
-        audio, audio_sample_rate = self._extract_audio_output(result)
-        if audio is not None and len(videos) != 1:
-            raise ValueError("A streaming result with audio must contain exactly one video.")
-        stream_metadata = self._extract_stream_metadata(result)
-        for index, video in enumerate(videos):
-            chunk = encoder.encode(video, audio, audio_sample_rate=audio_sample_rate)
-            metadata = self._build_chunk_metadata(
-                request_id=request_id,
-                kind="media",
-                byte_length=len(chunk),
-                num_frames=self._num_video_frames(video),
-                stream_metadata=stream_metadata if index == 0 else {},
-            )
-            if audio is not None:
-                metadata["num_audio_samples"] = self._num_audio_samples(audio)
-                metadata["audio_sample_rate"] = encoder.audio_sample_rate
-            yield (chunk, metadata)
+            # Shielded so a cancellation arriving during cleanup cannot skip
+            # either the worker drain or the muxer finalization.
+            try:
+                await asyncio.shield(shutdown())
+            except asyncio.CancelledError:
+                await shutdown()
+                raise
+            except BaseException:  # noqa: BLE001 - never mask the original failure
+                if not failed:
+                    raise
 
     async def _build_prompt_and_sampling_params(
         self,
         request: VideoGenerationRequest,
     ) -> tuple[OmniTextPrompt, OmniDiffusionSamplingParams, VideoParams]:
         """Build text-only diffusion inputs for the streaming endpoint."""
-        prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt)
+        prompt = cast(OmniTextPrompt, {"prompt": request.prompt})
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 
-        gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(self._engine_client))
+        gen_params = self._resolve_default_sampling_params()
         gen_params.streaming_buffer_seconds = request.streaming_buffer_seconds
         if request.streaming_pacing is not None and request.streaming_pacing.enabled:
             gen_params.streaming_max_output_bytes = request.streaming_pacing.max_output_bytes
@@ -1045,6 +1050,13 @@ class OmniStreamingVideoOutputHandler:
                 detail="image_reference must resolve to an image.",
             )
         return media_data
+
+    def _resolve_default_sampling_params(self) -> OmniDiffusionSamplingParams:
+        default_sampling_params_list = self._engine_client.default_sampling_params_list
+        for params in default_sampling_params_list:
+            if isinstance(params, OmniDiffusionSamplingParams):
+                return copy.deepcopy(params)
+        return OmniDiffusionSamplingParams()
 
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
@@ -1144,37 +1156,6 @@ class OmniStreamingVideoOutputHandler:
         return normalized
 
     @staticmethod
-    def _extract_audio_output(result: OmniRequestOutput) -> tuple[Any | None, int | None]:
-        """Return the chunk's audio payload and sample rate, if the model streams audio."""
-        multimodal_output = result.multimodal_output
-        if not isinstance(multimodal_output, dict):
-            return None, None
-        audio = multimodal_output.get("audio")
-        if audio is None:
-            return None, None
-        if isinstance(audio, list) and len(audio) == 1 and isinstance(audio[0], (np.ndarray, torch.Tensor)):
-            audio = audio[0]
-        metadata = multimodal_output.get("metadata")
-        sample_rate = None
-        if isinstance(metadata, dict):
-            audio_metadata = metadata.get("audio")
-            if isinstance(audio_metadata, dict):
-                sample_rate = audio_metadata.get("sample_rate")
-        return audio, _resolve_audio_sample_rate(audio, sample_rate) if sample_rate is not None else None
-
-    @staticmethod
-    def _num_audio_samples(audio: Any) -> int:
-        if isinstance(audio, (np.ndarray, torch.Tensor)):
-            if audio.ndim == 0:
-                return 0
-            if audio.ndim == 1:
-                return int(audio.shape[0])
-            return int(max(audio.shape[0], audio.shape[-1]))
-        if isinstance(audio, list):
-            return len(audio)
-        return 0
-
-    @staticmethod
     def _extract_stream_metadata(result: OmniRequestOutput) -> dict[str, Any]:
         multimodal_output = result.multimodal_output
         if not isinstance(multimodal_output, dict):
@@ -1202,12 +1183,6 @@ class OmniStreamingVideoOutputHandler:
         num_frames: int,
         stream_metadata: dict[str, Any],
     ) -> dict[str, Any]:
-        """Describe submitted media and emitted byte length, not a standalone fragment.
-
-        Frame/sample counts and event IDs refer to the source generation chunk.
-        Codec/muxer buffering can move its media into a later binary frame;
-        a trailer reports zero submitted frames while flushing buffered media.
-        """
         return {
             "type": "video.chunk_metadata",
             "request_id": request_id,
