@@ -818,16 +818,47 @@ def test_transfer_done_releases_the_producer_buffer(producer, consumer):
     assert producer._agent.registered == []
 
 
-def test_direct_metadata_has_ephemeral_ownership_endpoint(nixl_connector_cls):
-    connector = nixl_connector_cls({})
+@pytest.mark.parametrize("direct", [False, True])
+def test_ephemeral_ownership_endpoint_supports_metadata_discovery(nixl_connector_cls, direct):
+    connector = nixl_connector_cls({"host": "127.0.0.1", "zmq_port": 0})
+    receiver = None
     try:
         assert connector._zmq_ctx is not None
         assert connector._listener_thread is not None
         _, _, metadata = connector.put("0", "1", "req-4", torch.zeros(2))
-        assert metadata["sender_host"]
-        assert metadata["sender_zmq_port"] > 0
+        endpoint = connector.get_connection_info()
+        assert endpoint["host"] == metadata["sender_host"] == "127.0.0.1"
+        assert endpoint["zmq_port"] == metadata["sender_zmq_port"] > 0
+        receiver = nixl_connector_cls({"role": "receiver"})
+        forwarded = {"source_host": endpoint["host"], "source_port": endpoint["zmq_port"]}
+        resolved = _wait_for_metadata(receiver, "req-4", metadata if direct else forwarded)
+        assert resolved["generation"] == metadata["generation"]
+        assert receiver._notify_transfer_done("req-4", resolved)
+        assert not connector._pending
     finally:
+        if receiver is not None:
+            receiver.close()
+        for pending in connector._pending.values():
+            pending.claims.clear()  # This probe only queries metadata; it never submits DMA.
         connector.close()
+
+
+@pytest.mark.parametrize("role", ["sender", None])
+def test_handshake_bind_failure_cleans_up_partial_initialization(nixl_connector_cls, role):
+    with zmq.Context() as context, context.socket(zmq.ROUTER) as occupied:
+        port = occupied.bind_to_random_port("tcp://127.0.0.1")
+        connector = nixl_connector_cls.__new__(nixl_connector_cls)
+        try:
+            with pytest.raises(RuntimeError, match="failed to bind handshake socket"):
+                connector.__init__({"role": role, "host": "127.0.0.1", "zmq_port": port})
+            assert connector._closed
+            assert connector._zmq_ctx is None
+            assert connector._listener_thread is None
+            assert connector._lease_thread is None
+            assert connector._transfer_thread is None
+            connector.close()  # Cleanup remains safe when __del__ calls it again.
+        finally:
+            connector.close()
 
 
 def test_idle_producer_lease_expires_without_another_put(nixl_connector_cls):
