@@ -14,7 +14,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
-    from vllm_omni.diffusion.attention.schedule import AttentionSchedule
+    from vllm_omni.diffusion.attention.schedule import AttentionSchedule, AttentionSigmaSchedule
     from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
     from vllm_omni.diffusion.interaction.types import InteractionBoundaryContext
 
@@ -55,6 +55,9 @@ class StepBatchSamplingParamsKey:
     participate in the current homogeneous batching policy.
     """
 
+    # Packed and ordinary dense requests never share an execution contract.
+    mixfusion_key: tuple | None = None
+
     # Spatial / temporal shape.
     height: int | None = None
     width: int | None = None
@@ -90,13 +93,16 @@ class StepBatchSamplingParamsKey:
     # differently shaped outputs and cannot share a batch.
     num_outputs_per_prompt: int = 1
 
-    # LoRA identity. Requests with different adapters or scales must run in
-    # separate batches so the worker can activate exactly one adapter per step.
-    lora_int_id: int | None = None
-    lora_scale: float = 1.0
-    # Same resolved request schedule and source as the request-batch key.
+    # LoRA identity. Requests with different adapter combinations or scales
+    # must run in separate batches so the worker can activate exactly one
+    # adapter (or one composed multi-LoRA adapter) per step. Normalized via
+    # ``build_lora_batch_key``; None when no LoRA is active.
+    lora_key: tuple[tuple[int, float], ...] | None = None
+
+    # Same resolved request schedules, and step-range source, as the request-batch key.
     attention_schedule: AttentionSchedule = ()
     attention_schedule_explicit: bool = False
+    attention_sigma_schedule: AttentionSigmaSchedule = ()
 
 
 @dataclass(frozen=True, eq=True)
@@ -159,9 +165,8 @@ class RequestBatchSamplingParamsKey:
     # from being admitted to the same request batch.
     condition_key: tuple[Any, ...] | None = None
 
-    # LoRA identity.
-    lora_int_id: int | None = None
-    lora_scale: float = 1.0
+    # LoRA identity. See StepBatchSamplingParamsKey.lora_key.
+    lora_key: tuple[tuple[int, float], ...] | None = None
 
     # Request schedule resolved against the service default; () runs the baseline. Different ranges
     # must not share a batch.
@@ -169,6 +174,10 @@ class RequestBatchSamplingParamsKey:
     # Whether the request sent its schedule. An explicit schedule is checked against the step count and
     # an inherited default is not, so the two never share a batch even when their ranges are equal.
     attention_schedule_explicit: bool = False
+    # Sigma windows resolved against the service default; () runs without them. Nothing checks
+    # explicit windows differently from inherited ones, so an inherited default and the same windows
+    # sent explicitly share a batch, and no source bit is kept for them.
+    attention_sigma_schedule: AttentionSigmaSchedule = ()
 
 
 @dataclass
@@ -264,6 +273,8 @@ class DiffusionSchedulerOutput:
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
+    # Execution mode only; the worker owns the packed tensor layout.
+    use_mixfusion: bool = False
     # next request to background-prefetch KV
     kv_prefetch_job: KVPrefetchJob | None = None
     kv_connector_metadata: KVConnectorMetadata | None = None

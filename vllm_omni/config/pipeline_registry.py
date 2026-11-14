@@ -88,6 +88,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
 from vllm_omni.model_executor.models.kimi_audio.pipeline import KIMI_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.kokoro.pipeline import KOKORO_PIPELINE
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
+from vllm_omni.model_executor.models.lfm3_audio.pipeline import LFM3_AUDIO_PIPELINE, LFM3_AUDIO_TEXT_PIPELINE
 from vllm_omni.model_executor.models.lfm3_omni.pipeline import LFM3_OMNI_PIPELINE, LFM3_OMNI_TEXT_PIPELINE
 from vllm_omni.model_executor.models.lingbot_world.pipeline import LINGBOT_WORLD_PIPELINE
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
@@ -200,6 +201,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "kimi_audio": KIMI_AUDIO_PIPELINE,
     "kokoro": KOKORO_PIPELINE,
     "lance": LANCE_PIPELINE,
+    "lfm3_audio": LFM3_AUDIO_PIPELINE,
+    "lfm3_audio_text": LFM3_AUDIO_TEXT_PIPELINE,
     "lfm3_omni": LFM3_OMNI_PIPELINE,
     "lfm3_omni_text": LFM3_OMNI_TEXT_PIPELINE,
     "lingbot_world": LINGBOT_WORLD_PIPELINE,

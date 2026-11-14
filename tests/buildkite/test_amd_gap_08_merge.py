@@ -32,7 +32,7 @@ def test_gap_08_selects_bounded_advanced_rocm_cases() -> None:
     assert len(executions) == len(GROUPS)
     assert "diff -u" in collection
     for command in [collection, *executions]:
-        assert "-m 'advanced_model and tts and rocm and MI325 and cards_1'" in command
+        assert "-m 'slow and tts and rocm and MI325 and cards_1'" in command
         assert "--run-level advanced_model" in command
         assert "--shard-id=0 --num-shards=1" in command
     for node in NODES:

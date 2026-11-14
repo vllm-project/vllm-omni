@@ -150,7 +150,7 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _supports_segmentation,
     _update_if_not_none,
 )
-from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _parse_lora_request
+from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _parse_lora_requests
 from vllm_omni.entrypoints.openai.models import serving as openai_models_serving
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
@@ -2210,6 +2210,22 @@ def _build_image_response_metrics(
     return metrics
 
 
+def _image_json_response(response: Any) -> Any:
+    """Serialize an image response with orjson.
+
+    Image responses carry multi-megabyte base64 strings, which the default
+    FastAPI JSON path (``json.dumps``) serializes several times slower. The
+    JSON document is the same; streaming responses pass through unchanged.
+    """
+    if not isinstance(response, ImageGenerationResponse):
+        return response
+    try:
+        import orjson
+    except ImportError:
+        return response
+    return Response(content=orjson.dumps(response.model_dump(mode="json")), media_type="application/json")
+
+
 def _build_image_generation_response(
     *,
     images: list[Image.Image],
@@ -2335,7 +2351,7 @@ async def generate_images(
                 extra_body["generator_device"] = request.generator_device
             if request.lora is not None:
                 # Keep /images validation semantics: invalid LoRA should fail with 400.
-                _parse_lora_request(request.lora)
+                _parse_lora_requests(request.lora)
                 extra_body["lora"] = request.lora
             if request.bot_task is not None:
                 extra_body["bot_task"] = request.bot_task
@@ -2394,9 +2410,9 @@ async def generate_images(
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
-        lora_request, lora_scale = _parse_lora_request(request.lora) if request.lora is not None else (None, None)
-        _update_if_not_none(gen_params, "lora_request", lora_request)
-        _update_if_not_none(gen_params, "lora_scale", lora_scale)
+        lora_requests, lora_scales = _parse_lora_requests(request.lora)
+        _update_if_not_none(gen_params, "lora_request", lora_requests)
+        _update_if_not_none(gen_params, "lora_scale", lora_scales)
 
         # Parse and add size if provided
         if request.size:
@@ -2427,6 +2443,8 @@ async def generate_images(
         _update_if_not_none(gen_params, "true_cfg_scale", request.true_cfg_scale)
         # Whitelisted per-request sampling grid (e.g. QwenImage21Pipeline's sigmas).
         _update_if_not_none(gen_params, "sigmas", (request.model_extra or {}).get("sigmas"))
+        # Image modality on video pipelines (e.g. LingBot T2I) may need num_frames=1.
+        _update_if_not_none(gen_params, "num_frames", (request.model_extra or {}).get("num_frames"))
         if request.seed is not None:
             gen_params.seed = request.seed
         elif gen_params.seed is None:
@@ -2463,12 +2481,14 @@ async def generate_images(
         stage_durations = getattr(result, "stage_durations", None)
         peak_memory_mb = getattr(result, "peak_memory_mb", None)
         response_metrics = getattr(result, "metrics", None) if request.return_stage_metrics else None
-        return _build_image_generation_response(
-            images=images,
-            request=request,
-            stage_durations=stage_durations,
-            peak_memory_mb=peak_memory_mb,
-            response_metrics=response_metrics,
+        return _image_json_response(
+            _build_image_generation_response(
+                images=images,
+                request=request,
+                stage_durations=stage_durations,
+                peak_memory_mb=peak_memory_mb,
+                response_metrics=response_metrics,
+            )
         )
 
     except (EngineGenerateError, EngineDeadError) as exc:
@@ -2622,9 +2642,9 @@ async def edit_images(
         _update_if_not_none(gen_params, "num_outputs_per_prompt", n)
         # 3.1 Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_dict = _get_lora_from_json_str(lora)
-        lora_request, lora_scale = _parse_lora_request(lora_dict)
-        _update_if_not_none(gen_params, "lora_request", lora_request)
-        _update_if_not_none(gen_params, "lora_scale", lora_scale)
+        lora_requests, lora_scales = _parse_lora_requests(lora_dict)
+        _update_if_not_none(gen_params, "lora_request", lora_requests)
+        _update_if_not_none(gen_params, "lora_scale", lora_scales)
         # 3.2 Validate resolution if provided
         if resolution is not None and resolution not in SUPPORTED_LAYERED_RESOLUTIONS:
             raise HTTPException(
@@ -2762,7 +2782,7 @@ async def edit_images(
             if lora is not None:
                 # Validate LoRA, then pass through.
                 lora_dict = _get_lora_from_json_str(lora)
-                _parse_lora_request(lora_dict)
+                _parse_lora_requests(lora_dict)
                 extra_body["lora"] = lora_dict
             if bot_task is not None:
                 extra_body["bot_task"] = bot_task
@@ -2827,17 +2847,19 @@ async def edit_images(
             for img in images
         ]
 
-        return ImageGenerationResponse(
-            created=int(time.time()),
-            data=image_data,
-            output_format=output_format,
-            size=_generated_size_str(images, size_str),
-            cot_output=cot_output,
-            metrics=_build_image_response_metrics(
-                response_metrics=response_metrics,
-                stage_durations=stage_durations,
-                peak_memory_mb=peak_memory_mb,
-            ),
+        return _image_json_response(
+            ImageGenerationResponse(
+                created=int(time.time()),
+                data=image_data,
+                output_format=output_format,
+                size=_generated_size_str(images, size_str),
+                cot_output=cot_output,
+                metrics=_build_image_response_metrics(
+                    response_metrics=response_metrics,
+                    stage_durations=stage_durations,
+                    peak_memory_mb=peak_memory_mb,
+                ),
+            )
         )
 
     except (EngineGenerateError, EngineDeadError) as exc:

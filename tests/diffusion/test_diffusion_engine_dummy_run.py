@@ -178,6 +178,7 @@ def test_dummy_request_disables_attention_schedule(monkeypatch: pytest.MonkeyPat
 
     assert request is not None
     assert request.sampling_params.attention_schedule == ()
+    assert request.sampling_params.attention_sigma_schedule == ()
 
 
 @pytest.mark.parametrize(

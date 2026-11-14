@@ -323,7 +323,7 @@ def test_channels_last_bf16_preserves_normalization_rounding(silu):
     bits_equal(fp.rms_norm_fastpath(norm, x, silu=silu), expected)
     actual, cache = nc.norm_act_cat_time(x, norm.gamma, norm.scale, None, 2, channels_last=True, silu=silu)
     bits_equal(actual, F.pad(expected, (0, 0, 0, 0, 2, 0)))
-    bits_equal(cache, actual[:, :, -2:])
+    bits_equal(cache, actual[:, :, -1:])  # the x frame; the cache never holds the zero padding
 
 
 @torch.no_grad()

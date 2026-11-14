@@ -1,4 +1,4 @@
-# LFM3-Omni-2B on Ascend
+# LFM3-Omni-2B on Ascend and CUDA
 
 ## Model and execution
 
@@ -20,8 +20,8 @@ to the reference environment's version is not required.
 
 ## Deployment
 
-The integration is validated on one Ascend 910B1 with 64 GiB HBM. GPU execution
-has not been validated by this recipe.
+The integration is validated on one Ascend 910B1 with 64 GiB HBM and on one
+NVIDIA RTX 4090 with 24 GB.
 
 From the repository root, in an installed vLLM-Omni Ascend environment:
 
@@ -32,6 +32,11 @@ vllm serve LiquidAI/LFM3-Omni-2B --omni --trust-remote-code \
   --hf-overrides '{"lfm3_depth_graph":true,"lfm3_vectorized_greedy":true}' \
   --port 8091
 ```
+
+On CUDA, use the same command without `--hf-overrides`.
+`lfm3_depth_graph` captures NPU graphs only. On the RTX 4090,
+`lfm3_vectorized_greedy` measured within run-to-run noise; see the measured CUDA
+performance below.
 
 For text output, including image/audio/video understanding, select
 `vllm_omni/deploy/lfm3_omni_text.yaml` and omit `--async-chunk` and the audio
@@ -72,6 +77,9 @@ generation must end in `<|audio_start|>` or `<|mixed_start|>`, respectively.
   `lfm3_vectorized_greedy`, which groups the greedy codebook selection. Both
   switches default to false when omitted; stochastic sampling preserves its
   original scalar random-draw order.
+- On CUDA, the width-7 convolutions use the checkpoint's own Triton kernels and
+  its seven-input cache, as the reference does on CUDA. NPU and CPU keep the
+  torch convolution.
 - Audio sampling defaults to temperature 0.4, repetition penalty 1.2, and a
   64-frame repetition window. `SamplingParams.extra_args` accepts
   `audio_temperature`, `audio_top_k`, `audio_repetition_penalty`, and
@@ -101,6 +109,26 @@ was bitwise equal to the reference's 88,320 float samples. Nine online requests
 at concurrency 1, 2, and 4 matched the four-frame streaming reference within one
 PCM16 quantization unit, with normal worker shutdown. These fixed cases are
 regression evidence, not a broad quality benchmark.
+
+On one RTX 4090, with the same reference revision run in Transformers 5.20.2 on
+CUDA, nine cases matched. Prompt token IDs and generated text token IDs were
+identical for all nine:
+
+- Understanding: text, arithmetic, a 500-token prompt beyond the sliding window,
+  image, audio, and eight-frame video.
+- Speech: greedy TTS (42 frames), seeded temperature-0.4 TTS (42 frames), and
+  greedy interleaved generation (59 frames). Their waveforms were bitwise
+  identical with full payloads.
+- With `--async-chunk`, the waveforms were bitwise identical to the reference's
+  four-frame streaming decode, except for the final-chunk limitation below.
+- With `VLLM_BATCH_INVARIANT=1`, a concurrent mix of 18 requests matched each
+  request's single-request output. Without it, concurrent greedy speech can
+  differ from a single request's, because the GEMM shapes change.
+
+A stream whose frame count is a multiple of four is missing its 480-sample
+(20 ms) overlap-add tail. Its last chunk ends at a codec boundary, and the
+empty final payload is not decoded. This was measured on CUDA; Ascend uses the
+same scheduling path.
 
 For performance measurements, reserve the NPU, warm both stages, and run paired
 baseline/optimized measurements on the same card at each reported concurrency.
@@ -172,3 +200,29 @@ four-arm run reported here. No partial or failed-run timings are mixed in.
 These results apply to the stated workload and are the best of the measured
 configurations. They do not establish global optimality, broad quality
 equivalence, or realtime latency for arbitrary speech lengths and concurrency.
+
+## Measured CUDA performance
+
+These are smoke measurements on one RTX 4090 (24 GB) with the checked-in
+benchmark, for one English sentence (42 frames, 80,640 samples at
+concurrency 1). Setup: BF16, four-frame streaming codec chunks, a warmed
+engine, and three measured batches per concurrency. Timing covers the offline
+Omni API, including orchestration and the codec.
+
+```bash
+python benchmarks/lfm3_omni/benchmark.py --mode eager --output results/cuda-eager
+```
+
+| Audio temperature | Concurrency | First audio, s | Latency, s | RTF | Requests/s |
+| --- | --- | --- | --- | --- | --- |
+| 0.0 | 1 | 0.252 | 2.421 | 0.720 | 0.413 |
+| 0.0 | 2 | 0.401 | 3.871 | 1.136 | 0.516 |
+| 0.0 | 4 | 0.644 | 6.635 | 1.861 | 0.600 |
+| 0.4 | 1 | 0.264 | 2.531 | 0.753 | 0.395 |
+| 0.4 | 2 | 0.411 | 3.686 | 1.159 | 0.542 |
+| 0.4 | 4 | 0.683 | 6.366 | 1.966 | 0.628 |
+
+- With `--mode optimized`, the results were within 5% of these. At
+  concurrency 1, its waveforms were bitwise identical to eager mode.
+- Concurrent batches change the GEMM shapes, so greedy sample counts vary
+  across concurrency.
