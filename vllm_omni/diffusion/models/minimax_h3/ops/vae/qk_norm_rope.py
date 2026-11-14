@@ -219,9 +219,8 @@ def try_qk_norm_rope_exact(
     sin = sin.reshape(tokens, sin.shape[-1])
     q_output = torch.empty_like(q)
     k_output = torch.empty_like(k)
-    # The RMS sum is an explicit PyTorch vectorized-RMS parenthesization, so
-    # these launch dimensions no longer change its rounding. They stay fixed
-    # at the shape validated on SM90 and SM103.
+    # The RMS sum explicitly preserves PyTorch's vectorized-RMS rounding.
+    # Keep the launch geometry unchanged for this SM120 enablement.
     heads_per_program = 8
     grid = (tokens, triton.cdiv(heads, heads_per_program), 2)
     launch_args = {
