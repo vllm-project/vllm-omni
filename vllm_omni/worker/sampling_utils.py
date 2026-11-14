@@ -2,12 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Sampling helpers shared by the GPU and NPU AR model runners."""
 
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.logits_processor import LogitsProcessors, MinTokensLogitsProcessor
+
+if TYPE_CHECKING:
+    # Model Runner V1 only (removed upstream in vllm-project/vllm#63373). The
+    # MRv2 runner imports this module, so keep it out of module import.
+    from vllm.v1.sample.logits_processor import LogitsProcessors
 
 logger = init_logger(__name__)
 
@@ -141,7 +145,7 @@ def clamp_prompt_ids_to_penalty_padding(prompt_token_ids: torch.Tensor, logits_v
     return prompt_token_ids.clamp(max=logits_vocab)
 
 
-def sanitize_min_tokens_stop_ids(logitsprocs: LogitsProcessors, logits_vocab: int) -> None:
+def sanitize_min_tokens_stop_ids(logitsprocs: "LogitsProcessors", logits_vocab: int) -> None:
     """Drop stop ids the model head cannot emit from min-tokens masking state.
 
     vLLM's input processor unconditionally folds the stage tokenizer's EOS id
@@ -157,6 +161,8 @@ def sanitize_min_tokens_stop_ids(logitsprocs: LogitsProcessors, logits_vocab: in
     so each request is sanitized at most once; the processor's device-side
     mask slice is rebuilt only when an out-of-range id was found.
     """
+    from vllm.v1.sample.logits_processor import MinTokensLogitsProcessor
+
     for proc in logitsprocs.non_argmax_invariant:
         if not isinstance(proc, MinTokensLogitsProcessor):
             continue
