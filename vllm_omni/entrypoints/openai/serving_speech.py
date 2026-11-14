@@ -172,9 +172,11 @@ def _coerce_sample_rate(value: object) -> int | None:
     if value is None:
         return None
     if isinstance(value, (list, tuple)):
-        if not value:
-            return None
-        return _coerce_sample_rate(value[-1])
+        for candidate in reversed(value):
+            sample_rate = _coerce_sample_rate(candidate)
+            if sample_rate is not None:
+                return sample_rate
+        return None
     numel = getattr(value, "numel", None)
     if callable(numel) and numel() == 0:
         return None

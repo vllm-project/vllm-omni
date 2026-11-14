@@ -42,6 +42,7 @@ from vllm_omni.model_executor.models.interfaces import SupportsMRv2MultiFrameDec
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
+from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
@@ -50,6 +51,40 @@ from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
+_SPARSE_AUDIO_META_FIELDS = frozenset({"req_id", "sparse_audio"})
+_SPARSE_AUDIO_PROTOCOL_KEYS = frozenset({"meta.req_id", "meta.sparse_audio"})
+
+
+def _without_sparse_audio_protocol(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove routing-only sparse-audio metadata from a client payload."""
+    nested_meta = payload.get("meta")
+    has_nested_protocol = isinstance(nested_meta, dict) and bool(_SPARSE_AUDIO_META_FIELDS.intersection(nested_meta))
+    if not _SPARSE_AUDIO_PROTOCOL_KEYS.intersection(payload) and not has_nested_protocol:
+        return payload
+    stripped = {key: value for key, value in payload.items() if key not in _SPARSE_AUDIO_PROTOCOL_KEYS}
+    meta = stripped.get("meta")
+    if isinstance(meta, dict):
+        meta = {key: value for key, value in meta.items() if key not in _SPARSE_AUDIO_META_FIELDS}
+        if meta:
+            stripped["meta"] = meta
+        else:
+            stripped.pop("meta")
+    return stripped
+
+
+def _resolve_sparse_pooler_routing(
+    multimodal_outputs: dict[str, Any],
+    req_ids: list[str] | None,
+) -> tuple[dict[str, int], bool]:
+    if req_ids is None:
+        return {}, False
+    _downstream, sparse_mm_index, audio_sparse_output = resolve_sparse_mm_routing(
+        engine_output_type="audio",
+        req_ids_output_copy=req_ids,
+        downstream_req_ids=req_ids,
+        multimodal_outputs=multimodal_outputs,
+    )
+    return sparse_mm_index, audio_sparse_output
 
 
 def _copy_mm_to_snapshot_slot(value: Any, slot: dict[tuple[Any, ...], torch.Tensor], path: tuple[Any, ...] = ()) -> Any:
@@ -529,6 +564,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         num_reqs: int,
         padded_total_tokens: int | None = None,
         num_output_rows: np.ndarray | None = None,
+        req_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Build per-request payloads, excluding any CUDA Graph padding.
 
@@ -540,17 +576,25 @@ class OmniARModelRunner(OmniGPUModelRunner):
         total = int(num_scheduled_tokens[:num_reqs].sum())
         if num_output_rows is None:
             num_output_rows = num_scheduled_tokens
+        batch_req_ids = list(req_ids[:num_reqs]) if req_ids is not None else None
+        sparse_mm_index, audio_sparse_output = _resolve_sparse_pooler_routing(mm_cpu, batch_req_ids)
+        payload_mm = _without_sparse_audio_protocol(mm_cpu)
         pooler: list[dict[str, Any]] = []
         for i in range(num_reqs):
+            req_id = batch_req_ids[i] if batch_req_ids is not None and i < len(batch_req_ids) else None
+            if audio_sparse_output and (req_id is None or req_id not in sparse_mm_index):
+                pooler.append({})
+                continue
+            list_idx = sparse_mm_index[req_id] if audio_sparse_output and req_id is not None else i
             start = int(query_start_loc_np[i])
             end = start + int(num_output_rows[i])
             payload: dict[str, Any] = {}
             if hidden_cpu is not None:
                 payload["hidden"] = hidden_cpu[start:end].clone()
-            for k, v in mm_cpu.items():
+            for k, v in payload_mm.items():
                 payload[k] = _slice_pooler_value(
                     v,
-                    req_index=i,
+                    req_index=list_idx,
                     start=start,
                     end=end,
                     total_tokens=total,
@@ -567,26 +611,36 @@ class OmniARModelRunner(OmniGPUModelRunner):
         num_reqs: int,
         total_tokens: int,
         padded_total_tokens: int | None = None,
+        req_ids: list[str] | None = None,
     ) -> tuple[list[dict[str, Any] | None] | None, list[dict[str, Any] | None] | None]:
         """Build async-chunk payloads without materializing hidden on CPU."""
         if not mm_outputs:
             return None, None
 
+        batch_req_ids = list(req_ids[:num_reqs]) if req_ids is not None else None
+        sparse_mm_index, audio_sparse_output = _resolve_sparse_pooler_routing(mm_outputs, batch_req_ids)
+        payload_mm = _without_sparse_audio_protocol(mm_outputs)
         inter_stage_list: list[dict[str, Any] | None] = []
         client_mm_list: list[dict[str, Any] | None] = []
         for i in range(num_reqs):
+            req_id = batch_req_ids[i] if batch_req_ids is not None and i < len(batch_req_ids) else None
+            if audio_sparse_output and (req_id is None or req_id not in sparse_mm_index):
+                inter_stage_list.append(None)
+                client_mm_list.append(None)
+                continue
+            list_idx = sparse_mm_index[req_id] if audio_sparse_output and req_id is not None else i
             start = int(query_start_loc_np[i])
             end = start + int(num_scheduled_tokens[i])
             payload = {
                 key: _slice_pooler_value(
                     value,
-                    req_index=i,
+                    req_index=list_idx,
                     start=start,
                     end=end,
                     total_tokens=total_tokens,
                     padded_total_tokens=padded_total_tokens,
                 )
-                for key, value in mm_outputs.items()
+                for key, value in payload_mm.items()
             }
             inter_stage, client_mm = partition_flat_payload(flatten_payload(payload))
             inter_stage_list.append(inter_stage or None)
@@ -906,6 +960,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self._num_reqs: int = 0
         self._total_tokens: int = 0
         self._padded_total_tokens: int = 0
+        self._req_ids = list(model_runner_output.req_ids)
         if self._need_pooler and input_batch is not None:
             self._query_start_loc_np = input_batch.query_start_loc_np.copy()
             self._num_scheduled_tokens = np.array(input_batch.num_scheduled_tokens, dtype=np.int32)
@@ -1121,6 +1176,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     self._num_reqs,
                     self._total_tokens,
                     self._padded_total_tokens,
+                    self._req_ids,
                 )
             if self._streaming_audio is not None:
                 pooler_inter, pooler_client = None, self._streaming_audio.get_output()
@@ -1151,6 +1207,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 self._num_reqs,
                 self._padded_total_tokens,
                 num_output_rows,
+                self._req_ids,
             )
             pooler_payload = cast(list[dict[str, Any] | None], pooler_output) if pooler_output else None
             self.model_runner_output.pooler_output = pooler_payload

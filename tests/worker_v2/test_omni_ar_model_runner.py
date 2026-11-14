@@ -647,6 +647,50 @@ def test_async_output_slices_request_payloads_with_graph_padding(
 
 @pytest.mark.parametrize("async_chunk", [False, True])
 @pytest.mark.cpu
+def test_async_output_routes_sparse_audio_by_request_id(monkeypatch, mocker, async_chunk) -> None:
+    """A one-request audio delta must not be copied to its batch neighbours."""
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    audio = torch.arange(10 * 1024, dtype=torch.float32)
+    sample_rate = torch.tensor(22050, dtype=torch.int32)
+    batch = mocker.Mock(spec=InputBatch)
+    batch.query_start_loc_np = np.array([0, 1, 2])
+    batch.num_scheduled_tokens = np.array([1, 1])
+    batch.num_reqs = 2
+    batch.num_tokens_after_padding = 2
+
+    output = _async_output(
+        req_ids=["req-a", "req-b"],
+        sampler_output=SamplerOutput(
+            torch.ones(2, 1, dtype=torch.long),
+            None,
+            None,
+            torch.ones(2, dtype=torch.long),
+            torch.zeros(2, dtype=torch.long),
+        ),
+        num_sampled_tokens=torch.ones(2, dtype=torch.long),
+        multimodal_outputs={
+            "model_outputs": [audio],
+            "sr": [sample_rate],
+            "meta": {"req_id": ["req-b"], "sparse_audio": ["1"]},
+        },
+        input_batch=batch,
+        async_chunk=async_chunk,
+    ).get_output()
+
+    payloads = output.multimodal_outputs if async_chunk else output.inter_stage_outputs
+    assert payloads is not None
+    assert payloads[0] in ({}, None)
+    assert payloads[1] is not None
+    assert set(payloads[1]) == {"model_outputs", "sr"}
+    torch.testing.assert_close(payloads[1]["model_outputs"], audio)
+    torch.testing.assert_close(payloads[1]["sr"], sample_rate)
+    assert not any(key.startswith("meta.") for payload in payloads if payload for key in payload)
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.cpu
 def test_async_output_drops_rejected_draft_rows(monkeypatch, mocker, async_chunk):
     """Only rows of accepted tokens reach the next stage after draft verification."""
     from vllm.v1.worker.gpu.input_batch import InputBatch

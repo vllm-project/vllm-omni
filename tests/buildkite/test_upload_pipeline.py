@@ -1025,7 +1025,8 @@ def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatc
     label = "TTS · H100"
     matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
     assert len(matching_steps) == 1
-    assert matching_steps[0]["source_file_dependencies"] == [
+    step = matching_steps[0]
+    assert step["source_file_dependencies"] == [
         "tts_audex_weekly",
         "tts_higgs_audio_v3_weekly",
         "tts_step_audio2_weekly",
@@ -1033,6 +1034,22 @@ def test_h100_tts_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatc
         "tts_minimax_music3_weekly",
         "tts_yue2_weekly",
     ]
+    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"}
+    command = "\n".join(step["commands"])
+    v1_files = (
+        "tests/e2e/offline_inference/test_audex_s2s.py",
+        "tests/e2e/online_serving/test_audex_tta.py",
+        "tests/e2e/online_serving/test_audex_tts.py",
+        "tests/e2e/online_serving/test_minimax_music3.py",
+        "tests/e2e/online_serving/test_yue2.py",
+    )
+    assert "VLLM_OMNI_CI_MODEL_RUNNER=v1 pytest" in command
+    assert "VLLM_OMNI_CI_MODEL_RUNNER=v2 pytest" in command
+    for path in v1_files:
+        assert command.count(path) == 2
+        assert f"--ignore={path}" in command
+    assert "failed=0" in command
+    assert "exit $$failed" in command
 
     group = next(step for step in doc["steps"] if "H100 TTS Weekly" in step.get("group", ""))
     assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
