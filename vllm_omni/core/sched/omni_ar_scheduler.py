@@ -6,20 +6,21 @@ from __future__ import annotations
 import inspect
 import time
 from collections import defaultdict
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import replace
 from typing import Any, TypedDict
 
 import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingType
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.perf import PerfStats
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
@@ -29,9 +30,10 @@ from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
-from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import CONTINUE_TOKEN_ID
+from vllm_omni.worker_v2.ngram_adapter import is_npu_thinker_ngram, use_scheduler_ngram
 
 logger = init_logger(__name__)
 
@@ -167,6 +169,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._npu_thinker_ngram = is_npu_thinker_ngram(self.vllm_config)
+        self._scheduler_ngram: Callable[..., np.ndarray] | None = None
+        if use_scheduler_ngram(self.vllm_config):
+            from vllm.v1.spec_decode.ngram_proposer import _find_longest_matched_ngram_and_propose_tokens
+
+            self._scheduler_ngram = _find_longest_matched_ngram_and_propose_tokens
+            self._ngram_min = self.vllm_config.speculative_config.prompt_lookup_min
+            self._ngram_max = self.vllm_config.speculative_config.prompt_lookup_max
+            # Compile the lookup before serving the first request.
+            self._scheduler_ngram(
+                np.zeros(2, dtype=np.int32), self._ngram_min, self._ngram_max, self.max_model_len, self.num_spec_tokens
+            )
+            logger.info("MiniCPM-o Thinker MRv2 uses scheduler-side Ngram.")
         install_decode_allocate_fast_path(self.kv_cache_manager)
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
@@ -485,6 +500,40 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if stop_after_transfer and req_id in self.requests_needing_kv_transfer:
             self.pending_stop_after_extraction.add(req_id)
 
+    @staticmethod
+    def _uses_native_duplex_sampler(request: Request) -> bool:
+        if request.resumable:
+            return True
+        payload = getattr(request, "additional_information", None)
+        if isinstance(payload, AdditionalInformationPayload):
+            entry = payload.entries.get("duplex")
+            duplex = entry.scalar_data if entry is not None else None
+        else:
+            duplex = payload.get("duplex") if payload else None
+        return isinstance(duplex, dict) and duplex.get("data_plane") is True
+
+    def _propose_scheduler_ngram(self, req_id: str) -> list[int]:
+        request = self.requests.get(req_id)
+        if (
+            request is None
+            or request.is_finished()
+            or request.is_prefill_chunk
+            or self._uses_native_duplex_sampler(request)
+            or request.sampling_params is None
+            or request.sampling_params.sampling_type != SamplingType.GREEDY
+            or not request.output_token_ids
+        ):
+            return []
+        proposer = self._scheduler_ngram
+        assert proposer is not None
+        return proposer(
+            np.asarray(request.all_token_ids, dtype=np.int32),
+            self._ngram_min,
+            self._ngram_max,
+            self.max_model_len,
+            self.num_spec_tokens,
+        ).tolist()
+
     def update_draft_token_ids(self, draft_token_ids) -> None:
         """Align the per-request draft buffers before the next schedule().
 
@@ -502,6 +551,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         every buffer leaves the next step to schedule a uniform padded
         single-frame span, from which the K-step resumes on its own.
         """
+        if getattr(self, "_scheduler_ngram", None) is not None:
+            draft_token_ids = DraftTokenIds(
+                draft_token_ids.req_ids,
+                [self._propose_scheduler_ngram(req_id) for req_id in draft_token_ids.req_ids],
+            )
         super().update_draft_token_ids(draft_token_ids)
         if not self._talker_kstep_armed():
             return
@@ -668,6 +722,39 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if req.spec_token_ids:
                 req.spec_token_ids = []
 
+    def _limit_thinker_drafts(self, scheduler_output: SchedulerOutput) -> None:
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not spec_tokens:
+            return
+
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        draft_limit = scheduler_output.num_spec_tokens_to_schedule
+        scheduler_ngram = self._scheduler_ngram is not None
+        for req_id in num_scheduled_tokens:
+            request = self.requests[req_id]
+            params = request.sampling_params
+            # Native duplex needs one logit row per request. On the MRv2
+            # scheduler Ngram path, also keep non-greedy requests on the
+            # ordinary sampler when they share a step with greedy requests.
+            if self._uses_native_duplex_sampler(request) or (
+                scheduler_ngram and params is not None and params.sampling_type != SamplingType.GREEDY
+            ):
+                draft_limit = 0
+                break
+        else:
+            if not scheduler_ngram:
+                return
+        for req_id, drafts in list(spec_tokens.items()):
+            num_dropped = len(drafts) - draft_limit
+            if num_dropped <= 0:
+                continue
+            num_scheduled_tokens[req_id] -= num_dropped
+            scheduler_output.total_num_scheduled_tokens -= num_dropped
+            if draft_limit:
+                spec_tokens[req_id] = drafts[:draft_limit]
+            else:
+                del spec_tokens[req_id]
+
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         """Rewrite the K-step spans before upstream books the step.
 
@@ -690,6 +777,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         call site in ``schedule()`` below stays as a backstop for a step built
         without booking, where there is no accounting to settle.
         """
+        if getattr(self, "_npu_thinker_ngram", False):
+            self._limit_thinker_drafts(scheduler_output)
         self._enforce_kstep_span_uniformity(scheduler_output)
         super()._update_after_schedule(scheduler_output)
 

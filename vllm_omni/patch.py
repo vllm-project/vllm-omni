@@ -834,3 +834,14 @@ def _patch_mrv2_stop_token_capacity() -> None:
 
 
 _patch_mrv2_stop_token_capacity()
+
+
+def _patch_ascend_ngram() -> None:
+    # Runner selection happens here. Both speculator factory bindings are
+    # handled in platforms/npu/worker/npu_omni_v2_model_runner.py.
+    from vllm_omni.worker_v2.ngram_adapter import allow_ascend_scheduler_ngram
+
+    allow_ascend_scheduler_ngram()
+
+
+_patch_ascend_ngram()

@@ -43,6 +43,7 @@ _DEPLOY_DIR = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
 _DEPLOY_LAYOUTS = {
     "minicpmo_4_5.yaml": ["0", "0", "0"],
     "minicpmo_4_5_2gpu.yaml": ["0", "1", "1"],
+    "minicpmo_4_5_npu_2card.yaml": ["0", "0", "1"],
     "minicpmo_4_5_3gpu.yaml": ["0", "1", "2"],
     "minicpmo_4_5_8x4090.yaml": ["0,1,2,3", "4", "5"],
 }
@@ -162,7 +163,7 @@ class TestDeployTopology:
             "minicpmo_4_5.yaml",
             "minicpmo_4_5_3gpu_stage1_replicas.yaml",
             "minicpmo_4_5_4gpu_stage1_replicas.yaml",
-            "minicpmo_4_5_stage2_replicas.yaml",
+            "minicpmo_4_5_npu_2card.yaml",
             "minicpmo_4_5_turn.yaml",
             "minicpmo_4_5_duplex_h200.yaml",
         }
@@ -208,7 +209,7 @@ class TestDeployTopology:
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
             # The NPU overlay also retunes the per-stage memory budget for the
             # 910B single-card layout; every other platform keeps the base one.
-            expected_utils = [0.50, 0.10, 0.22] if is_npu else [0.55, 0.15, 0.18]
+            expected_utils = [0.55, 0.10, 0.22] if is_npu else [0.55, 0.15, 0.18]
             assert memory_utilizations == expected_utils
             assert sum(memory_utilizations) <= 0.9 + 1e-6
             # Keep the default Daily-Omni budget; Video-MME overrides stage 0 explicitly.
@@ -266,6 +267,28 @@ class TestDeployTopology:
         if filename == "minicpmo_4_5.yaml":
             expected_graph_config["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
         assert stages[2].yaml_engine_args["additional_config"] == expected_graph_config
+
+    @pytest.mark.parametrize(
+        ("filename", "devices"),
+        [("minicpmo_4_5.yaml", ["0", "0", "0"]), ("minicpmo_4_5_npu_2card.yaml", ["0", "0", "1"])],
+    )
+    def test_npu_default_uses_mrv2_with_thinker_ngram(self, filename, devices, monkeypatch):
+        monkeypatch.setattr(current_omni_platform, "device_name", "npu")
+        monkeypatch.setattr(current_omni_platform, "device_type", "npu")
+        deploy = load_deploy_config(_DEPLOY_DIR / filename)
+        stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
+
+        assert [stage.yaml_runtime["devices"] for stage in stages] == devices
+        assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+        thinker_args = stages[0].yaml_engine_args
+        assert thinker_args["async_scheduling"] is False
+        assert thinker_args["speculative_config"] == {
+            "method": "ngram",
+            "num_speculative_tokens": 7,
+            "prompt_lookup_min": 1,
+            "prompt_lookup_max": 1,
+        }
+        assert stages[1].yaml_engine_args["speculative_config"]["method"] == "ngram"
 
     def test_pipeline_exposes_full_and_async_payload_hooks(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
