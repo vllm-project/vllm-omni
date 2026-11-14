@@ -101,4 +101,7 @@ python -m pytest -q tests/benchmarks/test_lingbot_world_cases.py \
 ```
 
 Performance remains in `tests/dfx/perf` with its recorded JSON workflow.
-There is no stability or weekly LingBot test lane.
+These accuracy and performance workflows add no stability or weekly lane.
+Existing DFX stability cases keep
+`benchmarks/lingbot_world/benchmark_lingbot_world_realtime.py` and their deploy
+config paths. This compatibility entry delegates to the shared serving benchmark.

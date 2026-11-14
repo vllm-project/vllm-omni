@@ -229,10 +229,9 @@ async def run_session(
             finally:
                 if keepalive is not None:
                     keepalive.cancel()
-                    try:
-                        await keepalive
-                    except asyncio.CancelledError:
-                        pass
+                    # A failed ping must not replace the session outcome. Gather
+                    # consumes child errors while caller cancellation propagates.
+                    await asyncio.gather(keepalive, return_exceptions=True)
 
             wall_s = time.perf_counter() - started
 
