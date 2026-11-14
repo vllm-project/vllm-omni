@@ -218,7 +218,16 @@ def _omni_server_env() -> dict[str, str]:
     return {"VLLM_OMNI_STORAGE_PATH": str(storage_path)}
 
 
-def _resolve_offline_model(model: str) -> str:
+def _cli_flag_value(args: tuple[str, ...] | list[str], flag: str) -> str | None:
+    for index, arg in enumerate(args):
+        if arg == flag and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith(f"{flag}="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _resolve_offline_model(model: str, revision: str | None = None) -> str:
     """Resolve HF ids / MiniMax env overrides the same way as the diffusion runner."""
     import huggingface_hub
 
@@ -251,14 +260,15 @@ def _resolve_offline_model(model: str) -> str:
 
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         return model
-    return hf_api().snapshot_download(model, local_files_only=True)
+    # A pinned download (``hf download --revision <sha>``) caches no refs/main.
+    return hf_api().snapshot_download(model, revision=revision, local_files_only=True)
 
 
 @contextmanager
 def _start_omni_server(server_param):
     test_name, model, stage_config_path, stage_overrides, extra_cli_args, use_omni = server_param
     extra = tuple(extra_cli_args or ())
-    model = _resolve_offline_model(model)
+    model = _resolve_offline_model(model, revision=_cli_flag_value(extra, "--revision"))
 
     print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
@@ -687,6 +697,30 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
 
 def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
+    if params.get("dataset_name") == "realtime-video":
+        video = result.get("realtime_video")
+        assert isinstance(video, dict) and video.get("passed") is True, "Realtime video measurement is incomplete"
+        assert not video.get("finalization_errors"), "Realtime video finalization failed"
+        sessions = video.get("sessions")
+        assert isinstance(sessions, list) and len(sessions) == num_prompt, "Realtime video sessions are missing"
+        warmups = video.get("warmups")
+        assert isinstance(warmups, list) and len(warmups) == _resolve_num_warmups(params, default=2), (
+            "Realtime video warmups are missing"
+        )
+        assert all(row.get("success") is True and not row.get("error") for row in [*sessions, *warmups]), (
+            "Realtime video session or warmup failed"
+        )
+        for name in (
+            "mean_e2el_ms",
+            "request_throughput",
+            "mean_video_ttfc_ms",
+            "min_video_fps",
+            "mean_video_steady_interval_ms",
+            "p95_video_steady_interval_ms",
+            "mean_video_rtf",
+        ):
+            value = result.get(name)
+            assert _is_finite_number(value) and value >= 0, f"Realtime video has no valid {name} measurement"
     _assert_fixed_stage_workloads(result, params, num_prompt)
     assert_duplex_artifact_publication(result, params, num_prompt)
     for metric in params.get("required_duplex_metrics", []):

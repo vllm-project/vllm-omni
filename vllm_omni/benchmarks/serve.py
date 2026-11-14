@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from vllm.benchmarks.serve import main_async
+from vllm.benchmarks.serve import main_async as vllm_main_async
 
 # Import patch to register daily-omni dataset and omni backends
 # This monkey-patches vllm.benchmarks.datasets.get_samples before it's used
@@ -73,7 +73,14 @@ def _validate_fail_fast_on_timeout(args: argparse.Namespace) -> None:
         )
 
 
-def main(args: argparse.Namespace) -> dict[str, Any]:
+async def main_async(args: argparse.Namespace) -> dict[str, Any]:
+    """Run the common serving lifecycle from async protocol/CI callers too."""
+    if getattr(args, "realtime_video_evaluate", None):
+        # Saved outputs are scored after the generation server has released its
+        # devices; no server discovery, tokenizer or benchmark traffic is needed.
+        from vllm_omni.benchmarks.realtime_video.eval import evaluate_from_args
+
+        return await asyncio.to_thread(evaluate_from_args, args)
     if getattr(args, "seed_tts_wer_eval", False):
         os.environ["SEED_TTS_WER_EVAL"] = "1"
     if getattr(args, "seed_tts_wer_save_items", False):
@@ -100,4 +107,8 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         else contextlib.nullcontext()
     )
     with lock:
-        return asyncio.run(main_async(args))
+        return await vllm_main_async(args)
+
+
+def main(args: argparse.Namespace) -> dict[str, Any]:
+    return asyncio.run(main_async(args))

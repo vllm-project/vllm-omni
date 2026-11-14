@@ -105,6 +105,13 @@ from vllm_omni.benchmarks.omniinteract import (
     write_batch_artifacts as write_omniinteract_batch_artifacts,
 )
 from vllm_omni.benchmarks.omniinteract_eval import evaluate_batch as evaluate_omniinteract_batch
+from vllm_omni.benchmarks.realtime_video.serving import (
+    async_request_realtime_video,
+    bind_realtime_video,
+    finalize_realtime_video,
+    get_realtime_video_samples,
+    make_realtime_video_warmup,
+)
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.utils import coerce_bool, coerce_positive_float_scalar, coerce_positive_int_scalar
 
@@ -738,6 +745,8 @@ def get_samples(args, tokenizer, **kwargs):
         args.num_prompts = len(requests)
         return requests
 
+    if args.dataset_name == "realtime-video":
+        return get_realtime_video_samples(args)
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
     is_daily_omni = args.dataset_name == "daily-omni" or (
         args.dataset_name == "hf" and _daily_omni_repo_from_args(args) is not None
@@ -3705,6 +3714,7 @@ async def async_request_openai_realtime_chat(
 
 
 ASYNC_REQUEST_FUNCS["openai-realtime-chat"] = async_request_openai_realtime_chat
+ASYNC_REQUEST_FUNCS["realtime-video"] = async_request_realtime_video
 if "openai-realtime-chat" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-chat")
 
@@ -3761,6 +3771,7 @@ from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
     calculate_metrics,
     has_metric_samples,
+    metric_result_fields,
     validate_goodput_config,
 )
 
@@ -3950,6 +3961,7 @@ async def benchmark(
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
     _attach_omniinteract_to_request_func_input(input_requests[0], test_input)
     attach_duplex_eval(input_requests[0], test_input)
+    test_input = bind_realtime_video(input_requests[0], test_input)
 
     if ready_check_timeout_sec > 0:
         test_output = await wait_for_endpoint(
@@ -3969,6 +3981,7 @@ async def benchmark(
     else:
         print("Skipping endpoint ready check.")
 
+    warmup_outputs: list[RequestFuncOutput] = []
     if num_warmups > 0:
         print(f"Warming up with {num_warmups} requests...")
         warmup_pbar = None if disable_tqdm else tqdm(total=num_warmups)
@@ -3981,13 +3994,28 @@ async def benchmark(
 
         for i in range(num_warmups):
             warmup_input = _salted_copy(test_input, warmup_scope and f"{warmup_scope}-{i}")
+            warmup_input = make_realtime_video_warmup(warmup_input)
             request_task = asyncio.create_task(warmup_limited_request_func(warmup_input))
             warmup_tasks.append(request_task)
-        _ = await asyncio.gather(*warmup_tasks)
+        warmup_outputs = await asyncio.gather(*warmup_tasks)
 
         if warmup_pbar is not None:
             warmup_pbar.close()
         print("Warmup run completed.")
+
+    if endpoint_type == "realtime-video" and any(not output.success for output in warmup_outputs):
+        await session.close()
+        return await asyncio.to_thread(
+            finalize_realtime_video,
+            input_requests,
+            [],
+            warmup_outputs,
+            duration=0.0,
+            endpoint=api_url,
+            model=model_id,
+            selected_percentile_metrics=selected_percentile_metrics,
+            selected_percentiles=selected_percentiles,
+        )
 
     print("Starting main benchmark run...")
 
@@ -4119,6 +4147,7 @@ async def benchmark(
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         _attach_omniinteract_to_request_func_input(request, request_func_input)
         attach_duplex_eval(request, request_func_input)
+        request_func_input = bind_realtime_video(request, request_func_input)
         request_func_inputs.append(request_func_input)
         tasks.append(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
@@ -4145,6 +4174,20 @@ async def benchmark(
     # Capture the measurement boundary before metrics and accuracy evaluation.
     # Upstream's result "date" is populated only after this function returns.
     benchmark_end_time = datetime.now().isoformat()
+
+    if endpoint_type == "realtime-video":
+        await session.close()
+        return await asyncio.to_thread(
+            finalize_realtime_video,
+            input_requests,
+            outputs,
+            warmup_outputs,
+            duration=benchmark_duration,
+            endpoint=api_url,
+            model=model_id,
+            selected_percentile_metrics=selected_percentile_metrics,
+            selected_percentiles=selected_percentiles,
+        )
 
     duplex_eval_summary = await asyncio.to_thread(finalize_duplex_eval, input_requests, outputs)
     if duplex_eval_summary is not None:
@@ -4246,6 +4289,8 @@ async def benchmark(
             "max_concurrent_requests": mm_metrics.max_concurrent_requests,
             "rtfx": mm_metrics.rtfx,
         }
+        if getattr(mm_metrics, defs.TOTAL_VIDEO_DURATION_S) > 0:
+            result["video_metric_scopes"] = {defs.VIDEO_RTF: defs.VIDEO_RTF_SERVER_SCOPE}
         for sample_count in (
             "num_ttft_samples",
             "num_tpot_samples",
@@ -4416,24 +4461,7 @@ async def benchmark(
         is_text_token_metric = not (metric_attribute_name == "e2el" or metric_attribute_name.startswith("audio"))
         if is_text_token_metric and getattr(metrics, "total_output", 0) == 0:
             return
-        is_audio_rtf = metric_attribute_name == defs.AUDIO_RTF
-        is_audio_duration_or_underrun = metric_attribute_name in (defs.AUDIO_DURATION, defs.AUDIO_UNDERRUN)
-
-        suffix = "_ms"
-        if is_audio_duration_or_underrun:
-            suffix = "_s"
-        elif is_audio_rtf:
-            suffix = ""
-        mean_attr_name = f"mean_{metric_attribute_name}{suffix}"
-        mean_value = getattr(metrics, mean_attr_name, 0.0)
-        result[mean_attr_name] = mean_value
-
-        median_attr_name = f"median_{metric_attribute_name}{suffix}"
-        median_value = getattr(metrics, median_attr_name, 0.0)
-        result[median_attr_name] = median_value
-        for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}", None) or []:
-            p_word = str(int(p)) if int(p) == p else str(p)
-            result[f"p{p_word}_{metric_attribute_name}{suffix}"] = value
+        result.update(metric_result_fields(metrics, metric_attribute_name))
 
     if any(isinstance(getattr(output, "duplex_session_metrics", None), dict) for output in outputs):
         result["duplex_metric_aggregation"] = _DUPLEX_METRIC_AGGREGATION

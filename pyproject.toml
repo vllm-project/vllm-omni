@@ -207,6 +207,7 @@ include = ["vllm_omni*"]
 "vllm_omni" = [
     "_version.py",
     "py.typed",
+    "benchmarks/realtime_video/*.json",
     "deploy/*.md",
     "deploy/*.yaml",
     "diffusion/models/hy_nomas/camera_trajectories.json",

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """conftest.py for benchmarks unit tests.
 
@@ -11,10 +11,38 @@ symbols actually imported by
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from dataclasses import dataclass
 from typing import Any
+
+import pytest
+
+
+@pytest.fixture
+def lingbot_subprocess_env() -> dict[str, str]:
+    """Give isolated child launchers their own phase, policy and shard controls."""
+    environment = os.environ.copy()
+    for name in (
+        "BUILDKITE",
+        "BUILDKITE_PARALLEL_JOB",
+        "BUILDKITE_PARALLEL_JOB_COUNT",
+        "CI_POLICY_FILE",
+        "PYTEST_ADDOPTS",
+        "LINGBOT_ALLOCATION_FILE",
+        "LINGBOT_CASE_SHARD",
+        "LINGBOT_CI_PHASE",
+        "LINGBOT_EVALUATOR_PYTHON",
+        "LINGBOT_EVALUATOR_ROOT",
+        "LINGBOT_MEASUREMENT_REPEAT",
+        "LINGBOT_MODEL_PATH",
+        "LINGBOT_QUALITY_CASE_INDEX",
+        "LINGBOT_REFERENCE_ONLY",
+    ):
+        environment.pop(name, None)
+    environment["LINGBOT_REFERENCE_ONLY"] = "0"
+    return environment
 
 
 def _install_vllm_stubs() -> None:

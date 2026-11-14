@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "model_revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2",
+  "height": 480,
+  "width": 832,
+  "precision": "bfloat16",
+  "num_chunks": 40,
+  "warmup_chunks": 6,
+  "mux_fps": 16,
+  "target_fps": 12,
+  "startup_timeout_s": 1200,
+  "precision_timeout_s": 600,
+  "first_chunk_timeout_s": 900,
+  "chunk_timeout_s": 120,
+  "cases": [
+    {
+      "id": "boardwalk-42",
+      "image": "2560px-Gfp-wisconsin-madison-the-nature-boardwalk",
+      "prompt": "The camera moves through a wooden boardwalk in a green wetland.",
+      "camera_pattern": "forward",
+      "seed": 42
+    },
+    {
+      "id": "blossom-42",
+      "image": "cherry_blossom",
+      "prompt": "Cherry blossoms in a quiet park, detailed natural scenery.",
+      "camera_pattern": "orbit",
+      "seed": 42
+    },
+    {
+      "id": "street-42",
+      "image": "stop_sign",
+      "prompt": "A street corner with a stop sign and surrounding buildings.",
+      "camera_pattern": "hold",
+      "seed": 42
+    }
+  ],
+  "platform": "cuda",
+  "cards": 2,
+  "dies": 2,
+  "deploy_config": "tests/e2e/accuracy/lingbot_world/configs/usp2_compiled.yaml",
+  "warmup_num_chunks": 8,
+  "hardware": "H100",
+  "score_floors": {
+    "source": "vllm-omni Buildkite build 19532 at d60e82c0d5deeaed6c7bbcb7725f12d02e694f82: each recorded score minus 0.05, rounded down to 4 decimals. The largest per-dimension difference against CUDA build 18935 was 0.0175. Binary dynamic_degree is recorded only.",
+    "wbench": {
+      "boardwalk-42_aesthetic_quality": 0.6318,
+      "boardwalk-42_hpsv3_quality": 0.8186,
+      "boardwalk-42_imaging_quality": 0.6656,
+      "boardwalk-42_motion_smoothness": 0.9246,
+      "boardwalk-42_temporal_flickering": 0.8735,
+      "blossom-42_aesthetic_quality": 0.7803,
+      "blossom-42_hpsv3_quality": 0.7874,
+      "blossom-42_imaging_quality": 0.629,
+      "blossom-42_motion_smoothness": 0.9154,
+      "blossom-42_temporal_flickering": 0.8623,
+      "street-42_aesthetic_quality": 0.4267,
+      "street-42_hpsv3_quality": 0.8627,
+      "street-42_imaging_quality": 0.6866,
+      "street-42_motion_smoothness": 0.8937,
+      "street-42_temporal_flickering": 0.842
+    },
+    "vbench": {
+      "boardwalk-42_aesthetic_quality": 0.6177,
+      "boardwalk-42_background_consistency": 0.9096,
+      "boardwalk-42_imaging_quality": 0.7427,
+      "boardwalk-42_motion_smoothness": 0.929,
+      "boardwalk-42_subject_consistency": 0.8871,
+      "boardwalk-42_temporal_flickering": 0.8978,
+      "blossom-42_aesthetic_quality": 0.7875,
+      "blossom-42_background_consistency": 0.8838,
+      "blossom-42_imaging_quality": 0.7116,
+      "blossom-42_motion_smoothness": 0.9284,
+      "blossom-42_subject_consistency": 0.8893,
+      "blossom-42_temporal_flickering": 0.8948,
+      "street-42_aesthetic_quality": 0.4183,
+      "street-42_background_consistency": 0.8229,
+      "street-42_imaging_quality": 0.7473,
+      "street-42_motion_smoothness": 0.9084,
+      "street-42_subject_consistency": 0.8461,
+      "street-42_temporal_flickering": 0.8755
+    }
+  }
+}

@@ -461,6 +461,25 @@ steps:
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_lingbot_video_vllm_omni.json -m "H100 and B200 and cards_1"
+      - label: ":full_moon: Diffusion X2V · LingBot World Perf Test · 2-GPU"
+        key: lingbot-cuda-nightly-performance
+        source_file_dependencies: lingbot_world_perf
+        timeout_in_minutes: 45
+        mirror_hardwares: h100_2
+        artifact_paths:
+          - "tests/dfx/perf/results/*.json"
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_lingbot_world_realtime.json -m "full_model and diffusion and cuda and H100 and cards_2" --run-level full_model
+      - label: ":full_moon: Diffusion X2V · LingBot World Accuracy Test"
+        key: lingbot-cuda-nightly-accuracy
+        source_file_dependencies: lingbot_world_accuracy
+        timeout_in_minutes: 60
+        mirror_hardwares: h100_2
+        artifact_paths:
+          - "lingbot-artifacts/cuda-accuracy/**/*"
+        commands:
+          - pytest -sv tests/e2e/accuracy/lingbot_world/test_precision.py tests/e2e/accuracy/lingbot_world/test_wbench.py tests/e2e/accuracy/lingbot_world/test_vbench.py --lingbot-profile=tests/e2e/accuracy/lingbot_world/configs/cuda.json --lingbot-output=lingbot-artifacts/cuda-accuracy --run-level full_model
 
   - group: ":card_index_dividers: Diffusion Test"
     key: nightly-diffusion-test-group

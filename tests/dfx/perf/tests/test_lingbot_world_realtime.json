@@ -1,0 +1,148 @@
+[
+  {
+    "test_name": "test_lingbot_world_realtime_cuda",
+    "description": "Recorded-data recipe on 2 H100 devices: three 40-chunk boardwalk-42 measured rollouts after one separate 8-chunk warmup. H100 baseline references vllm-omni Buildkite build 19532 (commit d60e82c0d5deeaed6c7bbcb7725f12d02e694f82, recorded request_throughput 0.0166, mean_e2el_ms 60157.5497, mean_video_ttfc_ms 7520.7890, min_video_fps 6.7644, mean_video_rtf 1.5133, mean_video_steady_interval_ms 1349.9387, p95_video_steady_interval_ms 1524.8343): request_throughput and min_video_fps are measured x 0.90, latency, interval and RTF are measured x 1.10, rounded to 4 decimals. This single run is a reference measurement, not validation of later revisions.",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "server_params": {
+      "model": "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+      "serve_args": {
+        "deploy-config": "tests/e2e/accuracy/lingbot_world/configs/usp2_compiled.yaml",
+        "revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2"
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "boardwalk42_832x480_chunks40",
+        "dataset_name": "realtime-video",
+        "backend": "realtime-video",
+        "endpoint": "/v1/realtime/video",
+        "num_prompts": 3,
+        "max_concurrency": 1,
+        "num_warmups": 1,
+        "realtime_video_num_chunks": 40,
+        "realtime_video_warmup_num_chunks": 8,
+        "realtime_video_warmup_chunks": 6,
+        "realtime_video_width": 832,
+        "realtime_video_height": 480,
+        "realtime_video_fps": 16,
+        "realtime_video_target_fps": 12,
+        "realtime_video_seed": 42,
+        "realtime_video_camera_pattern": "forward",
+        "realtime_video_prompt": "The camera moves through a wooden boardwalk in a green wetland.",
+        "realtime_video_first_chunk_timeout": 900,
+        "realtime_video_chunk_timeout": 120,
+        "realtime_video_image": "https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
+        "realtime_video_flow_shift": 5.0,
+        "metadata": [
+          "recipe=boardwalk42_832x480_chunks40",
+          "model_revision=59cccf49f2d2dd27418ae7a04b82b10868d455c2",
+          "deploy_config=tests/e2e/accuracy/lingbot_world/configs/usp2_compiled.yaml",
+          "workload_image=https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
+          "workload_seed=42",
+          "workload_geometry=832x480",
+          "measured_chunks=40",
+          "session_warmup_chunks=8",
+          "attention_warmup_chunks=6",
+          "sequence_parallel_size=2"
+        ],
+        "baseline": {
+          "H100": {
+            "request_throughput": 0.015,
+            "mean_e2el_ms": 66173.3047,
+            "mean_video_ttfc_ms": 8272.8679,
+            "min_video_fps": 6.0879,
+            "mean_video_rtf": 1.6646,
+            "mean_video_steady_interval_ms": 1484.9326,
+            "p95_video_steady_interval_ms": 1677.3178
+          }
+        },
+        "percentile_metrics": "e2el,video_ttfc,video_fps,video_rtf,video_steady_interval",
+        "metric_percentiles": "50,95,99"
+      }
+    ]
+  },
+  {
+    "test_name": "test_lingbot_world_realtime_npu",
+    "description": "Recorded-data recipe on 4 A2 devices: three 40-chunk boardwalk-42 measured rollouts after one separate 8-chunk warmup. A2 baseline references vllm-omni-npu-ci Buildkite build 11393 (commit 414a6bbc0e04fed9935c12e10bffad53ac6878a2, runtime label 910B, recorded request_throughput 0.0079, mean_e2el_ms 127264.2863, mean_video_ttfc_ms 5756.7185, min_video_fps 3.7321, mean_video_rtf 3.2015, mean_video_steady_interval_ms 3152.5593, p95_video_steady_interval_ms 3816.8109): request_throughput and min_video_fps are measured x 0.90, latency, interval and RTF are measured x 1.10, rounded to 4 decimals. This single run is a reference measurement, not validation of later revisions.",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A2"
+          },
+          "num_cards": 4
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "server_params": {
+      "model": "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+      "serve_args": {
+        "deploy-config": "tests/e2e/accuracy/lingbot_world/configs/npu_usp4_offload.yaml",
+        "revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2"
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "boardwalk42_832x480_chunks40",
+        "dataset_name": "realtime-video",
+        "backend": "realtime-video",
+        "endpoint": "/v1/realtime/video",
+        "num_prompts": 3,
+        "max_concurrency": 1,
+        "num_warmups": 1,
+        "realtime_video_num_chunks": 40,
+        "realtime_video_warmup_num_chunks": 8,
+        "realtime_video_warmup_chunks": 6,
+        "realtime_video_width": 832,
+        "realtime_video_height": 480,
+        "realtime_video_fps": 16,
+        "realtime_video_target_fps": 12,
+        "realtime_video_seed": 42,
+        "realtime_video_camera_pattern": "forward",
+        "realtime_video_prompt": "The camera moves through a wooden boardwalk in a green wetland.",
+        "realtime_video_first_chunk_timeout": 900,
+        "realtime_video_chunk_timeout": 120,
+        "realtime_video_image": "https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
+        "realtime_video_flow_shift": 5.0,
+        "metadata": [
+          "recipe=boardwalk42_832x480_chunks40",
+          "model_revision=59cccf49f2d2dd27418ae7a04b82b10868d455c2",
+          "deploy_config=tests/e2e/accuracy/lingbot_world/configs/npu_usp4_offload.yaml",
+          "workload_image=https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
+          "workload_seed=42",
+          "workload_geometry=832x480",
+          "measured_chunks=40",
+          "session_warmup_chunks=8",
+          "attention_warmup_chunks=6",
+          "sequence_parallel_size=4"
+        ],
+        "baseline": {
+          "A2": {
+            "request_throughput": 0.0071,
+            "mean_e2el_ms": 139990.7149,
+            "mean_video_ttfc_ms": 6332.3904,
+            "min_video_fps": 3.3589,
+            "mean_video_rtf": 3.5217,
+            "mean_video_steady_interval_ms": 3467.8152,
+            "p95_video_steady_interval_ms": 4198.492
+          }
+        },
+        "percentile_metrics": "e2el,video_ttfc,video_fps,video_rtf,video_steady_interval",
+        "metric_percentiles": "50,95,99"
+      }
+    ]
+  }
+]

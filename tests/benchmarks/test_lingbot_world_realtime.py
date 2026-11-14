@@ -3,10 +3,9 @@
 """Unit tests for the LingBot-World realtime streaming benchmark.
 
 The arithmetic is tested against the server's own formulas rather than against
-hand-copied expectations, and the protocol handling runs against a real
-WebSocket server that replays ``/v1/realtime/video`` with scripted delays -- so
-a benchmark number can be wrong only if the server itself is, not because the
-client parsed incorrectly an event or timed the wrong edge.
+hand-copied expectations. Protocol handling uses a real WebSocket server that
+replays ``/v1/realtime/video`` with scripted delays, plus deterministic sockets
+for terminal races, to check event parsing and timing at the client boundary.
 """
 
 from __future__ import annotations
@@ -14,6 +13,8 @@ from __future__ import annotations
 # ruff: noqa: E402, I001
 import asyncio
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -25,16 +26,18 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from benchmarks.lingbot_world.benchmark_lingbot_world_realtime import (
+from vllm_omni.benchmarks.realtime_video.client import (
     BenchmarkError,
-    build_workload,
-    print_report,
-    endpoint_url,
-    parse_args,
     resolve_image_reference,
     run_session,
 )
-from benchmarks.lingbot_world.workload import (
+from vllm_omni.benchmarks.realtime_video.compat import (
+    build_workload,
+    endpoint_url,
+    parse_args,
+    run_benchmark,
+)
+from vllm_omni.benchmarks.realtime_video.workload import (
     DEFAULT_WARMUP_CHUNKS,
     FRAMES_PER_BLOCK,
     ChunkRecord,
@@ -323,6 +326,28 @@ def test_a_deeper_buffer_absorbs_the_same_jitter() -> None:
     assert buffered.underrun_count < fast.underrun_count
 
 
+def test_playback_startup_and_steady_stalls_preserve_the_complete_total() -> None:
+    records = _records([1.0, 0.9, 0.5, 2.0, 0.5])
+    result = simulate_playback(records, fps=16, buffer_chunks=1, startup_chunks=2)
+    assert result.startup_stall_s > 0
+    assert result.steady_stall_s > 0
+    assert result.total_stall_s == pytest.approx(result.startup_stall_s + result.steady_stall_s)
+    later_boundary = simulate_playback(records, fps=16, buffer_chunks=1, startup_chunks=4)
+    assert later_boundary.total_stall_s == result.total_stall_s
+    assert later_boundary.underrun_count == result.underrun_count
+    assert later_boundary.steady_stall_s == 0
+
+
+def test_compute_metrics_labels_stalls_using_the_pinned_steady_window() -> None:
+    records = _records([1.0, 0.9, 0.5, 2.0, 0.5, 0.5, 0.5, 2.0, 0.5])
+    metrics = compute_metrics(records, fps=16, warmup_chunks=6)
+    playback = metrics["playback"]
+    assert playback["startup_chunks"] == 6
+    assert playback["startup_stall_ms"] > 0
+    assert playback["steady_stall_ms"] > 0
+    assert playback["total_stall_ms"] == pytest.approx(playback["startup_stall_ms"] + playback["steady_stall_ms"])
+
+
 def test_playback_rejects_a_buffer_deeper_than_the_rollout() -> None:
     with pytest.raises(ValueError, match="exceeds"):
         simulate_playback(_records([1.0, 0.5]), fps=16, buffer_chunks=9)
@@ -382,7 +407,7 @@ def test_the_real_time_basis_is_independent_of_the_mux_label() -> None:
     assert at_16["video_rtf"] > at_12["video_rtf"]
     # Same wall clock, same bytes: only the basis moved.
     assert at_16["video_rtf"] / at_12["video_rtf"] == pytest.approx(16 / 12)
-    assert parse_args([]).target_fps is None, "default defers to the workload fps"
+    assert parse_args([]).realtime_video_target_fps is None, "default defers to the workload fps"
 
 
 # --------------------------------------------------------------------------- #
@@ -416,7 +441,7 @@ def _serve(script):
     return _Server()
 
 
-async def _emit_rollout(websocket, payload, *, intervals=None, chunks=None, trailer=True) -> None:
+async def _emit_rollout(websocket, payload, *, intervals=None, chunks=None, trailer=True, done=True) -> None:
     """Replay the documented event order: start, metadata+binary per chunk, done."""
     num_chunks = chunks if chunks is not None else len(payload["extra_params"]["camera_action_script"])
     await websocket.send(json.dumps({"type": "video.start", "request_id": "req-1", "format": "m4s"}))
@@ -453,7 +478,8 @@ async def _emit_rollout(websocket, payload, *, intervals=None, chunks=None, trai
             )
         )
         await websocket.send(tail)
-    await websocket.send(json.dumps({"type": "session.done", "stopped": False, "chunks": num_chunks}))
+    if done:
+        await websocket.send(json.dumps({"type": "session.done", "stopped": False, "chunks": num_chunks}))
 
 
 def _run(coro):
@@ -487,6 +513,56 @@ def test_session_records_one_chunk_per_block_and_ignores_the_trailer() -> None:
         # The trailer's bytes are kept for remuxing but carry no chunk record.
         assert len(result.media) == sum(record.byte_length for record in result.records) + 8
         assert server.start_payloads[0]["num_frames"] == workload.num_frames
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("warmup_sessions", [0, 1, 2])
+def test_short_warmup_does_not_shorten_measured_rollout(tmp_path: Path, warmup_sessions: int) -> None:
+    async def scenario() -> None:
+        server = _serve(_emit_rollout)
+        async with server as url:
+            result = await run_benchmark(
+                parse_args(
+                    [
+                        "--base-url",
+                        url,
+                        "--image",
+                        _IMAGE,
+                        "--num-chunks",
+                        "10",
+                        "--warmup-sessions",
+                        str(warmup_sessions),
+                        "--warmup-num-chunks",
+                        "8",
+                        "--ping-interval",
+                        "0",
+                        "--output-json",
+                        str(tmp_path / "benchmark.json"),
+                    ]
+                )
+            )
+        assert [chunks_for_num_frames(payload["num_frames"]) for payload in server.start_payloads] == [
+            *([8] * warmup_sessions),
+            10,
+        ]
+        assert len(result["sessions"][0]["chunks"]) == 10
+        assert result["config"]["warmup_num_chunks"] == 8
+        assert len(result["warmups"]) == warmup_sessions
+        for index, warmup in enumerate(result["warmups"]):
+            assert warmup["session_index"] == index
+            assert warmup["measured"] is False
+            assert len(warmup["chunks"]) == 8
+            assert warmup["ttfc_ms"] == warmup["chunks"][0]["arrival_s"] * 1000
+            assert 0 <= warmup["video_start_ms"] <= warmup["ttfc_ms"]
+            assert warmup["wall_seconds"] >= warmup["chunks"][-1]["arrival_s"]
+        assert result["metrics"]["sessions"] == 1
+        assert result["metrics"]["chunks_received"] == 10
+        assert result["metrics"]["total_frames"] == 117
+        assert result["metrics"]["ttfc_ms"] == result["sessions"][0]["metrics"]["ttfc_ms"]
+        assert json.loads((tmp_path / "benchmark.json").read_text())["warmups"] == result["warmups"]
+        common = json.loads((tmp_path / "benchmark-serve-result.json").read_text())
+        assert common["realtime_video"] == result
 
     _run(scenario())
 
@@ -547,6 +623,94 @@ def test_a_short_rollout_fails_loudly_instead_of_reporting_a_partial_cadence() -
             await server.__aexit__(None, None, None)
 
     _run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["warmup", "session"])
+@pytest.mark.parametrize("failure", ["timeout", "short", "server_error"])
+def test_failed_benchmark_retains_received_chunks(tmp_path: Path, phase: str, failure: str) -> None:
+    async def script(websocket, payload) -> None:
+        await _emit_rollout(websocket, payload, chunks=1, trailer=False, done=failure == "short")
+        if failure == "server_error":
+            await websocket.send(json.dumps({"type": "error", "message": "injected engine failure"}))
+        elif failure == "timeout":
+            await websocket.wait_closed()
+
+    async def scenario() -> None:
+        async with _serve(script) as url:
+            output = tmp_path / "benchmark.json"
+            args = parse_args(
+                [
+                    "--base-url",
+                    url,
+                    "--image",
+                    "data:image/png;base64,eA==",
+                    "--num-chunks",
+                    "4",
+                    "--warmup-sessions",
+                    "1" if phase == "warmup" else "0",
+                    "--first-chunk-timeout",
+                    "5",
+                    "--chunk-timeout",
+                    "0.2",
+                    "--ping-interval",
+                    "0",
+                    "--output-json",
+                    str(output),
+                ]
+            )
+            message = {
+                "timeout": "No media chunk",
+                "short": "Expected 4 chunks",
+                "server_error": "injected engine failure",
+            }[failure]
+            with pytest.raises(BenchmarkError, match=message):
+                await run_benchmark(args)
+        assert not output.exists(), "an incomplete run must not produce a successful benchmark"
+        # The common writer retains failed raw observations; compatibility
+        # must not publish that document as a successful legacy measurement.
+        shared = json.loads((tmp_path / "benchmark-serve-result.json").read_text())["realtime_video"]
+        assert shared["passed"] is False
+        trace = shared["warmups" if phase == "warmup" else "sessions"][0]
+        assert trace["success"] is False and message in trace["error"]
+        assert trace["request_id"] == "req-1"
+        assert shared["workload"]["num_chunks"] == 4
+        assert len(trace["chunks"]) == 1
+        assert trace["chunks"][0]["index"] == 0
+        assert trace["chunks"][0]["byte_length"] == 100
+        assert trace["ttfc_ms"] == trace["chunks"][0]["arrival_s"] * 1000
+        assert 0 <= trace["video_start_ms"] <= trace["ttfc_ms"]
+        assert trace["wall_seconds"] >= trace["chunks"][0]["arrival_s"]
+        assert any(event["type"] == "video.start" for event in trace["events"])
+        assert "metrics" not in trace
+
+    _run(scenario())
+
+
+def test_failed_trace_write_preserves_the_session_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    occupied = tmp_path / "occupied"
+    occupied.write_text("existing file")
+
+    async def script(websocket, payload) -> None:
+        await _emit_rollout(websocket, payload, chunks=1, trailer=False)
+
+    async def scenario() -> None:
+        async with _serve(script) as url:
+            with pytest.raises(BenchmarkError, match="Expected 4 chunks"):
+                await run_session(
+                    url,
+                    "model",
+                    _workload(num_chunks=4),
+                    first_chunk_timeout=5,
+                    chunk_timeout=5,
+                    ping_interval=0,
+                    collect_media=False,
+                    print_chunks=False,
+                    failure_output=occupied / "failure.json",
+                )
+
+    _run(scenario())
+    assert "Could not retain failed session trace" in capsys.readouterr().err
+    assert occupied.read_text() == "existing file"
 
 
 def test_a_server_error_event_aborts_the_session() -> None:
@@ -646,12 +810,143 @@ def test_keepalive_pings_reach_the_server_during_a_slow_first_chunk() -> None:
     _run(scenario())
 
 
+class _ClosedPingWebSocket:
+    """Deliver buffered terminal frames only after the actual ping task fails."""
+
+    def __init__(self, messages: list[str | bytes]) -> None:
+        self.messages = messages
+        self.ping_sent = asyncio.Event()
+        self.ping_task: asyncio.Task[None] | None = None
+
+    async def send(self, message: str) -> None:
+        from websockets.exceptions import ConnectionClosedError
+
+        if json.loads(message)["type"] == "session.ping":
+            self.ping_task = asyncio.current_task()
+            self.ping_sent.set()
+            raise ConnectionClosedError(None, None)
+
+    async def recv(self) -> str | bytes:
+        await self.ping_sent.wait()
+        assert self.ping_task is not None
+        while not self.ping_task.done():
+            await asyncio.sleep(0)
+        return self.messages.pop(0)
+
+    async def __aenter__(self) -> _ClosedPingWebSocket:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        pass
+
+
+def test_failed_keepalive_preserves_server_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ping failure must not replace the server's actionable rejection."""
+    socket = _ClosedPingWebSocket([json.dumps({"type": "error", "message": "resolution mismatch"})])
+    monkeypatch.setattr("websockets.asyncio.client.connect", lambda *args, **kwargs: socket)
+
+    async def scenario() -> None:
+        with pytest.raises(BenchmarkError, match="resolution mismatch.*requested 2 chunks"):
+            await run_session(
+                "ws://scripted.invalid/v1/realtime/video",
+                "model",
+                _workload(num_chunks=2),
+                first_chunk_timeout=5,
+                chunk_timeout=5,
+                ping_interval=0.001,
+                collect_media=False,
+                print_chunks=False,
+            )
+
+    _run(scenario())
+
+
+def test_failed_keepalive_preserves_completed_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A buffered complete rollout remains successful after the socket closes."""
+    socket = _ClosedPingWebSocket(
+        [
+            json.dumps({"type": "video.start", "request_id": "req-1"}),
+            json.dumps({"type": "video.chunk_metadata", "kind": "media", "generation_chunk_index": 0, "num_frames": 9}),
+            b"complete-media",
+            json.dumps({"type": "session.done", "stopped": False, "chunks": 1}),
+        ]
+    )
+    monkeypatch.setattr("websockets.asyncio.client.connect", lambda *args, **kwargs: socket)
+
+    async def scenario() -> None:
+        result = await run_session(
+            "ws://scripted.invalid/v1/realtime/video",
+            "model",
+            _workload(num_chunks=1),
+            first_chunk_timeout=5,
+            chunk_timeout=5,
+            ping_interval=0.001,
+            collect_media=True,
+            print_chunks=False,
+        )
+        assert result.request_id == "req-1"
+        assert len(result.records) == 1
+        assert result.media == b"complete-media"
+        assert result.done_event["type"] == "session.done"
+
+    _run(scenario())
+
+
+def test_caller_cancellation_propagates_during_keepalive_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Consuming child cancellation must not consume cancellation of the caller."""
+
+    async def scenario() -> None:
+        keepalive_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+
+        async def draining_keepalive(websocket, send_lock, interval) -> None:
+            keepalive_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await asyncio.Future()
+
+        monkeypatch.setattr("vllm_omni.benchmarks.realtime_video.client._keepalive", draining_keepalive)
+
+        async def script(websocket, payload) -> None:
+            await keepalive_started.wait()
+            await _emit_rollout(websocket, payload, trailer=False)
+
+        async with _serve(script) as url:
+            task = asyncio.create_task(
+                run_session(
+                    url,
+                    "model",
+                    _workload(num_chunks=1),
+                    first_chunk_timeout=5,
+                    chunk_timeout=5,
+                    ping_interval=0.001,
+                    collect_media=False,
+                    print_chunks=False,
+                )
+            )
+            try:
+                await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    _run(scenario())
+
+
 def test_prompt_updates_are_sent_on_their_chunk_boundary() -> None:
+    update = PromptUpdate(after_chunk=0, prompt="Rain begins", transition_chunks=1)
+    payload = update.to_payload()
     workload = Workload(
         prompt="start",
         image_reference=_IMAGE,
         camera_script=build_camera_script(3, "forward"),
-        prompt_updates=(PromptUpdate(after_chunk=0, prompt="Rain begins", transition_chunks=1),),
+        prompt_updates=(update,),
     )
     received: list[dict] = []
 
@@ -661,7 +956,7 @@ def test_prompt_updates_are_sent_on_their_chunk_boundary() -> None:
                 received.append(json.loads(message))
 
         drainer = asyncio.create_task(drain())
-        await _emit_rollout(websocket, payload, intervals=[0.02, 0.15, 0.02], trailer=False)
+        await _emit_rollout(websocket, payload, intervals=[0.02, 0.15, 0.02], chunks=workload.num_chunks, trailer=False)
         await asyncio.sleep(0.05)
         drainer.cancel()
 
@@ -683,8 +978,7 @@ def test_prompt_updates_are_sent_on_their_chunk_boundary() -> None:
             await server.__aexit__(None, None, None)
         interactions = [event for event in received if event.get("type") == "session.interaction"]
         assert len(interactions) == 1
-        assert interactions[0]["interaction"]["event"]["prompt"] == "Rain begins"
-        assert interactions[0]["interaction"]["transition_chunks"] == 1
+        assert interactions[0] == payload
 
     _run(scenario())
 
@@ -792,7 +1086,49 @@ def test_builtin_workload_keeps_default_flow_shift() -> None:
     assert build_workload(parse_args(["--image", _IMAGE])).flow_shift == 5.0
 
 
-def test_short_sample_report_qualifies_tail_percentiles(capsys) -> None:
-    metrics = compute_metrics(_records([1.0] * 16), fps=12)
-    print_report(metrics, workload=_workload(num_chunks=16), endpoint="ws://test", sessions=1, target_fps=12)
-    assert "not reliable tail estimates" in capsys.readouterr().out
+@pytest.fixture
+def benchmark_git_checkout(tmp_path) -> tuple[Path, str]:
+    root = tmp_path / "benchmark-source"
+    environment = {
+        "PATH": os.environ["PATH"],
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_AUTHOR_NAME": "Benchmark fixture",
+        "GIT_AUTHOR_EMAIL": "benchmark@example.invalid",
+        "GIT_COMMITTER_NAME": "Benchmark fixture",
+        "GIT_COMMITTER_EMAIL": "benchmark@example.invalid",
+        "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+00:00",
+        "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+00:00",
+    }
+    subprocess.run(["git", "init", "--quiet", "--initial-branch=main", str(root)], env=environment, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "core.hooksPath=" + os.devnull,
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "Benchmark source fixture",
+        ],
+        env=environment,
+        check=True,
+    )
+    revision = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], env=environment, text=True
+    ).strip()
+    return root, revision
+
+
+def test_source_benchmark_records_its_own_git_revision(benchmark_git_checkout, tmp_path, monkeypatch) -> None:
+    from vllm_omni.benchmarks.realtime_video import client as realtime
+
+    root, revision = benchmark_git_checkout
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(realtime, "REPO_ROOT", root)
+    assert realtime.git_revision() == revision
