@@ -114,6 +114,42 @@ def test_offloaded_encoder_produces_identical_mp4_bytes() -> None:
     assert asyncio.run(encode_off_loop()) == direct
 
 
+@pytest.mark.asyncio
+async def test_cancellation_drains_the_running_worker_before_closing() -> None:
+    """A cancelled host task leaves its worker running, so cleanup must drain it first."""
+    encoding = threading.Event()
+    release = threading.Event()
+    order: list[str] = []
+
+    def encode() -> bytes:
+        encoding.set()
+        release.wait(5)
+        order.append("encode-returned")
+        return b"chunk"
+
+    handler = object.__new__(OmniStreamingVideoOutputHandler)
+    track: list = []
+
+    async def run_encode() -> None:
+        await handler._run_encoder_call(encode, track=track)
+
+    task = asyncio.create_task(run_encode())
+    await asyncio.to_thread(encoding.wait)
+    assert len(track) == 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The host task has returned while the worker is still inside encode().
+    assert order == []
+
+    release.set()
+    for worker in track:
+        await OmniStreamingVideoOutputHandler._drain_encoder_call(worker)
+    order.append("close")
+
+    assert order == ["encode-returned", "close"], order
+
+
 def _build_test_app(
     *,
     mocker: MockerFixture,

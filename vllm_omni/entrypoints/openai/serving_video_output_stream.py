@@ -36,6 +36,7 @@ import time
 import uuid
 import weakref
 from collections.abc import AsyncGenerator, Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from http import HTTPStatus
 from typing import Any, cast
 
@@ -86,22 +87,23 @@ _MAX_CONTROL_RESPONSE_QUEUE_SIZE = 64
 
 
 _ENCODER_CONCURRENCY = 2
-_encoder_limiters: weakref.WeakKeyDictionary[Any, anyio.CapacityLimiter] = weakref.WeakKeyDictionary()
+_encoder_pools: weakref.WeakKeyDictionary[Any, ThreadPoolExecutor] = weakref.WeakKeyDictionary()
 
 
-def _encoder_limiter() -> anyio.CapacityLimiter:
-    """Share one encode ceiling per event loop across concurrent sessions.
+def _encoder_pool() -> ThreadPoolExecutor:
+    """Return the encode pool for the running event loop.
 
     PyAV already splits a single encode across threads, so letting every
-    streaming session start its own encode oversubscribes the host. A small
-    per-loop ceiling bounds that without serializing a single session.
+    streaming session start its own encode oversubscribes the host. One bounded
+    pool per loop keeps a ceiling without serializing a single session, and the
+    futures it returns are the handles a cancelling session needs to drain.
     """
     loop = asyncio.get_running_loop()
-    limiter = _encoder_limiters.get(loop)
-    if limiter is None:
-        limiter = anyio.CapacityLimiter(_ENCODER_CONCURRENCY)
-        _encoder_limiters[loop] = limiter
-    return limiter
+    pool = _encoder_pools.get(loop)
+    if pool is None:
+        pool = ThreadPoolExecutor(max_workers=_ENCODER_CONCURRENCY, thread_name_prefix="video-encode")
+        _encoder_pools[loop] = pool
+    return pool
 
 
 class _SessionProgress:
@@ -850,13 +852,24 @@ class OmniStreamingVideoOutputHandler:
 
         progress.touch()
 
-    async def _run_encoder_call(self, call: Callable[[], Any]) -> Any:
-        """Run blocking codec work off the event loop under the shared ceiling.
+    async def _run_encoder_call(self, call: Callable[[], Any], *, track: list[Future[Any]] | None = None) -> Any:
+        """Run blocking codec work on the encoder pool, recording the worker.
 
-        Cancellation waits for the worker instead of abandoning it, so the
-        encoder is never closed while PyAV is still using it.
+        ``anyio.to_thread`` abandons its worker on cancellation without handing
+        back a handle, which is exactly the case that let ``close()`` race an
+        in-flight encode. Submitting to a dedicated executor keeps the future,
+        so a caller that may still touch the encoder can drain it first.
         """
-        return await anyio.to_thread.run_sync(call, abandon_on_cancel=False, limiter=_encoder_limiter())
+        worker = _encoder_pool().submit(call)
+        if track is not None:
+            track.append(worker)
+        return await asyncio.wrap_future(worker)
+
+    @staticmethod
+    async def _drain_encoder_call(worker: Future[Any] | None) -> None:
+        """Wait for a recorded worker so cleanup cannot race an in-flight encode."""
+        if worker is not None:
+            await asyncio.shield(asyncio.wrap_future(worker))
 
     async def _stream_video_bytes(
         self,
@@ -880,12 +893,14 @@ class OmniStreamingVideoOutputHandler:
         pacing = request.streaming_pacing
         max_output_bytes = pacing.max_output_bytes if pacing is not None and pacing.enabled else None
         completed = False
+        workers: list[Future[Any]] = []
         try:
             async for result in self._iter_generation_outputs(prompt, gen_params, request_id, progress):
                 if result.error:
                     raise RuntimeError(str(result.error))
+                del workers[:]
                 encoded = await self._run_encoder_call(
-                    lambda: list(self._encode_generation_result(result, request_id, encoder))
+                    lambda: list(self._encode_generation_result(result, request_id, encoder)), track=workers
                 )
                 for chunk, metadata in encoded:
                     if max_output_bytes is not None and len(chunk) > max_output_bytes:
@@ -893,7 +908,8 @@ class OmniStreamingVideoOutputHandler:
                     yield (chunk, metadata)
 
             completed = True
-            final_chunk = await self._run_encoder_call(encoder.close)
+            del workers[:]
+            final_chunk = await self._run_encoder_call(encoder.close, track=workers)
             if max_output_bytes is not None and len(final_chunk or b"") > max_output_bytes:
                 raise ValueError("encoded streaming trailer exceeds streaming_pacing.max_output_bytes")
             if final_chunk:
@@ -907,6 +923,12 @@ class OmniStreamingVideoOutputHandler:
                         stream_metadata={},
                     ),
                 )
+        except asyncio.CancelledError:
+            # A cancelled host task leaves its worker running, so the encoder
+            # must not be touched until every recorded worker has returned.
+            for worker in workers:
+                await OmniStreamingVideoOutputHandler._drain_encoder_call(worker)
+            raise
         finally:
             if not completed:
                 # Synchronous: an abandoned session finalizes this generator
