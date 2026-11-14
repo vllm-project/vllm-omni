@@ -1,0 +1,42 @@
+# Praxis-1 DROID native policy: one GPU, one observation per request.
+# Observations, pose frames and settings: docs/models/praxis1.md.
+async_chunk: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: Praxis1Pipeline
+    default_sampling_params:
+      seed: 0
+    model_config:
+      # By default, place Wan2.2_VAE.pth and text_encoder/ in the checkpoint
+      # directory. Set vae_weights and text_encoder here to use other paths.
+      # attention_impl: flex (block-sparse FlexAttention, default) or backend
+      # (dense masks through the Omni-selected attention backend).
+      # Sampler fields can be overridden here; defaults are shared with the API.
+      max_num_steps: 16
+      session_idle_timeout: 300
+      warmup: true
+      max_sessions: 4
+      max_context_chunks: 1
+      exec_horizon: 24
+      control_mode: droid_impedance
+      policy_server_config:
+        policy: praxis
+        model_id: praxis-1-droid
+        needs_session_id: true
+        supports_close_session: true
+        needs_wrist_camera: true
+        n_external_cameras: 1
+        image_resolution: [234, 416]
+        tile_size: [224, 416]
+        video_antialias: true
+        action_space: cartesian_position_rotation_matrix_gripper
+        action_dim: 13
+        action_horizon: 24
+        first_action_horizon: 21
+        fps: 15
+        control_mode: droid_impedance
