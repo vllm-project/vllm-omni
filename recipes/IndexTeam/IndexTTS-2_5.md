@@ -109,6 +109,27 @@ python examples/online_serving/text_to_speech/indextts2/speech_client.py \
   --output indextts2_5.wav
 ```
 
+##### Long text
+
+For non-streaming `/v1/audio/speech` requests, the server normalizes the full
+input once and splits it into segments of at most 120 text tokens, including
+the language prefix. The model's text-position capacity can further reduce
+this limit. Pronunciation annotations stay intact; an annotation that cannot
+fit in one segment is rejected.
+
+Segments run sequentially with the same reference voice and synthesis
+settings. The server joins their waveforms with 200 ms of silence between
+segments, then encodes one response in the requested audio format. The
+`max_new_tokens` limit applies to each segment; output-token usage is summed
+across segments. Each segment receives the request's seed when one is supplied.
+If a segment fails or reaches its generation limit, the request fails without
+returning partial audio.
+
+Long inputs requiring multiple segments currently reject streaming and word
+timestamps. Automatic segmentation is not applied to offline `Omni` calls.
+Segment boundaries may affect prosody, so listen to the joined output when
+validating a new language or voice.
+
 ##### Native speed control
 
 The public `speed` field is handled natively. Its accepted range is
