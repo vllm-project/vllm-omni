@@ -7,6 +7,9 @@ that the checkpoint keeps resolving to the H3-derived classes while Duo's own
 stages (Intent / Realization / Codec) stay individually addressable.
 """
 
+import re
+from pathlib import Path
+
 import pytest
 
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
@@ -62,3 +65,41 @@ def test_duo_asr_pipeline_prepends_asr_stage():
     assert stages[1].input_sources == (0,)
     assert stages[2].input_sources == (1,)
     assert stages[3].input_sources == (2,)
+
+
+def test_duo_registry_entries_resolve_to_real_modules():
+    # The literal comparisons above cannot catch a tuple that is wrong in the
+    # registry and the test in the same way. Resolve each entry the way the
+    # registry does, so a typo in mod_folder/mod_relname/cls_name fails here.
+    for arch in ("DuoPipeline", "DuoCodecPipeline"):
+        mod_folder, mod_relname, cls_name = _DIFFUSION_MODELS[arch]
+        module_path = Path("vllm_omni/diffusion/models") / mod_folder / f"{mod_relname}.py"
+        assert module_path.is_file(), f"{arch} points at a missing module: {module_path}"
+        assert re.search(rf"^class {cls_name}\b", module_path.read_text(), re.MULTILINE), (
+            f"{arch} points at a class {cls_name} that the module does not define"
+        )
+    # The pre-process hooks must be real module-level functions in those modules.
+    for arch, func_name in _DIFFUSION_PRE_PROCESS_FUNCS.items():
+        if not arch.startswith("Duo"):
+            continue
+        _, mod_relname, _ = _DIFFUSION_MODELS[arch]
+        module_path = Path("vllm_omni/diffusion/models/duo") / f"{mod_relname}.py"
+        assert re.search(rf"^def {func_name}\b", module_path.read_text(), re.MULTILINE), (
+            f"{arch} pre-process hook {func_name} is not defined in {module_path}"
+        )
+
+
+def test_duo_stages_reference_registered_pipelines():
+    # A stage whose model_arch is not registered would only fail at engine
+    # construction, i.e. after the checkpoint has been loaded. The ASR stage
+    # deliberately reuses vLLM's own Qwen3-ASR arch, so both registries count.
+    from vllm.model_executor.models.registry import _VLLM_MODELS
+
+    from vllm_omni.model_executor.models.registry import _OMNI_MODELS
+
+    registered = set(_DIFFUSION_MODELS) | set(_OMNI_MODELS) | set(_VLLM_MODELS)
+    for name in ("duo", "duo_asr"):
+        for stage in OMNI_PIPELINES[name].stages:
+            assert stage.model_arch in registered, (
+                f"{name} stage {stage.stage_id} ({stage.model_stage}) uses unregistered arch {stage.model_arch}"
+            )

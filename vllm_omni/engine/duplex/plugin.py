@@ -353,6 +353,9 @@ class PartialStageForward:
     is_final_update: bool
     close_only: bool = False
     queue_close_after: bool = False
+    #: A completion notification may settle model state without resubmitting
+    #: downstream, so ``forward=False`` marks a settle-only update.
+    forward: bool = True
 
 
 def duplex_text_history(conversation: Iterable[Mapping[str, object]]) -> tuple[tuple[str, str], ...]:

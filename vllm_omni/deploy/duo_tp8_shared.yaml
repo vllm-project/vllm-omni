@@ -1,5 +1,6 @@
 # Duo shared-device deployment with Intent, Realization, Codec, and ASR stages.
-# Edit model paths; session and FP8 environment setup: docs/serving/duo.md.
+# Edit model paths; session and FP8 environment setup: docs/models/duo.md.
+# Realization weights must be exported from the release DCP first (see duo.md).
 pipeline: duo_asr
 async_chunk: false
 trust_remote_code: true
@@ -99,9 +100,7 @@ stages:
   diffusion_model_runner_cls: vllm_omni.diffusion.models.duo.model_runner.DuoModelRunner
   parallel_config:
     tensor_parallel_size: 8
-    use_vllm_tp_group: true
     sequence_parallel_size: 1
-    disable_custom_all_reduce: true
   model_config:
     duo:
       adapter_path: /target/models/realization_adapter.safetensors

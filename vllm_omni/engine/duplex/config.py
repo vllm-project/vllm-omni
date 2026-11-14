@@ -123,6 +123,9 @@ class DuplexCapabilities:
     supports_session_resume: bool = False
     session_admission_mode: str = "serving_managed"
     supports_audio_truncate: bool = False
+    #: Duo publishes a duplex ``video`` extension carrying JPEG frames next to
+    #: the audio stream, so serving must know video is an output modality.
+    supports_output_video: bool = False
     #: Whether this model can serve ``/v1/chat/completions`` on a duplex
     #: session. That needs one thing the protocol cannot assume: the model
     #: honours ``DuplexSessionConfig.initial_user_text``, so a turn can be
@@ -178,6 +181,7 @@ class DuplexCapabilities:
             "supports_session_resume": self.supports_session_resume,
             "session_admission_mode": self.session_admission_mode,
             "supports_audio_truncate": self.supports_audio_truncate,
+            "supports_output_video": self.supports_output_video,
             "supports_image_input": self.supports_image_input,
             "supports_text_only_turn": self.supports_text_only_turn,
             "requires_model_runner_kv": self.requires_model_runner_kv,

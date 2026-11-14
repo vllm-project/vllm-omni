@@ -50,20 +50,32 @@ The checkpoint is a *bundle*, not a single model directory:
 
 ```text
 Duo-1.0-causal-base/
-├── realization/            # H3-format backbone shards + DCP
+├── realization/            # H3-format backbone shards + released LoRA DCP
 │   ├── backbone/           # config.json + model-0000*-of-00013.safetensors
-│   ├── dcp/                # distributed checkpoint
-│   └── complete.json       # bundle identity: codec/intent/realization hashes
+│   ├── dcp/                # released Realization LoRA (torch distributed checkpoint)
+│   └── complete.json       # release manifest: identity hashes, sampler defaults
 ├── intent/                 # Qwen3-VL weights, tokenizer, preprocessors
-├── intent_adapter/         # LoRA adapter + protocol manifest
-├── codec/                  # video VAE + audio VAE
+├── intent_adapter/         # Intent tokenizer + LoRA adapter + protocol manifest
+├── codec/                  # video VAE + audio VAE (weights only)
 └── speech/                 # Qwen3-ASR recognizer + forced aligner
 ```
 
-`realization/complete.json` is the source of truth for the packaged model family
-and weight format; read it before assuming a layout. The Realization weights are
-H3-initialized and carry their own license — check the model provider's terms
-separately from this integration's Apache-2.0 code.
+**The released bundle is not directly servable.** `realization/complete.json`
+declares `storage.format: dcp` and `release.realization_storage: dcp`, so the
+only Realization adapter in the download is `realization/dcp/*.distcp`. The
+Realization stage loads `adapter_path` (a `.safetensors` with
+`layout`/`rank`/`alpha` metadata, validated strictly by
+`diffusion/models/duo/checkpoint.py`), so the DCP has to be exported first with
+upstream's `apps/duo/duo_dcp.py` before a deploy config can start. The loader
+does not read `complete.json`; nothing is auto-detected from it.
+
+The released manifest also pins the validated sampler defaults, which the deploy
+configs follow: `stage: causal` with 50 Euler steps and flow shift 1.0 for this
+causal-base checkpoint. The Realization weights are H3-initialized and carry
+their own license — check the model provider's terms separately from this
+integration's Apache-2.0 code. The codec directories ship VAE weights without a
+`config.json`, so point `codec:` at a layout that also provides the component
+configs.
 
 ## Client protocol
 

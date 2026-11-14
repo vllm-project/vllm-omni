@@ -84,7 +84,6 @@ stages:
   diffusion_model_runner_cls: vllm_omni.diffusion.models.duo.model_runner.DuoModelRunner
   parallel_config:
     tensor_parallel_size: 4
-    use_vllm_tp_group: true
     sequence_parallel_size: 1
   model_config:
     duo:

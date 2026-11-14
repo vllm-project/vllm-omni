@@ -1034,7 +1034,7 @@ def output_metadata(self, state, c):
         "fused_denoise": self.options["fused_denoise"],
         "reuse_static_text": self.options["reuse_static_text"],
         "merge_fixed_adapter": self.options["merge_fixed_adapter"],
-        "use_vllm_tp_group": self.od_config.parallel_config.use_vllm_tp_group,
+        "tensor_parallel_size": self.od_config.parallel_config.tensor_parallel_size,
         "realization_state_monotonic_ns": time.perf_counter_ns(),
         "realization_prepare_started_ns": state.extra["realization_prepare_started_ns"],
         "history_rows_before": state.extra["realization_history_rows_before"],
