@@ -276,7 +276,15 @@ def prefix_identity(sequence, *, namespace):
     for name in sequence.__dataclass_fields__:
         value = getattr(sequence, name)
         if isinstance(value, torch.Tensor):
-            value = value.detach().contiguous().cpu()
+            # The digest only has to separate distinct prefix contents; the
+            # hex value itself is never interpreted. Hash the raw bytes through
+            # a memoryview so the tensor is not copied out to numpy and then
+            # again to bytes on every admission.
+            value = value.detach()
+            if not value.is_contiguous():
+                value = value.contiguous()
+            value = value.to(device="cpu")
             digest.update(str((name, tuple(value.shape), value.dtype)).encode())
-            digest.update(value.view(torch.uint8).numpy().tobytes())
+            raw = value.view(torch.uint8)
+            digest.update(memoryview(raw.numpy()).cast("B"))
     return digest.hexdigest()
