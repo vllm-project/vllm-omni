@@ -3107,6 +3107,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         head_logits_all = None
         if projection_rows:
             if len(projection_rows) == 1:
+                # A slice avoids the H2D copy and stream sync for an index tensor on NPU.
                 row = projection_rows[0]
                 head_logits_all = self.head_code[0](hidden[row : row + 1]).float()
             else:

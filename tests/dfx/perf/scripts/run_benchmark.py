@@ -588,8 +588,8 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
     )
     subsets = params.get(_OMNIINTERACT_AGGREGATE_SUBSETS)
     min_ia_qtf1 = params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
-    passed = not _is_finite_number(min_ia_qtf1) or pooled.ia_qtf1 >= float(min_ia_qtf1)
     max_concurrency = result.get("max_concurrency")
+    passed = not _is_finite_number(min_ia_qtf1) or pooled.ia_qtf1 >= float(min_ia_qtf1)
     write_dfx_accuracy_result(
         accuracy_path,
         test_name=str(result.get("test_name") or params.get(_OMNIINTERACT_AGGREGATE_GROUP) or ""),
@@ -609,7 +609,7 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
         },
         branch=str(result.get("branch") or os.environ.get("BUILDKITE_BRANCH", "")),
         num_prompts=pooled.num_prompts,
-        max_concurrency=max_concurrency if isinstance(max_concurrency, int) else None,
+        max_concurrency=int(max_concurrency) if isinstance(max_concurrency, int) else None,
         benchmark_exit_code=0 if passed else 1,
         generation={
             "completed": pooled.completed,

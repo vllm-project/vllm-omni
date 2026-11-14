@@ -36,7 +36,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Ascend constructs a speculator in each of the two runner constructors.
+# GPUModelRunner initializes a speculator first. NPUModelRunner rebuilds
+# it with Ascend request state. Each constructor imports its own factory.
 gpu_runner.init_speculator = scheduler_ngram_factory(gpu_runner.init_speculator)
 ascend_runner.init_speculator = scheduler_ngram_factory(ascend_runner.init_speculator)
 
