@@ -157,6 +157,7 @@ FlashInfer.
 | MiniMax-H3 | `MiniMaxAI/MiniMax-H3` (`FL2VA` / `Ref2VA`) | Yes | Not validated | `quantization="fp8"` quantizes eligible DiT and text-encoder linears; mixed-precision input/output heads stay FP32 | None | ✅︎ |
 | MiniMax-H3-Image | `MiniMaxAI/MiniMax-H3-Image` (`t2i` / `edit`) | Yes | Not validated | DiT linears only; fused PDD heads stay FP32 and the text encoder stays BF16. On 4× RTX PRO 6000 (USP 4) median latency drops 16–20%; edits stay close to BF16 (~32 dB) while t2i layouts can shift (16–19 dB), so validate output quality before enabling | None | |
 | SenseNova-U1.5 | `sensenova/SenseNova-U1.5-8B-MoT` | Yes | Not validated | UND/GEN language-model linears only | None | |
+| Stable Audio Open | `stabilityai/stable-audio-open-1.0` | Yes | Not validated | Attention projections only; FFN and conditioning stay BF16 | None | |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
