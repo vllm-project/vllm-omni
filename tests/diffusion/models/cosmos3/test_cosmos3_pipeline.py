@@ -2168,6 +2168,14 @@ def test_checkpoint_key_remap() -> None:
         ),
     }
     assert {key: Cosmos3OmniDiffusersPipeline._remap_ckpt_key(key) for key in remaps} == remaps
+    for prefix in ("", "transformer.", "transformer.model."):
+        checkpoint_name = f"{prefix}layers.3.self_attn.add_k_proj"
+        for suffix in ("input_quantizer._amax", "weight_quantizer._amax", "weight_quantizer._scale"):
+            assert Cosmos3OmniDiffusersPipeline.remap_checkpoint_key(f"{checkpoint_name}.{suffix}") is None
+        for suffix in ("weight", "input_scale", "weight_scale"):
+            assert Cosmos3OmniDiffusersPipeline.remap_checkpoint_key(f"{checkpoint_name}.{suffix}") == (
+                f"transformer.gen_layers.3.cross_attention.to_k.{suffix}"
+            )
 
 
 def test_prepare_latents_for_video_image_sound_and_action(make_cosmos3_pipeline) -> None:
