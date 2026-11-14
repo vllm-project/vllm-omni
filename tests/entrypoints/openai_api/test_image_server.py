@@ -13,9 +13,12 @@ import io
 import json
 from argparse import Namespace
 from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -27,6 +30,7 @@ from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.resolver import resolve_omni_config
+from vllm_omni.config.stage_config import StageConfig, StageType
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -35,11 +39,328 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
 )
 from vllm_omni.entrypoints.openai.images.helpers import _check_max_generated_image_size
 from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
+from vllm_omni.entrypoints.openai.serving_capabilities import OmniServingCapabilities
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("path", ["/v1/images/generations", "/v1/images/edits"])
+@pytest.mark.parametrize(
+    "fixture,condition,error",
+    [
+        ("test_client", "ready", None),
+        ("test_client", "no_engine", "Multi-stage engine not initialized"),
+        ("test_client", "no_stages", "Stage configs not found"),
+        ("test_client", "text_stages", "No image generation stage found"),
+        ("async_omni_test_client", "ready", None),
+        ("async_omni_test_client", "missing_chat", "openai_serving_chat is not initialized"),
+        ("async_omni_test_client", "engine_only", None),
+        ("async_omni_test_client", "text_stages", "No image generation stage found"),
+    ],
+)
+def test_image_exposure_matches_real_route_guards(request, fixture, condition, error, path):
+    client = request.getfixturevalue(fixture)
+    state = client.app.state
+    engine = state.engine_client
+    if condition == "no_engine":
+        state.engine_client = None
+    elif condition in {"no_stages", "engine_only"}:
+        state.stage_configs = []
+    elif condition == "text_stages":
+        # App-stage compatibility data takes priority even when the engine
+        # declares diffusion stages. Discovery must match the actual request.
+        state.stage_configs = [StageConfig(0, "text", stage_type=StageType.LLM).to_omegaconf()]
+    elif condition == "missing_chat":
+        state.openai_serving_chat = None
+    state.omni_serving_capabilities = OmniServingCapabilities(client.app, engine)
+    body = client.get("/v1/omni/capabilities").json()
+    route = next(r for r in body["routes"] if r["path"] == path and r["method"] == "POST")
+    if path.endswith("/edits"):
+        response = client.post(path, data={"prompt": "edit", "size": "64x64"}, files={"image": make_test_image_bytes()})
+    else:
+        response = client.post(path, json={"prompt": "draw", "size": "64x64"})
+    if error is not None:
+        assert route["exposure"] == "disabled"
+        assert response.status_code == 503, response.text
+        assert error in response.json()["detail"]
+        assert engine.captured_prompt is None
+    else:
+        assert route["exposure"] == "enabled"
+        assert response.status_code == 200, response.text
+        output = Image.open(io.BytesIO(base64.b64decode(response.json()["data"][0]["b64_json"])))
+        assert output.size == (64, 64)
+        assert engine.captured_prompt is not None
+
+
+@pytest.fixture
+def edit_image_http_server(monkeypatch):
+    """Serve real image bytes and record every attempted fetch locally."""
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
+    monkeypatch.setenv("no_proxy", "localhost,127.0.0.1")
+    monkeypatch.delenv("VLLM_MEDIA_CACHE", raising=False)
+    requests = []
+    image = Image.new("RGBA", (64, 64), (12, 34, 56, 0))
+    image.putpixel((1, 2), (200, 100, 50, 255))
+    exif = Image.Exif()
+    exif[274] = 6
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", exif=exif)
+    payload = buffer.getvalue()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append((self.headers["Host"], self.path))
+            if self.path == "/redirect":
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{server.server_port}/target")
+            else:
+                self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            # A valid image body on a redirect must not turn it into a success.
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_port, requests, payload
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.fixture
+def edit_image_http_client(test_client, monkeypatch):
+    """Keep the official download client's session inside the test app's loop."""
+    from vllm.connections import HTTPConnection
+
+    async def create_session():
+        return aiohttp.ClientSession(trust_env=True)
+
+    with test_client as client:
+        session = client.portal.call(create_session)
+
+        async def get_client(self):
+            return session
+
+        monkeypatch.setattr(HTTPConnection, "get_async_client", get_client)
+        try:
+            yield client
+        finally:
+            client.portal.call(session.close)
+
+
+@pytest.mark.parametrize("field", ["url", "url[]", "mask_image", "reference_image"])
+@pytest.mark.parametrize("domains", [None, [], ["localhost"], ["media.example.com"]])
+def test_image_edit_urls_follow_deployment_domains(edit_image_http_client, edit_image_http_server, field, domains):
+    client = edit_image_http_client
+    port, requests, payload = edit_image_http_server
+    client.app.state.args.allowed_media_domains = domains
+    data = {"prompt": "edit", "size": "64x64", field: f"http://localhost:{port}/image.png"}
+    files = [] if field in ("url", "url[]") else [("image", payload)]
+    response = client.post("/v1/images/edits", data=data, files=files)
+    allowed = not domains or "localhost" in domains
+    assert response.status_code == (200 if allowed else 400), response.text
+    assert len(requests) == int(allowed)
+    assert client.app.state.engine_client.generate_calls == int(allowed)
+    if not allowed:
+        assert "allowed domains" in response.json()["detail"]
+        assert client.app.state.engine_client.captured_prompt is None
+
+
+@pytest.mark.parametrize("field", ["url", "mask_image", "reference_image"])
+@pytest.mark.parametrize("authority", ["localhost@127.0.0.1", "localhost.example.invalid"])
+def test_image_edit_domains_match_hostname(edit_image_http_client, edit_image_http_server, field, authority):
+    client = edit_image_http_client
+    port, requests, payload = edit_image_http_server
+    client.app.state.args.allowed_media_domains = ["localhost"]
+    data = {"prompt": "edit", field: f"http://{authority}:{port}/image.png"}
+    files = [] if field == "url" else [("image", payload)]
+    response = client.post("/v1/images/edits", data=data, files=files)
+    assert response.status_code == 400, response.text
+    assert "allowed domains" in response.json()["detail"]
+    assert requests == []
+    assert client.app.state.engine_client.generate_calls == 0
+
+
+@pytest.mark.parametrize("field", ["url", "mask_image", "reference_image"])
+def test_image_edit_does_not_enable_local_file_urls(edit_image_http_client, edit_image_http_server, tmp_path, field):
+    client = edit_image_http_client
+    _, requests, payload = edit_image_http_server
+    source = tmp_path / "local.png"
+    source.write_bytes(payload)
+    client.app.state.args.allowed_local_media_path = str(tmp_path)
+    data = {"prompt": "edit", field: source.as_uri()}
+    files = [] if field == "url" else [("image", payload)]
+    response = client.post("/v1/images/edits", data=data, files=files)
+    assert response.status_code == 400, response.text
+    assert "Unsupported input" in response.json()["detail"]
+    assert requests == []
+    assert client.app.state.engine_client.generate_calls == 0
+
+
+@pytest.mark.parametrize("field", ["url", "url[]", "mask_image", "reference_image"])
+@pytest.mark.parametrize("domains", [None, ["localhost"]])
+def test_image_edit_urls_do_not_follow_redirects(
+    edit_image_http_client, edit_image_http_server, monkeypatch, field, domains
+):
+    client = edit_image_http_client
+    port, requests, payload = edit_image_http_server
+    client.app.state.args.allowed_media_domains = domains
+    monkeypatch.setenv("VLLM_MEDIA_URL_ALLOW_REDIRECTS", "1")
+    data = {"prompt": "edit", "size": "64x64", field: f"http://localhost:{port}/redirect"}
+    files = [] if field in ("url", "url[]") else [("image", payload)]
+    response = client.post("/v1/images/edits", data=data, files=files)
+    assert response.status_code == 400, response.text
+    assert requests == [(f"localhost:{port}", "/redirect")]
+    assert client.app.state.engine_client.generate_calls == 0
+
+
+@pytest.mark.parametrize("wire", ["url", "data", "upload"])
+@pytest.mark.parametrize("normalize_rgb", [False, True])
+def test_image_edit_transports_preserve_pixels(edit_image_http_client, edit_image_http_server, wire, normalize_rgb):
+    client = edit_image_http_client
+    port, requests, payload = edit_image_http_server
+    client.app.state.args.allowed_media_domains = ["localhost"] if wire == "url" else ["media.example.com"]
+    data = {"prompt": "edit", "size": "64x64"}
+    if normalize_rgb:
+        data["sys_type"] = "default"
+    files = []
+    for field in ("image", "mask_image", "reference_image"):
+        if wire == "upload":
+            files.append((field, payload))
+        else:
+            name = "url" if field == "image" else field
+            data[name] = (
+                f"http://localhost:{port}/image.png"
+                if wire == "url"
+                else "data:image/png;base64," + base64.b64encode(payload).decode()
+            )
+    response = client.post("/v1/images/edits", data=data, files=files)
+    assert response.status_code == 200, response.text
+    assert len(requests) == (3 if wire == "url" else 0)
+    media = client.app.state.engine_client.captured_prompt["multi_modal_data"]
+    original = Image.open(io.BytesIO(payload))
+    for field in ("image", "mask_image", "reference_image"):
+        actual = media[field][0] if field == "image" else media[field]
+        expected = original.convert("RGB") if normalize_rgb and field != "mask_image" else original
+        assert isinstance(actual, Image.Image)
+        assert actual.mode == expected.mode
+        assert actual.size == expected.size
+        assert actual.tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize("field", ["mask_image", "reference_image"])
+def test_image_edit_rejects_unsupported_native_fields_before_loading(async_omni_test_client, monkeypatch, field):
+    import vllm_omni.entrypoints.openai.api_server as api_server_module
+
+    engine = async_omni_test_client.app.state.engine_client
+    async_omni_test_client.app.state.stage_configs = [SimpleNamespace(stage_type="diffusion")]
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(model_class_name="ZImagePipeline")
+    monkeypatch.setattr(
+        api_server_module, "_load_input_images", lambda *a, **kw: pytest.fail("must reject before decoding")
+    )
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((64, 64))), (field, make_test_image_bytes((64, 64)))],
+        data={"prompt": "edit the selection"},
+    )
+    assert response.status_code == 400
+    assert field in response.json()["detail"]
+    assert engine.captured_prompt is None
+
+
+@pytest.mark.parametrize("wire", ["upload", "data_uri"])
+def test_native_klein_mask_and_independent_reference_reach_engine(test_client, wire):
+    engine = test_client.app.state.engine_client
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+        model_class_name="Flux2KleinPipeline", supports_multimodal_inputs=True, max_multimodal_image_inputs=4
+    )
+    mask = Image.new("L", (64, 64), color=255)
+    mask.putpixel((0, 0), 0)
+    buffer = io.BytesIO()
+    mask.save(buffer, format="PNG")
+    files = [("image", make_test_image_bytes((64, 64))), ("reference_image", make_test_image_bytes((32, 32)))]
+    data = {"prompt": "edit selection", "size": "64x64"}
+    if wire == "upload":
+        files.append(("mask_image", buffer.getvalue()))
+    else:
+        data["mask_image"] = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    response = test_client.post("/v1/images/edits", files=files, data=data)
+    assert response.status_code == 200, response.text
+    media = engine.captured_prompt["multi_modal_data"]
+    assert media["mask_image"].getpixel((0, 0)) == 0
+    assert media["mask_image"].getpixel((1, 1)) == 255
+    assert len(media["image"]) == 1
+    assert media["reference_image"].size == (32, 32)
+
+
+@pytest.mark.parametrize("source_count,mask_size", [(2, (64, 64)), (1, (32, 64))])
+def test_native_klein_rejects_ambiguous_mask_canvas(test_client, source_count, mask_size):
+    engine = test_client.app.state.engine_client
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+        model_class_name="Flux2KleinPipeline", supports_multimodal_inputs=True, max_multimodal_image_inputs=4
+    )
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[
+            *[("image", make_test_image_bytes((64, 64))) for _ in range(source_count)],
+            ("mask_image", make_test_image_bytes(mask_size)),
+        ],
+        data={"prompt": "edit selection", "size": "64x64"},
+    )
+    assert response.status_code == 400
+    assert engine.captured_prompt is None
+
+
+@pytest.mark.parametrize(
+    "architecture,maximum", [("Flux2KleinPipeline", 4), ("ZImagePipeline", 1), ("Flux3Pipeline", 10)]
+)
+@pytest.mark.parametrize("over_limit", [False, True])
+def test_image_edit_source_count_matches_real_handler_limit(test_client, architecture, maximum, over_limit):
+    engine = test_client.app.state.engine_client
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+        model_class_name=architecture,
+        supports_multimodal_inputs=maximum > 1,
+        max_multimodal_image_inputs=maximum,
+    )
+    count = maximum + int(over_limit)
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((64, 64))) for _ in range(count)],
+        data={"prompt": "edit", "size": "64x64"},
+    )
+    assert response.status_code == (400 if over_limit else 200), response.text
+    if over_limit:
+        assert engine.captured_prompt is None
+    else:
+        media = engine.captured_prompt["multi_modal_data"]["image"]
+        assert len(media) == count if isinstance(media, list) else count == 1
+
+
+@pytest.mark.parametrize("field", ["mask_image", "reference_image"])
+def test_multi_stage_edit_rejects_native_fields_instead_of_dropping_them(async_omni_test_client, field):
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[
+            ("image", make_test_image_bytes((64, 64))),
+            (field, make_test_image_bytes((64, 64))),
+        ],
+        data={"prompt": "edit selection"},
+    )
+    assert response.status_code == 400
+    assert "multi-stage" in response.json()["detail"]
+    assert async_omni_test_client.app.state.engine_client.captured_prompt is None
+
 
 # Unit Tests
 
@@ -1570,6 +1891,29 @@ def test_generate_images_rejects_model_mismatch(test_client):
     assert "model mismatch" in response.json()["detail"].lower()
 
 
+@pytest.mark.parametrize("endpoint", ["generations", "edits"])
+@pytest.mark.parametrize("model", [None, "auto", "Qwen/Qwen-Image", "image-alias", "missing-model"])
+def test_image_endpoints_check_all_served_model_names(test_client, mock_async_diffusion, endpoint, model):
+    from vllm.entrypoints.openai.models.protocol import BaseModelPath
+
+    test_client.app.state.openai_serving_models.base_model_paths.append(
+        BaseModelPath(name="image-alias", model_path="Qwen/Qwen-Image")
+    )
+    listed = test_client.get("/v1/models").json()
+    assert {entry["id"] for entry in listed["data"]} == {"Qwen/Qwen-Image", "image-alias"}
+    payload = {"prompt": "a blue square"}
+    if model is not None:
+        payload["model"] = model
+    if endpoint == "edits":
+        response = test_client.post(
+            "/v1/images/edits", data=payload, files={"image": ("image.png", make_test_image_bytes(), "image/png")}
+        )
+    else:
+        response = test_client.post("/v1/images/generations", json=payload)
+    assert response.status_code == (400 if model == "missing-model" else 200)
+    assert mock_async_diffusion.generate_calls == (0 if model == "missing-model" else 1)
+
+
 @pytest.mark.parametrize(
     ("output_format", "expected_pil_format"),
     [("png", "PNG"), ("jpeg", "JPEG"), ("webp", "WEBP")],
@@ -2937,7 +3281,7 @@ def test_image_routes_inherit_engine_defaults(test_client: TestClient, route: st
     )
     test_client.app.state.engine_client.default_sampling_params_list = [defaults]
     for override in (explicit, False):
-        payload = {"prompt": "a cat"}
+        payload: dict[str, str | int | float] = {"prompt": "a cat"}
         if override:
             payload.update(guidance_scale=0.0, seed=0, n=1)
         if route == "generations":

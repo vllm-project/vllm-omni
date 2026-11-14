@@ -28,12 +28,13 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
     VideoGenerationResponse,
 )
+from vllm_omni.entrypoints.openai.serving_policy import get_video_stage_configs, video_generation_error
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
     resolve_diffusion_sampling_params,
 )
-from vllm_omni.entrypoints.openai.utils import get_stage_type, is_video_generation_pipeline, parse_lora_request
+from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
     _PlanarFrameConverter,
@@ -806,20 +807,12 @@ class OmniOpenAIServingVideo:
         *,
         on_started: Callable[[], Awaitable[None]] | None = None,
     ) -> object:
-        stage_configs = self._stage_configs or getattr(self._engine_client, "stage_configs", None)
-
-        if not stage_configs:
+        stage_configs = get_video_stage_configs(self._stage_configs, self._engine_client)
+        error = video_generation_error(stage_configs)
+        if error is not None:
             raise HTTPException(
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-                detail="Stage configs not found. Start server with an omni diffusion model.",
-            )
-
-        # Video pipelines may use preparatory AR stages (for example, a
-        # vLLM-hosted text encoder) before the diffusion stage.
-        if not is_video_generation_pipeline(stage_configs):
-            raise HTTPException(
-                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-                detail="No final video output stage found in video generation pipeline.",
+                detail=error,
             )
 
         # Common generation logic for both paths

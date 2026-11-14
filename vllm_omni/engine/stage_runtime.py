@@ -82,6 +82,7 @@ from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
 from vllm_omni.entrypoints.utils import inject_omni_kv_config
 from vllm_omni.outputs.output_metadata import FinalOutputModalityType
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.request_capabilities import RuntimeServingMetadata
 
 logger = init_logger(__name__)
 
@@ -92,6 +93,7 @@ class StageRuntimeInfo:
     final_output_type: FinalOutputModalityType | None
     stage_type: str
     model_stage: str | None = None
+    serving_metadata: RuntimeServingMetadata | None = None
 
 
 @dataclass
@@ -1801,6 +1803,7 @@ class DistStageRuntime(StageRuntime):
                 metadata,
                 request_address=resources.addresses.inputs[0],
                 response_address=resources.addresses.outputs[0],
+                serving_metadata=resources.serving_metadata,
             )
             logger.info(
                 "[DistStageRuntime] Remote diffusion replica attached stage=%d replica=%d",

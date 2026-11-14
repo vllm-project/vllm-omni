@@ -5,6 +5,8 @@
 Chunked vs end-to-end mode is dispatched from ``deploy.async_chunk``.
 """
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -13,6 +15,11 @@ from vllm_omni.config.stage_config import (
 from vllm_omni.outputs.output_modality import (
     TensorAccumulationStrategy,
     register_key_accumulation_strategy,
+)
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_TO_SPEECH,
+    declare_capabilities,
 )
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_tts"
@@ -30,6 +37,12 @@ register_key_accumulation_strategy("codes.ref", TensorAccumulationStrategy.REPLA
 register_key_accumulation_strategy("codec_frames", TensorAccumulationStrategy.CONCAT_DIM0)
 
 QWEN3_TTS_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/qwen3_tts/pipeline.py", "docs/serving/speech_api.md"),
+    ),
     model_type="qwen3_tts",
     default_deploy_config_name="qwen3_tts.yaml",
     # Pipeline-level default; the code2wav stage overrides per-stage below.
@@ -83,6 +96,12 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
 # streaming codec decoder and emits PCM as the final output (enable with the
 # ``talker_stream_decode`` model option). No Code2Wav stage, no connector.
 QWEN3_TTS_FUSED_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/qwen3_tts/pipeline.py", "docs/serving/speech_api.md"),
+    ),
     model_type="qwen3_tts_fused",
     default_deploy_config_name="qwen3_tts_fused_single_gpu.yaml",
     single_stage_async_chunk=True,

@@ -32,6 +32,7 @@ from vllm_omni.model_executor.models.kokoro.text_frontend import (
     resolve_lang_code,
     resolve_voices_dir,
 )
+from vllm_omni.request_capabilities import RequestConstraints
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -90,6 +91,46 @@ class KokoroAdapter(ARTTSAdapter):
 
     def _load_codec_frame_rate(self) -> float | None:
         return None
+
+    def get_request_constraints(self) -> RequestConstraints:
+        from vllm_omni.request_capabilities import InputConstraint, ParameterConstraint
+
+        request = super().get_request_constraints()
+        # This validator checks the actual loaded voices. Language aliases are
+        # accepted syntax; missing G2P packages can still disable a language.
+        parameters = {
+            **request.parameters,
+            "speed": ParameterConstraint(
+                support="supported",
+                type="number",
+                minimum=0.25,
+                maximum=4.0,
+            ),
+        }
+        if self.capabilities.supported_speakers:
+            parameters["voice"] = ParameterConstraint(
+                support="supported",
+                type="string",
+                enum_normalization="lower",
+                enum=tuple(
+                    sorted(
+                        self.capabilities.supported_speakers
+                        | ({"", "default"} if DEFAULT_VOICE in self.capabilities.supported_speakers else set())
+                    )
+                ),
+            )
+        return request.model_copy(
+            update={
+                "parameters": parameters,
+                "inputs": {
+                    **request.inputs,
+                    **{
+                        role: InputConstraint(support="unsupported", max_count=0)
+                        for role in ("reference_audio", "reference_text", "instructions")
+                    },
+                },
+            }
+        )
 
     def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
         if not request.input or not request.input.strip():

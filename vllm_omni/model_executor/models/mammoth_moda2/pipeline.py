@@ -14,10 +14,21 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    IMAGE_RESPONSE,
+    TEXT_RESPONSE,
+    TEXT_TO_IMAGE,
+    declare_capabilities,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.mammoth_moda2"
 
 MAMMOTH_MODA2_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        IMAGE_RESPONSE,
+        TEXT_TO_IMAGE,
+        sources=("vllm_omni/model_executor/models/mammoth_moda2/pipeline.py",),
+    ),
     model_type="mammoth_moda2",
     default_deploy_config_name="mammoth_moda2.yaml",
     model_arch="MammothModa2ForConditionalGeneration",
@@ -58,6 +69,10 @@ MAMMOTH_MODA2_PIPELINE = PipelineConfig(
 
 # Single-stage AR variant for understanding / summarization tasks
 MAMMOTH_MODA2_AR_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        sources=("vllm_omni/model_executor/models/mammoth_moda2/pipeline.py",),
+    ),
     model_type="mammoth_moda2_ar",
     default_deploy_config_name="mammoth_moda2_ar.yaml",
     model_arch="MammothModa2ForConditionalGeneration",

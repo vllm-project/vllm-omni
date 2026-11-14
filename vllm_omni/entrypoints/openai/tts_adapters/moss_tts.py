@@ -28,6 +28,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     conditioning_cache_salt,
 )
 from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realtime_prompt
+from vllm_omni.request_capabilities import RequestConstraints
 
 if TYPE_CHECKING:
     import torch
@@ -111,6 +112,26 @@ def _code_grid_cache_salt(audio_codes: Any) -> str:
 
 
 class _MossTTSAdapterBase(ARTTSAdapter):
+    def get_request_constraints(self) -> RequestConstraints:
+        from vllm_omni.request_capabilities import InputConstraint
+
+        request = super().get_request_constraints()
+        inputs = dict(request.inputs)
+        variant = self._moss_variant
+        alternatives: tuple[tuple[str, ...], ...] = ()
+        if variant == "sound_effect":
+            inputs["text"] = InputConstraint(support="supported", min_count=0, max_count=1)
+            inputs["ambient_sound"] = InputConstraint(support="supported", min_count=1, max_count=1)
+        elif variant == "voice_generator":
+            inputs["instructions"] = InputConstraint(support="supported", min_count=1, max_count=1)
+        else:
+            for role in ("voice", "reference_audio", "reference_text"):
+                inputs[role] = InputConstraint(support="supported", min_count=0, max_count=1)
+            alternatives = (("voice", "reference_audio"),)
+            if variant == "ttsd":
+                inputs["reference_audio_2"] = InputConstraint(support="supported", min_count=0, max_count=1)
+        return request.model_copy(update={"inputs": inputs, "required_any_of": alternatives})
+
     accumulate_nonstreaming: bool = False
 
     def __init__(self, ctx) -> None:
@@ -267,20 +288,12 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         OpenMOSS-Team/MOSS-TTSD-v1.0 vs --deploy-config moss_ttsd.yaml).
         """
         try:
-            name = (self.engine_client.model_config.model or "").lower().replace("-", "").replace("_", "")
+            model = self.engine_client.model_config.model or ""
         except Exception:
-            name = ""
-        if "realtime" in name:
-            return "realtime"
-        if "local" in name:
-            return "local"
-        if "ttsd" in name:
-            return "ttsd"
-        if "soundeffect" in name:
-            return "sound_effect"
-        if "voicegenerator" in name:
-            return "voice_generator"
-        return "tts"
+            model = ""
+        from vllm_omni.model_executor.models.moss_tts.model_variant import detect_moss_variant
+
+        return detect_moss_variant(model)
 
     def _codec_stage_devices(self) -> str | None:
         """Read the runtime ``devices`` entry of this pipeline's codec stage.

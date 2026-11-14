@@ -705,6 +705,7 @@ class StageDiffusionProc:
         *,
         local_client: bool,
         headless: bool,
+        serving_metadata: dict[str, object] | None = None,
     ) -> None:
         handshake_socket.send(
             msgspec.msgpack.encode(
@@ -712,6 +713,7 @@ class StageDiffusionProc:
                     "status": "READY",
                     "local": local_client,
                     "headless": headless,
+                    **({"serving_metadata": serving_metadata} if serving_metadata else {}),
                 }
             )
         )
@@ -774,11 +776,13 @@ class StageDiffusionProc:
             response_address = addresses.outputs[0]
 
             proc.initialize()
+            assert proc._engine is not None
 
             cls._send_startup_ready(
                 handshake_socket,
                 local_client=local_client,
                 headless=headless,
+                serving_metadata=proc._engine.serving_metadata.model_dump(exclude_none=True),
             )
             handshake_socket.close()
             handshake_ctx.term()
@@ -933,8 +937,11 @@ class StageDiffusionProcManager:
         return self
 
     def _wait_until_started(self, handshake_address: str, stage_init_timeout: int) -> None:
+        from vllm_omni.diffusion.startup_metadata import DiffusionStartupSocket
+
         try:
-            with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
+            with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as original_socket:
+                handshake_socket = DiffusionStartupSocket.shadow(original_socket)
                 wait_for_engine_startup_with_deadline(
                     handshake_socket,
                     [CoreEngine(index=0, local=True)],
@@ -960,6 +967,7 @@ class StageDiffusionProcManager:
                     kill_processes=lambda: shutdown([self.proc]),
                     stage_label=f"Diffusion stage process {self.proc.name}",
                 )
+                self.serving_metadata = handshake_socket.serving_metadata
         except Exception:
             shutdown([self.proc])
             raise

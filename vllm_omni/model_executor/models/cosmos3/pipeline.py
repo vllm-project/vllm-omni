@@ -32,8 +32,16 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.diffusion.capability_resolvers import COSMOS3_CAPABILITIES
+from vllm_omni.serving_capabilities import (
+    declare_capabilities,
+)
 
 COSMOS3_POLICY_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        unsupported_reason="outside_standard_operations",
+        sources=("vllm_omni/model_executor/models/cosmos3/pipeline.py",),
+    ),
     model_type="cosmos3_policy",
     model_arch="Cosmos3OmniDiffusersPipeline",
     stages=(
@@ -50,6 +58,7 @@ COSMOS3_POLICY_PIPELINE = PipelineConfig(
 )
 
 COSMOS3_OMNI_DEPLOY_PIPELINE = PipelineConfig(
+    serving_capabilities=COSMOS3_CAPABILITIES,
     model_type="cosmos3_omni_deploy",
     model_arch="Cosmos3OmniDiffusersPipeline",
     stages=(

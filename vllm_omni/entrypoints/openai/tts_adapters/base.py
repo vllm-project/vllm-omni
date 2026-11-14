@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_codec_frame_rate, load_supported_speakers
+from vllm_omni.request_capabilities import InputConstraint, ParameterConstraint, RequestConstraints
 
 logger = init_logger(__name__)
 
@@ -41,6 +42,48 @@ DEFAULT_TTS_LANGUAGES = frozenset(
         "Italian",
     }
 )
+
+
+def lyrics_request_constraints(
+    *, min_tokens: int, max_tokens: int, streaming: bool | None = None
+) -> RequestConstraints:
+    """Shared declarations for adapters explicitly validating this contract."""
+    parameters = {
+        "max_new_tokens": ParameterConstraint(
+            support="supported", type="integer", minimum=min_tokens, maximum=max_tokens
+        ),
+        "speed": ParameterConstraint(support="supported", type="number", enum=(1.0,)),
+        "voice": ParameterConstraint(
+            support="supported", type="string", enum=("", "default"), enum_normalization="strip_lower"
+        ),
+        "language": ParameterConstraint(support="unsupported"),
+    }
+    if streaming is False:
+        parameters["stream"] = ParameterConstraint(support="supported", type="boolean", enum=(False,))
+    return RequestConstraints(
+        inputs={
+            "text": InputConstraint(support="supported", min_count=1, max_count=1),
+            "instructions": InputConstraint(support="supported", min_count=1, max_count=1),
+            "reference_audio": InputConstraint(support="unsupported", max_count=0),
+            "reference_text": InputConstraint(support="unsupported", max_count=0),
+        },
+        parameters=parameters,
+    )
+
+
+def speech_inputs(
+    *supported: str,
+    unsupported: tuple[str, ...] = (),
+    required_any_of: tuple[tuple[str, ...], ...] = (),
+) -> RequestConstraints:
+    """Concise model-owner declarations; unmentioned roles remain unknown."""
+    return RequestConstraints(
+        inputs={
+            **{role: InputConstraint(support="supported", min_count=0) for role in supported},
+            **{role: InputConstraint(support="unsupported", max_count=0) for role in unsupported},
+        },
+        required_any_of=required_any_of,
+    )
 
 
 def resolve_stage_model_path(engine_client: Any) -> str | None:
@@ -280,6 +323,27 @@ class TTSModelAdapter(ABC):
     #: Target sample rates validated for this adapter's output path. An empty
     #: set means that the adapter does not expose per-request resampling.
     supported_output_sample_rates: ClassVar[frozenset[int]] = frozenset()
+    request_constraints: ClassVar[RequestConstraints] = RequestConstraints()
+
+    def get_request_constraints(self) -> RequestConstraints:
+        """Snapshot initialized adapter facts; never load capabilities here.
+
+        DEFAULT_TTS_LANGUAGES is intentionally not advertised: an inherited
+        default is not evidence that a model consumes or validates language.
+        Concrete adapters own voice, reference, and language declarations.
+        """
+        inputs = dict(self.request_constraints.inputs)
+        inputs["reference_audio_codes"] = InputConstraint(
+            support="supported" if self.supports_reference_codes else "unsupported",
+        )
+        parameters = dict(self.request_constraints.parameters)
+        if self.supported_output_sample_rates:
+            parameters["sample_rate"] = ParameterConstraint(
+                support="supported",
+                type="integer",
+                enum=tuple(sorted(self.supported_output_sample_rates)),
+            )
+        return self.request_constraints.model_copy(update={"inputs": inputs, "parameters": parameters})
 
     max_new_tokens_min = 1
 

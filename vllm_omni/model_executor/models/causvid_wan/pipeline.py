@@ -10,11 +10,19 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    TEXT_TO_VIDEO,
+    declare_capabilities,
+)
 
 # Opt-in via deploy ``pipeline: causvid_wan`` / explicit model_arch. Do not alias
 # ``WanPipeline`` — that Diffusers class is reserved for ``wan2_2_ti2v`` discovery
 # when the checkpoint basename does not disambiguate.
 CAUSVID_WAN_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_VIDEO,
+        sources=("vllm_omni/model_executor/models/causvid_wan/pipeline.py",),
+    ),
     model_type="causvid_wan",
     default_deploy_config_name="causvid_wan_self_forcing.yaml",
     model_arch="CausVidWanPipeline",

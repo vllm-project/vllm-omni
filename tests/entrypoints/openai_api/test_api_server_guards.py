@@ -195,6 +195,7 @@ def test_profiler_endpoints_detect_typed_stage_config():
 
 # Exact Omni router census on main. Update intentionally when routes change.
 _EXPECTED_ROUTER_ROUTES = {
+    ("GET", "/v1/omni/capabilities"),
     ("POST", "/v1/chat/completions"),
     ("POST", "/v1/chat/completions/batch"),
     ("POST", "/v1/audio/speech"),
@@ -1349,9 +1350,11 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     """
     stage = SimpleNamespace(stage_type="diffusion", engine_args={})
     engine = _FakeEngineClient(stage_configs=[stage])
+    handler_kwargs = {}
 
     def _for_diffusion_factory(label: str):
         def _factory(cls, *args, **kwargs):
+            handler_kwargs[label] = kwargs
             return _marker(label)
 
         return classmethod(_factory)
@@ -1376,7 +1379,7 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     await api_server.omni_init_app_state(
         engine,
         state,
-        _minimal_args(),
+        _minimal_args(served_model_name=["image-primary", "image-alias"]),
     )
 
     _assert_app_state_snapshot(
@@ -1386,6 +1389,8 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
         must_be_none=_DIFFUSION_MUST_BE_NONE,
     )
     assert state.diffusion_engine is engine
+    for label in ("chat", "chat_batch"):
+        assert handler_kwargs[label]["served_model_names"] == ["image-primary", "image-alias"]
 
 
 @pytest.mark.asyncio

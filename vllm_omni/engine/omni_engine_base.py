@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import importlib
 import queue
 import threading
 import time
@@ -68,6 +69,7 @@ from vllm_omni.entrypoints.utils import prepare_stage_config_inputs
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.inputs.preprocess import build_omni_renderer
 from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.serving_capabilities import ServingCapabilities
 
 logger = init_logger(__name__)
 
@@ -466,6 +468,7 @@ class OmniEngineBase:
                 final_output_type=client.final_output_type,
                 stage_type=client.stage_type,
                 model_stage=getattr(client, "model_stage", None),
+                serving_metadata=getattr(client, "serving_metadata", None),
             )
             for client in self.stage_clients
         ]
@@ -680,6 +683,19 @@ class OmniEngineBase:
     ) -> None:
         """Initialize engine-wide settings resolved from pipeline metadata."""
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
+        # Retain the final resolver result, including generic diffusion and
+        # checkpoint-specific pipeline variants. Discovery must not resolve it
+        # again, or use the earlier pre-resolution self.pipeline_config view.
+        self.serving_capabilities = (
+            pipeline_config.serving_capabilities if pipeline_config is not None else None
+        ) or ServingCapabilities()
+        resolver_path = pipeline_config.serving_capabilities_resolver if pipeline_config is not None else None
+        if resolver_path is not None:
+            module_name, resolver_name = resolver_path.rsplit(".", 1)
+            resolver = getattr(importlib.import_module(module_name), resolver_name)
+            self.serving_capabilities = resolver(self.serving_capabilities, self.stage_configs)
+            if not isinstance(self.serving_capabilities, ServingCapabilities):
+                raise TypeError("serving_capabilities_resolver must return ServingCapabilities")
         # No duplex_runtime_extension / duplex_serving_adapter / duplex_control
         # here: the pre-framework wiring they named is gone, and design rule 3
         # in docs/design/fullduplex.md keeps duplex vocabulary out of the base.

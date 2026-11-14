@@ -14,6 +14,7 @@ import numpy as np
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
 from vllm_omni.model_executor.models.omnivoice.prompt_utils import prepare_instruct, validate_instruction
+from vllm_omni.request_capabilities import RequestConstraints
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -23,6 +24,26 @@ if TYPE_CHECKING:
 class OmniVoiceAdapter(ARTTSAdapter):
     stage_keys = frozenset({"omnivoice_generator"})
     name = "omnivoice"
+
+    def get_request_constraints(self) -> RequestConstraints:
+        from vllm_omni.request_capabilities import InputConstraint, ParameterConstraint
+
+        request = super().get_request_constraints()
+        return request.model_copy(
+            update={
+                "inputs": {
+                    **request.inputs,
+                    **{
+                        role: InputConstraint(support="supported", min_count=0, max_count=1)
+                        for role in ("reference_audio", "reference_text", "instructions", "voice")
+                    },
+                },
+                "parameters": {
+                    **request.parameters,
+                    "language": ParameterConstraint(support="supported", type="string"),
+                },
+            }
+        )
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         if not request.input or not request.input.strip():

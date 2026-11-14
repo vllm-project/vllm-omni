@@ -461,6 +461,8 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             if self._accept_call_kwargs is None or key in self._accept_call_kwargs:
                 kwargs[key] = value
             else:
+                if key in {"mask_image", "reference_image"}:
+                    raise ValueError(f"The loaded diffusers pipeline does not support '{key}'")
                 logger.warning(
                     f"Skipping unsupported diffusers pipeline __call__ argument `{key}` from prompt input."
                     f"Check out the documentation of {self._pipeline.__class__.__name__}."

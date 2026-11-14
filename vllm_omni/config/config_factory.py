@@ -39,6 +39,7 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import get_diffusion_output_type
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
 logger = init_logger(__name__)
@@ -382,8 +383,11 @@ class StageConfigFactory:
         """Label the Lance video checkpoint as video without changing image Lance."""
         if pipeline_cfg.model_type != "lance" or _name_match_candidate(model) != "Lance_3B_Video":
             return pipeline_cfg
+        from vllm_omni.model_executor.models.lance.pipeline import LANCE_VIDEO_CAPABILITIES
+
         return replace(
             pipeline_cfg,
+            serving_capabilities=LANCE_VIDEO_CAPABILITIES,
             stages=tuple(
                 replace(stage, final_output_type="video") if stage.final_output else stage
                 for stage in pipeline_cfg.stages
@@ -775,6 +779,8 @@ class StageConfigFactory:
         pipeline = PipelineConfig(
             model_type="generic_diffusion",
             model_arch=str(model_class_name or ""),
+            serving_capabilities=get_diffusion_model_metadata(model_class_name).serving_capabilities,
+            serving_capabilities_resolver=get_diffusion_model_metadata(model_class_name).serving_capabilities_resolver,
             stages=(
                 StagePipelineConfig(
                     stage_id=0,

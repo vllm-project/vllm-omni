@@ -2,10 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Ming-3.0-audio-flash speech-understanding and speech-output topology."""
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
+)
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_RESPONSE,
+    TEXT_TO_SPEECH,
+    declare_capabilities,
 )
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.ming3_audio"
@@ -42,6 +50,11 @@ _TALKER_STAGE = StagePipelineConfig(
 )
 
 MING3_AUDIO_FLASH_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        AUDIO_RESPONSE,
+        sources=("vllm_omni/model_executor/models/ming3_audio/pipeline.py",),
+    ),
     model_type="bailing_moe_v3_audio",
     default_deploy_config_name="ming3_audio_flash.yaml",
     model_arch="BailingMoeV3AudioForConditionalGeneration",
@@ -50,6 +63,10 @@ MING3_AUDIO_FLASH_PIPELINE = PipelineConfig(
 )
 
 MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        sources=("vllm_omni/model_executor/models/ming3_audio/pipeline.py",),
+    ),
     model_type="bailing_moe_v3_audio_thinker_only",
     default_deploy_config_name="ming3_audio_flash_thinker_only.yaml",
     model_arch="BailingMoeV3AudioForConditionalGeneration",
@@ -61,6 +78,12 @@ MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE = PipelineConfig(
 # Converted Ming3 exports own their config and use per-request IP/clone controls.
 # Keep the legacy Ming2 standalone topology and preset semantics independent.
 MING3_AUDIO_TTS_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/ming3_audio/pipeline.py", "docs/serving/speech_api.md"),
+    ),
     model_type="ming3_audio_tts",
     default_deploy_config_name="ming3_audio_tts.yaml",
     model_arch="BailingTalker2",

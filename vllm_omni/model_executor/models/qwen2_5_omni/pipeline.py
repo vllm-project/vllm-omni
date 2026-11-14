@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen2.5-Omni pipeline topology (frozen).
 
 Stage 0: Thinker  — multimodal understanding + text generation
@@ -12,10 +12,20 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_RESPONSE,
+    declare_capabilities,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.qwen2_5_omni"
 
 QWEN2_5_OMNI_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        AUDIO_RESPONSE,
+        sources=("vllm_omni/model_executor/models/qwen2_5_omni/pipeline.py",),
+    ),
     model_type="qwen2_5_omni",
     default_deploy_config_name="qwen2_5_omni.yaml",
     model_arch="Qwen2_5OmniForConditionalGeneration",
@@ -68,6 +78,10 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
 
 # Single-stage thinker-only variant for the abort test.
 QWEN2_5_OMNI_THINKER_ONLY_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        sources=("vllm_omni/model_executor/models/qwen2_5_omni/pipeline.py",),
+    ),
     model_type="qwen2_5_omni_thinker_only",
     model_arch="Qwen2_5OmniForConditionalGeneration",
     stages=(

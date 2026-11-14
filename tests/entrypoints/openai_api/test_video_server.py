@@ -38,6 +38,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoParams,
     VideoResponse,
 )
+from vllm_omni.entrypoints.openai.serving_capabilities import OmniServingCapabilities
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
@@ -689,6 +690,58 @@ def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: 
             return last_payload
         time.sleep(0.02)
     raise AssertionError(f"Timed out waiting for status={status}. Last payload: {last_payload}")
+
+
+@pytest.mark.parametrize("path", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("condition", ["ready", "missing_handler", "missing_stages", "image_stages", "app_stages"])
+def test_video_exposure_matches_rejection_phase(test_client, mocker, path, condition):
+    from vllm_omni.config.stage_config import StageConfig, StageType
+
+    state = test_client.app.state
+    handler = state.openai_serving_video
+    engine = handler._engine_client
+    state.engine_client = engine
+    if condition == "missing_handler":
+        state.openai_serving_video = None
+    elif condition == "missing_stages":
+        engine.stage_configs = []
+    elif condition in {"image_stages", "app_stages"}:
+        image_stages = [
+            StageConfig(0, "diffusion", stage_type=StageType.DIFFUSION, final_output=True, final_output_type="image")
+        ]
+        if condition == "app_stages":
+            state.stage_configs = image_stages
+        else:
+            handler.set_stage_configs_if_missing(image_stages)
+    state.omni_serving_capabilities = OmniServingCapabilities(
+        test_client.app, engine, single_api_dependencies=(api_server._require_single_api_video_store,)
+    )
+    body = test_client.get("/v1/omni/capabilities").json()
+    route = next(r for r in body["routes"] if r["path"] == path and r["method"] == "POST")
+    assert route["exposure"] == ("enabled" if condition == "ready" else "disabled")
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"encoded-video")
+    response = test_client.post(path, data={"prompt": "video"})
+    if condition == "missing_handler":
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Video generation handler not initialized."
+    elif condition == "ready":
+        assert response.status_code == 200, response.text
+        if path == "/v1/videos":
+            _wait_for_status(test_client, response.json()["id"], "completed")
+        assert engine.captured_prompt is not None
+    else:
+        error = "Stage configs not found" if condition == "missing_stages" else "No final video output stage found"
+        if path == "/v1/videos":
+            # Keep asynchronous acceptance: the existing generation guard
+            # reports its error through the stored job, not the POST response.
+            assert response.status_code == 200, response.text
+            job = _wait_for_status(test_client, response.json()["id"], "failed")
+            assert error in job["error"]["message"]
+        else:
+            assert response.status_code == 503, response.text
+            assert error in response.json()["detail"]
+    if condition != "ready":
+        assert engine.captured_prompt is None
 
 
 def _wait_until(predicate, timeout_s: float = 2.0, interval_s: float = 0.02):
@@ -1515,25 +1568,30 @@ def test_typed_stage_drives_video_capability_checks():
 
 
 @pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
-def test_h3_latent_edit_uploads_reach_generation_and_are_cleaned(endpoint, test_client, mocker: MockerFixture):
+@pytest.mark.parametrize("scalar_masks", [False, True])
+def test_h3_latent_edit_uploads_reach_generation_and_are_cleaned(
+    endpoint, scalar_masks, test_client, mocker: MockerFixture
+):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
         return_value=b"fake-video",
     )
     engine = test_client.app.state.openai_serving_video._engine_client
     engine.model_class_name = "MiniMaxH3Pipeline"
-    video_mask = [[[0.0, 1.0], [0.5, 1.0]]]
-    audio_mask = [0.0, 0.25, 1.0]
+    video_mask = 0.0 if scalar_masks else [[[0.0, 1.0], [0.5, 1.0]]]
+    audio_mask = 0.0 if scalar_masks else [0.0, 0.25, 1.0]
+    files = [
+        ("source_video", ("source.mov", b"source-video", "video/quicktime")),
+        ("video_noise_mask", _mask_file(video_mask)),
+        ("audio_noise_mask", _mask_file(audio_mask)),
+    ]
+    if not scalar_masks:
+        files.append(("source_audio", ("source.mp3", b"source-audio", "audio/mpeg")))
 
     response = test_client.post(
         endpoint,
-        data={"prompt": "Replace only the masked regions."},
-        files=[
-            ("source_video", ("source.mov", b"source-video", "video/quicktime")),
-            ("source_audio", ("source.mp3", b"source-audio", "audio/mpeg")),
-            ("video_noise_mask", _mask_file(video_mask)),
-            ("audio_noise_mask", _mask_file(audio_mask)),
-        ],
+        data={"prompt": "Replace only the masked regions.", "extra_params": json.dumps({"task": "t2va"})},
+        files=files,
     )
 
     assert response.status_code == 200
@@ -1541,19 +1599,29 @@ def test_h3_latent_edit_uploads_reach_generation_and_are_cleaned(endpoint, test_
         _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
 
     multi_modal_data = engine.captured_prompt["multi_modal_data"]
-    assert engine.captured_latent_edit_source_bytes == {
-        "source_video": b"source-video",
-        "source_audio": b"source-audio",
-    }
+    expected_sources = {"source_video": b"source-video"}
+    if not scalar_masks:
+        expected_sources["source_audio"] = b"source-audio"
+    assert engine.captured_latent_edit_source_bytes == expected_sources
     assert multi_modal_data["video_noise_mask"] == video_mask
     assert multi_modal_data["audio_noise_mask"] == audio_mask
-    _wait_until(
-        lambda: (
-            not Path(multi_modal_data["source_video"]).exists() and not Path(multi_modal_data["source_audio"]).exists()
-        )
-    )
-    assert not Path(multi_modal_data["source_video"]).exists()
-    assert not Path(multi_modal_data["source_audio"]).exists()
+    assert engine.captured_sampling_params_list[0].extra_args["task"] == "t2va"
+    _wait_until(lambda: all(not Path(multi_modal_data[role]).exists() for role in expected_sources))
+    assert all(not Path(multi_modal_data[role]).exists() for role in expected_sources)
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_h3_regular_request_does_not_require_edit_fields(endpoint, test_client, mocker: MockerFixture):
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"fake-video")
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    response = test_client.post(endpoint, data={"prompt": "A red fox.", "extra_params": json.dumps({"task": "t2va"})})
+    assert response.status_code == 200
+    if not endpoint.endswith("/sync"):
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+    assert not engine.captured_latent_edit_source_bytes
+    for role in ("source_video", "video_noise_mask", "audio_noise_mask"):
+        assert role not in engine.captured_prompt.get("multi_modal_data", {})
 
 
 def test_h3_regenerate_forwards_a_maskless_draft(test_client, mocker: MockerFixture):
@@ -1578,7 +1646,10 @@ def test_h3_regenerate_forwards_a_maskless_draft(test_client, mocker: MockerFixt
     assert "latent_cache_key" not in engine.captured_sampling_params_list[0].extra_args
 
 
-def test_latent_edit_fields_are_rejected_for_models_without_capability(test_client):
+@pytest.mark.parametrize("architecture", ["WanPipeline", "SeedVR2Pipeline", "WanVACEPipeline"])
+def test_latent_edit_fields_are_rejected_for_models_without_capability(test_client, architecture):
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = architecture
     response = test_client.post(
         "/v1/videos/sync",
         data={"prompt": "edit"},
@@ -1590,6 +1661,7 @@ def test_latent_edit_fields_are_rejected_for_models_without_capability(test_clie
 
     assert response.status_code == 400
     assert "not supported" in response.json()["detail"].lower()
+    assert engine.captured_prompt is None
 
 
 @pytest.mark.parametrize(
@@ -2591,6 +2663,23 @@ def test_video_generation_rejects_model_mismatch(test_client):
     )
     assert response.status_code == 400
     assert "model mismatch" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize("model", [None, "Wan-AI/Wan2.2-T2V-A14B-Diffusers", "video-alias", "missing-model"])
+def test_video_generation_checks_all_served_model_names(test_client, model):
+    from vllm.entrypoints.openai.models.protocol import BaseModelPath
+
+    from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
+
+    primary = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+    test_client.app.state.openai_serving_models = _DiffusionServingModels(
+        [BaseModelPath(name=name, model_path=primary) for name in (primary, "video-alias")]
+    )
+    payload = {"prompt": "a moving blue square"}
+    if model is not None:
+        payload["model"] = model
+    response = test_client.post("/v1/videos", data=payload)
+    assert response.status_code == (400 if model == "missing-model" else 200)
 
 
 def test_invalid_size_parse_returns_422(test_client):

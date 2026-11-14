@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Audex (Nemotron-Labs-Audex-2B) TTS pipeline topology.
 
 Stage 0: Thinker  — ChatML text prompt → <speechcodec_N> tokens (LLM AR).
@@ -11,10 +11,19 @@ Users pass the HF repo ROOT (its manifest config.json carries
 files, so stage 1's tokenizer also points at the thinker checkpoint.
 """
 
+from dataclasses import replace
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
+)
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    CAPTION_TO_AUDIO,
+    TEXT_RESPONSE,
+    TEXT_TO_SPEECH,
+    declare_capabilities,
 )
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.audex"
@@ -31,6 +40,12 @@ AUDEX_AUDIOGEN_END_TOKEN_ID = 131074
 # 30B-A3B); forcing one name via hf_overrides would misbind the other
 # size. Decoder stages keep their explicit per-stage model_arch.
 AUDEX_TTS_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_TO_SPEECH,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/audex/pipeline.py", "docs/serving/speech_api.md"),
+    ),
     model_type="audex_tts",
     default_deploy_config_name="audex_tts.yaml",
     stages=(
@@ -84,6 +99,12 @@ AUDEX_TTS_PIPELINE = PipelineConfig(
 # speech decoder — text-modality passes finish at stage 0 and never reach
 # the codec path. The cascade itself is orchestrated by the client/example.
 AUDEX_S2S_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        AUDIO_RESPONSE,
+        TEXT_TO_SPEECH,
+        sources=("vllm_omni/model_executor/models/audex/pipeline.py", "examples/online_serving/audex/client.py"),
+    ),
     model_type="audex_s2s",
     default_deploy_config_name="audex_s2s.yaml",
     stages=(
@@ -138,6 +159,10 @@ AUDEX_S2S_PIPELINE = PipelineConfig(
 # audio-capable full checkpoint — speech (+ text instruction) in, text out.
 # Modeled on the ming_flash_omni / qwen2_5_omni thinker-only pipelines.
 AUDEX_THINKER_ONLY_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        sources=("vllm_omni/model_executor/models/audex/pipeline.py",),
+    ),
     model_type="audex_thinker_only",
     default_deploy_config_name="audex_thinker_only.yaml",
     stages=(
@@ -160,6 +185,12 @@ AUDEX_THINKER_ONLY_PIPELINE = PipelineConfig(
 
 
 AUDEX_TTA_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        CAPTION_TO_AUDIO,
+        replace(AUDIO_RESPONSE, support="unknown", reason_code="chat_prompt_contract_undeclared"),
+        unknown_reason="chat_prompt_contract_undeclared",
+        sources=("vllm_omni/model_executor/models/audex/pipeline.py", "examples/online_serving/audex/client.py"),
+    ),
     model_type="audex_tta",
     default_deploy_config_name="audex_tta.yaml",
     stages=(

@@ -9,12 +9,22 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_RESPONSE,
+    declare_capabilities,
+)
 
 _JOYAI_INPUT_PROCESSOR = "vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction"
 _QWEN3_TTS_INPUT_PROCESSOR = "vllm_omni.model_executor.stage_input_processors.qwen3_tts"
 
 
 JOYAI_VL_INTERACTION_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        AUDIO_RESPONSE,
+        sources=("vllm_omni/model_executor/models/joyai_vl_interaction/pipeline.py",),
+    ),
     model_type="joyai_vl_interaction",
     model_arch="Qwen3VLForConditionalGeneration",
     default_deploy_config_name="joyai_vl_interaction.yaml",
@@ -81,6 +91,11 @@ _JOYAI_STAGE, *_JOYAI_TTS_STAGES = JOYAI_VL_INTERACTION_PIPELINE.stages
 # Opt-in audio-input profile: Qwen3-ASR transcribes the audio for JoyAI; a request
 # without audio bypasses stage 0 and enters at JoyAI, so one deployment serves both.
 JOYAI_VL_INTERACTION_ASR_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        AUDIO_RESPONSE,
+        sources=("vllm_omni/model_executor/models/joyai_vl_interaction/pipeline.py",),
+    ),
     model_type="joyai_vl_interaction_asr",
     model_arch="Qwen3ASRForConditionalGeneration",
     default_deploy_config_name="joyai_vl_interaction_asr.yaml",

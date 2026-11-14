@@ -15,6 +15,11 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.serving_capabilities import (
+    AUDIO_RESPONSE,
+    TEXT_RESPONSE,
+    declare_capabilities,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni"
 MINICPMO45_REFERENCE_AUDIO_KEY = "_minicpmo45_reference_audio"
@@ -39,6 +44,11 @@ def _talker_stop_token_ids() -> list[int]:
 
 
 MINICPMO_4_5_PIPELINE = PipelineConfig(
+    serving_capabilities=declare_capabilities(
+        TEXT_RESPONSE,
+        AUDIO_RESPONSE,
+        sources=("vllm_omni/model_executor/models/minicpmo_4_5/pipeline.py",),
+    ),
     model_type="minicpmo_4_5",
     default_deploy_config_name="minicpmo_4_5.yaml",
     model_arch="MiniCPMO45OmniForConditionalGeneration",

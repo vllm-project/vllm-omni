@@ -45,7 +45,7 @@ from vllm.multimodal.image import open_image
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
-from vllm_omni.entrypoints.openai.app_state import Omnivideo
+from vllm_omni.entrypoints.openai.app_state import Omnivideo, _is_served_model
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import (
     SecondStr,
@@ -1236,7 +1236,7 @@ async def _parse_video_form(
     try:
         app_model_name, app_stage_configs = _resolve_video_runtime_context(raw_request)
         effective_model_name = handler.model_name or app_model_name or request.model or "unknown"
-        if request.model is not None and effective_model_name is not None and request.model != effective_model_name:
+        if request.model is not None and not _is_served_model(raw_request, request.model, effective_model_name):
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=(

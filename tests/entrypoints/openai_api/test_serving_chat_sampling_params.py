@@ -187,6 +187,7 @@ def test_duplicate_extras_return_the_same_bad_request_before_dispatch(
 ):
     serving_chat = build_serving_chat(engine_client=mock_engine_client)
     serving_chat._diffusion_mode = diffusion_mode
+    serving_chat._diffusion_model_names = ("test",)
     serving_chat._diffusion_extra_body_params = frozenset({"sample_solver"})
     serving_chat.engine_client.stage_configs = [SimpleNamespace(stage_type="diffusion")]
     check_model = mocker.patch.object(serving_chat, "_check_model", new=mocker.AsyncMock())
@@ -225,6 +226,7 @@ def test_pure_consumer_preserves_defaults_and_separate_cfg_owners(mock_engine_cl
             yield None
 
     serving_chat._diffusion_model_name = "test"
+    serving_chat._diffusion_model_names = ("test",)
     serving_chat._diffusion_engine = SimpleNamespace(
         stage_configs=[SimpleNamespace(stage_type="diffusion")],
         default_sampling_params_list=[
@@ -1026,6 +1028,7 @@ def test_diffusion_chat_inherits_engine_defaults(
 
     server = build_serving_chat(engine_client=mock_engine_client)
     server._diffusion_model_name = "test"
+    server._diffusion_model_names = ("test",)
     server._diffusion_engine = SimpleNamespace(
         stage_configs=[SimpleNamespace(stage_type="diffusion") for _ in range(stage_count)],
         default_sampling_params_list=defaults,
@@ -1083,6 +1086,7 @@ def test_diffusion_chat_overrides_leave_non_diffusion_params_unchanged(
 
     server = build_serving_chat(engine_client=mock_engine_client)
     server._diffusion_model_name = "test"
+    server._diffusion_model_names = ("test",)
     server._diffusion_engine = SimpleNamespace(
         stage_configs=[SimpleNamespace(stage_type="llm"), SimpleNamespace(stage_type="diffusion")],
         default_sampling_params_list=[llm_defaults, diffusion_defaults],

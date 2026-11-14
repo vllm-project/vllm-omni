@@ -138,6 +138,24 @@ codec may not import the engine, the entrypoints or the model code, which
 second consumer lands (#6592 P0b) the package is expected to graduate to its
 own module document with owners drawn from both consumers.
 
+## Capability discovery ownership
+
+`GET /v1/omni/capabilities` projects the final model-owned declarations and the
+initialized API routes. `PipelineConfig` and `DiffusionModelMetadata` own the
+request contracts; the endpoint layer adds route exposure and observes the
+frontend execution gate. It does not infer editing or speech support from
+output types. Query handling performs no configuration resolution, backend RPC,
+generation, or worker lifecycle operation. Multi-API observations retain worker
+scope, and duplex execution remains unknown because its admission owner differs.
+`serving_policy.py` supplies handler selection and the shared image, video,
+duplex, and API-worker conditions to both projection and route guards. Request
+handlers retain error formatting and validation order, including video errors
+reported during asynchronous job execution. Startup reads application state
+directly without synthesizing a request. Optional execution-observer failures
+or invalid observations produce unknown execution while retaining the deployment
+facts; cancellation propagates. No model-computation behavior changes.
+See [the public discovery contract](../../serving/capabilities.md).
+
 ## Candidate invariants
 
 These identifiers are proposals while the document is `draft`.

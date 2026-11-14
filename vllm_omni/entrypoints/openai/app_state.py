@@ -6,18 +6,23 @@ This module owns small helpers that read initialized serving objects or engine
 configuration from ``request.app.state``."""
 
 from http import HTTPStatus
-from typing import Any
+from typing import Any, cast
 
-from fastapi import HTTPException, Request
+from fastapi import HTTPException, Request, WebSocket
+from starlette.datastructures import State
 from vllm.engine.protocol import EngineClient
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.entrypoints.openai.serving_policy import (
+    get_image_stage_configs,
+    get_route_handler,
+    image_generation_error,
+)
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
-from vllm_omni.entrypoints.openai.utils import is_image_generation_stage
 
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
 
@@ -29,23 +34,36 @@ async def _get_vllm_config(engine_client: EngineClient) -> Any:
 
 
 def Omnivideo(request: Request) -> OmniOpenAIServingVideo | None:
-    return request.app.state.openai_serving_video
+    return cast(OmniOpenAIServingVideo | None, get_route_handler(request.app.state, "/v1/videos"))
 
 
 def Omnichat(request: Request) -> OmniOpenAIServingChat | None:
-    return request.app.state.openai_serving_chat
+    return cast(OmniOpenAIServingChat | None, get_route_handler(request.app.state, "/v1/chat/completions"))
 
 
 def OmniBatchChat(request: Request) -> OmniOpenAIServingChatBatch | None:
-    return request.app.state.openai_serving_chat_batch
+    return cast(OmniOpenAIServingChatBatch | None, get_route_handler(request.app.state, "/v1/chat/completions/batch"))
 
 
 def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
-    return request.app.state.openai_serving_speech
+    return cast(OmniOpenAIServingSpeech | None, get_route_handler(request.app.state, "/v1/audio/speech"))
 
 
 def OmniAudioGenerate(request: Request) -> OmniOpenAIServingAudioGenerate | None:
-    return getattr(request.app.state, "openai_serving_audio_generate", None)
+    return cast(OmniOpenAIServingAudioGenerate | None, get_route_handler(request.app.state, "/v1/audio/generate"))
+
+
+def _is_served_model(request: Request | WebSocket, model_name: str, default_model_name: str | None) -> bool:
+    """Check public aliases without changing the default response name.
+
+    Standalone handlers may have only a default name; initialized OpenAI apps
+    use the same base-model names as ``/v1/models``.
+    """
+    serving_models = getattr(request.app.state, "openai_serving_models", None)
+    base_model_paths = getattr(serving_models, "base_model_paths", None)
+    if base_model_paths:
+        return any(path.name == model_name for path in base_model_paths)
+    return model_name == default_model_name
 
 
 def _get_engine_and_model(raw_request: Request):
@@ -61,22 +79,12 @@ def _get_engine_and_model(raw_request: Request):
     # legacy generation-LLM DiT stage that emits images).
     # Prefer app state (compat layer populated at startup), then fall back to
     # the engine client's stage configs for refactored AsyncOmni paths.
-    stage_configs = getattr(raw_request.app.state, "stage_configs", None)
-    if not stage_configs:
-        stage_configs = getattr(engine_client, "stage_configs", None)
-    if not stage_configs:
+    normalized_stage_configs = get_image_stage_configs(raw_request.app.state, engine_client)
+    error = image_generation_error(normalized_stage_configs)
+    if error is not None:
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-            detail="Stage configs not found. Start server with a multi-stage omni model.",
-        )
-
-    normalized_stage_configs = list(stage_configs)
-    has_image_stage = any(is_image_generation_stage(stage_cfg) for stage_cfg in normalized_stage_configs)
-
-    if not has_image_stage:
-        raise HTTPException(
-            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-            detail="No image generation stage found in multi-stage pipeline.",
+            detail=error,
         )
 
     # Get server's loaded model name
@@ -90,9 +98,13 @@ def _get_engine_and_model(raw_request: Request):
     return engine_client, model_name, normalized_stage_configs
 
 
-def _get_diffusion_od_config(raw_request: Request, engine_client: Any) -> Any:
-    diffusion_engine = getattr(raw_request.app.state, "diffusion_engine", None) or engine_client
+def _get_diffusion_od_config_from_state(state: State, engine_client: object) -> object | None:
+    diffusion_engine = getattr(state, "diffusion_engine", None) or engine_client
     get_diffusion_od_config = getattr(diffusion_engine, "get_diffusion_od_config", None)
     return (
         get_diffusion_od_config() if callable(get_diffusion_od_config) else getattr(diffusion_engine, "od_config", None)
     )
+
+
+def _get_diffusion_od_config(raw_request: Request, engine_client: object) -> object | None:
+    return _get_diffusion_od_config_from_state(raw_request.app.state, engine_client)
