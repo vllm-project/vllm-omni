@@ -1169,6 +1169,10 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
     """
 
     quant_config: QuantizationConfig | None = None
+    # cuDNN SDPA picks its execution plan per process, so a request can encode
+    # to slightly different states after a restart. Disabling it uses PyTorch's
+    # other SDPA backends, which are reproducible across processes.
+    cudnn_sdp: bool = True
 
     def __init__(
         self,
@@ -1531,7 +1535,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             raise RuntimeError("call load_to_device() before encode_ids()")
 
         cudnn_sdp_enabled = torch.backends.cuda.cudnn_sdp_enabled()
-        torch.backends.cuda.enable_cudnn_sdp(True)
+        torch.backends.cuda.enable_cudnn_sdp(self.cudnn_sdp)
         try:
             hidden = self._encode(
                 input_ids,
