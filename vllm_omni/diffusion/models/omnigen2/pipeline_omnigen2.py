@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import inspect
 import json
@@ -1058,7 +1058,7 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
         self._text_guidance_scale = text_guidance_scale
         self._image_guidance_scale = (
             req.sampling_params.guidance_scale_2
-            if req.sampling_params.guidance_scale_2 is not None
+            if req.sampling_params.guidance_scale_2_provided
             else image_guidance_scale
         )
         self._cfg_range = cfg_range
