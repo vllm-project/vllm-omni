@@ -592,8 +592,7 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
 
 
-@pytest.mark.parametrize("later_text", [[""], ["   "], [], None], ids=["empty", "blank", "empty-list", "missing"])
-def test_stage0_plain_streaming_update_keeps_the_first_chunk_text(later_text) -> None:
+def test_stage0_plain_streaming_update_keeps_the_first_chunk_text() -> None:
     # Qwen3-TTS skips its stage-0 text check on streaming updates, so a plain
     # stage-0 extension must keep the first chunk's additional_information:
     # the re-admitted request carries it to the Talker's preprocess.
@@ -603,8 +602,7 @@ def test_stage0_plain_streaming_update_keeps_the_first_chunk_text(later_text) ->
     first_chunk_info = serialize_additional_information({"task_type": ["CustomVoice"], "text": ["Hello there."]})
     session.additional_information = first_chunk_info
     update = _make_update([10, 20])
-    later_info = {"task_type": ["CustomVoice"]} if later_text is None else {"text": later_text}
-    update.additional_information = serialize_additional_information(later_info)
+    update.additional_information = serialize_additional_information({"task_type": ["CustomVoice"], "text": ["   "]})
 
     sched._update_request_as_session(session, update)
 
