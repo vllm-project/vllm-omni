@@ -94,10 +94,15 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         do_sample: bool = True,
         repetition_penalty: float = 1.0,
         history_per_codebook: list[list[int]] | None = None,
+        history_codes: torch.Tensor | None = None,
+        generators: Sequence[torch.Generator | None] | None = None,
     ) -> torch.Tensor:
         """Generate one audio frame (rvq codebook tokens) for batch B.
 
         Returns a ``(B, rvq)`` LongTensor.
+
+        ``generators`` follows batch-row order and preserves each seeded
+        request's RNG stream across codebooks and successive frames.
 
         ``history_per_codebook[i]`` is a list of recently-emitted token ids for
         codebook ``i``; when ``repetition_penalty != 1.0`` those tokens get
@@ -105,8 +110,17 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         """
         device = backbone_last_hidden.device
         B = backbone_last_hidden.shape[0]
+        generators = _normalize_generators(generators, B)
         rvq = self.config.rvq
         hidden_size = self.config.hidden_size
+
+        if history_codes is not None:
+            if history_codes.ndim != 3 or history_codes.shape[:2] != (B, rvq):
+                raise ValueError("history_codes must have shape (batch, rvq, window)")
+            if history_codes.device != device:
+                raise ValueError("history_codes must remain on the same device as hidden states")
+            if history_per_codebook is not None:
+                raise ValueError("Pass either history_codes or legacy history_per_codebook")
 
         codec_embeds = self.model.codec_embedding
 
@@ -124,7 +138,9 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
             hidden = self.model(embeds[:, :seq_len, :], pos_ids_full[:, :seq_len])
             logits = lm_heads[step](hidden[:, step, :]).float()
 
-            if repetition_penalty != 1.0 and history_per_codebook is not None and step < len(history_per_codebook):
+            if repetition_penalty != 1.0 and history_codes is not None:
+                logits = _apply_batched_repetition_penalty(logits, history_codes[:, step, :], repetition_penalty)
+            elif repetition_penalty != 1.0 and history_per_codebook is not None and step < len(history_per_codebook):
                 hist = history_per_codebook[step]
                 if hist:
                     hist_t = torch.tensor(hist, dtype=torch.long, device=logits.device)
@@ -133,12 +149,26 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
                     sel = torch.where(pos, sel / repetition_penalty, sel * repetition_penalty)
                     logits.index_copy_(-1, hist_t, sel)
 
-            codes[:, step] = _sample_token(logits, temperature, top_k, top_p, do_sample)
+            codes[:, step] = _sample_token(logits, temperature, top_k, top_p, do_sample, generators=generators)
 
             if step + 1 < rvq:
                 embeds[:, step + 1, :] = codec_embeds[step](codes[:, step].view(B, 1)).view(B, hidden_size)
 
         return codes
+
+
+def _apply_batched_repetition_penalty(logits: torch.Tensor, history: torch.Tensor, penalty: float) -> torch.Tensor:
+    """Apply a row-local penalty without reading GPU history on the host.
+
+    -1 padding writes only a disposable sentinel column. Repeated history IDs
+    gather the same original logit, so the penalty applies once, not per hit.
+    """
+    vocab = logits.shape[-1]
+    indices = torch.where((history >= 0) & (history < vocab), history, vocab)
+    padded = F.pad(logits, (0, 1))
+    selected = padded.gather(1, indices)
+    selected = torch.where(selected > 0, selected / penalty, selected * penalty)
+    return padded.scatter(1, indices, selected)[:, :vocab]
 
 
 def _normalize_generators(
@@ -178,7 +208,12 @@ def _sample_token(
 
     When ``generators`` is provided (per-row), each row is sampled with its
     own generator via separate ``multinomial`` calls. This keeps the rest of
-    the forward batched while making seeded requests reproducible per-row.
+    the forward batched and isolates each request's RNG progress from other
+    requests. Identical sampled tokens additionally require identical
+    filtered probabilities and candidate ordering: tied top-k values and
+    floating-point rounding near the top-p cutoff can differ across batch
+    shapes, so bitwise equivalence across arbitrary batch compositions is
+    not guaranteed.
     ``generators`` must hold exactly one entry per batch row; a mismatch raises
     ``ValueError`` rather than silently falling back to the global RNG.
     """
