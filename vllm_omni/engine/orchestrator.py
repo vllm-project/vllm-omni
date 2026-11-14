@@ -66,6 +66,7 @@ from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AbortResultMessage,
     AddCompanionRequestMessage,
+    AppendTextMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
     EngineQueueMessage,
@@ -438,6 +439,8 @@ class OrchestratorBase:
         self.output_async_queue = output_async_queue
         self.rpc_async_queue = rpc_async_queue
         self._interaction_queue: asyncio.Queue[InteractionMessage] = asyncio.Queue(maxsize=64)
+        # Streamed-text sends still waiting for their engine core's answer.
+        self._append_text_tasks: set[asyncio.Task[None]] = set()
 
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
@@ -3834,6 +3837,8 @@ class Orchestrator(OrchestratorBase):
             await self._handle_streaming_update(cast(StageSubmissionMessage, msg))
         elif msg_type == "add_companion_request":
             await self._handle_add_companion(cast(AddCompanionRequestMessage, msg))
+        elif msg_type == "append_text":
+            self._start_append_text(cast(AppendTextMessage, msg))
         elif msg_type == "interaction":
             interaction = cast(InteractionMessage, msg)
             try:
@@ -4269,6 +4274,48 @@ class Orchestrator(OrchestratorBase):
             parent_id,
             self.stage_pools[0].get_bound_replica_id(companion_id),
         )
+
+    def _start_append_text(self, msg: AppendTextMessage) -> None:
+        """Send a request's streamed text ids to its entry stage.
+
+        The send starts in dispatch order, so appends reach the engine core
+        after the request's ADD and in the order they were made, while the
+        dispatch loop does not wait for the engine's answer. A scheduler that
+        refuses an append ends the live request with an error output; a stage
+        without ``append_text`` only refuses it, and this logs that. An append
+        for a request that already ended is dropped.
+        """
+        req_state = self.request_states.get(msg.request_id)
+        if req_state is None:
+            logger.debug("[Orchestrator] append_text for inactive req %s; dropping", msg.request_id)
+            return
+        task = asyncio.create_task(self._append_text(msg, req_state.entry_stage_id))
+        self._append_text_tasks.add(task)
+        task.add_done_callback(self._append_text_tasks.discard)
+
+    async def _append_text(self, msg: AppendTextMessage, stage_id: int) -> None:
+        """Send one append to the stage, then act on the answer."""
+        try:
+            refusal = await self.stage_pools[stage_id].append_text(msg.request_id, msg.token_ids, msg.final)
+        except ValueError as exc:
+            # The stage cannot take streamed text for this request: end it with the reason.
+            await self._fail_request_client_error(msg.request_id, stage_id, str(exc))
+        except Exception as exc:
+            # The text is lost (a transport or engine fault): end the request rather than leave
+            # it holding its seat until the text deadline, or forever with the deadline off.
+            logger.warning("[Orchestrator] append_text for req %s failed: %r", msg.request_id, exc)
+            if msg.request_id in self.request_states:
+                await self._fail_request_client_error(
+                    msg.request_id,
+                    stage_id,
+                    f"Streamed text could not be delivered: {exc}",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                    error_type="TextStreamDeliveryError",
+                )
+        else:
+            if refusal is not None:
+                # A scheduler refusal has already ended the request; a stage without append_text ends nothing.
+                logger.debug("[Orchestrator] append_text for req %s refused: %s", msg.request_id, refusal)
 
     async def _handle_interaction(self, msg: InteractionMessage) -> None:
         """Handle a midway interaction for an active streaming diffusion request."""

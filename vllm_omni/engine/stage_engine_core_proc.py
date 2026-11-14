@@ -183,6 +183,25 @@ class StageEngineCoreProc(EngineCoreProc):
             except Exception as e:
                 logger.debug("omni_release_request_resources(%s) failed: %s", request_id, e)
 
+    def omni_append_text(self, request_id: str, token_ids: list[int], final: bool) -> str | None:
+        """Add streamed text ids for *request_id*; returns why they were refused, or ``None``.
+
+        Invoked over the UTILITY channel, which the engine core reads in order
+        with the request's ADD and ABORT. A refusal (no open text stream, an
+        ended stream, an unknown request) is returned rather than raised: it is
+        a client error, not an engine fault.
+        """
+        append = getattr(self.scheduler, "append_text", None)
+        if append is None:
+            logger.warning_once("Streamed text was sent to a stage whose scheduler does not accept it; dropping it.")
+            return "This stage does not accept streamed text."
+        try:
+            # The scheduler checks each id against the stream's limits.
+            append(request_id, token_ids, final)
+        except ValueError as exc:
+            return str(exc)
+        return None
+
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
         scheduler_request, current_wave = super().preprocess_add_request(request)

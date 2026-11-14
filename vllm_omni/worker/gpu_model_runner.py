@@ -35,6 +35,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import stage_prefix_cache_config
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
+from vllm_omni.core.sched.text_stream import deliver_streamed_text
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
@@ -1996,6 +1997,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 # custom_process_input_func codec, so talker_preprocess reads
                 # the full thinker payload.
                 self._sync_local_stage_payloads()
+        deliver_streamed_text(self.model, scheduler_output)
 
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
             # Multimodal wrappers forward embeddings and therefore intentionally

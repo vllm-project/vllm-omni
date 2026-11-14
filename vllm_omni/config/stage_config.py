@@ -571,6 +571,7 @@ class StageDeployConfig:
     default_pooling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
     silence_ban_frames: int = 0
+    text_stream_policy: str | None = None
 
     # === Generic stage engine fields ===
     # Parallelism, scheduler, and memory-capacity controls.

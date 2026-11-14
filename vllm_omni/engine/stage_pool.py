@@ -1697,6 +1697,27 @@ class StagePool:
 
     # ---- Stage-local control plane ----
 
+    async def append_text(self, request_id: str, token_ids: list[int], final: bool) -> str | None:
+        """Send streamed text ids to the engine core that runs *request_id*.
+
+        Returns why the engine refused them, or ``None``; raises ``ValueError``
+        when this stage cannot take streamed text for the request at all.
+        Orchestrator ids are output-processor external ids; the engine core
+        keys the request by the internal id the input processor assigned.
+        Nothing awaits before the first send, so concurrent calls reach the
+        engine in call order.
+        """
+        client = self.get_bound_llm_client(request_id) if self.stage_type != "diffusion" else None
+        append = getattr(client, "append_text_async", None)
+        if append is None:
+            raise ValueError(f"Stage {self.stage_id} runs no request {request_id} that accepts streamed text.")
+        external_req_ids = getattr(self._output_processor, "external_req_ids", None) or {}
+        engine_request_ids = list(external_req_ids.get(request_id, ())) or [request_id]
+        reason = None
+        for engine_request_id in engine_request_ids:
+            reason = await append(engine_request_id, token_ids, final) or reason
+        return reason
+
     async def abort_requests(self, request_ids: list[str]) -> list[tuple[str, Any]]:
         """Abort the given requests in this stage pool.
 

@@ -131,6 +131,23 @@ class OmniRequestPrewarm:
 
 
 @dataclass
+class TextStreamDelivery:
+    """Streamed text ids that reach a request with one of its scheduled steps.
+
+    ``token_ids`` are the stream's ids from index ``start`` on; the first
+    delivery of a request starts at 0. ``ended`` says the stream's END has
+    arrived (no id follows the last one delivered), and ``prompt_ids`` is how
+    many streamed ids the request's prompt reads (see
+    :mod:`vllm_omni.core.sched.text_stream`).
+    """
+
+    start: int
+    token_ids: list[int]
+    ended: bool
+    prompt_ids: int
+
+
+@dataclass
 class OmniSchedulerOutput(SchedulerOutput):
     """Scheduler output with omni-specific transfer metadata."""
 
@@ -139,3 +156,5 @@ class OmniSchedulerOutput(SchedulerOutput):
     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
     input_terminal_req_ids: set[str] = field(default_factory=set)
     pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)
+    # Request id -> its newly arrived streamed text, for requests scheduled in this step.
+    text_stream_deliveries: dict[str, TextStreamDelivery] = field(default_factory=dict)

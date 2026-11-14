@@ -31,6 +31,7 @@ from vllm_omni.engine.async_engine_utils import (
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AddCompanionRequestMessage,
+    AppendTextMessage,
     EngineQueueMessage,
     InteractionMessage,
     NextStageInputMessage,
@@ -1032,6 +1033,14 @@ class AsyncOmniEngine(OmniEngineBase):
     ) -> None:
         """Async interaction API."""
         self.submit_interaction(request_id, interaction)
+
+    async def append_text_async(self, request_id: str, token_ids: list[int], final: bool = False) -> None:
+        """Send streamed text ids for a running request to the Orchestrator.
+
+        The message takes the same ordered request queue as the request's ADD,
+        so appends follow it and keep their order.
+        """
+        await self._put_request_queue(AppendTextMessage(request_id=request_id, token_ids=token_ids, final=final))
 
 
 # ``StageRuntimeInfo`` moved to ``omni_engine_base``; keep the historical import path.

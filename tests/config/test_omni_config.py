@@ -1470,6 +1470,7 @@ def test_sub_config_fields_match_structured_scopes():
         "default_sampling_params",
         "subtalker_sampling_params",
         "silence_ban_frames",
+        "text_stream_policy",
         "has_sampling_extra_args",
         "custom_voice_dir",
         "task_type",

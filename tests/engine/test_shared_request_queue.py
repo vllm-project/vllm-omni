@@ -9,7 +9,12 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from vllm_omni.distributed.weight_sharing.runtime import SharingRuntime
-from vllm_omni.engine.messages import AddCompanionRequestMessage, EngineQueueMessage, StageSubmissionMessage
+from vllm_omni.engine.messages import (
+    AddCompanionRequestMessage,
+    AppendTextMessage,
+    EngineQueueMessage,
+    StageSubmissionMessage,
+)
 from vllm_omni.engine.shared_request_queue import SharedRequestQueue
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -151,6 +156,21 @@ async def test_companions_wait_for_their_queued_parent():
         gate.finish(["one"], aborted=False)
         assert (await submitted.get()).request_id == "two"
         assert await submitted.get() is companion
+
+
+@pytest.mark.asyncio
+async def test_text_appends_wait_for_their_queued_request():
+    async with admission() as (gate, _, submitted, _):
+        gate.enqueue(request("one"))
+        gate.enqueue(request("two"))
+        append = AppendTextMessage(request_id="two", token_ids=[5, 6], final=False)
+        # Sent on, it would reach the orchestrator before its request and be dropped.
+        assert gate.enqueue(append)
+        assert not gate.enqueue(AppendTextMessage(request_id="unknown", token_ids=[1]))
+        assert (await submitted.get()).request_id == "one"
+        gate.finish(["one"], aborted=False)
+        assert (await submitted.get()).request_id == "two"
+        assert await submitted.get() is append
 
 
 @pytest.mark.asyncio

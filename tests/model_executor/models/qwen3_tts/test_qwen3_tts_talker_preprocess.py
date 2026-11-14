@@ -173,7 +173,7 @@ def test_single_token_prefill_uses_prefill_path():
     trailing_text = torch.ones((2, 4), dtype=torch.float32)
     ref_code = torch.arange(32, dtype=torch.long).reshape(2, 16)
 
-    def fake_build_prompt_embeds(*, task_type, info_dict):
+    def fake_build_prompt_embeds(*, task_type, info_dict, streamed_text=None):
         return full_prompt_embeds, trailing_text, 2, ref_code
 
     model = _make_minimal_talker(build_prompt_embeds=fake_build_prompt_embeds)
@@ -207,7 +207,7 @@ def test_single_token_prefill_can_be_inferred_from_token_progress():
     full_prompt_embeds = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     trailing_text = torch.ones((1, 4), dtype=torch.float32)
 
-    def fake_build_prompt_embeds(*, task_type, info_dict):
+    def fake_build_prompt_embeds(*, task_type, info_dict, streamed_text=None):
         return full_prompt_embeds, trailing_text, None, None
 
     model = _make_minimal_talker(build_prompt_embeds=fake_build_prompt_embeds)

@@ -26,6 +26,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
 from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.text_stream_mixin import TextStreamMixin
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
@@ -123,7 +124,7 @@ def _slice_sampled_logprobs(logprobs: Any, req_index: int, sampled_token_ids: li
     return sliced
 
 
-class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+class OmniARScheduler(TextStreamMixin, OmniSchedulerMixin, VLLMScheduler):
     """Synchronous AutoRegressive scheduler for vLLM-Omni. This class is also
     used as a base class for the OmniARAsyncScheduler and holds most of the
     core scheduling logic.
@@ -216,12 +217,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # External finishes release Request before their terminal output is assembled.
         self._held_token_ids: dict[str, list[int]] = {}
         self._init_prefill_admission_policy()
+        # Requests whose text arrives through append_text (text_stream_mixin.py).
+        self._init_text_streams()
 
     def add_request(self, request: Request) -> None:
         if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
             logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
             return
         super().add_request(request)
+        self._open_text_stream(request)
 
     def release_overflowed_requests(self, request_ids: Iterable[str]) -> None:
         """Release admission fences after an ordered abort, never an eager one."""
@@ -851,28 +855,42 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # refuses the rest.
         self._drop_talker_drafts_if_prefill_pending()
 
-        original_wait_queues = None
-        if self._should_defer_waiting_admission():
-            original_wait_queues = self.waiting, self.kv_holding_waiting
-            self.waiting = create_request_queue(self.policy)
-            self.kv_holding_waiting = create_request_queue(self.policy)
+        # Streamed text: end requests past their text deadline (nothing leaves a queue yet).
+        self._fail_text_stream_requests()
+        text_hold = None
 
+        original_wait_queues = None
         original_max_num_active_reqs = self.max_num_active_reqs
+        original_max_num_running_reqs = self.max_num_running_reqs
         async_chunk_transport = self._async_chunk_transport_enabled()
         reserved_running_slots = (
             self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
         )
-        if reserved_running_slots:
-            self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
         try:
+            # Keep out of this step every request whose text for it has not arrived.
+            text_hold = self._hold_for_text()
+            if self._should_defer_waiting_admission():
+                original_wait_queues = self.waiting, self.kv_holding_waiting
+                self.waiting = create_request_queue(self.policy)
+                self.kv_holding_waiting = create_request_queue(self.policy)
+            if reserved_running_slots:
+                self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
+            if text_hold is not None and text_hold.held:
+                # A held request keeps its KV cache and its seat: it runs no step this
+                # tick, and no waiting request is admitted into its seat.
+                self.max_num_active_reqs = max(0, self.max_num_active_reqs - len(text_hold.held))
+                self.max_num_running_reqs = max(0, original_max_num_running_reqs - len(text_hold.held))
             scheduler_output = super().schedule(throttle_prefills)
         finally:
             self.max_num_active_reqs = original_max_num_active_reqs
+            self.max_num_running_reqs = original_max_num_running_reqs
             if original_wait_queues is not None:
                 original_waiting, original_kv_holding = original_wait_queues
                 original_waiting.prepend_requests(self.waiting)
                 original_kv_holding.prepend_requests(self.kv_holding_waiting)
                 self.waiting, self.kv_holding_waiting = original_wait_queues
+            if text_hold is not None:
+                self._release_text_hold(text_hold)
             self._restore_omni_wait_queues()
 
         # Backstop: a step built without ``_update_after_schedule`` (nothing
@@ -887,10 +905,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finished_reqs = self.get_finished_requests_needing_kv_transfer()
 
         # Wrap in omni scheduler output to carry transfer metadata.
-        return self._wrap_omni_scheduler_output(
+        omni_output = self._wrap_omni_scheduler_output(
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+        if text_hold is not None:
+            self._attach_text_stream_deliveries(omni_output)
+        return omni_output
 
     def update_from_output(
         self,
@@ -2160,6 +2181,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         assert request.is_finished()
 
         self._omits_kv_transfer_cache.pop(request.request_id, None)
+        self._release_text_stream(request.request_id)
 
         # [Upstream compat] Discard request from in-flight prefills set added
         # upstream for routed-experts in-flight reservation tracking.

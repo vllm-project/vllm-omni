@@ -19,6 +19,7 @@ import torch
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 from vllm_omni import AsyncOmni, Omni
+from vllm_omni.model_executor.models.qwen3_tts.text_stream import TextLeadError, text_lead
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 logger = logging.getLogger(__name__)
@@ -133,7 +134,17 @@ def _estimate_prompt_len(
             spk_is_dialect=getattr(tcfg, "spk_is_dialect", None),
             estimate_ref_code_len=_estimate_ref_code_len,
         )
+    except TextLeadError:
+        raise  # the request's text_lead does not fit its prompt: a client error, not a reason for the fallback
     except Exception as exc:
+        # The fallback length fits no lead layout, and the lead went unchecked: refuse any lead, a malformed one too.
+        try:
+            lead = text_lead(additional_information)
+        except ValueError as lead_exc:
+            raise TextLeadError(str(lead_exc)) from lead_exc
+        if lead:
+            # The lead itself may be valid: the estimate failed, not the request.
+            raise RuntimeError(f"'text_lead' needs the prompt length estimate, which failed: {exc}") from exc
         logger.warning("Failed to estimate prompt length, using fallback 2048: %s", exc)
         return 2048
 

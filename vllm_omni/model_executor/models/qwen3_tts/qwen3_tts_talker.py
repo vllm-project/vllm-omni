@@ -24,6 +24,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, 
 from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.core.sched.output import TextStreamDelivery
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.common.ecapa_tdnn import ECAPATimeDelayNet
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
@@ -45,6 +46,7 @@ from .prompt_embeds_builder import (
 )
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
 from .stream_decode import stream_ref_context_frames, talker_stream_decode_enabled
+from .streamed_text import StreamedTexts
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Encoder
 
@@ -125,6 +127,12 @@ def _ref_audio_artifact_cache_capacity(vllm_config: VllmConfig) -> int:
     if capacity < 0:
         raise ValueError(f"ref_audio_artifact_cache_max_entries must be non-negative, got {capacity}")
     return capacity
+
+
+def _request_id(info_dict: Mapping[str, Any]) -> str | None:
+    """The request id the runner puts in a request's info (``req_id`` on MRV2, ``request_id`` on v1)."""
+    req_id = info_dict.get("req_id") or info_dict.get("request_id")
+    return None if req_id is None else str(req_id)
 
 
 def _has_tts_text_conditioning(info_dict: dict[str, Any], hidden_states: Any | None = None) -> bool:
@@ -347,8 +355,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._silence_ban_frames = max(0, int(getattr(vllm_config.model_config, "silence_ban_frames", 0) or 0))
         # vLLM only fills sampling_metadata.output_token_ids when penalties, bad
         # words, or a logits processor need history. compute_logits reads it for
-        # the per-request decode step, so request it when the ban is on.
-        self.logitsprocs_need_output_token_ids = self._silence_ban_frames > 0
+        # the per-request decode step, so request it when the ban is on, or when
+        # the stage accepts streamed text (the EOS gate reads it too).
+        text_stream_enabled = bool(getattr(vllm_config.model_config, "text_stream_policy", None))
+        self.logitsprocs_need_output_token_ids = self._silence_ban_frames > 0 or text_stream_enabled
         self.register_buffer("_silence_mask", torch.zeros((vocab,), dtype=torch.bool), persistent=False)
 
         # Per-request generation mode for the silence ban (#4966). The ban is a
@@ -360,6 +370,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._req_x_vector_only: dict[str, bool | None] = {}
         self._batch_req_ids: list[str] = []
         self._mrv2_silence_ban_mask: torch.Tensor | None = None
+        # MRV2's per-row sampled-frame counts while mrv2_sampling_context is open.
+        self._mrv2_num_output_tokens: torch.Tensor | None = None
 
         # Keys that should stay on GPU in model_intermediate_buffer to avoid
         # CPU-to-GPU round-trips on every decode step.
@@ -515,6 +527,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Prompt logprobs share this entry point with sampling, so preserve
         # the codec vocabulary mask even when the fused sampler is installed.
         logits = logits.masked_fill(self._codec_disallowed_mask, float("-inf"))
+        if self._streamed_texts:
+            logits = self._forbid_early_eos(logits, sampling_metadata)
 
         # Suppress silence-region tokens for the first N decode frames (#4966). The
         # per-request decode step is the length of its generated-token history.
@@ -563,6 +577,56 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     logits = logits.masked_fill(early & self._silence_mask, float("-inf"))
 
         return logits
+
+    @property
+    def _streamed_texts(self) -> StreamedTexts:
+        """Requests whose text streams in (streamed_text.py); created on first use."""
+        texts = self.__dict__.get("_streamed_text_state")
+        if texts is None:
+            texts = self.__dict__["_streamed_text_state"] = StreamedTexts()
+        return texts
+
+    def _forbid_early_eos(self, logits: torch.Tensor, sampling_metadata: object) -> torch.Tensor:
+        """Forbid codec EOS to streamed requests that have not read their text END (v1 and MRV2)."""
+        req_ids = self._batch_req_ids
+        if len(req_ids) != logits.shape[0]:
+            logger.warning_once("Qwen3-TTS: cannot place the batch rows; streamed requests may end before their text")
+            return logits
+        if sampling_metadata is None:
+            frames = self.__dict__.get("_mrv2_num_output_tokens")
+            if frames is None or int(frames.shape[0]) != logits.shape[0]:
+                return logits
+            return self._streamed_texts.forbid_early_eos(logits, req_ids, frames, self._codec_eos_token_id)
+        output_token_ids = getattr(sampling_metadata, "output_token_ids", None)
+        if output_token_ids is None or len(output_token_ids) != logits.shape[0]:
+            logger.warning_once("Qwen3-TTS: no output token ids; streamed requests may end before their text")
+            return logits
+        frames_host = [len(tokens) for tokens in output_token_ids]
+        return self._streamed_texts.forbid_early_eos(logits, req_ids, frames_host, self._codec_eos_token_id)
+
+    def append_streamed_text(self, deliveries: Mapping[str, TextStreamDelivery]) -> None:
+        """Take the streamed text the scheduler hands over with this step (core/sched/text_stream.py)."""
+        self._streamed_texts.receive(deliveries)
+
+    def on_requests_finished(self, finished_req_ids: Iterable[str]) -> None:
+        """Drop per-request state of finished or aborted requests."""
+        self._streamed_texts.release(finished_req_ids)
+
+    def _queue_streamed_text(
+        self, info_dict: Mapping[str, Any], tail: torch.Tensor | None, text_offset: int
+    ) -> tuple[torch.Tensor | None, int, bool]:
+        """Append the request's newly received streamed text rows to its trailing queue (see streamed_text.py)."""
+        if not self._streamed_texts:
+            return tail, text_offset, False
+        builder = self._prompt_builder
+        return self._streamed_texts.extend_queue(
+            _request_id(info_dict),
+            tail,
+            text_offset,
+            device=tail.device if isinstance(tail, torch.Tensor) else builder._device(),
+            project=builder._project_text_ids,
+            end_row=builder.text_end_row,
+        )
 
     # -------------------- Omni multimodal output plumbing --------------------
 
@@ -826,7 +890,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             except Exception:
                 is_prefill = span_len > 1
 
-        if not _has_tts_text_conditioning(info_dict, hs):
+        req_id = _request_id(info_dict)
+        if not _has_tts_text_conditioning(info_dict, hs) and req_id not in self._streamed_texts:
             raise ValueError("Missing Qwen3-TTS text conditioning: provide `text` or precomputed text token ids.")
 
         task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
@@ -847,7 +912,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             is_first_prefill = not isinstance(prompt_embeds_buffer, torch.Tensor) or prompt_embeds_buffer.ndim != 2
             if is_first_prefill:
                 full_prompt_embeds, tailing_text_hidden, ref_code_len, ref_code = (
-                    self._prompt_builder.build_prompt_embeds(task_type=task_type, info_dict=info_dict)
+                    self._prompt_builder.build_prompt_embeds(
+                        task_type=task_type,
+                        info_dict=info_dict,
+                        streamed_text=self._streamed_texts.prompt_text(req_id, input_ids.device),
+                    )
                 )
                 prompt_embeds_buffer = full_prompt_embeds.detach()
                 if not bool(getattr(self, "_use_v2_model_runner", False)):
@@ -932,6 +1001,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         tail = hs.get("trailing_text")
         text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
+        tail, text_offset, tail_extended = self._queue_streamed_text(info_dict, tail, text_offset)
         trailing_text_update = None
         if isinstance(tail, torch.Tensor) and tail.ndim == 2:
             tail_len = int(tail.shape[0])
@@ -955,6 +1025,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                         trailing_text_update = tail[next_text_offset:].contiguous()
                     next_text_offset = 0
             else:
+                if self._streamed_texts.is_open(req_id):
+                    logger.warning_once("Qwen3-TTS: a streamed request read PAD before its text END")
                 text_step = tts_pad_embed
                 next_text_offset = 0
                 if tail.numel() > 0:
@@ -962,6 +1034,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         else:
             text_step = tts_pad_embed
             next_text_offset = text_offset
+        if tail_extended and trailing_text_update is None:
+            trailing_text_update = tail  # the extended queue, read from next_text_offset
 
         last_hidden = hs.get("last")
         if isinstance(last_hidden, torch.Tensor):
@@ -1035,7 +1109,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             hs = payload.get("hidden_states", {})
             meta = payload.get("meta", {})
 
-            if not _has_tts_text_conditioning(info_dict, hs):
+            req_id = _request_id(info_dict)
+            if not _has_tts_text_conditioning(info_dict, hs) and req_id not in self._streamed_texts:
                 raise ValueError("Missing Qwen3-TTS text conditioning: provide `text` or precomputed text token ids.")
 
             task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
@@ -1051,6 +1126,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
             tail = hs.get("trailing_text")
             text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
+            tail, text_offset, tail_extended = self._queue_streamed_text(info_dict, tail, text_offset)
             trailing_text_update = None
             if isinstance(tail, torch.Tensor) and tail.ndim == 2:
                 tail_len = int(tail.shape[0])
@@ -1067,6 +1143,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                             trailing_text_update = tail[next_text_offset:].contiguous()
                         next_text_offset = 0
                 else:
+                    if self._streamed_texts.is_open(req_id):
+                        logger.warning_once("Qwen3-TTS: a streamed request read PAD before its text END")
                     text_step = tts_pad_embed
                     next_text_offset = 0
                     if tail.numel() > 0:
@@ -1074,6 +1152,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             else:
                 text_step = tts_pad_embed
                 next_text_offset = text_offset
+            if tail_extended and trailing_text_update is None:
+                trailing_text_update = tail  # the extended queue, read from next_text_offset
 
             text_step_list.append(text_step)
             info_update: dict[str, Any] = {
@@ -1316,9 +1396,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
     @contextmanager
     def mrv2_sampling_context(self, *, req_ids: list[str], num_output_tokens: torch.Tensor) -> Iterator[None]:
-        """Scope the silence gate to sampling, never prompt-logprob computation."""
+        """Scope the silence gate and the streamed-text EOS gate to sampling, never prompt-logprob computation."""
         self.set_batch_req_ids(req_ids)
         self._mrv2_silence_ban_mask = None
+        self._mrv2_num_output_tokens = num_output_tokens
         if self._silence_ban_frames > 0:
             in_scope = torch.tensor(
                 [self._req_x_vector_only.get(req_id) is True for req_id in req_ids],
@@ -1330,6 +1411,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             yield
         finally:
             self._mrv2_silence_ban_mask = None
+            self._mrv2_num_output_tokens = None
 
     def set_batch_req_ids(self, req_ids: Sequence[str]) -> None:
         """Record the current batch's req_ids, in the order that indexes logits.
@@ -1745,6 +1827,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         tail = hs.get("trailing_text") if isinstance(hs, dict) else None
         meta = info.get("meta")
         offset = meta.get("talker_text_offset", 0) if isinstance(meta, dict) else 0
+        if self._streamed_texts.queue_open(_request_id(info)):
+            return False  # streamed text whose END is not queued yet: more rows will come
         return isinstance(tail, torch.Tensor) and tail.numel() == 0 and not offset
 
     def eager_settled_text_step(self) -> torch.Tensor:

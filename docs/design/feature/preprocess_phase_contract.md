@@ -136,6 +136,20 @@ still implement their own model-specific work inside `preprocess`.
 | 1 | 0 | 1 | Prefill | No |
 | 5 | 5 | 2 | Decode | No (not a single-token span) |
 
+### Streamed text hand-over
+
+Both runners call `deliver_streamed_text(model, scheduler_output)`
+(`vllm_omni/core/sched/text_stream.py`) once per step, before the model's
+`preprocess`: the v1 runner in `OmniGPUModelRunner._preprocess`, after the
+stage payload sync, and MRV2 in `OmniModelRunner.update_requests`, after the
+upstream update. A step without deliveries does nothing. Otherwise the call
+passes `OmniSchedulerOutput.text_stream_deliveries` to the model's
+`append_streamed_text(deliveries)`; a model without that method raises rather
+than drop the text. A delivery holds the ids that arrived since the request's
+last step, the stream index of the first one, the end flag and the prompt's id
+count, so the model can place each text row (`models/qwen3_tts/streamed_text.py`
+for Qwen3-TTS).
+
 ### Compatibility
 
 !!! warning "vLLM-Omni 0.20.x and earlier"

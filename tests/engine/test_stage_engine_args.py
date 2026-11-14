@@ -112,6 +112,7 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "silence_ban_frames",
         "subtalker_sampling_params",
         "task_type",
+        "text_stream_policy",
         "tokenizer_subdir",
     }
 )
