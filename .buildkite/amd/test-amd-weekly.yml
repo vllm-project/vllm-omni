@@ -1333,6 +1333,105 @@ steps:
             tests/e2e/offline_inference/test_step_audio2_expansion.py
             2 tts rocm-step-audio2-weekly
 
+      - label: "Ming TTS · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 240
+        source_file_dependencies: tts_ming_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-ming-tts-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=210
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_ming_tts_expansion.py
+            6 tts rocm-ming-tts-weekly
+            tests/e2e/online_serving/test_ming_tts_expansion.py
+
+      - label: "GLM TTS · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 240
+        source_file_dependencies: tts_glm_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-glm-tts-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=210
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_glm_tts_expansion.py
+            5 tts rocm-glm-tts-weekly
+            tests/e2e/online_serving/test_glm_tts_expansion.py
+
+      - label: "IndexTTS2 · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 240
+        source_file_dependencies: tts_indextts2_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-indextts2-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=210
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_indextts2_expansion.py
+            3 tts rocm-indextts2-weekly
+            tests/e2e/online_serving/test_indextts2_expansion.py
+
+      - label: "Breeze TTS 2 · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 210
+        source_file_dependencies: tts_breeze_tts2_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-breeze-tts2-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=180
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/online_serving/test_breeze_tts_2.py
+            5 tts rocm-breeze-tts2-weekly
+
   - group: "HunyuanImage Expert Parallel"
     steps:
       - label: "HunyuanImage Expert Parallel Startup"

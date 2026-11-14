@@ -425,7 +425,12 @@ def _pipeline(*, load_vae_decoder=True):
 
 def _run(pipeline, conditioning, extra, *, num_outputs=1):
     sampling = SimpleNamespace(
-        extra_args=extra, quality=None, seed=7, num_outputs_per_prompt=num_outputs, attention_schedule=None
+        extra_args=extra,
+        quality=None,
+        seed=7,
+        num_outputs_per_prompt=num_outputs,
+        attention_schedule=None,
+        attention_sigma_schedule=None,
     )
     pipeline._prepare_request_inputs = lambda _prompt, _sampling: pipeline._prepare_encoder_conditioning_inputs(
         conditioning, _sampling
@@ -576,6 +581,7 @@ def test_preencoded_multi_output_and_decoder_stage_outputs_are_trimmed():
                 seed=7,
                 num_outputs_per_prompt=1,
                 attention_schedule=None,
+                attention_sigma_schedule=None,
             ),
         )
     )
@@ -593,6 +599,7 @@ def test_step_post_decode_keeps_the_real_tail_caches_and_trims():
             seed=1,
             num_outputs_per_prompt=1,
             attention_schedule=None,
+            attention_sigma_schedule=None,
         ),
     )
     window_video = torch.full((1, 24, _video_t(141), LATENT_H, LATENT_W), 50.0)

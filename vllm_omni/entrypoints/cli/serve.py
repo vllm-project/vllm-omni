@@ -828,6 +828,17 @@ class OmniServeCommand(CLISubcommand):
                 "Ignored for BF16, non-ModelOpt FP8, ROCm, and older CUDA GPUs."
             ),
         )
+        omni_config_group.add_argument(
+            "--diffusion-flashinfer-autotune",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Diffusion-only: autotune FlashInfer GEMMs (on SM100+: MXFP8 and per-tensor FP8 linears) so they use "
+                "tuned tactics instead of heuristics. Default: on for CUDA SM100+ with FlashInfer, off elsewhere; "
+                "--no-diffusion-flashinfer-autotune disables it. The first request of each new shape pays the tuning; "
+                "tactics are cached per rank under VLLM_CACHE_ROOT and reused after a restart."
+            ),
+        )
 
         # HSDP (Hybrid Sharded Data Parallel) parameters
         omni_config_group.add_argument(
@@ -887,11 +898,15 @@ class OmniServeCommand(CLISubcommand):
             "--diffusion-attention-schedule",
             type=_json_object,
             default=None,
-            help="Startup attention profiles and default step ranges as JSON or dotted flags. "
-            "Each profile is an independent attention config; ranges use zero-based [start, end) steps, "
-            "with null end meaning the actual sequence end. "
+            help="Startup attention profiles with either default step ranges or sigma noise windows, as JSON "
+            "or dotted flags. Each profile is an independent attention config. Step ranges use zero-based "
+            "[start, end), with null end meaning the actual sequence end. Sigma windows use scheduler "
+            "sigma in [0, 1] as [low, high); a high of 1 includes 1. Non-empty default and sigma lists "
+            "are mutually exclusive. "
             'Example: \'{"profiles": {"dense": {"default": "TORCH_SDPA"}}, '
-            '"default": [{"start": 3, "end": null, "profile": "dense"}]}\'.',
+            '"default": [{"start": 3, "end": null, "profile": "dense"}]}\'. Sigma example: '
+            '\'{"profiles": {"dense": {"default": "TORCH_SDPA"}}, '
+            '"sigma": [{"low": 0.0, "high": 0.3, "profile": "dense"}]}\'.',
         )
 
         # Cache optimization parameters

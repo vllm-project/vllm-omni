@@ -29,10 +29,14 @@ from vllm_omni.config.stage_config import resolve_diffusion_stage_role
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
+    AttentionSigmaSchedule,
     batch_attention_schedule,
+    batch_attention_sigma_schedule,
     require_attention_schedule_pipeline,
     resolve_batch_attention_schedule,
+    resolve_batch_attention_sigma_schedule,
     resolve_request_attention_schedule,
+    resolve_request_attention_sigma_schedule,
     stage_runs_denoising,
 )
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
@@ -171,12 +175,12 @@ def _normalize_pipeline_outputs(
 
 
 def _attention_schedule_scope(
-    schedule: AttentionSchedule, *, from_request: bool = False
+    schedule: AttentionSchedule, sigma_schedule: AttentionSigmaSchedule, *, from_request: bool = False
 ) -> AbstractContextManager[Any]:
-    """Bind a non-empty schedule; an unscheduled batch leaves the forward context untouched."""
-    if not schedule:
+    """Bind non-empty step ranges or sigma windows; an unscheduled batch leaves the forward context untouched."""
+    if not schedule and not sigma_schedule:
         return nullcontext()
-    return bind_attention_schedule(schedule, from_request=from_request)
+    return bind_attention_schedule(schedule, sigma_schedule, from_request=from_request)
 
 
 class DiffusionModelRunner(DiffusionStagePayloadMixin):
@@ -900,9 +904,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 raise ValueError("Cannot execute model with empty prompt")
         if require_request_batch_support and not getattr(self.pipeline, "supports_request_batch", False):
             raise RuntimeError(f"{type(self.pipeline).__name__} does not support request-batch forward.")
-        attention_schedule = resolve_batch_attention_schedule(
-            [req.sampling_params for req in reqs], getattr(od_config, "diffusion_attention_schedule", None)
-        )
+        service = getattr(od_config, "diffusion_attention_schedule", None)
+        sampling_params = [req.sampling_params for req in reqs]
+        attention_schedule = resolve_batch_attention_schedule(sampling_params, service)
+        sigma_schedule = resolve_batch_attention_sigma_schedule(sampling_params, service)
 
         # Use no_grad() for HSDP compatibility, inference_mode() otherwise for
         # better perf. HSDP2's fully_shard pre-forward hooks need tensor version
@@ -999,6 +1004,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # against the sequence; an inherited default is not.
                 _attention_schedule_scope(
                     attention_schedule,
+                    sigma_schedule,
                     from_request=any(req.sampling_params.attention_schedule is not None for req in reqs),
                 ),
             ):
@@ -1283,6 +1289,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     external_req_id=getattr(sched_new_req.req, "external_req_id", None),
                     mixfusion_info=sched_new_req.req.mixfusion_info,
                     attention_schedule=resolve_request_attention_schedule(
+                        sched_new_req.req.sampling_params, getattr(self.od_config, "diffusion_attention_schedule", None)
+                    ),
+                    attention_sigma_schedule=resolve_request_attention_sigma_schedule(
                         sched_new_req.req.sampling_params, getattr(self.od_config, "diffusion_attention_schedule", None)
                     ),
                 )
@@ -1587,6 +1596,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             had_active_states = bool(self.state_cache)
             states, new_request_ids = self._update_states(scheduler_output)
             attention_schedule = batch_attention_schedule(state.attention_schedule for state in states)
+            sigma_schedule = batch_attention_sigma_schedule(state.attention_sigma_schedule for state in states)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if (
                 record_output_peak_memory
@@ -1634,7 +1644,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 paged_kv_context,
             ):
                 clear_pipeline_stage_durations(pipeline)
-                with _attention_schedule_scope(attention_schedule):
+                with _attention_schedule_scope(attention_schedule, sigma_schedule):
                     driver = getattr(pipeline, "mixfusion_driver", None)
                     if getattr(input_batch, "use_mixfusion", False) and driver is None:
                         raise RuntimeError("Scheduler requested MixFusion without an installed driver")
