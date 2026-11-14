@@ -33,9 +33,7 @@ def _resolve_cuda_stages(monkeypatch):
 def test_personaplex_duplex_mrv2_profile_requests_duplex_and_v2(monkeypatch) -> None:
     config, stages = _resolve_cuda_stages(monkeypatch)
     assert config.session_mode == "duplex"
-    # Stage 0 (Talker) stays on V1 for lockstep post-sample depformer execution;
-    # Stage 1 (Code2Wav) opts in to MRv2.
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [False, True]
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True]
 
 
 @pytest.mark.parametrize("platform", ["npu", "xpu", "rocm", "musa"])
