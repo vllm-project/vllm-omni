@@ -12,6 +12,7 @@ headroom per layer so streaming reproduces the non-streaming decoder.
 import pytest
 import torch
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerModel
 from vllm_omni.model_executor.models.moss_tts.configuration_moss_audio_tokenizer_v2 import (
@@ -179,7 +180,7 @@ def test_packed_pool_preserves_distinct_scratch_slots_and_decode_state():
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="GPU required")
 @torch.no_grad()
 def test_packed_session_matches_mixed_length_streams_and_slot_reuse():
     import copy
@@ -196,7 +197,7 @@ def test_packed_session_matches_mixed_length_streams_and_slot_reuse():
     for entry in config.decoder_kwargs:
         if entry.get("module_type") == "Transformer":
             entry.update(d_model=64, num_heads=1, dim_feedforward=128)
-    reference = MossAudioTokenizerModel(config).eval().cuda()
+    reference = MossAudioTokenizerModel(config).eval().to(DEVICE_TYPE)
     reference.decoder.to(torch.bfloat16)
     reference.quantizer.build_decode_lut(2, dtype=torch.bfloat16)
     candidate = copy.deepcopy(reference)
@@ -221,7 +222,7 @@ def test_packed_session_matches_mixed_length_streams_and_slot_reuse():
     assert slots == [plain.acquire(), plain.acquire()]
     saved = []
     for lengths, terminal in [([1, 3], False), ([2, 1], False), ([3, 2], True)]:
-        codes = [torch.randint(0, 16, (2, n), device="cuda") for n in lengths]
+        codes = [torch.randint(0, 16, (2, n), device=DEVICE_TYPE) for n in lengths]
         actual = packed.step_packed([(slot, c, terminal) for slot, c in zip(slots, codes)])
         for slot, c in zip(slots, codes):
             expected = plain.step({slot: c}, terminal_slots={slot} if terminal else set())[slot]
@@ -232,7 +233,7 @@ def test_packed_session_matches_mixed_length_streams_and_slot_reuse():
             session.release(slot)
     slot = packed.acquire()
     assert slot == plain.acquire()
-    codes = torch.randint(0, 16, (2, 2), device="cuda")
+    codes = torch.randint(0, 16, (2, 2), device=DEVICE_TYPE)
     actual = packed.step_packed([(slot, codes, True)])[slot]
     expected = plain.step({slot: codes}, terminal_slots={slot})[slot]
     torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.01)
@@ -241,7 +242,7 @@ def test_packed_session_matches_mixed_length_streams_and_slot_reuse():
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="GPU required")
 @torch.no_grad()
 def test_packed_decoder_splits_long_chunks_into_ordered_rounds():
     import copy
@@ -261,7 +262,7 @@ def test_packed_decoder_splits_long_chunks_into_ordered_rounds():
     for entry in config.decoder_kwargs:
         if entry.get("module_type") == "Transformer":
             entry.update(d_model=64, num_heads=1, dim_feedforward=128)
-    reference = MossAudioTokenizerModel(config).eval().cuda()
+    reference = MossAudioTokenizerModel(config).eval().to(DEVICE_TYPE)
     reference.decoder.to(torch.bfloat16)
     reference.quantizer.build_decode_lut(2, dtype=torch.bfloat16)
     candidate = copy.deepcopy(reference)
@@ -289,7 +290,7 @@ def test_packed_decoder_splits_long_chunks_into_ordered_rounds():
     decoder._stream_req_slots = {}
     decoder._stream_state_capacity = 2
     decoder._stream_max_step_frames = 3
-    long, tail = torch.randint(0, 16, (2, 7), device="cuda"), torch.randint(0, 16, (2, 2), device="cuda")
+    long, tail = torch.randint(0, 16, (2, 7), device=DEVICE_TYPE), torch.randint(0, 16, (2, 2), device=DEVICE_TYPE)
     actual = decoder._decode_streaming_batch([(0, "long", long, False), (1, "tail", tail, True)])
     # The 7-frame chunk decodes as 3 + 3 + 1 frames, in order, next to the terminal tail.
     a, b = plain.acquire(), plain.acquire()
@@ -300,8 +301,8 @@ def test_packed_decoder_splits_long_chunks_into_ordered_rounds():
     assert set(decoder._stream_req_slots) == {"long"}
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="GPU required")
 @torch.no_grad()
 def test_one_frame_one_batch_retains_ordinary_decode():
     from vllm.config import CompilationConfig, VllmConfig
@@ -311,7 +312,7 @@ def test_one_frame_one_batch_retains_ordinary_decode():
         _MossCodecStreamSession,
     )
 
-    codec = tiny_codec().cuda()
+    codec = tiny_codec().to(DEVICE_TYPE)
     codec.decoder.to(torch.bfloat16)
     codec.quantizer.build_decode_lut(2, dtype=torch.bfloat16)
     session = _MossCodecStreamSession(
@@ -332,6 +333,6 @@ def test_one_frame_one_batch_retains_ordinary_decode():
     decoder._stream_req_slots = {}
     decoder._stream_state_capacity = 1
     decoder._stream_max_step_frames = 1
-    codes = torch.randint(0, 16, (2, 1), device="cuda")
+    codes = torch.randint(0, 16, (2, 1), device=DEVICE_TYPE)
     output = decoder._decode_streaming_batch([(0, "request", codes, False)])[0]
     assert output.shape == (1, 4) and torch.isfinite(output).all()

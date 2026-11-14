@@ -8,10 +8,10 @@ import numpy as np
 import pytest
 import torch
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
-from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA")]
+pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="requires CUDA")]
 
 
 class _Uva:
@@ -19,27 +19,27 @@ class _Uva:
         pass
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_generated_only_penalty_writes_skip_prompt_and_keep_resumed_outputs():
     from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import _generated_only_penalty_writes
 
     vocab, rows, width = 6761, 3, 16
-    tokens = torch.zeros(rows, width, dtype=torch.int32, device="cuda")
+    tokens = torch.zeros(rows, width, dtype=torch.int32, device=DEVICE_TYPE)
     # Row 0: fresh request whose prompt holds text ids beyond the speech head.
     tokens[0, :4] = torch.tensor([151645, 12, 7, 99999])
     # Row 1: resumed request, prompt [5, 6] then generated [7, 7, 9].
     tokens[1, :5] = torch.tensor([5, 6, 7, 7, 9])
-    prompt_len = torch.tensor([4, 2, 0], dtype=torch.int32, device="cuda")
+    prompt_len = torch.tensor([4, 2, 0], dtype=torch.int32, device=DEVICE_TYPE)
     prefill_len = torch.tensor([4, 5, 0], dtype=torch.int32)
     state = SimpleNamespace(
         _new_penalties_reqs=[0, 1],
-        device=torch.device("cuda"),
-        prompt_bin_mask=torch.full((rows, (vocab + 31) // 32), -1, dtype=torch.int32, device="cuda"),
-        output_bin_counts=torch.full((rows, vocab), 3, dtype=torch.int32, device="cuda"),
+        device=torch.device(DEVICE_TYPE),
+        prompt_bin_mask=torch.full((rows, (vocab + 31) // 32), -1, dtype=torch.int32, device=DEVICE_TYPE),
+        output_bin_counts=torch.full((rows, vocab), 3, dtype=torch.int32, device=DEVICE_TYPE),
         req_states=SimpleNamespace(
             all_token_ids=SimpleNamespace(gpu=tokens),
             prompt_len=SimpleNamespace(gpu=prompt_len),
-            prefill_len=SimpleNamespace(gpu=prefill_len.cuda(), np=np.asarray(prefill_len)),
+            prefill_len=SimpleNamespace(gpu=prefill_len.to(DEVICE_TYPE), np=np.asarray(prefill_len)),
         ),
         repetition_penalty=_Uva(),
         frequency_penalty=_Uva(),

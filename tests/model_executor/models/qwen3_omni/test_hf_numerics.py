@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe import fused_moe as fused_moe_module
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from tests.helpers.device import DEVICE_GRAPH, DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.qwen3_omni.hf_numerics import (
     HFNumericsDecoderLayer,
@@ -31,12 +32,11 @@ from vllm_omni.model_executor.models.qwen3_omni.hf_numerics import (
     hf_mrope,
     hf_rms_norm,
 )
-from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model]
 
 _DTYPES = [torch.float32, torch.bfloat16]
-_requires_cuda = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="needs CUDA")
+_requires_cuda = pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="needs CUDA")
 _DEVICES = [
     pytest.param("cpu", marks=pytest.mark.cpu),
     pytest.param("cuda", marks=[*hardware_marks(res={"cuda": "L4"}, num_cards=1), _requires_cuda]),
@@ -154,10 +154,10 @@ torch.manual_seed(0)
 config = Qwen3OmniMoeTextConfig(hidden_size=32, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
     rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "mrope_section": [3, 3, 2]})
 n, heads, kv_heads, d = 64, 4, 2, 16
-q = torch.randn(n, heads * d, dtype=torch.bfloat16, device="cuda")
-k = torch.randn(n, kv_heads * d, dtype=torch.bfloat16, device="cuda")
-positions = torch.arange(3000, 3000 + n, device="cuda")
-rope = HFNumericsRotaryEmbedding(config).cuda()
+q = torch.randn(n, heads * d, dtype=torch.bfloat16, device=DEVICE_TYPE)
+k = torch.randn(n, kv_heads * d, dtype=torch.bfloat16, device=DEVICE_TYPE)
+positions = torch.arange(3000, 3000 + n, device=DEVICE_TYPE)
+rope = HFNumericsRotaryEmbedding(config).to(DEVICE_TYPE)
 freqs = positions[:, None].float() * rope.inv_freq
 freqs = torch.cat((freqs, freqs), dim=-1)
 cos, sin = freqs.cos().to(q.dtype)[None], freqs.sin().to(q.dtype)[None]
@@ -191,7 +191,7 @@ def test_rotary_inv_freq_matches_hf_when_built_on_cuda():
         head_dim=128,
         rope_parameters={"rope_type": "default", "rope_theta": 1000000.0, "mrope_section": [24, 20, 20]},
     )
-    with torch.device("cuda"):
+    with torch.device(DEVICE_TYPE):
         rope = HFNumericsRotaryEmbedding(config)
     hf_inv_freq = Qwen3OmniMoeThinkerTextRotaryEmbedding(config).inv_freq
     assert rope.inv_freq.device.type == "cuda"
@@ -209,7 +209,7 @@ def test_rotary_rejects_non_default_rope_type():
 def _hf_moe_block(dtype: torch.dtype, experts_implementation: str = "grouped_mm"):
     config = _text_config()
     config._experts_implementation = experts_implementation
-    block = Qwen3OmniMoeThinkerTextSparseMoeBlock(config).to(device="cuda", dtype=dtype)
+    block = Qwen3OmniMoeThinkerTextSparseMoeBlock(config).to(device=DEVICE_TYPE, dtype=dtype)
     for p in block.parameters():
         p.data.normal_(0, 0.2)
     return block
@@ -223,27 +223,27 @@ def _hf_router_then_fused_experts(block, x: torch.Tensor) -> torch.Tensor:
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @_requires_cuda
 def test_moe_matches_hf_router_with_fused_experts():
     # bf16 only: the default fused_experts config for fp32 needs more shared memory than an L4 has.
     dtype = torch.bfloat16
     torch.manual_seed(0)
     block = _hf_moe_block(dtype)
-    x = torch.randn(9, 32, dtype=dtype, device="cuda")
+    x = torch.randn(9, 32, dtype=dtype, device=DEVICE_TYPE)
     out = hf_moe(x, block.gate.weight, block.experts.gate_up_proj, block.experts.down_proj, 2, True)
     torch.testing.assert_close(out, _hf_router_then_fused_experts(block, x), rtol=0, atol=0)
     torch.testing.assert_close(out, block(x[None])[0], rtol=2e-2, atol=2e-2)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @_requires_cuda
 def test_moe_rows_do_not_depend_on_the_batch(monkeypatch):
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     fused_moe_module.get_moe_configs.cache_clear()
     torch.manual_seed(0)
     block = _hf_moe_block(torch.bfloat16)
-    x = torch.randn(256, 32, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(256, 32, dtype=torch.bfloat16, device=DEVICE_TYPE)
 
     def moe(rows):
         return hf_moe(rows, block.gate.weight, block.experts.gate_up_proj, block.experts.down_proj, 2, True)
@@ -284,7 +284,7 @@ def _build_layer(tmp_path, moe_backend: str = "triton", dtype: torch.dtype = tor
         ),
         kernel_config=KernelConfig(moe_backend=moe_backend),
     )
-    with set_current_vllm_config(vllm_config), set_default_torch_dtype(dtype), torch.device("cuda"):
+    with set_current_vllm_config(vllm_config), set_default_torch_dtype(dtype), torch.device(DEVICE_TYPE):
         return HFNumericsDecoderLayer(vllm_config, prefix="model.layers.0")
 
 
@@ -300,18 +300,18 @@ def _load_hf_experts(layer: HFNumericsDecoderLayer, hf_block) -> None:
     experts.quant_method.process_weights_after_loading(experts)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @_requires_cuda
 def test_triton_loaded_moe_matches_hf_router_with_fused_experts(_dist, tmp_path):
     torch.manual_seed(0)
     layer = _build_layer(tmp_path, enforce_eager=True)
     hf_block = _hf_moe_block(torch.bfloat16)
     _load_hf_experts(layer, hf_block)
-    x = torch.randn(9, 32, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(9, 32, dtype=torch.bfloat16, device=DEVICE_TYPE)
     torch.testing.assert_close(layer.mlp(x), _hf_router_then_fused_experts(hf_block, x), rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @_requires_cuda
 def test_flashinfer_cutlass_moe_backend_is_rejected(_dist, tmp_path, monkeypatch):
     from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
@@ -326,23 +326,23 @@ def test_flashinfer_cutlass_moe_backend_is_rejected(_dist, tmp_path, monkeypatch
         _build_layer(tmp_path, enforce_eager=True)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @_requires_cuda
 def test_moe_capture_replay_matches_eager(_dist, tmp_path):
     torch.manual_seed(0)
     layer = _build_layer(tmp_path)
     _load_hf_experts(layer, _hf_moe_block(torch.bfloat16))
-    static_x = torch.randn(9, 32, dtype=torch.bfloat16, device="cuda")
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
+    static_x = torch.randn(9, 32, dtype=torch.bfloat16, device=DEVICE_TYPE)
+    stream = DEVICE_MODULE.Stream()
+    stream.wait_stream(DEVICE_MODULE.current_stream())
+    with DEVICE_MODULE.stream(stream):
         layer.mlp(static_x)
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    DEVICE_MODULE.current_stream().wait_stream(stream)
+    graph = DEVICE_GRAPH()
+    with DEVICE_MODULE.graph(graph):
         static_out = layer.mlp(static_x)
     for _ in range(3):
-        x = torch.randn(9, 32, dtype=torch.bfloat16, device="cuda")
+        x = torch.randn(9, 32, dtype=torch.bfloat16, device=DEVICE_TYPE)
         static_x.copy_(x)
         graph.replay()
         torch.testing.assert_close(static_out, layer.mlp(x), rtol=0, atol=0)

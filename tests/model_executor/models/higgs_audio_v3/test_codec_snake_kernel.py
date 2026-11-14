@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from tests.helpers.cudnn import deterministic_cudnn
+from tests.helpers.device import DEVICE_GRAPH, DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
@@ -21,7 +22,7 @@ def with_deterministic_cudnn():
         yield
 
 
-requires_cuda = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA")
+requires_cuda = pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="requires CUDA")
 
 _DAC_CONFIG = {
     "codebook_dim": 8,
@@ -76,9 +77,9 @@ def test_fused_snake_matches_transformers_snake(dtype, shape):
     reference.alpha.copy_(torch.rand_like(reference.alpha) * 4 + 0.05)
     fused = _FusedDacSnake1d(shape[1]).to("cuda", dtype)
     fused.load_state_dict(reference.state_dict())
-    x = (torch.randn(shape, device="cuda") * 3).to(dtype)
-    residual = (torch.randn(shape, device="cuda") * 3).to(dtype)
-    bias = (torch.randn(shape[1], device="cuda") * 3).to(dtype)
+    x = (torch.randn(shape, device=DEVICE_TYPE) * 3).to(dtype)
+    residual = (torch.randn(shape, device=DEVICE_TYPE) * 3).to(dtype)
+    bias = (torch.randn(shape[1], device=DEVICE_TYPE) * 3).to(dtype)
     assert torch.equal(fused(x), reference(x))
 
     total, out = fused.fused(x, bias, residual, write_sum=True)
@@ -95,7 +96,7 @@ def test_fused_snake_matches_transformers_snake(dtype, shape):
 @pytest.mark.parametrize("batch,frames", [(1, 33), (4, 8)])
 def test_fused_dac_decoder_matches_transformers_decoder(dtype, batch, frames):
     reference, fused = _dac_decoder_pair("cuda", dtype)
-    x = torch.randn(batch, _DAC_CONFIG["hidden_size"], frames, device="cuda").to(dtype)
+    x = torch.randn(batch, _DAC_CONFIG["hidden_size"], frames, device=DEVICE_TYPE).to(dtype)
     with torch.inference_mode():
         assert torch.equal(fused(x), reference(x))
 
@@ -134,15 +135,15 @@ def test_fuse_dac_decoder_keeps_state_dict_and_falls_back_on_cpu():
 @torch.inference_mode()
 def test_fused_decoder_graph_replays_changed_inputs(dtype, with_deterministic_cudnn):
     reference, fused = _dac_decoder_pair("cuda", dtype)
-    x = torch.randn(2, _DAC_CONFIG["hidden_size"], 8, device="cuda").to(dtype)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
+    x = torch.randn(2, _DAC_CONFIG["hidden_size"], 8, device=DEVICE_TYPE).to(dtype)
+    stream = DEVICE_MODULE.Stream()
+    stream.wait_stream(DEVICE_MODULE.current_stream())
+    with DEVICE_MODULE.stream(stream):
         for _ in range(3):
             fused(x)
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
+    DEVICE_MODULE.current_stream().wait_stream(stream)
+    graph = DEVICE_GRAPH()
+    with DEVICE_MODULE.graph(graph, stream=stream):
         output = fused(x)
     for _ in range(2):
         x.normal_()
@@ -151,17 +152,17 @@ def test_fused_decoder_graph_replays_changed_inputs(dtype, with_deterministic_cu
 
 
 @requires_cuda
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @torch.inference_mode()
 def test_fused_snake_uses_eager_on_non_nvidia_platform(monkeypatch):
     from transformers.models.dac.modeling_dac import Snake1d
 
     from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_decoder import _FusedDacSnake1d
 
-    reference = Snake1d(8).cuda()
-    fused = _FusedDacSnake1d(8).cuda()
+    reference = Snake1d(8).to(DEVICE_TYPE)
+    fused = _FusedDacSnake1d(8).to(DEVICE_TYPE)
     fused.load_state_dict(reference.state_dict())
-    x = torch.randn(2, 8, 33, device="cuda")
+    x = torch.randn(2, 8, 33, device=DEVICE_TYPE)
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
     assert not fused.can_fuse(x)
     assert torch.equal(fused(x), reference(x))
@@ -178,6 +179,6 @@ def test_fused_snake_preserves_float64_precision():
     reference = Snake1d(8).to("cuda", torch.float64)
     fused = _FusedDacSnake1d(8).to("cuda", torch.float64)
     fused.load_state_dict(reference.state_dict())
-    x = torch.randn(2, 8, 33, device="cuda", dtype=torch.float64)
+    x = torch.randn(2, 8, 33, device=DEVICE_TYPE, dtype=torch.float64)
     assert not fused.can_fuse(x)
     assert torch.equal(fused(x), reference(x))

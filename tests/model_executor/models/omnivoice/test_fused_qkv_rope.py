@@ -16,6 +16,7 @@ import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.omnivoice.fused_qkv_rope import (
     _eager_qkv_norm_rope,
@@ -25,7 +26,7 @@ from vllm_omni.model_executor.models.omnivoice.fused_qkv_rope import (
 
 pytestmark = [pytest.mark.core_model]
 
-cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+cuda_only = pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
 triton_only = pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 
 EPS = 1e-6
@@ -36,7 +37,7 @@ TOL = {
 }
 
 
-def _inputs(batch, seq_len, num_heads, num_kv_heads, head_dim, dtype, device="cuda"):
+def _inputs(batch, seq_len, num_heads, num_kv_heads, head_dim, dtype, device=DEVICE_TYPE):
     torch.manual_seed(11)
     total = num_heads + 2 * num_kv_heads
     qkv = torch.randn(batch, seq_len, total, head_dim, device=device, dtype=dtype)
@@ -74,7 +75,7 @@ def test_matches_the_unfused_reference(dtype, batch, seq_len, num_heads, num_kv_
         torch.testing.assert_close(a, b, msg=lambda m, n=name: f"{n}: {m}", **TOL[dtype])
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @cuda_only
 @triton_only
 def test_v_is_the_untouched_projection_broadcast_into_place():
@@ -89,7 +90,7 @@ def test_v_is_the_untouched_projection_broadcast_into_place():
     torch.testing.assert_close(v, expected.contiguous(), atol=0, rtol=0)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @cuda_only
 @triton_only
 def test_kv_heads_are_broadcast_not_reordered():
@@ -104,7 +105,7 @@ def test_kv_heads_are_broadcast_not_reordered():
         torch.testing.assert_close(k[:, head], k[:, (head // repeat) * repeat], atol=0, rtol=0)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @cuda_only
 @triton_only
 def test_position_zero_is_a_pure_rmsnorm():
@@ -113,7 +114,7 @@ def test_position_zero_is_a_pure_rmsnorm():
     qkv, q_weight, k_weight, _ = _inputs(batch, seq_len, num_heads, num_kv_heads, head_dim, torch.float32)
     half = head_dim // 2
     rope_table = torch.cat(
-        [torch.ones(seq_len, half, device="cuda"), torch.zeros(seq_len, half, device="cuda")], dim=-1
+        [torch.ones(seq_len, half, device=DEVICE_TYPE), torch.zeros(seq_len, half, device=DEVICE_TYPE)], dim=-1
     )
 
     q, _, _ = fused_qkv_norm_rope(qkv, q_weight, k_weight, rope_table, EPS, num_heads, num_kv_heads)
@@ -124,7 +125,7 @@ def test_position_zero_is_a_pure_rmsnorm():
     torch.testing.assert_close(q, expected.contiguous(), **TOL[torch.float32])
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @cuda_only
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,head_dim",
