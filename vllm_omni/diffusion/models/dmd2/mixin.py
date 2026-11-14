@@ -8,7 +8,7 @@ import os
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.dmd2.config import DMD2Config
-from vllm_omni.diffusion.models.schedulers import DMD2EulerScheduler
+from vllm_omni.diffusion.models.schedulers import DMD2EulerScheduler, is_injected_scheduler
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
@@ -28,12 +28,19 @@ class DMD2PipelineMixin:
 
         self.dmd2_config = DMD2Config.from_model_index(model_index)
 
-        self.scheduler = DMD2EulerScheduler(
-            num_train_timesteps=1000,
-            shift=1.0,
-            dmd2_timesteps=self.dmd2_config.resolve_timesteps(),
-            stochastic_sampling=(self.dmd2_config.solver == "sde"),
-        )
+        if is_injected_scheduler(self.od_config):
+            logger.warning(
+                "Skipping DMD2EulerScheduler overwrite: an injected scheduler "
+                "(od_config.scheduler=%r) is active and is left untouched.",
+                self.od_config.scheduler,
+            )
+        else:
+            self.scheduler = DMD2EulerScheduler(
+                num_train_timesteps=1000,
+                shift=1.0,
+                dmd2_timesteps=self.dmd2_config.resolve_timesteps(),
+                stochastic_sampling=(self.dmd2_config.solver == "sde"),
+            )
 
     def _sanitize_dmd2_request(self, req) -> None:
         """Sanitize CFG-related fields in-place. Works with both OmniDiffusionRequest and DiffusionRequestBatch."""

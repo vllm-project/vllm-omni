@@ -978,6 +978,8 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     override_transformer_cls_name: str | None = None
     worker_extension_cls: str | None = None
     custom_pipeline_args: dict[str, Any] | None = None
+    scheduler: str | None = None
+    scheduler_kwargs: dict[str, Any] | None = None
     additional_config: dict[str, Any] = field(default_factory=dict)
     kv_transfer_config: KVTransferConfig | None = None
     # Full stage-payload transport, independent of native paged KV transfer.

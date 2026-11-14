@@ -98,6 +98,18 @@ def normalize_omni_diffusion_kwargs(
     elif not isinstance(dtype, str):
         raise TypeError(f"Provided dtype must be a string or torch.dtype, got {type(dtype).__name__}")
 
+    # Keep the denoising sampler distinct from the stage request scheduler.
+    for alias, canonical in (
+        ("diffusion_scheduler", "scheduler"),
+        ("diffusion_scheduler_kwargs", "scheduler_kwargs"),
+    ):
+        alias_value = config_kwargs.pop(alias, None)
+        if alias_value is None:
+            continue
+        if config_kwargs.get(canonical) is not None:
+            raise ValueError(f"Diffusion config fields {alias!r} and {canonical!r} cannot both be provided.")
+        config_kwargs[canonical] = alias_value
+
     for legacy, canonical in (
         ("static_lora_scale", "lora_scale"),
         ("quantization", "quantization_config"),
@@ -1089,6 +1101,10 @@ class OmniDiffusionConfig:
 
     # Custom pipeline arguments for custom pipelines
     custom_pipeline_args: dict[str, Any] | None = None
+
+    # Per-pipeline denoising sampler; separate from request batching scheduler.
+    scheduler: str | None = None
+    scheduler_kwargs: dict[str, Any] | None = None
 
     # Diffusion model loading format
     # "default", "custom_pipeline", "dummy", "diffusers" (HF diffusers adapter)

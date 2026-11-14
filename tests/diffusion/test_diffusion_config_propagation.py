@@ -315,3 +315,18 @@ def test_additional_config_roundtrip():
     additional_config = {"torchair_graph_config": {"enabled": True}}
     od = _roundtrip_diffusion_config(model="x", additional_config=additional_config)
     assert od.additional_config == additional_config
+
+
+def test_diffusion_scheduler_engine_arg_maps_to_od_config():
+    od = _roundtrip_diffusion_config(
+        model="x",
+        diffusion_scheduler="my_pkg.CustomScheduler",
+        diffusion_scheduler_kwargs={"shift": 3.0},
+    )
+    assert od.scheduler == "my_pkg.CustomScheduler"
+    assert od.scheduler_kwargs == {"shift": 3.0}
+
+
+def test_diffusion_scheduler_alias_conflicts_with_canonical_field():
+    with pytest.raises(ValueError, match="diffusion_scheduler.*scheduler"):
+        _roundtrip_diffusion_config(model="x", scheduler="one", diffusion_scheduler="two")

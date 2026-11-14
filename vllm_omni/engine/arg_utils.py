@@ -297,6 +297,10 @@ class OmniEngineArgs(EngineArgs):
         custom_pipeline_args: Dictionary of arguments passed through to the
             diffusion pipeline. When it contains ``pipeline_class``, it triggers
             custom pipeline initialization.
+        diffusion_scheduler: Registry name or dotted class path of a diffusion
+            sampling scheduler, distinct from request ``scheduler_cls``.
+        diffusion_scheduler_kwargs: Extra kwargs forwarded to its
+            ``from_pretrained()`` constructor.
     """
 
     stage_id: int = 0
@@ -367,6 +371,8 @@ class OmniEngineArgs(EngineArgs):
     diffusers_load_kwargs: str | None = None
     diffusers_call_kwargs: str | None = None
     diffusion_quantization_config: str | None = None
+    diffusion_scheduler: str | None = None
+    diffusion_scheduler_kwargs: dict[str, Any] | None = None
     diffusion_attention_backend: str | None = None
     fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: str | None = None
@@ -788,6 +794,8 @@ class OrchestratorArgs:
     ring_degree: int | None = None
     allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
+    diffusion_scheduler: str | None = None
+    diffusion_scheduler_kwargs: dict[str, Any] | None = None
     use_hsdp: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = 1
@@ -881,6 +889,8 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "diffusers_load_kwargs",
         "diffusers_call_kwargs",
         "diffusion_quantization_config",
+        "diffusion_scheduler",
+        "diffusion_scheduler_kwargs",
         "diffusion_attention_backend",
         "fastvideo_vsa_topk",
         "diffusion_attention_config",
