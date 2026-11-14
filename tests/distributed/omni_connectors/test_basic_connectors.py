@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import threading
+
 import pytest
 from pytest_mock import MockerFixture
 
@@ -10,6 +12,21 @@ from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _prepare_unconstructed_get(connector):
+    connector.protocol = "rdma"
+    connector._state_lock = threading.RLock()
+    connector._req_local = threading.local()
+    connector._closing = False
+    connector._receiving_keys = set()
+    connector._pending_receives = {}
+    connector._in_flight_buffers = set()
+    connector._active_handlers = 0
+    connector._active_puts = 0
+    connector._close_scheduled = False
+    connector.max_inflight_receives = 64
+    connector._last_capacity_warning = 0.0
 
 
 def test_basic_serialization():
@@ -222,6 +239,10 @@ def test_mooncake_connector_defaults_missing_host_to_detected_ip(monkeypatch: py
         def get_rpc_port(self):
             return 23456
 
+        def get_local_topology(self, device_name=None):
+            del device_name
+            return '{"cuda:0": [["mlx5_0"], []]}'
+
         def register_memory(self, base_ptr, pool_size):
             del base_ptr, pool_size
             return 0
@@ -262,9 +283,15 @@ def test_mooncake_get_counts_zmq_timeout_separately(mocker: MockerFixture):
 
     connector = object.__new__(mooncake_module.MooncakeTransferEngineConnector)
     connector._closed = False
+    _prepare_unconstructed_get(connector)
     connector._metrics = {"errors": 0, "timeouts": 0}
     connector._resolve_metadata = mocker.Mock(
-        return_value={"source_host": "127.0.0.1", "source_port": 1234, "data_size": 8}
+        return_value={
+            "source_host": "127.0.0.1",
+            "source_port": 1234,
+            "data_size": 8,
+            "protocol_version": 2,
+        }
     )
     recv_buffer = mocker.Mock()
     connector._alloc_recv_buffer = mocker.Mock(return_value=(recv_buffer, 1000))
@@ -281,9 +308,15 @@ def test_mooncake_get_counts_cuda_sync_failure_as_error(mocker: MockerFixture):
 
     connector = object.__new__(mooncake_module.MooncakeTransferEngineConnector)
     connector._closed = False
+    _prepare_unconstructed_get(connector)
     connector._metrics = {"errors": 0, "timeouts": 0}
     connector._resolve_metadata = mocker.Mock(
-        return_value={"source_host": "127.0.0.1", "source_port": 1234, "data_size": 8}
+        return_value={
+            "source_host": "127.0.0.1",
+            "source_port": 1234,
+            "data_size": 8,
+            "protocol_version": 2,
+        }
     )
     recv_buffer = mocker.Mock()
     connector._alloc_recv_buffer = mocker.Mock(return_value=(recv_buffer, 1000))
