@@ -85,8 +85,16 @@ class TestKeyBasedReadWrite:
 
         from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
-        # Isolate the publication lock from the host's coordination directory.
-        monkeypatch.setattr(module, "open", lambda path, mode: (tmp_path / "writer.lock").open(mode), raising=False)
+        def open_lock(path, mode):
+            # The writer holds the capacity lock and the per-key lock together.
+            # Those must be different inodes: Linux flock does not nest across
+            # two open file descriptions of the same file, so one shared
+            # temporary file deadlocks the writer before os.ftruncate.
+            lock_name = "capacity.lock" if "omni_shm_cap_" in os.fspath(path) else "writer.lock"
+            return (tmp_path / lock_name).open(mode)
+
+        # Isolate publication locks from the host's coordination directory.
+        monkeypatch.setattr(module, "open", open_lock, raising=False)
         entered, release = threading.Event(), threading.Event()
         original = os.ftruncate
         opens = mocker.spy(module.shm_pkg, "SharedMemory")
@@ -664,3 +672,111 @@ def test_reaping_keeps_consumed_records_bounded_behind_unread_keys(connector):
         assert not connector._pending_keys
     finally:
         receiver.close()
+
+
+def test_put_waits_then_fails_when_shm_capacity_exhausted(connector, monkeypatch, mocker):
+    """Persistent /dev/shm exhaustion fails the put and does not publish (#10296)."""
+    from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+    free_reads = 0
+
+    def fake_free() -> int:
+        nonlocal free_reads
+        free_reads += 1
+        return 0
+
+    sleeps = 0
+
+    def fake_sleep(_seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+
+    monkeypatch.setattr(connector, "_shm_free_bytes", fake_free)
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+    write_bytes = mocker.spy(connector, "_write_bytes")
+
+    key = "capacity_gate_" + uuid.uuid4().hex[:8]
+    ok, size, meta = connector.put("s0", "s1", key, {"x": 1})
+
+    assert ok is False
+    assert size == 0
+    assert meta is None
+    assert key not in connector._pending_keys
+    assert write_bytes.call_count == 0
+    # The real helper must poll until its attempts are exhausted.
+    assert free_reads > 1
+    assert sleeps > 1
+
+
+def test_ensure_shm_capacity_recovers_when_space_frees(connector, monkeypatch):
+    from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+    frees = [0, 0, 1 << 30]
+    reads = 0
+
+    def fake_free() -> int:
+        nonlocal reads
+        reads += 1
+        return frees.pop(0) if frees else 1 << 30
+
+    monkeypatch.setattr(connector, "_shm_free_bytes", fake_free)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    assert connector._ensure_shm_capacity(1024, attempts=5) is True
+    # The first readings are short, so a helper that accepts immediately does not pass.
+    assert reads >= 3
+
+
+def test_capacity_reserve_scales_with_mount_and_honors_override(connector, monkeypatch):
+    """64 MiB mounts must not inherit a 512 MiB reserve; config can still pin one."""
+    frsize = 4096
+
+    def use_mount(total: int) -> None:
+        class Stat:
+            f_blocks = total // frsize
+            f_bavail = total // frsize
+            f_frsize = frsize
+
+        monkeypatch.setattr(os, "statvfs", lambda _path: Stat())
+
+    use_mount(64 << 20)
+    assert connector._shm_capacity_reserve_bytes() == (64 << 20) // 8
+    assert connector._ensure_shm_capacity(1, attempts=1) is True
+
+    use_mount(64 << 30)
+    assert connector._shm_capacity_reserve_bytes() == 512 << 20
+
+    connector.config["shm_capacity_reserve_bytes"] = 0
+    assert connector._shm_capacity_reserve_bytes() == 0
+    connector.config["shm_capacity_reserve_bytes"] = 1234
+    assert connector._shm_capacity_reserve_bytes() == 1234
+
+
+def test_put_accepts_payload_that_fits_on_small_shm_mount(connector, monkeypatch):
+    """An empty mount smaller than the default reserve can still take a payload that fits."""
+    mount = 64 << 20
+    frsize = 4096
+
+    class Stat:
+        f_blocks = mount // frsize
+        f_bavail = mount // frsize
+        f_frsize = frsize
+
+    real_statvfs = os.statvfs
+
+    def fake_statvfs(path):
+        if os.fspath(path) == connector.shm_directory:
+            return Stat()
+        return real_statvfs(path)
+
+    monkeypatch.setattr(os, "statvfs", fake_statvfs)
+    key = "small_mount_" + uuid.uuid4().hex[:8]
+    ok, size, meta = connector.put("s0", "s1", key, {"x": 1})
+    assert ok is True
+    assert size > 0
+    assert meta is not None
+    # The old unconditional 512 MiB reserve would have rejected this empty mount.
+    assert connector._shm_free_bytes() < size + (512 << 20)
+    assert connector._shm_free_bytes() >= size + connector._shm_capacity_reserve_bytes()
+    got = connector.get("s0", "s1", key, metadata=meta)
+    assert got is not None
+    assert got[0] == {"x": 1}
