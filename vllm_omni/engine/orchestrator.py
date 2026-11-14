@@ -92,6 +92,7 @@ from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
+from vllm_omni.outputs.audio_accumulation import AudioChunkBuffer
 from vllm_omni.tracing import RequestTrace
 
 if TYPE_CHECKING:
@@ -327,6 +328,7 @@ class OrchestratorRequestState:
     skip_legacy_stage_forward: bool = False
     running_counter_registered: bool = False
     request_artifact_dirs: set[str] = field(default_factory=set)
+    alignment_audio: dict[int, AudioChunkBuffer] = field(default_factory=dict)
     native_kv_transfer_id: str | None = None
     # First-frame delivery and final-stage outputs use different channels.
     upstream_first_audio: bool = False
@@ -2106,6 +2108,7 @@ class OrchestratorBase:
                     if trace_error is not None:
                         req_state.trace.fail(trace_error)
                     req_state.trace.end("cancelled" if abort else "success")
+                req_state.alignment_audio.clear()
                 cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", set()))
             if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                 self._running_counter.decrement()
@@ -2401,6 +2404,16 @@ class OrchestratorBase:
         if await self._intercept_stage_output(stage_id, replica_id, output, req_state, stage_metrics, submit_ts):
             return
 
+        try:
+            output = self._assemble_alignment_audio(stage_id, output, req_state, finished or segment_finished)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            logger.exception("Failed to assemble alignment audio for request %s", req_id)
+            await self._handle_stage_error(
+                stage_id,
+                ErrorMessage(request_id=req_id, error=f"Failed to assemble alignment audio: {exc}"),
+            )
+            return
+
         if (
             (finished or segment_finished)
             and stage_id < req_state.final_stage_id
@@ -2457,6 +2470,26 @@ class OrchestratorBase:
 
         if request_finished and not req_state.session_owned:
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+
+    def _assemble_alignment_audio(
+        self, stage_id: int, output: RequestOutput, req_state: OrchestratorRequestState, finished: bool
+    ) -> RequestOutput:
+        if stage_id >= req_state.final_stage_id:
+            return output
+        next_config = getattr(self.stage_pools[stage_id + 1], "stage_vllm_config", None)
+        model_config = getattr(next_config, "model_config", None)
+        if getattr(model_config, "model_stage", None) != "forced_aligner":
+            return output
+        if self._stage_receives_async_chunks(stage_id + 1):
+            return output
+        params = req_state.sampling_params_list[stage_id]
+        if getattr(params, "output_kind", None) != RequestOutputKind.DELTA:
+            return output
+        buffer = req_state.alignment_audio.setdefault(stage_id, AudioChunkBuffer())
+        result = buffer.append(output, finished=finished)
+        if finished:
+            req_state.alignment_audio.pop(stage_id, None)
+        return result
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
