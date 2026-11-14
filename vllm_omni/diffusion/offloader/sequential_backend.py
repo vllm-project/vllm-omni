@@ -129,9 +129,8 @@ class SequentialOffloadHook(ModelHook):
         module's hook, so staging state must be resolved on the target's hook
         to keep its ``loaded`` bookkeeping consistent.
         """
-        registry: HookRegistry | None = getattr(module, "_hook_registry", None)
-        hook = registry.get_hook(SequentialOffloadHook._HOOK_NAME) if registry is not None else None
-        return hook._stager if isinstance(hook, SequentialOffloadHook) else None
+        hook = find_sequential_offload_hook(module)
+        return hook._stager if hook is not None else None
 
     def _to_cpu(self, module: nn.Module) -> None:
         stager = self._module_stager(module)
@@ -299,10 +298,22 @@ def remove_sequential_offload(modules: list[nn.Module]) -> None:
         raise RuntimeError("Failed to remove one or more sequential offload hooks") from first_error
 
 
-def _get_sequential_offload_hook(module: nn.Module) -> SequentialOffloadHook:
+def find_sequential_offload_hook(module: nn.Module) -> SequentialOffloadHook | None:
+    """The sequential offload hook registered on ``module`` itself, if any.
+
+    Single source for the registry lookup: the stager resolution, the raising
+    accessor below and the paged-decode stand-down probe all ask this function
+    instead of re-deriving it, so a registry or hook-name change breaks in one
+    place instead of silently standing the guard down.
+    """
     registry: HookRegistry | None = getattr(module, "_hook_registry", None)
     hook = registry.get_hook(SequentialOffloadHook._HOOK_NAME) if registry is not None else None
-    if not isinstance(hook, SequentialOffloadHook):
+    return hook if isinstance(hook, SequentialOffloadHook) else None
+
+
+def _get_sequential_offload_hook(module: nn.Module) -> SequentialOffloadHook:
+    hook = find_sequential_offload_hook(module)
+    if hook is None:
         raise RuntimeError(f"{module.__class__.__name__} has no sequential offload hook")
     return hook
 
