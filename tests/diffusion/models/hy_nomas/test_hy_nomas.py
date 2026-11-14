@@ -26,7 +26,6 @@ from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import MODEL_ID,
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import build_transformer, load_transformer_weights
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import (
     HyNomasPipeline,
-    build_decoder,
     build_model_config,
     validate_config,
 )
@@ -512,6 +511,8 @@ def test_module_offload_rejects_unsupported_components(components, mocker):
         ({"quantization_config": "int8"}, "unquantized"),
         ({"lora_path": "adapter"}, "LoRA"),
         ({"custom_pipeline_args": {"arbitrary": True}}, "custom_pipeline_args"),
+        ({"custom_pipeline_args": {"decoder_backend": "reference"}}, "Unsupported Hy-Nomas custom_pipeline_args"),
+        ({"custom_pipeline_args": {"decoder_backend": "native"}}, "Unsupported Hy-Nomas custom_pipeline_args"),
         ({"enable_layerwise_offload": True}, "layer offload"),
         ({"flow_shift": 3.0}, "flow_shift=5"),
         ({"enforce_eager": False, "diffusion_compile_granularity": "full"}, "full transformer compilation"),
@@ -736,16 +737,6 @@ def test_native_transformer_factory_places_every_parameter(checkpoint):
     assert len(parameters) == 2268
     assert all(parameter.device.type == "meta" for parameter in parameters.values())
     assert all(parameter.dtype == torch.bfloat16 for parameter in parameters.values())
-
-
-def test_decoder_factory_places_every_parameter():
-    decoder = build_decoder(DECODER_CONFIG, torch.device("meta"))
-    parameters = dict(decoder.named_parameters())
-    assert len(parameters) == 476
-    assert all(name.startswith("decoder.") for name in parameters)
-    assert all(
-        parameter.device.type == "meta" and parameter.dtype == torch.bfloat16 for parameter in parameters.values()
-    )
 
 
 @pytest.mark.parametrize("sp_size,ulysses_size,world_size", [(1, 1, 1), (2, 2, 2), (2, 4, 2), (2, 2, 4)])
