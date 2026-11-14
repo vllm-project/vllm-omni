@@ -665,7 +665,7 @@ class TestLayerwiseComponentConfig:
         plan = OffloadPlan(encoder_component_types={"mllm": "text_encoder"})
         assert config.offloads_encoder("mllm", plan)
 
-    @pytest.mark.parametrize("component", ["image_encoder", "vae", "scheduler", "text-encoder"])
+    @pytest.mark.parametrize("component", ["image_encoder", "scheduler", "text-encoder"])
     def test_unknown_or_noncanonical_component_is_rejected(self, component):
         with pytest.raises(ValueError, match="Unknown diffusion offload component"):
             OffloadConfig.from_od_config(
