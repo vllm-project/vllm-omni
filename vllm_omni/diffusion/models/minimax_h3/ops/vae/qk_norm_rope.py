@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Bit-exact fused Q/K RMSNorm and RoPE for the MiniMax H3 video VAE."""
+"""Q/K RMSNorm and RoPE kernels for the MiniMax H3 video VAE."""
 
 from __future__ import annotations
 
@@ -258,4 +258,65 @@ def try_qk_norm_rope_exact(
     return q_output.reshape(output_shape), k_output.reshape(output_shape)
 
 
-__all__ = ["try_qk_norm_rope_exact"]
+_NPU_NORM_ROPE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def try_rms_norm_npu(
+    x: torch.Tensor, gamma: torch.Tensor, eps: float | None, *, unit_gamma: bool = False
+) -> torch.Tensor | None:
+    """Use the NPU RMSNorm kernel for a compatible last-dimension normalization."""
+    if (
+        x.device.type != "npu"
+        or x.device != gamma.device
+        or x.dtype not in _NPU_NORM_ROPE_DTYPES
+        or (x.dtype != gamma.dtype and not unit_gamma)
+        or x.ndim == 0
+        or x.numel() == 0
+        or gamma.ndim != 1
+        or x.shape[-1] != gamma.shape[0]
+        or eps is None
+    ):
+        return None
+
+    import torch_npu
+
+    # Q/K chunks may be non-dense. A temporary dtype conversion keeps the
+    # non-affine FP32 buffer itself stable for host/device staging.
+    return torch_npu.npu_rms_norm(x.contiguous(), gamma.to(dtype=x.dtype), epsilon=eps)[0]
+
+
+def try_rotary_npu(
+    x: torch.Tensor, rotary: tuple[torch.Tensor, torch.Tensor]
+) -> torch.Tensor | None:
+    """Rotate a supported half-split BSND prefix and preserve the suffix."""
+    cos, sin = rotary
+    if (
+        x.device.type != "npu"
+        or x.dtype not in _NPU_NORM_ROPE_DTYPES
+        or x.ndim != 4
+        or x.numel() == 0
+        or cos.ndim not in (3, 4)
+        or cos.shape != sin.shape
+        or cos.device != x.device
+        or sin.device != x.device
+        or not cos.is_floating_point()
+        or not sin.is_floating_point()
+        or cos.shape[0] not in (1, x.shape[0])
+        or cos.shape[1] != x.shape[1]
+    ):
+        return None
+    if cos.ndim == 3:
+        cos, sin = cos.unsqueeze(2), sin.unsqueeze(2)
+    width = cos.shape[-1]
+    if cos.shape[2] != 1 or width <= 0 or width % 16 != 0 or width > x.shape[-1]:
+        return None
+
+    import torch_npu
+
+    rotated = torch_npu.npu_rotary_mul(
+        x[..., :width].contiguous(), cos.to(x.dtype).contiguous(), sin.to(x.dtype).contiguous()
+    )
+    return torch.cat((rotated, x[..., width:]), dim=-1) if width < x.shape[-1] else rotated
+
+
+__all__ = ["try_qk_norm_rope_exact", "try_rms_norm_npu", "try_rotary_npu"]
