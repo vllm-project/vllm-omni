@@ -572,6 +572,19 @@ Delete an uploaded voice sample.
 curl -X DELETE http://localhost:8091/v1/audio/voices/custom_voice_1
 ```
 
+### tts-streaming-idle-timeout CLI Flag
+
+The ```tts-streaming-idle-timeout``` flag specifies the maximum length of time in seconds to wait between messages before closing the WebSocket. The default value is 30 seconds. The streaming idle timeout takes affect after the session config has been sent. The session config message must be sent within 10 seconds of initiating the WebSocket connection. Subsequent messages have a longer timeout of 30 seconds or the value of ```tts-streaming-idle-timeout```.
+
+**Usage Example:**
+
+```
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+--omni \
+--port 8091 \
+--tts-streaming-idle-timeout 45
+```
+
 ## Examples
 
 ### CustomVoice with Style Instruction

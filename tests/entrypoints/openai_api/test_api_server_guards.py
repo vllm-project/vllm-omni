@@ -1652,3 +1652,28 @@ def test_video_lifecycle_guard_precedes_processing(monkeypatch, count, status, m
     with TestClient(app) as client:
         response = client.request(method, path)
     assert response.status_code == status
+
+
+@pytest.mark.parametrize(("tts_streaming_idle_timeout", "expected_timeout"), [(45, 45), (5, 5), (None, 30)])
+def test_tts_streaming_idle_timeout_forwarded(mocker, tts_streaming_idle_timeout, expected_timeout):
+    app = FastAPI()
+    app.state.engine_client = mocker.MagicMock()
+    app.state.openai_serving_speech = mocker.MagicMock(spec=api_server.OmniOpenAIServingSpeech)
+
+    if tts_streaming_idle_timeout is not None:
+        app.state.engine_client.tts_streaming_idle_timeout = tts_streaming_idle_timeout
+    else:
+        # Simulate the attribute not being set at all
+        del app.state.engine_client.tts_streaming_idle_timeout
+
+    idle_timeout = getattr(app.state.engine_client, "tts_streaming_idle_timeout", None)
+    if idle_timeout is not None:
+        app.state.openai_streaming_speech = api_server.OmniStreamingSpeechHandler(
+            speech_service=app.state.openai_serving_speech, idle_timeout=idle_timeout
+        )
+    else:
+        app.state.openai_streaming_speech = api_server.OmniStreamingSpeechHandler(
+            speech_service=app.state.openai_serving_speech,
+        )
+
+    assert app.state.openai_streaming_speech._idle_timeout == expected_timeout

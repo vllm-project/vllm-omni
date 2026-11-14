@@ -3,7 +3,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, ClassVar, Literal, cast
 
 import numpy as np
 from pydantic import (
@@ -663,6 +663,8 @@ class BatchSpeechResponse(BaseModel):
 class StreamingSpeechSessionConfig(BaseModel):
     """Configuration sent as the first WebSocket message for streaming TTS."""
 
+    sensitive_fields: ClassVar = ["voice", "instructions", "ref_audio", "ref_text", "speaker_embedding", "watermarking"]
+
     model: str | None = None
     text_input_mode: Literal["buffered", "commitment"] = "buffered"
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
@@ -748,3 +750,27 @@ class StreamingSpeechSessionConfig(BaseModel):
                     "native speed control is only available through HTTP streaming."
                 )
         return self
+
+    def __str__(self):
+        # By default only print the session config insensitive fields
+        safe_fields = {}
+
+        for k, v in self.__dict__.items():
+            if k not in self.sensitive_fields:
+                safe_fields[k] = v
+
+        return str(safe_fields)
+
+    def debug(self):
+        # String function to call during debugging when it is safe to call sensitive config fields
+        pretty_dict = {}
+        for k, v in self.__dict__.items():
+            if v is not None:
+                if k in ["instructions", "ref_text"] and len(v) > 100:
+                    v = f"{v[:100]}..."
+                elif k in ["speaker_embedding", "ref_audio"]:
+                    v = True
+
+            pretty_dict[k] = v
+
+        return str(pretty_dict)

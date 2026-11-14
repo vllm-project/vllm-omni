@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import threading
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ from pydantic import ValidationError
 from pytest_mock import MockerFixture
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 
 from vllm_omni.entrypoints.openai import serving_speech_stream as streaming_speech_module
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
@@ -86,6 +88,8 @@ def _build_test_app(
         adapter = mocker.MagicMock(spec=TTSModelAdapter)
         adapter.text_commitment = Qwen3TTSAdapter.text_commitment
         speech_service._get_tts_adapter.return_value = adapter
+
+    speech_service.request_logger = RequestLogger(max_log_len=None)
 
     handler = OmniStreamingSpeechHandler(
         speech_service=speech_service,
@@ -1069,6 +1073,7 @@ class TestStreamingSpeechWebSocket:
                     ws.receive_json()
 
     def test_idle_timeout_closes_reused_connection(self, mocker: MockerFixture):
+        idle_timeout = 0.05
         app, _ = _build_test_app(idle_timeout=0.05, mocker=mocker)
 
         with TestClient(app) as client:
@@ -1086,7 +1091,31 @@ class TestStreamingSpeechWebSocket:
                 # gets timed out after the flush.
                 assert ws.receive_json() == {
                     "type": "error",
-                    "message": "Idle timeout: no message received",
+                    "message": f"Idle timeout: no message received for the last {idle_timeout} seconds",
+                }
+
+    def test_idle_timeout_default(self, mocker):
+        mock_speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
+        handler = OmniStreamingSpeechHandler(speech_service=mock_speech_service)
+
+        # Default value is 30.0 seconds (from _DEFAULT_IDLE_TIMEOUT)
+        assert handler._idle_timeout == 30.0
+
+    @pytest.mark.parametrize("idle_timeout", (0.05, 1, 10))
+    def test_idle_timeout_override(self, mocker: MockerFixture, idle_timeout):
+        """Assert that the idle_timeout for the streaming handler is overwritten and the timeout matches the value supplied"""
+        app, speech_service = _build_test_app(idle_timeout=idle_timeout, mocker=mocker)
+        print(speech_service)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian"})
+
+                time.sleep(idle_timeout + 1)
+
+                assert ws.receive_json() == {
+                    "type": "error",
+                    "message": f"Idle timeout: no message received for the last {idle_timeout} seconds",
                 }
 
     def test_commitment_active_generation_pauses_idle_timeout(self, mocker: MockerFixture):
@@ -1098,8 +1127,9 @@ class TestStreamingSpeechWebSocket:
             await asyncio.to_thread(release_generation.wait)
             return b"RIFF", "audio/wav"
 
+        idle_timeout = 0.02
         app, speech_service = _build_test_app(
-            idle_timeout=0.02,
+            idle_timeout=idle_timeout,
             commitment_supported=True,
             mocker=mocker,
         )
@@ -1151,14 +1181,15 @@ class TestStreamingSpeechWebSocket:
                 # is genuinely idle and the receive timeout starts again.
                 assert ws.receive_json() == {
                     "type": "error",
-                    "message": "Idle timeout: no message received",
+                    "message": f"Idle timeout: no message received for the last {idle_timeout} seconds",
                 }
 
         speech_service.engine_client.abort.assert_not_awaited()
 
     def test_commitment_unresolved_suffix_still_times_out(self, mocker: MockerFixture):
+        idle_timeout = 0.02
         app, speech_service = _build_test_app(
-            idle_timeout=0.02,
+            idle_timeout=idle_timeout,
             commitment_supported=True,
             mocker=mocker,
         )
@@ -1177,7 +1208,7 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json({"type": "input.text", "text": "unresolved"})
                 assert ws.receive_json() == {
                     "type": "error",
-                    "message": "Idle timeout: no message received",
+                    "message": f"Idle timeout: no message received for the last {idle_timeout} seconds",
                 }
 
         speech_service._generate_audio_bytes.assert_not_awaited()

@@ -1254,8 +1254,16 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Maximum length for TTS voice style instructions (overrides the pipeline default, default: 500).",
         )
-
-        # Disable safety guardrails for this server (currently only applicable for Cosmos3 and PAN2)
+        omni_config_group.add_argument(
+            "--tts-streaming-idle-timeout",
+            type=int,
+            default=None,
+            help=(
+                "Idle timeout sets the max length of time in seconds to wait"
+                "between messages for the audio streaming endpoint"
+            ),
+        )
+        # Disable safety guardrails for this server (currently only applicable for Cosmos3)
         # TODO: drop once --model-config-override lands (3/N config refactor)
         omni_config_group.add_argument(
             "--no-guardrails",
