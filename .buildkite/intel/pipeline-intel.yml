@@ -5,11 +5,16 @@
 # that sets NIGHTLY=1, or a PR labelled ``nightly-test``. Every ordinary PR
 # takes the pr scope.
 #
-#   pr     the no-card XPU-dispatch stage plus every core_model case: ~27min
-#          measured on one card. Needs tiny-random/Qwen-Image (30MB) and
-#          riverclouds/qwen_image_random (9.9GB) in the agent's HF cache.
-#   broad  also advanced_model and omni, which load Qwen3-TTS, Z-Image, Wan2.1
-#          and Voxtral, ~20min more, hence its larger budget.
+#   pr     the no-card XPU-dispatch stage, core_model on one and on two cards,
+#          and the omni models: ~37min measured. Needs tiny-random/Qwen-Image
+#          (30MB), riverclouds/qwen_image_random (9.9GB), Qwen2.5-Omni-3B (12GB)
+#          and Qwen2.5-Omni-7B (21GB) in the agent's HF cache.
+#   broad  also advanced_model on one and two cards (Qwen3-TTS, Z-Image, Wan2.1,
+#          Voxtral, and BAGEL-7B-MoT for sleep mode), hence its larger budget.
+#
+# The agents should expose at least two cards (ZE_AFFINITY_MASK=0,1 or wider):
+# the script pins the first card for the cards_1 stages and the first two for
+# the cards_2 ones, and skips the 2-card stages when it is handed a single card.
 #
 # Exactly one step runs per build, so the image is built once either way. To
 # get the broad scope on demand: new build with NIGHTLY=1, or label the PR
@@ -49,8 +54,8 @@ steps:
         env:
           <<: *common_xpu_env
           XPU_TEST_SCOPE: "broad"
-          # The two extra stages do not fit the pr budget.
-          XPU_TEST_BUDGET: "75m"
+          # The extra stages do not fit the pr budget.
+          XPU_TEST_BUDGET: "95m"
         priority: 100
-        timeout_in_minutes: 100
+        timeout_in_minutes: 120
         soft_fail: false

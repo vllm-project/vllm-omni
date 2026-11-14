@@ -173,7 +173,7 @@ def _get_sp_mode(ulysses_degree: int, ring_degree: int) -> str:
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 2, "rocm": 2})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 2, "rocm": 2})
 @pytest.mark.parametrize("model_name", MODELS)
 def test_sp_correctness(model_name: str):
     """Test that SP inference produces correct outputs and measure performance.
@@ -296,7 +296,7 @@ def test_sp_correctness(model_name: str):
 # @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("model_name", MODELS)
 def test_sp_correctness_advanced(model_name: str):
     """Test that SP inference produces correct outputs and measure performance.
