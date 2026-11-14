@@ -204,6 +204,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._init_omni_io_scheduling_state()
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        self._finished_req_output_token_ids: dict[str, list[int]] = {}
         # Streaming sessions finished because their next prompt extension
         # would exceed max_model_len: request_id -> (client_index, reason).
         # Drained into an explicit FinishReason.ERROR output on the next
@@ -2071,6 +2072,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+        if (
+            getattr(self, "num_spec_tokens", 0) > 0
+            and not self.use_v2_model_runner
+            and not self.vllm_config.model_config.async_chunk
+        ):
+            # Worker histories can contain post-stop verifier samples or async
+            # placeholders. Preserve the scheduler's final history before free.
+            self._finished_req_output_token_ids[request_id] = list(request.output_token_ids)
         self._new_prompt_len_snapshot.pop(request_id, None)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)

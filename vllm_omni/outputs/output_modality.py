@@ -151,6 +151,11 @@ _KEY_ACCUMULATION_OVERRIDES: dict[str, TensorAccumulationStrategy] = {
         "embed.embedding",
         "embed.speech_token_len",
         "meta.finished",
+        # Per-step speculative span controls are snapshots even when encoded
+        # as tensors; they must never concatenate with generated content.
+        "meta.decode_span",
+        "meta.consumed_input_span",
+        "meta.committed_token_count",
     )
 }
 

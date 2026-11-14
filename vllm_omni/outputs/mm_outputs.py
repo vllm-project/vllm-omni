@@ -30,7 +30,19 @@ logger = init_logger(__name__)
 # latest completion flag) may arrive as 0-d torch.Tensors. from_dict routes
 # all tensors into .tensors, so relocate these keys to .metadata before
 # consolidation to preserve the latest value without attempting torch.cat.
-_METADATA_TENSOR_KEYS: frozenset[str] = frozenset({"sr", "sample_rate", "audio_sample_rate", "meta.finished"})
+_METADATA_TENSOR_KEYS: frozenset[str] = frozenset(
+    {
+        "sr",
+        "sample_rate",
+        "audio_sample_rate",
+        "meta.finished",
+        # Speculative span controls describe the latest step, not content
+        # rows. committed_token_count is not a request-wide token total.
+        "meta.decode_span",
+        "meta.consumed_input_span",
+        "meta.committed_token_count",
+    }
+)
 
 
 def _cat_tensors(
