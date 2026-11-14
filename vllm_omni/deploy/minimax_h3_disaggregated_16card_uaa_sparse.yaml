@@ -1,0 +1,85 @@
+# MiniMax-H3 on 16 dies with RainFusion block-sparse attention: encoder stage +
+# 16-way Ulysses DiT (advanced_uaa) + independent VAE decoder stage.
+#
+# Same three-stage topology as minimax_h3_disaggregated_16card_uaa.yaml; the
+# only difference is the block-sparse attention backend on the DiT stage.
+#
+# Why pure Ulysses is required for sparsity:
+#   * RAINFUSION_ATTN needs the whole key sequence on every rank, so it rejects
+#     both AllGather-KV (allgather_degree > 1) and Ring (ring_degree > 1).  Pure
+#     Ulysses is the only sequence-parallel topology it accepts.
+#   * MiniMax-H3 has 56 attention heads, which 16 does not divide, so reaching
+#     16-way Ulysses requires ulysses_mode="advanced_uaa" (56 -> 64 padded
+#     heads, +14% attention FLOPs, numerically lossless).
+#   * start_step=0 makes the very first denoising step sparse, so a 2-step
+#     smoke request exercises the sparse kernel.
+pipeline: minimax_h3_disaggregated_decode
+async_chunk: false
+trust_remote_code: true
+distributed_executor_backend: mp
+
+stages:
+  - stage_id: 0 # encoder: text TP8 + video VAE patch8 + audio VAE leader
+    devices: "0,1,2,3,4,5,6,7"
+    tensor_parallel_size: 8
+    gpu_memory_utilization: 0.2
+    max_model_len: 65536
+    max_num_seqs: 1
+    enforce_eager: true
+    hf_overrides:
+      minimax_h3_encoder_components:
+        text_encoder:
+          parallel_mode: tp
+        video_vae:
+          parallel_mode: patch
+        audio_vae:
+          parallel_mode: leader
+    default_sampling_params:
+      detokenize: false
+      max_tokens: 1
+      temperature: 0.0
+
+  - stage_id: 1 # DiT on all 16 dies: pure Ulysses + UAA + RainFusion sparse
+    devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    max_num_seqs: 1
+    enforce_eager: true
+    enable_distributed_layerwise_offload: true
+    model_loaded:
+      text_encoder: false
+      vae_encoder: false
+      vae_decoder: false
+    parallel_config:
+      tensor_parallel_size: 1
+      ulysses_degree: 16
+      ulysses_mode: advanced_uaa
+      ring_degree: 1
+      allgather_degree: 1
+      vae_patch_parallel_size: 1
+    engine_extras:
+      diffusion_quantization_config:
+        transformer:
+          method: int8
+    diffusion_attention_config:
+      default:
+        backend: RAINFUSION_ATTN
+        block_sparse:
+          sparsity: 0.8
+          start_step: 0
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 50
+
+  - stage_id: 2 # independent VAE decoder on the 8 dies the encoder does not use
+    devices: "8,9,10,11,12,13,14,15"
+    max_num_seqs: 1
+    enforce_eager: true
+    vae_parallel_mode: tile
+    vae_use_tiling: true
+    parallel_config:
+      tensor_parallel_size: 1
+      ulysses_degree: 8
+      ring_degree: 1
+      allgather_degree: 1
+      vae_patch_parallel_size: 8
+    default_sampling_params:
+      seed: 42

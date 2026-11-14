@@ -1,0 +1,94 @@
+# MiniMax-H3 on 16 dies: encoder stage + 16-way Ulysses DiT (advanced_uaa) +
+# independent VAE decoder stage.
+#
+# Topology rationale:
+#   * Stage 0 runs the Qwen3-VL text encoder with tensor parallelism.  The model
+#     has 64 query heads and 8 KV heads, so text_encoder_tp_size must divide
+#     both and 8 is the ceiling.
+#   * Stage 1 runs the DiT on all 16 dies with pure Ulysses sequence
+#     parallelism.  MiniMax-H3 has 56 attention heads, which 16 does not divide,
+#     so ulysses_mode must be "advanced_uaa": the head count is padded to 64
+#     before the all-to-all and the padding is dropped on the way back.  The
+#     padding costs ~14% extra attention FLOPs and is numerically lossless.
+#     Ulysses is also the only topology the RainFusion sparse attention backend
+#     accepts (it rejects allgather_degree > 1), so this configuration is the
+#     only way to combine 16-way sequence parallelism with sparsity; see
+#     minimax_h3_disaggregated_16card_uaa_sparse.yaml.
+#   * Stage 2 decodes on 8 dies with tile (patch) parallelism.  The native VAE
+#     only supports a patch parallel size of 1 or the full group size, so it
+#     must equal the stage world size.
+#
+# Tuning notes:
+#   * stage-0 gpu_memory_utilization sizes the encoder's KV pool.  It is
+#     checked against the free device memory at startup; lower it when the
+#     dies are shared with another workload.
+#   * stage-0 max_model_len must cover the whole Qwen presentation.  A
+#     7-reference-image Ref2VA request is ~53.8k tokens; the model default of
+#     262144 would reserve 6.25 GiB of KV, so pin it explicitly.
+#   * vae_patch_parallel_size is a pure function of the output resolution:
+#     below ~768x448 the tile count drops under the group size and the decoder
+#     silently falls back to a rank-local decode.
+pipeline: minimax_h3_disaggregated_decode
+async_chunk: false
+trust_remote_code: true
+distributed_executor_backend: mp
+
+stages:
+  - stage_id: 0 # encoder: text TP8 + video VAE patch8 + audio VAE leader
+    devices: "0,1,2,3,4,5,6,7"
+    tensor_parallel_size: 8
+    gpu_memory_utilization: 0.2
+    max_model_len: 65536
+    max_num_seqs: 1
+    enforce_eager: true
+    hf_overrides:
+      minimax_h3_encoder_components:
+        text_encoder:
+          parallel_mode: tp
+        video_vae:
+          parallel_mode: patch
+        audio_vae:
+          parallel_mode: leader
+    default_sampling_params:
+      detokenize: false
+      max_tokens: 1
+      temperature: 0.0
+
+  - stage_id: 1 # DiT on all 16 dies; no VAE is loaded here
+    devices: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+    max_num_seqs: 1
+    enforce_eager: true
+    enable_distributed_layerwise_offload: true
+    model_loaded:
+      text_encoder: false
+      vae_encoder: false
+      vae_decoder: false
+    parallel_config:
+      tensor_parallel_size: 1
+      ulysses_degree: 16
+      ulysses_mode: advanced_uaa
+      ring_degree: 1
+      allgather_degree: 1
+      vae_patch_parallel_size: 1
+    engine_extras:
+      diffusion_quantization_config:
+        transformer:
+          method: int8
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 50
+
+  - stage_id: 2 # independent VAE decoder on the 8 dies the encoder does not use
+    devices: "8,9,10,11,12,13,14,15"
+    max_num_seqs: 1
+    enforce_eager: true
+    vae_parallel_mode: tile
+    vae_use_tiling: true
+    parallel_config:
+      tensor_parallel_size: 1
+      ulysses_degree: 8
+      ring_degree: 1
+      allgather_degree: 1
+      vae_patch_parallel_size: 8
+    default_sampling_params:
+      seed: 42
