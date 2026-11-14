@@ -25,6 +25,11 @@ stages:
     max_num_seqs: 1
     gpu_memory_utilization: 0.5
     enforce_eager: true
+    compilation_config:
+      cudagraph_mode: PIECEWISE
+      cudagraph_copy_inputs: true
+      encoder_cudagraph_token_budgets: [4, 8, 16, 24, 32, 64, 128, 256, 512]
+      encoder_cudagraph_max_vision_items_per_batch: 4
     trust_remote_code: true
     enable_prefix_caching: false
     max_num_batched_tokens: 8192
