@@ -183,6 +183,10 @@ class DuplexReplicaPlacement:
             self._reserved[replica] -= 1
             self._owners[replica].remove(session_id)
 
+    def is_declared_replica(self, stage_id: int, replica_id: int) -> bool:
+        """Return whether the replica belongs to the startup-declared topology."""
+        return (stage_id, replica_id) in self._all_replicas
+
     def route(self, session_id: str, stage_id: int) -> int:
         reservation = self._sessions.get(session_id)
         if reservation is None:

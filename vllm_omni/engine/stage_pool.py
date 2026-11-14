@@ -579,25 +579,58 @@ class StagePool:
         self.release_binding(request_id)
 
     def invalidate_addr(self, input_addr: str) -> list[str]:
-        """Drop affinity rows pointing at ``input_addr``; return affected request ids."""
+        """Drop affinity rows pointing at ``input_addr``; return affected request ids.
+
+        Pinned requests never enter ``_affinity``: duplex dispatch records them in
+        ``_request_bindings``. They are collected here too, so a replica that
+        leaves the pool also fails the turn it is pinned to. The bindings
+        themselves are kept, because the failure path uses them to attribute the
+        request to its replica.
+        """
         affected: list[str] = [rid for rid, addr in self._affinity.items() if addr == input_addr]
         for rid in affected:
             self._affinity.pop(rid, None)
+        replica_id = self._addr_to_replica_id.get(input_addr)
+        if replica_id is not None:
+            affected.extend(
+                rid for rid, bound in self._request_bindings.items() if bound == replica_id and rid not in affected
+            )
         return affected
 
-    # ---- Legacy (non-distributed) route binding ----
+    # ---- Route binding: local and distributed ----
+
+    def _reject_hub_down_replica(self, replica_id: int) -> None:
+        """Fail a pin the hub no longer reports as serviceable.
+
+        ``is_replica_available`` is the head-local view. Between the hub marking a
+        replica DOWN/ERROR and the membership watcher detaching it, a pin would
+        still be dispatched, so check the hub snapshot the way ``pick`` does.
+        """
+        if self._hub is None:
+            return
+        input_addr = self._client_input_addr(self.clients[replica_id])
+        if input_addr is not None and self._serviceable_replica_id_for_addr(input_addr) != replica_id:
+            raise StageUnavailableError(f"stage {self.stage_id} pinned replica {replica_id} is not UP in the hub")
 
     def bind_request_to_replica(self, request_id: str, replica_id: int) -> int:
-        """Bind a real request to a required local replica, without selecting a fallback.
+        """Bind a real request to a required replica, without selecting a fallback.
 
         Call before input preprocessing or sender metadata construction, then
         pass the same pin to submission to recheck availability. Session
         reservations belong to the duplex placement owner, not this ledger.
+
+        This applies to distributed pools too: ``clients`` holds a proxy per
+        attached replica whether it runs locally or behind the hub, and
+        ``is_replica_available`` is the pool's own view of that attachment. The
+        pin is therefore honoured by addressing the pinned client directly
+        instead of consulting the load balancer. A replica that the hub has
+        detached is rejected here by the availability check, and one that dies
+        mid-request still reaches ``_handle_dead_replica`` through
+        ``EngineDeadError``, which marks the reservation unavailable.
         """
-        if self._hub is not None or self._lb is not None:
-            raise StageUnavailableError("pinned replica routing is only supported for local stage pools")
         if not self.is_replica_available(replica_id):
             raise StageUnavailableError(f"stage {self.stage_id} pinned replica {replica_id} is unavailable")
+        self._reject_hub_down_replica(replica_id)
         bound = self.get_bound_replica_id(request_id)
         if bound is not None and bound != replica_id:
             raise StageUnavailableError(
@@ -754,10 +787,13 @@ class StagePool:
                 for replica in self._hub.get_replicas_for_stage(self.stage_id).replicas:
                     if replica.input_addr == input_addr:
                         return (outputs_qsize, max(int(replica.queue_length), 0))
-            # Distributed dispatch (pick): request_id -> input_addr in _affinity.
+            # Distributed dispatch: unpinned requests live in ``_affinity``
+            # (request_id -> input_addr); pinned duplex turns live in
+            # ``_request_bindings`` (request_id -> replica_id). Counting only the
+            # former under-reports load for pinned traffic.
             inflight = sum(
                 1 for input_addr in self._affinity.values() if self._addr_to_replica_id.get(input_addr) == replica_id
-            )
+            ) + sum(1 for bound in self._request_bindings.values() if bound == replica_id)
         else:
             # Legacy local dispatch (select_replica_id): request_id -> replica_id.
             inflight = sum(1 for bound_replica_id in self._request_bindings.values() if bound_replica_id == replica_id)

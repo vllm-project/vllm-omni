@@ -581,8 +581,8 @@ class OrchestratorBase:
             self._membership.install_membership_handlers(
                 output_queue=self.output_async_queue,
                 cleanup_callback=cleanup_member_requests,
-                replica_removed_callback=self._remove_stage_replica_metrics,
-                replica_added_callback=self._publish_replica_post_warmup_memory,
+                replica_removed_callback=self._on_replica_removed,
+                replica_added_callback=self._on_replica_added,
             )
             membership_watcher = self._membership.start()
 
@@ -1745,6 +1745,19 @@ class OrchestratorBase:
         engine_idx = self._stage_replica_to_engine_idx.get((stage_id, replica_id))
         if self._stat_logger is not None and engine_idx is not None:
             self._stat_logger.remove_stage_post_warmup_memory(engine_idx=engine_idx)
+
+    def _on_replica_removed(self, stage_id: int, replica_id: int) -> None:
+        """Handle a replica that left the pool through membership.
+
+        The base implementation only updates metrics. A runtime that keeps
+        per-replica state (duplex session reservations) overrides this to fail
+        what it held on the replica as well.
+        """
+        self._remove_stage_replica_metrics(stage_id, replica_id)
+
+    async def _on_replica_added(self, stage_id: int, replica_id: int, client: StagePoolClient) -> None:
+        """Handle a replica that joined, or rejoined, the pool."""
+        await self._publish_replica_post_warmup_memory(stage_id, replica_id, client)
 
     def _sync_engines_waiting_counter(self) -> None:
         """Aggregate per-replica waiting into the counter shared with the

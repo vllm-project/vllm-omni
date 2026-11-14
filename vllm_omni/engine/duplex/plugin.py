@@ -1015,8 +1015,18 @@ def validate_duplex_replica_policy(
     """Validate replica policy before workers start and against the actual stage pools."""
     if runtime_config.replica_policy == "legacy":
         return
-    if distributed:
-        raise ValueError("duplex_session.replica_policy=least_sessions does not support distributed hub/LB mode")
+    if distributed and runtime_config.replica_groups is None:
+        # In a distributed deployment the coordinator assigns ``replica_id`` as
+        # replicas register, so a group derived here would be numerically valid
+        # and physically arbitrary: this process does not know which replica runs
+        # where, and the operator cannot choose the ids from the config either.
+        # Requiring an explicit map forces the operator to read the attach log and
+        # record the grouping they observed; the config cannot verify that the
+        # numeric ids still correspond to those hosts.
+        raise ValueError(
+            "duplex_session.replica_policy=least_sessions in distributed hub/LB mode "
+            "requires duplex_session.replica_groups to declare the stage replica topology"
+        )
     cap = runtime_config.max_sessions_per_replica
     assert cap is not None
     # This capability depends on the requested capacity for some plugins; the

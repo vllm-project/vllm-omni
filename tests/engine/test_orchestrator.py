@@ -2282,6 +2282,54 @@ async def test_stage_pool_pinned_submit_preserves_route_and_legacy_round_robin(s
     assert pool.select_replica_id("companion", affinity_request_id="ordinary-1") == 1
 
 
+def _addressed_client(addr: str) -> FakeStageClient:
+    client = FakeStageClient()
+    client.client_addresses = {"input_address": addr}
+    return client
+
+
+def test_invalidate_addr_returns_pinned_requests_too() -> None:
+    """A detached replica must also fail the turn pinned to it.
+
+    Pinned requests never enter ``_affinity``, so the detach path used to walk
+    past them and the turn hung until the client timed out.
+    """
+    addr = "tcp://192.0.2.10:5001"
+    pool = StagePool(0, [FakeStageClient(), _addressed_client(addr)])
+    pool.add_client(addr, pool.clients[1], replica_id=1)
+
+    assert pool.bind_request_to_replica("pinned-turn", 1) == 1
+    assert pool.invalidate_addr(addr) == ["pinned-turn"]
+    # The binding survives: the failure path uses it to attribute the request.
+    assert pool.get_bound_replica_id("pinned-turn") == 1
+
+
+def _pinned_pool_with_hub_status(status: ReplicaStatus) -> StagePool:
+    addr = "tcp://192.0.2.10:5001"
+    pool = StagePool(0, [FakeStageClient(), _addressed_client(addr)])
+    pool.add_client(addr, pool.clients[1], replica_id=1)
+    pool.attach_hub(
+        SimpleNamespace(
+            get_replicas_for_stage=lambda stage_id: SimpleNamespace(replicas=[_routing_replica(addr, status)])
+        )
+    )
+    return pool
+
+
+def test_pinned_binding_accepts_a_replica_the_hub_reports_up() -> None:
+    """The hub check must not reject a healthy replica: it is on every submission."""
+    pool = _pinned_pool_with_hub_status(ReplicaStatus.UP)
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+
+
+def test_pinned_binding_rejects_a_replica_the_hub_reports_down() -> None:
+    """Between the hub marking a replica DOWN and the watcher detaching it, a pin
+    must not be dispatched: ``is_replica_available`` is only the local view."""
+    pool = _pinned_pool_with_hub_status(ReplicaStatus.DOWN)
+    with pytest.raises(StageUnavailableError, match="is not UP in the hub"):
+        pool.bind_request_to_replica("pinned", 1)
+
+
 class _RoutingHub:
     def __init__(self, replicas: list[ReplicaInfo]) -> None:
         self.replicas = replicas
@@ -2798,14 +2846,23 @@ async def test_stage_pool_pinned_submit_rejects_mismatched_cache_replica(monkeyp
 
 
 @pytest.mark.parametrize("distributed_hook", ["_hub", "_lb"])
-def test_stage_pool_pinned_binding_rejects_distributed_mode(distributed_hook: str) -> None:
+def test_stage_pool_pinned_binding_is_honoured_in_distributed_mode(distributed_hook: str) -> None:
+    """A pin addresses the attached client directly, so hub/LB mode cannot block it.
+
+    The load balancer only chooses a replica for unpinned submissions; a session
+    reservation from the duplex placement owner must still reach its replica.
+    """
     pool = StagePool(0, [FakeStageClient(), FakeStageClient()])
     setattr(pool, distributed_hook, object())
 
-    with pytest.raises(StageUnavailableError, match="only supported for local stage pools"):
-        pool.bind_request_to_replica("pinned", 1)
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+    assert pool.get_bound_replica_id("pinned") == 1
 
-    assert pool.get_bound_replica_id("pinned") is None
+    # The availability check is what keeps this safe: a detached replica is
+    # still refused instead of being silently rerouted to another one.
+    pool.clients[1] = None
+    with pytest.raises(StageUnavailableError, match="is unavailable"):
+        pool.bind_request_to_replica("other", 1)
 
 
 @pytest.mark.asyncio

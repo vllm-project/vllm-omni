@@ -678,7 +678,15 @@ independent real-model verification.
 ## Session-aware replica placement
 
 The opt-in `duplex_session.replica_policy: least_sessions` policy places each
-session on a local replica group mapping every stage to a replica. The
+session on a replica group mapping every stage to a replica. In a local
+deployment the group is local. In a distributed one the deployment declares the
+groups explicitly through `duplex_session.replica_groups`, but a stage edge may
+cross hosts only when its connector supports remote transport. The MiniCPM-o
+4.5 stage 1 -> 2 edge uses `SharedMemoryConnector`, which is local-only, so
+every stage-1 replica must run on the same host as the stage-2 replica it feeds.
+The supported distributed layout keeps stage 0 on the head and stages 1/2
+co-located on the worker; splitting a stage-1 replica from stage 2 is not
+supported by this connector configuration. The
 orchestrator owns a separate session reservation ledger; StagePool's request
 bindings continue to describe submitted requests only. Admission reserves a
 group synchronously after taking the global admission slot. The group must
@@ -699,8 +707,11 @@ replica.
 Replica failure marks the replica unavailable and closes every session in its
 reverse index, including idle sessions without an in-flight request. Other
 groups retain their reservations and can continue serving. This policy does
-not migrate model state or support coordinator/distributed deployments.
-Worker-local state capacity uses the per-replica cap, while `max_sessions`
+not migrate model state between replicas. A replica that leaves the declared
+topology is not re-added automatically: its group stays unavailable and
+recovery requires restarting the head. A replacement replica gets a new id
+outside `replica_groups` and can serve ordinary requests but not duplex
+sessions. Worker-local state capacity uses the per-replica cap, while `max_sessions`
 remains the global service cap. The default `legacy` policy preserves the
 existing routing, admission and worker capacity behavior. See the
 [configuration reference](../configuration/stage_configs.md#duplex-replica-placement)
@@ -727,7 +738,11 @@ have the same owner, and `K` must not exceed the group count. The global session
 budget is divided by floor/remainder across frontends and bounded by each
 frontend's owned replica capacity; budgets do not move between frontends.
 The reservation lifetime, strict stage pins and worker caps apply within each
-owner's groups. With `K=1`, routing and admission behavior are unchanged.
+owner's groups. With `K=1`, routing and admission behavior are unchanged. A distributed
+deployment is the `K=1` case: every group belongs to the single frontend. Stages
+may be spread across hosts only where the stage edge's connector supports remote
+transport; with MiniCPM-o 4.5's local-only stage 1 -> 2 `SharedMemoryConnector`,
+stage 1 and stage 2 in a group must be co-located.
 
 The multi-frontend WebSocket guard allows only `least_sessions` and plugins
 without session resume. Credentials, attachment state and replay journals
