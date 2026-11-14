@@ -1567,38 +1567,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             observation=observation,
         )
 
-    def partial_stage_followup(self, plan: PartialStageForward, req_state: object) -> PartialStageForward | None:
-        """Close the Talker stream after a resumable final sentence.
-
-        JoyAI now stamps ``finish_on_next_stop`` on that last sentence and
-        records ``close_sent``, so this follow-up is a no-op. Kept as a
-        safety net if a plan still asks for ``queue_close_after`` without
-        that stamp.
-        """
-        if plan is None or not plan.queue_close_after:
-            return None
-        from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.sentence_tts import (
-            SentenceTtsOutput,
-            _sentence_tts_bridge,
-            mark_close_sent,
-            mark_talker_prompt_flags,
-        )
-
-        bridge = _sentence_tts_bridge(req_state)
-        if isinstance(bridge, dict) and bridge.get("close_sent"):
-            # Already closed for this turn; a second terminal would finish a
-            # session that is already closing.
-            return None
-        mark_talker_prompt_flags(req_state, close_only=True)
-        # A later 2150 park must not send a second terminal for this turn.
-        mark_close_sent(req_state)
-        request_id = str(getattr(plan.output, "request_id", ""))
-        return PartialStageForward(
-            output=SentenceTtsOutput(request_id, ""),
-            is_final_update=True,
-            close_only=True,
-        )
-
     def project_intermediate_output(self, *, stage_id: int, output: object, context: object) -> bool:
         """Project JoyAI action text to the client while it is generated.
 

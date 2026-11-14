@@ -1563,12 +1563,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     save_kwargs["duplex_perf_chunk"] = perf_chunk
                 if is_segment_finished:
                     save_kwargs["segment_generation"] = boundary_generation
-                if finish_on_next_stop:
-                    # Enqueue the vocoder terminal even if this request is not
-                    # yet reporting is_finished() at save time. Without this,
-                    # Code2Wav stays in WAITING_FOR_CHUNK until the client
-                    # times out (JoyAI last-sentence hang).
-                    save_kwargs["force_request_finished"] = True
                 if batch_saves is not None:
                     batch_saves.append(
                         {
