@@ -77,7 +77,7 @@ class FluxPipeline(
     # so they are shared rather than concatenated (their length can coincide
     # with the branch batch size, e.g. one image token at batch 1).
     supports_cfg_batching = True
-    cfg_batching_shared_kwargs = frozenset({"txt_ids", "img_ids"})
+    cfg_batching_shared_kwargs = frozenset({"txt_ids", "img_ids", "image_rotary_emb"})
     supports_request_batch = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
@@ -462,6 +462,13 @@ class FluxPipeline(
     ) -> torch.Tensor:
         """Diffusion loop with optional image conditioning."""
         self.scheduler.set_begin_index(0)
+        # The RoPE tables depend only on the position ids: once per request, not per step.
+        image_rotary_emb = self.transformer.rotary_emb(text_ids, latent_image_ids, dtype=latents.dtype)
+        negative_image_rotary_emb = (
+            self.transformer.rotary_emb(negative_text_ids, latent_image_ids, dtype=latents.dtype)
+            if do_true_cfg and negative_text_ids is not None
+            else None
+        )
         for i, t in enumerate(timesteps):
             if self.interrupt:
                 continue
@@ -480,6 +487,7 @@ class FluxPipeline(
                 "img_ids": latent_image_ids,
                 "joint_attention_kwargs": self.joint_attention_kwargs,
                 "return_dict": False,
+                "image_rotary_emb": image_rotary_emb,
             }
 
             # Forward pass for negative prompt (CFG)
@@ -494,6 +502,7 @@ class FluxPipeline(
                     "img_ids": latent_image_ids,
                     "joint_attention_kwargs": self.joint_attention_kwargs,
                     "return_dict": False,
+                    "image_rotary_emb": negative_image_rotary_emb,
                 }
             else:
                 negative_kwargs = None

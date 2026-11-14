@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -610,6 +610,34 @@ class FluxTransformer2DModel(nn.Module):
         )
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 
+    def rotary_emb(
+        self,
+        txt_ids: torch.Tensor,
+        img_ids: torch.Tensor,
+        dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The joint RoPE ``(cos, sin)`` table of the text and image tokens.
+
+        The table depends only on the position ids, which are fixed for a request,
+        so a pipeline computes it once and passes it to every step's ``forward``
+        as ``image_rotary_emb``. ``dtype`` casts it once; the attention casts the
+        table to the query dtype on every use, so passing the query dtype leaves
+        the values unchanged.
+        """
+        if txt_ids.ndim == 3:
+            txt_ids = txt_ids[0]
+        if img_ids.ndim == 3:
+            img_ids = img_ids[0]
+        ids = torch.cat((txt_ids, img_ids), dim=0)
+        if is_torch_npu_available():
+            freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
+            freqs_cos, freqs_sin = freqs_cos.npu(), freqs_sin.npu()
+        else:
+            freqs_cos, freqs_sin = self.pos_embed(ids)
+        if dtype is not None:
+            freqs_cos, freqs_sin = freqs_cos.to(dtype), freqs_sin.to(dtype)
+        return freqs_cos, freqs_sin
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -621,6 +649,7 @@ class FluxTransformer2DModel(nn.Module):
         guidance: torch.Tensor | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = True,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | Transformer2DModelOutput:
         """
         The [`FluxTransformer2DModel`] forward method.
@@ -647,6 +676,9 @@ class FluxTransformer2DModel(nn.Module):
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
                 tuple.
+            image_rotary_emb (`tuple[torch.Tensor, torch.Tensor]`, *optional*):
+                The RoPE `(cos, sin)` table that `rotary_emb(txt_ids, img_ids)` returns. A caller that computes it
+                once per request passes it here; otherwise it is computed from `txt_ids` and `img_ids`.
 
         Returns:
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
@@ -666,25 +698,18 @@ class FluxTransformer2DModel(nn.Module):
         )
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
-        if txt_ids.ndim == 3:
-            logger.warning(
-                "Passing `txt_ids` 3d torch.Tensor is deprecated."
-                "Please remove the batch dimension and pass it as a 2d torch Tensor"
-            )
-            txt_ids = txt_ids[0]
-        if img_ids.ndim == 3:
-            logger.warning(
-                "Passing `img_ids` 3d torch.Tensor is deprecated."
-                "Please remove the batch dimension and pass it as a 2d torch Tensor"
-            )
-            img_ids = img_ids[0]
-
-        ids = torch.cat((txt_ids, img_ids), dim=0)
-        if is_torch_npu_available():
-            freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
-            image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
-        else:
-            image_rotary_emb = self.pos_embed(ids)
+        if image_rotary_emb is None:
+            if txt_ids.ndim == 3:
+                logger.warning(
+                    "Passing `txt_ids` 3d torch.Tensor is deprecated."
+                    "Please remove the batch dimension and pass it as a 2d torch Tensor"
+                )
+            if img_ids.ndim == 3:
+                logger.warning(
+                    "Passing `img_ids` 3d torch.Tensor is deprecated."
+                    "Please remove the batch dimension and pass it as a 2d torch Tensor"
+                )
+            image_rotary_emb = self.rotary_emb(txt_ids, img_ids)
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
@@ -801,6 +826,7 @@ class FluxKontextTransformer2DModel(FluxTransformer2DModel):
         guidance: torch.Tensor | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = True,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | Transformer2DModelOutput:
         hidden_states = self.x_embedder(hidden_states)
         timestep = timestep.to(hidden_states.dtype) * 1000
@@ -814,21 +840,18 @@ class FluxKontextTransformer2DModel(FluxTransformer2DModel):
 
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
-        if txt_ids is not None and txt_ids.ndim == 3:
-            logger.warning(
-                "Passing `txt_ids` 3d torch.Tensor is deprecated."
-                "Please remove the batch dimension and pass it as a 2d torch.Tensor"
-            )
-            txt_ids = txt_ids[0]
-        if img_ids is not None and img_ids.ndim == 3:
-            logger.warning(
-                "Passing `img_ids` 3d torch.Tensor is deprecated."
-                "Please remove the batch dimension and pass it as a 2d torch.Tensor"
-            )
-            img_ids = img_ids[0]
-
-        ids = torch.cat((txt_ids, img_ids), dim=0)
-        image_rotary_emb = self.pos_embed(ids)
+        if image_rotary_emb is None:
+            if txt_ids is not None and txt_ids.ndim == 3:
+                logger.warning(
+                    "Passing `txt_ids` 3d torch.Tensor is deprecated."
+                    "Please remove the batch dimension and pass it as a 2d torch.Tensor"
+                )
+            if img_ids is not None and img_ids.ndim == 3:
+                logger.warning(
+                    "Passing `img_ids` 3d torch.Tensor is deprecated."
+                    "Please remove the batch dimension and pass it as a 2d torch.Tensor"
+                )
+            image_rotary_emb = self.rotary_emb(txt_ids, img_ids)
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(

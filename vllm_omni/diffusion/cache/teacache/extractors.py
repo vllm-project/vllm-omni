@@ -1319,6 +1319,7 @@ def extract_flux_context(
     txt_ids: torch.Tensor,
     guidance: torch.Tensor | None = None,
     joint_attention_kwargs: dict[str, Any] | None = None,
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     **kwargs: Any,
 ) -> CacheContext:
     """
@@ -1337,6 +1338,8 @@ def extract_flux_context(
         txt_ids: Text position IDs for RoPE
         guidance: Optional guidance scale for guidance-distilled variants
         joint_attention_kwargs: Additional attention kwargs
+        image_rotary_emb: The RoPE table the pipeline computed once per request,
+            or None to compute it from ``txt_ids`` and ``img_ids``
         **kwargs: Additional keyword arguments
 
     Returns:
@@ -1363,17 +1366,8 @@ def extract_flux_context(
     )
     encoder_hidden_states = module.context_embedder(encoder_hidden_states)
 
-    if txt_ids.ndim == 3:
-        txt_ids = txt_ids[0]
-    if img_ids.ndim == 3:
-        img_ids = img_ids[0]
-
-    ids = torch.cat((txt_ids, img_ids), dim=0)
-    if current_omni_platform.is_npu():
-        freqs_cos, freqs_sin = module.pos_embed(ids.cpu())
-        image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
-    else:
-        image_rotary_emb = module.pos_embed(ids)
+    if image_rotary_emb is None:
+        image_rotary_emb = module.rotary_emb(txt_ids, img_ids)
 
     # ============================================================================
     # EXTRACT MODULATED INPUT (for cache decision)
