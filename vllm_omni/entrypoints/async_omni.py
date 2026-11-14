@@ -45,8 +45,12 @@ from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetric
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
+    from vllm.distributed.weight_transfer.base import (
+        WeightTransferInitRequest,
+        WeightTransferUpdateRequest,
+    )
     from vllm.tokenizers import TokenizerLike
-    from vllm.v1.engine import PauseMode
+    from vllm.v1.engine import CheckpointState, PauseMode
     from vllm.v1.engine.input_processor import InputProcessor
     from vllm.v1.kv_hints import KvHintsEnvelope
 
@@ -1316,14 +1320,23 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         return all(self._coerce_stage_bool(result) for result in results)
 
     async def release_kv_cache_memory(
-        self, *, stage_ids: list[int] | None = None, timeout: float = CACHE_RESET_TIMEOUT_S
+        self,
+        reset_connector: bool = True,
+        *,
+        stage_ids: list[int] | None = None,
+        timeout: float = CACHE_RESET_TIMEOUT_S,
     ) -> None:
         """Discard AR-stage KV memory after a completed generation pause.
 
         EngineCore checks that the scheduler is paused and all executor
         memory is resident. Diffusion stages have no KV cache to release.
         Restore KV memory with ``wake_up(tags=["kv_cache"])`` before resuming.
+
+        ``reset_connector`` is accepted for upstream ``EngineClient``
+        compatibility; omni stages own their connector teardown inside the
+        stage-side release RPC.
         """
+        _ = reset_connector
         ar_stage_ids, _ = self._split_stage_ids_by_type(stage_ids)
         if not ar_stage_ids:
             return
@@ -1337,10 +1350,40 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         self._record_stage_sleep(ar_stage_ids, [CuMemTag.KV_CACHE.value])
         self._hold_admission_until_resume = True
 
+    async def checkpoint_prepare(self, mode: PauseMode = "wait") -> str | None:
+        """Upstream ``EngineClient`` checkpoint hook (vLLM 0.34).
+
+        Omni's multi-stage sleep/pause lifecycle is driven by ``sleep`` /
+        ``pause_generation`` / ``release_kv_cache_memory``; stage-level
+        checkpoint preparation is not yet wired, so callers get a refusal
+        instead of a silent no-op.
+        """
+        return "AsyncOmni does not support checkpoint_prepare; use sleep()/pause_generation()"
+
+    async def checkpoint_restore(self) -> None:
+        """Upstream ``EngineClient`` checkpoint hook (vLLM 0.34); see
+        :meth:`checkpoint_prepare`."""
+        raise NotImplementedError("AsyncOmni does not support checkpoint_restore; use wake_up()")
+
+    async def checkpoint_state(self) -> tuple[CheckpointState, str | None]:
+        """Upstream ``EngineClient`` checkpoint hook (vLLM 0.34); see
+        :meth:`checkpoint_prepare`."""
+        from vllm.v1.engine import CheckpointState
+
+        return CheckpointState.RUNNING, None
+
     async def sleep(
-        self, stage_ids: list[int] | None = None, level: int = 2, mode: PauseMode = "abort"
+        self,
+        stage_ids: list[int] | None = None,
+        level: int = 2,
+        mode: PauseMode = "abort",
+        reset_connector: bool = True,
     ) -> list[OmniACK]:
         """Put stages to sleep.
+
+        ``reset_connector`` is accepted for upstream ``EngineClient``
+        compatibility; omni stages own their connector teardown inside the
+        stage-side sleep RPC.
 
         AR/LLM stages use EngineCore.sleep (pause scheduler, wait idle, then
         offload/discard memory) — matching vLLM AsyncLLM.sleep.
@@ -1731,12 +1774,21 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 raise RuntimeError(f"{method} failed on a stage: {result.get('error', result)}")
         return results
 
-    async def init_weight_transfer_engine(self, init_info: dict) -> None:
+    async def init_weight_transfer_engine(
+        self,
+        init_request: WeightTransferInitRequest | dict,
+    ) -> None:
         """Initialize weight transfer mechanism across all stages.
 
         Args:
-            init_info: Backend-specific initialization information
+            init_request: Upstream ``WeightTransferInitRequest`` (vLLM 0.34
+                ``EngineClient`` protocol) exposing ``.init_info``, or the
+                legacy backend-specific ``dict`` passed by omni callers.
         """
+        if hasattr(init_request, "init_info"):
+            init_info = init_request.init_info
+        else:
+            init_info = init_request
         await self._weight_transfer_rpc("init_weight_transfer_engine", (init_info,))
         logger.info("[%s] Weight transfer engine initialized", self._name)
 
@@ -1749,12 +1801,15 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         await self._weight_transfer_rpc("start_weight_update")
         logger.info("[%s] Weight update session started", self._name)
 
-    async def update_weights(self, update_info: dict) -> None:
+    async def update_weights(self, request: WeightTransferUpdateRequest | dict) -> None:
         """Send weight update chunk to all stages.
 
         Args:
-            update_info: Backend-specific update information containing weight data
+            request: Upstream ``WeightTransferUpdateRequest`` (vLLM 0.34
+                ``EngineClient`` protocol) exposing ``.update_info``, or the
+                legacy backend-specific ``dict`` passed by omni callers.
         """
+        update_info = request.update_info if hasattr(request, "update_info") else request
         await self._weight_transfer_rpc("update_weights", (update_info,))
         logger.debug("[%s] Weight chunk forwarded to stages", self._name)
 

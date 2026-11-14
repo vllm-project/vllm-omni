@@ -33,16 +33,7 @@ from vllm.v1.outputs import (
     KVConnectorOutput,
     make_empty_encoder_model_runner_output,
 )
-from vllm.v1.spec_decode.dflash import DFlashProposer
-from vllm.v1.spec_decode.draft_model import DraftModelProposer
-from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
-from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.utils import record_function_or_nullcontext
-from vllm.v1.worker.gpu_model_runner import (
-    AsyncGPUModelRunnerOutput,
-    PerLayerAttnMetadata,
-)
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
@@ -61,6 +52,13 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
 )
+from vllm_omni.worker.v1_compat.async_output import AsyncGPUModelRunnerOutput
+from vllm_omni.worker.v1_compat.dflash import DFlashProposer
+from vllm_omni.worker.v1_compat.draft_model import DraftModelProposer
+from vllm_omni.worker.v1_compat.eagle import EagleProposer
+from vllm_omni.worker.v1_compat.extract_hidden_states import ExtractHiddenStatesProposer
+from vllm_omni.worker.v1_compat.gemma4 import Gemma4Proposer
+from vllm_omni.worker.v1_compat.misc import PerLayerAttnMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +178,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             self.input_batch.remove_request(req_id)
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
-        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        # vLLM 0.34 removed resumed_req_ids from CachedRequestData (resumed
+        # requests are re-sent in full via scheduled_new_reqs), so payloads
+        # built by the pinned scheduler carry no resume set: empty is exact.
+        resumed_req_ids: set[str] = getattr(scheduler_output.scheduled_cached_reqs, "resumed_req_ids", set())
         unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
         for req_id in unscheduled_req_ids:
             self.input_batch.remove_request(req_id)
@@ -648,7 +649,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
-        req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
         if inter_stage_outputs and accumulate_full_payload:
             for i, rid in enumerate(req_ids_output_copy):
                 req_state = self.requests.get(rid)
@@ -657,7 +657,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
         output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
-            req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=[],
             logprobs=None,
             prompt_logprobs_dict={},

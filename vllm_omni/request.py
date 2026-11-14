@@ -83,6 +83,7 @@ class OmniRequest(Request):
         cls,
         request: OmniEngineCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
+        block_hashes: list["BlockHash"] | None = None,
     ) -> "Request":
         """Create an OmniRequest from an OmniEngineCoreRequest.
 
@@ -90,6 +91,9 @@ class OmniRequest(Request):
             request: The OmniEngineCoreRequest to convert
             block_hasher: Optional function to compute block hashes for
                 prefix caching
+            block_hashes: Optional frontend-computed prompt block hashes
+                (v0.34); the hasher continues from the first block they
+                do not cover.
 
         Returns:
             OmniRequest instance created from the engine core request
@@ -111,6 +115,7 @@ class OmniRequest(Request):
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            block_hashes=block_hashes,
             additional_information=request.additional_information,
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             payload_sender_info=request.payload_sender_info,

@@ -13,7 +13,6 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen
 from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.encoder_cudagraph import BudgetGraphMetadata, EncoderCudaGraphManager
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 import vllm_omni.model_executor.models.qwen3_omni.qwen3_omni as outer_module
 import vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker as thinker_module
@@ -24,6 +23,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
 )
 from vllm_omni.worker.encoder_cudagraph import SingleReplayEncoderCudaGraphManager
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.v1_compat.gpu_model_runner import V1GPUModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -96,6 +96,7 @@ def _config(stage="thinker", *, embeds=False):
             encoder_cudagraph_token_budgets=[2, 4],
             encoder_cudagraph_max_vision_items_per_batch=2,
             encoder_cudagraph_max_frames_per_batch=None,
+            encoder_cudagraph_max_token_budget=5120,
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
         device_config=SimpleNamespace(device="cpu"),
@@ -334,7 +335,7 @@ def test_graph_entry_preserves_vision_module_hooks():
 
 
 def _run_encoder_step(monkeypatch, model, manager, batches):
-    import vllm.v1.worker.gpu_model_runner as runner_module
+    import vllm_omni.worker.v1_compat.gpu_model_runner as runner_module
 
     monkeypatch.setattr(runner_module, "group_and_batch_mm_kwargs", lambda *args, **kwargs: iter(batches))
     keys = [f"item{index}" for index in range(sum(count for _, count, _ in batches))]
@@ -352,7 +353,7 @@ def _run_encoder_step(monkeypatch, model, manager, batches):
         _cache_encoder_output=lambda key, value, *args: cached.__setitem__(key, value),
     )
     scheduler = SimpleNamespace(ec_manager_metadata=None, free_encoder_mm_hashes=[])
-    GPUModelRunner._execute_mm_encoder(runner, scheduler)
+    V1GPUModelRunnerMixin._execute_mm_encoder(runner, scheduler)
     return [cached[key] for key in keys]
 
 

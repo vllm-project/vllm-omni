@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """BitsAndBytes 4-bit quantization config for diffusion transformers.
 
@@ -146,6 +147,15 @@ class BnBOnlineLinearMethod(LazyWeightMixin, LinearMethodBase):
             quant_type=self.quant_config.quant_type,
             compress_statistics=self.quant_config.compress_statistics,
         )
+
+        # The pin's replace_parameter keeps the existing Parameter object and
+        # rebinding a requires-grad float param's .data to the quantized
+        # integer tensor raises. The serialized checkpoint weight is a pure
+        # online-requantization source here, so flag it like the pin's
+        # OnlineRequantizationMixin.create_requantization_source_weights does
+        # and let replace_parameter register the quantized parameter over it.
+        if isinstance(getattr(layer, "weight", None), torch.nn.Parameter):
+            layer.weight.requantization_source = True  # type: ignore[attr-defined]
 
         replace_parameter(
             layer,

@@ -272,6 +272,8 @@ def test_partial_mooncake_registration_is_replaced_by_empty_notifications(cfg_re
     scheduler.is_kv_producer = False
     scheduler.is_kv_consumer = True
     scheduler._reqs_need_recv = {}
+    # vLLM 0.34 request_finished pops the lease registry before bailing out.
+    scheduler._lease_reqs = {}
     connector = object.__new__(MooncakeConnector)
     connector.connector_scheduler = scheduler
     requests, manager = cfg_registration

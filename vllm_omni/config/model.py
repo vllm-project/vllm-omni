@@ -8,7 +8,7 @@ from typing import Any, Literal
 from pydantic import ConfigDict, TypeAdapter
 from transformers import PretrainedConfig
 from vllm.config import ModelConfig
-from vllm.config.utils import config
+from vllm.config.utils import CompileFactors, config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     get_hf_text_config,
@@ -42,9 +42,10 @@ class OmniModelArchConfigConvertor(ModelArchConfigConvertorBase):
         self,
         hf_config,
         hf_text_config,
+        revision: str | None = None,
         stage_config_name: str | None = None,
     ):
-        super().__init__(hf_config, hf_text_config)
+        super().__init__(hf_config, hf_text_config, revision=revision)
         self.stage_config_name = stage_config_name
 
     def get_quantization_config(self):
@@ -170,13 +171,19 @@ class OmniModelConfig(ModelConfig):
     requires_full_payload_input: bool = False
     scheduling_metadata_adapter: str | None = None
 
-    def compute_hash(self) -> str:
-        """Compute the hash for the Omni Model config to be used for the compile cache."""
+    def compile_factors(self) -> CompileFactors:
+        """Compile factors for the Omni Model config, used for the compile cache.
+
+        v0.34 replaced ``ModelConfig.compute_hash``/``VllmConfig.compute_hash``
+        with ``compile_factors()`` + ``vllm.config.utils.hash_config``; this
+        ports the connector normalization that used to live in the removed
+        ``compute_hash`` override.
+        """
         from vllm_omni.distributed.omni_connectors.utils.config import connector_hash_factors
 
-        # Remove hash factors on a copy of the object, then use the mutated copy to get the hash.
+        # Remove hash factors on a copy of the object, then use the mutated copy to get the factors.
         # This is a workaround to vLLM's ModelConfig not having a clean way of changing its config
-        # factors. See: https://github.com/vllm-project/vllm/blob/v0.31.0/vllm/config/model.py#L434
+        # factors.
         hashed = copy.copy(self)
 
         # connector config are handled here to ensure UUIDs don't cause compile cache misses
@@ -186,7 +193,7 @@ class OmniModelConfig(ModelConfig):
             hashed.omni_kv_config = dict(self.omni_kv_config)
             hashed.omni_kv_config["connector_config"] = connector_hash_factors(self.omni_kv_config["connector_config"])
 
-        return super(OmniModelConfig, hashed).compute_hash()
+        return super(OmniModelConfig, hashed).compile_factors()
 
     @property
     def registry(self):
@@ -239,9 +246,10 @@ class OmniModelConfig(ModelConfig):
             convertor = OmniModelArchConfigConvertor(
                 self.hf_config,
                 self.hf_text_config,
+                revision=getattr(self, "revision", None),
                 stage_config_name=self.hf_config_name,
             )
-            return convertor.convert()
+            return convertor.convert(supports_multimodal=self._supports_multimodal_for_mm_prefix())
         return super().get_model_arch_config()
 
     def draw_hf_text_config(self) -> PretrainedConfig:

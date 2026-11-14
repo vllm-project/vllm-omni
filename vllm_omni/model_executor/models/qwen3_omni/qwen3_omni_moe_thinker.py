@@ -38,6 +38,7 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 )
 from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
     Qwen3OmniMoeProcessor,
+    Qwen3OmniMoeProcessorKwargs,
 )
 from transformers.models.whisper import WhisperFeatureExtractor
 from vllm.compilation.decorators import support_torch_compile
@@ -71,6 +72,7 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniAudioFeatureInputs,
     Qwen2_5OmniThinkerDummyInputsBuilder,
+    Qwen2_5OmniThinkerProcessingInfo,
     merge_interleaved_embeddings,
 )
 from vllm.model_executor.models.qwen2_5_vl import (
@@ -105,7 +107,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItems
-from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
+from vllm.multimodal.parse import AudioProcessorItems, ImageSize, MultiModalDataItems
 from vllm.multimodal.processing.processor import (
     MultiModalPromptUpdates,
     PlaceholderFeaturesInfo,
@@ -758,6 +760,8 @@ class Qwen3MoeLLMForCausalLM(Qwen3MoeForCausalLM):
 
 
 class Qwen3OmniMoeThinkerProcessingInfo(Qwen2AudioProcessingInfo, Qwen2_5_VLProcessingInfo):
+    processor_kwargs_cls = Qwen3OmniMoeProcessorKwargs
+
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3OmniMoeConfig).thinker_config
 
@@ -795,6 +799,33 @@ class Qwen3OmniMoeThinkerProcessingInfo(Qwen2AudioProcessingInfo, Qwen2_5_VLProc
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": None, "image": None, "video": None}
+
+    # Upstream's Qwen2_5OmniThinkerProcessingInfo provides the video dummy-
+    # input sizing surface (called by the pinned Qwen2_5OmniThinker video
+    # builder during profile_run); this fork derives from the same bases
+    # instead of that class, so mirror its implementation verbatim
+    # (vllm/model_executor/models/qwen2_5_omni_thinker.py).
+    def _get_videos_kwargs(self) -> dict[str, Any]:
+        processor = self.get_hf_processor()
+        return processor._merge_kwargs(
+            self.processor_kwargs_cls,
+            tokenizer_init_kwargs=processor.tokenizer.init_kwargs,
+            **self.ctx.get_merged_mm_kwargs({}),
+        )["videos_kwargs"]
+
+    def _get_video_size(self) -> dict[str, int]:
+        merged_kwargs = self.ctx.get_merged_mm_kwargs({})
+        if merged_kwargs.keys() & {"size", "min_pixels", "max_pixels"}:
+            return self._get_vision_size(
+                merged_kwargs,
+                default_size=self.get_hf_processor().video_processor.size,
+            )
+        return self._get_videos_kwargs()["size"]
+
+    def get_video_size_with_most_features(self) -> ImageSize:
+        return self.get_image_size_with_most_features(max_pixels=self._get_video_size()["longest_edge"])
+
+    get_video_frame_size = Qwen2_5OmniThinkerProcessingInfo.get_video_frame_size
 
     def get_mm_max_tokens_per_item(
         self,

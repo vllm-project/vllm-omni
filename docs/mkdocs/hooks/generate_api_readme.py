@@ -68,7 +68,8 @@ class APIVisitor(ast.NodeVisitor):
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         """Visit class definitions."""
         if not node.name.startswith("_"):
-            self.classes.append(f"{self.module_path}.{node.name}")
+            qualified_name = ".".join([*self._class_stack, node.name])
+            self.classes.append(f"{self.module_path}.{qualified_name}")
         # Track that we're entering a class
         self._class_stack.append(node.name)
         self.generic_visit(node)

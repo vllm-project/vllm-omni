@@ -281,6 +281,29 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
     # Step inputs
     # ------------------------------------------------------------------
 
+    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+        model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+        # Dummy runs skip run_preprocess, so the model's fixed-address step
+        # buffers keep whatever the last real step staged. vLLM 0.34's JIT
+        # kernel warmup runs real requests before CUDA graph capture, and the
+        # compiled forward gathers hidden states (sized by this dummy run's
+        # num_tokens) by sample_rows: a row staged for a longer warmup batch
+        # trips the gather's bounds assert inside capture. Stage the pure
+        # decode-step layout of this dummy size instead (the next real step
+        # rewrites every buffer before the model runs).
+        buffers = self.buffers
+        num_samples = min(num_tokens, self.max_num_seqs)
+        rows = torch.arange(num_tokens, device=self.device)
+        sampling = rows < min(num_reqs, num_samples)
+        buffers.token_slots[:num_tokens].fill_(buffers.dummy_slot)
+        buffers.token_from_slot[:num_tokens].fill_(True)
+        buffers.sample_token_rows[:num_tokens].copy_(sampling)
+        buffers.token_sample_index[:num_tokens].copy_(torch.where(sampling, rows, torch.zeros_like(rows)))
+        buffers.sample_rows[:num_samples].copy_(rows[:num_samples])
+        buffers.sample_valid[:num_samples].copy_(rows[:num_samples] < num_reqs)
+        buffers.sample_slots[:num_samples].fill_(buffers.dummy_slot)
+        return model_inputs
+
     def run_preprocess(self, input_batch, model_inputs, req_states=None, mtp_batch_descriptor_dispatcher=None):
         self._flush_slot_writes()
         buffers = self.buffers

@@ -20,17 +20,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv
-from vllm.v1.spec_decode.dflash import DFlashProposer
-from vllm.v1.spec_decode.draft_model import DraftModelProposer
-from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
-from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
-from vllm.v1.spec_decode.ngram_proposer_gpu import (
-    update_ngram_gpu_tensors_incremental,
-    update_scheduler_for_invalid_drafts,
-)
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner, PerLayerAttnMetadata
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import stage_prefix_cache_config
@@ -43,6 +33,18 @@ from vllm_omni.model_executor.models.model_local_kv import collect_model_local_k
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device
+from vllm_omni.worker.v1_compat.dflash import DFlashProposer
+from vllm_omni.worker.v1_compat.draft_model import DraftModelProposer
+from vllm_omni.worker.v1_compat.eagle import EagleProposer
+from vllm_omni.worker.v1_compat.extract_hidden_states import ExtractHiddenStatesProposer
+from vllm_omni.worker.v1_compat.gemma4 import Gemma4Proposer
+from vllm_omni.worker.v1_compat.gpu_model_runner import V1GPUModelRunnerMixin
+from vllm_omni.worker.v1_compat.input_batch import CachedRequestState
+from vllm_omni.worker.v1_compat.misc import PerLayerAttnMetadata
+from vllm_omni.worker.v1_compat.ngram_proposer_gpu import (
+    update_ngram_gpu_tensors_incremental,
+    update_scheduler_for_invalid_drafts,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -117,7 +119,7 @@ def _build_prefill_token_mask(
     return torch.tensor(token_mask, dtype=torch.bool, device=device)
 
 
-class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
+class OmniGPUModelRunner(PrefixCacheRunnerMixin, V1GPUModelRunnerMixin, GPUModelRunner):
     intermediate_tensors: IntermediateTensors | None
 
     def __init__(self, *args, **kwargs):
@@ -525,6 +527,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 **_filter_mrope_kwargs_for_model(self.model, kwargs),
             )
         else:
+            if req_state.prompt_token_ids is None:
+                raise ValueError("Omni M-RoPE position computation requires prompt_token_ids")
             req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(
                 req_state.prompt_token_ids,
                 hf_config=self.model_config.hf_config,
@@ -660,7 +664,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # they will be scheduled again sometime in the future.
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
-        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        # vLLM 0.34 removed resumed_req_ids from CachedRequestData (resumed
+        # requests are re-sent in full via scheduled_new_reqs), so payloads
+        # built by the pinned scheduler carry no resume set: empty is exact.
+        resumed_req_ids: set[str] = getattr(scheduler_output.scheduled_cached_reqs, "resumed_req_ids", set())
         # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
         # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
         # apart from the forced-preemption case in reset_prefix_cache. And in
@@ -684,12 +691,20 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
+            # Native 0.34 sends preempted requests in full. Their generated
+            # tokens remain outputs, whereas a streaming replacement folds
+            # the previous chunk's outputs into its new prompt.
+            output_token_ids = list(new_req_data.prefill_token_ids[new_req_data.prompt_len :])
             if req_id in self.requests:
-                self._update_streaming_input_additional_info(new_req_data, req_id)
-                if self._resume_streaming_row_in_place(req_id, new_req_data, scheduler_output):
-                    continue
+                if not output_token_ids:
+                    self._update_streaming_input_additional_info(new_req_data, req_id)
+                    if self._resume_streaming_row_in_place(req_id, new_req_data, scheduler_output):
+                        continue
                 req_state = self._update_streaming_request(req_id, new_req_data)
+                req_state.output_token_ids = output_token_ids
                 reqs_to_add.append(req_state)
+                if is_ngram_gpu:
+                    ngram_gpu_new_reqs.append(req_state)
                 continue
 
             sampling_params = new_req_data.sampling_params
@@ -720,7 +735,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 generator=generator,
                 block_ids=new_req_data.block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
-                output_token_ids=[],
+                output_token_ids=output_token_ids,
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
@@ -784,6 +799,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
+        req_resumed_req_ids: set[str] = getattr(req_data, "resumed_req_ids", set())
+        req_all_token_ids = getattr(req_data, "all_token_ids", {})
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
 
         # Save scheduler-allocated spec lengths before trimming so
@@ -805,7 +822,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
-            resumed_from_preemption = req_id in req_data.resumed_req_ids
+            resumed_from_preemption = req_id in req_resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
@@ -886,7 +903,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 if self.use_async_scheduling and num_output_tokens > 0:
                     # We must recover the output token ids for resumed requests in the
                     # async scheduling case, so that correct input_ids are obtained.
-                    resumed_token_ids = req_data.all_token_ids[req_id]
+                    resumed_token_ids = req_all_token_ids[req_id]
                     req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
 
                 reqs_to_add.append(req_state)
@@ -1689,7 +1706,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             req_state = self.requests[req_id]
             pe_cpu = getattr(req_state, "prompt_embeds_cpu", None)
             num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
-            prompt_len = len(req_state.prompt_token_ids)
+            prompt_len = req_state.num_prompt_tokens
             prompt_remaining = max(0, prompt_len - num_computed_tokens)
             sched_tokens = int(num_scheduled_tokens_np[req_index])
             overlay_len = min(sched_tokens, prompt_remaining)
@@ -2005,7 +2022,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             preprocess_device = preprocess_input_ids.device
             batch_preprocess_embeds = inputs_embeds
             if getattr(self.model, "preprocess_batch_requires_stable_decode", False) and (
-                scheduler_output.scheduled_new_reqs or scheduler_output.scheduled_cached_reqs.resumed_req_ids
+                scheduler_output.scheduled_new_reqs
+                or getattr(scheduler_output.scheduled_cached_reqs, "resumed_req_ids", None)
             ):
                 # Keep cleanup/prefetch hooks, but do not let a decode-only
                 # shortcut consume newly admitted or resumed requests.
@@ -2123,7 +2141,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 # call the custom process function
                 req_infos["request_id"] = req_id
                 req_infos["duplex_token_offset"] = int(self.input_batch.num_computed_tokens_cpu[req_index])
-                req_infos["duplex_prompt_len"] = len(req_state.prompt_token_ids) if req_state is not None else None
+                req_infos["duplex_prompt_len"] = req_state.num_prompt_tokens if req_state is not None else None
                 prompt_token_ids = getattr(req_state, "prompt_token_ids", ()) if req_state is not None else ()
                 prompt_len = len(prompt_token_ids or ())
                 num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
@@ -2351,7 +2369,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                             existing.setdefault(validity_key[0], {})[validity_key[1]] = torch.ones(
                                 (), dtype=torch.bool, device=code_predictor_codes.device
                             )
-                        req_state.additional_information_cpu = existing
+                        setattr(req_state, "additional_information_cpu", existing)
             else:
                 for idx, req_id in enumerate(decode_req_ids):
                     update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
@@ -2368,7 +2386,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         positions: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        **model_kwargs: dict[str, Any],
+        **model_kwargs: Any,
     ):
         """Inject omni-specific kwargs into forward and cache model output"""
         model_kwargs_extra = self._build_model_kwargs_extra()
@@ -2443,12 +2461,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     # __class__ cell inside this nested function. `narrow.context`
                     # is None once a narrow step was restored (fused graph
                     # declined); only a live step owns the one-query buffers.
-                    active = narrow is not None and narrow.context is not None
+                    active = narrow if narrow is not None and narrow.context is not None else None
                     return super(OmniGPUModelRunner, self)._model_forward(
-                        input_ids=None if active else input_ids,
-                        positions=narrow.positions if active else positions,
+                        input_ids=None if active is not None else input_ids,
+                        positions=active.positions if active is not None else positions,
                         intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=narrow.inputs_embeds if active else inputs_embeds,
+                        inputs_embeds=active.inputs_embeds if active is not None else inputs_embeds,
                         **model_kwargs,
                         **model_kwargs_extra,
                     )

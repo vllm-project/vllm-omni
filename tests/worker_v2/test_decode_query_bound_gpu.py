@@ -26,6 +26,9 @@ class _AttentionScales:
     _q_scale: torch.Tensor
     _k_scale: torch.Tensor
     _v_scale: torch.Tensor
+    _q_scale_float: float = 1.0
+    _k_scale_float: float = 1.0
+    _v_scale_float: float = 1.0
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)

@@ -324,7 +324,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
-            num_common_prefix_blocks=num_common_prefix_blocks,
+            # vLLM 0.34 removed num_common_prefix_blocks and ec_manager_metadata
+            # from SchedulerOutput; the parameter stays for callers, and the
+            # encoder-cache manager no longer publishes per-step metadata.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             # Preemptions accumulated since the previous step; cleared by
@@ -333,10 +335,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Upstream drains the manager-side list every step (unbounded growth
             # otherwise) and applies _skip_zero_block_ids before zeroing.
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
-            ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
+        del num_common_prefix_blocks
 
         # KVTransfer: package metadata
         if self.connector is not None:
@@ -716,11 +718,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._postprocess_omni_schedule_output(res)
                 return self._wrap_omni_scheduler_output(res)
 
-        # Compute common prefix blocks (aligned with v1)
+        # Compute common prefix blocks (aligned with v1). vLLM 0.34 removed
+        # KVCacheManager.get_num_common_prefix_blocks and the SchedulerOutput
+        # field, so the fast path keeps the placeholder the builder drops.
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
-        if self.running:
-            any_request = self.running[0]
-            num_common_prefix_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(any_request.request_id)
 
         # Assemble the current SchedulerOutput contract.
         if self.use_v2_model_runner:
@@ -741,7 +742,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # No running/resumed reqs scheduled in our fast path
         cached_reqs_data = self._make_cached_request_data(
             running_reqs=scheduled_running_reqs,
-            resumed_reqs=[],
             num_scheduled_tokens=num_scheduled_tokens,
             spec_decode_tokens=scheduled_spec_decode_tokens,
             req_to_new_blocks=req_to_new_blocks,
@@ -749,9 +749,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         cached_reqs_data = OmniCachedRequestData(
             req_ids=cached_reqs_data.req_ids,
-            resumed_req_ids=cached_reqs_data.resumed_req_ids,
+            resumed_req_ids=set(getattr(cached_reqs_data, "resumed_req_ids", ()) or ()),
             new_token_ids=cached_reqs_data.new_token_ids,
-            all_token_ids=cached_reqs_data.all_token_ids,
             new_block_ids=cached_reqs_data.new_block_ids,
             num_computed_tokens=cached_reqs_data.num_computed_tokens,
             num_output_tokens=cached_reqs_data.num_output_tokens,
@@ -760,10 +759,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-
-        # Record request ids scheduled in this step for the next update.
-        self.prev_step_scheduled_req_ids.clear()
-        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         scheduler_output = self._build_generation_scheduler_output(
             new_reqs_data,
@@ -920,6 +915,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
+        # The worker's output order follows its batch, not num_scheduled_tokens.
+        # ModelRunnerOutput.req_id_to_index was dropped upstream; derive the
+        # row index from req_ids like the pin's scheduler does.
+        req_indices = {req_id: i for i, req_id in enumerate(model_runner_output.req_ids)}
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
@@ -958,7 +957,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # this output must not be appended or emitted.
                 continue
 
-            req_index = model_runner_output.req_id_to_index[req_id]
+            req_index = req_indices[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
 
             scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)

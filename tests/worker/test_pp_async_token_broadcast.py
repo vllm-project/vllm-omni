@@ -29,10 +29,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from vllm.v1.worker import gpu_model_runner as upstream_runner_module
+from vllm.v1.worker.gpu import model_runner as upstream_runner_module
 
 from vllm_omni.worker import gpu_ar_model_runner as omni_runner_module
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, GPUARModelRunner
+from vllm_omni.worker.v1_compat import gpu_model_runner as v1_compat_runner_module
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.parallel]
 
@@ -159,8 +160,10 @@ def ledger(monkeypatch):
 
 
 def _use_pp(monkeypatch, pp):
-    # The guard lives in the Omni override; the sender/receiver bodies live in vLLM.
+    # The guard lives in the Omni override; the sender/receiver bodies live in
+    # the vendored V1 surface (v1_compat) since upstream removed MRv1.
     monkeypatch.setattr(omni_runner_module, "get_pp_group", lambda: pp)
+    monkeypatch.setattr(v1_compat_runner_module, "get_pp_group", lambda: pp)
     monkeypatch.setattr(upstream_runner_module, "get_pp_group", lambda: pp)
 
 
@@ -275,6 +278,7 @@ def _gloo_rank(rank: int, world_size: int, rendezvous: str, result_path: str) ->
     try:
         pp = _pp(rank=rank, world_size=world_size, device_group=dist.group.WORLD)
         omni_runner_module.get_pp_group = lambda: pp
+        v1_compat_runner_module.get_pp_group = lambda: pp
         upstream_runner_module.get_pp_group = lambda: pp
         if rank == world_size - 1:
             runner = _last_rank_runner(sampled=torch.tensor([[4], [7]], dtype=torch.int32), events=[])

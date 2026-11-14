@@ -12,7 +12,6 @@ from dataclasses import replace
 
 import numpy as np
 import torch
-import vllm.v1.worker.mamba_utils as mamba_utils
 from vllm.config import CUDAGraphMode
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
@@ -30,7 +29,6 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.utils import record_function_or_nullcontext
-from vllm.v1.worker.gpu_model_runner import PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
@@ -49,6 +47,8 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
 )
+from vllm_omni.worker.v1_compat import mamba_utils
+from vllm_omni.worker.v1_compat.misc import PerLayerAttnMetadata
 
 
 class _NPUHostCopyBatch:
@@ -136,7 +136,10 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             self.input_batch.remove_request(req_id)
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
-        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        # vLLM 0.34 removed resumed_req_ids from CachedRequestData (resumed
+        # requests are re-sent in full via scheduled_new_reqs), so payloads
+        # built by the pinned scheduler carry no resume set: empty is exact.
+        resumed_req_ids: set[str] = getattr(scheduler_output.scheduled_cached_reqs, "resumed_req_ids", set())
         unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
         for req_id in unscheduled_req_ids:
             self.input_batch.remove_request(req_id)
@@ -314,7 +317,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                     cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
                         num_scheduled_tokens_np,
                         self.input_batch.num_computed_tokens_cpu[:num_reqs],
-                        scheduler_output.num_common_prefix_blocks,
+                        getattr(scheduler_output, "num_common_prefix_blocks", ()),
                     )
 
                 (
@@ -419,6 +422,14 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                         batch_desc.num_reqs,
                     )
 
+                # Shared V1 metadata consumes per-group slot mappings; the drafter
+                # consumes the corresponding per-layer views of the same buffers.
+                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs_padded=num_reqs_padded,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    ubatch_slices=ubatch_slices_attn,
+                )
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,
@@ -429,8 +440,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                     logits_indices=logits_indices,
                     use_spec_decode=use_spec_decode,
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                    num_scheduled_tokens_np=num_scheduled_tokens_np,
-                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    slot_mappings=slot_mappings_by_group,
                 )
 
             (
@@ -520,6 +530,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 cudagraph_stats,
                 batch_desc,
                 multimodal_outputs,  # Omni-specific: pass multimodal_outputs to ExecuteModelState
+                slot_mappings=slot_mappings,
             )
             self.kv_connector_output = kv_connector_output
 
@@ -566,6 +577,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             cudagraph_stats,
             _batch_desc,
             multimodal_outputs_raw,  # Omni-Specific
+            _slot_mappings,
             _prefix_cache_step_id,  # generation stages never save to the prefix cache
         ) = self.execute_model_state
         pending_aux_output = self._prepare_omni_aux_output()
@@ -896,6 +908,12 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                         blk_table.slot_mapping.gpu.fill_(-1)
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+                slot_mappings_by_group, _ = self._get_slot_mappings(
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs_padded=num_reqs_padded,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
+                )
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,
@@ -904,10 +922,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                     max_query_len=max_query_len,
                     ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                     for_cudagraph_capture=is_graph_capturing,
-                    num_scheduled_tokens_np=num_scheduled_tokens,
-                    cudagraph_runtime_mode=cudagraph_runtime_mode,
-                    batch_descriptor=batch_desc,
-                    skip_gdn_state_update=skip_gdn_state_update,
+                    slot_mappings=slot_mappings_by_group,
                 )
 
         with self.maybe_dummy_run_with_lora(
@@ -991,7 +1006,11 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             def dummy_drafter_compute_logits(hidden_states):
                 if not need_dummy_logits or self.drafter is None:
                     return
-                if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
+                if (
+                    hasattr(self.drafter, "model")
+                    and self.drafter.model is not None
+                    and hasattr(self.drafter.model, "compute_logits")
+                ):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
             with set_ascend_forward_context(
@@ -1043,7 +1062,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
 
             return hidden_states, None
 
-    def profile_run(self) -> None:
+    def profile_run(self, randomize_inputs: bool = False) -> None:
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
@@ -1096,7 +1115,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                             self.encoder_cache[f"tmp_{i}"] = output
 
         # Add `is_profile` here to pre-allocate communication buffers
-        hidden_states, _ = self._dummy_run(self.max_num_tokens, is_profile=True)
+        hidden_states, _ = self._dummy_run(self.max_num_tokens, is_profile=True, randomize_inputs=randomize_inputs)
         output = None
         self._sync_device()
         del hidden_states

@@ -5,12 +5,14 @@ from collections.abc import Iterable
 from dataclasses import fields as dataclass_fields
 from typing import Any, cast
 
+import numpy as np
 import torch
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, PoolingOutput, PoolingRequestOutput, RequestError, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine.admission_control import SharedAdmissionStats
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
 from vllm.v1.engine.output_processor import (
     OutputProcessorOutput,
@@ -154,6 +156,15 @@ class OmniRequestState(RequestState):
         # because upstream RequestState.__init__ reorders parameters between
         # releases, making args[12] fragile.
         arrival_time = kwargs.get("arrival_time")
+        # vLLM 0.34 types EngineCoreRequest.prompt_token_ids as a 32-bit int
+        # ndarray at runtime (msgspec array_like), and the in-process
+        # orchestrator forwards that array here, but the client-side
+        # RequestState contract is a plain list (truthiness checks and
+        # list.extend in the base apply_streaming_update).  Normalize once so
+        # every consumer of this state sees list[int].
+        prompt_token_ids = kwargs.get("prompt_token_ids")
+        if isinstance(prompt_token_ids, np.ndarray):
+            kwargs["prompt_token_ids"] = prompt_token_ids.tolist()
         super().__init__(*args, **kwargs)
         self.is_pooling_request = False
         self.native_text_stats = RequestStateStats(arrival_time=float(arrival_time or 0.0))
@@ -166,6 +177,12 @@ class OmniRequestState(RequestState):
         self.mm_accumulated: MultimodalPayload = MultimodalPayload()
 
     def apply_streaming_update(self, update) -> None:
+        # Streaming updates are built from EngineCoreRequest.prompt_token_ids
+        # (a 32-bit ndarray on this side, see __init__); the base
+        # implementation evaluates ``update.prompt_token_ids or ()`` and
+        # extends self.prompt_token_ids with it, so hand it a plain list.
+        if isinstance(update.prompt_token_ids, np.ndarray):
+            update.prompt_token_ids = update.prompt_token_ids.tolist()
         super().apply_streaming_update(update)
         self.native_text_stats = RequestStateStats(arrival_time=float(update.arrival_time or 0.0))
 
@@ -223,9 +240,9 @@ class OmniRequestState(RequestState):
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
+        error: RequestError | None = None,
         *,
         routed_experts: Any = None,
-        error: RequestError | None = None,
     ) -> OmniRequestOutput | PoolingRequestOutput | None:
         """Create a request output from generation results.
 
@@ -461,6 +478,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         log_stats: bool,
         stream_interval: int = 1,
         tracing_enabled: bool = False,
+        admission_stats: "SharedAdmissionStats | None" = None,
         engine_core_output_type: str | None = None,
         output_modality: OutputModality = OutputModality.TEXT,
     ):
@@ -470,6 +488,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             tokenizer: Tokenizer for detokenizing text outputs
             log_stats: Whether to log statistics
             stream_interval: Stream interval for output generation
+            admission_stats: Upstream admission-control statistics handle
+                (vLLM 0.34 addition); forwarded to the base processor.
             engine_core_output_type: Optional output type string (e.g.,
                 "image", "audio", "latent", "token_ids"). Converted to OutputModality
                 internally. Kept for backward compatibility with
@@ -483,6 +503,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             log_stats=log_stats,
             stream_interval=stream_interval,
             tracing_enabled=tracing_enabled,
+            admission_stats=admission_stats,
         )
         # Convert string-based engine_core_output_type to OutputModality
         if engine_core_output_type is not None:

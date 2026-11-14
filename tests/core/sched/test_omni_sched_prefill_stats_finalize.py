@@ -96,7 +96,8 @@ def _frame(request: Request):
     model_runner_output.num_nans_in_logits = None
     model_runner_output.kv_connector_output = None
     model_runner_output.cudagraph_stats = None
-    model_runner_output.req_id_to_index = {request.request_id: 0}
+    # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+    model_runner_output.req_ids = [request.request_id]
     model_runner_output.routed_experts = None
     return scheduler_output, model_runner_output
 

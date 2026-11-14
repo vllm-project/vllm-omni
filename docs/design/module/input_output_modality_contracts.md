@@ -99,14 +99,14 @@ and recognized-format corruption errors propagate. Tests in
 
 ## Temporary video decoding compatibility
 
-With vLLM 0.33.0, Omni reuses one OpenCV capture for metadata and frame
+With vLLM 0.33.0 or 0.34.0rc3, Omni reuses one OpenCV capture for metadata and frame
 extraction within each synchronous video decode. The upstream decoder still
 owns frame counting, sampling, recovery, and output metadata. The reuse context
 is reset on completion or error and is isolated between concurrent calls.
 Standalone metadata reads open their own capture.
 
-`vllm_omni/inputs/video.py` only installs this workaround for 0.33.0 (including
-local build suffixes), and skips builds exposing the upstream optional `cap`
+`vllm_omni/inputs/video.py` only installs this workaround for 0.33.0 and
+0.34.0rc3 (including local build suffixes), and skips builds exposing the upstream optional `cap`
 argument from [vllm#66466](https://github.com/vllm-project/vllm/pull/66466).
 `tests/inputs/test_video_decode.py` checks frame and metadata parity, and fails
 when either CUDA/CI Docker version pin changes or the native decoder stops

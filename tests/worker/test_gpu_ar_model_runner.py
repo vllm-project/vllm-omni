@@ -18,10 +18,7 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker import gpu_input_batch
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_omni.core.prefix_cache import ModelCachePolicy, StageCacheOutputs
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -37,6 +34,9 @@ from vllm_omni.worker.gpu_ar_model_runner import (
 from vllm_omni.worker.output import payload_build
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding
+from vllm_omni.worker.v1_compat import input_batch as gpu_input_batch
+from vllm_omni.worker.v1_compat.input_batch import CachedRequestState, InputBatch
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

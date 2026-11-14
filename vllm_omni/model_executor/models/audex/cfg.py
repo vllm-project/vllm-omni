@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Adapted from nvidia/Nemotron-Labs-Audex-2B (Apache-2.0):
@@ -32,17 +33,17 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.logits_processor import (
-    BatchUpdate,
-    LogitsProcessor,
-    MoveDirectionality,
-)
 
 from vllm_omni.model_executor.models.common.cfg_pairing import (
     _COND,
     _UNCOND,
     apply_cfg_patches,
     cfg_patches_applied,
+)
+from vllm_omni.worker.v1_compat.logits_processor import (
+    BatchUpdate,
+    LogitsProcessor,
+    MoveDirectionality,
 )
 
 logger = init_logger(__name__)

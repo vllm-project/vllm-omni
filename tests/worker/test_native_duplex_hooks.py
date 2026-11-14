@@ -1150,9 +1150,8 @@ def test_minicpmo_seeded_text_survives_explicit_initial_listen():
 @pytest.mark.parametrize("initial_text", [None, "", "Please say hello.", "请说你好。"])
 @pytest.mark.parametrize("speech_envelope", [False, True])
 def test_minicpmo_seeded_context_keeps_assistant_turn_open_until_eos(initial_text, speech_envelope, mocker):
-    from vllm.v1.sample.metadata import SamplingMetadata
-
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+    from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
 
     runtime = _stage0_vision_runtime()
     state = _MiniCPMO45Stage0SessionState(session_id="seeded-context")

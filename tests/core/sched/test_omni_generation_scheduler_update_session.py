@@ -164,7 +164,8 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     model_runner_output.num_nans_in_logits = None
     model_runner_output.kv_connector_output = None
     model_runner_output.cudagraph_stats = None
-    model_runner_output.req_id_to_index = {session.request_id: 0}
+    # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+    model_runner_output.req_ids = [session.request_id]
     model_runner_output.routed_experts = None
 
     outputs = OmniGenerationScheduler.update_from_output(
@@ -236,7 +237,8 @@ def test_rejected_grammar_finishes_and_frees_generation_request(prompt_complete:
     model_runner_output.num_nans_in_logits = None
     model_runner_output.kv_connector_output = None
     model_runner_output.cudagraph_stats = None
-    model_runner_output.req_id_to_index = {session.request_id: 0}
+    # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+    model_runner_output.req_ids = [session.request_id]
     model_runner_output.routed_experts = None
 
     outputs = OmniGenerationScheduler.update_from_output(

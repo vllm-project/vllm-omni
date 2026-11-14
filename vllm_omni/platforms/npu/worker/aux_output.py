@@ -44,7 +44,8 @@ class NPUAuxOutputMixin:
 
         self._close_omni_aux_output()
         _install_ascend_capture_sources(self.model)
-        self.aux_output_connector = get_aux_output_connector(self.model, self.vllm_config, kv_cache_config)
+        self.aux_output_connector = get_aux_output_connector(self.model, self.vllm_config)
+        self.aux_output_connector.initialize_output_storage(kv_cache_config)
 
     def _begin_omni_aux_output_step(self, scheduler_output) -> None:
         if self.aux_output_connector is not None:

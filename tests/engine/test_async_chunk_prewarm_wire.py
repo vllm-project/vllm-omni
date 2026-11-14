@@ -10,6 +10,7 @@ import msgspec
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine.core_client import _with_packed_prompt
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from vllm_omni.data_entry_keys import ASYNC_CHUNK_PREWARM_NS
@@ -47,7 +48,12 @@ def _engine_core_round_trip(info: dict) -> object:
         prompt={"prompt_token_ids": [0, 0, 0], "additional_information": info},
         params=SamplingParams(max_tokens=4),
     )
-    received = MsgpackDecoder(OmniEngineCoreRequest).decode(MsgpackEncoder().encode(request))
+    # v0.34 sends prompt token ids as a packed int32 ndarray
+    # (`EngineCoreRequest.prompt_token_ids` is ndarray-typed on the wire and
+    # the decoder cannot materialize a plain Python list into it); the real
+    # clients pack via `_with_packed_prompt` in `add_request(_async)`.
+    packed = _with_packed_prompt(request)
+    received = MsgpackDecoder(OmniEngineCoreRequest).decode(MsgpackEncoder().encode(packed))
     assert isinstance(received, OmniEngineCoreRequest)
     return received.additional_information
 

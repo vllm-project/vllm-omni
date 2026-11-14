@@ -466,7 +466,9 @@ def test_audio_capture_keeps_the_window_bound_on_replay():
 
 
 def test_audio_budgets_stop_at_one_attention_window():
-    # 2 tokens per chunk and 8-token windows: auto budgets 2..128 keep 2, 4 and 8 for audio.
+    # 2 tokens per chunk and 8-token windows: the pin's budget grid keeps every
+    # whole-chunk multiple for audio (still capped at one window) and
+    # quarter-octave points for the default path.
     cfg = _config()
     cfg.compilation_config.encoder_cudagraph_token_budgets = []
     cfg.compilation_config.encoder_cudagraph_max_vision_items_per_batch = 0
@@ -476,8 +478,8 @@ def test_audio_budgets_stop_at_one_attention_window():
     thinker.audio_tower = _tower()
     thinker._enable_audio_encoder_cudagraph(cfg)
     manager = SingleReplayEncoderCudaGraphManager(cfg, torch.device("cpu"), torch.float32, thinker)
-    assert manager.path_token_budgets["audio"] == [0, 2, 4, 8]
-    assert manager.path_token_budgets["default"] == [0, 64, 128]
+    assert manager.path_token_budgets["audio"] == [0, 2, 4, 6, 8]
+    assert manager.path_token_budgets["default"] == [0, 64, 80, 96, 112, 128]
     # Explicit budgets raise the image path but not past the audio cap.
     explicit = _cpu_manager(_audio_thinker(budgets=(2, 4, 8, 16)))
     assert explicit.path_token_budgets["audio"] == [0, 2, 4, 8]

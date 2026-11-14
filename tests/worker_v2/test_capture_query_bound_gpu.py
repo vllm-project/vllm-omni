@@ -63,6 +63,9 @@ def _check_prefill():
             _q_scale=torch.ones((), device=device),
             _k_scale=torch.ones((), device=device),
             _v_scale=torch.ones((), device=device),
+            _q_scale_float=1.0,
+            _k_scale_float=1.0,
+            _v_scale_float=1.0,
         )
         batch.query_start_loc.copy_(torch.arange(65, device=device, dtype=torch.int32) * 4)
         batch.seq_lens.fill_(4)

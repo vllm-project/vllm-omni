@@ -5,8 +5,6 @@
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.v1.worker import gpu_input_batch
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from tests.model_executor.models.cosyvoice3.test_cosyvoice3_model_helpers import (
     _make_sampling_metadata,
@@ -14,6 +12,8 @@ from tests.model_executor.models.cosyvoice3.test_cosyvoice3_model_helpers import
 )
 from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker.v1_compat import input_batch as gpu_input_batch
+from vllm_omni.worker.v1_compat.input_batch import CachedRequestState, InputBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

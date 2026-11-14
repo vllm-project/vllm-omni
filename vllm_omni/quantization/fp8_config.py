@@ -57,6 +57,8 @@ class SerializedPerChannelFp8Config(ModelOptFp8Config):
 class OnlineBlockFp8LinearMethod(Fp8PerBlockOnlineLinearMethod):
     """Online FP8 with matching configurable weight and activation groups."""
 
+    accepts_activation_override = True
+
     def __init__(self, block_size: int) -> None:
         super().__init__()
         self.weight_block_size = [block_size, block_size]

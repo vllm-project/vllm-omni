@@ -50,7 +50,10 @@ class _BaseSampler:
 def test_custom_sampler_registers_native_masking_kernels(monkeypatch):
     """Seeded Talker sampling uses native masking even with FlashInfer available."""
     from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
-    from vllm.v1.sample.ops import topk_topp_sampler
+
+    # The talker sampler registers the vendored kernels the module it reads
+    # imports (upstream moved v1.sample.ops at the pin; omni vendored it).
+    from vllm_omni.worker.v1_compat.sample_ops import topk_topp_sampler
 
     monkeypatch.setattr(
         topk_topp_sampler,

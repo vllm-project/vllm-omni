@@ -4,7 +4,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 import torch
@@ -25,20 +25,22 @@ def test_verification_log_requires_successful_native_draft_sampling(monkeypatch,
     from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
     output = object()
-    native_call = MagicMock(return_value=output)
+    native_call = create_autospec(RejectionSampler.__call__, return_value=output)
     monkeypatch.setattr(RejectionSampler, "__call__", native_call)
     log = MagicMock()
     monkeypatch.setattr("vllm_omni.model_executor.models.cosyvoice3.cosyvoice3.logger.debug", log)
     verifier = object.__new__(_CosyVoice3RejectionSampler)
     logits = torch.zeros(1, 3)
     batch = SimpleNamespace(num_draft_tokens=num_draft_tokens)
-    draft_logits, invalid_drafts = object(), object()
+    from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
 
-    assert verifier(logits, batch, draft_logits, invalid_drafts) is output
-    native_call.assert_called_once_with(logits, batch, draft_logits, invalid_drafts)
+    draft_logits = DraftLogitsCache(1, 1, 3, dtype=torch.float32, fill=0.0, device="cpu")
+
+    assert verifier(logits, batch, draft_logits) is output
+    native_call.assert_called_once_with(verifier, logits, batch, draft_logits)
     if num_draft_tokens:
         log.assert_called_once_with("CosyVoice3 Talker is verifying draft codes")
-        verifier(logits, batch, draft_logits, invalid_drafts)
+        verifier(logits, batch, draft_logits)
         assert log.call_count == 2  # Warmup must not suppress subsequent request-time evidence.
     else:
         log.assert_not_called()
