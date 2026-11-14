@@ -62,7 +62,7 @@ tts_async_chunk_server_params = [
 ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_sync_server_params, indirect=True)
 def test_voice_clone_zh_sync(omni_server, online_client) -> None:
     """
@@ -83,7 +83,7 @@ def test_voice_clone_zh_sync(omni_server, online_client) -> None:
     online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_async_chunk_server_params, indirect=True)
 def test_voice_clone_zh_async_chunk(omni_server, online_client) -> None:
     """
@@ -105,7 +105,7 @@ def test_voice_clone_zh_async_chunk(omni_server, online_client) -> None:
     online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_sync_server_params, indirect=True)
 def test_models_endpoint(omni_server, online_client) -> None:
     """Test the /v1/models endpoint returns loaded model."""
