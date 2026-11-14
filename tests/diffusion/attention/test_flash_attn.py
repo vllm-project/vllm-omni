@@ -1564,6 +1564,66 @@ def test_npu_piecewise_matches_block_causal_reference(monkeypatch, causal):
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.cpu
+def test_materialize_paged_ring_kv_gathers_noncontiguous_slots():
+    block_size = 2
+    num_blocks = 4
+    num_heads = 2
+    head_size = 4
+
+    kv_cache = torch.full(
+        (num_blocks, num_heads, block_size, 2 * head_size),
+        -1.0,
+    )
+    slot_mapping = torch.tensor([4, 1, 7], dtype=torch.int64)
+
+    key = torch.arange(
+        3 * num_heads * head_size,
+        dtype=torch.float32,
+    ).reshape(3, num_heads, head_size)
+    value = key + 100
+
+    class FakeNativeImpl:
+        def do_kv_cache_update(
+            self,
+            _layer,
+            key_write,
+            value_write,
+            cache,
+            slots,
+        ):
+            key_cache, value_cache = cache.transpose(1, 2).split(
+                head_size,
+                dim=-1,
+            )
+            block_ids = slots // block_size
+            block_offsets = slots % block_size
+            key_cache[block_ids, block_offsets] = key_write
+            value_cache[block_ids, block_offsets] = value_write
+
+    layer = SimpleNamespace(
+        layer_name="layer-0",
+        head_size=head_size,
+        head_size_v=head_size,
+        kv_cache=kv_cache,
+        impl=FakeNativeImpl(),
+    )
+    context = SimpleNamespace(
+        layer=layer,
+        key_write=key,
+        value_write=value,
+        slot_mapping=slot_mapping,
+    )
+
+    backend = FlashAttentionImpl.__new__(FlashAttentionImpl)
+    actual_key, actual_value = backend.materialize_paged_ring_kv(context)
+
+    assert torch.equal(actual_key, key.unsqueeze(0))
+    assert torch.equal(actual_value, value.unsqueeze(0))
+    assert actual_key.is_contiguous()
+    assert actual_value.is_contiguous()
+
+
 if __name__ == "__main__":
     print("Running FlashAttention Padding Tests...")
     print("=" * 60)

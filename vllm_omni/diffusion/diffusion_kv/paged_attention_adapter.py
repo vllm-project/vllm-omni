@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -20,12 +20,16 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 
+from vllm_omni.diffusion.attention.backends.abstract import QueryRange
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     PagedPiecewisePlan,
     build_paged_piecewise_plan,
 )
 from vllm_omni.diffusion.forward_context import override_paged_kv_adapter
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 
 
 @dataclass(frozen=True)
@@ -263,6 +267,16 @@ class PreparedDiffusionPagedAttentionBatch:
 
 
 @dataclass(frozen=True, slots=True)
+class DiffusionPagedRingContext:
+    """Rank-local KV write inputs for paged Scheduler + Ring execution."""
+
+    layer: DiffusionPagedAttentionLayerAdapter
+    key_write: torch.Tensor
+    value_write: torch.Tensor
+    slot_mapping: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
 class DiffusionPagedAttentionContext:
     """One layer's native inputs for an Omni paged-backend invocation."""
 
@@ -276,6 +290,7 @@ class DiffusionPagedAttentionContext:
     piecewise_native_metadata: tuple[Any, ...]
     query_token_shape: tuple[int, ...]
     query_has_head_dims: bool
+    requires_separate_kv_write: bool = False
     output_scatter_indices: torch.Tensor | None = None
 
     def restore_output(self, output: torch.Tensor) -> torch.Tensor:
@@ -799,6 +814,202 @@ class DiffusionPagedAttentionAdapter:
         self._active_piecewise_native_metadata = tuple(metadata_by_segment)
         return self._active_piecewise_native_metadata
 
+    def validate_ring_sp_before_collective(
+        self,
+        layer_name: str,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        omni_attn_metadata: AttentionMetadata | None,
+        sequence_parallel_degree: int,
+    ) -> None:
+        """Fail every rank consistently before Paged Ring collectives.
+
+        Range checks in ``prepare_ring_layer_context`` depend on the Ring rank
+        and therefore cannot safely reject malformed global geometry after a
+        peer has entered Ulysses or Ring communication.  This validation uses
+        only Scheduler-global state and equal-shaped pre-collective inputs.
+        """
+
+        if self._active_batch is None:
+            raise RuntimeError("Paged attention forward must run inside adapter.activate(batch)")
+        try:
+            layer = self.layers[layer_name]
+        except KeyError as exc:
+            raise KeyError(f"Unknown diffusion paged attention layer {layer_name!r}") from exc
+
+        if not current_omni_platform.is_cuda():
+            raise NotImplementedError("Paged Ring MVP currently supports only CUDA's packed KV-cache layout")
+
+        kv_cache = getattr(layer, "kv_cache", None)
+        if not isinstance(kv_cache, torch.Tensor):
+            raise RuntimeError(f"Native KV cache is not bound for diffusion layer {layer_name!r}")
+        native_impl = getattr(layer, "impl", None)
+        if not callable(getattr(native_impl, "do_kv_cache_update", None)):
+            raise RuntimeError(f"Native attention implementation for {layer_name!r} cannot update the KV cache")
+        expected_content_size = layer.head_size + layer.head_size_v
+        if kv_cache.ndim != 4 or kv_cache.shape[-1] != expected_content_size:
+            raise NotImplementedError(
+                "Paged Ring MVP requires the packed CUDA KV-cache layout [num_blocks, num_kv_heads, block_size, K+V]"
+            )
+        if kv_cache.device != key.device or key.device != value.device:
+            raise ValueError(
+                "Paged Ring KV cache, key, and value must be on the same device: "
+                f"cache={kv_cache.device}, key={key.device}, value={value.device}"
+            )
+
+        if type(sequence_parallel_degree) is not int or sequence_parallel_degree <= 1:
+            raise ValueError(
+                f"Paged Ring requires a sequence-parallel degree greater than one; got {sequence_parallel_degree!r}"
+            )
+
+        batch = self._active_batch
+        if len(batch.rows) != 1:
+            raise NotImplementedError("Paged Ring MVP currently supports one row per forward")
+
+        if omni_attn_metadata is not None:
+            if omni_attn_metadata.query_ranges is not None or omni_attn_metadata.kv_write_ranges is not None:
+                raise ValueError("Paged Ring ranges must be produced by the Ring runner")
+        full_attn_spans = self._validate_omni_attn_metadata(omni_attn_metadata)
+        if full_attn_spans is not None:
+            raise NotImplementedError("Paged Ring MVP does not yet support piecewise attention")
+        if not bool(getattr(layer.spec, "non_causal", False)):
+            raise NotImplementedError("Paged Ring MVP currently supports only non-causal attention")
+
+        row = batch.rows[0]
+        if row.kv_start_pos != 0 or row.query_len != row.seq_len:
+            raise NotImplementedError("Paged Ring MVP currently supports only cold full-sequence KV writes")
+
+        for name, tensor in (("query", query), ("key", key), ("value", value)):
+            if tensor.ndim < 2:
+                raise ValueError(
+                    f"Paged Ring requires {name} to expose a sequence dimension; got shape={tuple(tensor.shape)}"
+                )
+            if tensor.shape[0] != 1:
+                raise NotImplementedError(
+                    f"Paged Ring MVP currently supports one tensor row per forward; {name}.shape={tuple(tensor.shape)}"
+                )
+
+        local_query_len = int(query.shape[1])
+        if int(key.shape[1]) != local_query_len or int(value.shape[1]) != local_query_len:
+            raise ValueError(
+                "Paged Ring requires aligned local Q/K/V sequence lengths before collectives: "
+                f"query={query.shape[1]}, key={key.shape[1]}, value={value.shape[1]}"
+            )
+
+        joint_tensors = ()
+        if omni_attn_metadata is not None:
+            joint_tensors = tuple(
+                tensor
+                for tensor in (
+                    omni_attn_metadata.joint_query,
+                    omni_attn_metadata.joint_key,
+                    omni_attn_metadata.joint_value,
+                )
+                if tensor is not None
+            )
+        if joint_tensors:
+            raise NotImplementedError("Paged Ring MVP does not yet support joint Q/K/V tensors")
+
+        expected_global_len = local_query_len * sequence_parallel_degree
+        if expected_global_len != row.query_len:
+            raise ValueError(
+                "Paged Ring local shard geometry does not match the Scheduler row: "
+                f"local_query_len={local_query_len}, "
+                f"sequence_parallel_degree={sequence_parallel_degree}, "
+                f"expected_global_len={expected_global_len}, "
+                f"row.query_len={row.query_len}. The sequence may have been padded."
+            )
+
+    def prepare_ring_layer_context(
+        self,
+        layer_name: str,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        omni_attn_metadata: Any | None = None,
+    ) -> DiffusionPagedRingContext:
+        """Prepare a Paged Ring context for one diffusion attention layer."""
+        if self._active_batch is None:
+            raise RuntimeError("Paged attention forward must run inside adapter.activate(batch)")
+        try:
+            layer = self.layers[layer_name]
+        except KeyError as exc:
+            raise KeyError(f"Unknown diffusion paged attention layer {layer_name!r}") from exc
+
+        batch = self._active_batch
+        if len(batch.rows) != 1:
+            raise NotImplementedError("Paged Ring MVP currently supports one row per forward")
+
+        # Query ranges map rank-local Q rows onto the global logical sequence.
+        query_ranges = getattr(omni_attn_metadata, "query_ranges", None)
+        kv_write_ranges = getattr(omni_attn_metadata, "kv_write_ranges", None)
+
+        if not isinstance(query_ranges, tuple) or len(query_ranges) != 1 or not isinstance(query_ranges[0], QueryRange):
+            raise ValueError("Paged Ring MVP requires one contiguous query range")
+
+        if (
+            not isinstance(kv_write_ranges, tuple)
+            or len(kv_write_ranges) != 1
+            or not isinstance(kv_write_ranges[0], QueryRange)
+        ):
+            raise ValueError("Paged Ring MVP requires one contiguous KV-write range")
+
+        if query_ranges != kv_write_ranges:
+            raise NotImplementedError("Paged Ring MVP requires aligned Q/K/V ranges")
+
+        row = batch.rows[0]
+        if row.kv_start_pos != 0 or row.query_len != row.seq_len:
+            raise NotImplementedError("Paged Ring MVP currently supports only cold full-sequence writes")
+
+        if not bool(getattr(layer.spec, "non_causal", False)):
+            raise NotImplementedError("Paged Ring MVP currently supports only non-causal attention")
+
+        key_flat, key_token_shape, _ = self._flatten_tensor(
+            key,
+            num_heads=layer.num_kv_heads,
+            head_size=layer.head_size,
+            name="Ring key",
+        )
+        value_flat, value_token_shape, _ = self._flatten_tensor(
+            value,
+            num_heads=layer.num_kv_heads,
+            head_size=layer.head_size_v,
+            name="Ring value",
+        )
+
+        if key_token_shape != value_token_shape:
+            raise ValueError("Paged Ring key/value token layouts must match")
+
+        write_range = kv_write_ranges[0]
+        local_len = write_range.local_end - write_range.local_start
+
+        if write_range.local_start != 0 or local_len != key_flat.shape[0]:
+            raise ValueError("Paged Ring KV-write range must cover the local K/V payload")
+
+        global_end = write_range.global_start + local_len
+        if write_range.global_start < 0 or global_end > row.seq_len:
+            raise ValueError("Paged Ring KV-write range exceeds the Scheduler sequence")
+
+        full_slot_mapping = batch.slot_mappings_by_layer.get(layer_name)
+        if full_slot_mapping is None:
+            raise KeyError(f"No native slot mapping was built for diffusion layer {layer_name!r}")
+
+        full_slot_mapping = full_slot_mapping.reshape(-1)[: batch.num_tokens]
+        write_offset = write_range.global_start - row.kv_start_pos
+        slot_mapping = full_slot_mapping[write_offset : write_offset + local_len]
+
+        if slot_mapping.numel() != local_len:
+            raise ValueError("Paged Ring KV-write range exceeds the prepared slot mapping")
+
+        return DiffusionPagedRingContext(
+            layer=layer,
+            key_write=key_flat,
+            value_write=value_flat,
+            slot_mapping=slot_mapping,
+        )
+
     def prepare_layer_context(
         self,
         layer_name: str,
@@ -816,6 +1027,28 @@ class DiffusionPagedAttentionAdapter:
             raise KeyError(f"Unknown diffusion paged attention layer {layer_name!r}") from exc
         batch = self._active_batch
         full_attn_spans = self._validate_omni_attn_metadata(omni_attn_metadata)
+        # Query ranges map rank-local Q rows onto the global logical sequence.
+        query_ranges = None if omni_attn_metadata is None else getattr(omni_attn_metadata, "query_ranges", None)
+        # No SP/strict Ulysses use an aligned Q/KV-write layout. AllGather-KV
+        # publishes query_ranges because Q remains local while K/V are global.
+        asymmetric_layout = query_ranges is not None
+
+        if query_ranges is not None:
+            if len(batch.rows) != 1:
+                raise NotImplementedError("Paged AllGather-KV MVP currently supports one row per forward")
+
+            if len(query_ranges) != 1:
+                raise NotImplementedError("Paged AllGather-KV MVP currently supports one contiguous query range")
+
+            if full_attn_spans is not None:
+                raise NotImplementedError("Paged AllGather-KV MVP does not yet support piecewise attention")
+
+            if not bool(getattr(layer.spec, "non_causal", False)):
+                raise NotImplementedError("Paged AllGather-KV MVP currently supports only non-causal attention")
+
+            row = batch.rows[0]
+            if row.kv_start_pos != 0 or row.query_len != row.seq_len:
+                raise NotImplementedError("Paged AllGather-KV MVP currently supports only cold full-sequence KV writes")
 
         query_flat, query_token_shape, query_has_head_dims = self._flatten_tensor(
             query,
@@ -835,36 +1068,103 @@ class DiffusionPagedAttentionAdapter:
             head_size=layer.head_size_v,
             name="value",
         )
-        if key_token_shape != query_token_shape:
-            if len(key_token_shape) == 1:
+
+        if query_ranges is not None:
+            if key_token_shape != value_token_shape:
                 raise ValueError(
-                    "Paged attention key token count must match the query layout: "
+                    "Paged AllGather-KV key/value write layouts must match: "
+                    f"key={key_token_shape}, value={value_token_shape}"
+                )
+
+            query_range = query_ranges[0]
+            local_query_len = query_range.local_end - query_range.local_start
+
+            if query_flat.shape[0] != local_query_len:
+                raise ValueError(
+                    "Paged AllGather-KV local query token count does not match "
+                    "query_ranges: "
+                    f"query_tokens={query_flat.shape[0]}, "
+                    f"query_range={query_range}"
+                )
+
+            row = batch.rows[0]
+            global_query_end = query_range.global_start + local_query_len
+            write_start = row.kv_start_pos
+            write_end = row.kv_start_pos + row.query_len
+
+            if not (write_start <= query_range.global_start and global_query_end <= write_end):
+                raise ValueError(
+                    "Paged AllGather-KV query range must lie inside the prepared "
+                    "global KV-write span: "
+                    f"query=[{query_range.global_start}, {global_query_end}), "
+                    f"write=[{write_start}, {write_end})"
+                )
+
+            # K/V are global gathered write payloads. Validate and pack them
+            # against the Scheduler-prepared global write batch.
+            kv_write_scatter_indices = self._token_packing_indices(
+                key_token_shape,
+                batch,
+                name="K/V write",
+                device=key.device,
+            )
+
+            if kv_write_scatter_indices is not None:
+                key_flat = key_flat.index_select(0, kv_write_scatter_indices)
+                value_flat = value_flat.index_select(
+                    0,
+                    kv_write_scatter_indices,
+                )
+
+            # The MVP accepts the local Q exactly as supplied. No batch-padding
+            # packing is needed for the single-row case.
+            output_scatter_indices = None
+
+        else:
+            if key_token_shape != query_token_shape:
+                if len(key_token_shape) == 1:
+                    raise ValueError(
+                        "Paged attention key token count must match the query layout: "
+                        f"query={query_token_shape}, key={key_token_shape}"
+                    )
+                raise ValueError(
+                    "Paged attention batched key layout must match prepared rows "
+                    "and the query layout: "
                     f"query={query_token_shape}, key={key_token_shape}"
                 )
-            raise ValueError(
-                "Paged attention batched key layout must match prepared rows and the query layout: "
-                f"query={query_token_shape}, key={key_token_shape}"
-            )
-        if value_token_shape != query_token_shape:
-            if len(value_token_shape) == 1:
+
+            if value_token_shape != query_token_shape:
+                if len(value_token_shape) == 1:
+                    raise ValueError(
+                        "Paged attention value token count must match the query layout: "
+                        f"query={query_token_shape}, value={value_token_shape}"
+                    )
                 raise ValueError(
-                    "Paged attention value token count must match the query layout: "
+                    "Paged attention batched value layout must match prepared rows "
+                    "and the query layout: "
                     f"query={query_token_shape}, value={value_token_shape}"
                 )
-            raise ValueError(
-                "Paged attention batched value layout must match prepared rows and the query layout: "
-                f"query={query_token_shape}, value={value_token_shape}"
+
+            output_scatter_indices = self._token_packing_indices(
+                query_token_shape,
+                batch,
+                name="Q/K/V",
+                device=query.device,
             )
-        output_scatter_indices = self._token_packing_indices(
-            query_token_shape,
-            batch,
-            name="Q/K/V",
-            device=query.device,
-        )
-        if output_scatter_indices is not None:
-            query_flat = query_flat.index_select(0, output_scatter_indices)
-            key_flat = key_flat.index_select(0, output_scatter_indices)
-            value_flat = value_flat.index_select(0, output_scatter_indices)
+
+            if output_scatter_indices is not None:
+                query_flat = query_flat.index_select(
+                    0,
+                    output_scatter_indices,
+                )
+                key_flat = key_flat.index_select(
+                    0,
+                    output_scatter_indices,
+                )
+                value_flat = value_flat.index_select(
+                    0,
+                    output_scatter_indices,
+                )
         if query.device != self.device or key.device != self.device or value.device != self.device:
             raise ValueError(
                 f"Paged attention Q/K/V must be on {self.device}; "
@@ -905,12 +1205,69 @@ class DiffusionPagedAttentionAdapter:
             key_flat = key_flat.contiguous()
         if value_flat.stride(-1) != 1 or (value_flat.shape[-2] > 1 and value_flat.stride(-2) != value_flat.shape[-1]):
             value_flat = value_flat.contiguous()
-        # The writer also consumes slot_mapping directly, so a span that starts
-        # inside a physical block naturally writes only the requested suffix.
-        try:
-            native_metadata = batch.attn_metadata[layer_name]
-        except KeyError as exc:
-            raise KeyError(f"No native attention metadata was built for diffusion layer {layer_name!r}") from exc
+        # Asymmetric AllGather-KV uses local query metadata while preserving
+        # the Scheduler-prepared global slot mapping for replicated KV writes.
+        if query_ranges is not None:
+            query_range = query_ranges[0]
+            local_query_len = query_range.local_end - query_range.local_start
+
+            query_start_loc_cpu = torch.tensor(
+                [0, local_query_len],
+                dtype=torch.int32,
+            )
+            query_start_loc = query_start_loc_cpu.to(self.device)
+
+            query_positions = torch.arange(
+                query_range.global_start,
+                query_range.global_start + local_query_len,
+                dtype=torch.int64,
+                device=self.device,
+            )
+
+            # Native BlockTables normally returns a view into its persistent
+            # batch slot-mapping buffer. Reusing that buffer here would
+            # overwrite the global K/V-write mapping with the rank-local query
+            # mapping. Keep query metadata in a separate buffer instead.
+            query_slot_mappings_buffer = torch.empty(
+                (len(self.block_tables.block_sizes), local_query_len),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            query_slot_mappings = self.block_tables.compute_slot_mappings(
+                batch.row_indices,
+                query_start_loc,
+                query_positions,
+                num_tokens_padded=local_query_len,
+                out=query_slot_mappings_buffer,
+            )
+
+            seq_lens_cpu = torch.tensor(
+                [row.seq_len for row in batch.rows],
+                dtype=torch.int32,
+            )
+
+            query_metadata_by_layer = self._build_native_metadata(
+                query_lens=[local_query_len],
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                positions=query_positions,
+                block_tables=batch.block_tables,
+                slot_mappings=query_slot_mappings,
+                causal=False,
+            )
+            try:
+                native_metadata = query_metadata_by_layer[layer_name]
+            except KeyError as exc:
+                raise KeyError(f"No native query metadata was built for diffusion layer {layer_name!r}") from exc
+        else:
+            # The writer also consumes slot_mapping directly, so a span that starts
+            # inside a physical block naturally writes only the requested suffix.
+            try:
+                native_metadata = batch.attn_metadata[layer_name]
+            except KeyError as exc:
+                raise KeyError(f"No native attention metadata was built for diffusion layer {layer_name!r}") from exc
         piecewise_plan: PagedPiecewisePlan | None = None
         piecewise_native_metadata: tuple[Any, ...] = ()
         if full_attn_spans is not None:
@@ -943,6 +1300,7 @@ class DiffusionPagedAttentionAdapter:
             piecewise_native_metadata=piecewise_native_metadata,
             query_token_shape=query_token_shape,
             query_has_head_dims=query_has_head_dims,
+            requires_separate_kv_write=asymmetric_layout,
             output_scatter_indices=output_scatter_indices,
         )
 
@@ -954,15 +1312,55 @@ class DiffusionPagedAttentionAdapter:
             return None
         full_attn_spans = getattr(metadata, "full_attn_spans", None)
         attn_mask = getattr(metadata, "attn_mask", None)
+        query_ranges = getattr(metadata, "query_ranges", None)
         unsupported_fields = [
             field_name
             for field_name in (
                 "joint_attn_mask",
-                "query_ranges",
                 "video_layout",
             )
             if getattr(metadata, field_name, None) is not None
         ]
+        # Query ranges are consumed by the asymmetric paged AllGather-KV path.
+        if query_ranges is not None:
+            if not isinstance(query_ranges, tuple) or not query_ranges:
+                raise TypeError("Diffusion paged attention query_ranges must be a non-empty tuple of QueryRange values")
+            covered_local_tokens = 0
+            previous_global_end = 0
+
+            for index, query_range in enumerate(query_ranges):
+                if not isinstance(query_range, QueryRange):
+                    raise TypeError(
+                        "Diffusion paged attention query_ranges must contain "
+                        f"QueryRange values; index {index} has "
+                        f"{type(query_range).__name__}"
+                    )
+
+                if (
+                    type(query_range.local_start) is not int
+                    or type(query_range.local_end) is not int
+                    or type(query_range.global_start) is not int
+                ):
+                    raise TypeError("Diffusion paged attention QueryRange coordinates must be integers")
+
+                if query_range.local_start != covered_local_tokens:
+                    raise ValueError(
+                        "Diffusion paged attention query_ranges must cover the local query contiguously from zero"
+                    )
+
+                range_len = query_range.local_end - query_range.local_start
+                if range_len <= 0:
+                    raise ValueError("Diffusion paged attention QueryRange values must have positive length")
+
+                if query_range.global_start < previous_global_end:
+                    raise ValueError(
+                        "Diffusion paged attention query_ranges must map to "
+                        "non-overlapping global positions in ascending order"
+                    )
+
+                covered_local_tokens = query_range.local_end
+                previous_global_end = query_range.global_start + range_len
+
         if attn_mask is not None:
             if full_attn_spans is None:
                 unsupported_fields.append("attn_mask")
