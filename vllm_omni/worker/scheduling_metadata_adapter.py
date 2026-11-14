@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Runner-side adapters for payload metadata that affects scheduling."""
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from typing import Any, Protocol, cast
 
 from vllm.logger import init_logger
 
+from vllm_omni.core.sched.duplex_stage_work import parse_perf_chunk
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.outputs import SchedulingMetadataUpdate
 
@@ -50,11 +51,13 @@ class DefaultSchedulingMetadataAdapter:
 
         resize_prompt_to = self._extract_prompt_length(payload, meta)
         prompt_token_ids = self._extract_prompt_token_ids(payload) if model_mode != "ar" else None
-        if resize_prompt_to is None and prompt_token_ids is None:
+        duplex_perf_chunk = parse_perf_chunk(meta.get("duplex_perf_chunk"))
+        if resize_prompt_to is None and prompt_token_ids is None and duplex_perf_chunk is None:
             return None
         return SchedulingMetadataUpdate(
             prompt_token_ids=prompt_token_ids,
             resize_prompt_to=resize_prompt_to,
+            duplex_perf_chunk=duplex_perf_chunk,
         )
 
     @staticmethod

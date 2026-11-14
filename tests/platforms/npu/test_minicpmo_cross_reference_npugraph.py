@@ -55,7 +55,7 @@ def test_equal_history_cross_reference_graph_matches_independent_solves(batch, c
     prompt_frames = 4
     # The deliberately distinct rows stand for different reference conditions.
     expected_att = [
-        torch.randn(backend.n_timesteps, arena.depth, 2, arena.heads, prompt_frames, arena.att_width, device="npu")
+        torch.randn(backend.n_timesteps, arena.depth, 2, 2, arena.heads, prompt_frames, arena.head_dim, device="npu")
         for _ in range(batch)
     ]
     actual_att = [value.clone() for value in expected_att]
@@ -122,7 +122,8 @@ def test_equal_history_cross_reference_graph_matches_independent_solves(batch, c
             expected_att = [value[2][0] for value in wanted]
             actual_cnn, actual_att = new_cnn, actual[2]
             if chunk >= 7:
-                assert all(value.shape[4] == prompt_frames + 100 for value in actual_att)
+                # Frames are the second-to-last axis of a split ``(n_t, depth, K/V, CFG, heads, frames, dim)`` cache.
+                assert all(value.shape[-2] == prompt_frames + 100 for value in actual_att)
     assert batch in accepted_batches
     stats = wrapper.stats_snapshot()
     assert stats["hits"] > 0 and stats["flushes"] == 0
@@ -144,7 +145,7 @@ def test_shared_prompt_input_is_not_overwritten(monkeypatch):
     token2wav.flow.decoder.inference_cfg_rate = 0.7
     backend = BatchedToken2Wav(token2wav, cfm_graph_config={"enabled": True, "fused_body": True})
     arena = backend._whole_euler_graph_wrapper.arena
-    cache = torch.randn(backend.n_timesteps, arena.depth, 2, arena.heads, 4, arena.att_width, device="npu")
+    cache = torch.randn(backend.n_timesteps, arena.depth, 2, 2, arena.heads, 4, arena.head_dim, device="npu")
     saved = cache.clone()
     with npu_token2wav_sdpa_context(require_math=True):
         result = backend._decode_cfm(

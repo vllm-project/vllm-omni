@@ -408,10 +408,10 @@ class MiniMaxH3ImagePipeline(
         if type(tile_parallel) is not bool:
             raise ValueError(f"vae_tile_parallel must be a bool, got {tile_parallel!r}")
         self._vae_group = dit_group if dit_world > 1 and tile_parallel else None
-        # decode_latent only captures graphs on CUDA devices (CUDA and ROCm);
-        # elsewhere (e.g. XPU) the tiles decode eagerly.
+        # decode_latent only captures graphs on a cuda-like platform (CUDA,
+        # ROCm and MUSA); elsewhere (e.g. XPU) the tiles decode eagerly.
         self._vae_cuda_graph = (
-            self.device.type == "cuda"
+            current_omni_platform.is_cuda_alike()
             and bool(getattr(od_config, "enable_cuda_graph_decode", True))
             and not bool(getattr(od_config, "enforce_eager", False))
         )

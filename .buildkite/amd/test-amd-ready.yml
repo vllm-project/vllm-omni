@@ -366,7 +366,7 @@ steps:
         # JoyImage's nonblocking nightly lane owns its cold AITER builds.
         # H3 VAE ops assume NVIDIA CUDA; ROCm sets torch.version.hip.
         - >-
-          bash .buildkite/amd/scripts/assert-pytest-collection.sh 117
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 120
           tests/diffusion/models/
           --ignore=tests/diffusion/models/auk/test_auk_vae_fastpath.py
           --ignore=tests/diffusion/models/mammoth_moda2/test_dit_attention_cuda.py
@@ -441,7 +441,7 @@ steps:
           set -euo pipefail
           node='tests/e2e/online_serving/test_qwen_image.py::test_batch_001[default]'
           pytest --collect-only -q "$$node" \
-            -m 'core_model and diffusion and rocm and MI325 and cards_1' \
+            -m 'slow and diffusion and rocm and MI325 and cards_1' \
             --run-level core_model \
             > "$$QWEN_IMAGE_BATCH_READY_ARTIFACT_DIR/collection.txt"
           count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
@@ -456,7 +456,7 @@ steps:
           timeout --signal=TERM --kill-after=2m 45m \
             pytest -s -v -ra \
             'tests/e2e/online_serving/test_qwen_image.py::test_batch_001[default]' \
-            -m 'core_model and diffusion and rocm and MI325 and cards_1' \
+            -m 'slow and diffusion and rocm and MI325 and cards_1' \
             --run-level core_model \
             --junitxml="$$QWEN_IMAGE_BATCH_READY_ARTIFACT_DIR/pytest.xml" \
             || status=$$?
@@ -557,7 +557,7 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       # Keep this broad integration/determinism matrix on the reference
       # backend. Existing READY diffusion jobs cover the ROCm default/AITER
       # path without making two cold JIT builds dominate this serial lane.
@@ -615,6 +615,28 @@ steps:
             -m "core_model and diffusion and rocm and MI325 and cards_1" \
             --run-level "core_model" \
             --junitxml="$$TINY_DIFFUSION_BASE_ARTIFACT_DIR/pytest.xml"
+          # Pytest includes subtests in the suite total; compare the parent node ids.
+          python -c 'import sys, xml.etree.ElementTree as ET
+          from collections import Counter
+          from pathlib import Path
+          root = ET.parse(sys.argv[1]).getroot()
+          if root.tag not in {"testsuite", "testsuites"}:
+              raise SystemExit("Unexpected JUnit root")
+          expected = Counter()
+          for node in Path(sys.argv[2]).read_text().splitlines():
+              module, name = node.split("::", 1)
+              expected[(module.removesuffix(".py").replace("/", "."), name)] += 1
+          actual = Counter((case.get("classname"), case.get("name")) for case in root.iter("testcase"))
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          bad_results = any(int(suite.get(key, "0")) != 0
+                            for suite in suites for key in ("skipped", "failures", "errors"))
+          bad_results = bad_results or any(list(root.iter(tag)) for tag in ("skipped", "failure", "error"))
+          if actual != expected or bad_results:
+              print("Expected every pinned tiny-diffusion READY node to execute without skips or failures; "
+                    f"missing={expected - actual}, unexpected={actual - expected}, bad_results={bad_results}",
+                    file=sys.stderr)
+              raise SystemExit(5)
+          ' "$$TINY_DIFFUSION_BASE_ARTIFACT_DIR/pytest.xml" /tmp/tiny-diffusion-base-ready-expected.txt
           TINY_DIFFUSION_BASE_READY
 
 
@@ -651,12 +673,12 @@ steps:
     # do not duplicate its model startup in this time-bounded coverage lane.
     # The CUDA ready job also covers tests/worker/test_batched_omni_output.py.
     # Keep the initial ROCm burn-in scoped to tests/model_executor/.
-    # Shard 0 checks the full 1424-node set. The other shards skip that
+    # Shard 0 checks the full 1438-node set. The other shards skip that
     # collection and run their pytest slice immediately. CUDA READY runs the
     # same guard when tests/model_executor/ or this file changes.
     - |
       if [[ "$${BUILDKITE_PARALLEL_JOB:-0}" == "0" ]]; then
-        bash .buildkite/amd/scripts/assert-pytest-collection.sh 1424 \
+        bash .buildkite/amd/scripts/assert-pytest-collection.sh 1438 \
           tests/model_executor/ \
           -m 'core_model and rocm and MI325 and not nvidia_only and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)' \
           --run-level "core_model"
@@ -1402,8 +1424,10 @@ steps:
             "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
           )
           printf '%s\n' "$${nodes[@]}" | sort > /tmp/drama3-ready-expected.txt
-          pytest -q tests/e2e/online_serving/test_drama_3.py \
-            -m "core_model and tts and rocm and MI325 and cards_1" \
+          # Select by node id: every Drama 3 case now shares ``slow``, so a
+          # file-level ``-m slow`` collect would also pull voice-clone nodes.
+          pytest -q 'tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]' \
+            -m "slow and tts and rocm and MI325 and cards_1" \
             --run-level "core_model" \
             --collect-only \
             | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
@@ -1412,8 +1436,8 @@ steps:
             echo "Drama 3 READY collection drifted from test_text_to_audio_001[drama_3-rocm]" >&2
             exit 1
           fi
-          pytest -s -v tests/e2e/online_serving/test_drama_3.py \
-            -m "core_model and tts and rocm and MI325 and cards_1" \
+          pytest -s -v 'tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]' \
+            -m "slow and tts and rocm and MI325 and cards_1" \
             --run-level "core_model" \
             --junitxml="$$DRAMA3_READY_ARTIFACT_DIR/pytest.xml"
           DRAMA3_READY
