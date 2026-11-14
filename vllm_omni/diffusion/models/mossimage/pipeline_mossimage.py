@@ -47,6 +47,7 @@ from torch import nn
 from transformers import AutoModel, AutoTokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.guidance import (
@@ -154,6 +155,7 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
     # Per-forward a DiffusionRequestBatch; homogeneous requests (same sampler
     # key: resolution/CFG/steps/shift/num_outputs) are fused into one batch.
     supports_request_batch: ClassVar[bool] = True
+    supports_request_cancellation: ClassVar[bool] = True
     # Continuous batching via step-wise execution (prepare_encode /
     # denoise_step / step_scheduler / post_decode).
     supports_step_execution: ClassVar[bool] = True
@@ -507,6 +509,7 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
 
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput | list[DiffusionOutput]:
+        check_request_cancellation()
         num_reqs = len(req.requests)
         sampling_list = req.sampling_params_list
         # Homogeneity (resolution / CFG / steps / num_outputs / shift) is
@@ -618,6 +621,7 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         negative_cache: dict = {}
         with self._dit_residency():
             for step_index, timestep in enumerate(timesteps_iter):
+                check_request_cancellation()
                 if self._interrupt:
                     break
                 positive_kwargs = {
@@ -649,6 +653,7 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
                 latents = self.scheduler_step_maybe_with_cfg(prediction, timestep, latents, do_cfg)
 
         # 4. VAE decode in fp32 with BN statistics and 2x2 channel unpacking.
+        check_request_cancellation()
         images = self._vae_decode(latents)
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else {}
 
