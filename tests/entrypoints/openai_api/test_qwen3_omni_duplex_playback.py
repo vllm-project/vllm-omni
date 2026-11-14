@@ -19,7 +19,7 @@ import websockets
 import yaml
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import validated_input_wav, validated_soft_interrupt_wav
-from tests.entrypoints.openai_api.test_qwen3_omni_realtime_websocket import (
+from tests.entrypoints.openai_api.helpers import (
     MODEL,
     _assert_auto_committed_turns,
     _duplex_fixture_pcm,
@@ -34,7 +34,6 @@ from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-pytest_plugins = ("tests.entrypoints.openai_api.test_qwen3_omni_realtime_websocket",)
 
 # These regressions use the engine-owned Qwen duplex plugin. The realtime
 # WebSocket module exercises the separate turn/STT deployment.

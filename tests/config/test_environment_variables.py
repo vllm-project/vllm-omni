@@ -4,6 +4,7 @@
 
 import ast
 import builtins
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from vllm_omni.config.environment_variable_inventory import (
     ENVIRONMENT_VARIABLE_INVENTORY,
     EnvironmentVariableCategory,
+    ModelEnvironmentVariableDisposition,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -156,6 +158,32 @@ def _environment_accesses(path: Path) -> set[str]:
                     names.add(name)
 
     return names
+
+
+def test_inventory_matches_reviewed_snapshot_counts():
+    """Make an inventory expansion an explicit review decision."""
+    category_counts = Counter(item.category for item in ENVIRONMENT_VARIABLE_INVENTORY.values())
+    assert category_counts == {
+        EnvironmentVariableCategory.PUBLIC_OMNI: 39,
+        EnvironmentVariableCategory.INHERITED_VLLM: 22,
+        EnvironmentVariableCategory.PLATFORM_EXTERNAL: 34,
+        EnvironmentVariableCategory.MODEL_SPECIFIC: 102,
+        EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 22,
+        EnvironmentVariableCategory.INTERNAL: 8,
+    }
+
+    disposition_counts = Counter(
+        item.model_disposition
+        for item in ENVIRONMENT_VARIABLE_INVENTORY.values()
+        if item.category is EnvironmentVariableCategory.MODEL_SPECIFIC
+    )
+    assert {disposition: disposition_counts[disposition] for disposition in ModelEnvironmentVariableDisposition} == {
+        ModelEnvironmentVariableDisposition.PROMOTE: 74,
+        ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 5,
+        ModelEnvironmentVariableDisposition.EXTERNAL: 0,
+        ModelEnvironmentVariableDisposition.INTERNALIZE: 17,
+        ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 7,
+    }
 
 
 def test_new_public_omni_names_use_project_prefix():
