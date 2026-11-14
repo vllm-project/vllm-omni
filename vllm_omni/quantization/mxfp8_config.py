@@ -178,7 +178,8 @@ class DiffusionMXFP8Config(QuantizationConfig):
             if current_omni_platform.is_xpu():
                 if self.is_checkpoint_mxfp8_serialized:
                     raise NotImplementedError(self._XPU_OFFLINE_UNSUPPORTED)
-                return VllmMxfp8OnlineMoEMethod(layer=layer)
+                # vLLM's online MoE methods take the FusedMoEConfig as keyword-only `moe`.
+                return VllmMxfp8OnlineMoEMethod(moe=layer.moe_config)
             # NPU has no MXFP8 MoE op yet; leave the experts in BF16 rather
             # than failing the whole model load.
             return None

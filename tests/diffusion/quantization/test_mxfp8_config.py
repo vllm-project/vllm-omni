@@ -167,6 +167,36 @@ def test_get_quant_method_online(mocker: MockerFixture):
         assert type(method).__name__ == "VllmMxfp8OnlineLinearMethod"
 
 
+def test_get_quant_method_online_moe_xpu_passes_moe_config(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
+    """XPU online MXFP8 experts must hand vLLM's MoE method the FusedMoEConfig as the
+    keyword-only ``moe``; ``layer=`` raised TypeError for every MoE model at load."""
+    import inspect
+
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    import vllm_omni.quantization.mxfp8_config as mxfp8_config
+
+    assert "moe" in inspect.signature(mxfp8_config.VllmMxfp8OnlineMoEMethod.__init__).parameters
+
+    calls: list[dict] = []
+    sentinel = object()
+
+    def fake_moe_method(**kwargs):
+        calls.append(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(mxfp8_config, "VllmMxfp8OnlineMoEMethod", fake_moe_method)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_xpu", lambda: True)
+
+    layer = mocker.Mock(spec=RoutedExperts)
+    layer.moe_config = object()
+    method = mxfp8_config.DiffusionMXFP8Config().get_quant_method(layer, "model.layers.0.mlp.experts")
+
+    assert method is sentinel
+    assert calls == [{"moe": layer.moe_config}]
+
+
 def test_xpu_online_method_keeps_vllm_weight_lifecycle():
     """XPU online MXFP8 must not replace vLLM's create_weights: that is where vLLM
     builds the meta-device weight and selects the shape-dependent MXFP8 kernel."""
