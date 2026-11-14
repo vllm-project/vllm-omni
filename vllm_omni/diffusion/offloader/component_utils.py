@@ -15,6 +15,7 @@ from torch.distributed.tensor import DTensor
 from vllm.logger import init_logger
 
 from .config import TEXT_ENCODER_COMPONENT
+from .module_residency import BoundedAllocatorCache, PinnedModuleStager
 from .offload_plan import OffloadPlan
 from .tensor_utils import set_tensor_storage
 
@@ -126,6 +127,101 @@ def clear_encoder_layerwise_state(module: nn.Module) -> None:
     module._omni_layerwise_hooks = []
     module._omni_layerwise_block_groups = []
     module._omni_layerwise_enabled = False
+
+
+def supports_layerwise_staging(module: nn.Module) -> bool:
+    """Whether an on-demand component stages around hooked blocks itself."""
+    return bool(getattr(module, "_omni_supports_layerwise_staging", False))
+
+
+def non_block_modules(module: nn.Module, block_groups: Sequence[Sequence[nn.Module]]) -> list[nn.Module]:
+    """Return the largest submodules of ``module`` that hold no streamed block."""
+    block_ids = {id(block) for blocks in block_groups for block in blocks}
+    found: list[nn.Module] = []
+
+    def visit(current: nn.Module, name: str) -> None:
+        if id(current) in block_ids:
+            return
+        if not any(id(child) in block_ids for child in current.modules()):
+            found.append(current)
+            return
+        if any(tensor is not None for tensor in chain(current._parameters.values(), current._buffers.values())):
+            # The stager works on whole modules, so a tensor owned directly by
+            # a block's ancestor has no module of its own to stage it with.
+            raise ValueError(
+                f"{type(current).__name__} at {name or '<root>'} owns tensors next to streamed blocks; "
+                "move them into a submodule to stage it around layerwise hooks"
+            )
+        for child_name, child in current.named_children():
+            visit(child, f"{name}.{child_name}" if name else child_name)
+
+    visit(module, "")
+    return found
+
+
+class LayerwiseAwareStager:
+    """Stage a pipeline-managed component around layerwise hooks on its blocks.
+
+    Without hooks the whole module is staged. Once a layerwise backend has
+    hooked block lists on ``owner``, the hooks stream those blocks and only the
+    remaining modules are staged. The choice is made at every load, so it
+    follows what the backend actually selected rather than a global flag.
+    Both stagers are built lazily: snapshotting the whole module before the
+    hooks copy the blocks would pin those blocks on the host twice.
+    """
+
+    def __init__(
+        self,
+        owner: nn.Module,
+        module: nn.Module,
+        device: torch.device,
+        *,
+        pin_memory: bool,
+        cache_retention: BoundedAllocatorCache | None = None,
+    ) -> None:
+        self.owner = owner
+        self.module = module
+        self.device = device
+        self.pin_memory = pin_memory
+        self.cache_retention = cache_retention
+        self._whole: PinnedModuleStager | None = None
+        self._non_block: PinnedModuleStager | None = None
+
+    def _hooked(self) -> bool:
+        return bool(getattr(self.owner, "_omni_layerwise_enabled", False))
+
+    def _stager(self) -> PinnedModuleStager:
+        if not self._hooked():
+            if self._whole is None:
+                self._whole = PinnedModuleStager(
+                    self.module, self.device, pin_memory=self.pin_memory, cache_retention=self.cache_retention
+                )
+            return self._whole
+        if self._whole is not None:
+            # Hooks were installed after a whole-module load; they own the blocks now.
+            self._whole.offload()
+            self._whole = None
+        if self._non_block is None:
+            self._non_block = PinnedModuleStager(
+                non_block_modules(self.module, self.owner._omni_layerwise_block_groups),
+                self.device,
+                pin_memory=self.pin_memory,
+                cache_retention=self.cache_retention,
+            )
+        return self._non_block
+
+    def load(self) -> None:
+        self._stager().load()
+
+    def offload(self) -> None:
+        if self._hooked():
+            for hook in self.owner._omni_layerwise_hooks:
+                hook.offload_layer()
+            stager = self._non_block
+        else:
+            stager = self._whole
+        if stager is not None:
+            stager.offload()
 
 
 def validate_on_demand_component(module: nn.Module, name: str) -> None:
