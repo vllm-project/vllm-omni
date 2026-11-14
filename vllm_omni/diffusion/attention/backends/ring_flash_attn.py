@@ -93,8 +93,10 @@ def ring_flash_attn_forward(
                 block_rank,
                 comm.world_size,
             )
-            step_k = k[:, :block_valid_length]
-            step_v = v[:, :block_valid_length]
+            # Avoid alias-only views of inference tensors used by native P2P.
+            # Keep actual padding trims; full blocks need no slice.
+            step_k = k if block_valid_length == k.shape[1] else k[:, :block_valid_length]
+            step_v = v if block_valid_length == v.shape[1] else v[:, :block_valid_length]
             if step == 0 and joint_tensor_key is not None:
                 if joint_strategy == "front":
                     step_k = torch.cat([joint_tensor_key, step_k], dim=1)
