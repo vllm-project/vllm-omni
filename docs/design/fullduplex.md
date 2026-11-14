@@ -716,7 +716,9 @@ client input is admitted (indexed in wire order when the runner takes it on
 its mailbox; an input the manager refuses at admission is indexed by an
 explicit `runner.input_refused` call in each refusal branch, which only queues
 a payload-free marker acknowledged as `rejected`, like an append the runner
-refuses before any of its audio reaches the model, `_refuse_append`), begins
+refuses before its audio reaches the model, `_refuse_append`; an append server
+VAD split into segments is refused from the refused segment on, the segments
+before it stay buffered and its `audio_end_ms` says where they end), begins
 and ends, a Stage0 submission is created / accepted / finishes, a committed turn is deferred or
 its deferred audio is dropped, a cancel advances the epoch, and teardown. Each
 stage output puts a `StageProgress` item on the session mailbox *after* the

@@ -1103,3 +1103,19 @@ def test_a_refused_input_takes_its_audio_back() -> None:
         (2, 200, "rejected"),
         (3, 400, None),
     ]
+
+
+def test_an_input_refused_after_part_of_it_was_handled_keeps_that_part_counted() -> None:
+    """Server VAD split the append: the segment handled before the refused one stays in ``audio_end_ms``."""
+    clock, sent = _clock()
+    ack = _begin(clock, APPEND)
+    clock.note_input_audio(ack, samples=24000, sample_rate_hz=16000)
+    clock.note_input_handled(ack, samples=16000, sample_rate_hz=16000)
+    clock.refuse_input(ack, "input_backpressure")
+    clock.end_input(ack)
+    _append(clock, ms=200, units=0)
+
+    assert [(e.input_index, e.audio_end_ms, e.decision, e.reason) for e in sent] == [
+        (1, 1000, "rejected", "input_backpressure"),
+        (2, 1200, None, None),
+    ]

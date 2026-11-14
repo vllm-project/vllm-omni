@@ -1318,16 +1318,19 @@ class DuplexSessionRunner:
         discard_pending_commit_item(projector, realtime_item_id)
 
     def _refuse_append(self, code: str, message: str, event: Mapping[str, object]) -> None:
-        """Reject an append before any of its audio reached the model.
+        """Reject an append, or the rest of one, before that audio reaches the model.
 
         The error carries the client's ``event_id``. In an input-clocked
         session the append is acknowledged as ``decision: "rejected"`` with
-        ``reason`` = ``code``, like an input the manager refused at admission.
+        ``reason`` = ``code``, like an input the manager refused at admission;
+        its ``audio_end_ms`` says where the audio the session kept ends (the
+        segments server VAD split off before the refused one stay buffered,
+        ``_on_append_audio``).
         """
         self._emit_error(code, message, event_id=event.get("realtime_event_id"))
         ack = self._current_input_ack
         if self._input_clock is not None and ack is not None:
-            # Rejected, and its audio no longer counts in ``audio_end_ms``.
+            # Rejected, and the refused audio no longer counts in ``audio_end_ms``.
             self._input_clock.refuse_input(ack, code)
 
     def _require_projector(self) -> RealtimeProjectionState:
@@ -1668,6 +1671,8 @@ class DuplexSessionRunner:
         sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
         sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else 16000
         client_force_listen = bool(event.get("force_listen", False))
+        clock = self._input_clock
+        ack = self._current_input_ack
         detected: list[tuple[dict[str, object], TurnDetectionResult | None]]
         if video_only:
             # No PCM to decode; frames alone are the turn content.
@@ -1708,8 +1713,6 @@ class DuplexSessionRunner:
             event["audio"] = audio
             event["format"] = fmt
             event["sample_rate_hz"] = sample_rate_hz
-            clock = self._input_clock
-            ack = self._current_input_ack
             if clock is not None and ack is not None and isinstance(sample_rate_hz, int | float):
                 clock.note_input_audio(
                     ack, samples=helpers.pcm_sample_count(audio, fmt), sample_rate_hz=int(sample_rate_hz)
@@ -1758,6 +1761,23 @@ class DuplexSessionRunner:
                 if release is not None:
                     # A dropped or skipped segment never reached its handoff.
                     release()
+                if clock is None or ack is None:
+                    continue
+                if ack.refused is not None:
+                    # Input-clocked sessions: the input is refused from this segment
+                    # on. Its acknowledgement says where the kept audio ends
+                    # (``audio_end_ms``) and the client resends from there, which one
+                    # position can only say if the segments after it are not tried
+                    # (without the clock each segment is tried on its own, as on main).
+                    break
+                segment_audio = segment.get("audio")
+                segment_rate = segment.get("sample_rate_hz")
+                if isinstance(segment_audio, str | bytes) and segment_audio and isinstance(segment_rate, int | float):
+                    clock.note_input_handled(
+                        ack,
+                        samples=helpers.pcm_sample_count(segment_audio, segment.get("format")),
+                        sample_rate_hz=int(segment_rate),
+                    )
 
     async def _append_detected_audio(
         self,

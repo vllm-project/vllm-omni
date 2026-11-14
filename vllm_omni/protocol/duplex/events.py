@@ -362,10 +362,13 @@ class InputProcessed(RealtimeEvent):
     earlier acknowledgement reported, oldest first:
     ``{"end_ms", "decision"}``, plus ``"reason"`` for a unit settled as
     ``cancelled``, ``aborted`` or ``timed_out`` (a ``dropped`` unit has no
-    reason). The acknowledgement of an input the session refused before any of
-    it reached the model carries ``decision: "rejected"`` and ``reason`` (the
-    code of its ``error``). A session teardown acknowledges all inputs still
-    owed with one event that also carries ``first_input_index``.
+    reason). The acknowledgement of an input the session refused before (the
+    rest of) it reached the model carries ``decision: "rejected"`` and
+    ``reason`` (the code of its ``error``); its ``audio_end_ms`` says where
+    the audio the session kept ends (an append server VAD split into segments
+    keeps the segments before the refused one). A session teardown
+    acknowledges all inputs still owed with one event that also carries
+    ``first_input_index``.
     """
 
     wire_type = "input_audio_buffer.processed"
@@ -380,7 +383,7 @@ class InputProcessed(RealtimeEvent):
     #: Client event type acknowledged (``input_audio_buffer.append`` / ``.commit`` / ``response.create``).
     trigger: str = ""
     units: tuple[Mapping[str, object], ...] = ()
-    #: ``"rejected"`` only for an input the session refused at admission (otherwise omitted).
+    #: ``"rejected"`` only for an input the session refused, at admission or preparing its audio (otherwise omitted).
     decision: str | None = None
     #: With ``decision``: the code of the ``error`` the input was refused with, e.g. ``input_backpressure``.
     reason: str | None = None

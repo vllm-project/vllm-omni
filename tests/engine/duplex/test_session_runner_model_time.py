@@ -17,6 +17,7 @@ import pytest
 from tests.engine.duplex.test_session_runner import (
     LISTEN_TOKEN_ID,
     SESSION_ID,
+    _SplitDetector,
     append_audio,
     close_harness,
     commands,
@@ -274,6 +275,47 @@ async def test_an_append_the_runner_refuses_after_decoding_does_not_count_its_au
 
         (ack,) = _acks(await h.run(append_audio(samples=3200)))  # a resend of what fits counts once
         assert (ack.input_index, ack.audio_end_ms, ack.decision) == (2, 200, None)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_an_append_refused_from_a_later_vad_segment_on_keeps_the_segments_before_it() -> None:
+    """Server VAD split the append in two and only the second segment exceeds the budget.
+
+    The first stays buffered, so the acknowledgement is ``rejected`` with
+    ``audio_end_ms`` at the end of that segment: the client resends from there,
+    and the buffer, the next commit and its unit hold exactly that audio.
+    """
+    h = await open_harness(
+        auto_response=False,
+        extra_body=INPUT_CLOCK,
+        runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=80_000),
+    )
+    h.runner.control._detector = _SplitDetector()  # 1 s (64 000 bytes as f32) and the 0.5 s remainder
+    try:
+        # pcm16: 48 000 wire bytes pass admission; decoded, the two segments are 64 000 + 32 000 bytes.
+        events = await h.run(append_audio(samples=24_000, event_id="evt-split", audio_format="pcm16"))
+
+        assert [(e.code, e.related_event_id) for e in events if e.type == "error"] == [
+            ("input_backpressure", "evt-split")
+        ]
+        (ack,) = _acks(events)
+        assert (ack.decision, ack.reason, ack.audio_end_ms) == ("rejected", "input_backpressure", 1000)
+        assert h.session.pending_input_bytes == h.runner.model_state.audio_buffer.pending_byte_count == 64_000
+        assert h.port.submissions == []
+
+        events = await h.run(commands.Commit(create_response=True, event_id="evt-commit"))
+        (submission,) = h.port.submissions
+        payload = submission.prompt["model_intermediate_buffer"]["duplex"]["payload"]
+        assert (payload["format"], len(base64.b64decode(payload["audio"]))) == ("pcm_f32le", 64_000), (
+            "the commit submits the kept segment and nothing of the refused one"
+        )
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        events += await _deliver_listen(h, submission.context.request_id)
+        (ack,) = _acks(events)
+        assert (ack.input_index, ack.audio_end_ms, ack.unit_end_ms) == (2, 1000, 1000)
+        assert ack.units == ({"end_ms": 1000, "decision": "listen"},)
     finally:
         await close_harness(h)
 

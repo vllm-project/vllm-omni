@@ -240,10 +240,12 @@ class PendingAck:
     audio_end_us: int
     #: Units created before this input was handled; ``None`` until then.
     watermark: int | None = None
-    #: Error code of an input refused before any of it reached the model (acknowledged as ``rejected``).
+    #: Error code of an input refused before (the rest of) it reached the model (acknowledged as ``rejected``).
     refused: str | None = None
-    #: Input audio this input added to ``audio_end_ms`` (taken back if the input is refused).
+    #: Input audio this input added to ``audio_end_ms`` (its part not handled yet is taken back if it is refused).
     audio_us: Fraction = Fraction(0)
+    #: The part of ``audio_us`` the session handled before refusing the rest of the input: it stays counted.
+    handled_us: Fraction = Fraction(0)
 
 
 class InputClock:
@@ -360,15 +362,29 @@ class InputClock:
         ack.audio_us += audio_us
         ack.audio_end_us = self.audio_end_us
 
-    def refuse_input(self, ack: PendingAck, code: str) -> None:
-        """The input being handled was refused before any of it reached the model (error ``code``).
+    def note_input_handled(self, ack: PendingAck, *, samples: int, sample_rate_hz: int) -> None:
+        """``samples`` more of the input's audio were handled (buffered, submitted or discarded).
 
-        It is acknowledged as ``rejected`` and its audio no longer counts in
-        ``audio_end_ms``: the client sends it again if the model should hear it.
+        A refusal of the input after that (``refuse_input``) takes back only
+        the audio not handled yet: an append server VAD split into segments
+        keeps the segments before the refused one.
+        """
+        if samples <= 0 or sample_rate_hz <= 0:
+            return
+        ack.handled_us = min(ack.audio_us, ack.handled_us + Fraction(samples * 1_000_000, int(sample_rate_hz)))
+
+    def refuse_input(self, ack: PendingAck, code: str) -> None:
+        """The input being handled was refused before the rest of it reached the model (error ``code``).
+
+        It is acknowledged as ``rejected`` and the refused audio no longer
+        counts in ``audio_end_ms``, which then says where the audio the session
+        kept ends (the input's start, unless segments before the refused one
+        were handled, ``note_input_handled``): the client sends the audio from
+        there again if the model should hear it.
         """
         ack.refused = code
-        self._audio_end -= ack.audio_us
-        ack.audio_us = Fraction(0)
+        self._audio_end -= ack.audio_us - ack.handled_us
+        ack.audio_us = ack.handled_us
         ack.audio_end_us = self.audio_end_us
 
     def end_input(self, ack: PendingAck) -> None:
