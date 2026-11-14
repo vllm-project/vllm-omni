@@ -191,6 +191,46 @@ def _native_mask_forward(query, key, value, mask, scale, inner_precise):
     return out.transpose(1, 2)
 
 
+def _eagle_mask_forward(query, key, value, mask, scale, inner_precise):
+    """EagleQBSA with independent Q and KV lengths (Q/K per-block INT8, V per-channel FP8).
+
+    The CANN operator takes actual_seq_lengths and actual_seq_lengths_kv separately and a
+    rectangular [B, N, q_blocks, kv_blocks] mask, so a compacted query needs no padding.
+    MindIE-SD's own rf_v3 wrapper passes one length for both and refuses to combine
+    rectangular shapes with multi-video spans, which is the gap this path closes.
+    """
+    import torch_npu
+    from mindiesd.layers import _custom_ops  # noqa: F401
+    from mindiesd.layers.flash_attn.sparse_flash_attn_rf_v3 import _eagle_qbsa_quant_qkv
+
+    q_q, k_q, v_q, q_scales, k_scales, v_scales = _eagle_qbsa_quant_qkv(
+        query, key, value, block_size_q=64, layout="BSND"
+    )
+    out, _ = torch.ops.mindiesd.eagle_quant_block_sparse_attention(
+        query=q_q,
+        key=k_q,
+        value=v_q.view(torch.int8),
+        block_sparse_mask=mask.to(torch.int8).contiguous(),
+        block_shape=[128, 128],
+        q_input_layout="BNSD",
+        kv_input_layout="BNSD",
+        num_key_value_heads=query.shape[2],
+        scale_value=scale,
+        inner_precise=inner_precise,
+        softmax_lse_flag=0,
+        actual_seq_lengths=[query.shape[1]],
+        actual_seq_lengths_kv=[key.shape[1]],
+        query_scale=q_scales,
+        key_scale=k_scales,
+        value_scale=v_scales,
+        query_dtype=torch.int8,
+        key_dtype=torch.int8,
+        value_dtype=torch_npu.float8_e4m3fn,
+        output_dtype=query.dtype,
+    )
+    return out.permute(0, 2, 1, 3)
+
+
 def hybrid_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -203,6 +243,7 @@ def hybrid_attention(
     inner_precise: int = 0,
     kernel_dtype: str = "fp16",
     input_scale: float = 256.0,
+    precision: str = "bf16",
 ) -> torch.Tensor:
     """BSND, one packed document; output contains only the caller's Q rows."""
     if query.shape[0] != 1 or key.shape != value.shape or query.shape[2:] != key.shape[2:]:
@@ -219,6 +260,14 @@ def hybrid_attention(
         sparse_k = key.index_select(1, plan.key_permutation)
         mask = block_mask(sparse_q, sparse_k, plan, sparsity, scale)
         sparse_v = value.index_select(1, plan.key_permutation)
+        if precision == "mix":
+            # EagleQBSA quantizes internally and keeps the caller's dtype, so the
+            # FP16 range-protection dance below does not apply.
+            sparse_out = _eagle_mask_forward(sparse_q, sparse_k, sparse_v, mask, scale, inner_precise)
+            out.index_copy_(1, plan.sparse_queries, sparse_out.to(query.dtype))
+            return out
+        if precision != "bf16":
+            raise ValueError(f"hybrid RainFusion precision must be bf16 or mix, got {precision!r}")
         output_dtype = query.dtype
         restore_scale = 1.0
         kernel_scale = scale

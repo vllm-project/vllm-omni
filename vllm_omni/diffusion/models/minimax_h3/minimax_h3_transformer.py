@@ -1353,10 +1353,16 @@ class MiniMaxH3DiTModel(nn.Module):
                 "MiniMax H3 reference-KV reuse requires no SP or pure Ulysses attention, and FASTVIDEO_VSA "
                 "in neither the base attention nor any attention schedule profile"
             )
-        from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import MiniMaxH3ReferenceKVTier2State
+        from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import (
+            MiniMaxH3ReferenceKVDeviceState,
+            MiniMaxH3ReferenceKVTier2State,
+        )
         from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache_dit import iter_minimax_h3_blocks
 
-        return MiniMaxH3ReferenceKVTier2State.from_config(
+        state_cls = (
+            MiniMaxH3ReferenceKVDeviceState if config.kv_cache_location == "device" else MiniMaxH3ReferenceKVTier2State
+        )
+        return state_cls.from_config(
             config=config,
             num_layers=sum(1 for _ in iter_minimax_h3_blocks(self.blocks)),
             global_reference_rows=global_reference_rows,
