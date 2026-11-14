@@ -1150,6 +1150,20 @@ source_file_dependencies:
     - vllm_omni/worker_v2/
     - vllm_omni/platforms/npu/worker/npu_omni_v2_model_runner.py
 
+  tts_voxcpm2_function:
+    - vllm_omni/model_executor/models/voxcpm2/
+    - vllm_omni/platforms/npu/models/voxcpm2_talker.py
+    - vllm_omni/platforms/npu/models/voxcpm2_model_state.py
+    - vllm_omni/entrypoints/openai/tts_adapters/voxcpm2.py
+    - vllm_omni/transformers_utils/configs/voxcpm2.py
+    - vllm_omni/deploy/voxcpm2.yaml
+    - tests/e2e/online_serving/test_voxcpm2_tts.py
+    # ASR backend used by the advanced_model transcript assertion.
+    - tests/helpers/media.py
+    # VoxCPM2 runs on Model Runner V2, so runner changes must run these jobs.
+    - vllm_omni/platforms/npu/worker/npu_omni_v2_model_runner.py
+    - vllm_omni/worker_v2/
+
   tts_lfm3_function:
     - *lfm3
     - tests/e2e/online_serving/test_lfm3_omni.py

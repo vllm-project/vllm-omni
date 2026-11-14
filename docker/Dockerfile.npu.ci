@@ -53,6 +53,7 @@ RUN python3 -m pip install -U pip && \
       "librosa>=0.10.0" \
       "datasets>=3.0.0" \
       "torchmetrics==1.9.0" \
+      "voxcpm==2.0.3" \
       --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
       --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
       --default-timeout=60
