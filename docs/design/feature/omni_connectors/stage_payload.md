@@ -98,6 +98,11 @@ An unsupported backend must implement this capability before being used for
 synchronous remote-only payloads. Existing asynchronous `get()` users are
 unchanged.
 
+`MooncakeStoreConnector` also implements deadline-aware receive: its store
+polling and retry sleeps share the caller's deadline. Individual native store
+calls remain subject to the limitation below. This does not imply support for
+the separate Mooncake Transfer Engine connector.
+
 The deadline covers retry sleeps, metadata socket waits, and NIXL completion
 polling. It is **not a hard real-time bound** on Python execution, allocation,
 serialization, individual native driver calls, device copies, or payload-group
