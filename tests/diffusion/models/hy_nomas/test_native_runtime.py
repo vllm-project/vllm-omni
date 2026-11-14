@@ -319,3 +319,97 @@ def _native_ulysses_worker(rank, rendezvous):
 @pytest.mark.parallel
 def test_native_model_uses_public_ulysses_with_real_gloo(tmp_path):
     mp.spawn(_native_ulysses_worker, args=((tmp_path / "rendezvous").as_uri(),), nprocs=2, join=True)
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@torch.no_grad()
+def test_native_visibility_reuse_scope(monkeypatch, shared):
+    torch.manual_seed(49)
+    model = _small_transformer(num_layers=2)
+    monkeypatch.setenv("VLLM_OMNI_HY_NOMAS_B3_VISIBILITY_REUSE", "1")
+    seen = []
+    hook = model.attention.register_forward_pre_hook(lambda module, args, kwargs: seen.append(kwargs), with_kwargs=True)
+    for history, commit in [(0, False), (2, True), (1, False)]:
+        masks = [torch.ones(1, 32, dtype=torch.bool)]
+        masks.append(masks[0] if shared else masks[0].clone())
+        if not shared:
+            masks[1][:, 0] = False
+        candidate_masks = [masks[0].clone()]
+        candidate_masks.append(candidate_masks[0] if shared else masks[1].clone())
+        caches = [{k: torch.randn(1, 32, 4, 8) for k in ("k", "v")} for _ in range(2)]
+        candidate_caches = [{k: v.clone() for k, v in c.items()} for c in caches]
+        inputs = dict(
+            hidden_states=torch.randn(1, 4, 2, 1, 1),
+            timestep=torch.tensor([300.0]),
+            text_states=torch.randn(1, 3, 6),
+            text_mask=torch.tensor([[1, 1, 0]]),
+            cache_valid_len=history,
+            update_cache=commit,
+        )
+        monkeypatch.setenv("VLLM_OMNI_HY_NOMAS_B3_MASK_REUSE", "0")
+        expected, written = model.forward_with_cache(**inputs, kv_cache_list=caches, cache_mask_list=masks)
+        seen.clear()
+        monkeypatch.setenv("VLLM_OMNI_HY_NOMAS_B3_MASK_REUSE", "1")
+        actual, actual_written = model.forward_with_cache(
+            **inputs, kv_cache_list=candidate_caches, cache_mask_list=candidate_masks
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert written == actual_written
+        assert len(seen) == 2
+        if shared:
+            assert seen[0]["_forward_masks"] is seen[1]["_forward_masks"] is not None
+            assert seen[0]["query_mask"] is seen[1]["query_mask"]
+        else:
+            assert all(x["_forward_masks"] is None for x in seen)
+        for i in range(2):
+            assert torch.equal(masks[i], candidate_masks[i])
+            for k in ("k", "v"):
+                assert torch.equal(caches[i][k], candidate_caches[i][k])
+    hook.remove()
+
+
+@torch.no_grad()
+def test_native_rope_upload_preserves_absolute_positions(monkeypatch):
+    torch.manual_seed(52)
+    model = _small_transformer(num_layers=2)
+    for offset in (0, 16, 736):
+        inputs = dict(
+            hidden_states=torch.randn(1, 4, 2, 1, 1),
+            timestep=torch.tensor([300.0]),
+            text_states=torch.randn(1, 3, 6),
+            text_mask=torch.tensor([[1, 1, 0]]),
+            global_frame_counter=offset,
+            update_cache=True,
+        )
+        outputs, states = [], []
+        for enabled in ("0", "1"):
+            monkeypatch.setenv("VLLM_OMNI_HY_NOMAS_B3_ROPE_UPLOAD_REUSE", enabled)
+            caches = [{name: torch.zeros(1, 20, 4, 8) for name in ("k", "v")} for _ in range(2)]
+            mask = torch.zeros(1, 20, dtype=torch.bool)
+            output, written = model.forward_with_cache(**inputs, kv_cache_list=caches, cache_mask_list=[mask] * 2)
+            assert written == 5
+            outputs.append(output)
+            states.append((caches, mask))
+        torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+        assert torch.equal(states[0][1], states[1][1])
+        for before, after in zip(states[0][0], states[1][0]):
+            for name in ("k", "v"):
+                torch.testing.assert_close(before[name], after[name], rtol=0, atol=0)
+
+
+def test_rope_fusion_cpu_fallback_preserves_autograd(monkeypatch):
+    from vllm_omni.diffusion.models.hy_nomas.layers import apply_rotary, rotary_tables
+
+    torch.manual_seed(41)
+    tables = rotary_tables((2, 2, 2), (2, 2, 4), 256.0, time_offset=16)
+    source = torch.randn(1, 8, 2, 8)
+    baseline_input = source.clone().requires_grad_(True)
+    candidate_input = source.clone().requires_grad_(True)
+    monkeypatch.delenv("VLLM_OMNI_HY_NOMAS_B3_ROPE_FUSION", raising=False)
+    baseline = apply_rotary(baseline_input, tables)
+    baseline.square().sum().backward()
+    monkeypatch.setenv("VLLM_OMNI_HY_NOMAS_B3_ROPE_FUSION", "1")
+    candidate = apply_rotary(candidate_input, tables)
+    candidate.square().sum().backward()
+    torch.testing.assert_close(candidate, baseline, rtol=0, atol=0)
+    torch.testing.assert_close(candidate_input.grad, baseline_input.grad, rtol=0, atol=0)

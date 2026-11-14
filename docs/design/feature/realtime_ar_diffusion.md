@@ -241,3 +241,31 @@ CPU contract tests cover:
 GPU validation must additionally exercise real model loading, action input,
 prompt switching, rolling-window replacement, reset, close, finite output
 latents, and exact metadata/request identity.
+
+## Hy-Nomas opt-in forward reuse
+
+Hy-Nomas has experimental B3 switches for evaluating redundant work in its
+transformer. All default to disabled; set a variable to `1` before starting the
+workers to enable it. These switches do not change session scheduling or KV
+ownership.
+
+| Variable | Behavior |
+| --- | --- |
+| `VLLM_OMNI_HY_NOMAS_B3_MASK_REUSE` | Memoize attention masks within one forward when every layer shares the same cache-mask object. |
+| `VLLM_OMNI_HY_NOMAS_B3_VISIBILITY_REUSE` | Also reuse visibility tensors and ranges; requires mask reuse. |
+| `VLLM_OMNI_HY_NOMAS_B3_DIRECT_OUTPUT` | Return the batch-one attention result directly; requires the forward mask memo. |
+| `VLLM_OMNI_HY_NOMAS_B3_ROPE_UPLOAD_REUSE` | Upload the original rank-local rotary tables once per forward. |
+| `VLLM_OMNI_HY_NOMAS_B3_ROPE_FUSION` | Fuse adjacent-pair rotary arithmetic for supported CUDA inference tensors. |
+
+The mask memo and visibility tensors are local to a single forward. They are
+not retained across denoising steps, commits, or prompts. Separate per-layer
+cache masks use the existing path. Rotary table generation and absolute time
+offsets remain unchanged. Fusion requires device-local contiguous FP32 tables
+and four-dimensional FP16/BF16 inputs with gradients disabled; unsupported
+inputs use the eager implementation. Enabling upload reuse alongside fusion
+makes the CPU-generated tables eligible. The fused kernel disables FMA to
+preserve separate FP32 multiplication and addition rounding.
+
+These are experimental controls, not a guarantee of end-to-end acceleration.
+Validate output equivalence and latency on the intended workload and hardware
+before opting in. Disabling all five variables restores the baseline behavior.

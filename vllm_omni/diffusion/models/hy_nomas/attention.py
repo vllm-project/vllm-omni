@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from Tencent-Hunyuan/Hy-Nomas (Copyright 2026 Tencent).
 
+import os
 from collections import OrderedDict
 from functools import cache
 
@@ -101,7 +102,7 @@ class RangeAttention(nn.Module):
     def clear(self) -> None:
         self.masks.clear()
 
-    def forward(self, q, k, v, *, ranges=None, query_mask=None, key_mask=None, block_mask=None):
+    def forward(self, q, k, v, *, ranges=None, query_mask=None, key_mask=None, block_mask=None, _forward_masks=None):
         if q.ndim != 4 or k.ndim != 4 or k.shape != v.shape or q.shape[0] != k.shape[0]:
             raise ValueError("Hy-Nomas attention requires matching BSND query/key/value tensors.")
         if (
@@ -143,30 +144,45 @@ class RangeAttention(nn.Module):
                 scale=self.softmax_scale,
                 enable_gqa=q.shape[2] != k.shape[2],
             ).transpose(1, 2)
-        output = torch.empty_like(q)
+        direct_output = (
+            _forward_masks is not None
+            and q.shape[0] == 1
+            and q.shape[1] > 0
+            and k.shape[1] > 0
+            and os.environ.get("VLLM_OMNI_HY_NOMAS_B3_DIRECT_OUTPUT") == "1"
+        )
+        output = None if direct_output else torch.empty_like(q)
         for batch in range(q.shape[0]):
-            qr = np.ones(q.shape[1], dtype=bool) if query_mask is None else query_mask[batch].detach().cpu().numpy()
-            kr = np.ones(k.shape[1], dtype=bool) if key_mask is None else key_mask[batch].detach().cpu().numpy()
-            rectangles = [(0, q.shape[1], 0, k.shape[1])] if ranges is None else ranges[batch]
-            if not q.shape[1] or not k.shape[1]:
-                output[batch].zero_()
-                continue
-            cache_key = (q.shape[1], k.shape[1], str(q.device), tuple(rectangles), qr.tobytes(), kr.tobytes())
-            if cache_key not in self.masks:
-                self.masks[cache_key] = build_range_mask(q.shape[1], k.shape[1], rectangles, q.device, qr, kr)
-                while len(self.masks) > 32:
-                    self.masks.popitem(last=False)
-            self.masks.move_to_end(cache_key)
+            forward_key = (batch, q.shape[1], k.shape[1], str(q.device))
+            mask = None if _forward_masks is None else _forward_masks.get(forward_key)
+            if mask is None:
+                qr = np.ones(q.shape[1], dtype=bool) if query_mask is None else query_mask[batch].detach().cpu().numpy()
+                kr = np.ones(k.shape[1], dtype=bool) if key_mask is None else key_mask[batch].detach().cpu().numpy()
+                rectangles = [(0, q.shape[1], 0, k.shape[1])] if ranges is None else ranges[batch]
+                if not q.shape[1] or not k.shape[1]:
+                    output[batch].zero_()
+                    continue
+                cache_key = (q.shape[1], k.shape[1], str(q.device), tuple(rectangles), qr.tobytes(), kr.tobytes())
+                if cache_key not in self.masks:
+                    self.masks[cache_key] = build_range_mask(q.shape[1], k.shape[1], rectangles, q.device, qr, kr)
+                    while len(self.masks) > 32:
+                        self.masks.popitem(last=False)
+                self.masks.move_to_end(cache_key)
+                mask = self.masks[cache_key]
+                if _forward_masks is not None:
+                    _forward_masks[forward_key] = mask
             kernel = compiled_flex() if q.device.type == "cuda" else flex_attention
             result = kernel(
                 q[batch].transpose(0, 1)[None],
                 k[batch].transpose(0, 1)[None],
                 v[batch].transpose(0, 1)[None],
-                block_mask=self.masks[cache_key],
+                block_mask=mask,
                 scale=self.softmax_scale,
                 enable_gqa=q.shape[2] != k.shape[2],
                 kernel_options={"ROWS_GUARANTEED_SAFE": False, "BLOCKS_ARE_CONTIGUOUS": False},
             )
+            if direct_output:
+                return result.transpose(1, 2)
             output[batch].copy_(result[0].transpose(0, 1))
         return output
 
