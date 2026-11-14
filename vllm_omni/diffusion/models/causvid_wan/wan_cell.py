@@ -31,6 +31,7 @@ class WanCell(CellAdapter):
         device: torch.device,
         dtype: torch.dtype,
         on_finished: Callable[[int, torch.Tensor], None] | None = None,
+        serial_key: Hashable | None = None,
     ) -> None:
         self.transformer = transformer
         self.sampler = sampler
@@ -42,6 +43,11 @@ class WanCell(CellAdapter):
         self.device = device
         self.dtype = dtype
         self.on_finished = on_finished
+        # Members sharing one model call must agree on this key. The pipeline
+        # sets it for requests that cannot safely share a forward: Same-Step
+        # schedules (each step reads a different history version) and remote
+        # stream decodes (each decode owns a Gloo tag sequence).
+        self.serial_key = serial_key
         self.num_denoise_steps = len(sampler.timesteps)
         self.finished: dict[str, dict[int, torch.Tensor]] = {}
         self._live: dict[str, dict[int, torch.Tensor]] = {}
@@ -52,7 +58,7 @@ class WanCell(CellAdapter):
     def compatibility_key(self, cell: Cell) -> Hashable:
         """Same DiT block + latent shape/dtype may pack; chunk/step/t are member inputs."""
         _chunk, _step, block = cell
-        return (int(block), self.latent_shape, str(self.dtype))
+        return (int(block), self.latent_shape, str(self.dtype), self.serial_key)
 
     def _init_noise(self, chunk: int) -> torch.Tensor:
         gen = torch.Generator(device=self.device)
@@ -67,15 +73,35 @@ class WanCell(CellAdapter):
         member_input: Any,
         live: dict[int, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Resolve one member's latent and peer tokens.
+
+        ``None`` is the legitimate initial state and falls back to the stored
+        live latent or fresh noise. Anything else must match the declared
+        schema; a wrong type or a non-tensor payload fails instead of silently
+        becoming fresh noise, which would hide a producer bug.
+        """
         latent: torch.Tensor | None = None
         tokens: torch.Tensor | None = None
-        if isinstance(member_input, dict):
-            if "latent" in member_input and isinstance(member_input["latent"], torch.Tensor):
-                latent = member_input["latent"]
-            if "hidden_states" in member_input and isinstance(member_input["hidden_states"], torch.Tensor):
-                tokens = member_input["hidden_states"]
+        if member_input is None:
+            pass
         elif isinstance(member_input, torch.Tensor):
             latent = member_input
+        elif isinstance(member_input, dict):
+            unknown = set(member_input) - {"latent", "hidden_states"}
+            if unknown:
+                raise TypeError(f"WanCell member input {req!r} has unexpected keys {sorted(unknown)}")
+            for key in ("latent", "hidden_states"):
+                value = member_input.get(key)
+                if value is not None and not isinstance(value, torch.Tensor):
+                    raise TypeError(
+                        f"WanCell member input {req!r} field {key!r} must be a tensor, got {type(value).__name__}"
+                    )
+            latent = member_input.get("latent")
+            tokens = member_input.get("hidden_states")
+        else:
+            raise TypeError(
+                f"WanCell member input {req!r} must be a tensor, dict or None, got {type(member_input).__name__}"
+            )
         if latent is None:
             stored = live.get(chunk)
             latent = self._init_noise(chunk) if stored is None else stored

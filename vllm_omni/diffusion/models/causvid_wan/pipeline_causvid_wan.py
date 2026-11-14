@@ -4,7 +4,7 @@
 
 Wires Wan codec + ``StageWanTransformer`` onto ``ARDiffusionEngine``, with
 CausVid defaults (shift=8, D=3, S=D+1) and optional student ``model.pt`` overlay.
-CausVidWan accepts ``self_forcing`` / ``latest_kv`` only (not ``same_step``).
+CausVidWan supports clean-history and Same-Step policies with their declared topology.
 
 * Codec base: Diffusers ``Wan-AI/Wan2.1-T2V-1.3B-Diffusers``
 * Student DiT: ``tianweiy/CausVid`` → ``autoregressive_checkpoint/model.pt``
@@ -13,8 +13,10 @@ CausVidWan accepts ``self_forcing`` / ``latest_kv`` only (not ``same_step``).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator
+import time
+from collections.abc import Callable, Hashable, Iterable, Iterator
 from contextlib import contextmanager
+from functools import partial
 from typing import Any, ClassVar
 
 import torch
@@ -62,9 +64,40 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     NoisyKVState,
     clean_history_cells,
 )
+from vllm_omni.experimental.ar_diffusion.request_binding import kv_request_binding
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 
 logger = init_logger(__name__)
+
+
+def _record_chunk_timeline(
+    chunk: int,
+    latent: torch.Tensor,
+    *,
+    timeline_file: Any,
+    previous_callback: Callable[[int, torch.Tensor], None] | None,
+) -> None:
+    """Append one chunk finish time, then run the callback this wrapper replaced."""
+    if latent.is_cuda:
+        torch.accelerator.synchronize(latent.device)
+    with open(str(timeline_file), "a", encoding="utf-8") as fh:
+        fh.write(f"{int(chunk)}\t{time.time()}\n")
+    if previous_callback is not None:
+        previous_callback(chunk, latent)
+
+
+def _chunk_timeline_callback(
+    on_finished: Callable[[int, torch.Tensor], None] | None,
+    timeline_file: Any,
+    *,
+    finish_rank: int,
+    pp_rank: int,
+) -> Callable[[int, torch.Tensor], None] | None:
+    """Bind chunk timeline recording on the last-noisy producer rank."""
+    if timeline_file is None or pp_rank != finish_rank:
+        return on_finished
+    return partial(_record_chunk_timeline, timeline_file=timeline_file, previous_callback=on_finished)
+
 
 HF_MODEL_ID = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 HF_CAUSVID_REPO = "tianweiy/CausVid"
@@ -250,6 +283,13 @@ class CausVidWanPipeline(nn.Module):
 
     def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec:
         local_layers = max(1, self.transformer.local_num_layers)
+        # The diagonal orderings retain one version per chunk (the clean KV), so the
+        # window size is also the version count. Same-Step keeps one version per
+        # denoise step plus chunk 0's clean sink, so the retained set is wider and
+        # the shared pool has to be sized for it at load time.
+        versions_per_chunk = 1
+        if self.step_replicas > 1 and self.step_replicas == self._default_denoise:
+            versions_per_chunk = self._default_denoise + 1
         return ARDiffusionNoisyKVSpec(
             num_layers=local_layers,
             num_kv_heads=self.transformer.num_heads,
@@ -257,6 +297,7 @@ class CausVidWanPipeline(nn.Module):
             block_size=self.block_size,
             max_chunk_tokens=self.max_chunk_tokens,
             max_history_chunks=max(1, self.max_history_chunks),
+            max_history_versions=max(1, max(1, self.max_history_chunks) * versions_per_chunk),
         )
 
     @contextmanager
@@ -363,7 +404,13 @@ class CausVidWanPipeline(nn.Module):
         length = int(mask.gt(0).sum().item())
         return torch.cat([hidden[:, :length], hidden.new_zeros(1, max_length - length, hidden.shape[2])], dim=1)
 
-    def _plan_for(self, req: OmniDiffusionRequest, *, chunk_base: int = 0):
+    def _plan_for(
+        self,
+        req: OmniDiffusionRequest,
+        *,
+        chunk_base: int = 0,
+        same_step_session: bool = False,
+    ):
         sp = req.sampling_params
         extra = dict(sp.extra_args or {}) if sp is not None else {}
         if "shift" not in extra:
@@ -392,8 +439,12 @@ class CausVidWanPipeline(nn.Module):
             ordering = Ordering.SELF_FORCING
         elif schedule_name == "latest_kv":
             ordering = Ordering.LATEST_KV
+        elif schedule_name == "same_step":
+            ordering = Ordering.SAME_STEP
         else:
-            raise ValueError(f"CausVidWan cell_schedule must be 'self_forcing' or 'latest_kv', got {schedule_name!r}")
+            raise ValueError(
+                f"CausVidWan cell_schedule must be 'self_forcing', 'latest_kv' or 'same_step', got {schedule_name!r}"
+            )
         step_replicas = self.step_replicas
         if ordering is Ordering.SELF_FORCING and step_replicas > 1:
             # Self-Forcing is single-replica (paper semantics, layer PP);
@@ -409,8 +460,15 @@ class CausVidWanPipeline(nn.Module):
                 f"latest_kv requires step_replicas=D+1 ({denoise + 1}) for clean history, "
                 "got 1; step_replicas=1 layer PP uses cell_schedule: self_forcing"
             )
-        # CausVid rejects same_step; vertical is S=D+1 only (S=D stays schedule-level).
-        if step_replicas not in (1, denoise + 1):
+        # Same-Step is the S=D vertical placement (one replica per denoise step);
+        # Latest-KV is S=D+1 (one extra clean replica).
+        if ordering is Ordering.SAME_STEP:
+            if step_replicas != denoise:
+                raise ValueError(
+                    f"same_step requires step_replicas=D ({denoise}) so every denoise step owns a "
+                    f"replica, got {step_replicas}"
+                )
+        elif step_replicas not in (1, denoise + 1):
             if explicit_denoise is not None:
                 raise ValueError(f"step_replicas must be 1 or D+1 ({denoise + 1}), got {step_replicas}")
             # S>=2 here (S=1 is always in the set above); infer D = S-1 → S = D+1.
@@ -439,6 +497,7 @@ class CausVidWanPipeline(nn.Module):
             blocks=num_blocks if num_blocks > 0 else None,
             blocks_per_rank=local_blocks if local_blocks > 0 else None,
             chunk_base=chunk_base,
+            same_step_session=same_step_session,
         )
         # Logical prior (not local residency) drives plan sources + cross-rank handoffs.
         prior = expected_prior_cells(schedule)
@@ -521,45 +580,12 @@ class CausVidWanPipeline(nn.Module):
         return self._stream_decode_group
 
     @staticmethod
-    def _maybe_timeline(
-        on_finished: Callable[[int, torch.Tensor], None] | None,
-        timeline_file: Any,
-        *,
-        finish_rank: int,
-        pp_rank: int,
-    ) -> Callable[[int, torch.Tensor], None] | None:
-        """Append chunk finish times on the last-noisy producer rank."""
-        if timeline_file is None or pp_rank != finish_rank:
-            return on_finished
-        import time as _time
-
-        prev = on_finished
-
-        def _wrapped(chunk: int, latent: torch.Tensor) -> None:
-            if latent.is_cuda:
-                torch.accelerator.synchronize(latent.device)
-            with open(str(timeline_file), "a", encoding="utf-8") as fh:
-                fh.write(f"{int(chunk)}\t{_time.time()}\n")
-            if prev is not None:
-                prev(chunk, latent)
-
-        return _wrapped
-
-    @staticmethod
     def _noisy_request_lifecycle(
         req: OmniDiffusionRequest,
     ) -> tuple[str, bool, bool, bool]:
-        """Return ``(kv_id, persist, reset, close_session)`` — shared by batch and single paths."""
-        req_id = str(getattr(req, "request_id", None) or "")
-        sp = req.sampling_params
-        extra = dict(sp.extra_args or {}) if sp is not None else {}
-        raw_session = extra.get("session_id")
-        explicit_session = raw_session is not None and str(raw_session) != ""
-        reset = bool(extra.get("reset", False))
-        close_session = bool(extra.get("close_session", False))
-        persist = explicit_session and not close_session
-        kv_id = str(raw_session) if explicit_session else req_id
-        return kv_id, persist, reset, close_session
+        """Compatibility projection of the runner/model shared KV binding."""
+        binding = kv_request_binding(req)
+        return binding.owner, binding.persist, binding.reset, binding.close
 
     def admit_cell_request(
         self, req: OmniDiffusionRequest, *, decode_tag: int = 0
@@ -575,15 +601,12 @@ class CausVidWanPipeline(nn.Module):
         param = next(self.transformer.parameters())
         device, dtype = param.device, param.dtype
 
-        kv_id, persist, _reset, _close_session = self._noisy_request_lifecycle(req)
+        binding = kv_request_binding(req)
+        kv_id = binding.owner
         if not kv_id:
             raise ValueError("CausVidWan path requires a non-empty request_id or session_id")
-        sp = req.sampling_params
-        extra_peek = dict(sp.extra_args or {}) if sp is not None else {}
-        chunk_base = int(extra_peek.get("chunk_base", 0) or 0)
-        if chunk_base < 0:
-            raise ValueError(f"chunk_base must be non-negative, got {chunk_base}")
-        plan, extra, denoise = self._plan_for(req, chunk_base=chunk_base)
+        persist = binding.persist
+        plan, extra, denoise = self._plan_for(req, chunk_base=binding.chunk_base, same_step_session=persist)
         schedule = plan.schedule
         if persist:
             ctx.kv.cache.bind_session_structure(kv_id, schedule.structural_key())
@@ -597,13 +620,13 @@ class CausVidWanPipeline(nn.Module):
             ]
             if missing_owned:
                 raise ValueError(
-                    f"session continuation chunk_base={chunk_base} for {kv_id!r} missing owned "
+                    f"session continuation chunk_base={binding.chunk_base} for {kv_id!r} missing owned "
                     f"prior cells {sorted(missing_owned)!r} on rank {pp_rank}; "
                     "restart with chunk_base=0 or fix retain/release"
                 )
         shape = tuple(int(x) for x in (extra.get("latent_shape") or _DEFAULT_LATENT_SHAPE))
-        if len(shape) != 5:
-            raise ValueError(f"latent_shape must be B,C,T,H,W; got {shape}")
+        if len(shape) != 5 or shape[0] != 1 or any(dim <= 0 for dim in shape):
+            raise ValueError(f"latent_shape must be positive 1,C,T,H,W; got {shape}")
         shift = float(extra.get("shift", self._default_shift))
         seed = int(extra.get("seed", getattr(req.sampling_params, "seed", 0) or 0))
         chunk_tokens = self.transformer.seq_len_for_latent(shape)
@@ -633,6 +656,17 @@ class CausVidWanPipeline(nn.Module):
             finish_rank = self.layer_groups - 1
         # Remote stream_decode only for vertical; S=1 stays local (_start_local).
         source_rank = finish_rank if self.step_replicas > 1 else None
+        # Members may share one model call only when this key agrees. Same-Step
+        # schedules must stay serial: each denoise step reads a different
+        # history version, so packing two of them would mix histories. Remote
+        # stream decodes also stay serial because their sends are untagged on
+        # one shared Gloo group and cannot be demultiplexed per member.
+        if plan.schedule.ordering is Ordering.SAME_STEP:
+            serial_key = ("serial", kv_id)
+        elif stream_decode and source_rank is not None:
+            serial_key = ("remote_stream", kv_id)
+        else:
+            serial_key = None
         adapter, stream_job = self._start_stream_decode_and_wan_cell(
             kv_id=kv_id,
             n_chunks=plan.schedule.chunks,
@@ -649,6 +683,7 @@ class CausVidWanPipeline(nn.Module):
             pp_group=pp_group,
             timeline_file=extra.get("chunk_timeline_file"),
             decode_tag=decode_tag,
+            serial_key=serial_key,
         )
         return adapter, kv_id, persist, stream_job
 
@@ -670,6 +705,7 @@ class CausVidWanPipeline(nn.Module):
         pp_group: Any,
         timeline_file: Any,
         decode_tag: int = 0,
+        serial_key: Hashable | None = None,
     ) -> tuple[Any, Any | None]:
         """Start stream_decode (if any) then build WanCell; cancel the job on build failure.
 
@@ -696,7 +732,7 @@ class CausVidWanPipeline(nn.Module):
                 decode_tag=decode_tag,
             )
             on_finished = stream_job.on_finished
-        on_finished = self._maybe_timeline(on_finished, timeline_file, finish_rank=finish_rank, pp_rank=pp_rank)
+        on_finished = _chunk_timeline_callback(on_finished, timeline_file, finish_rank=finish_rank, pp_rank=pp_rank)
         try:
             adapter = WanCell(
                 self.transformer,
@@ -707,6 +743,7 @@ class CausVidWanPipeline(nn.Module):
                 device=device,
                 dtype=dtype,
                 on_finished=on_finished,
+                serial_key=serial_key,
             )
         except Exception:
             if stream_job is not None:
@@ -737,8 +774,10 @@ class CausVidWanPipeline(nn.Module):
         """Mainline request entry: plan, run the Cell executor, then emit.
 
         Compatible requests admitted into the same Cell context share one
-        ``run_cell_pipeline`` so same-cell members can compute together.
-        Session reset and release stay on the runner.
+        ``run_cell_pipeline`` so same-cell members can compute together. The
+        executor groups members through ``CellAdapter.compatibility_key``; that
+        key keeps Same-Step requests serial and isolates concurrent remote
+        decodes. Session reset and release stay on the runner.
         """
         ctx = self._execution_context()
         previous = getattr(self, "_chunk_ctx", None)
