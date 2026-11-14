@@ -55,6 +55,9 @@ class StepBatchSamplingParamsKey:
     participate in the current homogeneous batching policy.
     """
 
+    # Packed and ordinary dense requests never share an execution contract.
+    mixfusion_key: tuple | None = None
+
     # Spatial / temporal shape.
     height: int | None = None
     width: int | None = None
@@ -265,6 +268,8 @@ class DiffusionSchedulerOutput:
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
+    # Execution mode only; the worker owns the packed tensor layout.
+    use_mixfusion: bool = False
     # next request to background-prefetch KV
     kv_prefetch_job: KVPrefetchJob | None = None
     kv_connector_metadata: KVConnectorMetadata | None = None

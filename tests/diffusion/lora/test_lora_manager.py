@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -245,6 +246,7 @@ def test_lora_manager_matches_scoped_moe_targets(monkeypatch, target_modules):
         pipeline=pipeline,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
+        max_num_batched_tokens=8,
     )
 
     peft_helper = type(
@@ -256,6 +258,176 @@ def test_lora_manager_matches_scoped_moe_targets(monkeypatch, target_modules):
 
     assert "transformer.experts" in manager._lora_modules
     assert isinstance(pipeline.transformer.experts, _DummyBaseLayerWithLoRA)
+
+
+def test_moe_adapter_fails_before_dense_layers_are_wrapped_without_token_capacity(monkeypatch):
+    import vllm.model_executor.layers.fused_moe as upstream_moe
+
+    import vllm_omni.lora.manager as manager_mod
+
+    class _TargetMoERunner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe_config = SimpleNamespace(is_act_and_mul=True, num_experts=2)
+            self.global_num_experts = 2
+
+    monkeypatch.setattr(upstream_moe, "MoERunner", _TargetMoERunner)
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+    from_layer = Mock(side_effect=AssertionError("preflight must run before wrapping"))
+    monkeypatch.setattr(manager_mod, "from_layer", from_layer)
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.foo = _FakeLinearBase()
+    pipeline.transformer.experts = _TargetMoERunner()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    peft_helper = type(
+        "_PH",
+        (),
+        {"r": 1, "target_modules": ["gate_proj"]},
+    )()
+    with pytest.raises(
+        RuntimeError,
+        match="request-time MoE adapters cannot use the native MXFP4 path",
+    ):
+        manager._replace_layers_with_lora(peft_helper)
+
+    from_layer.assert_not_called()
+    assert manager._lora_modules == {}
+
+
+def test_rejected_moe_adapter_preserves_cache_active_adapter_and_rank(monkeypatch):
+    import vllm.model_executor.layers.fused_moe as upstream_moe
+
+    import vllm_omni.lora.manager as manager_mod
+
+    class _TargetMoERunner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe_config = SimpleNamespace(is_act_and_mul=True, num_experts=2)
+            self.global_num_experts = 2
+
+    monkeypatch.setattr(upstream_moe, "MoERunner", _TargetMoERunner)
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+    monkeypatch.setattr(
+        manager_mod,
+        "from_layer",
+        lambda *, layer, **_kwargs: _DummyBaseLayerWithLoRA(layer),
+    )
+    monkeypatch.setattr(
+        manager_mod,
+        "replace_submodule",
+        lambda root, name, sub: fake_replace_submodule(root, name, sub),
+    )
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.foo = _FakeLinearBase()
+    pipeline.transformer.experts = _TargetMoERunner()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+    dense_helper = SimpleNamespace(r=4, target_modules=["foo"])
+    moe_helper = SimpleNamespace(r=64, target_modules=["gate_proj"])
+
+    def _fake_load(request: LoRARequest):
+        lora_model = type("LM", (), {"id": request.lora_int_id})()
+        return lora_model, dense_helper if request.lora_int_id == 1 else moe_helper
+
+    activated: list[int] = []
+
+    def _fake_activate(adapter_id: int, scale: float) -> None:
+        manager._active_adapter_id = adapter_id
+        manager._active_scale = scale
+        manager._update_adapter_scale(adapter_id, scale)
+        activated.append(adapter_id)
+
+    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    monkeypatch.setattr(manager, "_activate_adapter", _fake_activate)
+
+    def _state():
+        return (
+            list(manager._registered_adapters),
+            list(manager._adapter_access_order),
+            manager._active_adapter_id,
+            manager._max_lora_rank,
+            dict(manager._adapter_scales),
+            list(manager._lora_modules),
+            type(pipeline.transformer.foo).__name__,
+        )
+
+    dense_request = _dummy_lora_request(1)
+    moe_request = _dummy_lora_request(2)
+    manager.set_active_adapter(dense_request, lora_scale=1.0)
+    state_before_rejection = _state()
+
+    for _ in range(2):
+        with pytest.raises(
+            RuntimeError,
+            match="request-time MoE adapters cannot use the native MXFP4 path",
+        ):
+            manager.set_active_adapter(moe_request, lora_scale=1.0)
+        assert _state() == state_before_rejection
+
+    manager.set_active_adapter(dense_request, lora_scale=0.5)
+    assert manager._active_adapter_id == 1
+    assert activated == [1, 1]
+
+
+def test_dense_only_adapter_still_wraps_without_moe_token_capacity(monkeypatch):
+    import vllm.model_executor.layers.fused_moe as upstream_moe
+
+    import vllm_omni.lora.manager as manager_mod
+
+    class _TargetMoERunner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe_config = SimpleNamespace(is_act_and_mul=True, num_experts=2)
+            self.global_num_experts = 2
+
+    monkeypatch.setattr(upstream_moe, "MoERunner", _TargetMoERunner)
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+    wrapped_names: list[str] = []
+
+    def _fake_from_layer_diffusion(*, layer: torch.nn.Module, **_kwargs):
+        wrapped_names.append(type(layer).__name__)
+        return _DummyBaseLayerWithLoRA(layer)
+
+    monkeypatch.setattr(manager_mod, "from_layer", _fake_from_layer_diffusion)
+    monkeypatch.setattr(
+        manager_mod,
+        "replace_submodule",
+        lambda root, name, sub: fake_replace_submodule(root, name, sub),
+    )
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.foo = _FakeLinearBase()
+    pipeline.transformer.experts = _TargetMoERunner()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    peft_helper = type(
+        "_PH",
+        (),
+        {"r": 1, "target_modules": ["foo"]},
+    )()
+    manager._replace_layers_with_lora(peft_helper)
+
+    assert wrapped_names == ["FakeLinearBase"]
+    assert isinstance(pipeline.transformer.foo, _DummyBaseLayerWithLoRA)
+    assert isinstance(pipeline.transformer.experts, _TargetMoERunner)
 
 
 def test_moe_punica_initializes_public_mapping_metadata(monkeypatch):
@@ -1788,6 +1960,31 @@ def test_scale_or_adapter_change_forces_rebind(monkeypatch, second_scale):
     assert len(layer.set_calls) == 2, "must rebind"
     assert manager._suspended_adapter_id is None
     assert manager._active_adapter_id == other_id
+
+
+def test_adapter_state_changes_invalidate_denoise_graphs(monkeypatch):
+    """Captured denoise graphs froze the LoRA masks and scale, so every change of
+    the active adapter must drop them; repeating the same adapter must not."""
+    import vllm_omni.lora.manager as manager_mod
+
+    reasons: list[str] = []
+    monkeypatch.setattr(manager_mod, "invalidate_denoise_graphs", reasons.append)
+    adapter_id = 7
+    req = _dummy_lora_request(adapter_id)
+    manager, _ = _suspend_harness(monkeypatch, adapter_id)
+
+    manager.set_active_adapter(req, lora_scale=0.5)
+    assert len(reasons) == 1
+    manager.set_active_adapter(req, lora_scale=0.5)
+    assert len(reasons) == 1, "same adapter and scale keeps the graphs"
+    manager.set_active_adapter(None)
+    assert len(reasons) == 2
+    manager.set_active_adapter(None)
+    assert len(reasons) == 2
+    manager.set_active_adapter(req, lora_scale=0.5)  # re-arm the suspended upload
+    assert len(reasons) == 3
+    manager.set_active_adapter(req, lora_scale=0.25)
+    assert len(reasons) == 4
 
 
 def test_partial_packed_mask_survives_suspend_resume(monkeypatch):

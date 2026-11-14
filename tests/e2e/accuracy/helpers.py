@@ -86,9 +86,19 @@ def model_output_dir(parent_dir: Path, model: str) -> Path:
     return path
 
 
-def write_json_artifact(path: Path, value: Any) -> None:
-    """Write a UTF-8 accuracy artifact, rejecting non-finite JSON numbers."""
-    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+def write_json_artifact(
+    path: Path,
+    value: Any,
+    *,
+    ensure_ascii: bool = True,
+    allow_nan: bool = False,
+) -> None:
+    """Write a UTF-8 accuracy artifact, rejecting non-finite JSON numbers by default."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, indent=2, ensure_ascii=ensure_ascii, allow_nan=allow_nan) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _omni_acc_bench_core():
@@ -555,6 +565,91 @@ def _acc_result_filename(model: str, suite: str, when: datetime | None = None) -
     """
     when = datetime.now() if when is None else when
     return f"result_acc_{_acc_model_name(model)}_{suite}_{when.strftime('%Y%m%d')}_{when.strftime('%H%M%S')}.json"
+
+
+_OMNIINTERACT_DATASET = "omniinteract"
+_OMNIINTERACT_AGGREGATE_SUITE = "omniinteract_aggregate"
+_OMNIINTERACT_DEFAULT_ACC_DIR = Path("tests/e2e/accuracy/omniinteract/results")
+_DUPLEX_EVAL_DEFAULT_ACC_DIR = Path("tests/e2e/accuracy/omni_duplex_eval/results")
+_OMNIINTERACT_ALL_GLOBAL_METRICS = (
+    "IA_QTF1",
+    "Precision",
+    "Recall",
+    "Global_TP",
+    "Global_FP",
+    "Global_FN",
+)
+
+
+def dfx_accuracy_result_dir(default: Path | str, *, fallback_to_benchmark_dir: bool = False) -> Path:
+    """Resolve the ``result_acc_*.json`` directory.
+
+    Prefer ``ACC_BENCH_RESULT_DIR``. When ``fallback_to_benchmark_dir`` is set
+    (OmniInteract), reuse ``BENCHMARK_DIR`` if present. Otherwise use ``default``.
+    """
+    explicit = os.environ.get("ACC_BENCH_RESULT_DIR")
+    if explicit:
+        return Path(explicit)
+    if fallback_to_benchmark_dir:
+        fallback = os.environ.get("BENCHMARK_DIR")
+        if fallback:
+            return Path(fallback)
+    return Path(default)
+
+
+def omniinteract_accuracy_result_dir() -> Path:
+    """Directory for OmniInteract ``result_acc_*.json`` files."""
+    return dfx_accuracy_result_dir(_OMNIINTERACT_DEFAULT_ACC_DIR, fallback_to_benchmark_dir=True)
+
+
+def flatten_omniinteract_accuracy_metrics(accuracy: Mapping[str, object]) -> dict[str, object]:
+    """Copy judge output and lift All Global scores onto ``accuracy``."""
+    payload = dict(accuracy)
+    summary = accuracy.get("summary")
+    if isinstance(summary, Mapping):
+        for key in _OMNIINTERACT_ALL_GLOBAL_METRICS:
+            if key in summary and key not in payload:
+                payload[key] = summary[key]
+    return payload
+
+
+def write_dfx_accuracy_result(
+    path: Path,
+    *,
+    test_name: str,
+    name: str | None,
+    model_id: str,
+    dataset: str,
+    dataset_path: str,
+    date: str,
+    hardware: str,
+    baseline: Mapping[str, object],
+    branch: str,
+    num_prompts: int,
+    max_concurrency: int | None,
+    benchmark_exit_code: int,
+    generation: Mapping[str, object],
+    accuracy: Mapping[str, object],
+) -> Path:
+    """Write the shared DFX accuracy envelope."""
+    record = {
+        "test_name": test_name,
+        "name": name,
+        "model_id": model_id,
+        "dataset": dataset,
+        "dataset_path": dataset_path,
+        "date": date,
+        "Hardware": hardware,
+        "baseline": {key: value for key, value in baseline.items() if value is not None},
+        "branch": branch,
+        "num_prompts": num_prompts,
+        "max_concurrency": max_concurrency,
+        "benchmark_exit_code": benchmark_exit_code,
+        "generation": dict(generation),
+        "accuracy": dict(accuracy),
+    }
+    write_json_artifact(path, record, ensure_ascii=False, allow_nan=True)
+    return path
 
 
 def _build_common_args(
@@ -1047,6 +1142,11 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
 
 
 DEFAULT_DEVICE_PROFILE = "default"
+# Torch's NPU name does not contain the CI profile key ``A3``. Atlas A3 runners
+# report ``Ascend910`` / ``Ascend910_93xx``; Atlas A2 reports ``Ascend910B*``
+# and must not inherit the A3 accuracy row. #10054.
+_DEVICE_NAME_PROFILE_ALIASES: tuple[tuple[str, str], ...] = (("Ascend910", "A3"),)
+_DEVICE_NAME_PROFILE_ALIAS_BLOCKLIST: tuple[tuple[str, str], ...] = (("Ascend910", "Ascend910B"),)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1057,31 +1157,75 @@ class SimilarityThresholds:
     psnr: float
 
 
+def _current_device_identity() -> tuple[str | None, str | None]:
+    """Return the current device marketing name and architecture, best effort."""
+    try:
+        from vllm_omni.platforms import current_omni_platform
+    except Exception:
+        logging.getLogger(__name__).debug("Could not import the current Omni platform", exc_info=True)
+        return None, None
+
+    device_name: str | None = None
+    device_architecture: str | None = None
+    try:
+        value = current_omni_platform.get_device_name()
+        if value:
+            device_name = str(value)
+    except Exception:
+        logging.getLogger(__name__).debug("Could not read the device marketing name", exc_info=True)
+
+    try:
+        device_module = torch.get_device_module(current_omni_platform.get_torch_device())
+        properties = device_module.get_device_properties(0)
+        value = getattr(properties, "gcnArchName", None)
+        if value:
+            device_architecture = str(value)
+    except Exception:
+        logging.getLogger(__name__).debug("Could not read the device architecture", exc_info=True)
+
+    return device_name, device_architecture
+
+
 def resolve_device_profile(
     device_name: str | None = None,
     *,
+    device_architecture: str | None = None,
     profiles: Mapping[str, Any],
 ) -> str:
-    """Map a device marketing name to a key in *profiles*.
+    """Map a device marketing name or architecture to a key in *profiles*.
 
-    When *device_name* is omitted, uses ``current_omni_platform.get_device_name()``.
-    Non-``default`` keys are matched as substrings; unmatched devices use ``default``.
+    When both identifiers are omitted, queries the current platform. Non-
+    ``default`` profile keys are matched as substrings of either identifier
+    first so a later explicit row (for example ``Ascend910B``) wins over an
+    alias. Otherwise a name such as ``Ascend910`` / ``Ascend910_93xx`` is
+    rewritten to its CI alias (``A3``) when that key is present;
+    ``Ascend910B*`` (Atlas A2) is excluded from that alias. Unmatched devices
+    use ``default``. Callers with an already captured device record should pass
+    both values so profile selection uses the same evidence as the saved
+    artifacts.
     """
-    if device_name is None:
-        try:
-            from vllm_omni.platforms import current_omni_platform
+    if device_name is None and device_architecture is None:
+        device_name, device_architecture = _current_device_identity()
 
-            device_name = current_omni_platform.get_device_name()
-        except Exception:
-            return DEFAULT_DEVICE_PROFILE
-
-    if not device_name:
+    identifiers = tuple(value for value in (device_name, device_architecture) if value)
+    if not identifiers:
         return DEFAULT_DEVICE_PROFILE
 
     for profile in profiles:
         if profile == DEFAULT_DEVICE_PROFILE:
             continue
-        if profile in device_name:
+        if any(profile in identifier for identifier in identifiers):
+            return profile
+
+    for identifier in identifiers:
+        for needle, profile in _DEVICE_NAME_PROFILE_ALIASES:
+            if profile not in profiles or needle not in identifier:
+                continue
+            if any(
+                blocked_needle == needle and blocked in identifier
+                for blocked_needle, blocked in _DEVICE_NAME_PROFILE_ALIAS_BLOCKLIST
+            ):
+                continue
             return profile
     return DEFAULT_DEVICE_PROFILE
 
@@ -1091,11 +1235,16 @@ def resolve_similarity_thresholds(
     device_profile: str | None = None,
     *,
     device_name: str | None = None,
+    device_architecture: str | None = None,
 ) -> SimilarityThresholds:
     """Pick SSIM/PSNR thresholds from *table* for the current (or given) device profile."""
     if DEFAULT_DEVICE_PROFILE not in table:
         raise ValueError("threshold table must include a 'default' entry")
-    profile = device_profile or resolve_device_profile(device_name, profiles=table)
+    profile = device_profile or resolve_device_profile(
+        device_name,
+        device_architecture=device_architecture,
+        profiles=table,
+    )
     return table.get(profile, table[DEFAULT_DEVICE_PROFILE])
 
 
@@ -1103,20 +1252,25 @@ def resolve_device_threshold(
     thresholds: float | int | Mapping[str, float],
     *,
     device_name: str | None = None,
+    device_architecture: str | None = None,
     label: str = "threshold",
 ) -> tuple[str, float]:
-    """Resolve a scalar or per-GPU threshold for the current CUDA device.
+    """Resolve a scalar or per-device threshold for the current accelerator.
 
     Returns ``(profile_key, threshold)``. A bare number uses profile ``default``.
-    A mapping matches keys as substrings of the device name via
-    ``resolve_device_profile`` (for example ``{"H100": 0.3, "B200": 0.36}``).
-    Prefer an explicit ``default`` entry when unmatched GPUs should fall back;
+    A mapping matches keys as substrings of the device name or architecture via
+    ``resolve_device_profile`` (for example ``{"H100": 0.3, "gfx942": 0.36}``).
+    Prefer an explicit ``default`` entry when unmatched devices should fall back;
     otherwise unmatched devices raise.
     """
     if isinstance(thresholds, float | int):
         return DEFAULT_DEVICE_PROFILE, float(thresholds)
 
-    profile = resolve_device_profile(device_name, profiles=thresholds)
+    profile = resolve_device_profile(
+        device_name,
+        device_architecture=device_architecture,
+        profiles=thresholds,
+    )
     if profile in thresholds:
         return profile, float(thresholds[profile])
     if DEFAULT_DEVICE_PROFILE in thresholds:

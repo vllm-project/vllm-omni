@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import copy
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -32,6 +31,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
+    resolve_diffusion_sampling_params,
 )
 from vllm_omni.entrypoints.openai.utils import get_stage_type, is_video_generation_pipeline, parse_lora_requests
 from vllm_omni.entrypoints.openai.video_api_utils import (
@@ -387,7 +387,7 @@ class OmniOpenAIServingVideo:
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 
-        gen_params = self._resolve_default_sampling_params()
+        gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(self._engine_client))
 
         input_image = None if reference_image is None else reference_image.data
         input_video = None if reference_video is None else reference_video.data
@@ -780,17 +780,6 @@ class OmniOpenAIServingVideo:
         if video_params is None or "video_params" not in request.model_fields_set:
             return False
         return "num_frames" in video_params.model_fields_set and video_params.num_frames is not None
-
-    def _resolve_default_sampling_params(self) -> OmniDiffusionSamplingParams:
-        default_sampling_params_list = getattr(self._engine_client, "default_sampling_params_list", None)
-        if default_sampling_params_list:
-            for params in default_sampling_params_list:
-                if isinstance(params, OmniDiffusionSamplingParams):
-                    # Requests mutate sampling params in-place, including
-                    # nested dict fields like extra_args. Deep-copy the stage
-                    # defaults so one request cannot leak state into another.
-                    return copy.deepcopy(params)
-        return OmniDiffusionSamplingParams()
 
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
