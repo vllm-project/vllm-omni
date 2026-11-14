@@ -3771,6 +3771,7 @@ from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
     calculate_metrics,
     has_metric_samples,
+    metric_result_fields,
     validate_goodput_config,
 )
 
@@ -4012,6 +4013,8 @@ async def benchmark(
             duration=0.0,
             endpoint=api_url,
             model=model_id,
+            selected_percentile_metrics=selected_percentile_metrics,
+            selected_percentiles=selected_percentiles,
         )
 
     print("Starting main benchmark run...")
@@ -4182,6 +4185,8 @@ async def benchmark(
             duration=benchmark_duration,
             endpoint=api_url,
             model=model_id,
+            selected_percentile_metrics=selected_percentile_metrics,
+            selected_percentiles=selected_percentiles,
         )
 
     duplex_eval_summary = await asyncio.to_thread(finalize_duplex_eval, input_requests, outputs)
@@ -4284,6 +4289,8 @@ async def benchmark(
             "max_concurrent_requests": mm_metrics.max_concurrent_requests,
             "rtfx": mm_metrics.rtfx,
         }
+        if getattr(mm_metrics, defs.TOTAL_VIDEO_DURATION_S) > 0:
+            result["video_metric_scopes"] = {defs.VIDEO_RTF: defs.VIDEO_RTF_SERVER_SCOPE}
         for sample_count in (
             "num_ttft_samples",
             "num_tpot_samples",
@@ -4454,24 +4461,7 @@ async def benchmark(
         is_text_token_metric = not (metric_attribute_name == "e2el" or metric_attribute_name.startswith("audio"))
         if is_text_token_metric and getattr(metrics, "total_output", 0) == 0:
             return
-        is_audio_rtf = metric_attribute_name == defs.AUDIO_RTF
-        is_audio_duration_or_underrun = metric_attribute_name in (defs.AUDIO_DURATION, defs.AUDIO_UNDERRUN)
-
-        suffix = "_ms"
-        if is_audio_duration_or_underrun:
-            suffix = "_s"
-        elif is_audio_rtf:
-            suffix = ""
-        mean_attr_name = f"mean_{metric_attribute_name}{suffix}"
-        mean_value = getattr(metrics, mean_attr_name, 0.0)
-        result[mean_attr_name] = mean_value
-
-        median_attr_name = f"median_{metric_attribute_name}{suffix}"
-        median_value = getattr(metrics, median_attr_name, 0.0)
-        result[median_attr_name] = median_value
-        for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}", None) or []:
-            p_word = str(int(p)) if int(p) == p else str(p)
-            result[f"p{p_word}_{metric_attribute_name}{suffix}"] = value
+        result.update(metric_result_fields(metrics, metric_attribute_name))
 
     if any(isinstance(getattr(output, "duplex_session_metrics", None), dict) for output in outputs):
         result["duplex_metric_aggregation"] = _DUPLEX_METRIC_AGGREGATION

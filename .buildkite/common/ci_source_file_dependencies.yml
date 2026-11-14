@@ -434,8 +434,8 @@ source_file_dependencies:
   lingbot_world_accuracy:
     - tests/e2e/accuracy/lingbot_world/
     - pyproject.toml
-    - requirements/lingbot-quality.txt
-    - requirements/lingbot-quality.in
+    - requirements/video-quality.txt
+    - requirements/video-quality.in
     - vllm_omni/benchmarks/realtime_video/
     - vllm_omni/benchmarks/serve.py
     - vllm_omni/benchmarks/patch/patch.py

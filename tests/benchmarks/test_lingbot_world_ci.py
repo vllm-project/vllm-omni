@@ -249,7 +249,7 @@ def evaluator_repository(root: Path):
     evaluator_lock.write_text('{"repositories": {}, "files": {}}')
     (directory / "opencv_provider.py").write_text("# canonical provider policy\n")
     (root / "requirements").mkdir()
-    (root / "requirements/lingbot-quality.txt").write_text("example==1\n")
+    (root / "requirements/video-quality.txt").write_text("example==1\n")
 
 
 @pytest.mark.parametrize("broken", [False, True])
@@ -278,9 +278,9 @@ def test_evaluator_cache_isolated_by_code_weights_and_dependencies(tmp_path: Pat
 
     evaluator_repository(tmp_path)
     initial = evaluator_cache_key(tmp_path)
-    (tmp_path / "requirements/lingbot-quality.txt").write_text("example==2\n")
+    (tmp_path / "requirements/video-quality.txt").write_text("example==2\n")
     assert evaluator_cache_key(tmp_path) != initial
-    (tmp_path / "requirements/lingbot-quality.txt").write_text("example==1\n")
+    (tmp_path / "requirements/video-quality.txt").write_text("example==1\n")
     (tmp_path / "vllm_omni/benchmarks/realtime_video/evaluators.lock.json").write_text('{"revision": "different"}')
     assert evaluator_cache_key(tmp_path) != initial
     (tmp_path / "vllm_omni/benchmarks/realtime_video/evaluators.lock.json").write_text(
@@ -337,7 +337,7 @@ def test_ready_evaluator_is_never_resynced(tmp_path: Path, monkeypatch: pytest.M
     prepare._prepare_evaluators(root)
     assert sum(command[:3] == ["uv", "pip", "sync"] for command in calls) == 1
     assert sum(command[:3] == ["uv", "pip", "install"] for command in calls) == 1
-    (repository / "requirements/lingbot-quality.txt").write_text("example==2\n")
+    (repository / "requirements/video-quality.txt").write_text("example==2\n")
     with pytest.raises(RegressionError, match="fresh evaluator root"):
         prepare._prepare_evaluators(root)
     assert sum(command[:3] == ["uv", "pip", "sync"] for command in calls) == 1

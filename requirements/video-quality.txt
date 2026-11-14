@@ -2,7 +2,7 @@ absl-py==2.5.1
     # via tensorboard
 accelerate==1.15.0
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   peft
     #   pyiqa
     #   trl
@@ -37,7 +37,7 @@ datasets==4.0.0
     #   pyiqa
     #   trl
 decord==0.6.0
-    # via -r requirements/lingbot-quality.in
+    # via -r requirements/video-quality.in
 dill==0.3.8
     # via
     #   datasets
@@ -45,15 +45,15 @@ dill==0.3.8
 distlib==0.4.3
     # via virtualenv
 easydict==1.13
-    # via -r requirements/lingbot-quality.in
+    # via -r requirements/video-quality.in
 einops==0.8.2
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   pyiqa
 facexlib==0.3.0
     # via pyiqa
 fairscale==0.4.13
-    # via -r requirements/lingbot-quality.in
+    # via -r requirements/video-quality.in
 filelock==4.2.0
     # via
     #   datasets
@@ -66,7 +66,7 @@ filelock==4.2.0
 filterpy==1.4.5
     # via facexlib
 fire==0.7.1
-    # via -r requirements/lingbot-quality.in
+    # via -r requirements/video-quality.in
 fonttools==4.67.0
     # via matplotlib
 frozenlist==1.8.0
@@ -80,13 +80,13 @@ fsspec==2025.3.0
     #   torch
 ftfy==6.3.1
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   open-clip-torch
     #   openai-clip
 future==1.0.0
     # via pyiqa
 fvcore==0.1.5.post20221221
-    # via -r requirements/lingbot-quality.in
+    # via -r requirements/video-quality.in
 grpcio==1.84.0
     # via tensorboard
 hf-xet==1.7.0
@@ -152,7 +152,7 @@ numba==0.68.0
     # via facexlib
 numpy==1.26.4
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   accelerate
     #   bitsandbytes
     #   contourpy
@@ -209,16 +209,16 @@ nvidia-nvjitlink-cu12==12.4.99
 nvidia-nvtx-cu12==12.4.99
     # via torch
 omegaconf==2.3.1
-    # via -r requirements/lingbot-quality.in
+    # via -r requirements/video-quality.in
 open-clip-torch==3.3.0
-    # via -r requirements/lingbot-quality.in
+    # via -r requirements/video-quality.in
 openai-clip==1.0.1
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   pyiqa
 opencv-python==4.11.0.86
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   facexlib
 opencv-python-headless==4.11.0.86
     # via pyiqa
@@ -242,7 +242,7 @@ pandas==3.0.6
     #   datasets
     #   pyiqa
 peft==0.15.2
-    # via -r requirements/lingbot-quality.in
+    # via -r requirements/video-quality.in
 pillow==12.3.0
     # via
     #   facexlib
@@ -276,14 +276,14 @@ psutil==7.2.2
     #   peft
 pyarrow==19.0.1
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   datasets
 pygments==2.21.0
     # via
     #   pytest
     #   rich
 pyiqa==0.1.15.post2
-    # via -r requirements/lingbot-quality.in
+    # via -r requirements/video-quality.in
 pyparsing==3.3.3
     # via matplotlib
 pytest==9.1.1
@@ -296,7 +296,7 @@ python-discovery==1.6.2
     # via virtualenv
 pyyaml==6.0.3
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   accelerate
     #   datasets
     #   fvcore
@@ -309,7 +309,7 @@ pyyaml==6.0.3
     #   transformers
     #   yacs
 qwen-vl-utils==0.0.11
-    # via -r requirements/lingbot-quality.in
+    # via -r requirements/video-quality.in
 regex==2026.9.29
     # via
     #   open-clip-torch
@@ -328,7 +328,7 @@ ruff==0.17.1
     # via pyiqa
 safetensors==0.8.0
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   accelerate
     #   open-clip-torch
     #   peft
@@ -336,11 +336,11 @@ safetensors==0.8.0
     #   transformers
 scikit-image==0.25.2
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   pyiqa
 scipy==1.15.3
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   facexlib
     #   filterpy
     #   pyiqa
@@ -349,7 +349,7 @@ sentencepiece==0.2.2
     # via pyiqa
 setuptools==80.9.0
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   tensorboard
     #   torch
 six==1.17.0
@@ -360,7 +360,7 @@ tabulate==0.10.0
     # via fvcore
 tensorboard==2.20.0
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   pyiqa
 tensorboard-data-server==0.7.2
     # via tensorboard
@@ -372,14 +372,14 @@ tifffile==2026.3.3
     # via scikit-image
 timm==1.0.29
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   open-clip-torch
     #   pyiqa
 tokenizers==0.21.4
     # via transformers
 torch==2.4.0+cu124
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   accelerate
     #   bitsandbytes
     #   facexlib
@@ -391,7 +391,7 @@ torch==2.4.0+cu124
     #   torchvision
 torchvision==0.19.0+cu124
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   facexlib
     #   open-clip-torch
     #   pyiqa
@@ -410,14 +410,14 @@ tqdm==4.70.1
     #   transformers
 transformers==4.51.3
     # via
-    #   -r requirements/lingbot-quality.in
+    #   -r requirements/video-quality.in
     #   peft
     #   pyiqa
     #   trl
 triton==3.0.0
     # via torch
 trl==0.17.0
-    # via -r requirements/lingbot-quality.in
+    # via -r requirements/video-quality.in
 typing-extensions==4.16.0
     # via
     #   aiohttp

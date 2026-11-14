@@ -67,7 +67,7 @@ def run_accuracy(settings, data, suite):
                     "--realtime-video-evaluator-python",
                     str(python),
                     "--realtime-video-evaluator-requirements",
-                    str(ROOT / "requirements/lingbot-quality.txt"),
+                    str(ROOT / "requirements/video-quality.txt"),
                 ]
             )
         report = bench_serve(build_serve_args(arguments))["realtime_video_evaluation"]

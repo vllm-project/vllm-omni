@@ -73,7 +73,7 @@ def verify_environment(python: Path, requirements: Path) -> dict[str, str]:
     )
     actual = json.loads(result.stdout)
     if actual != expected:
-        raise RegressionError("Evaluator environment differs from requirements/lingbot-quality.txt")
+        raise RegressionError("Evaluator environment differs from requirements/video-quality.txt")
     return actual
 
 
