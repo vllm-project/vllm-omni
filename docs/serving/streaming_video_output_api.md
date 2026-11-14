@@ -213,10 +213,11 @@ Models that implement interaction updates can change the active prompt:
 }
 ```
 
-Models that register the camera modality (for example LingBot-World) also
-accept structural SE3 payloads on `event.multi_modal_data.camera`. Coordinates
-follow Unity semantics (`+X` right, `+Y` up, `+Z` forward; same as LingBot's
-native camera frame). WASD key tokens are not admitted by the engine:
+Models that register the camera modality also accept camera updates on
+`event.multi_modal_data.camera`; the payload is model-specific. LingBot-World
+takes structural SE3 payloads. Coordinates follow Unity semantics (`+X` right,
+`+Y` up, `+Z` forward; same as LingBot's native camera frame), and WASD key
+tokens are not admitted:
 
 ```json
 {
@@ -241,6 +242,10 @@ native camera frame). WASD key tokens are not admitted by the engine:
 `mode` is `target` (lerp to an absolute pose over `transition_chunks`) or
 `velocity` (hold a per-frame SE3 delta until replaced). Prompt and camera may
 be combined in one interaction event.
+
+ABot-World instead conditions on W/A/S/D/I/J/K/L key actions, sent in `state`
+or `script` mode, and registers only the camera modality; see the
+[ABot-World recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ACVLab/ABot-World.md#realtime-serving).
 
 The example client's `--prompt-updates` and `--camera-updates` schedules assign
 a distinct `event_id` to each entry within the session, including entries with
