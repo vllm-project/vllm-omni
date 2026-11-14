@@ -42,6 +42,7 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
+            prompt_transform_func="vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder.check_text_prompt",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
             supports_native_mrv2_data_plane=True,
             custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
@@ -94,6 +95,7 @@ QWEN3_TTS_FUSED_PIPELINE = PipelineConfig(
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             owns_tokenizer=True,
+            prompt_transform_func="vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder.check_text_prompt",
             final_output=True,
             final_output_type="audio",
             # The API output processor tags ``model_outputs`` by this modality.

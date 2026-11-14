@@ -126,6 +126,25 @@ def first_value(value: object, default: object = None) -> object:
     return value if value is not None else default
 
 
+def check_text_prompt(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
+    """Reject blank ``text`` before the request is submitted (stage-0 prompt transform).
+
+    The speech API rejects blank input in its adapter, but offline callers pass
+    ``additional_information`` straight to the engine. There, whitespace-only
+    text is synthesized, and empty text raises inside the Talker's
+    ``preprocess``, which stops the engine. Rejecting both here fails only the
+    caller's request.
+    """
+    for item in prompt if isinstance(prompt, list) else (prompt,):
+        info = item.get("additional_information") if isinstance(item, dict) else None
+        if not isinstance(info, dict) or "text" not in info or PRECOMPUTED_TEXT_IDS_KEY in info:
+            continue
+        text = first_value(info["text"])
+        if isinstance(text, str) and not text.strip():
+            raise ValueError("Qwen3-TTS input text cannot be empty or whitespace-only")
+    return prompt
+
+
 def coerce_ref_code_tensor(value: object, *, device: torch.device) -> torch.Tensor | None:
     value = first_value(value)
     if value is None:
