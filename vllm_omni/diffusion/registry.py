@@ -36,6 +36,8 @@ def resolve_native_single_file(model_class_name: str | None) -> str | None:
 
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
+    "DuoPipeline": ("duo", "pipeline", "DuoPipeline"),
+    "DuoCodecPipeline": ("duo", "codec", "DuoCodecPipeline"),
     "HyNomasPipeline": ("hy_nomas", "pipeline_hy_nomas", "HyNomasPipeline"),
     "HyNomasModularPipeline": ("hy_nomas", "pipeline_hy_nomas", "HyNomasPipeline"),
     "SeedVR2Pipeline": ("seedvr2", "pipeline_seedvr2", "SeedVR2Pipeline"),
@@ -865,6 +867,8 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
+    "DuoPipeline": "get_duo_pre_process_func",
+    "DuoCodecPipeline": "get_duo_codec_pre_process_func",
     "MOSSImagePipeline": "get_mossimage_pre_process_func",
     "SeedVR2Pipeline": "get_seedvr2_pre_process_func",
     # arch: pre_process_func

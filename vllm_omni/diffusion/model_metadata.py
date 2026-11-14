@@ -59,6 +59,8 @@ FLUX3_MAX_INPUT_IMAGES = 10
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "DuoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "DuoCodecPipeline": DiffusionModelMetadata(final_output_type="video"),
     "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
     "HyNomasModularPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
