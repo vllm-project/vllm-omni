@@ -5,10 +5,11 @@
 # that sets NIGHTLY=1, or a PR labelled ``nightly-test``. Every ordinary PR
 # takes the pr scope.
 #
-#   pr     core_model + the mxfp8 config check, one card, ~20min. The only
-#          weights it touches are the tiny CI models.
-#   broad  also advanced_model and omni, which load Qwen3-TTS, Z-Image,
-#          Wan2.1 and Voxtral from the agent's HF cache, ~20min more.
+#   pr     the no-card XPU-dispatch stage plus every core_model case: ~27min
+#          measured on one card. Needs tiny-random/Qwen-Image (30MB) and
+#          riverclouds/qwen_image_random (9.9GB) in the agent's HF cache.
+#   broad  also advanced_model and omni, which load Qwen3-TTS, Z-Image, Wan2.1
+#          and Voxtral, ~20min more, hence its larger budget.
 #
 # Exactly one step runs per build, so the image is built once either way. To
 # get the broad scope on demand: new build with NIGHTLY=1, or label the PR
@@ -48,6 +49,8 @@ steps:
         env:
           <<: *common_xpu_env
           XPU_TEST_SCOPE: "broad"
+          # The two extra stages do not fit the pr budget.
+          XPU_TEST_BUDGET: "75m"
         priority: 100
         timeout_in_minutes: 100
         soft_fail: false
