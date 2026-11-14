@@ -39,6 +39,21 @@ logger = init_logger(__name__)
 _MOSS_REALTIME_REF_ENCODER_DEVICE_ENV = "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE"
 
 
+def _load_moss_processor(model_id: str, variant: str) -> object:
+    """Load processors whose remote classes reject AutoProcessor loader kwargs."""
+    native_class = {
+        "local": "processing_moss_tts.MossTTSLocalProcessor",
+        "tts": "processing_moss_tts.MossTTSDelayProcessor",
+    }.get(variant)
+    if native_class is not None:
+        processor_cls = get_class_from_dynamic_module(native_class, model_id)
+        return processor_cls.from_pretrained(model_id, trust_remote_code=True)
+
+    from transformers import AutoProcessor
+
+    return AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+
+
 def _local_continuation_prompt(proc: Any, user_kwargs: dict[str, Any], reference: Any) -> tuple[list[int], Any] | None:
     """Build the Local-v1.5 continuation prompt without the generic processor call.
 
@@ -369,17 +384,10 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         cached = getattr(self, "_moss_processor_cache", None)
         if cached is not None:
             return cached
-        from transformers import AutoProcessor
-
         model_id = self.engine_client.model_config.model
-        if self._moss_variant == "local":
-            # AutoProcessor injects loader-only kwargs (e.g. revision) that
-            # Local's custom from_pretrained forwards to ProcessorMixin.__init__.
-            # Invoke the checkpoint's loader directly, as for Realtime below.
-            processor_cls = get_class_from_dynamic_module("processing_moss_tts.MossTTSLocalProcessor", model_id)
-            proc = processor_cls.from_pretrained(model_id, trust_remote_code=True)
-        else:
-            proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        # AutoProcessor injects loader-only kwargs (e.g. revision) that the
+        # Local and Delay remote loaders forward to ProcessorMixin.__init__.
+        proc = cast(Any, _load_moss_processor(model_id, cast(str, self._moss_variant)))
         if hasattr(proc, "audio_tokenizer"):
             device = self._resolve_ref_encoder_device()
             proc._vllm_omni_ref_encoder_device = device

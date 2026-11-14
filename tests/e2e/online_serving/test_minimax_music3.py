@@ -78,6 +78,8 @@ def test_text_to_music_001(omni_server, openai_client) -> None:
         "max_new_tokens": _FRAMES_10S,
         "stream": False,
         "response_format": "wav",
+        # Lyrics guide music generation; they are not a speech-ASR contract.
+        "transcript_expected_text": "",
         "timeout": DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
         "min_audio_bytes": _MIN_BYTES_10S,
     }
@@ -106,6 +108,8 @@ def test_text_to_music_multi_window_002(omni_server, openai_client) -> None:
         "max_new_tokens": _FRAMES_30S,
         "stream": False,
         "response_format": "wav",
+        # Keep WAV/payload validation without requiring literal lyric ASR.
+        "transcript_expected_text": "",
         "timeout": DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
         "min_audio_bytes": _MIN_BYTES_30S,
     }

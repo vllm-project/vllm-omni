@@ -397,7 +397,9 @@ async def test_yue2_preemption_and_synthesis_abort(chunked, enforce_eager, monke
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=600)
         observations = await probe()
         assert observations["preemptions"] > 0, observations
-        assert observations["rollbacks"] > 0, observations
+        # Rollback count is diagnostic: recompute can catch a discarded row up
+        # before the next accepted model row without truncating model history.
+        # Direct rollback behavior stays pinned in test_yue2_request_state.py.
         assert observations["checked_rows"] >= 4 * frames, observations
         assert observations["mixed_steps"] > 0, observations
         if enforce_eager:

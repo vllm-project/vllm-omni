@@ -4117,6 +4117,7 @@ def _build_streaming_speech_app(
     mocker: MockerFixture,
     chunk: torch.Tensor | None = None,
     sample_rate: int | None = None,
+    sparse_first: bool = False,
 ) -> FastAPI:
     """Speech app whose mock engine yields one intermediate then one final chunk.
 
@@ -4128,10 +4129,17 @@ def _build_streaming_speech_app(
     if chunk is None:
         chunk = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, 24000))
 
-    def _make_output(finished: bool) -> OmniRequestOutput:
-        mm_output: dict = {"audio": chunk}
-        if sample_rate is not None:
-            mm_output["sr"] = torch.tensor(sample_rate)
+    def _make_output(
+        finished: bool,
+        *,
+        output_chunk: torch.Tensor = chunk,
+        output_sample_rate: int | torch.Tensor | None = sample_rate,
+    ) -> OmniRequestOutput:
+        mm_output: dict = {"audio": output_chunk}
+        if output_sample_rate is not None:
+            mm_output["sr"] = (
+                output_sample_rate if isinstance(output_sample_rate, torch.Tensor) else torch.tensor(output_sample_rate)
+            )
 
         class MockCompletionOutput:
             def __init__(self, index: int = 0):
@@ -4162,7 +4170,14 @@ def _build_streaming_speech_app(
         )
 
     async def mock_generate_streaming(*args, **kwargs):
-        yield _make_output(finished=False)
+        if sparse_first:
+            yield _make_output(
+                finished=False,
+                output_chunk=torch.empty(0),
+                output_sample_rate=torch.empty(0),
+            )
+        else:
+            yield _make_output(finished=False)
         yield _make_output(finished=True)
 
     mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_streaming)
@@ -4231,6 +4246,17 @@ class TestStreamingResponse:
         client = TestClient(streaming_app)
         response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": "pcm"})
         self._assert_sse_audio_response(response)
+
+    def test_streaming_ignores_empty_sparse_sample_rate_before_audio(self, mocker: MockerFixture):
+        """An empty sparse step must not become the stream's first audio chunk."""
+        app = _build_streaming_speech_app(mocker, sample_rate=22050, sparse_first=True)
+        response = TestClient(app).post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream": True, "response_format": "wav"},
+        )
+
+        self._assert_sse_audio_response(response, response_format="wav")
+        assert "event: speech.audio.error" not in response.text
 
     def test_stream_format_audio_streaming(self, streaming_app):
         """stream_format=audio without stream=True returns raw audio/pcm chunks."""
