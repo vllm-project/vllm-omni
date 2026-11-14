@@ -138,11 +138,15 @@ class ComponentQuantizationConfig(QuantizationConfig):
         return [torch.bfloat16, torch.float16]
 
     def get_min_capability(self) -> int:
-        """Return the minimum capability across all component configs."""
+        """Return the strictest (highest) minimum capability of any component.
+
+        All components run on the same device, so the device must satisfy
+        every routed config, not just the most permissive one.
+        """
         caps = [c.get_min_capability() for c in self._components.values() if c is not None]
         if self._default is not None:
             caps.append(self._default.get_min_capability())
-        return min(caps) if caps else 0
+        return max(caps) if caps else 0
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> ComponentQuantizationConfig:
