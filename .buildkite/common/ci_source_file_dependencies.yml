@@ -872,14 +872,18 @@ source_file_dependencies:
 
   tts_audex_weekly:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - tests/e2e/offline_inference/test_audex_s2s.py
     - tests/e2e/offline_inference/test_audex_s2t.py
     - tests/e2e/offline_inference/test_audex_tta.py
     - tests/e2e/offline_inference/test_audex_tts.py
+    - tests/e2e/online_serving/test_audex_tta.py
+    - tests/e2e/online_serving/test_audex_tts.py
     - tests/helpers/media.py
     - tests/helpers/runtime.py
     - tests/helpers/stage_config.py
     - vllm_omni/config/
     - vllm_omni/deploy/audex_thinker_only.yaml
+    - vllm_omni/deploy/audex_s2s.yaml
     - vllm_omni/deploy/audex_tta.yaml
     - vllm_omni/deploy/audex_tts.yaml
     - vllm_omni/engine/
@@ -1037,6 +1041,7 @@ source_file_dependencies:
   tts_step_audio2_weekly:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - tests/e2e/offline_inference/test_step_audio2_expansion.py
+    - tests/e2e/online_serving/test_step_audio2_expansion.py
     - tests/helpers/media.py
     - tests/helpers/runtime.py
     - tests/helpers/stage_config.py
@@ -1044,6 +1049,7 @@ source_file_dependencies:
     - vllm_omni/deploy/step_audio2_ci.yaml
     - vllm_omni/engine/
     - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/openai/
     - vllm_omni/metrics/utils.py
     - vllm_omni/model_executor/models/step_audio2/
     - vllm_omni/model_executor/stage_input_processors/step_audio2.py

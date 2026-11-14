@@ -50,6 +50,13 @@ XCODEC1_DEFAULT_REPO = "hf-audio/xcodec-hubert-general-balanced"
 _AUDIOGEN_INDEX_FILE = "checkpoint_folder_audiogen/model.safetensors.index.json"
 
 
+def load_audex_tokenizer(model_dir: str):
+    """Load Audex's declared fast tokenizer without probing remote model code."""
+    from transformers import PreTrainedTokenizerFast
+
+    return PreTrainedTokenizerFast.from_pretrained(model_dir)
+
+
 def _download_audiogen_index(model: str) -> str:
     """Resolve the audiogen dedup index to a local path (tiny, cache-first).
 
