@@ -568,7 +568,9 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
                 'For text metrics, "ttft", "tpot", and "itl" affect the global benchmark and text '
                 'stage metrics. "tpop" also requests text TPOT/TPOP globally and per stage, and internal '
                 'stream TPOP. "ttfc", "tpoc", and "icl" only affect internal stream stage metrics. '
-                'Audio metrics include "audio_ttfp", "audio_rtf", "audio_duration", and "audio_underrun".'
+                'Audio metrics include "audio_ttfp", "audio_rtf", "audio_duration", and "audio_underrun". '
+                'Realtime video supports "e2el", "video_ttfc", "video_fps", "video_rtf", and '
+                '"video_steady_interval"; all are selected by default for that backend.'
             )
         if action.dest == "goodput":
             action.help = (
@@ -639,8 +641,15 @@ def add_realtime_video_cli_args(parser: argparse.ArgumentParser) -> None:
 def _preprocess_realtime_video_args(args: argparse.Namespace) -> None:
     from vllm_omni.benchmarks.realtime_video.client import realtime_video_base_url
     from vllm_omni.benchmarks.realtime_video.workload import DEFAULT_MODEL
+    from vllm_omni.metrics import definitions as defs
 
     explicit = getattr(args, "explicit_keys", ())
+    supported_metrics = {"e2el", *defs.VIDEO_STREAM_METRIC_UNITS}
+    if args.percentile_metrics is None:
+        args.percentile_metrics = ",".join(("e2el", *defs.VIDEO_STREAM_METRIC_UNITS))
+    unsupported = set(args.percentile_metrics.split(",")) - supported_metrics
+    if unsupported:
+        raise ValueError(f"realtime-video does not support percentile metrics: {sorted(unsupported)}")
     for name, expected in (
         ("backend", "realtime-video"),
         ("dataset_name", "realtime-video"),

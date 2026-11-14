@@ -565,12 +565,11 @@ def compute_metrics(
         "total_bytes": sum(record.byte_length for record in ordered),
         "video_seconds": video_seconds,
         "wall_seconds": wall_seconds,
-        # RTF is processing time over content duration, as vLLM-Omni computes it
-        # (`patch.py`: generation_s / video_duration; `compute_audio_rtf`: latency
-        # / audio_duration, "SLO red line < 1"). LOWER IS BETTER and below 1.0 is
-        # real time. RTFX is the reciprocal the repo reports under its own name,
-        # kept here because "fraction of real time achieved" reads better on a
-        # dashboard -- but the two must never be confused for one another.
+        # Client-session RTF uses frames / target playback FPS, independently
+        # of the mux label. It includes first-chunk and terminal receive time;
+        # the ordinary video backend instead prefers server generation time
+        # over payload content duration. Both are cost ratios (lower is better),
+        # with their distinct scopes declared in shared definitions/result JSON.
         "video_rtf": (wall_seconds / video_seconds) if video_seconds > 0 else 0.0,
         "video_rtfx": (video_seconds / wall_seconds) if wall_seconds > 0 else 0.0,
         "frames_per_second": (total_frames / wall_seconds) if wall_seconds > 0 else 0.0,

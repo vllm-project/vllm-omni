@@ -46,6 +46,10 @@ model and workload are separate from the CUDA evaluator hardware.
 CUDA generation uses two H100 GPUs with Ulysses/SP=2. NPU uses the existing
 four-device A2 configuration, followed by the same scorers on a CUDA worker.
 Evaluator dependencies, source revisions and weight checksums remain pinned.
+`requirements/video-quality.in` and `requirements/video-quality.txt` describe
+the independent WBench/VBench evaluator environment. They are not model
+documentation or default inference dependencies; provisioning syncs the lock
+into a separate Python 3.12 virtual environment for the older evaluator APIs.
 
 CUDA check (requires two H100 GPUs, pinned model assets and evaluator cache
 or network access for initial provisioning):
@@ -76,8 +80,37 @@ python -m pytest -sv --run-level full_model \
   --lingbot-output=lingbot-artifacts/npu-accuracy-results
 ```
 
-CI saves the numerical NPZ, videos, raw evaluator scores, workload/source
-manifest and JSON reports as artifacts and prints measurements with `pytest -sv`.
+CI prints measurements with `pytest -sv` and uploads these result files:
+
+| Result | Path |
+| --- | --- |
+| Performance JSON | `tests/dfx/perf/results/result_test_lingbot_world_realtime_{cuda,npu}_*.json` |
+| Three standard accuracy results | `<output>/results/result_acc_lingbot-world-v2-14b-causal-fast-diffusers_lingbot_world_{precision,wbench,vbench}_*.json` |
+| Shared benchmark scoring results | `<output>/results/bench-{precision,wbench,vbench}.json` |
+| Per-suite reports | `<output>/{precision,wbench,vbench}.json` |
+| Raw scoring details | `<output>/precision/precision.json`, `<output>/wbench/` and `<output>/vbench/` |
+
+`<output>` is `lingbot-artifacts/cuda-accuracy` on CUDA and
+`lingbot-artifacts/npu-accuracy-results` on the NPU evaluation worker. Raw
+semantic directories include evaluator logs, input manifests, worker results
+and native per-video scores. Capture artifacts include `generation.json`,
+`candidate/precision.npz` and each `candidate/<case>/` directory's
+`rollout.mp4`, `benchmark.json` and `serve-result.json`, with model, source,
+workload and allocation provenance. On CUDA, capture and scoring share the
+output directory. NPU capture is uploaded separately under
+`lingbot-artifacts/npu-accuracy` and downloaded by the evaluation step; both
+NPU directories are uploaded recursively.
+
+Existing uploads were checked in CUDA [build 19659](https://buildkite.com/vllm/vllm-omni/builds/19659)
+and NPU [build 11510](https://buildkite.com/vllm/vllm-omni-npu-ci/builds/11510),
+both at `b0e2faeb7fa37f90b14764fc8817d93f1f887540`. They contain nonempty
+performance JSON, all three accuracy results, numerical NPZ and video/scoring
+artifacts. This confirms uploads for that historical revision; it does not
+validate later revisions on native hardware.
+
+Normal measurement or score-floor failures retain their reports before the
+pytest assertion, and partial capture retains available inputs and its
+manifest. Early setup failure or host termination can prevent complete output.
 Score floors come only from reviewed CI measurements; new results are never
 auto-promoted to a baseline.
 

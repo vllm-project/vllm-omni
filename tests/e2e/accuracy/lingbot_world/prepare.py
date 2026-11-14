@@ -133,7 +133,7 @@ def prepare_npu_allocation(settings: dict, output: Path) -> str:
 def evaluator_cache_key(root: Path = ROOT) -> str:
     files = (
         root / "vllm_omni/benchmarks/realtime_video/evaluators.lock.json",
-        root / "requirements/lingbot-quality.txt",
+        root / "requirements/video-quality.txt",
         root / "tests/e2e/accuracy/lingbot_world/opencv_provider.py",
     )
     return hashlib.sha256(b"\0".join(path.read_bytes() for path in files)).hexdigest()[:16]
@@ -236,13 +236,13 @@ def _prepare_evaluators(root: Path) -> Path:
                 "https://download.pytorch.org/whl/cu124",
                 "--index-strategy",
                 "unsafe-best-match",
-                str(ROOT / "requirements/lingbot-quality.txt"),
+                str(ROOT / "requirements/video-quality.txt"),
             ],
             check=True,
             timeout=1800,
         )
     python = (venv / "bin/python").absolute()
-    packages = verify_environment(python, ROOT / "requirements/lingbot-quality.txt")
+    packages = verify_environment(python, ROOT / "requirements/video-quality.txt")
     version = packages.get(PROVIDER)
     if not version or version != packages.get("opencv-python"):
         raise RegressionError("Evaluator OpenCV distributions must have matching pinned versions")

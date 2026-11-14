@@ -9,7 +9,6 @@ import argparse
 import copy
 import math
 import platform
-import statistics
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -19,7 +18,9 @@ from typing import Any
 import aiohttp
 from vllm.benchmarks.datasets import SampleRequest
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput, RequestFuncOutput
+from vllm.benchmarks.serve import TaskType
 
+from vllm_omni.benchmarks.metrics.metrics import calculate_metrics, metric_result_fields, process_one_metric
 from vllm_omni.benchmarks.realtime_video.client import (
     SessionResult,
     git_revision,
@@ -41,8 +42,10 @@ from vllm_omni.benchmarks.realtime_video.workload import (
     compute_metrics,
     default_workload,
     load_workload,
+    pixel_frames_in_chunk,
     warmup_workload,
 )
+from vllm_omni.metrics import definitions as defs
 
 
 @dataclass(frozen=True)
@@ -70,7 +73,18 @@ class RealtimeVideoSampleRequest(SampleRequest):
 
 @dataclass
 class RealtimeVideoRequestOutput(RequestFuncOutput):
+    """A rollout plus native shared observations; durations/gaps use seconds.
+
+    FPS measures frames/second. Video observations do not populate text tokens.
+    """
+
     session_result: SessionResult | None = None
+    video_duration: float = 0.0
+    video_frames: int = 0
+    video_rtf: float = 0.0
+    video_ttfc: float | None = None
+    video_fps: float | None = None
+    video_steady_intervals: list[float] = field(default_factory=list)
 
 
 def build_serve_args(argv: list[str], *, workload: Workload | None = None) -> argparse.Namespace:
@@ -234,6 +248,7 @@ def _session_payload(output: RealtimeVideoRequestOutput, index: int, *, measured
         else None,
         "ttfc_ms": result.ttfc_s * 1000.0 if result is not None and result.ttfc_s is not None else None,
         "wall_seconds": result.wall_s if result is not None else output.latency,
+        "request_latency_ms": output.latency * 1000.0,
         "chunks": [record.to_dict() for record in result.records] if result is not None else [],
         "events": result.events if result is not None else [],
         "done_event": result.done_event if result is not None else {},
@@ -248,6 +263,8 @@ def finalize_realtime_video(
     duration: float,
     endpoint: str,
     model: str,
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[float],
 ) -> dict[str, Any]:
     """Assemble video metrics after the shared measured interval has finished."""
     sample = requests[0]
@@ -264,6 +281,11 @@ def finalize_realtime_video(
         if output.success and output.session_result is not None:
             result = output.session_result
             try:
+                if any(
+                    record.byte_length <= 0 or record.num_frames != pixel_frames_in_chunk(record.index)
+                    for record in result.records
+                ):
+                    raise ValueError("Missing media or incorrect frame coverage")
                 metrics = compute_metrics(
                     result.records,
                     fps=target_fps,
@@ -275,6 +297,16 @@ def finalize_realtime_video(
                 )
                 payload["metrics"] = metrics
                 session_metrics.append(metrics)
+                output.video_duration = metrics["video_seconds"]
+                output.video_frames = metrics["total_frames"]
+                output.video_rtf = metrics["video_rtf"]
+                output.video_ttfc = result.ttfc_s
+                output.video_fps = metrics["frames_per_second"]
+                # The protocol adapter owns this population. Common aggregation
+                # receives seconds, never frames disguised as token intervals.
+                output.video_steady_intervals = [
+                    record.inter_arrival_s for record in result.records[max(1, options.warmup_chunks) : -1]
+                ]
             except Exception as error:
                 # Keep the raw measurement available to the standard writer,
                 # while making an invalid metric document visibly fail.
@@ -342,26 +374,33 @@ def finalize_realtime_video(
         "dataset_name": "realtime-video",
         "realtime_video": document,
     }
-    if completed == len(requests) and not failed_warmups:
+    if completed == len(requests) and not failed_warmups and not finalization_errors:
         try:
-            scalars = {
-                # These are full measured requests, including connection/setup,
-                # distinct from steady chunk cadence. Warmups enter neither.
-                "mean_e2el_ms": statistics.mean(output.latency for output in outputs) * 1000.0,
-                "request_throughput": completed / duration,
-                "mean_video_ttfc_ms": statistics.mean(row["ttfc_ms"] for row in session_metrics),
-                "min_video_fps": min(row["frames_per_second"] for row in session_metrics),
-                "mean_video_rtf": statistics.mean(row["video_rtf"] for row in session_metrics),
-            }
             steady_per_session = max(0, workload.num_chunks - max(1, options.warmup_chunks) - 1)
             if steady_per_session:
-                summary = performance_metrics(
+                performance_metrics(
                     document, num_chunks=workload.num_chunks, min_steady=len(requests) * steady_per_session
                 )
-                scalars.update(
-                    mean_video_steady_interval_ms=summary["mean_ms"],
-                    p95_video_steady_interval_ms=summary["p95_ms"],
-                )
+            shared, _ = calculate_metrics(
+                requests,
+                outputs,
+                duration,
+                tokenizer=None,
+                selected_percentiles=selected_percentiles,
+                goodput_config_dict={},
+                task_type=TaskType.GENERATION,
+                selected_percentile_metrics=selected_percentile_metrics,
+                max_concurrency=1,
+                request_rate=math.inf,
+                benchmark_duration=duration,
+            )
+            scalars = {"request_throughput": shared.request_throughput}
+            for metric in selected_percentile_metrics:
+                scalars.update(metric_result_fields(shared, metric))
+                if metric in (defs.VIDEO_TTFC, defs.VIDEO_FPS, defs.VIDEO_STEADY_INTERVAL):
+                    process_one_metric(metric, shared)
+            if defs.VIDEO_FPS in selected_percentile_metrics:
+                scalars[defs.MIN_VIDEO_FPS] = getattr(shared, defs.MIN_VIDEO_FPS)
             if any(not math.isfinite(value) or value < 0 for value in scalars.values()):
                 raise ValueError("Nonfinite or negative realtime-video summary")
             result_json.update(scalars)
@@ -369,6 +408,9 @@ def finalize_realtime_video(
                 "e2el/request_throughput: whole measured rollouts; video TTFC/FPS/RTF: session records; "
                 "steady intervals: attention warmup and terminal excluded; session warmups excluded throughout"
             )
+            result_json["video_metric_scopes"] = {
+                defs.VIDEO_RTF: {**defs.VIDEO_RTF_CLIENT_SCOPE, "target_fps": target_fps, "mux_fps": workload.fps}
+            }
         except Exception as error:
             message = f"recorded metrics: {type(error).__name__}: {error}"
             finalization_errors.append(message)

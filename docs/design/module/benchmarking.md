@@ -56,6 +56,34 @@ separate from tokens. The common result retains `realtime_video` raw records;
 the legacy script translates flags and projects that result without a separate
 request loop.
 
+Realtime-video observations enter the shared `MultiModalsBenchmarkMetrics`
+aggregation with their native populations: one full request latency, TTFC,
+generated FPS and client-session RTF per successful measured rollout, and
+pooled steady chunk intervals selected by the protocol adapter. Frames remain
+frames; text token fields are not invented. Public names and units are
+registered in `vllm_omni/metrics/definitions.py`. `--percentile-metrics` selects
+`e2el`, `video_ttfc`, `video_fps`, `video_rtf` and `video_steady_interval`; all
+are the realtime backend's default selection, without changing other backends.
+`--metric-percentiles` keeps the shared default of 99 and controls the emitted
+percentile fields. The performance recipe explicitly requests 50,95,99,
+including its recorded p95 baseline. Failed warmups, measured rollouts or
+finalization retain raw diagnostics and prevent the entire realtime summary
+from being accepted.
+
+RTF is a dimensionless cost ratio, with a declared timing and duration scope.
+Realtime `mean_video_rtf` preserves its recorded definition: wall time after
+the `session.start` send completes through receiving `session.done` and draining keepalive
+cleanup, divided by `received frames / target_fps`. Connection setup is
+excluded; first-chunk and terminal receive time are included. Target playback
+FPS can differ from the mux FPS. Ordinary video RTF prefers server-reported
+generation time over resolved content duration, falling back to full request
+latency when server timing is absent. Content duration resolves payload
+`duration_s`, payload `num_frames/fps`, request `seconds`, then request
+`num_frames/fps`. Result `video_metric_scopes.video_rtf`
+identifies these distinct boundaries; realtime results also record target and
+mux FPS. The values are not interchangeable across scopes. Existing baseline
+keys, numeric thresholds and legacy raw-result projections retain their meaning.
+
 LingBot performance is configured through `tests/dfx/perf` and its ordinary
 recorded JSON hardware baselines. Candidate runs do not restart a live reference
 or derive a calibration/CV limit. Each workload has a distinct excluded

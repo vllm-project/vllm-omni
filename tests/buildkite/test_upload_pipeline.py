@@ -1243,8 +1243,8 @@ def test_qwen_image_21_accuracy_model_dependencies(
         ("tests/e2e/accuracy/lingbot_world/test_precision.py", {"accuracy"}),
         ("tests/benchmarks/test_realtime_video_eval.py", {"accuracy"}),
         ("pyproject.toml", {"accuracy"}),
-        ("requirements/lingbot-quality.txt", {"accuracy"}),
-        ("requirements/lingbot-quality.in", {"accuracy"}),
+        ("requirements/video-quality.txt", {"accuracy"}),
+        ("requirements/video-quality.in", {"accuracy"}),
         ("vllm_omni/benchmarks/audio_continuity.py", set()),
     ],
 )

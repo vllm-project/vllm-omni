@@ -9,6 +9,7 @@ import math
 import statistics
 from pathlib import Path
 
+import numpy as np
 import pytest
 from websockets.asyncio.server import serve
 
@@ -17,6 +18,97 @@ from vllm_omni.benchmarks.realtime_video.workload import pixel_frames_in_chunk
 from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
+
+
+@pytest.mark.parametrize(
+    "selection,percentiles,num_chunks",
+    [
+        ("e2el", "50,99", 10),
+        ("video_ttfc,video_steady_interval", "75", 10),
+        ("e2el,video_ttfc,video_fps,video_rtf,video_steady_interval", "50,95,99", 10),
+        ("video_steady_interval", "75", 2),
+    ],
+)
+def test_shared_video_percentile_selection_reaches_saved_results(
+    tmp_path: Path, selection: str, percentiles: str, num_chunks: int
+):
+    """CLI selection governs request and native-video summaries, excluding warmup."""
+
+    async def scenario():
+        async with serve(_emit_transport_rollout, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            args = build_serve_args(
+                [
+                    "--base-url",
+                    f"ws://127.0.0.1:{port}",
+                    "--model",
+                    "test-video",
+                    "--num-prompts",
+                    "2",
+                    "--num-warmups",
+                    "1",
+                    "--realtime-video-num-chunks",
+                    str(num_chunks),
+                    "--realtime-video-warmup-num-chunks",
+                    "8",
+                    "--realtime-video-image",
+                    "data:image/png;base64,eA==",
+                    "--realtime-video-ping-interval",
+                    "0",
+                    "--realtime-video-target-fps",
+                    "12",
+                    "--percentile-metrics",
+                    selection,
+                    "--metric-percentiles",
+                    percentiles,
+                    "--disable-tqdm",
+                    "--save-result",
+                    "--result-dir",
+                    str(tmp_path),
+                    "--result-filename",
+                    "selection.json",
+                ]
+            )
+            await asyncio.to_thread(OmniBenchmarkServingSubcommand.cmd, args)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=30))
+    saved = json.loads((tmp_path / "selection.json").read_text())
+    video = saved["realtime_video"]
+    sessions = video["sessions"]
+    assert video["passed"] and len(sessions) == 2
+    assert len(video["warmups"]) == 1 and len(video["warmups"][0]["chunks"]) == min(8, num_chunks)
+    assert all(len(row["chunks"]) == num_chunks for row in sessions)
+    assert not any(key in saved for key in ("total_output_tokens", "mean_ttft_ms", "itls"))
+    selected = selection.split(",")
+    first_metric = selected[0]
+    suffix = "" if first_metric in ("video_fps", "video_rtf") else "_ms"
+    assert (f"p{percentiles.split(',')[0]}_{first_metric}{suffix}" in saved) is (num_chunks > 7)
+    populations = {
+        "e2el": ([row["request_latency_ms"] for row in sessions], "_ms"),
+        "video_ttfc": ([row["ttfc_ms"] for row in sessions], "_ms"),
+        "video_fps": ([row["metrics"]["frames_per_second"] for row in sessions], ""),
+        "video_rtf": ([row["metrics"]["video_rtf"] for row in sessions], ""),
+        "video_steady_interval": (
+            [chunk["inter_arrival_ms"] for row in sessions for chunk in row["chunks"][6:-1]],
+            "_ms",
+        ),
+    }
+    for metric, (values, suffix) in populations.items():
+        if metric in selected and values:
+            assert saved[f"mean_{metric}{suffix}"] == pytest.approx(statistics.mean(values))
+            for percentile in percentiles.split(","):
+                assert saved[f"p{percentile}_{metric}{suffix}"] == pytest.approx(
+                    np.percentile(values, float(percentile))
+                )
+        else:
+            assert f"mean_{metric}{suffix}" not in saved
+    assert ("min_video_fps" in saved) is ("video_fps" in selected)
+    if "95" not in percentiles.split(","):
+        assert "p95_video_steady_interval_ms" not in saved
+    scope = saved["video_metric_scopes"]["video_rtf"]
+    assert scope["numerator"] == "client_session_wall_seconds"
+    assert scope["denominator"] == "frames / target_fps"
+    assert scope["target_fps"] == 12 and scope["mux_fps"] == 16
 
 
 @pytest.mark.parametrize("failure", [None, "warmup", "measured", "save-video"])
@@ -127,7 +219,7 @@ def test_real_serve_entry_saves_video_sessions_and_failed_warmups(monkeypatch, t
         assert "save video:" in video["errors"][0]
     elif failure:
         assert video["errors"] and "deliberate WS failure" in video["errors"][0]
-    if failure in (None, "save-video"):
+    if failure is None:
         sessions = video["sessions"]
         assert saved["request_throughput"] == pytest.approx(2 / saved["duration"])
         assert math.isfinite(saved["mean_e2el_ms"]) and saved["mean_e2el_ms"] > 0
@@ -168,6 +260,14 @@ def test_realtime_video_defaults_are_safe_and_do_not_change_text_defaults():
     args = build_serve_args([])
     assert (args.num_prompts, args.num_warmups, args.max_concurrency) == (1, 0, 1)
     assert args.skip_tokenizer_init and args.ready_check_timeout_sec == 0
+    assert set(args.percentile_metrics.split(",")) == {
+        "e2el",
+        "video_ttfc",
+        "video_fps",
+        "video_rtf",
+        "video_steady_interval",
+    }
+    assert args.metric_percentiles == "99"
     parser = TrackingArgumentParser()
     OmniBenchmarkServingSubcommand.add_cli_args(parser)
     text_args = parser.parse_args([])
@@ -177,9 +277,11 @@ def test_realtime_video_defaults_are_safe_and_do_not_change_text_defaults():
     assert text_args.num_prompts == 1000
     assert text_args.ready_check_timeout_sec == baseline_args.ready_check_timeout_sec
     assert text_args.skip_tokenizer_init == baseline_args.skip_tokenizer_init
+    assert text_args.percentile_metrics == baseline_args.percentile_metrics
+    assert text_args.metric_percentiles == baseline_args.metric_percentiles
 
 
-async def _emit_transport_rollout(websocket):
+async def _emit_transport_rollout(websocket, *, num_frames_override: int | None = None):
     payload = json.loads(await websocket.recv())
     count = len(payload["extra_params"]["camera_action_script"])
     await websocket.send(json.dumps({"type": "video.start", "request_id": "transport-test", "format": "m4s"}))
@@ -190,13 +292,56 @@ async def _emit_transport_rollout(websocket):
                     "type": "video.chunk_metadata",
                     "kind": "media",
                     "generation_chunk_index": index,
-                    "num_frames": pixel_frames_in_chunk(index),
+                    "num_frames": pixel_frames_in_chunk(index) if num_frames_override is None else num_frames_override,
                     "byte_length": 1,
                 }
             )
         )
         await websocket.send(b"x")
     await websocket.send(json.dumps({"type": "session.done", "stopped": False, "chunks": count}))
+
+
+def test_malformed_short_video_retains_raw_data_without_shared_summaries(tmp_path: Path):
+    """Invalid native frame coverage must fail before zero-token classification."""
+
+    async def scenario():
+        async def malformed(websocket):
+            await _emit_transport_rollout(websocket, num_frames_override=0)
+
+        async with serve(malformed, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            args = build_serve_args(
+                [
+                    "--base-url",
+                    f"ws://127.0.0.1:{port}",
+                    "--model",
+                    "test-video",
+                    "--realtime-video-num-chunks",
+                    "2",
+                    "--realtime-video-image",
+                    "data:image/png;base64,eA==",
+                    "--realtime-video-ping-interval",
+                    "0",
+                    "--disable-tqdm",
+                    "--save-result",
+                    "--result-dir",
+                    str(tmp_path),
+                    "--result-filename",
+                    "malformed.json",
+                ]
+            )
+            with pytest.raises(RuntimeError, match="Realtime video benchmark failed"):
+                await asyncio.to_thread(OmniBenchmarkServingSubcommand.cmd, args)
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=30))
+    saved = json.loads((tmp_path / "malformed.json").read_text())
+    raw = saved["realtime_video"]
+    assert not raw["passed"] and raw["finalization_errors"]
+    assert "incorrect frame coverage" in raw["finalization_errors"][0]
+    assert len(raw["sessions"][0]["chunks"]) == 2
+    assert raw["sessions"][0]["done_event"]["type"] == "session.done"
+    assert not any(key.startswith(("mean_", "p99_")) for key in saved)
+    assert "total_output_tokens" not in saved
 
 
 @pytest.mark.parametrize("with_header", [False, True])
