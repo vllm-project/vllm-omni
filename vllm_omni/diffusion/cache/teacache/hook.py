@@ -12,6 +12,7 @@ to support new models.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -262,7 +263,7 @@ class TeaCacheHook(ModelHook):
             True to compute full transformer, False to reuse cached residual
         """
         # First timestep: always compute
-        if state.cnt == 0:
+        if state.cnt < max(1, self.config.warmup_steps):
             state.accumulated_rel_l1_distance = 0.0
             return True
 
@@ -279,8 +280,18 @@ class TeaCacheHook(ModelHook):
         mean_diff, mean_prev = _average_l1_stats_across_sp(mean_diff, mean_prev)
         rel_distance = (mean_diff / (mean_prev + 1e-8)).item()
 
-        # Apply model-specific polynomial rescaling
+        # Calibrated profiles must not extrapolate beyond their measured range.
+        limit = self.config.max_input_distance
+        if not math.isfinite(rel_distance) or (limit is not None and rel_distance > limit):
+            state.accumulated_rel_l1_distance = 0.0
+            return True
+
         rescaled_distance = float(self.rescale_func(rel_distance))
+        if not math.isfinite(rescaled_distance):
+            state.accumulated_rel_l1_distance = 0.0
+            return True
+        if self.config.clamp_negative_prediction:
+            rescaled_distance = max(0.0, rescaled_distance)
         state.accumulated_rel_l1_distance += abs(rescaled_distance)
 
         # Decision: below threshold = cache, above = compute

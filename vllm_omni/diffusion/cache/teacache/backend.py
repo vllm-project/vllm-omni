@@ -180,7 +180,67 @@ def enable_kandinsky6_teacache(pipeline: Any, config: DiffusionCacheConfig) -> N
     )
 
 
+def enable_wan_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    """Enable experimental stage-local caching for Wan 1.3B T2V."""
+    import torch
+
+    parallel = pipeline.od_config.parallel_config
+    transformer = pipeline.transformer
+    if transformer is None:
+        raise ValueError("Wan TeaCache is limited to the single-expert Wan2.1 T2V 1.3B architecture")
+    model_config = transformer.config
+    if (
+        pipeline.has_transformer_2
+        or pipeline.expand_timesteps
+        or pipeline.is_dmd
+        or model_config.in_channels != 16
+        or model_config.num_layers != 30
+        or model_config.num_attention_heads != 12
+        or model_config.attention_head_dim != 128
+    ):
+        raise ValueError("Wan TeaCache is limited to the single-expert Wan2.1 T2V 1.3B architecture")
+    if (
+        parallel.pipeline_parallel_size not in (1, 2)
+        or parallel.cfg_parallel_size not in (1, 2)
+        or parallel.tensor_parallel_size != 1
+        or parallel.sequence_parallel_size != 1
+        or getattr(pipeline.od_config, "quantization_config", None) is not None
+        or getattr(pipeline.od_config, "quantization", None) is not None
+        or transformer.dtype != torch.bfloat16
+    ):
+        raise ValueError("Wan TeaCache requires BF16, PP/CFG sizes 1 or 2, TP=SP=1 and no quantization")
+    if config.wan_profile is not None:
+        from vllm_omni.diffusion.cache.teacache.wan_profile import stage_config
+        from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
+
+        if config.coefficients is not None or config.rel_l1_thresh is not None:
+            raise ValueError("Wan profile cannot be combined with global coefficients or threshold overrides")
+        teacache_config = stage_config(
+            config.wan_profile,
+            model=str(pipeline.od_config.model),
+            revision=pipeline.od_config.revision,
+            pp_size=parallel.pipeline_parallel_size,
+            cfg_size=parallel.cfg_parallel_size,
+            pp_rank=get_pp_group().rank_in_group,
+        )
+        apply_teacache_hook(transformer, teacache_config)
+        return
+    if config.coefficients is None:
+        raise ValueError(
+            "Wan TeaCache has no qualified default profile; explicit experimental coefficients are required"
+        )
+    apply_teacache_hook(
+        transformer,
+        TeaCacheConfig(
+            transformer_type="WanTransformer3DModel",
+            rel_l1_thresh=config.rel_l1_thresh,
+            coefficients=config.coefficients,
+        ),
+    )
+
+
 CUSTOM_TEACACHE_ENABLERS = {
+    "Wan22Pipeline": enable_wan_teacache,
     "BagelPipeline": enable_bagel_teacache,
     "Flux2KleinPipeline": enable_flux2_klein_teacache,
     "HunyuanImage3Pipeline": enable_hunyuan_image3_teacache,
