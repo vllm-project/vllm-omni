@@ -17,7 +17,7 @@
 # does not set parallelism; the uploader does. Enrolled steps always write
 # `timings/jobs/*.json`. A one-node process (the entrypoint VRAM workaround)
 # runs when BUILDKITE_PARALLEL_JOB is unset or 0.
-
+# debug for test
 env:
   VLLM_WORKER_MULTIPROC_METHOD: spawn
   HF_HUB_DOWNLOAD_TIMEOUT: 300
