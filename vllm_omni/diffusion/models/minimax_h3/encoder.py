@@ -31,10 +31,11 @@ complete ``[seq, 5120]`` hidden state.
 from __future__ import annotations
 
 import itertools
+import os
 import re
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -48,6 +49,9 @@ from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
 )
+
+if TYPE_CHECKING:
+    from .vision_parallel import VisionAllToAll
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
@@ -629,14 +633,20 @@ class MiniMaxH3Qwen3VLVisionBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        sequence_parallel: VisionAllToAll | None = None,
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
-            cu_seqlens=cu_seqlens,
-            position_embeddings=position_embeddings,
-        )
+        normalized = self.norm1(hidden_states)
+        if sequence_parallel is None:
+            output = self.attn(normalized, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+        else:
+            from .vision_sp import attention_sp8
+
+            output = attention_sp8(
+                self.attn, normalized, position_embeddings, sequence_parallel, _apply_rotary_pos_emb_vision
+            )
+        hidden_states = hidden_states + output
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 
@@ -697,7 +707,14 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
         embeddings = embeddings.flatten(1)
         return embeddings
 
-    def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
+    def fast_pos_embed_interpolate(
+        self, grid_thw: torch.Tensor, *, token_indices: tuple[int, ...] | None = None
+    ) -> torch.Tensor:
+        """Interpolate all positions, or selected rows in final merger order.
+
+        Selection moves only the lookup before interpolation: coordinates, weight
+        conversion and the original four-term addition order remain unchanged.
+        """
         grid_thw_list = grid_thw.tolist()
         grid_ts = [row[0] for row in grid_thw_list]
         grid_hs = [row[1] for row in grid_thw_list]
@@ -731,10 +748,33 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
             for i in range(4):
                 idx_list[i].extend(indices[i].tolist())
                 weight_list[i].extend(weights[i].tolist())
+        if token_indices is not None:
+            # Undo frame repetition and spatial merger ordering using CPU metadata.
+            # Keep the original scalar weights, including their dtype conversion.
+            spatial_rows = []
+            merge = self.spatial_merge_size
+            for token in token_indices:
+                full_start = spatial_start = 0
+                for t, h, w in grid_thw_list:
+                    if full_start <= token < full_start + t * h * w:
+                        row = (token - full_start) % (h * w)
+                        block, inner = divmod(row, merge * merge)
+                        block_y, block_x = divmod(block, w // merge)
+                        inner_y, inner_x = divmod(inner, merge)
+                        spatial_rows.append(spatial_start + (block_y * merge + inner_y) * w + block_x * merge + inner_x)
+                        break
+                    full_start += t * h * w
+                    spatial_start += h * w
+                else:
+                    raise ValueError(f"vision position token index out of range: {token}")
+            idx_list = [[values[row] for row in spatial_rows] for values in idx_list]
+            weight_list = [[values[row] for row in spatial_rows] for values in weight_list]
         idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
         weight_tensor = torch.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=device)
         pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+        if token_indices is not None:
+            return patch_pos_embeds
         patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
         patch_pos_embeds_permute = []
         merge_size = self.spatial_merge_size
@@ -753,6 +793,11 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
         hidden_states: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        group = getattr(self, "sequence_parallel_group", None)
+        if group is not None:
+            from .vision_sp import forward_sp8
+
+            return forward_sp8(self, hidden_states, grid_thw, group=group)
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds
@@ -1188,6 +1233,11 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         _validate_encoder_quant_config(quant_config)
         dtype = torch.bfloat16
         self.vision = MiniMaxH3Qwen3VLVisionModel(config.vision_config)
+        from .vision_parallel import resolve_vision_sp_group
+
+        self.vision.sequence_parallel_group = resolve_vision_sp_group(
+            os.environ.get("VLLM_OMNI_H3_VISION_SP_SIZE", "0"), encoder_group
+        )
         self.vision.to(dtype=dtype)
         self.text_model = MiniMaxH3Qwen3VLTextModel(
             encoder_group,
@@ -1199,9 +1249,10 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         if not isinstance(quant_config, FastH3NVFP4Config):
             self.text_model.to(dtype=dtype)
         logger.info(
-            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision replicated",
+            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision_sp=%s",
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
             self._tp_size,
+            os.environ.get("VLLM_OMNI_H3_VISION_SP_SIZE", "0"),
         )
 
     @property
