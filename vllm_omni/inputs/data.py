@@ -484,7 +484,9 @@ class OmniDiffusionSamplingParams:
     def from_dict(cls, params: dict[str, Any]) -> "OmniDiffusionSamplingParams":
         """Reconstruct params from a dict decoded after IPC, handling LoRA."""
         lora_request = params.get("lora_request")
-        if isinstance(lora_request, list):
+        # A single array-like LoRARequest serializes as [name, id, path, ...].
+        # A stack serializes as a list of those arrays (or in-process requests).
+        if isinstance(lora_request, list) and (not lora_request or not isinstance(lora_request[0], str)):
             params["lora_request"] = [
                 req if isinstance(req, LoRARequest) else msgspec.convert(req, LoRARequest) for req in lora_request
             ]
