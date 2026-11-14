@@ -45,6 +45,7 @@ PLUGIN_DIR = Path(__file__).resolve().parents[4] / "apps" / "ComfyUI-vLLM-Omni"
 GUIDE_WORKFLOW = PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Timeline Guides.json"
 SCHEMA_COMPLETE_WORKFLOWS = {
     GUIDE_WORKFLOW,
+    PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Fun ControlNet Union.json",
     PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 All-in-One.json",
     PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Music Video.json",
 }
@@ -250,6 +251,7 @@ def test_generate_video_appends_timeline_guides_port_last():
         "fast_h3",
         "latent_edit",
         "timeline_guides",
+        "control",
     ]
     assert schema["optional"]["timeline_guides"] == ("H3_TIMELINE_GUIDES",)
     assert VLLMOmniGenerateVideo.RETURN_TYPES == ("VIDEO",)
