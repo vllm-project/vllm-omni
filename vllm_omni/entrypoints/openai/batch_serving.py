@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from __future__ import annotations
+
 import asyncio
+import os
 import time
+from collections import defaultdict
+from typing import Any
 
 from fastapi import Request
 from pydantic import ValidationError
+from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.openai.chat_completion.protocol import (
     BatchChatCompletionRequest,
     ChatCompletionRequest,
@@ -16,10 +22,24 @@ from vllm.entrypoints.serve.engine.protocol import (
     UsageInfo,
 )
 from vllm.logger import init_logger
+from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.mistral import (
+    MistralTokenizer,
+    maybe_serialize_tool_calls,
+    truncate_tool_call_ids,
+    validate_request_params,
+)
+from vllm.utils.async_utils import merge_async_iterators
 
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.entrypoints.openai.utils import get_stage_type
+from vllm_omni.entrypoints.utils import coerce_param_message_types
 
 logger = init_logger(__name__)
+
+# Profiling aid for benchmarks/batch_chat_completion_bench.py: logs per-batch
+# render/submit/collect phase timings when enabled.
+_BENCH_PHASE_LOG = os.environ.get("VLLM_OMNI_BENCH_PHASE_LOG", "").lower() in ("1", "true", "yes")
 
 
 class OmniOpenAIServingChatBatch(OmniOpenAIServingChat):
@@ -60,12 +80,463 @@ class OmniOpenAIServingChatBatch(OmniOpenAIServingChat):
         """Get the request ID for each entry in the batch request to be resubmitted to chat completions."""
         return [f"{base_id}-idx-{idx}" for idx in range(len(request.messages))]
 
+    async def render_batch_chat_request(
+        self,
+        request: BatchChatCompletionRequest,
+    ) -> tuple[list[Any], list[Any], list[ChatCompletionRequest]] | ErrorResponse:
+        """Validate the batch request once and preprocess each conversation.
+
+        Runs all shared checks (model, engine health, LoRA, tokenizer,
+        parsers, template, modalities, audio format) a single time,
+        then preprocesses each conversation individually.
+
+        Returns:
+            (all_conversations, all_engine_prompts, single_requests,
+            all_entry_stage_ids) on success, or ErrorResponse on failure.
+        """
+        # --- Batch-level checks (run once for the whole batch) ---
+
+        # Check 1: Model existence
+        error_check_ret = await self._check_model(request)
+        if error_check_ret is not None:
+            logger.error("Error with model %s", error_check_ret)
+            return error_check_ret
+
+        # Check 2: Engine health
+        if self.engine_client.errored:
+            raise self.engine_client.dead_error
+
+        # Check 3: Tokenizer
+        renderer = self.renderer
+        tokenizer = renderer.get_tokenizer()
+        if tokenizer is None:
+            tokenizer = await self.engine_client.get_tokenizer()
+
+        # Check 4: Tool parser class
+        tool_parser = self.parser_cls.tool_parser_cls if self.parser_cls is not None else None
+
+        # Check 5: Tool choice validation + tool_dicts
+        tool_choice = getattr(request, "tool_choice", None)
+        tools = getattr(request, "tools", None)
+        tool_parsing_unavailable = (
+            tool_parser is None and not isinstance(tokenizer, MistralTokenizer) and not self.use_harmony
+        )
+        if tool_parsing_unavailable and tool_choice not in (None, "none"):
+            if tool_choice == "auto" and not self.enable_auto_tools:
+                return self.create_error_response(
+                    '"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set'
+                )
+            elif tool_choice != "auto":
+                return self.create_error_response(f'tool_choice="{tool_choice}" requires --tool-call-parser to be set')
+
+        if tools is None or (tool_choice == "none" and self.exclude_tools_when_tool_choice_none):
+            tool_dicts = None
+        else:
+            tool_dicts = [tool.model_dump() for tool in tools]
+
+        # Check 6: Chat template validation
+        if not self.use_harmony:
+            error_check_ret = self.online_renderer.validate_chat_template(
+                request_chat_template=getattr(request, "chat_template", None),
+                chat_template_kwargs=getattr(request, "chat_template_kwargs", None),
+                trust_request_chat_template=self.trust_request_chat_template,
+            )
+            if error_check_ret is not None:
+                return error_check_ret
+
+        # Check 7: Output modalities validation
+        engine_output_modalities = [x for x in self.engine_client.output_modalities if x is not None]
+        output_modalities = getattr(request, "modalities", engine_output_modalities)
+        request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
+
+        if not isinstance(request.modalities, list) or not all(isinstance(m, str) for m in request.modalities):
+            return self.create_error_response("'modalities' must be a list of strings.")
+        allowed_modalities = set(engine_output_modalities)
+        unsupported = set(request.modalities) - allowed_modalities
+        if unsupported:
+            return self.create_error_response(
+                f"Unsupported output modalities {', '.join(sorted(unsupported))} "
+                f"for this model. Supported modalities: "
+                f"{', '.join(sorted(allowed_modalities))}",
+            )
+
+        # Check 8: Audio format validation
+        if request.modalities and "audio" in request.modalities:
+            audio_format_check = self._resolve_audio_format(request)
+            if isinstance(audio_format_check, ErrorResponse):
+                return audio_format_check
+
+        # --- Per-item conversion (synchronous, lightweight) ---
+
+        single_requests: list[ChatCompletionRequest] = []
+        for idx, messages in enumerate(request.messages):
+            try:
+                single_request = request.to_chat_completion_request(messages)
+            except (ValidationError, ValueError, TypeError) as e:
+                return self.create_error_response(
+                    f"Message {idx} could not be converted to a chat completion request: {e}",
+                )
+            single_request.stream = False
+
+            if isinstance(tokenizer, MistralTokenizer):
+                maybe_serialize_tool_calls(single_request)
+                truncate_tool_call_ids(single_request)
+                validate_request_params(single_request)
+
+            single_requests.append(single_request)
+
+        # --- Per-item preprocessing (concurrent) ---
+
+        async def _preprocess_item(single_request: ChatCompletionRequest) -> tuple[Any, Any, int]:
+            # A request that bypasses stage 0 is rendered with the tokenizer
+            # and chat template of the stage it enters at (mirrors the
+            # single-request path).
+            entry_stage_id = self.engine_client.resolve_entry_stage_id(self._input_modalities(single_request.messages))
+            item_renderer = self.engine_client.get_stage_renderer(entry_stage_id) if entry_stage_id else renderer
+            if not self.use_harmony:
+                merged_kwargs = self._effective_chat_template_kwargs(single_request)
+                conversation, engine_prompts = await self._preprocess_chat(
+                    single_request,
+                    single_request.messages,
+                    default_template=(single_request.chat_template or self.chat_template),
+                    default_template_content_format=self.chat_template_content_format,
+                    default_template_kwargs=merged_kwargs,
+                    tool_dicts=tool_dicts,
+                    tool_parser=tool_parser,
+                    renderer=item_renderer,
+                    add_generation_prompt=single_request.add_generation_prompt,
+                    continue_final_message=single_request.continue_final_message,
+                    documents=getattr(single_request, "documents", None),
+                    add_special_tokens=single_request.add_special_tokens,
+                    entry_stage_id=entry_stage_id,
+                )
+            else:
+                should_include_tools = tool_dicts is not None
+                conversation, engine_prompts = self.online_renderer._make_request_with_harmony(
+                    single_request,
+                    should_include_tools,
+                )
+            return conversation, engine_prompts[0], entry_stage_id
+
+        try:
+            results = await asyncio.gather(*[_preprocess_item(r) for r in single_requests])
+        except (ValueError, TypeError, RuntimeError) as e:
+            logger.exception("Error preprocessing batch item")
+            message = str(e)
+            if e.__cause__ is not None:
+                message = f"{message} {e.__cause__}"
+            return self.create_error_response(message)
+
+        all_conversations = [r[0] for r in results]
+        all_engine_prompts = [r[1] for r in results]
+        all_entry_stage_ids = [r[2] for r in results]
+
+        return all_conversations, all_engine_prompts, single_requests, all_entry_stage_ids
+
+    @staticmethod
+    def _count_output_tokens(omni_output: Any) -> tuple[int, int]:
+        """Count (prompt, completion) tokens directly from an ``OmniRequestOutput``.
+
+        Text choices report usage via ``_create_text_choice``; audio and
+        image choices don't, so count from the request output itself
+        (mirrors the streaming path's final usage accounting).
+        """
+        prompt_tokens = len(getattr(omni_output, "prompt_token_ids", None) or ())
+        encoder_ids = getattr(omni_output, "encoder_prompt_token_ids", None)
+        if encoder_ids is not None:
+            prompt_tokens += len(encoder_ids)
+        completion_tokens = sum(
+            len(getattr(o, "token_ids", None) or ()) for o in getattr(omni_output, "outputs", None) or ()
+        )
+        return prompt_tokens, completion_tokens
+
+    async def chat_completion_full_generator_batch(
+        self,
+        request: BatchChatCompletionRequest,
+        generators: list[Any],
+        request_id: str,
+        model_name: str,
+        all_conversations: list[Any],
+        tokenizer: TokenizerLike,
+        request_metadata: RequestResponseMetadata,
+        reasoning_parser: Any = None,
+        single_requests: list[ChatCompletionRequest] | None = None,
+    ) -> ErrorResponse | ChatCompletionResponse:
+        """Collect results from N generators and build one response.
+
+        Uses ``merge_async_iterators`` to fan out N generators (one per
+        conversation).  Each generator may yield multiple
+        ``OmniRequestOutput`` objects (e.g. text + audio), which are
+        grouped by prompt index.  Multi-modal choices are collapsed
+        into one choice per conversation via ``_maybe_collapse_choices``.
+        """
+        created_time = int(time.time())
+
+        per_item_outputs: dict[int, list[Any]] = defaultdict(list)
+        try:
+            async for prompt_idx, res in merge_async_iterators(*generators):
+                per_item_outputs[prompt_idx].append(res)
+        except asyncio.CancelledError:
+            for gen in generators:
+                if hasattr(gen, "aclose"):
+                    await gen.aclose()
+            raise
+
+        choices: list[ChatCompletionResponseChoice] = []
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+
+        requested_modalities = (
+            set(request.modalities) if hasattr(request, "modalities") and request.modalities else None
+        )
+
+        for prompt_idx in range(len(generators)):
+            outputs = per_item_outputs.get(prompt_idx)
+            if not outputs:
+                return self.create_error_response(
+                    f"No output received from the engine for prompt {prompt_idx}.",
+                )
+
+            if single_requests is not None:
+                role = self.get_chat_request_role(single_requests[prompt_idx])
+            else:
+                role = self.response_role
+
+            # Choice builders read chat-only fields (e.g. ``tools`` in the
+            # harmony parser) that ``BatchChatCompletionRequest`` does not
+            # carry, so pass the per-item request, not the batch request.
+            item_request = single_requests[prompt_idx] if single_requests is not None else request
+
+            item_choices: list[ChatCompletionResponseChoice] = []
+
+            for omni_output in outputs:
+                if hasattr(omni_output, "finished") and not omni_output.finished:
+                    continue
+
+                output_type = getattr(omni_output, "final_output_type", "text")
+                if requested_modalities is not None and output_type not in requested_modalities:
+                    continue
+
+                if output_type == "text":
+                    conversation = all_conversations[prompt_idx]
+                    (
+                        choices_data,
+                        usage,
+                        _prompt_logprobs,
+                        _prompt_token_ids,
+                        _kv_transfer_params,
+                    ) = self._create_text_choice(
+                        item_request,
+                        omni_output,
+                        tokenizer,
+                        conversation,
+                        role,
+                        reasoning_parser,
+                    )
+                    item_choices.extend(choices_data)
+                    total_prompt_tokens += usage.prompt_tokens
+                    total_completion_tokens += usage.completion_tokens
+
+                elif output_type == "audio":
+                    audio_choices = self._create_audio_choice(
+                        omni_output,
+                        role,
+                        item_request,
+                        stream=False,
+                    )
+                    if isinstance(audio_choices, ErrorResponse):
+                        return audio_choices
+                    item_choices.extend(audio_choices)
+                    p, c = self._count_output_tokens(omni_output)
+                    total_prompt_tokens += p
+                    total_completion_tokens += c
+
+                elif output_type == "image":
+                    img_choices = self._create_image_choice(
+                        omni_output,
+                        role,
+                        item_request,
+                        stream=False,
+                    )
+                    item_choices.extend(img_choices)
+                    p, c = self._count_output_tokens(omni_output)
+                    total_prompt_tokens += p
+                    total_completion_tokens += c
+
+            if not item_choices:
+                return self.create_error_response(
+                    f"No valid output for prompt {prompt_idx}.",
+                )
+
+            try:
+                collapsed = self._maybe_collapse_choices(item_choices)
+            except ValueError as e:
+                return self.create_error_response(
+                    f"Failed to collapse choices for item {prompt_idx}: {e}",
+                )
+            collapsed.index = prompt_idx
+            choices.append(collapsed)
+
+        usage = UsageInfo(
+            prompt_tokens=total_prompt_tokens,
+            completion_tokens=total_completion_tokens,
+            total_tokens=total_prompt_tokens + total_completion_tokens,
+        )
+        request_metadata.final_usage_info = usage
+
+        return ChatCompletionResponse(
+            id=request_id,
+            created=created_time,
+            model=model_name,
+            choices=choices,
+            usage=usage,
+        )
+
     async def create_batch_chat_completion(
         self,
         request: BatchChatCompletionRequest,
         raw_request: Request,
     ) -> ChatCompletionResponse | ErrorResponse:
-        """Given a request, submit each request to chat completions & collect the results."""
+        """Process N conversations concurrently via direct engine submission.
+
+        Validates the request once, preprocesses each conversation, submits
+        each to the engine directly, and collects results into a single
+        response.  Falls back to per-item fan-out for engines serving
+        diffusion (mirrors the dispatch in ``_create_chat_completion``).
+        """
+        stage_configs = getattr(self.engine_client, "stage_configs", ()) or ()
+        serves_diffusion = self._diffusion_mode or any(
+            get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs
+        )
+        if serves_diffusion:
+            return await self._create_batch_chat_completion_diffusion(request, raw_request)
+
+        _t_render0 = time.perf_counter()
+        render_result = await self.render_batch_chat_request(request)
+        if isinstance(render_result, ErrorResponse):
+            return render_result
+        all_conversations, all_engine_prompts, single_requests, entry_stage_ids = render_result
+
+        base_id = self._base_request_id(raw_request, request.request_id)
+        request_id = f"chatcmpl-batch-{base_id}"
+
+        lora_request = self._maybe_get_adapters(
+            request,
+            supports_default_mm_loras=True,
+        )
+        model_name = self.models.model_name(lora_request)
+
+        # Mirror the single-request path: a request that bypasses stage 0 is
+        # tokenized with the entry stage's tokenizer.  Mixed batches with
+        # differing entry stages fall back to the stage-0 tokenizer.
+        tokenizer = self.renderer.get_tokenizer()
+        entry0 = entry_stage_ids[0] if entry_stage_ids else 0
+        if entry0 and all(e == entry0 for e in entry_stage_ids):
+            tokenizer = self.engine_client.get_stage_renderer(entry0).get_tokenizer() or tokenizer
+        if tokenizer is None:
+            tokenizer = await self.engine_client.get_tokenizer()
+
+        reasoning_parser = None
+        if self.parser_cls is not None and self.parser_cls.reasoning_parser_cls is not None:
+            chat_template_kwargs = self._effective_chat_template_kwargs(
+                single_requests[0],
+            )
+            reasoning_parser = self.parser_cls.reasoning_parser_cls(
+                tokenizer,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+
+        request_metadata = RequestResponseMetadata(request_id=request_id)
+        if raw_request:
+            raw_request.state.request_metadata = request_metadata
+
+        output_modalities = request.modalities
+
+        request_timestamp = time.time()
+        if raw_request is not None:
+            request_timestamp = float(
+                getattr(
+                    raw_request.state,
+                    "request_timestamp",
+                    request_timestamp,
+                )
+            )
+
+        _t_render1 = time.perf_counter()
+        generators = []
+        try:
+            for i, engine_prompt in enumerate(all_engine_prompts):
+                sub_request_id = f"{request_id}-idx-{i}"
+
+                if hasattr(request, "sampling_params_list") and request.sampling_params_list:
+                    sampling_params_list = self._to_sampling_params_list(
+                        request.sampling_params_list,
+                    )
+                else:
+                    sampling_params_list = self._build_sampling_params_list_from_request(
+                        single_requests[i],
+                    )
+
+                sampling_params_list = coerce_param_message_types(
+                    sampling_params_list,
+                    False,
+                )
+
+                self._log_inputs(
+                    sub_request_id,
+                    engine_prompt,
+                    params_list=sampling_params_list,
+                    lora_request=lora_request,
+                )
+
+                generator = self.engine_client.generate(
+                    prompt=engine_prompt,
+                    request_id=sub_request_id,
+                    sampling_params_list=sampling_params_list,
+                    output_modalities=output_modalities,
+                    arrival_time=request_timestamp,
+                    lora_request=lora_request,
+                    entry_stage_id=entry_stage_ids[i],
+                )
+                generators.append(generator)
+        except ValueError as e:
+            return self.create_error_response(str(e))
+
+        _t_submit1 = time.perf_counter()
+        response = await self.chat_completion_full_generator_batch(
+            request,
+            generators,
+            request_id,
+            model_name,
+            all_conversations,
+            tokenizer,
+            request_metadata,
+            reasoning_parser,
+            single_requests=single_requests,
+        )
+        if _BENCH_PHASE_LOG:
+            logger.info(
+                "[BENCH-PHASE] batch n=%d render=%.1fms submit=%.1fms collect=%.1fms",
+                len(all_engine_prompts),
+                (_t_render1 - _t_render0) * 1000,
+                (_t_submit1 - _t_render1) * 1000,
+                (time.perf_counter() - _t_submit1) * 1000,
+            )
+        return response
+
+    async def _create_batch_chat_completion_diffusion(
+        self,
+        request: BatchChatCompletionRequest,
+        raw_request: Request,
+    ) -> ChatCompletionResponse | ErrorResponse:
+        """Fan-out path for engines serving diffusion.
+
+        Diffusion requests need the per-model generation dispatch in
+        ``create_chat_completion`` (diffusion mode uses a separate engine;
+        multistage hybrids need diffusion-aware prompt extraction and
+        sampling-param handling), so each item is submitted as a full chat
+        completion and the results are gathered.
+        """
         model = ""
         enabled_streaming = False
         chat_requests: list[ChatCompletionRequest] = []
