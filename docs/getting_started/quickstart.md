@@ -12,7 +12,7 @@ This guide will help you quickly get started with vLLM-Omni to perform:
 
 ## Installation
 
-For installation on GPU from source:
+For installation of vLLM-Omni 0.32.0 on GPU from source:
 
 ```bash
 uv venv --python 3.12 --seed
@@ -24,6 +24,7 @@ uv pip install --torch-backend=cu130 \
 
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
+git checkout v0.32.0
 uv pip install -e .
 ```
 
@@ -31,10 +32,13 @@ These commands install the vLLM 0.32.0 release-branch wheel at the exact
 tested tag commit, with PyTorch 2.13.0 and CUDA 13.0. The
 [vLLM 0.32.0 release](https://github.com/vllm-project/vllm/releases/tag/v0.32.0),
 PyPI wheel and matching ROCm wheel are published. ROCm runtime validation
-with this checkout remains pending. A vLLM-Omni 0.32 wheel is not yet
-published; install Omni from source as shown above. For published
-vLLM-Omni wheels and additional installation methods, see the
-[installation guide](installation/README.md).
+with this checkout remains pending. The [vLLM-Omni 0.32.0 release](https://github.com/vllm-project/vllm-omni/releases/tag/v0.32.0)
+also provides a published wheel. For wheel installation and additional
+installation methods, see the [installation guide](installation/README.md).
+
+These instructions target the tagged 0.32.0 release. The
+[`latest` documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/)
+follows development on `main` and may require different dependencies.
 
 !!! note
     It is important to install the same major & minor version of vLLM and vLLM Omni, otherwise things may not work as expected. If the versions are misaligned, you will see a warning when you import vLLM Omni.
