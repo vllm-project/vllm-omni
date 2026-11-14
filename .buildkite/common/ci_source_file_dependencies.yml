@@ -77,6 +77,7 @@ x-lfm3: &lfm3
   - vllm_omni/deploy/lfm3_omni.yaml
   - vllm_omni/deploy/lfm3_audio.yaml
   - vllm_omni/entrypoints/openai/tts_adapters/lfm3_omni.py
+
 x-spark-tts: &spark_tts
   - vllm_omni/model_executor/models/spark_tts/
   - vllm_omni/model_executor/stage_input_processors/spark_tts.py
@@ -1178,6 +1179,7 @@ source_file_dependencies:
     - vllm_omni/platforms/npu/models/moss_tts_streaming_decode_wrapper.py
     - vllm_omni/platforms/npu/graph_tools.py
     - vllm_omni/worker_v2/
+
   tts_spark_tts_function:
     - *spark_tts
     - tests/e2e/offline_inference/test_spark_tts.py

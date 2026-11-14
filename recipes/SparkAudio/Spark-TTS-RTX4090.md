@@ -168,6 +168,13 @@ paragraph, a 1024-token cap produced 19.70 s of speech (Whisper large-v3
 WER 18/94). With the new default of 3000, the model generated 1255 tokens
 and 24.30 s of speech with WER 0/94. The Buildkite L4 run is still pending.
 
+After rebasing onto upstream `b8f128171`, both real-weight offline tests passed
+again on the local RTX 5060 Ti (16 GB, WSL2, driver 621.01), using vLLM 0.33.0,
+PyTorch 2.14.0+cu130 and the default FlashInfer sampler. The advanced run
+passed 2 tests in 133.74 s, including the Whisper small final-sentence check.
+The long case generated 1255 tokens. Both stage processes completed shutdown.
+This is local validation; a maintainer-admitted Buildkite L4 run is still needed.
+
 The deploy config selects runner v1, eager execution, and `async_chunk: false`.
 Stage 0 defaults to 3000 generated tokens, matching the official generator.
 Its 4096-token context leaves 1096 input tokens when using the full output

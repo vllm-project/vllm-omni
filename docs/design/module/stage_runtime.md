@@ -120,16 +120,18 @@ AR stage deployments may set `engine_extras.shutdown_timeout` to a nonnegative
 grace period in seconds. The stage client uses it when shutdown has no explicit
 timeout; an explicit caller timeout takes precedence, including zero. With no
 stage override, a positive upstream shutdown timeout is honored, otherwise the
-upstream process manager retains its default grace period. The timeout bounds
+process manager uses the pipeline cleanup default described below. The timeout bounds
 process cleanup; it does not change request draining or admission policy.
+
 On POSIX, a local LLM stage wakes its input queue when it receives a signal.
 This lets an idle worker's main thread run its shutdown handler even when
 another thread received SIGTERM. A pipeline can declare a finite, nonnegative
 `StagePipelineConfig.shutdown_grace_s` for an LLM stage's process cleanup.
 `None` retains the upstream timeout policy. The value reaches the process
 manager through both structured and legacy stage configs, for colocated,
-distributed launches with or without a coordinator, and headless launches. An explicit caller timeout takes
-precedence, including zero. Spark declares 15 seconds on its BiCodec stage;
+distributed launches with or without a coordinator, and headless launches.
+An explicit caller timeout, or a timeout forwarded by the stage client as
+described above, takes precedence, including zero. Spark declares 15 seconds on its BiCodec stage;
 the shared process manager does not select policy by model name. This grace
 is separate from vLLM's request-draining `shutdown_timeout`. Pipeline construction
 and the legacy launch boundary validate the value. vLLM owns the actual
