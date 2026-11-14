@@ -49,7 +49,21 @@ class AsyncOmniEngine(OmniEngineBase):
     """Turn-based engine used by ``Omni`` / ``AsyncOmni``."""
 
     def _create_orchestrator(self, **orchestrator_kwargs: Any) -> OrchestratorBase:
+        orchestrator_kwargs.setdefault("dit_load_aware", self._detect_dit_load_aware())
         return Orchestrator(**orchestrator_kwargs)
+
+    def _detect_dit_load_aware(self) -> bool:
+        """Return True if any AR stage has dit_load_aware enabled."""
+        for cfg in self.stage_configs:
+            # Structured config path (production): BaseVllmOmniStageConfig.model_config
+            mc = getattr(cfg, "model_config", None)
+            if getattr(mc, "dit_load_aware", False):
+                return True
+            # Legacy path (override/test): StageConfig.yaml_engine_args
+            ea = getattr(cfg, "yaml_engine_args", None)
+            if isinstance(ea, dict) and ea.get("dit_load_aware"):
+                return True
+        return False
 
     # ---- request helpers ----
 

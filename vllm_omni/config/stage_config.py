@@ -592,6 +592,10 @@ class StageDeployConfig:
     async_scheduling: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = None
+    # AR-stage DiT-load-aware scheduling (DTPS): when True, the AR scheduler
+    # reorders its waiting queue by task type + downstream DiT load.
+    # dit_load_threshold is computed internally (DiT max_num_seqs + 1).
+    dit_load_aware: bool | None = None
     # Hybrid-mamba stages (e.g. the NemotronVoiceChat thinker's NemotronH
     # backbone) pin the SSM state dtype; projected onto vLLM CacheConfig.
     mamba_ssm_cache_dtype: str | None = None
@@ -1584,6 +1588,26 @@ def merge_pipeline_deploy(
         )
         if ps.execution_type == StageExecutionType.LLM_AR:
             engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
+            _dit_load_aware = bool(ds.dit_load_aware) if ds is not None else False
+            if _dit_load_aware:
+                _dit_stages = [
+                    s
+                    for s in pipeline.stages
+                    if s.execution_type == StageExecutionType.DIFFUSION and ps.stage_id in (s.input_sources or ())
+                ]
+                if not _dit_stages:
+                    logger.warning(
+                        "[OmniDTPS] dit_load_aware is set on AR stage %d in "
+                        "pipeline %r but it has no downstream DIFFUSION stage; "
+                        "ignoring.",
+                        ps.stage_id,
+                        pipeline.model_type,
+                    )
+                    engine_args["dit_load_aware"] = False
+                else:
+                    _dit_ds = deploy_by_id.get(_dit_stages[0].stage_id)
+                    _dit_max_seqs = getattr(_dit_ds, "max_num_seqs", None) or 1
+                    engine_args["dit_load_threshold"] = _dit_max_seqs + 1
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:
