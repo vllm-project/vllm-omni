@@ -18,7 +18,7 @@ from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import HAS_TRITON
 
 if HAS_TRITON:
-    from vllm_omni.worker.v1_compat.sample_ops.topk_topp_triton import (
+    from vllm.v1.sample.ops.topk_topp_triton import (
         _topk_topp,
         _topp_split_mask,
         _topp_split_stats,

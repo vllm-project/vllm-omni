@@ -15,7 +15,7 @@ from vllm_omni.worker.sampler_warmup import register_top_k_top_p_warmup
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_SAMPLER_MODULE = "vllm_omni.worker.v1_compat.sample_ops.topk_topp_sampler"
+_SAMPLER_MODULE = "vllm.v1.sample.ops.topk_topp_sampler"
 
 
 class _FakeKernel:
@@ -54,6 +54,27 @@ def test_registers_kernels_with_v2_runner_registry(fake_kernels):
 
     assert register_top_k_top_p_warmup(worker) is True
     assert len(worker.model_runner.jit_warmup_registry) == len(fake_kernels)
+
+
+def test_registers_actual_shared_native_kernel_identities(monkeypatch):
+    from vllm.v1.sample.ops import topk_topp_sampler as native_sampler
+
+    from vllm_omni.worker.v1_compat.sample_ops import topk_topp_sampler as compat_sampler
+
+    kernel_names = ("_topk_topp", "_topp_split_stats", "_topp_split_step", "_topp_split_mask")
+    kernels = {getattr(native_sampler, name) for name in kernel_names}
+    for name in kernel_names:
+        assert getattr(compat_sampler, name) is getattr(native_sampler, name)
+
+    monkeypatch.setattr("vllm.triton_utils.HAS_TRITON", True)
+    monkeypatch.setattr(native_sampler, "HAS_TRITON", True)
+    monkeypatch.setattr(sampler_warmup.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(native_sampler.current_platform, "is_cpu", lambda: False)
+    monkeypatch.setattr(native_sampler.current_platform, "is_cuda_alike", lambda: True)
+    worker = _worker()
+
+    assert register_top_k_top_p_warmup(worker) is True
+    assert set(worker.model_runner.jit_warmup_registry._registrations) == kernels
 
 
 @pytest.mark.parametrize(

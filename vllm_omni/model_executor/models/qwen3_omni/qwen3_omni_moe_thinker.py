@@ -72,6 +72,7 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniAudioFeatureInputs,
     Qwen2_5OmniThinkerDummyInputsBuilder,
+    Qwen2_5OmniThinkerProcessingInfo,
     merge_interleaved_embeddings,
 )
 from vllm.model_executor.models.qwen2_5_vl import (
@@ -823,6 +824,8 @@ class Qwen3OmniMoeThinkerProcessingInfo(Qwen2AudioProcessingInfo, Qwen2_5_VLProc
 
     def get_video_size_with_most_features(self) -> ImageSize:
         return self.get_image_size_with_most_features(max_pixels=self._get_video_size()["longest_edge"])
+
+    get_video_frame_size = Qwen2_5OmniThinkerProcessingInfo.get_video_frame_size
 
     def get_mm_max_tokens_per_item(
         self,
