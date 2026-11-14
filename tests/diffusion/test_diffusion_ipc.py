@@ -3,6 +3,7 @@
 
 import contextlib
 import multiprocessing as mp
+import os
 import queue
 import threading
 import time
@@ -16,7 +17,7 @@ import torch
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
+from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor, _ExecutorShutdownCleaner
 from vllm_omni.diffusion.ipc import (
     _SHM_TENSOR_THRESHOLD,
     DIFFUSION_RPC_RESULT_ENVELOPE,
@@ -28,6 +29,106 @@ from vllm_omni.diffusion.ipc import (
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def _abrupt_result_queue_worker(connection: Connection) -> None:
+    result_mq = MessageQueue(n_reader=1, n_local_reader=1, max_chunk_bytes=1024, max_chunks=2)
+    connection.send(result_mq.export_handle())
+    assert connection.recv() == "exit"
+    os._exit(23)
+
+
+@pytest.mark.parametrize("kill_worker", [False, True])
+def test_shutdown_reclaims_result_queue_after_worker_crash(kill_worker: bool) -> None:
+    """A dead queue creator cannot run its shared-memory destructor."""
+    ctx = mp.get_context("spawn")
+    parent, child = ctx.Pipe()
+    process = ctx.Process(target=_abrupt_result_queue_worker, args=(child,))
+    handle = None
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(30), "result queue worker failed to initialize"
+        handle = parent.recv()
+        assert handle.buffer_handle is not None
+        name = handle.buffer_handle[3]
+        if kill_worker:
+            process.kill()
+        else:
+            parent.send("exit")
+        process.join(10)
+        if kill_worker:
+            assert process.exitcode not in (None, 0)
+        else:
+            assert process.exitcode == 23
+
+        cleaner = _ExecutorShutdownCleaner(processes=[process])
+        # Assign after construction so this regression also runs on the
+        # original cleaner, which did not retain worker result handles.
+        cleaner.result_handles = [handle]
+        cleaner()
+        with pytest.raises(FileNotFoundError):
+            leaked = shared_memory.SharedMemory(name=name)
+            leaked.close()
+        cleaner()
+    finally:
+        if process.is_alive():
+            process.kill()
+        process.join(10)
+        process.close()
+        parent.close()
+        if handle is not None and handle.buffer_handle is not None:
+            with contextlib.suppress(FileNotFoundError):
+                leaked = shared_memory.SharedMemory(name=handle.buffer_handle[3])
+                leaked.unlink()
+                leaked.close()
+
+
+def test_shutdown_keeps_result_queue_until_worker_is_reaped(monkeypatch) -> None:
+    from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+    ctx = mp.get_context("spawn")
+    parent, child = ctx.Pipe()
+    process = ctx.Process(target=_abrupt_result_queue_worker, args=(child,))
+    handle = None
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(30), "result queue worker failed to initialize"
+        handle = parent.recv()
+        assert handle.buffer_handle is not None
+        cleaner = _ExecutorShutdownCleaner(processes=[process], result_handles=[handle])
+        with monkeypatch.context() as patch:
+            patch.setattr(executor_module, "_WORKER_SHUTDOWN_GRACE_S", 0.0)
+            patch.setattr(executor_module, "_WORKER_TERMINATE_GRACE_S", 0.0)
+            patch.setattr(executor_module, "_WORKER_KILL_GRACE_S", 0.0)
+            patch.setattr(process, "terminate", lambda: None)
+            patch.setattr(process, "kill", lambda: None)
+            cleaner()
+        assert cleaner.processes == [process]
+        assert cleaner.result_handles == [handle]
+        attached = shared_memory.SharedMemory(name=handle.buffer_handle[3])
+        attached.close()
+
+        process.kill()
+        process.join(10)
+        cleaner()
+        assert cleaner.processes == []
+        assert cleaner.result_handles == []
+        with pytest.raises(FileNotFoundError):
+            attached = shared_memory.SharedMemory(name=handle.buffer_handle[3])
+            attached.close()
+    finally:
+        if process.is_alive():
+            process.kill()
+        process.join(10)
+        process.close()
+        parent.close()
+        if handle is not None and handle.buffer_handle is not None:
+            with contextlib.suppress(FileNotFoundError):
+                leaked = shared_memory.SharedMemory(name=handle.buffer_handle[3])
+                leaked.unlink()
+                leaked.close()
 
 
 def _large_numel(dtype: torch.dtype) -> int:

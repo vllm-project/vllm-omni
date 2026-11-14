@@ -1398,6 +1398,7 @@ def test_runtime_config_fields_match_structured_runtime_scope():
         "num_gpus",
         "log_level",
         "log_stats",
+        "parallel_decode_timeout_s",
     }
 
 

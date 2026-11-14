@@ -21,6 +21,13 @@ connectors:
 ## Notes
 
 - Auto-mode uses SharedMemoryConnector if no connector is declared for an edge.
+- Opt-in H3 video/audio decoder stages use separate single-consumer SHM keys.
+  The envelope validates request ID, stage, modality, version and output order;
+  the ZMQ control message carries a reference. Consumption or request teardown
+  releases segments. This path performs CPU serialization and copies; it does
+  not imply zero-copy or support cross-host decoder placement. See
+  `vllm_omni/diffusion/stage_latent_transport.py` and
+  `tests/diffusion/test_stage_latent_transport.py`.
 
 ---
 

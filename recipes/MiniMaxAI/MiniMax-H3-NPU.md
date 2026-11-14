@@ -663,3 +663,30 @@ logs. A successful HTTP response alone does not prove the cache was used.
 - [Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
+
+## Opt-in parallel video/audio decoder stages
+
+The four-stage deployment runs Encoder → DiT → {Video, Audio} → join. The
+existing serial deployment remains the default. Each decoder receives only its
+own latents, and the API returns the existing audio/video response after both
+branches finish.
+
+```bash
+VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS=15 vllm serve MiniMaxAI/MiniMax-H3 \
+  --omni --trust-remote-code --task-type ref2va \
+  --deploy-config vllm_omni/deploy/minimax_h3_disaggregated_parallel_decode.yaml
+```
+
+The example assigns three devices to video and one to audio on a four-device
+pool. Encoder/DiT placement is independent and can reuse those devices before
+decode. To change the partition, update each decoder stage's `devices` and
+parallel world size. Video uses
+`vae_patch_parallel_size` equal to its group size; audio uses 1. The validator
+rejects inconsistent groups and overlap unless explicitly permitted.
+
+Each decoder uses the existing `enable_distributed_layerwise_offload` option.
+Set it independently on stages 2 and 3; keep DiT offload and precision fixed
+when comparing deployments. Report latency on the same total device pool:
+removing video ranks may offset the benefit of concurrent audio. Current
+functional tests do not establish a speedup or long-run stability for every
+partition.
