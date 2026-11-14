@@ -33,7 +33,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.interface import supports_chunked_vae_decode
-from vllm_omni.diffusion.utils.media_utils import ChunkedMP4Encoder
+from vllm_omni.diffusion.utils.ffmpeg_encoder import make_chunked_video_encoder
 
 logger = init_logger(__name__)
 
@@ -370,6 +370,9 @@ class ChunkedVideoMP4Session:
         transfer_slots: int = 2,
         max_pending_bytes: int | None = _DEFAULT_MAX_PENDING_BYTES,
         skip_frames: int = 0,
+        encoder_backend: str = "pyav",
+        num_segments: int = 0,
+        segment_ratio: str | None = None,
     ) -> None:
         if batch_frames <= 0:
             raise ValueError("batch_frames must be positive")
@@ -388,8 +391,11 @@ class ChunkedVideoMP4Session:
         self._skip_frames = skip_frames
         self._transfer_slots = transfer_slots
         self._max_pending_bytes = max_pending_bytes
-        self._encoders: list[ChunkedMP4Encoder] = []
+        self._encoders: list[Any] = []
         self._output_shape: tuple[int, int, int] | None = None
+        self._encoder_backend = encoder_backend
+        self._num_segments = num_segments
+        self._segment_ratio = segment_ratio
         self._pending: list[torch.Tensor] = []
         self._pending_frames = 0
         self._ring: PinnedChunkRing | None = None
@@ -408,7 +414,8 @@ class ChunkedVideoMP4Session:
         try:
             for waveform in waveforms:
                 self._encoders.append(
-                    ChunkedMP4Encoder(
+                    make_chunked_video_encoder(
+                        self._encoder_backend,
                         width=width,
                         height=height,
                         fps=self._fps,
@@ -416,6 +423,8 @@ class ChunkedVideoMP4Session:
                         audio_sample_rate=self._audio_sample_rate,
                         max_pending=self._max_pending,
                         video_codec_options=self._video_codec_options,
+                        num_segments=self._num_segments,
+                        segment_ratio=self._segment_ratio,
                     )
                 )
         except BaseException:
