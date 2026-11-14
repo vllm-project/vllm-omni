@@ -336,15 +336,18 @@ class _AutoDenoiseProfilerPipeline(DiffusionPipelineProfilerMixin):
     def forward(self):
         return None
 
-    def denoise_step(self):
+    # Signature matches the pipeline protocol so the override type-checks; the
+    # profiler calls it without arguments.
+    def denoise_step(self, input_batch=None, **kwargs):
+        del input_batch, kwargs
         return "ok"
 
 
 class _InterruptingStepPipeline(_StepPipeline):
     interrupt = True
 
-    def denoise_step(self, state, **kwargs):
-        del state, kwargs
+    def denoise_step(self, input_batch, **kwargs):
+        del input_batch, kwargs
         self.denoise_calls += 1
         return None
 
@@ -1408,6 +1411,8 @@ class TestRunner:
         kv_payload = object()
 
         class _CapturingStepPipeline(_StepPipeline):
+            device: torch.device
+
             def prepare_encode(self, state, **kwargs):
                 captured["past_key_values"] = getattr(state.sampling, "past_key_values", None)
                 return super().prepare_encode(state, **kwargs)
