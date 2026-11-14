@@ -111,6 +111,7 @@ def pack_local_shard(
     manifest: PartManifest,
     *,
     allocator: PinnedAllocator | None = None,
+    source_transform: Callable[[str, torch.Tensor], torch.Tensor] | None = None,
 ) -> dict[torch.dtype, torch.Tensor]:
     def _cpu_empty(numel: int, dtype: torch.dtype) -> torch.Tensor:
         return torch.empty(numel, dtype=dtype, device="cpu")
@@ -136,7 +137,12 @@ def pack_local_shard(
                     continue
                 # Materialize only once per tensor, and only when this rank needs it.
                 if source is None:
-                    source = flatten_physical_storage(sources[tensor_meta.name], tensor_meta.numel)
+                    tensor = sources[tensor_meta.name]
+                    source = (
+                        source_transform(tensor_meta.name, tensor)
+                        if source_transform is not None
+                        else flatten_physical_storage(tensor, tensor_meta.numel)
+                    )
                 count = overlap_end - overlap_begin
                 dst = chunk.cpu_offset + overlap_begin - begin
                 local[dst : dst + count].copy_(

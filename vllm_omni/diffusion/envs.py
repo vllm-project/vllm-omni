@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     CUDA_HOME: str | None = None
     LOCAL_RANK: int = 0
     VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS: str | None = None
+    VLLM_OMNI_NPU_INT8_WEIGHT_NZ: bool = False
+    VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE: str = "reactor"
     VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -35,6 +37,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "0" = always fuse; unset = each consumer's own measured default. Raw
     # string or None; validated by fused_qk_norm_rope_min_tokens().
     "VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS": lambda: os.environ.get("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", None),
+    # Opt in to FRACTAL_NZ storage for NPU INT8 linear weights.
+    "VLLM_OMNI_NPU_INT8_WEIGHT_NZ": lambda: (
+        os.environ.get("VLLM_OMNI_NPU_INT8_WEIGHT_NZ", "0").strip().lower() in ("1", "true", "yes", "on")
+    ),
+    # Select the DLO upload path; validated by get_weight_nz_mode().
+    "VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE": lambda: os.environ.get("VLLM_OMNI_NPU_INT8_WEIGHT_NZ_MODE", "reactor"),
     # On ROCm, run the shared diffusion RMSNorm and SiluAndMul in PyTorch instead
     # of vLLM's precompiled kernels. Opt-in for runtimes whose vLLM build lacks
     # kernels for the GPU arch (hipErrorInvalidImage); off by default.
