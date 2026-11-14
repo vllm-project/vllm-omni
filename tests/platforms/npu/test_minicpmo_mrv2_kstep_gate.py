@@ -90,7 +90,7 @@ def test_span_info_count_mismatch_raises():
 
 
 def test_gate_passes_to_frame_loop(monkeypatch):
-    import vllm_omni.platforms.npu.worker.talker_multiframe as multiframe
+    from vllm_omni.worker import talker_multiframe as multiframe
 
     seen = {}
 

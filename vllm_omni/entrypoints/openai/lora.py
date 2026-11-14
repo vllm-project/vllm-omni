@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from vllm_omni.entrypoints.openai.utils import parse_lora_request
+from vllm_omni.entrypoints.openai.utils import parse_lora_request, parse_lora_requests
 
 
 def _get_lora_from_json_str(lora_body):
@@ -22,8 +22,8 @@ def _get_lora_from_json_str(lora_body):
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid LoRA JSON string")
 
-    if not isinstance(lora_dict, dict):
-        raise HTTPException(status_code=400, detail="LoRA must be a JSON object")
+    if not isinstance(lora_dict, (dict, list)):
+        raise HTTPException(status_code=400, detail="LoRA must be a JSON object or an array of objects")
 
     return lora_dict
 
@@ -31,6 +31,16 @@ def _get_lora_from_json_str(lora_body):
 def _parse_lora_request(lora_body: dict[str, Any]):
     try:
         return parse_lora_request(lora_body)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=str(e),
+        ) from e
+
+
+def _parse_lora_requests(lora_body: Any):
+    try:
+        return parse_lora_requests(lora_body)
     except ValueError as e:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,

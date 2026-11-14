@@ -244,8 +244,10 @@ def _sink_pipeline_worker(
             def __init__(self):
                 self.device = device
                 self.clean_calls = 0
-                self.stash = {}
                 self.completed = {}
+
+            def compatibility_key(self, cell):
+                return cell
 
             def activation_spec(self, *, batch, include_hidden):
                 if not fixed_shape:
@@ -255,14 +257,13 @@ def _sink_pipeline_worker(
                     schema.append(("hidden_states", (batch,), torch.float32))
                 return schema
 
-            def stash_activation(self, payload, *, handles=None, meta=None):
-                self.stash[meta[1:]] = payload
-
-            def forward(self, tasks, kv_contexts, *, hidden):
-                _req, cell = tasks[0]
+            def forward(self, batch, members, *, member_inputs):
+                del members
+                m0 = batch.members[0]
+                cell = (m0.chunk, m0.step, m0.block)
                 chunk, step, block = cell
                 self.clean_calls += int(step == steps)
-                payload = hidden if isinstance(hidden, dict) else self.stash.pop((chunk, step), None)
+                payload = member_inputs[0] if member_inputs else None
                 if block == 0:
                     if step > 0:
                         assert payload is not None, "step input must come from the executor or transport"
@@ -273,7 +274,7 @@ def _sink_pipeline_worker(
                     assert payload is not None
                     value = payload["hidden_states"]
                 torch.testing.assert_close(value, torch.tensor([inputs[cell]], device=device), rtol=1e-5, atol=1e-5)
-                context = kv_contexts[0][0]
+                context = batch.kv_views[0]
                 n = context.seq_len - 1
                 table = context.block_table[0, :n].long()
                 past = context.key_pool[table].sum() if n else torch.tensor(0.0, device=device)
@@ -299,7 +300,7 @@ def _sink_pipeline_worker(
             spec=CellRunSpec(topology=CellTopology(steps, groups), rank=rank, pp_group=pp), kv=state
         )
         ctx.enqueue("A", plan, chunk_tokens=1)
-        run_cell_pipeline(ctx=ctx, adapter=adapter)
+        run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
         assert state.resident_versions == 0
         assert bool(fixed_calls) == fixed_shape
         expected_clean = sum(

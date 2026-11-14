@@ -1167,23 +1167,31 @@ def test_hy_nomas_rejects_conflicting_frame_count_and_model_duration():
         normalize_request(engine.captured_prompt, engine.captured_sampling_params_list[0])
 
 
-def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
-    """Kandinsky 6 publishes Pro-geometry defaults (480x864, 125 frames, 50
-    steps) but is not a fixed-duration model: an explicit ``num_frames``
-    must be honoured rather than rejected."""
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers",
+        "kandinskylab/Kandinsky-6.0-Lite-distill-5s-Diffusers",
+        "kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers",
+    ],
+)
+def test_kandinsky6_serving_defers_checkpoint_defaults_and_preserves_explicit_values(model_name):
+    """The model resolves omitted settings from its checkpoint; explicit values survive serving."""
     engine = FakeAsyncOmni()
     engine.model_class_name = "Kandinsky6TI2VAPipeline"
     handler = OmniOpenAIServingVideo.for_diffusion(
         diffusion_engine=engine,
-        model_name="kandinsky6-bundle",
+        model_name=model_name,
     )
 
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A dog runs on a beach"), "defaults"))
     assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
-    assert (sampling.width, sampling.height) == (864, 480)
-    assert sampling.num_frames == 125
-    assert sampling.num_inference_steps == 50
+    assert (sampling.width, sampling.height) == (None, None)
+    # The generic image-model sentinel is resolved to the checkpoint's video
+    # length by Kandinsky6TI2VAPipeline._resolve_generation_settings().
+    assert sampling.num_frames == 1
+    assert sampling.num_inference_steps is None
     assert sampling.fps == 24.0
 
     asyncio.run(
