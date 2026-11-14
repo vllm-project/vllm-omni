@@ -14,6 +14,7 @@ from vllm_omni.quantization import build_quant_config
 from vllm_omni.quantization.convrot_config import (
     ConvRotInt4OnlineLinearMethod,
     ConvRotInt8OnlineLinearMethod,
+    NPUConvRotInt8OnlineLinearMethod,
     pack_int4,
     quantize_int4,
     regular_hadamard,
@@ -125,6 +126,26 @@ def test_layers_route_to_int4_int8_or_unquantized(mocker: MockerFixture, monkeyp
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
     with pytest.raises(NotImplementedError, match="CUDA"):
         config.get_quant_method(layer, "blocks.0.ff.net.2")
+
+
+def test_int8_routes_to_the_npu_kernel_method_on_ascend(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
+    """Rotated INT8 reuses the shared INT8 kernels, so Ascend selects its own method class."""
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    mocker.patch.object(NPUConvRotInt8OnlineLinearMethod, "__init__", lambda self, quant_config: None)
+    layer = mocker.Mock(spec=LinearBase)
+
+    assert isinstance(
+        build_quant_config("convrot_int8").get_quant_method(layer, "blocks.0.ff.net.2"),
+        NPUConvRotInt8OnlineLinearMethod,
+    )
+    # The INT8 slice of a convrot_int4 config lands on the same NPU method.
+    int8_slice = build_quant_config({"method": "convrot_int4", "int8_layers": ["attn.to_out"]})
+    assert isinstance(int8_slice.get_quant_method(layer, "blocks.0.attn.to_out"), NPUConvRotInt8OnlineLinearMethod)
+
+    # convrot_int4 has no NPU kernel and stays CUDA-only.
+    with pytest.raises(NotImplementedError, match="INT4"):
+        build_quant_config("convrot_int4").get_quant_method(layer, "blocks.0.ff.net.2")
 
 
 @cuda_available

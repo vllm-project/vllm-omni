@@ -44,6 +44,7 @@ from vllm_omni.quantization.int8_config import (
     DiffusionInt8Config,
     Int8OnlineLinearMethod,
     LazyWeightMixin,
+    NPUInt8OnlineLinearMethod,
 )
 
 if TYPE_CHECKING:
@@ -208,10 +209,16 @@ class DiffusionConvRotConfig(QuantizationConfig):
             return None
         if self._matches(prefix, self.ignored_layers):
             return UnquantizedLinearMethod()
-        if not current_omni_platform.is_cuda():
-            raise NotImplementedError("ConvRot quantization currently runs on CUDA only.")
         if self.weight_bits == 8 or self._matches(prefix, self.int8_layers):
-            return ConvRotInt8OnlineLinearMethod(self)
+            # Rotated INT8 reuses the shared INT8 kernels, so each platform keeps the
+            # method that binds the rotation to its own kernel implementation.
+            if current_omni_platform.is_cuda():
+                return ConvRotInt8OnlineLinearMethod(self)
+            if current_omni_platform.is_npu():
+                return NPUConvRotInt8OnlineLinearMethod(self)
+            raise NotImplementedError("ConvRot INT8 quantization runs on CUDA and Ascend NPU only.")
+        if not current_omni_platform.is_cuda():
+            raise NotImplementedError("ConvRot INT4 quantization currently runs on CUDA only.")
         return ConvRotInt4OnlineLinearMethod(self)
 
 
@@ -231,12 +238,10 @@ class DiffusionConvRotInt4Config(DiffusionConvRotConfig):
         return "convrot_int4"  # type: ignore[return-value]
 
 
-class ConvRotInt8OnlineLinearMethod(Int8OnlineLinearMethod):
-    """Rotated W8A8: per-output-channel INT8 weights and dynamic per-token INT8 activations."""
+class _ConvRotInt8Mixin:
+    """Rotation half of rotated W8A8; the base class supplies the INT8 kernels."""
 
-    def __init__(self, quant_config: DiffusionConvRotConfig):
-        super().__init__(quant_config._int8)
-        self.rotation_group_size = quant_config.rotation_group_size
+    rotation_group_size: int
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
@@ -245,9 +250,25 @@ class ConvRotInt8OnlineLinearMethod(Int8OnlineLinearMethod):
         super().process_weights_after_loading(layer)
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-        if layer.convrot_hadamard is not None:
+        if getattr(layer, "convrot_hadamard", None) is not None:
             x = rotate(x, layer.convrot_hadamard)
         return super().apply(layer, x, bias)
+
+
+class ConvRotInt8OnlineLinearMethod(_ConvRotInt8Mixin, Int8OnlineLinearMethod):
+    """Rotated W8A8: per-output-channel INT8 weights and dynamic per-token INT8 activations."""
+
+    def __init__(self, quant_config: DiffusionConvRotConfig):
+        super().__init__(quant_config._int8)
+        self.rotation_group_size = quant_config.rotation_group_size
+
+
+class NPUConvRotInt8OnlineLinearMethod(_ConvRotInt8Mixin, NPUInt8OnlineLinearMethod):
+    """Rotated W8A8 on Ascend NPU; identical math, NPU INT8 kernels behind the base class."""
+
+    def __init__(self, quant_config: DiffusionConvRotConfig):
+        super().__init__(quant_config._int8)
+        self.rotation_group_size = quant_config.rotation_group_size
 
 
 class ConvRotInt4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
