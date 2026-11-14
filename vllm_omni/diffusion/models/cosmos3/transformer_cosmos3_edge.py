@@ -15,13 +15,13 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
+from vllm_omni.diffusion.models.cosmos3.rope import Cosmos3RotaryEmbedding
 from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
 
 from .transformer_cosmos3 import (
     Cosmos3VFMTransformer,
     Qwen3VLTextRotaryEmbedding,
     RMSNorm,
-    _apply_rotary_pos_emb,
     _nested_get,
     _tf_config_get,
 )
@@ -147,6 +147,7 @@ class Cosmos3EdgeCausalAttention(nn.Module):
         )
 
         self.k_norm_und_for_gen = RMSNorm(self.head_dim, eps=rms_norm_eps) if use_und_k_norm_for_gen else None
+        self.rotary_embedding = Cosmos3RotaryEmbedding()
         self.attn = FrameworkAttention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
@@ -168,7 +169,7 @@ class Cosmos3EdgeCausalAttention(nn.Module):
         k = self.to_k(hidden_states).view(B, S, self.num_kv_heads_local, self.head_dim)
         v = self.to_v(hidden_states).view(B, S, self.num_kv_heads_local, self.head_dim)
 
-        q_reasoner, k_reasoner = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
+        q_reasoner, k_reasoner = self.rotary_embedding(q, k, freqs_cos, freqs_sin)
 
         if self.k_norm_und_for_gen is not None:
             k_gen = F.rms_norm(
@@ -177,7 +178,7 @@ class Cosmos3EdgeCausalAttention(nn.Module):
                 self.k_norm_und_for_gen.weight,
                 eps=self.k_norm_und_for_gen.variance_epsilon,
             )
-            _, k_gen = _apply_rotary_pos_emb(q, k_gen, freqs_cos, freqs_sin)
+            _, k_gen = self.rotary_embedding(q, k_gen, freqs_cos, freqs_sin)
         else:
             k_gen = k_reasoner
 
