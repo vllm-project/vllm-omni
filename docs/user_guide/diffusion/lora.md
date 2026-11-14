@@ -134,6 +134,8 @@ For Qwen-Image and Wan pipelines, the distill backend calls `pipeline.load_lora_
 | `Wan22Pipeline` | `lightx2v/Wan2.1-Distill-Loras`, `lightx2v/Wan2.2-Distill-Loras` | Wan2.1 uses one LoRA file. For dual-transformer Wan2.2 MoE, pass high-noise then low-noise LoRA files. |
 | `Wan22I2VPipeline` | `lightx2v/Wan2.2-Distill-Loras` | For dual-transformer Wan2.2 MoE, pass high-noise then low-noise LoRA files. |
 
+The distill backend fuses into unquantized weights only. Startup fails with a `ValueError` when an adapter targets a weight that quantization has already converted (for example online `int8` or `fp8`).
+
 Other diffusion pipelines are not currently listed as supporting distilled LoRA. Use the PEFT backend for request-time adapters, or bake converted weights into a local Diffusers directory before serving.
 
 Single-file example (Qwen-Image-Lightning):

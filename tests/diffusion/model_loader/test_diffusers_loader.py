@@ -315,6 +315,67 @@ def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot(lora_scale, shou
         warning.assert_not_called()
 
 
+def test_maybe_fuse_distilled_lora_rejects_online_int8_weights(mock_tp_group, mocker, tmp_path: Path):
+    """Distilled LoRA is fused after load_weights. Online INT8 has already replaced
+    the weight with int8 (K, N) data by then, so B @ A must not be added to it."""
+    import vllm_omni.quantization.int8_config as int8_config
+    from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
+
+    kernel = MagicMock()
+    kernel.layer_param_names = ("weight", "weight_scale", "input_scale", "input_zero_point", "azp_adj")
+    mocker.patch.object(int8_config, "init_int8_linear_kernel", return_value=kernel)
+
+    def scaled_int8_quant(weight, scale=None):
+        scale = weight.float().abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / 127
+        return torch.round(weight.float() / scale).to(torch.int8), scale, None
+
+    mocker.patch.object(int8_config.ops, "scaled_int8_quant", side_effect=scaled_int8_quant)
+
+    def copy_loader(param, loaded_weight, *args, **kwargs):
+        param.data.copy_(loaded_weight)
+
+    # Square layer: the (K, N) int8 weight has the same shape as the (N, K) delta,
+    # so without the check the merge silently truncates the delta instead of failing.
+    features = 8
+    method = int8_config.Int8OnlineLinearMethod(int8_config.DiffusionInt8Config())
+    proj = nn.Module()
+    proj.quant_method = method
+    method.create_weights(proj, features, [features], features, features, torch.bfloat16, weight_loader=copy_loader)
+    proj.weight.weight_loader(proj.weight, torch.randn(features, features, dtype=torch.bfloat16))
+    assert proj.weight.dtype == torch.int8
+
+    class _Pipeline(nn.Module, QwenImageLoraLoaderMixin):
+        def __init__(self):
+            super().__init__()
+            self.transformer = nn.Module()
+            self.transformer.proj = proj
+
+    lora_path = tmp_path / "distill.safetensors"
+    save_file(
+        {
+            "transformer.proj.lora_A.weight": torch.randn(2, features),
+            "transformer.proj.lora_B.weight": torch.randn(features, 2),
+        },
+        str(lora_path),
+    )
+    od_config = OmniDiffusionConfig(
+        model="",
+        dtype=torch.bfloat16,
+        lora_backend=LoRABackend.DISTILL,
+        lora_path=str(lora_path),
+        lora_scale=1.0,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = _Pipeline()
+    weight_before = proj.weight.detach().clone()
+
+    with pytest.raises(ValueError, match=r"transformer\.proj\.weight"):
+        loader._maybe_fuse_distilled_lora(model)
+
+    assert torch.equal(proj.weight, weight_before)
+    assert model.lora_is_fused is False
+
+
 def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_path: Path, monkeypatch):
     from vllm_omni.diffusion.model_loader import diffusers_loader as loader_module
 
