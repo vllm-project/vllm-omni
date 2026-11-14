@@ -266,7 +266,7 @@ class JoyAIDataPlane(DuplexDataPlane):
                     # The call is one result of its own: the recognised call
                     # short-circuits the rest of this output, so a spoken note
                     # is projected separately and may still enter TTS.
-                    yield from self._project_delegation(observation, action, event, context)
+                    yield from self._project_delegation(observation, action, event, context, finished=finished)
                     continue
                 if observation.text_sent:
                     continue
@@ -430,47 +430,67 @@ class JoyAIDataPlane(DuplexDataPlane):
         action: ParsedAction,
         event: dict[str, object],
         context: DuplexDataPlaneContext,
+        *,
+        finished: bool,
     ) -> Iterator[dict[str, object]]:
-        """Project one delegated action as a call plus, at most, its spoken note.
+        """Project a delegated action as streamed note deltas, then one call.
 
-        A recognised call short-circuits the rest of the output, so the call
-        result carries the whole output's ``end_of_turn``: nothing else of this
-        output will carry it. The note is the ordinary spoken reply that
-        follows, so it carries the text of its own response whenever the audio
-        stage is going to render it. A delegation without a note still owes the
-        observation a terminal of its own: the call is published, but the shared
-        call handler returns before the response lifecycle runs, so an empty
-        terminal releases the request instead of leaving it open.
+        ``</delegation>`` can appear before the question is finished. Publishing
+        the call then would set ``call_sent`` on an empty or partial question,
+        so later tokens never reach the solver. Mid-generation only the spoken
+        note is shown; the call is published at finish. The shared call handler
+        returns before the response lifecycle, so a note-free call still owes
+        the observation an empty terminal.
         """
+        spoken = action.text or ""
+        emitted = observation.text_emitted
+        delta = spoken[len(emitted) :] if spoken.startswith(emitted) else spoken
+        audio = "audio" in context.modalities
+
+        def spoken_note() -> dict[str, object]:
+            item = dict(event)
+            item.update(
+                text=delta,
+                model_context_text=spoken,
+                # The call already ended the turn; only a text-only observation
+                # has no audio stage left to produce the terminal.
+                end_of_turn=not audio,
+                # Without this the session would commit the note as spoken history
+                # when its audio never completed, e.g. a cancel between projection
+                # and the first Code2Wav output.
+                text_requires_complete_audio=audio,
+                # A note that ends the turn here skips the Talker: free the prewarmed Code2Wav request.
+                abort_data_plane_request=not audio,
+            )
+            return item
+
+        if not finished:
+            if observation.call_sent or not delta:
+                return
+            observation.text_emitted = spoken
+            observation.response_text = spoken
+            note_event = dict(event)
+            note_event.update(
+                text=delta,
+                end_of_turn=False,
+                text_requires_complete_audio=audio,
+                abort_data_plane_request=False,
+            )
+            yield note_event
+            return
         if observation.call_sent:
             return
-        already_spoke = bool(observation.text_emitted)
-        audio = "audio" in context.modalities
-        call_event = dict(event)
-        note_event = dict(event)
-        note_event.update(
-            text=action.text,
-            model_context_text=action.text,
-            # The call already ended the turn; only a text-only observation
-            # has no audio stage left to produce the terminal.
-            end_of_turn=not audio,
-            # Without this the session would commit the note as spoken history
-            # when its audio never completed, e.g. a cancel between projection
-            # and the first Code2Wav output.
-            text_requires_complete_audio=audio,
-            # A note that ends the turn here skips the Talker: free the prewarmed Code2Wav request.
-            abort_data_plane_request=not audio,
-        )
         arguments = delegation_arguments(action)
         observation.call_sent = True
-        call_event["end_of_turn"] = True
+        observation.text_sent = True
+        observation.response_text = spoken
+        if delta:
+            observation.text_emitted = spoken
         if arguments is None:
             # Nothing to hand over: the note is an ordinary observation and no
             # call is exposed.
-            observation.text_sent = True
-            if already_spoke:
-                return
-            if not action.text:
+            if not spoken:
+                note_event = dict(event)
                 note_event.update(
                     text="",
                     model_context_text="",
@@ -478,21 +498,24 @@ class JoyAIDataPlane(DuplexDataPlane):
                     text_requires_complete_audio=False,
                     abort_data_plane_request=True,
                 )
-            yield note_event
+                yield note_event
+                return
+            if not delta:
+                return
+            yield spoken_note()
             return
-        observation.text_sent = True
-        observation.response_text = action.text
+        call_event = dict(event)
+        call_event["end_of_turn"] = True
         call_event["joyai_function_call"] = {
             "call_id": f"call_{uuid.uuid4().hex}",
             "name": DELEGATION_TOOL_NAME,
             "arguments": arguments,
         }
         yield call_event
-        if action.text and not already_spoke:
-            observation.text_emitted = action.text
-            yield note_event
+        if delta:
+            yield spoken_note()
             return
-        if already_spoke:
+        if spoken:
             return
         # A note-free call still ends its observation. The call result above is
         # published, but nothing else of this output will produce a terminal.
