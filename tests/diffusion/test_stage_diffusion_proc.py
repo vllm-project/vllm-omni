@@ -479,14 +479,14 @@ async def test_real_executor_rpc_finishes_before_cancellation() -> None:
     started = threading.Event()
     release = threading.Event()
 
-    def blocking_profile(*_args):
+    def blocking_rpc(*_args):
         started.set()
         assert release.wait(timeout=5)
 
     proc = object.__new__(StageDiffusionProc)
-    proc._engine = SimpleNamespace(profile=blocking_profile)
+    proc._engine = SimpleNamespace(collective_rpc=blocking_rpc)
     proc._executor = ThreadPoolExecutor(max_workers=1)
-    task = asyncio.create_task(proc._handle_collective_rpc("profile", None, (True, None), {}))
+    task = asyncio.create_task(proc._handle_collective_rpc("list_loras", None, (), {}))
     try:
         assert await asyncio.to_thread(started.wait, 1)
         task.cancel()
@@ -499,6 +499,35 @@ async def test_real_executor_rpc_finishes_before_cancellation() -> None:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
         proc._executor.shutdown(wait=True, cancel_futures=True)
+
+
+@pytest.mark.asyncio
+async def test_profile_rpc_finishes_before_cancellation() -> None:
+    """Cancelling a profile RPC must wait for the busy-loop profile call."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = []
+
+    async def async_profile(is_start, profile_prefix):
+        started.set()
+        await release.wait()
+        finished.append((is_start, profile_prefix))
+
+    proc = object.__new__(StageDiffusionProc)
+    proc._engine = SimpleNamespace(async_profile=async_profile)
+    task = asyncio.create_task(proc._handle_collective_rpc("profile", None, (False,), {}))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "cancellation must wait for the in-flight profile RPC"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        assert finished == [(False, None)]
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
