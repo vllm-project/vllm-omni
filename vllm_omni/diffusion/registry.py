@@ -184,6 +184,11 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2_i2v",
         "Wan22I2VPipeline",
     ),
+    "BoundlessWorldModelPipeline": (
+        "bwm",
+        "pipeline_bwm",
+        "BoundlessWorldModelPipeline",
+    ),
     "WanS2VPipeline": (
         "wan2_2",
         "pipeline_wan2_2_s2v",
@@ -810,6 +815,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "StableAudio3Pipeline": "get_stable_audio_3_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
+    "BoundlessWorldModelPipeline": "get_bwm_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
