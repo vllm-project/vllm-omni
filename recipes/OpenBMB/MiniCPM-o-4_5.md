@@ -70,6 +70,33 @@ Code2Wav consumes them through a shared-memory async connector.
 | 3-GPU | GPU 0 | GPU 1 | GPU 2 | 3x GPU |
 | 8x RTX 4090 24GB | GPU 0–3 (TP=4) | GPU 4 | GPU 5 | 8x RTX 4090 consumer |
 
+### Default model runner
+
+The default CUDA deployment runs all three stages on Model Runner V2. The
+Talker uses FlashAttention and decodes up to eight codec frames per K-step.
+`minicpmo_4_5_turn.yaml` inherits these settings for ordinary HTTP serving.
+
+CUDA turn serving enables Thinker prefix caching and passes the completed
+Thinker payload to the Talker. The Talker streams codec chunks to Code2Wav.
+MRv2 restores cached latent rows and their token and position metadata
+together. CUDA duplex and the NPU, ROCm, XPU and MUSA profiles disable Thinker
+prefix caching. To select V1 on CUDA, set `platforms.cuda.model_runner: v1`
+in a custom deployment overlay.
+
+Stage-0 speculative decoding (including n-gram) cannot be combined with the
+stage-output prefix cache. Existing CUDA turn overlays that enable speculation
+must also set stage 0 `enable_prefix_caching: false` under `platforms.cuda`;
+otherwise initialization raises an error asking to disable prefix caching.
+Setting it only at stage level does not override an explicit platform entry.
+
+The output cache also needs host RAM: its persistent CPU mirror has the same
+number of blocks as the Thinker KV pool, with no independent block limit.
+It stores hidden states, `latent`, token ids and positions. Temporary GPU rows
+awaiting a host copy use a 512 MiB flush threshold, not a hard allocation cap.
+The H200 turn profile's 4 GiB Talker KV reservation does not budget these buffers.
+See [cache memory sizing](../../docs/design/minicpm_o45_mrv2_performance.md#turn-prefix-cache-memory)
+before enabling large Thinker KV pools or increasing concurrency.
+
 ### Migration from the fused deployment
 
 MiniCPM-o 4.5 now requires the three-stage topology: the Talker owns

@@ -12,13 +12,25 @@ from __future__ import annotations
 import queue
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
+
+_DECODE_DRAIN_TIMEOUT_S = 5.0
+
+
+def _drain_latent_work(work: Any) -> None:
+    """Do not reuse a transport whose cancelled latent transfer cannot drain."""
+    try:
+        if work.wait(timeout=timedelta(seconds=_DECODE_DRAIN_TIMEOUT_S)) is False:
+            raise TimeoutError("Latent transfer did not complete")
+    except Exception as exc:
+        raise SystemExit("Cancelled latent transport did not drain; stop the Worker") from exc
 
 
 def _rescale_latents(vae: Any, latent: torch.Tensor) -> torch.Tensor:
@@ -57,7 +69,14 @@ class AsyncStreamDecodeJob:
 
     on_finished: Callable[[int, torch.Tensor], None] | None
     join: Callable[[], torch.Tensor | None]
-    _send_works: list = field(default_factory=list)
+    _cancel: Callable[[], None] | None = None
+
+    def cancel(self) -> None:
+        """Stop side threads when the request is aborted before ``join()``."""
+        cancel = self._cancel
+        self._cancel = None
+        if cancel is not None:
+            cancel()
 
 
 def start_async_stream_decode(
@@ -72,12 +91,16 @@ def start_async_stream_decode(
     source_rank: int | None,
     pp_group: Any,
     stream_group: Any,
+    decode_tag: int = 0,
 ) -> AsyncStreamDecodeJob:
     """Wire producer (final denoise) → consumer (VAE owner) without blocking DiT.
 
     * Producer ``on_finished``: async D2H + queue; a send thread waits the copy
       then ``isend`` (or local queue for S=1 single-rank layer PP, G=1).
     * Consumer thread: ``irecv``/queue → rescale → ``decode_chunk``.
+    * ``decode_tag`` identifies the member within the fixed execution wave on
+      every rank. Per-tag FIFO keeps its chunks ordered while other members
+      send concurrently. All jobs retire before the next wave reuses tags.
     * ``join()`` waits side threads and returns concatenated pixels on owner,
       else ``None``.
     """
@@ -97,6 +120,8 @@ def start_async_stream_decode(
     if pp_rank == source_rank:
         send_q: queue.Queue = queue.Queue()
         stop = object()
+        cancelled = threading.Event()
+        send_errors: list[Exception] = []
 
         def _sender() -> None:
             while True:
@@ -104,10 +129,16 @@ def start_async_stream_decode(
                 if item is stop:
                     break
                 _chunk, host, event = item
-                if event is not None:
-                    event.synchronize()
-                work = dist.isend(host, dst=owner, group=stream_group)
-                send_works.append((host, work))
+                try:
+                    if event is not None:
+                        event.synchronize()
+                    if cancelled.is_set():
+                        continue
+                    work = dist.isend(host, dst=owner, group=stream_group, tag=decode_tag)
+                    send_works.append((host, work))
+                except Exception as exc:
+                    send_errors.append(exc)
+                    return
 
         sender_thread = threading.Thread(target=_sender, name="causvid-latent-send", daemon=True)
         sender_thread.start()
@@ -119,19 +150,41 @@ def start_async_stream_decode(
         def join() -> torch.Tensor | None:
             send_q.put(stop)
             sender_thread.join()
+            if send_errors:
+                raise SystemExit("Latent sender failed; stop the Worker") from send_errors[0]
             for _host, work in send_works:
                 work.wait()
             return None
 
-        return AsyncStreamDecodeJob(on_finished=on_finished, join=join, _send_works=send_works)
+        def cancel() -> None:
+            cancelled.set()
+            send_q.put(stop)
+            sender_thread.join(timeout=_DECODE_DRAIN_TIMEOUT_S)
+            if sender_thread.is_alive() or send_errors:
+                raise SystemExit("Latent sender did not stop cleanly; stop the Worker")
+            # Complete this member's posted receives; the owner discards fillers
+            # while cancelling. The sender has exited, so the count is stable.
+            for _host, work in send_works:
+                _drain_latent_work(work)
+            if len(send_works) < n_chunks:
+                filler = torch.zeros(latent_shape, device="cpu", dtype=dtype)
+                for _ in range(n_chunks - len(send_works)):
+                    try:
+                        work = dist.isend(filler, dst=owner, group=stream_group, tag=decode_tag)
+                    except Exception as exc:
+                        raise SystemExit("Cancelled latent send failed; stop the Worker") from exc
+                    _drain_latent_work(work)
+
+        return AsyncStreamDecodeJob(on_finished=on_finished, join=join, _cancel=cancel)
 
     if pp_rank == 0:
         if vae is None or decoder is None:
             raise ValueError("VAE owner requires VAE + WanStreamingDecoder for stream_decode")
         buffers = [torch.empty(latent_shape, device="cpu", dtype=dtype, pin_memory=True) for _ in range(n_chunks)]
-        recv_works = [dist.irecv(buf, src=source, group=stream_group) for buf in buffers]
+        recv_works = [dist.irecv(buf, src=source, group=stream_group, tag=decode_tag) for buf in buffers]
         pixels_out: list[torch.Tensor] = []
         error: list[BaseException] = []
+        cancelled = threading.Event()
 
         def _consumer() -> None:
             assert decoder is not None and vae is not None
@@ -139,12 +192,13 @@ def start_async_stream_decode(
             try:
                 for buf, work in zip(buffers, recv_works):
                     work.wait()
+                    if cancelled.is_set():
+                        continue
                     scaled = _rescale_latents(vae, buf)
                     pixels_out.append(decoder.decode_chunk(scaled, state).clamp(-1, 1))
             except BaseException as exc:  # noqa: BLE001
                 error.append(exc)
-                decoder.release(state)
-            else:
+            finally:
                 decoder.release(state)
 
         thread = threading.Thread(target=_consumer, name="causvid-stream-decode", daemon=True)
@@ -158,12 +212,20 @@ def start_async_stream_decode(
                 return None
             return torch.cat(pixels_out, dim=2)
 
-        return AsyncStreamDecodeJob(on_finished=None, join=join, _send_works=send_works)
+        def cancel() -> None:
+            cancelled.set()
+            for work in recv_works:
+                _drain_latent_work(work)
+            thread.join(timeout=_DECODE_DRAIN_TIMEOUT_S)
+            if thread.is_alive():
+                raise SystemExit("Latent decoder did not stop cleanly; stop the Worker")
+
+        return AsyncStreamDecodeJob(on_finished=None, join=join, _cancel=cancel)
 
     def join() -> torch.Tensor | None:
         return None
 
-    return AsyncStreamDecodeJob(on_finished=None, join=join, _send_works=send_works)
+    return AsyncStreamDecodeJob(on_finished=None, join=join)
 
 
 def _start_local(
@@ -198,8 +260,7 @@ def _start_local(
                 pixels_out.append(decoder.decode_chunk(scaled, state).clamp(-1, 1))
         except BaseException as exc:  # noqa: BLE001
             error.append(exc)
-            decoder.release(state)
-        else:
+        finally:
             decoder.release(state)
 
     thread = threading.Thread(target=_consumer, name="causvid-local-stream-decode", daemon=True)
@@ -218,4 +279,10 @@ def _start_local(
             return None
         return torch.cat(pixels_out, dim=2)
 
-    return AsyncStreamDecodeJob(on_finished=on_finished, join=join)
+    def cancel() -> None:
+        latent_q.put(stop)
+        thread.join(timeout=_DECODE_DRAIN_TIMEOUT_S)
+        if thread.is_alive():
+            raise SystemExit("Local latent decoder did not stop; stop the Worker")
+
+    return AsyncStreamDecodeJob(on_finished=on_finished, join=join, _cancel=cancel)

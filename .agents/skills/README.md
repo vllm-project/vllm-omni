@@ -1,10 +1,6 @@
 # Portable MiniMax H3 Skills
 
-This directory contains one general prompt-writing skill and eight creative
-skills adapted from
-[MiniMax-AI/MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills).
-See [H3-SOURCES.md](H3-SOURCES.md) for the source revision, attribution, and
-adaptation scope.
+This directory contains general H3 prompt-writing guidance, eight creative skills adapted from [MiniMax-AI/MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills), and the repository-specific `vllm-omni-h3-character-replacement` skill. See [H3-SOURCES.md](H3-SOURCES.md) for the adapted collection's source revision, attribution and scope.
 
 ## Skill catalog
 
@@ -19,6 +15,7 @@ adaptation scope.
 | [co-op-game-intro-generator](co-op-game-intro-generator/SKILL.md) | Two-player game menus, confirmation images, and animated world entry |
 | [paper-collage-explainer-generator](paper-collage-explainer-generator/SKILL.md) | Halftone photo collage, incremental paper assembly, and visual metaphors |
 | [handdrawn-live-video-generator](handdrawn-live-video-generator/SKILL.md) | Live action with rough luminous drawings, physical contact, continuous morphing, and delayed pursuit |
+| [vllm-omni-h3-character-replacement](vllm-omni-h3-character-replacement/SKILL.md) | Visual segment planning, per-segment replacement prompts and execution through reusable H3-04 ComfyUI workflows |
 
 ## Usage
 
@@ -66,12 +63,14 @@ completely, and its final audio must come from the supplied source rather than a
 model reconstruction.
 
 When moving the collection to another repository or a user-level skill folder,
-copy all nine skill directories and preserve their sibling layout. The eight
+copy the nine upstream-adapted skill directories and preserve their sibling layout. The eight
 creative skills share `h3-prompt-writing/references/portable-workflow.md` and the
 H3 format guides, so copying only one `SKILL.md` is insufficient. Keep each
 skill's `references/` and `agents/` directories with it. `agents/openai.yaml`
 provides optional Codex UI metadata and does not restrict the workflow to an
 OpenAI-based agent or require a dedicated plugin.
+
+The character-replacement skill also depends on repository workflow templates linked from its entrypoint. Preserve those relative paths when relocating it, or update the links for the destination.
 
 ## Execution boundaries
 

@@ -659,8 +659,13 @@ def _validate_latent_edit_inputs(
     source_audio: UploadFile | None,
     video_noise_mask: Any | None,
     audio_noise_mask: Any | None,
+    regenerate: bool = False,
 ) -> bool:
-    """Validate cross-field latent-edit requirements before persisting files."""
+    """Validate cross-field latent-edit requirements before persisting files.
+
+    A MiniMax H3 ``regenerate`` request carries its draft as ``source_video``
+    without masks; the encoder supplies the all-keep mask itself.
+    """
     has_any_input = any(value is not None for value in (source_video, source_audio, video_noise_mask, audio_noise_mask))
     if not has_any_input:
         return False
@@ -669,7 +674,7 @@ def _validate_latent_edit_inputs(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Latent-mask editing is not supported by this model.",
         )
-    if video_noise_mask is None and audio_noise_mask is None:
+    if video_noise_mask is None and audio_noise_mask is None and not (regenerate and source_video is not None):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Latent-mask editing requires at least one of video_noise_mask or audio_noise_mask.",
@@ -1180,6 +1185,16 @@ async def _parse_video_form(
             ),
         )
 
+    parsed_lora = _parse_form_json(lora)
+    if parsed_lora is not None and not (
+        isinstance(parsed_lora, dict)
+        or (isinstance(parsed_lora, list) and all(isinstance(item, dict) for item in parsed_lora))
+    ):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Invalid JSON in form field: expected dict or list of dict, got {type(parsed_lora).__name__}.",
+        )
+
     if model == "auto":
         model = None
     request_data: dict[str, Any] = {
@@ -1214,7 +1229,7 @@ async def _parse_video_form(
         "frame_interpolation_exp": frame_interpolation_exp,
         "frame_interpolation_scale": frame_interpolation_scale,
         "frame_interpolation_model_path": frame_interpolation_model_path,
-        "lora": _parse_form_json(lora, expected_type=dict),
+        "lora": parsed_lora,
         "extra_params": _parse_form_json(extra_params, expected_type=dict),
         "return_stage_metrics": return_stage_metrics,
     }
@@ -1257,6 +1272,7 @@ async def _parse_video_form(
         source_audio=source_audio,
         video_noise_mask=parsed_video_noise_mask,
         audio_noise_mask=parsed_audio_noise_mask,
+        regenerate=(request.extra_params or {}).get("regenerate") is True,
     )
 
     h3_control = handler.is_minimax_h3

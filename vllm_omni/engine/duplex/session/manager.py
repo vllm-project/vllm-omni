@@ -63,6 +63,7 @@ from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, 
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.session.perf_ledger import SessionPerfLedger
 from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider, SmartTurnBackendProvider
+from vllm_omni.engine.duplex.vad_batcher import TurnDetectionBatcher
 from vllm_omni.inputs.data import disable_watermarking
 from vllm_omni.tracing import SessionTrace
 
@@ -155,6 +156,9 @@ class DuplexSessionManager:
         self.semantic_vad_backend_provider = SmartTurnBackendProvider(
             model_path=getattr(runtime_config, "semantic_vad_model_path", None)
         )
+        #: A single thread that runs every session's turn detection, batching Silero
+        #: across sessions; Smart Turn work goes to the session executor.
+        self.turn_detection_batcher = TurnDetectionBatcher(self.executor)
         self.runners: dict[str, DuplexSessionRunner] = {}
         self._outputs: dict[str, DuplexOutputBuffer] = {}
         self._output_failed: set[str] = set()
@@ -1132,6 +1136,7 @@ class DuplexSessionManager:
         self._request_index.clear()
         self._outputs.clear()
         self._output_failed.clear()
+        self.turn_detection_batcher.close()
         if self._owns_executor:
             self.executor.shutdown(wait=False, cancel_futures=True)
 

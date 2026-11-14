@@ -9,6 +9,18 @@ LoRA adapters are lightweight, model-specific fine-tuning weights that can be ap
 - **PEFT backend** (`--lora-backend peft`, default): Loads a PEFT-format adapter folder via `DiffusionLoRAManager`. Adapters are cached (LRU) and activated per request via `LoRARequest`. It uses a unified LoRA handling mechanisms similar to vLLM with LRU cache management.
 - **Distill backend** (`--lora-backend distill`): Calls `pipeline.load_lora_weights` once at initialization to fuse one or more concrete checkpoint files directly into the base weights. Typically used for distilled few-step LoRAs (e.g. Lightning, LightX2V).
 
+### Global merged policy
+
+`--lora-application merged` with `--lora-backend peft` merges a single startup
+`--lora-path` into unquantized dense weights. Requests use the merged policy
+without attaching a `LoRARequest`; per-request adapter selection is rejected.
+Removing the adapter restores the exact base weights. Runtime application is
+the default. Fixed-model adapters, MoE, HSDP and inference weight offloading are
+not supported by this generic path.
+
+For adapter-only RL updates and memory/validation requirements, see
+[engine-side LoRA merge](../weight_transfer.md#engine-side-lora-merge).
+
 ## LoRA Adapter Format
 
 ### PEFT (Parameter-Efficient Fine-Tuning) format (default)
@@ -42,6 +54,36 @@ validation; unsupported module suffixes may already fail during loading.
 Checkpoint-to-engine name mapping is tracked in [#8001](https://github.com/vllm-project/vllm-omni/issues/8001);
 until it is available, adapter keys must resolve to supported engine modules.
 
+## LoRA scale semantics
+
+The request-level `lora_scale` is a multiplier applied on top of the adapter's
+own PEFT scaling, not a replacement for it. The applied weight delta is:
+
+```text
+delta = lora_scale × (lora_alpha / r) × (B @ A)
+```
+
+At load time the `lora_alpha / r` factor is folded into the adapter weights
+(upstream `LoRALayerWeights.optimize`); `lora_scale` is applied when the adapter
+is activated. This is the same convention as diffusers'
+`cross_attention_kwargs={"scale": s}` and LightX2V's `--lora-scale`: to
+reproduce a reference invocation, pass the same numeric value here.
+
+Do **not** pass the already-multiplied effective strength `scale × alpha /
+rank`. That applies `alpha / r` a second time and shrinks the adapter by that
+factor.
+
+!!! example "MiniMax-H3 Turbo"
+    LightX2V's reference script drives
+    `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors` (rank 128,
+    declared `alpha` 8) with `--lora-scale 1.3`, an effective strength of
+    `1.3 × 8 / 128 = 0.08125`. Passing `0.08125` as vLLM-Omni's `lora_scale`
+    yields `0.08125 × 8 / 128 ≈ 0.005` — 1/16 of the intended strength. An
+    8-step distilled sampler running at 1/16 adapter strength produces blurred
+    output. Pass `1.3`, the same number the reference uses. See the
+    [Turbo LoRA table](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#turbo-lora)
+    for the declared `alpha` of every published artifact.
+
 ## Quick Start
 
 ### Offline Inference
@@ -52,6 +94,7 @@ Load a PEFT-format LoRA adapter at initialization. The adapter is pre-loaded int
 
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 
 lora_path = "/path/to/lora_adapter"
@@ -69,11 +112,53 @@ lora_request = LoRARequest(
 )
 
 outputs = omni.generate(
-    prompt="A piece of cheesecake",
-    lora_request=lora_request,
-    lora_scale=2.0, # optional arg, default 1.0
+    "A piece of cheesecake",
+    OmniDiffusionSamplingParams(
+        lora_request=lora_request,
+        lora_scale=2.0,  # optional arg, default 1.0
+    ),
 )
 ```
+
+#### PEFT backend: stacking multiple LoRAs in one request
+
+A single request can activate several LoRA adapters at once, each with its own
+scale. The adapters are composed into a single adapter whose per-layer rank is
+the sum of the individual ranks; the composed adapter is cached and activated
+like any other adapter, and requests with different LoRA combinations (or
+different scales) are scheduled into separate batches.
+
+Constraints:
+
+- The summed rank of the stacked adapters must not exceed **512** per layer.
+  Two or three typical LoRAs (rank 4-64) fit comfortably.
+- Adapters with a scale of approximately 0 are skipped.
+- Packed-projection stacking requires a compatible loader and packed-module mapping; MiniMax-H3 supports its fused QKV and MLP projections.
+- MiniMax-H3 accepts ordinary adapter stacks and at most one compatible Turbo adapter. Native distilled adapters such as FlashGen cannot be composed with other adapters.
+- FastH3 Omni accepts ordinary adapters with independent scales, including under distributed layerwise offload; Turbo and native distilled adapters remain unsupported with this checkpoint.
+
+Offline: pass a list of `LoRARequest` objects together with a matching list of
+scales:
+
+```python
+outputs = omni.generate(
+    prompt="A piece of cheesecake",
+    lora_request=[lora_request_a, lora_request_b],
+    lora_scale=[0.8, 0.6],
+)
+```
+
+Online: the `lora` request field accepts an array of objects instead of a
+single object (a single object remains valid):
+
+```json
+"lora": [
+  {"name": "style", "local_path": "/path/to/style.safetensors", "scale": 0.8, "int_id": 1},
+  {"name": "character", "local_path": "/path/to/character.safetensors", "scale": 0.6, "int_id": 2}
+]
+```
+
+`int_id` is optional; when omitted it is derived from `local_path`.
 
 #### Distill backend: fuse distilled LoRA at init
 
@@ -108,7 +193,7 @@ omni = Omni(
     lora_backend="distill",
 )
 
-outputs = omni.generate(prompt="A piece of cheesecake")
+outputs = omni.generate("A piece of cheesecake")
 ```
 
 Multi-file example (Wan2.2 MoE, high + low noise):

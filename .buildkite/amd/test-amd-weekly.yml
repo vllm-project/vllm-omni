@@ -21,10 +21,62 @@ steps:
         grade: NonBlocking
         timeout_in_minutes: 180
         source_file_dependencies: omni_qwen3_omni_reliability
+        artifact_paths:
+          - artifacts/rocm-qwen3-omni-reliability/**/*
         commands:
-          - >-
-            pytest -s -v tests/dfx/reliability/test_qwen3_omni.py
-            -m "slow and rocm and MI325 and cards_2"
+          - export ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-reliability"
+          - mkdir -p "$$ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q tests/dfx/reliability/test_qwen3_omni.py \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and cards_2" \
+              > "$$ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 37 ]]; then
+              echo "Expected exactly 37 Qwen3-Omni reliability nodes, found $$count." >&2
+              cat "$$ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra tests/dfx/reliability/test_qwen3_omni.py \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and cards_2" \
+                --junitxml="$$ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 37 or skipped != 10:
+                print(
+                    f"Expected exactly 37 executed Qwen3-Omni reliability tests with 10 known skips; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
 
       - label: "Reliability Test · wan22"
         agent_pool: mi300_1
@@ -33,10 +85,62 @@ steps:
         grade: NonBlocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_wan22_reliability
+        artifact_paths:
+          - artifacts/rocm-wan22-reliability/**/*
         commands:
-          - >-
-            pytest -s -v tests/dfx/reliability/test_wan22.py
-            -m "slow and rocm and MI325 and cards_1"
+          - export ROCM_WAN22_RELIABILITY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-wan22-reliability"
+          - mkdir -p "$$ROCM_WAN22_RELIABILITY_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q tests/dfx/reliability/test_wan22.py \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and cards_1" \
+              > "$$ROCM_WAN22_RELIABILITY_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_WAN22_RELIABILITY_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 17 ]]; then
+              echo "Expected exactly 17 Wan2.2 reliability nodes, found $$count." >&2
+              cat "$$ROCM_WAN22_RELIABILITY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra tests/dfx/reliability/test_wan22.py \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and cards_1" \
+                --junitxml="$$ROCM_WAN22_RELIABILITY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_WAN22_RELIABILITY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_WAN22_RELIABILITY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_WAN22_RELIABILITY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 17 or skipped != 5:
+                print(
+                    f"Expected exactly 17 executed Wan2.2 reliability tests with 5 known skips; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_WAN22_RELIABILITY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
 
       - label: "Reliability Test · hunyuan-image"
         agent_pool: mi300_4
@@ -105,6 +209,137 @@ steps:
             fi
             (exit "$$status")
 
+      - label: "Reliability Test · minicpmo-4.5"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: omni_minicpmo_4_5_reliability
+        artifact_paths:
+          - artifacts/rocm-minicpmo-reliability/**/*
+        commands:
+          - export ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-reliability"
+          - mkdir -p "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q tests/dfx/reliability/test_minicpmo_4_5.py \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and cards_1" \
+              > "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 3 ]]; then
+              echo "Expected exactly 3 MiniCPM-o 4.5 reliability nodes, found $$count." >&2
+              cat "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra tests/dfx/reliability/test_minicpmo_4_5.py \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and cards_1" \
+                --junitxml="$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 3 or skipped != 0:
+                print(
+                    f"Expected exactly 3 executed MiniCPM-o 4.5 reliability tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+      - label: "Reliability Test · Invalid parameters · MI300 · Single-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        source_file_dependencies: reliability_invalid_param_h100
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-invalid-parameters-single/**/*
+        commands:
+          - export ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-invalid-parameters-single"
+          - mkdir -p "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q tests/dfx/reliability/invalid_param_test/ \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and H100 and cards_1" \
+              > "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 76 ]]; then
+              echo "Expected exactly 76 single-GPU invalid-parameter nodes, found $$count." >&2
+              cat "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 75m \
+                pytest -s -v -ra tests/dfx/reliability/invalid_param_test/ \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and H100 and cards_1" \
+                --junitxml="$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 76 or skipped != 5:
+                print(
+                    f"Expected exactly 76 single-GPU invalid-parameter tests with 5 known skips; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_INVALID_PARAMETERS_SINGLE_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
       - label: "Reliability Test · Invalid parameters · MI300 · 2-GPU"
         agent_pool: mi300_2
         depends_on: amd-build
@@ -112,14 +347,134 @@ steps:
         grade: NonBlocking
         timeout_in_minutes: 90
         source_file_dependencies: reliability_invalid_param_h100
+        artifact_paths:
+          - artifacts/rocm-invalid-parameters-reliability/**/*
         commands:
-          - >-
-            pytest -s -v
-            tests/dfx/reliability/invalid_param_test/test_invalid_omni_chat.py
-            -m "slow and rocm and MI325 and cards_2"
+          - export ROCM_INVALID_PARAMETERS_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-invalid-parameters-reliability"
+          - mkdir -p "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q \
+              tests/dfx/reliability/invalid_param_test/test_invalid_omni_chat.py \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and H100 and cards_2" \
+              > "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 24 ]]; then
+              echo "Expected exactly 24 invalid-parameter reliability nodes, found $$count." >&2
+              cat "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 75m \
+                pytest -s -v -ra \
+                tests/dfx/reliability/invalid_param_test/test_invalid_omni_chat.py \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and H100 and cards_2" \
+                --junitxml="$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 24 or skipped != 0:
+                print(
+                    f"Expected exactly 24 executed invalid-parameter reliability tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_INVALID_PARAMETERS_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
 
-  # CUDA weekly Omni H100 full_model sweeps. Only the ROCm-marked cases run
-  # here. Ming online is skipped for 4x H100, and Covo has no MI325 mark.
+      - label: "Reliability Test · Invalid parameters · Audio · MI300 · Single-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        source_file_dependencies: reliability_invalid_param_l4
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-invalid-parameters-audio/**/*
+        commands:
+          - export ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-invalid-parameters-audio"
+          - mkdir -p "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q tests/dfx/reliability/invalid_param_test/ \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and L4 and cards_1" \
+              > "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 127 ]]; then
+              echo "Expected exactly 127 audio invalid-parameter nodes, found $$count." >&2
+              cat "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 105m \
+                pytest -s -v -ra tests/dfx/reliability/invalid_param_test/ \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and L4 and cards_1" \
+                --junitxml="$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 127 or skipped != 26:
+                print(
+                    f"Expected exactly 127 audio invalid-parameter tests with 26 known skips; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_INVALID_PARAMETERS_AUDIO_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+  # CUDA weekly Omni full_model sweeps. Run the ROCm-marked MiMo, Covo, Ming,
+  # and Qwen2.5 cases here; Ming online remains skipped for 4x H100.
   - group: "Omni E2E Weekly"
     steps:
       - label: "MiMo-Audio · 1-GPU"
@@ -187,6 +542,96 @@ steps:
                 )
                 raise SystemExit(5)
             ' "$$ROCM_MIMO_WEEKLY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+      - label: "Covo-Audio · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: omni_covo_audio_function
+        artifact_paths:
+          - artifacts/rocm-covo-audio-weekly/**/*
+        commands:
+          - export ROCM_COVO_WEEKLY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-covo-audio-weekly"
+          - mkdir -p "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR"
+          - |
+            files=(
+              "tests/e2e/online_serving/test_covo_audio_expansion.py"
+              "tests/e2e/offline_inference/test_covo_audio_expansion.py"
+            )
+            pytest --collect-only -q "$${files[@]}" \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and omni and cards_1" \
+              --run-level full_model \
+              2>&1 | tee "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/collection.txt"
+            collection_status="$${PIPESTATUS[0]}"
+            if [[ "$$collection_status" -ne 0 ]]; then
+              exit "$$collection_status"
+            fi
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 2 ]]; then
+              echo "Expected exactly two Covo-Audio ROCm nodes, found $$count." >&2
+              cat "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            expected_nodes=(
+              "tests/e2e/online_serving/test_covo_audio_expansion.py::test_audio_to_audio_001"
+              "tests/e2e/offline_inference/test_covo_audio_expansion.py::test_audio_to_audio"
+            )
+            for node in "$${expected_nodes[@]}"; do
+              if ! grep -Fq "$$node" \
+                "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/collection.txt"; then
+                echo "Covo-Audio node was not collected: $$node" >&2
+                cat "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            if (
+              trap - ERR
+              set +e
+              files=(
+                "tests/e2e/online_serving/test_covo_audio_expansion.py"
+                "tests/e2e/offline_inference/test_covo_audio_expansion.py"
+              )
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra "$${files[@]}" \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and omni and cards_1" \
+                --run-level full_model --durations=20 \
+                --junitxml="$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 2 or skipped != 0:
+                print(
+                    f"Expected exactly two executed Covo-Audio tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_COVO_WEEKLY_ARTIFACT_DIR/pytest.xml"
               then
                 status=0
               else
@@ -286,6 +731,714 @@ steps:
               fi
             fi
             (exit "$$status")
+
+      # CUDA weekly names these files at core_model and also sweeps slow Omni
+      # cases at full_model. MERGE runs eight nodes at core_model; weekly runs
+      # the seven stable full-weight cases. The mixed-input semantic case is
+      # known-red with synthetic media (PR #2211) and remains explicitly
+      # deselected until its fixtures can exercise recognition reliably.
+      # Both files are MI325 cards_2; CUDA's offline mark is cards_4 and is not
+      # claimed.
+      - label: "Qwen2.5-Omni expansion · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 195
+        source_file_dependencies: omni_qwen2_5_omni_expansion
+        # Build #15565 exceeded OpenBLAS's compiled 192-thread metadata limit
+        # during evaluation, then segfaulted and held both GPUs until timeout.
+        # GPU inference dominates this job, so keep host math libraries bounded.
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-qwen25-omni-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export ROCM_QWEN25_WEEKLY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen25-omni-weekly"
+          - mkdir -p "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_audio_in_video_boundaries[False-omni_server0]"
+              "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_audio_in_video_boundaries[True-omni_server0]"
+              "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_text_to_text_001[omni_server0]"
+              "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_speaker_001[Chelsie-omni_server0]"
+              "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_speaker_001[ETHAN-omni_server0]"
+              "tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py::test_mix_to_audio[omni_runner0-rocm]"
+              "tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py::test_text_to_text[omni_runner0-rocm]"
+            )
+            printf '%s\n' "$${nodes[@]}" | sort > \
+              "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/expected-nodes.txt"
+            pytest -q \
+              tests/e2e/online_serving/test_qwen2_5_omni_expansion.py \
+              tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py \
+              -m "slow and rocm and MI325 and omni and cards_2" \
+              --collect-only \
+              --run-level full_model \
+              --shard-id=0 --num-shards=1 \
+              --deselect='tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_mix_to_text_audio_001[omni_server0]' \
+              | tee "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/collection.log"
+            collection_status="$${PIPESTATUS[0]}"
+            if [[ "$$collection_status" -ne 0 ]]; then
+              exit "$$collection_status"
+            fi
+            sed -n 's/^\(tests\/.*::.*\)/\1/p' \
+              "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/collection.log" \
+              | sort > "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/collected-nodes.txt"
+            if ! diff -u \
+              "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/expected-nodes.txt" \
+              "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/collected-nodes.txt"
+            then
+              echo "Expected exactly seven Qwen2.5-Omni weekly ROCm nodes; collection drifted." >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra \
+                tests/e2e/online_serving/test_qwen2_5_omni_expansion.py \
+                tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py \
+                -m "slow and rocm and MI325 and omni and cards_2" \
+                --run-level full_model \
+                --shard-id=0 --num-shards=1 \
+                --deselect='tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_mix_to_text_audio_001[omni_server0]' \
+                --junitxml="$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 7 or skipped != 0:
+                print(
+                    f"Expected exactly seven executed Qwen2.5-Omni weekly tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+  # Only test_bagel_img2img_online carries rocm: MI325. The other Bagel
+  # weekly cases are H100-only and stay out of this job.
+  - group: "Diffusion E2E Weekly"
+    steps:
+      - label: "Bagel img2img · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        source_file_dependencies: diffusion_bagel_weekly
+        artifact_paths:
+          - artifacts/rocm-bagel-weekly/**/*
+        commands:
+          - export ROCM_BAGEL_WEEKLY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-bagel-weekly"
+          - mkdir -p "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR"
+          - |
+            node="tests/e2e/online_serving/test_bagel.py::test_bagel_img2img_online[omni_server0]"
+            set +e
+            pytest --collect-only -q "$$node" \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and diffusion and rocm and MI325 and cards_1" \
+              --run-level full_model \
+              > "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt" 2>&1
+            collection_status=$$?
+            set -e
+            if [[ "$$collection_status" -ne 0 ]]; then
+              cat "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+              exit "$$collection_status"
+            fi
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one Bagel weekly ROCm node, found $$count." >&2
+              cat "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            if ! grep -Fq "$$node" "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt"; then
+              echo "Bagel weekly node was not collected: $$node" >&2
+              cat "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            if grep -Eq 'test_bagel_text2img_online|test_bagel_image_edit_' \
+              "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/collection.txt"; then
+              echo "H100-only Bagel nodes were collected." >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              node="tests/e2e/online_serving/test_bagel.py::test_bagel_img2img_online[omni_server0]"
+              timeout --signal=TERM --kill-after=2m 75m \
+                pytest -s -v -ra "$$node" \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and diffusion and rocm and MI325 and cards_1" \
+                --run-level full_model --durations=20 \
+                --junitxml="$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 1 or skipped != 0:
+                print(
+                    f"Expected exactly one executed Bagel weekly test; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_BAGEL_WEEKLY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+  # CUDA weekly "TTS · Moss · L4" selects these three slow MI325 cards_1
+  # nodes at full_model. That CUDA job failed twice on build 18613; this
+  # lane stays NonBlocking until an exact-head MI300 run executes them.
+  - group: "TTS E2E Weekly"
+    steps:
+      - label: "Moss TTS expansion · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        source_file_dependencies: tts_moss_tts_expansion
+        artifact_paths:
+          - artifacts/rocm-moss-tts-weekly/**/*
+        commands:
+          - export ROCM_MOSS_WEEKLY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-moss-tts-weekly"
+          - mkdir -p "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/offline_inference/test_moss_tts_expansion.py::test_moss_tts_delay_english[omni_runner0]"
+              "tests/e2e/offline_inference/test_moss_tts_expansion.py::test_moss_tts_delay_chinese[omni_runner0]"
+              "tests/e2e/offline_inference/test_moss_tts_expansion.py::test_moss_tts_delay_batch[omni_runner0]"
+            )
+            printf '%s\n' "$${nodes[@]}" | sort > \
+              "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/expected-nodes.txt"
+            pytest -q tests/e2e/offline_inference/test_moss_tts_expansion.py \
+              -m "slow and tts and rocm and MI325 and cards_1" \
+              --collect-only \
+              --run-level full_model \
+              --shard-id=0 --num-shards=1 \
+              | tee "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/collection.log"
+            collection_status="$${PIPESTATUS[0]}"
+            if [[ "$$collection_status" -ne 0 ]]; then
+              exit "$$collection_status"
+            fi
+            sed -n 's/^\(tests\/.*::.*\)/\1/p' \
+              "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/collection.log" \
+              | sort > "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/collected-nodes.txt"
+            if ! diff -u \
+              "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/expected-nodes.txt" \
+              "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/collected-nodes.txt"
+            then
+              echo "Expected exactly three Moss TTS weekly ROCm nodes; collection drifted." >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 75m \
+                pytest -s -v -ra \
+                tests/e2e/offline_inference/test_moss_tts_expansion.py \
+                -m "slow and tts and rocm and MI325 and cards_1" \
+                --run-level full_model \
+                --shard-id=0 --num-shards=1 \
+                --junitxml="$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 3 or skipped != 0:
+                print(
+                    f"Expected exactly three executed Moss TTS weekly tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_MOSS_WEEKLY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+      # Cover CUDA's L4 and H100 Audex paths together while retaining one model-
+      # specific owner and exact collection/JUnit accounting on ROCm.
+      - label: "Audex TTS/TTA/S2S · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 360
+        source_file_dependencies: tts_audex_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+          # Audex's CFG/RVQ processors implement the V1 logits-processor
+          # contract. Keep CUDA and ROCm on the same runner explicitly.
+          VLLM_OMNI_CI_MODEL_RUNNER: "v1"
+        artifact_paths:
+          - artifacts/rocm-audex-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=330
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_audex_tts.py
+            15 tts rocm-audex-weekly
+            tests/e2e/offline_inference/test_audex_s2s.py
+            tests/e2e/offline_inference/test_audex_s2t.py
+            tests/e2e/offline_inference/test_audex_tta.py
+            tests/e2e/online_serving/test_audex_tta.py
+            tests/e2e/online_serving/test_audex_tts.py
+
+      # This exact full-weight case previously ran on AMD nightly. Move it to
+      # weekly beside its CUDA counterpart and remove retry masking for burn-in.
+      - label: "CosyVoice3 offline and online · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: tts_cosyvoice3_function
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-cosyvoice3-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=150
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_cosyvoice3_expansion.py
+            5 tts rocm-cosyvoice3-weekly
+            tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py
+
+      # Match CUDA's full Qwen3-TTS word-timestamp file on one MI325. The
+      # forced aligner is part of this path, so keep all three API modes here.
+      - label: "Qwen3-TTS word timestamps · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        source_file_dependencies: tts_qwen3_tts_function
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-qwen3-tts-word-timestamps-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=90
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py
+            3 tts rocm-qwen3-tts-word-timestamps-weekly
+
+      # Split CUDA's combined VoxCPM2/Voxtral lane so each model family has a
+      # bounded MI325 owner while preserving every CUDA weekly test file.
+      - label: "VoxCPM2 TTS · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: tts_voxcpm2_weekly
+        env:
+          # Match CUDA weekly's runner. The test-only deploy overlay selects the
+          # native ROCm attention profile without changing production defaults.
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-voxcpm2-tts-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=150
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_voxcpm2_tts.py
+            9 tts rocm-voxcpm2-tts-weekly
+            tests/e2e/online_serving/test_voxcpm2_tts.py
+            tests/e2e/online_serving/test_voxcpm2_tts_expansion.py
+            tests/e2e/online_serving/test_voxcpm2_tts_lora.py
+
+      - label: "Voxtral TTS · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 210
+        source_file_dependencies: tts_voxtral_weekly
+        env:
+          # Preserve the existing CUDA weekly runner contract on ROCm.
+          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-voxtral-tts-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=180
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_voxtral_tts_expansion.py
+            10 tts rocm-voxtral-tts-weekly
+            tests/e2e/online_serving/test_voxtral_tts_expansion.py
+
+      # Complete the non-Nano half of CUDA's Moss lane without changing the
+      # existing three-test VoiceGenerator burn-in owner.
+      - label: "Moss TTS realtime and online · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: tts_moss_tts_extended_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-moss-tts-extended-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=150
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_moss_tts_realtime.py
+            6 tts rocm-moss-tts-extended-weekly
+            tests/e2e/offline_inference/test_moss_tts_realtime_expansion.py
+            tests/e2e/online_serving/test_moss_tts_expansion.py
+
+      - label: "Moss TTS Nano · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 210
+        source_file_dependencies: tts_moss_tts_nano_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-moss-tts-nano-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=180
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_moss_tts_nano_expansion.py
+            9 tts rocm-moss-tts-nano-weekly
+            tests/e2e/online_serving/test_moss_tts_nano_expansion.py
+
+      # CUDA keeps Higgs V2 and V3 in one lane. Split them on AMD so a model-
+      # specific startup or quality regression has one bounded owner.
+      - label: "Higgs Audio V2 · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 210
+        source_file_dependencies: tts_higgs_audio_v2_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-higgs-audio-v2-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=180
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_higgs_audio_v2_expansion.py
+            9 tts rocm-higgs-audio-v2-weekly
+            tests/e2e/online_serving/test_higgs_audio_v2_expansion.py
+
+      - label: "Higgs Audio V3 · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 240
+        source_file_dependencies: tts_higgs_audio_v3_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-higgs-audio-v3-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=210
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/online_serving/test_higgs_audio_v3.py
+            13 tts rocm-higgs-audio-v3-weekly
+
+      # CUDA owns these in one L4 lane. Keep the online sweep separate on AMD
+      # so its shared server lifetime cannot hide offline or graph-parity failures.
+      - label: "OmniVoice offline and graph parity · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 240
+        source_file_dependencies: tts_omnivoice_offline_parity_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-omnivoice-offline-parity-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=210
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_omnivoice_expansion.py
+            4 tts rocm-omnivoice-offline-parity-weekly
+            tests/e2e/online_serving/test_omnivoice_parity.py
+
+      - label: "OmniVoice online · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 300
+        source_file_dependencies: tts_omnivoice_online_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-omnivoice-online-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=270
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/online_serving/test_omnivoice_expansion.py
+            19 tts rocm-omnivoice-online-weekly
+
+      - label: "Step-Audio-2 offline and online · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 300
+        source_file_dependencies: tts_step_audio2_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-step-audio2-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=270
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_step_audio2_expansion.py
+            5 tts rocm-step-audio2-weekly
+            tests/e2e/online_serving/test_step_audio2_expansion.py
+
+      - label: "Ming TTS · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 240
+        source_file_dependencies: tts_ming_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-ming-tts-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=210
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_ming_tts_expansion.py
+            6 tts rocm-ming-tts-weekly
+            tests/e2e/online_serving/test_ming_tts_expansion.py
+
+      - label: "GLM TTS · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 240
+        source_file_dependencies: tts_glm_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-glm-tts-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=210
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_glm_tts_expansion.py
+            5 tts rocm-glm-tts-weekly
+            tests/e2e/online_serving/test_glm_tts_expansion.py
+
+      - label: "IndexTTS2 · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 240
+        source_file_dependencies: tts_indextts2_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-indextts2-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=210
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_indextts2_expansion.py
+            3 tts rocm-indextts2-weekly
+            tests/e2e/online_serving/test_indextts2_expansion.py
+
+      - label: "Breeze TTS 2 · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 210
+        source_file_dependencies: tts_breeze_tts2_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-breeze-tts2-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=180
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/online_serving/test_breeze_tts_2.py
+            5 tts rocm-breeze-tts2-weekly
 
   - group: "HunyuanImage Expert Parallel"
     steps:

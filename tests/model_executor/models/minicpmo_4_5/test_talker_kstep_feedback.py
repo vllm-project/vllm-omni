@@ -47,12 +47,13 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _TURN_END_QUIET_STOP_FRAMES,
     MiniCPMO45OmniTTSForConditionalGeneration,
     _codec_int_param,
+    _KStepPendingRow,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     codec_sample_result,
     make_device_state,
 )
-from vllm_omni.platforms.npu.worker import talker_multiframe
+from vllm_omni.worker import talker_multiframe
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -82,15 +83,17 @@ def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
     # `__init__` is bypassed here: `_codec_sample_setup` still reads the
     # fused-prelude switch, so set it explicitly (eager chain, no kernels).
     model._codec_fused_prelude = False
+    model._codec_fused_tail = False
     emb = nn.Embedding(_NUM_AUDIO_TOKENS, 4)
     with torch.no_grad():
         emb.weight.zero_()
         emb.weight[42] = 1.0
         emb.weight[43] = 2.0
     model.emb_code = nn.ModuleList([emb])
+    model.head_code = nn.ModuleList([nn.Linear(8, _NUM_AUDIO_TOKENS)])
     queue = iter(scripted_samples)
 
-    def _greedy(_hidden, codes, _request_id, step, _min_tokens, max_tokens, _eos_window_masked=False):
+    def _greedy(_hidden, codes, _request_id, step, _min_tokens, max_tokens, _eos_window_masked=False, *, logits=None):
         # Return a real sample result, not a bare tensor: the device state
         # inside it owns the eos/limit transition, and the production
         # bare-tensor fallback the old stub used to hit has been removed
@@ -138,13 +141,74 @@ def test_kstep_frame_sample_is_recorded_for_next_frame():
     assert model._request_codec_history["r1"] == [42, 43]
 
 
-def test_legacy_single_frame_path_does_not_touch_last_code():
-    model = _make_talker(k_step_frames=0, scripted_samples=[42])
-    state = {"step": 0, "codes": torch.tensor([10, 11])}
-    model._request_audio_states["r1"] = state
+def test_kstep_lazy_projection_skips_finished_and_ineligible_rows():
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
 
-    _frame_call(model, torch.randn(1, 8))
-    assert "last_code" not in state
+    class CountingHead(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, hidden):
+            self.calls += 1
+            return torch.zeros(hidden.shape[0], _NUM_AUDIO_TOKENS)
+
+    head = CountingHead()
+    model.head_code = nn.ModuleList([head])
+    model._request_audio_states.update(
+        {
+            "finished": {"finished": True, "step": 1},
+            "ineligible": {"step": 0},
+        }
+    )
+    hidden = torch.randn(2, 8)
+    out = model.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[{"request_id": "finished"}, {"request_id": "ineligible"}],
+        request_token_spans=[(0, 1), (1, 2)],
+        request_sample_eligible=[True, False],
+    )
+    assert head.calls == 0
+    assert [delta.numel() for delta in out.multimodal_outputs["codes"]["audio"]] == [0, 0]
+
+
+def test_kstep_lazy_projection_keeps_mixed_row_alignment():
+    model = _make_talker(k_step_frames=8, scripted_samples=[])
+    model._codec_repetition_penalty = 1.0
+    real_greedy = type(model)._sample_audio_code_greedy
+    model._sample_audio_code_greedy = real_greedy.__get__(model, type(model))
+
+    class CountingHead(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.batch_sizes = []
+
+        def forward(self, hidden):
+            self.calls += 1
+            self.batch_sizes.append(hidden.shape[0])
+            logits = torch.zeros(hidden.shape[0], _NUM_AUDIO_TOKENS)
+            logits[:, 42] = 10.0
+            return logits
+
+    head = CountingHead()
+    model.head_code = nn.ModuleList([head])
+    model._request_audio_states["finished"] = {"finished": True, "step": 1}
+    for request_id in ("live1", "live2"):
+        model._request_audio_states[request_id] = {"step": 0, "codes": torch.tensor([10, 11])}
+    for frame in range(3):
+        out = model.make_omni_output(
+            torch.randn(3, 8),
+            model_intermediate_buffer=[{"request_id": name} for name in ("finished", "live1", "live2")],
+            request_token_spans=[(0, 1), (1, 2), (2, 3)],
+            request_sample_eligible=[True, True, True],
+        )
+        assert head.calls == frame + 1
+        assert head.batch_sizes == [2] * (frame + 1)
+        assert [delta.reshape(-1).tolist() for delta in out.multimodal_outputs["codes"]["audio"]] == [[], [42], [42]]
+        for request_id in ("live1", "live2"):
+            assert model._request_audio_states[request_id]["step"] == frame + 1
+            assert model._request_codec_history[request_id] == [42] * (frame + 1)
 
 
 def test_decode_preprocess_embeds_state_last_code():
@@ -236,18 +300,16 @@ def test_decode_batch_reembeds_live_rows_from_last_code():
     assert torch.equal(scalar_embeds[0], embeds[0])
 
 
-def test_multi_frame_decode_is_rejected_under_v2_model_runner():
+def test_multi_frame_decode_arms_under_both_model_runners():
     def _config(*, use_v2_model_runner: bool):
         return SimpleNamespace(
             model_config=SimpleNamespace(model_stage="tts", use_v2_model_runner=use_v2_model_runner),
             speculative_config={"method": "ngram", "num_speculative_tokens": 7},
         )
 
-    # The same config arms eight frames on V1 and is refused on Model Runner
-    # V2, whose decode preprocess cannot re-embed the real previous frame.
+    # Both runners arm K=8; MRv2 replays one forward per frame.
     assert MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=False)) == 8
-    with pytest.raises(ValueError, match="Model Runner V2"):
-        MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=True))
+    assert MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=True)) == 8
 
 
 def _make_scheduler(*, num_spec: int, waiting=(), running=(), stage: str = "tts"):
@@ -282,39 +344,31 @@ def _req(*, computed: int, prompt: int, spec: list[int], total: int | None = Non
     )
 
 
-def test_buffer_alignment_clears_a_stale_short_buffer():
+def test_buffer_alignment_fills_a_stale_short_buffer():
     """A request whose draft buffer survived from an earlier state (a duplex
     takeover snapshot, a step whose schedule clipped it mid-batch) sits next
     to neighbours with full buffers; the next ``schedule()`` would book 8-
     and 4-wide spans in one step and the runner dies on the refusal. The
-    alignment pass must clear every buffer so the step schedules a uniform
-    padded single-frame span, from which the K-step resumes on its own."""
+    alignment pass fills the short buffer to ``num_spec`` so the step books a
+    uniform K-wide span instead of forcing the batch onto a single-frame
+    round trip (a c1..c32 sweep measured 21368 eight-frame steps against
+    86032 single-frame ones under the old clear). The schedule-time
+    uniformity rewrite still collapses any span the step cannot actually
+    run, so filling stays safe."""
     good = _req(computed=100, prompt=100, spec=[0] * 7, total=108, req_id="good")
     stale = _req(computed=100, prompt=100, spec=[0] * 3, total=104, req_id="stale")
     sched = _make_scheduler(num_spec=7, waiting=[], running=[good, stale])
 
     sched.update_draft_token_ids(SimpleNamespace(req_ids=[], draft_token_ids=[]))
-    assert good.spec_token_ids == []
-    assert stale.spec_token_ids == []
+    assert good.spec_token_ids == [0] * 7
+    assert stale.spec_token_ids == [0] * 7
 
 
-def test_buffer_alignment_clears_a_zero_and_full_mix():
-    """A full buffer next to an empty one is itself uneven: the next
-    ``schedule()`` books a 1+num_spec-wide row for the full buffer next to
-    a 1-wide row for the prefill chunk's empty one. The alignment pass must
-    clear the full buffer so the step stays uniform."""
-    good = _req(computed=100, prompt=100, spec=[0] * 7, total=108, req_id="good")
-    chunk = _req(computed=50, prompt=100, spec=[], total=107, req_id="chunk")
-    sched = _make_scheduler(num_spec=7, waiting=[], running=[good, chunk])
-
-    sched.update_draft_token_ids(SimpleNamespace(req_ids=[], draft_token_ids=[]))
-    assert good.spec_token_ids == []
-    assert chunk.spec_token_ids == []
-
-
-def test_buffer_alignment_keeps_a_single_value_batch():
-    """Every buffer holding the same length -- all full, or all empty -- is
-    uniform and must be left untouched."""
+def test_buffer_alignment_fills_an_all_empty_batch():
+    """Every buffer holding the same length is uniform, but an all-empty
+    batch is undrafted: the alignment pass fills it to ``num_spec`` so the
+    next step books the K span (the convergence contract). An all-full batch
+    stays untouched."""
     full_a = _req(computed=100, prompt=100, spec=[0] * 7, total=108, req_id="a")
     full_b = _req(computed=110, prompt=100, spec=[0] * 7, total=118, req_id="b")
     sched = _make_scheduler(num_spec=7, waiting=[], running=[full_a, full_b])
@@ -326,8 +380,8 @@ def test_buffer_alignment_keeps_a_single_value_batch():
     empty_b = _req(computed=110, prompt=100, spec=[], total=111, req_id="b")
     sched = _make_scheduler(num_spec=7, waiting=[], running=[empty_a, empty_b])
     sched.update_draft_token_ids(SimpleNamespace(req_ids=[], draft_token_ids=[]))
-    assert empty_a.spec_token_ids == []
-    assert empty_b.spec_token_ids == []
+    assert empty_a.spec_token_ids == [0] * 7
+    assert empty_b.spec_token_ids == [0] * 7
 
 
 def _sched_out(num_scheduled: dict, spec: dict):
@@ -590,18 +644,15 @@ def test_talker_stop_token_ids_match_the_multi_frame_head():
     NPU worker, and the codec EOS on every platform without that worker.
     """
     from vllm_omni.model_executor.models.minicpmo_4_5 import pipeline as mcp_pipeline
-    from vllm_omni.platforms.npu.worker import talker_multiframe
 
     assert talker_multiframe.STOP_TOKEN_ID == 1
     # The pipeline default cannot depend on the platform: the block that
     # collapses the head is a deploy-config decision, so the marker is added
-    # there (test_minicpmo_talker_multi_frame_is_npu_scoped pins the merge).
+    # there (test_minicpmo_talker_multi_frame_is_platform_scoped pins the merge).
     assert mcp_pipeline._talker_stop_token_ids() == [mcp_pipeline._CODEC_EOS_TOKEN_ID]
 
 
 def test_multiframe_gate_matrix():
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     model = _contract_stub(armed=True)
     state = {"step": 5}
 
@@ -653,8 +704,6 @@ def test_constant_drafts_fold_when_a_stop_truncates_a_row():
     way of saying the short row belongs to a request that has never
     multi-framed and must re-arm the K-step.
     """
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     # Five staggered codecs, K=6: one stopped at frame 3 (4 tokens), three
     # at frame 4 (5 tokens), one ran the step out (6 tokens). Every request
     # ran on a drafted step (5 drafts each), so the short rows are real
@@ -682,8 +731,6 @@ def test_constant_drafts_cold_start_short_row_still_drafts():
     emitted": the step after a fold schedules one token per request again,
     so every row looks short, and folding those too would starve the loop
     forever (the three-tier bench stall, 31/32 requests)."""
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     # Both rows sat on a draftless step (scheduled=0): one produced one
     # token, the other a full-width row. Neither is a stop truncation.
     sampled = [[5], [1, 2, 3, 4, 5, 6]]
@@ -695,8 +742,6 @@ def test_constant_drafts_cold_start_short_row_still_drafts():
 
 
 def test_constant_drafts_fold_when_a_row_samples_nothing():
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     sampled = [[1, 2, 3, 4, 5, 6], [], [1, 2, 3, 4, 5, 6]]
     scheduled = [5, 5, 5]
     assert talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=3, scheduled_draft_counts=scheduled) == [
@@ -707,8 +752,6 @@ def test_constant_drafts_fold_when_a_row_samples_nothing():
 def test_constant_drafts_keep_drafts_when_every_row_is_full():
     """No stop anywhere: every request accepted the step's K tokens and the
     drafts arm the next K-frame step exactly as before the fold rule."""
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     sampled = [[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]]
     scheduled = [5, 5]
     drafts = talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=2, scheduled_draft_counts=scheduled)
@@ -724,8 +767,6 @@ def test_constant_drafts_start_kstep_after_a_draftless_step():
     and no drafts ever appear). Regression for the three-tier bench stall
     where 31/32 requests hung on this exact shape.
     """
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     # Prefill just completed for both requests: one token each, zero drafts.
     sampled = [[42], [43]]
     scheduled = [0, 0]
@@ -737,18 +778,6 @@ def test_constant_drafts_start_kstep_after_a_draftless_step():
     sampled = [[7]]
     drafts = talker_multiframe.constant_drafts(sampled, frames=8, num_reqs=1, scheduled_draft_counts=[0])
     assert drafts == [[talker_multiframe.CONTINUE_TOKEN_ID] * 7]
-
-
-def test_constant_drafts_fold_a_mixed_drafted_and_undrafted_batch():
-    """Some requests ran the K-step span while others sat out on a
-    single-frame step: the rows cannot share one span (``applies`` refuses
-    non-uniform schedules), so the batch folds rather than guess."""
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
-    sampled = [[1, 2, 3, 4, 5, 6, 7, 8], [9]]
-    scheduled = [7, 0]
-    drafts = talker_multiframe.constant_drafts(sampled, frames=8, num_reqs=2, scheduled_draft_counts=scheduled)
-    assert drafts == [[], []]
 
 
 def _contract_stub(*, armed: bool):
@@ -786,8 +815,6 @@ def test_stop_vocab_gate_reports_the_two_wide_stop_row_not_the_hidden_width():
     EOS (the 910C scene where stage 1 reported ``finished_reason=length`` for
     all 34 requests).
     """
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     assert talker_multiframe.STOP_ROW_WIDTH == 2
 
     runner = _vocab_runner(supports_multi_frame=True, vocab_size=0)
@@ -801,8 +828,6 @@ def test_stop_vocab_gate_reports_the_two_wide_stop_row_not_the_hidden_width():
 
 
 def test_stop_vocab_gate_stays_off_without_multi_frame_or_rows():
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     # Single-frame models (K=1, stage 0/2) never take the branch that reads
     # vocab_size; the gate must leave them exactly as they were.
     single = _vocab_runner(supports_multi_frame=False, vocab_size=0)
@@ -832,8 +857,6 @@ def test_kstep_min_tokens_neutralization_clears_the_censor_list():
     guard already holds the codec EOS back with ``state.step < min_tokens``, so
     this layer is redundant.
     """
-    from vllm_omni.platforms.npu.worker import talker_multiframe
-
     censor = _MinTokensLogitsProcessor({0: (50, [0, 0, 0], {1})})
     untouched = _MinTokensLogitsProcessor({0: (50, [0], {1})})
     untouched.__class__ = type("SomeOtherProcessor", (object,), {})  # not the target processor
@@ -879,6 +902,25 @@ def test_incomplete_prefill_chunk_skips_sampling():
     out2 = _frame_call(model, torch.randn(1, 8))
     assert state["last_code"] == 42
     assert out2.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [42]
+
+
+def test_draftless_mixed_step_samples_only_eligible_rows_and_stops():
+    model = _make_talker(k_step_frames=8, scripted_samples=[42, _EOS_ID])
+    decode = {"step": 7, "last_code": 43}
+    model._request_audio_states["decode"] = decode
+    buffers = [{"req_id": rid} for rid in ("prefill", "decode", "partial")]
+    out = model.make_omni_output(
+        torch.randn(10, 8),
+        model_intermediate_buffer=buffers,
+        request_token_spans=[(0, 5), (5, 6), (6, 10)],
+        request_sample_eligible=[True, True, False],
+    )
+    assert [delta.flatten().tolist() for delta in out.multimodal_outputs["codes"]["audio"]] == [[42], [], []]
+    assert model.batch_stop_logits.argmax(dim=1).tolist() == [0, 1, 0]
+    assert model._request_codec_history == {"prefill": [42]}
+    assert model._request_audio_states["prefill"]["step"] == 1
+    assert model._request_audio_states["partial"].get("step", 0) == 0
+    assert decode["finished"] is True
 
 
 def test_outer_wrapper_forwards_sampling_eligibility_flag():
@@ -1315,11 +1357,208 @@ def _real_boundary_talker(temperature: float):
     return model
 
 
+def _cuda_prepare_stub():
+    states = {
+        "a": {"step": 2, "finished": False},
+        "b": {"step": 4, "finished": False},
+    }
+    model = SimpleNamespace(
+        head_code=[SimpleNamespace(weight=torch.empty((_NUM_AUDIO_TOKENS, 1)))],
+        _request_audio_states=states,
+        _request_codec_history={"a": [11], "b": [22]},
+        _codec_min_tokens=0,
+        _codec_max_tokens=100,
+        _codec_temperature=0.0,
+        _codec_repetition_penalty=1.0,
+        _codec_top_k=0,
+        _codec_top_p=1.0,
+        _codec_seed=42,
+        _codec_eos_id=_EOS_ID,
+        _codec_fused_prelude=False,
+        _codec_fused_tail=False,
+        _merge_request_codec_params=lambda *args, **kwargs: None,
+        _request_generator=lambda request_id, device: None,
+    )
+    hidden = torch.zeros(2, 8)
+
+    def prepare(order=("a", "b")):
+        return MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(
+            model,
+            hidden,
+            1,
+            model_intermediate_buffer=[{"request_id": request_id} for request_id in order],
+            request_token_spans=[(index, index + 1) for index in range(len(order))],
+        )
+
+    return model, states, prepare
+
+
+def test_cuda_kstep_feedback_updates_the_latest_committed_code():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        _apply_cuda_kstep_host_frames,
+    )
+
+    state = {"step": 1, "last_code": 11}
+    model = SimpleNamespace(
+        _request_audio_states={"a": state},
+        _request_codec_history={"a": [11]},
+    )
+    frames = [[[22, 1, 0]], [[_EOS_ID, 0, 1]], [[33, 0, 1]]]
+    _apply_cuda_kstep_host_frames(model, frames, 3, [state], ["a"], [None], [None], [None])
+    assert model._request_codec_history["a"] == [11, 22]
+    assert state == {"step": 3, "last_code": 22, "finished": True}
+
+
+def test_cuda_kstep_bank_migrates_rows_without_host_refresh(monkeypatch):
+    model, states, prepare = _cuda_prepare_stub()
+    workspace = prepare()
+    pointers = workspace.storage_key()
+    bank = model._cuda_kstep_request_bank
+    bank.scatter(workspace, model._cuda_kstep_bank_indices)
+    refreshes = []
+    gather = bank.gather
+
+    def tracked_gather(workspace, slots, refresh):
+        refreshes.extend(refresh)
+        return gather(workspace, slots, refresh)
+
+    monkeypatch.setattr(bank, "gather", tracked_gather)
+    assert prepare(("b", "a")) is workspace
+    assert workspace.steps.tolist() == [4, 2]
+    assert workspace.last_tokens.tolist() == [22, 11]
+    assert workspace.storage_key() == pointers
+    assert not refreshes
+    # An eager step invalidates the device mirror even with an unchanged id.
+    states["a"]["step"] = 3
+    prepare()
+    assert [row[0] for row in refreshes] == [bank.entries["a"].slot]
+    assert workspace.steps.tolist() == [3, 4]
+    refreshes.clear()
+    # Replacing the state object is a new request lifetime.
+    states["b"] = dict(states["b"])
+    prepare()
+    assert [row[0] for row in refreshes] == [bank.entries["b"].slot]
+
+
+def test_cuda_kstep_parameters_reuse_staging_and_refresh_changes(monkeypatch):
+    model, states, prepare = _cuda_prepare_stub()
+    workspace = prepare()
+    pointers = {key: value.data_ptr() for key, value in model._cuda_kstep_host_staging.items()}
+    states["a"]["codec_temperature"] = 0.0
+    states["a"]["codec_top_k"] = 7
+    prepare()
+    assert workspace.top_k.tolist() == [7, 0]
+    assert pointers == {key: value.data_ptr() for key, value in model._cuda_kstep_host_staging.items()}
+
+
+def test_cuda_kstep_cleanup_drops_request_bank_and_rng_binding():
+    model, _, prepare = _cuda_prepare_stub()
+    prepare()
+    bank = model._cuda_kstep_request_bank
+    released = bank.entries["a"].slot
+    model._deferred_cleanup_ids = {"a"}
+    model._cuda_kstep_rng_bindings = {(1, 0): ("a", 1, 2, 3), (1, 1): ("b", 4, 5, 6)}
+    MiniCPMO45OmniTTSForConditionalGeneration._flush_deferred_cleanup(model)
+    assert set(bank.entries) == {"b"}
+    assert set(model._cuda_kstep_rng_bindings) == {(1, 1)}
+    model._request_audio_states["c"] = {"step": 9, "finished": False}
+    model._request_codec_history["c"] = [99]
+    workspace = prepare(("c", "b"))
+    assert bank.entries["c"].slot == released
+    assert workspace.steps.tolist() == [9, 4]
+    assert workspace.last_tokens.tolist() == [99, 22]
+
+
 def _bias_head_to(model, token_id: int):
     """Make the head's argmax land exactly on ``token_id``."""
     with torch.no_grad():
         model.head_code[0].weight.zero_()
         model.head_code[0].weight[token_id] = 1.0
+
+
+def test_frame_loop_repetition_stop_surfaces_as_stop_row():
+    """Repetition detection must surface as a stop row in the detecting step.
+
+    Review follow-up (PR #9733): ``_codec_repetition_detected`` runs in
+    ``flush_kstep_pending``, which now runs before the stop rows freeze into
+    ``batch_stop_logits``. The detecting step rewrites its own row from
+    continue to stop, so the stop slot wins the batch stop logits lookup in
+    the same step -- previously the rewrite waited for a next step that a
+    duplex turn-boundary request may never get scheduled, and the scheduler
+    never learned the request ended (it ran on to ``max_tokens``).
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42] * 16)
+    state = {
+        "step": 0,
+        "codes": torch.tensor([10, 11]),
+        "codec_full_ids": [10, 11],
+        "codec_repetition_detection": SimpleNamespace(min_pattern_size=1, max_pattern_size=1, min_count=2),
+    }
+    model._request_audio_states["r1"] = state
+    hidden = torch.randn(1, 8)
+
+    warming = _frame_call(model, hidden)
+    # One sample is not a repetition yet; the frame is a normal continue row.
+    assert state["finished"] is False
+    assert warming.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [42]
+    assert int(model.batch_stop_logits[0].argmax()) == 0
+
+    detecting = _frame_call(model, hidden)
+    # The flush that notices the repeating tail rewrites this step's row, so
+    # the detecting frame still carries audio *and* its stop row is a stop.
+    assert state["finished"] is True
+    assert detecting.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [42]
+    logits = model.batch_stop_logits
+    assert logits is not None and logits.shape[0] >= 1
+    assert int(logits[0].argmax()) == 1
+
+    stopping = _frame_call(model, hidden)
+    # The finished early-exit packs the row as a stop row and emits no
+    # further audio.
+    assert stopping.multimodal_outputs["codes"]["audio"][0].numel() == 0
+    assert int(model.batch_stop_logits[0].argmax()) == 1
+
+
+def test_mid_block_stop_keeps_late_frames_as_stop_rows():
+    """A stop mid-block keeps every later frame in the block a stop row.
+
+    Review follow-up (PR #9733): in an 8-frame block a repetition stop on
+    frame 3 leaves frames 4-8 on the finished early-exit. Each of those
+    frames must still pack its own row as a stop -- no audio delta, the stop
+    slot winning the batch logits, and the terminal flag high on every frame
+    the finished request still occupies.
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42] * 16)
+    state = {
+        "step": 0,
+        "codes": torch.tensor([10, 11]),
+        "codec_full_ids": [10, 11],
+        "codec_repetition_detection": SimpleNamespace(min_pattern_size=1, max_pattern_size=1, min_count=2),
+    }
+    model._request_audio_states["r1"] = state
+    hidden = torch.randn(1, 8)
+
+    frames: list = []
+    deltas: list[int] = []
+    stops: list[int] = []
+    for _ in range(8):
+        out = _frame_call(model, hidden)
+        frames.append(out)
+        audio = out.multimodal_outputs["codes"]["audio"][0]
+        deltas.append(audio.numel())
+        logits = model.batch_stop_logits
+        stops.append(int(logits[0].argmax()) if logits is not None and logits.shape[0] else -1)
+
+    # Frame 1 warms the window: one sample is not yet a repetition.
+    assert deltas[0] == 1 and stops[0] == 0
+    # Frame 2 detects the repeating tail: audio and stop in the same step.
+    assert deltas[1] == 1 and stops[1] == 1
+    # Frames 3-8 run the finished early-exit: silent rows, stop id, and the
+    # merged terminal flag high every time.
+    assert deltas[2:] == [0] * 6
+    assert stops[2:] == [1] * 6
+    assert all(bool(out.multimodal_outputs["meta"]["finished"][0]) for out in frames[2:])
+    assert state["finished"] is True
 
 
 def test_stop_id_finishes_request_through_device_state_greedy():
@@ -1587,16 +1826,23 @@ def test_kstep_turn_end_drain_matches_single_frame(drain, previous, current, exp
 
 
 def test_kstep_drain_until_silent_across_steps():
-    """Step by step, as the multi-frame loop runs: the stop lands where the single-frame path puts it."""
+    """Step by step, as the multi-frame loop runs: the closing stop lands in the same step.
+
+    The quiet run only completes when the closing silent code commits in
+    ``flush_kstep_pending``; the flush re-checks the drain condition with that
+    frame confirmed and rewrites the closing frame's stop row in the same
+    step, so the request finishes without waiting for a next frame (which a
+    duplex turn boundary may never schedule).
+    """
     # The silent pair straddles the step boundary at frame 16, the closing
-    # silence fills the fourth step, and the stop lands on frame 0 of the fifth.
+    # silence fills the fourth step, and the stop lands on its closing frame.
     k = 8
     script = [_SPEECH] * 15 + [_SILENT] * 2 + [_SPEECH] * 7 + [_SILENT] * _TURN_END_QUIET_STOP_FRAMES
     model = _make_talker(k_step_frames=k, scripted_samples=[])
     queue = iter(script)
     masked = []
 
-    def _greedy(_hidden, codes, _request_id, step, _min_tokens, max_tokens, eos_window_masked=False):
+    def _greedy(_hidden, codes, _request_id, step, _min_tokens, max_tokens, eos_window_masked=False, *, logits=None):
         masked.append(eos_window_masked)
         device_state = make_device_state(codes, step=step, max_tokens=max_tokens, finished=False)
         return codec_sample_result(device_state, torch.tensor(next(queue), dtype=torch.long), eos_token_id=_EOS_ID)
@@ -1615,12 +1861,19 @@ def test_kstep_drain_until_silent_across_steps():
         stops = model.take_batch_stop_logits().argmax(dim=-1).tolist()
         codes = merged.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist()
         finished = bool(merged.multimodal_outputs["meta"]["finished"][0])
-        if step_index < full_steps:
+        if step_index < full_steps - 1:
             assert codes == script[step_index * k : (step_index + 1) * k], step_index
             assert stops == [0] * k, step_index
             assert not finished, step_index
+        elif step_index == full_steps - 1:
+            # The closing frame's flush confirms the eighth quiet code and
+            # flips that frame's stop row: audio still emits, and the request
+            # finishes in this same step.
+            assert codes == script[step_index * k : (step_index + 1) * k], step_index
+            assert stops == [0] * (k - 1) + [1], step_index
+            assert finished, step_index
         else:
-            # The eighth silent code stops the chunk on the next frame, without sampling.
+            # The finished early-exit emits no further audio.
             assert codes == []
             assert stops == [1] * k
             assert finished
@@ -1636,7 +1889,54 @@ def test_kstep_drain_until_silent_across_steps():
     assert [frame for frame, flag in enumerate(masked) if not flag] == [17, 26, 27, 28, 29, 30, 31]
 
 
-_TALKER_LOGGER = "vllm_omni.platforms.npu.worker.talker_multiframe"
+@pytest.mark.parametrize("length", [0, 1, 15, 16])
+def test_kstep_commits_variable_length_history(length):
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    state = {"codes": torch.arange(length), "step": length}
+    model._request_audio_states["r1"] = state
+    _frame_call(model, torch.randn(1, 8))
+    assert state["codes"].tolist() == list(range(length))[-15:] + [42]
+    assert model._request_codec_history["r1"] == [42]
+    assert not model._kstep_pending_packed
+
+
+@pytest.mark.parametrize("replaced", [False, True])
+def test_kstep_flush_discards_stale_request(replaced):
+    model = _make_talker(k_step_frames=8, scripted_samples=[])
+    old_state = {"codes": torch.empty(0, dtype=torch.long)}
+    model._request_audio_states["r1"] = {} if replaced else old_state
+    model._deferred_cleanup_ids = set() if replaced else {"r1"}
+    model._kstep_pending_packed = [
+        _KStepPendingRow(
+            packed=torch.tensor([42, 0, 1]),
+            request_id="r1",
+            state=old_state,
+            info=None,
+            deltas=None,
+            delta_slot=0,
+            stop_rows=None,
+            terminal_flags=None,
+            stop_slot=0,
+            row_stop=None,
+            flag_true=None,
+        )
+    ]
+    model.flush_kstep_pending()
+    assert model._request_codec_history == {}
+    assert "last_code" not in old_state
+
+
+def test_kstep_eos_does_not_consume_later_frame_rng():
+    model = _make_talker(k_step_frames=8, scripted_samples=[_EOS_ID])
+    hidden = torch.randn(1, 8)
+    for _ in range(8):
+        output = _frame_call(model, hidden)
+        assert output.multimodal_outputs["codes"]["audio"][0].numel() == 0
+    assert model._request_audio_states["r1"]["finished"]
+    assert model._request_audio_states["r1"]["step"] == 1
+
+
+_TALKER_LOGGER = talker_multiframe.__name__
 
 
 def test_kstep_log_reasons_are_deduped_by_reason_set(caplog, monkeypatch):
@@ -1651,13 +1951,18 @@ def test_kstep_log_reasons_are_deduped_by_reason_set(caplog, monkeypatch):
     """
     monkeypatch.setattr(talker_multiframe, "_LOGGED_BLOCKS", set())
     monkeypatch.setattr(talker_multiframe, "_LOGGED_FOLDS", set())
-    monkeypatch.setattr(talker_multiframe, "_LOGGED_NARROW_BLOCKS", set())
+    from vllm_omni.platforms.npu.worker import talker_narrow_replay
+
+    monkeypatch.setattr(talker_narrow_replay, "_LOGGED_NARROW_BLOCKS", set())
 
     stopped_mid_step = "a request stopped mid-step, short of its drafts; no drafts this step"
     mixed_batch = "a batch mixed drafted and undrafted requests; no drafts this step"
     never_engaged = "request token spans are not uniform"
 
-    with caplog.at_level(logging.INFO, logger=_TALKER_LOGGER):
+    with (
+        caplog.at_level(logging.INFO, logger=_TALKER_LOGGER),
+        caplog.at_level(logging.INFO, logger=talker_narrow_replay.__name__),
+    ):
         talker_multiframe._log_fold_once(stopped_mid_step)
         talker_multiframe._log_fold_once(mixed_batch)
         talker_multiframe._log_fold_once(stopped_mid_step)
@@ -1669,9 +1974,9 @@ def test_kstep_log_reasons_are_deduped_by_reason_set(caplog, monkeypatch):
         blocks = [r.getMessage() for r in caplog.records if "not engaged" in r.getMessage()]
 
         caplog.clear()
-        talker_multiframe._decline("no one-query graph captured for 3 rows")
-        talker_multiframe._decline("no one-query graph captured for 5 rows")
-        talker_multiframe._decline("no one-query graph captured for 3 rows")
+        talker_narrow_replay._decline("no one-query graph captured for 3 rows")
+        talker_narrow_replay._decline("no one-query graph captured for 5 rows")
+        talker_narrow_replay._decline("no one-query graph captured for 3 rows")
         declines = [r.getMessage() for r in caplog.records if "one-query Talker replay" in r.getMessage()]
 
     assert folds == [
@@ -1683,3 +1988,49 @@ def test_kstep_log_reasons_are_deduped_by_reason_set(caplog, monkeypatch):
         "[minicpmo] one-query Talker replay not engaged: no one-query graph captured for 3 rows",
         "[minicpmo] one-query Talker replay not engaged: no one-query graph captured for 5 rows",
     ]
+
+
+@pytest.mark.parametrize("graph_first", [False, True])
+def test_kstep_mixed_outputs_preserve_codec_validity(graph_first):
+    """Eager frames and graph padding must share one full-payload row mask."""
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin,
+    )
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _extract_codec_delta
+
+    model = _make_talker(k_step_frames=8, scripted_samples=[42])
+    model._request_audio_states["r1"] = {"step": 0}
+    eager = _frame_call(model, torch.zeros(1, 8)).multimodal_outputs
+    eager_payload = {"codes.audio": eager["codes"]["audio"][0]}
+    if "codec_frame_valid" in eager["meta"]:
+        eager_payload["meta.codec_frame_valid"] = eager["meta"]["codec_frame_valid"][0]
+    # CUDA commit retains all eight rows, including padding after EOS.
+    graph_payload = {
+        "codes.audio": torch.tensor([[70], [71], [0], [0], [0], [0], [0], [0]]),
+        "meta.codec_frame_valid": torch.tensor([True, True, False, False, False, False, False, False]),
+    }
+    transport = _OmniConnectorPayloadTransportMixin()
+    transport._pending_full_payload_send = {}
+    transport._full_payload_replace_keys_cached = frozenset()
+    outputs = [graph_payload, eager_payload] if graph_first else [eager_payload, graph_payload]
+    for output in outputs:
+        transport.accumulate_full_payload_output("r1", output, None)
+    full, _ = transport._materialize_full_payload_entry(transport._pending_full_payload_send["r1"])
+    assert _extract_codec_delta(full, "r1") == ([70, 71, 42] if graph_first else [42, 70, 71])
+
+
+@pytest.mark.parametrize("samples", [[42, 43, _EOS_ID], [_EOS_ID]])
+def test_kstep_merged_frames_preserve_codec_validity(samples):
+    """Validity follows codec rows, including empty frames after a stop."""
+    model = _make_talker(k_step_frames=8, scripted_samples=samples)
+    model._request_audio_states["r1"] = {"step": 0}
+    frames, stops = [], []
+    for _ in range(8):
+        frames.append(_frame_call(model, torch.zeros(1, 8)))
+        stops.append(model.take_batch_stop_logits())
+    merged = model.merge_frame_outputs(frames, stops).multimodal_outputs
+    audio = merged["codes"]["audio"][0].reshape(-1)
+    valid = merged["meta"]["codec_frame_valid"][0]
+    assert valid.dtype == torch.bool
+    assert valid.tolist() == [True] * (len(samples) - 1)
+    assert audio[valid].tolist() == samples[:-1]

@@ -9,14 +9,13 @@ transformer linear was built with ``quant_config=None``. These tests cover:
   to the S2V transformer, and the default (no quantization) path stays BF16
 - auto-detected startup metadata defers to the checkpoint's own config.json
 - the quant config reaches every transformer-block linear with its module path
-  as prefix, while the audio injector, embedders and proj_out stay unquantized
+  as prefix, while the audio injector (unless VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR=1), embedders and proj_out stay unquantized
 - the transformer binds its packed QKV mapping to the quant config, so a real
   ignored_layers skip policy on to_q/to_k/to_v covers the fused to_qkv
 
 All tests are pure-CPU and do not load model weights.
 """
 
-import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -217,8 +216,9 @@ def tp1_group():
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29502")
+    from tests.helpers.runtime import assign_ephemeral_master_port
+
+    assign_ephemeral_master_port()
     init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
     initialize_model_parallel()
     yield
@@ -306,3 +306,94 @@ def test_s2v_partially_ignored_qkv_shards_are_rejected(tp1_group):
     """Mixed precision inside the fused to_qkv cannot be honored and must fail loudly."""
     with pytest.raises(ValueError, match="some but not all shards"):
         _tiny_s2v_transformer(_SkipPolicyQuantConfig(ignored_layers=["blocks.0.self_attn.to_q"]))
+
+
+def test_s2v_audio_injector_quant_can_be_forced_on(tp1_group, monkeypatch):
+    """VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR=1 hands any quant config to the injector cross-attentions too."""
+    monkeypatch.setenv("VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR", "1")
+    quant_config = _RecordingQuantConfig()
+    _tiny_s2v_transformer(quant_config)
+
+    blocks = [f"blocks.{i}.{name}" for i in range(_NUM_LAYERS) for name in _BLOCK_LINEARS]
+    injector = [f"audio_injector.injector.{i}.{name}" for i in range(2) for name in ("to_q", "to_k", "to_v", "to_out")]
+    assert sorted(quant_config.prefixes) == sorted(blocks + injector)
+
+
+def test_s2v_audio_injection_is_a_compiled_region(tp1_group):
+    """The audio injection is its own module class in _repeated_blocks, so regional compile covers it."""
+    model = _tiny_s2v_transformer(None)
+    assert "WanS2VAudioInjectLayer" in model._repeated_blocks
+    assert [type(m).__name__ for m in model.modules()].count("WanS2VAudioInjectLayer") == 1
+    assert not any(True for _ in model.audio_inject_layer.parameters())
+
+
+@pytest.mark.parametrize("enable_adain", [True, False])
+def test_s2v_audio_injection_matches_inline_reference(tp1_group, monkeypatch, enable_adain):
+    """after_transformer_block through WanS2VAudioInjectLayer equals the former inline injection (fp32)."""
+    from einops import rearrange
+
+    from vllm_omni.diffusion.attention import layer
+
+    # torch SDPA runs on CPU tensors whatever the host platform's default attention backend is.
+    monkeypatch.setattr(layer, "get_attn_backend_for_role", lambda **kwargs: (layer.SDPABackend, None))
+    torch.manual_seed(0)
+    frames, frame_len, dim = 3, 8, 32
+    model = WanS2VTransformer3DModel(
+        audio_dim=16,
+        num_audio_token=4,
+        enable_adain=enable_adain,
+        audio_inject_layers=[0, 1],
+        motion_token_num=16,
+        dim=dim,
+        ffn_dim=64,
+        freq_dim=16,
+        text_dim=16,
+        text_len=8,
+        num_heads=2,
+        num_layers=_NUM_LAYERS,
+    ).eval()
+    with torch.no_grad():  # zero-init to_out would make every residual 0
+        for p in model.audio_injector.parameters():
+            p.normal_(0.0, 0.2)
+    model.original_seq_len = frames * frame_len
+    model.merged_audio_emb = torch.randn(1, frames, 4, dim)
+    model.audio_emb_global = torch.randn(1, frames, 1, dim)
+    hidden_states = torch.randn(1, model.original_seq_len + 5, dim)
+
+    expected = hidden_states.clone()
+    x = rearrange(expected[:, : model.original_seq_len], "b (t n) c -> (b t) n c", t=frames)
+    if enable_adain:
+        temb = rearrange(model.audio_emb_global, "b t n c -> (b t) n c")[:, 0]
+        x = model.audio_injector.injector_adain_layers[0](x, temb=temb)
+    else:
+        x = model.audio_injector.injector_pre_norm_feat[0](x)
+    audio = rearrange(model.merged_audio_emb, "b t n c -> (b t) n c")
+    lens = torch.full((x.shape[0],), audio.shape[1], dtype=torch.long)
+    residual = model.audio_injector.injector[0](x=x, context=audio, context_lens=lens)
+    expected[:, : model.original_seq_len].add_(rearrange(residual, "(b t) n c -> b (t n) c", t=frames))
+
+    with torch.no_grad():
+        out = model.after_transformer_block(0, hidden_states.clone())
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(("env", "expected"), [(None, False), ("0", False), ("1", True)])
+def test_s2v_audio_injector_quant_is_opt_in(tp1_group, monkeypatch, env, expected):
+    """The injector stays BF16 under any quant config unless VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR=1."""
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import _quantize_audio_injector
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    if env is None:
+        monkeypatch.delenv("VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR", env)
+    assert _quantize_audio_injector(DiffusionMXFP8Config()) is expected
+    assert _quantize_audio_injector(None) is False
+
+
+def test_s2v_quantized_audio_injection_is_not_compiled(tp1_group, monkeypatch):
+    """A quantized injector keeps the injection out of the regionally compiled blocks."""
+    monkeypatch.setenv("VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR", "1")
+    model = _tiny_s2v_transformer(_RecordingQuantConfig())
+    assert model._repeated_blocks == ["WanS2VTransformerBlock"]
+    assert "WanS2VAudioInjectLayer" in type(model)._repeated_blocks

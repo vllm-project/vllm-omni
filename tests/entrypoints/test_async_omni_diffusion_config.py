@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -418,6 +419,20 @@ def test_serve_cli_accepts_ulysses_mode():
     assert parallel_config["ulysses_mode"] == "advanced_uaa"
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_serve_cli_preserves_ulysses_a2a_permute(enabled: bool) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+    flag = "--ulysses-a2a-permute" if enabled else "--no-ulysses-a2a-permute"
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-degree", "4", flag])
+
+    stage_cfg = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config["ulysses_degree"] == 4
+    assert parallel_config["ulysses_a2a_permute"] is enabled
+
+
 def test_serve_cli_accepts_text_encoder_tp_size():
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
@@ -694,6 +709,45 @@ def test_serve_cli_accepts_diffusion_attention_backend():
     assert diffusion_attention_config.default is not None
     assert diffusion_attention_config.default.backend == "FASTVIDEO_VSA"
     assert diffusion_attention_config.default.backend_kwargs() == {"topk": 96}
+
+
+@pytest.mark.diffusion
+@pytest.mark.parametrize("style", ["json", "dotted"])
+@pytest.mark.parametrize("schedule_kind", ["step", "sigma"])
+def test_serve_cli_forwards_attention_schedule_to_default_stage(style, schedule_kind):
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+    schedule_key = "default" if schedule_kind == "step" else "sigma"
+    ranges: list[dict[str, Any]] = (
+        [{"start": 3, "end": None, "profile": "dense"}]
+        if schedule_kind == "step"
+        else [{"low": 0.3, "high": 1.0, "profile": "dense"}]
+    )
+    raw = {"profiles": {"dense": {"default": "TORCH_SDPA"}}, schedule_key: ranges}
+    flags = (
+        ["--diffusion-attention-schedule", json.dumps(raw)]
+        if style == "json"
+        else [
+            "--diffusion-attention-schedule.profiles.dense.default",
+            "TORCH_SDPA",
+            f"--diffusion-attention-schedule.{schedule_key}",
+            json.dumps(ranges),
+        ]
+    )
+    args = parser.parse_args(["serve", "Qwen/Qwen-Image", "--omni", *flags])
+    stage = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
+    config = _terminal_config(stage)
+
+    assert config.diffusion_attention_schedule.profiles["dense"].default.backend == "TORCH_SDPA"
+    if schedule_kind == "step":
+        assert config.diffusion_attention_schedule.default[0].start == 3
+        assert config.diffusion_attention_schedule.default[0].end is None
+        assert config.diffusion_attention_schedule.sigma == ()
+    else:
+        assert config.diffusion_attention_schedule.sigma[0].low == 0.3
+        assert config.diffusion_attention_schedule.sigma[0].high == 1.0
+        assert config.diffusion_attention_schedule.default == ()
 
 
 def test_serve_cli_accepts_request_batch_max_wait_ms():

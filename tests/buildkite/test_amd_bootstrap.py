@@ -39,6 +39,8 @@ def _run_bootstrap(
     git_verify_status: int = 0,
     git_fetch_status: int = 0,
     git_merge_base: str = "",
+    git_diff_files: tuple[str, ...] = (),
+    git_show_status: int = 0,
     keep_suites: bool = False,
     vllm_use_precompiled: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -47,6 +49,9 @@ def _run_bootstrap(
         ".buildkite/common/scripts/resolve_skip_ci.sh",
         ".buildkite/common/scripts/release_line_branch.sh",
         ".buildkite/amd/scripts/select_test_suites.py",
+        ".buildkite/amd/scripts/filter_test_suite.py",
+        ".buildkite/common/scripts/upload_pipeline.py",
+        ".buildkite/common/ci_source_file_dependencies.yml",
         ".buildkite/amd/test-template-amd-omni.j2",
         ".buildkite/amd/test-amd-ready.yml",
         ".buildkite/amd/test-amd-merge.yml",
@@ -76,6 +81,9 @@ def _run_bootstrap(
         "TEST_GIT_VERIFY_STATUS": str(git_verify_status),
         "TEST_GIT_FETCH_STATUS": str(git_fetch_status),
         "TEST_GIT_MERGE_BASE": git_merge_base,
+        "TEST_GIT_DIFF": "\n".join(git_diff_files),
+        "TEST_GIT_SHOW_FILE": str(tmp_path / ".buildkite/amd/test-amd-nightly.yml"),
+        "TEST_GIT_SHOW_STATUS": str(git_show_status),
         "TEST_SKIP_CI_STATUS": "1" if keep_suites else "0",
     }
     if debug_test_yaml is not None:
@@ -115,6 +123,15 @@ git() {
             ;;
         merge-base)
             printf '%s\n' "${TEST_GIT_MERGE_BASE:-}"
+            ;;
+        diff)
+            printf '%s\n' "${TEST_GIT_DIFF:-}"
+            ;;
+        show)
+            if [[ "${TEST_GIT_SHOW_STATUS:-0}" -ne 0 ]]; then
+                return "$TEST_GIT_SHOW_STATUS"
+            fi
+            command cat "$TEST_GIT_SHOW_FILE"
             ;;
     esac
     return 0
@@ -298,6 +315,20 @@ def test_feature_branch_diff_uses_main_merge_base_once(tmp_path):
     assert result.returncode == 0, result.stderr
     merge_base_calls = [call for call in _git_calls(tmp_path) if "merge-base" in call]
     assert merge_base_calls == ["merge-base origin/main HEAD"]
+
+
+def test_pr_nightly_pipeline_edit_reads_base_revision(tmp_path):
+    merge_base = "7" * 40
+    result = _run_bootstrap(
+        tmp_path,
+        labels=("nightly-test",),
+        git_merge_base=merge_base,
+        git_diff_files=(".buildkite/amd/test-amd-nightly.yml",),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"show {merge_base}:.buildkite/amd/test-amd-nightly.yml" in _git_calls(tmp_path)
+    assert "Prepared AMD nightly jobs using PR/scheduled source-filter policy." in result.stdout
 
 
 def test_version_branch_reads_parent_from_commit_header(tmp_path):

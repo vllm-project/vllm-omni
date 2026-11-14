@@ -68,7 +68,14 @@ def _minimaxh3_params_builder(
 
     if "flow_shift" in params:
         form_fields["flow_shift"] = params.pop("flow_shift")
-    for key in ("audio_flow_shift",):
+    for key in (
+        "audio_flow_shift",
+        "long_video",
+        "long_video_mode",
+        "continuation_window_frames",
+        "continuation_overlap_frames",
+        "latent_upscale",
+    ):
         if key in params:
             merged_extra_params[key] = params.pop(key)
     # "native" is the server default; omit it so ordinary requests are unchanged.
@@ -131,7 +138,7 @@ _MODEL_PIPELINE_SPECS: dict[str, Spec] = {
             }
         ],
     },
-    r"MiniMax-H3(/FL2VA|/Ref2VA)?": {
+    r"MiniMax-H3(/FL2VA|/Ref2VA)?|FastVideo-FastH3-Omni-8-Step-V1": {
         "stages": ["diffusion"],
         "modes": [
             {
