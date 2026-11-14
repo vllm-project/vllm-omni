@@ -174,10 +174,11 @@ def release_module_parameters_to_meta(module: nn.Module) -> None:
     The module must finish construction first so initialization code and vLLM
     weight-loader metadata follow the ordinary CPU path. ``swap_tensors`` keeps
     each registered Parameter object's identity while dropping only its storage.
-    Persistent buffers intentionally remain materialized.
+    Persistent buffers and optional checkpoint parameters remain materialized
+    so their initialized defaults survive when the checkpoint omits them.
     """
     for param in module.parameters():
-        if param.device.type == "meta":
+        if param.device.type == "meta" or getattr(param, "is_checkpoint_optional", False):
             continue
 
         meta_tensor = torch.empty_like(param, device="meta")

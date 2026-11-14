@@ -1388,6 +1388,19 @@ class MiniMaxH3Pipeline(
             enable_diffusion_pipeline_profiler=(od_config.enable_diffusion_pipeline_profiler)
         )
 
+    @staticmethod
+    def _remap_ckpt_key(name: str) -> str:
+        """Map a Diffusers DiT block prefix to the runtime ``blocks.N`` group name.
+
+        Only the block prefix changes so pre-sharded HSDP block groups can claim
+        their tensors; ``MiniMaxH3DiTModel.load_block_weights`` converts the rest.
+        """
+        for prefix in ("transformer.", "transformers_ref."):
+            old = prefix + "transformer_blocks."
+            if name.startswith(old):
+                return prefix + "blocks." + name[len(old) :]
+        return name
+
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -1439,6 +1452,10 @@ class MiniMaxH3Pipeline(
             if component is None:
                 continue
             loaded_with_prefix.update(f"{component_name}.{name}" for name, _ in component.named_parameters())
+        if "transformer." not in loaded_prefixes:
+            # Pre-sharded HSDP streams only the non-DiT sources here (e.g. the
+            # text encoder); its checkpoint proxies already require every DiT tensor.
+            return loaded_with_prefix
         if self._vdn is not None:
             self._vdn.validate(transformer_loaded, self.transformer.vdn_parameter_names())
         if self._fasth3 is not None:
@@ -1481,6 +1498,16 @@ class MiniMaxH3Pipeline(
         config = self.od_config.cache_config
         path = config.get(key) if isinstance(config, Mapping) else getattr(config, key, None)
         if path is None or not transformer.adaln_cache.max_bytes:
+            return
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        if getattr(parallel_config, "use_hsdp", False) and (
+            getattr(self.od_config, "hsdp_weight_load_strategy", "full") == "pre_sharded"
+        ):
+            # The sidecar is verified against the DiT weights streamed through
+            # load_weights, which per-block pre-sharded loading bypasses.
+            logger.warning(
+                "Ignoring the optional H3 AdaLN sidecar with pre-sharded HSDP loading; runtime caching remains enabled"
+            )
             return
         try:
             if not eligible or get_tensor_model_parallel_world_size() != 1:

@@ -592,6 +592,29 @@ def test_optional_sidecar_supports_eager_and_compiled_execution(tmp_path, mocker
     assert transformer.adaln_cache.max_bytes > 0
 
 
+@pytest.mark.parametrize("strategy", ["full", "pre_sharded"])
+def test_pre_sharded_hsdp_ignores_optional_sidecar(tmp_path, mocker, strategy):
+    import vllm_omni.diffusion.models.minimax_h3.adaln_cache as cache_module
+
+    arch, _, _, manifest, path = _fixture(tmp_path)
+    open_sidecar = mocker.spy(cache_module, "safe_open")
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        cache_config={"cache": str(path)},
+        enforce_eager=True,
+        hsdp_weight_load_strategy=strategy,
+        parallel_config=SimpleNamespace(use_hsdp=True),
+    )
+    transformer = SimpleNamespace(arch=arch, adaln_cache=MiniMaxH3RuntimeAdalnCache())
+
+    pipeline._configure_adaln_sidecar(transformer, "cache", manifest["model_variant"], None, eligible=True)
+
+    # Per-block loading never streams the DiT weights the sidecar is verified against.
+    assert hasattr(transformer, "_adaln_sidecar_candidate") == (strategy == "full")
+    assert open_sidecar.called == (strategy == "full")
+
+
 def test_corrupt_optional_sidecar_falls_back_without_rejecting_model(tmp_path):
     path = tmp_path / "truncated.safetensors"
     path.write_bytes(b"truncated")

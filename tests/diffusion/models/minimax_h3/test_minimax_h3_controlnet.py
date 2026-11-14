@@ -606,6 +606,18 @@ def test_control_rejects_sequence_parallel_before_weight_loading(control_startup
         resolve_root.assert_not_called()
 
 
+def test_control_rejects_pre_sharded_hsdp_before_weight_loading(control_startup):
+    # Pre-sharded loading plans only DiT sources and would load the controlnet.
+    # source into an already sharded DiT, so the constructor must reject it.
+    pipeline_module, config = control_startup
+    config.parallel_config.use_hsdp = True
+    config.hsdp_weight_load_strategy = "pre_sharded"
+    with patch.object(pipeline_module, "_resolve_minimax_h3_model_root") as resolve_root:
+        with pytest.raises(ValueError, match="no cache/offload/SP/HSDP"):
+            pipeline_module.MiniMaxH3Pipeline(od_config=config)
+        resolve_root.assert_not_called()
+
+
 def test_control_rows_and_padded_sequence_survive_denoise_preparation():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
