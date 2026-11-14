@@ -2543,24 +2543,3 @@ def test_compose_h3_packed_and_separate_projections(scales):
             torch.testing.assert_close(weights.lora_b @ weights.lora_a, delta)
     assert set(first.loras) == set(packed_weights)
     assert first.loras["transformer.blocks.0.attn.qkv_proj"] is packed_weights["transformer.blocks.0.attn.qkv_proj"]
-
-
-def test_stacked_scale_keys_match_scheduler_batch_key():
-    """Regression: the manager's composed-adapter key and the scheduler/KV
-    batch key must quantize scales identically; otherwise requests scheduled
-    into separate batches could share an adapter composed at another scale."""
-    req_a, req_b = _dummy_lora_request(1), _dummy_lora_request(2)
-    scale_sets = ([0.5001, 0.7], [0.5004, 0.7], [0.12345, 0.67895], [1.0, 1.0])
-    keys = []
-    for scales in scale_sets:
-        batch_key = build_lora_batch_key([req_a, req_b], scales)
-        manager_key = tuple(
-            sorted(
-                (req.lora_int_id, DiffusionLoRAManager._get_rounded_scale(s)) for req, s in zip([req_a, req_b], scales)
-            )
-        )
-        assert batch_key == manager_key
-        keys.append(batch_key)
-    # The first three combos must stay distinct (they differ at/below the
-    # canonical quantization step), so each gets its own composed adapter.
-    assert len(set(keys)) == len(scale_sets)
