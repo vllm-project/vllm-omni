@@ -1604,8 +1604,9 @@ class MiniCPMO45Code2Wav(nn.Module):
     def on_requests_added(self, prewarms: list[OmniRequestPrewarm]) -> None:
         """Queue reference prefetches for new async-chunk placeholders.
 
-        Only validates and enqueues; :meth:`run_idle_prefetch` does the work
-        (the prompt, plus the setup with ``token2wav_ref_prefetch_setup``).
+        By default only validates and enqueues; :meth:`run_idle_prefetch` does
+        the work (plus setup with ``token2wav_ref_prefetch_setup``). Optional
+        CPU workers materialize and pin references within the same pin budget.
         A bad payload is logged and skipped, never raised. The V1 GPU, MRv2
         GPU and NPU generation runners call this hook and
         :meth:`run_idle_prefetch`; runners without these optional hooks prepare
@@ -1650,11 +1651,15 @@ class MiniCPMO45Code2Wav(nn.Module):
             self._prefetch_queue[state_id] = _RefPrefetch(ref_audio=ref_audio, sample_rate=sample_rate)
             workers = getattr(self, "_ref_cpu_prefetch_workers", 0)
             if workers and ref_audio.device.type == "cpu":
+                if not self._prefetch_pin_available(state_id):
+                    continue
                 try:
                     cache_key, entry = self._materialize_runtime_prompt(ref_audio, sample_rate)
                     entry.pins.add(state_id)
                     self._prefetch_pins[state_id] = cache_key
-                    self.backend.prefetch_prompt_cpu(entry.cache_id, entry.path, workers)
+                    if not self.backend.prefetch_prompt_cpu(entry.cache_id, entry.path, workers):
+                        self._drop_prefetch(state_id)
+                        continue
                     self._trim_runtime_prompts()
                 except Exception:
                     logger.exception("MiniCPM-o CPU reference prefetch failed for %s", state_id)
@@ -1706,6 +1711,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         ):
             return self._run_prefetch_phase(state_id, record)
 
+    def _prefetch_pin_available(self, state_id: str) -> bool:
+        # An accepted CPU job already holds this request's pin. Its later idle
+        # phase may reuse that pin even when the budget is full.
+        return state_id in self._prefetch_pins or len(self._prefetch_pins) < max(1, self._runtime_prompt_cache_size)
+
     def _run_prefetch_phase(self, state_id: str, record: _RefPrefetch) -> bool:
         """Run the next phase of ``record``; see ``run_idle_prefetch``."""
         entry = record.entry
@@ -1715,7 +1725,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 # pinned entries are never trimmed. The record waits at the
                 # head until a pin is released; its own chunk 0 or finish
                 # still drops it as usual.
-                if len(self._prefetch_pins) >= max(1, self._runtime_prompt_cache_size):
+                if not self._prefetch_pin_available(state_id):
                     return False
                 # Phase A. The pin keeps the entry (and with it the backend's
                 # prompt features) alive until chunk 0 or finish releases it.
@@ -1942,11 +1952,11 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "(token2wav_device_spk=false)"
             )
         if read_bool_flag(extra, "token2wav_spk_cuda_graph", False):
-            token2wav.enable_speaker_cuda_graph(self.vllm_config)
-            logger.info("MiniCPM-o Code2Wav: exact-shape Torch speaker CUDA graphs enabled")
+            if token2wav.enable_speaker_cuda_graph(self.vllm_config):
+                logger.info("MiniCPM-o Code2Wav: exact-shape Torch speaker CUDA graphs enabled")
         if read_bool_flag(extra, "token2wav_s3_cuda_graph", False):
-            token2wav.enable_s3_cuda_graph(self.vllm_config)
-            logger.info("MiniCPM-o Code2Wav: exact-shape S3 CUDA graphs enabled")
+            if token2wav.enable_s3_cuda_graph(self.vllm_config):
+                logger.info("MiniCPM-o Code2Wav: exact-shape S3 CUDA graphs enabled")
         self.backend = BatchedToken2Wav(
             token2wav,
             trt_stepper=trt_stepper,
