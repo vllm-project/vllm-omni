@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Validated Mooncake Thinker captures and request-local row assembly.
 
+Each stored block carries both capture tensors the Talker needs: the Thinker
+input embedding and the hidden state of the configured layer. "HS" in the key
+format and symbol names refers to that pair, not to hidden states alone.
+
 This module has no dependency on Mooncake or vLLM. Store operations and request
 attempt ownership belong to the connector; tensors here are CPU snapshots.
 """

@@ -21,7 +21,7 @@ import torch
 from vllm_omni.distributed.kv_transfer.mooncake import connector as connector_module
 from vllm_omni.distributed.kv_transfer.mooncake.config import MooncakeConfig
 from vllm_omni.distributed.kv_transfer.mooncake.connector import Attempt, OmniMooncakeStoreConnector, PendingSave
-from vllm_omni.distributed.kv_transfer.mooncake.hs import decode_hs, hs_key
+from vllm_omni.distributed.kv_transfer.mooncake.thinker_captures import decode_hs, hs_key
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
