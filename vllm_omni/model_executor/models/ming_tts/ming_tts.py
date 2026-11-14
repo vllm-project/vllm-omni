@@ -74,11 +74,16 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
             self.model = init_vllm_registered_model(vllm_config=vllm_config, architectures=["MingLLMModel"])
             self.has_preprocess = True
             self.has_postprocess = True
+            # forward returns OmniOutput; MRV2 unwraps it to hidden states for
+            # PIECEWISE capture and keeps this stage off FULL graphs.
+            self._returns_tuple = True
             self.set_custom_preprocess(self.preprocess)
             self.set_custom_postprocess(self.postprocess)
         elif self.model_stage == "audio_vae":
             self.model = init_vllm_registered_model(vllm_config=vllm_config, architectures=["MingAudioVAEModel"])
             self.requires_raw_input_tokens = True
+            # Key decoder state by the runner's request id so on_requests_finished can free it.
+            self.requires_request_ids = True
         else:
             raise ValueError(f"Invalid Ming model_stage={self.model_stage}")
         self.make_empty_intermediate_tensors = getattr(self.model, "make_empty_intermediate_tensors", lambda: None)
@@ -102,6 +107,11 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
 
     def sample(self, logits, sampling_metadata):
         return self.model.sample(logits, sampling_metadata) if hasattr(self.model, "sample") else None
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        on_finished = getattr(self.model, "on_requests_finished", None)
+        if callable(on_finished):
+            on_finished(finished_req_ids)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = list(weights)
@@ -138,7 +148,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
     def postprocess(self, hidden_states: torch.Tensor, **info_dict: Any) -> dict[str, Any]:
         if self.model_stage != "llm" or hidden_states.numel() == 0:
             return {}
-        req_id = info_dict.get(KEY_REQUEST_ID, info_dict.get("request_id"))
+        req_id = _request_id(info_dict)
         pending = self.model.pop_postprocess_update(req_id)
         if not pending or not isinstance(pending.get(self.model.latent_patch_key), torch.Tensor):
             return {}
@@ -161,7 +171,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
     def _prefill_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: Any):
         if bool(info_dict.get(KEY_TEXT_MODE, False)):
             update: dict[str, Any] = {KEY_TEXT_MODE: True}
-            request_id = info_dict.get(KEY_REQUEST_ID, info_dict.get("request_id"))
+            request_id = _request_id(info_dict)
             if request_id is not None:
                 update[KEY_REQUEST_ID] = request_id
             if int(input_ids.shape[0]) > 1 and int(input_ids[-1].item()) == AUDIO_START_TOKEN_ID:
@@ -201,7 +211,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
             if take > 0:
                 input_embeds[placeholder_pos[:take]] = prompt_embeds[:take].to(dtype=input_embeds.dtype)
 
-        request_id = info_dict.get(KEY_REQUEST_ID, info_dict.get("request_id"))
+        request_id = _request_id(info_dict)
         if request_id is not None:
             update[KEY_REQUEST_ID] = request_id
         _copy_runtime_controls(update, info_dict)
@@ -210,7 +220,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
     def _decode_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: Any):
         if bool(info_dict.get(KEY_TEXT_MODE, False)):
             update: dict[str, Any] = {KEY_TEXT_MODE: True}
-            request_id = info_dict.get(KEY_REQUEST_ID, info_dict.get("request_id"))
+            request_id = _request_id(info_dict)
             if request_id is not None:
                 update[KEY_REQUEST_ID] = request_id
             return input_ids, input_embeds, update
@@ -242,11 +252,17 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
             if not torch.isfinite(input_embeds[0]).all():
                 raise RuntimeError("Non-finite backbone input_embeds after decode preprocess write.")
 
-        request_id = info_dict.get(KEY_REQUEST_ID, info_dict.get("request_id"))
+        request_id = _request_id(info_dict)
         if request_id is not None:
             update[KEY_REQUEST_ID] = request_id
         _copy_runtime_controls(update, info_dict)
         return input_ids, input_embeds, update
+
+
+def _request_id(info_dict: dict[str, Any]) -> str | None:
+    # The V1 runner injects ``request_id``; the MRV2 intermediate buffer keys it ``req_id``.
+    # Take the first non-None so an explicit None under an earlier key cannot hide a later one.
+    return next((info_dict[k] for k in (KEY_REQUEST_ID, "request_id", "req_id") if info_dict.get(k) is not None), None)
 
 
 def _copy_runtime_controls(update: dict[str, Any], info_dict: dict[str, Any]) -> None:
