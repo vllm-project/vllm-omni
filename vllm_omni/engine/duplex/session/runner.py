@@ -1180,7 +1180,11 @@ class DuplexSessionRunner:
 
     def _wake_memory(self, _completed: object = None) -> None:
         """Wake memory policy on the mailbox after accepted input or owned work finishes."""
-        if self.plugin.supports_auxiliary_requests and not self.closing and not self._worker_stopped:
+        if (
+            (self.plugin.supports_auxiliary_requests or self.plugin.supports_context_auxiliary_requests)
+            and not self.closing
+            and not self._worker_stopped
+        ):
             self._post_memory_event("auxiliary_ready", {})
 
     def _session_auto_responds(self) -> bool:

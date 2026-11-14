@@ -2085,3 +2085,112 @@ them out into typed events before they reach a client.
   turn-based HTTP routes report "not available" in duplex mode. To use the
   ordinary online serving stack, select `session_mode: turn` as described in
   [Full Duplex](full_duplex_api.md#enable-full-duplex).
+
+### Qwen long-session context policies (experimental)
+
+Qwen3-Omni deployments can opt into token-budgeted history and background
+summary memory. These policies extend the existing commit-based duplex session;
+they do not increase the checkpoint's native context length.
+
+```yaml
+base_config: qwen3_omni_duplex_mrv2.yaml
+duplex_session:
+  qwen_context_policy: budget_summary
+  qwen_context_max_tokens: 4096
+  context_keep_media_turns: 2
+  qwen_summary_max_tokens: 512
+  qwen_summary_input_max_tokens: 3072
+  qwen_summary_timeout_s: 30
+  context_auxiliary_budget:
+    max_input_tokens: 8192
+    max_output_tokens: 1024
+    window_s: 60
+    cooldown_s: 5
+    idle_s: 1
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `qwen_context_policy` | `legacy` | `legacy`, `budget`, or `budget_summary` |
+| `qwen_context_max_tokens` | `null` | Total input plus output allowance; null uses Thinker `max_model_len` |
+| `qwen_summary_max_tokens` | `512` | Maximum tokens generated for a summary |
+| `qwen_summary_input_max_tokens` | `8192` | Maximum summary input, additionally capped by the deployment context allowance |
+| `qwen_summary_timeout_s` | `30` | Auxiliary model request deadline in seconds |
+| `context_auxiliary_budget` | `null` | Optional common auxiliary allowance; all five fields must be provided |
+| `context_memory_tokens` | `0` | Experimental card block allowance, including formatting, from 0 to 256 tokens within the total prompt budget |
+
+These settings are deployment-owned, not client session overrides. Set the
+context allowance no higher than the deployed Thinker's `max_model_len`.
+`legacy` retains the existing recent-message policy. `budget` uses complete
+historical turns and reserves the actual Thinker generation `max_tokens`.
+Instructions, system messages, current input and pending tool continuations
+are mandatory. If these alone exceed the allowance, the response fails with
+`context_budget_exceeded`; shorten the input or reduce the output allowance.
+If history changes during asynchronous prompt preparation, retry the response
+after `context_changed`. A tool continuation whose original input was edited,
+deleted or is no longer available fails with `context_source_unavailable`; its
+result is not attached to a different user turn.
+
+`budget_summary` also uses idle time to summarize eligible, committed turns
+excluded by the budget. The same Thinker generates private text-only summaries;
+they do not create response events or audio. Active user interaction takes
+priority. Failed, empty, truncated, timed-out or stale results are ignored,
+as are known bare acknowledgments and explicit no-memory results, and
+the prompt continues with budget selection and any still-valid memory. A failed
+source is not retried repeatedly without new eligible evidence.
+
+The example's auxiliary limits are explicit experimental values. The account
+charges input token IDs and reserved output tokens within a rolling `window_s`,
+with `cooldown_s` between submissions and `idle_s` after user activity. A
+submitted request remains charged if it fails or is cancelled. Work waiting for
+resources consumes no model allowance and can resume when capacity returns.
+Limits remain fixed across live-session resume. The account is separate from
+the foreground prompt-token allowance; clients cannot override it. With no
+common account, summaries keep their existing scheduling and extraction-only
+cards retain their existing compute settings. Configuring both policies
+requires the explicit common account, whose output allowance must fit each
+request's reserved generation.
+
+Card consumption additionally requires `context_memory` extraction and a
+positive `context_memory_tokens`. It preserves the history/summary selection
+and uses only the remaining prompt space, dropping lower-ranked cards first.
+The single historical-data block follows configured instructions and precedes
+summary/history. Retrieval uses only the current text or an available current
+transcript. Audio-only input with no transcript gets no cards; this setting
+does not run ASR. The default zero allowance adds no capture, retrieval or
+card-counting processor passes. `legacy` permits extraction with consumption
+disabled; positive card consumption requires `budget` or `budget_summary`.
+
+The consumer rechecks context and the actual token budget immediately before
+local stage acceptance. If only selected cards have become stale, it can rebuild
+once without cards. Changed conversation, summary or session settings remain
+`context_changed` errors; an input that exceeds the final context allowance
+remains `context_budget_exceeded`. Pending card reconciliation does not block
+an otherwise valid response without cards.
+
+With both summary memory and card extraction enabled, ready work alternates on
+the same private request slot. Each kind keeps its finite retry state across
+policy idleness and input preemption. User interaction takes priority; the next
+private request waits for successful cleanup. Resource-deferred work keeps the
+next admission opportunity, which can leave a small remaining allowance unused
+until the common account or execution permit becomes available.
+
+The most recent complete historical turn takes priority over summary memory.
+A usable summary then takes priority over additional older verbatim turns.
+When all available original context fits, original text takes priority, except
+where a summary still represents expired media that is no longer available.
+Source edits, deletion and truncation invalidate affected memory. Live-session
+resume retains valid memory; restarting the server does not restore it.
+
+Use `context_keep_media_turns` to retain existing text/transcripts when old
+media is omitted. This does not perform ASR or infer descriptions of discarded
+images. A user turn with no usable text cannot become summary evidence.
+Interrupted assistant replies contribute only the authoritative committed text,
+including accepted heard-prefix calibration when configured. A complete turn
+that cannot fit the auxiliary input allowance is not partially summarized.
+
+Summary text and concurrent auxiliary requests are bounded. Authoritative
+history, source references and other session bookkeeping still grow with the
+session; token budgeting is not a bound on total host memory. Larger prompts
+and summary forwards can increase latency and GPU work. Measure recall and
+latency on the target deployment before enabling this policy in production.

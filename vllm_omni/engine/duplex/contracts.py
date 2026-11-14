@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import base64
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
@@ -33,8 +33,18 @@ class DuplexOutputAction(str, Enum):
 
 
 @dataclass(frozen=True)
+class DuplexContextSelection:
+    """References selected by a formatter; owner receipts never cross this boundary."""
+
+    card_node_ids: tuple[int, ...]
+    summary_node_id: int | None
+    omitted_source_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class DuplexAppendPlan:
     prompt: dict[str, object]
+    context_selection: DuplexContextSelection | None = None
 
 
 @dataclass(frozen=True)
@@ -139,7 +149,16 @@ class DuplexStagePort(ABC):
     def ensure_request(self, context: DuplexStageRequestContext) -> None: ...
 
     @abstractmethod
-    async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult: ...
+    async def submit(
+        self, submission: DuplexStageSubmission, *, before_accept: Callable[[object], None] | None = None
+    ) -> DuplexStageSubmissionResult:
+        """Validate locally after preparation/routing, before accepting transport.
+
+        The optional guard is synchronous and owner-only. It is never included
+        in a worker request. Post-acceptance changes use the existing request
+        cancellation lifecycle; this does not promise remote execution atomicity.
+        """
+        ...
 
     @abstractmethod
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None: ...
@@ -259,6 +278,7 @@ def duplex_resource_request_belongs_to_session(request_id: str, session_id: str)
 __all__ = [
     "DuplexFence",
     "DuplexAppendPlan",
+    "DuplexContextSelection",
     "DuplexOutputAction",
     "DuplexOutputContext",
     "DuplexOutputDecision",

@@ -556,6 +556,7 @@ async def test_prepare_runtime_config_rejects_an_unknown_voice_at_open():
         hf_config=SimpleNamespace(talker_config=SimpleNamespace(speaker_id={"Chelsie": 1})),
         model="qwen",
         trust_remote_code=True,
+        max_model_len=4096,
     )
 
     with pytest.raises(DuplexRuntimeConfigError, match="Invalid speaker 'nova'") as exc_info:

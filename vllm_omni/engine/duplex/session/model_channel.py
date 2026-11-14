@@ -35,6 +35,7 @@ from vllm.logger import init_logger
 from vllm_omni.engine.duplex.config import DuplexSessionState
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
+    DuplexContextSelection,
     DuplexFence,
     DuplexOutputContext,
     DuplexOutputDecision,
@@ -67,6 +68,13 @@ if TYPE_CHECKING:
     from vllm.outputs import RequestOutput
 
 logger = init_logger(__name__)
+
+
+class _CardSelectionChangedError(DuplexRuntimeConfigError):
+    """Only this pre-acceptance rejection permits one no-card rebuild."""
+
+    def __init__(self) -> None:
+        super().__init__("Selected memory cards changed during context preparation", code="context_changed")
 
 
 def _response_awaits_playback_ack(session, response_id, *, should_commit: bool, committed_message) -> bool:
@@ -424,12 +432,20 @@ class ModelChannel:
             view_policy = self._ctx.plugin.context_view_policy(
                 stage_id=stage_id, runtime_config=self._ctx.manager.runtime_config
             )
-            if view_policy is None:
+            if view_policy is None and not self._ctx.plugin.uses_context_ledger:
                 history, item_ids = session.history_for_prompt()
                 snapshot = None
             else:
                 snapshot = session.history_snapshot()
                 history, item_ids = session.history, snapshot.item_ids
+            if self._ctx.plugin.uses_context_ledger:
+                assert snapshot is not None
+                self._ctx.plugin.observe_history_context(
+                    snapshot=snapshot,
+                    ledger=session.context_ledger,
+                    state=self._ctx.model_state,
+                    runtime_config=session.runtime_config,
+                )
             prompt_session = {
                 **request_context.session_config,
                 # Keep the prompt accessor's nested content identity: Qwen
@@ -448,56 +464,203 @@ class ModelChannel:
                 prompt_session["conversation_view"] = list(
                     session.render_history_view(view_policy, snapshot=snapshot).messages
                 )
-            append_plan = await self._ctx.plugin.prepare_append_plan(
-                request_id=request_id,
-                fence=fence,
-                session_config=self._ctx.plugin.prepare_prompt_config(
-                    prompt_session,
-                    state=self._ctx.model_state,
-                    payload=prompt_payload,
-                ),
-                runtime_config=dict(request_context.runtime_config),
-                seq=reservation.update.seq,
-                turn_seq=reservation.update.turn_seq,
-                payload=payload,
-                final=final,
-                sampling_params=request_context.stage_sampling_params,
+            prepared_session = self._ctx.plugin.prepare_prompt_config(
+                prompt_session,
+                state=self._ctx.model_state,
+                payload=prompt_payload,
             )
-            # Preparation may yield while cancellation or session teardown runs.
-            # Never submit the worker's stale result to the model.
-            if session.epoch != fence.epoch or session.state != DuplexSessionState.OPEN:
-                raise DuplexFenceMismatchError(session.fence, fence)
-            if not isinstance(append_plan, DuplexAppendPlan):
-                raise TypeError("duplex plugin plan_append() must return DuplexAppendPlan")
-            if on_append_prepared is not None:
-                on_append_prepared()
-            prompt = dict(append_plan.prompt)
-            perf, perf_chunk = session.perf, None
-            if perf is not None:
-                # Before submit: a live resumable request can report spans while it awaits.
-                perf_chunk = perf.open_chunk(
-                    epoch=fence.epoch,
-                    seq=reservation.update.seq,
-                    turn_id=reservation.update.turn_id,
-                    turn_seq=reservation.update.turn_seq,
-                    submitted_ns=accepted_ns,
-                )
-                prompt = with_perf_chunk(prompt, perf_chunk)
-            try:
-                runtime_patch = self._ctx.plugin.runtime_patch_for_submitted_prompt(prompt)
-                submission = DuplexStageSubmission(
-                    context=request_context,
-                    prompt=prompt,
-                    already_submitted=already_submitted,
-                    resumable=resumable,
-                )
-                if remaining_transcription_input is not None:
-                    self._input_transcriptions[request_id] = remaining_transcription_input
-                submission_result = await self._ctx.stage_port.submit(submission)
-            except BaseException:
-                if perf is not None and perf_chunk is not None:
-                    perf.drop_chunk(perf_chunk)
-                raise
+            memory_capture = None
+            memory_query = self._ctx.plugin.memory_prompt_query(session_config=prepared_session, payload=prompt_payload)
+            if memory_query is not None:
+                memory_capture = session.capture_memory_prompt(query=memory_query)
+                prepared_session["context_memory_cards"] = memory_capture.cards
+            config_revision = session.config_revision
+            response_id = session.active_response_id
+            resource_key = (stage_id, request_id)
+            prompt_resource = session.request_resources[resource_key]
+            resource_fence, resource_submitted = prompt_resource.fence, prompt_resource.submitted
+            original_selection = None
+            prepared_notified = False
+            for attempt in range(2):
+                perf, perf_chunk = session.perf, None
+                guard_rejected = submission_attempted = False
+                try:
+                    append_plan = await self._ctx.plugin.prepare_append_plan(
+                        request_id=request_id,
+                        fence=fence,
+                        session_config=prepared_session,
+                        runtime_config=dict(request_context.runtime_config),
+                        seq=reservation.update.seq,
+                        turn_seq=reservation.update.turn_seq,
+                        payload=payload,
+                        final=final,
+                        sampling_params=request_context.stage_sampling_params,
+                    )
+                    # Preparation may yield during cancellation or history edits.
+                    if session.epoch != fence.epoch or session.state != DuplexSessionState.OPEN:
+                        raise DuplexFenceMismatchError(session.fence, fence)
+                    if self._ctx.plugin.uses_context_ledger:
+                        assert snapshot is not None
+                        if session.history_revision != snapshot.history_revision:
+                            raise DuplexRuntimeConfigError(
+                                "Conversation changed during context preparation; retry the response",
+                                code="context_changed",
+                            )
+                    if not isinstance(append_plan, DuplexAppendPlan):
+                        raise TypeError("duplex plugin plan_append() must return DuplexAppendPlan")
+                    selection = append_plan.context_selection
+                    if selection is None and original_selection is not None:
+                        raise DuplexRuntimeConfigError(
+                            "Context selection disappeared during rebuild", code="context_changed"
+                        )
+                    before_accept: Callable[[object], None] | None = None
+                    if selection is not None:
+                        if not isinstance(selection, DuplexContextSelection) or snapshot is None:
+                            raise DuplexRuntimeConfigError("Invalid context selection", code="context_changed")
+                        ids = selection.card_node_ids
+                        omitted_ids = selection.omitted_source_ids
+                        if (
+                            not isinstance(ids, tuple)
+                            or len(ids) > 16
+                            or any(type(node_id) is not int or node_id < 0 for node_id in ids)
+                            or len(set(ids)) != len(ids)
+                            or not isinstance(omitted_ids, tuple)
+                            or len(omitted_ids) > len(snapshot.source_ids)
+                            or any(type(source_id) is not int or source_id < 0 for source_id in omitted_ids)
+                            or len(set(omitted_ids)) != len(omitted_ids)
+                            or not set(omitted_ids).issubset(snapshot.source_ids)
+                            or (
+                                selection.summary_node_id is not None
+                                and (type(selection.summary_node_id) is not int or selection.summary_node_id < 0)
+                            )
+                        ):
+                            raise DuplexRuntimeConfigError("Invalid context node references", code="context_changed")
+                        if ids and (
+                            memory_capture is None
+                            or not set(ids).issubset(card.node_id for card in memory_capture.cards)
+                        ):
+                            raise DuplexRuntimeConfigError("Context nodes were not captured", code="context_changed")
+                        if original_selection is None:
+                            original_selection = selection
+                        elif original_selection.summary_node_id != selection.summary_node_id:
+                            raise DuplexRuntimeConfigError(
+                                "Base summary changed during rebuild", code="context_changed"
+                            )
+
+                        def validate_base() -> None:
+                            if (
+                                session.state != DuplexSessionState.OPEN
+                                or session.lease.terminal_reason is not None
+                                or session.epoch != fence.epoch
+                                or session.config_revision != config_revision
+                                or session.config_generation != request_context.config_generation
+                                or session.active_response_id != response_id
+                                or session.request_resources.get(resource_key) is not prompt_resource
+                                or prompt_resource.fence != resource_fence
+                                or prompt_resource.submitted != resource_submitted
+                            ):
+                                raise DuplexRuntimeConfigError(
+                                    "Session context changed before acceptance", code="context_changed"
+                                )
+                            assert snapshot is not None
+                            if session.history_revision != snapshot.history_revision:
+                                raise DuplexRuntimeConfigError(
+                                    "Conversation changed before acceptance", code="context_changed"
+                                )
+                            assert original_selection is not None
+                            summary_id = original_selection.summary_node_id
+                            if summary_id is not None:
+                                # The history revision check makes this captured
+                                # source snapshot current without another copy.
+                                session.context_ledger.refresh(snapshot)
+                                if not session.context_ledger.valid(summary_id):
+                                    raise DuplexRuntimeConfigError(
+                                        "Summary changed before acceptance", code="context_changed"
+                                    )
+
+                        def validate_cards() -> None:
+                            # Empty selections still validate their base. Pending
+                            # reconciliation must not block a no-card foreground.
+                            if ids and (
+                                memory_capture is None
+                                or not session.memory_prompt_matches(
+                                    memory_capture, ids, omitted_source_ids=omitted_ids
+                                )
+                            ):
+                                raise _CardSelectionChangedError()
+
+                        def validate_final(materialized: object) -> None:
+                            nonlocal guard_rejected
+                            try:
+                                validate_base()
+                                self._ctx.plugin.validate_context_prompt(
+                                    materialized=materialized, sampling_params=request_context.stage_sampling_params
+                                )
+                                validate_cards()
+                            except BaseException:
+                                guard_rejected = True
+                                raise
+
+                        before_accept = validate_final
+                        validate_base()
+                        validate_cards()
+                    if on_append_prepared is not None and not prepared_notified:
+                        on_append_prepared()
+                        prepared_notified = True
+                    prompt = dict(append_plan.prompt)
+                    if perf is not None:
+                        perf_chunk = perf.open_chunk(
+                            epoch=fence.epoch,
+                            seq=reservation.update.seq,
+                            turn_id=reservation.update.turn_id,
+                            turn_seq=reservation.update.turn_seq,
+                            submitted_ns=accepted_ns,
+                        )
+                        prompt = with_perf_chunk(prompt, perf_chunk)
+                    runtime_patch = self._ctx.plugin.runtime_patch_for_submitted_prompt(prompt)
+                    submission = DuplexStageSubmission(
+                        context=request_context,
+                        prompt=prompt,
+                        already_submitted=already_submitted,
+                        resumable=resumable,
+                    )
+                    if remaining_transcription_input is not None:
+                        self._input_transcriptions[request_id] = remaining_transcription_input
+                    submission_attempted = True
+                    if before_accept is None:
+                        submission_result = await self._ctx.stage_port.submit(submission)
+                    else:
+                        submission_result = await self._ctx.stage_port.submit(submission, before_accept=before_accept)
+                    break
+                except BaseException as exc:
+                    if perf is not None and perf_chunk is not None:
+                        perf.drop_chunk(perf_chunk)
+                    card_changed = isinstance(exc, _CardSelectionChangedError)
+                    rejected = guard_rejected or (card_changed and not submission_attempted)
+                    if (
+                        not rejected
+                        or already_submitted
+                        or session.request_resources.get(resource_key) is not prompt_resource
+                        or prompt_resource.submitted
+                    ):
+                        raise
+                    # Only a known pre-acceptance rejection owns this cleanup.
+                    # Transport failures, including similarly typed exceptions,
+                    # may already have sent the request and must never retry.
+                    cleaned = False
+                    try:
+                        await self._ctx.stage_port.cleanup([request_id], abort=False)
+                        cleaned = True
+                    except Exception as cleanup_exc:
+                        logger.warning(
+                            "Rejected duplex context retains its resource for teardown (%s)",
+                            type(cleanup_exc).__name__,
+                        )
+                    if not cleaned or not card_changed or attempt:
+                        raise
+                    validate_base()
+                    self._ctx.stage_port.ensure_request(request_context)
+                    prepared_session = {**prepared_session, "context_memory_cards": ()}
             try:
                 if submission_result.request_id != request_id or submission_result.stage_id != stage_id:
                     raise RuntimeError("duplex stage adapter returned a mismatched submission result")

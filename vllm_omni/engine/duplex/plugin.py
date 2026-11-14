@@ -29,12 +29,22 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexOutputDecision,
 )
+from vllm_omni.engine.duplex.memory_types import (
+    DuplexContextAuxiliaryInput,
+    DuplexContextAuxiliaryPolicy,
+    DuplexContextAuxiliaryRechunk,
+    DuplexContextAuxiliaryWork,
+    DuplexMemoryProposalBatch,
+)
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
+    from vllm_omni.engine.duplex.session.auxiliary_budget import DuplexAuxiliaryBudgetLimits
+    from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
     from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
+    from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
     from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
 
 
@@ -415,8 +425,10 @@ class DuplexAuxiliaryRequest:
     timeout_s: float = 30.0
     model_source: object | None = None
     retry_delays_s: tuple[float, ...] = ()
-    # Continue at this interval after the short retry budget is exhausted.
+    # Legacy path only: continue at this interval after short retry exhaustion.
     retry_cooldown_s: float | None = None
+    # Issued and bound by the session owner, never supplied by model output.
+    context_work: DuplexContextAuxiliaryWork | None = None
 
 
 class DuplexModelPlugin(ABC):
@@ -438,6 +450,7 @@ class DuplexModelPlugin(ABC):
 
     projects_intermediate_outputs: bool = False
     supports_auxiliary_requests: bool = False
+    supports_context_auxiliary_requests: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
     #: Samples per silence unit the runner appends to keep a model turn going.
@@ -453,6 +466,22 @@ class DuplexModelPlugin(ABC):
 
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
         """Bind model policy to the resolved deployment topology before admission."""
+
+    def configure_session_runtime(self, runtime_config: DuplexSessionRuntimeConfig) -> None:
+        """Bind deployment-owned policy before sessions can be admitted."""
+        if runtime_config.context_memory is not None:
+            raise ValueError("context_memory is unsupported by this duplex plugin")
+        if runtime_config.context_memory_tokens:
+            raise ValueError("context_memory_tokens is unsupported by this duplex plugin")
+        if runtime_config.context_auxiliary_budget is not None:
+            raise ValueError("context_auxiliary_budget is unsupported by this duplex plugin")
+
+    def auxiliary_budget_limits(self) -> DuplexAuxiliaryBudgetLimits | None:
+        """Return the deployment's shared private-work allowance, or opt out."""
+        return None
+
+    def auxiliary_request_submitted(self, *, request: DuplexAuxiliaryRequest, state: DuplexModelSessionState) -> None:
+        """Mark prepared work attempted after resource admission, without yielding."""
 
     def input_stage_id(self, payload: object) -> int:
         """Select the entry stage for one append before reserving its request."""
@@ -496,6 +525,41 @@ class DuplexModelPlugin(ABC):
     ) -> dict[str, object]:
         """Add model-owned context before planning an append on the session loop."""
         return config
+
+    def memory_prompt_query(self, *, session_config: Mapping[str, object], payload: Mapping[str, object]) -> str | None:
+        """Opt into card retrieval using only current text or an available transcript."""
+        return None
+
+    def validate_context_prompt(self, *, materialized: object, sampling_params: object) -> None:
+        """Check an opt-in context plan's final stage input synchronously."""
+
+    def context_auxiliary_policy(self, *, runtime_config: Mapping[str, object]) -> DuplexContextAuxiliaryPolicy | None:
+        """Select owner-bound work; a common account may arbitrate both auxiliary policies."""
+        return None
+
+    async def prepare_context_auxiliary_request(
+        self, *, context: DuplexContextAuxiliaryInput, runtime_config: Mapping[str, object]
+    ) -> DuplexAuxiliaryRequest | DuplexContextAuxiliaryRechunk | None:
+        """Prepare private work from detached evidence, without live session state."""
+        return None
+
+    def decode_context_auxiliary_result(
+        self, *, request: DuplexAuxiliaryRequest, output: object
+    ) -> DuplexMemoryProposalBatch | None:
+        """Pure decode only; the session validates and admits returned proposals."""
+        return None
+
+    uses_context_ledger: bool = False
+
+    def observe_history_context(
+        self,
+        *,
+        snapshot: DuplexHistorySnapshot,
+        ledger: DuplexContextLedger,
+        state: DuplexModelSessionState,
+        runtime_config: Mapping[str, object],
+    ) -> None:
+        """Observe versioned sources on the session owner loop, never a worker thread."""
 
     async def prepare_auxiliary_request(
         self,
