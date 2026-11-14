@@ -6,6 +6,7 @@ Two-stage non-streaming pipeline. S2Mel flow matching (25 Euler steps) requires
 the full mel code sequence, so async_chunk is not applicable.
 """
 
+from vllm_omni.config.endpoint_policy import speech_only_endpoint_restrictions
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -16,6 +17,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.indextts2"
 
 INDEXTTS2_PIPELINE = PipelineConfig(
     model_type="indextts2",
+    endpoint_restrictions=speech_only_endpoint_restrictions("IndexTTS2"),
     default_deploy_config_name="indextts2.yaml",
     model_arch="IndexTTS2TalkerForConditionalGeneration",
     stages=(
@@ -53,6 +55,7 @@ INDEXTTS2_PIPELINE = PipelineConfig(
 
 INDEXTTS25_PIPELINE = PipelineConfig(
     model_type="indextts2_5",
+    endpoint_restrictions=speech_only_endpoint_restrictions("IndexTTS2.5"),
     default_deploy_config_name="indextts2_5.yaml",
     model_arch="IndexTTS25TalkerForConditionalGeneration",
     stages=(

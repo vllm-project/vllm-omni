@@ -432,8 +432,13 @@ def client(test_app):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enable_scale_out", [False, True], ids=["default", "scale-out"])
 async def test_server_worker_applies_speech_only_endpoint_restrictions(
-    mocker: MockerFixture, enable_scale_out, request: pytest.FixtureRequest
+    mocker: MockerFixture,
+    enable_scale_out: bool,
+    request: pytest.FixtureRequest,
 ):
+    # Per-pipeline restrictions are covered in test_endpoint_policy.py. Here
+    # exercise their installation by the real server worker in both modes.
+    model_name = "CosyVoice3"
     # SageMaker route registration imports a dependency that changes root.level.
     # Restore it through setLevel so later tests also clear cached log filters.
     root_logger = logging.getLogger()
@@ -488,6 +493,9 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
             create_messages=mocker.AsyncMock(return_value=unexpected_dispatch_error)
         ),
         "serving_tokens": SimpleNamespace(serve_tokens=mocker.AsyncMock(return_value=unexpected_dispatch_error)),
+        "openai_serving_audio_generate": SimpleNamespace(
+            create_audio_generate=mocker.AsyncMock(return_value=unexpected_dispatch_error)
+        ),
     }
     captured_app = None
     serve_started = asyncio.Event()
@@ -548,16 +556,20 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
         with closing(TestClient(captured_app)) as client:
             completion_response = client.post(
                 "/v1/completions",
-                json={"model": "cosyvoice3", "prompt": "hello"},
+                json={"model": model_name, "prompt": "hello"},
             )
             chat_response = client.post(
                 "/v1/chat/completions",
-                json={"model": "cosyvoice3", "messages": [{"role": "user", "content": "hello"}]},
+                json={
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 8,
+                },
             )
             chat_batch_response = client.post(
                 "/v1/chat/completions/batch",
                 json={
-                    "model": "cosyvoice3",
+                    "model": model_name,
                     "messages": [
                         [{"role": "user", "content": "hello"}],
                         [{"role": "user", "content": "another request"}],
@@ -565,15 +577,16 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
                 },
             )
             sibling_payloads = {
-                "/v1/responses": {"model": "cosyvoice3", "input": "hello"},
+                "/v1/audio/generate": {"model": "cosyvoice3", "input": "hello"},
+                "/v1/responses": {"model": model_name, "input": "hello"},
                 "/v1/messages": {
-                    "model": "cosyvoice3",
+                    "model": model_name,
                     "max_tokens": 1,
                     "messages": [{"role": "user", "content": "hello"}],
                 },
-                "/invocations": {"model": "cosyvoice3", "prompt": "hello", "max_tokens": 1},
+                "/invocations": {"model": model_name, "prompt": "hello", "max_tokens": 1},
                 "/inference/v1/generate": {
-                    "model": "cosyvoice3",
+                    "model": model_name,
                     "token_ids": [151645],
                     "sampling_params": {"max_tokens": 1},
                 },
@@ -584,14 +597,14 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
                 body = response.json()
                 assert body["error"]["type"] == "BadRequestError", path
                 assert body["error"]["code"] == 400, path
-                assert "CosyVoice3 does not support" in body["error"]["message"], path
+                assert f"{model_name} does not support" in body["error"]["message"], path
             speech_response = client.post(
                 "/v1/audio/speech",
-                json={"model": "cosyvoice3", "input": "hello", "voice": "alloy"},
+                json={"model": model_name, "input": "hello", "voice": "alloy"},
             )
             speech_batch_response = client.post(
                 "/v1/audio/speech/batch",
-                json={"model": "cosyvoice3", "items": [{"input": "hello"}], "voice": "alloy"},
+                json={"model": model_name, "items": [{"input": "hello"}], "voice": "alloy"},
             )
     finally:
         http_shutdown.set()
@@ -623,6 +636,7 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(
     sibling_handlers["openai_serving_responses"].create_responses.assert_not_awaited()
     sibling_handlers["anthropic_serving_messages"].create_messages.assert_not_awaited()
     sibling_handlers["serving_tokens"].serve_tokens.assert_not_awaited()
+    sibling_handlers["openai_serving_audio_generate"].create_audio_generate.assert_not_awaited()
     speech_handler.create_speech.assert_awaited_once()
     speech_handler.create_speech_batch.assert_awaited_once()
     speech_handler.shutdown.assert_called_once()

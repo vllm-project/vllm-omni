@@ -7,6 +7,7 @@ Stage 0: fish_omni   — text + voice references → one sampled 10-codebook fra
 Stage 1: dac_decoder — frames → 44.1 kHz audio; the same Fish DAC codec as S2 Pro.
 """
 
+from vllm_omni.config.endpoint_policy import speech_only_endpoint_restrictions
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -19,6 +20,7 @@ FISH_OMNI_PIPELINE = PipelineConfig(
     model_type="fish_omni",
     default_deploy_config_name="fish_omni.yaml",
     model_arch="FishOmniForConditionalGeneration",
+    endpoint_restrictions=speech_only_endpoint_restrictions("Drama-3"),
     stages=(
         StagePipelineConfig(
             stage_id=0,
