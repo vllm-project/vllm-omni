@@ -937,6 +937,8 @@ class Flux2Pipeline(
             req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
         )
         generator = req.sampling_params.generator or generator
+        if req.sampling_params.latents is not None:
+            latents = req.sampling_params.latents
         num_images_per_prompt = (
             req.sampling_params.num_outputs_per_prompt
             if req.sampling_params.num_outputs_per_prompt > 0

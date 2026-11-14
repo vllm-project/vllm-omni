@@ -1255,6 +1255,7 @@ class QwenImage21Pipeline(
             sigmas=sampling.sigmas,
             num_images_per_prompt=num_images_per_prompt,
             generator=sampling.generator,
+            latents=sampling.latents,
             true_cfg_scale=sampling.true_cfg_scale if sampling.true_cfg_scale is not None else 1.0,
             max_sequence_length=sampling.max_sequence_length or self._max_length,
             per_request_images=per_request_images,
