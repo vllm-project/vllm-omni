@@ -92,12 +92,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._generation_min_batch_size = 1
                 self._generation_max_wait_s = 0.0
                 self._generation_max_regular_batch = 0
-            elif not (
-                self._retains_state_across_chunks
-                and parallel.tensor_parallel_size == parallel.pipeline_parallel_size == 1
-            ):
-                raise ValueError("Generation batch waiting requires a stateful native MRV2 TP1/PP1 stage")
+            elif not (parallel.tensor_parallel_size == parallel.pipeline_parallel_size == 1):
+                raise ValueError("Generation batch waiting requires a native MRV2 TP1/PP1 stage")
             else:
+                # Coalescing counts ready requests before slot allocation and
+                # does not require slots to remain assigned between chunks.
                 logger.info(
                     "Generation input coalescing: target batch=%d, max wait=%.3f ms",
                     self._generation_min_batch_size,
@@ -253,6 +252,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 waited_without_input = True
             elif len(runnable) >= target or len(self.requests) < target:
                 break
+            for req_id in runnable:
+                if (audio := getattr(self, "_stream_audio", {}).get(req_id)) is not None:
+                    deadline = min(deadline, audio[0] + audio[1])
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -393,6 +395,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
 
     def _handle_stopped_request(self, request: Request) -> bool:
+        getattr(self, "_chunk_started", set()).discard(request.request_id)
+        getattr(self, "_stream_audio", {}).pop(request.request_id, None)
         if (
             request.resumable
             and not request.streaming_queue
@@ -831,15 +835,17 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             rate = int(rate.reshape(-1)[0]) if rate.numel() else 0
         if not isinstance(rate, int) or rate <= 0:
             return
-        entry = self._stream_audio.setdefault(request_id, [time.monotonic(), 0.0])
+        now = time.monotonic()
+        entry = self._stream_audio.setdefault(request_id, [now, 0.0])
+        if entry[0] + entry[1] < now:
+            entry[0], entry[1] = now, 0.0
         entry[1] += audio.numel() / rate
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        if getattr(self, "_first_chunk_express", False):
-            self._chunk_started.discard(request.request_id)
-            getattr(self, "_stream_audio", {}).pop(request.request_id, None)
+        getattr(self, "_chunk_started", set()).discard(request.request_id)
+        getattr(self, "_stream_audio", {}).pop(request.request_id, None)
         if self.input_coordinator is None:
             return super()._free_request(request, delay_free_blocks)
 
@@ -992,7 +998,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             ec_transfer_params = None
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
-            if getattr(self, "_express_min_slack_s", 0) > 0 and self._first_chunk_express:
+            if (getattr(self, "_express_min_slack_s", 0) > 0 and self._first_chunk_express) or (
+                getattr(self, "_generation_max_wait_s", 0) > 0 and getattr(self, "_generation_min_batch_size", 1) > 1
+            ):
                 self._record_stream_audio(req_id, mm_output)
             status_before_stop = request.status
             finish_reason = None
@@ -1209,5 +1217,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         Do not expend prompt id using update.
         """
+        getattr(self, "_chunk_started", set()).discard(session.request_id)
+        getattr(self, "_stream_audio", {}).pop(session.request_id, None)
         set_request_perf_chunk(session, perf_chunk_from_buffer(getattr(update, "model_intermediate_buffer", None)))
         self._replace_streaming_session(session, update)
