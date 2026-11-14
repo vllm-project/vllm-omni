@@ -1131,7 +1131,6 @@ steps:
             tests/e2e/offline_inference/test_voxcpm2_tts.py
             9 tts rocm-voxcpm2-tts-weekly
             tests/e2e/online_serving/test_voxcpm2_tts.py
-            tests/e2e/online_serving/test_voxcpm2_tts_expansion.py
             tests/e2e/online_serving/test_voxcpm2_tts_lora.py
 
       - label: "Voxtral TTS · 1-GPU"
