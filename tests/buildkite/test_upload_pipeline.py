@@ -940,7 +940,7 @@ def test_ming_glm_indextts_breeze_weekly_pr_validation_is_focused(monkeypatch: p
         step = matching_steps[0]
         assert step["source_file_dependencies"] == [item["dependency"]]
         assert step["timeout_in_minutes"] == 90
-        assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"}
+        assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v1"}
         assert step["mirror_hardwares"] == "l4_1"
         command = "\n".join(step["commands"])
         assert set(item["files"]) <= {path for path in all_files if path in command}

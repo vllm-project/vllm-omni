@@ -194,7 +194,10 @@ steps:
   # Qualify the CUDA owner of the Ming, GLM, IndexTTS, and Breeze AMD
   # additions on weekly-test PRs without enabling unrelated E2E jobs. Keep
   # each model in a separate process/agent lifetime so full-weight teardown
-  # from one model cannot corrupt or prevent startup of the next model.
+  # from one model cannot corrupt or prevent startup of the next model. These
+  # established L4 profiles use model runner v1: forcing v2 corrupts Ming/GLM
+  # online audio and breaks IndexTTS2/Breeze output metadata during execution
+  # or sampler warmup.
   - group: ":microphone: Ming GLM IndexTTS and Breeze Weekly Test"
     depends_on: upload-weekly-pipeline
     if: build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"
@@ -205,7 +208,7 @@ steps:
           - tts_ming_weekly
         timeout_in_minutes: 90
         env:
-          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v1"
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
@@ -226,7 +229,7 @@ steps:
           - tts_glm_weekly
         timeout_in_minutes: 90
         env:
-          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v1"
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
@@ -247,7 +250,7 @@ steps:
           - tts_indextts2_weekly
         timeout_in_minutes: 90
         env:
-          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v1"
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
@@ -268,7 +271,7 @@ steps:
           - tts_breeze_tts2_weekly
         timeout_in_minutes: 90
         env:
-          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
+          VLLM_OMNI_CI_MODEL_RUNNER: "v1"
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
