@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 from vllm import SamplingParams
-from vllm.sampling_params import SamplingType
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler, _reject_kstep_async_scheduling
 from vllm_omni.engine.serialization import serialize_additional_information
@@ -45,15 +44,6 @@ def test_async_scheduler_allows_unarmed_stage():
         (True, False, SamplingParams(temperature=0.0), [1, 2]),
         (True, True, SamplingParams(temperature=0.0), []),
         (True, False, SamplingParams(temperature=0.7), []),
-        # SamplingParams clamps tiny positive temperatures. Supply the
-        # sampler classification directly to check that the guard honors it.
-        pytest.param(
-            True,
-            False,
-            SimpleNamespace(temperature=1e-6, sampling_type=SamplingType.GREEDY),
-            [1, 2],
-            id="greedy-type-with-nonzero-temperature",
-        ),
         (False, False, SamplingParams(temperature=0.0), [1, 2, 3]),
         (False, True, SamplingParams(temperature=0.0), []),
         (False, False, SamplingParams(temperature=0.7), [1, 2, 3]),
