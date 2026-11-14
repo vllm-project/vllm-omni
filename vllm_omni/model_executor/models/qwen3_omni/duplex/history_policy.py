@@ -18,10 +18,12 @@ from dataclasses import InitVar, dataclass, field
 
 import regex as re
 
+from vllm_omni.engine.duplex.history import unanswered_turn_start
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger, DuplexSourceRef, source_refs
 from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
+from vllm_omni.engine.duplex.session.source_costs import SourceTokenCache
+from vllm_omni.engine.duplex.session.visual_history import SessionVisualHistory, VisualWork
 from vllm_omni.engine.duplex.visual_memory import VisualMemory
-from vllm_omni.model_executor.models.qwen3_omni.duplex.history_visual import QwenVisualHistory, VisualWork
 
 Message = Mapping[str, object]
 AudioEntry = tuple[tuple[object, ...], Mapping[str, object]]
@@ -142,11 +144,7 @@ def has_audio(message: Message) -> bool:
 
 def has_unanswered_user_input(history: Sequence[Message]) -> bool:
     """Find pending user input across system updates, until an assistant reply."""
-    for message in reversed(history):
-        role = message.get("role")
-        if role in {"user", "assistant"}:
-            return role == "user"
-    return False
+    return unanswered_turn_start(history) < len(history)
 
 
 def turn_ranges(history: Sequence[Message]) -> list[tuple[int, int]]:
@@ -202,6 +200,8 @@ class HistoryWork:
     previous_partial: HistoryFold | None = None
     end_offset: int | None = None
     complete: bool = True
+    # A preparation optimization, excluded from source/scheduling identity.
+    source_tokens: int | None = field(default=None, compare=False)
 
 
 @dataclass
@@ -227,16 +227,17 @@ class QwenHistoryState:
     counts: Counter[str] = field(default_factory=Counter)
     preparing: dict[int, RetainedAudio] = field(default_factory=dict)
     media_revision: int = 0
-    policy_cache_key: tuple[object, int, int, int] | None = None
+    policy_cache_key: tuple[object, int, int, int, bool] | None = None
     cached_source_key: Hashable | None = None
     # Keep scheduling identity stable when token fitting narrows the proposal.
     token_plan: tuple[Hashable, HistoryWork | VisualWork] | None = None
     partial: HistoryFold | None = None
+    source_costs: SourceTokenCache = field(default_factory=SourceTokenCache)
     limits: InitVar[HistoryLimits] = field(kw_only=True)
-    visual: QwenVisualHistory = field(init=False)
+    visual: SessionVisualHistory = field(init=False)
 
     def __post_init__(self, limits: HistoryLimits) -> None:
-        self.visual = QwenVisualHistory(
+        self.visual = SessionVisualHistory(
             memory=VisualMemory(
                 chunk_frames=limits.visual_chunk_images,
                 mid_group=limits.visual_mid_group,
@@ -295,8 +296,18 @@ class QwenHistoryState:
             self.counts["partial_invalidations"] += 1
         self.history = tuple(history)
         self.visual.reconcile(history, self.snapshot, self.ledger)
+        self.prune_source_costs()
         live = {id(m.get("content")) for m in history if has_audio(m)}
         self.audio = [a for a in self.audio if id(a) in self.preparing or any(id(c) in live for c in a.contents)]
+
+    def prune_source_costs(self) -> None:
+        """Drop costs for processed, revised or regrouped turns."""
+        if self.source_costs:
+            self.source_costs.retain(
+                self.sources[max(start, self.processed) : end]
+                for start, end in turn_ranges(self.history)
+                if end > self.processed
+            )
 
     def retain(self, entries: Sequence[AudioEntry], limits: HistoryLimits) -> None:
         """Retain eligible sources, evicting the oldest by Session order.
@@ -395,6 +406,7 @@ class QwenHistoryState:
         self.processed = work.end
         self.partial = None
         self.processed_sources = work.sources
+        self.prune_source_costs()
         self.generation += 1
         self.policy_cache_key = None
         self.cached_source_key = None

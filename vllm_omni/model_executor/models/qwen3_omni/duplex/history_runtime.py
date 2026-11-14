@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.engine.duplex.plugin import DuplexAuxiliaryPolicy, DuplexAuxiliaryRequest, DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.session.visual_history import VisualWork
 from vllm_omni.engine.duplex.text_folding import fit_text_excerpt
 from vllm_omni.engine.duplex.visual_memory import EncodedVisualImage, VisualFrame, VisualSummary
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
@@ -36,7 +37,7 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
     load_history_policy,
     turn_ranges,
 )
-from vllm_omni.model_executor.models.qwen3_omni.duplex.history_visual import VisualWork, decode_image
+from vllm_omni.model_executor.models.qwen3_omni.duplex.history_visual import decode_image, visual_summary_text
 
 if TYPE_CHECKING:
     from transformers import ProcessorMixin
@@ -162,9 +163,9 @@ class QwenHistoryRuntime:
             parts = []
             text = text_of(message)
             if has_audio(message):
-                encoded = next(
+                binding = next(
                     (
-                        payload["audio"]
+                        (contents, payload["audio"])
                         for contents, payload in reversed(available_audio)
                         if any(message.get("content") is c for c in contents)
                         and isinstance(payload.get("audio"), str)
@@ -173,15 +174,17 @@ class QwenHistoryRuntime:
                     None,
                 )
                 retained = state.audio_for(message)
-                if encoded is None and retained is not None:
-                    encoded = retained.encoded
+                if binding is None and retained is not None:
+                    binding = retained.contents, retained.encoded
+                encoded = binding[1] if binding is not None else None
+                binding_key = tuple(id(content) for content in binding[0]) if binding is not None else ()
                 if encoded is None:
                     transcript = audio_transcript(message)
                     if not transcript:
                         return None
                     text = "\n".join(filter(None, (text, transcript)))
-                elif id(encoded) not in seen:
-                    seen.add(id(encoded))
+                elif binding_key not in seen:
+                    seen.add(binding_key)
                     audio.append(encoded)
                     parts.append({"type": "audio"})
             content = message.get("content")
@@ -266,7 +269,7 @@ class QwenHistoryRuntime:
                 groups.append(PromptGroup((audio_message,), (encoded,)))
         if not groups:
             raise DuplexRuntimeConfigError("No usable current input for Qwen history policy")
-        return HistoryPrompt(tuple(groups), state.summary, state.visual.summaries())
+        return HistoryPrompt(tuple(groups), state.summary, visual_summary_text(state.visual))
 
     def _render(
         self, messages: list[dict], encoded: Sequence[str], images: Sequence[str | EncodedVisualImage] = ()
@@ -460,15 +463,48 @@ class QwenHistoryRuntime:
         held = {id(audio.encoded): audio for audio in state.audio}
         unique_audio = {id(value): value for value in group.audio}
         selected = [held.get(key) or RetainedAudio((), value, "") for key, value in unique_audio.items()]
+        before = {id(audio.encoded) for audio in state.held_audio}
         state.preparing = {id(audio): audio for audio in selected}
         del held
-        state.media_revision += 1
-        state.trim_audio(self.limits)
+        if before != {id(audio.encoded) for audio in state.held_audio}:
+            state.media_revision += 1
+            state.trim_audio(self.limits)
         try:
             return await self._joined_worker(function, *args, **kwargs)
         finally:
+            before = {id(audio.encoded) for audio in state.held_audio}
             state.preparing.clear()
-            state.media_revision += 1
+            if before != {id(audio.encoded) for audio in state.held_audio}:
+                state.media_revision += 1
+
+    @staticmethod
+    def _cost_view(state: QwenHistoryState, start: int, end: int, group: PromptGroup) -> Hashable | None:
+        """Identify the rendered media without retaining its encoded payloads.
+
+        Public revisions cover text/URL changes. Retained audio keys cover PCM
+        rebinding; visual markers cover publication/decoding failures. A live
+        fallback without a retained key is counted afresh rather than cached.
+        """
+        audio = []
+        for value in group.audio:
+            keys = tuple(
+                item.key
+                for item in state.audio
+                if item.encoded is value and any(item.belongs_to(message) for message in state.history[start:end])
+            )
+            if not keys:
+                return None
+            audio.append(keys)
+        images = tuple(
+            (item.source, item.part_index, "omitted", item.message_index)
+            if index in state.visual.omitted
+            else (item.source, item.part_index, "covered", item.message_index)
+            if index < state.visual.covered
+            else (item.source, item.part_index, "original")
+            for index, item in enumerate(state.visual.inputs)
+            if start <= item.message_index < end
+        )
+        return tuple(audio), images
 
     async def _token_work(
         self, state: QwenHistoryState, work: HistoryWork, audio_provider: Callable[[], Sequence[AudioEntry]] | None
@@ -483,12 +519,14 @@ class QwenHistoryRuntime:
         if work.previous_partial is not None:
             return work
         sources = state.sources
+        media_revision = state.media_revision
         costs = []
         total_tokens = batch_tokens = 0
         batch_end, batch_ready = work.start, False
         for start, end in turn_ranges(state.history):
             if end <= work.start:
                 continue
+            start = max(start, work.start)
             if self.limits.recent_tokens is None and end > work.end:
                 break
             group = self.group(state, start, end, audio_provider() if audio_provider else ())
@@ -506,7 +544,17 @@ class QwenHistoryRuntime:
                     # this fallback. Estimation alone must not evict live audio.
                     count = self.max_model_len + 1
                 else:
-                    count = await self._with_audio(state, group, self._source_tokens, group)
+                    refs = sources[start:end]
+                    view = self._cost_view(state, start, end, group)
+                    cached = state.source_costs.get(refs, view) if view is not None else None
+                    if cached is not None:
+                        count = cached
+                    else:
+                        count = await self._with_audio(state, group, self._source_tokens, group)
+                        if state.sources != sources or not state.matches(work, state.history):
+                            return None
+                        if view is not None and self._cost_view(state, start, end, group) == view:
+                            state.source_costs.put(refs, view, count)
             if state.sources != sources or not state.matches(work, state.history):
                 return None
             costs.append((start, end, count))
@@ -547,7 +595,16 @@ class QwenHistoryRuntime:
             batch_tokens += count
             if self.limits.chunk_tokens is not None and batch_tokens >= self.limits.chunk_tokens:
                 break
-        return replace(work, end=end, sources=state.sources[:end]) if end > work.start else None
+        return (
+            replace(
+                work,
+                end=end,
+                sources=state.sources[:end],
+                source_tokens=batch_tokens if state.media_revision == media_revision else None,
+            )
+            if end > work.start
+            else None
+        )
 
     def _prepare_compression(
         self, group: PromptGroup, work: HistoryWork, *, allow_fold: bool
@@ -556,14 +613,16 @@ class QwenHistoryRuntime:
         previous = work.previous_partial.text if work.previous_partial else work.previous_summary
         prompt, count, temperature = {}, self.max_model_len + 1, 0.0
         if work.previous_partial is None:
-            prompt, count, temperature = self._render_compression(group, previous)
             source_fits = (
                 self.limits.chunk_tokens is None
                 or bool(group.audio or group.images)
-                or self._source_tokens(group) <= self.limits.chunk_tokens
+                or (work.source_tokens if work.source_tokens is not None else self._source_tokens(group))
+                <= self.limits.chunk_tokens
             )
-            if count + self.limits.summary_tokens <= self.max_model_len and source_fits:
-                return prompt, count, temperature, work
+            if source_fits:
+                prompt, count, temperature = self._render_compression(group, previous)
+                if count + self.limits.summary_tokens <= self.max_model_len:
+                    return prompt, count, temperature, work
         if not allow_fold or group.audio or group.images:
             return prompt, count, temperature, work
         lines, spans = [], []
@@ -581,8 +640,10 @@ class QwenHistoryRuntime:
 
         def render(excerpt: str) -> tuple[dict, int, float, int]:
             quoted = PromptGroup(({"role": "user", "content": [{"type": "text", "text": excerpt}]},), ())
-            prompt, count, temperature = self._render_compression(quoted, previous)
             source_tokens = self._source_tokens(quoted) if self.limits.chunk_tokens is not None else 0
+            if self.limits.chunk_tokens is not None and source_tokens > self.limits.chunk_tokens:
+                return {}, self.max_model_len + 1, 0.0, source_tokens
+            prompt, count, temperature = self._render_compression(quoted, previous)
             return prompt, count, temperature, source_tokens
 
         fitted = fit_text_excerpt(
@@ -657,7 +718,7 @@ class QwenHistoryRuntime:
                 return state.token_plan
             proposed = self.work(state)
             if proposed is not None and proposed.end >= fitted.end:
-                return state.token_plan
+                return state.token_plan[0], replace(fitted, source_tokens=None)
         state.token_plan = None
         return None
 
@@ -665,7 +726,7 @@ class QwenHistoryRuntime:
         self, state: QwenHistoryState, history: Sequence[Message], history_revision: int | None = None
     ) -> DuplexAuxiliaryPolicy | None:
         """Cache unchanged plans; complete pending visual evidence before text."""
-        key = (self, history_revision, state.generation, state.media_revision)
+        key = (self, history_revision, state.generation, state.media_revision, bool(state.preparing))
         if history_revision is not None and state.policy_cache_key == key:
             source = state.cached_source_key
             return None if source is None else DuplexAuxiliaryPolicy(source_key=source)
@@ -682,7 +743,9 @@ class QwenHistoryRuntime:
             source = None if work is None else self._planning_key(state, work)
         state.cached_source_key = source
         state.policy_cache_key = (
-            (self, history_revision, state.generation, state.media_revision) if history_revision is not None else None
+            (self, history_revision, state.generation, state.media_revision, bool(state.preparing))
+            if history_revision is not None
+            else None
         )
         return None if source is None else DuplexAuxiliaryPolicy(source_key=source)
 
@@ -753,13 +816,15 @@ class QwenHistoryRuntime:
                     ]
                 messages.append({"role": "user", "content": content})
             group = PromptGroup(tuple(messages), (), tuple(images))
+            if (
+                self.limits.chunk_tokens is not None
+                and len(entries) > 1
+                and self._source_tokens(group) > self.limits.chunk_tokens
+            ):
+                entries = entries[:-1]
+                continue
             prompt, count, temperature = self._render_compression(group, "")
-            source_fits = (
-                self.limits.chunk_tokens is None
-                or len(entries) == 1
-                or self._source_tokens(group) <= self.limits.chunk_tokens
-            )
-            if count + self.limits.summary_tokens <= self.max_model_len and source_fits:
+            if count + self.limits.summary_tokens <= self.max_model_len:
                 source = replace(work.source, covered_ids=work.source.covered_ids[: len(entries)])
                 return prompt, count, temperature, replace(work, source=source)
             entries = entries[:-1]
@@ -878,6 +943,7 @@ class QwenHistoryRuntime:
                     work.previous_summary,
                     work.previous_node_id,
                     work.previous_partial,
+                    source_tokens=work.source_tokens if end == work.end else None,
                 )
                 if (
                     self.limits.chunk_tokens is None

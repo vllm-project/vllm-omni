@@ -180,6 +180,8 @@ async def test_configured_media_capacity_triggers_before_sources_are_lost(limit,
         policy = plugin.auxiliary_policy(state=state, history_revision=index, history=history)
         if policy:
             request = await plugin.prepare_auxiliary_request(state=state, history=(), runtime_config={})
+            if not tokens:
+                assert request is not None
             if request is not None:
                 planned.append(index)
                 assert plugin.apply_auxiliary_result(state=state, request=request, output=completion())
@@ -510,7 +512,8 @@ async def test_cancelled_preparation_keeps_media_charged_until_cpu_worker_finish
     assert owner.policy_for(state, state.history, 1) is not None
 
 
-def test_identical_pcm_in_distinct_turns_is_not_confused_with_current_input():
+@pytest.mark.asyncio
+async def test_identical_pcm_in_distinct_turns_is_not_confused_with_current_input():
     owner = runtime()
     state = owner.create_state()
     old, payload = audio_message(0)
@@ -519,6 +522,21 @@ def test_identical_pcm_in_distinct_turns_is_not_confused_with_current_input():
     context = owner.foreground(state, payload)
     assert len(context.groups) == 2
     assert sum(len(group.audio) for group in context.groups) == 2
+    newer, _ = audio_message(1)
+    sync_history(
+        state,
+        [
+            old,
+            {"role": "assistant", "content": "old response"},
+            newer,
+            {"role": "assistant", "content": "new response"},
+            *text_history(8),
+        ],
+    )
+    state.retain([((newer["content"],), payload)], owner.limits)
+    request = await owner.prepare(state)
+    assert request is not None
+    assert len(request.prompt["multi_modal_data"]["audio"]) == 2
 
 
 def test_rebinding_audio_counts_source_still_held_by_preparation():
@@ -585,19 +603,20 @@ def test_byte_trigger_is_independent_of_legacy_cache(trigger_bytes, pool_bytes, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["recent", "bounded_recent", "incremental"])
 @pytest.mark.parametrize(("commits", "system_update"), [(5, False), (8, False), (10, False), (2, True)])
-async def test_consecutive_commits_share_one_source_in_foreground_and_summary(commits, system_update):
+async def test_consecutive_commits_share_one_source_in_foreground_and_summary(commits, system_update, policy):
     from tests.engine.duplex.test_session_runner import append_audio, tts_output
     from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
     from vllm_omni.engine.duplex.commands import AckPlayback, Commit, CreateItem, CreateResponse
 
     h = await open_qwen()
     try:
-        owner = runtime(recent_messages=1)
+        owner = runtime(policy, recent_messages=1 if policy == "incremental" else 32)
         h.runner.plugin._history_runtime = owner
         # Keep automatic scheduling off to inspect the prepared request directly.
         for index in range(commits):
-            await h.run(append_audio(value=0.1))
+            await h.run(append_audio(value=0.1 * (index + 1)))
             await h.run(Commit(final=True, create_response=False))
             if system_update:
                 await h.run(
@@ -613,6 +632,8 @@ async def test_consecutive_commits_share_one_source_in_foreground_and_summary(co
         await h.run(CreateResponse())
         submission = h.port.submissions[-1]
         assert len(submission.prompt["multi_modal_data"]["audio"]) == 1
+        original = np.concatenate([np.full(16000, 0.1 * (i + 1), dtype="<f4") for i in range(commits)])
+        np.testing.assert_allclose(submission.prompt["multi_modal_data"]["audio"][0][0], original)
         assert sum(m["role"] == "user" for m in h.session.history) == commits
         response_id = h.session.active_response_id
         await h.deliver_and_settle(
@@ -628,8 +649,10 @@ async def test_consecutive_commits_share_one_source_in_foreground_and_summary(co
         await h.run(Commit(final=True, create_response=True))
         audios = h.port.submissions[-1].prompt["multi_modal_data"]["audio"]
         assert len(audios) == 2
-        np.testing.assert_allclose(audios[0][0], np.full(commits * 16000, 0.1, dtype="<f4"))
+        np.testing.assert_allclose(audios[0][0], original)
         np.testing.assert_allclose(audios[1][0], np.full(16000, 0.2, dtype="<f4"))
+        if policy != "incremental":
+            return
         memory = h.runner.model_state.history_policy_state
         sync_history(memory, h.session.history, session=h.session)
         request = await owner.prepare(memory)

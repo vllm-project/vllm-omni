@@ -876,11 +876,13 @@ def test_history_tool_pairs_keep_each_call_with_its_question():
     assert prompt_messages[5]["content"] == "29C"
 
 
-def test_new_user_audio_does_not_rebind_the_previous_question():
+@pytest.mark.parametrize("same_payload", [False, True])
+def test_new_user_audio_does_not_rebind_the_previous_question(same_payload):
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
     state = plugin.create_session_state()
     paris = {"role": "user", "content": [{"type": "audio_url"}]}
-    plugin.prepare_prompt_config({"conversation": [paris]}, state=state, payload={"audio": "paris"})
+    first_payload = {"audio": "paris"}
+    plugin.prepare_prompt_config({"conversation": [paris]}, state=state, payload=first_payload)
     tokyo = {"role": "user", "content": [{"type": "audio_url"}]}
     config = plugin.prepare_prompt_config(
         {
@@ -888,10 +890,10 @@ def test_new_user_audio_does_not_rebind_the_previous_question():
             "qwen_tool_turns": [_weather_turn("call_p", "Paris", "18C", 1)],
         },
         state=state,
-        payload={"audio": "tokyo"},
+        payload=first_payload if same_payload else {"audio": "tokyo"},
     )
     payloads = [message["audio_payload"]["audio"] for message in config["qwen_messages"] if "audio_payload" in message]
-    assert payloads == ["paris", "tokyo"]
+    assert payloads == ["paris", "paris" if same_payload else "tokyo"]
 
 
 def test_missing_parse_function_call_is_not_a_call():

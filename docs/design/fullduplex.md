@@ -110,7 +110,10 @@ remain in the Qwen plugin. Published dialogue and visual summaries are `SUMMARY`
 nodes in `DuplexEngineSession.context_ledger`; the public history snapshot supplies
 their source IDs and revisions. Qwen and JoyAI share `engine/duplex/text_folding.py`
 for labeled text excerpts and `engine/duplex/visual_memory.py` for visual batching
-and retention. `SessionMemoryRuntime` executes private requests with the Thinker
+and retention. `SessionVisualHistory` in `engine/duplex/session/visual_history.py`
+binds visual sources to the public snapshot, resolves valid ledger text, and
+publishes/retires visual summaries. Models supply decoded batches and prompt
+formatting. `SessionMemoryRuntime` executes private requests with the Thinker
 as both entry and final stage.
 
 Each Session holds `QwenDuplexSessionState.history_policy_state`. This state keeps
@@ -128,6 +131,9 @@ compression work still validates its original message labels and is retried
 when those positions move.
 
 Unanswered user items and intervening system messages form one protected turn.
+Multiple audio commits within that turn share one merged payload in the prompt,
+including on the default `recent` path. Distinct audio source bindings remain
+separate even when their payload objects or PCM values are identical.
 Foreground fitting preserves that complete turn, including original media, or
 returns an explicit capacity error. Background dialogue and visual compression
 wait until the turn has an assistant reply. `chunk_messages` is a batch target:
@@ -229,11 +235,15 @@ Pass the overlay with `vllm serve ... --omni --deploy-config /path/to/history.ya
 Set `history_policy` to `bounded_recent` for clipping, or to
 `your_package.policy:YourPolicy` for a server-importable class with a no-argument
 constructor. Subclass `IncrementalHistoryPolicy` to reuse its selection and
-batching while overriding compression. Default `recent` behavior is unchanged.
+batching while overriding compression. The default policy remains `recent`.
 The optional `history_limits.max_context_tokens` caps context below the resolved
 model limit, including reserved output; omitting it uses the model limit.
 
-Token targets can independently replace message-count triggering and batching:
+Message count alone cannot distinguish a short text turn from a large image or
+audio turn. Optional token targets let deployments trigger compression according
+to the cost of the originals that remain in context, while keeping the same
+selection/compression interface. They independently replace message-count
+triggering and batching:
 
 ```yaml
 base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
@@ -263,8 +273,11 @@ Counting runs in joined CPU workers. Dialogue targets sum the rendered token
 costs of complete original turns, including their chat templates and expanded
 audio/image tokens. Existing summaries, compression instructions and reserved
 output are excluded from these source targets; the final rendered request
-must still fit all of them within the effective model-context limit. Token
-counting adds CPU preparation work and does not bound total Session storage.
+must still fit all of them within the effective model-context limit. The shared `SourceTokenCache` stores only scalar costs, public source references
+and model-supplied media-view keys. Unchanged turns reuse their costs after an
+append; edits, regrouping, audio rebinding and visual summary/omission changes
+require a fresh count. Processed and removed groups are pruned. Token counting
+adds CPU preparation work and does not bound total Session storage.
 Visual batches also shrink to `chunk_tokens`, within their existing image-count
 and summary-group targets. Indivisible audio turns and visual entries may exceed
 the soft batch target when they fit the hard model/media limits. An oversized
@@ -275,8 +288,9 @@ preparation logs the capacity issue and keeps the original source pending.
 
 Incomplete implementations fail at server initialization. Selection is
 stateless and may be cached while
-the Session history revision, memory generation and retained-media revision are
-unchanged. Source checks still run before submitting or applying a summary.
+the Session history revision, memory generation, retained-media revision and
+audio-preparation ownership are unchanged. Reusing an already retained audio
+payload for counting does not change its retained-media revision. Source checks still run before submitting or applying a summary.
 Audio compression uses the renderer's effective per-request audio count and a
 separate `audio_summary_trigger_bytes` setting (default 8 MiB). The trigger is
 capped by the strategy's `max_audio_bytes` retention limit (default 32 MiB),
@@ -338,7 +352,9 @@ materials.
 
 The plugin separately provides Session image admission limits. Opt-in Qwen
 policies default to 200 stored images / 32 MiB of encoded image URLs; default
-`recent` retains 8 images / 4 MiB. These records are not deleted by summarization.
+`recent` retains the original Session defaults of 8 images / 4 MiB, named
+`DEFAULT_IMAGE_HISTORY_MAX_ITEMS` and `DEFAULT_IMAGE_HISTORY_MAX_BYTES` in
+`engine/duplex/config.py`. These records are not deleted by summarization.
 Reaching this limit rejects additional images; deleting source items also revokes
 memory derived from them. The visual preparation store has its own configurable
 image count, encoded PNG byte and decoded pixel byte bounds. These are not

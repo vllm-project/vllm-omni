@@ -20,7 +20,7 @@ from tests.model_executor.models.qwen3_omni.test_history_policy import (
     sync_history,
 )
 from vllm_omni.config.stage_config import load_deploy_config
-from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import HistoryLimits
+from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import AudioEntry, HistoryLimits
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -306,3 +306,103 @@ async def test_session_rechecks_token_trigger_after_growth_without_recounting_un
         assert not h.runner.model_state.history_policy_state.omissions
     finally:
         await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["text", "audio", "reused_audio", "image"])
+async def test_unchanged_turn_costs_are_reused_after_appends_and_only_changed_sources_recount(kind, mocker):
+    owner = runtime(recent_tokens=100000, chunk_tokens=512)
+    state = owner.create_state()
+    count = mocker.spy(owner, "_source_tokens")
+    history = []
+    entries: list[AudioEntry] = []
+    for index in range(3):
+        if kind == "text":
+            messages = turn(100)
+        else:
+            if kind in {"audio", "reused_audio"}:
+                message, payload = audio_message(index)
+                if kind == "reused_audio" and entries:
+                    payload = entries[0][1]
+                entries.append(((message["content"],), payload))
+            else:
+                message = image_message()
+            messages = [message, {"role": "assistant", "content": "observed"}]
+        history.extend(messages)
+        sync_history(state, history)
+        state.retain(entries, owner.limits)
+        assert await owner.prepare(state) is None
+        assert count.call_count == index + 1
+    if kind in {"audio", "reused_audio"}:
+        _, replacement = audio_message(8)
+        entries[1] = (entries[1][0], replacement)
+    elif kind == "image":
+        history[2] = image_message("blue")
+    else:
+        history[2] = {"role": "user", "content": "corrected original"}
+    sync_history(state, history)
+    state.retain(entries, owner.limits)
+    assert await owner.prepare(state) is None
+    assert count.call_count == 4
+    assert len(state.source_costs) == 3
+    sync_history(state, history[2:])
+    assert await owner.prepare(state) is None
+    assert len(state.source_costs) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["text", "audio", "image"])
+async def test_estimation_keeps_media_revision_when_owned_allocations_do_not_change(kind):
+    owner = runtime(recent_tokens=100000, chunk_tokens=512)
+    state = owner.create_state()
+    if kind == "text":
+        history = turn(100)
+    else:
+        if kind == "audio":
+            message, payload = audio_message(0)
+            state.retain([((message["content"],), payload)], owner.limits)
+        else:
+            message = image_message()
+        history = [message, {"role": "assistant", "content": "observed"}]
+    sync_history(state, history)
+    revision = state.media_revision
+    assert await owner.prepare(state) is None
+    assert state.media_revision == revision
+    assert not state.preparing
+
+
+@pytest.mark.asyncio
+async def test_compression_reuses_the_measured_original_turn_cost(mocker):
+    owner = runtime(recent_tokens=1, chunk_tokens=512)
+    state = owner.create_state()
+    sync_history(state, turn(400))
+    count = mocker.spy(owner, "_source_tokens")
+    request = await owner.prepare(state)
+    assert request is not None
+    assert count.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decodable", [False, True])
+async def test_visual_token_cost_expires_when_the_same_source_becomes_summary_or_omission(decodable, mocker):
+    owner = runtime(recent_tokens=100000, chunk_tokens=512)
+    state = owner.create_state()
+    message = image_message()
+    if not decodable:
+        message["content"][0]["image_url"]["url"] = "data:image/png;base64,iVBORw0KGgpub3QgYW4gaW1hZ2U="
+    sync_history(state, [message, {"role": "assistant", "content": "seen"}])
+    refs = state.sources
+    count = mocker.spy(owner, "_source_tokens")
+    assert await owner.prepare(state) is None
+    assert count.call_count == 1
+    work = state.visual.plan(required_end=2, completed_end=2, max_images=owner.max_images)
+    assert work is not None
+    request = await owner._prepare_visual(state, work)
+    if decodable:
+        assert request is not None and owner.apply(state, request, completion("red image"))
+    else:
+        assert request is None and state.counts["visual_omissions"] == 1
+    assert state.sources == refs
+    assert await owner.prepare(state) is None
+    assert count.call_count == 2
+    assert len(state.source_costs) == 1

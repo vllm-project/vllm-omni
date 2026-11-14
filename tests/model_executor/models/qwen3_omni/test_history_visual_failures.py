@@ -62,7 +62,7 @@ async def test_ledger_rejection_keeps_visual_sources_and_allows_retry(monkeypatc
         assert visual_snapshot(state) == before
     # The rejected publication must leave a usable retry, not an orphaned entry.
     assert owner.apply(state, request, completion("accepted red"))
-    assert "accepted red" in state.visual.summaries()[-1]
+    assert "accepted red" in state.visual.summaries()[-1].text
 
 
 @pytest.mark.asyncio
@@ -106,7 +106,7 @@ async def test_marker_only_summary_keeps_evidence_pending_for_retry(visual, text
     assert owner.apply(state, retry, completion("A red square with reference code END_MEMORY."))
     if visual:
         assert state.visual.covered == 1
-        assert "reference code END_MEMORY" in state.visual.summaries()[0]
+        assert "reference code END_MEMORY" in state.visual.summaries()[0].text
     else:
         assert state.processed > 0
         assert "reference code END_MEMORY" in state.summary

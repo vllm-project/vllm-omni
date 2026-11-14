@@ -23,7 +23,13 @@ from typing import TYPE_CHECKING
 
 import pybase64 as base64
 
-from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexContextViewPolicy, DuplexSessionConfig
+from vllm_omni.engine.duplex.config import (
+    DEFAULT_IMAGE_HISTORY_MAX_BYTES,
+    DEFAULT_IMAGE_HISTORY_MAX_ITEMS,
+    DuplexCapabilities,
+    DuplexContextViewPolicy,
+    DuplexSessionConfig,
+)
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
     DuplexFence,
@@ -520,7 +526,7 @@ class DuplexModelPlugin(ABC):
         These admission limits are distinct from per-request media limits and
         model-owned compression buffers. Summarization does not delete records.
         """
-        return 8, 4 * 1024 * 1024
+        return DEFAULT_IMAGE_HISTORY_MAX_ITEMS, DEFAULT_IMAGE_HISTORY_MAX_BYTES
 
     def auxiliary_policy(
         self,

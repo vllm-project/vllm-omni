@@ -19,7 +19,7 @@ from tests.model_executor.models.qwen3_omni.test_history_policy import (
     text_history,
 )
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
-from vllm_omni.model_executor.models.qwen3_omni.duplex.history_visual import VisualWork
+from vllm_omni.engine.duplex.session.visual_history import VisualWork
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

@@ -43,7 +43,7 @@ async def test_materializing_assistant_placeholder_keeps_valid_visual_memory(mer
     assert {item.source for item in state.visual.inputs} == source_ids
     assert state.visual.nodes == nodes
     assert state.visual.covered == covered
-    assert "red" in " ".join(state.visual.summaries())
+    assert "red" in " ".join(item.text for item in state.visual.summaries())
 
 
 @pytest.mark.asyncio

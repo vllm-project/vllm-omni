@@ -26,6 +26,7 @@ from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexContextViewPolicy, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_resource_request_belongs_to_session
+from vllm_omni.engine.duplex.history import unanswered_turn_start
 from vllm_omni.engine.duplex.plugin import (
     DuplexAuxiliaryPolicy,
     DuplexAuxiliaryRequest,
@@ -1005,9 +1006,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if has_audio:
             # System updates do not answer pending user input. Keep the same
             # unanswered-turn boundary as foreground selection and compression.
-            for index, message in reversed(list(enumerate(history))):
-                if index < bind_from or message.get("role") == "assistant":
-                    break
+            start = unanswered_turn_start(history, lower_bound=bind_from)
+            for message in history[start:]:
                 if message.get("role") != "user":
                     continue
                 content = message.get("content")
@@ -1039,16 +1039,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         view = config.get("conversation_view")
         if not isinstance(view, list) or len(view) != len(history):
             view = None
-        current_turn_start = len(history)
-        if view is not None:
-            # System instructions do not answer a pending user question.
-            # Protect its media even when they follow the user item.
-            for index in range(len(history) - 1, -1, -1):
-                role = history[index].get("role")
-                if role == "assistant":
-                    break
-                if role == "user":
-                    current_turn_start = index
+        current_turn_start = unanswered_turn_start(history)
         has_audio = bool(payload.get("audio"))
         retained = state.audio_history
         # Match the official demo's unit of history: consecutive user items
@@ -1062,6 +1053,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             turns[-1][1].append(message)
 
         messages = []
+        included_audio = set()
         for index, turn in turns:
             # Keep the existing recent-message window, rounded outwards to a
             # complete turn. Never retain an answer whose input was cut off.
@@ -1070,7 +1062,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             if turn[0].get("role") == "assistant":
                 continue
             resolved = []
-            included_audio = set()
+            turn_audio = set()
             for offset, message in enumerate(turn):
                 src = index + offset
                 source_content = message.get("content")
@@ -1081,10 +1073,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 content = message.get("content")
                 if message.get("role") == "user" and isinstance(content, list):
                     if any(part.get("type") == "audio_url" for part in content):
-                        audio = next(
-                            (value for keys, value in retained if any(key is source_content for key in keys)), None
+                        binding = next(
+                            (entry for entry in retained if any(key is source_content for key in entry[0])), None
                         )
-                        if audio is None:
+                        if binding is None:
                             # The clip left the audio slots. Keep the turn as
                             # the view's text instead of dropping it.
                             text = [] if view is None else self._view_text_parts(view[src])
@@ -1092,9 +1084,13 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                                 break
                             resolved.append({"role": "user", "content": text, "_src": src})
                             continue
-                        if id(audio) not in included_audio:
-                            resolved.append({"role": "user", "audio_payload": audio, "_src": src})
-                            included_audio.add(id(audio))
+                        # One merged commit can span system-separated groups.
+                        # Deduplicate its binding, not PCM value: distinct turns
+                        # may intentionally submit identical audio.
+                        binding_id = id(binding[0])
+                        if binding_id not in included_audio and binding_id not in turn_audio:
+                            resolved.append({"role": "user", "audio_payload": binding[1], "_src": src})
+                            turn_audio.add(binding_id)
                         # Preserve text/images in mixed source items as well.
                         other_parts = [part for part in content if part.get("type") != "audio_url"]
                         if other_parts:
@@ -1108,6 +1104,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 resolved.append(copied)
             else:
                 messages.extend(resolved)
+                included_audio.update(turn_audio)
         if has_audio and not current_is_in_history:
             # History is context, not a replacement for the current request.
             # Re-encoding only history here makes Qwen answer an old question.
