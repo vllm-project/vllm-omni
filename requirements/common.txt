@@ -12,7 +12,7 @@ av>=14.0.0
 # floor instead of relying on the version vLLM/torch pull transitively.
 typing_extensions>=4.13
 omegaconf>=2.3.0
-diffusers==0.40.0
+diffusers==0.42.1
 # Hub kernels, including LTX-2.5 NATTEN. 0.16+ resolves torch-stable-abi*
 # FA3 builds on torch 2.13 / cu130; keep in sync with transformers above.
 kernels==0.16.1
