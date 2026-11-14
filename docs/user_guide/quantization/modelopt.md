@@ -238,6 +238,15 @@ CFG, and with `hsdp_replicate_size=2`. HSDP cannot be combined with CPU offload.
 Under HSDP, NVFP4 packed weights stay replicated, so their memory does not
 shrink with the shard count.
 
+ModelOpt FP8 routed experts (`FusedMoE` layers) follow the same schedule. On
+A16 steps, the experts are dequantized from the live FP8 weights and run with
+BF16 activations; middle steps use vLLM's native FP8 MoE kernel. Scheduled
+routed experts require the Triton or FlashInfer CUTLASS MoE backend and no
+expert, tensor, or data parallelism for the expert layers. Monolithic MoE
+kernels and NVFP4 experts fail closed, and LoRA and Cache-DiT are rejected at
+load time when routed experts are scheduled. Shared experts are supported when
+the MoE runner executes them outside the expert kernel.
+
 Without HSDP, the live-weight design is compatible with model-level and
 standard layer-wise offload, but those paths still require GPU end-to-end
 validation. Distributed layer-wise offload is rejected because its direct
