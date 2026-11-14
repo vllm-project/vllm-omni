@@ -62,6 +62,10 @@ from vllm_omni.diffusion.forward_context import (
     get_ulysses_mode,
     is_forward_context_available,
 )
+from vllm_omni.diffusion.mixfusion.packed_attention import (
+    MIXFUSION_PLAN_KEY,
+    run_mixfusion_packed_attention,
+)
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -892,13 +896,23 @@ class Attention(nn.Module):
                 return False
         return True
 
+    def _effective_kv_cache_dtype(self) -> str | None:
+        """The quantization policy this forward would run attention with.
+
+        None means dequantized (unset, "float" or "auto"); a policy disabled
+        by ``_disable_kv_quant`` or the skip rules reports "float". Mirrors
+        what ``_with_kv_cache_dtype`` would inject, without touching metadata,
+        so capability checks can gate on the same policy.
+        """
+        dtype = getattr(self, "_kv_cache_dtype", None)
+        if dtype in (None, "float", "auto"):
+            return None
+        if getattr(self, "_disable_kv_quant", False) or not self._should_apply_kv_cache_quant():
+            return "float"
+        return dtype
+
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
-        disabled = self._disable_kv_quant or not self._should_apply_kv_cache_quant()
-        dtype = self._kv_cache_dtype
-        if dtype in (None, "float"):
-            dtype = None
-        elif disabled:
-            dtype = "float"
+        dtype = self._effective_kv_cache_dtype()
         if dtype is None and (attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra):
             return attn_metadata
         extra = dict(attn_metadata.extra) if attn_metadata is not None else {}
@@ -917,12 +931,34 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if attn_metadata is not None and attn_metadata.extra.get(MIXFUSION_PLAN_KEY) is not None:
+            # MixFusion chunked layout: recover each request to
+            # ``text + full image`` right before the kernel and scatter back
+            # after it, at the same pre/post boundary the sequence-parallel
+            # strategies use around their all-to-all.
+            if torch.compiler.is_compiling():
+                return run_mixfusion_packed_attention(self, query, key, value, attn_metadata)
+            # The packed path and its dense fallbacks call back into forward()
+            # with fresh metadata. Metadata that still carries the plan key
+            # would recurse, so a nested plan-keyed call fails loudly instead.
+            if getattr(self, "_mixfusion_packed_active", False):
+                raise RuntimeError(
+                    "Attention.forward re-entered with MIXFUSION_PLAN_KEY while a packed "
+                    "MixFusion call is running; inner forwards must not carry the plan."
+                )
+            self._mixfusion_packed_active = True
+            try:
+                return run_mixfusion_packed_attention(self, query, key, value, attn_metadata)
+            finally:
+                self._mixfusion_packed_active = False
+
         if torch.compiler.is_compiling() and self._schedule_configured:
-            # Selecting a scheduled candidate reads the step, the total and the bound
-            # schedule from the forward context, and backend-private gates read the step or
-            # timestep. Traced, those values would become guards and each new step or range
-            # boundary would recompile the enclosing graph. The decision uses only the
-            # construction-time flag, so a layer without a startup schedule adds no boundary.
+            # Selecting a scheduled candidate reads the bound schedule from the forward context,
+            # with the step and total for step ranges or the denoise sigma for sigma windows, and
+            # backend-private gates read the step or timestep. Traced, those values would become
+            # guards and each new step or sigma value would recompile the enclosing graph. The
+            # decision uses only the construction-time flag, so a layer without a startup schedule
+            # adds no boundary.
             encoded = (
                 _encode_scheduled_op_metadata(attn_metadata) if self._schedule_op_eligible(query, key, value) else None
             )
@@ -945,6 +981,91 @@ class Attention(nn.Module):
             return self._forward_hsdp_compile_boundary(query, key, value, attn_metadata)
 
         return self._forward_impl(query, key, value, attn_metadata)
+
+    def supports_multi_doc_packed_varlen(self, kv_cache_dtype: str | None = None) -> bool:
+        """Whether one forward can isolate N packed documents via cu_seqlens.
+
+        Delegates to the selected backend class. Custom attention modules
+        carry no backend, so they conservatively report ``False`` and
+        ``forward_packed`` serves them through the dense fallback.
+        ``kv_cache_dtype`` is the effective quantization policy of the planned
+        forward; backends whose quantized kernel cannot consume packed
+        cu_seqlens metadata report ``False`` for it.
+        """
+        _, backend, _ = self.effective_attention()
+        if backend is None:
+            return False
+        return bool(backend.supports_multi_doc_packed_varlen(kv_cache_dtype=kv_cache_dtype))
+
+    def forward_packed(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """Run attention over a flat ``[total_tokens, heads, head_dim]`` packing.
+
+        ``cu_seqlens`` are the cumulative document boundaries; documents never
+        attend across them. Backends advertising
+        ``supports_multi_doc_packed_varlen`` for the effective quantization
+        policy receive one varlen forward; every other backend is served by
+        mask-free equal-length dense buckets with the same isolation.
+        """
+        if self.supports_multi_doc_packed_varlen(kv_cache_dtype=self._effective_kv_cache_dtype()):
+            metadata = AttentionMetadata(
+                extra={
+                    "cu_seqlens_q": cu_seqlens,
+                    "cu_seqlens_k": cu_seqlens,
+                    "max_seqlen_q": max_seqlen,
+                    "max_seqlen_k": max_seqlen,
+                    "attention_mask_mode": "none",
+                }
+            )
+            # Varlen backends run the packed row as [1, total_tokens, heads,
+            # head_dim] (TRTLLM's forward_cuda unpacks a 4-D query; Flash
+            # accepts either layout and returns the one it got), and the
+            # result returns to the flat packing.
+            out = self.forward(query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0), metadata)
+            return out.reshape(query.shape)
+        return self._forward_packed_dense_buckets(query, key, value, cu_seqlens)
+
+    def _forward_packed_dense_buckets(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Serve packed documents with mask-free dense attention, by length.
+
+        Documents sharing a sequence length are stacked into one dense
+        ``[m, L, heads, head_dim]`` forward; the outputs scatter back into
+        the flat layout, so no attention crosses a document boundary even
+        though the underlying backend never sees cu_seqlens.
+        """
+        seqlens = cu_seqlens.diff().tolist()
+        buckets: dict[int, list[int]] = {}
+        for segment, length in enumerate(seqlens):
+            if length > 0:
+                buckets.setdefault(length, []).append(segment)
+        cu = cu_seqlens.to(device=query.device, dtype=torch.long)
+        out = torch.empty_like(query)
+        for length, segments in buckets.items():
+            rows = cu[segments].unsqueeze(1) + torch.arange(length, device=query.device)
+            flat_rows = rows.reshape(-1)
+            # Q and K/V may carry different head counts; each gets its own
+            # bucket shape and scatters back to its own flat layout.
+            bucket_out = self.forward(
+                query.index_select(0, flat_rows).reshape(len(segments), length, *query.shape[1:]),
+                key.index_select(0, flat_rows).reshape(len(segments), length, *key.shape[1:]),
+                value.index_select(0, flat_rows).reshape(len(segments), length, *value.shape[1:]),
+                AttentionMetadata(),
+            )
+            out.index_copy_(0, flat_rows, bucket_out.reshape(flat_rows.shape[0], *query.shape[1:]))
+        return out
 
     def _register_scheduled_op(self) -> None:
         """Give this layer the id the compiled scheduled-attention op carries.

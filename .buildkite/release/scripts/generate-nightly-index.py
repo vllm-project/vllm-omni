@@ -66,6 +66,20 @@ def parse_from_filename(file: str) -> WheelFileInfo:
     )
 
 
+# Device suffixes setup.py appends to the version; CUDA wheels have none.
+VARIANTS = ("xpu",)
+
+
+def get_variant(version: str) -> str | None:
+    """Return the device variant of a wheel version, or None for the default.
+
+    Release wheels end in `+xpu`; dev wheels end in `+g<hash>.xpu`.
+    """
+    _, _, local = version.partition("+")
+    suffix = local.split(".")[-1]
+    return suffix if suffix in VARIANTS else None
+
+
 def generate_project_list(package_names: list[str], comment: str = "") -> str:
     """Generate top-level PEP 503 project list HTML."""
     href_tags = []
@@ -107,10 +121,16 @@ def generate_index(
 
     Output structure:
         index_base_dir/
-            index.html          # project list linking to vllm-omni/
+            index.html          # project list linking to vllm-omni/ and xpu/
             vllm-omni/
                 index.html      # package index linking to wheel files
                 metadata.json   # machine-readable metadata
+            xpu/                # same layout, XPU wheels only
+                index.html
+                vllm-omni/
+
+    Variant wheels get their own directory because pip ranks 0.32.0+xpu above
+    0.32.0, so a shared index would serve the XPU wheel to CUDA users.
     """
     parsed_files = [parse_from_filename(f) for f in whl_files]
 
@@ -121,28 +141,34 @@ def generate_index(
     comment_str = f" ({comment})" if comment else ""
     comment_tmpl = f"Generated on {datetime.now().isoformat()}{comment_str}"
 
-    # Group by normalized package name
-    packages: dict[str, list[WheelFileInfo]] = {}
+    # Group by variant directory ("" is the default), then by package name
+    # The root group always exists so the root page links to the variant
+    # directories even when the default wheel build failed.
+    variant_dirs: dict[str, dict[str, list[WheelFileInfo]]] = {"": {}}
     for file in parsed_files:
+        variant_dir = get_variant(file.version) or ""
         name = normalize_package_name(file.package_name)
-        packages.setdefault(name, []).append(file)
+        variant_dirs.setdefault(variant_dir, {}).setdefault(name, []).append(file)
 
-    print(f"Found packages: {list(packages.keys())}")
+    for variant_dir, packages in variant_dirs.items():
+        print(f"Found packages for variant '{variant_dir or 'default'}': {list(packages.keys())}")
+        variant_index_dir = index_base_dir / variant_dir
+        for package, files in packages.items():
+            package_dir = variant_index_dir / package
+            package_dir.mkdir(parents=True, exist_ok=True)
+            index_str, metadata_str = generate_package_index(files, wheel_base_dir, package_dir, comment)
+            with open(package_dir / "index.html", "w") as f:
+                f.write(index_str)
+            with open(package_dir / "metadata.json", "w") as f:
+                f.write(metadata_str)
 
-    # Generate per-package index
-    for package, files in packages.items():
-        package_dir = index_base_dir / package
-        package_dir.mkdir(parents=True, exist_ok=True)
-        index_str, metadata_str = generate_package_index(files, wheel_base_dir, package_dir, comment)
-        with open(package_dir / "index.html", "w") as f:
-            f.write(index_str)
-        with open(package_dir / "metadata.json", "w") as f:
-            f.write(metadata_str)
-
-    # Generate top-level project list
-    project_list_str = generate_project_list(sorted(packages.keys()), comment_tmpl)
-    with open(index_base_dir / "index.html", "w") as f:
-        f.write(project_list_str)
+        # The root list also links to each variant directory
+        entries = list(packages.keys())
+        if variant_dir == "":
+            entries += [v for v in variant_dirs if v]
+        project_list_str = generate_project_list(sorted(entries), comment_tmpl)
+        with open(variant_index_dir / "index.html", "w") as f:
+            f.write(project_list_str)
 
 
 if __name__ == "__main__":

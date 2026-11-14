@@ -6,7 +6,11 @@ from __future__ import annotations
 from dataclasses import fields
 from typing import TYPE_CHECKING
 
-from vllm_omni.diffusion.attention.schedule import resolve_request_attention_schedule
+from vllm_omni.diffusion.attention.schedule import (
+    resolve_request_attention_schedule,
+    resolve_request_attention_sigma_schedule,
+)
+from vllm_omni.diffusion.mixfusion.request import request_batch_key_allowed
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -16,6 +20,7 @@ from vllm_omni.diffusion.sched.interface import (
     SchedulerRequestState,
     _AdmissionWaitDecision,
 )
+from vllm_omni.lora.utils import build_lora_batch_key
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import AttentionScheduleConfig
@@ -29,9 +34,10 @@ _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
 ) - {
     "attention_schedule",
     "attention_schedule_explicit",
+    "attention_sigma_schedule",
     "condition_key",
     "flow_shift",
-    "lora_int_id",
+    "lora_key",
     "sample_solver",
 }
 
@@ -57,7 +63,8 @@ def build_request_batch_sampling_params_key(
 
     ``attention_schedule_config`` is the service's ``diffusion_attention_schedule``. The key carries
     the request's resolved schedule and whether the request sent it, so a request that inherits the
-    default and one that sends the same ranges explicitly stay in separate batches.
+    default and one that sends the same ranges explicitly stay in separate batches. Sigma windows are
+    keyed on their resolved value only.
     """
     sampling = request.sampling_params
     # LoRA identity is optional on sampling params (and on test stubs).
@@ -70,9 +77,12 @@ def build_request_batch_sampling_params_key(
     key_kwargs["sample_solver"] = _normalize_explicit_sample_solver(extra_args.get("sample_solver"))
     key_kwargs["flow_shift"] = _normalize_explicit_flow_shift(extra_args.get("flow_shift"))
     key_kwargs["condition_key"] = getattr(request, "batch_compatibility_key", None)
-    key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
+    key_kwargs["lora_key"] = build_lora_batch_key(lora_request, getattr(sampling, "lora_scale", None))
     key_kwargs["attention_schedule"] = resolve_request_attention_schedule(sampling, attention_schedule_config)
     key_kwargs["attention_schedule_explicit"] = sampling.attention_schedule is not None
+    key_kwargs["attention_sigma_schedule"] = resolve_request_attention_sigma_schedule(
+        sampling, attention_schedule_config
+    )
     return RequestBatchSamplingParamsKey(**key_kwargs)
 
 
@@ -127,7 +137,16 @@ class RequestScheduler(BaseScheduler):
             or (decision.deadline is not None and now >= decision.deadline)
         )
 
-    def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
+    def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey | None:
+        """Build a request-batch compatibility key from sampling parameters.
+
+        Request-mode batches resolve one height/width for the whole batch from
+        the first request (see ``QwenImagePipeline.forward``), so resolution
+        stays in the key even for MixFusion requests; only per-prompt inputs
+        make a MixFusion request unbatchable.
+        """
+        if not request_batch_key_allowed(request, self.od_config, supported=self._mixfusion_supported):
+            return None
         return build_request_batch_sampling_params_key(
             request, getattr(self.od_config, "diffusion_attention_schedule", None)
         )
