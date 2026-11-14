@@ -29,6 +29,7 @@ from typing import Any
 from benchmarks.kernels._magi2_gpu_bench import (
     add_arguments,
     check_pair,
+    count_kernels,
     emit,
     load_musa,
     measure_pair,
@@ -59,7 +60,11 @@ def benchmark_shape(torch: Any, mhc: Any, args: argparse.Namespace, tokens: int)
     coefficients = prepare_reference()
     mix_reference = partial(mix_op.forward_native, streams, branch, *coefficients)
     mix_fused = partial(mix_op, streams, branch, *coefficients)
-    post_kernel, mix_kernel = "_mhc_post_residual_kernel", "_mhc_mix_kernel"
+    # MUSA dispatches to the #7261 tile kernel; the bit-exact unrolled kernel
+    # is CUDA-only (see MHCPostResidual.forward_cuda).
+    is_musa = hasattr(torch.version, "musa") and torch.version.musa is not None
+    post_kernel = "_mhc_post_residual_tile_kernel" if is_musa else "_mhc_post_residual_kernel"
+    mix_kernel = "_mhc_mix_kernel"
     cases = {
         "post_residual": (prepare_reference, prepare_fused, (post_kernel,)),
         "mix": (mix_reference, mix_fused, (mix_kernel,)),
@@ -83,6 +88,11 @@ def benchmark_shape(torch: Any, mhc: Any, args: argparse.Namespace, tokens: int)
         )
         parity = check_pair(torch, reference, fused, mhc, kernels, rtol=rtol, atol=atol)
         timing = measure_pair(torch, reference, fused, args)
+        # Launch-count evidence (CUDA only; MUSA has no CUPTI profiler).
+        native_kernels = count_kernels(torch, reference)
+        fused_kernels = count_kernels(torch, fused)
+        timing["native_kernels"] = native_kernels
+        timing["fused_kernels"] = fused_kernels
         # Logical minimum traffic: input reads plus output writes. Native
         # intermediates and repeat parameter loads can add actual DRAM traffic.
         element_bytes = streams.element_size()
