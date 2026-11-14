@@ -300,8 +300,6 @@ class BasicResBlock(nn.Module):
                 nn.BatchNorm2d(out_channels, affine=True),
             )
         self.causal = causal
-        self.stride_t = stride[-1] if isinstance(stride, tuple) else stride
-        self.cache_frames = 2 + 2 * self.stride_t
 
     def forward(self, x):
         if self.causal:
@@ -400,7 +398,6 @@ class MECT_block(nn.Module):
         )
         self.expansion_project = nn.Sequential(nn.Conv1d(hidden_dims, self.fcdims, 1))
         self.up_sample = nn.Upsample(scale_factor=self.scale_t, mode="nearest")
-        self.pos_conv_receptive_field = 113 - 1
 
     def _make_layer(self, block, out_channels, num_blocks, group_divisor, stride):
         strides = [stride] + [1] * (num_blocks - 1)

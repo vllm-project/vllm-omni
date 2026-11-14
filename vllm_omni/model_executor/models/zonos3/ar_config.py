@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from typing import Any
 
 
-
 @dataclass(frozen=True)
 class Zonos3Architecture:
     n_layers: int
