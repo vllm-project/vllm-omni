@@ -96,6 +96,12 @@ This document owns offline API semantics, CLI and serve composition,
 supported OpenAI-compatible routes, request validation and normalization,
 response conversion, streaming/session behavior, and engine handoff.
 
+`AsyncOmni.generate(priority=...)` forwards the value when creating a
+stage-0 AR request, including the first ADD for streaming input and the
+terminal ADD for an empty stream. The stage's scheduling policy determines
+how that value is used; cross-stage priority propagation is outside this
+entrypoint guarantee.
+
 The serving composition removes inherited `/tokenize`, `/detokenize`, and
 optional `/tokenizer_info` routes when no tokenization handler is configured
 (including pure diffusion mode). These endpoints return HTTP 404 and are absent
