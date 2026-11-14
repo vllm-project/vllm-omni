@@ -61,6 +61,73 @@ def _make_engine() -> DiffusionEngine:
     return engine
 
 
+def _make_offload_engine(
+    pending: dict,
+    sizes: dict[bytes, int] | Exception,
+) -> tuple[DiffusionEngine, SimpleNamespace, SimpleNamespace]:
+    from vllm_omni.diffusion.diffusion_kv.offload import OffloadedKVPage
+
+    page = OffloadedKVPage.create(
+        group_index=0,
+        block_hash=b"block-1",
+        source_block_id=2,
+        num_tokens=4,
+    )
+    scheduler = SimpleNamespace(
+        pending_kv_page_offloads=Mock(return_value={rid: [page] for rid in pending}),
+        commit_kv_page_offload=Mock(),
+        abort_kv_page_offload=Mock(),
+    )
+    executor = SimpleNamespace(
+        save_diffusion_kv_pages=Mock(side_effect=sizes if isinstance(sizes, Exception) else Mock(return_value=sizes)),
+    )
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.scheduler = scheduler
+    engine.executor = executor
+    engine._fail_engine = Mock()
+    return engine, scheduler, executor
+
+
+def test_drain_kv_page_offloads_commits_saved_sizes() -> None:
+    engine, scheduler, executor = _make_offload_engine(pending={"r0": True}, sizes={b"block-1\x00\x00\x00\x00": 128})
+
+    engine._drain_kv_page_offloads()
+
+    executor.save_diffusion_kv_pages.assert_called_once()
+    scheduler.commit_kv_page_offload.assert_called_once_with("r0", {b"block-1\x00\x00\x00\x00": 128})
+    scheduler.abort_kv_page_offload.assert_not_called()
+    engine._fail_engine.assert_not_called()
+
+
+def test_drain_kv_page_offloads_aborts_when_the_save_fails() -> None:
+    engine, scheduler, executor = _make_offload_engine(pending={"r0": True}, sizes=RuntimeError("D2H copy failed"))
+
+    engine._drain_kv_page_offloads()
+
+    scheduler.commit_kv_page_offload.assert_not_called()
+    scheduler.abort_kv_page_offload.assert_called_once_with(["r0"])
+    engine._fail_engine.assert_not_called()
+
+
+def test_drain_kv_page_offloads_fails_engine_when_abort_also_fails() -> None:
+    engine, scheduler, executor = _make_offload_engine(pending={"r0": True}, sizes=RuntimeError("D2H copy failed"))
+    scheduler.abort_kv_page_offload.side_effect = RuntimeError("scheduler is broken")
+
+    with pytest.raises(RuntimeError, match="scheduler is broken"):
+        engine._drain_kv_page_offloads()
+
+    engine._fail_engine.assert_called_once()
+
+
+def test_drain_kv_page_offloads_is_a_noop_without_holds() -> None:
+    engine, scheduler, executor = _make_offload_engine(pending={}, sizes={})
+
+    engine._drain_kv_page_offloads()
+
+    executor.save_diffusion_kv_pages.assert_not_called()
+    scheduler.commit_kv_page_offload.assert_not_called()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("started", [False, True])
 async def test_closing_response_stream_releases_queue(started: bool) -> None:
