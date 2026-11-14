@@ -102,9 +102,11 @@ HF_CACHE="${HF_CACHE:-$(realpath ~)/.cache/huggingface}"
 mkdir -p "${HF_CACHE}"
 HF_MOUNT="/root/.cache/huggingface"
 
-# One hour of tests inside the container. The stage budgets below sum to less
-# than this; timeout_in_minutes on the step has to cover this plus the image
-# build (check the "time docker build" line above when tuning either).
+# One hour of tests inside the container. Each stage also has its own cap, and
+# those caps sum to 32m in the pr scope and 57m in the broad scope, so a single
+# runaway stage cannot eat the whole budget. Measured: 7m02s + 4m43s + <1m in
+# the pr scope. timeout_in_minutes on the step has to cover this budget plus
+# the image build (check the "time docker build" line above when tuning either).
 XPU_TEST_BUDGET="${XPU_TEST_BUDGET:-60m}"
 
 # pr    = core_model + the mxfp8 config check (~20m; the only weights it needs
@@ -191,13 +193,13 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     mapfile -t cpu_skip < <(grep -v "^#" .buildkite/intel/xpu-cpu-lane-skip.txt | grep .)
     cpu_ignore=()
     for f in "${cpu_skip[@]}"; do cpu_ignore+=(--ignore "${f}"); done
-    stage "device-agnostic (no card)" 30m -n "${XPU_CPU_WORKERS:-8}" \
+    stage "device-agnostic (no card)" 15m -n "${XPU_CPU_WORKERS:-8}" \
         "${cpu_paths[@]}" "${cpu_ignore[@]}" \
         -m "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
 
     # core_model excludes omni: the async-omni tests carry both markers and
     # would otherwise run twice, and they need their own process (broad scope).
-    stage "core_model" 30m "${paths[@]}" "${ignore[@]}" "${pr_ignore[@]}" \
+    stage "core_model" 15m "${paths[@]}" "${ignore[@]}" "${pr_ignore[@]}" \
         -m "core_model and not omni and xpu and B60 and cards_1" --run-level core_model
     stage "mxfp8 config" 2m tests/diffusion/quantization/test_mxfp8_config.py
 
