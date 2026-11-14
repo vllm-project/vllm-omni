@@ -3,7 +3,9 @@
 """QK RMSNorm/RoPE matching ATen's CUDA head128 reduction and BF16 roundings."""
 
 import torch
+from torch.library import Library
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import supports_exact_rope
 
@@ -31,6 +33,7 @@ if HAS_TRITON:
         freq_stride1: tl.constexpr,
         eps: tl.constexpr,
         rows_per_block: tl.constexpr,
+        fuse_products: tl.constexpr,
     ):
         row = tl.program_id(0) * rows_per_block + tl.arange(0, rows_per_block)
         lane = tl.arange(0, 32)
@@ -77,10 +80,85 @@ if HAS_TRITON:
         cb = tl.load(freq_ptr + fi + freq_stride1, mask, 0)
         sb = tl.load(freq_ptr + fi + freq_stride1 + 1, mask, 0)
         out = row[:, None] * 128 + lane[None, :] * 4
-        tl.store(output_ptr + out, tl.fma(a, ca, -b * sa).to(tl.bfloat16), mask)
-        tl.store(output_ptr + out + 1, tl.fma(b, ca, a * sa).to(tl.bfloat16), mask)
-        tl.store(output_ptr + out + 2, tl.fma(c, cb, -d * sb).to(tl.bfloat16), mask)
-        tl.store(output_ptr + out + 3, tl.fma(d, cb, c * sb).to(tl.bfloat16), mask)
+        if fuse_products:
+            # CUDA's complex64 multiply fuses the real leading and imaginary
+            # trailing products; the other two round first.
+            r0 = tl.fma(a, ca, -b * sa)
+            r1 = tl.fma(b, ca, a * sa)
+            r2 = tl.fma(c, cb, -d * sb)
+            r3 = tl.fma(d, cb, c * sb)
+        else:
+            # The real-arithmetic rotation rounds every product first.
+            r0 = a * ca - b * sa
+            r1 = b * ca + a * sa
+            r2 = c * cb - d * sb
+            r3 = d * cb + c * sb
+        tl.store(output_ptr + out, r0.to(tl.bfloat16), mask)
+        tl.store(output_ptr + out + 1, r1.to(tl.bfloat16), mask)
+        tl.store(output_ptr + out + 2, r2.to(tl.bfloat16), mask)
+        tl.store(output_ptr + out + 3, r3.to(tl.bfloat16), mask)
+
+
+def _launch_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    wq: torch.Tensor,
+    wk: torch.Tensor,
+    f: torch.Tensor,
+    eps: float,
+    fuse_products: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    oq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    ok = torch.empty_like(oq)
+    ff = torch.view_as_real(f)
+    _full[(triton.cdiv(q.numel() // 128, 4), 2)](
+        q,
+        k,
+        wq,
+        wk,
+        ff,
+        oq,
+        ok,
+        q.numel() // 128,
+        q.shape[1],
+        q.shape[2],
+        *q.stride()[:3],
+        *k.stride()[:3],
+        *ff.stride()[:2],
+        eps,
+        4,
+        fuse_products,
+        enable_fp_fusion=False,
+    )
+    return oq, ok
+
+
+def _musa_qk_norm_rope(
+    q: torch.Tensor, k: torch.Tensor, wq: torch.Tensor, wk: torch.Tensor, f: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _launch_qk(q, k, wq, wk, f, eps, fuse_products=False)
+
+
+def _musa_qk_norm_rope_fake(
+    q: torch.Tensor, k: torch.Tensor, wq: torch.Tensor, wk: torch.Tensor, f: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty(q.shape, dtype=q.dtype, device=q.device),
+        torch.empty(k.shape, dtype=k.dtype, device=k.device),
+    )
+
+
+# MUSA calls the kernel from regionally compiled blocks through an opaque op, which
+# keeps the launch, and its enable_fp_fusion=False, out of the traced graph.
+_OMNI_OP_LIB = Library("vllm_omni", "FRAGMENT")
+if HAS_TRITON and not hasattr(torch.ops.vllm_omni, "musa_qk_norm_rope"):
+    direct_register_custom_op(
+        op_name="musa_qk_norm_rope",
+        op_func=_musa_qk_norm_rope,
+        fake_impl=_musa_qk_norm_rope_fake,
+        mutates_args=[],
+        target_lib=_OMNI_OP_LIB,
+    )
 
 
 def qk_rotary(
@@ -93,7 +171,7 @@ def qk_rotary(
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     if (
         not HAS_TRITON
-        or q.device.type != "cuda"
+        or q.device.type not in ("cuda", "musa")
         or q.dtype != torch.bfloat16
         or q.ndim != 4
         or q.shape != k.shape
@@ -114,32 +192,11 @@ def qk_rotary(
         or f.device != q.device
         or f.shape != (q.shape[1], 64)
         or q.numel() == 0
-        or torch.compiler.is_compiling()
         or torch.is_grad_enabled()
     ):
         return None
-    if not supports_exact_rope(q.device):
+    if q.device.type == "musa":
+        return torch.ops.vllm_omni.musa_qk_norm_rope(q, k, wq, wk, f, eps)
+    if torch.compiler.is_compiling() or not supports_exact_rope(q.device):
         return None
-
-    oq = torch.empty(q.shape, device=q.device, dtype=q.dtype)
-    ok = torch.empty_like(oq)
-    ff = torch.view_as_real(f)
-    _full[(triton.cdiv(q.numel() // 128, 4), 2)](
-        q,
-        k,
-        wq,
-        wk,
-        ff,
-        oq,
-        ok,
-        q.numel() // 128,
-        q.shape[1],
-        q.shape[2],
-        *q.stride()[:3],
-        *k.stride()[:3],
-        *ff.stride()[:2],
-        eps,
-        4,
-        enable_fp_fusion=False,
-    )
-    return oq, ok
+    return _launch_qk(q, k, wq, wk, f, eps, fuse_products=True)

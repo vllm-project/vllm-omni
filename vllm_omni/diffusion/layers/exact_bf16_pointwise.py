@@ -3,7 +3,9 @@
 """BF16 pointwise fusion preserving eager intermediate rounding."""
 
 import torch
+from torch.library import Library
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 
 def eligible(*values: torch.Tensor) -> bool:
@@ -105,6 +107,7 @@ if HAS_TRITON:
         freq_stride0: tl.constexpr,
         freq_stride1: tl.constexpr,
         block_size: tl.constexpr,
+        fuse_products: tl.constexpr,
     ):
         index = tl.program_id(0) * block_size + tl.arange(0, block_size)
         pair = index % 64
@@ -116,33 +119,20 @@ if HAS_TRITON:
         imag = tl.load(input_ptr + base + 1, index < elements, 0).to(tl.float32)
         cosine = tl.load(freq_ptr + token * freq_stride0 + pair * freq_stride1, index < elements, 0)
         sine = tl.load(freq_ptr + token * freq_stride0 + pair * freq_stride1 + 1, index < elements, 0)
-        # Match CUDA's complex64 multiply: the real leading product and the
-        # imaginary trailing product use FMA. The other products round first.
-        rotated_real = tl.fma(real, cosine, -imag * sine)
-        rotated_imag = tl.fma(imag, cosine, real * sine)
+        if fuse_products:
+            # Match CUDA's complex64 multiply: the real leading product and the
+            # imaginary trailing product use FMA. The other products round first.
+            rotated_real = tl.fma(real, cosine, -imag * sine)
+            rotated_imag = tl.fma(imag, cosine, real * sine)
+        else:
+            # Match the real-arithmetic rotation: every product rounds first.
+            rotated_real = real * cosine - imag * sine
+            rotated_imag = imag * cosine + real * sine
         tl.store(output_ptr + index * 2, rotated_real.to(tl.bfloat16), index < elements)
         tl.store(output_ptr + index * 2 + 1, rotated_imag.to(tl.bfloat16), index < elements)
 
 
-def rotary(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor | None:
-    if (
-        not HAS_TRITON
-        or torch.version.hip is not None
-        or x.device.type != "cuda"
-        or x.dtype != torch.bfloat16
-        or x.ndim != 4
-        or x.shape[-1] != 128
-        or x.stride(-1) != 1
-        or freqs.dtype != torch.complex64
-        or freqs.device != x.device
-        or freqs.shape != (x.shape[1], 64)
-        or torch.is_grad_enabled()
-        or x.numel() == 0
-        or torch.compiler.is_compiling()
-    ):
-        return None
-    if not supports_exact_rope(x.device):
-        return None
+def _launch_rope(x: torch.Tensor, freqs: torch.Tensor, fuse_products: bool) -> torch.Tensor:
     output = torch.empty(x.shape, device=x.device, dtype=x.dtype)
     real_freqs = torch.view_as_real(freqs)
     _rope_kernel[(triton.cdiv(x.numel() // 2, 256),)](
@@ -155,6 +145,51 @@ def rotary(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor | None:
         *x.stride()[:3],
         *real_freqs.stride()[:2],
         256,
+        fuse_products,
         enable_fp_fusion=False,
     )
     return output
+
+
+def _musa_interleaved_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    return _launch_rope(x, freqs, fuse_products=False)
+
+
+def _musa_interleaved_rope_fake(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    return torch.empty(x.shape, dtype=x.dtype, device=x.device)
+
+
+# MUSA calls the kernel from regionally compiled blocks through an opaque op, which
+# keeps the launch, and its enable_fp_fusion=False, out of the traced graph.
+_OMNI_OP_LIB = Library("vllm_omni", "FRAGMENT")
+if HAS_TRITON and not hasattr(torch.ops.vllm_omni, "musa_interleaved_rope"):
+    direct_register_custom_op(
+        op_name="musa_interleaved_rope",
+        op_func=_musa_interleaved_rope,
+        fake_impl=_musa_interleaved_rope_fake,
+        mutates_args=[],
+        target_lib=_OMNI_OP_LIB,
+    )
+
+
+def rotary(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor | None:
+    if (
+        not HAS_TRITON
+        or torch.version.hip is not None
+        or x.device.type not in ("cuda", "musa")
+        or x.dtype != torch.bfloat16
+        or x.ndim != 4
+        or x.shape[-1] != 128
+        or x.stride(-1) != 1
+        or freqs.dtype != torch.complex64
+        or freqs.device != x.device
+        or freqs.shape != (x.shape[1], 64)
+        or torch.is_grad_enabled()
+        or x.numel() == 0
+    ):
+        return None
+    if x.device.type == "musa":
+        return torch.ops.vllm_omni.musa_interleaved_rope(x, freqs)
+    if torch.compiler.is_compiling() or not supports_exact_rope(x.device):
+        return None
+    return _launch_rope(x, freqs, fuse_products=True)
