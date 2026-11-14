@@ -294,6 +294,10 @@ class StageDiffusionProc:
             assert self._engine is not None
             is_start = args[0] if args else True
             profile_prefix = args[1] if len(args) > 1 else None
+            if is_start:
+                # Profilers keep thread-local state. Before the first request,
+                # route profiling through the same busy loop as inference.
+                await self._engine._check_and_start_background_loop()
             return await run_executor(partial(self._engine.profile, is_start, profile_prefix, **(kwargs or {})))
 
         if method == "add_lora":
