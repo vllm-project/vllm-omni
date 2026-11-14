@@ -1528,6 +1528,9 @@ def _make_step_worker(lora_manager=None, *, expected_output=None):
     worker = object.__new__(DiffusionWorker)
     worker.lora_manager = lora_manager
     worker._step_lora_state = {}
+    # The bare worker has no od_config/rank; keep the SM100+ FlashInfer
+    # autotune probe out of these LoRA-state unit tests.
+    worker._flashinfer_autotune_on = False
     output = expected_output if expected_output is not None else RunnerOutput(request_id="req-1")
     worker.model_runner = SimpleNamespace(execute_stepwise=lambda arg: output)
     return worker

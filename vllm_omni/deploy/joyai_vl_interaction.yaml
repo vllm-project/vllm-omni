@@ -78,3 +78,8 @@ stages:
       top_k: -1
       max_tokens: 65536
       repetition_penalty: 1.0
+
+# Use the shared MRv2 runners on CUDA; preserve other platforms.
+platforms:
+  cuda:
+    model_runner: v2
