@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from Tencent-Hunyuan/Hy-Nomas@911cea6458 (Copyright 2026 Tencent).
 
+import hashlib
 from collections import OrderedDict
 from collections.abc import Iterable
 from functools import partial
@@ -342,8 +343,27 @@ class HyNomasTransformer(nn.Module):
         self._step_camera_plan_cache: OrderedDict[tuple, tuple] = OrderedDict()
 
     @staticmethod
-    def _tensor_meta(t: torch.Tensor) -> tuple:
-        return (id(t), t.data_ptr(), t._version, tuple(t.shape), t.device, t.dtype)
+    def _tensor_meta(t: torch.Tensor, *, slice_end: int | None = None) -> tuple:
+        if not t.is_inference():
+            return (id(t), t.data_ptr(), t._version, tuple(t.shape), t.device, t.dtype)
+        if t.device.type == "cpu":
+            view = t if slice_end is None else t[:, :slice_end]
+            digest = hashlib.blake2b(view.detach().contiguous().view(torch.uint8).numpy(), digest_size=16).digest()
+            return (id(t), t.data_ptr(), "cpu_inference", digest, tuple(t.shape), t.device, t.dtype)
+        end = -1 if slice_end is None else int(slice_end)
+        return (id(t), t.data_ptr(), "device_inference", end, tuple(t.shape), t.device, t.dtype)
+
+    @staticmethod
+    def _inference_snapshots(targets: tuple[tuple[torch.Tensor, int | None], ...]) -> tuple:
+        return tuple(
+            (t, end, (t if end is None else t[:, :end]).detach().clone())
+            for t, end in targets
+            if t.is_inference() and t.device.type != "cpu"
+        )
+
+    @staticmethod
+    def _snapshots_match(snapshots: tuple) -> bool:
+        return not snapshots or all(torch.equal(t if end is None else t[:, :end], snap) for t, end, snap in snapshots)
 
     @staticmethod
     def _lru_put(cache: OrderedDict, key: tuple, value: tuple) -> None:
@@ -380,7 +400,11 @@ class HyNomasTransformer(nn.Module):
     def _make_step_attention_key(self, kw: tuple, update_cache: bool) -> tuple:
         shape, text_mask, unique_masks, valid_len, cache_txt, offsets, windows, device = kw
         has_act = bool(cache_txt and offsets is not None and windows)
-        cache_meta = (int(valid_len), tuple(self._tensor_meta(m) for m in unique_masks)) if valid_len > 0 else (0,)
+        cache_meta = (
+            (int(valid_len), tuple(self._tensor_meta(m, slice_end=valid_len) for m in unique_masks))
+            if valid_len > 0
+            else (0,)
+        )
         act_meta = (self._normalize_nested(offsets), self._normalize_nested(windows)) if has_act else (None, None)
         flags = (bool(cache_txt), bool(update_cache), bool(cache_txt or update_cache))
         return (shape, self.sp_size, device, *flags, self._tensor_meta(text_mask), cache_meta, *act_meta)
@@ -398,9 +422,10 @@ class HyNomasTransformer(nn.Module):
         unique_masks = tuple({id(mask): mask for mask in cache_masks}.values())
         kw = (shape, text_mask, unique_masks, valid_len, cache_txt, offsets, windows, device)
         plan_key = self._make_step_attention_key(kw, update)
-        if plan_key in self._step_attention_plan_cache:
+        entry = self._step_attention_plan_cache.get(plan_key)
+        if entry is not None and self._snapshots_match(entry[2]):
             self._step_attention_plan_cache.move_to_end(plan_key)
-            current_mask, resolved, _ = self._step_attention_plan_cache[plan_key]
+            current_mask, resolved, snapshots, _ = entry
         else:
             image_tokens = img_local * self.sp_size
             image_mask = torch.ones((batch, image_tokens), dtype=torch.bool, device=device)
@@ -427,13 +452,18 @@ class HyNomasTransformer(nn.Module):
                 )
                 resolved_list.append(bm)
             resolved = tuple(resolved_list)
-            self._cache_attention_plan_variants((current_mask, resolved, (text_mask, unique_masks)), kw, update)
+            targets = (
+                ((text_mask, None), *((m, valid_len) for m in unique_masks)) if valid_len > 0 else ((text_mask, None),)
+            )
+            snapshots = self._inference_snapshots(targets)
+            entry = (current_mask, resolved, snapshots, (text_mask, unique_masks))
+            self._cache_attention_plan_variants(entry, kw, update)
         if update:
             count = img_local * self.sp_size + (text_mask.shape[1] if cache_txt else 0)
             written_slice = current_mask[:, :count]
             for mask in unique_masks:
                 mask[:, valid_len : valid_len + count] = written_slice
-            self._cache_attention_plan_variants((current_mask, resolved, (text_mask, unique_masks)), kw, update)
+            self._cache_attention_plan_variants(entry, kw, update)
         by_id = {id(m): bm for m, bm in zip(unique_masks, resolved)}
         return resolved * len(cache_masks) if len(resolved) == 1 else tuple(by_id[id(m)] for m in cache_masks)
 
@@ -444,9 +474,10 @@ class HyNomasTransformer(nn.Module):
         freqs_cos, freqs_sin = self.action_modules[0].freqs_cos, self.action_modules[0].freqs_sin
         meta = (self._tensor_meta(freqs_cos), self._tensor_meta(freqs_sin))
         cam_key = (batch, length, first, frames, height, width, device, *meta)
-        if cam_key in self._step_camera_plan_cache:
+        entry = self._step_camera_plan_cache.get(cam_key)
+        if entry is not None and self._snapshots_match(entry[3]):
             self._step_camera_plan_cache.move_to_end(cam_key)
-            q_rotary, k_rotary, cam_block_masks, _ = self._step_camera_plan_cache[cam_key]
+            q_rotary, k_rotary, cam_block_masks, _, _ = entry
             return q_rotary, k_rotary, cam_block_masks
         frame_ids = (torch.arange(length, device=freqs_cos.device) + first) // (height * width)
         q_rotary = (freqs_cos[frame_ids].to(device=device), freqs_sin[frame_ids].to(device=device))
@@ -460,7 +491,15 @@ class HyNomasTransformer(nn.Module):
             length, frames, device, batch_size=batch, ranges=[rectangles] * batch
         )
         self._lru_put(
-            self._step_camera_plan_cache, cam_key, (q_rotary, k_rotary, cam_block_masks, (freqs_cos, freqs_sin))
+            self._step_camera_plan_cache,
+            cam_key,
+            (
+                q_rotary,
+                k_rotary,
+                cam_block_masks,
+                self._inference_snapshots(((freqs_cos, None), (freqs_sin, None))),
+                (freqs_cos, freqs_sin),
+            ),
         )
         return q_rotary, k_rotary, cam_block_masks
 

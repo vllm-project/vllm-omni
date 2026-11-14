@@ -177,77 +177,87 @@ def _step_kw(f=2, h=1, w=1, txt_mask=(1, 1, 0), offs=None, wins=None, **extra):
     }
 
 
-@torch.no_grad()
-def test_transformer_hoists_step_masks_and_camera_and_hits_warm_fast_path(mocker):
+@pytest.mark.parametrize("use_inference", [False, True])
+def test_transformer_hoists_step_masks_and_camera_and_hits_warm_fast_path(mocker, use_inference):
     from vllm_omni.diffusion.models.hy_nomas import hy_nomas_transformer, layers
 
-    torch.manual_seed(29)
-    model = _small_transformer(num_layers=3)
-    cache = [{"k": torch.zeros(1, 32, 4, 8), "v": torch.zeros(1, 32, 4, 8)} for _ in range(3)]
-    shared_mask = torch.zeros(1, 32, dtype=torch.bool)
-    shared_mask[:, :4] = torch.tensor([[True, False, True, True]])
-    inputs = _step_kw(
-        offs=[[1, 2]],
-        wins=[(0, 1, 0), (1, 2, 1)],
-        kv_cache_list=cache,
-        cache_valid_len=4,
-        global_frame_counter=2,
-        cache_mask_list=[shared_mask] * 3,
-        camera_embedding=torch.randn(1, 2, 64),
-    )
-    sr, sa = mocker.spy(hy_nomas_transformer, "rotary_tables"), mocker.spy(hy_nomas_transformer, "action_ranges")
-    sm, sc = mocker.spy(model.attention, "resolve_masks"), mocker.spy(model.camera_attention, "resolve_masks")
-
-    cold_out, cold_written = model.forward_with_cache(**inputs)
-    assert (cold_written, sr.call_count, sa.call_count, sm.call_count, sc.call_count) == (0, 1, 1, 1, 1)
-    cached_rope_gt0 = next(iter(model._step_rope_cache.values()))
-
-    warm_out, warm_written = model.forward_with_cache(**inputs)
-    assert (warm_written, sr.call_count, sa.call_count, sm.call_count, sc.call_count) == (0, 1, 1, 1, 1)
-    assert next(iter(model._step_rope_cache.values()))[0] is cached_rope_gt0[0]
-    torch.testing.assert_close(warm_out, cold_out, rtol=0, atol=0)
-
-    gfc0_cold, _ = model.forward_with_cache(**{**inputs, "global_frame_counter": 0})
-    assert sr.call_count == 2
-    gfc0_warm, _ = model.forward_with_cache(**{**inputs, "global_frame_counter": 0})
-    assert sr.call_count == 2
-    torch.testing.assert_close(gfc0_warm, gfc0_cold, rtol=0, atol=0)
-
-    commit_out, commit_written = model.forward_with_cache(**{**inputs, "update_cache": True})
-    assert (commit_written, sm.call_count, sr.call_count) == (5, 1, 2)
-    torch.testing.assert_close(commit_out, cold_out, rtol=0, atol=0)
-    assert shared_mask[0, 4:9].tolist() == [True, True, True, True, False]
-
-    post_commit_warm_out, _ = model.forward_with_cache(**inputs)
-    torch.testing.assert_close(post_commit_warm_out, cold_out, rtol=0, atol=0)
-    assert (sm.call_count, sr.call_count) == (1, 2)
-
-    shared_mask[0, 0] = False
-    mutated_out, _ = model.forward_with_cache(**inputs)
-    assert sm.call_count == 2 and not torch.equal(mutated_out, cold_out)
-
-    model.clear_attention_cache()
-    assert not model._step_attention_plan_cache and not model._step_camera_plan_cache and not model._step_rope_cache
-    assert not hasattr(layers, "FlashAttentionImpl") and isinstance(
-        layers.TokenRefinerBlock(32, 4).attn, layers.SDPAImpl
-    )
-    assert layers.TimestepEmbedder(32, device="meta")(torch.empty(1, device="meta")).device.type == "meta"
-
-    m0, m1 = torch.ones(1, 32, dtype=torch.bool), torch.ones(1, 32, dtype=torch.bool)
-    m1[0, 0] = False
-    hetero_out, _ = model.forward_with_cache(**{**inputs, "cache_mask_list": [m0, m1, m0]})
-    homo_out, _ = model.forward_with_cache(**{**inputs, "cache_mask_list": [m0] * 3})
-    assert not torch.equal(hetero_out, homo_out)
-
-    for valid_len in range(1, 11):
-        hs = torch.randn(1, 4, 2, 1, (valid_len % 3) + 1)
-        model.forward_with_cache(
-            **{**inputs, "cache_valid_len": valid_len, "global_frame_counter": valid_len, "hidden_states": hs}
+    with torch.inference_mode() if use_inference else torch.no_grad():
+        torch.manual_seed(29)
+        model = _small_transformer(num_layers=3)
+        cache = [{"k": torch.zeros(1, 32, 4, 8), "v": torch.zeros(1, 32, 4, 8)} for _ in range(3)]
+        shared_mask = torch.zeros(1, 32, dtype=torch.bool)
+        shared_mask[:, :4] = torch.tensor([[True, False, True, True]])
+        inputs = _step_kw(
+            offs=[[1, 2]],
+            wins=[(0, 1, 0), (1, 2, 1)],
+            kv_cache_list=cache,
+            cache_valid_len=4,
+            global_frame_counter=2,
+            cache_mask_list=[shared_mask] * 3,
+            camera_embedding=torch.randn(1, 2, 64),
         )
-    assert (
-        max(len(c) for c in (model._step_attention_plan_cache, model._step_camera_plan_cache, model._step_rope_cache))
-        <= 8
-    )
+        assert shared_mask.is_inference() == use_inference and inputs["text_mask"].is_inference() == use_inference
+        assert model.action_modules[0].freqs_cos.is_inference() == use_inference
+        sr, sa = mocker.spy(hy_nomas_transformer, "rotary_tables"), mocker.spy(hy_nomas_transformer, "action_ranges")
+        sm, sc = mocker.spy(model.attention, "resolve_masks"), mocker.spy(model.camera_attention, "resolve_masks")
+
+        cold_out, cold_written = model.forward_with_cache(**inputs)
+        assert (cold_written, sr.call_count, sa.call_count, sm.call_count, sc.call_count) == (0, 1, 1, 1, 1)
+        cached_rope_gt0 = next(iter(model._step_rope_cache.values()))
+
+        warm_out, warm_written = model.forward_with_cache(**inputs)
+        assert (warm_written, sr.call_count, sa.call_count, sm.call_count, sc.call_count) == (0, 1, 1, 1, 1)
+        assert next(iter(model._step_rope_cache.values()))[0] is cached_rope_gt0[0]
+        torch.testing.assert_close(warm_out, cold_out, rtol=0, atol=0)
+
+        gfc0_cold, _ = model.forward_with_cache(**{**inputs, "global_frame_counter": 0})
+        assert sr.call_count == 2
+        gfc0_warm, _ = model.forward_with_cache(**{**inputs, "global_frame_counter": 0})
+        assert sr.call_count == 2
+        torch.testing.assert_close(gfc0_warm, gfc0_cold, rtol=0, atol=0)
+
+        commit_out, commit_written = model.forward_with_cache(**{**inputs, "update_cache": True})
+        assert (commit_written, sm.call_count, sr.call_count) == (5, 1, 2)
+        torch.testing.assert_close(commit_out, cold_out, rtol=0, atol=0)
+        assert shared_mask[0, 4:9].tolist() == [True, True, True, True, False]
+
+        post_commit_warm_out, _ = model.forward_with_cache(**inputs)
+        torch.testing.assert_close(post_commit_warm_out, cold_out, rtol=0, atol=0)
+        assert (sm.call_count, sr.call_count) == (1, 2)
+
+        shared_mask[0, 0] = False
+        mutated_out, _ = model.forward_with_cache(**inputs)
+        assert sm.call_count == 2 and not torch.equal(mutated_out, cold_out)
+
+        inputs["text_mask"][0, 0] = 0
+        txt_mutated_out, _ = model.forward_with_cache(**inputs)
+        assert sm.call_count == 3 and not torch.equal(txt_mutated_out, mutated_out)
+
+        model.clear_attention_cache()
+        assert not model._step_attention_plan_cache and not model._step_camera_plan_cache and not model._step_rope_cache
+        assert not hasattr(layers, "FlashAttentionImpl") and isinstance(
+            layers.TokenRefinerBlock(32, 4).attn, layers.SDPAImpl
+        )
+        assert layers.TimestepEmbedder(32, device="meta")(torch.empty(1, device="meta")).device.type == "meta"
+
+        m0, m1 = torch.ones(1, 32, dtype=torch.bool), torch.ones(1, 32, dtype=torch.bool)
+        m1[0, 0] = False
+        hetero_out, _ = model.forward_with_cache(**{**inputs, "cache_mask_list": [m0, m1, m0]})
+        homo_out, _ = model.forward_with_cache(**{**inputs, "cache_mask_list": [m0] * 3})
+        assert not torch.equal(hetero_out, homo_out)
+
+        for valid_len in range(1, 11):
+            hs = torch.randn(1, 4, 2, 1, (valid_len % 3) + 1)
+            model.forward_with_cache(
+                **{**inputs, "cache_valid_len": valid_len, "global_frame_counter": valid_len, "hidden_states": hs}
+            )
+        assert (
+            max(
+                len(c)
+                for c in (model._step_attention_plan_cache, model._step_camera_plan_cache, model._step_rope_cache)
+            )
+            <= 8
+        )
 
 
 @torch.no_grad()

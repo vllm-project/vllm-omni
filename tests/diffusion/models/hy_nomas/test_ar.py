@@ -927,3 +927,32 @@ def test_worker_cancellation_reclaims_committed_and_pending_archive_tensors(rece
             archive.publish()
         assert not runner._sessions and not runner.pipeline._ar_sessions
         assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
+
+
+def test_inference_mode_boundary_preserves_versioned_masks_and_plan_cache(runner):
+    from tests.diffusion.models.hy_nomas.test_native_runtime import _small_transformer
+
+    pipeline, probe, plan_ids = runner.pipeline, _small_transformer(num_layers=runner.pipeline.num_double_blocks), []
+    orig_fwd, orig_res, calls = pipeline.transformer_forward, probe.attention.resolve_masks, [0]
+    probe.attention.resolve_masks = lambda *a, **kw: (calls.__setitem__(0, calls[0] + 1), orig_res(*a, **kw))[1]
+
+    def wrapped_forward(**kw):
+        vl, tm, cms, hs = kw["cache_valid_len"], kw["text_mask"], kw["cache_mask_list"], kw["hidden_states"]
+        assert not tm.is_inference() and all(not m.is_inference() for m in cms)
+        if vl > 0:
+            shape = (hs.shape[0], hs.shape[2], hs.shape[3], hs.shape[4])
+            img = hs.reshape(hs.shape[0], -1, hs.shape[1])
+            act = (kw["intra_seg_txt_offsets"], kw["intra_seg_vid_windows"])
+            probe._last = (shape, img, tm, cms, vl, kw["update_cache"], kw["cache_txt"], act)
+            plan_ids.append(id(probe._resolve_step_attention_plan(*probe._last)[0][0]))
+        return orig_fwd(**{**kw, "cache_mask_list": [m.clone() for m in cms]})
+
+    pipeline.transformer.forward_with_cache = wrapped_forward
+    with torch.inference_mode():
+        assert execute(runner, batch(index=0)).error is None and execute(runner, batch(index=1)).error is None
+        assert not pipeline._ar_sessions["s"].history_mask.is_inference()
+        assert len(plan_ids) == 5 and len(set(plan_ids)) == 1 and calls[0] == 1
+        probe._last[3][0][0, 0] = not probe._last[3][0][0, 0]
+        probe._resolve_step_attention_plan(*probe._last[:5], False, *probe._last[6:])
+        assert calls[0] == 2
+    runner.close_session("s")

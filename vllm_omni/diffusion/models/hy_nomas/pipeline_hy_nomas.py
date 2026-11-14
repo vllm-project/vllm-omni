@@ -194,6 +194,13 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
 
 
+def _as_versioned_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if not tensor.is_inference():
+        return tensor
+    with torch.inference_mode(False), torch.no_grad():
+        return torch.empty_like(tensor).copy_(tensor)
+
+
 @dataclass
 class HyNomasSession:
     height: int
@@ -559,7 +566,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 noise,
                 generator,
                 self.vae.create_streaming_decode_session() if bound is not None else None,
-                torch.empty((1, 0), dtype=torch.bool, device=self.device),
+                _as_versioned_tensor(torch.empty((1, 0), dtype=torch.bool, device=self.device)),
             )
             if recent:
                 session.noise_generator = torch.Generator(device="cpu").manual_seed(request.seed)
@@ -632,7 +639,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             # The reference owns padding and action-token coordinates. The
             # generic batcher must not trim that conditioning to mask.sum().
             state.prompt_embeds_mask = None
-            state.extra["hy_nomas_text_mask"] = encoded["text_mask"]
+            state.extra["hy_nomas_text_mask"] = _as_versioned_tensor(encoded["text_mask"])
             state.txt_seq_lens = [int(state.prompt_embeds.shape[1])]
             if state.txt_seq_lens[0] > int(self.args.text_len):
                 raise OmniClientError("Hy-Nomas prompt exceeds the deployed text token limit.")
@@ -750,8 +757,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             or len(mask_list) != self.num_double_blocks
             or any(item is not mask for item in mask_list)
         ):
-            mask = torch.cat(
-                (session.history_mask, torch.zeros((1, current_tokens), device=self.device, dtype=torch.bool)), 1
+            mask = _as_versioned_tensor(
+                torch.cat(
+                    (session.history_mask, torch.zeros((1, current_tokens), device=self.device, dtype=torch.bool)), 1
+                )
             )
             for segment, start, end in session.action_tails:
                 if segment != state.extra["hy_nomas_segment_id"]:
@@ -861,12 +870,16 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                         session.history_archive.publish()
                     if recent:
                         session.history_frames = frames
-                        session.history_mask = torch.cat((session.history_mask, mask[:, history:]), 1)[:, cut:].clone()
+                        session.history_mask = _as_versioned_tensor(
+                            torch.cat((session.history_mask, mask[:, history:]), 1)[:, cut:].clone()
+                        )
                         session.action_tails = action_tails(frames)
                 elif written != current_tokens:
                     raise RuntimeError("Hy-Nomas clean forward wrote an unexpected KV token count.")
                 if not recent:
-                    session.history_mask = torch.cat((session.history_mask, mask[:, history:].clone()), 1)
+                    session.history_mask = _as_versioned_tensor(
+                        torch.cat((session.history_mask, mask[:, history:].clone()), 1)
+                    )
                 action_start = state.extra["hy_nomas_action_start"]
                 if (
                     not recent
