@@ -47,8 +47,7 @@ connectors:
       # eager HiFT (32 of 798 decode calls in the 2026-10-30 c8 round, and the
       # last 7 of 1088 prompts on CUDA seed-tts EN, all (1, 76, 3840) =
       # codec width 34, one past the previous 33 cap).
-      hift_graph_continuation_frames: [3, 43]
-      hift_graph_capture_batch_sizes: [1, 2, 4, 8, 16]
+      hift_graph_continuation_frames: [3, 34]
       # Batch 2 was the last eager residue: every batch-2 continuation shape
       # missed both the buckets (only 1/2/4/8 x 50/58 are captured) and the
       # batch-1 exact graphs (2026-10-30: 5 of 798 decode calls).
@@ -90,15 +89,8 @@ connectors:
       # startup instead of the first request. Overlays that still set
       # cfm_graph_precapture_after_load get a warning; it no longer has any effect.
       cfm_graph_precapture_at_init: true
-      # Seed-TTS reference and flow optimizations. Quality qualification pending.
-      token2wav_spk_cpu_reference: false
-      token2wav_spk_cuda_graph: true
-      token2wav_s3_cuda_graph: true
-      initial_codec_chunk_frames: 0
-      ref_setup_batch_size: 4
-      token2wav_float16: true
-      # Four-worker CPU prefetch regressed C16; keep it disabled.
-      token2wav_ref_cpu_prefetch_workers: 0
+      # Non-CUDA retains FP32 Flow (required for NPU cross-reference CFM).
+      # CUDA reference and flow tuning is scoped in platforms.cuda.connectors.
       token2wav_n_timesteps: 5
 
 stages:
@@ -185,6 +177,20 @@ stages:
 platforms:
   cuda:
     model_runner: v2
+    connectors:
+      connector_of_shared_memory:
+        extra:
+          # Seed-TTS tuning; retain shared connector options on every platform.
+          hift_graph_continuation_frames: [3, 43]
+          hift_graph_capture_batch_sizes: [1, 2, 4, 8, 16]
+          token2wav_spk_cpu_reference: false
+          token2wav_spk_cuda_graph: true
+          token2wav_s3_cuda_graph: true
+          initial_codec_chunk_frames: 0
+          ref_setup_batch_size: 4
+          token2wav_float16: true
+          # Four-worker CPU prefetch regressed C16; keep it disabled.
+          token2wav_ref_cpu_prefetch_workers: 0
     # Private MPS for colocated CUDA stages. NPU does not read this block.
     # A missing or failing nvidia-cuda-mps-control daemon, parallel stage
     # init, or a stage that is not one numeric GPU disables MPS and continues. Set false

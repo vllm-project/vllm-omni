@@ -807,16 +807,16 @@ def test_prefetch_waiter_limit_must_be_positive():
         _prefetch_model(max_waiters=0)
 
 
-def test_placeholder_dedup_and_pins():
-    model, _ = _prefetch_model(capacity=0)
+def test_placeholder_dedup_and_pins(mocker):
+    model, _ = _prefetch_model(capacity=2)
     model._ref_cpu_prefetch_workers = 4
-    calls = []
-    model.backend.prefetch_prompt_cpu = lambda *args: calls.append(args)
+    submit = mocker.patch.object(model.backend, "prefetch_prompt_cpu", return_value=True)
     model.on_requests_added([_prewarm("a"), _prewarm("a"), _prewarm("b")])
-    assert len(calls) == 2
+    assert submit.call_count == 2
     assert model._prefetch_pins["a"] == model._prefetch_pins["b"]
     entry = next(iter(model._runtime_prompts.values()))
     assert entry.pins == {"a", "b"} and Path(entry.path).exists()
+    model._runtime_prompt_cache_size = 0
     model._drop_prefetch("a")
     assert entry.pins == {"b"} and Path(entry.path).exists()
     model._drop_prefetch("b")
@@ -835,13 +835,68 @@ def test_prefetch_failure_releases_pin():
     assert not model._prefetch_queue and not model._prefetch_pins and not model._runtime_prompts
 
 
-def test_cpu_prefetch_is_bounded_by_placeholder_queue():
-    model, _ = _prefetch_model(capacity=0)
+def test_cpu_prefetch_is_bounded_by_placeholder_queue(mocker):
+    model, _ = _prefetch_model(capacity=32)
     model._ref_cpu_prefetch_workers = 4
-    calls = []
-    model.backend.prefetch_prompt_cpu = lambda *args: calls.append(args)
+    submit = mocker.patch.object(model.backend, "prefetch_prompt_cpu", return_value=True)
     model.on_requests_added([_prewarm(str(i)) for i in range(40)])
-    assert len(calls) == 32 and len(model._prefetch_queue) == 32
+    assert submit.call_count == 32 and len(model._prefetch_queue) == 32
+    model._runtime_prompt_cache_size = 0
     for i in range(40):
         model._drop_prefetch(str(i))
     assert not model._runtime_prompts
+
+
+@pytest.mark.parametrize("capacity", [0, 1, 4])
+def test_cpu_prefetch_respects_pin_budget_before_materializing(capacity, mocker):
+    model, _ = _prefetch_model(capacity=capacity)
+    model._ref_cpu_prefetch_workers = 1
+    submit = mocker.patch.object(model.backend, "prefetch_prompt_cpu", return_value=True)
+    materialize = mocker.spy(model, "_materialize_runtime_prompt")
+    prewarms = [_prewarm(str(i), torch.tensor([0.0, (i + 1) / 64])) for i in range(32)]
+    model.on_requests_added(prewarms)
+    limit = max(1, capacity)
+    assert materialize.call_count == submit.call_count == limit
+    assert len(model._prefetch_pins) == len(model._runtime_prompts) == limit
+    assert len(model._prefetch_queue) == 32
+    # A skipped request still prepares its reference at chunk 0.
+    baseline, _ = _prefetch_model(ref_prefetch=False)
+    info = _chunk0(prewarms[-1].payload["ref_audio"])
+    actual = _forward(model, [info], request_ids=["31"])
+    expected = _forward(baseline, [info], request_ids=["31"])
+    torch.testing.assert_close(
+        actual.multimodal_outputs["model_outputs"][0], expected.multimodal_outputs["model_outputs"][0]
+    )
+    model.on_requests_finished([str(i) for i in range(32)])
+    assert not model._prefetch_pins and not model._prefetch_queue
+
+
+@pytest.mark.parametrize("capacity", [0, 4])
+def test_cpu_prefetch_rejected_submission_releases_pin(capacity, mocker):
+    model, _ = _prefetch_model(capacity=capacity)
+    model._ref_cpu_prefetch_workers = 1
+    submit = mocker.patch.object(model.backend, "prefetch_prompt_cpu", return_value=False)
+    model.on_requests_added([_prewarm(str(i), torch.tensor([0.0, (i + 1) / 64])) for i in range(32)])
+    assert submit.call_count == 32
+    assert not model._prefetch_pins and not model._prefetch_queue
+    assert len(model._runtime_prompts) <= capacity
+    assert all(not entry.pins for entry in model._runtime_prompts.values())
+    baseline, _ = _prefetch_model(ref_prefetch=False)
+    actual = _forward(model, [_chunk0(_REF_A)], request_ids=["0"])
+    expected = _forward(baseline, [_chunk0(_REF_A)], request_ids=["0"])
+    torch.testing.assert_close(
+        actual.multimodal_outputs["model_outputs"][0], expected.multimodal_outputs["model_outputs"][0]
+    )
+
+
+def test_idle_phase_reuses_cpu_prefetch_pin_at_capacity(mocker):
+    model, token2wav = _prefetch_model(capacity=1)
+    model._ref_cpu_prefetch_workers = 1
+    mocker.patch.object(model.backend, "prefetch_prompt_cpu", return_value=True)
+    model.on_requests_added([_prewarm("a")])
+    assert len(model._prefetch_pins) == 1
+    assert model.run_idle_prefetch() is True
+    assert _cold(token2wav) == (1, 0)
+    assert len(model._prefetch_pins) == 1
+    model.on_requests_finished(["a"])
+    _assert_no_prefetch_state(model)

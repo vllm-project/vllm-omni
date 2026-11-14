@@ -104,21 +104,23 @@ rounding and requires speech-quality and service validation; it is off by
 default and does not reduce the number of flow steps.
 
 `token2wav_spk_cuda_graph: true` opts the CUDA Torch CAM++ backend into
-exact-shape graph replay. It requires the Torch speaker backend and rejects
-CPU/NPU or TensorRT speaker configurations. Up to four feature shapes are
+exact-shape graph replay. CPU/NPU or TensorRT speaker configurations keep their
+selected backend and skip this option. Up to four feature shapes are
 captured without padding; additional shapes use the existing eager forward.
 Autocast or a changed precision policy also uses the eager path. Each replay
-returns an owned embedding. This option is off by default and does not expand
-the reference-audio cache or batch reference extraction.
+returns an owned embedding. The backend option is off by default; the shipped
+CUDA deployment enables it. It does not expand the reference-audio cache or
+batch reference extraction.
 
 `token2wav_s3_cuda_graph: true` opts CUDA Code2Wav into exact-shape replay
-of the S3 reference tokenizer. It requires the S3 `AudioEncoderV2` and keeps
+of the S3 reference tokenizer. Non-CUDA tokenizers skip this option. CUDA replay
+requires the S3 `AudioEncoderV2` and keeps
 the pinned `s3tokenizer==0.3.0` encoder and quantizer without reimplementing
 their arithmetic. Up to two repeated shapes are
 captured; additional shapes run eagerly. Long references retain the library's
 sliding-window path. Replay owns its returned codes and lengths, and a changed
-precision policy uses the original eager encoder. This option is off by
-default; end-to-end performance and speech-quality qualification are pending.
+precision policy uses the original eager encoder. The backend option is off by
+default; the shipped CUDA deployment enables it.
 
 ## Turn-mode conditioning transport
 
@@ -576,8 +578,12 @@ and the CFM setup-cache capacity are unchanged.
 CUDA development configuration: Thinker ngram speculation, 16-frame Talker
 K-step, two Code2Wav replicas on one GPU, grouped reference setup of four,
 HiFT continuation shapes 3/43, speaker/S3 graph replay, and Flow FP16.
-The existing turn deployment inherits these defaults. The development runs used private
-CUDA MPS on one L20X; this profile is not qualified for other platforms.
+The existing turn deployment inherits these defaults. Connector tuning is scoped
+to `platforms.cuda.connectors` in the existing YAML; other platforms retain their
+shared defaults, including FP32 Flow for NPU cross-reference CFM batching.
+Speaker replay also checks the selected backend, so CPU ONNX Runtime and
+TensorRT overrides remain usable. The development runs used private CUDA MPS
+on one L20X; the CUDA tuning is not qualified for other platforms.
 
 The runtime bundle includes:
 
@@ -593,7 +599,10 @@ The runtime bundle includes:
   encoder/CFM setup, preserve voice order, separate output state ownership and
   bounded setup-cache retention.
 - `token2wav_ref_cpu_prefetch_workers` (default 0): experimental CPU-only
-  reference extraction with at most 32 pending futures. GPU completion stays on
+  reference extraction with at most 32 pending futures. Before materializing a
+  WAV, CPU submission shares the idle-prefetch pin limit of
+  `max(1, runtime_prompt_cache_size)` requests. A rejected submission releases
+  its pin and leaves reference preparation to chunk 0. GPU completion stays on
   the caller thread. Eviction cancels queued work or waits for an active reader
   before unlinking its WAV. Non-FP32 default dtype bypasses background work.
   Four workers regressed the C16 screen, so the default profile
