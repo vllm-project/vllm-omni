@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -13,8 +14,15 @@ import pytest
 from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
 
+from tests.engine.test_orchestrator import FakeStageClient, _build_harness
 from vllm_omni.diffusion.data import CuMemTag, OmniACK
-from vllm_omni.engine.messages import AddCompanionRequestMessage, ErrorMessage
+from vllm_omni.engine.messages import (
+    AddCompanionRequestMessage,
+    ErrorMessage,
+    ShutdownRequestMessage,
+)
+from vllm_omni.engine.omni_engine_base import OmniEngineBase
+from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.entrypoints.async_omni import CACHE_RESET_TIMEOUT_S, AsyncOmni
 
 pytestmark = [pytest.mark.core_model]
@@ -877,6 +885,168 @@ def test_pause_and_sleep_do_not_reset_unselected_stages_or_reset_twice(operation
 
 
 _SLEEP_TAGS = {CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value}
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("failure", ["exception", "error-result"])
+def test_wake_up_reaches_ar_stages_after_partial_sleep_failure(failure):
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion", "llm"])
+        asleep: set[int] = set()
+
+        async def rpc(*, method, args, kwargs, stage_ids):
+            if method == "sleep":
+                # One EngineCore has offloaded memory before another fails.
+                asleep.add(stage_ids[0])
+                if failure == "exception":
+                    raise RuntimeError("stage 2 sleep failed")
+                return [[None], [{"supported": False, "error": "stage 2 sleep failed"}]]
+            if method == "wake_up":
+                asleep.difference_update(stage_ids)
+            return [None for _ in stage_ids]
+
+        omni.collective_rpc = AsyncMock(side_effect=rpc)
+        omni._sleep_diffusion = AsyncMock()
+        omni._wake_diffusion = AsyncMock(return_value=[])
+        with pytest.raises(RuntimeError, match="stage 2 sleep failed"):
+            await omni.sleep(level=1)
+
+        assert asleep == {0}
+        assert await omni.is_sleeping(stage_ids=[0, 2])
+        assert not await omni.is_sleeping(stage_ids=[1])
+        omni._sleep_diffusion.assert_not_awaited()
+
+        acks = await omni.wake_up(stage_ids=[0, 2])
+
+        assert not asleep
+        assert {ack.stage_id for ack in acks} == {0, 2}
+        assert not await omni.is_sleeping()
+        omni._wake_diffusion.assert_not_awaited()
+        assert await omni.is_paused()
+        await omni.resume_generation(stage_ids=[0, 2])
+        assert not await omni.is_paused()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_cancelled_ar_sleep_preserves_wake_targets():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "llm"])
+        first_stage_slept = asyncio.Event()
+        pending = asyncio.Event()
+        asleep: set[int] = set()
+
+        async def rpc(*, method, args, kwargs, stage_ids):
+            if method == "sleep":
+                asleep.add(0)
+                first_stage_slept.set()
+                await pending.wait()
+            elif method == "wake_up":
+                asleep.difference_update(stage_ids)
+            return [None for _ in stage_ids]
+
+        omni.collective_rpc = AsyncMock(side_effect=rpc)
+        sleep_task = asyncio.create_task(omni.sleep(level=1))
+        await asyncio.wait_for(first_stage_slept.wait(), timeout=1)
+        sleep_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sleep_task
+
+        await omni.wake_up()
+
+        assert not asleep
+        assert not await omni.is_sleeping()
+        assert await omni.is_paused()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("discard_weights", [False, True])
+def test_failed_ar_level2_sleep_preserves_wake_policy(monkeypatch, discard_weights):
+    monkeypatch.setenv("VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS", "1" if discard_weights else "0")
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "llm"])
+        omni.collective_rpc = AsyncMock(return_value=[None, {"error": "stage 1 sleep failed"}])
+        with pytest.raises(RuntimeError, match="stage 1 sleep failed"):
+            await omni.sleep(level=2)
+
+        assert await omni.is_sleeping()
+        omni.collective_rpc = AsyncMock(return_value=[None, None])
+        if discard_weights:
+            acks = await omni.wake_up()
+            assert {ack.stage_id for ack in acks} == {0, 1}
+            assert not await omni.is_sleeping()
+        else:
+            # A successful replica may already have discarded its weights.
+            with pytest.raises(NotImplementedError, match="weights were discarded"):
+                await omni.wake_up()
+            omni.collective_rpc.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_cancelled_ar_sleep_can_wake_through_orchestrator_transport():
+    async def run() -> None:
+        started = threading.Event()
+        finish_sleep = threading.Event()
+        asleep: set[int] = set()
+        clients = [FakeStageClient(stage_type="llm") for _ in range(2)]
+
+        async def sleep_first(*_args):
+            asleep.add(0)
+
+        async def sleep_second(*_args):
+            started.set()
+            assert await asyncio.to_thread(finish_sleep.wait, 10)
+            asleep.add(1)
+
+        clients[0].sleep_async = AsyncMock(side_effect=sleep_first)
+        clients[1].sleep_async = AsyncMock(side_effect=sleep_second)
+        for sid, client in enumerate(clients):
+            client.wake_up_async = AsyncMock(side_effect=lambda *, tags, sid=sid: asleep.discard(sid))
+
+        fixture = _build_harness(clients)
+        transport = CorrelatedRpcClient(fixture.request_sync_q, fixture.queues[2].sync_q)
+        omni = _make_omni(stage_types=["llm", "llm"])
+        engine = object.__new__(OmniEngineBase)
+        engine.stage_configs = omni.engine.stage_configs
+        engine._correlated_rpc_client = transport
+        omni.engine = engine
+        # Exercise the real frontend, executor-thread bridge, Janus queues,
+        # correlated result router, orchestrator and StagePool dispatch.
+        del omni.collective_rpc
+        sleep_task = asyncio.create_task(omni.sleep(level=1))
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            assert asleep == {0}
+            sleep_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await sleep_task
+
+            # Cancelling the caller does not cancel the remote control RPC.
+            finish_sleep.set()
+            acks = await asyncio.wait_for(omni.wake_up(), timeout=5)
+
+            assert {ack.stage_id for ack in acks} == {0, 1}
+            assert not asleep
+            assert await omni.is_paused()
+            assert fixture.thread.is_alive()
+        finally:
+            finish_sleep.set()
+            sleep_task.cancel()
+            await asyncio.gather(sleep_task, return_exceptions=True)
+            fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+            await asyncio.to_thread(fixture.thread.join, 5)
+            transport.close()
+            for q in fixture.queues:
+                q.close()
+
+    asyncio.run(run())
+
 
 # In-process stages return OmniACK, subprocess stages return its dict form,
 # and StagePool returns an error dict when the RPC itself failed.

@@ -35,6 +35,15 @@ Omni Sleep Mode is optimized for high-performance computing backends:
 * **Memory Considerations**: System RAM must be sufficient to hold offloaded weights during sleep.
 * **TP Support**: Tensor Parallel groups synchronize sleep/wake transitions across all workers.
 
+### Recovering an interrupted AR sleep
+
+Cancelling an `AsyncOmni.sleep()` call can leave the remote RPC running after some AR stages
+have already offloaded memory. The frontend retains the attempted stages as wake targets.
+When the engine is still alive, use `wake_up(stage_ids=...)` to restore them, then explicitly
+call `resume_generation()` to reopen frontend admission. The existing level-2 restriction
+still applies when weights may have been discarded. Fatal worker errors that shut down the
+orchestrator require engine recovery instead.
+
 ### Quiescing a busy diffusion stage: `pause_generation(mode="keep")`
 
 `sleep()` on a diffusion stage is a worker-level RPC: it offloads memory but does not stop the
@@ -124,7 +133,7 @@ Start the server with sleep mode enabled:
 
 The first method
 
-```
+```bash
 
 vllm serve ByteDance-Seed/BAGEL-7B-MoT \
 --omni \
@@ -136,7 +145,7 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT \
 
 The second method
 
-```
+```bash
 
 python3 -m vllm_omni.entrypoints.openai.api_server \
     --model ByteDance-Seed/BAGEL-7B-MoT \
@@ -155,7 +164,7 @@ Objective: Verify VRAM reclamation for Stage 0 (Thinker).
 
 Trigger sleep (Level 1 or Level 2) via client:
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/sleep \
      -H "Content-Type: application/json" \
@@ -171,7 +180,7 @@ Objective: Verify VRAM reclamation for Stage 1 (Diffusion).
 
 Trigger sleep (Level 1 or Level 2) via client:
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/sleep \
      -H "Content-Type: application/json" \
@@ -185,7 +194,7 @@ Objective: Test concurrent sleep and rapid wake-up across multiple stages.
 
 Concurrent Sleep (Stage 0 & 1):
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/sleep \
      -H "Content-Type: application/json" \
@@ -195,7 +204,7 @@ curl -X POST http://localhost:8000/v1/omni/sleep \
 
 Rapid Wake-up:
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/wakeup \
      -H "Content-Type: application/json" \
@@ -211,7 +220,7 @@ Check Initial State: Observe baseline VRAM usage.
 
 Trigger Deep Sleep (Level 2):
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/sleep \
      -H "Content-Type: application/json" \
@@ -221,7 +230,7 @@ curl -X POST http://localhost:8000/v1/omni/sleep \
 
 Wake-up Model:
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/omni/wakeup \
      -H "Content-Type: application/json" \
@@ -232,7 +241,7 @@ curl -X POST http://localhost:8000/v1/omni/wakeup \
 Verify Functional Integrity (Inference):
 Ensure the model still generates valid output after reloading weights.
 
-```
+```bash
 
 curl -X POST http://localhost:8000/v1/images/generations \
      -H "Content-Type: application/json" \
@@ -270,7 +279,7 @@ curl -X POST http://localhost:8000/v1/images/generations \
 Metadata Field Analysis
 The metadata field is a dynamic dictionary containing hardware-specific telemetry and audit data, primarily used for verifying memory reclamation on various backends (e.g., AMD ROCm, NVIDIA CUDA).
 
-```
+```json
 "metadata": {
     "source": "Platform_AMD_Instinct_MI300X",
     "total_freed_gib": "78.57",

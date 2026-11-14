@@ -1394,6 +1394,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 level,
                 mode,
             )
+            # A replica may offload memory before another fails, or before
+            # this caller is cancelled. Keep every attempted AR stage as a
+            # wake target even when the aggregate RPC does not complete.
+            self._record_stage_sleep(ar_stage_ids, sleep_tags)
+            if level == 2 and not ar_level2_wake_enabled():
+                self._level2_sleeping = True
             await self._engine_core_rpc(
                 "sleep",
                 stage_ids=ar_stage_ids,
@@ -1412,10 +1418,6 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 )
                 for sid in ar_stage_ids
             )
-            self._record_stage_sleep(ar_stage_ids, sleep_tags)
-            if level == 2 and not ar_level2_wake_enabled():
-                self._level2_sleeping = True
-
         if diffusion_stage_ids:
             acks: list[OmniACK] = []
             try:
