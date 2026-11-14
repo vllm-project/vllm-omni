@@ -130,9 +130,10 @@ def test_hy_nomas_transformer_warm_step_has_zero_cuda_syncs(global_frame_counter
         regionally_compile(model, dynamic=True, options={"triton.cudagraphs": False, "triton.cudagraph_trees": False})
         wrapped = {n for n, m in model.named_modules() if "forward" in m.__dict__}
         assert wrapped == {"double_blocks.0", "double_blocks.1", "action_modules.0", "action_modules.1"}
-        comp_cold, _ = model.forward_with_cache(**_fresh_state())
-        comp_warmup_commit, _ = model.forward_with_cache(**{**_fresh_state(), "update_cache": True})
-        comp_warm, comp_commit, comp_post, written_c = _run_zero_sync_sequence(_fresh_state())
+        comp_in = _fresh_state()
+        comp_cold, _ = model.forward_with_cache(**comp_in)
+        comp_warmup_commit, _ = model.forward_with_cache(**{**comp_in, "update_cache": True})
+        comp_warm, comp_commit, comp_post, written_c = _run_zero_sync_sequence(comp_in)
     finally:
         torch._dynamo.reset()
 
