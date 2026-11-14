@@ -102,16 +102,19 @@ HF_CACHE="${HF_CACHE:-$(realpath ~)/.cache/huggingface}"
 mkdir -p "${HF_CACHE}"
 HF_MOUNT="/root/.cache/huggingface"
 
-# One hour of tests inside the container. Each stage also has its own cap, and
-# those caps sum to 32m in the pr scope and 57m in the broad scope, so a single
-# runaway stage cannot eat the whole budget. Measured: 7m02s + 4m43s + <1m in
-# the pr scope. timeout_in_minutes on the step has to cover this budget plus
-# the image build (check the "time docker build" line above when tuning either).
+# Test budget inside the container; the pipeline gives the broad scope more.
+# Each stage also has its own cap, summing to 42m in the pr scope and 67m in the
+# broad scope, so one runaway stage cannot eat the whole budget. Measured in the
+# pr scope on one card: 3m02s dispatch + 23m29s core_model + <1m mxfp8 = ~27m.
+# timeout_in_minutes on the step has to cover the budget plus the image build
+# (check the "time docker build" line above when tuning either).
 XPU_TEST_BUDGET="${XPU_TEST_BUDGET:-60m}"
 
-# pr    = core_model + the mxfp8 config check (~20m; the only weights it needs
-#         are the tiny CI models, tiny-random/Qwen-Image and qwen_image_random).
-# broad = also advanced_model and omni, which load full checkpoints (~20m more).
+# pr    = the no-card XPU-dispatch stage plus every core_model case, including
+#         the two that start an engine (tiny-random/Qwen-Image 30MB and
+#         riverclouds/qwen_image_random 9.9GB must be in the mounted HF cache).
+# broad = also advanced_model and omni, which load Qwen3-TTS, Z-Image, Wan2.1
+#         and Voxtral (~20m more).
 # Set XPU_TEST_SCOPE=broad on the nightly or a manually triggered build.
 export XPU_TEST_SCOPE="${XPU_TEST_SCOPE:-pr}"
 
@@ -158,12 +161,6 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     # the mounted cache. It carries no XPU marker, so skip the file outright.
     ignore=(--ignore tests/e2e/offline_inference/test_cosyvoice3_expansion.py)
 
-    # core_model, but each case starts an engine on a real checkpoint: 507s for
-    # 4 nodes and 142s for 1. They carry no signal the kernel tests do not, so
-    # the blocking lane leaves them to the broad scope.
-    pr_ignore=(--ignore tests/diffusion/batching
-               --ignore tests/diffusion/cache/test_teacache.py)
-    [ "${XPU_TEST_SCOPE:-pr}" = "broad" ] && pr_ignore=()
 
     rc=0
     # stage <name> <budget> <pytest args...>
@@ -189,13 +186,13 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     # not apply to files named explicitly, which is why the exclusions live in
     # the list itself. See the header of both files for the measurements.
     mapfile -t xpu_path < <(grep -v "^#" .buildkite/intel/xpu-path-tests.txt | grep .)
-    stage "xpu dispatch (no card)" 15m -n "${XPU_CPU_WORKERS:-8}" \
+    stage "xpu dispatch (no card)" 10m -n "${XPU_CPU_WORKERS:-8}" \
         "${xpu_path[@]}" \
         -m "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
 
     # core_model excludes omni: the async-omni tests carry both markers and
     # would otherwise run twice, and they need their own process (broad scope).
-    stage "core_model" 15m "${paths[@]}" "${ignore[@]}" "${pr_ignore[@]}" \
+    stage "core_model" 30m "${paths[@]}" "${ignore[@]}" \
         -m "core_model and not omni and xpu and B60 and cards_1" --run-level core_model
     stage "mxfp8 config" 2m tests/diffusion/quantization/test_mxfp8_config.py
 
