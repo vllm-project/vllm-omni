@@ -167,7 +167,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
         EnvironmentVariableCategory.PUBLIC_OMNI: 39,
         EnvironmentVariableCategory.INHERITED_VLLM: 22,
         EnvironmentVariableCategory.PLATFORM_EXTERNAL: 34,
-        EnvironmentVariableCategory.MODEL_SPECIFIC: 102,
+        EnvironmentVariableCategory.MODEL_SPECIFIC: 103,
         EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 22,
         EnvironmentVariableCategory.INTERNAL: 8,
     }
