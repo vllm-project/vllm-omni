@@ -1,5 +1,11 @@
 # vLLM-Omni Benchmark CLI Guide
 
+For speaker attribution, turn-entry decisions, and response quality with a
+fixed three-judge panel, use the standalone
+[SocialOmni benchmark](https://github.com/vllm-project/vllm-omni/tree/main/benchmarks/socialomni).
+It runs separate decision, generation, and scoring phases through chat
+completions rather than the serving throughput command described below.
+
 The vllm bench command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
 
 ## Notes
