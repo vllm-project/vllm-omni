@@ -6,7 +6,7 @@ The payload lifecycle is described in
 
 ## Method
 
-**Revision:** all results below were rerun using a clean frozen tree of `caf99e8c80814dcf749c85bf6bc1739e7b1fa262`, rebased onto upstream `7b3c84a5e`. Subsequent validation-document commits do not change runtime code. These results supersede the earlier frozen `529ff4c6` + `d45ed8d5` measurements. Source diff SHA256: `563e5c0235371f1476d654971fab6a239ed6ef41db17c92fe07e544ed1aa8d9c`.
+**Historical A100 revision:** the A100 results below were rerun using a clean frozen tree of `caf99e8c80814dcf749c85bf6bc1739e7b1fa262`, rebased onto upstream `7b3c84a5e`. Subsequent validation-document commits do not change runtime code. These results supersede the earlier frozen `529ff4c6` + `d45ed8d5` measurements. Source diff SHA256: `563e5c0235371f1476d654971fab6a239ed6ef41db17c92fe07e544ed1aa8d9c`. The L20 numerical follow-up at the end has a separate revision and workload.
 
 **Hardware/software:** 3 × NVIDIA A100-SXM4-40GB: Thinker TP2 on GPU0/1; ordinary Talker and Code2Wav on GPU2; fourth GPU unused. vLLM 0.33.0 wheel at `4ba787ec9959e566d3b587a796dff07673324da5`, Torch 2.14.0+cu130, MRv1, FlashAttention, Qwen3-Omni-30B-A3B-Instruct, four speculative tokens, prefix caching disabled.
 
@@ -29,7 +29,7 @@ Performance services have no audit hooks. Throughput is successful requests divi
 
 **Controlled correctness protocol:** five inputs (three audio, one image, one video, including previously divergent samples), text-only/speech, two repetitions, c1, A/B/C baseline/DFlash. Thinker and Talker main codebook greedy; Talker residual codebooks explicitly `subtalker_sampling_params: {do_sample: false}`. Compare final Thinker IDs and all 16 codec codebooks after removing repeated chunk left context. Generated-speech ASR uses the same model as a screening reference, not independent ASR/listening. Audit services run separately and their timings are excluded from performance.
 
-## Current-head eager results
+## Historical A100 eager results
 
 All 1,440 timed requests, 120 controlled main requests and 30 generated-speech
 ASR checks completed successfully. All six performance and six correctness
@@ -217,8 +217,9 @@ Strict greedy equivalence is not established: the controlled A/B/C inputs
 still match the baseline in only 4/10 Thinker token sequences. Full-payload
 DFlash repeats identical Thinker tokens but differs in codec frames for one
 image request (4/5 frame-repeat agreement). Same-prefix logits/argmax-margin
-analysis has not been completed; these differences are not attributed to
-BF16 or numerics without measurements. The five-input set includes known
+analysis was not completed for that A100 run. The L20 measurements below
+do not retrospectively establish the cause of those historical differences.
+The five-input set includes known
 divergent cases and is not a population accuracy estimate.
 
 Low reference WER and successful HTTP completion do not establish complete
@@ -238,3 +239,27 @@ The related CPU regression suite passed with 286 passed, 6 skipped and
 run. Local manifests, exact deploy configurations, frozen sources, per-request
 JSONL, token/frame traces, WAV/ASR files and service logs are retained locally;
 the benchmark harness and raw media are not included in this document.
+
+## L20 greedy numerical follow-up (2026-11-14)
+
+At runtime revision `9ef93b01`, targeted MRv1 Thinker-only comparisons on
+2 × L20 (TP=2, BF16, eager, FlashAttention 2) support batch-shape-dependent
+target numerics as the explanation for the reproduced greedy mismatch.
+Default baseline/DFlash scores differ at an identical token prefix.
+A baseline-only QKV projection replay also changes with batch row count
+while input-row values and weights remain fixed; invariant linear replay
+eliminates those differences.
+
+With `VLLM_BATCH_INVARIANT=1` set before starting both services, four
+previously divergent distinct inputs (two text, one image, one video)
+match every output token ID and the complete returned top-five logprob
+records in seven paired runs, including repeats/duplicates. Baseline-only
+concurrency 1/5 controls also match with invariance enabled. These targeted
+results do not establish a full dataset or full-distribution equivalence,
+or prove that every implementation issue is excluded.
+
+No runtime/default change is introduced. Invariant-mode performance,
+audio-input/speech equivalence, CUDA Graphs, MRv2 and stochastic distributions
+were not validated by this follow-up; historical A100 limitations remain.
+Detailed same-prefix scores and independent controls are reported in the
+PR discussion; raw artifacts and the diagnostic harness are retained locally.
