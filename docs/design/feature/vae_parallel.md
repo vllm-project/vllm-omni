@@ -469,24 +469,26 @@ m = Omni(
     )
 ```
 
-When vae_patch_parallel_size is larger than the DiT world size, it will automatically fall back to using the DiT world size instead.
+For tile parallelism, a requested size larger than the DiT world size is capped
+at that world size. Spatial-shard modes have model-specific validation described
+below.
 
 ## Reference Implementations
 
 Complete examples in the codebase:
 
-| Model | Path | Decode Parallel | Encode Parallel |
-| ------- | ------ | ----------------- | ----------------- |
-| **Z-Image** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl.py` | ✅ | ❌ |
-| **Wan2.2** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_wan.py` | ✅ | ✅ |
-| **Qwen-Image** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py` | ✅ | ❌ |
-| **FLUX.2-dev** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_flux2.py` | ✅ | ✅ |
+| Model | Path | Decode Parallel | Encode Parallel | Spatial-Shard Decode |
+| ------- | ------ | ----------------- | ----------------- | -------------------- |
+| **Z-Image** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl.py` | ✅ | ❌ | ❌ |
+| **Wan2.2** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_wan.py` | ✅ | ✅ | ✅ |
+| **Qwen-Image** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py` | ✅ | ❌ | ✅ (Ming-Image validated) |
+| **FLUX.2-dev** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_flux2.py` | ✅ | ✅ | ❌ |
 
 ---
 
-## Spatially-Sharded Decode (Wan)
+## Spatially-Sharded Decode (Wan and Qwen-Image)
 
-The tile-parallel executor above assigns independent spatial **tiles** to ranks. The Wan VAE additionally supports a **spatially-sharded decode** backend, selected through `DiffusionParallelConfig.vae_parallel_mode` (`"spatial_shard_height"` or `"spatial_shard_width"`; default is `"tile"`).
+The tile-parallel executor above assigns independent spatial **tiles** to ranks. The Wan and Qwen-Image VAEs additionally support a **spatially-sharded decode** backend, selected through `DiffusionParallelConfig.vae_parallel_mode` (`"spatial_shard_height"` or `"spatial_shard_width"`; default is `"tile"`).
 
 ### How it differs from tile parallel
 
@@ -513,8 +515,23 @@ serve.py (--vae-parallel-mode) / OmniEngineArgs
 
 `DistributedAutoencoderKLWan._spatial_shard_decode_enabled()` gates the path: it requires distributed decode to be enabled, a 5D latent, and `vae_patch_parallel_size == DiT group size`. Otherwise it logs a warning and falls back to tile-parallel decode.
 
+`DistributedAutoencoderKLQwenImage._decode()` dispatches explicit spatial modes
+to `_spatial_decode()` even below the tile threshold. Its adapter in
+`qwen_spatial_shard.py` reuses the halo-exchange primitives from
+`wan_spatial_shard.py` and gathers the full feature map for global attention.
+Unlike Wan, a parallel-size/executor-group mismatch raises `ValueError` rather
+than falling back to tiles. Multiple ranks require distributed initialization
+and an explicit executor group. Without distributed initialization, size one
+runs full, non-tiled decode without installing the spatial wrappers.
+
+The shared Qwen VAE class intentionally exposes this opt-in mode to Ming-Image,
+Qwen-Image, Krea2, and Anima. Real-checkpoint validation currently covers
+Ming-Image; the other pipelines remain unvalidated on this path.
+
 ### Notes
 
+- After a Qwen multi-rank spatial decode, changing direction, process group, parallel size, or returning to tile mode requires a fresh VAE instance.
+- Qwen checkpoint correctness is covered by `tests/diffusion/distributed/test_qwen_spatial_shard_correctness.py` for both split directions in the dedicated B200 two-GPU nightly job.
 - The decoder is patched **in place** the first time spatial-shard decode runs and is bound to a single split dimension for the lifetime of the VAE instance.
 - Numerical correctness vs. single-GPU decode is covered by `tests/diffusion/distributed/test_wan_spatial_shard.py::test_spatial_shard_decode_matches_reference` (multi-GPU, nightly `full_model` + `cards_2`).
 
