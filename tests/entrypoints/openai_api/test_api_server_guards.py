@@ -98,7 +98,13 @@ def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tracing_mode", ["enabled", "disabled", "no-engine", "no-provider"])
-async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracing_mode):
+@pytest.mark.parametrize(
+    "robot_enabled,configured_size,expected_size",
+    [(False, None, None), (True, None, 64 * 1024 * 1024), (True, 4096, 4096)],
+)
+async def test_omni_run_server_worker_forwards_client_config(
+    monkeypatch, tracing_mode, robot_enabled, configured_size, expected_size
+):
     import httpx
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -113,6 +119,7 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracin
     exporter = InMemorySpanExporter()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     app = FastAPI()
+    app.state.openai_serving_realtime_robot = object() if robot_enabled else None
     app.add_middleware(CORSMiddleware, allow_origins=["http://client"])
 
     @app.get("/trace")
@@ -147,6 +154,7 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracin
 
     async def fake_serve_http(app, **_kwargs):
         assert app.state.api_server_count == 2
+        assert _kwargs.get("ws_max_size") == expected_size
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
             for sampled in ("01", "00"):
                 parent = f"00-12345678901234567890123456789012-1234567890123456-{sampled}"
@@ -172,7 +180,8 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracin
     args = _minimal_args(model="dummy")
     config = {"client_count": 2, "client_index": 1, "stage_addresses": {}}
 
-    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config)
+    options = {} if configured_size is None else {"ws_max_size": configured_size}
+    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config, **options)
     assert captured["client_config"] is config
     spans = exporter.get_finished_spans()
     assert len(spans) == int(tracing_enabled)

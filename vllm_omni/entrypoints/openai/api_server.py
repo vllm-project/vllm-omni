@@ -580,6 +580,12 @@ async def omni_run_server_worker(
             # their owned replica groups through the local engine.
             warmup_task = asyncio.create_task(_warmup_duplex_realtime(app, args, duplex_warmup_frames))
 
+        if getattr(app.state, "openai_serving_realtime_robot", None) is not None:
+            from vllm_omni.protocol.numpy_msgpack import MAX_PAYLOAD_BYTES
+
+            # Camera histories must reach the handler's own payload check.
+            uvicorn_kwargs.setdefault("ws_max_size", MAX_PAYLOAD_BYTES)
+
         shutdown_task = await serve_http(
             _TimestampMiddleware(app),
             sock=sock,
