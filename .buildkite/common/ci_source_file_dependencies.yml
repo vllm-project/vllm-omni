@@ -428,6 +428,10 @@ source_file_dependencies:
     - tests/helpers/
 
   # --- features ---
+  ar_diffusion_kv:
+    - tests/diffusion/ar_diffusion/
+    - vllm_omni/experimental/ar_diffusion/
+
   diffusion_distributed_attention:
     - tests/diffusion/distributed/
     - tests/diffusion/test_mossimage_rope.py
