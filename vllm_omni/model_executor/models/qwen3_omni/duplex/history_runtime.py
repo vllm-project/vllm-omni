@@ -30,6 +30,7 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
     Message,
     QwenHistoryState,
     RetainedAudio,
+    audio_pressure_cutoff,
     has_audio,
     has_unanswered_user_input,
     load_history_policy,
@@ -428,6 +429,126 @@ class QwenHistoryRuntime:
         prompt, count = self._render(messages, group.audio, group.images)
         return prompt, count, compression.temperature
 
+    def _source_tokens(self, group: PromptGroup) -> int:
+        """Count one original turn, with its template and processor-expanded media.
+
+        Called only in a joined worker. A corrupt image needs the existing
+        visual-preparation path to classify it; report pressure without claiming
+        coverage or mutating the source here.
+        """
+        try:
+            return self._render(list(group.messages), group.audio, group.images)[1]
+        except (Base64DecodeError, OSError, SyntaxError):
+            if not group.images:
+                raise
+            return self.max_model_len + 1
+
+    async def _with_audio(
+        self,
+        state: QwenHistoryState,
+        group: PromptGroup,
+        function: Callable[WorkerArgs, WorkerResult],
+        *args: WorkerArgs.args,
+        **kwargs: WorkerArgs.kwargs,
+    ) -> WorkerResult:
+        """Charge borrowed audio during a CPU worker, including cancellation cleanup.
+
+        The caller checks per-turn media capacity before borrowing references.
+        Neither counting nor compression may hide foreground-cache fallbacks
+        from the strategy's retention accounting.
+        """
+        held = {id(audio.encoded): audio for audio in state.audio}
+        unique_audio = {id(value): value for value in group.audio}
+        selected = [held.get(key) or RetainedAudio((), value, "") for key, value in unique_audio.items()]
+        state.preparing = {id(audio): audio for audio in selected}
+        del held
+        state.media_revision += 1
+        state.trim_audio(self.limits)
+        try:
+            return await self._joined_worker(function, *args, **kwargs)
+        finally:
+            state.preparing.clear()
+            state.media_revision += 1
+
+    async def _token_work(
+        self, state: QwenHistoryState, work: HistoryWork, audio_provider: Callable[[], Sequence[AudioEntry]] | None
+    ) -> HistoryWork | None:
+        """Fit candidate turns to independent original-token retention and batch targets.
+
+        Turn costs include chat-template and expanded media tokens, summed over
+        the unsummarized originals. Stored memory and compression instructions
+        are excluded from these soft targets and included in the final hard
+        request-capacity check. Source changes during counting discard the plan.
+        """
+        if work.previous_partial is not None:
+            return work
+        sources = state.sources
+        costs = []
+        total_tokens = batch_tokens = 0
+        batch_end, batch_ready = work.start, False
+        for start, end in turn_ranges(state.history):
+            if end <= work.start:
+                continue
+            if self.limits.recent_tokens is None and end > work.end:
+                break
+            group = self.group(state, start, end, audio_provider() if audio_provider else ())
+            count = 0
+            if group is not None:
+                held = {id(audio.encoded): audio.encoded for audio in state.held_audio}
+                held.update((id(value), value) for value in group.audio)
+                can_count = (
+                    len(held) <= self.limits.max_audio_items
+                    and sum(map(len, held.values())) <= self.limits.max_audio_bytes
+                )
+                del held  # Counting must not pin other pool entries across the await.
+                if not can_count:
+                    # Count conservatively until actual compression can borrow
+                    # this fallback. Estimation alone must not evict live audio.
+                    count = self.max_model_len + 1
+                else:
+                    count = await self._with_audio(state, group, self._source_tokens, group)
+            if state.sources != sources or not state.matches(work, state.history):
+                return None
+            costs.append((start, end, count))
+            total_tokens += count
+            if not batch_ready and end <= work.end:
+                if (
+                    self.limits.chunk_tokens is not None
+                    and batch_end > work.start
+                    and batch_tokens + count > self.limits.chunk_tokens
+                ):
+                    batch_ready = True
+                else:
+                    batch_end = end
+                    batch_tokens += count
+                    batch_ready = end == work.end or (
+                        self.limits.chunk_tokens is not None and batch_tokens >= self.limits.chunk_tokens
+                    )
+            if batch_ready and (self.limits.recent_tokens is None or total_tokens > self.limits.recent_tokens):
+                break  # Later sources cannot change this trigger or batch.
+        cutoff = work.end
+        if self.limits.recent_tokens is not None:
+            # Once triggered, fill the independent batch target rather than
+            # summarizing only the small amount just above the recent target.
+            # Media pressure can still require a prefix below the token trigger.
+            if total_tokens <= self.limits.recent_tokens:
+                cutoff = audio_pressure_cutoff(state, self.limits, self.max_audio)
+        end, batch_tokens = work.start, 0
+        for start, stop, count in costs:
+            if start >= cutoff or stop > work.end:
+                break
+            if (
+                self.limits.chunk_tokens is not None
+                and end > work.start
+                and batch_tokens + count > self.limits.chunk_tokens
+            ):
+                break
+            end = stop
+            batch_tokens += count
+            if self.limits.chunk_tokens is not None and batch_tokens >= self.limits.chunk_tokens:
+                break
+        return replace(work, end=end, sources=state.sources[:end]) if end > work.start else None
+
     def _prepare_compression(
         self, group: PromptGroup, work: HistoryWork, *, allow_fold: bool
     ) -> tuple[dict, int, float, HistoryWork]:
@@ -436,7 +557,12 @@ class QwenHistoryRuntime:
         prompt, count, temperature = {}, self.max_model_len + 1, 0.0
         if work.previous_partial is None:
             prompt, count, temperature = self._render_compression(group, previous)
-            if count + self.limits.summary_tokens <= self.max_model_len:
+            source_fits = (
+                self.limits.chunk_tokens is None
+                or bool(group.audio or group.images)
+                or self._source_tokens(group) <= self.limits.chunk_tokens
+            )
+            if count + self.limits.summary_tokens <= self.max_model_len and source_fits:
                 return prompt, count, temperature, work
         if not allow_fold or group.audio or group.images:
             return prompt, count, temperature, work
@@ -453,9 +579,11 @@ class QwenHistoryRuntime:
             offset += len(line) + 1
         transcript = "\n".join(lines)
 
-        def render(excerpt: str) -> tuple[dict, int, float]:
+        def render(excerpt: str) -> tuple[dict, int, float, int]:
             quoted = PromptGroup(({"role": "user", "content": [{"type": "text", "text": excerpt}]},), ())
-            return self._render_compression(quoted, previous)
+            prompt, count, temperature = self._render_compression(quoted, previous)
+            source_tokens = self._source_tokens(quoted) if self.limits.chunk_tokens is not None else 0
+            return prompt, count, temperature, source_tokens
 
         fitted = fit_text_excerpt(
             transcript,
@@ -463,13 +591,21 @@ class QwenHistoryRuntime:
             offset=work.previous_partial.offset if work.previous_partial else 0,
             max_chars=None,
             render=render,
-            fits=lambda result: result[1] + self.limits.summary_tokens <= self.max_model_len,
+            fits=lambda result: result[1] + self.limits.summary_tokens <= self.max_model_len
+            and (self.limits.chunk_tokens is None or result[3] <= self.limits.chunk_tokens),
         )
         if fitted is None:
             # An already partial turn must remain pending when even one source
             # character no longer fits; it must never publish partial coverage.
+            if self.limits.chunk_tokens is not None:
+                logger.warning(
+                    "Qwen history cannot fit a labeled excerpt with chunk_tokens=%d and context=%d; "
+                    "sources remain pending",
+                    self.limits.chunk_tokens,
+                    self.max_model_len,
+                )
             return {}, self.max_model_len + 1, temperature, work
-        (prompt, count, temperature), stop = fitted
+        (prompt, count, temperature, _), stop = fitted
         return prompt, count, temperature, replace(work, end_offset=stop, complete=stop == len(transcript))
 
     def _visual_work(self, state: QwenHistoryState, work: HistoryWork | None) -> VisualWork | None:
@@ -480,7 +616,11 @@ class QwenHistoryRuntime:
         if has_unanswered_user_input(state.history):
             completed_end = turn_ranges(state.history)[-1][0]
         return state.visual.plan(
-            required_end=work.end if work else max(0, len(state.history) - self.limits.recent_messages),
+            required_end=work.end
+            if work
+            else (
+                0 if self.limits.recent_tokens is not None else max(0, len(state.history) - self.limits.recent_messages)
+            ),
             completed_end=completed_end,
             max_images=self.max_images,
         )
@@ -493,23 +633,58 @@ class QwenHistoryRuntime:
             return ("visual", work.generation, work.source, work.start, work.end)
         return (work.start, work.end, work.sources, work.generation)
 
+    def _planning_key(self, state: QwenHistoryState, work: HistoryWork | VisualWork) -> Hashable:
+        """Include every source whose growth can change an unmeasured token trigger."""
+        key = self._source_key(work)
+        if self.limits.recent_tokens is not None and isinstance(work, HistoryWork):
+            # The message batch may stay unchanged while later originals push
+            # the total over the token trigger. A completed no-op must wake again.
+            # An all-corrupt visual admission can also finish without a model
+            # request, leaving dialogue eligible under the same source versions.
+            visual_progress = (state.visual.admitted, state.visual.covered, state.visual.memory.generation)
+            return ("token_budget", key, state.sources[work.end :], visual_progress)
+        return key
+
+    def _token_plan(self, state: QwenHistoryState) -> tuple[Hashable, HistoryWork | VisualWork] | None:
+        """Reuse a fitted request's identity across retries and unrelated appends.
+
+        The proposal identifies the scheduling attempt; only the fitted work
+        identifies summary evidence. They retire together when that work changes.
+        """
+        if state.token_plan is not None and self.source_matches(state, state.token_plan[1]):
+            fitted = state.token_plan[1]
+            if isinstance(fitted, VisualWork):
+                return state.token_plan
+            proposed = self.work(state)
+            if proposed is not None and proposed.end >= fitted.end:
+                return state.token_plan
+        state.token_plan = None
+        return None
+
     def policy_for(
         self, state: QwenHistoryState, history: Sequence[Message], history_revision: int | None = None
     ) -> DuplexAuxiliaryPolicy | None:
         """Cache unchanged plans; complete pending visual evidence before text."""
         key = (self, history_revision, state.generation, state.media_revision)
         if history_revision is not None and state.policy_cache_key == key:
-            work = state.cached_work
-            return None if work is None else DuplexAuxiliaryPolicy(source_key=self._source_key(work))
+            source = state.cached_source_key
+            return None if source is None else DuplexAuxiliaryPolicy(source_key=source)
         self.validate_history(history)
         state.reconcile(history)
-        text_work = self.work(state)
-        work = self._visual_work(state, text_work) or text_work
-        state.cached_work = work
+        plan = self._token_plan(state)
+        if plan is not None:
+            source = plan[0]
+        else:
+            text_work = self.work(state)
+            # Token eligibility is measured off-loop during prepare(). Do not
+            # use unmeasured candidates to compress images before the trigger.
+            work = self._visual_work(state, None if self.limits.recent_tokens is not None else text_work) or text_work
+            source = None if work is None else self._planning_key(state, work)
+        state.cached_source_key = source
         state.policy_cache_key = (
             (self, history_revision, state.generation, state.media_revision) if history_revision is not None else None
         )
-        return None if work is None else DuplexAuxiliaryPolicy(source_key=self._source_key(work))
+        return None if source is None else DuplexAuxiliaryPolicy(source_key=source)
 
     @staticmethod
     async def _joined_worker(
@@ -577,8 +752,14 @@ class QwenHistoryRuntime:
                         }
                     ]
                 messages.append({"role": "user", "content": content})
-            prompt, count, temperature = self._render_compression(PromptGroup(tuple(messages), (), tuple(images)), "")
-            if count + self.limits.summary_tokens <= self.max_model_len:
+            group = PromptGroup(tuple(messages), (), tuple(images))
+            prompt, count, temperature = self._render_compression(group, "")
+            source_fits = (
+                self.limits.chunk_tokens is None
+                or len(entries) == 1
+                or self._source_tokens(group) <= self.limits.chunk_tokens
+            )
+            if count + self.limits.summary_tokens <= self.max_model_len and source_fits:
                 source = replace(work.source, covered_ids=work.source.covered_ids[: len(entries)])
                 return prompt, count, temperature, replace(work, source=source)
             entries = entries[:-1]
@@ -660,11 +841,30 @@ class QwenHistoryRuntime:
         """
         # A missing source must not park all subsequent batches. Limit local
         # progress per wake; normal batches retain the runtime's retry budget.
-        visual_work = self._visual_work(state, self.work(state))
-        if visual_work is not None:
-            return await self._prepare_visual(state, visual_work)
         for _ in range(self.limits.chunk_messages):
-            work = self.work(state)
+            plan = self._token_plan(state)
+            if plan is not None and isinstance(plan[1], VisualWork):
+                return await self._prepare_visual(state, plan[1])
+            work = plan[1] if plan is not None else self.work(state)
+            assert work is None or isinstance(work, HistoryWork)
+            token_targets = self.limits.recent_tokens is not None or self.limits.chunk_tokens is not None
+            proposal_key = plan[0] if plan is not None else None
+            if token_targets and plan is None:
+                proposal = self._visual_work(state, None if self.limits.recent_tokens is not None else work) or work
+                if proposal is not None:
+                    proposal_key = self._planning_key(state, proposal)
+            if work is not None and plan is None and token_targets:
+                work = await self._token_work(state, work, audio_provider)
+            visual_work = self._visual_work(state, work)
+            if visual_work is not None:
+                request = await self._prepare_visual(state, visual_work)
+                if request is not None and token_targets:
+                    assert isinstance(request.model_source, VisualWork)
+                    state.token_plan = (
+                        proposal_key if proposal_key is not None else self._planning_key(state, visual_work),
+                        request.model_source,
+                    )
+                return request
             if work is None:
                 return None
             boundaries = [b for a, b in turn_ranges(state.history) if work.start <= a < work.end]
@@ -679,7 +879,11 @@ class QwenHistoryRuntime:
                     work.previous_node_id,
                     work.previous_partial,
                 )
-                if candidate.end - candidate.start > self.limits.chunk_messages and len(boundaries) > 1:
+                if (
+                    self.limits.chunk_tokens is None
+                    and candidate.end - candidate.start > self.limits.chunk_messages
+                    and len(boundaries) > 1
+                ):
                     boundaries.pop()
                     continue
                 group = self.group(state, candidate.start, candidate.end, audio_provider() if audio_provider else ())
@@ -721,24 +925,17 @@ class QwenHistoryRuntime:
                         continue
                     state.advance(candidate, omission="summary_capacity")
                     break
-                # Foreground-cache fallback also consumes strategy capacity.
-                # These worker-only references do not create new source bindings.
-                held = {id(a.encoded): a for a in state.audio}
-                selected = [held.get(key) or RetainedAudio((), value, "") for key, value in unique_audio.items()]
-                state.preparing = {id(a): a for a in selected}
-                del held  # Do not keep evicted pool entries alive across the worker await.
-                state.media_revision += 1
-                state.trim_audio(self.limits)
-                try:
-                    prompt, count, temperature, candidate = await self._joined_worker(
-                        self._prepare_compression, group, candidate, allow_fold=len(boundaries) == 1
-                    )
-                finally:
-                    state.preparing.clear()
-                    state.media_revision += 1
+                prompt, count, temperature, candidate = await self._with_audio(
+                    state, group, self._prepare_compression, group, candidate, allow_fold=len(boundaries) == 1
+                )
                 if not state.matches(candidate, state.history):
                     return None
                 if count + self.limits.summary_tokens <= self.max_model_len:
+                    if token_targets:
+                        state.token_plan = (
+                            proposal_key if proposal_key is not None else self._planning_key(state, candidate),
+                            candidate,
+                        )
                     state.counts["planned_requests"] += 1
                     state.counts["planned_input_tokens"] += count
                     logger.debug(

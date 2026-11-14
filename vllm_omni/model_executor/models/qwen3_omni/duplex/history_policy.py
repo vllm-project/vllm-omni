@@ -13,7 +13,7 @@ import importlib
 import math
 from abc import ABC, abstractmethod
 from collections import Counter, deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import InitVar, dataclass, field
 
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger, DuplexSourceRef, source_refs
@@ -49,6 +49,8 @@ class HistoryLimits:
 
     recent_messages: int = 8
     chunk_messages: int = 8
+    recent_tokens: int | None = field(default=None, kw_only=True)
+    chunk_tokens: int | None = field(default=None, kw_only=True)
     summary_tokens: int = 512
     max_audio_items: int = 64
     max_audio_bytes: int = 32 * 1024 * 1024
@@ -67,7 +69,7 @@ class HistoryLimits:
         """Reject nonintegral or unbounded deployment settings at initialization."""
         for name in self.__dataclass_fields__:
             value = getattr(self, name)
-            if name == "max_context_tokens" and value is None:
+            if name in {"max_context_tokens", "recent_tokens", "chunk_tokens"} and value is None:
                 continue
             if type(value) is not int or value <= 0:
                 raise ValueError(f"history policy {name} must be a positive integer")
@@ -220,7 +222,9 @@ class QwenHistoryState:
     preparing: dict[int, RetainedAudio] = field(default_factory=dict)
     media_revision: int = 0
     policy_cache_key: tuple[object, int, int, int] | None = None
-    cached_work: HistoryWork | VisualWork | None = None
+    cached_source_key: Hashable | None = None
+    # Keep scheduling identity stable when token fitting narrows the proposal.
+    token_plan: tuple[Hashable, HistoryWork | VisualWork] | None = None
     partial: HistoryFold | None = None
     limits: InitVar[HistoryLimits] = field(kw_only=True)
     visual: QwenVisualHistory = field(init=False)
@@ -266,7 +270,7 @@ class QwenHistoryState:
         if self.snapshot is None or self.ledger is None or len(history) != len(self.sources):
             raise RuntimeError("Bind the current Session history context before Qwen history hooks")
         self.policy_cache_key = None
-        self.cached_work = None
+        self.cached_source_key = None
         if (self.processed and self.sources[: self.processed] != self.processed_sources) or (
             self.summary_node_id is not None and not self.ledger.valid(self.summary_node_id)
         ):
@@ -387,11 +391,36 @@ class QwenHistoryState:
         self.processed_sources = work.sources
         self.generation += 1
         self.policy_cache_key = None
-        self.cached_work = None
+        self.cached_source_key = None
         needed = {id(m.get("content")) for m in self.history[self.processed :] if has_audio(m)}
         self.audio = [a for a in self.audio if id(a) in self.preparing or any(id(c) in needed for c in a.contents)]
         # This releases only the strategy's references, never Session records
         # or the independent foreground cache.
+
+
+def audio_pressure_cutoff(state: QwenHistoryState, limits: HistoryLimits, max_audio: int) -> int:
+    """Find the old audio prefix needing compression independently of text targets."""
+    positions, seen = [], set()
+    for index in range(state.processed, len(state.history)):
+        message = state.history[index]
+        if not has_audio(message):
+            continue
+        retained = state.audio_for(message)
+        key = retained.key if retained else str(id(message.get("content")))
+        if key not in seen:
+            seen.add(key)
+            positions.append(index)
+    cutoff = state.processed
+    audio_limit = max(1, min(max_audio, limits.max_audio_items))
+    if len(positions) >= audio_limit:
+        cutoff = positions[len(positions) - audio_limit] + 1
+    next_audio_bytes = max((len(audio.encoded) for audio in state.audio), default=0)
+    if (
+        state.audio_bytes + next_audio_bytes > min(limits.audio_summary_trigger_bytes, limits.max_audio_bytes)
+        and positions
+    ):
+        cutoff = max(cutoff, positions[0] + 1)
+    return cutoff
 
 
 class QwenHistoryPolicy(ABC):
@@ -410,7 +439,7 @@ class QwenHistoryPolicy(ABC):
 
     @abstractmethod
     def next_batch(self, state: QwenHistoryState, limits: HistoryLimits, *, max_audio: int) -> tuple[int, int] | None:
-        """Select an old prefix using the renderer's effective per-request audio limit."""
+        """Propose an old prefix; runtime fitting applies token and model-input limits."""
 
     @abstractmethod
     def build_compression(
@@ -463,30 +492,11 @@ class IncrementalHistoryPolicy(QwenHistoryPolicy):
         if state.partial is not None:
             return state.processed, state.partial.end
         history = state.history
-        cutoff = max(0, len(history) - limits.recent_messages)
-        # Consolidate before the next input exceeds the renderer's audio limit,
-        # independently of the text-message threshold and legacy recent cache.
-        audio_positions, seen = [], set()
-        for i in range(state.processed, len(history)):
-            message = history[i]
-            if not has_audio(message):
-                continue
-            retained = state.audio_for(message)
-            key = retained.key if retained else str(id(message.get("content")))
-            if key not in seen:
-                seen.add(key)
-                audio_positions.append(i)
-        audio_limit = max(1, min(max_audio, limits.max_audio_items))
-        if len(audio_positions) >= audio_limit:
-            cutoff = max(cutoff, audio_positions[len(audio_positions) - audio_limit] + 1)
-        # Leave room for another utterance as large as the largest retained one.
-        # Checking only equality misses byte limits between two item sizes.
-        next_audio_bytes = max((len(a.encoded) for a in state.audio), default=0)
-        if (
-            state.audio_bytes + next_audio_bytes > min(limits.audio_summary_trigger_bytes, limits.max_audio_bytes)
-            and audio_positions
-        ):
-            cutoff = max(cutoff, audio_positions[0] + 1)
+        # Token targets need model rendering in a CPU worker. Offer completed
+        # candidates here; the runtime measures and narrows this range before
+        # submitting any summary, including when the history is below target.
+        cutoff = len(history) if limits.recent_tokens is not None else max(0, len(history) - limits.recent_messages)
+        cutoff = max(cutoff, audio_pressure_cutoff(state, limits, max_audio))
         end = state.processed
         for start, stop in turn_ranges(history):
             if stop <= state.processed:
@@ -496,10 +506,10 @@ class IncrementalHistoryPolicy(QwenHistoryPolicy):
             # Do not consolidate an unanswered user input.
             if stop == len(history) and has_unanswered_user_input(history):
                 break
-            if end > state.processed and stop - state.processed > limits.chunk_messages:
+            if limits.chunk_tokens is None and end > state.processed and stop - state.processed > limits.chunk_messages:
                 break
             end = stop
-            if end - state.processed >= limits.chunk_messages:
+            if limits.chunk_tokens is None and end - state.processed >= limits.chunk_messages:
                 break
         return (state.processed, end) if end > state.processed else None
 

@@ -228,6 +228,46 @@ batching while overriding compression. Default `recent` behavior is unchanged.
 The optional `history_limits.max_context_tokens` caps context below the resolved
 model limit, including reserved output; omitting it uses the model limit.
 
+Token targets can independently replace message-count triggering and batching:
+
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+duplex_session:
+  model_custom_options:
+    history_policy: incremental
+    history_limits:
+      recent_tokens: 6000
+      chunk_tokens: 2000
+      summary_tokens: 512
+```
+
+`recent_tokens` starts dialogue compression when unsummarized originals exceed
+the target. Once triggered, the policy fills a batch up to `chunk_tokens` from
+the oldest completed turns. For example, roughly 7000 original tokens can
+produce a batch of roughly 2000 tokens, leaving roughly 5000 original tokens
+alongside the new summary. The output size is controlled by `summary_tokens`.
+Reaching the trigger does not require a full batch to be available.
+
+Both token targets default to unset. Setting `recent_tokens` replaces
+`recent_messages`; setting `chunk_tokens` replaces `chunk_messages` for batch
+size. Either can be used alone with the other message-count setting. Targets
+must be positive integers. Audio count/byte pressure and visual count pressure
+remain independent triggers, including below `recent_tokens`.
+
+Counting runs in joined CPU workers. Dialogue targets sum the rendered token
+costs of complete original turns, including their chat templates and expanded
+audio/image tokens. Existing summaries, compression instructions and reserved
+output are excluded from these source targets; the final rendered request
+must still fit all of them within the effective model-context limit. Token
+counting adds CPU preparation work and does not bound total Session storage.
+Visual batches also shrink to `chunk_tokens`, within their existing image-count
+and summary-group targets. Indivisible audio turns and visual entries may exceed
+the soft batch target when they fit the hard model/media limits. An oversized
+text turn uses the existing private excerpt-folding path, even when the whole
+turn would fit the model context. No partial excerpt publishes summary coverage.
+An unusably small `chunk_tokens` value can leave no room for excerpt labels;
+preparation logs the capacity issue and keeps the original source pending.
+
 Incomplete implementations fail at server initialization. Selection is
 stateless and may be cached while
 the Session history revision, memory generation and retained-media revision are

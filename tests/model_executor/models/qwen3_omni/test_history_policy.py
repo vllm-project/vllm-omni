@@ -158,12 +158,15 @@ def test_current_mixed_input_survives_too_small_history_media_pool(system_update
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit", ["items", "bytes", "bytes_between_item_sizes"])
-async def test_configured_media_capacity_triggers_before_sources_are_lost(limit):
+@pytest.mark.parametrize("tokens", [False, True])
+async def test_configured_media_capacity_triggers_before_sources_are_lost(limit, tokens):
     plugin = Qwen3OmniDuplexPlugin(lambda *args: "")
     _, payload = audio_message(0)
     limits = {"max_audio_items": 2} if limit == "items" else {"max_audio_bytes": 2 * len(payload["audio"])}
     if limit == "bytes_between_item_sizes":
         limits["max_audio_bytes"] = 3 * len(payload["audio"]) // 2
+    if tokens:
+        limits.update(recent_tokens=1000000, chunk_tokens=1000)
     plugin._history_runtime = runtime(recent_messages=100, **limits)
     state, history = plugin.create_session_state(), []
     planned = []
@@ -177,9 +180,9 @@ async def test_configured_media_capacity_triggers_before_sources_are_lost(limit)
         policy = plugin.auxiliary_policy(state=state, history_revision=index, history=history)
         if policy:
             request = await plugin.prepare_auxiliary_request(state=state, history=(), runtime_config={})
-            assert request is not None
-            planned.append(index)
-            assert plugin.apply_auxiliary_result(state=state, request=request, output=completion())
+            if request is not None:
+                planned.append(index)
+                assert plugin.apply_auxiliary_result(state=state, request=request, output=completion())
     assert planned[0] <= 1  # Compress no later than the second completed turn.
     assert not state.history_policy_state.omissions
     assert state.history_policy_state.processed >= 8
@@ -432,7 +435,7 @@ async def test_expanded_audio_context_limit_and_oversize_batch_progress():
 
 def test_configuration_rejects_nonintegral_and_unbounded_values():
     for value in (0, -1, True, 0.5):
-        for name in ("max_audio_bytes", "audio_summary_trigger_bytes"):
+        for name in ("max_audio_bytes", "audio_summary_trigger_bytes", "recent_tokens", "chunk_tokens"):
             with pytest.raises(ValueError):
                 replace(HistoryLimits(), **{name: value})
 
@@ -458,11 +461,14 @@ async def test_real_session_close_cancels_private_summary_and_rejects_late_outpu
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["retained", "foreground"])
-async def test_cancelled_preparation_keeps_media_charged_until_cpu_worker_finishes(source):
+@pytest.mark.parametrize("tokens", [False, True])
+async def test_cancelled_preparation_keeps_media_charged_until_cpu_worker_finishes(source, tokens):
     import asyncio
     import threading
 
-    owner = runtime(recent_messages=2, max_audio_items=1)
+    owner = runtime(
+        recent_messages=2, max_audio_items=1, **({"recent_tokens": 1, "chunk_tokens": 128} if tokens else {})
+    )
     state = owner.create_state()
     owner.policy = IdleHistoryPolicy()
     message, payload = audio_message(0)

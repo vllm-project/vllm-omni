@@ -111,13 +111,14 @@ async def test_marker_only_summary_keeps_evidence_pending_for_retry(visual, text
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("corruption", ["body", "metadata"])
-async def test_admitted_corrupt_image_does_not_block_valid_visual_or_dialogue(caplog, corruption):
+@pytest.mark.parametrize("tokens", [False, True])
+async def test_admitted_corrupt_image_does_not_block_valid_visual_or_dialogue(caplog, corruption, tokens):
     from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
     from vllm_omni.engine.duplex.commands import CreateItem
 
     h = await open_qwen()
     try:
-        owner = runtime(recent_messages=2)
+        owner = runtime(recent_messages=2, **({"recent_tokens": 1, "chunk_tokens": 256} if tokens else {}))
         h.runner.plugin._history_runtime = owner
         broken = "data:image/png;base64," + pybase64.b64encode(b"\x89PNG\r\n\x1a\nbroken body").decode()
         if corruption == "metadata":
@@ -258,13 +259,16 @@ async def test_visual_resource_and_programming_errors_preserve_retryable_sources
 
 
 @pytest.mark.asyncio
-async def test_all_corrupt_visual_batch_allows_runtime_to_schedule_dialogue():
+@pytest.mark.parametrize("tokens", [False, True])
+async def test_all_corrupt_visual_batch_allows_runtime_to_schedule_dialogue(tokens):
     from tests.model_executor.models.joyai_vl_interaction.test_duplex_memory import start_summary
     from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
 
     h = await open_qwen()
     try:
-        h.runner.plugin._history_runtime = runtime(recent_messages=2)
+        h.runner.plugin._history_runtime = runtime(
+            recent_messages=2, **({"recent_tokens": 1, "chunk_tokens": 256} if tokens else {})
+        )
         h.runner.plugin.supports_auxiliary_requests = True
         broken = "data:image/png;base64," + pybase64.b64encode(b"\x89PNG\r\n\x1a\nbroken body").decode()
         h.session.append_history_message(
