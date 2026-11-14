@@ -52,6 +52,27 @@ rounded initial weighted value and the same FMA accumulation order. This
 preserves bitwise parity when the compiler inlines attention into sampling,
 including SM89 code generation affected by LLVM SLP reduction reordering.
 
+## Model-state sampling and determined tokens
+
+Models whose physical outputs differ from scheduler tokens can perform sampling
+and state transitions in `ModelState.postprocess_model_output`. The returned
+multimodal snapshot owns its tensors until asynchronous D2H finishes. Request-owned
+rows must remain independent of token-span slicing, including mixed prefills.
+
+`ModelState.sample_determined_tokens` returns the already decided scheduler tokens
+and effective sampled/rejected counts. The runner uses this hook when grammar,
+speculative decoding and distributed execution do not require the standard path.
+An incomplete prefill must not advance physical generation; terminal in-flight
+steps must not emit another frame or mutate completed request state. Model-owned
+validity flags are consumed after the existing D2H boundary.
+
+During startup profiling, the AR runner calls the optional
+`ModelState.warmup_sampling(hidden_states, req_states)` instead of text sampler
+warmup. It should exercise the serving head/filter/draw path and configured batch
+shapes, then reset dummy history, RNG and feedback state before requests arrive.
+States without this hook retain upstream dummy sampling. Decoder graph capture
+warms its own captured path separately.
+
 ## Qwen3-Omni Talker sampling
 
 The MRv2 Talker adapter follows the selected vLLM sampler's dispatch contract,

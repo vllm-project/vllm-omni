@@ -65,3 +65,27 @@ def test_adapter_preserves_stock_sampler_staged_write_fast_path():
     assert OmniSampler(object.__new__(Sampler)).omni_static_staged_writes
     assert not OmniSampler(SimpleNamespace()).omni_static_staged_writes
     assert OmniSampler(SimpleNamespace(omni_static_staged_writes=True)).omni_static_staged_writes
+
+
+@pytest.mark.parametrize("model_warmup", [False, True])
+def test_ar_runner_uses_model_state_sampling_warmup_or_upstream(monkeypatch, model_warmup):
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    calls = []
+
+    class State:
+        def warmup_sampling(self, hidden, requests):
+            calls.append((hidden, requests))
+
+    runner = object.__new__(OmniARModelRunner)
+    runner.model_state = State() if model_warmup else SimpleNamespace()
+    runner.req_states = object()
+    upstream = Mock()
+    monkeypatch.setattr(OmniGPUModelRunner, "_dummy_sampler_run", upstream)
+    hidden = torch.zeros(2, 8)
+    runner._dummy_sampler_run(hidden)
+    assert len(calls) == int(model_warmup)
+    assert upstream.call_count == int(not model_warmup)
+    if model_warmup:
+        assert calls[0][0] is hidden and calls[0][1] is runner.req_states

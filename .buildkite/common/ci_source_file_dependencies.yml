@@ -852,6 +852,23 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py
     - tests/worker_v2/
 
+  tts_zonos3_function:
+    - vllm_omni/model_executor/models/zonos3/
+    - vllm_omni/model_executor/stage_input_processors/zonos3.py
+    - vllm_omni/entrypoints/openai/tts_adapters/zonos3.py
+    - vllm_omni/transformers_utils/configs/zonos3.py
+    - vllm_omni/transformers_utils/parsers/zonos3.py
+    - vllm_omni/deploy/zonos3_mini.yaml
+    - vllm_omni/data_entry_keys.py
+    - vllm_omni/config/
+    - vllm_omni/worker_v2/
+    - vllm_omni/distributed/omni_connectors/
+    - tests/model_executor/models/test_zonos3_*.py
+    - tests/model_executor/stage_input_processors/test_zonos3.py
+    - tests/e2e/online_serving/test_zonos3_mini.py
+    - tests/helpers/
+    - pyproject.toml
+
   tts_qwen3_tts_function:
     - tests/helpers/assertions.py
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh

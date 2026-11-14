@@ -113,6 +113,13 @@ def _guard_graph_replay_for_pooler_copy(
 class OmniARModelRunner(OmniGPUModelRunner):
     """AR stage runner. Produces per-request hidden states + multimodal outputs."""
 
+    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
+        warmup = getattr(type(self.model_state), "warmup_sampling", None)
+        if warmup is not None:
+            warmup(self.model_state, hidden_states, self.req_states)
+            return
+        super()._dummy_sampler_run(hidden_states)
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.kv_transfer_manager: OmniKVTransferManager | None = None
@@ -176,9 +183,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
         # An explicitly declared model-state hook may return already determined
         # tokens. Unsupported sampling features retain the upstream path.
         sample_determined = getattr(type(self.model_state), "sample_determined_tokens", None)
+        determined_warmup = bool(
+            grammar_output is not None
+            and getattr(type(self.model_state), "sample_determined_tokens_during_warmup", False)
+            and input_batch.num_reqs > 0
+            and all(is_warmup_request(req_id) for req_id in input_batch.req_ids)
+        )
         if (
             sample_determined is not None
-            and grammar_output is None
+            and (grammar_output is None or determined_warmup)
             and self.batch_sharder is None
             and self.pp_handler is None
             and input_batch.num_draft_tokens == 0

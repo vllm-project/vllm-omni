@@ -34,6 +34,13 @@ classifiers = [
 
 [project.optional-dependencies]
 
+# Official ZONOS3 GDN kernels; the serving path explicitly selects Triton
+# (FLA_TILELANG=0) and verifies this version before graph warmup/capture.
+zonos3 = [
+    "fla-core==0.5.2",
+    "zyphra-textnorm==0.1.0",
+]
+
 tracing = [
     "opentelemetry-sdk>=1.28.0",
     "opentelemetry-exporter-otlp>=1.28.0",
@@ -215,6 +222,7 @@ include = ["vllm_omni*"]
     "transformers_utils/chat_templates/*.jinja",
 ]
 "vllm_omni.model_executor.models.ming_flash_omni" = ["data/*.json", "LICENSE.Ming", "NOTICE"]
+"vllm_omni.model_executor.models.zonos3" = ["LICENSE.Zyphra", "languages.json"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm

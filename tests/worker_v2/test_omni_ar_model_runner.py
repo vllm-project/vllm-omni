@@ -50,6 +50,29 @@ def _async_output(req_ids=("req-0",), **overrides) -> OmniAsyncOutput:
     return OmniAsyncOutput(**(kwargs | overrides))
 
 
+def test_determined_sampler_can_handle_grammar_on_synthetic_warmup() -> None:
+    determined = SamplerOutput(torch.tensor([[1]]), None, None, torch.tensor([1]), torch.tensor([0]))
+
+    class WarmupModelState:
+        sample_determined_tokens_during_warmup = True
+
+        def sample_determined_tokens(self, batch, sampler):
+            return determined
+
+    runner = object.__new__(OmniARModelRunner)
+    runner.model_state = WarmupModelState()
+    runner.sampler = object()
+    runner.batch_sharder = None
+    runner.pp_handler = None
+    batch = SimpleNamespace(num_reqs=1, req_ids=["_warmup_0_"], num_draft_tokens=0)
+
+    output, sampled, rejected = runner.sample(torch.empty((1, 2)), batch, grammar_output=object())
+
+    assert output is determined
+    assert sampled is determined.num_sampled
+    assert rejected is determined.num_rejected
+
+
 @pytest.mark.parametrize("compact_width", [1, 2])
 @pytest.mark.cpu
 def test_async_output_blocking_event_preserves_masks_and_aux_output(monkeypatch, compact_width) -> None:
@@ -643,6 +666,30 @@ def test_async_output_slices_request_payloads_with_graph_padding(
                 torch.testing.assert_close(payload["hidden"], hidden[offsets[i] : offsets[i + 1]])
             else:
                 assert "hidden" not in payload
+
+
+@pytest.mark.cpu
+def test_async_output_preserves_request_scoped_codec_validity_mask(monkeypatch, mocker):
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = mocker.Mock(spec=InputBatch)
+    batch.query_start_loc_np = np.array([0, 1, 2])
+    batch.num_scheduled_tokens = np.array([1, 1])
+    batch.num_reqs = 2
+    batch.num_tokens_after_padding = 2
+    validity = torch.tensor([True, False])
+    output = _async_output(
+        req_ids=["a", "b"],
+        multimodal_outputs={
+            "codes": {"audio": list(torch.arange(20).reshape(2, 1, 10).unbind(0))},
+            "meta": {"codec_frame_valid": list(validity.split(1))},
+        },
+        input_batch=batch,
+        async_chunk=True,
+    ).get_output()
+    assert [payload["meta.codec_frame_valid"].tolist() for payload in output.inter_stage_outputs] == [[True], [False]]
+    assert output.inter_stage_outputs[0]["codes.audio"].shape == (1, 10)
 
 
 @pytest.mark.parametrize("async_chunk", [False, True])
