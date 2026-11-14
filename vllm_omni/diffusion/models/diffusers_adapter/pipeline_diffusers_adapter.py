@@ -177,6 +177,34 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         # Attention backend
         self._set_attention_backend()
 
+    def attach_structure_only_pipeline(self, pipeline: DiffusionPipeline) -> None:
+        """Attach a Loader-constructed pipeline without loading or moving weights.
+
+        The unified Loader owns component construction, dtype resolution and
+        placement. Only non-weight adapter setup belongs here.
+        """
+        self._pipeline = pipeline
+        self._pipeline_utils = get_pipeline_utils_for_config(self.od_config)
+        self._pipeline_utils.apply_post_load_updates(self._pipeline, self.od_config)
+        self._accept_call_kwargs = set(inspect.signature(self._pipeline.__call__).parameters.keys())
+
+        if self.od_config.vae_use_slicing:
+            try:
+                self._pipeline.enable_vae_slicing()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to enable VAE slicing for diffusers pipeline {self._pipeline.__class__.__name__}: {e}"
+                )
+        if self.od_config.vae_use_tiling:
+            try:
+                self._pipeline.enable_vae_tiling()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to enable VAE tiling for diffusers pipeline {self._pipeline.__class__.__name__}: {e}"
+                )
+
+        self._set_attention_backend()
+
     def _load_pipeline_from_pretrained(
         self,
         model_id: str,
