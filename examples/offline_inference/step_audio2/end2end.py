@@ -110,12 +110,7 @@ def get_text_to_audio_query(
         text = "Hello, this is a test of Step Audio 2 text to speech synthesis."
 
     prompt = (
-        "<|im_start|>system\n"
-        "请逐字朗读用户提供的文本，不要改写或补充。<|im_end|>\n"
-        "<|im_start|>user\n"
-        f"{text}<|im_end|>\n"
-        "<|im_start|>assistant\n"
-        "<tts_start>"
+        f"<|BOT|>system\n以自然的语速读出下面的文字。<|EOT|><|BOT|>human\n{text}<|EOT|><|BOT|>assistant\n<tts_start>"
     )
 
     inputs = {
@@ -151,14 +146,7 @@ def get_audio_to_audio_query(
     if question is None:
         question = "请仔细聆听这段语音，然后复述其内容。"
 
-    prompt = (
-        "<|im_start|>system\n"
-        f"{question}<|im_end|>\n"
-        "<|im_start|>user\n"
-        "<audio_patch><|im_end|>\n"
-        "<|im_start|>assistant\n"
-        "<tts_start>"
-    )
+    prompt = f"<|BOT|>system\n{question}<|EOT|><|BOT|>human\n<audio_patch><|EOT|><|BOT|>assistant\n<tts_start>"
 
     # Load source audio
     if audio_path:
@@ -257,17 +245,7 @@ def main(args):
 
     omni_llm = Omni(**omni_kwargs)
 
-    # Configure sampling parameters for each stage
-    # Stage 0 (Thinker): Generate text and audio tokens
-    # Note: For audio generation tasks, we need to allow the model to generate audio tokens
-    # Audio tokens are in range [151696, 158257], so we should not stop too early
-    # Qwen EOS token is typically 151645 (<|im_end|>), but we want to allow audio generation
-    # So we don't set stop_token_ids for audio tasks, but we do set it for text-only tasks
-    stop_token_ids = None
-    if args.query_type == "audio_to_text":
-        # For ASR, stop at EOS token
-        stop_token_ids = [151645]  # Qwen EOS token <|im_end|>
-
+    # The model tokenizer provides the native EOT EOS for every task.
     # Adjust sampling parameters based on query type
     # For audio generation tasks, we need higher repetition_penalty to avoid text loops
     # and allow the model to transition to audio token generation
@@ -281,7 +259,6 @@ def main(args):
         seed=SEED,
         detokenize=True,
         repetition_penalty=repetition_penalty,
-        stop_token_ids=stop_token_ids,
     )
 
     # Stage 1 (Token2Wav): Convert audio tokens to waveform

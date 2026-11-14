@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 set -euo pipefail
 
 # Step-Audio2 curl client for online serving
@@ -6,6 +9,7 @@ set -euo pipefail
 
 QUERY_TYPE="${1:-audio_to_text}"
 API_BASE="${API_BASE:-http://localhost:8092}"
+MODALITIES=null
 
 # Validate query type
 if [[ ! "$QUERY_TYPE" =~ ^(audio_to_text|text_to_audio|audio_to_audio)$ ]]; then
@@ -16,8 +20,6 @@ if [[ ! "$QUERY_TYPE" =~ ^(audio_to_text|text_to_audio|audio_to_audio)$ ]]; then
     echo "  audio_to_audio: Voice conversion"
     exit 1
 fi
-
-SEED=42
 
 # Default test audio URL
 MARY_HAD_LAMB_URL="https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/mary_had_lamb.ogg"
@@ -46,12 +48,12 @@ token2wav_sampling_params='{
 # Build request based on query type
 case "$QUERY_TYPE" in
   audio_to_text)
-    system_content='[{"type": "text", "text": "You are a speech recognition assistant. Transcribe the audio accurately."}]'
+    MODALITIES='["text"]'
+    system_content='[{"type": "text", "text": "请记录下你所听到的语音内容。"}]'
     user_content='[
-      {"type": "audio_url", "audio_url": {"url": "'"$MARY_HAD_LAMB_URL"'"}},
-      {"type": "text", "text": "Please transcribe this audio."}
+      {"type": "audio_url", "audio_url": {"url": "'"$MARY_HAD_LAMB_URL"'"}}
     ]'
-    # Add stop token for ASR
+    # Use the model EOT EOS; no additional legacy stop token.
     thinker_sampling_params='{
       "temperature": 0.7,
       "top_p": 0.9,
@@ -59,14 +61,13 @@ case "$QUERY_TYPE" in
       "max_tokens": 1024,
       "seed": 42,
       "detokenize": true,
-      "repetition_penalty": 1.05,
-      "stop_token_ids": [151645]
+      "repetition_penalty": 1.05
     }'
     ;;
   text_to_audio)
-    system_content='[{"type": "text", "text": "You are a text-to-speech assistant. Read the text aloud exactly as provided."}]'
+    system_content='[{"type": "text", "text": "以自然的语速读出下面的文字。"}]'
     user_content='[
-      {"type": "text", "text": "Hello, this is a test of Step Audio 2 text to speech synthesis.<tts_start>"}
+      {"type": "text", "text": "Hello, this is a test of Step Audio 2 text to speech synthesis."}
     ]'
     thinker_sampling_params='{
       "temperature": 0.7,
@@ -81,8 +82,7 @@ case "$QUERY_TYPE" in
   audio_to_audio)
     system_content='[{"type": "text", "text": "You are an audio processing assistant. Listen and repeat the audio content."}]'
     user_content='[
-      {"type": "audio_url", "audio_url": {"url": "'"$MARY_HAD_LAMB_URL"'"}},
-      {"type": "text", "text": "Please listen to this audio and repeat its content.<tts_start>"}
+      {"type": "audio_url", "audio_url": {"url": "'"$MARY_HAD_LAMB_URL"'"}}
     ]'
     thinker_sampling_params='{
       "temperature": 0.7,
@@ -95,6 +95,14 @@ case "$QUERY_TYPE" in
     }'
     ;;
 esac
+
+# Continue the assistant's speech prefix, matching the Python client.
+assistant_message=''
+generation_options=''
+if [[ "$QUERY_TYPE" != "audio_to_text" ]]; then
+  assistant_message=', {"role": "assistant", "content": "<tts_start>"}'
+  generation_options='"continue_final_message": true, "add_generation_prompt": false,'
+fi
 
 sampling_params_list='[
   '"$thinker_sampling_params"',
@@ -111,7 +119,9 @@ output=$(curl -sS -X POST "${API_BASE}/v1/chat/completions" \
     -d @- <<EOF
 {
   "model": "stepfun-ai/Step-Audio-2-mini",
+  "modalities": $MODALITIES,
   "sampling_params_list": $sampling_params_list,
+  $generation_options
   "messages": [
     {
       "role": "system",
@@ -120,7 +130,7 @@ output=$(curl -sS -X POST "${API_BASE}/v1/chat/completions" \
     {
       "role": "user",
       "content": $user_content
-    }
+    }$assistant_message
   ]
 }
 EOF

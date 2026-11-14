@@ -8,6 +8,7 @@ Request shape follows examples/online_serving/step_audio2/openai_chat_completion
 """
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +21,7 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 MODEL = "stepfun-ai/Step-Audio-2-mini"
 DEPLOY_CONFIG = get_deploy_config_path("step_audio2_ci.yaml")
+CHAT_TEMPLATE = Path(__file__).resolve().parents[3] / "vllm_omni/transformers_utils/chat_templates/step_audio2.jinja"
 SAMPLE_RATE = 16000
 SEED = 42
 SYNTH_PHRASE = "how are you"
@@ -28,7 +30,13 @@ TEST_PARAMS = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            server_args=["--deploy-config", DEPLOY_CONFIG, "--trust-remote-code"],
+            server_args=[
+                "--deploy-config",
+                DEPLOY_CONFIG,
+                "--trust-remote-code",
+                "--chat-template",
+                str(CHAT_TEMPLATE),
+            ],
             env_dict={"VLLM_IMAGE_FETCH_TIMEOUT": "60"},
         ),
         id="step_audio2",
@@ -76,7 +84,7 @@ def _build_audio_to_text_request_config(omni_server, audio_base64: str) -> dict:
                 "content": [
                     {
                         "type": "text",
-                        "text": "You are a speech recognition assistant. Transcribe the audio accurately.",
+                        "text": "请记录下你所听到的语音内容。",
                     }
                 ],
             },
@@ -84,7 +92,6 @@ def _build_audio_to_text_request_config(omni_server, audio_base64: str) -> dict:
                 "role": "user",
                 "content": [
                     {"type": "audio_url", "audio_url": {"url": audio_url}},
-                    {"type": "text", "text": "Please transcribe the audio content."},
                 ],
             },
         ],
