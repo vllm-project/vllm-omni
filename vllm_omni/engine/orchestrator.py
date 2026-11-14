@@ -93,7 +93,7 @@ from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
 from vllm_omni.tracing import RequestTrace
 
 if TYPE_CHECKING:
-    from vllm_omni.engine import OmniEngineCoreOutput
+    from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
     from vllm_omni.engine.stage_client import StagePoolClient
 
 logger = init_logger(__name__)
@@ -2111,7 +2111,9 @@ class OrchestratorBase:
             self._shared_requests.finish(cleanup_ids, aborted=abort or trace_error is not None)
         return abort_outputs
 
-    def _stamp_poll_segment_finished(self, stage_id: int, raw_outputs: Any, processed: list[Any]) -> None:
+    def _stamp_poll_segment_finished(
+        self, stage_id: int, raw_outputs: OmniEngineCoreOutputs, processed: list[RequestOutput]
+    ) -> None:
         """Bind this poll's ``is_segment_finished`` onto processed outputs.
 
         Duplex intercept must not read a leftover ``streaming.segments[stage].finished``
@@ -2244,7 +2246,7 @@ class OrchestratorBase:
         replica_id: int,
         request_id: str,
         req_state: OrchestratorRequestState,
-        pool: Any,
+        pool: StagePool,
     ) -> None:
         """Route a swallowed duplex request-end through the session interceptor.
 

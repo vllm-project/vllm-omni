@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-# SPDX-FileCopyrightText: Copyright contributors to the VLLM-Omni project
 """JoyAI streaming-text gates and sentence-level Talker handoff.
 
 The duplex profile runs the JoyAI stage with ``RequestOutputKind.DELTA`` so the

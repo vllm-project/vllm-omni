@@ -63,6 +63,80 @@ from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def _output_context(*, segment_finished: bool) -> DuplexOutputContext:
+    return DuplexOutputContext(
+        identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=DuplexFence(session_id=SESSION_ID)),
+        final_stage_id=2,
+        segment_finished=segment_finished,
+    )
+
+
+@dataclass
+class _PartialStageClient:
+    custom_process_input_func: object = None
+
+
+@dataclass
+class _PartialPool:
+    stage_client: _PartialStageClient = field(default_factory=_PartialStageClient)
+
+
+@dataclass
+class _PartialOrchestrator:
+    stage_pools: list[_PartialPool]
+
+    def _stage_receives_async_chunks(self, stage_id: int) -> bool:
+        del stage_id
+        return False
+
+
+def _partial_orchestrator(talker_processor: object) -> _PartialOrchestrator:
+    # Two pools: ``_stage1_processor_name`` reads ``stage_pools[1]`` for the
+    # Talker's input processor, and an out-of-range lookup would make
+    # ``plan_partial_stage_output`` bail out before the switch is consulted.
+    return _PartialOrchestrator(
+        stage_pools=[
+            _PartialPool(_PartialStageClient(None)),
+            _PartialPool(_PartialStageClient(talker_processor)),
+        ]
+    )
+
+
+@dataclass
+class _PartialStreaming:
+    bridge_states: dict[str, object] = field(default_factory=dict)
+    enabled: bool = False
+
+
+@dataclass
+class _PartialReqState:
+    session_owned: bool = True
+    final_stage_id: int = 2
+    request_id: str = "req-1"
+    prompt: dict[str, object] = field(default_factory=lambda: {"additional_information": {}})
+    streaming: _PartialStreaming = field(default_factory=_PartialStreaming)
+
+
+@dataclass
+class _PartialCompletion:
+    text: str
+    cumulative_text: str | None = None
+
+
+@dataclass
+class _PartialOutput:
+    request_id: str = "req-1"
+    outputs: list[_PartialCompletion] = field(default_factory=list)
+    finished: bool = False
+
+
+def _stage0_output(text: str, *, finished: bool = False) -> _PartialOutput:
+    return _PartialOutput(
+        finished=finished,
+        outputs=[_PartialCompletion(text=text, cumulative_text=text if finished else None)],
+    )
+
+
 class Processor:
     merge_size = 2
     image_token = "<|image_pad|>"
@@ -356,10 +430,10 @@ def test_joyai_streams_text_and_talker_sentence_parks():
     assert configured[0].seed is None
     assert configured[2].seed is None
     assert plugin.project_intermediate_output(
-        stage_id=0, output=object(), context=SimpleNamespace(segment_finished=False)
+        stage_id=0, output=object(), context=_output_context(segment_finished=False)
     )
     assert not plugin.project_intermediate_output(
-        stage_id=1, output=object(), context=SimpleNamespace(segment_finished=False)
+        stage_id=1, output=object(), context=_output_context(segment_finished=False)
     )
 
 
@@ -399,10 +473,10 @@ def test_async_chunk_disabled_reverts_the_whole_streaming_profile():
 
     # Text is projected once, at the segment boundary, as before live text.
     assert not plugin.project_intermediate_output(
-        stage_id=0, output=object(), context=SimpleNamespace(segment_finished=False)
+        stage_id=0, output=object(), context=_output_context(segment_finished=False)
     )
     assert plugin.project_intermediate_output(
-        stage_id=0, output=object(), context=SimpleNamespace(segment_finished=True)
+        stage_id=0, output=object(), context=_output_context(segment_finished=True)
     )
 
 
@@ -429,31 +503,9 @@ def test_plan_partial_is_off_when_async_chunk_is_disabled():
     plugin.configure_pipeline(JOYAI_VL_INTERACTION_PIPELINE)
     plugin.configure_async_chunk(enabled=False)
 
-    def joyai_action_to_tts() -> None:
-        return None
-
-    orchestrator = SimpleNamespace(
-        # Two pools: ``_stage1_processor_name`` reads ``stage_pools[1]`` for the
-        # Talker's input processor, and an out-of-range lookup would make
-        # ``plan_partial_stage_output`` bail out before the switch is consulted.
-        stage_pools=[
-            SimpleNamespace(stage_client=SimpleNamespace(custom_process_input_func=None)),
-            SimpleNamespace(stage_client=SimpleNamespace(custom_process_input_func=joyai_action_to_tts)),
-        ],
-        _stage_receives_async_chunks=lambda stage_id: False,
-    )
-    req_state = SimpleNamespace(
-        session_owned=True,
-        final_stage_id=2,
-        request_id="req-1",
-        prompt={"additional_information": {}},
-        streaming=SimpleNamespace(bridge_states={}, enabled=False),
-    )
-    output = SimpleNamespace(
-        request_id="req-1",
-        finished=True,
-        outputs=[SimpleNamespace(text="</response> 水开了。", cumulative_text="</response> 水开了。")],
-    )
+    orchestrator = _partial_orchestrator(joyai_action_to_tts)
+    req_state = _PartialReqState()
+    output = _stage0_output("</response> 水开了。", finished=True)
     # A spoken, complete action: only the disabled switch can make this None.
     assert plugin.plan_partial_stage_output(orchestrator, 0, 0, output, req_state) is None
     assert req_state.streaming.enabled is False
@@ -470,65 +522,19 @@ def test_plugin_queues_a_close_sentinel_after_the_last_sentence():
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.configure_pipeline(JOYAI_VL_INTERACTION_PIPELINE)
 
-    def joyai_action_to_tts() -> None:
-        return None
-
-    @dataclass
-    class _StageClient:
-        custom_process_input_func: object = joyai_action_to_tts
-
-    @dataclass
-    class _Pool:
-        stage_client: _StageClient = field(default_factory=_StageClient)
-
-    @dataclass
-    class _Orchestrator:
-        stage_pools: list[_Pool] = field(default_factory=lambda: [_Pool(), _Pool()])
-
-        def _stage_receives_async_chunks(self, stage_id: int) -> bool:
-            del stage_id
-            return False
-
-    @dataclass
-    class _Streaming:
-        bridge_states: dict[str, object] = field(default_factory=dict)
-        enabled: bool = False
-
-    @dataclass
-    class _ReqState:
-        session_owned: bool = True
-        final_stage_id: int = 2
-        request_id: str = "req-1"
-        prompt: dict[str, object] = field(default_factory=lambda: {"additional_information": {}})
-        streaming: _Streaming = field(default_factory=_Streaming)
-
-    @dataclass
-    class _Completion:
-        text: str
-        cumulative_text: str | None = None
-
-    @dataclass
-    class _Output:
-        request_id: str
-        outputs: list[_Completion]
-        finished: bool = False
-
-    orchestrator = _Orchestrator()
-    req_state = _ReqState()
-    first = _Output(
-        request_id="req-1",
-        outputs=[_Completion(text="</response> 水开了。关")],
-    )
+    orchestrator = _partial_orchestrator(joyai_action_to_tts)
+    req_state = _PartialReqState()
+    first = _stage0_output("</response> 水开了。关")
     plan = plugin.plan_partial_stage_output(orchestrator, 0, 0, first, req_state)
     assert plan is not None
     assert plan.is_final_update is False
     assert plan.close_only is False
     assert plugin.partial_stage_followup(plan, req_state) is None
 
-    done = _Output(
+    done = _PartialOutput(
         finished=True,
         request_id="req-1",
-        outputs=[_Completion(text="关火。", cumulative_text="</response> 水开了。关火。")],
+        outputs=[_PartialCompletion(text="关火。", cumulative_text="</response> 水开了。关火。")],
     )
     last = plugin.plan_partial_stage_output(orchestrator, 0, 0, done, req_state)
     assert last is not None
@@ -555,42 +561,17 @@ def test_plugin_closes_after_an_idle_talker_finishes_the_last_sentence():
     plugin.configure_pipeline(JOYAI_VL_INTERACTION_PIPELINE)
     plugin.configure_async_chunk(enabled=True)
 
-    def joyai_action_to_tts() -> None:
-        return None
+    orchestrator = _partial_orchestrator(joyai_action_to_tts)
+    req_state = _PartialReqState()
 
-    orchestrator = SimpleNamespace(
-        # Two pools: ``_stage1_processor_name`` reads ``stage_pools[1]`` for the
-        # Talker's input processor, and an out-of-range lookup would make
-        # ``plan_partial_stage_output`` bail out before the switch is consulted.
-        stage_pools=[
-            SimpleNamespace(stage_client=SimpleNamespace(custom_process_input_func=None)),
-            SimpleNamespace(stage_client=SimpleNamespace(custom_process_input_func=joyai_action_to_tts)),
-        ],
-        _stage_receives_async_chunks=lambda stage_id: False,
-    )
-    req_state = SimpleNamespace(
-        session_owned=True,
-        final_stage_id=2,
-        request_id="req-1",
-        prompt={"additional_information": {}},
-        streaming=SimpleNamespace(bridge_states={}, enabled=False),
-    )
-
-    def stage0(text: str, *, finished: bool = False) -> SimpleNamespace:
-        return SimpleNamespace(
-            request_id="req-1",
-            finished=finished,
-            outputs=[SimpleNamespace(text=text, cumulative_text=text if finished else None)],
-        )
-
-    first = plugin.plan_partial_stage_output(orchestrator, 0, 0, stage0("</response> 水开了。关"), req_state)
+    first = plugin.plan_partial_stage_output(orchestrator, 0, 0, _stage0_output("</response> 水开了。关"), req_state)
     assert first is not None
     assert plugin.partial_stage_followup(first, req_state) is None
     # Talker finished sentence 1 and parked with nothing queued.
     req_state.streaming.bridge_states["joyai_sentence_tts"]["talker_busy"] = False
 
     last = plugin.plan_partial_stage_output(
-        orchestrator, 0, 0, stage0("</response> 水开了。关火。", finished=True), req_state
+        orchestrator, 0, 0, _stage0_output("</response> 水开了。关火。", finished=True), req_state
     )
     assert last is not None
     assert "关火" in last.output.text
