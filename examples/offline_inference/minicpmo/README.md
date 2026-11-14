@@ -1,8 +1,9 @@
 # MiniCPM-o 4.5: Offline inference
 
-Two-stage pipeline: **thinker** (multimodal understanding) → **talker + Token2Wav**
-(24 kHz speech). Deploy config auto-loads from
-`vllm_omni/deploy/minicpmo_4_5.yaml` (2-GPU default).
+Three-stage pipeline: **Thinker** (multimodal understanding and text) →
+**Talker** (speech codes) → **Code2Wav** (24 kHz speech). Deploy config
+auto-loads from `vllm_omni/deploy/minicpmo_4_5.yaml` (all three stages on one
+GPU).
 
 ## Setup
 
@@ -25,10 +26,10 @@ bash run_single_prompt.sh
 bash run_multiple_prompts.sh
 ```
 
-### Thinker tensor parallel (3-GPU)
+### Three GPUs (one stage per GPU)
 
 ```bash
-bash run_single_prompt_tp.sh
+bash run_single_prompt_3gpu.sh
 ```
 
 ### Modality control
@@ -60,7 +61,7 @@ python end2end.py --query-type use_mixed_modalities \
 Supported `--query-type` values:
 
 | Query type | Inputs |
-|---|---|
+| --- | --- |
 | `text` | Text only |
 | `use_image` | Image + text |
 | `use_audio` | Audio + text |
@@ -83,7 +84,11 @@ python end2end.py --query-type text \
 - Output WAV is **24 kHz mono**.
 - Placeholders in the prompt are MiniCPM-style:
   `(<image>./</image>)`, `(<audio>./</audio>)`, `(<video>./</video>)`.
-- Default layout needs **2 GPUs**. Async chunking is off in the bundled YAMLs.
+- The default deploy puts all three stages on one GPU; `minicpmo_4_5_2gpu.yaml`
+  and `minicpmo_4_5_3gpu.yaml` spread them over two or three GPUs. Async
+  chunking is on in the bundled YAMLs.
+- `end2end.py` overrides only the Thinker's sampling params; the Talker and
+  Code2Wav keep the deploy defaults.
 
 ## Online serving
 
