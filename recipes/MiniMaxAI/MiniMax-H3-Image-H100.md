@@ -165,6 +165,11 @@ headroom on your host.
   two ranks and was faster on H200 (5.6 s against 8.6 s for rank-local).
   The text encoder must stay `rank-local`: under text-encoder TP its ranks
   hold different shards.
+- Selecting `text_encoder` for offload keeps its large BF16 text tower on CPU
+  during model initialization, including when online DiT quantization uses
+  the accelerator. The vision tower keeps its original initialization device
+  to preserve its fixed FP32 rotary frequencies. The configured offloader
+  still owns runtime transfers for both towers.
 - `layer_options.dit.resident_layers` above zero runs but is not qualified:
   24 resident blocks took about 15 s per step on H200, slower than streaming
   every block.
