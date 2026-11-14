@@ -83,6 +83,19 @@ RUN PYTHON_SITE=$(python3 -c 'import sysconfig; print(sysconfig.get_path("pureli
     --no-build-isolation-package lmcache --reinstall-package lmcache \
     -r requirements/cuda-bootstrap.txt "lmcache==0.5.6"
 RUN uv pip check --system && rm -rf /tmp/gradio-pillow13
+
+# Cache Spark's source-only codec with the CI dependency image. GPU jobs use
+# this immutable checkout without fetching code or installing packages.
+ARG SPARK_TTS_REVISION=2f1ea9082400547242641f5271b6f941c9f439d1
+ENV SPARK_TTS_SOURCE=/opt/spark-tts
+RUN git clone --quiet --filter=blob:none --no-checkout https://github.com/SparkAudio/Spark-TTS.git "${SPARK_TTS_SOURCE}" && \
+    git -C "${SPARK_TTS_SOURCE}" checkout --quiet --detach "${SPARK_TTS_REVISION}" && \
+    test "$(git -C "${SPARK_TTS_SOURCE}" rev-parse HEAD)" = "${SPARK_TTS_REVISION}" && \
+    uv pip install --system --no-deps "einops==0.8.2" "einx==0.4.3" "frozendict==2.5.1" \
+        "omegaconf==2.3.1" "soxr==1.1.0" && \
+    uv pip check --system && \
+    PYTHONPATH="${SPARK_TTS_SOURCE}" python3 -c 'from sparktts.models.bicodec import BiCodec'
+
 # cuDNN 9.24 causes the original Qwen-Image 2.1 pixel gate to fail under
 # Torch 2.14. Keep Torch's declared Python dependencies and load the verified
 # NVIDIA 9.25.1 wheel in a private target outside Python's import path.

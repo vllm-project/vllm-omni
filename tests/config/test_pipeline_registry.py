@@ -48,6 +48,16 @@ def test_minicpmo_kstep_is_on_by_default():
     assert not (repo_root / "vllm_omni/deploy/minicpmo_4_5_kstep.yaml").exists()
 
 
+def test_spark_tts_package_exports_match_registered_models():
+    from vllm_omni.model_executor.models import spark_tts
+    from vllm_omni.model_executor.models.registry import OmniModelRegistry
+    from vllm_omni.model_executor.models.spark_tts import SparkBiCodecDecoder, SparkQwen2ForCausalLM
+
+    for cls in (SparkQwen2ForCausalLM, SparkBiCodecDecoder):
+        assert cls.__name__ in spark_tts.__all__
+        assert OmniModelRegistry.models[cls.__name__].load_model_cls() is cls
+
+
 @pytest.mark.parametrize("topology,ports", [("eg", [50081]), ("egd", [50091, 50092])])
 @pytest.mark.parametrize("nixl", [False, True], ids=["shared_memory", "nixl"])
 def test_wan_deploy_transport_is_explicit_opt_in(topology, ports, nixl):

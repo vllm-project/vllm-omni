@@ -1829,6 +1829,10 @@ class BaseVllmOmniStageConfig:
         return self.stage_pipeline_config.model_stage
 
     @property
+    def shutdown_grace_s(self) -> float | None:
+        return self.stage_pipeline_config.shutdown_grace_s
+
+    @property
     def input_sources(self) -> list[int]:
         return list(self.stage_pipeline_config.input_sources)
 
