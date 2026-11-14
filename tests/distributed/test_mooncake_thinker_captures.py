@@ -10,7 +10,7 @@ import pytest
 import torch
 from safetensors.torch import save as save_tensors
 
-from vllm_omni.distributed.kv_transfer.mooncake.hs import (
+from vllm_omni.distributed.kv_transfer.mooncake.thinker_captures import (
     HSBlockSpec,
     RequestHS,
     decode_hs,

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Publish request-scoped Mooncake captures after MRv2's existing D2H copy.
+"""Model Runner V2 binding of Mooncake Thinker capture publication.
 
 The connector owns restored rows and save buffers. This bridge snapshots the
 step's token positions before sampling advances them, and rewrites the two
-Thinker capture fields before the ordinary Thinker-to-Talker handoff.
+Thinker capture fields before the ordinary Thinker-to-Talker handoff. It stays
+on the worker side because it reads ``req_states``, writes per-row output
+channels and needs ``is_warmup_request``.
 """
 
 from __future__ import annotations

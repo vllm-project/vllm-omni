@@ -54,7 +54,7 @@ from vllm_omni.distributed.kv_transfer.mooncake.connector import (
     PendingSave,
     cache_namespace,
 )
-from vllm_omni.distributed.kv_transfer.mooncake.hs import RequestHS, encode_hs, hs_key
+from vllm_omni.distributed.kv_transfer.mooncake.thinker_captures import RequestHS, encode_hs, hs_key
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

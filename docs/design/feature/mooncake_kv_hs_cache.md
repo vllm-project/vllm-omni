@@ -33,7 +33,7 @@ prompt positions: the input embeddings and the hidden states of
 | `OmniMooncakeStoreConnector`, scheduler role | Engine core | Lookup deadlines, recovery bypass, load-attempt tokens, cancellation notices |
 | `JointStoreWorker` | Worker rank 0 | Joint KV/HS lookup over the native lookup channel |
 | `OmniMooncakeStoreConnector`, worker role | Worker | HS reads and writes, staging budget, restored rows, receive completion |
-| `vllm_omni/worker_v2/mooncake.py` | Worker | Step snapshots and the Thinker capture rewrite before output publication |
+| `vllm_omni/worker_v2/mooncake_capture.py` | Worker | Step snapshots and the Thinker capture rewrite before output publication |
 
 ## Stored data and identity
 
@@ -237,9 +237,9 @@ block would find no Thinker rows.
 
 ## Validation
 
-CPU tests cover HS encoding and row assembly (`tests/distributed/test_mooncake_hs.py`),
+CPU tests cover HS encoding and row assembly (`tests/distributed/test_mooncake_thinker_captures.py`),
 the connector protocol (`tests/distributed/test_mooncake_connector.py`), the
-runner rewrite (`tests/worker_v2/test_mooncake.py`), and configuration
+runner rewrite (`tests/worker_v2/test_mooncake_capture.py`), and configuration
 (`tests/engine/test_map_offload_config.py`). The connector tests include a
 stalled lookup driven through the production AR scheduler and the pinned
 lookup client, saves waiting for KV on real worker threads, completion records

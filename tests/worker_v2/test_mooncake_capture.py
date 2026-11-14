@@ -14,7 +14,7 @@ from vllm.config import DeviceConfig, KVTransferConfig, VllmConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker_v2.mooncake import CaptureRequestContext, MooncakeOutputRewrite, snapshot_mooncake_output
+from vllm_omni.worker_v2.mooncake_capture import CaptureRequestContext, MooncakeOutputRewrite, snapshot_mooncake_output
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -244,7 +244,7 @@ def test_missing_attempt_is_rejected():
 
 
 def test_real_request_assembly_across_chunked_prefill_and_decode():
-    from vllm_omni.distributed.kv_transfer.mooncake.hs import RequestHS
+    from vllm_omni.distributed.kv_transfer.mooncake.thinker_captures import RequestHS
 
     state = RequestHS(prompt_tokens=8, block_size=4, max_bytes=1024)
     prefix = torch.arange(8, dtype=torch.float32).reshape(4, 2)

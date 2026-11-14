@@ -47,7 +47,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 
 from .config import MooncakeConfig
-from .hs import CaptureTensors, HSBlockSpec, RequestHS, decode_hs, encode_hs, hs_key, prefix_digest
+from .thinker_captures import CaptureTensors, HSBlockSpec, RequestHS, decode_hs, encode_hs, hs_key, prefix_digest
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig

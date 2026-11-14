@@ -41,7 +41,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
-from vllm_omni.worker_v2.mooncake import snapshot_mooncake_output
+from vllm_omni.worker_v2.mooncake_capture import snapshot_mooncake_output
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
