@@ -589,6 +589,7 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
     subsets = params.get(_OMNIINTERACT_AGGREGATE_SUBSETS)
     min_ia_qtf1 = params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
     passed = not _is_finite_number(min_ia_qtf1) or pooled.ia_qtf1 >= float(min_ia_qtf1)
+    max_concurrency = result.get("max_concurrency")
     write_dfx_accuracy_result(
         accuracy_path,
         test_name=str(result.get("test_name") or params.get(_OMNIINTERACT_AGGREGATE_GROUP) or ""),
@@ -608,7 +609,7 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
         },
         branch=str(result.get("branch") or os.environ.get("BUILDKITE_BRANCH", "")),
         num_prompts=pooled.num_prompts,
-        max_concurrency=int(result["max_concurrency"]) if isinstance(result.get("max_concurrency"), int) else None,
+        max_concurrency=max_concurrency if isinstance(max_concurrency, int) else None,
         benchmark_exit_code=0 if passed else 1,
         generation={
             "completed": pooled.completed,
@@ -842,6 +843,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         "duplex_eval_score_floor_hardware",
         "duplex_performance_only",
         "required_duplex_metrics",
+        "require_speculative_stage",
         "name",
         "enable_negative_prompt",
         "random_request_config",
@@ -941,6 +943,19 @@ def test_performance_benchmark(omni_server, benchmark_params):
                 assert_result(result, assert_params, num_prompt)
             finally:
                 _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
+        if (stage_id := params.get("require_speculative_stage")) is not None:
+            import httpx
+            from prometheus_client.parser import text_string_to_metric_families
+
+            response = httpx.get(f"http://{host}:{port}/metrics", timeout=10)
+            response.raise_for_status()
+            assert any(
+                sample.name == "vllm:spec_decode_num_accepted_tokens_total"
+                and sample.labels.get("stage") == str(stage_id)
+                and sample.value > 0
+                for family in text_string_to_metric_families(response.text)
+                for sample in family.samples
+            ), f"Stage {stage_id} accepted no speculative tokens"
     finally:
         if artifact_root is not None:
             artifact_root.cleanup()

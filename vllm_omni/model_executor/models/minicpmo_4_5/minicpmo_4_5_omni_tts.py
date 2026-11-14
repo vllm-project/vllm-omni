@@ -3107,10 +3107,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         head_logits_all = None
         if projection_rows:
             if len(projection_rows) == 1:
-                # Single-row projection: a Python slice of ``hidden`` avoids
-                # the implicit H2D copy and stream sync that building a
-                # device-side index tensor would trigger on NPU.
-                head_logits_all = self.head_code[0](hidden[projection_rows[0] : projection_rows[0] + 1]).float()
+                row = projection_rows[0]
+                head_logits_all = self.head_code[0](hidden[row : row + 1]).float()
             else:
                 frame_rows = torch.tensor(projection_rows, device=hidden.device, dtype=torch.long)
                 head_logits_all = self.head_code[0](hidden.index_select(0, frame_rows)).float()

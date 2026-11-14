@@ -268,6 +268,21 @@ class TestDeployTopology:
             expected_graph_config["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
         assert stages[2].yaml_engine_args["additional_config"] == expected_graph_config
 
+    @pytest.mark.parametrize(
+        ("filename", "devices"),
+        [("minicpmo_4_5.yaml", ["0", "0", "0"]), ("minicpmo_4_5_npu_2card.yaml", ["0", "0", "1"])],
+    )
+    def test_npu_default_keeps_mrv2_without_thinker_drafts(self, filename, devices, monkeypatch):
+        monkeypatch.setattr(current_omni_platform, "device_name", "npu")
+        monkeypatch.setattr(current_omni_platform, "device_type", "npu")
+        deploy = load_deploy_config(_DEPLOY_DIR / filename)
+        stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
+
+        assert [stage.yaml_runtime["devices"] for stage in stages] == devices
+        assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+        assert stages[0].yaml_engine_args.get("speculative_config") is None
+        assert stages[1].yaml_engine_args["speculative_config"]["method"] == "ngram"
+
     def test_pipeline_exposes_full_and_async_payload_hooks(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
         talker = pipeline.get_stage(1)

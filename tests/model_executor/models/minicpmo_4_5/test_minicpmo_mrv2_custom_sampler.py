@@ -87,7 +87,6 @@ def test_thinker_ngram_verifies_with_underlying_sampler(monkeypatch):
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2_sampling import MiniCPMO45DuplexSampler
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
 
-    monkeypatch.setenv("VLLM_OMNI_MRV2_NGRAM", "1")
     spec = SimpleNamespace(method="ngram")
     model = SimpleNamespace(
         model_stage="llm",

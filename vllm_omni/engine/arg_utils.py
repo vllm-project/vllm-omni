@@ -628,54 +628,6 @@ class OmniEngineArgs(EngineArgs):
                 shutil.rmtree(self._temp_config_dir, ignore_errors=True)
                 del self._temp_config_dir
 
-        # The per-stage runner override bypasses Ascend's Ngram fallback.
-        # Resolve only those two methods here. Other speculative methods keep
-        # the runner from the deploy config.
-        from vllm_omni.worker_v2.ngram_adapter import NGRAM_METHODS, spec_method
-
-        use_v2_model_runner = self.use_v2_model_runner
-        if (
-            use_v2_model_runner
-            and current_omni_platform.is_npu()
-            and spec_method(self.speculative_config) in NGRAM_METHODS
-        ):
-            from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
-                talker_kstep_frames,
-            )
-            from vllm_omni.worker_v2.ngram_adapter import (
-                MINICPMO_THINKER_ARCH,
-                resolve_use_v2_model_runner,
-            )
-
-            spec = self.speculative_config
-            kstep_frames = talker_kstep_frames(self.model_stage, spec)
-            use_v2_model_runner = resolve_use_v2_model_runner(
-                use_v2_model_runner=use_v2_model_runner,
-                is_npu=True,
-                speculative_config=spec,
-                kstep_frames=kstep_frames,
-                supports_scheduler_ngram=(
-                    self.model_stage == "llm"
-                    and (self.model_arch or model_config.architecture) == MINICPMO_THINKER_ARCH
-                    and self.async_scheduling is False
-                    and self.pipeline_parallel_size == 1
-                    and self.prefill_context_parallel_size == 1
-                    and self.decode_context_parallel_size == 1
-                    and self.kv_transfer_config is None
-                ),
-            )
-            if not use_v2_model_runner:
-                logger.warning(
-                    "Stage %s: %s speculation on NPU requires MRv1 for this configuration.",
-                    self.stage_id,
-                    spec_method(spec),
-                )
-            elif not kstep_frames:
-                logger.info(
-                    "Stage %s: keeping the MRv2 runner for ngram speculation via the V2 ngram speculator adapter.",
-                    self.stage_id,
-                )
-
         omni_config = OmniModelConfig.from_vllm_model_config(
             model_config=model_config,
             # All kwargs below are Omni specific
@@ -686,7 +638,7 @@ class OmniEngineArgs(EngineArgs):
             supports_pending_generation=self.supports_pending_generation,
             supports_running_prefix_cache_reset=self.supports_running_prefix_cache_reset,
             recompute_preemption=self.recompute_preemption,
-            use_v2_model_runner=use_v2_model_runner,
+            use_v2_model_runner=self.use_v2_model_runner,
             supports_native_mrv2_data_plane=self.supports_native_mrv2_data_plane,
             active_stream_window=self.active_stream_window,
             duplex_max_sessions=self.duplex_max_sessions,

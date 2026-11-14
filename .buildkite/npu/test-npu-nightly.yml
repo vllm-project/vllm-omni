@@ -143,7 +143,6 @@ steps:
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          VLLM_OMNI_MRV2_NGRAM: "1"
           HF_TOKEN: "${HF_TOKEN}"
         artifact_paths:
           - tests/dfx/perf/results/minicpmo-4-5-a3-2card/*.json
@@ -157,10 +156,6 @@ steps:
               --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_a3_2card.json \
               -m "full_model and omni and npu and A3 and cards_2" \
               --run-level full_model 2>&1 | tee "$$BENCHMARK_DIR/pytest.log"
-            if ! grep -Fq "MiniCPM-o Thinker MRv2 uses scheduler-side Ngram." "$$BENCHMARK_DIR/pytest.log"; then
-              echo "The MiniCPM-o Thinker did not start with MRv2 Ngram." >&2
-              exit 1
-            fi
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test (A2)"
         source_file_dependencies: omni_minicpmo_4_5_perf
         key: nightly-omni-performance-minicpmo-4-5-npu-a2

@@ -107,9 +107,7 @@ stages:
     # Thinker prefix caching stays off here: this profile serves duplex, whose
     # KV window refuses the cache (duplex/window_kv.py). minicpmo_4_5_turn.yaml
     # enables it for CUDA turn serving on both runners. Stage-0 n-gram
-    # speculation is enabled for NPU in the platform block below; the omni
-    # prefix cache refuses ngram next to enable_prefix_caching, so profiles
-    # that turn the cache on (turn serving) keep it off.
+    # speculation is opt-in on NPU and requires prefix caching disabled.
     enable_prefix_caching: false
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
@@ -225,8 +223,7 @@ platforms:
           stop_token_ids: [1]
 
   npu:
-    # Select MRv2 for NPU stages. The stage-0 Ngram runner is resolved
-    # against the installed Ascend and vLLM capabilities below.
+    # All three stages use MRv2.
     model_runner: v2
     stages:
       - stage_id: 0
@@ -266,16 +263,6 @@ platforms:
           # second graph set, so stage 0 keeps the decode-only graph. Stage 1
           # below already ships FULL_DECODE_ONLY with the K-step.
           cudagraph_mode: FULL_DECODE_ONLY
-        # Stage-0 n-gram speculation uses the V1 runner by default.
-        # VLLM_OMNI_MRV2_NGRAM=1 enables scheduler-side Ngram for ordinary
-        # greedy requests on the NPU MRv2 Thinker. The synchronous scheduler
-        # proposes from committed token history and MRv2 verifies on device.
-        async_scheduling: false
-        speculative_config:
-          method: ngram
-          num_speculative_tokens: 7
-          prompt_lookup_min: 1
-          prompt_lookup_max: 1
       - stage_id: 1
         # Concurrency cap raised from 4 to 8; the override block only covered
         # stages 0 and 2, so stage 1 kept the base value of 4.

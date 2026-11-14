@@ -19,13 +19,15 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.worker.gpu import model_runner as gpu_runner
+from vllm_ascend.worker.v2 import model_runner as ascend_runner
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
     MINICPMO_TALKER_FRAMES_MAX,
     talker_kstep_frames,
 )
-from vllm_omni.worker_v2.ngram_adapter import ngram_runner_scope, use_scheduler_ngram
+from vllm_omni.worker_v2.ngram_adapter import scheduler_ngram_factory, use_scheduler_ngram
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
@@ -33,6 +35,10 @@ if TYPE_CHECKING:
     from vllm_ascend.worker.v2.input_batch import AscendInputBuffers
 
 logger = init_logger(__name__)
+
+# Ascend constructs a speculator in each of the two runner constructors.
+gpu_runner.init_speculator = scheduler_ngram_factory(gpu_runner.init_speculator)
+ascend_runner.init_speculator = scheduler_ngram_factory(ascend_runner.init_speculator)
 
 
 def _call_without_unknown_kwargs(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -164,11 +170,7 @@ class NPUOmniV2RunnerMixin:
         _default_ascend_decode_graph_flag()
         _install_pcp_partition_stub()
         _install_v2_moe_comm_context()
-        # The ngram adapter needs the runner being built while Ascend's
-        # init_speculator runs (it has no runner argument). A no-op scope when
-        # VLLM_OMNI_MRV2_NGRAM is unset, so the default path is untouched.
-        with ngram_runner_scope(self):
-            super().__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def prepare_inputs(
         self,
@@ -270,8 +272,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
     def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc, num_active_loras=0):
         drafts = scheduler_output.scheduled_spec_decode_tokens
         if self._scheduler_ngram and drafts:
-            # The scheduler is the source of truth for these proposals. Upload
-            # one batch rather than one tensor per request.
+            # Upload the scheduler's drafts as one batch.
             draft_ids = np.zeros(self.req_states.draft_tokens.shape, dtype=np.int64)
             for req_id, tokens in drafts.items():
                 row = self.req_states.req_id_to_index[req_id]
@@ -280,8 +281,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         return super().prepare_inputs(scheduler_output, batch_req_state, batch_desc, num_active_loras)
 
     def _can_skip_spec_cpu_length_sync(self) -> bool:
-        # In synchronous scheduling update_requests has already installed the
-        # exact rejection-adjusted counts from the scheduler on the CPU.
+        # The synchronous scheduler already supplies rejection-adjusted lengths.
         return self._scheduler_ngram or super()._can_skip_spec_cpu_length_sync()
 
     def _kstep_active(self) -> bool:
@@ -450,8 +450,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
 
     def _propose_draft_tokens(self, input_batch, draft, num_sampled, num_rejected, mm_inputs):
         if self._scheduler_ngram:
-            # The synchronous engine calls back with the request IDs after
-            # it has applied this step's accepted tokens to their histories.
+            # Return request IDs so the scheduler can draft after committing this step.
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch, self.req_states.draft_tokens[: input_batch.num_reqs, :0]
             )
@@ -474,9 +473,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
     def initialize_kv_cache(self, kv_cache_config: Any, *args: Any, **kwargs: Any) -> None:
         spec = self.speculative_config
         if self._scheduler_ngram and not spec.uses_dynamic_speculative_decoding():
-            # Capture both one-token decode and full-width verification. The
-            # scheduler can emit a shorter draft or batch requests at different
-            # widths, which the normal graph dispatcher handles eagerly.
+            # Capture ordinary decode and full-width verification.
             spec.num_speculative_tokens_per_batch_size = [
                 (1, 1, 0),
                 (2, 2, self.num_speculative_steps),

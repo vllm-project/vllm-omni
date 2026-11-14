@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler, _reject_kstep_async_scheduling
+from vllm_omni.engine.serialization import serialize_additional_information
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -36,18 +37,14 @@ def test_async_scheduler_allows_unarmed_stage():
     _reject_kstep_async_scheduling(_Scheduler())
 
 
-@pytest.mark.parametrize(
-    ("scheduler_ngram", "native_duplex", "expected"),
-    [(True, False, [1, 2]), (True, True, []), (False, False, [1, 2, 3]), (False, True, [])],
-)
-def test_scheduler_ngram_trims_drafts_before_accounting(scheduler_ngram, native_duplex, expected):
+@pytest.mark.parametrize(("native_duplex", "expected"), [(False, [1, 2]), (True, [])])
+def test_scheduler_ngram_trims_drafts_before_accounting(native_duplex, expected):
     scheduler = object.__new__(OmniARScheduler)
-    scheduler._scheduler_ngram = object() if scheduler_ngram else None
     scheduler.requests = {
         "chat": SimpleNamespace(resumable=False),
         "duplex": SimpleNamespace(
             resumable=False,
-            additional_information={"duplex": {"data_plane": native_duplex}},
+            additional_information=serialize_additional_information({"duplex": {"data_plane": native_duplex}}),
         ),
     }
     output = SimpleNamespace(

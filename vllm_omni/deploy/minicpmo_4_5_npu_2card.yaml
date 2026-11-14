@@ -1,9 +1,4 @@
-# MiniCPM-o 4.5 NPU two-card layout: the thinker (stage 0) and the talker
-# (stage 1) share the first card, Code2Wav (stage 2) owns the second. Stage-0
-# n-gram speculation, sizing and graph modes are inherited from
-# minicpmo_4_5.yaml. Launch with ASCEND_RT_VISIBLE_DEVICES listing exactly two
-# cards. minicpmo_4_5_2gpu.yaml instead keeps the Thinker on its own
-# device and colocates Talker and Code2Wav.
+# Thinker and Talker share the first NPU. Code2Wav uses the second.
 base_config: minicpmo_4_5.yaml
 pipeline: minicpmo_4_5
 
@@ -14,16 +9,6 @@ stages:
     devices: "0"
   - stage_id: 2
     devices: "1"
-
-platforms:
-  npu:
-    stages:
-      - stage_id: 0
-        devices: "0"
-      - stage_id: 1
-        devices: "0"
-      - stage_id: 2
-        devices: "1"
 
 connectors:
   connector_of_shared_memory:

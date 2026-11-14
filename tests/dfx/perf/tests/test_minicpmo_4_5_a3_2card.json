@@ -1,7 +1,7 @@
 [
   {
     "test_name": "test_minicpmo_4_5_a3_2card",
-    "description": "Five-tier Seed-TTS EN sweep for the A3 two-card deployment with MRv2 Thinker Ngram. Collect metrics before setting a two-card A3 baseline.",
+    "description": "Five-tier Seed-TTS EN sweep for A3 two-card MRv2 Thinker Ngram.",
     "mark": [
       {
         "hardware_marks": {
@@ -23,7 +23,10 @@
         "--stage-init-timeout",
         "1200",
         "--init-timeout",
-        "1500"
+        "1500",
+        "--stage-overrides",
+        "{\"0\":{\"async_scheduling\":false,\"speculative_config\":{\"method\":\"ngram\",\"num_speculative_tokens\":7,\"prompt_lookup_min\":1,\"prompt_lookup_max\":1}}}",
+        "--log-stats"
       ]
     },
     "benchmark_params": [
@@ -60,7 +63,8 @@
             "use_tts_template": true
           }
         },
-        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "require_speculative_stage": 0
       }
     ]
   }
