@@ -82,6 +82,12 @@ last_verified_commit: 3d7fc3b9ba3cac88d579d4dc35b78b0b641675fc
 Entrypoints translate offline, CLI, and serving requests into stable engine
 operations and translate engine outputs into public responses.
 
+`AsyncOmni` explicitly rejects the process checkpoint methods exposed by newer
+vLLM `EngineClient` versions (`checkpoint_prepare`, `checkpoint_restore`, and
+`checkpoint_state`). This keeps ordinary serving instantiable without claiming
+checkpoint support. All three raise `NotImplementedError` before accessing or
+changing stage state; sleep and weight-transfer APIs retain their own contracts.
+
 ## Contract status
 
 This document describes current entrypoint responsibilities plus the boundary

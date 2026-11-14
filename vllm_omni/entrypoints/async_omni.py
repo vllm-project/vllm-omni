@@ -17,7 +17,7 @@ import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import anyio
 import msgspec
@@ -1587,6 +1587,18 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         if stage_ids is not None:
             return bool(self._sleeping_tags_for_stages(stage_ids))
         return bool(getattr(self, "_sleeping_tags", None))
+
+    async def checkpoint_prepare(self, mode: PauseMode = "wait") -> NoReturn:
+        """Reject process checkpointing without draining or modifying stages."""
+        raise NotImplementedError("AsyncOmni does not support process checkpointing.")
+
+    async def checkpoint_restore(self) -> NoReturn:
+        """Keep the checkpoint interface concrete for newer vLLM EngineClient."""
+        raise NotImplementedError("AsyncOmni does not support process checkpointing.")
+
+    async def checkpoint_state(self) -> NoReturn:
+        """Do not report a checkpoint lifecycle state that Omni does not own."""
+        raise NotImplementedError("AsyncOmni does not support process checkpointing.")
 
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into all stages.
