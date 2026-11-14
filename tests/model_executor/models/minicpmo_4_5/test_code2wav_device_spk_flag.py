@@ -418,24 +418,81 @@ def test_device_spk_false_overrides_cpu_reference_speaker(tmp_path, monkeypatch)
     assert token2wav.device_spk_calls == 0
 
 
-@pytest.mark.parametrize(
-    "extra,env",
-    [({"token2wav_trt": True}, None), ({}, "1")],
-)
-def test_full_dit_trt_overrides_cpu_reference_speaker(tmp_path, monkeypatch, extra, env):
-    """MINICPMO_TOKEN2WAV_TRT and token2wav_trt keep the full DiT TensorRT path."""
-    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
-    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
-    if env is None:
-        monkeypatch.delenv("MINICPMO_TOKEN2WAV_TRT", raising=False)
-    else:
-        monkeypatch.setenv("MINICPMO_TOKEN2WAV_TRT", env)
+def _record_dit_trt_builds(monkeypatch) -> list[dict]:
+    """Replace the TensorRT engine builder with a recorder of its keyword arguments."""
     from vllm_omni.model_executor.models.step_audio2 import step_audio2_dit_trt
 
-    monkeypatch.setattr(step_audio2_dit_trt, "build_dit_trt_stepper", lambda *args, **kwargs: object())
+    builds: list[dict] = []
+
+    def _fake_build(*args, **kwargs):
+        builds.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(step_audio2_dit_trt, "build_dit_trt_stepper", _fake_build)
+    return builds
+
+
+@pytest.fixture
+def cuda_platform_without_trt_env(monkeypatch):
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    for name in ("MINICPMO_TOKEN2WAV_TRT", "MINICPMO_TOKEN2WAV_TRT_DTYPE", "MINICPMO_TOKEN2WAV_TRT_CACHE"):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.parametrize(
+    "extra,env,expect_trt",
+    [
+        pytest.param({"token2wav_trt": True}, None, True, id="key-true"),
+        pytest.param({}, "1", True, id="env-only"),
+        pytest.param({"token2wav_trt": False}, "1", False, id="key-false-beats-env"),
+    ],
+)
+def test_full_dit_trt_overrides_cpu_reference_speaker(
+    tmp_path, monkeypatch, cuda_platform_without_trt_env, extra, env, expect_trt
+):
+    """token2wav_trt selects full DiT TensorRT; the legacy env var counts only while it is unset (#6232)."""
+    if env is not None:
+        monkeypatch.setenv("MINICPMO_TOKEN2WAV_TRT", env)
+    builds = _record_dit_trt_builds(monkeypatch)
     _, token2wav = _build_backend(tmp_path, monkeypatch, {"token2wav_spk_cpu_reference": True, **extra})
+    assert len(builds) == int(expect_trt)
+    # Without full DiT TensorRT the default CPU-reference speaker engine is used.
     assert token2wav.trt_spk_calls == 1
-    assert token2wav.trt_cpu_reference is False
+    assert token2wav.trt_cpu_reference is (not expect_trt)
+
+
+@pytest.mark.parametrize(
+    "extra,expected_dtype,expected_cache",
+    [
+        pytest.param({}, torch.float16, None, id="defaults"),
+        pytest.param(
+            {"token2wav_trt_dtype": "FP32", "token2wav_trt_cache_dir": "/keys/cache"},
+            torch.float32,
+            "/keys/cache",
+            id="keys",
+        ),
+    ],
+)
+def test_full_dit_trt_dtype_and_cache_dir_reach_engine_builder(
+    tmp_path, monkeypatch, cuda_platform_without_trt_env, extra, expected_dtype, expected_cache
+):
+    builds = _record_dit_trt_builds(monkeypatch)
+    _build_backend(tmp_path, monkeypatch, {"token2wav_trt": True, **extra})
+    assert len(builds) == 1
+    assert builds[0]["dtype"] is expected_dtype
+    assert builds[0]["cache_dir"] == expected_cache
+
+
+@pytest.mark.parametrize("platform", ["cuda", "npu"])
+def test_invalid_token2wav_trt_dtype_fails_at_startup(tmp_path, monkeypatch, cuda_platform_without_trt_env, platform):
+    """A dtype typo in a stage key fails on every platform instead of silently selecting fp16."""
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: platform == "cuda")
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: platform == "npu")
+    builds = _record_dit_trt_builds(monkeypatch)
+    with pytest.raises(ValueError, match="token2wav_trt_dtype must be one of"):
+        _build_backend(tmp_path, monkeypatch, {"token2wav_trt": True, "token2wav_trt_dtype": "bf16"})
+    assert builds == []
 
 
 def test_cpu_reference_speaker_falls_back_without_tensorrt(tmp_path, monkeypatch):

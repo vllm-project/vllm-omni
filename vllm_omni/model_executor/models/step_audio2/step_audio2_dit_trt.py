@@ -38,8 +38,6 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_TRT_CACHE_ENV = "MINICPMO_TOKEN2WAV_TRT_CACHE"
-
 
 def _publish_atomically(
     path: Path,
@@ -376,9 +374,6 @@ class TrtDiTStepper:
 
 
 def _default_cache_dir() -> Path:
-    env = os.environ.get(_TRT_CACHE_ENV, "").strip()
-    if env:
-        return Path(env)
     hf_home = os.environ.get("HF_HOME", "").strip()
     base = Path(hf_home) if hf_home else Path.home() / ".cache" / "huggingface"
     return base / "vllm_omni" / "token2wav_trt"
@@ -394,8 +389,8 @@ def build_dit_trt_stepper(
 ) -> TrtDiTStepper:
     """Export (if needed), build (if needed) and load the DiT TRT engine.
 
-    Artifacts are cached under ``cache_dir`` (default: ``$MINICPMO_TOKEN2WAV_TRT_CACHE``
-    or ``$HF_HOME/vllm_omni/token2wav_trt``), keyed by dtype/batch/TRT
+    Artifacts are cached under ``cache_dir`` (default:
+    ``$HF_HOME/vllm_omni/token2wav_trt``), keyed by dtype/batch/TRT
     version/GPU architecture — serialized plans are SM-specific, so a cache
     shared across heterogeneous machines must not reuse another arch's plan.
     """
