@@ -97,8 +97,19 @@ def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("disable_compression", "uvicorn_kwargs", "expected_kwargs"),
+    [
+        (False, {}, {}),
+        (False, {"ws_per_message_deflate": True}, {"ws_per_message_deflate": True}),
+        (False, {"ws_per_message_deflate": False}, {"ws_per_message_deflate": False}),
+        (True, {"ws_per_message_deflate": True}, {"ws_per_message_deflate": False}),
+    ],
+)
 @pytest.mark.parametrize("tracing_mode", ["enabled", "disabled", "no-engine", "no-provider"])
-async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracing_mode):
+async def test_omni_run_server_worker_forwards_client_config(
+    monkeypatch, tracing_mode, disable_compression, uvicorn_kwargs, expected_kwargs
+):
     import httpx
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -120,7 +131,6 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracin
         return capture_trace_headers()
 
     app.middleware_stack = app.build_middleware_stack()
-
     captured: dict[str, object] = {}
 
     @asynccontextmanager
@@ -145,7 +155,7 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracin
 
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
 
-    async def fake_serve_http(app, **_kwargs):
+    async def fake_serve_http(app, **kwargs):
         assert app.state.api_server_count == 2
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
             for sampled in ("01", "00"):
@@ -163,16 +173,18 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracin
                     assert carrier["tracestate"] == "vendor=state"
                 else:
                     assert carrier == {}
+        actual = {key: value for key, value in kwargs.items() if key == "ws_per_message_deflate"}
+        assert actual == expected_kwargs
         task = asyncio.create_task(asyncio.sleep(0))
         await asyncio.sleep(0)
         return task
 
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
 
-    args = _minimal_args(model="dummy")
+    args = _minimal_args(model="dummy", disable_websocket_compression=disable_compression)
     config = {"client_count": 2, "client_index": 1, "stage_addresses": {}}
 
-    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config)
+    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config, **uvicorn_kwargs)
     assert captured["client_config"] is config
     spans = exporter.get_finished_spans()
     assert len(spans) == int(tracing_enabled)
