@@ -155,6 +155,13 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     # the mounted cache. It carries no XPU marker, so skip the file outright.
     ignore=(--ignore tests/e2e/offline_inference/test_cosyvoice3_expansion.py)
 
+    # core_model, but each case starts an engine on a real checkpoint: 507s for
+    # 4 nodes and 142s for 1. They carry no signal the kernel tests do not, so
+    # the blocking lane leaves them to the broad scope.
+    pr_ignore=(--ignore tests/diffusion/batching
+               --ignore tests/diffusion/cache/test_teacache.py)
+    [ "${XPU_TEST_SCOPE:-pr}" = "broad" ] && pr_ignore=()
+
     rc=0
     # stage <name> <budget> <pytest args...>
     stage() {
@@ -174,7 +181,7 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
 
     # core_model excludes omni: the async-omni tests carry both markers and
     # would otherwise run twice, and they need their own process (broad scope).
-    stage "core_model" 30m "${paths[@]}" "${ignore[@]}" \
+    stage "core_model" 30m "${paths[@]}" "${ignore[@]}" "${pr_ignore[@]}" \
         -m "core_model and not omni and xpu and B60 and cards_1" --run-level core_model
     stage "mxfp8 config" 2m tests/diffusion/quantization/test_mxfp8_config.py
 
