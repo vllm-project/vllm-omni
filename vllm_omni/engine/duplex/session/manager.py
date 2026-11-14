@@ -29,7 +29,7 @@ from opentelemetry import trace
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.commands import AppendAudio, Commit, DuplexCommand
-from vllm_omni.engine.duplex.config import apply_session_stats_capability
+from vllm_omni.engine.duplex.config import apply_input_clock_capabilities, apply_session_stats_capability
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexStagePort,
@@ -637,8 +637,9 @@ class DuplexSessionManager:
             except ValueError as exc:
                 raise DuplexRuntimeConfigError(str(exc)) from exc
             collect_stats = bool(getattr(self.runtime_config, "collect_stats", False))
-            capabilities = apply_session_stats_capability(
-                self.plugin.capabilities(max_sessions=max_sessions), collect_stats
+            capabilities = apply_input_clock_capabilities(
+                apply_session_stats_capability(self.plugin.capabilities(max_sessions=max_sessions), collect_stats),
+                config.extra_body,
             )
             session = DuplexEngineSession(
                 session_id=session_id,

@@ -501,7 +501,11 @@ class DuplexModelPlugin(ABC):
     #: Paths that submit to Stage 0 for something other than a model unit break
     #: that count too, so a plugin that routes committed input through an input
     #: transcription request, or resumes the model on a tool result, does not
-    #: opt in until those submissions are accounted for.
+    #: opt in until those submissions are accounted for. Likewise a submission
+    #: no client input makes (the remainder of a split committed input, a held
+    #: listen-only prefix, an item command's internal payload) is created after
+    #: its input's acknowledgement was fixed and is reported with the next
+    #: client input; a plugin that relies on those paths does not opt in yet.
     supports_input_clock: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
@@ -790,7 +794,7 @@ class DuplexModelPlugin(ABC):
     def unit_output_complete(
         self,
         *,
-        unit: DuplexUnitOutputs | None,
+        unit: DuplexUnitOutputs,
         final_stage_id: int,
         new_output: object | None,
         new_context: DuplexOutputContext | None,
@@ -805,8 +809,7 @@ class DuplexModelPlugin(ABC):
         later speaking unit), after the segment end of the stage just before
         the final stage, and, once a unit completed, again for the next one
         with no new output (so one output may complete several units). The
-        engine only calls it with a speaking unit (``unit`` is never None; the
-        type keeps ``None`` for compatibility).
+        engine only calls it with a speaking unit.
 
         The engine keeps no output history: a plugin that needs more than the
         flags of ``unit`` keeps it in ``state``, a dict it owns for the current
@@ -836,7 +839,7 @@ class DuplexModelPlugin(ABC):
         request instead is future work.
         """
         del final_stage_id, new_output, new_context, state, runtime_config
-        return unit is not None and unit.final_segment_finished
+        return unit.final_segment_finished
 
     # ---- session policy (was ServingRuntimeAdapter) ----
 

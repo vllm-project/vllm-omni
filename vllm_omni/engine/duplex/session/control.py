@@ -48,6 +48,10 @@ from vllm_omni.protocol.duplex.events import error_event
 logger = init_logger(__name__)
 
 
+class TurnDetectionAudioError(ValueError):
+    """Turn detection could not read an append's audio: the runner refuses the append (``bad_audio``)."""
+
+
 class SessionControl:
     """Server VAD and the control events that reconfigure one session."""
 
@@ -144,8 +148,10 @@ class SessionControl:
             self._detector = None
             return [(event, None)]
         except ValueError as exc:
-            self._out.emit_error("bad_audio", str(exc))
-            return []
+            # The runner refuses the append (error ``bad_audio`` with the
+            # client's event id; an input-clocked session also acknowledges it
+            # as rejected), like audio that failed to decode.
+            raise TurnDetectionAudioError(str(exc)) from exc
         detected: list[tuple[dict[str, object], TurnDetectionResult | None]] = []
         for index, segment in enumerate(segments):
             payload = dict(event, audio=segment.audio, format="pcm_f32le", sample_rate_hz=16000)

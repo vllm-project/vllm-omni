@@ -64,7 +64,7 @@ class _FrameCoveragePlugin(_DefaultHooksPlugin):
     def unit_output_complete(
         self,
         *,
-        unit: DuplexUnitOutputs | None,
+        unit: DuplexUnitOutputs,
         final_stage_id: int,
         new_output: object | None,
         new_context: DuplexOutputContext | None,
@@ -356,7 +356,7 @@ def test_upstream_segment_ends_are_credited_to_the_speaking_units_in_order() -> 
     class _NeedsUpstream(_DefaultHooksPlugin):
         def unit_output_complete(self, *, unit, final_stage_id, new_output, new_context, state, runtime_config):
             del final_stage_id, new_output, new_context, state, runtime_config
-            return unit is not None and unit.upstream_segment_finished and unit.final_segment_finished
+            return unit.upstream_segment_finished and unit.final_segment_finished
 
     clock, sent = _clock(_plugin(_NeedsUpstream))
     _append(clock)
@@ -914,7 +914,7 @@ def test_later_stage_progress_that_overtakes_its_stage0_segment_end_is_held_for_
     class _NeedsUpstream(_DefaultHooksPlugin):
         def unit_output_complete(self, *, unit, final_stage_id, new_output, new_context, state, runtime_config):
             del final_stage_id, new_output, new_context, state, runtime_config
-            return unit is not None and unit.upstream_segment_finished and unit.final_segment_finished
+            return unit.upstream_segment_finished and unit.final_segment_finished
 
     clock, sent = _clock(_plugin(_NeedsUpstream))
     _append(clock)
@@ -933,7 +933,7 @@ def test_later_stage_progress_that_overtakes_its_stage0_segment_end_is_held_for_
 class _NeedsUpstreamAndFinal(_DefaultHooksPlugin):
     def unit_output_complete(self, *, unit, final_stage_id, new_output, new_context, state, runtime_config):
         del final_stage_id, new_output, new_context, state, runtime_config
-        return unit is not None and unit.upstream_segment_finished and unit.final_segment_finished
+        return unit.upstream_segment_finished and unit.final_segment_finished
 
 
 def test_final_segment_ends_ahead_of_upstream_ones_go_to_their_own_units() -> None:
@@ -1119,3 +1119,76 @@ def test_an_input_refused_after_part_of_it_was_handled_keeps_that_part_counted()
         (1, 1000, "rejected", "input_backpressure"),
         (2, 1200, None, None),
     ]
+
+
+def test_handled_audio_never_exceeds_the_inputs_audio() -> None:
+    """``note_input_handled`` past the input's own audio (a padded segment) keeps at most what the input added."""
+    clock, sent = _clock()
+    ack = _begin(clock, APPEND)
+    clock.note_input_audio(ack, samples=16000, sample_rate_hz=16000)
+    clock.note_input_handled(ack, samples=32000, sample_rate_hz=16000)
+    clock.refuse_input(ack, "input_backpressure")
+    clock.end_input(ack)
+    _append(clock, ms=200, units=0)
+
+    assert [(e.audio_end_ms, e.decision) for e in sent] == [(1000, "rejected"), (1200, None)]
+
+
+def test_a_reserved_turn_a_cancel_released_is_not_submittable_by_the_end_of_a_response() -> None:
+    """Its commit was acknowledged as cancelled: a late promotion must not take the settled slot."""
+    clock, sent = _clock()
+    ack = _begin(clock, COMMIT)
+    clock.reserve_unit("turn-a")
+    clock.end_input(ack)
+    assert clock.turn_submittable("turn-a") is True
+
+    clock.release_placeholder("turn-a", "output_audio_buffer_clear")
+
+    assert _decisions(sent) == [[("cancelled", "output_audio_buffer_clear")]]
+    assert clock.turn_submittable("turn-a") is False, "unlike a slot settled by a timeout"
+    assert clock.turn_submittable("turn-b") is False
+
+
+def test_a_reserved_turn_settled_by_a_timeout_stays_submittable() -> None:
+    now = [0.0]
+    clock, sent = _clock(now=now)
+    clock.reserve_unit("turn-a")
+    clock.end_input(_begin(clock, COMMIT))
+    now[0] = DEFAULT_UNIT_TIMEOUT_S
+    assert clock.expire() is True and _decisions(sent) == [[("timed_out", "no_progress")]]
+
+    assert clock.turn_submittable("turn-a") is True
+
+
+def test_output_of_a_cancelled_epoch_does_not_reset_the_liveness_valve() -> None:
+    """A cancelled request still draining must not keep the live epoch's units from timing out."""
+    now = [0.0]
+    clock, sent = _clock(now=now)
+    _append(clock)
+    clock.cancel_open("client_cancelled", before_epoch=1)
+    assert _decisions(sent) == [[("cancelled", "client_cancelled")]]
+    _append(clock, epoch=1)
+    for second in range(1, int(DEFAULT_UNIT_TIMEOUT_S)):
+        now[0] = float(second)
+        clock.note_progress(0)  # the cancelled epoch's output, dropped by the session
+    now[0] = DEFAULT_UNIT_TIMEOUT_S
+
+    assert clock.expire() is True
+    assert _decisions(sent)[-1] == [("timed_out", "no_progress")]
+
+
+def test_a_maximum_age_settlement_does_not_restart_the_liveness_window() -> None:
+    """Only the valve firing restarts its window; the next no-progress check is not pushed out by ``max_age``."""
+    now = [0.0]
+    clock, sent = _clock(now=now)
+    _append(clock)
+    _progress(clock, stage_id=0)  # speaking
+    now[0] = DEFAULT_UNIT_MAX_AGE_S - 1.0
+    clock.note_progress()
+    _append(clock)  # a second unit, open behind the first
+    now[0] = DEFAULT_UNIT_MAX_AGE_S
+    assert clock.expire() is True and _decisions(sent)[-1] == [("timed_out", "max_age")]
+
+    now[0] = DEFAULT_UNIT_MAX_AGE_S - 1.0 + DEFAULT_UNIT_TIMEOUT_S
+    assert clock.expire() is True, "no progress since the last output, whatever the max_age settlement"
+    assert _decisions(sent)[-1] == [("timed_out", "no_progress")]

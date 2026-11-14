@@ -265,9 +265,9 @@ vllm_omni/
 │       ├── __init__.py              re-exports the Tier 1 helper functions (audio, formats,
 │       │                            items, session, capabilities) so the engine never
 │       │                            imports protocol/realtime directly
-│       ├── events.py                the whole 43-event vocabulary: 21 Tier-1 re-exports,
+│       ├── events.py                the whole 44-event vocabulary: 21 Tier-1 re-exports,
 │       │                            9 Tier-2 subclasses (session.created + resume_token, ...),
-│       │                            13 Tier-3 events (listen/speak, playback, resume, ...);
+│       │                            14 Tier-3 events (listen/speak, playback, resume, ...);
 │       │                            DuplexEvent = RealtimeEvent
 │       ├── commands.py              the whole 17-command vocabulary: 8 Tier-1 re-exports,
 │       │                            2 Tier-2 subclasses (append + hints, commit + final),
@@ -800,11 +800,12 @@ What a plugin must guarantee before it opts in:
   different units do not interleave (each unit's audio ends with its own
   segment end before the next unit's begins). A model whose final stage
   streams across unit boundaries must override it. Turns never overlap in
-  an input-clocked session: the runner does not open the concurrent-turn
-  gate (`supports_concurrent_turn_requests`) for it, so a commit during a
-  response waits for that response (the deferred-turn path), because the
-  clock credits outputs to the speaking units in order. Crediting by
-  request, which would let turns overlap, is future work.
+  an input-clocked session: the session is created without
+  `supports_concurrent_turn_requests` (`apply_input_clock_capabilities`)
+  and the runner does not open the concurrent-turn gate for it, so a commit
+  during a response waits for that response (the deferred-turn path),
+  because the clock credits outputs to the speaking units in order.
+  Crediting by request, which would let turns overlap, is future work.
 - A unit is complete when everything the model emits for it has been
   emitted. A final stage that synthesises the end of a unit's output only
   together with later units' input (e.g. a vocoder lookahead, or a codec

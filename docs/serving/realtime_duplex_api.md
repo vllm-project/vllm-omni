@@ -1096,8 +1096,8 @@ session) gives that contract:
   input and before the input's own.
   (Units are acknowledged in order, so an acknowledgement can also cover
   output of earlier inputs that was still pending. Events no input caused —
-  errors for other commands, session lifecycle events, the turn of a server
-  VAD commit — are not bracketed.) A client that sends one input, waits for
+  errors for other commands, session lifecycle events — are not bracketed.)
+  A client that sends one input, waits for
   its acknowledgement, and repeats, gets the same event sequence whatever
   its pacing, given deterministic sampling and the same concurrent load on
   the server: which other sessions share a batch changes the model's
@@ -1178,7 +1178,14 @@ Input clocking is available only for models whose plugin declares it
 model's real unit boundaries to know when a unit's output is complete. On any
 other model, a session with `clock: "input"` is refused with error
 `input_clock_unsupported` — at session creation, or on a `session.update`
-that sets it.
+that sets it. No model shipped with vLLM-Omni declares it yet: the option is
+for plugins that opt in once their unit boundaries are mapped (see
+*Input-clocked sessions* in the model's entry when it does).
+
+An input-clocked session never overlaps turns: a commit during a response
+waits for that response, also on a model that otherwise runs concurrent turn
+requests, and the session's advertised
+`capabilities.supports_concurrent_turn_requests` is `false` accordingly.
 
 ##### Acknowledgement contract
 
@@ -1291,9 +1298,11 @@ that sets it.
   event. (An engine shutdown sends no events at all. A session closed for
   `output_backpressure` suppresses ordinary events, this acknowledgement
   included; see [Output limits and slow consumers](#output-limits-and-slow-consumers).)
-- **Server VAD.** With server VAD turn detection the commit the server
-  derives is not a client input, so its response is reported with the next
-  acknowledged input; drive turns with explicit commits instead.
+- **Server VAD.** With server VAD turn detection in a committing session,
+  the commit the server derives at a detected turn end is handled inside
+  the append that carried it, so that append's acknowledgement waits for
+  the committed turn like any unit the append submitted (its `units` lists
+  the turn). In an auto-responding session server VAD derives no commit.
 
 ##### Timeouts
 

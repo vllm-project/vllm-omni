@@ -28,7 +28,7 @@ from tests.engine.duplex.test_session_runner import (
     types,
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.duplex.config import DuplexSessionConfig
+from vllm_omni.engine.duplex.config import DuplexPlaybackCommitPolicy, DuplexSessionConfig
 from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage, ResumeDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexUnitDecision
 from vllm_omni.engine.duplex.session import runner as runner_module
@@ -1615,3 +1615,282 @@ def test_an_input_clocked_session_gets_the_default_idle_window() -> None:
     assert explicit.idle_timeout_s == 30.0
     assert DuplexSessionConfig.from_realtime({"extra_body": {"clock": "input"}}).idle_timeout_s == 300.0
     assert DuplexSessionConfig.from_event({"session": {"extra_body": {"clock": "input"}}}).idle_timeout_s == 300.0
+
+
+# ---- review follow-ups -------------------------------------------------------
+
+
+class _UnreadableAudioDetector:
+    """A detector that cannot read the append's audio (the batcher raises what it raises)."""
+
+    def segment_steps(self, base64_audio, *, fmt, sample_rate_hz):
+        del base64_audio, fmt, sample_rate_hz
+        raise ValueError("audio is not a whole number of frames")
+        yield  # pragma: no cover - a generator, like the real detector's steps
+
+    def reset(self) -> None:
+        pass
+
+
+class _ResettingSplitDetector(_SplitDetector):
+    def __init__(self) -> None:
+        self.resets = 0
+
+    def reset(self) -> None:
+        self.resets += 1
+
+
+@pytest.mark.parametrize("clocked", [True, False], ids=["input-clocked", "wall-clock"])
+@pytest.mark.usefixtures("input_clock_model")
+async def test_an_append_turn_detection_cannot_read_is_refused_like_undecodable_audio(clocked: bool) -> None:
+    """``bad_audio`` from turn detection names the client's event; the clock counts none of the audio."""
+    h = await open_harness(auto_response=False, extra_body=INPUT_CLOCK if clocked else None)
+    h.runner.control._detector = _UnreadableAudioDetector()
+    try:
+        events = await h.run(append_audio(samples=3200, event_id="evt-vad"))
+
+        assert [(e.code, e.related_event_id) for e in events if e.type == "error"] == [("bad_audio", "evt-vad")]
+        assert h.session.pending_input_bytes == 0 and not h.runner.model_state.audio_buffer.has_pending()
+        if clocked:
+            (ack,) = _acks(events)
+            assert (ack.decision, ack.reason, ack.audio_end_ms) == ("rejected", "bad_audio", 0)
+        else:
+            assert _acks(events) == []
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_an_append_refused_from_its_first_vad_segment_keeps_nothing_and_tries_no_later_segment() -> None:
+    """The kept audio must be a prefix: the second segment would fit, but is not tried; the detector forgets both."""
+    h = await open_harness(
+        auto_response=False,
+        extra_body=INPUT_CLOCK,
+        runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=60_000),
+    )
+    detector = h.runner.control._detector = _ResettingSplitDetector()  # 64 000 + 32 000 decoded bytes
+    try:
+        # pcm16: 48 000 wire bytes pass admission; the first decoded segment does not.
+        events = await h.run(append_audio(samples=24_000, event_id="evt-first", audio_format="pcm16"))
+
+        assert [(e.code, e.related_event_id) for e in events if e.type == "error"] == [
+            ("input_backpressure", "evt-first")
+        ]
+        (ack,) = _acks(events)
+        assert (ack.decision, ack.reason, ack.audio_end_ms) == ("rejected", "input_backpressure", 0)
+        assert h.session.pending_input_bytes == 0 and not h.runner.model_state.audio_buffer.has_pending()
+        assert detector.resets == 1, "the refused audio is scored again when the client resends it"
+
+        (ack,) = _acks(await h.run(append_audio(samples=3200)))
+        assert (ack.input_index, ack.audio_end_ms) == (2, 200)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_closing_with_nothing_owed_adds_no_acknowledgement() -> None:
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+        assert [a.input_index for a in _acks(await h.run(append_audio(samples=3200)))] == [1]
+
+        events = await h.run(commands.CloseSession())
+
+        assert types(events) == ["session.closed"]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("clocked", [True, False], ids=["input-clocked", "wall-clock"])
+@pytest.mark.usefixtures("input_clock_model")
+async def test_an_input_clocked_session_does_not_advertise_concurrent_turn_requests(
+    monkeypatch: pytest.MonkeyPatch, clocked: bool
+) -> None:
+    """The advertised capability says what the session does: a commit during a response waits for it."""
+    capabilities = MiniCPMO45DuplexPlugin.capabilities
+    monkeypatch.setattr(
+        MiniCPMO45DuplexPlugin,
+        "capabilities",
+        lambda self, **kw: replace(capabilities(self, **kw), supports_concurrent_turn_requests=True),
+    )
+    h = await open_harness(extra_body=INPUT_CLOCK if clocked else None)
+    try:
+        assert h.session.capabilities.supports_concurrent_turn_requests is (not clocked)
+        assert h.session.as_public_dict()["capabilities"]["supports_concurrent_turn_requests"] is (not clocked)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_cancel_between_the_responses_end_and_the_deferred_turns_promotion_does_not_submit_it() -> None:
+    """``response.done`` queues the deferred turn's promotion on the mailbox; a cancel already queued behind that
+    output runs first. The client is still playing the response, so the ``output_audio_buffer.clear`` advances
+    the epoch, releases the turn's slot and acknowledges its commit as ``cancelled``. The promotion must then
+    not submit the turn: its response would stream behind an acknowledgement that said it was cancelled, and no
+    later acknowledgement would cover it. The kept audio waits for the client's next ``response.create``.
+    """
+    h = await open_harness(auto_response=False, extra_body=INPUT_CLOCK)
+    h.session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
+    try:
+        request_id = await _defer_a_commit_behind_the_active_response(h)
+
+        h.deliver(
+            tts_output(request_id, samples=24000, text="hello", tts_is_last_chunk=True, finished=True),
+            segment_finished=True,
+        )
+        h.submit(commands.ClearOutputAudio())
+        events = await h.settle()
+
+        assert "response.done" in types(events)
+        acks = _acks(events)
+        assert [a.input_index for a in acks] == [2, 3, 4]
+        assert _units(acks[2]) == [("cancelled", "output_audio_buffer_clear")]
+        assert len(h.port.submissions) == 1, "the released turn is not submitted behind its cancelled acknowledgement"
+        assert h.runner.model_state.committed_audio_payload is not None, "its audio is kept for the next input"
+
+        events = await h.run(commands.CreateResponse())
+        assert len(h.port.submissions) == 2 and _acks(events) == []
+        (ack,) = _acks(await _deliver_listen(h, h.port.submissions[-1].context.request_id))
+        assert (ack.input_index, ack.trigger, _units(ack)) == (5, "response.create", [("listen", None)])
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_commit_that_merges_a_deferred_turns_kept_audio_owns_the_merged_turn() -> None:
+    """After a cancel kept the deferred turn's audio, a *commit* (not ``response.create``) merges and submits it."""
+    h = await open_harness(auto_response=False, extra_body=INPUT_CLOCK)
+    try:
+        await _defer_a_commit_behind_the_active_response(h)
+        acks = _acks(await h.run(commands.ClearOutputAudio()))
+        assert _units(acks[0]) == [("cancelled", "output_audio_buffer_clear")]
+        assert h.runner.model_state.committed_audio_payload is not None and len(h.port.submissions) == 1
+
+        assert [a.input_index for a in _acks(await h.run(append_audio(samples=3200)))] == [5]
+        events = await h.run(commands.Commit(create_response=True))
+
+        assert len(h.port.submissions) == 2 and _acks(events) == [], "the merged turn is this commit's unit"
+        (ack,) = _acks(await _deliver_listen(h, h.port.submissions[-1].context.request_id))
+        assert (ack.input_index, ack.trigger, _units(ack)) == (6, "input_audio_buffer.commit", [("listen", None)])
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_with_three_stages_a_final_segment_end_waits_for_the_middle_stages_segment_end() -> None:
+    """Stage 0 -> thinker -> TTS: the TTS segment end arrives before the thinker's; the unit completes on the latter."""
+    h = await open_harness(stage_count=3, extra_body=INPUT_CLOCK)
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        assert h.deliver(_speak_segment_end(request_id), stage_id=0, segment_finished=True) is False
+
+        events = await h.deliver_and_settle(
+            tts_output(request_id, samples=24000, text="hello", tts_is_last_chunk=True),
+            stage_id=2,
+            segment_finished=True,
+        )
+        assert "response.output_audio.delta" in types(events)
+        assert _acks(events) == [], "the thinker may still end the unit with a decision"
+
+        thinker = SimpleNamespace(
+            request_id=request_id,
+            finished=False,
+            outputs=[SimpleNamespace(text="hello", token_ids=[7, 8], multimodal_output={})],
+            multimodal_output={},
+        )
+        (ack,) = _acks(await h.deliver_and_settle(thinker, stage_id=1, segment_finished=True))
+
+        assert (ack.input_index, ack.unit_end_ms, _units(ack)) == (1, 1000, [("speak", None)])
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_with_three_stages_a_middle_stage_decision_ends_the_unit() -> None:
+    """A listen decided on the thinker stage ends the unit; nothing reaches TTS."""
+    h = await open_harness(stage_count=3, extra_body=INPUT_CLOCK)
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        assert h.deliver(_speak_segment_end(request_id), stage_id=0, segment_finished=True) is False
+
+        events = await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=1,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+
+        assert "response.listen" in types(events)
+        (ack,) = _acks(events)
+        assert (ack.input_index, ack.unit_end_ms, _units(ack)) == (1, 1000, [("listen", None)])
+    finally:
+        await close_harness(h)
+
+
+def _whole_unit_backlog(self, *, operation_id, chunk_period_ms):
+    """A buffer hook that hands out one more whole unit while the buffer holds one (no model's buffer does yet)."""
+    if self._sample_rate_hz is None or len(self._buffer) // 4 < self._sample_rate_hz * chunk_period_ms // 1000:
+        return None
+    payload = {"type": "audio", "audio": "", "format": "pcm_f32le", "sample_rate_hz": self._sample_rate_hz}
+    return self.prepare_append(payload, operation_id=operation_id, chunk_period_ms=chunk_period_ms)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_backlog_reservation_without_a_payload_is_rolled_back_and_ends_the_backlog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rolled_back: list[str] = []
+    calls: list[str] = []
+
+    class _EmptyReservation:
+        operation_id = "backlog-empty"
+        payload = None
+        active = True
+        byte_count = 0
+
+        def commit(self) -> None:
+            raise AssertionError("a reservation without a payload is never committed")
+
+        def rollback(self) -> None:
+            rolled_back.append(self.operation_id)
+
+    def _prepare_backlog(self, *, operation_id, chunk_period_ms):
+        del self, chunk_period_ms
+        calls.append(operation_id)
+        return _EmptyReservation()
+
+    monkeypatch.setattr(MiniCPMO45PcmAppendBuffer, "prepare_backlog", _prepare_backlog, raising=False)
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+        events = await h.run(append_audio(samples=16000 * 2))
+
+        assert len(h.port.submissions) == 1 and len(calls) == 1 and rolled_back == ["backlog-empty"]
+        assert h.runner.model_state.audio_buffer.pending_byte_count == 64_000, "the rest stays buffered"
+        assert _acks(events) == []
+        (ack,) = _acks(await _deliver_listen(h, h.stage0_request_id()))
+        assert (ack.audio_end_ms, ack.unit_end_ms, _units(ack)) == (2000, 1000, [("listen", None)])
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_failing_append_in_the_backlog_chain_stops_the_backlog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The first unit's submission fails before Stage 0 took it: no further unit of the append is submitted.
+
+    The append is answered with an ``error`` and its one unit is ``dropped``; the
+    acknowledgement lists only that unit, so the backlog loop stopped at the failed chain.
+    """
+    monkeypatch.setattr(MiniCPMO45PcmAppendBuffer, "prepare_backlog", _whole_unit_backlog, raising=False)
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    h.port.fail_submit = RuntimeError("stage 0 refused the submission")
+    try:
+        events = await h.run(append_audio(samples=16000 * 3))
+
+        assert h.port.submissions == [] and "error" in types(events) and "session.closed" not in types(events)
+        (ack,) = _acks(events)
+        assert (ack.input_index, ack.audio_end_ms, ack.unit_end_ms) == (1, 3000, 1000)
+        assert _units(ack) == [("dropped", None)], "one unit was tried; the backlog stopped at the failed chain"
+    finally:
+        await close_harness(h)

@@ -107,7 +107,7 @@ from vllm_omni.engine.duplex.session.context import (
     DuplexSessionTasks,
     StageOutput,
 )
-from vllm_omni.engine.duplex.session.control import SessionControl
+from vllm_omni.engine.duplex.session.control import SessionControl, TurnDetectionAudioError
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibration
@@ -689,7 +689,7 @@ class DuplexSessionRunner:
         clock = self._input_clock
         if clock is None:
             return None
-        clock.note_progress()
+        clock.note_progress(context.identity.fence.epoch)
         final_stage_id = context.final_stage_id
         final = stage_id >= final_stage_id
         if not (context.segment_finished or final or decision is not None):
@@ -1025,6 +1025,15 @@ class DuplexSessionRunner:
             # start a turn; replaying an old one could abort the newer request.
             if self.model_state.committed_audio_payload is not payload:
                 return
+            clock = self._input_clock
+            if clock is not None and not clock.turn_submittable(self.model_state.committed_audio_operation_id):
+                # Input-clocked sessions: a cancel between the response's end
+                # and this promotion (an ``output_audio_buffer.clear`` that kept
+                # the audio) released the turn's slot and acknowledged its
+                # commit as ``cancelled``. Submitting it now would stream a
+                # response no acknowledgement covers; the kept audio waits for
+                # the client's next commit or ``response.create`` instead.
+                return
             if not await self._submit_held_commit_prefixes():
                 return
             await self._start_append(
@@ -1332,6 +1341,10 @@ class DuplexSessionRunner:
         if self._input_clock is not None and ack is not None:
             # Rejected, and the refused audio no longer counts in ``audio_end_ms``.
             self._input_clock.refuse_input(ack, code)
+            # Turn detection may already have scored the refused audio; the
+            # client sends it again from ``audio_end_ms``, so the detector must
+            # not hear it twice.
+            self.control.reset_vad()
 
     def _require_projector(self) -> RealtimeProjectionState:
         return self.out.require_projector()
@@ -1717,7 +1730,13 @@ class DuplexSessionRunner:
                 clock.note_input_audio(
                     ack, samples=helpers.pcm_sample_count(audio, fmt), sample_rate_hz=int(sample_rate_hz)
                 )
-            detected = await self.control.run_turn_detection(event)
+            try:
+                detected = await self.control.run_turn_detection(event)
+            except TurnDetectionAudioError as exc:
+                # Nothing of the append was buffered: refused like audio that
+                # failed to decode (its acknowledgement is ``rejected``).
+                self._refuse_append("bad_audio", str(exc), event)
+                return
             for segment, _ in detected:
                 # Turn detection hands back base64 segments; audio it did not split
                 # (no detector) is still the decoded bytes, encoded here for the plugin.

@@ -411,12 +411,13 @@ class InputClock:
     ) -> InputClockUnit:
         """A Stage-0 submission is starting; the submission of a deferred turn claims its reserved slot.
 
-        A deferred turn whose slot was already settled (timed out, or released
-        by a cancel that kept its audio) takes that settled unit's place when
-        the end of the response submits it (``from_input=False``): its output
-        stays its own and no acknowledgement waits for it. Submitted by a
-        client input (a ``response.create``, a commit it was merged into), it
-        is that input's new unit.
+        A deferred turn whose slot was already settled by a timeout takes that
+        settled unit's place when the end of the response submits it
+        (``from_input=False``): its output stays its own and no acknowledgement
+        waits for it. A slot a cancel released is not re-submittable that way
+        (``turn_submittable``). Submitted by a client input (a
+        ``response.create``, a commit it was merged into), the turn is that
+        input's new unit.
         """
         now = self._clock()
         input_us = max(0, input_us)
@@ -480,11 +481,34 @@ class InputClock:
         return [unit.turn for unit in self._units if unit.placeholder]
 
     def release_placeholder(self, turn: str | None, reason: str) -> None:
-        """The deferred turn was not submitted: its audio was dropped, or the response it waited for was cancelled."""
+        """The deferred turn was not submitted: its audio was dropped, or the response it waited for was cancelled.
+
+        Its commit is acknowledged as ``cancelled``, so the end of a response
+        must not submit the turn after all (``turn_submittable``): the client
+        was told the turn is gone and drives the kept audio with its next
+        commit or ``response.create``. Only a slot settled by a timeout keeps
+        a late submission its own.
+        """
         for unit in list(self._units):
             if unit.placeholder and unit.turn == turn:
                 self.settle_unit(unit, DECISION_CANCELLED, reason=reason)
+                if turn is not None:
+                    self._settled_turns.pop(turn, None)
                 return
+
+    def turn_submittable(self, turn: str | None) -> bool:
+        """Whether the end of a response may still submit the deferred turn ``turn``.
+
+        True while its slot is reserved, or was settled by a timeout (the
+        submission then takes the settled unit, ``new_unit``); False once a
+        cancel released the slot, since its commit was acknowledged as
+        ``cancelled``.
+        """
+        if self._closed:
+            return False
+        if any(unit.placeholder and unit.turn == turn for unit in self._units):
+            return True
+        return turn is not None and turn in self._settled_turns
 
     def unit_submitted(self, unit: InputClockUnit) -> None:
         """Stage 0 accepted the unit's submission: it takes the next ordinal of its epoch.
@@ -607,8 +631,15 @@ class InputClock:
     # Model side (called from the mailbox, after the referenced output)  #
     # ------------------------------------------------------------------ #
 
-    def note_progress(self) -> None:
-        """The session's pipeline produced something (resets the liveness valve)."""
+    def note_progress(self, epoch: int | None = None) -> None:
+        """The session's pipeline produced something (resets the liveness valve).
+
+        Output of a cancelled epoch (``epoch`` below the live one) is dropped
+        by the session and does not count: a cancelled request still draining
+        must not keep the valve from settling the live epoch's units.
+        """
+        if epoch is not None and epoch < self._live_epoch:
+            return
         self.last_progress = self._clock()
 
     def on_stage_progress(self, progress: StageProgress) -> None:
@@ -988,7 +1019,10 @@ class InputClock:
                     "input clock: settling unit %s (decision=%s) after a timeout (%s)", unit.seq, unit.decision, reason
                 )
             self._settle(unit, DECISION_TIMED_OUT, reason)
-        self.last_progress = now
+        if any(reason == REASON_NO_PROGRESS for _, reason in expired):
+            # The valve fired: its window restarts. A maximum-age settlement
+            # alone says nothing about the pipeline's liveness.
+            self.last_progress = now
         self.flush()
         return True
 

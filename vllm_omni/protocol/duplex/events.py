@@ -425,7 +425,7 @@ def error_event(
 
 
 #: The complete event vocabulary a duplex client may receive: 21 Tier 1
-#: classes re-exported unchanged, the 9 Tier 2 ones defined above, and 13
+#: classes re-exported unchanged, the 9 Tier 2 ones defined above, and 14
 #: Tier 3 ones. A duplex consumer imports from here and never reaches past
 #: this module into ``vllm_omni.protocol.realtime``.
 __all__ = [
