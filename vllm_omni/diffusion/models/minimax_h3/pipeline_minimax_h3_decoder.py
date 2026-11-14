@@ -123,13 +123,20 @@ class MiniMaxH3DecoderPipeline(
                         width=payload["width"],
                         video_codec_options=payload["video_codec_options"],
                         batch_frames=payload["preencode_batch_frames"],
+                        crop_offset=payload.get("crop_offset", (0, 0)),
                         frame_counts=frame_counts,
                         trim=payload.get("trim"),
                     )
                 )
                 audios.append(None)
             else:
-                video, audio = self.decode(video_latent, audio_latent, height=payload["height"], width=payload["width"])
+                video, audio = self.decode(
+                    video_latent,
+                    audio_latent,
+                    height=payload["height"],
+                    width=payload["width"],
+                    crop_offset=payload.get("crop_offset", (0, 0)),
+                )
                 if payload.get("trim") is not None:
                     # A continuation's hidden overlap was decoded only as causal context.
                     video, audio = trim_decoded_overlap(video, audio, **payload["trim"])

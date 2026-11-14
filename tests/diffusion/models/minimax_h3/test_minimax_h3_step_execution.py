@@ -758,7 +758,8 @@ def test_scheduled_request_loop_restarts_progress_for_each_denoise_sequence():
 
 @pytest.mark.parametrize("sampler", ["euler", "res_multistep"])
 @pytest.mark.parametrize("batch_frames", [1, 33])
-def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames, sampler):
+@pytest.mark.parametrize("exact_size", [False, True])
+def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames, sampler, exact_size):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=8)
@@ -777,6 +778,9 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames, sa
         "audio_t": 3,
         **{key: None for key in mod._MINIMAX_H3_DENOISE_INPUT_KEYS},
     }
+
+    if exact_size:
+        context.update(output_height=90, output_width=62)
 
     pipeline = _step_pipeline(_SegmentMeanModel())
     conditioning = object()
@@ -844,6 +848,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames, sa
     monkeypatch.setattr(pipeline, "decode_to_mp4", decode_to_mp4)
     assert pipeline.post_decode(state).output == (b"mp4", None)
     assert calls[0]["batch_frames"] == batch_frames
+    assert (calls[0]["height"], calls[0]["width"]) == ((90, 62) if exact_size else (96, 64))
+    assert calls[0].get("crop_offset", (0, 0)) == ((3, 1) if exact_size else (0, 0))
 
 
 def test_prepare_encode_rejects_request_mode_only_features():
