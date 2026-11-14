@@ -30,7 +30,10 @@ from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
+from vllm_omni.core.sched.output import OmniNewRequestData
+from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import has_tts_text_conditioning
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -587,6 +590,30 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert session._output_token_ids == []
     assert session.num_prompt_tokens == 8
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
+
+
+@pytest.mark.parametrize("later_text", [[""], ["   "], [], None], ids=["empty", "blank", "empty-list", "missing"])
+def test_stage0_plain_streaming_update_keeps_the_first_chunk_text(later_text) -> None:
+    # Qwen3-TTS skips its stage-0 text check on streaming updates, so a plain
+    # stage-0 extension must keep the first chunk's additional_information:
+    # the re-admitted request carries it to the Talker's preprocess.
+    sched = _make_scheduler(stage_id=0)
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    first_chunk_info = serialize_additional_information({"task_type": ["CustomVoice"], "text": ["Hello there."]})
+    session.additional_information = first_chunk_info
+    update = _make_update([10, 20])
+    later_info = {"task_type": ["CustomVoice"]} if later_text is None else {"text": later_text}
+    update.additional_information = serialize_additional_information(later_info)
+
+    sched._update_request_as_session(session, update)
+
+    assert session.status == RequestStatus.WAITING
+    assert session.additional_information is first_chunk_info
+    readmitted = OmniNewRequestData.from_request(session, block_ids=([],))
+    info = deserialize_additional_information(readmitted.additional_information)
+    assert info["text"] == ["Hello there."]
+    assert has_tts_text_conditioning(info, allow_blank_text=False)
 
 
 def test_stage0_streaming_update_keeps_full_hash_block() -> None:
