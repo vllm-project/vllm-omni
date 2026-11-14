@@ -12,6 +12,10 @@ from msgspec import msgpack
 from PIL import Image
 from vllm.outputs import CompletionOutput, RequestOutput
 
+from vllm_omni.distributed.omni_connectors.utils.codec_registry import (
+    OmniCodecRegistry,
+)
+
 # Type markers for custom serialization
 _TENSOR_MARKER = "__tensor__"
 _NDARRAY_MARKER = "__ndarray__"
@@ -39,6 +43,10 @@ class OmniMsgpackEncoder:
     """
 
     def __init__(self):
+        self.codec_registry = OmniCodecRegistry()
+        self.codec_registry.register(torch.Tensor, _TENSOR_MARKER, self._encode_tensor)
+        self.codec_registry.register(np.ndarray, _NDARRAY_MARKER, self._encode_ndarray)
+        self.codec_registry.register(Image.Image, _PIL_IMAGE_MARKER, self._encode_pil_image)
         self.encoder = msgpack.Encoder(enc_hook=self._enc_hook)
 
     def encode(self, obj: Any) -> bytes:
@@ -52,17 +60,14 @@ class OmniMsgpackEncoder:
 
     def _enc_hook(self, obj: Any) -> Any:
         """Custom encoding hook for non-standard types."""
-        # torch.Tensor
-        if isinstance(obj, torch.Tensor):
-            return self._encode_tensor(obj)
-
-        # numpy.ndarray (exclude object/void dtypes)
-        if isinstance(obj, np.ndarray) and obj.dtype.kind not in ("O", "V"):
-            return self._encode_ndarray(obj)
-
-        # PIL.Image
-        if isinstance(obj, Image.Image):
-            return self._encode_pil_image(obj)
+        codec = self.codec_registry.lookup(type(obj))
+        if codec is not None and codec.encode is not None:
+            if isinstance(obj, np.ndarray) and obj.dtype.kind in ("O", "V"):
+                pass
+            else:
+                return codec.encode(obj)
+        else:
+            pass
 
         # RequestOutput (not a dataclass, needs special handling).
         # Note: OmniRequestOutput subclasses RequestOutput but is a dataclass,
@@ -188,6 +193,10 @@ class OmniMsgpackDecoder:
     """
 
     def __init__(self):
+        self.codec_registry = OmniCodecRegistry()
+        self.codec_registry.register(torch.Tensor, _TENSOR_MARKER, decode=self._decode_tensor)
+        self.codec_registry.register(np.ndarray, _NDARRAY_MARKER, decode=self._decode_ndarray)
+        self.codec_registry.register(Image.Image, _PIL_IMAGE_MARKER, decode=self._decode_pil_image)
         self.decoder = msgpack.Decoder()
 
     def decode(self, data: bytes | bytearray | memoryview) -> Any:
@@ -198,13 +207,9 @@ class OmniMsgpackDecoder:
     def _post_process(self, obj: Any) -> Any:
         """Recursively restore tensor/ndarray/image/RequestOutput/OmniRequestOutput from their dict representations."""
         if isinstance(obj, dict):
-            # Check for type markers first
-            if obj.get(_TENSOR_MARKER):
-                return self._decode_tensor(obj)
-            if obj.get(_NDARRAY_MARKER):
-                return self._decode_ndarray(obj)
-            if obj.get(_PIL_IMAGE_MARKER):
-                return self._decode_pil_image(obj)
+            codec = self.codec_registry.lookup_marker(obj)
+            if codec is not None and codec.decode is not None:
+                return codec.decode(obj)
 
             # Process values recursively first
             processed = {k: self._post_process(v) for k, v in obj.items()}
