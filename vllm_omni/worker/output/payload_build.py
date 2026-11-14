@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Per-request multimodal payload builders.
 
 State-free extraction helpers that turn a step's `multimodal_outputs`
@@ -15,7 +15,7 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.utils.mm_outputs import to_payload_element
+from vllm_omni.utils.mm_outputs import DROPPED_PAYLOAD, to_payload_element
 
 logger = init_logger(__name__)
 
@@ -150,7 +150,7 @@ def build_omni_mm_payload(
             sparse_val = mm_val[sparse_idx]
             mm_payload[mm_key] = sparse_val.clone() if isinstance(sparse_val, torch.Tensor) else sparse_val
             continue
-        mm_payload[mm_key] = to_payload_element(
+        value = to_payload_element(
             element=mm_val,
             idx=idx,
             start=start,
@@ -158,5 +158,9 @@ def build_omni_mm_payload(
             pass_lists_through=False,
             seq_len=hidden_seq_len,
             scheduled_seq_len=scheduled_seq_len,
+            rid=rid,
+            mm_key=mm_key,
         )
+        if value is not DROPPED_PAYLOAD:
+            mm_payload[mm_key] = value
     return mm_payload
