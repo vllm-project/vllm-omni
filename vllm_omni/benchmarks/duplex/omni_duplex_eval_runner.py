@@ -16,9 +16,11 @@ import hashlib
 import json
 import math
 import time
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
 import pybase64 as base64
@@ -133,6 +135,8 @@ class GenerateSampleResult:
     diagnostics: dict[str, object] = field(default_factory=dict)
     output_tokens: int = 0
     audio_bytes: int = 0
+    # Retain the received PCM until serving publishes artifacts after timing.
+    audio_pcm: bytes = field(default=b"", repr=False)
     audio_sample_rate: int = 24_000
     error: str = ""
 
@@ -224,11 +228,33 @@ def _cached_response_has_chunks(output: Path) -> bool:
     return has_response_chunks(raw)
 
 
+def _write_result_audio(result: GenerateSampleResult, audio_path: Path) -> None:
+    """Atomically publish received PCM, or remove a stale same-stem WAV."""
+    if result.audio_pcm:
+        if result.audio_sample_rate <= 0:
+            raise ValueError("output audio sample rate must be positive")
+        if len(result.audio_pcm) % 2:
+            raise ValueError("output audio must contain complete PCM16 samples")
+        from vllm_omni.clients.duplex import write_pcm16_wav
+
+        temporary_audio = audio_path.with_suffix(".wav.part")
+        try:
+            write_pcm16_wav(temporary_audio, result.audio_pcm, sample_rate_hz=result.audio_sample_rate)
+            temporary_audio.replace(audio_path)
+        finally:
+            temporary_audio.unlink(missing_ok=True)
+    else:
+        audio_path.unlink(missing_ok=True)
+
+
 def write_sample_result(result: GenerateSampleResult) -> None:
     """Publish the judge input (RTD reads sentences, PR reads chunks); serving calls this after timing."""
     output = result.output
     output.parent.mkdir(parents=True, exist_ok=True)
     meta_path = output.with_name(output.stem + ".meta.json")
+    # A result directory can be reused by the standalone generator. Do not
+    # leave an older audio artifact beside a newly published LISTEN result.
+    _write_result_audio(result, output.with_suffix(".wav"))
     # Publish the judge-visible JSON last. A failed write cannot leave a partial
     # response that the evaluator would mistake for a complete sample.
     meta_path.write_text(json.dumps(result.metadata, indent=2), encoding="utf-8")
@@ -242,10 +268,11 @@ def write_sample_result(result: GenerateSampleResult) -> None:
 
 
 def write_failed_sample_diagnostics(result: GenerateSampleResult) -> Path:
-    """Publish a failed session's control-state trace outside judge input paths."""
+    """Publish failed-session diagnostics and partial audio outside judge inputs."""
     output = result.output
     diagnostics = output.parent.parent / "failed_sessions" / output.parent.name / f"{output.stem}.json"
     diagnostics.parent.mkdir(parents=True, exist_ok=True)
+    _write_result_audio(result, diagnostics.with_suffix(".wav"))
     temporary = diagnostics.with_suffix(".json.part")
     try:
         payload = {
@@ -267,6 +294,7 @@ def _event_collector_from_realtime(source: RealtimeEventCollector) -> EventColle
     from vllm_omni.clients.duplex import EventCollector
 
     collector = EventCollector()
+    collector.output_sample_rate_hz = source.output_sample_rate_hz
     for event, received_at_s in zip(source.events, source.event_received_at_s, strict=True):
         collector.add(event, received_at_s=received_at_s)
     for record in source.client_appends:
@@ -578,8 +606,10 @@ async def _bounded_ack_join(task: asyncio.Task) -> None:
     if pending:
         task.add_done_callback(_consume_task_exception)
         logger.warning("DuplexEval: the periodic playback ack ignored cancellation")
-    elif not task.cancelled() and task.exception() is not None:
-        raise task.exception()
+    elif not task.cancelled():
+        error = task.exception()
+        if error is not None:
+            raise error
 
 
 async def _close_duplex_session(client: RealtimeDuplexClient, *, timeout_s: float = _FINAL_CLOSE_TIMEOUT_S) -> None:
@@ -663,6 +693,280 @@ async def _commit_clip_then_pad(client, period_ms: int, stop: asyncio.Event) -> 
     return asyncio.create_task(_pad_silence_until_stopped(client, period_ms, stop)), commit_timeout
 
 
+@dataclass
+class ReplayDrainResult:
+    """Input finalization and response completion reported by a replay session."""
+
+    response_done: bool = False
+    input_committed: bool = False
+    commit_timeout: str | None = None
+    drain_timeout: str | None = None
+    drain_timeout_state: dict[str, object] | None = None
+
+
+class DuplexReplaySession(Protocol):
+    """Session operations used by the shared dataset replay and metric collector.
+
+    Implementations expose normalized events with their original client receive
+    timestamps and keep input finalization and wire-specific control local.
+    """
+
+    @property
+    def events(self) -> RealtimeEventCollector: ...
+
+    @property
+    def frame_transport(self) -> str: ...
+
+    @property
+    def supports_session_stats(self) -> bool: ...
+
+    @property
+    def session_configuration(self) -> dict[str, object]: ...
+
+    async def configure(
+        self,
+        model: str,
+        *,
+        ref_audio: str | None,
+        instructions: str | None,
+        extra_body: dict[str, object] | None,
+        turn_detection: str,
+    ) -> None: ...
+
+    def prepare_input(self, pcm: bytes, frames: tuple[tuple[float, bytes], ...]) -> bytes: ...
+
+    async def stream_input(
+        self,
+        pcm: bytes,
+        frames: tuple[tuple[float, bytes], ...],
+        *,
+        sample_id: str,
+        unit_ms: int,
+        realtime: bool,
+    ) -> None: ...
+
+    async def finish_input(self, *, timeout_s: float) -> ReplayDrainResult: ...
+
+    async def acknowledge_playback(self) -> None: ...
+
+    async def get_session_stats(self, *, timeout_s: float, event_id: str) -> dict[str, object]: ...
+
+    async def close(self, *, timeout_s: float) -> None: ...
+
+
+ReplaySessionFactory = Callable[[str, str, dict[str, str] | None], AbstractAsyncContextManager[DuplexReplaySession]]
+
+
+class _VLLMReplaySession:
+    def __init__(self, client: RealtimeDuplexClient) -> None:
+        self._client = client
+        self.events = client.events
+        self._server_turns: bool
+        self._period_ms: int
+        self.frame_transport: str
+        self._drain = ReplayDrainResult()
+        self._drain_timeout_event_count = 0
+        self.session_configuration: dict[str, object] = {}
+
+    async def configure(
+        self,
+        model: str,
+        *,
+        ref_audio: str | None,
+        instructions: str | None,
+        extra_body: dict[str, object] | None,
+        turn_detection: str,
+    ) -> None:
+        self._server_turns = turn_detection == TURN_DETECTION_SERVER_VAD
+        options = dict(extra_body or {})
+        options.pop("native_duplex", None)
+        options.pop("sglang", None)
+        nested_sampling = options.pop("sampling", {})
+        if not isinstance(nested_sampling, Mapping):
+            raise ValueError("extra_body.sampling must be an object")
+        normalized_options = dict(nested_sampling)
+        normalized_options.update(options)
+        temperature = normalized_options.pop("temperature", None)
+        if temperature is not None and (not isinstance(temperature, int | float) or isinstance(temperature, bool)):
+            raise ValueError("sampling temperature must be a number")
+        await self._client.configure(
+            model,
+            ref_audio=ref_audio,
+            instructions=instructions,
+            temperature=float(temperature) if temperature is not None else None,
+            extra_body=normalized_options,
+            auto_response=not self._server_turns,
+            turn_detection=session_turn_detection(turn_detection),
+        )
+        requested_sampling = {**normalized_options, "force_listen_count": 0}
+        if temperature is not None:
+            requested_sampling["temperature"] = float(temperature)
+        self.session_configuration = {
+            "backend": "vllm",
+            "requested_sampling": requested_sampling,
+            "sampling_source": "client_request",
+        }
+        self.frame_transport = select_frame_transport(_session_capabilities(self._client))
+
+    def prepare_input(self, pcm: bytes, frames: tuple[tuple[float, bytes], ...]) -> bytes:
+        if self._server_turns:
+            return pcm
+
+        from vllm_omni.clients.duplex import chunk_period_ms, has_residual_model_unit
+
+        # Keep a residual model unit for the commit to flush, so the
+        # model's decision on the end of the clip arrives after the commit.
+        self._period_ms = chunk_period_ms(self.events.events)
+        if len(pcm) >= PCM16_BYTES_PER_SAMPLE and not has_residual_model_unit(pcm, chunk_period_ms=self._period_ms):
+            trimmed_end_s = (len(pcm) // PCM16_BYTES_PER_SAMPLE - 1) / PCM16_SAMPLE_RATE
+            if frames and frames[-1][0] >= trimmed_end_s:
+                # A real frame in the final sample must survive. Keep that
+                # sample and add silence for commit's residual unit instead.
+                return pcm + bytes(PCM16_BYTES_PER_SAMPLE)
+            return pcm[:-PCM16_BYTES_PER_SAMPLE]
+        return pcm
+
+    async def stream_input(
+        self,
+        pcm: bytes,
+        frames: tuple[tuple[float, bytes], ...],
+        *,
+        sample_id: str,
+        unit_ms: int,
+        realtime: bool,
+    ) -> None:
+        image_items = (
+            ImageItemWindow(self._client.send, item_prefix=f"duplexeval_frame_{sample_id}")
+            if self.frame_transport == FRAME_TRANSPORT_IMAGE_ITEMS
+            else None
+        )
+        await self._client.stream_av_units(
+            iter_av_units(pcm, iter(frames), unit_ms=unit_ms),
+            realtime=realtime,
+            frame_sink=image_items.push if image_items is not None else None,
+        )
+
+    async def finish_input(self, *, timeout_s: float) -> ReplayDrainResult:
+        client = self._client
+        commit_from = len(client.events.events)
+        seen_activity = 0
+        stable_since = time.monotonic()
+
+        def responses_finished(*, settled_silence_is_terminal: bool = False) -> bool:
+            # The residual unit decides after input_audio_buffer.committed.
+            # A reply that was already open only promotes that unit when it
+            # completes, and Stage1 can still open a response afterwards.
+            # Either ending waits until this activity has been quiet.
+            nonlocal seen_activity, stable_since
+            client.raise_if_reader_stopped()
+            events = client.events.events
+            # The drain wait runs after the commit, where 'none' mode only
+            # streams silence padding; the server's per-unit listens must
+            # not reset the quiet window (see _DRAIN_ACTIVITY).
+            activity = _completion_activity(events, commit_from, activity_types=_DRAIN_ACTIVITY)
+            if activity != seen_activity:
+                seen_activity, stable_since = activity, time.monotonic()
+            if not all(client.events.response_is_done(response_id) for response_id in client.events.response_ids):
+                return False
+            if time.monotonic() - stable_since < _COMPLETION_SETTLE_S:
+                return False
+            return _residual_unit_decided(
+                events,
+                commit_from,
+                settled_silence_is_terminal=settled_silence_is_terminal,
+            )
+
+        result = self._drain
+        silence_stop = asyncio.Event()
+        silence_task: asyncio.Task[None] | None = None
+
+        try:
+            if self._server_turns:
+                await _wait_for_server_turns(client, timeout_s=timeout_s)
+                result.response_done = client.events.count("response.done") > 0
+            else:
+                silence_task, result.commit_timeout = await _commit_clip_then_pad(client, self._period_ms, silence_stop)
+                result.input_committed = result.commit_timeout is None
+                await wait_for(
+                    responses_finished,
+                    timeout_s=timeout_s,
+                    label="response.done",
+                )
+                result.response_done = True
+        except TimeoutError as exc:
+            # Finishing the in-flight reply can promote another response,
+            # so it cannot end the normal wait. Once the entire drain
+            # window has elapsed, accept settled terminal silence only when
+            # every created response is done and the usual quiet window
+            # still holds.
+            if not self._server_turns and responses_finished(settled_silence_is_terminal=True):
+                result.response_done = True
+            else:
+                result.drain_timeout = str(exc)
+                result.drain_timeout_state = _completion_diagnostics(
+                    client.events.events,
+                    commit_from,
+                    response_ids=client.events.response_ids,
+                    stable_since=stable_since,
+                )
+                self._drain_timeout_event_count = len(client.events.events)
+                # No artifacts survive a drain timeout, so the trace has to reach the log.
+                logger.warning(
+                    "duplex drain timeout state: %s",
+                    json.dumps(result.drain_timeout_state, default=str)[:4000],
+                )
+        finally:
+            if silence_task is not None:
+                silence_stop.set()
+                silence_task.cancel()
+                try:
+                    await silence_task
+                except asyncio.CancelledError:
+                    pass
+                except (ConnectionClosed, OSError):
+                    # A transport that is already dead is the expected way
+                    # padding ends here; the sample still reports its own
+                    # timeouts. Anything else is a coding error in the
+                    # padding path and must surface instead of silently
+                    # looking like a drain timeout.
+                    pass
+
+        return result
+
+    async def acknowledge_playback(self) -> None:
+        await self._client.acknowledge_playback()
+
+    @property
+    def supports_session_stats(self) -> bool:
+        return _session_capabilities(self._client).get("supports_session_stats") is True
+
+    async def get_session_stats(self, *, timeout_s: float, event_id: str) -> dict[str, object]:
+        return await self._client.get_session_stats(timeout_s=timeout_s, event_id=event_id)
+
+    async def close(self, *, timeout_s: float) -> None:
+        try:
+            await _close_duplex_session(self._client, timeout_s=timeout_s)
+        finally:
+            state = self._drain.drain_timeout_state
+            if state is not None:
+                state["completion_state_events_after_timeout"] = _completion_diagnostics(
+                    self.events.events,
+                    self._drain_timeout_event_count,
+                    response_ids=self.events.response_ids,
+                    stable_since=time.monotonic(),
+                )["completion_state_events"]
+
+
+@asynccontextmanager
+async def _open_vllm_replay_session(
+    url: str, model: str, additional_headers: dict[str, str] | None
+) -> AsyncIterator[DuplexReplaySession]:
+    async with RealtimeDuplexClient(
+        build_realtime_url(url, model, autostart=False), additional_headers=additional_headers
+    ) as client:
+        yield _VLLMReplaySession(client)
+
+
 async def generate_sample(
     sample: DuplexSample,
     *,
@@ -682,9 +986,11 @@ async def generate_sample(
     extra_body: dict[str, object] | None = None,
     instructions: str | None = DEFAULT_INSTRUCTIONS,
     turn_detection: str = TURN_DETECTION_NONE,
+    session_factory: ReplaySessionFactory = _open_vllm_replay_session,
 ) -> GenerateSampleResult:
     """Generate one sample's timed sentences and collect duplex session metrics.
 
+    The session factory selects the wire protocol for this replay.
     Timed sentences and ``*.meta.json`` stay the quality-eval artifacts. Duplex
     request/session metrics are returned for the CLI to write
     ``duplex_metrics.json``; they are not written into meta.
@@ -737,52 +1043,24 @@ async def generate_sample(
         # No final commit: trailing silence lets the VAD close the last turn.
         pcm += bytes(round(SERVER_VAD_TAIL_S * PCM16_SAMPLE_RATE) * PCM16_BYTES_PER_SAMPLE)
     realtime = pace == "realtime"
-    client = RealtimeDuplexClient(
-        build_realtime_url(url, model, autostart=False), additional_headers=additional_headers
-    )
-    response_done = False
-    drain_timeout = None
-    drain_timeout_state: dict[str, object] | None = None
-    drain_timeout_event_count = 0
     close_timeout = None
     ack_timeout = None
     input_timeout = None
-    commit_timeout = None
     server_errors: list[str] = []
     session_stats_errors: list[str] = []
     session_stats: dict[str, object] | None = None
     stats_event_id: str | None = None
-    input_committed = False
     stream_start: float | None = None
-    async with client:
+    async with session_factory(url, model, additional_headers) as client:
         await client.configure(
             model,
             ref_audio=prepared.ref_audio,
             instructions=instructions,
             extra_body=extra_body,
-            auto_response=not server_turns,
-            turn_detection=session_turn_detection(turn_detection),
+            turn_detection=turn_detection,
         )
-        frame_transport = select_frame_transport(_session_capabilities(client))
-        if not server_turns:
-            from vllm_omni.clients.duplex import chunk_period_ms, has_residual_model_unit
-
-            # Keep a residual model unit for the commit to flush, so the
-            # model's decision on the end of the clip arrives after the commit.
-            period_ms = chunk_period_ms(client.events.events)
-            if len(pcm) >= PCM16_BYTES_PER_SAMPLE and not has_residual_model_unit(pcm, chunk_period_ms=period_ms):
-                trimmed_end_s = (len(pcm) // PCM16_BYTES_PER_SAMPLE - 1) / PCM16_SAMPLE_RATE
-                if prepared.frames and prepared.frames[-1][0] >= trimmed_end_s:
-                    # A real frame in the final sample must survive. Keep that
-                    # sample and add silence for commit's residual unit instead.
-                    pcm += bytes(PCM16_BYTES_PER_SAMPLE)
-                else:
-                    pcm = pcm[:-PCM16_BYTES_PER_SAMPLE]
-        image_items = (
-            ImageItemWindow(client.send, item_prefix=f"duplexeval_frame_{sample.id}")
-            if frame_transport == FRAME_TRANSPORT_IMAGE_ITEMS
-            else None
-        )
+        frame_transport = client.frame_transport
+        pcm = client.prepare_input(pcm, prepared.frames)
         ack_task = asyncio.create_task(_ack_playback(client))
         try:
             stream_start = time.monotonic()
@@ -794,10 +1072,12 @@ async def generate_sample(
             # heard, and the commit below still flushes the residual unit.
             try:
                 await asyncio.wait_for(
-                    client.stream_av_units(
-                        iter_av_units(pcm, iter(prepared.frames), unit_ms=unit_ms),
+                    client.stream_input(
+                        pcm,
+                        prepared.frames,
+                        sample_id=sample.id,
+                        unit_ms=unit_ms,
                         realtime=realtime,
-                        frame_sink=image_items.push if image_items is not None else None,
                     ),
                     timeout=prepared.duration + _INPUT_SLACK_S,
                 )
@@ -805,87 +1085,7 @@ async def generate_sample(
                 input_timeout = str(exc) or "input streaming timed out"
                 logger.warning("DuplexEval: input stalled for sample %s: %s", sample.id, exc)
 
-            commit_from = len(client.events.events)
-            seen_activity = 0
-            stable_since = time.monotonic()
-
-            def responses_finished(*, settled_silence_is_terminal: bool = False) -> bool:
-                # The residual unit decides after input_audio_buffer.committed.
-                # A reply that was already open only promotes that unit when it
-                # completes, and Stage1 can still open a response afterwards.
-                # Either ending waits until this activity has been quiet.
-                nonlocal seen_activity, stable_since
-                client.raise_if_reader_stopped()
-                events = client.events.events
-                # The drain wait runs after the commit, where 'none' mode only
-                # streams silence padding; the server's per-unit listens must
-                # not reset the quiet window (see _DRAIN_ACTIVITY).
-                activity = _completion_activity(events, commit_from, activity_types=_DRAIN_ACTIVITY)
-                if activity != seen_activity:
-                    seen_activity, stable_since = activity, time.monotonic()
-                if not all(client.events.response_is_done(response_id) for response_id in client.events.response_ids):
-                    return False
-                if time.monotonic() - stable_since < _COMPLETION_SETTLE_S:
-                    return False
-                return _residual_unit_decided(
-                    events,
-                    commit_from,
-                    settled_silence_is_terminal=settled_silence_is_terminal,
-                )
-
-            silence_stop = asyncio.Event()
-            silence_task: asyncio.Task[None] | None = None
-
-            try:
-                if server_turns:
-                    await _wait_for_server_turns(client, timeout_s=_drain_timeout_s(prepared.duration))
-                    response_done = client.events.count("response.done") > 0
-                else:
-                    silence_task, commit_timeout = await _commit_clip_then_pad(client, period_ms, silence_stop)
-                    input_committed = commit_timeout is None
-                    await wait_for(
-                        responses_finished,
-                        timeout_s=_drain_timeout_s(prepared.duration),
-                        label="response.done",
-                    )
-                    response_done = True
-            except TimeoutError as exc:
-                # Finishing the in-flight reply can promote another response,
-                # so it cannot end the normal wait. Once the entire drain
-                # window has elapsed, accept settled terminal silence only when
-                # every created response is done and the usual quiet window
-                # still holds.
-                if not server_turns and responses_finished(settled_silence_is_terminal=True):
-                    response_done = True
-                else:
-                    drain_timeout = str(exc)
-                    drain_timeout_state = _completion_diagnostics(
-                        client.events.events,
-                        commit_from,
-                        response_ids=client.events.response_ids,
-                        stable_since=stable_since,
-                    )
-                    drain_timeout_event_count = len(client.events.events)
-                    # No artifacts survive a drain timeout, so the trace has to reach the log.
-                    logger.warning(
-                        "duplex drain timeout state: %s",
-                        json.dumps(drain_timeout_state, default=str)[:4000],
-                    )
-            finally:
-                if silence_task is not None:
-                    silence_stop.set()
-                    silence_task.cancel()
-                    try:
-                        await silence_task
-                    except asyncio.CancelledError:
-                        pass
-                    except (ConnectionClosed, OSError):
-                        # A transport that is already dead is the expected way
-                        # padding ends here; the sample still reports its own
-                        # timeouts. Anything else is a coding error in the
-                        # padding path and must surface instead of silently
-                        # looking like a drain timeout.
-                        pass
+            drain = await client.finish_input(timeout_s=_drain_timeout_s(prepared.duration))
         finally:
             ack_task.cancel()
             await _bounded_ack_join(ack_task)
@@ -900,7 +1100,7 @@ async def generate_sample(
             # diagnosis, not folded into ``error`` and not a retry reason.
             ack_timeout = str(exc) or "playback ack timed out"
             logger.warning("DuplexEval: playback ack not delivered for sample %s: %s", sample.id, exc)
-        if _session_capabilities(client).get("supports_session_stats") is True:
+        if client.supports_session_stats:
             stats_event_id = f"evt_{uuid4().hex}"
             try:
                 fetched = await client.get_session_stats(
@@ -912,20 +1112,13 @@ async def generate_sample(
                 fetched = None
             session_stats = fetched or None
         try:
-            await _close_duplex_session(client, timeout_s=_FINAL_CLOSE_TIMEOUT_S)
+            await client.close(timeout_s=_FINAL_CLOSE_TIMEOUT_S)
         except TimeoutError as exc:
             # Same socket, same stall: record it and tear the transport down.
             close_timeout = str(exc)
             logger.warning("DuplexEval: session close not delivered for sample %s: %s", sample.id, exc)
         events = list(client.events.events)
         collector = _event_collector_from_realtime(client.events)
-    if drain_timeout_state is not None:
-        drain_timeout_state["completion_state_events_after_timeout"] = _completion_diagnostics(
-            events,
-            drain_timeout_event_count,
-            response_ids=client.events.response_ids,
-            stable_since=time.monotonic(),
-        )["completion_state_events"]
     timed = [sentence.as_dict() for sentence in extract_timed_sentences(events, clock=clock)]
     chunks = [chunk.as_dict() for chunk in extract_timed_chunks(events, clock=clock)]
     meta = {
@@ -940,16 +1133,17 @@ async def generate_sample(
         "turn_detection": turn_detection,
         "frame_transport": frame_transport,
         "instructions": instructions,
-        "response_done": response_done,
-        "input_committed": input_committed,
+        "response_done": drain.response_done,
+        "input_committed": drain.input_committed,
         "input_timeout": input_timeout,
-        "commit_timeout": commit_timeout,
-        "drain_timeout": drain_timeout,
+        "commit_timeout": drain.commit_timeout,
+        "drain_timeout": drain.drain_timeout,
         "close_timeout": close_timeout,
         "ack_timeout": ack_timeout,
         "server_errors": server_errors,
         "session_stats_errors": session_stats_errors,
         "ref_audio_sha256": prepared.ref_audio_sha256,
+        "session_configuration": getattr(client, "session_configuration", {}),
     }
     from vllm_omni.benchmarks.duplex_session_metrics import collect_duplex_session_metrics
 
@@ -979,8 +1173,8 @@ async def generate_sample(
     # the reply completed does not: the artifacts are already complete, so
     # ``close_timeout`` is advisory there (like ``ack_timeout``) and only
     # names the transport that died when it is the session that did not finish.
-    errors.extend(str(error) for error in (input_timeout, commit_timeout, drain_timeout) if error)
-    if close_timeout and not response_done:
+    errors.extend(str(error) for error in (input_timeout, drain.commit_timeout, drain.drain_timeout) if error)
+    if close_timeout and not drain.response_done:
         errors.append(close_timeout)
     finished = set()
     for event in events:
@@ -995,6 +1189,7 @@ async def generate_sample(
     # boundary in metadata; drain/close timeouts and server errors above still
     # fail the sample instead of silently publishing a broken session.
     meta["unfinished_response_ids"] = sorted(set(client.events.response_ids) - finished)
+    output_audio_pcm = client.events.audio_bytes()
     result = GenerateSampleResult(
         output=output,
         request_metrics=[_with_sample_identity(metric, sample) for metric in bundle.request_metrics],
@@ -1002,9 +1197,10 @@ async def generate_sample(
         timed_sentences=timed,
         timed_chunks=chunks,
         metadata=meta,
-        diagnostics={"drain_timeout_state": drain_timeout_state} if drain_timeout_state is not None else {},
+        diagnostics={"drain_timeout_state": drain.drain_timeout_state} if drain.drain_timeout_state is not None else {},
         output_tokens=bundle.output_tokens,
-        audio_bytes=len(client.events.audio_bytes()),
+        audio_bytes=len(output_audio_pcm),
+        audio_pcm=output_audio_pcm,
         audio_sample_rate=client.events.output_sample_rate_hz,
         error="; ".join(errors),
     )
@@ -1013,7 +1209,7 @@ async def generate_sample(
     return result
 
 
-async def _ack_playback(client: RealtimeDuplexClient) -> None:
+async def _ack_playback(client: DuplexReplaySession) -> None:
     while True:
         await asyncio.sleep(0.25)
         await client.acknowledge_playback()

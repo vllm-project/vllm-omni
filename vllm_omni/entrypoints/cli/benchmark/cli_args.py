@@ -227,6 +227,46 @@ def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--duplex-eval-eval-workers", type=_positive_int, default=1)
 
 
+def add_full_duplex_bench_cli_args(parser: argparse.ArgumentParser) -> None:
+    from vllm_omni.benchmarks.duplex.full_duplex_bench_dataset import FDB_VERSIONS
+    from vllm_omni.benchmarks.duplex_session_inputs import TURN_DETECTION_MODES, TURN_DETECTION_NONE
+
+    group = parser.add_argument_group("Full-Duplex-Bench Replay Options")
+    group.add_argument(
+        "--fdb-version",
+        choices=FDB_VERSIONS,
+        default="1.5",
+        help="Dataset layout to replay. v1.5 expands every selected pair into input and clean_input sessions.",
+    )
+    group.add_argument(
+        "--fdb-subsets",
+        nargs="+",
+        help="Subset names to replay; defaults to every subset in the selected version.",
+    )
+    group.add_argument(
+        "--fdb-sample-ids",
+        nargs="+",
+        help="Exact subset/sample IDs. Mutually exclusive with --fdb-max-per-subset.",
+    )
+    group.add_argument(
+        "--fdb-max-per-subset",
+        type=_positive_int,
+        help="Take the first N naturally sorted source samples from each selected subset.",
+    )
+    group.add_argument(
+        "--fdb-ref-audio",
+        type=_existing_file,
+        help="Reference WAV for models that clone it (MiniCPM-o).",
+    )
+    group.add_argument(
+        "--fdb-turn-detection",
+        choices=TURN_DETECTION_MODES,
+        default=TURN_DETECTION_NONE,
+        help="Use 'none' for model-native duplex replay; server_vad is available for turn-based servers.",
+    )
+    group.add_argument(
+        "--fdb-instructions",
+        help="Session system prompt. Defaults to the native-duplex prompt; pass '' to use the server default.",
 def add_duplex_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add shared duplex workload and metric options."""
     group = parser.add_argument_group("Duplex Benchmark Options")
@@ -519,6 +559,7 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
 
 _OMNI_BENCH_DATASET_CHOICES = (
     "daily-omni",
+    "full-duplex-bench",
     "omniinteract",
     "omni-duplex-eval",
     "seed-tts",
@@ -558,8 +599,14 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
     for action in parser._actions:
         if action.dest == "num_prompts":
             action.help = (
-                f"{action.help} OmniInteract uses {_DEFAULT_OMNIINTERACT_NUM_PROMPTS} and Omni-DuplexEval uses 3 "
-                "when this option is omitted; 0 selects all available cases for either dataset."
+                f"{action.help} OmniInteract uses {_DEFAULT_OMNIINTERACT_NUM_PROMPTS}, Omni-DuplexEval uses 3, "
+                "and Full-Duplex-Bench uses 2 when omitted; 0 selects all available cases. "
+                "Full-Duplex-Bench v1.5 requires an even value to preserve input/clean_input pairs."
+            )
+        if action.dest == "result_dir":
+            action.help = (
+                f"{action.help} Full-Duplex-Bench also creates its per-session run directory here, "
+                "even when --save-result is not set."
             )
         if action.dest == "percentile_metrics":
             action.help = (
@@ -567,7 +614,11 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
                 'For text metrics, "ttft", "tpot", and "itl" affect the global benchmark and text '
                 'stage metrics. "tpop" also requests text TPOT/TPOP globally and per stage, and internal '
                 'stream TPOP. "ttfc", "tpoc", and "icl" only affect internal stream stage metrics. '
-                'Audio metrics include "audio_ttfp", "audio_rtf", "audio_duration", and "audio_underrun".'
+                'Audio metrics include "audio_ttfp", "audio_rtf", "audio_duration", "audio_underrun", '
+                '"total_underrun", "audio_underrun_event_count", "audio_underrun_ratio", '
+                '"audio_underrun_events_per_minute", '
+                'and "audio_continuity_rate" (alias "audio_continuity_ok_rate"). '
+                "Continuity compares total_underrun to the threshold over measured audio replies, not a percentile."
             )
         if action.dest == "goodput":
             action.help = (
@@ -607,6 +658,7 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
     add_videomme_cli_args(parser)
     add_omniinteract_cli_args(parser)
     add_duplex_eval_cli_args(parser)
+    add_full_duplex_bench_cli_args(parser)
     add_duplex_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
@@ -615,9 +667,41 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
 
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
+    duplex_replay_backends = {"openai-realtime-duplex", "sglang-realtime-duplex"}
+    if getattr(args, "backend", None) == "sglang-realtime-duplex" and getattr(args, "dataset_name", None) not in {
+        "full-duplex-bench",
+        "omni-duplex-eval",
+    }:
+        raise ValueError("sglang-realtime-duplex supports full-duplex-bench and omni-duplex-eval only")
+    if getattr(args, "dataset_name", None) == "full-duplex-bench":
+        if args.backend not in duplex_replay_backends or args.endpoint != "/v1/realtime":
+            raise ValueError(
+                "Full-Duplex-Bench requires --backend openai-realtime-duplex or "
+                "sglang-realtime-duplex with --endpoint /v1/realtime"
+            )
+        if not args.dataset_path:
+            raise ValueError("Full-Duplex-Bench requires a local --dataset-path")
+        for name in ("ignore_eos", "profile", "skip_tokenizer_init", "probe_request_rate"):
+            if getattr(args, name, False):
+                raise ValueError(f"Full-Duplex-Bench does not support --{name.replace('_', '-')}")
+        if "num_prompts" not in getattr(args, "explicit_keys", ()):
+            args.num_prompts = 2
+        if args.num_prompts < 0:
+            raise ValueError("Full-Duplex-Bench --num-prompts must be non-negative (0 selects all)")
+        if args.fdb_version == "1.5" and args.num_prompts % 2:
+            raise ValueError("Full-Duplex-Bench v1.5 --num-prompts must be even to preserve paired sessions")
+        if args.max_concurrency is None:
+            args.max_concurrency = 1
+        elif args.max_concurrency <= 0:
+            raise ValueError("Full-Duplex-Bench requires positive --max-concurrency")
+        if args.backend == "sglang-realtime-duplex" and args.fdb_turn_detection != "none":
+            raise ValueError("SGLang Full-Duplex-Bench replay requires --fdb-turn-detection none")
     if getattr(args, "dataset_name", None) == "omni-duplex-eval":
-        if args.backend != "openai-realtime-duplex" or args.endpoint != "/v1/realtime":
-            raise ValueError("Omni-DuplexEval requires --backend openai-realtime-duplex --endpoint /v1/realtime")
+        if args.backend not in duplex_replay_backends or args.endpoint != "/v1/realtime":
+            raise ValueError(
+                "Omni-DuplexEval requires --backend openai-realtime-duplex or "
+                "sglang-realtime-duplex with --endpoint /v1/realtime"
+            )
         if args.duplex_eval_evaluate and not args.duplex_eval_judge_model:
             raise ValueError("Omni-DuplexEval evaluation requires --duplex-eval-judge-model")
         for name in ("ignore_eos", "profile", "skip_tokenizer_init", "probe_request_rate"):
@@ -631,6 +715,8 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
             args.max_concurrency = 1
         elif args.max_concurrency <= 0:
             raise ValueError("Omni-DuplexEval requires positive --max-concurrency")
+        if args.backend == "sglang-realtime-duplex" and args.duplex_eval_turn_detection != "none":
+            raise ValueError("SGLang Omni-DuplexEval replay requires --duplex-eval-turn-detection none")
     if getattr(args, "dataset_name", None) == "omniinteract":
         if getattr(args, "backend", None) != "openai-realtime-duplex":
             raise ValueError("OmniInteract requires --backend openai-realtime-duplex")

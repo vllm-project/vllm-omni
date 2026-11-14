@@ -324,6 +324,19 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             "rtf": pytest.approx(0.3, abs=0.03),
             "audio_generation_ms": pytest.approx(30.0, abs=2.0),
             "audio_duration_ms": 100.0,
+            "audio_continuity": {
+                "response_id": "resp-1",
+                "audio_underrun_s": 0.0,
+                "audio_max_single_underrun_s": 0.0,
+                "total_underrun_s": 0.0,
+                "audio_continuity_ok": True,
+                "audio_underrun_event_count": 0,
+                "audio_duration_s": 0.1,
+                "audio_underrun_ratio": 0.0,
+                "audio_underrun_events_per_minute": 0.0,
+                "audio_chunk_count": 1,
+                "audio_continuity_threshold_s": 0.1,
+            },
         }
     session = output.duplex_session_metrics
     assert session["session_id"] == session_id
@@ -556,7 +569,7 @@ async def test_retryable_cache_error_retries_before_output(mocker: MockerFixture
     session = mocker.Mock()
     session.post.side_effect = [failed, success]
     sleep = mocker.patch.object(patch.asyncio, "sleep", new_callable=mocker.AsyncMock)
-    mocker.patch.object(patch.time, "perf_counter", side_effect=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    mocker.patch.object(patch.time, "perf_counter", side_effect=[float(value) for value in range(1, 11)])
 
     output = await async_request_openai_chat_omni_completions(request_input, session)
 

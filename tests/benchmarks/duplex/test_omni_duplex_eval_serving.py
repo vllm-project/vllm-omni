@@ -8,6 +8,7 @@ import json
 import math
 import threading
 import time
+import wave
 import weakref
 from dataclasses import replace
 from pathlib import Path
@@ -27,6 +28,8 @@ from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcom
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
+
+_OUTPUT_PCM = b"\x01\x00" * 24_000
 
 
 def _args(tmp_path, *extra, ref_audio=True):
@@ -100,7 +103,8 @@ def _result(sample):
         timed_chunks=[{"text": "Done.", "current_time": 0.01}],
         metadata={"response_done": True, "clock": "media"},
         output_tokens=3,
-        audio_bytes=48000,
+        audio_bytes=len(_OUTPUT_PCM),
+        audio_pcm=_OUTPUT_PCM,
     )
 
 
@@ -483,6 +487,71 @@ async def test_adapter_preserves_metrics_and_forwards_request(tmp_path, prepared
         "sentences": expected.timed_sentences,
         "chunks": expected.timed_chunks,
     }
+    with wave.open(str(expected.output.with_suffix(".wav")), "rb") as output_audio:
+        assert output_audio.getnchannels() == 1
+        assert output_audio.getsampwidth() == 2
+        assert output_audio.getframerate() == expected.audio_sample_rate
+        assert output_audio.readframes(output_audio.getnframes()) == _OUTPUT_PCM
+
+
+@pytest.mark.asyncio
+async def test_vllm_session_normalizes_shared_sampling_options():
+    class Client:
+        def __init__(self):
+            self.events = runner.RealtimeEventCollector()
+            self.events.add({"type": "session.created", "session": {"capabilities": {}}})
+            self.configured = None
+
+        async def configure(self, model, **kwargs):
+            self.configured = (model, kwargs)
+
+    client = Client()
+    session = runner._VLLMReplaySession(client)
+    await session.configure(
+        "served-model",
+        ref_audio=None,
+        instructions=None,
+        extra_body={
+            "sampling": {"temperature": 0.7, "top_p": 0.8, "force_listen_count": 2},
+            "force_listen_count": 0,
+            "sglang": {"tail_policy": "pad"},
+        },
+        turn_detection="none",
+    )
+
+    assert client.configured is not None
+    model, configured = client.configured
+    assert model == "served-model"
+    assert configured["temperature"] == 0.7
+    assert configured["extra_body"] == {"top_p": 0.8, "force_listen_count": 0}
+    assert session.session_configuration == {
+        "backend": "vllm",
+        "requested_sampling": {"top_p": 0.8, "force_listen_count": 0, "temperature": 0.7},
+        "sampling_source": "client_request",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sglang_backend_selects_sglang_session_factory(tmp_path, prepared, monkeypatch):
+    from vllm_omni.benchmarks.duplex.sglang_replay_session import open_sglang_replay_session
+
+    sample = _samples(tmp_path)[0]
+    expected = replace(
+        _result(sample),
+        request_metrics=[{"audio_continuity": {"response_id": "response-1"}}],
+        output_tokens=0,
+    )
+    calls = []
+
+    async def generate(case, **kwargs):
+        calls.append((case, kwargs))
+        return expected
+
+    monkeypatch.setattr(runner, "generate_sample", generate)
+    output = await patch.async_request_sglang_realtime_duplex(_request(sample), session=None)
+    assert output.success
+    assert output.tpot_measured is False
+    assert calls[0][1]["session_factory"] is open_sglang_replay_session
 
 
 @pytest.mark.asyncio
@@ -606,14 +675,19 @@ async def test_failed_sessions_are_not_judge_inputs(tmp_path, prepared, monkeypa
     assert summary["published"] == 0
     assert not _result(sample).output.exists()
     diagnostic = sample.response_root / "failed_sessions" / sample.sample.split / f"{sample.sample.id}.json"
+    partial_audio = diagnostic.with_suffix(".wav")
     if failure in {"protocol", "drain"}:
         assert summary["failed_diagnostics"] == 1
         assert json.loads(diagnostic.read_text())["diagnostics"] == {
             "drain_timeout_state": {"committed_observed": True}
         }
+        with wave.open(str(partial_audio), "rb") as output_audio:
+            assert output_audio.getframerate() == 24_000
+            assert output_audio.readframes(output_audio.getnframes()) == _OUTPUT_PCM
     else:
         assert summary["failed_diagnostics"] == 0
         assert not diagnostic.exists()
+        assert not partial_audio.exists()
 
 
 @pytest.mark.asyncio

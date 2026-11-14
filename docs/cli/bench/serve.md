@@ -4,7 +4,10 @@ The vllm bench command launches the vLLM-Omni benchmark to evaluate the performa
 
 ## Notes
 
-vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, `openai-realtime-duplex`, `openai-realtime-tts`, and `openai-realtime-chat` serving benchmark backends. It also adds the `omniinteract` dataset.
+vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`,
+`openai-image-edits-omni`, `daily-omni`, `openai-realtime-duplex`,
+`openai-realtime-tts`, and `openai-realtime-chat` serving benchmark backends.
+It also adds the `omniinteract` and `full-duplex-bench` datasets.
 
 `openai-chat-omni` retries explicit `ServiceUnavailableError` responses with
 code 503 up to three times, provided no text, reasoning, tool, audio, or image
@@ -40,7 +43,8 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
 
 - `--dataset-name`
   The name of the dataset used; `random-mm` generates random multimodal inputs (images, videos, audio),
-  `omniinteract` replays official OmniInteract videos, and `videomme` loads Video-MME MCQ videos
+  `omniinteract` replays official OmniInteract videos, `full-duplex-bench` replays local
+  Full-Duplex-Bench v1.0/v1.5 audio, and `videomme` loads Video-MME MCQ videos
   (`lmms-eval/Video-MME`, MiniCPM OmniEvalKit packing).
 
 - `--num-prompts`
@@ -75,7 +79,74 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
         "Comma-separated list of selected metrics to report percentiles."
                     "This argument specifies the metrics to report percentiles."
                     'Allowed metric names are "ttft", "tpot", "itl", "ttfc", "tpoc", "icl", '
-                    '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
+                    '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration", '
+                    '"audio_underrun", "audio_max_single_underrun", "total_underrun", "audio_underrun_event_count", '
+                    '"audio_underrun_ratio", "audio_underrun_events_per_minute", "audio_continuity_rate". '
+
+### Streaming audio continuity
+
+Add `audio_underrun,audio_continuity_rate` to `--percentile-metrics` for
+`openai-chat-omni` (also its `daily-omni` alias), `openai-realtime-duplex`,
+or `openai-audio-speech`. For example, append the following to an existing
+audio-output benchmark command:
+
+```bash
+--percentile-metrics ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_underrun,audio_max_single_underrun,total_underrun,audio_underrun_event_count,audio_underrun_ratio,audio_underrun_events_per_minute,audio_continuity_rate
+```
+
+`audio_underrun` preserves its legacy cumulative-deficit meaning and
+equals `total_underrun`. The new `audio_max_single_underrun` measures the
+largest **individual playback stall** in seconds per response.
+Let chunk `i` arrive at `t_i`, contain `d_i` seconds, and let `E_i` be its
+scheduled playback end. Start with `E_0 = t_0 + d_0`, then compute:
+
+```text
+g_i = max(0, t_i - E_(i-1))
+E_i = max(t_i, E_(i-1)) + d_i
+audio_max_single_underrun = max(g_i)
+audio_underrun = total_underrun = sum(g_i)
+audio_underrun_event_count = count(g_i > 0)
+audio_underrun_ratio = total_underrun / (sum(d_i) + total_underrun)
+audio_underrun_events_per_minute = event_count / (sum(d_i) / 60)
+```
+
+Playback starts at the first non-empty audio chunk. First-packet waiting and
+waiting for EOF / `response.done` are excluded. This simulates FIFO playback;
+it does not measure an actual audio device or detect acoustic artifacts.
+Gaps at or below `1e-9` seconds are ignored to avoid roundoff-generated stalls.
+All time metrics and their saved statistics use `_s`, in seconds. Counts,
+ratios and events/minute have no time suffix. All means and percentiles are
+computed from response values with equal response weights; the event sum is
+also saved as `total_audio_underrun_events`. Ratios are in the range 0-1.
+
+`audio_continuity_rate` remains the fraction of measured responses whose
+**total_underrun**, rather than their largest individual stall, is at most
+`VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S` (default: `0.1` seconds).
+It prints as a percentage; `audio_continuity_ok_rate` is an accepted selector
+alias and the saved JSON key (a value from 0 to 1). A rate has no latency
+percentiles. Use the same threshold when comparing runs.
+
+Measurement scope:
+
+- Chat: one sample per successful request with decodable WAV audio deltas.
+  WAV headers are excluded from audio duration. Non-WAV formats, absent audio,
+  or invalid/inconsistent WAV chunks are unmeasured. Request audio output,
+  for example with `--extra-body '{"modalities":["text","audio"],"response_format":"wav"}'`.
+- Duplex: one sample per completed PCM16 audio reply (`response_id`), including
+  OmniInteract sessions. Replies are evaluated independently, so listening
+  periods between replies do not count as underruns. Cancelled, failed,
+  incomplete, LISTEN-only and invalid-audio replies are excluded. A session
+  with multiple replies contributes multiple samples.
+- A single audio chunk produces zero underrun because it has no inter-chunk
+  gap; use `audio_ttfp` alongside continuity to assess startup latency.
+
+The console reports the measured sample count. With no measured samples the
+rate is `N/A`, saved as JSON `null`, rather than 100%. Saved results include
+`num_audio_continuity_samples` and `audio_continuity_samples` with request
+indices, duplex response IDs where applicable, maximum/total stalls, event count,
+ratio, events per minute, audio duration, pass/fail, chunk count and threshold. Failed benchmark requests do not enter this rollup.
+
+### Additional parameters
 
 - `--goodput`
   Specify request-level service objectives as space-separated `KEY:VALUE` pairs, with values in milliseconds.
@@ -320,6 +391,94 @@ not synthesize a request audio-completion latency from their mean RTF.
 
 </details>
 
+### Full-Duplex-Bench Native Realtime Replay
+
+`full-duplex-bench` streams the official v1.0 or v1.5 audio into one native
+`/v1/realtime` session per benchmark session. It measures serving performance;
+it does not run the Full-Duplex-Bench ASR or quality evaluators.
+
+```bash
+vllm bench serve --omni \
+  --backend openai-realtime-duplex --endpoint /v1/realtime \
+  --base-url http://127.0.0.1:8000 \
+  --model openbmb/MiniCPM-o-4_5 \
+  --dataset-name full-duplex-bench \
+  --dataset-path /path/to/Full-Duplex-Bench/dataset \
+  --fdb-version 1.5 --fdb-max-per-subset 2 \
+  --fdb-ref-audio /path/to/reference.wav \
+  --num-prompts 8 --disable-shuffle --max-concurrency 1 \
+  --num-warmups 0 --ready-check-timeout-sec 0 \
+  --save-result --result-dir ./fdb-runs
+```
+
+To replay the identical dataset through an SGLang-Omni native duplex server,
+change only the backend and server identity:
+
+```bash
+vllm bench serve --omni \
+  --backend sglang-realtime-duplex --endpoint /v1/realtime \
+  --base-url http://127.0.0.1:30000 \
+  --model openbmb/MiniCPM-o-4_5 \
+  --dataset-name full-duplex-bench \
+  --dataset-path /path/to/Full-Duplex-Bench/dataset \
+  --fdb-version 1.5 --fdb-max-per-subset 2 \
+  --fdb-ref-audio /path/to/reference.wav \
+  --num-prompts 8 --disable-shuffle --max-concurrency 1 \
+  --num-warmups 0 --ready-check-timeout-sec 0 \
+  --save-result --result-dir ./fdb-sglang-runs
+```
+
+`--dataset-path` may point directly at a version directory containing the
+subset directories, or at its parent containing `v1.0/` and `v1.5/`.
+`--fdb-subsets` and `--fdb-sample-ids subset/sample ...` select exact inputs;
+`--fdb-max-per-subset` takes the first N samples in natural numeric order.
+`--num-prompts` remains the global session cap over that candidate pool. Unless
+`--disable-shuffle` is set, source samples are shuffled with `--seed`.
+
+Every v1.0 source sample produces one session from `input.wav`. Every v1.5
+source pair produces two adjacent sessions, first `input.wav` (overlap) and
+then `clean_input.wav` (control). Accordingly, `--num-prompts` counts sessions
+and must be even for v1.5; `0` selects all complete pairs. Pair selection and
+shuffling happen before expansion, so a run never drops one half of a pair.
+The default is two sessions and one concurrent session.
+
+Both backends use the same decoded input, realtime pacing, replay lifecycle and
+metric collector. The vLLM backend commits input and acknowledges playback;
+the SGLang backend uses its native `sglang.input_audio.end` / `drained`
+handshake and timestamped image events. `--fdb-turn-detection none` is the
+default for MiniCPM-o and is required by the SGLang backend. Reference
+audio is encoded once and shared by all sessions. Each invocation creates a
+new `run-*` artifact directory under `--result-dir`, containing per-session
+response metadata and `duplex_metrics.json`. Each successful session that
+emits audio also writes a same-stem `.wav` beside its response JSON. The WAV is
+mono PCM16 at the negotiated output sample rate. For sessions with multiple
+responses, it concatenates emitted audio in response creation order without
+inserting synthetic silence. If `--result-dir` is omitted,
+artifacts default to `full-duplex-bench-output/`. Standard TTFT, audio TTFP and
+per-response RTF use the backend-provided response metrics when present;
+separately named `duplex_client_*` and `duplex_stream_*` fields retain
+client-observed timing.
+
+For a controlled MiniCPM-o comparison, pass one shared sampling object to both
+backends:
+
+```bash
+--extra-body '{"sampling":{"temperature":0.7,"top_p":0.8,"top_k":20,"repetition_penalty":1.05,"force_listen_count":0}}'
+```
+
+The adapters lower this object to each backend's native session shape. A
+top-level value in `--extra-body` overrides its same-named nested sampling
+value. Both adapters default `force_listen_count` to zero, so model response
+eligibility starts at the same input unit even when the object is omitted.
+Every sample metadata file records the requested sampling configuration; the
+SGLang adapter also records the configuration echoed by `session.updated` and
+the server's supported sampling fields.
+
+For SGLang, standard TTFT and audio TTFP come from its top-level
+`response_request_metrics`, while RTF and audio continuity use the same
+client-received audio packets as the vLLM run. This keeps server response-start
+timing separate from network delivery cadence.
+
 ### Omni-DuplexEval Realtime Benchmark
 
 Omni-DuplexEval uses the same serving-benchmark lifecycle as OmniInteract. Each
@@ -334,6 +493,22 @@ vllm bench serve --omni \
   --base-url http://127.0.0.1:8000 --endpoint /v1/realtime \
   --duplex-eval-ref-audio /path/to/reference.wav \
   --duplex-eval-response-root ./duplex-eval-runs \
+  --duplex-eval-split PR_correction \
+  --num-prompts 3 --disable-shuffle --max-concurrency 1 --num-warmups 0 \
+  --ready-check-timeout-sec 0 --save-result
+```
+
+The SGLang-Omni form uses the same dataset options:
+
+```bash
+vllm bench serve --omni \
+  --backend sglang-realtime-duplex --endpoint /v1/realtime \
+  --base-url http://127.0.0.1:30000 \
+  --model openbmb/MiniCPM-o-4_5 \
+  --dataset-name omni-duplex-eval \
+  --dataset-path Hothan/Omni-DuplexEval \
+  --duplex-eval-ref-audio /path/to/reference.wav \
+  --duplex-eval-response-root ./duplex-eval-sglang \
   --duplex-eval-split PR_correction \
   --num-prompts 3 --disable-shuffle --max-concurrency 1 --num-warmups 0 \
   --ready-check-timeout-sec 0 --save-result
@@ -472,14 +647,19 @@ server errors, failed responses, and drain/close timeouts still fail the sample.
 Failed measured sessions write a compact control-state trace under
 `failed_sessions/<split>/<id>.json`. These files record the committed event,
 response IDs and statuses, listen metadata, open responses, and quiet-window
-timing, but are never passed to the judge.
+timing, but are never passed to the judge. When a failed session emitted audio,
+its partial PCM is preserved as a same-stem `.wav` in that diagnostics
+directory. It remains a failed session and is excluded from published samples
+and success metrics.
 
 `--duplex-eval-response-root` is a **parent directory** and may already exist.
 Each invocation creates an exclusive `run-*` subdirectory, so repeated runs and
 concurrency/QPS sweeps do not overwrite or reuse earlier responses. The actual
 run path is logged and returned in `omni_duplex_eval.response_root` in the saved
 benchmark result. Only successful measured sessions publish `<split>/<id>.json`
-and `<id>.meta.json`, using the upstream judge format: RTD scoring reads its
+and `<id>.meta.json`; a session with response audio also publishes
+`<split>/<id>.wav` with the same PCM16 contract as Full-Duplex-Bench. These
+files use the upstream judge format: RTD scoring reads its
 `sentences`, and PR scoring places its per-output `chunks` (`text`,
 `current_time`) in the 10-second reminder window. A response that is a bare
 sentence list is scored by sentence start. The standalone `generate` command
