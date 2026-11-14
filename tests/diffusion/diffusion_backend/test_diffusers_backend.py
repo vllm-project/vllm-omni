@@ -242,6 +242,11 @@ class TestPipelineArgumentsHandling:
             ),
         )
 
+    def test_rocm_rdna_is_not_blackwell(self, monkeypatch):
+        self._patch_platform(monkeypatch, rocm=True, major=12, minor=0)
+
+        assert DiffusersAdapterPipeline._is_blackwell_gpu() is False
+
     @pytest.mark.parametrize("rocm,major,minor", [(False, 9, 0), (False, 10, 0), (True, 9, 4), (True, 11, 5)])
     @pytest.mark.parametrize(
         "backend", [None, "FLASH_ATTN", "FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB", "SAGE_ATTN", "TORCH_SDPA", "ASCEND"]

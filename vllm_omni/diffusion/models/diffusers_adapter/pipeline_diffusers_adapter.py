@@ -316,6 +316,9 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     @staticmethod
     def _is_blackwell_gpu() -> bool:
         """Return True on Blackwell-class CUDA GPUs (sm_10x / sm_11x / sm_12x)."""
+        # ROCm gfx11xx/gfx12xx also report major 11/12.
+        if not current_omni_platform.is_cuda():
+            return False
         capability = None
         try:
             capability = current_omni_platform.get_device_capability()
