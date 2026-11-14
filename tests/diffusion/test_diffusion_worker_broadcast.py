@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import threading
 import time
@@ -10,6 +10,7 @@ from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
 import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
+from vllm_omni.errors import OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -103,11 +104,132 @@ def test_busy_loop_releases_failed_rpc_traceback_and_device_cache(monkeypatch):
     worker_proc._worker_busy_loop()
 
     worker_proc._return_result.assert_called_once_with(
-        {"status": "error", "error": "model execution failed", "wave_id": None}
+        {
+            "status": "error",
+            "error": "model execution failed",
+            "error_status_code": None,
+            "error_type": None,
+            "wave_id": None,
+        }
     )
     assert original.__traceback__ is None
     gc_collect.assert_called_once_with()
     mock_platform.empty_cache.assert_called_once_with()
+
+
+@pytest.mark.parametrize("dp_multi_reply", [False, True], ids=["single-reply", "dp-multi-reply"])
+def test_busy_loop_sync_error_reply_keeps_client_error_metadata(monkeypatch, dp_multi_reply):
+    import vllm.distributed.parallel_state as vllm_parallel_state
+
+    import vllm_omni.diffusion.distributed.parallel_state as omni_parallel_state
+
+    worker_proc = WorkerProc.__new__(WorkerProc)
+    worker_proc.gpu_id = 0
+    worker_proc.mq = Mock()
+    worker_proc.mq.dequeue.side_effect = [
+        {
+            "type": "rpc",
+            "method": "execute_model",
+            "args": (),
+            "kwargs": {},
+            "output_rank": None if dp_multi_reply else 0,
+            "exec_all_ranks": True,
+            "wave_id": 3,
+        },
+        {"type": "shutdown"},
+    ]
+    worker_proc.worker = Mock()
+    worker_proc.worker.execute_method.side_effect = OmniClientError("bad overlap", status_code=422, error_type="X")
+    worker_proc.result_mq = object()
+    worker_proc._return_result = Mock()
+    worker_proc.wake_event = None
+    worker_proc._running = True
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", Mock())
+    monkeypatch.setattr(vllm_parallel_state, "get_tensor_model_parallel_rank", lambda: 0)
+    for name in ("get_sequence_parallel_rank", "get_classifier_free_guidance_rank", "get_pipeline_parallel_rank"):
+        monkeypatch.setattr(omni_parallel_state, name, lambda: 0)
+    monkeypatch.setattr(omni_parallel_state, "get_data_parallel_rank", lambda: 1)
+
+    worker_proc._worker_busy_loop()
+
+    reply = worker_proc._return_result.call_args.args[0]
+    assert reply["status"] == "error"
+    assert reply["error"] == "bad overlap"
+    assert reply["error_status_code"] == 422
+    assert reply["error_type"] == "X"
+    assert reply["wave_id"] == 3
+    if dp_multi_reply:
+        assert reply["dp_rank"] == 1
+
+
+@pytest.mark.parametrize("client_error", [True, False], ids=["client-error-warns", "server-error-logs-traceback"])
+def test_busy_loop_logs_client_rpc_errors_without_traceback(monkeypatch, client_error):
+    exc = OmniClientError("bad overlap") if client_error else RuntimeError("cuda failed")
+    worker_proc = WorkerProc.__new__(WorkerProc)
+    worker_proc.gpu_id = 0
+    worker_proc.mq = Mock()
+    worker_proc.mq.dequeue.side_effect = [
+        {"type": "rpc", "method": "execute_model", "args": (), "kwargs": {}, "rpc_id": "7"},
+        {"type": "shutdown"},
+    ]
+    worker_proc.worker = Mock()
+    worker_proc.worker.execute_method.side_effect = exc
+    worker_proc.result_mq = object()
+    worker_proc._enqueue_result = Mock()
+    worker_proc.wake_event = None
+    worker_proc._running = True
+    logger = Mock()
+    monkeypatch.setattr(diffusion_worker_module, "logger", logger)
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", Mock())
+
+    worker_proc._worker_busy_loop()
+
+    if client_error:
+        logger.warning.assert_called_once()
+        logger.error.assert_not_called()
+    else:
+        assert logger.error.call_args_list
+        assert all(call.kwargs.get("exc_info") is True for call in logger.error.call_args_list)
+    reply = worker_proc._enqueue_result.call_args.args[0]
+    assert reply.rpc_id == "7"
+    assert reply.error_status_code == (400 if client_error else None)
+
+
+@pytest.mark.parametrize("client_error", [True, False], ids=["client-error-warns", "server-error-logs-traceback"])
+def test_rank_status_rpc_logs_client_errors_without_traceback(monkeypatch, client_error):
+    exc = OmniClientError("bad lora") if client_error else RuntimeError("cuda failed")
+    worker_proc = WorkerProc.__new__(WorkerProc)
+    worker_proc.gpu_id = 0
+    worker_proc.result_mq = object()
+    worker_proc.worker = Mock()
+    worker_proc.worker.execute_method.side_effect = exc
+    worker_proc._gather_rpc_rank_statuses = Mock(side_effect=lambda status: [status])
+    logger = Mock()
+    monkeypatch.setattr(diffusion_worker_module, "logger", logger)
+    monkeypatch.setattr(diffusion_worker_module, "current_omni_platform", Mock())
+
+    envelope, should_reply = worker_proc._execute_rpc(
+        {
+            "method": "add_lora",
+            "output_rank": 0,
+            "exec_all_ranks": True,
+            "collect_rank_status": True,
+        }
+    )
+
+    assert should_reply
+    (status,) = envelope["rank_statuses"]
+    assert status["ok"] is False
+    assert status["error_type"] == type(exc).__name__
+    if client_error:
+        logger.warning.assert_called_once()
+        logger.error.assert_not_called()
+        assert status["traceback"] is None
+    else:
+        logger.warning.assert_not_called()
+        logger.error.assert_called_once()
+        assert logger.error.call_args.kwargs["exc_info"] is True
+        assert "cuda failed" in status["traceback"]
 
 
 def test_busy_loop_preserves_order_when_overflow_payload_is_delayed(monkeypatch):
