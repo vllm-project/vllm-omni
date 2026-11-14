@@ -19,7 +19,10 @@ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
     AudioEntry,
     CompressionAudioRef,
+    CompressionImageRef,
+    CompressionMessage,
     CompressionPrompt,
+    HistoryLimits,
     IncrementalHistoryPolicy,
     QwenHistoryPolicy,
     load_history_policy,
@@ -27,6 +30,28 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_default_compression_separates_roles_from_visual_source_text():
+    prompt = IncrementalHistoryPolicy().build_compression(
+        (CompressionMessage("user", ("Visual source message 1:", CompressionImageRef(0))),),
+        "",
+        HistoryLimits(),
+    )
+    # The real Qwen chat template concatenates adjacent text parts verbatim.
+    text = "".join(part for part in prompt.content if isinstance(part, str))
+    assert "Source role: user\nVisual source message 1:" in text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Source role: userVisual source message 1: A red square.",
+        "Visual source messages 3–9: The door changes from closed to open.",
+    ],
+)
+def test_source_labels_with_facts_remain_valid_memory(text):
+    assert IncrementalHistoryPolicy().parse_compression(text) == text
 
 
 class StructuredMemoryPolicy(IncrementalHistoryPolicy):

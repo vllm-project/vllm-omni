@@ -85,6 +85,9 @@ async def test_invalid_visual_completion_does_not_publish_a_ledger_node():
         "END_PREVIOUS_MEMORY\nEND_NEW_DIALOGUE",
         "\n NEW_DIALOGUE \n END_MEMORY \n",
         "PREVIOUS_MEMORY\nEND_PREVIOUS_MEMORY\nNEW_DIALOGUE\nEND_NEW_DIALOGUE\nReturn the complete updated memory.",
+        "PREVIOUS_MEMORY\n\nEND_PREVIOUS_MEMORY\nNEW_DIALOGUE\nSource role: userVisual source message 1:",
+        "Source role: user\nVisual source message 27:\nEND_SOURCE_MESSAGE",
+        "Source role: assistant\nVisual source messages 3–9:",
     ],
 )
 async def test_marker_only_summary_keeps_evidence_pending_for_retry(visual, text):
@@ -107,6 +110,28 @@ async def test_marker_only_summary_keeps_evidence_pending_for_retry(visual, text
     else:
         assert state.processed > 0
         assert "reference code END_MEMORY" in state.summary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("visual", [False, True])
+async def test_framing_only_replacement_preserves_published_memory(visual):
+    owner = runtime(recent_messages=2, visual_mid_group=1)
+    state = state_for(owner)
+    history = [image_message(), {"role": "assistant", "content": "red"}] if visual else []
+    history.extend(text_history(4))
+    sync_history(state, history)
+    first = await owner.prepare(state)
+    assert owner.apply(state, first, completion("A red square; the user budget is 3000."))
+    if not visual:
+        sync_history(state, [*history, *text_history(4)])
+    replacement = await owner.prepare(state)
+    assert replacement is not None
+    before = (state.processed, state.summary, state.summary_node_id, state.partial, visual_snapshot(state))
+    assert not owner.apply(state, replacement, completion("Source role: userVisual source messages 1–8:"))
+    assert (state.processed, state.summary, state.summary_node_id, state.partial, visual_snapshot(state)) == before
+    retry = await owner.prepare(state)
+    assert retry.model_source == replacement.model_source
+    assert owner.apply(state, retry, completion("A red square; the corrected user budget is 5000."))
 
 
 @pytest.mark.asyncio

@@ -201,11 +201,16 @@ input. The interface uses the same Qwen Thinker; it does not support external
 summarization services, arbitrary retrieval stores or mid-session switching.
 
 The built-in incremental parser also rejects output containing only source
-delimiter markers and the closing instruction `Return the complete updated memory.`
-Such an output supplies no memory and must leave the source pending for retry.
-Marker words inside actual memory facts remain valid text.
-Matching ignores surrounding whitespace but otherwise requires exact case and
-punctuation for each control line.
+delimiter markers, role labels, numbered visual-source labels and the closing
+instruction `Return the complete updated memory.` Rejection preserves published
+memory, pending images and text, and compression progress for retry. Labels
+accompanied by actual facts remain valid memory. These checks detect structural
+echoes; they do not certify factual accuracy. Control-line matching ignores
+surrounding whitespace but otherwise requires exact case and punctuation.
+
+The default compression prompt separates role labels from source text. For
+images, it requests observable content even without a stated user preference
+and combines repeated observations across frames into one memory.
 
 Configure the policy in a deployment overlay:
 
