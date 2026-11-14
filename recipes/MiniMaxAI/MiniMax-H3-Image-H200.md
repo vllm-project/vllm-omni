@@ -131,6 +131,18 @@ vllm serve MiniMaxAI/MiniMax-H3-Image --omni \
   --host 0.0.0.0 --port 8000
 ```
 
+### Optional prompt embedding cache
+
+For repeated text prompts, set these variables before starting a one-GPU server:
+
+```bash
+export OMNI_DIFFUSION_PROMPT_EMBED_CACHE=1
+export OMNI_DIFFUSION_PROMPT_EMBED_CACHE_SIZE=32
+```
+
+Disabled by default; capacity defaults to 32 CPU entries.
+Reference-image edits and multi-rank requests bypass caching.
+
 ### Two GPUs with Ulysses SP
 
 The resident Ulysses layout peaks at 94.6 GiB per GPU.
