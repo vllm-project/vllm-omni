@@ -1,13 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Patch Qwen3-TTS NPU runtime setup and weights.
-
-The code2wav runtime/weight fixes apply on every NPU. On A5 (Ascend 950 PR)
-``torch.stft`` is unavailable, so the speaker-encoder mel front-end of the
-prompt-embeds builder runs on CPU and the result is moved back to NPU
-(same trade-off as the 310P path).
-"""
+"""Patch Qwen3-TTS NPU runtime setup and weights."""
 
 from __future__ import annotations
 
@@ -23,7 +17,6 @@ from vllm_omni.platforms.npu import is_a5
 logger = init_logger(__name__)
 
 _PATCHED = False
-_A5_PATCHED = False
 _original_init = None
 _original_load_weights = None
 _ACL_FORMAT_FRACTAL_Z = 4
@@ -82,41 +75,8 @@ def _patched_load_weights(self, weights):
 
 
 def apply_qwen3_tts_patches() -> None:
-    """Install all Qwen3-TTS NPU patches.
-
-    The code2wav runtime/weight patch applies on every NPU; the A5
-    prompt-embeds builder swap is gated on ``is_a5()`` because it changes the
-    speaker-encoder mel front-end (``torch.stft`` is unsupported there).
-    """
+    """Install all Qwen3-TTS NPU patches."""
     apply_qwen3_tts_code2wav_patch()
-    if not is_a5():
-        return
-    _apply_a5_prompt_embeds_builder_patch()
-
-
-def _apply_a5_prompt_embeds_builder_patch() -> None:
-    global _A5_PATCHED
-    if _A5_PATCHED:
-        return
-
-    # Import and patch lazily so the Qwen3-TTS model modules are only loaded
-    # on A5 devices (same gate-then-import convention as the 310P patch).
-    from vllm_omni.model_executor.models.qwen3_tts import (
-        prompt_embeds_builder,
-        qwen3_tts_talker,
-    )
-
-    class _Qwen3TTSPromptEmbedsBuilderA5(prompt_embeds_builder.Qwen3TTSPromptEmbedsBuilder):
-        """Qwen3-TTS prompt-embeds builder specialized for the A5 NPU path."""
-
-        _mel_spectrogram_on_cpu = True
-
-    # The talker imports the builder by name at module scope, so its reference
-    # must be swapped as well (same as the 310P patch).
-    setattr(prompt_embeds_builder, "Qwen3TTSPromptEmbedsBuilder", _Qwen3TTSPromptEmbedsBuilderA5)
-    setattr(qwen3_tts_talker, "Qwen3TTSPromptEmbedsBuilder", _Qwen3TTSPromptEmbedsBuilderA5)
-    _A5_PATCHED = True
-    logger.debug("Applied A5 prompt-embeds builder patch for Qwen3-TTS")
 
 
 def apply_qwen3_tts_code2wav_patch() -> None:
