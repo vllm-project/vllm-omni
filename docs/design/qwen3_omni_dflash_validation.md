@@ -6,7 +6,7 @@ The payload lifecycle is described in
 
 ## Method
 
-**Revision:** the validation matrix uses frozen revision `caf99e8`, based on upstream `7b3c84a5e`. The targeted numerical analysis below records its own runtime revision and environment.
+**Revision:** the validation matrix uses the [frozen validation snapshot](https://github.com/YuDeng0102/vllm-omni/tree/caf99e8c80814dcf749c85bf6bc1739e7b1fa262), based on upstream `7b3c84a5e`. The targeted numerical analysis below records its own runtime revision and environment.
 
 **Hardware/software:** 3 × NVIDIA A100-SXM4-40GB: Thinker TP2 on GPU0/1; ordinary Talker and Code2Wav on GPU2; fourth GPU unused. vLLM 0.33.0, Torch 2.14.0+cu130, MRv1, FlashAttention, Qwen3-Omni-30B-A3B-Instruct, four speculative tokens, prefix caching disabled.
 
