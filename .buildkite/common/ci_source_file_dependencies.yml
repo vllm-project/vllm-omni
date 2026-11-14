@@ -953,6 +953,9 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_voxcpm2_tts.py
     # ASR backend used by the advanced_model transcript assertion.
     - tests/helpers/media.py
+    # VoxCPM2 runs on Model Runner V2, so runner changes must run these jobs.
+    - vllm_omni/platforms/npu/worker/npu_omni_v2_model_runner.py
+    - vllm_omni/worker_v2/
 
   tts_lfm3_function:
     - *lfm3
