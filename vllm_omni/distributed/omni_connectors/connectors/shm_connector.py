@@ -22,6 +22,10 @@ from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
 
+# Headroom kept free beyond a payload on a large shared-memory mount.
+# Smaller mounts scale this down; see SharedMemoryConnector._shm_capacity_reserve_bytes.
+_DEFAULT_SHM_CAPACITY_RESERVE_BYTES = 512 << 20
+
 
 def _wakeup_enabled() -> bool:
     return os.environ.get("VLLM_OMNI_SHM_WAKEUP", "1") == "1"
@@ -85,6 +89,33 @@ class SharedMemoryConnector(OmniConnectorBase):
             return 1 << 62
         return int(st.f_bavail) * int(st.f_frsize)
 
+    def _shm_mount_bytes(self) -> int:
+        """Total size of ``shm_directory``, or a huge sentinel if it cannot be read."""
+        try:
+            st = os.statvfs(self.shm_directory)
+        except OSError:
+            return 1 << 62
+        return int(st.f_blocks) * int(st.f_frsize)
+
+    def _shm_capacity_reserve_bytes(self) -> int:
+        """Bytes of free space required beyond the payload.
+
+        A large mount keeps a 512 MiB cushion for lockfiles, wake FIFOs,
+        SemLock objects, and a sibling rank. That cushion is capped at one
+        eighth of the mount, so a mount smaller than 512 MiB (for example an
+        empty 64 MiB ``/dev/shm``) can still accept a payload that fits.
+
+        Set ``shm_capacity_reserve_bytes`` in the connector config to replace
+        this policy, including ``0`` to require only the payload itself.
+        """
+        configured = self.config.get("shm_capacity_reserve_bytes")
+        if configured is not None:
+            return max(0, int(configured))
+        mount = self._shm_mount_bytes()
+        if mount <= 0:
+            return 0
+        return min(_DEFAULT_SHM_CAPACITY_RESERVE_BYTES, mount // 8)
+
     def _capacity_lock_path(self) -> str:
         # Serialize capacity check + segment create across TP ranks / processes
         # so concurrent puts cannot race past a free-space check (#10296).
@@ -98,9 +129,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         a SemLock) then fails with ``ENOSPC`` / silent worker death (#10296).
         Block briefly so the consumer can catch up instead of OOMing the host.
         """
-        # Headroom covers lockfiles, wake FIFOs, SemLock objects, and a sibling
-        # TP rank that may already be past its own capacity check.
-        need = int(nbytes) + (512 << 20)
+        need = int(nbytes) + self._shm_capacity_reserve_bytes()
         if need <= 0:
             return True
         for attempt in range(max(1, attempts)):
