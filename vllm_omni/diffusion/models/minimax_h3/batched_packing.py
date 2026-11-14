@@ -71,6 +71,8 @@ def minimax_h3_batched_forward_kwargs(
         )
 
     device = branches[0].device
+    if any(branch.static_kwargs["video_token_layout"].pre_rearranged for branch in branches):
+        raise ValueError("RF reorder hoist supports one request per forward; disable it for continuous batching")
     total_seq = sum(branch.seq_len for branch in branches)
 
     img_pos_parts: list[torch.Tensor] = []

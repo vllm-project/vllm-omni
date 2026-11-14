@@ -160,6 +160,9 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
+    # This fixture replaces methods with monkeypatch, whose teardown uses
+    # nn.Module.__delattr__; initialize its bookkeeping without loading weights.
+    torch.nn.Module.__init__(pipeline)
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
     pipeline.transformer = model
