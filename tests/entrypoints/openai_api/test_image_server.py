@@ -35,6 +35,7 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
 )
 from vllm_omni.entrypoints.openai.images.helpers import _check_max_generated_image_size
 from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
+from vllm_omni.entrypoints.openai.safety_checker import SafetyChecker
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -717,6 +718,48 @@ def test_generate_images_guardrail_error_returns_400(test_client, mock_async_dif
     )
     assert response.status_code == 400
     assert response.json()["detail"] == "Input was blocked by Cosmos3 guardrails."
+
+
+class _FakeSafetyChecker(SafetyChecker):
+    def __init__(self, results=None, error=None):
+        super().__init__()
+        self._results = results
+        self._error = error
+
+    def check_images(self, images):
+        if self._error is not None:
+            raise self._error
+        return self._results
+
+
+def _fake_safety_checker(results=None, error=None):
+    return _FakeSafetyChecker(results, error)
+
+
+@pytest.mark.parametrize(
+    ("checker", "status_code"),
+    [
+        (_fake_safety_checker([(True, 0.1)]), 200),
+        (_fake_safety_checker([(False, 0.9)]), 400),
+        (_fake_safety_checker(error=RuntimeError("model failed")), 503),
+    ],
+    ids=["safe", "flagged", "checker_failure"],
+)
+def test_generate_images_safety_checker(test_client, checker, status_code):
+    test_client.app.state.safety_checker = checker
+    response = test_client.post("/v1/images/generations", json={"prompt": "a cat", "n": 1, "size": "1024x1024"})
+    assert response.status_code == status_code
+
+
+def test_image_edits_safety_checker_flagged_returns_400(async_omni_stage_configs_only_client):
+    async_omni_stage_configs_only_client.app.state.safety_checker = _fake_safety_checker([(False, 0.9)])
+    response = async_omni_stage_configs_only_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((16, 16)))],
+        data={"prompt": "edit me", "size": "auto"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Generated image was flagged as potentially unsafe."
 
 
 def test_generate_images_async_omni_sampling_params(async_omni_test_client):
