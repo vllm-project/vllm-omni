@@ -32,7 +32,12 @@ stages:
   - stage_id: 0
     max_num_seqs: 1
     gpu_memory_utilization: 0.95
-    enforce_eager: true
+    # FULL CUDA graphs for decode, no torch.compile: AR TPOT 76 -> 6 ms on
+    # GB200 TP4. Inductor collapsed some temp-0 outputs, so compile stays off.
+    enforce_eager: false
+    compilation_config:
+      mode: 0
+      cudagraph_mode: FULL_DECODE_ONLY
     max_num_batched_tokens: 32768
     devices: "0,1"
     tensor_parallel_size: 2
@@ -76,6 +81,7 @@ platforms:
     stages:
       - stage_id: 0
         gpu_memory_utilization: 0.8
+        enforce_eager: true
         devices: "0,1,2,3"
         tensor_parallel_size: 4
         max_num_batched_tokens: 8192
@@ -94,6 +100,7 @@ platforms:
       # Both stages stay resident, so they cannot share cards.
       - stage_id: 0
         gpu_memory_utilization: 0.95
+        enforce_eager: true
         devices: "0,1,2,3"
         tensor_parallel_size: 4
         # fp8 AR weights leave under 1 GiB for KV; 22800 tokens will not fit.
