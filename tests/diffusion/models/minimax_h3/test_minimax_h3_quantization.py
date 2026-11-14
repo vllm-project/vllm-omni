@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -343,3 +344,85 @@ def test_pipeline_resolves_transformer_component_quant_config():
     assert transformer_config.ignored_layers == ignored_layers
     assert _resolve_component_quant_config(component_config, "transformer") is transformer_config
     assert _resolve_component_quant_config(transformer_config, "transformer") is transformer_config
+
+
+@pytest.mark.parametrize("case", ["offline", "online", "missing_op", "non_int8", "wrapped"])
+def test_mlp_optional_mindiesd_int8_swiglu(mocker, case):
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear, UnquantizedLinearMethod
+
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MiniMaxH3MLP
+    from vllm_omni.quantization.int8_config import (
+        DiffusionInt8Config,
+        NPUInt8LinearMethod,
+        NPUInt8OnlineLinearMethod,
+    )
+
+    input_tensor = torch.zeros(2, 3, 4, dtype=torch.bfloat16)
+    x = mocker.Mock(
+        wraps=input_tensor,
+        device=mocker.Mock(type="npu"),
+        shape=input_tensor.shape,
+        dtype=input_tensor.dtype,
+    )
+    linear_output = torch.zeros(2, 3, 10, dtype=x.dtype)
+    activated = torch.zeros(2, 3, 5, dtype=x.dtype)
+    output = torch.zeros_like(input_tensor)
+    fc1 = MergedColumnParallelLinear.__new__(MergedColumnParallelLinear)
+    nn.Module.__init__(fc1)
+    method = NPUInt8OnlineLinearMethod if case == "online" else NPUInt8LinearMethod
+    fc1.quant_method = (
+        UnquantizedLinearMethod()
+        if case == "non_int8"
+        else method(DiffusionInt8Config(is_checkpoint_int8_serialized=case != "online"))
+    )
+    weight_dtype = x.dtype if case == "non_int8" else torch.int8
+    fc1.weight = nn.Parameter(torch.zeros(4, 10, dtype=weight_dtype), requires_grad=False)
+    fc1.weight_scale = nn.Parameter(torch.ones(10), requires_grad=False)
+    fc1.forward = mocker.Mock(return_value=(linear_output, None))
+    mlp = MiniMaxH3MLP.__new__(MiniMaxH3MLP)
+    nn.Module.__init__(mlp)
+    mlp.fc1 = mocker.Mock(wraps=fc1, quant_method=fc1.quant_method) if case == "wrapped" else fc1
+    mlp.act_fn = mocker.Mock(return_value=activated)
+    mlp.fc2 = mocker.Mock(return_value=(output, None))
+
+    quantized = torch.zeros(6, 4, dtype=torch.int8)
+    pertoken_scale = torch.ones(6)
+    fused_output = torch.arange(30, dtype=x.dtype).reshape(6, 5)
+    torch_npu = ModuleType("torch_npu")
+    torch_npu.__dict__["npu_dynamic_quant"] = mocker.Mock(return_value=(quantized, pertoken_scale))
+    custom_ops = ModuleType("mindiesd.layers._custom_ops")
+    fused_op = mocker.Mock(return_value=fused_output)
+    if case != "missing_op":
+        custom_ops.__dict__["eagle_quant_batch_matmul_swiglu"] = fused_op
+    mocker.patch.dict(
+        sys.modules,
+        {
+            "torch_npu": torch_npu,
+            "mindiesd": ModuleType("mindiesd"),
+            "mindiesd.layers": ModuleType("mindiesd.layers"),
+            "mindiesd.layers._custom_ops": custom_ops,
+        },
+    )
+
+    assert mlp(x) is output
+
+    if case in {"offline", "online"}:
+        x.reshape.assert_called_once_with(-1, 4)
+        torch_npu.npu_dynamic_quant.assert_called_once()
+        torch.testing.assert_close(torch_npu.npu_dynamic_quant.call_args.args[0], input_tensor.reshape(6, 4))
+        fused_op.assert_called_once_with(
+            quantized, fc1.weight, fc1.weight_scale, pertoken_scale=pertoken_scale, output_dtype=x.dtype
+        )
+        mlp.fc2.assert_called_once()
+        torch.testing.assert_close(mlp.fc2.call_args.args[0], fused_output.reshape(2, 3, 5))
+        fc1.forward.assert_not_called()
+        mlp.act_fn.assert_not_called()
+    else:
+        x.reshape.assert_not_called()
+        torch_npu.npu_dynamic_quant.assert_not_called()
+        fused_op.assert_not_called()
+        fc1.forward.assert_called_once_with(x)
+        mlp.act_fn.assert_called_once_with(linear_output)
+        mlp.fc2.assert_called_once_with(activated)
+        if case == "wrapped":
+            mlp.fc1.assert_called_once_with(x)
