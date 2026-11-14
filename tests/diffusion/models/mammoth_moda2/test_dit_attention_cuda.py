@@ -485,9 +485,10 @@ def test_model_prepares_three_rope_tables_with_one_threshold_lookup(monkeypatch,
         tables.extend((context, noise))
         return refiners(text, text_mask, context, img, img_mask, noise, temb)
 
-    def record_layers(hidden, mask, joint, temb):
+    def record_layers(hidden, mask, joint, temb, attention_mask_is_full=False):
+        assert attention_mask_is_full
         tables.append(joint)
-        return layers(hidden, mask, joint, temb)
+        return layers(hidden, mask, joint, temb, attention_mask_is_full=attention_mask_is_full)
 
     monkeypatch.setattr(model, "_apply_refiners", record_refiners)
     monkeypatch.setattr(model, "_apply_transformer_layers", record_layers)
