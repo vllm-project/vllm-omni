@@ -21,6 +21,17 @@ if HAS_TRITON:
         )
 
     @triton.jit
+    def _mul_rn_f32_amdgcn(x, y):
+        return tl.inline_asm_elementwise(
+            "v_mul_f32 $0, $1, $2",
+            constraints="=v,v,v",
+            args=[x, y],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+
+    @triton.jit
     def _scaled_residual_exact_kernel(
         output_ptr,
         residual_ptr,
@@ -30,6 +41,7 @@ if HAS_TRITON:
         branch_stride_row,
         hidden_size: tl.constexpr,
         block_n: tl.constexpr,
+        is_hip: tl.constexpr,
     ):
         row = tl.program_id(0)
         columns = tl.arange(0, block_n)
@@ -46,7 +58,10 @@ if HAS_TRITON:
         ).to(tl.float32)
         scale = tl.load(scale_ptr + columns, mask=mask, other=0.0).to(tl.float32)
         # Prevent contraction into FMA and retain the eager rounding boundary.
-        updated = residual + _mul_rn_f32(branch, scale)
+        if is_hip:
+            updated = residual + _mul_rn_f32_amdgcn(branch, scale)
+        else:
+            updated = residual + _mul_rn_f32(branch, scale)
         tl.store(output_ptr + row * hidden_size + columns, updated, mask=mask)
 
 
@@ -59,7 +74,6 @@ def try_scaled_residual_exact(
 
     if not (
         HAS_TRITON
-        and torch.version.hip is None
         and not torch.is_grad_enabled()
         and not torch.compiler.is_compiling()
         and residual.is_cuda
@@ -93,6 +107,7 @@ def try_scaled_residual_exact(
         branch_2d.stride(0),
         hidden_size=hidden_size,
         block_n=triton.next_power_of_2(hidden_size),
+        is_hip=torch.version.hip is not None,
         num_warps=8,
     )
     return output.reshape_as(residual)

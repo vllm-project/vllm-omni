@@ -68,6 +68,8 @@ def _failing_norm_input(_module, _hidden_states):
 @pytest.mark.parametrize(("batch", "sequence"), [(1, 1), (1, 195), (2, 1797)])
 def test_h3_vae_qk_norm_rope_is_bit_exact(batch, sequence):
     device, operators = _selected_operators()
+    if operators.qk_norm_rope is None:
+        pytest.skip("This target keeps the eager QK RMSNorm + RoPE")
 
     torch.manual_seed(17)
     qkv = torch.randn(
@@ -377,9 +379,11 @@ def test_h3_vae_dispatch_selects_supported_cuda_capabilities(monkeypatch):
 
     platform = Mock()
     platform.is_cuda.return_value = True
+    platform.is_rocm.return_value = False
     platform.is_available.return_value = True
     monkeypatch.setattr(dispatch, "HAS_TRITON", True)
     monkeypatch.setattr(dispatch, "current_omni_platform", platform)
+    monkeypatch.setattr(torch.version, "hip", None)
 
     for capability in (89, 90, 100, 103):
         platform.get_device_capability.return_value.to_int.return_value = capability
@@ -388,3 +392,26 @@ def test_h3_vae_dispatch_selects_supported_cuda_capabilities(monkeypatch):
     for capability in (80, 101, 110):
         platform.get_device_capability.return_value.to_int.return_value = capability
         assert dispatch.resolve_h3_vae_operators(torch.device("cuda:0")) is None
+
+
+@pytest.mark.parametrize(
+    ("arch", "selected"),
+    [("gfx1201", True), ("gfx1200", True), ("gfx1250", False), ("gfx1100", False), ("gfx942", False)],
+)
+def test_h3_vae_dispatch_selects_rocm_gfx12(monkeypatch, arch, selected):
+    from vllm_omni.diffusion.models.minimax_h3.ops.vae import dispatch
+
+    platform = Mock()
+    platform.is_cuda.return_value = False
+    platform.is_rocm.return_value = True
+    platform.is_available.return_value = True
+    monkeypatch.setattr(dispatch, "HAS_TRITON", True)
+    monkeypatch.setattr(dispatch, "current_omni_platform", platform)
+    monkeypatch.setattr(torch.version, "hip", "7.0")
+    props = Mock(gcnArchName=f"{arch}:sramecc-:xnack-")
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _index: props)
+
+    operators = dispatch.resolve_h3_vae_operators(torch.device("cuda:0"))
+    assert (operators is not None) is selected
+    if selected:
+        assert operators.qk_norm_rope is None

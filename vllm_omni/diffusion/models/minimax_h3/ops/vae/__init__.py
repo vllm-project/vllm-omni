@@ -180,6 +180,10 @@ def _decoder_block_linears(decoder: nn.Module) -> tuple[nn.Linear, ...] | None:
     return tuple(linears)
 
 
+def _keep_eager_qk_norm_rope(*_args) -> None:
+    return None
+
+
 def install_h3_vae_optimizations(
     decoder: nn.Module,
     *,
@@ -205,7 +209,7 @@ def install_h3_vae_optimizations(
     for block in decoder.transformer_blocks:
         block.ff._omni_silu_and_mul = SiluAndMul()
         block.ff.forward = MethodType(_optimized_feed_forward, block.ff)
-        block.attn._omni_qk_norm_rope = operators.qk_norm_rope
+        block.attn._omni_qk_norm_rope = operators.qk_norm_rope or _keep_eager_qk_norm_rope
         block.attn.forward = MethodType(_optimized_attention, block.attn)
         block._omni_scaled_residual = operators.scaled_residual
         block.forward = MethodType(_optimized_transformer_block, block)

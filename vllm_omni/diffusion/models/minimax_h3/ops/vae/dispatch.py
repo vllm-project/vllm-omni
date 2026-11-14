@@ -35,7 +35,8 @@ class H3VAEOperatorSet:
     """One validated hardware implementation of the H3 VAE operations."""
 
     supports: Callable[[torch.device], bool]
-    qk_norm_rope: QKNormRopeOp
+    # None keeps the eager QK RMSNorm + RoPE on this target.
+    qk_norm_rope: QKNormRopeOp | None
     scaled_residual: ScaledResidualOp
 
 
@@ -69,6 +70,20 @@ def _supports_cuda_sm103(device: torch.device) -> bool:
     return _supports_cuda_capability(device, 103)
 
 
+def _supports_rocm_gfx12(device: torch.device) -> bool:
+    if (
+        not HAS_TRITON
+        or device.type != "cuda"
+        or torch.version.hip is None
+        or not current_omni_platform.is_rocm()
+        or not current_omni_platform.is_available()
+    ):
+        return False
+    device_index = torch.accelerator.current_device_index() if device.index is None else int(device.index)
+    # RDNA4 (gfx1200/gfx1201) only; gfx1250 is a different family and untested.
+    return torch.cuda.get_device_properties(device_index).gcnArchName.startswith("gfx120")
+
+
 # Keep hardware selection flat: adding a backend means adding one operator set,
 # without changing the installer or the model execution path.
 H3_VAE_OPERATOR_TABLE: tuple[H3VAEOperatorSet, ...] = (
@@ -90,6 +105,12 @@ H3_VAE_OPERATOR_TABLE: tuple[H3VAEOperatorSet, ...] = (
     H3VAEOperatorSet(
         supports=_supports_cuda_sm103,
         qk_norm_rope=try_qk_norm_rope_exact,
+        scaled_residual=try_scaled_residual_exact,
+    ),
+    H3VAEOperatorSet(
+        supports=_supports_rocm_gfx12,
+        # The exact QK kernel is written with PTX packed-half arithmetic.
+        qk_norm_rope=None,
         scaled_residual=try_scaled_residual_exact,
     ),
 )
