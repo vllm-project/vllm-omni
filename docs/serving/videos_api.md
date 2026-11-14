@@ -187,6 +187,13 @@ curl -s http://localhost:8091/v1/videos \
   -F "fps=16"
 ```
 
+MiniMax H3 Ref2VA accepts the boolean
+`extra_params.reference_video_decode_reuse` (default `false`; offline:
+`extra_args`). Setting it to `true` reuses RGB from reference transcoding for
+Qwen3VL sampling and VAE input. Each prepared reference needs temporary
+`frame_count × height × width × 3` bytes, removed with the request artifacts.
+Non-boolean values are rejected, and other H3 tasks cannot enable this option.
+
 JSON references currently support `image_url`/`video_url`; `file_id` references
 are not implemented yet. Models may expose additional V2V controls through
 `extra_params`. For example, Cosmos3 supports
