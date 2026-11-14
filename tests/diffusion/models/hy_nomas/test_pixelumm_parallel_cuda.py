@@ -25,6 +25,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.models.hy_nomas.decoder import local_attention_layout
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import build_decoder
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.platforms import current_omni_platform
@@ -86,7 +87,9 @@ def _decode_worker(rank: int, rendezvous: str, root: str):
             initialize_model_parallel(sequence_parallel_size=2, ulysses_degree=2, backend="nccl")
             model = _load_decoder(Path(root), device)
             generator = torch.Generator().manual_seed(42)
-            latent = torch.randn((1, 32, 20, 8, 8), generator=generator, dtype=torch.bfloat16).to(device)
+            latent = torch.randn((1, 32, 20, 22, 40), generator=generator, dtype=torch.bfloat16).to(device)
+            layout = local_attention_layout((1, 44, 80), model.decoder.local_attention_tile, device)
+            assert layout is not None and len(layout[2]) == 32
             calls = []
             hook = model.decoder.register_forward_hook(lambda *_: calls.append(1))
             with (
