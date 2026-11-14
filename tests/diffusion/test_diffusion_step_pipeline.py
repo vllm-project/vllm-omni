@@ -19,7 +19,7 @@ import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.diffusion.attention import schedule as schedule_module
-from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, AttentionSigmaWindow
 from vllm_omni.diffusion.data import DiffusionOutput, parse_attention_schedule_config
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -994,6 +994,41 @@ class TestRunner:
         DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
 
         expected = (AttentionScheduleRange(start=1, end=None, profile="dense"),)
+        assert seen == [expected, expected]
+        assert resolved == [expected]
+
+    def test_cached_step_reuses_the_sigma_schedule_resolved_at_admission(self, monkeypatch):
+        """A request's sigma windows are resolved once when it reaches the runner, not again on each later step."""
+        runner = _make_runner()
+        runner.vllm_config = None
+        runner.od_config.diffusion_attention_schedule = parse_attention_schedule_config(
+            {
+                "profiles": {"dense": {"default": "TORCH_SDPA"}},
+                "sigma": [{"low": 0.0, "high": 0.5, "profile": "dense"}],
+            }
+        )
+        resolved: list[object] = []
+        real_resolve = schedule_module.resolve_attention_sigma_schedule
+
+        def _recording_resolve(*args, **kwargs):
+            schedule = real_resolve(*args, **kwargs)
+            resolved.append(schedule)
+            return schedule
+
+        monkeypatch.setattr(schedule_module, "resolve_attention_sigma_schedule", _recording_resolve)
+        seen: list[object] = []
+
+        class _ContextRecordingStepPipeline(_StepPipeline):
+            def denoise_step(self, input_batch, **kwargs):
+                seen.append(get_forward_context().attention_sigma_schedule)
+                return super().denoise_step(input_batch, **kwargs)
+
+        runner.pipeline = _ContextRecordingStepPipeline()
+
+        DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(_make_step_request(), step_id=0))
+        DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+
+        expected = (AttentionSigmaWindow(low=0.0, high=0.5, profile="dense"),)
         assert seen == [expected, expected]
         assert resolved == [expected]
 

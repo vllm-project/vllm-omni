@@ -13,9 +13,11 @@ make the miss loud in the unit tests instead, and the Protocol gives the
 supported surface one name.
 """
 
+from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
+    "SupportsMRv2MultiFrameDecode",
     "SupportsMultiFrameDecode",
     "requires_request_sample_eligibility",
     "supports_multi_frame_decode",
@@ -44,6 +46,31 @@ class SupportsMultiFrameDecode(Protocol):
     def merge_frame_outputs(self, frame_outputs: list[Any], frame_stop_logits: list[Any]) -> Any: ...
 
 
+class SupportsMRv2MultiFrameDecode(SupportsMultiFrameDecode, Protocol):
+    """Model-owned codec state and inputs for the MRv2 frame loop."""
+
+    kstep_continue_token_id: int
+
+    def kstep_rows_ready(self, request_ids: Sequence[str]) -> bool: ...
+
+    def prepare_kstep_inputs(
+        self,
+        extra: dict[str, Any],
+        *,
+        num_reqs: int,
+        prefilling: Any,
+        seed_ids: Any,
+        ib_ids: Any,
+        logits_idx: Any,
+    ) -> None: ...
+
+    def rewrite_kstep_initial_embeds(
+        self, inputs_embeds: Any, extra: dict[str, Any], spans: list[tuple[int, int]], input_ids: Any = None
+    ) -> None: ...
+
+    def flush_cuda_kstep_feedback(self) -> None: ...
+
+
 # The members a runner actually calls, spelled out instead of read off the
 # Protocol: ``SupportsMultiFrameDecode.__protocol_attrs__`` is only filled in on
 # Python 3.12+ (typing._get_protocol_attrs sets it when the class is created),
@@ -57,24 +84,35 @@ _REQUIRED_MULTI_FRAME_MEMBERS: tuple[str, ...] = (
     "merge_frame_outputs",
 )
 
+_REQUIRED_MRV2_MULTI_FRAME_MEMBERS: tuple[str, ...] = (
+    "kstep_continue_token_id",
+    "kstep_rows_ready",
+    "prepare_kstep_inputs",
+    "rewrite_kstep_initial_embeds",
+    "flush_cuda_kstep_feedback",
+)
+
 
 def _missing_members(model: Any, names: tuple[str, ...]) -> list[str]:
     return [name for name in names if not hasattr(model, name)]
 
 
-def supports_multi_frame_decode(model: Any) -> bool:
+def supports_multi_frame_decode(model: Any, *, mrv2: bool = False) -> bool:
     """Whether ``model`` runs the multi-frame loop, verified when it says yes.
 
     Returns False when the flag is off or absent (that is the common case:
     Thinker stages and every model without the loop). When the flag is on but
     a member of the contract is missing, raises TypeError naming what is
     absent -- a dropped forward fails in CI rather than as empty audio on a
-    device.
+    device. Pass ``mrv2=True`` to check the CUDA MRv2 hooks as well.
     """
     flag = getattr(model, "supports_multi_frame_decode", False)
     if not flag:
         return False
-    missing = _missing_members(model, _REQUIRED_MULTI_FRAME_MEMBERS)
+    required = _REQUIRED_MULTI_FRAME_MEMBERS
+    if mrv2:
+        required += _REQUIRED_MRV2_MULTI_FRAME_MEMBERS
+    missing = _missing_members(model, required)
     if missing:
         raise TypeError(
             f"{type(model).__name__} advertises supports_multi_frame_decode but does not provide "

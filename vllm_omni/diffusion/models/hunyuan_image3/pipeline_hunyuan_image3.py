@@ -21,12 +21,17 @@ from vllm.config.vllm import get_current_vllm_config
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.transformers_utils.config import get_config
 
-from vllm_omni.diffusion.attention.schedule import require_request_attention_schedule_fits
+from vllm_omni.diffusion.attention.schedule import (
+    require_request_attention_schedule_fits,
+    resolve_request_attention_sigma_schedule,
+)
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
+    check_scheduler_sigmas,
+    denoise_sigma,
     get_forward_context,
     is_forward_context_available,
     request_denoise_progress,
@@ -95,17 +100,24 @@ def _log_step0_profile_reuse(od_config: OmniDiffusionConfig) -> None:
     """Note at startup that a default schedule's step-0 profile also shapes every later step.
 
     Later steps reuse the prompt K/V computed in the step-0 forward, and deeper layers' prompt K/V
-    depend on earlier layers' attention outputs. Ranges are ordered, so only the first can cover
-    step 0. A request's own schedule is not known at startup. Every TP/SP rank builds the pipeline,
-    so only rank 0 logs.
+    depend on earlier layers' attention outputs. Ranges and windows are ordered, so only the first
+    range can cover step 0 and only the last window can cover sigma 1.0, where every run starts. A
+    request's own schedule is not known at startup. Every TP/SP rank builds the pipeline, so only
+    rank 0 logs.
     """
     schedule_config = od_config.diffusion_attention_schedule
-    default = schedule_config.default if schedule_config is not None else ()
-    if default and default[0].start == 0 and _is_rank_zero():
+    if schedule_config is None or not _is_rank_zero():
+        return
+    profile = None
+    if schedule_config.default and schedule_config.default[0].start == 0:
+        profile = schedule_config.default[0].profile
+    elif schedule_config.sigma and schedule_config.sigma[-1].high == 1.0:
+        profile = schedule_config.sigma[-1].profile
+    if profile is not None:
         logger.info(
             "HunyuanImage-3.0 reuses the step-0 prompt K/V on every later step, so profile %r, which the "
             "default attention schedule selects at step 0, also affects the steps it does not cover.",
-            default[0].profile,
+            profile,
         )
 
 
@@ -2154,6 +2166,14 @@ class HunyuanImage3Pipeline(
         require_request_attention_schedule_fits(
             state.sampling, self.od_config.diffusion_attention_schedule, len(timesteps)
         )
+        # The scheduler sigmas the request's sigma windows read are checked here too, so unusable ones fail
+        # this request's prepare_encode rather than a denoise_step it shares with other requests.
+        check_scheduler_sigmas(
+            self.scheduler.sigmas,
+            sigma_scheduled=bool(
+                resolve_request_attention_sigma_schedule(state.sampling, self.od_config.diffusion_attention_schedule)
+            ),
+        )
         pipe._num_timesteps = len(timesteps)
         req_scheduler = copy.deepcopy(self.scheduler)
         if hasattr(req_scheduler, "set_begin_index"):
@@ -2442,9 +2462,11 @@ class HunyuanImage3Pipeline(
                 "HunyuanImage3 paged_scheduler currently supports request-level execution only; "
                 "disable step execution or use dense_legacy."
             )
-        # A bound schedule selects attention from each request's own step and total, so requests
-        # run one at a time and the batch-wide backend check, which reads the baseline config, is skipped.
-        scheduled = is_forward_context_available() and bool(get_forward_context().attention_schedule)
+        # Bound step ranges or sigma windows select attention from each request's own progress (step and
+        # total, or sigma), so requests run one at a time and the batch-wide backend check, which reads the
+        # baseline config, is skipped.
+        ctx = get_forward_context() if is_forward_context_available() else None
+        scheduled = ctx is not None and bool(ctx.attention_schedule or ctx.attention_sigma_schedule)
         if scheduled:
             groups = [[state] for state in states]
         else:
@@ -2460,21 +2482,23 @@ class HunyuanImage3Pipeline(
 
     @staticmethod
     def _scheduled_request_progress(state: "StepRequestState"):
-        """Publish one scheduled request's step, actual total and normalized timestep around its group.
+        """Publish one scheduled request's step, actual total, normalized timestep and sigma around its group.
 
         _denoise_step_group republishes the same step and clears it after its forward; the returned
-        context manager restores the step, timestep and total on any exit.
+        context manager restores the step, timestep, total and sigma on any exit.
         """
-        timestep = state.current_timestep
+        current_timestep = state.current_timestep
         scheduler = state.scheduler
-        if timestep is None or not isinstance(scheduler, FlowMatchEulerDiscreteScheduler):
+        if current_timestep is None or not isinstance(scheduler, FlowMatchEulerDiscreteScheduler):
             raise RuntimeError(
                 f"scheduled HunyuanImage-3.0 request {state.request_id} needs a current timestep and a "
-                f"flow-matching scheduler; got {type(timestep).__name__} and {type(scheduler).__name__}"
+                f"flow-matching scheduler; got {type(current_timestep).__name__} and {type(scheduler).__name__}"
             )
-        return request_denoise_progress(
-            state.step_index, state.total_steps, float(timestep) / scheduler.config.num_train_timesteps
-        )
+        timestep = current_timestep.item() / scheduler.config.num_train_timesteps
+        sigma = None
+        if get_forward_context().attention_sigma_schedule:
+            sigma = denoise_sigma(state.step_index, scheduler.sigmas)
+        return request_denoise_progress(state.step_index, state.total_steps, timestep, sigma=sigma)
 
     def step_scheduler(
         self,
