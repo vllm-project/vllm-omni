@@ -65,6 +65,11 @@ def test_compile_keeps_native_backend_and_has_no_steady_state_wrapper(monkeypatc
     estimator(value)
     compiler.assert_called_once()
     assert estimator.transformer_blocks[0].attn.attn.attn_backend.get_name() == backend
+    packer = estimator.transformer_blocks[0].attn.fuse_qkv_projections
+    if backend == "CUDNN_ATTN":
+        packer.assert_called_once_with()
+    else:
+        packer.assert_not_called()
 
 
 @pytest.mark.parametrize("device", ["cpu", "meta"])

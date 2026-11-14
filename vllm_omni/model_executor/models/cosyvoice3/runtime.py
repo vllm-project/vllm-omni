@@ -94,6 +94,9 @@ def compile_cosyvoice3_padded_dit(estimator: torch.nn.Module, device: torch.devi
     backends = {block.attn.attn.attn_backend.get_name() for block in estimator.transformer_blocks}
     if len(backends) != 1 or not backends <= {"CUDNN_ATTN", "FLASH_ATTN", "TORCH_SDPA"}:
         raise ValueError(f"cosyvoice3_compile_dit does not support the selected attention backends: {sorted(backends)}")
+    if backends == {"CUDNN_ATTN"}:
+        for block in estimator.transformer_blocks:
+            block.attn.fuse_qkv_projections()
     estimator.forward = torch.compile(estimator.forward, options={"emulate_precision_casts": True})
 
 
