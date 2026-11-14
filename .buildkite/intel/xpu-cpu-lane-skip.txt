@@ -1,0 +1,61 @@
+# Files excluded from the Intel device-agnostic lane (cpu-marked tests run with
+# current_platform == xpu, no card). Measured 2026-11-14 on one B60 host:
+# 29235 passed / 333 failed across these 50 files / 229 skipped in 16m33s.
+#
+# Two causes, both tracked in VLLMZ-3554:
+#   * the case resolves a real checkpoint, which the Intel agents' HF cache
+#     does not carry (LocalEntryNotFoundError / HFValidationError);
+#   * the case asserts CUDA-specific behaviour - an attention backend reported
+#     as supported, a CUDA graph, or a CUDA-only exception type.
+#
+# Prune a line once its XPU path lands.
+tests/attention/test_fish_kvcache_attn.py
+tests/diffusion/attention/test_kernels_hub.py
+tests/diffusion/attention/test_sage_attn.py
+tests/diffusion/diffusion_backend/test_diffusers_backend.py
+tests/diffusion/distributed/test_a2a_permute.py
+tests/diffusion/distributed/test_sp_plan_hooks.py
+tests/diffusion/distributed/test_wan_vae_fastpath_install.py
+tests/diffusion/model_loader/test_diffusers_loader.py
+tests/diffusion/models/anima/test_anima.py
+tests/diffusion/models/auk/test_auk_fp8_linear.py
+tests/diffusion/models/causvid_wan/test_async_stream_decode.py
+tests/diffusion/models/hunyuan_image3/test_hunyuan_image3_it2i_multi_image.py
+tests/diffusion/models/hunyuan_image3/test_hunyuan_image3_prompt_utils.py
+tests/diffusion/models/ltx2/test_ltx2_audio_transformer.py
+tests/diffusion/models/magi2/test_musa_pipeline.py
+tests/diffusion/models/magi2/test_native_compile.py
+tests/diffusion/models/mammoth_moda2/test_dit_quant_config.py
+tests/diffusion/models/mammoth_moda2/test_pipeline_mammothmoda2_dit.py
+tests/diffusion/models/mammoth_moda2/test_vae_memory_flags.py
+tests/diffusion/models/ming_flash_omni/test_pipeline_ming_imagegen.py
+tests/diffusion/models/omnivoice/test_step_scheduling.py
+tests/diffusion/models/ovis_image/test_ovis_image.py
+tests/diffusion/models/sana_video/test_cache_offload.py
+tests/diffusion/models/sensenova_u1/test_sensenova_u1_paged_decode.py
+tests/diffusion/quantization/test_inc_config.py
+tests/diffusion/quantization/test_int8_config.py
+tests/diffusion/quantization/test_online_block_fp8.py
+tests/diffusion/test_cumem_free_patch.py
+tests/diffusion/test_data_is_moe.py
+tests/diffusion/test_diffusion_engine.py
+tests/diffusion/test_omni_diffusion_config_master_port.py
+tests/diffusion/test_step_request_lifecycle.py
+tests/diffusion/test_vllm_config.py
+tests/engine/test_arg_utils.py
+tests/engine/test_arg_utils_shared_fields.py
+tests/engine/test_async_omni_engine_stage_init.py
+tests/engine/test_parallel_stage_init.py
+tests/engine/test_single_stage_mode.py
+tests/engine/test_stage_device_layout.py
+tests/model_executor/models/ming_flash_omni/test_talker_llm_graph.py
+tests/model_executor/models/ming_image/test_config_and_pipeline.py
+tests/model_executor/models/minicpmo_4_5/test_duplex_mrv2_sampling.py
+tests/model_executor/models/minicpmo_4_5/test_flow_encoder_graph.py
+tests/model_executor/models/omnivoice/test_nonverbal_tags_tokenize.py
+tests/model_executor/models/personaplex/test_mimi_cudagraph.py
+tests/model_executor/models/qwen3_omni/test_duplex_context_view_processor.py
+tests/model_executor/models/qwen3_tts/test_qwen3_tts_code2wav.py
+tests/model_executor/models/test_omni_processing.py
+tests/platforms/test_record_device_event.py
+tests/worker/test_worker_base.py

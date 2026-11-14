@@ -128,6 +128,7 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     -e HF_TOKEN \
     -e HF_HUB_OFFLINE \
     -e XPU_TEST_SCOPE \
+    -e XPU_CPU_WORKERS \
     -e ZE_AFFINITY_MASK \
     --name "${container_name}" \
     "${image_name}" \
@@ -178,6 +179,21 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
             rc=1
         fi
     }
+
+    # Device-agnostic lane: cpu-marked tests, which take no card but do run
+    # with current_platform == xpu. That is coverage no other CI lane has, and
+    # it reaches the areas the card lane cannot afford - engine, config, the
+    # scheduler, entrypoints, distributed. The skip list pins the cases that
+    # need a real checkpoint or assert CUDA-specific behaviour (VLLMZ-3554).
+    cpu_paths=(tests/platforms tests/config tests/core tests/utils tests/attention
+               tests/engine tests/worker tests/worker_v2 tests/distributed
+               tests/model_executor tests/diffusion)
+    mapfile -t cpu_skip < <(grep -v "^#" .buildkite/intel/xpu-cpu-lane-skip.txt | grep .)
+    cpu_ignore=()
+    for f in "${cpu_skip[@]}"; do cpu_ignore+=(--ignore "${f}"); done
+    stage "device-agnostic (no card)" 30m -n "${XPU_CPU_WORKERS:-8}" \
+        "${cpu_paths[@]}" "${cpu_ignore[@]}" \
+        -m "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
 
     # core_model excludes omni: the async-omni tests carry both markers and
     # would otherwise run twice, and they need their own process (broad scope).
