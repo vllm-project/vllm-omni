@@ -219,6 +219,13 @@ def indexed_gate(
     rows, hidden_size = x.shape
     if rows == 0:
         return output
+    if x.device.type == "npu":
+        try:
+            from mindiesd.layers.index_modulation import indexed_gate as mindiesd_indexed_gate
+        except ImportError:
+            pass
+        else:
+            return mindiesd_indexed_gate(output, x, gate, other, indices)
     _launch_row_chunks(
         _indexed_gate_kernel,
         rows,
@@ -256,6 +263,13 @@ def rms_norm_indexed_scale_shift(
         normalized = normalized * torch.rsqrt(variance + eps)
         normalized = (weight.float() * normalized).to(input_dtype)
         return (normalized * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(input_dtype)
+    if x.device.type == "npu":
+        try:
+            from mindiesd import rms_norm_indexed_scale_shift as mindiesd_rms_norm_indexed_scale_shift
+        except ImportError:
+            pass
+        else:
+            return mindiesd_rms_norm_indexed_scale_shift(x, weight, shift, scale, indices, eps)
     output = torch.empty_like(x)
     rows, hidden_size = x.shape
     if rows:
@@ -303,6 +317,15 @@ def indexed_gate_rms_norm_scale_shift(
             input_dtype
         )
         return residual_out, modulated_out
+    if residual.device.type == "npu":
+        try:
+            from mindiesd.layers._custom_ops import eagle_indexed_gate_norm_modulate
+        except ImportError:
+            pass
+        else:
+            return eagle_indexed_gate_norm_modulate(
+                residual, gate, branch, shift, scale, indices, weight=weight, norm_type=0, eps=eps
+            )
     residual_out = torch.empty_like(residual)
     modulated_out = torch.empty_like(residual)
     rows, hidden_size = residual.shape
