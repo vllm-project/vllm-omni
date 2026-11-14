@@ -8,6 +8,28 @@ import torch
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("shape", [(3, 8), (2, 3, 8), (2, 2, 3, 8)])
+@pytest.mark.parametrize("strided", [False, True])
+def test_mxfp_apply_contiguous_flattened_input(shape, strided):
+    from torch import nn
+
+    from vllm_omni.quantization.inc_config import _MXFlattenedLinearMethod
+
+    class Scheme:
+        def apply_weights(self, layer, x, bias):
+            assert x.ndim == 2
+            assert x.is_contiguous()
+            return nn.functional.linear(x, layer.weight, bias)
+
+    layer = nn.Linear(8, 4)
+    x = torch.randn(*shape[:-1], shape[-1] * 2)[..., ::2] if strided else torch.randn(*shape)
+    assert x.is_contiguous() is not strided
+    method = _MXFlattenedLinearMethod(Scheme())
+    actual = method.apply(layer, x, layer.bias)
+    torch.testing.assert_close(actual, nn.functional.linear(x, layer.weight, layer.bias))
+    assert actual.shape == (*shape[:-1], 4)
+
+
 @pytest.mark.parametrize(
     ("data_type", "group_size", "packing_format"),
     [
