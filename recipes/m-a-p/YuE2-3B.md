@@ -39,22 +39,139 @@ validation details.
 | MoT | NAR path (`nar_self_attn`/`nar_mlp` per layer) shares embed_tokens, final norm and lm_head with the AR path |
 | Frames | Single codebook: one codec token per frame, 25 frames/s, span [151853, 184521) |
 | Sampling | temperature/top-k/top-p + windowed repetition penalty, seeded; model-owned (phase-masked vocab) |
-| Guidance | Off by default (1.0 full/melody, 1.01 off); not exercised |
+| Guidance | Paired semantic CFG, default scale 1.0 (disabled) |
 | Acoustic | 32-step midpoint flow matching over 64-dim latents on the NAR path, chunked ~12k frames |
 | VAE | `m-a-p/YuE2-Vae` decoder-only, tiled (1024 core + 16 halo frames), FP32 |
 | Output | 48 kHz stereo, whole song delivered when the semantic request finishes |
 
-Generation is one or two requests on a single AR stage: the abc phase writes
-the score, the semantic phase generates codec frames, then queues the ODE and VAE on a
-high-priority CUDA stream. Other requests keep decoding while the finishing
-request emits HOLD tokens (up to 4096 steps, within its token/context budget).
-The scheduler is unchanged. Weights load once; the VAE loads at startup from
-`$YUE2_VAE` or the hub id.
+The single `yue2` pipeline uses one worker and one set of model weights.
+Semantic completion releases the request's native AR slot and paged KV
+blocks. NAR and VAE finish in a model-owned acoustic queue, while the native
+request stays alive until complete audio is returned or cancellation cleans
+it up. Synthesis does not consume HOLD tokens. The VAE is loaded at startup
+from `hf_overrides.yue2_vae_path`.
+
+### Automatic ABC and paired CFG
+
+YuE2 supports automatic ABC: with `cot=full` or `cot=melody`, omit
+`abc` to generate the score and then semantic tokens within one request.
+Supplying `abc` uses that score directly; `cot=off` skips ABC. ABC and semantic
+sampling retain their independent presets and restart at the same request
+seed. Offline outputs include `abc_token_ids` and `meta.abc_truncated` when
+ABC was generated. The speech endpoint returns the final audio and reports
+budget truncation through its existing response metadata.
+
+```bash
+vllm serve m-a-p/YuE2-3B --omni \
+    --deploy-config vllm_omni/deploy/yue2.yaml
+```
+
+```bash
+curl http://localhost:8000/v1/audio/speech \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"m-a-p/YuE2-3B","input":"[Verse]\nWalking home tonight", "instructions":"Gentle acoustic folk", "seed":831001, "max_new_tokens":200, "response_format":"wav", "extra_params":{"cot":"full","abc_max_tokens":4096}}' \
+    --output song.wav
+```
+
+`max_new_tokens` is the semantic frame budget (up to 9000); `abc_max_tokens`
+is a separate ABC budget (1–4096). The prompt plus both budgets must fit
+`max_model_len`. A truncated nonempty ABC can still proceed to synthesis;
+an empty or invalid score fails that request. The existing offline script
+continues to use two calls. Native callers can use
+`vllm_omni.model_executor.models.yue2.request.prepare_song` to obtain a
+token prompt and `SamplingParams` for one native request.
+
+Set `extra_params.cfg_scale`, for example `1.5`, to enable paired semantic
+CFG on the same endpoint. The default is `1.0` (no negative branch); finite
+values from 0 to 20 are accepted. The negative branch shares the exact ABC,
+uses a separate native AR slot and paged KV, and receives the token sampled
+once from guided logits on the positive branch. Only the positive branch
+synthesizes audio.
+
+CFG needs at least two AR slots, complete prefills, sufficient prefill token
+budget for both actual prefixes, and enough KV capacity to reserve both
+branches through their output budgets. A pair that cannot fit fails its
+request instead of waiting forever. Set deployment capacity for the expected
+request lengths; four AR slots allow at most two guided semantic songs.
+Ordinary CFG=1 songs retain native AR admission and support one-slot servers.
+
+This implementation requires one GPU (`TP=PP=1`), model runner v1,
+synchronous FCFS scheduling, prefix caching disabled, and no external KV
+connector or speculative decoding. Chunked prefill remains available for
+ordinary requests; CFG requests require it disabled. The default config
+keeps the existing 24576 context, four AR slots and eager backbone, with
+chunked prefill disabled. Existing two-call ABC/semantic clients and external
+scores remain supported; pipeline, architecture and HTTP endpoint names stay
+`yue2`, `Yue2ForCausalLM` and `/v1/audio/speech`.
+
+### Acoustic batching and memory
+
+Set `hf_overrides.yue2_nar_batch_size: 2` in `yue2.yaml` to batch up to two
+ready songs; VAE decoding stays at one tile at a time. NAR packs real tokens with separate
+attention spans; each request writes its conditioning KV directly into the
+final packed storage. This removes an intermediate KV copy, not all memory
+movement in synthesis. A single-song batch retains the original NAR path.
+
+Set these fields under the stage's `hf_overrides` and restart to apply them:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `yue2_nar_batch_size` | 1 | Positive batch cap, independent of AR `max_num_seqs`; use 2 to enable packing |
+| `yue2_nar_batch_wait_ms` | 0 | Maximum wait from the oldest ready song; full batches start immediately, B1 never waits |
+| `yue2_nar_batch_max_tokens` | 0 | Aggregate conditioning plus NAR token budget; 0 disables this limit |
+| `yue2_vae_batch_size` | 1 | VAE tile batch cap; retain 1 for lower peak memory |
+| `yue2_vae_tile_frames` | 1024 | Core frames per VAE tile, with the existing halo |
+
+The token budget preserves FIFO order. An oversized first request runs alone;
+the budget is not a hard memory limit or an OOM recovery mechanism. Waiting
+time includes time spent behind the previous acoustic job. B2 requires two
+ready songs and may rarely trigger when AR is the bottleneck. Packed kernels
+can change floating-point results and subsequent generated audio; do not
+assume bitwise equivalence across batching configurations.
+
+AR paged KV, NAR conditioning KV, graphs and VAE activations all contribute to
+peak memory. The synthesis job waits for the final NAR completion event and
+releases its KV and graph buffers before allocating VAE workspace. The shared
+graph allocator pool retains reserved storage for reuse.
+If NAR graph capture runs out of memory, it discards the failed graph,
+synchronizes and clears unused cached memory, then attempts capture once more.
+This recovery also covers an OOM wrapped by CUDA's capture-invalidated error;
+other errors and a second OOM propagate to the synthesis job.
+Successful captures and graph replays do not perform this reclamation.
+
+The supplied four-slot / 0.70 memory-utilization settings are starting points,
+not a 24 GiB deployment guarantee. For long songs on a 24 GiB card, start with
+one AR slot, an explicit 3 GiB KV cache and two client requests, keeping
+NAR1/VAE1 and the default zero wait/token budget. This configuration completed
+the recorded full-CoT 9000-frame workload; it is not a guarantee for other
+prompts or environments. CFG requires at least two AR slots and therefore
+needs a separate memory assessment. Tune AR slots, client concurrency and
+acoustic caps together on the actual workload.
+
+## Checkpoints and revisions
+
+Both checkpoints accept a local directory or HF repository ID. The deployment
+YAML selects the VAE independently of the main model:
+
+```yaml
+hf_overrides:
+  architectures: [Yue2ForCausalLM]
+  yue2_vae_path: m-a-p/YuE2-Vae
+  yue2_vae_revision: main
+```
+
+Use a commit SHA for each revision to pin the weights. `vllm serve --revision`
+selects the main checkpoint and its `qwen.tiktoken`; the VAE uses
+`yue2_vae_revision`. The offline example accepts `--revision`, `--vae`,
+`--vae-revision`, and `--deploy-config` for the same settings. HF cache and
+authentication follow the engine configuration. An explicit `yue2_vae_path`
+takes precedence over the existing `YUE2_VAE` environment variable. With the
+default YAML value `null`, that variable remains supported; if unset, the VAE
+loads from `m-a-p/YuE2-Vae`.
 
 ## Running
 
 ```bash
-export YUE2_VAE=/models/YuE2-Vae   # or omit and let it resolve from the hub
 python examples/offline_inference/yue2/end2end.py \
     --model /models/YuE2-3B \
     --style "A melancholic lo-fi hip-hop track at 85 BPM in F minor" \
@@ -82,7 +199,6 @@ and cached YuE2-3B and YuE2-Vae weights:
 
 ```bash
 export YUE2_MODEL_DIR=/path/to/YuE2-3B
-export YUE2_VAE=/path/to/YuE2-Vae
 CUDA_VISIBLE_DEVICES=0 python -m pytest tests/e2e/online_serving/test_yue2.py \
     -k preemption_and_synthesis_abort -m 'slow and tts' --run-level full_model -q -s
 ```
