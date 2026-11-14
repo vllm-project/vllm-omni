@@ -20,6 +20,7 @@ import math
 import struct
 import time
 import uuid
+from dataclasses import dataclass
 from io import BytesIO
 from typing import TYPE_CHECKING, TypedDict, cast
 
@@ -28,6 +29,8 @@ import pybase64 as base64
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
+    from vllm_omni.engine.duplex.config import DuplexCapabilities
+    from vllm_omni.engine.duplex.process_engine import ProcessDuplexEngineClient
     from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 
 logger = init_logger(__name__)
@@ -54,8 +57,25 @@ class _WarmupAudioAppendKwargs(TypedDict, total=False):
     video_frames: list[str]
 
 
+@dataclass(frozen=True)
+class _ProcessWarmupProfile:
+    """Serializable startup facts, without loading a model plugin in the API process."""
+
+    engine: ProcessDuplexEngineClient
+
+    def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
+        return self.engine.duplex_capabilities
+
+    def silence_unit_payload(self) -> dict[str, object]:
+        return dict(self.engine.metadata.warmup_audio)
+
+
 def lookup_duplex_plugin(engine_client: object) -> object | None:
+    from vllm_omni.engine.duplex.process_engine import ProcessDuplexEngineClient
+
     engine = getattr(engine_client, "engine", None)
+    if isinstance(engine, ProcessDuplexEngineClient):
+        return _ProcessWarmupProfile(engine)
     plugin = getattr(engine, "plugin", None) if engine is not None else None
     if plugin is None:
         plugin = getattr(engine_client, "plugin", None)
