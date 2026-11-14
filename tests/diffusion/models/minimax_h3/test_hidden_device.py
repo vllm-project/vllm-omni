@@ -138,6 +138,8 @@ def test_real_module_hooks_and_component_cleanup(mocker, monkeypatch, enabled, b
     events = []
 
     class Encoder(torch.nn.Module):
+        cudnn_sdp = True
+
         forward = method("encoder.py", "MiniMaxH3Qwen3VLEncoder", "forward")
         encode_ids = method("encoder.py", "MiniMaxH3Qwen3VLEncoder", "encode_ids")
 
