@@ -14,7 +14,7 @@ import hashlib
 import io
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,7 +26,16 @@ from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexContextViewPolicy, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_resource_request_belongs_to_session
-from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexModelPlugin, DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.history import unanswered_turn_start
+from vllm_omni.engine.duplex.plugin import (
+    DuplexAuxiliaryPolicy,
+    DuplexAuxiliaryRequest,
+    DuplexDataPlane,
+    DuplexModelPlugin,
+    DuplexRuntimeConfigError,
+)
+from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import Message
+from vllm_omni.model_executor.models.qwen3_omni.duplex.history_runtime import HISTORY_PROMPT, QwenHistoryRuntime
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
     ThinkerToolCursor,
@@ -39,6 +48,8 @@ from vllm_omni.utils.speakers import (
 
 if TYPE_CHECKING:
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+    from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
+    from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
 
 logger = init_logger(__name__)
 
@@ -345,10 +356,74 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         self.processor = None
         self._processor_lock = asyncio.Lock()
         self._history_calibrator = None
+        self._history_runtime = QwenHistoryRuntime("recent", {})
+        self._history_configuration = None
         # Checkpoint speaker names, loaded once from the stage-0 model config.
         # ``None`` means "not attempted" (no validation); an empty set means the
         # checkpoint declares no speaker_id mapping (names pass through unvalidated).
         self._supported_speakers: set[str] | None = None
+
+    def configure_server(self, runtime_config: DuplexSessionRuntimeConfig) -> None:
+        """Load trusted server history settings before binding the model processor."""
+        custom_options = dict(runtime_config.model_custom_options)
+        policy_name = custom_options.pop("history_policy", "recent")
+        history_limits = custom_options.pop("history_limits", {})
+        if custom_options or not isinstance(policy_name, str) or not isinstance(history_limits, dict):
+            raise DuplexRuntimeConfigError("Invalid Qwen server model_custom_options")
+        if self._history_configuration == (policy_name, history_limits):
+            return
+        self._history_runtime = QwenHistoryRuntime(policy_name, history_limits)
+        self._history_configuration = (policy_name, dict(history_limits))
+        self.supports_auxiliary_requests = self._history_runtime.policy is not None
+
+    @property
+    def uses_history_context(self) -> bool:
+        return self._history_runtime.policy is not None
+
+    def bind_history_context(
+        self, *, state: QwenDuplexSessionState, snapshot: DuplexHistorySnapshot, ledger: DuplexContextLedger
+    ) -> None:
+        state.history_policy_state.bind_context(snapshot, ledger)
+
+    def auxiliary_policy(
+        self, *, state: QwenDuplexSessionState, history_revision: int, history: Sequence[Message]
+    ) -> DuplexAuxiliaryPolicy | None:
+        """Reconcile changed Session sources; unchanged stream events reuse planning."""
+        if self._history_runtime.policy is None:
+            return None
+        return self._history_runtime.policy_for(state.history_policy_state, history, history_revision)
+
+    async def prepare_auxiliary_request(
+        self,
+        *,
+        history: tuple[tuple[str, str], ...],
+        runtime_config: Mapping[str, object],
+        state: QwenDuplexSessionState,
+    ) -> DuplexAuxiliaryRequest | None:
+        """Build one bounded summary from effective history and still-readable audio."""
+        if self._history_runtime.policy is None:
+            return None
+        return await self._history_runtime.prepare(state.history_policy_state, lambda: state.audio_history)
+
+    def auxiliary_source_matches(
+        self, *, request: DuplexAuxiliaryRequest, state: QwenDuplexSessionState, history: Sequence[Message]
+    ) -> bool:
+        """Check current effective sources before submission or late-result application."""
+        memory = state.history_policy_state
+        memory.reconcile(history)
+        return self._history_runtime.source_matches(memory, request.model_source)
+
+    def apply_auxiliary_result(
+        self, *, request: DuplexAuxiliaryRequest, output: object, state: QwenDuplexSessionState
+    ) -> bool:
+        """Apply a valid private summary on the session loop without emitting output."""
+        return self._history_runtime.apply(state.history_policy_state, request, output)
+
+    def image_history_limits(self) -> tuple[int, int]:
+        if self._history_runtime.policy is None:
+            return super().image_history_limits()
+        limits = self._history_runtime.limits
+        return limits.max_session_images, limits.max_session_image_bytes
 
     def history_calibrator(self, runtime_config):
         if runtime_config.history_asr_url is None and runtime_config.history_ms_per_token is None:
@@ -415,11 +490,13 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         )
 
     def create_session_state(self):
-        return QwenDuplexSessionState()
+        return QwenDuplexSessionState(history_policy_state=self._history_runtime.create_state())
 
     def validate_client_extra_body(self, extra_body):
         if not isinstance(extra_body, Mapping):
             return
+        if self._history_runtime.policy is not None and extra_body.get("realtime_tools"):
+            raise DuplexRuntimeConfigError("Experimental Qwen history policies do not support tools")
         if extra_body.get("auto_response"):
             raise DuplexRuntimeConfigError(
                 "Qwen requires server VAD or explicit commits; native auto_response is unsupported"
@@ -458,6 +535,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                     trust_remote_code=model_config.trust_remote_code,
                     revision=getattr(model_config, "revision", None),
                 )
+        if self._history_runtime.policy is not None:
+            self._history_runtime.bind(self.processor, model_config)
         return self.runtime_config_for_update(config, {})
 
     def runtime_config_for_update(self, config, current):
@@ -877,12 +956,31 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 params[0].max_tokens = runtime_config["max_tokens"]
         return params
 
-    def prepare_prompt_config(self, config, *, state, payload):
+    def prepare_prompt_config(
+        self, config: dict[str, object], *, state: QwenDuplexSessionState, payload: dict[str, object]
+    ) -> dict[str, object]:
+        """Capture effective input on the session loop before offloading rendering."""
+        if self._history_runtime.policy is None:
+            return self._prepare_recent_prompt_config(config, state=state, payload=payload)
+        self._history_runtime.validate_history(config.get("conversation", ()))
+        previous_audio = list(state.audio_history)
+        self._bind_audio_history(config, state=state, payload=payload)
+        memory = state.history_policy_state
+        memory.reconcile(config.get("conversation", ()))
+        memory.retain([*previous_audio, *state.audio_history], self._history_runtime.limits)
+        prompt = self._history_runtime.foreground(memory, payload, state.audio_history)
+        logger.debug("Qwen history memory counts=%s retained_audio_bytes=%d", dict(memory.counts), memory.audio_bytes)
+        return {**config, HISTORY_PROMPT: prompt}
+
+    def _bind_audio_history(
+        self, config: dict[str, object], *, state: QwenDuplexSessionState, payload: dict[str, object]
+    ) -> bool:
+        """Bind submitted PCM to Session items and maintain the shared audio cache.
+
+        Return whether the submitted audio has source items in Session history.
+        Prompt selection is performed separately by each history policy.
+        """
         history = config.get("conversation", [])
-        # Formatting may read the L1 view; audio binding stays on ``history``.
-        view = config.get("conversation_view")
-        if not isinstance(view, list) or len(view) != len(history):
-            view = None
         bind_from = 0
         lengths = []
         for key in ("qwen_tool_turns", "qwen_tool_turns_inflight"):
@@ -905,22 +1003,13 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         # before response.create. Search only the unanswered user turn so a new
         # payload can never overwrite an earlier, already answered utterance.
         current_contents = []
-        current_turn_start = len(history)
-        if view is not None:
-            # System instructions do not answer a pending user question.
-            # Protect its media even when they follow the user item.
-            for index in range(len(history) - 1, -1, -1):
-                role = history[index].get("role")
-                if role == "assistant":
-                    break
-                if role == "user":
-                    current_turn_start = index
         if has_audio:
-            # Keep payload binding on its existing trailing-user boundary;
-            # formatting protection above has a separate responsibility.
-            for index, message in reversed(list(enumerate(history))):
-                if index < bind_from or message.get("role") != "user":
-                    break
+            # System updates do not answer pending user input. Keep the same
+            # unanswered-turn boundary as foreground selection and compression.
+            start = unanswered_turn_start(history, lower_bound=bind_from)
+            for message in history[start:]:
+                if message.get("role") != "user":
+                    continue
                 content = message.get("content")
                 if isinstance(content, list) and any(part.get("type") == "audio_url" for part in content):
                     current_contents.append(content)
@@ -941,6 +1030,18 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         while len(retained) > 1 and sum(len(value.get("audio", "")) for _, value in retained) > 8 * 1024 * 1024:
             retained.pop(0)
         state.audio_history = retained
+        return current_is_in_history
+
+    def _prepare_recent_prompt_config(self, config, *, state, payload):
+        current_is_in_history = self._bind_audio_history(config, state=state, payload=payload)
+        history = config.get("conversation", [])
+        # Formatting may read the L1 view; audio binding stays on ``history``.
+        view = config.get("conversation_view")
+        if not isinstance(view, list) or len(view) != len(history):
+            view = None
+        current_turn_start = unanswered_turn_start(history)
+        has_audio = bool(payload.get("audio"))
+        retained = state.audio_history
         # Match the official demo's unit of history: consecutive user items
         # followed by their assistant reply(s). Prune whole turns, before
         # formatting, so a camera item cannot rescue an orphaned answer.
@@ -952,6 +1053,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             turns[-1][1].append(message)
 
         messages = []
+        included_audio = set()
         for index, turn in turns:
             # Keep the existing recent-message window, rounded outwards to a
             # complete turn. Never retain an answer whose input was cut off.
@@ -960,7 +1062,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             if turn[0].get("role") == "assistant":
                 continue
             resolved = []
-            included_audio = set()
+            turn_audio = set()
             for offset, message in enumerate(turn):
                 src = index + offset
                 source_content = message.get("content")
@@ -971,10 +1073,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 content = message.get("content")
                 if message.get("role") == "user" and isinstance(content, list):
                     if any(part.get("type") == "audio_url" for part in content):
-                        audio = next(
-                            (value for keys, value in retained if any(key is source_content for key in keys)), None
+                        binding = next(
+                            (entry for entry in retained if any(key is source_content for key in entry[0])), None
                         )
-                        if audio is None:
+                        if binding is None:
                             # The clip left the audio slots. Keep the turn as
                             # the view's text instead of dropping it.
                             text = [] if view is None else self._view_text_parts(view[src])
@@ -982,9 +1084,13 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                                 break
                             resolved.append({"role": "user", "content": text, "_src": src})
                             continue
-                        if id(audio) not in included_audio:
-                            resolved.append({"role": "user", "audio_payload": audio, "_src": src})
-                            included_audio.add(id(audio))
+                        # One merged commit can span system-separated groups.
+                        # Deduplicate its binding, not PCM value: distinct turns
+                        # may intentionally submit identical audio.
+                        binding_id = id(binding[0])
+                        if binding_id not in included_audio and binding_id not in turn_audio:
+                            resolved.append({"role": "user", "audio_payload": binding[1], "_src": src})
+                            turn_audio.add(binding_id)
                         # Preserve text/images in mixed source items as well.
                         other_parts = [part for part in content if part.get("type") != "audio_url"]
                         if other_parts:
@@ -998,6 +1104,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 resolved.append(copied)
             else:
                 messages.extend(resolved)
+                included_audio.update(turn_audio)
         if has_audio and not current_is_in_history:
             # History is context, not a replacement for the current request.
             # Re-encoding only history here makes Qwen answer an old question.
@@ -1145,6 +1252,13 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     ):
         if not final or not isinstance(payload, dict):
             raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")
+        if HISTORY_PROMPT in session_config:
+            output_tokens = getattr(sampling_params, "max_tokens", None) or 2048
+            return DuplexAppendPlan(
+                prompt=self._history_runtime.build_foreground(
+                    session_config[HISTORY_PROMPT], runtime_config, output_tokens
+                )
+            )
         has_audio = bool(payload.get("audio"))
         if not has_audio and payload.get("type") != "conversation":
             raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")

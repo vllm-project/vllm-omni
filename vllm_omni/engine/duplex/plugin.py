@@ -23,7 +23,13 @@ from typing import TYPE_CHECKING
 
 import pybase64 as base64
 
-from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexContextViewPolicy, DuplexSessionConfig
+from vllm_omni.engine.duplex.config import (
+    DEFAULT_IMAGE_HISTORY_MAX_BYTES,
+    DEFAULT_IMAGE_HISTORY_MAX_ITEMS,
+    DuplexCapabilities,
+    DuplexContextViewPolicy,
+    DuplexSessionConfig,
+)
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
     DuplexFence,
@@ -34,7 +40,9 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
+    from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
     from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
+    from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
     from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
 
 
@@ -454,6 +462,11 @@ class DuplexModelPlugin(ABC):
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
         """Bind model policy to the resolved deployment topology before admission."""
 
+    def configure_server(self, runtime_config: DuplexSessionRuntimeConfig) -> None:
+        """Validate server-owned model options before accepting sessions."""
+        if runtime_config.model_custom_options:
+            raise DuplexRuntimeConfigError(f"{self.plugin_id} does not support model_custom_options")
+
     def input_stage_id(self, payload: object) -> int:
         """Select the entry stage for one append before reserving its request."""
         return 0
@@ -506,6 +519,14 @@ class DuplexModelPlugin(ABC):
     ) -> DuplexAuxiliaryRequest | None:
         """Plan bounded background work from committed text; default opt-out."""
         return None
+
+    def image_history_limits(self) -> tuple[int, int]:
+        """Maximum stored image count and encoded URL bytes in Session records.
+
+        These admission limits are distinct from per-request media limits and
+        model-owned compression buffers. Summarization does not delete records.
+        """
+        return DEFAULT_IMAGE_HISTORY_MAX_ITEMS, DEFAULT_IMAGE_HISTORY_MAX_BYTES
 
     def auxiliary_policy(
         self,
@@ -688,6 +709,24 @@ class DuplexModelPlugin(ABC):
 
     @abstractmethod
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities: ...
+
+    @property
+    def uses_history_context(self) -> bool:
+        """Whether this plugin consumes Session snapshots and the context ledger."""
+        return False
+
+    def bind_history_context(
+        self, *, state: DuplexModelSessionState, snapshot: DuplexHistorySnapshot, ledger: DuplexContextLedger
+    ) -> None:
+        """Bind current source authority before prompt/planning/result hooks.
+
+        Opt in with ``uses_history_context``. The Session owner calls this
+        synchronously after refreshing its ledger, including immediately before
+        auxiliary source validation and writeback. Plugins may keep node IDs and
+        planning state; published derived messages belong in this ledger.
+        Snapshot containers and ledger nodes must be treated as read-only.
+        """
+        del state, snapshot, ledger
 
     def context_view_policy(
         self, *, stage_id: int, runtime_config: DuplexSessionRuntimeConfig

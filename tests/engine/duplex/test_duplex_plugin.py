@@ -532,9 +532,9 @@ def test_slots_session_states_track_committed_audio_consume() -> None:
     the field on those states, the first commit raises AttributeError.
     """
     from vllm_omni.model_executor.models.aura_omni.duplex.session import AuraServingSessionState
-    from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 
-    for state in (AuraServingSessionState(), QwenDuplexSessionState()):
+    for state in (AuraServingSessionState(), Qwen3OmniDuplexPlugin(lambda *args: "").create_session_state()):
         first = {"audio": "YQ=="}
         state.retain_committed_audio(first, operation_id="op1", reserved_bytes=4)
         assert state.mergeable_committed_audio() is first

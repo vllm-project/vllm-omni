@@ -98,6 +98,271 @@ hard-capped replies remain in its bounded cache for prefix correction. Every
 completion path preserves that evidence until calibration retires it. Sessions
 without calibration release stopped output immediately.
 
+## Experimental Qwen history policy
+
+Qwen can opt into a bounded history policy through server-owned
+`duplex_session.model_custom_options`. `recent` preserves the default clipping path;
+`bounded_recent` provides an equal-context/media-budget clipping control;
+`incremental` folds older text and original audio into a bounded text memory,
+and images into intermediate and long-term visual memories.
+Model-specific selection, source retention, compression prompts and token budgets
+remain in the Qwen plugin. Published dialogue and visual summaries are `SUMMARY`
+nodes in `DuplexEngineSession.context_ledger`; the public history snapshot supplies
+their source IDs and revisions. Qwen and JoyAI share `engine/duplex/text_folding.py`
+for labeled text excerpts and `engine/duplex/visual_memory.py` for visual batching
+and retention. `SessionVisualHistory` in `engine/duplex/session/visual_history.py`
+binds visual sources to the public snapshot, resolves valid ledger text, and
+publishes/retires visual summaries. Models supply decoded batches and prompt
+formatting. `SessionMemoryRuntime` executes private requests with the Thinker
+as both entry and final stage.
+
+Each Session holds `QwenDuplexSessionState.history_policy_state`. This state keeps
+summary node IDs, selection progress, retained media and unfinished text excerpts.
+Summary text is read from the Session ledger. Qwen's visual store keeps batch
+metadata; its published text is also read from ledger nodes. Original Session
+records and source dependencies remain retained, so the bounded prompt and media
+limits do not bound total Session storage.
+
+An assistant reply reserves a history position before becoming visible. When
+generation or playback materializes that reply, unchanged camera sources can
+move to later list positions. Their published visual summaries remain valid
+while source IDs, revisions, image parts and URLs are unchanged. Pending
+compression work still validates its original message labels and is retried
+when those positions move.
+
+Unanswered user items and intervening system messages form one protected turn.
+Multiple audio commits within that turn share one merged payload in the prompt,
+including on the default `recent` path. Distinct audio source bindings remain
+separate even when their payload objects or PCM values are identical.
+Foreground fitting preserves that complete turn, including original media, or
+returns an explicit capacity error. Background dialogue and visual compression
+wait until the turn has an assistant reply. `chunk_messages` is a batch target:
+an indivisible audio turn can exceed it when its actual audio count, retained
+bytes and processor-expanded input plus reserved output fit the hard limits.
+
+The summary lifecycle is:
+
+1. The Session owner supplies a current snapshot and refreshed ledger through
+   `bind_history_context`. Qwen selects sources by position in that snapshot and
+   captures their public `(source_id, revision)` references.
+2. Qwen's compression policy prepares one private Thinker request. The existing
+   `SessionMemoryRuntime` handles submission, cancellation, cleanup and retry.
+3. Before applying its result, the runtime supplies the current snapshot again.
+   Qwen checks source references and its selection progress, validates the model
+   output, and publishes through `ledger.replace_summary` on the owner loop.
+4. A rolling dialogue summary inherits all dependencies of the previous summary
+   plus the new batch's sources. A long-term visual summary inherits all sources
+   of its intermediate summaries. Replaced nodes are retired after publication.
+5. Before foreground preparation, the owner refreshes the ledger against current
+   history. Qwen reads surviving nodes and applies its own selection and token
+   budget. Deletion, correction, transcript or playback revision changes revoke
+   affected summaries, including when a tighter cutoff leaves visible text equal.
+
+Replacing summaries flattens their source dependencies, so obsolete summary
+nodes do not accumulate into a parent chain. Qwen rewinds its dialogue selection
+progress after invalidation; an invalidated visual batch resets its visual plan.
+Evicting a long-term visual summary also removes its ledger node. Visual writeback
+first stages batch/cursor changes using copies of the small metadata lists, sharing
+immutable encoded payloads. Only successful ledger publication adopts that state;
+either validation failure leaves the previous visual store and ledger intact.
+L1 nodes remain independent. A missing audio source records an omission and does
+not block later work; the omitted source is not claimed as summary evidence. Media eligibility
+remains independent of the recent text window.
+
+External policies inherit `QwenHistoryPolicy` and supply four methods:
+
+| Method | Decision |
+| --- | --- |
+| `select(state, limits)` | Original whole turns offered to the next foreground request; the runtime adds stored memory and fits the actual input. |
+| `next_batch(state, limits, *, max_audio)` | Next unprocessed prefix to compress, or `None`. |
+| `build_compression(batch, previous_memory, limits)` | Compression instructions, quoted source layout and temperature for a private Thinker request. |
+| `parse_compression(text)` | Complete replacement memory, or rejection of the model output. |
+
+For example, an extension can reuse incremental selection/batching while
+replacing free-form summaries with a validated JSON fact list. Compression
+instructions and result interpretation belong to the policy. The runtime owns
+PCM binding, Qwen processing, actual token limits and committing valid results;
+`SessionMemoryRuntime` still owns submission, cancellation and retry. The
+extension does not implement a second model-execution loop.
+
+Compression builders run in the joined CPU preparation worker on frozen
+`CompressionMessage` values. Text, batch-local `CompressionAudioRef` and
+`CompressionImageRef` indices replace borrowed Session objects and media. Every
+reference must appear once in source order within its modality in the returned
+`CompressionPrompt`. The same compression hooks construct and parse visual
+summaries. `compress_visual_history=False` disables visual summarization;
+`bounded_recent` uses this setting. If a batch must shrink
+to fit context, the builder runs again on that actual smaller batch. Parsers
+run on the Session loop and must be small and nonblocking. Both hooks are
+stateless, perform no I/O and must not retain input material. Selection hooks
+receive Session-owned state under a read-only contract; server-loaded Python
+extensions are trusted code, not a sandbox.
+
+Before invoking the parser, the runtime rejects stale, empty, truncated or
+overlong model output. It also bounds the parsed text before committing memory
+and source progress together. A parser can return `None` or raise `ValueError`
+to reject malformed output without advancing progress. Memory remains bounded
+text (including serialized JSON), inserted as reference data in foreground
+input. The interface uses the same Qwen Thinker; it does not support external
+summarization services, arbitrary retrieval stores or mid-session switching.
+
+The built-in incremental parser also rejects output containing only source
+delimiter markers, role labels, numbered visual-source labels and the closing
+instruction `Return the complete updated memory.` Rejection preserves published
+memory, pending images and text, and compression progress for retry. Labels
+accompanied by actual facts remain valid memory. These checks detect structural
+echoes; they do not certify factual accuracy. Control-line matching ignores
+surrounding whitespace but otherwise requires exact case and punctuation.
+
+The default compression prompt separates role labels from source text. For
+images, it requests observable content even without a stated user preference
+and combines repeated observations across frames into one memory.
+
+Configure the policy in a deployment overlay:
+
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+duplex_session:
+  model_custom_options:
+    history_policy: incremental
+    history_limits:
+      recent_messages: 8
+      chunk_messages: 8
+      summary_tokens: 512
+```
+
+Pass the overlay with `vllm serve ... --omni --deploy-config /path/to/history.yaml`.
+Set `history_policy` to `bounded_recent` for clipping, or to
+`your_package.policy:YourPolicy` for a server-importable class with a no-argument
+constructor. Subclass `IncrementalHistoryPolicy` to reuse its selection and
+batching while overriding compression. The default policy remains `recent`.
+The optional `history_limits.max_context_tokens` caps context below the resolved
+model limit, including reserved output; omitting it uses the model limit.
+
+Message count alone cannot distinguish a short text turn from a large image or
+audio turn. Optional token targets let deployments trigger compression according
+to the cost of the originals that remain in context, while keeping the same
+selection/compression interface. They independently replace message-count
+triggering and batching:
+
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+duplex_session:
+  model_custom_options:
+    history_policy: incremental
+    history_limits:
+      recent_tokens: 6000
+      chunk_tokens: 2000
+      summary_tokens: 512
+```
+
+`recent_tokens` starts dialogue compression when unsummarized originals exceed
+the target. Once triggered, the policy fills a batch up to `chunk_tokens` from
+the oldest completed turns. For example, roughly 7000 original tokens can
+produce a batch of roughly 2000 tokens, leaving roughly 5000 original tokens
+alongside the new summary. The output size is controlled by `summary_tokens`.
+Reaching the trigger does not require a full batch to be available.
+
+Both token targets default to unset. Setting `recent_tokens` replaces
+`recent_messages`; setting `chunk_tokens` replaces `chunk_messages` for batch
+size. Either can be used alone with the other message-count setting. Targets
+must be positive integers. Audio count/byte pressure and visual count pressure
+remain independent triggers, including below `recent_tokens`.
+
+Counting runs in joined CPU workers. Dialogue targets sum the rendered token
+costs of complete original turns, including their chat templates and expanded
+audio/image tokens. Existing summaries, compression instructions and reserved
+output are excluded from these source targets; the final rendered request
+must still fit all of them within the effective model-context limit. The shared `SourceTokenCache` stores only scalar costs, public source references
+and model-supplied media-view keys. Unchanged turns reuse their costs after an
+append; edits, regrouping, audio rebinding and visual summary/omission changes
+require a fresh count. Processed and removed groups are pruned. Token counting
+adds CPU preparation work and does not bound total Session storage.
+Visual batches also shrink to `chunk_tokens`, within their existing image-count
+and summary-group targets. Indivisible audio turns and visual entries may exceed
+the soft batch target when they fit the hard model/media limits. An oversized
+text turn uses the existing private excerpt-folding path, even when the whole
+turn would fit the model context. No partial excerpt publishes summary coverage.
+An unusably small `chunk_tokens` value can leave no room for excerpt labels;
+preparation logs the capacity issue and keeps the original source pending.
+
+Incomplete implementations fail at server initialization. Selection is
+stateless and may be cached while
+the Session history revision, memory generation, retained-media revision and
+audio-preparation ownership are unchanged. Reusing an already retained audio
+payload for counting does not change its retained-media revision. Source checks still run before submitting or applying a summary.
+Audio compression uses the renderer's effective per-request audio count and a
+separate `audio_summary_trigger_bytes` setting (default 8 MiB). The trigger is
+capped by the strategy's `max_audio_bytes` retention limit (default 32 MiB),
+independently of the legacy recent cache. The policy receives the resolved
+per-request count as `next_batch(..., max_audio=...)`. A still-valid foreground
+source can be recovered for compression, but its worker references must fit the
+strategy limits and remain charged until
+feature preparation finishes. Current text/audio/image input is preserved independently of
+background retention capacity; unavailable current audio is an explicit error.
+
+Foreground rendering emits one debug record per successful prompt build with
+`degraded`, `trimmed_turns` and `summary_dropped`. These count preparation-time
+clipping, including plans cancelled before submission, rather than completed
+responses. Worker logging does not mutate Session state.
+
+When an indivisible text turn exceeds the compression input capacity, the
+runtime folds labeled excerpts using private `HistoryFold` state. Each request
+includes the previous intermediate memory. Only the final successful excerpt
+publishes replacement memory and advances the processed position. Failed or
+cancelled excerpts leave progress unchanged; source edits revoke partial state.
+Text folding uses the same custom compression builder and parser as whole
+batches. Raw audio is not split by the text algorithm.
+
+Visual input uses existing `input_image` items with JPEG/PNG data URLs, including
+client-extracted video frames. No video-file decoder or audio-append frame path
+is added. Completed visual sources become eligible when selected dialogue needs
+compression, when they leave the recent-message target, or when unsummarized
+images reach the per-request image limit. The runtime processes up to
+`visual_chunk_images` (default 8) at a time, shrinking to the actual processor
+capacity. Five intermediate summaries (`visual_mid_group`) trigger a long-term
+merge; at most 15 long-term summaries (`visual_max_long`) are retained. Each
+visual output is limited by `summary_tokens`, default 512. Oldest long-term
+summaries are retired beyond this bound. Source message positions label visual
+evidence; they are not video timestamps. Qwen installs visual limits when the
+Session model state is constructed; planning does not rewrite live limits.
+Both the history state and its deployment limits are required constructor
+arguments, so callers cannot silently fall back to default visual limits.
+
+An admitted JPEG/PNG can have a valid header but an undecodable body. For completed
+history, the preparation worker identifies that source as unavailable. After
+rechecking its identity on the owner loop, Qwen records a visual omission, advances
+past it and continues with valid images or dialogue. The failed image is not
+included in a visual summary's source dependencies. Resource errors, including
+Pillow decompression-bomb protection, and programming errors still fail
+preparation without advancing visual progress. Original Session records remain intact, and an undecodable
+current input still fails foreground preparation rather than being silently omitted.
+
+Visual summaries are separate from dialogue memory. Source images remain
+available until a valid visual result commits; dialogue compression waits for
+its visual sources to be summarized or explicitly marked unavailable. Foreground requests include visual memories
+and uncompressed images. Consumed originals use a neutral “original image omitted”
+marker, which remains accurate if visual memory is retired or excluded from this
+request. If current input plus memories exceeds capacity, the
+runtime removes dialogue memory and then oldest visual memories before failing
+the current request. It subsequently adds older whole turns while they fit.
+Image edits or deletions revoke derived visual memory and stale results. Worker
+cancellation joins decoding/rendering before another preparation can own its
+materials.
+
+The plugin separately provides Session image admission limits. Opt-in Qwen
+policies default to 200 stored images / 32 MiB of encoded image URLs; default
+`recent` retains the original Session defaults of 8 images / 4 MiB, named
+`DEFAULT_IMAGE_HISTORY_MAX_ITEMS` and `DEFAULT_IMAGE_HISTORY_MAX_BYTES` in
+`engine/duplex/config.py`. These records are not deleted by summarization.
+Reaching this limit rejects additional images; deleting source items also revokes
+memory derived from them. The visual preparation store has its own configurable
+image count, encoded PNG byte and decoded pixel byte bounds. These are not
+process RSS limits.
+
+Opt-in policies accept text/audio/images and reject tools. The default policy
+retains existing image/tool support.
+
 ## Architecture
 
 ```text
@@ -383,7 +648,8 @@ Epoch changes fence in-flight work independently of source validity.
 Re-leasing the same live session on resume preserves IDs and revisions;
 dropping the session drops this state. Snapshots do not imply persistence
 across process restarts. Existing prompt construction remains unchanged;
-memory or stage-view consumers can adopt the snapshot in their own changes.
+stage views and Qwen L2 memory consume these snapshots without changing Session
+history ownership.
 
 ### Derived context and per-stage views
 
@@ -404,6 +670,17 @@ a historical snapshot does not displace a newer L1 source lookup; duplicate
 L1 nodes for the same source revision are rejected through either admission
 API. Callers refresh against a current authoritative snapshot before reading
 valid nodes.
+
+`get(node_id)` reads a node after refresh. `remove(*node_ids)` explicitly retires
+nodes and their descendants, preserving unrelated nodes and L1 lookup indexes.
+`replace_summary(snapshot, sources=..., replaces=..., message=...)` validates new
+source references and all replaced summaries against the supplied snapshot. It
+copies the complete transitive source dependencies into the new `SUMMARY`, then
+removes the old summaries and their descendants. The new node has no parent edges,
+so retiring old summaries does not invalidate their replacement. Invalid sources,
+missing replacements, non-summary replacements or message-copy failures leave the
+ledger unchanged. This API does not refresh implicitly: the caller supplies the
+current authoritative snapshot for result acceptance.
 
 Admission detaches message dictionaries, lists and tuples from the caller while
 sharing opaque payloads. Batch admission prepares every message before writing
@@ -434,8 +711,11 @@ when rendering the view, so both come from the same capture. Policy config
 is deployment-owned; plugin request runtime state is a separate input.
 
 Qwen3-Omni opts in its Thinker stage when
-`duplex_session.context_keep_media_turns` is set (default `null`). It then
-formats older user items from the view, including mixed text/media items.
+`duplex_session.context_keep_media_turns` is set (default `null`). Its default
+`recent` policy formats older user items from the view, including mixed
+text/media items. The experimental Qwen history policies instead select original
+turns and ledger summaries using their own context and media budgets; the L1
+candidate view does not override that selection.
 Dropped images are never decoded, and a text-only view replaces old audio
 even while its payload remains in the retained audio slots. A turn whose
 audio left those slots keeps its available transcript instead of being
@@ -610,8 +890,18 @@ Requests may specify short retry delays and a cooldown for subsequent attempts;
 failures remain keyed to the same source as newer observations arrive. Background
 failures are logged on the server. Successful application allows the next
 bounded chunk to catch up without waiting for new input.
-The session's committed-history revision lets unchanged input events skip history
-snapshotting and hashing. Prefix fingerprints still validate summary writeback.
+Plugins with `uses_history_context=True` also receive
+`bind_history_context(state=..., snapshot=..., ledger=...)` before foreground
+preparation, auxiliary planning and auxiliary source validation. The owner first
+refreshes the Session ledger; validation and result application run consecutively
+on the owner loop without yielding. The hook supplies source authority while
+leaving existing model-specific auxiliary request and compression interfaces
+unchanged. Plugins that do not opt in retain their existing path.
+
+The committed-history revision lets auxiliary events reuse an unchanged snapshot.
+The ledger is still refreshed before use, and Qwen compares public source IDs and
+revisions before submission and writeback. These checks can grow with retained
+history and summary dependencies; they do not provide constant CPU or memory cost.
 The runner delegates auxiliary lifecycle and retry state to this helper through
 `DuplexSessionContext`, tracks its tasks, and dispatches completion events through
 the existing mailbox. Model plugins retain the existing policy hooks and own

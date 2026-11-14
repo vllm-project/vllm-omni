@@ -80,6 +80,7 @@ def _channel(session: DuplexEngineSession, port: _StagePort, run: DuplexRunState
         input_stage_id=lambda payload: 0,
         prepare_prompt_config=lambda config, **kwargs: config,
         context_view_policy=lambda **kwargs: None,
+        uses_history_context=False,
         extra_prompt_config=lambda runtime_config: {},
         runtime_patch_for_submitted_prompt=lambda prompt: None,
         commit_append_plan=lambda request_id: None,

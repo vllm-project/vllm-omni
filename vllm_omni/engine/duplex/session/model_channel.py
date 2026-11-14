@@ -424,7 +424,7 @@ class ModelChannel:
             view_policy = self._ctx.plugin.context_view_policy(
                 stage_id=stage_id, runtime_config=self._ctx.manager.runtime_config
             )
-            if view_policy is None:
+            if view_policy is None and not self._ctx.plugin.uses_history_context:
                 history, item_ids = session.history_for_prompt()
                 snapshot = None
             else:
@@ -447,6 +447,12 @@ class ModelChannel:
                 assert snapshot is not None
                 prompt_session["conversation_view"] = list(
                     session.render_history_view(view_policy, snapshot=snapshot).messages
+                )
+            if self._ctx.plugin.uses_history_context:
+                assert snapshot is not None
+                session.context_ledger.refresh(snapshot)
+                self._ctx.plugin.bind_history_context(
+                    state=self._ctx.model_state, snapshot=snapshot, ledger=session.context_ledger
                 )
             append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
