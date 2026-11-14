@@ -146,9 +146,7 @@ class RequestScheduler(BaseScheduler):
         """
         if not request_batch_key_allowed(request, self.od_config, supported=self._mixfusion_supported):
             return None
-        return build_request_batch_sampling_params_key(
-            request, getattr(self.od_config, "diffusion_attention_schedule", None)
-        )
+        return build_request_batch_sampling_params_key(request, self.od_config.diffusion_attention_schedule)
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids

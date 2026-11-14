@@ -69,7 +69,7 @@ def _initialized_scheduler(scheduler_cls, monkeypatch: pytest.MonkeyPatch, pipel
         lambda model_class_name: pipeline_cls,
     )
     scheduler = scheduler_cls()
-    scheduler.initialize(SimpleNamespace(model_class_name="StubPipeline"))
+    scheduler.initialize(SimpleNamespace(model_class_name="StubPipeline", diffusion_attention_schedule=None))
     return scheduler
 
 

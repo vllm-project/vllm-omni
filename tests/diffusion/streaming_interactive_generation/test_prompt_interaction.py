@@ -97,6 +97,7 @@ def _make_diffusion_model_runner(
         streaming_output=streaming_output,
         cache_backend=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
+        diffusion_attention_schedule=None,
     )
     runner.vllm_config = object()
     runner.device = torch.device("cpu")

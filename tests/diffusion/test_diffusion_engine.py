@@ -775,7 +775,7 @@ class TestRequestBatchAdmission:
     def test_scheduler_exposes_waiting_and_running_counts(self) -> None:
         from vllm_omni.diffusion.sched import RequestScheduler
 
-        od_config = SimpleNamespace(max_num_seqs=4)
+        od_config = SimpleNamespace(max_num_seqs=4, diffusion_attention_schedule=None)
         scheduler = RequestScheduler()
         scheduler.initialize(od_config)
 
@@ -810,6 +810,7 @@ class TestRequestBatchAdmission:
             max_num_seqs=32,
             request_batch_max_wait_ms=1000.0,
             step_execution=False,
+            diffusion_attention_schedule=None,
         )
         scheduler = RequestScheduler()
         scheduler.initialize(od_config)

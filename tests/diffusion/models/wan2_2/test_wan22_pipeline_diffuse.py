@@ -1224,6 +1224,7 @@ def _graph_od_config(**overrides) -> SimpleNamespace:
         enable_layerwise_offload=False,
         parallel_config=SimpleNamespace(pipeline_parallel_size=1),
         diffusion_kv_cache_skip_step_indices=None,
+        diffusion_attention_schedule=None,
     )
     vars(od_config).update(overrides)
     return od_config

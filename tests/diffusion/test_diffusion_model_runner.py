@@ -249,6 +249,7 @@ def _make_runner(cache_backend, cache_backend_name: str | None, enable_cache_dit
     runner.od_config = SimpleNamespace(
         cache_backend=cache_backend_name,
         enable_cache_dit_summary=enable_cache_dit_summary,
+        diffusion_attention_schedule=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
         streaming_output=False,
         video_output_transport=VideoOutputTransportConfig(),
@@ -1185,6 +1186,7 @@ def _make_batch_runner(pipeline):
     runner.od_config = SimpleNamespace(
         cache_backend="none",
         enable_cache_dit_summary=False,
+        diffusion_attention_schedule=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
         video_output_transport=VideoOutputTransportConfig(),
     )
@@ -1460,6 +1462,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch, e
         model_class_name="NextStep11Pipeline",
         enforce_eager=True,
         streaming_output=False,
+        diffusion_attention_schedule=None,
     )
 
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
@@ -1511,6 +1514,7 @@ def test_load_model_rejects_env_prompt_cache_before_text_encoder_allgather(monke
         enforce_eager=True,
         streaming_output=False,
         step_execution=False,
+        diffusion_attention_schedule=None,
     )
     monkeypatch.setenv("OMNI_DIFFUSION_PROMPT_EMBED_CACHE", "1")
     runtime_init = Mock(side_effect=pytest.fail)

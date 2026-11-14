@@ -1651,7 +1651,7 @@ class OmniDiffusionConfig:
         # The baseline plus every schedule profile, so a profile the service default never
         # references still has its calibration discovered. The loader uses the same helper.
         baseline = cfg if isinstance(cfg, AttentionConfig) else None
-        specs = collect_calibration_specs(baseline, getattr(self, "diffusion_attention_schedule", None))
+        specs = collect_calibration_specs(baseline, self.diffusion_attention_schedule)
         if not specs:
             return
 

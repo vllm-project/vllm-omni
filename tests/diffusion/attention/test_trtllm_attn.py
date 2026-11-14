@@ -443,6 +443,7 @@ def test_propagate_calibration_045_schema(monkeypatch):
     OmniDiffusionConfig._propagate_skip_softmax_calibration(
         types.SimpleNamespace(
             diffusion_attention_config=cfg,
+            diffusion_attention_schedule=None,
             model="/x",
         ),
         tf,
@@ -471,6 +472,7 @@ def test_target_sparsity_without_calibration_raises():
             diffusion_attention_config=AttentionConfig(
                 default=AttentionSpec(backend="TRTLLM_ATTN", skip_softmax=skip_softmax)
             ),
+            diffusion_attention_schedule=None,
             model="/models/no-such-calibration",
         )
 
@@ -667,6 +669,7 @@ def test_skip_end_to_end_config_path(monkeypatch):
     OmniDiffusionConfig._propagate_skip_softmax_calibration(
         types.SimpleNamespace(
             diffusion_attention_config=cfg,
+            diffusion_attention_schedule=None,
             model="/x",
         ),
         tf,

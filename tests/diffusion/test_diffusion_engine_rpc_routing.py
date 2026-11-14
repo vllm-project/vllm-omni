@@ -168,7 +168,9 @@ def _make_engine_with_loop(
     sched = scheduler
     if sched is None:
         sched = RequestScheduler()
-        sched.initialize(SimpleNamespace(max_num_seqs=1, request_batch_max_wait_ms=0.0))
+        sched.initialize(
+            SimpleNamespace(max_num_seqs=1, request_batch_max_wait_ms=0.0, diffusion_attention_schedule=None)
+        )
     engine.scheduler = sched
     engine.step_execution = False
     engine.supports_request_batch = False
@@ -235,7 +237,7 @@ def _start_paced_engine(execute_fn) -> DiffusionEngine:
     from vllm_omni.diffusion.sched import StepScheduler
 
     scheduler = StepScheduler()
-    scheduler.initialize(SimpleNamespace(max_num_seqs=1))
+    scheduler.initialize(SimpleNamespace(max_num_seqs=1, diffusion_attention_schedule=None))
     engine = _make_engine_with_loop(asyncio.get_running_loop(), scheduler=scheduler, start_loop=False)
     engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
     engine.od_config.streaming_output = True
@@ -1072,7 +1074,9 @@ async def test_pause_rejects_unsupported_modes_without_closing_the_gate():
 async def test_keep_pause_during_batching_wait_holds_the_batch():
     loop = asyncio.get_running_loop()
     sched = _GatedAdmissionScheduler()
-    sched.initialize(SimpleNamespace(max_num_seqs=4, request_batch_max_wait_ms=1000.0))
+    sched.initialize(
+        SimpleNamespace(max_num_seqs=4, request_batch_max_wait_ms=1000.0, diffusion_attention_schedule=None)
+    )
     engine = _make_engine_with_loop(loop, scheduler=sched)
     try:
         waiting = _submit(engine, "W")

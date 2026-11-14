@@ -172,6 +172,7 @@ def _config():
         diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
         max_num_seqs=1,
         model_class_name="TestDiffusionPipeline",
+        diffusion_attention_schedule=None,
     )
 
 

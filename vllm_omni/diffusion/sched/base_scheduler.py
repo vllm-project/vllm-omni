@@ -192,7 +192,7 @@ class BaseScheduler(ABC):
                 request.sampling_params.attention_sigma_schedule = None
             validate_request_attention_schedules(
                 request.sampling_params,
-                getattr(self.od_config, "diffusion_attention_schedule", None),
+                self.od_config.diffusion_attention_schedule,
             )
         except (TypeError, ValueError) as exc:
             raise InvalidAttentionScheduleError(str(exc)) from exc
@@ -798,11 +798,11 @@ class BaseScheduler(ABC):
             return None
         return StepBatchSamplingParamsKey(
             attention_schedule=resolve_request_attention_schedule(
-                sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
+                sampling, self.od_config.diffusion_attention_schedule
             ),
             attention_schedule_explicit=sampling.attention_schedule is not None,
             attention_sigma_schedule=resolve_request_attention_sigma_schedule(
-                sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
+                sampling, self.od_config.diffusion_attention_schedule
             ),
             condition_key=getattr(request, "batch_compatibility_key", None),
             lora_int_id=lora_request.lora_int_id if lora_request is not None else None,

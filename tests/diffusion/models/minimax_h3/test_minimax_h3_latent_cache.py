@@ -386,7 +386,7 @@ def _pipeline(*, load_vae_decoder=True):
     pipeline = _bare_pipeline()
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
-    pipeline.od_config = SimpleNamespace(step_execution=False)
+    pipeline.od_config = SimpleNamespace(step_execution=False, diffusion_attention_schedule=None)
     pipeline.load_vae_decoder = load_vae_decoder
     pipeline._fasth3 = pipeline._fasth3_checkpoint = pipeline._vdn = None
     pipeline._active_turbo_spec = lambda _sampling: None

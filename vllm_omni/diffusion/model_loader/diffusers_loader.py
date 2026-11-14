@@ -1094,7 +1094,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         cfg = getattr(self.od_config, "diffusion_attention_config", None)
         # A schedule profile can be the only spec carrying calibration, so discovery has to
         # look past the baseline config or that candidate would stay dense at runtime.
-        schedule = getattr(self.od_config, "diffusion_attention_schedule", None)
+        schedule = self.od_config.diffusion_attention_schedule
         apply_skip_softmax_calibration(cfg, model, schedule=schedule)
 
     def _validate_attention_schedule_candidates(self, model: nn.Module) -> None:
@@ -1103,7 +1103,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         The traversal resolves the same per-candidate calibration dict that stamping uses. It does
         not read stamped impl state. Without a schedule it walks nothing.
         """
-        if getattr(self.od_config, "diffusion_attention_schedule", None) is None:
+        if self.od_config.diffusion_attention_schedule is None:
             return
         validated = validate_attention_schedule_candidates(model, self.od_config)
         logger.debug("Attention schedule: %d prepared candidate(s) passed startup checks.", validated)
