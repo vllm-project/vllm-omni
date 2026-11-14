@@ -131,6 +131,7 @@ class DiTAttention(nn.Module):
         mask: torch.Tensor | None = None,
         rope=None,
         blocked_attn_mask: torch.Tensor | None = None,
+        attention_mask_mode: str | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len = x.shape[0], x.shape[1]
 
@@ -154,7 +155,14 @@ class DiTAttention(nn.Module):
 
             # The diffusion Attention layer expects (batch, seq, heads, head_dim)
             attn_mask = _normalize_attention_mask(mask, batch_size, seq_len)
-            attn_metadata = AttentionMetadata(attn_mask=attn_mask) if attn_mask is not None else None
+            if attn_mask is None:
+                attn_metadata = None
+            elif attention_mask_mode is None:
+                attn_metadata = AttentionMetadata(attn_mask=attn_mask)
+            else:
+                attn_metadata = AttentionMetadata(
+                    attn_mask=attn_mask, extra={"attention_mask_mode": attention_mask_mode}
+                )
             use_fia = (
                 self._use_npu_graph_attention
                 and query.device.type == "npu"
@@ -178,8 +186,8 @@ class DiTAttention(nn.Module):
             out = out.to(x.dtype)
             out = self.to_out(out)
 
-        # Apply mask if provided
-        if attn_mask is not None:
+        # Apply mask if provided; a mask published as "none" masks nothing.
+        if attn_mask is not None and attention_mask_mode != "none":
             out = out.masked_fill(~attn_mask.unsqueeze(-1), 0.0)
 
         return out
@@ -202,7 +210,7 @@ class DiTBlock(nn.Module):
         self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
 
-    def forward(self, x, t, mask=None, rope=None, blocked_attn_mask=None):
+    def forward(self, x, t, mask=None, rope=None, blocked_attn_mask=None, attention_mask_mode=None):
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_adalayernorm_attention"):
             norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
 
@@ -212,6 +220,7 @@ class DiTBlock(nn.Module):
                 mask=mask,
                 rope=rope,
                 blocked_attn_mask=blocked_attn_mask,
+                attention_mask_mode=attention_mask_mode,
             )
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_residual"):
@@ -424,6 +433,17 @@ class DiT(nn.Module):
         self.static_chunk_size = static_chunk_size
         self.num_decoding_left_chunks = num_decoding_left_chunks
 
+    def _reads_unpublished_masks(self, device_type: str) -> bool:
+        # Only FLASH_ATTN's forward_cuda honors a published mode. ROCm reports
+        # device type "cuda" and dispatches to forward_cuda directly; MUSA
+        # reports "musa" and forward_musa defaults to forward_cuda too, so
+        # both land on the same honoring path. Elsewhere the read would only
+        # add a sync, and NPU graph capture must not read the host.
+        if device_type not in ("cuda", "musa") or getattr(self, "_use_npu_graph_attention", False):
+            return False
+        backend = getattr(self.transformer_blocks[0].attn.attn, "attn_backend", None)
+        return backend is not None and backend.get_name() == "FLASH_ATTN"
+
     def forward(self, x, mask, mu, t, spks=None, cond=None, blocked_attn_mask=None):
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_prepare_inputs"):
             x = x.transpose(1, 2)
@@ -450,6 +470,11 @@ class DiT(nn.Module):
                 from vllm_omni.platforms.npu.models.cosyvoice3_graph import cosyvoice3_fia_blocked_mask
 
                 blocked_attn_mask = cosyvoice3_fia_blocked_mask(attn_mask, seq_len, seq_len)
+            attention_mask_mode = None
+            if self._reads_unpublished_masks(attn_mask.device.type):
+                # FLASH_ATTN reads an unpublished mask back to the host in every
+                # layer; one read here classifies the mask for all layers.
+                attention_mask_mode = "none" if bool(attn_mask.all()) else "padding"
 
         if self.long_skip_connection is not None:
             residual = x
@@ -463,6 +488,7 @@ class DiT(nn.Module):
                         mask=attn_mask,
                         rope=rope,
                         blocked_attn_mask=blocked_attn_mask,
+                        attention_mask_mode=attention_mask_mode,
                     )
 
         if self.long_skip_connection is not None:
