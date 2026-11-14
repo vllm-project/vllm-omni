@@ -9,10 +9,15 @@ import importlib.metadata
 import sys
 
 
+def _is_omni_invocation(argv: list[str]) -> bool:
+    """Return whether the CLI should dispatch to the Omni subcommands."""
+    return "--omni" in argv or argv[1:2] == ["doctor"]
+
+
 def main():
     """Main CLI entry point that intercepts vLLM commands."""
-    # Check if --omni flag is present
-    if "--omni" not in sys.argv:
+    # `doctor` is read-only and is reachable without the serve-time --omni flag.
+    if not _is_omni_invocation(sys.argv):
         from vllm.entrypoints.cli.main import main as vllm_main
 
         vllm_main()
@@ -30,12 +35,14 @@ def main():
         from vllm.logger import configure_logging_from_args
 
         import vllm_omni.entrypoints.cli.benchmark.main
+        import vllm_omni.entrypoints.cli.doctor
         import vllm_omni.entrypoints.cli.serve
         from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
         CMD_MODULES = [
             vllm_omni.entrypoints.cli.serve,
             vllm_omni.entrypoints.cli.benchmark.main,
+            vllm_omni.entrypoints.cli.doctor,
         ]
 
         cli_env_setup()
