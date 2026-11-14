@@ -1300,6 +1300,21 @@ def test_indextts25_validates_explicit_language():
     assert "Unsupported IndexTTS 2.5 language" in adapter._validate_extra_params({"lang": "xx-invalid"})
 
 
+@pytest.mark.parametrize(
+    ("extras", "message"),
+    [
+        ({"emo_vector": [10**400] + [0.0] * 7}, "emo_vector must be a list of 8 finite numbers"),
+        ({"emo_alpha": 10**400}, "emo_alpha must be a finite number"),
+    ],
+    ids=["emo_vector", "emo_alpha"],
+)
+def test_indextts2_rejects_integers_too_large_for_float(extras, message):
+    """float() raises OverflowError on these JSON integers; validation must return an error instead."""
+    adapter = IndexTTS2Adapter(SimpleNamespace(server=object()))
+
+    assert message in adapter._validate_extra_params(extras)
+
+
 def _indextts25_adapter_and_request(*, speed: float):
     server = SimpleNamespace(
         uploaded_speakers={},

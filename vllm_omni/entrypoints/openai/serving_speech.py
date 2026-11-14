@@ -1070,7 +1070,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if "speaker_embedding" not in tensors:
                 logger.warning("Key 'speaker_embedding' missing in %s", file_path)
                 return None
-            return tensors["speaker_embedding"].squeeze().tolist()
+            embedding = tensors["speaker_embedding"].squeeze()
+            # Uploads now reject non-finite values, but a file stored before that
+            # check (for example 1e39, which became Inf in float32) is still on disk.
+            if not bool(torch.isfinite(embedding).all()):
+                logger.warning("Stored 'speaker_embedding' for voice %s is not finite: %s", voice_name, file_path)
+                return None
+            return embedding.tolist()
         except Exception as e:
             logger.error("Could not load embedding for voice %s: %s", voice_name, e)
             return None
@@ -1367,7 +1373,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if not all(isinstance(x, (int, float)) for x in embedding):
             raise ValueError("'speaker_embedding' must contain only numeric values")
 
-        if not all(math.isfinite(x) for x in embedding):
+        # Check the float32 tensor that gets stored, not the parsed numbers: 1e39 is a
+        # finite float that becomes Inf in float32, and an integer too large for a float
+        # raises OverflowError, which the route would report as a 500.
+        try:
+            tensor = torch.tensor([float(x) for x in embedding], dtype=torch.float32)
+        except OverflowError:
+            tensor = None
+        if tensor is None or not bool(torch.isfinite(tensor).all()):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
 
         emb_dim = len(embedding)
@@ -1385,7 +1398,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sanitized_consent = _sanitize_filename(consent)
             timestamp = self._next_upload_timestamp()
 
-            tensor = torch.tensor(embedding, dtype=torch.float32)
             filename = f"{sanitized_name}_{sanitized_consent}_{timestamp}.safetensors"
             file_path = self.uploaded_speakers_dir / filename
             if not _validate_path_within_directory(file_path, self.uploaded_speakers_dir):

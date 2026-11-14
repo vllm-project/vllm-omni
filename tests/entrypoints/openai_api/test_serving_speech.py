@@ -1263,6 +1263,32 @@ class TestSpeechAPI:
         assert response.status_code == 400
         assert "finite" in response.json()["detail"]
 
+    @pytest.mark.parametrize(
+        "bad_value",
+        ["1" + "0" * 400, "1e39"],
+        ids=["int_too_large_for_float", "overflows_float32"],
+    )
+    def test_upload_voice_embedding_out_of_range_rejected(self, test_app, bad_value):
+        """Values that cannot be stored as finite float32 return 400, not a 500 or a stored Inf."""
+
+        # Use the production route: its error mapping (ValueError -> 400, anything
+        # else -> 500) is what decides the status code, not the fixture's route.
+        app = FastAPI()
+        app.state.openai_serving_speech = test_app.state.openai_serving_speech
+        app.add_api_route("/v1/audio/voices", api_server_module.upload_voice, methods=["POST"])
+        app.add_api_route("/v1/audio/voices", api_server_module.list_voices, methods=["GET"])
+        client = TestClient(app)
+        data = {
+            "speaker_embedding": "[" + ", ".join(["0.1"] * 1023 + [bad_value]) + "]",
+            "consent": "consent_range",
+            "name": "range_voice",
+        }
+        response = client.post("/v1/audio/voices", data=data)
+        assert response.status_code == 400
+        assert "finite" in response.json()["error"]["message"]
+        listing = client.get("/v1/audio/voices").json()
+        assert "range_voice" not in {v["name"] for v in listing["uploaded_voices"]}
+
     @pytest.mark.asyncio
     async def test_diffusion_create_speech_with_unknown_voice(self, mocker: MockerFixture):
         engine_client = mocker.MagicMock()
@@ -2237,6 +2263,20 @@ class TestTTSMethods:
 
         assert speech_server._validate_tts_request(req) is None
         assert req.task_type == "Base"
+
+    def test_stored_non_finite_speaker_embedding_is_not_used(self, speech_server):
+        """A voice file stored before uploads were checked for float32 overflow is not used."""
+        from safetensors.torch import save_file
+
+        asyncio.run(speech_server.upload_voice_embedding(json.dumps([0.25] * 8), "consent", "old_voice"))
+        assert speech_server._get_uploaded_speaker_embedding("old_voice") == pytest.approx([0.25] * 8)
+
+        # What the old upload path stored for a 1e39 value: Inf in a float32 tensor.
+        stored = torch.full((8,), 0.25, dtype=torch.float32)
+        stored[3] = float("inf")
+        save_file({"speaker_embedding": stored}, speech_server.uploaded_speakers["old_voice"]["file_path"])
+
+        assert speech_server._get_uploaded_speaker_embedding("old_voice") is None
 
     def test_upload_voice_embedding_wrong_dims_rejected(self, speech_server):
         """Embedding uploads must match the loaded Qwen3-TTS model before being stored."""
