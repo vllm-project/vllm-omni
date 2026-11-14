@@ -684,6 +684,7 @@ def _load_qwen3_tts_code2wav_npu_patch(
             self.deconv = torch.nn.ConvTranspose1d(4, 4, 4)
             self.grouped_conv = torch.nn.Conv1d(4, 4, 3, groups=2)
             self.cache_precompute_calls = 0
+            self._npu_incremental = None
 
         def precompute_snake_caches(self):
             self.cache_precompute_calls += 1
@@ -737,6 +738,7 @@ def _make_patched_code2wav(target, *, dtype=torch.bfloat16):
         vllm_config=SimpleNamespace(
             device_config=SimpleNamespace(device=torch.device("cpu")),
             model_config=SimpleNamespace(dtype=dtype),
+            additional_config={"npu_incremental_codec": False},
         ),
         prefix="stage1",
     )

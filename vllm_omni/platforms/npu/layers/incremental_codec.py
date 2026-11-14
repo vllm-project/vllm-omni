@@ -19,10 +19,6 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def _scatter_rows(target: torch.Tensor, indices: torch.Tensor, source: torch.Tensor) -> None:
-    target.index_copy_(0, indices, source)
-
-
 class _SlotHistory:
     def __init__(self, arena: NPUIncrementalCodec, indices: torch.Tensor) -> None:
         self.arena = arena
@@ -32,7 +28,7 @@ class _SlotHistory:
         return self.arena.histories[module].index_select(0, self.indices)
 
     def __setitem__(self, module: torch.nn.Module, value: torch.Tensor) -> None:
-        self.arena.scatter(self.arena.histories[module], self.indices, value)
+        self.arena.histories[module].index_copy_(0, self.indices, value)
 
 
 class _CodecCache(Cache):
@@ -48,8 +44,8 @@ class _CodecCache(Cache):
         keys = torch.cat((old_keys.index_select(0, self.indices), keys), dim=2)
         values = torch.cat((old_values.index_select(0, self.indices), values), dim=2)
         kept = self.arena.history
-        self.arena.scatter(old_keys, self.indices, keys[:, :, -kept:])
-        self.arena.scatter(old_values, self.indices, values[:, :, -kept:])
+        old_keys.index_copy_(0, self.indices, keys[:, :, -kept:])
+        old_values.index_copy_(0, self.indices, values[:, :, -kept:])
         return keys, values
 
 
@@ -108,7 +104,7 @@ class _ShapeGraph:
                 hidden = run(block, hidden, self.state)
         for block in decoder.decoder:
             hidden = run(block, hidden, self.state)
-        self.arena.scatter(self.arena.frames, self.indices, frames + self.length)
+        self.arena.frames.index_copy_(0, self.indices, frames + self.length)
         return hidden.clamp(min=-1, max=1)
 
     @torch.inference_mode()
@@ -145,17 +141,7 @@ class _ShapeGraph:
 class NPUIncrementalCodec:
     """Slot arena over one decoder. One worker thread owns the buffers."""
 
-    def __init__(self, decoder, slots: int, max_batch: int, chunk_frames: int, streams: int = 1) -> None:
-        if type(streams) is not int or streams not in (1, 2):
-            raise ValueError("incremental codec streams must be 1 or 2")
-        self.stream_count = streams
-        self.scatter = _scatter_rows
-        if streams == 2:
-            # Native index_copy may touch unrelated rows. Concurrent groups
-            # require stores that write only their disjoint selected slots.
-            from vllm_omni.platforms.npu.layers.codec_row_scatter import scatter_rows
-
-            self.scatter = scatter_rows
+    def __init__(self, decoder, slots: int, max_batch: int, chunk_frames: int) -> None:
         if slots < 1 or max_batch < 1 or chunk_frames < 1:
             raise ValueError("incremental codec slots, batch and chunk frames must be positive")
         if max_batch > slots:
@@ -190,11 +176,9 @@ class NPUIncrementalCodec:
         self.frames = torch.zeros(slots, device=weight.device, dtype=torch.long)
         self.buffers = list(self.histories.values()) + self.keys + self.values + [self.frames]
         self.free = list(range(slots))
-        self.graphs: dict[tuple[int, int, int], _ShapeGraph] = {}
-        self.streams = [torch.npu.Stream(device=self.device) for _ in range(2)] if streams == 2 else []
-        # Reuse the capture stream within each lane. Every captured graph owns
-        # a separate scratch pool; outputs are cloned before the next replay.
-        self.capture_streams = self.streams or [torch.npu.Stream(device=self.device)]  # type: ignore[attr-defined]
+        self.graphs: dict[tuple[int, int], _ShapeGraph] = {}
+        # Reuse one capture stream; every captured shape owns a private pool.
+        self.capture_stream = torch.npu.Stream(device=self.device)  # type: ignore[attr-defined]
         # Runtime formats are prepared by the NPU Code2Wav loader. Attention
         # selection is local to each incremental call; preserve the shared config.
         self.prewarm()
@@ -203,25 +187,23 @@ class NPUIncrementalCodec:
         lengths = sorted({1, self.chunk_frames})
         for batch in range(1, self.max_batch + 1):
             for length in lengths:
-                for lane in range(self.stream_count):
-                    self._graph(batch, length, lane=lane, capture=True)
+                self._graph(batch, length, capture=True)
         logger.info(
-            "Prepared Qwen3-TTS incremental codec graphs: slots=%d batches=1..%d frames=%s streams=%d",
+            "Prepared Qwen3-TTS incremental codec graphs: slots=%d batches=1..%d frames=%s",
             self.slots,
             self.max_batch,
             lengths,
-            self.stream_count,
         )
 
-    def _graph(self, batch: int, length: int, *, lane: int = 0, capture: bool = False) -> _ShapeGraph:
-        key = (batch, length, lane)
+    def _graph(self, batch: int, length: int, *, capture: bool = False) -> _ShapeGraph:
+        key = (batch, length)
         graph = self.graphs.get(key)
         if graph is None:
             graph = _ShapeGraph(self, batch, length)
             # Only prewarm captures graphs. A final partial chunk must not
             # synchronize the device and run several warmups on a live request.
             if capture:
-                graph.capture(pool=torch.npu.graph_pool_handle(), stream=self.capture_streams[lane])
+                graph.capture(pool=torch.npu.graph_pool_handle(), stream=self.capture_stream)
                 self.graphs[key] = graph
         return graph
 
@@ -280,7 +262,7 @@ class NPUIncrementalCodec:
         raise TypeError(f"Unsupported incremental codec module: {kind}")
 
     @torch.inference_mode()
-    def _decode_same_length(self, slots: list[int], codes: torch.Tensor, *, lane: int = 0) -> torch.Tensor:
+    def _decode_same_length(self, slots: list[int], codes: torch.Tensor) -> torch.Tensor:
         """``codes`` is ``[B, Q, T]``. Returns ``[B, 1, T * upsample]``."""
         if not slots:
             raise ValueError("incremental codec received an empty batch")
@@ -291,7 +273,7 @@ class NPUIncrementalCodec:
         while offset < length:
             step = min(self.chunk_frames, length - offset)
             batch = len(slots)
-            graph = self._graph(batch, step, lane=lane)
+            graph = self._graph(batch, step)
             piece = graph.run(indices, codes[:, :, offset : offset + step], replay=True)
             pieces.append(piece)
             offset += step
@@ -329,36 +311,14 @@ class NPUIncrementalCodec:
                 self.reset(slot)
                 cache["npu_produced"] = 0
             groups.setdefault(length, []).append(index)
-        plans = []
         for length, indices in groups.items():
             for start in range(0, len(indices), self.max_batch):
                 chosen = indices[start : start + self.max_batch]
                 chosen_codes = codes[chosen, :, :length].to(device=self.device, dtype=torch.long)
                 slots = [int(caches[index]["npu_slot"]) for index in chosen]
-                plans.append((chosen, slots, chosen_codes, length))
-        # Singleton work stays on the owner stream. Every multi-group call
-        # fences both lanes before reset/release, including partial failures.
-        owner = torch.npu.current_stream()
-        overlap = bool(self.streams) and len(plans) > 1 and not torch.npu.is_current_stream_capturing()
-        if overlap:
-            for stream in self.streams:
-                stream.wait_stream(owner)
-        try:
-            for group, (chosen, slots, chosen_codes, length) in enumerate(plans):
-                lane = group % self.stream_count if overlap else 0
-                stream = self.streams[lane] if overlap else owner
-                with torch.npu.stream(stream):
-                    if overlap:
-                        chosen_codes.record_stream(stream)
-                    waveform = self._decode_same_length(slots, chosen_codes, lane=lane)
-                    if overlap:
-                        waveform.record_stream(owner)
-                    for row, index in enumerate(chosen):
-                        outputs[index] = self._trim(waveform[row, 0], caches[index], length)
-        finally:
-            if overlap:
-                for stream in self.streams:
-                    owner.wait_stream(stream)
+                waveform = self._decode_same_length(slots, chosen_codes)
+                for row, index in enumerate(chosen):
+                    outputs[index] = self._trim(waveform[row, 0], caches[index], length)
         if any(output is None for output in outputs):
             raise RuntimeError("incremental codec did not produce an output for every request")
         return [output for output in outputs if output is not None]

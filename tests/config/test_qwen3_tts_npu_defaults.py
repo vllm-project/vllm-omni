@@ -42,10 +42,7 @@ def test_resolved_defaults_are_npu_only(monkeypatch, platform):
     # to those defaults and give custom deployments different behavior.
     npu_options = {
         *PREDICTOR_OPTIONS,
-        "npu_fused_snake",
         "npu_incremental_codec",
-        "npu_codec_streams",
-        "npu_conv_graph_shapes",
         "code_predictor_kv_cache",
     }
     assert npu_options.isdisjoint(connector.get("extra", {}))

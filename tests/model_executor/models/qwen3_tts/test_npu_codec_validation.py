@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Reject unsafe concurrent codec work before slot or device mutations."""
+"""Reject invalid codec requests before slot or device mutations."""
 
 from unittest.mock import Mock
 
@@ -12,10 +12,15 @@ from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize("streams", [0, 3, True, 2.0, "2"])
-def test_invalid_stream_count_requires_no_device(streams):
-    with pytest.raises(ValueError, match="streams must be"):
-        NPUIncrementalCodec(None, slots=4, max_batch=2, chunk_frames=4, streams=streams)
+def test_decoder_conversion_releases_incremental_graphs(mocker):
+    from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
+
+    decoder = _make_decoder()
+    arena = mocker.Mock()
+    decoder._npu_incremental = arena
+    decoder.to(dtype=torch.bfloat16)
+    arena.close.assert_called_once_with()
+    assert decoder._npu_incremental is None
 
 
 @pytest.mark.parametrize(

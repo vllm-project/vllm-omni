@@ -916,7 +916,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self.post_init()
 
         # CUDA Graph support
-        self._npu_conv_graphs = None
         self._npu_incremental = None
         self._cudagraph_enabled = False
         self._cudagraph_wrapper = None
@@ -1015,9 +1014,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         logger.info("Qwen3-TTS decoder: time-major (GEMM) conv stack enabled")
 
     def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True):
-        if self._npu_conv_graphs is not None:
-            self._npu_conv_graphs.close()
-            self._npu_conv_graphs = None
         if self._npu_incremental is not None:
             self._npu_incremental.close()
             self._npu_incremental = None
@@ -1025,11 +1021,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
     def _conv_decode(self, hidden: torch.Tensor) -> torch.Tensor:
         """Pre-transformer output ``[B, T, latent]`` -> unclamped waveform ``[B, 1, T * total_upsample]``."""
-        if self._npu_conv_graphs is not None and not self.training:
-            return self._npu_conv_graphs(hidden)
-        return self._conv_decode_eager(hidden)
-
-    def _conv_decode_eager(self, hidden: torch.Tensor) -> torch.Tensor:
         if self._time_major_stack is not None:
             return self._time_major_stack(hidden)
         hidden = hidden.permute(0, 2, 1)

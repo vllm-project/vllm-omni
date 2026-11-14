@@ -614,19 +614,12 @@ This cycles through four configs (Baseline -> + Batch -> + CUDA Graph -> + Async
 The codec uses reference codebook normalization directly from the loaded weights.
 There is no normalized-embedding cache or cache-preparation helper.
 
-Qwen3-TTS keeps its Ascend SnakeBeta kernel disabled by default. It supports contiguous, nonempty NCT
-BF16 inference tensors within its validated grid size. The kernel preserves
-BF16 rounding between multiply, sine, square, scale and addition. Unsupported
-dtypes/layouts and training or gradient-enabled calls retain the existing path;
-other models retain their existing behavior. Set `npu_fused_snake: true` in the
-NPU Code2Wav stage `additional_config` or connector `extra` to opt in.
-This deployment policy is not a performance conclusion:
-shape-dependent JIT compilation and eager dispatch can outweigh reduced device
-work. Shape dimensions are now runtime arguments without specialization; the
-earlier eager probe does not qualify this kernel revision. Measure
-your graph mode and workload when choosing it. If Triton is unavailable, the NPU
-loader keeps the eager path. CUDA behavior is unchanged. Runtime compilation
-errors are surfaced rather than silently hidden.
+NPU SnakeBeta uses the existing eager implementation. Codec request groups run
+serially on the worker's stream, and each incremental graph owns a private
+scratch pool. The experimental dual-stream executor, stateless convolution
+graphs, fused NPU Snake and their configuration options have been removed.
+The dual-stream-only selected-row Triton store is also removed; state updates
+use the existing `index_copy_` operation.
 
 These changes reduce repeated codec work; they do not establish an end-to-end
 throughput gain without matched model-level measurements and audio validation.
@@ -635,31 +628,10 @@ throughput gain without matched model-level measurements and audio validation.
 
 The default NPU profile enables seven paths: Model Runner V2 with sampling
 uniforms, Talker full decode graphs, Predictor frame graphs, frame-local KV,
-fused RoPE/KV writes, incremental Codec, and fused SwiGLU. Fused sampling,
-native GQA, dual Codec streams, stateless convolution graphs and fused Snake
-require explicit opt-in. Codebook lookup uses reference normalization; incremental
-graphs use separate scratch pools and the selected-row kernel uses ordinary
-Triton specialization. Existing non-NPU defaults are unchanged.
-
-The Code2Wav connector `extra` can set `npu_conv_graph_shapes`, a list of exact
-`[batch, hidden_frames]` shapes (for example `[[1, 1], [1, 25]]`). These are the
-convolution segment inputs, not necessarily the new codec chunk lengths: suffix
-context can increase the frame dimension. An empty list disables this path;
-the NPU default is an empty list.
-Incremental decode takes precedence and skips these redundant captures. Explicit shapes
-apply when `npu_incremental_codec: false`; omitted shapes keep them disabled.
-Selected shapes are captured at model load, after weight and coefficient
-preparation; unseen shapes remain eager rather than capturing on a live request.
-`enforce_eager=true` skips these captures with a warning. Explicit shape selection
-bounds graph memory; include only shapes observed for the target workload.
-
-The graph owns only scratch activations, not request IDs or streaming state.
-Its output is copied before returning so a later replay cannot overwrite a
-previous request's audio. The decoder keeps its existing per-request cache,
-sliding-window and tail handling. Outer NPU graph capture uses the eager body
-to avoid nested replay; reload or module conversion releases the inner graphs.
-This is a stateless convolution graph optimization, not a replacement of the
-streaming cache with fixed request slots.
+fused RoPE/KV writes, incremental Codec, and fused SwiGLU. Fused sampling and
+native GQA require explicit opt-in. Codebook lookup uses reference
+normalization, incremental graphs use separate scratch pools, and Codec decode
+uses one stream. Existing non-NPU defaults are unchanged.
 
 On NPU BF16, `code_predictor_kv_cache: true` reuses per-layer K/V buffers
 inside the predictor frame graph. It prefills the first two positions, then
@@ -699,10 +671,8 @@ written; future positions remain masked by attention.
 sliding-window KV in per-request slots. It is enabled by default on NPU.
 Startup captures full chunks and single frames. Final partial chunks execute
 without live graph capture. Each captured graph owns its scratch pool, and
-outputs are copied before the next replay. Selected-row state stores retain
-Triton's default stride and alignment specialization, so an unseen tail layout
-may compile a new kernel variant on a live request. Avoiding live graph capture
-does not guarantee zero live Triton compilation.
+outputs are copied before the next replay. Per-request state is updated with
+`index_copy_` on the worker's stream.
 Request completion releases and resets the slot; loading weights or
 converting the decoder releases its graphs. This path changes the streaming
 execution strategy and needs paired audio validation for the target workload.
@@ -716,12 +686,8 @@ The Qwen3-TTS predictor and NPU codec loader own their respective defaults;
 its code default. Override it via stage `additional_config` or connector `extra`.
 Explicit connector values override stage values, and explicit false/empty values
 remain authoritative. `code_predictor_npu_native_gqa` defaults to false and
-`code_predictor_npu_fused_swiglu` defaults to true on NPU. `npu_codec_streams`
-defaults to one. An explicit
-`npu_codec_streams: 2` without either prerequisite raises a configuration error;
-the single-stream default does not require Triton. By contrast,
-`enforce_eager=true` deliberately skips stateless convolution graph capture,
-including explicitly requested shapes, as the documented graph opt-out.
+`code_predictor_npu_fused_swiglu` defaults to true on NPU. Codec decode runs
+serially; `npu_incremental_codec: false` selects the existing stateless decoder.
 Predictor frame-local KV is enabled with NPU frame graphs; explicit false retains re-prefill.
 
 Compare actual graph coverage, startup cost, memory, latency and audio quality
@@ -740,17 +706,16 @@ these existing Omni owners:
 | Packed QKV / gate-up projections, native normalization / rotary | Already provided by the shared code predictor and the Talker backend |
 | Fixed predictor rotary coefficients (U002) | Predictor already uses precomputed cos/sin tables on NPU; no request-position cache or module replacement is needed |
 | Model-fixed prompt embeddings | Existing prompt builder caches projected special tokens and CustomVoice speaker/language prefixes |
-| Cached codec codebooks and fused Snake | Reference codebook normalization (no cache); opt-in `npu_fused_snake`, disabled by default |
+| Cached codec codebooks and fused Snake | Not integrated; reference normalization and eager NPU Snake |
 | Prefill/decode graphs and continuous batching | Existing vLLM scheduler, paged KV and Talker graph runner |
-| Incremental codec and convolution graphs | `npu_incremental_codec` and `npu_conv_graph_shapes` |
+| Incremental codec | NPU-default `npu_incremental_codec` |
 | Native grouped-query predictor attention | Opt-in `code_predictor_npu_native_gqa` |
 | Fused predictor SwiGLU | NPU-default `code_predictor_npu_fused_swiglu` |
-| Overlapping disjoint codec groups (U005) | Opt-in `npu_codec_streams: 2` |
+| Overlapping disjoint codec groups (U005) | Not integrated; Codec groups run serially |
 
 Override these defaults in stage `additional_config` or connector `extra`.
 On NPU fused SwiGLU defaults to `true`, native GQA defaults to `false`, and
-codec decoding defaults to one stream. Two streams require an explicit opt-in,
-the incremental decoder and Triton. Native predictor attention
+codec decoding uses one stream. Native predictor attention
 passes the original grouped K/V heads to Ascend inference attention instead of
 materializing repeated heads, with an explicit causal mask. The supported path
 uses FP16/BF16; unsupported inputs retain the existing attention path. Native SwiGLU
@@ -760,26 +725,6 @@ can change floating-point rounding and therefore sampled codec tokens. Qualify
 paired audio quality for the deployment; operator tolerances are not a
 waveform-equivalence guarantee. CUDA behavior and shared predictor defaults
 are unchanged.
-
-Two codec streams require `npu_incremental_codec: true` and Triton Ascend.
-They overlap the existing groups without changing group sizes, request order,
-chunk lengths or `decode_batch_max_size`. Each lane owns separate graph inputs,
-scratch and output copies. A selected-row store kernel updates only each group's
-disjoint convolution/KV slots; a native whole-tensor update is not safe for this
-concurrency. Inputs are prepared on the owner stream, both lanes wait for it,
-and the owner waits for both lanes before returning or propagating an exception.
-Only then may request completion reset/reuse slots. Returned audio is independent
-of graph scratch. A single group or outer graph capture stays on the owner
-stream; later multi-group
-calls wait for that work before reusing lane storage. Invalid or overlapping
-request slots are rejected before any group is submitted.
-
-Prewarming captures the same full-chunk and single-frame shapes for both lanes,
-doubling the number of incremental codec graphs. Other lengths remain eager;
-no live request captures a new graph. Request state remains one shared slot
-arena with disjoint writers, while graph scratch and startup costs increase.
-Reload and module conversion use the existing graph cleanup. Benchmark memory,
-startup and steady-state latency separately.
 
 The independent engine's packed prefill-KV admission and single-request borrowed
 views belong to its contiguous arena and request loop. They are not copied over
