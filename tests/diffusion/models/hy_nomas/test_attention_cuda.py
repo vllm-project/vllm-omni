@@ -140,3 +140,28 @@ def test_hy_nomas_transformer_warm_step_has_zero_cuda_syncs(global_frame_counter
     assert written_e == written_c == 5 and len(model.attention.masks) == 1 and len(model.camera_attention.masks) == 1
     for out in (comp_cold, comp_warmup_commit, comp_warm, comp_commit, comp_post):
         torch.testing.assert_close(out, ref_cold, rtol=1e-2, atol=1e-2)
+
+    from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import _as_versioned_tensor
+
+    model.clear_attention_cache()
+    with torch.inference_mode():
+        inf_in = {**_fresh_state(), "text_mask": base_inputs["text_mask"].clone()}
+        assert inf_in["text_mask"].is_inference() and inf_in["cache_mask_list"][0].is_inference()
+        inf_cold, _ = model.forward_with_cache(**inf_in)
+        torch.testing.assert_close(model.forward_with_cache(**inf_in)[0], inf_cold, rtol=0, atol=0)
+        assert len(model.attention.masks) == 1
+        inf_in["cache_mask_list"][0][0, 0] = False
+        assert not torch.equal(model.forward_with_cache(**inf_in)[0], inf_cold)
+
+        model.clear_attention_cache()
+        ver_mask = _as_versioned_tensor(inf_in["cache_mask_list"][0])
+        ver_in = {
+            **_fresh_state(),
+            "text_mask": _as_versioned_tensor(inf_in["text_mask"]),
+            "cache_mask_list": [ver_mask] * 2,
+        }
+        ver_cold, _ = model.forward_with_cache(**ver_in)
+        ver_warm, ver_commit, ver_post, ver_written = _run_zero_sync_sequence(ver_in)
+        assert ver_written == 5
+        for out in (ver_warm, ver_commit, ver_post):
+            torch.testing.assert_close(out, ver_cold, rtol=0, atol=0)
