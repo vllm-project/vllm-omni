@@ -664,7 +664,8 @@ source_file_dependencies:
     - vllm_omni/platforms/npu/worker/npu_generation_model_runner.py
     - vllm_omni/platforms/npu/worker/npu_generation_worker.py
     - vllm_omni/platforms/npu/worker/npu_model_runner.py
-    - vllm_omni/platforms/npu/worker/talker_multiframe.py
+    - vllm_omni/platforms/npu/worker/talker_narrow_replay.py
+    - vllm_omni/worker/talker_multiframe.py
     - docker/Dockerfile.npu.ci
     - requirements/npu.txt
     - .buildkite/npu/scripts/build-npu-image.sh

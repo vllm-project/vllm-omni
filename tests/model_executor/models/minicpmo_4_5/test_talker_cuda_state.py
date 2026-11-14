@@ -16,6 +16,83 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.fixture
+def talker():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration as Talker,
+    )
+
+    model = Talker.__new__(Talker)
+    torch.nn.Module.__init__(model)
+    model._request_codec_history = {}
+    return model
+
+
+def test_initial_embedding_uses_confirmed_history_only(talker):
+    embedding = torch.nn.Embedding(64, 3)
+    talker.emb_code = [embedding]
+    talker._request_codec_history = {"embedding-test": [17, 23]}
+    state = {"step": 2, "last_code": 11, "codes": torch.tensor([61, 62])}
+    info = {"req_id": "embedding-test", "audio_state": state}
+    embeds = torch.zeros(8, 3)
+    ids = torch.zeros(8, dtype=torch.long)
+    talker.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
+    torch.testing.assert_close(embeds[0], embedding.weight[23])
+    assert torch.count_nonzero(embeds[1:]) == 0
+    assert ids.tolist() == [23, 0, 0, 0, 0, 0, 0, 0]
+    assert state["last_code"] == 23
+
+
+def test_initial_embedding_resolves_history_by_request_id(talker):
+    """Find the committed codec under the request ID used by the model."""
+    embedding = torch.nn.Embedding(64, 3)
+    talker.emb_code = [embedding]
+    talker._request_codec_history = {"req-abc-1": [17, 23]}
+    state = {"step": 10, "last_code": 11}
+    info = {"req_id": "sched-internal-9", "request_id": "req-abc-1", "audio_state": state}
+    embeds = torch.zeros(8, 3)
+    ids = torch.zeros(8, dtype=torch.long)
+    talker.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
+    torch.testing.assert_close(embeds[0], embedding.weight[23])
+    assert torch.count_nonzero(embeds[1:]) == 0
+    assert ids.tolist() == [23, 0, 0, 0, 0, 0, 0, 0]
+    assert state["last_code"] == 23
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_initial_embedding_falls_back_to_row_token_on_first_kstep(talker, dtype):
+    embedding = torch.nn.Embedding(64, 3)
+    talker.emb_code = [embedding]
+    state = {"step": 1}
+    info = {"req_id": "first-kstep", "audio_state": state}
+    embeds = torch.zeros(8, 3)
+    ids = torch.tensor([23, 0, 0, 0, 0, 0, 0, 0], dtype=dtype)
+    talker.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
+    torch.testing.assert_close(embeds[0], embedding.weight[23])
+    assert torch.count_nonzero(embeds[1:]) == 0
+    assert ids.tolist() == [23, 0, 0, 0, 0, 0, 0, 0]
+    assert state["last_code"] == 23
+    assert state["_kstep_last_code"] == 23
+
+
+def test_initial_embedding_declines_control_row_token_after_first_step(talker):
+    """Later K-steps must not treat the 2-wide control token as a codec.
+
+    Once past the first K-step the row's first slot is the previous step's
+    continue/stop sample (0/1), not a codec id; conditioning frame 1 on it
+    would poison the state. The fallback is gated on ``step <= 1``.
+    """
+    embedding = torch.nn.Embedding(64, 3)
+    talker.emb_code = [embedding]
+    state = {"step": 9}
+    info = {"req_id": "later-kstep", "audio_state": state}
+    embeds = torch.zeros(8, 3)
+    ids = torch.tensor([1, 0, 0, 0, 0, 0, 0, 0], dtype=torch.long)
+    talker.rewrite_kstep_initial_embeds(embeds, {"model_intermediate_buffer": [info]}, [(0, 8)], ids)
+    assert torch.count_nonzero(embeds) == 0
+    assert "last_code" not in state
+
+
 def workspace(rows=2, frames=3):
     state = TalkerCudaKStepState.allocate(rows, frames, torch.device("cpu"))
     state.temperatures.zero_()
@@ -407,7 +484,8 @@ def test_model_binding_commit_and_batch_compaction():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize("eos_frame", [0, 1, 2])
-def test_native_model_graph_eos_restores_request_rng(eos_frame):
+@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
+def test_native_model_graph_eos_restores_request_rng(eos_frame, use_v2):
     from types import MethodType, SimpleNamespace
 
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
@@ -416,11 +494,15 @@ def test_native_model_graph_eos_restores_request_rng(eos_frame):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         _flush_cuda_kstep_host_pending,
     )
+    from vllm_omni.platforms import current_omni_platform
     from vllm_omni.worker.talker_cuda_graph import CUDANarrowStep
+
+    batched_noise = use_v2 and current_omni_platform.is_cuda()
 
     generators = {name: torch.Generator(device="cuda").manual_seed(seed) for name, seed in (("a", 123), ("b", 456))}
     references = {name: torch.Generator(device="cuda").manual_seed(seed) for name, seed in (("a", 123), ("b", 456))}
     model = SimpleNamespace(
+        _use_v2_model_runner=use_v2,
         _request_audio_states={},
         _request_codec_history={},
         _codec_temperature=0.8,
@@ -469,7 +551,8 @@ def test_native_model_graph_eos_restores_request_rng(eos_frame):
         )
         assert state is not None
 
-        graph_generators = model._cuda_kstep_generators
+        assert bool(model._cuda_kstep_rng_increment) is batched_noise
+        graph_generators = tuple(g for g in model._cuda_kstep_generators if g is not None)
 
         def snapshot():
             return state.snapshot(), tuple(g.get_state() for g in graph_generators)
@@ -511,14 +594,24 @@ def test_native_model_graph_eos_restores_request_rng(eos_frame):
         _flush_cuda_kstep_host_pending(model)
         for row, name in enumerate(order):
             draws = eos_frame + 1 if row == 0 else 3
-            for frame in range(draws):
-                torch.multinomial(scores[frame, row].softmax(-1), 1, generator=references[name])
+            if batched_noise:
+                base = references[name].get_offset()
+                reference_noise = torch.empty(VOCAB_SIZE, device="cuda")
+                for _ in range(draws):
+                    reference_noise.exponential_(generator=references[name])
+                assert generators[name].get_offset() == base + draws * model._cuda_kstep_rng_increment
+                continuation = torch.empty_like(reference_noise).exponential_(generator=generators[name])
+                reference_noise.exponential_(generator=references[name])
+                torch.testing.assert_close(continuation, reference_noise, rtol=0, atol=0)
+            else:
+                for frame in range(draws):
+                    torch.multinomial(scores[frame, row].softmax(-1), 1, generator=references[name])
+                continuation = torch.ones(VOCAB_SIZE, device="cuda")
+                assert torch.equal(
+                    torch.multinomial(continuation, 1, generator=generators[name]),
+                    torch.multinomial(continuation, 1, generator=references[name]),
+                )
             assert torch.equal(generators[name].get_state(), references[name].get_state())
-            continuation = torch.ones(VOCAB_SIZE, device="cuda")
-            assert torch.equal(
-                torch.multinomial(continuation, 1, generator=generators[name]),
-                torch.multinomial(continuation, 1, generator=references[name]),
-            )
         assert narrow.captures == 1
         assert narrow.replays == iteration + 1
 
