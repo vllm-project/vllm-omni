@@ -28,6 +28,7 @@ def test_h3_full_pipeline_profiler_includes_local_encoding():
     assert targets == [
         "encode_prompt",
         "_encode_local_media",
+        "_encode_images_data_parallel",
         "diffuse",
         "decode",
         "video_vae.decode_latent",

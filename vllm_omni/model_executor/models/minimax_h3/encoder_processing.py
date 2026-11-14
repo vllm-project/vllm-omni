@@ -1001,12 +1001,22 @@ def encode_media(
     audio_vae: Any,
     emit_conditioning: bool,
     component_scope: Callable[[Any], AbstractContextManager[Any]] = nullcontext,
+    image_encoder: Callable[[], tuple[list[torch.Tensor], list[tuple[int, int, int]]]] | None = None,
+    encode_non_image_visuals: bool = True,
+    on_visual_complete: Callable[[], None] | None = None,
 ) -> MiniMaxH3EncoderMediaConditioning | None:
     """Run codecs on participating ranks; only the output rank runs audio.
 
     The caller selects participating ranks and configures the VAE process group.
     Every visual participant must call this function with the same references.
     Component scopes allow the diffusion runner to stage one codec at a time.
+    ``image_encoder`` lets the caller replace the serial image loop with a
+    data-parallel implementation while still running inside the VAE residency
+    window; it must return one row block and one shape per input image.
+    ``encode_non_image_visuals=False`` skips reference video/edit/guide codecs
+    on ranks that only participate in image-level data parallelism.
+    ``on_visual_complete`` runs after the visual codecs finish and before the
+    audio codecs start, letting the caller release the video encoder first.
     """
     # Validate before the non-leader return so all participants reject bad input.
     audio_inputs = _effective_audio_inputs(
@@ -1027,33 +1037,49 @@ def encode_media(
         if video_vae is None:
             raise RuntimeError("MiniMax H3 video VAE is not resident on this rank")
         with component_scope(video_vae):
-            for value in media.images:
-                image = _image_from_tensor(value)
-                visual_rows.append(video_vae.encode_image(image))
-                visual_shapes.append((1, image.height // 16, image.width // 16))
-            for value in media.videos:
-                frames = np.asarray(value.detach().cpu().to(torch.uint8).contiguous().numpy())
-                rows, shape = video_vae.encode_video(frames)
-                visual_rows.append(rows)
-                visual_shapes.append(tuple(int(item) for item in shape))
-            if media.video_edit is not None:
-                frames = np.asarray(media.video_edit.detach().cpu().to(torch.uint8).contiguous().numpy())
-                rows, shape = video_vae.encode_video(frames)
-                shape = tuple(int(item) for item in shape)
-                expected_shape = (media.latent_t, media.height // 16, media.width // 16)
-                expected_rows = media.latent_t * (media.height // 32) * (media.width // 32)
-                if shape != expected_shape or tuple(rows.shape) != (expected_rows, 96):
-                    raise ValueError(
-                        "MiniMax H3 video edit encoder shape mismatch: "
-                        f"got latent shape {shape} and rows {tuple(rows.shape)}, "
-                        f"expected {expected_shape} and ({expected_rows}, 96)"
-                    )
-                video_edit_clean_rows = rows.to(dtype=torch.float32).contiguous()
-            # Guide stills and clips share the video VAE collective with the
-            # references, so every visual participant encodes them as well.
-            guide_visual_rows = [
-                _encode_guide_frames(guide, video_vae, media.height, media.width) for guide in media.timeline_guides
-            ]
+            if media.images:
+                if image_encoder is None:
+                    for value in media.images:
+                        image = _image_from_tensor(value)
+                        visual_rows.append(video_vae.encode_image(image))
+                        visual_shapes.append((1, image.height // 16, image.width // 16))
+                else:
+                    image_rows, image_shapes = image_encoder()
+                    if len(image_rows) != len(media.images) or len(image_shapes) != len(media.images):
+                        raise ValueError(
+                            "MiniMax H3 image encoder returned "
+                            f"{len(image_rows)} row blocks and {len(image_shapes)} shapes for "
+                            f"{len(media.images)} images"
+                        )
+                    visual_rows.extend(image_rows)
+                    visual_shapes.extend(image_shapes)
+            if encode_non_image_visuals:
+                for value in media.videos:
+                    frames = np.asarray(value.detach().cpu().to(torch.uint8).contiguous().numpy())
+                    rows, shape = video_vae.encode_video(frames)
+                    visual_rows.append(rows)
+                    visual_shapes.append(tuple(int(item) for item in shape))
+                if media.video_edit is not None:
+                    frames = np.asarray(media.video_edit.detach().cpu().to(torch.uint8).contiguous().numpy())
+                    rows, shape = video_vae.encode_video(frames)
+                    shape = tuple(int(item) for item in shape)
+                    expected_shape = (media.latent_t, media.height // 16, media.width // 16)
+                    expected_rows = media.latent_t * (media.height // 32) * (media.width // 32)
+                    if shape != expected_shape or tuple(rows.shape) != (expected_rows, 96):
+                        raise ValueError(
+                            "MiniMax H3 video edit encoder shape mismatch: "
+                            f"got latent shape {shape} and rows {tuple(rows.shape)}, "
+                            f"expected {expected_shape} and ({expected_rows}, 96)"
+                        )
+                    video_edit_clean_rows = rows.to(dtype=torch.float32).contiguous()
+                # Guide stills and clips share the video VAE collective with the
+                # references, so every visual participant encodes them as well.
+                guide_visual_rows = [
+                    _encode_guide_frames(guide, video_vae, media.height, media.width) for guide in media.timeline_guides
+                ]
+
+    if on_visual_complete is not None:
+        on_visual_complete()
 
     if not emit_conditioning:
         return None
