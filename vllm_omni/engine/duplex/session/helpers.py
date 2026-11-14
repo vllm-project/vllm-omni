@@ -113,6 +113,41 @@ def audio_payload_size_bytes(payload: Mapping[str, object]) -> int:
     return base64_decoded_size(audio) or 0
 
 
+def base64_payload_size_bytes(payload: Mapping[str, object]) -> int:
+    """Decoded size of a payload's base64 audio, from its length (no decode).
+
+    For audio the engine encoded itself (no whitespace); ``audio_payload_size_bytes``
+    validates client input.
+    """
+    audio = payload.get("audio") or payload.get("data")
+    if not isinstance(audio, str):
+        return 0
+    return len(audio) * 3 // 4 - len(audio[-2:]) + len(audio[-2:].rstrip("="))
+
+
+def pcm_bytes_per_sample(fmt: object) -> int:
+    """Bytes per mono sample of an engine-side PCM payload format."""
+    if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
+        return 2
+    return 4  # pcm_f32le, the engine's decoded format
+
+
+def pcm_sample_count(audio: object, fmt: object) -> int:
+    """Mono samples in an engine-side PCM payload: the decoded bytes of a client append, or base64 text.
+
+    The input clock counts the client's audio from this. A client append
+    arrives as decoded bytes (``payload(encode_audio=False)``); what the
+    converter hands back for pcm16 / G.711 is base64 text. Anything else
+    would count nothing, so that is an error here rather than a silently
+    stalled ``audio_end_ms``.
+    """
+    if isinstance(audio, bytes):
+        return len(audio) // pcm_bytes_per_sample(fmt)
+    if not isinstance(audio, str):
+        raise TypeError(f"engine-side PCM payload must be bytes or base64 text, got {type(audio).__name__}")
+    return base64_payload_size_bytes({"audio": audio}) // pcm_bytes_per_sample(fmt)
+
+
 # --------------------------------------------------------------------------- #
 # Turn transitions                                                            #
 # --------------------------------------------------------------------------- #
