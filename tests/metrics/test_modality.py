@@ -16,6 +16,7 @@ from vllm_omni.metrics.modality import (
     observe_modality_at_finalize,
 )
 from vllm_omni.metrics.stats import OrchestratorAggregator
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -578,6 +579,27 @@ class TestDiffusionUnitConversion:
             "kv_recv_time_s": pytest.approx(0.04),
         }
 
+    def test_accumulator_leaves_unobserved_keys_absent(self):
+        """Keys the engine left out stay out of the per-request record; they
+        are not created as 0.0, and finished outputs are summed per key."""
+        aggregator = OrchestratorAggregator(
+            num_stages=1,
+            log_stats=True,
+            wall_start_ts=0.0,
+            final_stage_id_for_e2e=0,
+        )
+        for _ in range(2):
+            engine_output = OmniRequestOutput(
+                request_id="req-sparse",
+                metrics={"diffusion_engine_exec_time_ms": 1000.0, "postprocess_time_ms": 10.0},
+            )
+            aggregator.accumulate_diffusion_metrics("diffusion", "req-sparse", engine_output)
+
+        assert dict(aggregator.diffusion_metrics["req-sparse"]) == {
+            "diffusion_engine_exec_time_s": pytest.approx(2.0),
+            "postprocess_time_s": pytest.approx(0.02),
+        }
+
 
 class TestObserveDiffusionFinalize:
     @pytest.mark.parametrize(
@@ -600,6 +622,43 @@ class TestObserveDiffusionFinalize:
         )
 
         assert (call_name, "2", "0", value) in stub.calls
+        # Without engine timings there is no preprocess sample, as before.
+        assert not any(c[0] == "observe_diffusion_preprocess" for c in stub.calls)
+
+    def test_preprocess_histogram_keeps_zero_sample_without_preprocessor(self):
+        """The engine leaves preprocess out when no pre-processor ran; the
+        histogram still records the 0 it recorded before (RFC #8671 leaves
+        that sample to the metrics owners)."""
+        stub = _StubModMetrics()
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=_Bag(
+                diffusion_metrics={"diffusion_engine_exec_time_s": 1.2, "postprocess_time_s": 0.3},
+            ),
+            engine_outputs=_Bag(),
+        )
+
+        preprocess_calls = [c for c in stub.calls if c[0] == "observe_diffusion_preprocess"]
+        assert preprocess_calls == [("observe_diffusion_preprocess", "2", "0", 0.0)]
+
+    def test_measured_preprocess_is_observed_once(self):
+        stub = _StubModMetrics()
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=_Bag(
+                diffusion_metrics={"diffusion_engine_exec_time_s": 1.2, "preprocess_time_s": 0.05},
+            ),
+            engine_outputs=_Bag(),
+        )
+
+        preprocess_calls = [c for c in stub.calls if c[0] == "observe_diffusion_preprocess"]
+        assert preprocess_calls == [("observe_diffusion_preprocess", "2", "0", 0.05)]
 
     def test_audio_diffusion_stage_fires_both_paths(self):
         stub = _StubModMetrics()
