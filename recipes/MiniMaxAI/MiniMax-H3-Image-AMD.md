@@ -205,6 +205,86 @@ Important settings for this profile:
   at every GPU count; TP uses less memory per GPU. One GPU needs no parallel
   flags and holds the full model (about 112 GiB of weights).
 
+### Four independent SP1 replicas
+
+For concurrent request throughput, use four complete single-GPU pipelines
+instead of one four-GPU SP4 pipeline. Each GPU must hold the full image model,
+text encoder and VAE; the weights are replicated rather than sharded. Stop
+the SP4 server before reusing its GPUs and port.
+
+After the model preparation above, start the shared replica-DP launcher in
+the prepared ROCm runtime:
+
+```bash
+docker run -d --name minimax-h3-image-sp1x4-amd \
+  --device=/dev/kfd --device=/dev/dri \
+  --security-opt seccomp=unconfined --group-add video \
+  --ipc=host --network host \
+  -v "$SOURCE_DIR:/workspace:ro" \
+  -v "$CACHE_ROOT:$CACHE_ROOT:ro" \
+  -v "$RUNTIME_DIR/model_index.local.json:$MODEL_DIR/model_index.json:ro" \
+  -w /workspace \
+  -e PYTHONPATH=/workspace \
+  -e HIP_VISIBLE_DEVICES=4,5,6,7 -e CUDA_VISIBLE_DEVICES=4,5,6,7 \
+  -e MODEL="$MODEL_DIR" -e NUM_REPLICAS=4 -e DEVICES=0,1,2,3 \
+  -e DEPLOY_TEMPLATE=/workspace/examples/online_serving/replica_data_parallel/minimax_h3_image_dp.yaml \
+  -e HOST=127.0.0.1 -e PORT=8001 \
+  -e VLLM_OMNI_ROCM_NATIVE_DIFFUSION_OPS=1 \
+  -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
+  -e VLLM_ROCM_USE_AITER=1 -e VLLM_ROCM_USE_SKINNY_GEMM=0 \
+  -e HF_HUB_OFFLINE=1 -e OMNI_DIFFUSION_PROMPT_EMBED_CACHE=0 \
+  --entrypoint bash "$SERVER_IMAGE" \
+  /workspace/examples/online_serving/replica_data_parallel/run_server.sh
+
+curl --fail --silent --show-error http://127.0.0.1:8001/health
+```
+
+The template sets `num_replicas=4` and keeps TP, SP, CFG, VAE patch parallelism
+and text-encoder TP at one per engine, with `max_num_seqs=1`. `DEVICES` indexes
+the launcher's visible devices: logical 0–3 above map to physical GPUs 4–7.
+Do not add `--num-gpus 4`; that requests four GPUs inside each replica.
+The existing native replica runtime owns routing and worker lifecycle. The
+[shared example](../../examples/online_serving/replica_data_parallel/README.md)
+also supports changing the replica count and forwarding extra serving flags.
+
+This profile disables VAE graph decode and encoder cuDNN SDP to match the
+historical throughput experiment. It does not install a tuned GEMM table.
+Use the image benchmark below to compare layouts with identical inputs.
+
+#### Historical replica throughput experiment
+
+These measurements used a separate HTTP supervisor prototype on four MI350X
+GPUs, not this native replica-DP configuration at the current revision. They
+motivate the layout; GPU inference and performance for the new configuration
+remain to be validated. CPU tests check template rendering, native stage
+resolution and disjoint single-GPU replica placement.
+
+| Concurrency | One SP4 pipeline, images/s | Four SP1 replicas, images/s | Throughput change |
+| ---: | ---: | ---: | ---: |
+| 4 | 1.0917 | 1.4052 | +28.72% |
+| 8 | 1.0958 | 1.4778 | +34.86% |
+
+C1 mean latency increased from 0.939 s to 2.726 s (2.90×). At C8, the two
+replica runs delivered 1.4644–1.4912 images/s versus 1.0957–1.0960 for SP4.
+These are descriptive repeat ranges, not confidence intervals.
+
+The baseline–replicas–replicas–baseline comparison completed 800 measured
+requests: 200 per run, with C1=60, C2=20, C4=20 and C8=100. Each of six phases
+had eight excluded warmups. Both layouts included the same HTTP router and
+used 20 prompts with seeds 42–61, six steps, 1344×768 delivered PNG images from a
+2720×1536 internal canvas, BF16 model/FP32 sampler paths, disabled prompt
+embedding caching and the same untuned GEMM table. The layout change includes
+encoder TP and VAE placement; it does not isolate collective-kernel savings.
+Latency ends at full response-body receipt; throughput includes client PNG
+validation and persistence. Generation POSTs were never retried.
+
+The historical runtime used vLLM `0.33.0+rocm100`, PyTorch
+`2.13.0+rocm10.0.0` and AITER `0.1.26`, in image
+`sha256:6d8c202c1026531331b960714216ea2df01af1545b0648dfa254e4d74e350bff`.
+Its frozen source overlay is identified by manifest SHA256
+`99aca1126bdd40032018a9d537ecc5e4c255ee31ccfd2009346fccbf7e4c4442`;
+the image ID alone does not identify that overlay.
+
 ## Generate an image
 
 Submit six inference steps or omit the step count to use the checkpoint's
