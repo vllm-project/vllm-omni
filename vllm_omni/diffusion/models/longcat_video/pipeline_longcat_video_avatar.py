@@ -529,6 +529,10 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         self.use_distill = _as_bool(additional_config.get("use_distill"), True)
         self.use_int8 = _as_bool(additional_config.get("use_int8"), True)
         self.build_components_on_gpu = _as_bool(additional_config.get("build_components_on_gpu"), False)
+        self.enable_bsa = _as_bool(additional_config.get("enable_bsa"), False)
+        self.bsa_params = additional_config.get("bsa_params") or {}
+        if isinstance(self.bsa_params, str):
+            self.bsa_params = json.loads(self.bsa_params)
         self.resolution = str(additional_config.get("resolution") or "480p")
         self.model_dir = _ensure_local_dir(
             od_config.model,
@@ -595,12 +599,16 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
                 self.transformer = create_quantized_avatar_dit(
                     str(self.model_dir),
                     subfolder="base_model_int8",
+                    enable_bsa=self.enable_bsa,
+                    bsa_params=self.bsa_params,
                     cp_split_hw=[1, 1],
                 )
             else:
                 self.transformer = create_full_precision_avatar_dit(
                     str(self.model_dir),
                     subfolder="base_model",
+                    enable_bsa=self.enable_bsa,
+                    bsa_params=self.bsa_params,
                     cp_split_hw=[1, 1],
                 )
                 self.transformer = self.transformer.to(dtype=dtype)
