@@ -111,6 +111,10 @@ def test_eager_post_fills_codec_graph_inputs_and_scratch(n, size):
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(
+    DEVICE_TYPE == "xpu",
+    reason="VLLMZ-3554: the packed metadata holds device pointers as signed int64, and XPU USM addresses do not fit",
+)
 def test_history_scatter_preserves_independent_storage_and_offsets():
     import numpy as np
 
@@ -134,6 +138,7 @@ def test_history_scatter_preserves_independent_storage_and_offsets():
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(DEVICE_TYPE == "xpu", reason="VLLMZ-3554: no graph-pool handle on torch.xpu")
 @torch.inference_mode()
 def test_codec_direct_inputs_wait_for_slow_side_stream():
     from types import SimpleNamespace

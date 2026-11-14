@@ -148,14 +148,6 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     # the mounted cache. It carries no XPU marker, so skip the file outright.
     ignore=(--ignore tests/e2e/offline_inference/test_cosyvoice3_expansion.py)
 
-    # Known-red on XPU, tracked separately: these assert CUDA-only behaviour
-    # (pointer ranges, torch.cuda stream semantics) rather than the kernel.
-    deselect=(--deselect tests/worker/test_device_copy.py::test_tensor_copy_cuda_handles_pageable_and_pinned_sources
-              --deselect tests/worker/test_device_copy.py::test_device_stager_views_survive_until_their_readers_finish
-              --deselect tests/worker/test_device_copy.py::test_device_stager_empty_input_does_not_consume_a_ring_slot
-              --deselect tests/worker_v2/test_eager_frame_kernels.py::test_history_scatter_preserves_independent_storage_and_offsets
-              --deselect tests/worker_v2/test_eager_frame_kernels.py::test_codec_direct_inputs_wait_for_slow_side_stream)
-
     rc=0
     # stage <name> <budget> <pytest args...>
     stage() {
@@ -175,16 +167,16 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
 
     # core_model excludes omni: the async-omni tests carry both markers and
     # would otherwise run twice, and they need their own process (below).
-    stage "core_model" 30m "${paths[@]}" "${ignore[@]}" "${deselect[@]}" \
+    stage "core_model" 30m "${paths[@]}" "${ignore[@]}" \
         -m "core_model and not omni and xpu and B60 and cards_1" --run-level core_model
     stage "mxfp8 config" 2m tests/diffusion/quantization/test_mxfp8_config.py
     # full_model is excluded: those cases pull tens of GB of weights.
-    stage "advanced_model" 15m "${paths[@]}" "${ignore[@]}" "${deselect[@]}" \
+    stage "advanced_model" 15m "${paths[@]}" "${ignore[@]}" \
         -m "advanced_model and not full_model and xpu and B60 and cards_1" --run-level core_model
     # The async-omni engine leaves worker VRAM mapped in the pytest parent, so
     # a 16 GiB thinker started after the other tests in the same process OOMs.
     # CUDA splits this test out for the same reason; keep it last and alone.
-    stage "omni" 10m "${paths[@]}" "${ignore[@]}" "${deselect[@]}" \
+    stage "omni" 10m "${paths[@]}" "${ignore[@]}" \
         -m "omni and xpu and B60 and cards_1" --run-level core_model
 
     exit "${rc}"
