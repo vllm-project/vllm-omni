@@ -295,7 +295,7 @@ This policy is adapted from [Ghostty's AI Usage Policy](https://github.com/ghost
 If you encounter a bug or have a feature request, please search existing issues first to see if it has already been reported. If not, please file a new issue, providing as much relevant information as possible.
 
 !!! important
-    Do not report suspected security vulnerabilities through a public issue, pull request, discussion, or Slack channel. Follow the [security disclosure instructions](../community/contact_us.md#security-disclosures) to arrange a private report.
+    Do not report suspected security vulnerabilities through a public issue, pull request, discussion, or Slack channel. Follow the instructions in the [security policy](https://github.com/vllm-project/vllm-omni/blob/main/SECURITY.md).
 
 ## Pull Requests & Code Reviews
 
