@@ -865,6 +865,24 @@ class DuplexSessionRuntimeConfig:
 
 
 @dataclass
+class IdleSleepRuntimeConfig:
+    """API-process policy for sleeping an idle consumer deployment."""
+
+    timeout_s: float | None = None
+
+    def __post_init__(self) -> None:
+        timeout = self.timeout_s
+        if timeout is None:
+            return
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise ValueError("idle_sleep.timeout_s must be a finite positive number or null")
+        timeout = float(timeout)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("idle_sleep.timeout_s must be a finite positive number or null")
+        self.timeout_s = timeout
+
+
+@dataclass
 class DeployConfig:
     """Loaded from deploy/<model>.yaml — the only config file users edit.
 
@@ -886,6 +904,7 @@ class DeployConfig:
     # Experimental local NVIDIA MPS; disabled unless a deploy explicitly opts in.
     cuda_mps: bool = False
     duplex_session: DuplexSessionRuntimeConfig = field(default_factory=DuplexSessionRuntimeConfig)
+    idle_sleep: IdleSleepRuntimeConfig = field(default_factory=IdleSleepRuntimeConfig)
     speech_cache: SpeechCacheConfig = field(default_factory=SpeechCacheConfig)
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
@@ -1010,7 +1029,7 @@ _DEEP_MERGE_KEYS = frozenset(
 )
 
 
-_DEPLOY_DEEP_MERGE_KEYS = frozenset({"speech_cache"})
+_DEPLOY_DEEP_MERGE_KEYS = frozenset({"idle_sleep", "speech_cache"})
 
 
 def _merge_config_fields(base: dict, overlay: dict, *, deep_merge_keys: frozenset[str]) -> dict:
@@ -1133,6 +1152,9 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     speech_cache = raw_dict.get("speech_cache", {})
     if not isinstance(speech_cache, dict):
         raise ValueError("speech_cache must be a mapping")
+    idle_sleep = raw_dict.get("idle_sleep", {})
+    if not isinstance(idle_sleep, dict):
+        raise ValueError("idle_sleep must be a mapping")
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 
     model_runner = raw_dict.get("model_runner", "v1")
@@ -1151,6 +1173,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "session_mode": raw_dict.get("session_mode", "turn"),
         "model_runner": model_runner,
         "duplex_session": DuplexSessionRuntimeConfig(**(raw_dict.get("duplex_session") or {})),
+        "idle_sleep": IdleSleepRuntimeConfig(**idle_sleep),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
         "stages": stages,

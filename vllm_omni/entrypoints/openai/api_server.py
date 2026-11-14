@@ -130,6 +130,11 @@ from vllm_omni.entrypoints.openai.errors import (
     _create_speech_error_json_response,
     _error_response_to_json_response,
 )
+from vllm_omni.entrypoints.openai.idle_sleep import (
+    IdleSleepASGI,
+    IdleSleepConflictError,
+    create_idle_sleep_controller,
+)
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
     encode_image_base64_with_compression,
@@ -471,6 +476,18 @@ async def omni_run_server_worker(
         _register_omni_exception_handlers(app)
 
         await omni_init_app_state(engine_client, app.state, args)
+        idle_sleep_config = getattr(engine_client, "idle_sleep_config", None)
+        idle_sleep_controller = (
+            create_idle_sleep_controller(
+                engine_client,
+                idle_sleep_config,
+                api_server_count=api_server_count,
+                sleeping_stages=app.state.sleeping_stages,
+            )
+            if idle_sleep_config is not None
+            else None
+        )
+        app.state.idle_sleep_controller = idle_sleep_controller
 
         # The inherited routes assume a tokenization handler. Pure diffusion
         # has none; omit those capabilities instead of dereferencing None.
@@ -580,8 +597,13 @@ async def omni_run_server_worker(
             # their owned replica groups through the local engine.
             warmup_task = asyncio.create_task(_warmup_duplex_realtime(app, args, duplex_warmup_frames))
 
+        asgi_app: ASGIApp = _TimestampMiddleware(app)
+        if idle_sleep_controller is not None:
+            await idle_sleep_controller.start()
+            asgi_app = IdleSleepASGI(asgi_app, idle_sleep_controller)
+
         shutdown_task = await serve_http(
-            _TimestampMiddleware(app),
+            asgi_app,
             sock=sock,
             enable_ssl_refresh=args.enable_ssl_refresh,
             host=args.host,
@@ -604,6 +626,8 @@ async def omni_run_server_worker(
         try:
             await shutdown_task
         finally:
+            if idle_sleep_controller is not None:
+                await idle_sleep_controller.close()
             if warmup_task is not None:
                 warmup_task.cancel()
             state = getattr(app, "state", None)
@@ -2165,6 +2189,14 @@ async def health(raw_request: Request) -> JSONResponse:
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
         )
 
+    idle_sleep_controller = getattr(raw_request.app.state, "idle_sleep_controller", None)
+    idle_sleep_error = getattr(idle_sleep_controller, "error_reason", None)
+    if idle_sleep_error:
+        return JSONResponse(
+            content={"status": "unhealthy", "reason": idle_sleep_error},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+
     try:
         await engine_client.check_health()
         return JSONResponse(content={"status": "healthy"})
@@ -3159,6 +3191,25 @@ async def create_video(
         _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
         _cleanup_timeline_guides(request)
 
+    async def _run_job(job_id: str) -> None:
+        controller = getattr(raw_request.app.state, "idle_sleep_controller", None)
+        if controller is not None:
+            await controller.begin_activity()
+        try:
+            await _run_video_generation_job(
+                handler,
+                request,
+                job_id,
+                reference_image,
+                reference_video,
+                reference_audio,
+                app_state=raw_request.app.state,
+                latent_edit_input=latent_edit_input,
+            )
+        finally:
+            if controller is not None:
+                await controller.end_activity()
+
     task: asyncio.Task[None] | None = None
     ref = None
     try:
@@ -3166,18 +3217,7 @@ async def create_video(
         ref = video_response_from_request(effective_model_name, request)
         ref.remixed_from_video_id = continue_from
         await VIDEO_STORE.upsert(ref.id, ref)
-        task = asyncio.create_task(
-            _run_video_generation_job(
-                handler,
-                request,
-                ref.id,
-                reference_image,
-                reference_video,
-                reference_audio,
-                app_state=raw_request.app.state,
-                latent_edit_input=latent_edit_input,
-            )
-        )
+        task = asyncio.create_task(_run_job(ref.id))
         # A task cancelled before its first step never enters its finally block.
         task.add_done_callback(lambda _: _cleanup_request_resources())
         await VIDEO_TASKS.upsert(ref.id, task)
@@ -3521,6 +3561,23 @@ async def stop_profile(raw_request: Request, request: ProfileRequest | None = No
         )
 
 
+def _manual_lifecycle_lock(raw_request: Request) -> asyncio.Lock:
+    state = raw_request.app.state
+    lock = getattr(state, "omni_lifecycle_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        state.omni_lifecycle_lock = lock
+    return lock
+
+
+async def _refresh_sleeping_stages(engine_client: Any, sleeping_set: set[int], stage_ids: list[int]) -> None:
+    for stage_id in stage_ids:
+        if await engine_client.is_sleeping(stage_ids=[stage_id]):
+            sleeping_set.add(stage_id)
+        else:
+            sleeping_set.discard(stage_id)
+
+
 @router.post("/v1/omni/sleep")
 async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
     _reject_process_local_state_with_multiple_api_workers(raw_request, "Sleep")
@@ -3529,14 +3586,20 @@ async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
     if not hasattr(engine_client, "sleep"):
         raise HTTPException(status_code=501, detail="Engine does not support sleep")
     try:
-        acks = await engine_client.sleep(stage_ids=request.stage_ids, level=request.level)
+        controller = getattr(raw_request.app.state, "idle_sleep_controller", None)
+        if controller is not None:
+            acks = await controller.manual_sleep(stage_ids=request.stage_ids, level=request.level)
+        else:
+            async with _manual_lifecycle_lock(raw_request):
+                try:
+                    acks = await engine_client.sleep(stage_ids=request.stage_ids, level=request.level)
+                finally:
+                    # A failed sleep may still leave a stage for wakeup to reach.
+                    await _refresh_sleeping_stages(engine_client, sleeping_set, request.stage_ids)
     except ValueError as e:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
     except RuntimeError as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Failed to sleep: {e}") from e
-    finally:
-        # Mirror the engine: a failed sleep may still leave stages for wakeup to reach.
-        sleeping_set.update([sid for sid in request.stage_ids if await engine_client.is_sleeping(stage_ids=[sid])])
     return {
         "status": "SUCCESS",
         "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) and not isinstance(a, type) else a for a in acks],
@@ -3548,12 +3611,21 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
     _reject_process_local_state_with_multiple_api_workers(raw_request, "Wakeup")
     engine_client = raw_request.app.state.engine_client
     sleeping_set = raw_request.app.state.sleeping_stages
-    if not any(sid in sleeping_set for sid in request.stage_ids):
-        return {"status": "SKIPPED", "reason": "Target stages are not sleeping."}
     if not hasattr(engine_client, "wake_up"):
         raise HTTPException(status_code=501, detail="Engine does not support wake_up")
     try:
-        acks = await engine_client.wake_up(stage_ids=request.stage_ids)
+        controller = getattr(raw_request.app.state, "idle_sleep_controller", None)
+        if controller is not None:
+            acks = await controller.manual_wake(stage_ids=request.stage_ids)
+        else:
+            async with _manual_lifecycle_lock(raw_request):
+                if not any(sid in sleeping_set for sid in request.stage_ids):
+                    return {"status": "SKIPPED", "reason": "Target stages are not sleeping."}
+                acks = await engine_client.wake_up(stage_ids=request.stage_ids)
+        if acks is None:
+            return {"status": "SKIPPED", "reason": "Target stages are not sleeping."}
+    except IdleSleepConflictError as e:
+        raise HTTPException(status_code=HTTPStatus.CONFLICT.value, detail=str(e)) from e
     except NotImplementedError:
         raise
     except ValueError as e:
