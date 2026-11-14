@@ -164,6 +164,17 @@ class AsyncOmniBase(OmniBase):
         queue, where ``generate()`` would raise on it.
         """
         assert msg.request_id is not None and msg.event_id is not None
+        if req_state.interaction_errors_closed:
+            # The request is already cleaning up, and a callback started now
+            # would outlive both the drain and the request state.
+            logger.warning(
+                "[%s] Interaction %s rejected while req %s was finishing: %s",
+                self._name,
+                msg.event_id,
+                msg.request_id,
+                msg.error,
+            )
+            return
         task = asyncio.ensure_future(
             self._report_interaction_rejection(req_state, msg.request_id, msg.event_id, msg.error)
         )
@@ -184,12 +195,16 @@ class AsyncOmniBase(OmniBase):
         await handler(event_id, error)
 
     async def _drain_interaction_error_tasks(self, req_state: ClientRequestState) -> None:
-        """Let pending rejection callbacks finish briefly, then cancel the rest."""
+        """Let pending rejection callbacks finish briefly, then cancel the rest.
+
+        Admission closes first, so the output loop cannot add a callback
+        while the wait below is suspended.
+        """
+        req_state.interaction_errors_closed = True
         tasks = set(req_state.interaction_error_tasks)
-        if not tasks:
-            return
-        _, pending = await asyncio.wait(tasks, timeout=INTERACTION_ERROR_DRAIN_TIMEOUT_S)
-        for task in pending:
+        if tasks:
+            await asyncio.wait(tasks, timeout=INTERACTION_ERROR_DRAIN_TIMEOUT_S)
+        for task in list(req_state.interaction_error_tasks):
             task.cancel()
 
     def _resolve_transfer_replica(self, stage_id: int, request_id: str) -> int | None:

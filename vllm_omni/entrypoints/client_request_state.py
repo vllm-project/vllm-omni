@@ -57,3 +57,6 @@ class ClientRequestState:
         # ``AsyncOmni.submit_interaction_async``), and the tasks running it.
         self.interaction_error_handler: Callable[[str, str], Awaitable[None]] | None = None
         self.interaction_error_tasks: set[asyncio.Future] = set()
+        # Set once request cleanup starts draining those tasks; a rejection
+        # that arrives afterwards is logged instead of starting a new one.
+        self.interaction_errors_closed = False

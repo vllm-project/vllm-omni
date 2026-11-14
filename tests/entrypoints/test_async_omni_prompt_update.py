@@ -300,6 +300,90 @@ async def test_pending_rejection_callbacks_are_drained_then_cancelled(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_rejection_arriving_during_cleanup_drain_starts_no_callback(mocker, monkeypatch) -> None:
+    monkeypatch.setattr(async_omni_base, "INTERACTION_ERROR_DRAIN_TIMEOUT_S", 0.2)
+    first = ErrorMessage(error="Failed interaction: bad pose", request_id="req-uuid", event_id="ev-1", stage_id=0)
+    late = ErrorMessage(error="Failed interaction: bad pose", request_id="req-uuid", event_id="ev-2", stage_id=0)
+    omni, req_state, _ = _make_rejection_omni(mocker, [])
+    inbox: asyncio.Queue[list] = asyncio.Queue()
+    inbox.put_nowait([first])
+    late_sent = False
+    late_handled = asyncio.Event()
+    started: list[str] = []
+    cancelled: list[str] = []
+    first_started = asyncio.Event()
+
+    async def get_outputs_async(timeout: float):
+        del timeout
+        # The loop asks again only after it has routed the previous batch.
+        if late_sent and inbox.empty():
+            late_handled.set()
+        try:
+            return await asyncio.wait_for(inbox.get(), 0.01)
+        except asyncio.TimeoutError:
+            return []
+
+    async def on_error(event_id: str, message: str) -> None:
+        del message
+        started.append(event_id)
+        first_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(event_id)
+            raise
+
+    omni.engine = SimpleNamespace(get_outputs_async=get_outputs_async)  # pyright: ignore[reportAttributeAccessIssue]
+    req_state.interaction_error_handler = on_error
+    omni._final_output_handler()
+    try:
+        await asyncio.wait_for(first_started.wait(), 1)
+        drain = asyncio.ensure_future(omni._drain_interaction_error_tasks(req_state))
+        await asyncio.sleep(0)
+        assert not drain.done()
+
+        # The request is still registered, so the output loop routes this one too.
+        inbox.put_nowait([late])
+        late_sent = True
+        await asyncio.wait_for(late_handled.wait(), 1)
+        assert not drain.done()
+        await asyncio.wait_for(drain, 1)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert started == ["ev-1"]
+        assert cancelled == ["ev-1"]
+        assert not req_state.interaction_error_tasks
+        assert req_state.queue.empty()
+    finally:
+        assert omni.final_output_task is not None
+        omni.final_output_task.cancel()
+        await asyncio.gather(omni.final_output_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_drain_cancels_callbacks_added_while_it_waits(monkeypatch) -> None:
+    monkeypatch.setattr(async_omni_base, "INTERACTION_ERROR_DRAIN_TIMEOUT_S", 0.05)
+    omni = object.__new__(AsyncOmni)
+    req_state = ClientRequestState(request_id="req-uuid")
+    early = asyncio.ensure_future(asyncio.Event().wait())
+    req_state.interaction_error_tasks.add(early)
+
+    drain = asyncio.ensure_future(omni._drain_interaction_error_tasks(req_state))
+    await asyncio.sleep(0)
+    late = asyncio.ensure_future(asyncio.Event().wait())
+    req_state.interaction_error_tasks.add(late)
+
+    try:
+        await asyncio.wait_for(drain, 1)
+        await asyncio.wait({early, late}, timeout=1)
+
+        assert early.cancelled() and late.cancelled()
+    finally:
+        late.cancel()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_cancels_pending_rejection_callbacks(mocker) -> None:
     omni = object.__new__(AsyncOmni)
     omni.final_output_task = None

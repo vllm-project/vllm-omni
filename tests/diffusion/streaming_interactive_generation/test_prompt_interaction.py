@@ -797,6 +797,89 @@ class TestPromptUpdateIntegration:
                 await asyncio.gather(generate_task, return_exceptions=True)
             await self._shutdown_pipeline_omni_harness(omni, fixture, inline_client)
 
+    @pytest.mark.asyncio
+    async def test_rejection_during_cleanup_drain_leaves_no_callback_behind(
+        self, pipeline: HeliosPipeline, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A rejection routed while ``generate()`` drains its callbacks must not start one that outlives it."""
+        monkeypatch.setattr(async_omni_base, "INTERACTION_ERROR_DRAIN_TIMEOUT_S", 0.2)
+        pipeline.encode_prompt = MagicMock(  # pyright: ignore[reportAttributeAccessIssue]
+            side_effect=ValueError("prompt embeds are not ready")
+        )
+        runner = _make_diffusion_model_runner(pipeline=pipeline)
+        started: list[str] = []
+        cancelled: list[str] = []
+        dispatched: list[str | None] = []
+
+        async def on_error(event_id: str, reason: str) -> None:
+            del reason
+            started.append(event_id)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(event_id)
+                raise
+
+        prompt_update_engine = self._PromptUpdateEngine(
+            self._IncrementalStreamingPipeline(),
+            runner,
+            ready_for_next_chunk=lambda _state: bool(started),
+        )
+        inline_client = self._make_inline_pipeline_client(prompt_update_engine)
+        fixture = _build_harness([inline_client])
+        omni = self._make_async_omni(self._OrchestratorBridgeEngine(fixture))
+        dispatch = omni._dispatch_interaction_error
+        drain = omni._drain_interaction_error_tasks
+
+        def recording_dispatch(req_state, msg):
+            dispatched.append(msg.event_id)
+            dispatch(req_state, msg)
+
+        async def drain_and_reject_again(req_state):
+            # Scheduled to run once the drain is suspended in its bounded wait,
+            # while the request is still registered with the output loop.
+            asyncio.get_running_loop().call_soon(
+                fixture.output_sync_q.put_nowait,
+                ErrorMessage(
+                    error="Failed interaction: late",
+                    request_id=req_state.request_id,
+                    event_id="ui-update-2",
+                    stage_id=0,
+                ),
+            )
+            await drain(req_state)
+
+        monkeypatch.setattr(omni, "_dispatch_interaction_error", recording_dispatch)
+        monkeypatch.setattr(omni, "_drain_interaction_error_tasks", drain_and_reject_again)
+
+        generate_task: asyncio.Task[list[OmniRequestOutput]] | None = None
+        try:
+            generate_task = asyncio.create_task(self._collect_generate_outputs(omni))
+            await _wait_for(
+                lambda: (
+                    len(runner.state_cache) > 0
+                    and any(state.external_request_id == "req-omni" for state in omni.request_states.values())
+                )
+            )
+            await omni.submit_interaction_async(
+                "req-omni",
+                interaction=_prompt_interaction("new scene", event_id="ui-update-1"),
+                on_error=on_error,
+            )
+            outputs = await asyncio.wait_for(generate_task, 5)
+            await asyncio.sleep(0.01)
+
+            assert [output.custom_output["chunk"] for output in outputs] == [0, 1]
+            assert dispatched == ["ui-update-1", "ui-update-2"]
+            assert started == ["ui-update-1"]
+            assert cancelled == ["ui-update-1"]
+            assert not omni.request_states
+        finally:
+            if generate_task is not None and not generate_task.done():
+                generate_task.cancel()
+                await asyncio.gather(generate_task, return_exceptions=True)
+            await self._shutdown_pipeline_omni_harness(omni, fixture, inline_client)
+
     @staticmethod
     async def _collect_generate_outputs(omni: AsyncOmni) -> list[OmniRequestOutput]:
         outputs: list[OmniRequestOutput] = []
