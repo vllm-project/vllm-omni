@@ -467,6 +467,16 @@ padded embedding lookup/TP collective per step and one embedding CPU transfer;
 the CPU finalizer removes padding and sentinels with a matching row mask.
 Falling back to inline construction therefore keeps async scheduling enabled.
 
+For MRv1 speculative full-payload sends, the scheduler snapshots the final
+output token IDs when freeing the request and carries them with the next
+finished-request notification. The runner gives the full-payload processor a
+request copy with this confirmed history, replacing both post-stop verifier
+samples and async `-1` placeholders. Qwen3-Omni fences accumulated embedding
+rows to that history before applying its existing terminal-row trim. EOS,
+explicit stop tokens, and length limits therefore use the scheduler's boundary
+even when it falls inside a verifier step. The snapshot is consumed once;
+async-chunk and MRv2 keep their existing transport contracts.
+
 The model's `finalize_pooler_payload` hook owns the speech wire contract:
 `ids.output`, layer-0 replacement, decode-span metadata, and removal of verifier
 hidden rows. Generic runner code does not interpret those fields. Other models

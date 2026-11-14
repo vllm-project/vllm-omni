@@ -3,15 +3,21 @@
 
 """CPU contract tests for speculative payload token alignment."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.outputs import SamplerOutput
+from vllm.v1.request import Request
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.data_entry_keys import deserialize_payload, flatten_payload, serialize_payload
 from vllm_omni.model_executor.models.qwen3_omni.speculative_payload import (
     STAGING_KEY,
@@ -544,6 +550,112 @@ def test_inline_zero_draft_handoff_accumulates_full_payload_without_missing_or_d
     )
     result = thinker2talker_full_payload(manager, combined, request)
     assert result["embed"]["prefill"].flatten().tolist() == request.all_token_ids[:-1]
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize(
+    ("samples", "stop_ids", "max_tokens", "max_model_len"),
+    [
+        pytest.param((11, 99, 13), [], 20, 100, id="eos-middle"),
+        pytest.param((99, 12, 13), [], 20, 100, id="eos-first"),
+        pytest.param((11, 12, 99), [], 20, 100, id="eos-last"),
+        pytest.param((11, 12, 13), [12], 20, 100, id="stop-token-middle"),
+        pytest.param((11, 12, 13), [], 3, 100, id="max-tokens-middle"),
+        pytest.param((11, 12, 13), [], 20, 6, id="max-model-len-middle"),
+    ],
+)
+def test_full_payload_flush_honors_scheduler_stop_boundary(
+    monkeypatch, async_scheduling, samples, stop_ids, max_tokens, max_model_len
+):
+    """Verifier acceptance can extend past the scheduler's terminal token."""
+    params = SamplingParams(max_tokens=max_tokens, stop_token_ids=stop_ids)
+    params.update_from_generation_config({}, eos_token_id=99)
+    scheduled_request = Request("r1", [1, 2, 3], params, pooling_params=None)
+    scheduled_request.append_output_token_ids(10)
+    scheduled_request.num_computed_tokens = 6
+    scheduler = object.__new__(Scheduler)
+    scheduler.max_model_len = max_model_len
+    _, stopped = scheduler._update_request_with_output(scheduled_request, list(samples))
+    assert stopped
+    final_ids = list(scheduled_request.output_token_ids)
+
+    runner = object.__new__(GPUARModelRunner)
+    runner._pending_full_payload_send = {}
+    runner._full_payload_replace_keys_cached = frozenset()
+    runner._stage_id = 0
+    # Upstream async bookkeeping stores placeholders, while sync bookkeeping
+    # stores every verifier sample, including samples past the stop boundary.
+    cached_ids = [-1, -1] if async_scheduling else [10, *samples]
+    request = CachedRequestState(
+        req_id="r1",
+        prompt_token_ids=[1, 2, 3],
+        mm_features=[],
+        sampling_params=params,
+        generator=None,
+        block_ids=([],),
+        num_computed_tokens=6,
+        output_token_ids=cached_ids,
+    )
+    for inputs, step_samples, position in (((1, 2, 3), (10, -1, -1), 0), ((10, 11, 12), samples, 3)):
+        mm = finalize_speculative_payload(
+            _prepare(
+                inputs=inputs,
+                samples=(step_samples,),
+                positions=tuple(range(position, position + len(inputs))),
+                offsets=(0, len(inputs)),
+                speculative_ids={"r1"} if position else set(),
+            )
+        )
+        raw = {
+            "hidden_states.layer_0": torch.tensor(inputs).float().view(-1, 1),
+            "hidden_states.layer_24": torch.ones(len(inputs), 1),
+        }
+        runner.accumulate_full_payload_output("r1", flatten_payload(apply_speculative_payload(raw, mm, 0)), request)
+
+    manager = SimpleNamespace(
+        config=SimpleNamespace(hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=24)))
+    )
+    sent = []
+
+    def send(*, scheduler_output, outputs):
+        payload, terminal_request = outputs["r1"]
+        sent.append(thinker2talker_full_payload(manager, payload, terminal_request))
+
+    # Exercise the real execute_model flush before finished requests are removed.
+    # Stop at input preparation: this contract needs neither a model nor a GPU.
+    class InputPreparationReachedError(Exception):
+        pass
+
+    def update_states(_output):
+        raise InputPreparationReachedError
+
+    runner.send_full_payload_outputs = send
+    runner.execute_model_state = None
+    runner._warmup_state_cleared = True
+    runner._prefix_cache_step_begin = lambda _: None
+    runner.kv_transfer_manager = SimpleNamespace(handle_finished_requests_kv_transfer=lambda **_: set())
+    runner.kv_caches = []
+    runner.cache_config = SimpleNamespace(block_size=16, cache_dtype="auto")
+    runner._resolve_global_request_id = lambda rid: rid
+    runner._omni_connector = object()
+    runner.recv_full_payload_inputs = lambda _: None
+    runner.requests = {"r1": request}
+    runner.speculative_config = None
+    runner.synchronize_input_prep = nullcontext
+    runner._update_states = update_states
+    monkeypatch.setattr("vllm_omni.worker.gpu_ar_model_runner.has_kv_transfer_group", lambda: False)
+    output = OmniSchedulerOutput.make_empty()
+    output.finished_req_ids = {"r1"}
+    output.finished_req_output_token_ids = {"r1": final_ids}
+    with pytest.raises(InputPreparationReachedError):
+        runner.execute_model(output)
+
+    assert len(sent) == 1
+    assert sent[0]["ids"]["all"] == [1, 2, 3, *final_ids]
+    assert sent[0]["embed"]["prefill"].flatten().tolist() == [1, 2, 3, *final_ids][:-1]
+    assert request.output_token_ids is cached_ids
+    assert request.output_token_ids == ([-1, -1] if async_scheduling else [10, *samples])
+    assert not runner._pending_full_payload_send
 
 
 @pytest.mark.parametrize(

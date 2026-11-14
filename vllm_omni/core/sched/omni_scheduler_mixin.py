@@ -779,9 +779,14 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             if request_id in self.requests
         ]
         pending_prewarms.clear()
+        pending_output_ids: dict[str, list[int]] = getattr(self, "_finished_req_output_token_ids", {})
+        finished_output_ids = {
+            req_id: pending_output_ids.pop(req_id) for req_id in base.finished_req_ids if req_id in pending_output_ids
+        }
         scheduler_output = OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
+            finished_req_output_token_ids=finished_output_ids,
             pending_input_registrations=pending_input_registrations,
             data_plane_terminal_req_ids=data_plane_terminal_req_ids,
             input_terminal_req_ids=input_terminal_req_ids or set(),

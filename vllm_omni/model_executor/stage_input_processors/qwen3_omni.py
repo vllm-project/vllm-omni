@@ -839,6 +839,12 @@ def thinker2talker_full_payload(
         output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
         all_token_ids = list(prompt_token_ids) + list(output_token_ids)
 
+    if pooling_output.get("meta.decode_span", False):
+        # Inline verifier payloads include all accepted samples, even those
+        # past EOS/stop/length limits. Full-payload flush supplies the final
+        # scheduler history; fence rows to it before removing the terminal row.
+        thinker_emb = thinker_emb[: len(all_token_ids)]
+
     model_config = (
         transfer_manager._get_model_config()
         if hasattr(transfer_manager, "_get_model_config")

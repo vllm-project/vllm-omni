@@ -584,7 +584,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
-                    self.flush_full_payload_outputs(flush_ids)
+                    self.flush_full_payload_outputs(
+                        flush_ids,
+                        finished_req_output_token_ids=getattr(scheduler_output, "finished_req_output_token_ids", None),
+                    )
 
         # Exactly once per real scheduler_output, before _update_states.
         self._prefix_cache_step_begin(scheduler_output)
