@@ -109,12 +109,28 @@ def test_reused_descriptor_does_not_fall_back_from_a_truncated_sidecar(monkeypat
         )
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")
+@pytest.fixture(scope="module")
+def ffmpeg_rgb_encoder():
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg is required")
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"],
+        check=True,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    if "libx264rgb" not in result.stdout:
+        pytest.skip("ffmpeg with the libx264rgb encoder is required")
+
+
 @pytest.mark.parametrize(
     ("target_frames", "duration", "start", "pad", "expected_count"),
     [(6, None, 0.0, False, 6), (0, 0.25, 0.125, False, 6), (20, None, 0.0, True, 20), (0, None, 0.0, False, 12)],
 )
-def test_transcode_sidecar_matches_prepared_video_pixels(tmp_path, target_frames, duration, start, pad, expected_count):
+def test_transcode_sidecar_matches_prepared_video_pixels(
+    tmp_path, ffmpeg_rgb_encoder, target_frames, duration, start, pad, expected_count
+):
     """Catch divergence in RGB conversion, trimming, seeking or last-frame padding."""
     source = str(tmp_path / "source.mp4")
     subprocess.run(
