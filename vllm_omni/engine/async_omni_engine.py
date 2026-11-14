@@ -20,6 +20,7 @@ from vllm.multimodal.cache import ShmObjectStoreSenderCache
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.kv_hints import KvHintsEnvelope
 
+from vllm_omni.config.stage_config import SKIP_STREAMING_UPDATES_ATTR
 from vllm_omni.data_entry_keys import REQUEST_ARTIFACT_DIRS_KEY, TRANSFORM_OWNED_META_KEYS
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import (
@@ -310,7 +311,10 @@ class AsyncOmniEngine(OmniEngineBase):
                     inject_global_id(item, request_id)
 
             prompt_transform_func = getattr(self, "prompt_transform_func", None)
-            if prompt_transform_func is not None:
+            if prompt_transform_func is not None and not (
+                message_type == "streaming_update"
+                and getattr(prompt_transform_func, SKIP_STREAMING_UPDATES_ATTR, False)
+            ):
                 prompt = prompt_transform_func(
                     copy.copy(prompt),
                     effective_sampling_params_list,

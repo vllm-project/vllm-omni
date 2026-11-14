@@ -37,6 +37,10 @@ _REJECTED = {
     "blank-trailing-hidden": _prompt([""], hidden_states={"trailing_text": None}),
     "plain-string": "Hello.",
     "text-prompt-dict": {"prompt": "Hello."},
+    "token-only": {"prompt_token_ids": [0]},
+    # The engine stamps a request id into every dict prompt before this check runs.
+    "request-id-only": {"prompt_token_ids": [0], "additional_information": {"global_request_id": ["r"]}},
+    "non-dict-info": {"prompt_token_ids": [0], "additional_information": "Hello."},
 }
 _ACCEPTED = {
     "text": _prompt(["Hello."]),
@@ -45,8 +49,6 @@ _ACCEPTED = {
     # Precomputed text ids carry the text; the raw string is not used.
     "text-ids": _prompt([""], **{PRECOMPUTED_TEXT_IDS_KEY: [[1, 2, 3]]}),
     "trailing-hidden": _prompt([""], hidden_states={"trailing_text": torch.zeros(1)}),
-    # AsyncOmni closes a streaming input with a token prompt that has no additional_information.
-    "stream-close": {"prompt_token_ids": [0]},
 }
 
 
@@ -64,7 +66,7 @@ def test_prompt_with_usable_text_passes_through_unchanged(prompt):
     assert check_text_prompt(prompt, []) is prompt
 
 
-_ACCEPTED_INFOS = {name: p["additional_information"] for name, p in _ACCEPTED.items() if "additional_information" in p}
+_ACCEPTED_INFOS = {name: p["additional_information"] for name, p in _ACCEPTED.items()}
 
 
 @pytest.mark.parametrize("info", list(_ACCEPTED_INFOS.values()), ids=list(_ACCEPTED_INFOS))

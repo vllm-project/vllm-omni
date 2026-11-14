@@ -41,6 +41,7 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
 
+from vllm_omni.config.stage_config import skip_on_streaming_updates
 from vllm_omni.utils.audio import mel_filter_bank
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
@@ -146,6 +147,7 @@ def has_tts_text_conditioning(
     return isinstance(hidden_states, dict) and isinstance(hidden_states.get("trailing_text"), torch.Tensor)
 
 
+@skip_on_streaming_updates
 def check_text_prompt(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
     """Reject requests without usable text before submission (stage-0 prompt transform).
 
@@ -153,16 +155,17 @@ def check_text_prompt(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
     ``additional_information`` straight to the engine. There, blank text is
     synthesized, and text that :func:`has_tts_text_conditioning` rejects raises
     inside the Talker's ``preprocess``, which stops the engine. Rejecting here
-    fails only the caller's request. A token-only prompt without
-    ``additional_information`` passes: ``AsyncOmni`` closes a streaming input
-    with ``TokensPrompt([0])``.
+    fails only the caller's request.
+
+    Streaming-input updates skip this check: the Talker builds its prompt from
+    the first chunk only, and ``AsyncOmni`` closes the stream with a text-less
+    ``TokensPrompt([0])`` update.
     """
     for item in prompt if isinstance(prompt, list) else (prompt,):
         info = item.get("additional_information") if isinstance(item, dict) else None
-        if isinstance(info, dict):
-            ok = has_tts_text_conditioning(info, info.get("hidden_states"), allow_blank_text=False)
-        else:
-            ok = info is not None or (isinstance(item, dict) and "prompt" not in item)
+        ok = isinstance(info, dict) and has_tts_text_conditioning(
+            info, info.get("hidden_states"), allow_blank_text=False
+        )
         if not ok:
             raise ValueError(
                 "Qwen3-TTS requests need `additional_information` with `text` as a list whose "
