@@ -18,6 +18,11 @@ from vllm_omni.profiler.omni_torch_profiler import OmniTorchProfilerWrapper
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+# Captured before any fixture runs: the real base-class __init__, which the
+# autouse patch_worker_profiler_init fixture replaces for the direct-call
+# tests. Tests that drive the public start()/step() lifecycle restore it.
+_REAL_WORKER_PROFILER_INIT = profiler_mod.WorkerProfiler.__init__
+
 
 @pytest.fixture(autouse=True)
 def patch_worker_profiler_init(monkeypatch):
@@ -40,6 +45,11 @@ class DummyProfilerConfig:
     torch_profiler_with_stack: bool = True
     torch_profiler_with_flops: bool = False
     torch_profiler_dump_cuda_time_total: bool = False
+    wait_iterations: int = 0
+    warmup_iterations: int = 0
+    active_iterations: int = 5
+    delay_iterations: int = 0
+    max_iterations: int = 0
 
 
 class FakeEvent:
@@ -104,9 +114,13 @@ class FakeTorchProfiler:
         self.on_trace_ready = on_trace_ready
         self.exported_traces = []
         self.exported_stacks = []
+        self.step_calls = 0
 
     def start(self):
         self.started = True
+
+    def step(self):
+        self.step_calls += 1
 
     def stop(self):
         self.stopped = True
@@ -712,3 +726,145 @@ def test_event_list_to_rows_contains_expected_fields(wrapper):
     assert row["self_cuda_memory_usage_bytes"] == 1024
     assert "[[8, 16], [16, 32]]" == row["input_shapes"]
     assert row["stack"] == "f1\nf2"
+
+
+# =============================================================================
+# Schedule support: wait/warmup/active iterations (#9286)
+# =============================================================================
+
+
+def test_no_schedule_built_by_default(wrapper, fake_profiler_factory):
+    assert wrapper._uses_schedule is False
+    assert "schedule" not in fake_profiler_factory["kwargs"]
+
+
+def test_schedule_forwarded_when_warmup_configured(fake_config, fake_profiler_factory):
+    fake_config.wait_iterations = 1
+    fake_config.warmup_iterations = 2
+    fake_config.active_iterations = 3
+
+    wrapper = OmniTorchProfilerWrapper(
+        profiler_config=fake_config,
+        worker_name="worker0",
+        local_rank=0,
+        activities=["CPU", "CUDA"],
+    )
+
+    assert wrapper._uses_schedule is True
+    assert fake_profiler_factory["kwargs"]["schedule"] is wrapper._schedule
+    # start() consumes schedule step 0, leaving wait + warmup - 1 steps.
+    assert wrapper._initial_warmup_steps_remaining == 2
+
+
+def test_schedule_built_from_wait_alone(fake_config, fake_profiler_factory):
+    fake_config.wait_iterations = 2
+
+    wrapper = OmniTorchProfilerWrapper(
+        profiler_config=fake_config,
+        worker_name="worker0",
+        local_rank=0,
+        activities=["CPU", "CUDA"],
+    )
+
+    assert wrapper._uses_schedule is True
+    assert wrapper._initial_warmup_steps_remaining == 1
+
+
+def test_profiler_step_true_without_schedule(wrapper):
+    assert wrapper._profiler_step() is True
+    assert wrapper.profiler.step_calls == 0
+
+
+def test_profiler_step_advances_schedule_and_skips_warmup(fake_config, fake_profiler_factory):
+    fake_config.wait_iterations = 1
+    fake_config.warmup_iterations = 2
+
+    wrapper = OmniTorchProfilerWrapper(
+        profiler_config=fake_config,
+        worker_name="worker0",
+        local_rank=0,
+        activities=["CPU", "CUDA"],
+    )
+
+    results = [wrapper._profiler_step() for _ in range(4)]
+    # Two warmup-trailing steps record nothing, active steps return True.
+    assert results == [False, False, True, True]
+    assert wrapper.profiler.step_calls == 4
+
+
+def test_profiler_step_stops_session_once_schedule_cycle_exhausted(fake_config, fake_profiler_factory, monkeypatch):
+    fake_config.wait_iterations = 1
+    fake_config.warmup_iterations = 2
+    fake_config.active_iterations = 3
+    # Drive the exhaustion through the public step() with the real stop():
+    # restore the base-class __init__ the autouse fixture replaces, so the
+    # lifecycle lock and the session counters are the real ones.
+    monkeypatch.setattr(profiler_mod.WorkerProfiler, "__init__", _REAL_WORKER_PROFILER_INIT)
+
+    wrapper = OmniTorchProfilerWrapper(
+        profiler_config=fake_config,
+        worker_name="worker0",
+        local_rank=0,
+        activities=["CPU", "CUDA"],
+    )
+    wrapper.set_trace_filename("case_schedule_exhaustion")
+
+    wrapper.start()
+    for _ in range(6):
+        wrapper.step()
+
+    # wait+warmup-1 non-active steps then 3 active steps exhaust the
+    # repeat=1 cycle; the 6th worker step stopped the session through the
+    # public stop() instead of advancing the profiler past RECORD_AND_SAVE.
+    # Fails on a46ba0adb, which stepped a 6th time and never stopped.
+    assert wrapper.profiler.step_calls == 5
+    assert wrapper.profiler.stopped is True
+    assert wrapper.is_running is False
+    assert wrapper._profiling_for_iters == 0
+    # The stop() from inside the hook is observable through the base class:
+    # later worker steps are no-ops, and the reset counters let a later
+    # start() open a fresh session instead of being ignored.
+    wrapper.step()
+    assert wrapper.profiler.step_calls == 5
+    wrapper.start()
+    assert wrapper.is_running is True
+    assert wrapper.profiler.step_calls == 0
+    assert wrapper.profiler.started is True
+
+
+def test_start_rebuilds_profiler_and_resets_warmup_with_schedule(fake_config, fake_profiler_factory, monkeypatch):
+    fake_config.warmup_iterations = 2
+    monkeypatch.setattr(profiler_mod.torch.cuda, "is_available", lambda: False)
+
+    wrapper = OmniTorchProfilerWrapper(
+        profiler_config=fake_config,
+        worker_name="worker0",
+        local_rank=0,
+        activities=["CPU", "CUDA"],
+    )
+    wrapper.set_trace_filename("case_schedule_restart")
+
+    wrapper._start()
+    first = wrapper.profiler
+    wrapper._profiler_step()
+    assert wrapper._warmup_steps_remaining == 0
+
+    # Second session: the exhausted schedule must be rebuilt and the warmup
+    # counter reset, matching vLLM's wrapper.
+    wrapper._active = False
+    wrapper._start()
+    assert wrapper.profiler is not first
+    assert wrapper.profiler.started is True
+    assert wrapper._warmup_steps_remaining == wrapper._initial_warmup_steps_remaining
+
+
+def test_start_keeps_reusing_profiler_without_schedule(wrapper, monkeypatch):
+    monkeypatch.setattr(profiler_mod.torch.cuda, "is_available", lambda: False)
+    wrapper.set_trace_filename("case_no_schedule_reuse")
+
+    wrapper._start()
+    first = wrapper.profiler
+    wrapper._active = False
+    wrapper._start()
+
+    assert wrapper.profiler is first
