@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -177,7 +179,10 @@ def test_separate_qkv_names_rejected(tmp_path, transformer):
         load(path, transformer)
 
 
-def test_pipeline_loads_native_adapter_without_distilled_schedule(tmp_path, transformer):
+@pytest.mark.parametrize("partition,distributed_offload", [("fl2va", False), ("ref2va", True)])
+def test_pipeline_loads_native_adapter_without_distilled_schedule(
+    tmp_path, transformer, partition, distributed_offload
+):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     path = tmp_path / "realism.safetensors"
@@ -190,7 +195,8 @@ def test_pipeline_loads_native_adapter_without_distilled_schedule(tmp_path, tran
     )
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.partition = "fl2va"
+    pipeline.partition = partition
+    pipeline.od_config = SimpleNamespace(enable_distributed_layerwise_offload=distributed_offload)
     pipeline.transformer = transformer
     pipeline._turbo_lora_specs = {}
     pipeline._native_distilled_lora_adapter_ids = set()

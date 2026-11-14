@@ -133,11 +133,9 @@ Constraints:
 - The summed rank of the stacked adapters must not exceed **512** per layer.
   Two or three typical LoRAs (rank 4-64) fit comfortably.
 - Adapters with a scale of approximately 0 are skipped.
-- Stacking adapters on packed (merged-projection) layers such as fused QKV is
-  not supported yet.
-- Pipelines with model-specific LoRA hooks (e.g. MiniMax-H3 turbo/native,
-  whose adapters pin a sampler contract) reject stacked requests with a
-  client error instead of stacking them.
+- Packed-projection stacking requires a compatible loader and packed-module mapping; MiniMax-H3 supports its fused QKV and MLP projections.
+- MiniMax-H3 accepts ordinary adapter stacks and at most one compatible Turbo adapter. Native distilled adapters such as FlashGen cannot be composed with other adapters.
+- FastH3 Omni accepts ordinary adapters with independent scales, including under distributed layerwise offload; Turbo and native distilled adapters remain unsupported with this checkpoint.
 
 Offline: pass a list of `LoRARequest` objects together with a matching list of
 scales:
