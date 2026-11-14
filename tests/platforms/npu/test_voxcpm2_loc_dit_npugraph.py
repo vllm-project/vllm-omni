@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the Ascend VoxCPM2 LocDiT NPUGraph adapter."""
 
+import logging
 import sys
 from types import SimpleNamespace
 
@@ -171,3 +172,53 @@ def test_loc_dit_npugraph_falls_back_when_apis_are_unavailable(monkeypatch) -> N
 
     assert not hasattr(model.estimator, "_voxcpm2_npu_graph_runner")
     FakeGraphRunner.supported = True
+
+
+def test_disable_switch_leaves_patch_and_setup_inert(monkeypatch) -> None:
+    FakeGraphRunner.instances.clear()
+    monkeypatch.setattr(npu_adapter, "_PATCHED", False)
+    monkeypatch.setattr(npu_adapter, "_original_init", None)
+    # truthy spellings beyond the exact "1" must disable too
+    monkeypatch.setenv("VLLM_OMNI_DISABLE_VOXCPM2_NPU_PATCH", "TRUE")
+
+    npu_adapter.apply_voxcpm2_talker_patch()
+    assert npu_adapter._PATCHED is False, "patch must not install under the disable switch"
+
+    # setup stays a no-op even for a talker with no tts.feat_decoder.estimator
+    npu_adapter.setup_voxcpm2_loc_dit_npu_graph(object())
+    assert FakeGraphRunner.instances == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 8),  # unset -> the CANN-validated default
+        ("4", 4),  # valid int passes through
+        ("0", 1),  # zero clamps to the 1 floor
+        ("-3", 1),  # negative clamps to the 1 floor
+        ("abc", 8),  # non-int warns and falls back to the default
+        ("16", 16),  # above the validated limit: honored, not clamped, but warned
+    ],
+)
+def test_max_graphs_env_resolution(monkeypatch, caplog, raw, expected) -> None:
+    FakeGraphRunner.instances.clear()
+    FakeGraphRunner.supported = True
+    monkeypatch.setattr(npu_adapter, "_get_npu_exact_graph_runner_cls", lambda: FakeGraphRunner)
+    if raw is None:
+        monkeypatch.delenv("VLLM_OMNI_VOXCPM2_LOC_DIT_MAX_GRAPHS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_VOXCPM2_LOC_DIT_MAX_GRAPHS", raw)
+
+    # vLLM's logging setup may set propagate=False on this logger in some
+    # configurations, which would hide the warning from caplog; force the
+    # propagation on for the duration of the assertion.
+    test_logger = logging.getLogger("vllm_omni.platforms.npu.models.voxcpm2_talker")
+    with caplog.at_level("WARNING", logger=test_logger.name), monkeypatch.context() as m:
+        m.setattr(test_logger, "propagate", True)
+        model = FakeTalker()
+        npu_adapter.setup_voxcpm2_loc_dit_npu_graph(model)
+
+    runner = FakeGraphRunner.instances[0]
+    assert runner.max_graphs == expected
+    warned = any("exceeds the validated CANN-stable" in r.message for r in caplog.records)
+    assert warned is (expected == 16), "the above-limit override must warn; the rest must not"
