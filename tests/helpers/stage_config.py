@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from vllm_omni.config.stage_config import load_deploy_config
+from vllm_omni.config.stage_config import load_deploy_config, resolve_deploy_yaml
 
 
 def modify_stage_config(
@@ -50,8 +50,7 @@ def modify_stage_config(
         raise FileNotFoundError(f"yaml does not exist: {path}")
 
     try:
-        with open(yaml_path, encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
+        config = resolve_deploy_yaml(path)
     except Exception as e:
         raise ValueError(f"Cannot parse YAML file: {e}")
 
@@ -236,7 +235,8 @@ def modify_stage_config(
                 # Direct top-level key
                 config[key] = value
 
-    # The copy lives elsewhere, and a relative base_config resolves next to the file.
+    # The copy lives in a temporary directory; keep inheritance anchored to
+    # the source deploy rather than resolving its relative base under /tmp.
     if isinstance(config.get("base_config"), str):
         config["base_config"] = str((path.parent / config["base_config"]).resolve())
 
@@ -263,6 +263,42 @@ _CI_GENERATED_DIR = _REPO_ROOT / "tests" / ".ci_generated"
 # CI overlays as Python dicts (LSP-friendly). Materialized on demand to
 # tests/.ci_generated/<model>.yaml via get_deploy_config_path("ci/<name>.yaml").
 _CI_OVERLAYS: dict[str, dict[str, Any]] = {
+    "voxcpm2": {
+        "base_config": "voxcpm2.yaml",
+        # Run-level test modifiers inspect the raw overlay before resolving its
+        # base config. Keep a stage-id anchor so those modifiers can preserve
+        # the inherited stage while applying CI-only runner selection.
+        "stages": [{"stage_id": 0}],
+        "platforms": {
+            "rocm": {
+                "stages": [
+                    {
+                        "stage_id": 0,
+                        # Qualify vLLM's native ROCm attention path for transcript
+                        # quality without changing the production deploy profile.
+                        "attention_backend": "ROCM_ATTN",
+                        # MI325 qualification currently produces corrupted speech
+                        # when VoxCPM2's internal Inductor path and LocDiT rewrites
+                        # are active. Keep this correctness-first compatibility
+                        # profile CI-only while preserving production and CUDA
+                        # defaults. Re-enable each optimization independently after
+                        # it passes transcript-quality qualification on ROCm.
+                        "engine_extras": {
+                            "hf_overrides": {
+                                "voxcpm2_runtime_config": {
+                                    "enable_torch_compile": False,
+                                    "enable_loc_dit_fused_qkv": False,
+                                    "enable_loc_dit_fused_mlp": False,
+                                    "enable_loc_dit_zero_dt_cache": False,
+                                    "enable_loc_dit_skip_qkv_contig": False,
+                                },
+                            },
+                        },
+                    },
+                ],
+            },
+        },
+    },
     "qwen2_5_omni": {
         "base_config": "qwen2_5_omni.yaml",
         "async_chunk": False,
@@ -739,9 +775,8 @@ def get_deploy_duplex_max_sessions(rel_path: str) -> int:
 
 
 def _stage_ids_from_deploy_yaml(stage_config_path: str) -> list[int]:
-    """Return ``stage_id`` values from a new-schema deploy YAML (``stages``)."""
-    with open(stage_config_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+    """Return all stage IDs, including stages inherited through ``base_config``."""
+    cfg = resolve_deploy_yaml(stage_config_path)
     try:
         return load_stage_ids(cfg)
     except ValueError as exc:
@@ -769,8 +804,7 @@ def _delete_dummy_load_format(
     """For ``advanced_model`` / ``full_model``, strip ``load_format: dummy`` so real weights load."""
     if run_level not in {"advanced_model", "full_model"} or stage_config_path is None:
         return stage_config_path
-    with open(stage_config_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+    cfg = resolve_deploy_yaml(stage_config_path)
     try:
         stages = get_stage_entries(cfg)
     except ValueError as exc:
@@ -793,11 +827,77 @@ def _delete_dummy_load_format(
     )
 
 
+# Weekly CI sets this so the launched deploy YAML selects the runner. Upstream
+# VLLM_USE_V2_MODEL_RUNNER does not: Omni stages read deploy ``model_runner``.
+_CI_MODEL_RUNNER_ENV = "VLLM_OMNI_CI_MODEL_RUNNER"
+
+
+def _ci_model_runner_override() -> str | None:
+    raw = os.environ.get(_CI_MODEL_RUNNER_ENV, "").strip().lower()
+    if not raw:
+        return None
+    if raw not in {"v1", "v2"}:
+        raise ValueError(f"{_CI_MODEL_RUNNER_ENV} must be 'v1' or 'v2', got {raw!r}")
+    return raw
+
+
+def _apply_ci_model_runner(stage_config_path: str | None) -> str | None:
+    """Write deploy-level ``model_runner`` into a copy of the launch YAML.
+
+    A stage that already sets ``model_runner`` keeps that pin. A CUDA platform
+    block that already sets it is updated too, because that platform value
+    replaces the deploy-level choice when the server loads the file.
+    """
+    runner = _ci_model_runner_override()
+    if runner is None:
+        return stage_config_path
+    if stage_config_path is None:
+        raise ValueError(
+            f"{_CI_MODEL_RUNNER_ENV} is set but this test did not provide a deploy config. "
+            "Weekly CI cannot select model_runner without a deploy YAML."
+        )
+
+    path = Path(stage_config_path)
+    with open(path, encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"Deploy YAML must be a mapping: {stage_config_path}")
+    config["model_runner"] = runner
+    base_config = config.get("base_config")
+    if isinstance(base_config, str) and not Path(base_config).is_absolute():
+        # The copy lives in the temp directory, so a relative base would no
+        # longer resolve next to the original file.
+        config["base_config"] = str((path.parent / base_config).resolve())
+    # Platform model_runner replaces the deploy-level value at load time, including
+    # a value inherited through base_config. Put the override on this file so the
+    # overlay wins without dropping the base platform's other fields.
+    resolved = resolve_deploy_yaml(path)
+    resolved_cuda = (resolved.get("platforms") or {}).get("cuda") if isinstance(resolved, dict) else None
+    local_platforms = config.get("platforms")
+    local_cuda = local_platforms.get("cuda") if isinstance(local_platforms, dict) else None
+    if (isinstance(resolved_cuda, dict) and "model_runner" in resolved_cuda) or (
+        isinstance(local_cuda, dict) and "model_runner" in local_cuda
+    ):
+        platforms = config.setdefault("platforms", {})
+        if isinstance(platforms, dict):
+            cuda = platforms.setdefault("cuda", {})
+            if isinstance(cuda, dict):
+                cuda["model_runner"] = runner
+
+    output_fd, output_path = tempfile.mkstemp(prefix=f"{path.stem}_", suffix=".yaml")
+    atexit.register(Path(output_path).unlink, missing_ok=True)
+    with os.fdopen(output_fd, "w", encoding="utf-8") as f:
+        yaml.dump(config, f, default_flow_style=None, sort_keys=False, allow_unicode=True, indent=2)
+    return output_path
+
+
 def stage_config_path_for_run_level(stage_config_path: str | None, run_level: str) -> str | None:
     """Apply run-level deploy YAML tweaks for weight loading (dummy vs real)."""
     if run_level in {"advanced_model", "full_model"}:
-        return _delete_dummy_load_format(stage_config_path, run_level)
-    return _add_dummy_load_format(stage_config_path, run_level)
+        resolved = _delete_dummy_load_format(stage_config_path, run_level)
+    else:
+        resolved = _add_dummy_load_format(stage_config_path, run_level)
+    return _apply_ci_model_runner(resolved)
 
 
 __all__ = [

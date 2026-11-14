@@ -25,6 +25,7 @@ _EOS = 6561
 
 def _talker(max_reqs: int = 8, max_position_embeddings: int = 4096):
     talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    talker._k_step_frames = 0
     talker._codec_eos_id = _EOS
     talker._tts_config = SimpleNamespace(max_position_embeddings=max_position_embeddings)
     talker._mrv2_empty_speech = torch.zeros(max_reqs, dtype=torch.bool)
@@ -465,6 +466,52 @@ def test_turn_decode_does_not_build_duplex_limit_tensors(monkeypatch):
     assert talker._mrv2_masked_eos is None
 
 
+def _control_rows_sampler(expanded: list[int], seq_lens: list[int], prompt_lens: dict[int, int]):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import MiniCPMO45TalkerSampler
+
+    batch = SimpleNamespace(
+        num_reqs=len(seq_lens),
+        expanded_idx_mapping=torch.tensor(expanded, dtype=torch.int64),
+        # Scheduled counts, not row counts (K=8 arrives as cu=[0, 1]).
+        cu_num_logits_np=np.array([0] + [1] * len(seq_lens), dtype=np.int32),
+        idx_mapping=torch.tensor(list(prompt_lens), dtype=torch.int32),
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+    )
+    sampler = object.__new__(MiniCPMO45TalkerSampler)
+    # seq_len below prefill_len means chunked prefill.
+    prefill_len = torch.zeros(8, dtype=torch.int32)
+    for slot, value in prompt_lens.items():
+        prefill_len[slot] = value
+    sampler.req_states = SimpleNamespace(prefill_len=SimpleNamespace(gpu=prefill_len))
+    return sampler, batch
+
+
+def _adopted(rows: torch.Tensor, num_sampled: torch.Tensor) -> list[list[int]]:
+    """What the engine keeps: row i truncated at num_sampled[i]."""
+    return [row[: int(count)].tolist() for row, count in zip(rows, num_sampled)]
+
+
+def test_kstep_control_rows_report_one_padded_row_per_request():
+    """A K-row step reports one padded row of adopted frames per request."""
+    sampler, batch = _control_rows_sampler([0, 0, 0, 1, 1, 1], [11, 11], {0: 4, 1: 4})
+    # Request 1 stops on its last frame, request 0 keeps going.
+    sampled = torch.tensor([0, 0, 0, 0, 0, 1])
+    rows, num_sampled, num_rejected = sampler._control_rows_output(sampled, batch)
+    assert _adopted(rows, num_sampled) == [[0, 0, 0], [0, 0, 1]]
+    assert num_sampled.tolist() == [3, 3]
+    assert num_rejected.tolist() == [0, 0]
+
+
+def test_kstep_control_rows_pad_uneven_counts_and_skip_chunked_prefill():
+    sampler, batch = _control_rows_sampler([0, 0, 1, 1, 1], [3, 11], {0: 6, 1: 4})
+    sampled = torch.tensor([5, 6, 7, 8, 9])
+    rows, num_sampled, num_rejected = sampler._control_rows_output(sampled, batch)
+    # Request 0 is still in chunked prefill: its frames are not sampled yet.
+    assert _adopted(rows, num_sampled) == [[], [7, 8, 9]]
+    assert num_sampled.tolist() == [0, 3]
+    assert num_rejected.tolist() == [0, 0]
+
+
 def test_mrv2_output_marks_each_draft_row() -> None:
     talker = _talker()
     prompt_lens = {0: 4, 1: 4, 3: 4096 - 100}
@@ -699,7 +746,7 @@ def test_draft_verification_at_forced_rows_with_the_rejection_kernels():
     assert batch.input_ids[:kept].tolist() == [5, 6] and valid[:kept].tolist() == [True, True]
 
 
-def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
+def test_talker_verifies_drafts_with_its_codec_sampler(mocker, monkeypatch):
     import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts as module
 
     talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
@@ -720,13 +767,25 @@ def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
     assert rejection.sampler._sampler is sampler
     assert rejection.talker is talker
     # Any draft method is refused at load where draft codes can't be verified.
-    for session, k_step in (("duplex", 0), ("turn", 2)):
+    monkeypatch.setattr(module.current_omni_platform, "is_cuda", lambda: False)
+    for session, k_step, pattern in (
+        ("duplex", 0, "turn sessions only"),
+        ("turn", 2, "K-step frames require session_mode: duplex"),
+    ):
         talker.vllm_config = SimpleNamespace(
             speculative_config=spec_config, model_config=SimpleNamespace(session_mode=session)
         )
         talker._k_step_frames = k_step
-        with pytest.raises(NotImplementedError, match="turn sessions only"):
+        with pytest.raises(NotImplementedError, match=pattern):
             talker.mrv2_custom_sampler(sampler)
+    # K-step frames on a turn session sample inside the runner's frame
+    # orchestration, so no draft-code verification sampler is built.
+    talker.vllm_config = SimpleNamespace(
+        speculative_config=spec_config, model_config=SimpleNamespace(session_mode="turn")
+    )
+    talker._k_step_frames = 2
+    monkeypatch.setattr(module.current_omni_platform, "is_cuda", lambda: True)
+    assert talker.mrv2_custom_sampler(sampler) == ("talker-sampler", None)
 
 
 def test_drafter_loading_finds_the_codec_table_and_no_head(mocker):

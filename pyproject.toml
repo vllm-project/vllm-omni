@@ -209,8 +209,6 @@ include = ["vllm_omni*"]
     "py.typed",
     "deploy/*.md",
     "deploy/*.yaml",
-    "diffusion/distributed/csrc/*.cu",
-    "diffusion/distributed/csrc/*.hpp",
     "diffusion/models/hy_nomas/camera_trajectories.json",
     "model_executor/models/covo_audio/speaker_prompt/*.npy",
     "model_executor/models/step_audio2/assets/*.wav",

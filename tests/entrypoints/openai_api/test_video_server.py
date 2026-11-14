@@ -1167,23 +1167,31 @@ def test_hy_nomas_rejects_conflicting_frame_count_and_model_duration():
         normalize_request(engine.captured_prompt, engine.captured_sampling_params_list[0])
 
 
-def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
-    """Kandinsky 6 publishes Pro-geometry defaults (480x864, 125 frames, 50
-    steps) but is not a fixed-duration model: an explicit ``num_frames``
-    must be honoured rather than rejected."""
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers",
+        "kandinskylab/Kandinsky-6.0-Lite-distill-5s-Diffusers",
+        "kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers",
+    ],
+)
+def test_kandinsky6_serving_defers_checkpoint_defaults_and_preserves_explicit_values(model_name):
+    """The model resolves omitted settings from its checkpoint; explicit values survive serving."""
     engine = FakeAsyncOmni()
     engine.model_class_name = "Kandinsky6TI2VAPipeline"
     handler = OmniOpenAIServingVideo.for_diffusion(
         diffusion_engine=engine,
-        model_name="kandinsky6-bundle",
+        model_name=model_name,
     )
 
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A dog runs on a beach"), "defaults"))
     assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
-    assert (sampling.width, sampling.height) == (864, 480)
-    assert sampling.num_frames == 125
-    assert sampling.num_inference_steps == 50
+    assert (sampling.width, sampling.height) == (None, None)
+    # The generic image-model sentinel is resolved to the checkpoint's video
+    # length by Kandinsky6TI2VAPipeline._resolve_generation_settings().
+    assert sampling.num_frames == 1
+    assert sampling.num_inference_steps is None
     assert sampling.fps == 24.0
 
     asyncio.run(
@@ -4440,3 +4448,32 @@ def test_h3_control_does_not_borrow_another_stage_checkpoint():
         assert not handler.controlnet_configured
     finally:
         handler.shutdown()
+
+
+@pytest.mark.parametrize("route", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("explicit", [False, True], ids=["inherit", "override-zero"])
+def test_video_routes_inherit_engine_defaults(test_client, mocker: MockerFixture, route: str, explicit: bool) -> None:
+    _mock_encode_video_bytes(mocker)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    defaults = OmniDiffusionSamplingParams(
+        num_inference_steps=4,
+        guidance_scale=3.0,
+        seed=42,
+        extra_args={"stage_default": "keep"},
+    )
+    engine.default_sampling_params_list = [defaults]
+    for override in (explicit, False):
+        payload = {"prompt": "a cat", "fps": "8"}
+        if override:
+            payload.update(guidance_scale="0", seed="0")
+        response = test_client.post(route, data=payload)
+        assert response.status_code == 200, response.text
+        if route == "/v1/videos":
+            _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+        params = engine.captured_sampling_params_list[0]
+        assert params.num_inference_steps == 4
+        assert params.guidance_scale == (0.0 if override else 3.0)
+        assert params.seed == (0 if override else 42)
+        assert params.extra_args["stage_default"] == "keep"
+        params.extra_args["stage_default"] = "mutated"
+    assert defaults.extra_args == {"stage_default": "keep"}

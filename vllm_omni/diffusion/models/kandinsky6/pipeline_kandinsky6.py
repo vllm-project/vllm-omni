@@ -44,12 +44,18 @@ from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.offloader.config import offload_enabled
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .kandinsky6_transformer import Kandinsky6Transformer3DModel
 from .modeling_kandinsky6_audio import Kandinsky6AudioVAE
 from .modeling_kandinsky6_vae import AutoencoderKLHunyuanVideo
-from .scheduling_kandinsky6 import KandinskyFlowMatchScheduler
+from .scheduling_kandinsky6 import KandinskyFlowMatchScheduler, KandinskyPiFlowScheduler
+from .super_resolution import (
+    Kandinsky6SuperResolution,
+    resolve_super_resolution,
+    validate_super_resolution_execution,
+)
 
 
 class TextEmbeds(TypedDict):
@@ -513,6 +519,13 @@ def denoise_loop(  # noqa: PLR0912, PLR0913, PLR0915
     video = bundle.video  # (sum_T, H, W, C) or (sum_T, H, W, C+extra) for instruct
     audio = bundle.audio  # (sum_A, audio_dim) or None
     is_multimodal = video is not None and audio is not None
+    if isinstance(scheduler, KandinskyPiFlowScheduler):
+        if not is_multimodal:
+            raise ValueError("Kandinsky Pro Distil Pi-Flow requires paired video and audio latents")
+        if not sample_video or not sample_audio:
+            raise ValueError("Kandinsky Pro Distil Pi-Flow requires sample_video=True and sample_audio=True")
+        if abs(guidance_weight - 1.0) > 1e-6:
+            raise ValueError("Kandinsky Pro Distil Pi-Flow requires guidance_scale=1.0")
 
     device = video.device if video is not None else audio.device
     guidance_epsilon = 1e-6
@@ -634,6 +647,24 @@ def denoise_loop(  # noqa: PLR0912, PLR0913, PLR0915
             vel_uncond = guided
             if cache is not None:
                 cache.store(vel_cond, vel_uncond)
+
+        if isinstance(scheduler, KandinskyPiFlowScheduler):
+            if not isinstance(vel_cond, tuple) or video is None or audio is None:
+                raise ValueError("Kandinsky Pro Distil Pi-Flow requires paired video and audio predictions")
+            if not sample_video or not sample_audio:
+                raise ValueError("Kandinsky Pro Distil Pi-Flow requires sample_video=True and sample_audio=True")
+            if abs(guidance_weight - 1.0) > guidance_epsilon:
+                raise ValueError("Kandinsky Pro Distil Pi-Flow requires guidance_scale=1.0")
+            vel_v, vel_a = vel_cond
+            uncond_v, uncond_a = vel_uncond if vel_uncond is not vel_cond else (vel_v, vel_a)
+            guided_v = apply_cfg(vel_v, uncond_v, guidance_weight)
+            guided_a = apply_cfg(vel_a, uncond_a, guidance_weight)
+            if out_c is None:
+                out_c = video.shape[-1]
+            video, audio = scheduler.step_pair(guided_v, guided_a, t, video, audio)
+            if progress_callback is not None:
+                progress_callback()
+            continue
 
         # Step per modality. A single scheduler step is consumed for each
         # denoising iteration; when both modalities are sampled, the same
@@ -915,10 +946,23 @@ def get_kandinsky6_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-def get_kandinsky6_pre_process_func(od_config: OmniDiffusionConfig):
-    """Factory for the request pre-process hook (image-conditioning input)."""
+def _checkpoint_scheduler_type(scheduler_config: dict[str, Any]) -> type[KandinskyFlowMatchScheduler]:
+    name = str(scheduler_config.get("_class_name", "")).lower().replace("_", "")
+    return KandinskyPiFlowScheduler if "piflow" in name else KandinskyFlowMatchScheduler
 
-    def pre_process_func(request):
+
+def get_kandinsky6_pre_process_func(od_config: OmniDiffusionConfig):
+    """Materialize checkpoint step defaults before StepScheduler admission."""
+    model_root = _resolve_bundle_root(od_config.model)
+    config_path = os.path.join(model_root, "scheduler", "scheduler_config.json")
+    scheduler_config = _load_json(model_root, "scheduler/scheduler_config.json") if os.path.isfile(config_path) else {}
+    scheduler_type = _checkpoint_scheduler_type(scheduler_config)
+    default_steps = int(scheduler_config.get("default_num_inference_steps", scheduler_type.default_num_inference_steps))
+
+    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        sampling = request.sampling_params
+        if sampling.num_inference_steps is None and sampling.timesteps is None and sampling.sigmas is None:
+            sampling.num_inference_steps = default_steps
         return request
 
     return pre_process_func
@@ -959,7 +1003,7 @@ class Kandinsky6TI2VAPipeline(
     support_image_input = True
     # Startup warmup is a 512px image-to-video probe. Skip it for the 28B DiT.
     dummy_run_num_frames = 0
-    default_num_inference_steps = 50
+    default_num_inference_steps = KandinskyFlowMatchScheduler.default_num_inference_steps
 
     def __init__(
         self,
@@ -983,6 +1027,7 @@ class Kandinsky6TI2VAPipeline(
     ) -> None:
         super().__init__()
         self.od_config = od_config
+        self._super_resolution = None
         self.device = get_local_device()
 
         if od_config is not None:
@@ -1012,6 +1057,17 @@ class Kandinsky6TI2VAPipeline(
         self.text_encoder = text_encoder
         self.audio_vae = audio_vae
         self.scheduler = scheduler
+        self.default_num_inference_steps = int(
+            getattr(scheduler, "default_num_inference_steps", self.default_num_inference_steps)
+        )
+        self.default_height = int(getattr(scheduler, "default_height", KandinskyFlowMatchScheduler.default_height))
+        self.default_width = int(getattr(scheduler, "default_width", KandinskyFlowMatchScheduler.default_width))
+        self.default_num_frames = int(
+            getattr(scheduler, "default_num_frames", KandinskyFlowMatchScheduler.default_num_frames)
+        )
+        self.default_guidance_scale = float(
+            getattr(scheduler, "default_guidance_scale", KandinskyFlowMatchScheduler.default_guidance_scale)
+        )
         self.tokenizer = tokenizer
         self.text_encoder_2 = text_encoder_2
         self.tokenizer_2 = tokenizer_2
@@ -1142,7 +1198,28 @@ class Kandinsky6TI2VAPipeline(
                 _load_json(model_root, "scheduler/scheduler_config.json").get("shift", checkpoint_scheduler_scale)
             )
         scheduler_scale = float(model_config.get("scheduler_scale", checkpoint_scheduler_scale))
-        scheduler = KandinskyFlowMatchScheduler(scheduler_scale=scheduler_scale, device=self.device)
+        scheduler_kwargs = {}
+        scheduler_config = {}
+        if os.path.isfile(scheduler_config_path):
+            scheduler_config = _load_json(model_root, "scheduler/scheduler_config.json")
+        scheduler_type = _checkpoint_scheduler_type(scheduler_config)
+        if scheduler_type is KandinskyPiFlowScheduler:
+            scheduler_kwargs = {
+                "n_grid": scheduler_config.get("n_grid", scheduler_config.get("dx_num_grid_points", 10)),
+                "num_policy_substeps": scheduler_config.get("num_policy_substeps", 128),
+                "final_step_size_scale": scheduler_config.get("final_step_size_scale", 0.5),
+                "eps": scheduler_config.get("eps", 1e-6),
+            }
+        scheduler = scheduler_type(scheduler_scale=scheduler_scale, device=self.device, **scheduler_kwargs)
+        for key in (
+            "default_num_inference_steps",
+            "default_height",
+            "default_width",
+            "default_num_frames",
+            "default_guidance_scale",
+        ):
+            if key in scheduler_config:
+                setattr(scheduler, key, scheduler_config[key])
 
         return transformer, vae, text_encoder, audio_vae, scheduler, tokenizer, text_encoder_2, tokenizer_2
 
@@ -1484,6 +1561,32 @@ class Kandinsky6TI2VAPipeline(
             cache.store(guided, guided)
         return guided
 
+    def _resolve_generation_settings(self, sampling: Any) -> tuple[int, int, int, int, float]:
+        """Resolve omitted video settings from the loaded checkpoint's scheduler."""
+        # Sampling parameters default to one frame for image models. Treat
+        # that sentinel as an unspecified video length for Kandinsky.
+        num_frames = sampling.num_frames
+        if num_frames is None or num_frames == 1:
+            num_frames = self.default_num_frames
+        sr = resolve_super_resolution(sampling)
+        if sr is not None:
+            validate_super_resolution_execution(self.od_config)
+        return (
+            self.default_height if sr is not None else (sampling.height or self.default_height),
+            self.default_width if sr is not None else (sampling.width or self.default_width),
+            num_frames,
+            sampling.num_inference_steps or self.default_num_inference_steps,
+            sampling.guidance_scale if sampling.guidance_scale_provided else self.default_guidance_scale,
+        )
+
+    def _refine_generated_video(self, video: np.ndarray, sampling: Any) -> np.ndarray:
+        settings = resolve_super_resolution(sampling)
+        if settings is None:
+            return video
+        if self._super_resolution is None:
+            self._super_resolution = Kandinsky6SuperResolution(self)
+        return self._super_resolution.refine(video, sampling, settings)
+
     def prepare_encode(self, state: Any, **kwargs: Any) -> Any:
         """Encode one request and store everything the denoise step needs."""
         del kwargs
@@ -1501,13 +1604,14 @@ class Kandinsky6TI2VAPipeline(
                 image = image[0] if image else None
         sampling = state.sampling
         _raw_dit(self.transformer).clear_text_proj_cache()
-        height = sampling.height or 512
-        width = sampling.width or 768
-        num_frames = sampling.num_frames or 121
-        num_inference_steps = sampling.num_inference_steps or self.default_num_inference_steps
-        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 5.0
+        height, width, num_frames, num_inference_steps, guidance_scale = self._resolve_generation_settings(sampling)
         extra_args = sampling.extra_args or {}
         sample_audio = bool(extra_args.get("sample_audio", True))
+        if isinstance(self.scheduler, KandinskyPiFlowScheduler):
+            if not sample_audio:
+                raise ValueError("Kandinsky Pro Distil Pi-Flow requires sample_audio=True")
+            if abs(guidance_scale - 1.0) > 1e-6:
+                raise ValueError("Kandinsky Pro Distil Pi-Flow requires guidance_scale=1.0")
         # The Diffusers TI2VA pipeline always appends a reference image as a masked tail frame.
         visual_cond_scheme = "tail_cond_first_frame" if image else "pretrain"
         generator = sampling.generator
@@ -1569,10 +1673,20 @@ class Kandinsky6TI2VAPipeline(
         )
         if generated_visual_mask is not None:
             visual_rope = torch.cat([visual_rope, visual_rope[:1]], dim=0)
-        scheduler = KandinskyFlowMatchScheduler(
-            scheduler_scale=self.scheduler.scheduler_scale,
-            device=device,
-        )
+        if isinstance(self.scheduler, KandinskyPiFlowScheduler):
+            scheduler = KandinskyPiFlowScheduler(
+                scheduler_scale=self.scheduler.scheduler_scale,
+                device=device,
+                n_grid=self.scheduler.n_grid,
+                num_policy_substeps=self.scheduler.num_policy_substeps,
+                final_step_size_scale=self.scheduler.final_step_size_scale,
+                eps=self.scheduler.eps,
+            )
+        else:
+            scheduler = KandinskyFlowMatchScheduler(
+                scheduler_scale=self.scheduler.scheduler_scale,
+                device=device,
+            )
         scheduler.set_timesteps(num_inference_steps, device=device)
         text_rope, null_rope, audio_rope = self._text_ropes(
             raw_dit,
@@ -1649,6 +1763,16 @@ class Kandinsky6TI2VAPipeline(
         bundle = extra["bundle"]
         ref_positions = bundle.video_cu_seqlens[1:] - 1 if tail_cond and bundle.video_cu_seqlens is not None else None
         first_frames = extra["first_frames"]
+        if isinstance(scheduler, KandinskyPiFlowScheduler):
+            audio = extra["audio"]
+            audio_velocity = extra.get("audio_velocity")
+            if noise_pred is None or audio is None or audio_velocity is None:
+                raise ValueError("Kandinsky Pro Distil Pi-Flow requires paired video and audio predictions")
+            if not extra["sample_video"] or not extra["sample_audio"] or video is None:
+                raise ValueError("Kandinsky Pro Distil Pi-Flow requires video and audio sampling")
+            state.latents, extra["audio"] = scheduler.step_pair(noise_pred, audio_velocity, t, video, audio)
+            state.step_index += 1
+            return
         if extra["sample_video"] and video is not None and video.ndim >= 4:
             video = scheduler.step(noise_pred, t, video, return_dict=False)[0]
             if tail_cond and first_frames is not None and ref_positions is not None:
@@ -1693,6 +1817,8 @@ class Kandinsky6TI2VAPipeline(
             else None
         )
         audio_sample_rate = self.audio_sample_rate if audio_out is not None else None
+        if state.sampling.output_type != "latent":
+            video_out = self._refine_generated_video(video_out, state.sampling)
         return DiffusionOutput(output={"video": video_out, "audio": audio_out, "audio_sample_rate": audio_sample_rate})
 
     @torch.no_grad()
@@ -1728,13 +1854,14 @@ class Kandinsky6TI2VAPipeline(
         _raw_dit(self.transformer).clear_text_proj_cache()
 
         sampling = req.sampling_params
-        height = sampling.height or 512
-        width = sampling.width or 768
-        num_frames = sampling.num_frames or 121
-        num_inference_steps = sampling.num_inference_steps or self.default_num_inference_steps
-        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 5.0
+        height, width, num_frames, num_inference_steps, guidance_scale = self._resolve_generation_settings(sampling)
         extra_args = sampling.extra_args or {}
         sample_audio = bool(extra_args.get("sample_audio", True))
+        if isinstance(self.scheduler, KandinskyPiFlowScheduler):
+            if not sample_audio:
+                raise ValueError("Kandinsky Pro Distil Pi-Flow requires sample_audio=True")
+            if abs(guidance_scale - 1.0) > 1e-6:
+                raise ValueError("Kandinsky Pro Distil Pi-Flow requires guidance_scale=1.0")
         # ``normalize`` (peak-normalize each waveform) matches the k6_video
         # production pipeline; ``clip`` keeps the raw decoded amplitude.
         audio_normalization = str(extra_args.get("audio_normalization", "normalize"))
@@ -1848,6 +1975,8 @@ class Kandinsky6TI2VAPipeline(
             postprocess_audio(result, self.audio_vae, normalization_mode=audio_normalization) if sample_audio else None
         )
         audio_sample_rate = self.audio_sample_rate if audio_out is not None else None
+        if sampling.output_type != "latent":
+            video_out = self._refine_generated_video(video_out, sampling)
         return DiffusionOutput(output={"video": video_out, "audio": audio_out, "audio_sample_rate": audio_sample_rate})
 
 
