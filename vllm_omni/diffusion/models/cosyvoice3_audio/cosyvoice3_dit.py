@@ -113,6 +113,7 @@ class DiTAttention(nn.Module):
         self.to_q = nn.Linear(dim, self.inner_dim)
         self.to_k = nn.Linear(dim, self.inner_dim)
         self.to_v = nn.Linear(dim, self.inner_dim)
+        self.to_qkv: nn.Linear | None = None
 
         # Output projection
         self.to_out = nn.Sequential(nn.Linear(self.inner_dim, dim), nn.Dropout(dropout))
@@ -125,6 +126,21 @@ class DiTAttention(nn.Module):
             causal=False,
         )
 
+    @torch.no_grad()
+    def fuse_qkv_projections(self) -> None:
+        """Pack loaded inference weights without changing the checkpoint format."""
+        if self.training:
+            raise ValueError("QKV packing requires inference mode")
+        if self.to_qkv is not None:
+            return
+        # Meta initialization avoids consuming the serving RNG before sampling.
+        packed = nn.Linear(self.dim, 3 * self.inner_dim, device="meta")
+        packed.weight = nn.Parameter(
+            torch.cat([self.to_q.weight, self.to_k.weight, self.to_v.weight]), requires_grad=False
+        )
+        packed.bias = nn.Parameter(torch.cat([self.to_q.bias, self.to_k.bias, self.to_v.bias]), requires_grad=False)
+        self.to_qkv = packed.eval()
+
     def forward(
         self,
         x: torch.Tensor,
@@ -135,9 +151,12 @@ class DiTAttention(nn.Module):
         batch_size, seq_len = x.shape[0], x.shape[1]
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_qkv_projection"):
-            query = self.to_q(x)
-            key = self.to_k(x)
-            value = self.to_v(x)
+            if self.to_qkv is None:
+                query = self.to_q(x)
+                key = self.to_k(x)
+                value = self.to_v(x)
+            else:
+                query, key, value = self.to_qkv(x).chunk(3, dim=-1)
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_rope"):
             if rope is not None:
