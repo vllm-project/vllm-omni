@@ -91,6 +91,22 @@ def stream_decode(model, codes, chunk_frames, *, headroom):
         model.close_decoder_state_pool()
 
 
+def stream_decode_slice(model, codes, chunk_frames, *, slot0):
+    n_q, _, total = codes.shape
+    model.initialize_decoder_state_pool(1, 0)
+    try:
+        slot = torch.zeros(1, dtype=torch.long)
+        valid = torch.ones(1, dtype=torch.bool)
+        parts = []
+        for start in range(0, total, chunk_frames):
+            chunk = codes[:, :, start : start + chunk_frames]
+            lengths = torch.full((1,), chunk.shape[-1], dtype=torch.long)
+            parts.append(model.decode_streaming_batch(chunk, lengths, slot, valid, slot0=slot0).audio)
+        return torch.cat(parts, dim=-1)
+    finally:
+        model.close_decoder_state_pool()
+
+
 @pytest.mark.cpu
 @torch.no_grad()
 def test_ring_headroom_sizes_each_layer_for_one_chunk():
@@ -335,3 +351,23 @@ def test_one_frame_one_batch_retains_ordinary_decode():
     codes = torch.randint(0, 16, (2, 1), device="cuda")
     output = decoder._decode_streaming_batch([(0, "request", codes, False)])[0]
     assert output.shape == (1, 4) and torch.isfinite(output).all()
+
+
+@torch.no_grad()
+def test_stream_slice_batch_path_matches_gather_batch_path():
+    """B==1 slice path (slot0 passed) through decode_streaming_batch matches
+    the gather path (slot0=None) bit-identically across ring-wrapping steps.
+
+    Runs the full decode_streaming_batch -> StreamingExecutionContext ->
+    RingKVCache.complete wiring, so dropping slot0 from the API (as in v1's
+    4-arg decode_streaming_batch) would fail this test. 9-frame chunks exceed
+    the second transformer's 8-token ring, so the write also lands in the
+    T > capacity tail-clamped arm of the slice path; a missing clamp or a
+    slot0 inconsistent with state_slot_ids would diverge the output.
+    """
+    model = tiny_codec()
+    torch.manual_seed(3)
+    codes = torch.randint(0, 16, (2, 1, 18))
+    with_slot = stream_decode_slice(model, codes, 9, slot0=0)
+    without_slot = stream_decode_slice(model, codes, 9, slot0=None)
+    torch.testing.assert_close(with_slot, without_slot, rtol=1e-5, atol=1e-5)

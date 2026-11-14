@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from contextlib import nullcontext
 from functools import partial
@@ -229,6 +230,16 @@ class _MossCodecStreamSession:
         self._n_vq = int(n_vq)
         self._device = next(codec.parameters()).device
         self._gpu_output = gpu_output and self._device.type == "cuda"
+        # B==1 slice fast path: on NPU with a v2 codec, pass the single active
+        # slot as a python int so RingKVCache.complete takes a contiguous *view*
+        # of the cache instead of a gather+writeback. v1's
+        # decode_streaming_batch has no slot0 parameter. Opt out with
+        # MOSS_CODEC_SLICE=0. Resolved once here, not per-step.
+        self._slice_fast_path: bool = (
+            self._device.type == "npu"
+            and isinstance(codec, MossAudioTokenizerV2Model)
+            and os.getenv("MOSS_CODEC_SLICE", "1") != "0"
+        )
         self._free_stream_slots = list(reversed(range(self._state_capacity)))
         self._leased_slots: set[int] = set()
         self._closed = False
@@ -460,11 +471,20 @@ class _MossCodecStreamSession:
                 device=self._device,
             )
             valid_rows = torch.ones(len(slots), dtype=torch.bool, device=self._device)
+            # B==1 slice fast path: slot0 is the single active slot as a python
+            # int (slots[0], NO .item() -> no host sync, async-safe at
+            # concurrency). It is CPU-consistent with state_slot_ids[0] by
+            # construction -- both derive from the same `slots` list before any
+            # device copy. None for B>1 (general gather path).
+            slot0: int | None = None
+            if self._slice_fast_path and len(slots) == 1:
+                slot0 = int(slots[0])
             result = self._codec.decode_streaming_batch(
                 codes_step,
                 codes_lengths,
                 state_slot_ids,
                 valid_rows,
+                **({} if slot0 is None else {"slot0": slot0}),
             )
             if result.audio is None:
                 return {}
