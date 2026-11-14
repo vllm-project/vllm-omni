@@ -232,6 +232,8 @@ def offload_model_config(monkeypatch):
     for name in ("ColumnParallelLinear", "RowParallelLinear", "MergedColumnParallelLinear", "QKVParallelLinear"):
         monkeypatch.setattr(blocks, name, _FakeLinear)
     monkeypatch.setattr(blocks, "Attention", _FakeAttention)
+    # These constructor-only placement tests do not need vendor activation kernels.
+    monkeypatch.setattr(blocks, "SiluAndMul", torch.nn.Identity)
     monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(h3.current_omni_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 3)
@@ -334,6 +336,7 @@ def test_adaln_offload_preserves_incompatible_modes(offload_model_config, monkey
         config.parallel_config.use_hsdp = True
     elif setting == "non_cuda":
         monkeypatch.setattr(h3.current_omni_platform, "is_cuda", lambda: False)
+        monkeypatch.setattr(h3.current_omni_platform, "is_npu", lambda: False)
     else:
         quant = object()
     if explicit:
@@ -384,6 +387,42 @@ def test_disabling_adaln_cache_keeps_weights_resident_by_default(offload_model_c
     model = h3.MiniMaxH3DiTModel(offload_model_config)
     assert not model.adaln_cache.offload_weights
     assert model.adaln_cache.max_bytes == 0
+
+
+@pytest.mark.parametrize("config_type", [dict, SimpleNamespace], ids=["mapping", "attributes"])
+@pytest.mark.parametrize("pipeline", ["MiniMaxH3ImagePipeline", "MiniMaxH3Pipeline", None])
+def test_npu_adaln_offload_default_is_image_only(offload_model_config, monkeypatch, mocker, config_type, pipeline):
+    monkeypatch.setattr(h3.current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(h3.current_omni_platform, "is_npu", lambda: True)
+    capability = mocker.patch.object(h3.current_omni_platform, "get_device_capability")
+    offload_model_config.model_class_name = pipeline
+    offload_model_config.cache_config = config_type()
+    with torch.device("meta"):
+        model = h3.MiniMaxH3DiTModel(offload_model_config)
+    enabled = pipeline == "MiniMaxH3ImagePipeline"
+    assert model.adaln_cache.offload_weights is enabled
+    assert model.blocks[0].adaln_proj.linear.weight.device.type == ("cpu" if enabled else "meta")
+    capability.assert_not_called()
+
+
+@pytest.mark.parametrize("setting", ["disabled", "cache_disabled", "module", "layer", "hsdp", "quantized"])
+def test_npu_adaln_default_preserves_opt_out_and_incompatible_modes(offload_model_config, monkeypatch, setting):
+    monkeypatch.setattr(h3.current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(h3.current_omni_platform, "is_npu", lambda: True)
+    config = offload_model_config
+    config.model_class_name = "MiniMaxH3ImagePipeline"
+    config.cache_config = {}
+    if setting == "disabled":
+        config.cache_config["minimax_h3_adaln_offload"] = False
+    elif setting == "cache_disabled":
+        config.cache_config["minimax_h3_adaln_cache"] = False
+    elif setting in {"module", "layer"}:
+        config.diffusion_offload_config = {"mode": setting, "components": ["dit"]}
+    elif setting == "hsdp":
+        config.parallel_config.use_hsdp = True
+    with torch.device("meta"):
+        model = h3.MiniMaxH3DiTModel(config, quant_config=object() if setting == "quantized" else None)
+    assert not model.adaln_cache.offload_weights
 
 
 def test_optional_sidecar_seeds_runtime_projection(tmp_path, mocker):

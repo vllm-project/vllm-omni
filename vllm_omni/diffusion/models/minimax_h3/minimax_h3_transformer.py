@@ -812,15 +812,23 @@ class MiniMaxH3DiTModel(nn.Module):
         conflicting_offload = (
             offload.strategy is not OffloadStrategy.NONE and offload.offloads(DIT_COMPONENT)
         ) or getattr(od_config.parallel_config, "use_hsdp", False)
-        # Limit automatic offload to the validated SM120 deployment. Other
-        # CUDA architectures keep their resident weights unless opted in.
+        # Default to host staging for the NPU image pipeline and SM120 CUDA.
+        # Other pipelines/platforms keep resident weights unless opted in.
         # Use the worker's current device, not logical device zero.
         default_offload_adaln = (
             enabled
-            and current_omni_platform.is_cuda()
             and quant_config is None
             and not conflicting_offload
-            and current_omni_platform.get_device_capability(torch.accelerator.current_device_index()) == (12, 0)
+            and (
+                (
+                    current_omni_platform.is_cuda()
+                    and current_omni_platform.get_device_capability(torch.accelerator.current_device_index()) == (12, 0)
+                )
+                or (
+                    current_omni_platform.is_npu()
+                    and getattr(od_config, "model_class_name", None) == "MiniMaxH3ImagePipeline"
+                )
+            )
         )
         offload_adaln = (
             cache_config.get("minimax_h3_adaln_offload", default_offload_adaln)
@@ -830,8 +838,8 @@ class MiniMaxH3DiTModel(nn.Module):
         if type(offload_adaln) is not bool:
             raise ValueError("minimax_h3_adaln_offload must be a boolean")
         if offload_adaln:
-            if not current_omni_platform.is_cuda():
-                raise ValueError("MiniMax H3 AdaLN offload requires CUDA")
+            if not (current_omni_platform.is_cuda() or current_omni_platform.is_npu()):
+                raise ValueError("MiniMax H3 AdaLN offload requires CUDA or NPU")
             if quant_config is not None:
                 raise ValueError("MiniMax H3 AdaLN offload requires unquantized BF16 weights")
             if conflicting_offload:

@@ -696,8 +696,8 @@ class MiniMaxH3AdalnProj(nn.Module):
     def _prepare_weight_stager(self, device: torch.device) -> None:
         if not self._offload_weights:
             return
-        if device.type != "cuda" or torch.is_grad_enabled() or torch.compiler.is_compiling():
-            raise RuntimeError("MiniMax H3 AdaLN offload requires eager CUDA inference")
+        if device.type not in {"cuda", "npu"} or torch.is_grad_enabled() or torch.compiler.is_compiling():
+            raise RuntimeError("MiniMax H3 AdaLN offload requires eager CUDA or NPU inference")
         assert self._adaln_cache is not None
         if self._adaln_cache._has_forward_hooks(self.linear):
             raise RuntimeError("MiniMax H3 AdaLN offload does not support projection forward hooks")

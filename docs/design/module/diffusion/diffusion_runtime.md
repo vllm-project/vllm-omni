@@ -533,3 +533,19 @@ at idle through the engine, executor, worker, and runner using two CPU regressio
 - [Async diffusion output](../../feature/async_diffusion_output.md)
 - [Engine orchestration](../engine_orchestration.md)
 - [Stage runtime](../stage_runtime.md)
+
+### NPU worker finalization
+
+NPU runtime finalization can continue after the worker reports application
+shutdown. The multiprocess executor allows a shared 60-second graceful join
+window on NPU, retaining the 15-second window on other platforms and the
+existing bounded terminate/kill escalation. Exit-code logging distinguishes
+natural process exit from a completed application cleanup message.
+
+The out-of-process NPU `mp` stage client waits up to 80 seconds for a sent
+shutdown request: the worker grace plus both escalation windows and stage
+finalization. It then falls back to the bounded signal-based shutdown. This
+prevents the outer process manager from cutting short the worker deadline.
+This grace is gated on the resolved executor's `uses_multiproc` capability,
+including default and custom executors. Single-device default `uni` stages
+retain the normal bounded signal-based shutdown without the 80-second wait.
