@@ -312,9 +312,7 @@ class SessionPrefixStore:
         and the append happen under the same lock hold. A failed check
         returns False and stores nothing.
         """
-        return self._append(
-            session_id, key, rows, expected_length=expected_length, expected_epoch=expected_epoch
-        )
+        return self._append(session_id, key, rows, expected_length=expected_length, expected_epoch=expected_epoch)
 
     def append_beyond(
         self,

@@ -518,9 +518,7 @@ class OmniPrefixCacheManager:
         # to drop a finished request's queue or a superseded session's
         # generation).
         self._append_lock = threading.Lock()
-        self._pending_appends: dict[
-            tuple[ReqId, TensorName], list[tuple[int, int, torch.Tensor, int | None, str]]
-        ] = {}
+        self._pending_appends: dict[tuple[ReqId, TensorName], list[tuple[int, int, torch.Tensor, int | None, str]]] = {}
         self._pending_seq = 0
 
         # Planned-but-unread slot refs. A write reusing their slots copies the
@@ -1948,9 +1946,7 @@ class OmniPrefixCacheManager:
                         queue = self._pending_appends.setdefault((req_id, key), [])
                         bisect.insort(queue, (a_expected, self._pending_seq, rows.clone(), epoch, session_id))
                         continue
-                    self._session_store.append_beyond(
-                        session_id, key, a_expected, rows, expected_epoch=epoch
-                    )
+                    self._session_store.append_beyond(session_id, key, a_expected, rows, expected_epoch=epoch)
                     self._drain_pending_appends_locked(req_id, session_id, key)
 
     def _drain_pending_appends_locked(self, req_id: ReqId, session_id: str, key: TensorName) -> None:

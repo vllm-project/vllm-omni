@@ -2412,7 +2412,7 @@ def test_session_pending_reservation_released_on_turn_end():
     """A queued row whose turn ends must release its budget reservation."""
     mgr, view = make_manager()
     try:
-        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
         s2 = run_decode_step(mgr, view, "a", [0, 1, 2], 8, 4)
         mgr.discard_step(s2)  # queues behind the unmaterialized prefill
         assert mgr._session_store.pending_bytes() > 0
@@ -2430,7 +2430,7 @@ def test_session_epoch_advance_drops_stale_queued_reservations():
     release their reservations, not hold them across turns."""
     mgr, view = make_manager()
     try:
-        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S", session_epoch=0)
+        run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S", session_epoch=0)
         s2 = run_decode_step(mgr, view, "a", [0, 1, 2], 8, 4)
         mgr.discard_step(s2)
         assert mgr._session_store.pending_bytes() > 0
