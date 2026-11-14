@@ -321,6 +321,7 @@ class SessionPrefixStore:
         batch_start: int,
         rows: torch.Tensor,
         *,
+        reserved_bytes: int = 0,
         expected_epoch: int | None = None,
     ) -> bool:
         """Append the not-yet-stored tail of a batch starting at ``batch_start``.
@@ -349,6 +350,13 @@ class SessionPrefixStore:
         session) when the session's generation moved on since the step was
         published, closing the window between the manager's epoch check
         and this append.
+        ``reserved_bytes`` releases a queued-append reservation under the
+        same lock hold as the append: ``reserve_pending`` promised these
+        bytes, and releasing them and then appending in separate lock
+        holds would let another session's append take the freed budget
+        in between, so the reservation would not actually guarantee the
+        append. The release happens before the epoch gate, so a refused
+        append still frees its reservation instead of leaking it.
         Raises ValueError for a non-tensor/empty batch, a negative
         batch_start, or a trailing-shape mismatch with the stream.
         """
@@ -357,35 +365,8 @@ class SessionPrefixStore:
         if batch_start < 0:
             raise ValueError(f"session store append_beyond needs batch_start >= 0, got {batch_start}")
         with self._lock:
-            if not self._epoch_matches_locked(session_id, expected_epoch):
-                return False
-            self._touch_locked(session_id)
-            return self._append_beyond_locked(session_id, key, batch_start, rows)
-
-    def append_reserved_beyond(
-        self,
-        session_id: SessionId,
-        key: TensorName,
-        batch_start: int,
-        rows: torch.Tensor,
-        *,
-        reserved_bytes: int,
-        expected_epoch: int | None = None,
-    ) -> bool:
-        """Release a queued-append reservation and append under one lock.
-
-        ``reserve_pending`` promised these bytes; releasing them and then
-        appending in separate lock holds would let another session's append
-        take the freed budget in between, so the reservation would not
-        actually guarantee the append. This method does both atomically.
-        The append itself follows :meth:`append_beyond`'s rules.
-        """
-        if not isinstance(rows, torch.Tensor) or rows.ndim < 2 or rows.shape[0] == 0:
-            raise ValueError(f"session store append needs a non-empty per-token tensor, got {type(rows)}")
-        if batch_start < 0:
-            raise ValueError(f"session store append_beyond needs batch_start >= 0, got {batch_start}")
-        with self._lock:
-            self._pending_bytes = max(0, self._pending_bytes - int(reserved_bytes))
+            if reserved_bytes:
+                self._pending_bytes = max(0, self._pending_bytes - int(reserved_bytes))
             if not self._epoch_matches_locked(session_id, expected_epoch):
                 return False
             self._touch_locked(session_id)

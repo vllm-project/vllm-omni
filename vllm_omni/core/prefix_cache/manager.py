@@ -1978,7 +1978,7 @@ class OmniPrefixCacheManager:
             queue.pop(0)
             # Release the queue's reservation and append in one store-lock
             # hold, so another session cannot take the freed budget first.
-            if not self._session_store.append_reserved_beyond(
+            if not self._session_store.append_beyond(
                 session_id,
                 key,
                 expected,

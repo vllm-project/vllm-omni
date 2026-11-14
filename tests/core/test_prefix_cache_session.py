@@ -470,7 +470,7 @@ def test_reserve_pending_shares_the_byte_budget():
     assert store.append("S", "hidden", rows)
 
 
-def test_append_reserved_beyond_releases_and_appends_atomically():
+def test_append_beyond_with_reserved_bytes_releases_and_appends_atomically():
     """The release and the append share one lock hold, so the reservation
     guarantees the append even if other work could use the budget."""
     store = SessionPrefixStore(max_bytes=32)
@@ -478,7 +478,7 @@ def test_append_reserved_beyond_releases_and_appends_atomically():
     reserved = rows.numel() * rows.element_size()
     assert store.reserve_pending("S", reserved)
     assert not store.append("S", "hidden", _rows(0, 1))
-    assert store.append_reserved_beyond("S", "hidden", 0, rows, reserved_bytes=reserved)
+    assert store.append_beyond("S", "hidden", 0, rows, reserved_bytes=reserved)
     assert store.pending_bytes() == 0
     assert store.stored_tokens("S", "hidden") == 2
 
