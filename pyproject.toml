@@ -459,3 +459,8 @@ convnet = "convnet"
 thr = "thr"
 promt = "promt"
 scren = "scren"
+
+# Preserve the exact native parallel-drafting API identifiers in these files.
+[tool.typos.type.v1-parallel-drafting-fields]
+extend-glob = ["llm_base_proposer.py", "test_v1_proposer_compat.py"]
+extend-ignore-identifiers-re = ["^pard_token$", "^ptd_token_id$"]
