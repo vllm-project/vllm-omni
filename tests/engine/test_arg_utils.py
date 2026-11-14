@@ -722,6 +722,8 @@ DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
     ("max_generated_image_size", 1048576),
     ("tts_max_instructions_length", 1000),
     ("enable_diffusion_pipeline_profiler", True),
+    ("dlo_chunk_size_mb", 32),
+    ("controlnet_model_path", "/ckpt/control.safetensors"),
 ]
 
 
@@ -758,6 +760,8 @@ def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
         "enable_cuda_graph_decode": False,
         "enable_cfg_batching": True,
         "vae_encode_fast_path": "off",
+        "dlo_chunk_size_mb": 32,
+        "controlnet_model_path": "/ckpt/control.safetensors",
     }
     engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**overrides))
     stage_cfg = StageConfigFactory.create_default_diffusion(
@@ -772,6 +776,8 @@ def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
     assert resolved["enable_cuda_graph_decode"] is False
     assert resolved["enable_cfg_batching"] is True
     assert resolved["vae_encode_fast_path"] == "off"
+    assert resolved["dlo_chunk_size_mb"] == 32
+    assert resolved["controlnet_model_path"] == "/ckpt/control.safetensors"
 
 
 def test_native_mrv2_worker_provides_connector_without_legacy_mixin():
