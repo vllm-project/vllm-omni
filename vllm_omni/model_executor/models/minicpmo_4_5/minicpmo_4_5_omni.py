@@ -38,6 +38,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import caches_turn_outputs
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMMultiModalProcessor,
@@ -177,11 +178,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Thinker reuses native KV only. The Talker reads reply rows, which a
         # new request's hit never covers, and llm2tts takes them from the row
         # ledger.
-        self.supports_mrv2_prefix_cache_outputs = (
-            self.model_stage == "llm"
-            and getattr(vllm_config.model_config, "session_mode", None) == "turn"
-            and getattr(vllm_config, "speculative_config", None) is None
-        )
+        self.supports_mrv2_prefix_cache_outputs = caches_turn_outputs(vllm_config)
         # The Thinker's row ledger needs real token identities even when
         # embeddings are supplied, including during CUDA graph capture/replay.
         self.requires_raw_input_tokens = self.model_stage == "llm"
