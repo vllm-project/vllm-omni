@@ -167,7 +167,7 @@ def test_bagel_step_preprocessor_buckets_effective_img2img_sizes(tmp_path):
     assert (second.sampling_params.height, second.sampling_params.width) == (512, 1024)
 
     scheduler = StepScheduler()
-    scheduler.initialize(types.SimpleNamespace(max_num_seqs=2))
+    scheduler.initialize(types.SimpleNamespace(max_num_seqs=2, diffusion_attention_schedule=None))
     scheduler.add_request(first)
     scheduler.add_request(second)
 

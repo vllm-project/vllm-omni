@@ -91,7 +91,7 @@ def _make_engine(num_gpus: int = 1):
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine.od_config = SimpleNamespace(streaming_output=False)
     sched = RequestScheduler()
-    sched.initialize(SimpleNamespace())
+    sched.initialize(SimpleNamespace(diffusion_attention_schedule=None))
     engine.scheduler = sched
     engine.executor = executor
     engine._rpc_lock = threading.RLock()

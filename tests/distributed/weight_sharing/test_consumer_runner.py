@@ -77,7 +77,7 @@ def consumer_load(weight_sharing, contracts, monkeypatch):
         },
     )
     loader = loader_cls()
-    loader.od_config = SimpleNamespace(weight_sharing=group, dtype="float32")
+    loader.od_config = SimpleNamespace(weight_sharing=group, dtype="float32", diffusion_attention_schedule=None)
     loader.quant_config = None
     loader.parallel_config = SimpleNamespace(use_hsdp=False)
     loader._init_from_load_format = Mock(return_value=model)

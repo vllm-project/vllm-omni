@@ -189,7 +189,7 @@ def _guide_pipeline():
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace()
+    pipeline.od_config = SimpleNamespace(diffusion_attention_schedule=None)
     pipeline._base_schedule_by_partition = {"t2va": None, "fl2va": None, "ref2va": None}
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False

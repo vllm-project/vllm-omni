@@ -553,6 +553,7 @@ class TestSupportedPipelines:
             step_execution=False,
             model_class_name="NoStepPipeline",
             parallel_config=SimpleNamespace(use_hsdp=False),
+            diffusion_attention_schedule=None,
         )
         runner.device = torch.device("cpu")
         runner.pipeline = None

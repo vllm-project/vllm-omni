@@ -240,6 +240,7 @@ def _prepare_failure_worker(rank, world_size, rendezvous):
                 data_parallel_size=1, sequence_parallel_size=world_size, ulysses_degree=world_size
             )
             runner.od_config.cache_backend = None
+            runner.od_config.diffusion_attention_schedule = None
             runner.od_config.streaming_output = True
             runner.kv_transfer_manager = OmniKVTransferManager.from_od_config(runner.od_config)
             runner.cache_backend = None

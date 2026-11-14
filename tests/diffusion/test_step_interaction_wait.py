@@ -18,7 +18,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 def _scheduler():
     scheduler = StepScheduler()
-    scheduler.initialize(SimpleNamespace(max_num_seqs=1))
+    scheduler.initialize(SimpleNamespace(max_num_seqs=1, diffusion_attention_schedule=None))
     scheduler.add_request(_make_step_request("held"))
     return scheduler
 

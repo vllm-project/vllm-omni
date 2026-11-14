@@ -411,7 +411,7 @@ def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expecte
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace()
+    pipeline.od_config = SimpleNamespace(diffusion_attention_schedule=None)
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
     pipeline.text_encoder = object()
@@ -465,7 +465,7 @@ def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace()
+    pipeline.od_config = SimpleNamespace(diffusion_attention_schedule=None)
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
     cache_spec = object()
@@ -1260,7 +1260,7 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace()
+    pipeline.od_config = SimpleNamespace(diffusion_attention_schedule=None)
     pipeline._base_schedule_by_partition = schedules
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
