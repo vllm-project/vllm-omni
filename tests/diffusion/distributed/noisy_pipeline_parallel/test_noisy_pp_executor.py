@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+from functools import partial
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 
@@ -16,6 +20,7 @@ from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor i
 )
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     CellSchedule,
+    Inflight,
     Ordering,
     build_cell_plan,
 )
@@ -46,6 +51,147 @@ class CountingAdapter(CellAdapter):
 
     def unpack_activation(self, payload):
         return payload["hidden_states"]
+
+
+class _BoomAdapter(CountingAdapter):
+    """Raises from the shared forward so the executor's failure path runs."""
+
+    def forward(self, batch, members, *, member_inputs):
+        del batch, members, member_inputs
+        raise RuntimeError("boom")
+
+
+class _StatelessAdapter(CellAdapter):
+    """Asserts which member inputs the executor hands each Cell."""
+
+    def compatibility_key(self, cell):
+        return cell
+
+    def forward(self, batch, members, *, member_inputs):
+        del members
+        m0 = batch.members[0]
+        cell = (m0.chunk, m0.step, m0.block)
+        hidden = member_inputs[0] if member_inputs else None
+        if cell == (0, 1, 0):
+            assert hidden is not None, "executor dropped the final latent before clean"
+            torch.testing.assert_close(hidden["latent"], torch.tensor([7.0]))
+        else:
+            # Neither the initial chunk nor the tail may inherit stale input.
+            assert hidden is None
+        return {"latent": torch.tensor([7.0]).expand(batch.size).clone()}
+
+
+class _StashRowAdapter(CellAdapter):
+    """Records the per-row latent values a slot batch started from."""
+
+    def __init__(self, seen: list[list[float]]) -> None:
+        self.seen = seen
+
+    def compatibility_key(self, c):
+        return c[2]  # block only
+
+    def forward(self, batch, members, *, member_inputs):
+        del members
+        rows = []
+        for inp in member_inputs:
+            assert isinstance(inp, dict) and "latent" in inp
+            rows.append(float(inp["latent"].reshape(-1)[0]))
+        self.seen.append(rows)
+        return {"latent": torch.zeros(batch.size, 1)}
+
+
+class _GeomAdapter(CellAdapter):
+    """Emits a request-specific latent shape so mixed geometry stays visible."""
+
+    def __init__(self, req: str, shape: tuple[int, ...], finished: dict[str, tuple[int, ...]]) -> None:
+        self.req = req
+        self.shape = shape
+        self.finished = finished
+
+    def compatibility_key(self, cell):
+        return (cell[2], self.shape)
+
+    def forward(self, batch, members, *, member_inputs):
+        del member_inputs
+        latents = []
+        for member_ref, member in zip(batch.members, members, strict=True):
+            assert isinstance(member, _GeomAdapter)
+            latent = torch.full(member.shape, float(ord(member.req[0])))
+            self.finished[member_ref.request_id] = tuple(latent.shape)
+            latents.append(latent)
+        # Homogeneous ComputeBatch may cat; cross-geometry packing is executor-side.
+        return {"latent": torch.cat(latents, dim=0)}
+
+
+class _SpecAdapter(CellAdapter):
+    """Declares an activation spec without ever running a forward."""
+
+    def __init__(self, shape: tuple[int, ...], dtype: torch.dtype = torch.float32) -> None:
+        self._shape = shape
+        self._dtype = dtype
+        self.latent_shape = shape
+        self.dtype = dtype
+
+    def compatibility_key(self, cell):
+        return (cell[2], self._shape, str(self._dtype))
+
+    def forward(self, batch, members, *, member_inputs):
+        del batch, members, member_inputs
+        raise AssertionError("expand must not run forward")
+
+    def activation_spec(self, *, batch: int, include_hidden: bool):
+        _b, c, t, h, w = self._shape
+        spec: list[tuple[str, tuple[int, ...], torch.dtype]] = [("latent", (batch, c, t, h, w), self._dtype)]
+        if include_hidden:
+            spec.append(("hidden_states", (batch, t * h * w, 8), self._dtype))
+        return spec
+
+
+class _MidGroupAdapter(CellAdapter):
+    """Records which member/block pairs the real executor loop visits."""
+
+    def __init__(self, seen: list[tuple[str, int]]) -> None:
+        self.seen = seen
+
+    def compatibility_key(self, cell):
+        return cell[2]
+
+    def forward(self, batch, members, *, member_inputs):
+        member = batch.members[0]
+        self.seen.append((member.request_id, member.block))
+        if member.request_id == "B" and member.block == 1:
+            assert member_inputs[0] is not None
+            torch.testing.assert_close(member_inputs[0]["hidden_states"], torch.tensor([[42.0]]))
+        else:
+            assert member_inputs == [None]
+        return {"hidden_states": torch.tensor([[42.0]])}
+
+
+def _inflight_item(req, cell, *, schedule):
+    """Build an Inflight whose plan exposes only this rank's cell."""
+    return SimpleNamespace(
+        req=req,
+        t0=0,
+        plan=SimpleNamespace(
+            schedule=schedule,
+            num_slots=1,
+            task=partial(_rank_cell_task, cell),
+        ),
+    )
+
+
+def _rank_cell_task(cell, _slot, rank):
+    """Return ``cell`` on rank 0 only, mirroring a single-rank plan view."""
+    return cell if rank == 0 else None
+
+
+def _slot_plan(cells, *, schedule):
+    """Build a plan whose slot ``i`` runs ``cells[i]`` on every rank."""
+    return SimpleNamespace(schedule=schedule, num_slots=2, task=partial(_slot_cell_task, cells))
+
+
+def _slot_cell_task(cells, slot, _rank):
+    return cells[slot]
 
 
 def test_consumer_stash_meta_cross_stage_vs_same_stage():
@@ -208,14 +354,10 @@ def test_executor_releases_versions_when_forward_raises():
     )
     assert ctx.admit("A", plan, chunk_tokens=4, slot=0)
 
-    class BoomAdapter(CountingAdapter):
-        def forward(self, batch, members, *, member_inputs):
-            del batch, members, member_inputs
-            raise RuntimeError("boom")
-
     with pytest.raises(RuntimeError, match="boom"):
-        adapter = BoomAdapter()
+        adapter = _BoomAdapter()
         run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
+
     assert not ctx.inflight
     assert not ctx.pending
     assert len(cache.pool.keys) == 0
@@ -316,25 +458,8 @@ def test_same_rank_clean_receives_final_latent_without_adapter_cache():
         kv=NoisyKVState(cache),
     )
 
-    class StatelessAdapter(CellAdapter):
-        def compatibility_key(self, cell):
-            return cell
-
-        def forward(self, batch, members, *, member_inputs):
-            del members
-            m0 = batch.members[0]
-            cell = (m0.chunk, m0.step, m0.block)
-            hidden = member_inputs[0] if member_inputs else None
-            if cell == (0, 1, 0):
-                assert hidden is not None, "executor dropped the final latent before clean"
-                torch.testing.assert_close(hidden["latent"], torch.tensor([7.0]))
-            else:
-                # Neither the initial chunk nor the tail may inherit stale input.
-                assert hidden is None
-            return {"latent": torch.tensor([7.0]).expand(batch.size).clone()}
-
     assert ctx.admit("A", plan, chunk_tokens=1, slot=0)
-    adapter = StatelessAdapter()
+    adapter = _StatelessAdapter()
     run_cell_pipeline(ctx=ctx, members={item.req: adapter for item in (*ctx.inflight, *ctx.pending)})
     assert not ctx.inflight
     assert ctx.kv.resident_versions == 0
@@ -350,20 +475,7 @@ def test_run_slot_batches_uses_per_request_stash_rows():
     tasks = (("A", cell), ("B", cell), ("C", cell))
     seen: list[list[float]] = []
 
-    class _Adapter(CellAdapter):
-        def compatibility_key(self, c):
-            return c[2]  # block only
-
-        def forward(self, batch, members, *, member_inputs):
-            del members
-            rows = []
-            for inp in member_inputs:
-                assert isinstance(inp, dict) and "latent" in inp
-                rows.append(float(inp["latent"].reshape(-1)[0]))
-            seen.append(rows)
-            return {"latent": torch.zeros(batch.size, 1)}
-
-    members = {"A": _Adapter(), "B": _Adapter(), "C": _Adapter()}
+    members = {"A": _StashRowAdapter(seen), "B": _StashRowAdapter(seen), "C": _StashRowAdapter(seen)}
     act_stash = {
         ("A", 0, 0): {"latent": torch.full((1,), 1.0)},
         ("B", 0, 0): {"latent": torch.full((1,), 2.0)},
@@ -434,28 +546,9 @@ def test_mixed_latent_geometry_same_slot_retains_shapes():
 
     finished: dict[str, tuple[int, ...]] = {}
 
-    class _GeomAdapter(CellAdapter):
-        def __init__(self, req: str, shape: tuple[int, ...]) -> None:
-            self.req = req
-            self.shape = shape
-
-        def compatibility_key(self, cell):
-            return (cell[2], self.shape)
-
-        def forward(self, batch, members, *, member_inputs):
-            del member_inputs
-            latents = []
-            for member_ref, member in zip(batch.members, members, strict=True):
-                assert isinstance(member, _GeomAdapter)
-                latent = torch.full(member.shape, float(ord(member.req[0])))
-                finished[member_ref.request_id] = tuple(latent.shape)
-                latents.append(latent)
-            # Homogeneous ComputeBatch may cat; cross-geometry packing is executor-side.
-            return {"latent": torch.cat(latents, dim=0)}
-
     run_cell_pipeline(
         ctx=ctx,
-        members={"A": _GeomAdapter("A", shape_a), "B": _GeomAdapter("B", shape_b)},
+        members={"A": _GeomAdapter("A", shape_a, finished), "B": _GeomAdapter("B", shape_b, finished)},
     )
     assert finished == {"A": shape_a, "B": shape_b}
     assert not ctx.inflight
@@ -471,27 +564,6 @@ def test_expand_activation_edges_agrees_without_local_outs():
     from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
         _expand_activation_edges_for_geometry,
     )
-
-    class _SpecAdapter(CellAdapter):
-        def __init__(self, shape: tuple[int, ...], dtype: torch.dtype = torch.float32) -> None:
-            self._shape = shape
-            self._dtype = dtype
-            self.latent_shape = shape
-            self.dtype = dtype
-
-        def compatibility_key(self, cell):
-            return (cell[2], self._shape, str(self._dtype))
-
-        def forward(self, batch, members, *, member_inputs):
-            del batch, members, member_inputs
-            raise AssertionError("expand must not run forward")
-
-        def activation_spec(self, *, batch: int, include_hidden: bool):
-            _b, c, t, h, w = self._shape
-            spec: list[tuple[str, tuple[int, ...], torch.dtype]] = [("latent", (batch, c, t, h, w), self._dtype)]
-            if include_hidden:
-                spec.append(("hidden_states", (batch, t * h * w, 8), self._dtype))
-            return spec
 
     topology = CellTopology(step_replicas=1, layer_groups=2)
     same_a = _SpecAdapter((1, 4, 1, 2, 4))
@@ -531,9 +603,47 @@ def test_expand_activation_edges_agrees_without_local_outs():
     ]
 
 
+def test_single_chunk_session_clean_block0_receives_final_latent():
+    """G=2 one-chunk session: the clean pass must be wired, not just scheduled.
+
+    ``D=S=2, G=2, blocks=2, chunks=1, same_step_session=True`` schedules a clean
+    pass at ``(0, D, *)``, which lives on the final noisy replica. Clean block 0
+    sits on a *different* rank than the last noisy block, so the handoff has to
+    cross ranks. Keying that edge on ``chunks > 1`` dropped it and left the clean
+    pass with no latent.
+    """
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import _activation_edges
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Inflight, rank_of_block
+
+    schedule = CellSchedule(
+        chunks=1,
+        num_denoise_steps=2,
+        step_replicas=2,
+        layer_groups=2,
+        blocks=2,
+        kv_history_chunks=1,
+        ordering=Ordering.SAME_STEP,
+        same_step_session=True,
+    )
+    assert schedule.same_step_has_sink
+    plan = build_cell_plan(schedule)
+    topology = CellTopology(step_replicas=2, layer_groups=2)
+    inflight = (Inflight(req="A", t0=0, plan=plan),)
+
+    # Sanity: the plan really does run a clean pass, on these ranks.
+    last_noisy = (0, schedule.num_denoise_steps - 1, schedule.num_blocks - 1)
+    clean_block0 = (0, schedule.num_denoise_steps, 0)
+    src = rank_of_block(last_noisy[1], last_noisy[2], schedule)
+    dst = rank_of_block(clean_block0[1], clean_block0[2], schedule)
+    assert src != dst, "fixture must exercise a cross-rank clean handoff"
+
+    noisy_tick = plan.completion_tick(last_noisy)
+    edges = _activation_edges(topology=topology, inflight=inflight, slot=noisy_tick, schedule=schedule)
+    assert (src, dst, (("A", last_noisy),)) in edges
+
+
 def test_activation_edges_only_send_boundary_members():
     """A boundary member must not drag a mid-group member into PP transport."""
-    from types import SimpleNamespace
 
     from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import _activation_edges
 
@@ -546,29 +656,16 @@ def test_activation_edges_only_send_boundary_members():
         kv_history_chunks=1,
         ordering=Ordering.SELF_FORCING,
     )
-
-    def item(req, cell):
-        return SimpleNamespace(
-            req=req,
-            t0=0,
-            plan=SimpleNamespace(
-                schedule=schedule,
-                task=lambda _slot, rank: cell if rank == 0 else None,
-            ),
-        )
-
-    inflight = (item("boundary", (0, 0, 1)), item("local", (0, 0, 0)))
+    inflight = (
+        _inflight_item("boundary", (0, 0, 1), schedule=schedule),
+        _inflight_item("local", (0, 0, 0), schedule=schedule),
+    )
     edges = _activation_edges(topology=CellTopology(1, 2), inflight=inflight, slot=0, schedule=schedule)
     assert edges == [(0, 1, (("boundary", (0, 0, 1)),))]
 
 
 def test_executor_preserves_mid_group_hidden_beside_boundary_member():
     """Run the actual loop: A leaves the group while B must keep its next-block input."""
-    from types import SimpleNamespace
-    from typing import Any
-    from unittest.mock import MagicMock
-
-    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Inflight
 
     schedule = CellSchedule(
         chunks=1,
@@ -580,34 +677,17 @@ def test_executor_preserves_mid_group_hidden_beside_boundary_member():
         blocks=4,
     )
 
-    def plan(cells) -> Any:
-        return SimpleNamespace(schedule=schedule, num_slots=2, task=lambda slot, _rank: cells[slot])
-
     kv = MagicMock()
     kv.uses_comm_stream = False
     kv.prepare.side_effect = lambda tasks: [[None] for _ in tasks]
     ctx = ARDiffusionCellContext(spec=CellRunSpec(CellTopology(1, 2), rank=0, max_batch_size=2), kv=kv)
     ctx.inflight = [
-        Inflight("A", 0, plan([(0, 0, 1), None])),
-        Inflight("B", 0, plan([(0, 0, 0), (0, 0, 1)])),
+        Inflight("A", 0, _slot_plan([(0, 0, 1), None], schedule=schedule)),
+        Inflight("B", 0, _slot_plan([(0, 0, 0), (0, 0, 1)], schedule=schedule)),
     ]
     seen = []
 
-    class Adapter(CellAdapter):
-        def compatibility_key(self, cell):
-            return cell[2]
-
-        def forward(self, batch, members, *, member_inputs):
-            member = batch.members[0]
-            seen.append((member.request_id, member.block))
-            if member.request_id == "B" and member.block == 1:
-                assert member_inputs[0] is not None
-                torch.testing.assert_close(member_inputs[0]["hidden_states"], torch.tensor([[42.0]]))
-            else:
-                assert member_inputs == [None]
-            return {"hidden_states": torch.tensor([[42.0]])}
-
-    run_cell_pipeline(ctx=ctx, members={"A": Adapter(), "B": Adapter()})
+    run_cell_pipeline(ctx=ctx, members={"A": _MidGroupAdapter(seen), "B": _MidGroupAdapter(seen)})
     assert seen == [("A", 1), ("B", 0), ("B", 1)]
     assert not ctx.inflight
 

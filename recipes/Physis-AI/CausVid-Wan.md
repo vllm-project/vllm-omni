@@ -57,9 +57,12 @@ cfg.stages[0].model_config.causvid_ckpt = (
     "/data/models/CausVid/autoregressive_checkpoint/model.pt"
 )
 
+# Omni consumes a YAML path; keep the checked-in deployment unchanged.
+config_path = Path("/tmp/causvid-wan-self-forcing.yaml")
+OmegaConf.save(cfg, config_path)
 omni = Omni(
     model="/data/models/Wan2.1-T2V-1.3B-Diffusers",
-    deploy_config=cfg,
+    deploy_config=str(config_path),
 )
 out = omni.generate(
     "A corgi running on the beach at sunset.",
@@ -76,6 +79,7 @@ out = omni.generate(
         },
     ),
 )
+omni.close()  # Release workers after consuming outputs.
 ```
 
 For Latest-KV, load `causvid_wan_latest_kv.yaml` instead (4 GPUs) and keep
@@ -85,8 +89,8 @@ For Latest-KV, load `causvid_wan_latest_kv.yaml` instead (4 GPUs) and keep
 
 - **Self-Forcing** (`Ordering.SELF_FORCING`) matches CausVid clean-history
   semantics on **S=1** layer PP. **Latest-KV** needs vertical **S=D+1** and
-  reads the newest finished history step (may P2P KV). CausVidWan rejects
-  `same_step`.
+  reads the newest finished history step (may P2P KV). Same-Step uses `S=D`
+  and retains matching-step history plus the first-chunk clean sink.
 - Exact official DMD timestep table parity (`1000/757/522`) vs the shared
   FlowEuler grid is still converging; defaults use CausVid **shift=8** and
   **D=3** (S=1 Self-Forcing uses clean when `H>0`; Latest-KV YAML uses
