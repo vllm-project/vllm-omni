@@ -103,6 +103,7 @@ class _FakeNativeMetadata:
     positions: torch.Tensor
     slot_mappings: torch.Tensor
     max_num_splits: int = 0
+    scheduler_metadata: torch.Tensor | None = None
 
 
 class _FakeLayer:
@@ -443,9 +444,19 @@ def test_platform_prewrite_updates_once_then_piecewise_reads_cache(monkeypatch: 
     assert all(call[1] is None and call[2] is None for call in layer.calls)
 
 
-def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("fa_version", [2, 3, 4])
+def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.MonkeyPatch, fa_version: int) -> None:
     adapter, _, layer, events = _make_adapter(monkeypatch)
-    layer.impl.vllm_flash_attn_version = 2
+    layer.impl.vllm_flash_attn_version = fa_version
+    original_build = adapter._build_native_metadata
+
+    def build_with_schedule(**kwargs):
+        metadata = original_build(**kwargs)
+        for item in metadata.values():
+            item.scheduler_metadata = torch.tensor([7], dtype=torch.int32)
+        return metadata
+
+    monkeypatch.setattr(adapter, "_build_native_metadata", build_with_schedule)
     batch = adapter.prepare_batch(
         [
             DiffusionPagedAttentionRow(
@@ -505,7 +516,10 @@ def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.
     assert all(call[1] is None and call[2] is None for call in layer.calls)
     assert all(call[3] is event[2] for call, event in zip(layer.calls, events[1:], strict=True))
     assert [metadata.build_id for metadata in context.piecewise_native_metadata] == [1, 2, 3]
-    assert [metadata.max_num_splits for metadata in context.piecewise_native_metadata] == [1, 1, 1]
+    expected_splits = 1 if fa_version in (2, 3) else 0
+    assert [metadata.max_num_splits for metadata in context.piecewise_native_metadata] == [expected_splits] * 3
+    if fa_version == 3:
+        assert all(metadata.scheduler_metadata is None for metadata in context.piecewise_native_metadata)
 
     # The first metadata build is the normal whole-query path. Piecewise calls
     # then use causal [3, 5), full [5, 8), and causal [8, 9) segments.

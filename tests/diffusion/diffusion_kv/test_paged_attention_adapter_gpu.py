@@ -44,21 +44,21 @@ class _SmokeDiffusionAttention(nn.Module):
         self.softmax_scale = _HEAD_SIZE**-0.5
 
 
-def _native_adapter(num_rows: int = 1):
+def _native_adapter(num_rows: int = 1, max_seq_len: int = 32, dtype: torch.dtype = torch.float16):
     device = torch.device("cuda", torch.accelerator.current_device_index())
     vllm_config = VllmConfig(
         cache_config=CacheConfig(
             block_size=_BLOCK_SIZE,
-            cache_dtype="float16",
+            cache_dtype="bfloat16" if dtype == torch.bfloat16 else "float16",
             enable_prefix_caching=False,
         ),
         attention_config=AttentionConfig(use_non_causal=True),
     )
     model_config = _DiffusionVllmModelConfig(
         model=None,
-        dtype=torch.float16,
-        max_model_len=32,
-        original_max_model_len=32,
+        dtype=dtype,
+        max_model_len=max_seq_len,
+        original_max_model_len=max_seq_len,
         hf_config=SimpleNamespace(model_type="diffusion_paged_attention_smoke"),
     )
     vllm_config.model_config = model_config
@@ -74,7 +74,7 @@ def _native_adapter(num_rows: int = 1):
         block_size=_BLOCK_SIZE,
         num_kv_heads=_NUM_HEADS,
         head_size=_HEAD_SIZE,
-        dtype=torch.float16,
+        dtype=dtype,
         non_causal=True,
     )
     with set_current_vllm_config(vllm_config):
@@ -88,9 +88,10 @@ def _native_adapter(num_rows: int = 1):
     vllm_config.compilation_config.static_forward_context[_LAYER_NAME] = native_layer
 
     canonical_spec = native_layer.spec
+    blocks_per_row = (max_seq_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE + 2
     kv_cache_config = KVCacheConfig(
-        num_blocks=4 * num_rows,
-        kv_cache_tensors=[build_kv_cache_tensor(canonical_spec, 4 * num_rows, [_LAYER_NAME])],
+        num_blocks=blocks_per_row * num_rows,
+        kv_cache_tensors=[build_kv_cache_tensor(canonical_spec, blocks_per_row * num_rows, [_LAYER_NAME])],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 layer_names=[_LAYER_NAME],
@@ -119,13 +120,18 @@ def _native_adapter(num_rows: int = 1):
         block_tables = BlockTables(
             block_sizes=[_BLOCK_SIZE],
             max_num_reqs=num_rows,
-            max_num_batched_tokens=32 * num_rows,
-            max_num_blocks_per_group=[2],
+            max_num_batched_tokens=max_seq_len * num_rows,
+            max_num_blocks_per_group=[blocks_per_row - 2],
             device=device,
         )
 
     for row in range(num_rows):
-        block_tables.append_block_ids(row, ([4 * row + 3, 4 * row + 1],), overwrite=True)
+        order = [3, 1] + [i for i in range(blocks_per_row) if i not in (3, 1)]
+        block_tables.append_block_ids(
+            row,
+            ([blocks_per_row * row + i for i in order[: blocks_per_row - 2]],),
+            overwrite=True,
+        )
     block_tables.apply_staged_writes()
     adapter = DiffusionPagedAttentionAdapter(
         vllm_config=vllm_config,
@@ -136,7 +142,7 @@ def _native_adapter(num_rows: int = 1):
         layers={_LAYER_NAME: native_layer},
         resolve_row=lambda _request_id, sequence_id, _context_id: DiffusionPagedAttentionRowBinding(
             row_index=sequence_id,
-            max_seq_len=19,
+            max_seq_len=max_seq_len,
         ),
     )
     return adapter, diffusion_layer, device
@@ -307,3 +313,63 @@ def test_hunyuan_homogeneous_cfg_paged_attention_graph_replay() -> None:
         torch.testing.assert_close(actual.reshape_as(reference), reference, rtol=2e-2, atol=2e-2)
         torch.testing.assert_close(actual, eager, rtol=2e-2, atol=2e-2)
         assert captured.data_ptr() == output_ptr
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for native paged attention")
+def test_fa3_piecewise_cached_prefix_uses_single_pass_and_matches_sdpa():
+    prefix_len, cached_len, target_len = 1268, 1264, 8
+    seq_len = prefix_len + target_len
+    batch_size = 2
+    adapter, layer, device = _native_adapter(batch_size, max_seq_len=seq_len, dtype=torch.bfloat16)
+    if adapter.layers[_LAYER_NAME].impl.vllm_flash_attn_version != 3:
+        pytest.skip("Regression exercises FA3 automatic SplitKV scheduling")
+    torch.manual_seed(10333)
+    packed = torch.randn(batch_size, seq_len, 3, _NUM_HEADS, _HEAD_SIZE, device=device, dtype=torch.bfloat16)
+    query, key, value = packed.unbind(dim=2)
+    backend = FlashAttentionImpl(
+        num_heads=_NUM_HEADS, head_size=_HEAD_SIZE, softmax_scale=layer.softmax_scale, num_kv_heads=_NUM_HEADS
+    )
+    spans = AttentionMetadata(full_attn_spans=[[(prefix_len, seq_len)]] * batch_size)
+    cold = adapter.prepare_batch(
+        [
+            DiffusionPagedAttentionRow(request_id="cfg", sequence_id=i, query_len=seq_len, seq_len=seq_len)
+            for i in range(batch_size)
+        ]
+    )
+    with adapter.activate(cold):
+        context = adapter.prepare_layer_context(_LAYER_NAME, query, key, value, omni_attn_metadata=spans)
+        cold_output = backend.forward_paged(context).reshape(batch_size, seq_len, _NUM_HEADS, _HEAD_SIZE).clone()
+    warm = adapter.prepare_batch(
+        [
+            DiffusionPagedAttentionRow(
+                request_id="cfg",
+                sequence_id=i,
+                query_len=seq_len - cached_len,
+                seq_len=seq_len,
+                kv_start_pos=cached_len,
+            )
+            for i in range(batch_size)
+        ]
+    )
+    with adapter.activate(warm):
+        context = adapter.prepare_layer_context(
+            _LAYER_NAME, query[:, cached_len:], key[:, cached_len:], value[:, cached_len:], omni_attn_metadata=spans
+        )
+        warm_output = backend.forward_paged(context).reshape(batch_size, seq_len - cached_len, _NUM_HEADS, _HEAD_SIZE)
+    assert all(item.max_num_splits == 1 for item in context.piecewise_native_metadata)
+    assert all(item.scheduler_metadata is None for item in context.piecewise_native_metadata)
+    # Compare against the mathematical suffix query, including the causal
+    # prefix tail and full-attention image span, using the native-suite bounds.
+    q_positions = torch.arange(cached_len, seq_len, device=device)
+    k_positions = torch.arange(seq_len, device=device)
+    mask = k_positions.unsqueeze(0) <= q_positions.unsqueeze(1)
+    mask[q_positions >= prefix_len] = True
+    reference = F.scaled_dot_product_attention(
+        query[:, cached_len:].float().transpose(1, 2),
+        key.float().transpose(1, 2),
+        value.float().transpose(1, 2),
+        attn_mask=mask,
+        scale=layer.softmax_scale,
+    ).transpose(1, 2)
+    torch.testing.assert_close(cold_output[:, cached_len:].float(), reference, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(warm_output.float(), reference, rtol=2e-2, atol=2e-2)

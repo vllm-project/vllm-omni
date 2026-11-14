@@ -768,19 +768,23 @@ class DiffusionPagedAttentionAdapter:
                 slot_mappings=slot_mappings,
                 causal=(row_segments[0].mode == "causal"),
             )
-            # FA2's ``num_splits=0`` auto policy selects SplitKV for these
-            # already-small piecewise calls. Reuse vLLM's supported metadata
-            # control to select the single-pass kernel and avoid its extra
-            # partial-output/reduction work. Leave newer native backends and
-            # metadata without this control untouched.
+            # Prefix hits shorten causal queries without changing their K/V.
+            # FA2/FA3 automatic SplitKV can then choose a different reduction
+            # than the cold prefill. Keep piecewise calls single-pass so those
+            # recomputed prefix tokens avoid additional split-order drift. Other
+            # backends keep their native scheduling policy.
             for layer_name, native_metadata in segment_metadata.items():
                 layer = self.layers.get(layer_name)
                 if (
                     layer is not None
-                    and getattr(layer.impl, "vllm_flash_attn_version", None) == 2
+                    and getattr(layer.impl, "vllm_flash_attn_version", None) in (2, 3)
                     and hasattr(native_metadata, "max_num_splits")
                 ):
                     native_metadata.max_num_splits = 1
+                    if getattr(layer.impl, "vllm_flash_attn_version", None) == 3:
+                        # A cached AOT schedule was built for automatic splitting.
+                        # Let FA3 construct the single-pass schedule instead.
+                        native_metadata.scheduler_metadata = None
             # FA3's full-CUDA-graph metadata builder reuses one persistent
             # scheduler buffer across builds. Piecewise attention prepares all
             # segments before executing any of them, so each segment needs its
