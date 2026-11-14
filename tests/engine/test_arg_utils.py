@@ -127,6 +127,39 @@ def test_npu_speculative_stage_runner_gate(monkeypatch, tmp_path):
     assert dspark.use_v2_model_runner is True
 
 
+def test_npu_ngram_keeps_mrv2_when_enabled(monkeypatch, tmp_path):
+    """With a V2 ngram speculator available, the opt-in keeps stage 0 on MRv2."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    monkeypatch.setenv("VLLM_OMNI_MRV2_NGRAM", "1")
+    availability = "vllm_omni.worker_v2.ngram_adapter.ngram_speculator_available"
+    monkeypatch.setattr(availability, lambda: True)
+    ngram = {
+        "method": "ngram",
+        "num_speculative_tokens": 7,
+        "prompt_lookup_min": 1,
+        "prompt_lookup_max": 1,
+    }
+
+    def build():
+        return OmniEngineArgs(
+            model=str(tmp_path),
+            model_stage="llm",
+            model_arch="MiniCPMO45OmniForConditionalGeneration",
+            use_v2_model_runner=True,
+            async_scheduling=False,
+            speculative_config=dict(ngram),
+        ).create_model_config()
+
+    assert build().use_v2_model_runner is True
+    # A vLLM build without the Triton V2 ngram speculator must still fall back.
+    monkeypatch.setattr(availability, lambda: False)
+    assert build().use_v2_model_runner is False
+
+
 def test_default_stage_id_is_concrete_int():
     """Ensure `stage_id` stays safe for downstream arithmetic/indexing."""
     engine_args = OmniEngineArgs()

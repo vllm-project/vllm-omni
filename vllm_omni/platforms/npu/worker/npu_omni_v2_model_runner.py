@@ -16,13 +16,16 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
     MINICPMO_TALKER_FRAMES_MAX,
     talker_kstep_frames,
 )
+from vllm_omni.worker_v2.ngram_adapter import ngram_runner_scope, use_scheduler_ngram
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
@@ -161,7 +164,11 @@ class NPUOmniV2RunnerMixin:
         _default_ascend_decode_graph_flag()
         _install_pcp_partition_stub()
         _install_v2_moe_comm_context()
-        super().__init__(*args, **kwargs)
+        # The ngram adapter needs the runner being built while Ascend's
+        # init_speculator runs (it has no runner argument). A no-op scope when
+        # VLLM_OMNI_MRV2_NGRAM is unset, so the default path is untouched.
+        with ngram_runner_scope(self):
+            super().__init__(*args, **kwargs)
 
     def prepare_inputs(
         self,
@@ -229,6 +236,8 @@ class NPUOmniV2RunnerMixin:
 class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunner):
     """NPU autoregressive models with Ascend attention metadata."""
 
+    _scheduler_ngram = False
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         import os
 
@@ -251,11 +260,29 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
                 static_shape_decode.install_into_ascend_backend()
                 logger.info_once(
                     "[minicpmo] v2 static-shape decode backend installed (arch=%s)",
-                    architectures,
+                    tuple(architectures),
                 )
             except Exception:
                 logger.exception("[minicpmo] v2 static-shape install failed; stock backend kept")
         super().__init__(*args, **kwargs)
+        self._scheduler_ngram = use_scheduler_ngram(self.vllm_config)
+
+    def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc, num_active_loras=0):
+        drafts = scheduler_output.scheduled_spec_decode_tokens
+        if self._scheduler_ngram and drafts:
+            # The scheduler is the source of truth for these proposals. Upload
+            # one batch rather than one tensor per request.
+            draft_ids = np.zeros(self.req_states.draft_tokens.shape, dtype=np.int64)
+            for req_id, tokens in drafts.items():
+                row = self.req_states.req_id_to_index[req_id]
+                draft_ids[row, : len(tokens)] = tokens
+            async_tensor_h2d(draft_ids, out=self.req_states.draft_tokens)
+        return super().prepare_inputs(scheduler_output, batch_req_state, batch_desc, num_active_loras)
+
+    def _can_skip_spec_cpu_length_sync(self) -> bool:
+        # In synchronous scheduling update_requests has already installed the
+        # exact rejection-adjusted counts from the scheduler on the CPU.
+        return self._scheduler_ngram or super()._can_skip_spec_cpu_length_sync()
 
     def _kstep_active(self) -> bool:
         """Talker K-step block armed, per the shared contract."""
@@ -422,6 +449,13 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         return out
 
     def _propose_draft_tokens(self, input_batch, draft, num_sampled, num_rejected, mm_inputs):
+        if self._scheduler_ngram:
+            # The synchronous engine calls back with the request IDs after
+            # it has applied this step's accepted tokens to their histories.
+            self.draft_tokens_handler.set_draft_tokens(
+                input_batch, self.req_states.draft_tokens[: input_batch.num_reqs, :0]
+            )
+            return
         # K-step drafts are not predictions: they reserve the K-1 extra KV
         # rows of the next step. V1 feeds CONTINUE_TOKEN_ID (0) for every row;
         # MRv2's speculator (if any) would propose real token ids instead.
@@ -438,7 +472,21 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         )
 
     def initialize_kv_cache(self, kv_cache_config: Any, *args: Any, **kwargs: Any) -> None:
-        super().initialize_kv_cache(kv_cache_config, *args, **kwargs)
+        spec = self.speculative_config
+        if self._scheduler_ngram and not spec.uses_dynamic_speculative_decoding():
+            # Capture both one-token decode and full-width verification. The
+            # scheduler can emit a shorter draft or batch requests at different
+            # widths, which the normal graph dispatcher handles eagerly.
+            spec.num_speculative_tokens_per_batch_size = [
+                (1, 1, 0),
+                (2, 2, self.num_speculative_steps),
+            ]
+            try:
+                super().initialize_kv_cache(kv_cache_config, *args, **kwargs)
+            finally:
+                spec.num_speculative_tokens_per_batch_size = None
+        else:
+            super().initialize_kv_cache(kv_cache_config, *args, **kwargs)
         # The Ascend override initializes native KV directly, bypassing the
         # shared MRv2 mixin. Thinker hits also need cached stage-output rows.
         is_profiling = bool(kwargs.get("is_profiling", args[0] if args else False))

@@ -633,27 +633,55 @@ class OmniEngineArgs(EngineArgs):
         # config's use_v2_model_runner field. MRv2 only serves speculation
         # through the Talker K-step contract, so a stage whose speculative
         # config is not a K-step config (e.g. the thinker stage's ngram
-        # drafting) must resolve back to the V1 runner here, at the single
-        # point where every consumer reads the same field. DSpark is the
-        # exception: the model serves it on the V2 runner through its own
-        # draft loop (cosyvoice3.py rejects a V1 runner for it), so a dspark
-        # config must keep the V2 runner.
+        # drafting) normally resolves back to V1 here, at the single point
+        # where every consumer reads the same field. DSpark is the exception:
+        # the model serves it on V2 through its own draft loop.
+        #
+        # VLLM_OMNI_MRV2_NGRAM opts those ngram stages into the MRv2 adapter
+        # (vllm_omni.worker_v2.ngram_adapter): vLLM 0.32+ has a V2 ngram
+        # speculator, and the adapter wires it into vllm-ascend. The flag is
+        # off by default; if the speculator is unavailable the V1 fallback
+        # below still applies.
         use_v2_model_runner = self.use_v2_model_runner
         if use_v2_model_runner and current_omni_platform.is_npu() and self.speculative_config is not None:
             from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
                 talker_kstep_frames,
             )
+            from vllm_omni.worker_v2.ngram_adapter import (
+                MINICPMO_THINKER_ARCH,
+                is_ngram_spec,
+                mrv2_ngram_enabled,
+                resolve_use_v2_model_runner,
+            )
 
             spec = self.speculative_config
-            spec_method = spec.get("method") if isinstance(spec, dict) else getattr(spec, "method", None)
-            if talker_kstep_frames(self.model_stage, spec) == 0 and spec_method != "dspark":
-                use_v2_model_runner = False
+            kstep_frames = talker_kstep_frames(self.model_stage, spec)
+            use_v2_model_runner = resolve_use_v2_model_runner(
+                use_v2_model_runner=use_v2_model_runner,
+                is_npu=True,
+                speculative_config=spec,
+                kstep_frames=kstep_frames,
+                supports_scheduler_ngram=(
+                    self.model_stage == "llm"
+                    and (self.model_arch or model_config.architecture) == MINICPMO_THINKER_ARCH
+                    and self.async_scheduling is False
+                    and self.pipeline_parallel_size == 1
+                    and self.prefill_context_parallel_size == 1
+                    and self.decode_context_parallel_size == 1
+                    and self.kv_transfer_config is None
+                ),
+            )
+            if not use_v2_model_runner:
                 logger.info(
                     "Stage %s: speculative config %r is not servable by the V2 model "
-                    "runner on NPU (only the Talker K-step contract is); using the "
-                    "V1 model runner.",
+                    "runner on NPU; using the V1 model runner.",
                     self.stage_id,
                     self.speculative_config,
+                )
+            elif not kstep_frames and is_ngram_spec(spec) and mrv2_ngram_enabled():
+                logger.info(
+                    "Stage %s: keeping the MRv2 runner for ngram speculation via the V2 ngram speculator adapter.",
+                    self.stage_id,
                 )
 
         omni_config = OmniModelConfig.from_vllm_model_config(

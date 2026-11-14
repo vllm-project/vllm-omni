@@ -290,14 +290,10 @@ platforms:
           # second graph set, so stage 0 keeps the decode-only graph. Stage 1
           # below already ships FULL_DECODE_ONLY with the K-step.
           cudagraph_mode: FULL_DECODE_ONLY
-        # Stage-0 n-gram speculation: MRv2 does not serve ngram on NPU, so the
-        # engine-args gate resolves this stage back to the V1 model runner and
-        # the draft actually runs. async_scheduling is pinned false --
-        # speculation and async scheduling are mutually exclusive (same
-        # contract as stage 1's K-step below). Measured on 910B3, seed-tts en,
-        # mean audio RTF at 32@1 / 64@4 / 128@8: 0.2239 / 0.4762 / 0.7238
-        # without the draft -> 0.1850 / 0.4134 / 0.6363 with it (audio TTFP
-        # -27.4% / -16.6% / -22.5%).
+        # Stage-0 n-gram speculation uses the V1 runner by default.
+        # VLLM_OMNI_MRV2_NGRAM=1 enables scheduler-side Ngram for ordinary
+        # greedy requests on the NPU MRv2 Thinker. The synchronous scheduler
+        # proposes from committed token history and MRv2 verifies on device.
         async_scheduling: false
         speculative_config:
           method: ngram

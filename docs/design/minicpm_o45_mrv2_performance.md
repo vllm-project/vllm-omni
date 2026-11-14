@@ -165,6 +165,14 @@ Duplex sessions keep their own sampler and are not covered, and platforms
 whose profiles fall back to V1 (NPU, XPU, ROCm, MUSA) do not run this path.
 Greedy text can differ from decoding without drafts at near-tied tokens.
 
+On Ascend, the default MiniCPM-o deployment can run its stage-0 `ngram`
+configuration on MRv2 with `VLLM_OMNI_MRV2_NGRAM=1`. The synchronous scheduler
+proposes from committed token history for greedy chat requests, and the NPU
+runner verifies the drafts. Batches containing native duplex requests use
+ordinary decoding so the duplex sampling policy receives one logit per request.
+The default runner selection still uses MRv1 for Thinker Ngram when the opt-in
+is unset or the installed vLLM lacks the MRv2 Ngram interface.
+
 ## Thinker prefix cache with drafts
 
 With a stage-0 `speculative_config` the MRv2 Thinker does not set

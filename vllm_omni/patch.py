@@ -834,3 +834,17 @@ def _patch_mrv2_stop_token_capacity() -> None:
 
 
 _patch_mrv2_stop_token_capacity()
+
+
+def _patch_mrv2_ngram_speculation() -> None:
+    """Opt-in: let the NPU MRv2 (V2) runner serve ngram speculative decoding.
+
+    Off by default; without ``VLLM_OMNI_MRV2_NGRAM`` the PR #10313 V1 fallback
+    stays in force. See ``vllm_omni.worker_v2.ngram_adapter``.
+    """
+    from vllm_omni.worker_v2.ngram_adapter import install_ascend_ngram_patches
+
+    install_ascend_ngram_patches()
+
+
+_patch_mrv2_ngram_speculation()

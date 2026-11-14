@@ -1077,8 +1077,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2_sampling import (
                 MiniCPMO45DuplexSampler,
             )
+            from vllm_omni.worker_v2.ngram_adapter import use_scheduler_ngram
 
-            return MiniCPMO45DuplexSampler(sampler, self), None
+            # Keep the duplex wrapper's output contract. The rejection sampler
+            # verifies ordinary requests using the underlying token sampler.
+            duplex_sampler = MiniCPMO45DuplexSampler(sampler, self)
+            if not use_scheduler_ngram(self.vllm_config):
+                return duplex_sampler, None
+
+            from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+
+            spec = self.vllm_config.speculative_config
+            return duplex_sampler, RejectionSampler(sampler, spec, sampler.req_states.draft_tokens.device)
         # Keep the runner's defaults, including the rejection sampler that
         # verifies draft tokens.
         return None

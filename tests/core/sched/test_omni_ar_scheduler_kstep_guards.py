@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+
 import pytest
 
-from vllm_omni.core.sched.omni_ar_scheduler import _reject_kstep_async_scheduling
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler, _reject_kstep_async_scheduling
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -32,3 +34,27 @@ def test_async_scheduler_allows_unarmed_stage():
             return False
 
     _reject_kstep_async_scheduling(_Scheduler())
+
+
+@pytest.mark.parametrize(("native_duplex", "draft_limit", "expected"), [(False, 2, [1, 2]), (True, 3, [])])
+def test_scheduler_ngram_trims_drafts_before_accounting(native_duplex, draft_limit, expected):
+    scheduler = object.__new__(OmniARScheduler)
+    scheduler.requests = {
+        "chat": SimpleNamespace(resumable=False),
+        "duplex": SimpleNamespace(
+            resumable=False,
+            additional_information={"duplex": {"data_plane": native_duplex}},
+        ),
+    }
+    output = SimpleNamespace(
+        num_scheduled_tokens={"chat": 4, "duplex": 1},
+        total_num_scheduled_tokens=5,
+        scheduled_spec_decode_tokens={"chat": [1, 2, 3]},
+        num_spec_tokens_to_schedule=draft_limit,
+    )
+
+    scheduler._limit_thinker_drafts(output)
+
+    assert output.scheduled_spec_decode_tokens == ({"chat": expected} if expected else {})
+    assert output.num_scheduled_tokens == {"chat": 1 + len(expected), "duplex": 1}
+    assert output.total_num_scheduled_tokens == 2 + len(expected)
