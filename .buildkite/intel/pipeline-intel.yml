@@ -1,22 +1,53 @@
 # .buildkite/intel/pipeline-intel.yml
+#
+# Two mutually exclusive XPU steps. The scope follows the same signals the CUDA
+# weekly/nightly steps use (.buildkite/cuda/test-weekly.yml): a scheduled build
+# that sets NIGHTLY=1, or a PR labelled ``nightly-test``. Every ordinary PR
+# takes the pr scope.
+#
+#   pr     core_model + the mxfp8 config check, one card, ~20min. The only
+#          weights it touches are the tiny CI models.
+#   broad  also advanced_model and omni, which load Qwen3-TTS, Z-Image,
+#          Wan2.1 and Voxtral from the agent's HF cache, ~20min more.
+#
+# Exactly one step runs per build, so the image is built once either way. To
+# get the broad scope on demand: new build with NIGHTLY=1, or label the PR
+# ``nightly-test``.
+common_xpu_env: &common_xpu_env
+  DOCKER_BUILDKIT: "1"
+  # Buildkite will automatically replace this with the actual commit hash
+  VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
+  VLLM_VERSION: "v0.33.0"
+  # The CI image is local-only and the run's trap deletes it, so compressing
+  # its ~37GB of layers only costs test time.
+  EXPORT_COMPRESSION: "uncompressed"
+  # Container test budget; leaves the rest of timeout_in_minutes for the
+  # image build.
+  XPU_TEST_BUDGET: "60m"
+
 steps:
   - group: "INTEL Tests"
     steps:
       - label: "Intel: XPU Test"
+        if: build.env("NIGHTLY") != "1" && !(build.pull_request.labels includes "nightly-test")
         command: "bash .buildkite/intel/scripts/run-xpu-test.sh"
         agents:
           queue: "intel-gpu-omni"
         env:
-          DOCKER_BUILDKIT: "1"
-          # Buildkite will automatically replace this with the actual commit hash
-          VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
-          VLLM_VERSION: "v0.33.0"
-          # The CI image is local-only and the run's trap deletes it, so
-          # compressing its ~37GB of layers only costs test time.
-          EXPORT_COMPRESSION: "uncompressed"
-          # Container test budget; leaves the rest of timeout_in_minutes for
-          # the image build.
-          XPU_TEST_BUDGET: "60m"
+          <<: *common_xpu_env
+          XPU_TEST_SCOPE: "pr"
         priority: 100
         timeout_in_minutes: 80
+        soft_fail: false
+
+      - label: "Intel: XPU Test (broad)"
+        if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
+        command: "bash .buildkite/intel/scripts/run-xpu-test.sh"
+        agents:
+          queue: "intel-gpu-omni"
+        env:
+          <<: *common_xpu_env
+          XPU_TEST_SCOPE: "broad"
+        priority: 100
+        timeout_in_minutes: 100
         soft_fail: false

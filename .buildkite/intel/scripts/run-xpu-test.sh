@@ -107,6 +107,12 @@ HF_MOUNT="/root/.cache/huggingface"
 # build (check the "time docker build" line above when tuning either).
 XPU_TEST_BUDGET="${XPU_TEST_BUDGET:-60m}"
 
+# pr    = core_model + the mxfp8 config check (~20m; the only weights it needs
+#         are the tiny CI models, tiny-random/Qwen-Image and qwen_image_random).
+# broad = also advanced_model and omni, which load full checkpoints (~20m more).
+# Set XPU_TEST_SCOPE=broad on the nightly or a manually triggered build.
+export XPU_TEST_SCOPE="${XPU_TEST_SCOPE:-pr}"
+
 # Container variables below must expand in the container shell.
 # shellcheck disable=SC2016
 time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
@@ -121,6 +127,7 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     -e VLLM_OMNI_LOGGING_LEVEL \
     -e HF_TOKEN \
     -e HF_HUB_OFFLINE \
+    -e XPU_TEST_SCOPE \
     -e ZE_AFFINITY_MASK \
     --name "${container_name}" \
     "${image_name}" \
@@ -166,18 +173,29 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     }
 
     # core_model excludes omni: the async-omni tests carry both markers and
-    # would otherwise run twice, and they need their own process (below).
+    # would otherwise run twice, and they need their own process (broad scope).
     stage "core_model" 30m "${paths[@]}" "${ignore[@]}" \
         -m "core_model and not omni and xpu and B60 and cards_1" --run-level core_model
     stage "mxfp8 config" 2m tests/diffusion/quantization/test_mxfp8_config.py
-    # full_model is excluded: those cases pull tens of GB of weights.
-    stage "advanced_model" 15m "${paths[@]}" "${ignore[@]}" \
-        -m "advanced_model and not full_model and xpu and B60 and cards_1" --run-level core_model
-    # The async-omni engine leaves worker VRAM mapped in the pytest parent, so
-    # a 16 GiB thinker started after the other tests in the same process OOMs.
-    # CUDA splits this test out for the same reason; keep it last and alone.
-    stage "omni" 10m "${paths[@]}" "${ignore[@]}" \
-        -m "omni and xpu and B60 and cards_1" --run-level core_model
+
+    # Everything past this point loads a full checkpoint (Qwen3-TTS, Z-Image,
+    # Wan2.1, Voxtral) from the mounted HF cache and costs about 20 minutes, so
+    # it is off on PRs and runs on the nightly or a manually triggered build
+    # (XPU_TEST_SCOPE=broad).
+    if [ "${XPU_TEST_SCOPE:-pr}" = "broad" ]; then
+        # full_model stays out until the cache is seeded: those cases pull tens
+        # of GB of weights.
+        stage "advanced_model" 15m "${paths[@]}" "${ignore[@]}" \
+            -m "advanced_model and not full_model and xpu and B60 and cards_1" --run-level core_model
+        # The async-omni engine leaves worker VRAM mapped in the pytest parent,
+        # so a 16 GiB thinker started after the other tests in the same process
+        # fails to initialise. CUDA splits this test out for the same reason;
+        # keep it last and alone.
+        stage "omni" 10m "${paths[@]}" "${ignore[@]}" \
+            -m "omni and xpu and B60 and cards_1" --run-level core_model
+    else
+        echo "--- :pytest: skipping advanced_model and omni (XPU_TEST_SCOPE=pr)"
+    fi
 
     exit "${rc}"
 '
