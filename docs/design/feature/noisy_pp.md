@@ -195,6 +195,30 @@ calls `AsyncStreamDecodeJob.cancel()` when a side job is present.
 
 ## NoisyKV
 
+### KV lifecycle boundary
+
+The [AR-Diffusion backend contract](ar_diffusion_kv_backends.md) describes the
+shared preparation/publication, request/history lifetime, and compute-member
+boundaries used by the legacy and Noisy paths. Storage remains backend-specific.
+
+`KVCacheLifecycle[OwnerT]` separates `finish_request(owner)` from
+`release_history(owner)`. Owners are backend-local: a legacy session/branch
+adapter or a Noisy version namespace. The protocol does not require shared
+token, layer or Cell coordinates.
+
+Legacy window/segment commits and Noisy retention select history independently.
+Finishing a request keeps that history and retires temporary execution state;
+releasing history returns pool pages/slots, not their backing tensors. Model
+computation must stop before either operation; storage communication must
+complete before a page or slot is recycled.
+
+Noisy `protect` can declare future products to retain, while `retain_history`
+validates already-resident products. `finish_request` preserves those versions;
+`release_history` rejects active owners and releases finished history. A later
+request may bind the retained namespace using the existing continuation plan
+and absolute chunk positions. `end_request(req, retain=...)` remains the
+compatibility boundary; `retain=()` clears history explicitly.
+
 Implemented in `vllm_omni/experimental/ar_diffusion/kv_cache/noisy.py`
 (`NoisyKVCache` / `NoisyKVState`). Stays experimental; not graduated with
 the plan/executor. Mainline only sees `SupportsNoisyPPKV` on the cell
@@ -212,13 +236,15 @@ remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`
 
 ### Same-Step with a first-chunk clean sink
 
-`Ordering.SAME_STEP` uses a first-chunk clean sink when a request has multiple chunks.
+`Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests and
+persistent single-chunk bootstrap requests.
 The topology stays `S=D`. Chunk 0 runs one extra clean forward on the last
 replica, then its clean KV is distributed once to the readers before later
 chunks start. When the clean successor is on the same rank, the executor carries
 the final latent directly into that pass, without adapter-local latent storage.
-Subsequent chunks use the normal Same-Step schedule. A single-chunk
-request skips the unused clean forward and sink distribution.
+Subsequent chunks use the normal Same-Step schedule. An ephemeral single-chunk
+request skips the unused clean forward and sink distribution; a persistent
+single-chunk request produces and retains it for continuation.
 
 Each chunk reads the fixed clean sink plus its most recent `H` Same-Step
 history chunks, deduplicating chunk 0 while it is in the window. `H=0` keeps
@@ -233,7 +259,7 @@ requires separate validation.
 | `ar_diffusion_stage_config` | `step_replicas` | `S` |
 | | `max_batch_size` | `R` |
 | | `max_history_chunks` | Cap for `H` |
-| Request `extra_args` | `cell_schedule` | CausVidWan: `self_forcing` \| `latest_kv`; Same-Step is schedule-level only |
+| Request `extra_args` | `cell_schedule` | CausVidWan (this stack layer): `self_forcing` \| `latest_kv`. Same-Step is shared plan/executor support only — the CausVidWan parser rejects it until the exposing stack layer lands. |
 | | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (clean scheduling follows the ordering and CellPlan shape) |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML.
@@ -251,7 +277,7 @@ DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
 | Combination | Status |
 | --- | --- |
 | No session + Self-Forcing / Latest-KV | Supported (opt-in; CausVid) |
-| No session + Same-Step | Generic schedule primitive with a clean sink; not exposed by CausVidWan |
+| No session + Same-Step | Supported schedule path with a clean sink; checkpoint quality requires validation |
 | Session + legacy loop | Supported (unchanged) |
 | Session + Cell path | Supported (single active session; see [#9758](https://github.com/vllm-project/vllm-omni/pull/9758)) |
 
