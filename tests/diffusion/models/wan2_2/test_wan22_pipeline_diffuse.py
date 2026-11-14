@@ -16,7 +16,11 @@ from tests.diffusion.attention.test_attention_schedule_candidates import _fake_r
 from vllm_omni.config.stage_config import DiffusionStageRole
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
-from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionScheduleRange,
+    AttentionSigmaWindow,
+    InvalidAttentionScheduleError,
+)
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
     AttentionConfig,
@@ -34,7 +38,12 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context,
 )
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
+    FASTWAN_DMD_SCHEDULER_SHIFT,
+    FASTWAN_DMD_TIMESTEPS,
+    Wan22Pipeline,
+    build_wan_scheduler,
+)
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -83,6 +92,8 @@ class _StubVae(nn.Module):
 class _StubScheduler:
     def __init__(self, timesteps: list[int]) -> None:
         self.timesteps = torch.tensor(timesteps, dtype=torch.int64)
+        # Pipelines read the sigma ladder after set_timesteps.
+        self.sigmas = torch.linspace(1.0, 0.0, len(timesteps) + 1)
         self.config = SimpleNamespace(num_train_timesteps=1000)
         self.set_timesteps_calls: list[tuple[int, torch.device, float | None]] = []
 
@@ -236,6 +247,44 @@ def test_forward_passes_request_shift_without_mutating_scheduler_config(solver: 
         else:
             reference.set_timesteps(5, device="cpu")
         torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("flow_shift", [float("nan"), float("inf")])
+def test_forward_rejects_unusable_sigmas_right_after_set_timesteps(flow_shift: float) -> None:
+    """Under sigma windows, sigmas that a bad flow_shift produces fail this request before its latents are
+    prepared or any denoise forward runs; a valid flow_shift and an unscheduled request are unaffected."""
+    reached: list[str] = []
+
+    def run(shift: float) -> None:
+        # A fresh pipeline per request, so no request inherits the scheduler another one built.
+        pipeline = _make_pipeline()
+
+        def prepare_latents(**kwargs):
+            reached.append("prepare_latents")
+            return torch.zeros((1, 4, 1, 8, 8), dtype=torch.float32)
+
+        def diffuse(**kwargs):
+            reached.append("diffuse")
+            return kwargs["latents"]
+
+        pipeline.prepare_latents = prepare_latents
+        pipeline.diffuse = diffuse
+        sampling = _make_sampling(num_inference_steps=4, extra_args={"sample_solver": "euler", "flow_shift": shift})
+        request = OmniDiffusionRequest(prompt="prompt", request_id="sigma-check", sampling_params=sampling)
+        pipeline.forward(DiffusionRequestBatch(requests=[request]))
+
+    with set_forward_context(), bind_attention_schedule(None, (AttentionSigmaWindow(0.0, 1.0, "p"),)):
+        with pytest.raises(InvalidAttentionScheduleError, match="check flow_shift"):
+            run(flow_shift)
+        assert reached == []
+        run(12.0)
+        assert reached == ["prepare_latents", "diffuse"]
+
+    # Without sigma windows nothing reads the sigmas, so the check does not run.
+    reached.clear()
+    with set_forward_context():
+        run(flow_shift)
+    assert reached == ["prepare_latents", "diffuse"]
 
 
 def test_forward_batches_text_generators_latents_and_splits_outputs() -> None:
@@ -505,24 +554,32 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
     assert torch.equal(result, torch.full_like(latents, 10.0))
 
 
+@pytest.mark.parametrize("kind", ["steps", "sigma"])
 @pytest.mark.parametrize("fail", [False, True], ids=["exit", "exception"])
-def test_diffuse_clears_the_scheduled_step_on_any_exit(fail) -> None:
+def test_diffuse_clears_the_scheduled_step_on_any_exit(fail, kind) -> None:
     pipeline = _make_pipeline()
+    pipeline.scheduler.sigmas = torch.tensor([1.0, 0.5, 0.25, 0.0])
     latents = torch.zeros((1, 1, 1, 2, 2), dtype=torch.float32)
     seen: list[tuple[int | None, float | None, int | None]] = []
+    sigmas_seen: list[float | None] = []
 
     def _fake_predict_noise_maybe_with_cfg(**kwargs):
         context = get_forward_context()
         seen.append((context.denoise_step_idx, context.denoise_timestep, context.total_denoise_steps))
+        sigmas_seen.append(context.denoise_sigma)
         if fail and context.denoise_step_idx == 1:
             raise RuntimeError("forward failed")
         return torch.zeros_like(latents)
 
     pipeline.predict_noise_maybe_with_cfg = _fake_predict_noise_maybe_with_cfg  # type: ignore[method-assign]
     pipeline.scheduler_step_maybe_with_cfg = lambda noise_pred, t, current, cfg: current  # type: ignore[method-assign]
-    schedule = (AttentionScheduleRange(start=1, end=2, profile="candidate"),)
+    if kind == "steps":
+        schedule = (AttentionScheduleRange(start=1, end=2, profile="candidate"),)
+        binding = bind_attention_schedule(schedule, from_request=True)
+    else:
+        binding = bind_attention_schedule(None, (AttentionSigmaWindow(0.0, 0.5, "candidate"),))
 
-    with set_forward_context(), bind_attention_schedule(schedule, from_request=True):
+    with set_forward_context(), binding:
         raises = pytest.raises(RuntimeError, match="forward failed") if fail else nullcontext()
         with raises:
             pipeline.diffuse(
@@ -537,12 +594,20 @@ def test_diffuse_clears_the_scheduled_step_on_any_exit(fail) -> None:
                 attention_kwargs={},
             )
         context = get_forward_context()
-        after = (context.denoise_step_idx, context.denoise_timestep, context.total_denoise_steps)
+        after = (
+            context.denoise_step_idx,
+            context.denoise_timestep,
+            context.total_denoise_steps,
+            context.denoise_sigma,
+        )
 
     # _StubScheduler normalizes by num_train_timesteps=1000.
     published = [(0, pytest.approx(0.007), 3), (1, pytest.approx(0.003), 3), (2, pytest.approx(0.001), 3)]
     assert seen == (published[:2] if fail else published)
-    assert after == (None, None, None)
+    # Sigma windows publish the scheduler noise at each step; step ranges never compute it.
+    expected_sigmas = [1.0, 0.5, 0.25] if kind == "sigma" else [None] * 3
+    assert sigmas_seen == expected_sigmas[: len(seen)]
+    assert after == (None, None, None, None)
 
 
 def test_cache_dit_expert_budgets_follow_each_request_schedule(monkeypatch) -> None:
@@ -836,6 +901,7 @@ def test_runner_rejects_wan_schedule_past_actual_total_before_denoise(monkeypatc
 
 class _StubDMDScheduler:
     def __init__(self) -> None:
+        self.config = SimpleNamespace(num_train_timesteps=1000)
         self.predict_clean_calls: list[tuple[float, float, float]] = []
         self.add_noise_calls: list[tuple[float, float, float]] = []
 
@@ -847,8 +913,13 @@ class _StubDMDScheduler:
         self.add_noise_calls.append((float(clean_sample.mean()), float(noise.mean()), float(timestep)))
         return clean_sample + 10.0
 
+    def sigma_for_timestep(self, timestep, *, device=None):
+        # Off t / 1000 on purpose, so the test sees that the pipeline publishes this value.
+        return torch.tensor(float(timestep) / 1000 - 0.01, device=device)
 
-def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> None:
+
+@pytest.mark.parametrize("scope", ["no-context", "unbound", "disabled", "step-only", "sigma"])
+def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch, scope) -> None:
     pipeline = _make_pipeline()
     pipeline.is_dmd = True
     pipeline.scheduler = _StubDMDScheduler()
@@ -861,18 +932,36 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> N
         lambda *args, **kwargs: torch.full(args[0], 2.0, dtype=kwargs["dtype"]),
     )
 
-    result = pipeline.diffuse(
-        latents=latents,
-        timesteps=timesteps,
-        prompt_embeds=torch.zeros(1, 8),
-        negative_prompt_embeds=None,
-        guidance_low=1.0,
-        guidance_high=1.0,
-        boundary_timestep=None,
-        dtype=torch.float32,
-        attention_kwargs={},
-        generator=torch.Generator(device="cpu").manual_seed(1),
-    )
+    published = []
+
+    def predict(**kwargs):
+        published.append(get_forward_context().denoise_sigma if is_forward_context_available() else None)
+        return torch.ones_like(latents)
+
+    pipeline.predict_noise_maybe_with_cfg = predict
+    with (
+        set_forward_context() if scope != "no-context" else nullcontext(),
+        bind_attention_schedule(None, (AttentionSigmaWindow(0.0, 1.0, "p"),))
+        if scope == "sigma"
+        else (bind_attention_schedule(None, ()) if scope == "disabled" else nullcontext()),
+        bind_attention_schedule((AttentionScheduleRange(0, None, "p"),)) if scope == "step-only" else nullcontext(),
+    ):
+        result = pipeline.diffuse(
+            latents=latents,
+            timesteps=timesteps,
+            prompt_embeds=torch.zeros(1, 8),
+            negative_prompt_embeds=None,
+            guidance_low=1.0,
+            guidance_high=1.0,
+            boundary_timestep=None,
+            dtype=torch.float32,
+            attention_kwargs={},
+            generator=torch.Generator(device="cpu").manual_seed(1),
+        )
+    if scope == "sigma":
+        assert published == pytest.approx([0.99, 0.747, 0.512])
+    else:
+        assert published == [None] * 3
 
     assert pipeline.scheduler.predict_clean_calls == [
         (1.0, 0.0, 1000.0),
@@ -884,6 +973,46 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> N
         (8.0, 2.0, 522.0),
     ]
     torch.testing.assert_close(result, torch.tensor([[[[[17.0]]]]]))
+
+
+def test_diffuse_dmd_publishes_the_grid_sigma_each_real_scheduler_step_uses(monkeypatch) -> None:
+    pipeline = _make_pipeline()
+    pipeline.is_dmd = True
+    pipeline.scheduler = build_wan_scheduler("euler", FASTWAN_DMD_SCHEDULER_SHIFT)
+    used: dict[float, float] = {}
+    sigma_for_timestep = pipeline.scheduler.sigma_for_timestep
+
+    def record(timestep, **kwargs):
+        sigma = sigma_for_timestep(timestep, **kwargs)
+        used[float(timestep)] = float(sigma)
+        return sigma
+
+    pipeline.scheduler.sigma_for_timestep = record  # type: ignore[method-assign]
+    latents = torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32)
+    published = []
+
+    def predict(**kwargs):
+        published.append(get_forward_context().denoise_sigma)
+        return torch.ones_like(latents)
+
+    pipeline.predict_noise_maybe_with_cfg = predict  # type: ignore[method-assign]
+    with set_forward_context(), bind_attention_schedule(None, (AttentionSigmaWindow(0.0, 1.0, "p"),)):
+        pipeline.diffuse(
+            latents=latents,
+            timesteps=torch.tensor(FASTWAN_DMD_TIMESTEPS),
+            prompt_embeds=torch.zeros(1, 8),
+            negative_prompt_embeds=None,
+            guidance_low=1.0,
+            guidance_high=1.0,
+            boundary_timestep=None,
+            dtype=torch.float32,
+            attention_kwargs={},
+            generator=torch.Generator(device="cpu").manual_seed(1),
+        )
+    assert published == [used[t] for t in FASTWAN_DMD_TIMESTEPS]
+    # The grid sigma stays within 3e-4 of t / 1000, the value the earlier version published.
+    for t, sigma in zip(FASTWAN_DMD_TIMESTEPS, published):
+        assert abs(sigma - t / 1000) < 3e-4
 
 
 def _denoise_progress():

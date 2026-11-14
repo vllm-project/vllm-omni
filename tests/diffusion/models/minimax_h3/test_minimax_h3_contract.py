@@ -14,7 +14,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionScheduleRange,
+    InvalidAttentionScheduleError,
+    parse_attention_sigma_schedule,
+)
 from vllm_omni.diffusion.cache.cachedit import CacheDiTRequestSpec, RequestScopedCacheDiTRuntime
 from vllm_omni.diffusion.data import (
     AttentionConfig,
@@ -25,6 +29,8 @@ from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
 from vllm_omni.diffusion.models.minimax_h3.lora import TurboSpec, parse_turbo_filename
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
 from vllm_omni.diffusion.models.minimax_h3.quality_policy import MINIMAX_H3_HIGH_CACHE_KEY, MiniMaxH3QualityPolicy
+from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
+from vllm_omni.diffusion.sampler import SamplingState
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -1178,6 +1184,16 @@ def test_uniform_sigma_schedule_has_one_interval_per_requested_step(num_steps, s
     assert all(current > following for current, following in zip(sigmas, sigmas[1:]))
 
 
+@pytest.mark.parametrize("shift_scale", [2.14, 3.0, 12.0])
+def test_shifted_sigmas_stay_in_0_1_so_the_sampler_accepts_them(shift_scale):
+    """Without the clamp, float32 rounds the first sigma for flow_shift 2.14 to one ulp above 1."""
+    sigmas = minimax_h3_time_shift_sigmas(num_steps=8, shift_scale=shift_scale)
+
+    assert sigmas[0] == 1.0
+    assert all(0.0 <= value <= 1.0 for value in sigmas)
+    SamplingState((torch.zeros(1),), (sigmas,))  # the sampler rejects sigmas outside [0, 1]
+
+
 def test_base_schedule_overrides_the_uniform_sigma_positions():
     from vllm_omni.diffusion.models.minimax_h3.time_request import (
         minimax_h3_time_shift_sigmas,
@@ -1261,7 +1277,13 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     return pipeline
 
 
-def _t2va_batch(num_inference_steps=None, attention_schedule=None, extra_args=None, quality="lossless"):
+def _t2va_batch(
+    num_inference_steps=None,
+    attention_schedule=None,
+    extra_args=None,
+    quality="lossless",
+    attention_sigma_schedule=None,
+):
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -1275,6 +1297,7 @@ def _t2va_batch(num_inference_steps=None, attention_schedule=None, extra_args=No
         num_inference_steps=num_inference_steps,
         extra_args={"task": "t2va", "aspect_ratio": "16:9", **(extra_args or {})},
         attention_schedule=attention_schedule,
+        attention_sigma_schedule=attention_sigma_schedule,
     )
     return DiffusionRequestBatch(
         [
@@ -1405,7 +1428,8 @@ class _RecordingCacheDiTRuntime(RequestScopedCacheDiTRuntime):
         self.prepared.append(spec)
 
 
-def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit(monkeypatch):
+@pytest.mark.parametrize("schedule_kind", ["step", "sigma-request", "sigma-default"])
+def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit(monkeypatch, schedule_kind):
     """A schedule is rejected before Cache-DiT is prepared when the quality plan installs it."""
     _allow_cpu_empty_cache(monkeypatch)
     diffuse_calls: list[dict[str, Any]] = []
@@ -1415,19 +1439,62 @@ def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit(mon
     pipeline._quality_policy = MiniMaxH3QualityPolicy(pipeline.od_config)
     runtime = _RecordingCacheDiTRuntime(pipeline)
     pipeline._cache_dit_runtime = runtime
-    schedule = [{"start": 0, "end": 2, "profile": "sparse"}]
-
+    if schedule_kind == "step":
+        field = "attention_schedule"
+        schedule = [{"start": 0, "end": 2, "profile": "sparse"}]
+    else:
+        field = "attention_sigma_schedule"
+        schedule = [{"low": 0.0, "high": 0.3, "profile": "sparse"}]
+        if schedule_kind == "sigma-default":
+            pipeline.od_config.diffusion_attention_schedule.sigma = parse_attention_sigma_schedule(schedule)
+    request_override = {} if schedule_kind == "sigma-default" else {field: schedule}
     with pytest.raises(InvalidAttentionScheduleError, match="Cache-DiT"):
-        pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=schedule, quality="high"))
+        pipeline.forward(_t2va_batch(num_inference_steps=4, quality="high", **request_override))
     assert runtime.prepared == []
     assert diffuse_calls == []
 
-    # Without a schedule, or with the request disabling it, Cache-DiT is prepared.
-    pipeline.forward(_t2va_batch(num_inference_steps=4, quality="high"))
-    pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=[], quality="high"))
+    # Both explicit and inherited windows must be disabled before installing
+    # request-scoped Cache-DiT. Unbound explicit configurations remain accepted.
+    if schedule_kind != "sigma-default":
+        pipeline.forward(_t2va_batch(num_inference_steps=4, quality="high"))
+    pipeline.forward(_t2va_batch(num_inference_steps=4, quality="high", **{field: []}))
+    count = 1 if schedule_kind == "sigma-default" else 2
     prepared_keys = [None if spec is None else spec.installation_key for spec in runtime.prepared]
-    assert prepared_keys == [MINIMAX_H3_HIGH_CACHE_KEY] * 2
-    assert len(diffuse_calls) == 2
+    assert prepared_keys == [MINIMAX_H3_HIGH_CACHE_KEY] * count
+    assert len(diffuse_calls) == count
+
+
+def test_cache_dit_rejection_names_both_schedule_fields(monkeypatch):
+    """An empty list of one kind keeps the service default of the other, so the Cache-DiT rejection
+    asks for both fields to be emptied, and a request that follows it runs with Cache-DiT."""
+    _allow_cpu_empty_cache(monkeypatch)
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+    pipeline.od_config = _scheduled_od_config()
+    pipeline.od_config.diffusion_attention_schedule.sigma = parse_attention_sigma_schedule(
+        [{"low": 0.0, "high": 0.3, "profile": "sparse"}]
+    )
+    # quality=high resolves to the request-scoped Cache-DiT profile.
+    pipeline._quality_policy = MiniMaxH3QualityPolicy(pipeline.od_config)
+    runtime = _RecordingCacheDiTRuntime(pipeline)
+    pipeline._cache_dit_runtime = runtime
+
+    with pytest.raises(InvalidAttentionScheduleError) as exc_info:
+        pipeline.forward(
+            _t2va_batch(
+                num_inference_steps=4, attention_schedule=[{"start": 0, "end": 2, "profile": "sparse"}], quality="high"
+            )
+        )
+    assert "attention_schedule=[] and attention_sigma_schedule=[]" in str(exc_info.value)
+    with pytest.raises(InvalidAttentionScheduleError, match="Cache-DiT"):
+        pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=[], quality="high"))
+
+    pipeline.forward(
+        _t2va_batch(num_inference_steps=4, attention_schedule=[], attention_sigma_schedule=[], quality="high")
+    )
+    prepared_keys = [None if spec is None else spec.installation_key for spec in runtime.prepared]
+    assert prepared_keys == [MINIMAX_H3_HIGH_CACHE_KEY]
+    assert len(diffuse_calls) == 1
 
 
 @pytest.mark.parametrize(

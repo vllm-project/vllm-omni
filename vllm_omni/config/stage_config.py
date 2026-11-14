@@ -21,6 +21,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.speech_cache import SpeechCacheConfig
+from vllm_omni.config.weight_sharing import WeightSharingConfig, parse_weight_sharing
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -123,6 +124,7 @@ def build_stage_runtime_overrides(
         internal_keys = (internal_blacklist_keys() | SHARED_FIELDS) - deploy_runtime_override_keys()
 
     result: dict[str, Any] = {}
+    stage_overrides: dict[str, Any] = {}
 
     for key, value in cli_overrides.items():
         if value is None or key in internal_keys:
@@ -133,11 +135,13 @@ def build_stage_runtime_overrides(
             override_stage_id = int(match.group(1))
             param_name = match.group(2)
             if override_stage_id == stage_id and param_name not in internal_keys:
-                result[param_name] = value
+                stage_overrides[param_name] = value
             continue
 
         result[key] = value
 
+    # Stage-scoped inputs take precedence regardless of their insertion order.
+    result.update(stage_overrides)
     return result
 
 
@@ -645,6 +649,7 @@ class StageDeployConfig:
     diffusion_use_graph: bool | None = None
     diffusion_graph_release_after_denoise: bool | None = None
     fa_deterministic: bool | None = None
+    enable_cfg_batching: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
     video_output_transport: dict[str, Any] | None = None
@@ -681,6 +686,10 @@ class StageDeployConfig:
     dlo_host_registration_limit_gib: float | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
+    # Mixed-resolution batch packing (MixFusion) server-level defaults.
+    enable_mixfusion: bool | None = None
+    mixfusion_min_chunk_tokens: int | None = None
+    mixfusion_max_chunks: int | None = None
 
     # Modality/service constraints consumed outside the core engine config.
     max_generated_image_size: int | None = None
@@ -869,6 +878,7 @@ class DeployConfig:
 
     # Async chunk's default depends on whether or not the pipeline supports it.
     async_chunk: bool | None = None
+    weight_sharing: WeightSharingConfig | None = None
     session_mode: str = "turn"
     model_runner: Literal["v1", "v2"] = "v1"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
@@ -1135,6 +1145,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     # TODO (Alex): Clean this up, we should not have fallback values here
     kwargs: dict[str, Any] = {
         "speech_cache": SpeechCacheConfig(**speech_cache),
+        "weight_sharing": parse_weight_sharing(raw_dict.get("weight_sharing")),
         "cuda_mps": raw_dict.get("cuda_mps", False),
         "async_chunk": raw_dict.get("async_chunk"),
         "session_mode": raw_dict.get("session_mode", "turn"),
@@ -1249,7 +1260,7 @@ def _apply_platform_overrides(
                 if key in _DEEP_MERGE_KEYS and isinstance(val, dict):
                     base_val = getattr(base, key, None)
                     if isinstance(base_val, dict):
-                        setattr(base, key, {**base_val, **val})
+                        setattr(base, key, _get_recursively_merged_dict(base_val, val))
                         continue
                 setattr(base, key, val)
             else:

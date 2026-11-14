@@ -25,7 +25,7 @@ _PARAMS = [
             ],
         ),
         id="stable_audio_open",
-        marks=hardware_marks(res={"cuda": "L4"}),
+        marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}),
     ),
 ]
 

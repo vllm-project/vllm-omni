@@ -38,6 +38,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
+from vllm_omni.model_executor.models.interfaces import SupportsMRv2MultiFrameDecode
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
@@ -45,6 +46,7 @@ from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
 from vllm_omni.worker_v2.streaming_audio import StreamingAudioSnapshot
+from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
@@ -120,6 +122,18 @@ class OmniARModelRunner(OmniGPUModelRunner):
         self._async_mm_snapshot_pending = [False] * 4
         self._async_mm_snapshot_cursor = 0
         self._last_multimodal_snapshot_slot: int | None = None
+
+    def load_model(self, *args: Any, **kwargs: Any) -> None:
+        super().load_model(*args, **kwargs)
+        if (
+            self.num_speculative_steps > 0
+            and self.is_last_pp_rank
+            and self.rejection_sampler is None
+            and self._kstep_frames == 0
+        ):
+            raise ValueError(
+                "MRv2 AR speculative decoding requires a rejection sampler; check the model's custom sampler"
+            )
 
     def _ensure_kv_transfer_manager(self) -> OmniKVTransferManager:
         if self.kv_transfer_manager is None:
@@ -220,6 +234,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
         text_hidden, multimodal_outputs = self.model_state.postprocess_model_output(
             raw_output, input_batch, self.req_states
         )
+        if getattr(self.model, "postprocess_requires_multimodal_outputs", False):
+            # The raw forward cannot publish this state: make_omni_output()
+            # above creates the current feedback frame.
+            self.model_state.run_postprocess(text_hidden, input_batch, multimodal_outputs)
         prefix_cache_rewrite = self._prefix_cache_save_mrv2(input_batch, text_hidden, multimodal_outputs)
         if bool(getattr(self.model_config, "async_chunk", False)) and multimodal_outputs:
             multimodal_outputs = self._retain_multimodal_outputs(multimodal_outputs)
@@ -394,6 +412,23 @@ class OmniARModelRunner(OmniGPUModelRunner):
     ) -> None:
         """Draft the next step's tokens, as the parent runner's ``sample_tokens`` does."""
         num_spec_tokens = draft.num_spec_tokens
+        if self._kstep_frames > 1:
+            # The placeholders reserve query positions for the next Talker
+            # step. Only rows with confirmed codec state may enter that loop.
+            model = cast(SupportsMRv2MultiFrameDecode, self.model)
+            ready = not any(is_warmup_request(req_id) for req_id in input_batch.req_ids) and (
+                model.kstep_rows_ready(input_batch.req_ids)
+            )
+            buffer = self.req_states.draft_tokens
+            if ready and num_spec_tokens > 0:
+                drafts = buffer.new_full((input_batch.num_reqs, buffer.shape[1]), -1)
+                drafts[:, :num_spec_tokens] = model.kstep_continue_token_id
+                buffer[input_batch.idx_mapping] = drafts
+                drafts = drafts[:, :num_spec_tokens]
+            else:
+                drafts = buffer.new_empty((input_batch.num_reqs, 0))
+            self.draft_tokens_handler.set_draft_tokens(input_batch, drafts)
+            return
         if self.speculator is not None:
             assert self.sampler is not None
             if isinstance(self.speculator, DraftModelSpeculator):
