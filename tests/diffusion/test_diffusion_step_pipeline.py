@@ -1519,6 +1519,9 @@ class _RecordingLoRAManager:
     def set_request_adapter(self, adapter, scale: float = 1.0) -> None:
         self.calls.append((adapter, scale))
 
+    def set_request_adapters(self, adapters, scales=1.0) -> None:
+        self.calls.append((adapters, scales))
+
 
 def _make_step_worker(lora_manager=None, *, expected_output=None):
     """Build a bare DiffusionWorker primed for execute_stepwise tests."""

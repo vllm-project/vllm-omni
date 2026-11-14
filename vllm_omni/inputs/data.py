@@ -343,8 +343,8 @@ class OmniDiffusionSamplingParams:
     return_frames: bool = False
 
     # LoRA
-    lora_request: LoRARequest | None = None
-    lora_scale: float = 1.0
+    lora_request: LoRARequest | list[LoRARequest] | None = None
+    lora_scale: float | list[float] = 1.0
 
     # STA parameters
     STA_param: list | None = None
@@ -480,7 +480,11 @@ class OmniDiffusionSamplingParams:
     def from_dict(cls, params: dict[str, Any]) -> "OmniDiffusionSamplingParams":
         """Reconstruct params from a dict decoded after IPC, handling LoRA."""
         lora_request = params.get("lora_request")
-        if lora_request is not None and not isinstance(lora_request, LoRARequest):
+        if isinstance(lora_request, list):
+            params["lora_request"] = [
+                req if isinstance(req, LoRARequest) else msgspec.convert(req, LoRARequest) for req in lora_request
+            ]
+        elif lora_request is not None and not isinstance(lora_request, LoRARequest):
             params["lora_request"] = msgspec.convert(lora_request, LoRARequest)
         return cls(**params)
 
