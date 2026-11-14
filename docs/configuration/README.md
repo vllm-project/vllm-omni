@@ -16,6 +16,7 @@ For an introduction, see [Pipeline and deploy configurations](./stage_configs.md
 
 ## Memory Configuration
 
+- **[Low-VRAM diffusion preset](./low_vram.md)** - Opt-in FP8, offload, cache policy and VAE tiling composition
 - **[GPU Memory Calculation and Configuration](./gpu_memory_utilization.md)** - Guide on how to calculate memory requirements and set up `gpu_memory_utilization` for optimal performance
 
 ## Optimization Features

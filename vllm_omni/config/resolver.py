@@ -229,6 +229,10 @@ def resolve_omni_config(
             strategy_specs=strategy_specs,
         )
     if structured_config is not None:
+        if normalized_overrides.get("low_vram_preset") is not None and not any(
+            getattr(stage, "diffusion_config", None) is not None for stage in structured_config.stage_configs
+        ):
+            raise ValueError("low_vram_preset requires a diffusion stage; it cannot be applied to a TTS/LLM pipeline")
         return _build_registered_resolution(structured_config)
 
     _apply_generic_stage_overrides(normalized_overrides, stage_overrides)

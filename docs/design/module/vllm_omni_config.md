@@ -98,6 +98,14 @@ Diffusion keeps its existing engine-field ownership and projection surface.
 Shared Python inheritance must not be treated as evidence that an LLM-only
 parallel input is effective for a diffusion stage.
 
+The opt-in diffusion `low_vram_preset` remains unexpanded at ingress so that
+deploy and CLI sources can merge without manufactured overrides. Terminal
+normalization and the diffusion projection expand its unset fields through
+`diffusion/low_vram.py`. Structured stage construction checks the single-GPU
+and sleep restrictions; terminal configuration revalidates the composed
+settings. Architecture discovery also checks the preset's supported pipeline
+and cache combinations. See the [user guide](../../configuration/low_vram.md).
+
 ## Safe-change guide while deferred
 
 Changes should trace every affected producer to its runtime consumer and test

@@ -640,6 +640,7 @@ class StageDeployConfig:
     diffusion_attention_schedule: dict[str, Any] | None = None
 
     # Diffusion execution, cache, and VAE behavior.
+    low_vram_preset: str | None = None
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
     # CUDA graph capture of fixed-shape KV-cache decode steps (Qwen-Image-2.1
