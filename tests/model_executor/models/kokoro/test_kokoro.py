@@ -366,6 +366,27 @@ def test_speed_shortens_durations(network: KokoroNetwork) -> None:
     assert int(fast.sum()) < int(slow.sum())
 
 
+@torch.inference_mode()
+def test_decoder_without_cudnn_scopes_the_flag_to_the_decoder(
+    network: KokoroNetwork, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[bool] = []
+    decoder_forward = network.decoder.forward
+
+    def record(*args, **kwargs):
+        seen.append(torch.backends.cudnn.enabled)
+        return decoder_forward(*args, **kwargs)
+
+    monkeypatch.setattr(network.decoder, "forward", record)
+    input_ids, ref_s = _inputs()
+    default, _ = network(input_ids, ref_s, 1.0, torch.Generator().manual_seed(0))
+    monkeypatch.setattr(network, "decoder_without_cudnn", True)
+    without, _ = network(input_ids, ref_s, 1.0, torch.Generator().manual_seed(0))
+    assert seen == [torch.backends.cudnn.enabled, False]
+    assert torch.backends.cudnn.enabled
+    assert torch.equal(default, without)
+
+
 # ---------------------------------------------------------------------------
 # Generator lifecycle under the AR runner
 # ---------------------------------------------------------------------------
