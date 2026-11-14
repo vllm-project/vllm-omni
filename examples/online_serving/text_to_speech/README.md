@@ -807,6 +807,12 @@ Three model variants exposed via separate checkpoints:
 
 Each variant ships smaller `0.6B` companions where available.
 
+For the three 1.7B variants on a single Ascend 910B3 64GB, see the
+[Ascend 910B3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-TTS-Ascend910B3.md).
+It records the tested vLLM-Omni 0.28.0 commit, image environment, unchanged
+deployment configuration, and verification scope; its measurements do not
+qualify current main.
+
 ### Launch
 
 ```bash
