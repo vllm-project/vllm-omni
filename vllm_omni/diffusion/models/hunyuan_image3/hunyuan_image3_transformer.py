@@ -78,6 +78,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
     begin_scheduled_denoise,
+    check_scheduler_sigmas,
     get_forward_context,
     get_paged_kv_computed_tokens,
     is_forward_context_available,
@@ -2723,19 +2724,21 @@ class HunyuanImage3Text2ImagePipelineOutput(BaseOutput):
 
 @contextmanager
 def _clear_denoise_progress_on_exit():
-    """Clear the published denoise step on any exit and restore the timestep and total seen on entry.
+    """Clear the published denoise step on any exit and restore the timestep, total and sigma seen on entry.
 
-    The denoise loop publishes a timestep and total only when a schedule is bound; without one, the
-    restore assigns the values those fields already hold.
+    The denoise loop publishes a timestep, total and sigma only when a schedule is bound; without one,
+    the restore assigns the values those fields already hold. Wan2.2 uses
+    ``clear_scheduled_denoise_step_on_exit`` instead, which clears the step, total and sigma only
+    for scheduled runs.
     """
     ctx = get_forward_context() if is_forward_context_available() else None
-    previous = (ctx.denoise_timestep, ctx.total_denoise_steps) if ctx is not None else (None, None)
+    previous = (ctx.denoise_timestep, ctx.total_denoise_steps, ctx.denoise_sigma) if ctx is not None else (None,) * 3
     try:
         yield
     finally:
         set_forward_context_denoise_step_idx(None)
         if ctx is not None:
-            ctx.denoise_timestep, ctx.total_denoise_steps = previous
+            ctx.denoise_timestep, ctx.total_denoise_steps, ctx.denoise_sigma = previous
 
 
 class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
@@ -3308,6 +3311,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # Check a bound schedule against the sequence this call runs, before any forward below, including
         # the AR-reuse prefill. None when no schedule is bound, which keeps the step-only publish.
         scheduled_total = begin_scheduled_denoise(len(timesteps))
+        # Bound sigma windows read these scheduler sigmas at every step; reject unusable ones here too.
+        check_scheduler_sigmas(self.scheduler.sigmas)
 
         # Prepare latent variables
         latents = self.prepare_latents(
