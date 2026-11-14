@@ -68,10 +68,12 @@ def test_legacy_trt_env_applies_on_cuda_while_key_is_unset(monkeypatch, warnings
         ("MINICPMO_TOKEN2WAV_TRT_CACHE", " /env/cache ", "token2wav_trt_cache_dir", "cache_dir", "/env/cache"),
     ],
 )
-@pytest.mark.parametrize("unset", [{}, None], ids=["missing", "null"])
-def test_legacy_engine_env_applies_with_trt_on_cuda(monkeypatch, warnings, name, value, key, field, expected, unset):
+@pytest.mark.parametrize("null_key", [False, True], ids=["missing", "null"])
+def test_legacy_engine_env_applies_with_trt_on_cuda(monkeypatch, warnings, name, value, key, field, expected, null_key):
     monkeypatch.setenv(name, value)
-    extra = {"token2wav_trt": True} if unset == {} else {"token2wav_trt": True, key: None}
+    extra: dict[str, object] = {"token2wav_trt": True}
+    if null_key:
+        extra[key] = None
     assert getattr(resolve_token2wav_trt_config(extra, cuda=True), field) == expected
     assert len(warnings) == 1
     assert f"{name} is deprecated and will be removed" in warnings[0]
