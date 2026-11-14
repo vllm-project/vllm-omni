@@ -16,6 +16,7 @@ import torch.nn as nn
 import vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav as batched_token2wav_module
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
+    PromptFeatures,
     _token2wav_sdpa_context,
     plan_token2wav_encode_slices,
     relpos_encode_token_budget,
@@ -194,6 +195,8 @@ class _FakeHiFT(nn.Module):
 
 
 class _FakeToken2Wav:
+    cold_setups: list[tuple[str, str]]
+
     def __init__(self):
         self.flow = _FakeFlow()
         self.hift = _FakeHiFT()
@@ -2695,3 +2698,34 @@ def test_eager_per_request_history_matches_stacked_history():
     peer = actual_rows[1].clone()
     actual_rows[0].zero_()
     assert torch.equal(actual_rows[1], peer)
+
+
+@pytest.mark.parametrize("capacity", [0, 1, 8])
+def test_grouped_reference_setup_preserves_order_and_ownership(capacity):
+    actual = BatchedToken2Wav(_FakeToken2Wav(), setup_cache_size=capacity)
+    expected = BatchedToken2Wav(_FakeToken2Wav(), setup_cache_size=capacity)
+    features = []
+    for i, length in enumerate((2, 3, 2, 2, 3)):
+        features.append(
+            PromptFeatures(
+                (str(i), str(i)),
+                torch.full((1, length), 5 + i, dtype=torch.long),
+                torch.ones(1, 1),
+                torch.ones(1, length + 2, 1) * (i + 1),
+            )
+        )
+    reference = [expected.setup_batch(f, 1)[0] for f in features]
+    result = actual.setup_prompts(features, 2)
+    for a, b in zip(result, reference, strict=True):
+        for field in ("flow_cache", "hift_cache"):
+            for key, x in getattr(a, field).items():
+                torch.testing.assert_close(x, getattr(b, field)[key], rtol=0, atol=0)
+    assert actual.flow.encoder.calls == [2, 1, 2], actual.flow.encoder.calls
+    calls = len(actual.flow.encoder.calls)
+    if capacity == 8:
+        retained = actual.setup_prompts(features, 2)
+        assert len(actual.flow.encoder.calls) == calls
+        assert all(a is b for a, b in zip(retained, result, strict=True))
+    before = result[2].flow_cache["estimator_att_cache"].clone()
+    result[0].flow_cache["estimator_att_cache"].fill_(123)
+    torch.testing.assert_close(result[2].flow_cache["estimator_att_cache"], before, rtol=0, atol=0)

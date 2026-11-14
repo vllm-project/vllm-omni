@@ -805,3 +805,43 @@ def test_configured_waiter_limit_still_defers_above_limit_and_while_busy():
 def test_prefetch_waiter_limit_must_be_positive():
     with pytest.raises(ValueError, match="max_waiters"):
         _prefetch_model(max_waiters=0)
+
+
+def test_placeholder_dedup_and_pins():
+    model, _ = _prefetch_model(capacity=0)
+    model._ref_cpu_prefetch_workers = 4
+    calls = []
+    model.backend.prefetch_prompt_cpu = lambda *args: calls.append(args)
+    model.on_requests_added([_prewarm("a"), _prewarm("a"), _prewarm("b")])
+    assert len(calls) == 2
+    assert model._prefetch_pins["a"] == model._prefetch_pins["b"]
+    entry = next(iter(model._runtime_prompts.values()))
+    assert entry.pins == {"a", "b"} and Path(entry.path).exists()
+    model._drop_prefetch("a")
+    assert entry.pins == {"b"} and Path(entry.path).exists()
+    model._drop_prefetch("b")
+    assert not model._runtime_prompts and not Path(entry.path).exists()
+
+
+def test_prefetch_failure_releases_pin():
+    model, _ = _prefetch_model(capacity=0)
+    model._ref_cpu_prefetch_workers = 4
+
+    def fail(*args):
+        raise RuntimeError("injected")
+
+    model.backend.prefetch_prompt_cpu = fail
+    model.on_requests_added([_prewarm("a")])
+    assert not model._prefetch_queue and not model._prefetch_pins and not model._runtime_prompts
+
+
+def test_cpu_prefetch_is_bounded_by_placeholder_queue():
+    model, _ = _prefetch_model(capacity=0)
+    model._ref_cpu_prefetch_workers = 4
+    calls = []
+    model.backend.prefetch_prompt_cpu = lambda *args: calls.append(args)
+    model.on_requests_added([_prewarm(str(i)) for i in range(40)])
+    assert len(calls) == 32 and len(model._prefetch_queue) == 32
+    for i in range(40):
+        model._drop_prefetch(str(i))
+    assert not model._runtime_prompts
