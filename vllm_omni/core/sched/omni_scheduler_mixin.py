@@ -45,7 +45,9 @@ from vllm_omni.core.sched.output import (
 )
 from vllm_omni.data_entry_keys import (
     ASYNC_CHUNK_PREWARM_NS,
+    JOYAI_FINISH_ON_NEXT_STOP_KEY,
     deserialize_payload,
+    request_flag_is_set,
     returns_stage_payload,
     unflatten_payload,
 )
@@ -61,46 +63,11 @@ logger = init_logger(__name__)
 
 _STATS_INTERVAL_S = 1.0
 _ASYNC_CHUNK_PREWARM_PREFIX = f"{ASYNC_CHUNK_PREWARM_NS}."
-_JOYAI_FINISH_ON_NEXT_STOP = "joyai_finish_on_next_stop"
-_JOYAI_FINISH_ON_NEXT_STOP_DOTTED = f"meta.{_JOYAI_FINISH_ON_NEXT_STOP}"
-
-
-def _flag_is_set(value: object) -> bool:
-    return value is True or value == 1
-
-
-def _info_has_meta_flag(info: object, flag: str, dotted: str) -> bool:
-    """True when ``flag`` is set on a nested ``meta`` dict, a dotted key, or top-level.
-
-    JoyAI stamps ``joyai_finish_on_next_stop`` on the prompt additional_information
-    (top-level) and copies it into Talker ``meta`` for the last sentence. The
-    EngineCore wire may keep either shape after serialize_payload / to_struct.
-    """
-    if isinstance(info, dict):
-        meta = info.get("meta")
-        if isinstance(meta, dict) and _flag_is_set(meta.get(flag)):
-            return True
-        return _flag_is_set(info.get(flag)) or _flag_is_set(info.get(dotted))
-    entries = getattr(info, "entries", None)
-    if not isinstance(entries, dict):
-        return False
-    for key in (dotted, flag):
-        entry = entries.get(key)
-        if entry is not None and _flag_is_set(getattr(entry, "scalar_data", None)):
-            return True
-    return False
+_FINISH_ON_NEXT_STOP_ATTR = f"_{JOYAI_FINISH_ON_NEXT_STOP_KEY}"
 
 
 def _request_finishes_on_next_stop(request: Request) -> bool:
-    return _info_has_meta_flag(
-        getattr(request, "additional_information", None),
-        _JOYAI_FINISH_ON_NEXT_STOP,
-        _JOYAI_FINISH_ON_NEXT_STOP_DOTTED,
-    ) or _info_has_meta_flag(
-        getattr(request, "model_intermediate_buffer", None),
-        _JOYAI_FINISH_ON_NEXT_STOP,
-        _JOYAI_FINISH_ON_NEXT_STOP_DOTTED,
-    )
+    return request_flag_is_set(request, JOYAI_FINISH_ON_NEXT_STOP_KEY)
 
 
 # Upper bound on how long a request may wait for stage input before the
@@ -1229,7 +1196,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                 return
         finishes_on_next_stop = _request_finishes_on_next_stop(request)
         if finishes_on_next_stop:
-            request._joyai_finish_on_next_stop = True
+            setattr(request, _FINISH_ON_NEXT_STOP_ATTR, True)
         existing = self.requests.get(request.request_id)
         if existing is None:
             # Only a fresh prewarm placeholder carries the payload; streaming
@@ -1237,7 +1204,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             self._take_async_chunk_prewarm(request)
         else:
             if finishes_on_next_stop:
-                existing._joyai_finish_on_next_stop = True
+                setattr(existing, _FINISH_ON_NEXT_STOP_ATTR, True)
             if existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
                 adapter = None if getattr(request, "resumable", False) else self._adapter_owing_terminal(existing)
                 if adapter is not None:

@@ -1677,9 +1677,7 @@ class OrchestratorBase:
                     stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
-            final_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
-            if req_state.session_owned and stage_id in final_ids and getattr(output, "finished", False):
-                req_state.routed_final_finished = True
+            self._note_routed_stage_output(stage_id, output, req_state)
 
     async def _handle_stage_error(
         self,
@@ -2117,35 +2115,18 @@ class OrchestratorBase:
         """Bind this poll's ``is_segment_finished`` onto processed outputs.
 
         Duplex intercept must not read a leftover ``streaming.segments[stage].finished``
-        from an earlier sentence park. A real request-end eco (``finish_reason`` set,
-        ``is_segment_finished=False``) wins over a later eco in the same poll so
-        ``RequestOutput.finished`` is not stripped before ``response.done``.
+        from an earlier sentence park. Turn-based requests do not need this.
         """
-        poll_is_segment_finished: dict[str, bool] = {}
-        poll_request_end: set[str] = set()
-        for eco in getattr(raw_outputs, "outputs", ()) or ():
-            rid = getattr(eco, "request_id", None)
-            if not isinstance(rid, str):
-                continue
-            segment_finished = bool(getattr(eco, "is_segment_finished", False))
-            poll_is_segment_finished[rid] = segment_finished
-            if getattr(eco, "finish_reason", None) is not None and not segment_finished:
-                poll_request_end.add(rid)
+        del stage_id, raw_outputs, processed
 
-        for output in processed:
-            rid = getattr(output, "request_id", None)
-            if not isinstance(rid, str):
-                continue
-            this_poll_segment = bool(poll_is_segment_finished.get(rid)) and rid not in poll_request_end
-            setattr(output, "is_segment_finished", this_poll_segment)
-            if rid not in poll_request_end:
-                continue
-            req_state = self.request_states.get(rid)
-            if req_state is None or not req_state.streaming.enabled:
-                continue
-            snap = req_state.streaming.segments.get(stage_id)
-            if snap is not None:
-                snap.finished = False
+    def _note_routed_stage_output(
+        self,
+        stage_id: int,
+        output: object,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Record that a processed output was routed; no-op outside duplex."""
+        del stage_id, output, req_state
 
     async def _apply_raw_terminal_stage_finish(
         self,
@@ -2248,45 +2229,8 @@ class OrchestratorBase:
         req_state: OrchestratorRequestState,
         pool: StagePool,
     ) -> None:
-        """Route a swallowed duplex request-end through the session interceptor.
-
-        Segment parks never reach ``_finish_raw_terminal_requests``. Skip when a
-        processed final output already kept ``finished=True``. Do not put the
-        empty fallback on the client queue and do not cleanup here: the mailbox
-        still has to project ``response.done``.
-        """
-        if req_state.routed_final_finished:
-            return
-        if not pool.final_output:
-            return
-        final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
-        if not final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids):
-            return
-        final_output_type = getattr(pool.stage_client, "final_output_type", None)
-        logger.info(
-            "[Orchestrator] req=%s stage-%s session raw terminal produced no processed "
-            "terminal; routing empty %s output through intercept",
-            request_id,
-            stage_id,
-            final_output_type or "text",
-        )
-        terminal_output = OmniRequestOutput.from_stage_output(
-            _build_terminal_empty_output(
-                request_id,
-                final_output_type=final_output_type,
-                audio_sample_rate=pool._infer_audio_sample_rate(),
-            ),
-            request_id=request_id,
-            finished=True,
-            stage_id=stage_id,
-            final_output_type=final_output_type if isinstance(final_output_type, str) else "audio",
-        )
-        completion = next(iter(terminal_output.outputs or ()), None)
-        mm = getattr(completion, "multimodal_output", None)
-        if mm:
-            terminal_output._multimodal_output = mm
-        setattr(terminal_output, "is_segment_finished", False)
-        await self._route_output(stage_id, replica_id, terminal_output, req_state, None)
+        """Route a swallowed duplex request-end through intercept; no-op outside duplex."""
+        del stage_id, replica_id, request_id, req_state, pool
 
     async def _finish_raw_terminal_requests(
         self,

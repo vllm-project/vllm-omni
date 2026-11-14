@@ -85,8 +85,8 @@ def _holds_payloadless_outputs(model_config: object) -> bool:
 def _streaming_update_replaces_prompt(update_infos: tuple[object, ...]) -> bool:
     """Whether this streaming update is a new utterance, not a prompt extension.
 
-    MiniCPM sets a nested dict ``meta.replace_streaming_prompt``. JoyAI sentence
-    TTS serializes the same flag through ``serialize_payload``, so it arrives as
+    MiniCPM sets a nested dict ``meta.replace_streaming_prompt``. Sentence TTS
+    serializes the same flag through ``serialize_payload``, so it arrives as
     an ``AdditionalInformationPayload`` entry ``meta.replace_streaming_prompt``.
     The dict-only check missed that wire shape and appended the next sentence
     onto leftover Talker codec KV.
@@ -1358,20 +1358,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Capture before resumable stop handling can clear token history.
             num_generation_tokens = _num_generation_tokens(request)
             if stopped:
-                # Last JoyAI sentence: this 2150 is the Code2Wav request terminal.
-                # Mixin copies the flag onto the parked session; also read the
+                # Last sentence: this 2150 is the Code2Wav request terminal.
+                # Mixin copies the stamp onto the parked session; also read the
                 # last sentence's additional_information in case that copy
-                # missed the wire shape. Only this JoyAI key may force a request
+                # missed the wire shape. Only this stamp may force a request
                 # finish — a bare 2150 is still a segment park for other models.
-                stamped = bool(getattr(request, "_joyai_finish_on_next_stop", False))
-                wire = _request_finishes_on_next_stop(request)
-                finish_on_next_stop = stamped or wire
+                finish_on_next_stop = _request_finishes_on_next_stop(request)
                 logger.info(
-                    "[JoyAI] talker 2150 req=%s finish_on_next_stop=%s stamped=%s wire=%s resumable=%s",
+                    "[JoyAI] talker 2150 req=%s finish_on_next_stop=%s resumable=%s",
                     req_id,
                     finish_on_next_stop,
-                    stamped,
-                    wire,
                     getattr(request, "resumable", False),
                 )
                 if finish_on_next_stop:
@@ -1439,7 +1435,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.spec_token_ids = []
                     request._output_token_ids.clear()
                 if finished:
-                    # Last JoyAI sentence: enqueue the vocoder terminal *before*
+                    # Last-sentence terminal: enqueue the vocoder chunk *before*
                     # ``_free_request``. Saving after free drops that chunk
                     # (#6670); Code2Wav then parks on the last segment until the
                     # client times out. Immediate ``save_async``, not

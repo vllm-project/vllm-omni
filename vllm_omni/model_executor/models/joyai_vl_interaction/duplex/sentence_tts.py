@@ -33,6 +33,7 @@ import time
 import regex as re
 from vllm.logger import init_logger
 
+from vllm_omni.data_entry_keys import JOYAI_FINISH_ON_NEXT_STOP_KEY
 from vllm_omni.engine.duplex.plugin import PartialStageForward
 from vllm_omni.entrypoints.openai.speech_text_splitter import SpeechTextSplitter
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import (
@@ -52,7 +53,7 @@ JOYAI_TTS_PARTIAL_KEY = "joyai_tts_partial"
 JOYAI_TTS_CLOSE_ONLY_KEY = "joyai_tts_close_only"
 # Stamped on the last queued sentence so Talker's 2150 is a request terminal
 # (Code2Wav ``finished``) instead of a parked close that never reaches the vocoder.
-JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY = "joyai_finish_on_next_stop"
+JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY = JOYAI_FINISH_ON_NEXT_STOP_KEY
 # CustomVoice speaker rows are deterministic; codec sampling is not. Pin Talker
 # (and its MTP) so each turn starts from the same voice instead of a new RNG.
 JOYAI_TTS_SEED = 0

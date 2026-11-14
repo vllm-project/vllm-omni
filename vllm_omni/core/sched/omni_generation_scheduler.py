@@ -1050,7 +1050,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     # meta.finished. MRv2 native only stamps input_terminal;
                     # a session-owned Code2Wav would otherwise park this stop
                     # as WAITING_FOR_STREAMING_REQ and the client never sees
-                    # response.done (JoyAI last-sentence hang).
+                    # response.done.
                     request.resumable = False
 
             # Validate grammar before terminal cleanup and finish-reason capture.

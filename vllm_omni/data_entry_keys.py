@@ -33,6 +33,45 @@ TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
 # scalars (a dict holding a tensor would come back as a list); the receiving
 # scheduler pops these keys before the request reaches the model.
 ASYNC_CHUNK_PREWARM_NS = "_async_chunk_prewarm"
+# Last-sentence Talker unpark: the next 2150 is Code2Wav's request terminal.
+# Duplex sentence TTS stamps this; independent Qwen3-TTS never does.
+JOYAI_FINISH_ON_NEXT_STOP_KEY = "joyai_finish_on_next_stop"
+
+
+def payload_flag_is_set(info: object, key: str) -> bool:
+    """True when ``key`` is set on nested ``meta``, dotted ``meta.key``, or top-level.
+
+    EngineCore may keep a plain dict or an ``AdditionalInformationPayload`` after
+    serialize_payload / to_struct.
+    """
+    dotted = f"meta.{key}"
+
+    def _truthy(value: object) -> bool:
+        return value is True or value == 1
+
+    if isinstance(info, dict):
+        meta = info.get("meta")
+        if isinstance(meta, dict) and _truthy(meta.get(key)):
+            return True
+        return _truthy(info.get(key)) or _truthy(info.get(dotted))
+    entries = getattr(info, "entries", None)
+    if not isinstance(entries, dict):
+        return False
+    for lookup in (dotted, key):
+        entry = entries.get(lookup)
+        if entry is not None and _truthy(getattr(entry, "scalar_data", None)):
+            return True
+    return False
+
+
+def request_flag_is_set(request: object, key: str) -> bool:
+    """True when ``_{key}`` is on the request or ``key`` is in its serialized info."""
+    if bool(getattr(request, f"_{key}", False)):
+        return True
+    return payload_flag_is_set(getattr(request, "additional_information", None), key) or payload_flag_is_set(
+        getattr(request, "model_intermediate_buffer", None), key
+    )
+
 
 if TYPE_CHECKING:
     from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
