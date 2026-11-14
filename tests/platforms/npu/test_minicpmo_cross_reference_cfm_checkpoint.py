@@ -106,7 +106,7 @@ def test_trained_cfm_long_stream_matches_independent_graphs(
             f"stats={wrapper.stats_snapshot()}, max_graphs={wrapper.max_graphs}, "
             f"cached={len(wrapper._cache)}, unsupported={wrapper._unsupported}, "
             f"batch={kwargs['x'].shape[0]}, query={kwargs['x'].shape[2]}, "
-            f"offsets={[int(row.shape[4]) for row in kwargs['att_cache']] if isinstance(kwargs['att_cache'], list) else None}"
+            f"offsets={[int(row.shape[-2]) for row in kwargs['att_cache']] if isinstance(kwargs['att_cache'], list) else None}"
         )
         accepted.append(int(kwargs["x"].shape[0]))
         return result
@@ -192,7 +192,7 @@ def test_trained_cfm_long_stream_matches_independent_graphs(
                 reference = [(value[1], value[2]) for value in expected]
                 current = next_states
                 if chunk >= (3 if variable_queries else 1):
-                    assert all(value[1].shape[4] == prompt_lengths[row] + 100 for row, value in enumerate(current))
+                    assert all(value[1].shape[-2] == prompt_lengths[row] + 100 for row, value in enumerate(current))
         assert accepted.count(batch) >= 24
         stats = wrapper.stats_snapshot()
         assert stats["hits"] > 0 and stats["flushes"] == 0

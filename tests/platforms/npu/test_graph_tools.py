@@ -223,6 +223,7 @@ def test_code2wav_patch_reads_stage_additional_config(
         "enabled": bool(expected_prepared),
         "max_graphs": max_graphs,
         "enable_whole_euler": True,
+        "npu_fused_qkv_norm": True,
     }
     if expected_prepared:
         graph_runner = code2wav_patch._backend_graph_runners[model.backend]
@@ -271,6 +272,43 @@ def test_code2wav_patch_allows_disabled_bfloat16_attention_cache(monkeypatch, va
     code2wav_patch._patched_build_backend(model)
 
     assert built
+
+
+@pytest.mark.parametrize("value,expected", [(None, True), (True, True), (False, False), ("false", False)])
+def test_code2wav_qkv_norm_config_is_instance_local(monkeypatch, value, expected):
+    from vllm_omni.platforms.npu.models.minicpmo_fused import prepare_estimator
+
+    def build_backend(instance):
+        estimator = SimpleNamespace(blocks=[SimpleNamespace(attn=torch.nn.Identity())])
+        prepare_estimator(estimator, fused_qkv_norm=instance._cfm_graph_config["npu_fused_qkv_norm"])
+        instance.backend = SimpleNamespace(flow=SimpleNamespace(decoder=SimpleNamespace(estimator=estimator)))
+
+    monkeypatch.setattr(code2wav_patch, "_original_build_backend", build_backend)
+    models = []
+    for setting in (value, not expected):
+        model = SimpleNamespace(
+            backend=None,
+            _extra_config=lambda: {},
+            _cfm_graph_config={"enabled": False},
+            vllm_config=SimpleNamespace(additional_config={"code2wav_fused_qkv_norm": setting}),
+        )
+        code2wav_patch._patched_build_backend(model)
+        models.append(model)
+    assert models[0].backend.flow.decoder.estimator.blocks[0].attn._npu_fused_qkv_norm is expected
+    assert models[1].backend.flow.decoder.estimator.blocks[0].attn._npu_fused_qkv_norm is not expected
+
+
+@pytest.mark.parametrize("value", ["off", "typo", 2])
+def test_code2wav_qkv_norm_rejects_invalid_config_before_loading(monkeypatch, value):
+    model = SimpleNamespace(
+        backend=None,
+        _extra_config=lambda: {},
+        vllm_config=SimpleNamespace(additional_config={"code2wav_fused_qkv_norm": value}),
+    )
+    monkeypatch.setattr(code2wav_patch, "_original_build_backend", lambda _: pytest.fail("must not load assets"))
+    with pytest.raises(ValueError, match="code2wav_fused_qkv_norm"):
+        code2wav_patch._patched_build_backend(model)
+    assert model.backend is None
 
 
 @pytest.mark.parametrize("with_cache", [False, True])

@@ -243,3 +243,117 @@ def test_convolution_graph_storage_survives_fused_body_warmup():
         graph.replay()
         torch.npu.synchronize()
         torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("batch,frames", [(2, 50), (4, 100), (8, 300)])
+@pytest.mark.parametrize("affine", [False, True])
+@torch.inference_mode()
+def test_qkv_norm_npu_graph_matches_native(batch, frames, affine):
+    from vllm_omni.model_executor.models.minicpmo_4_5.ops.fused_qkv_layer_norm import (
+        _use_npu_triton,
+        qkv_head_layer_norm,
+    )
+
+    prepare_code2wav_graph_runtime()
+    torch.manual_seed(42)
+    heads, dim, history = 8, 64, 17
+    # Exercise explicit strides, including a cache capacity larger than the live span.
+    qkv = torch.randn(batch, frames, 3 * heads * dim + 16, device="npu")[..., : 3 * heads * dim]
+    kv = torch.randn(2, batch, heads, frames + history + 9, dim, device="npu")[:, :, :, :-9]
+    q_norm = torch.nn.LayerNorm(dim, eps=1e-6, elementwise_affine=affine, device="npu")
+    k_norm = torch.nn.LayerNorm(dim, eps=1e-5, elementwise_affine=affine, device="npu")
+    assert _use_npu_triton(qkv, kv, q_norm, k_norm, dim), "This test must exercise the NPU Triton kernel"
+
+    def run():
+        return qkv_head_layer_norm(qkv, kv, num_heads=heads, head_dim=dim, q_norm=q_norm, k_norm=k_norm)
+
+    run()  # Compile before capture.
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        query = run()
+    for _ in range(2):
+        qkv.normal_()
+        kv.normal_()
+        if affine:
+            for norm in (q_norm, k_norm):
+                norm.weight.uniform_(0.5, 1.5)
+                norm.bias.uniform_(-0.5, 0.5)
+        packed = qkv.view(batch, frames, 3, heads, dim)
+        expected_q = q_norm(packed[:, :, 0].transpose(1, 2))
+        expected_k = k_norm(packed[:, :, 1].transpose(1, 2))
+        expected_v = packed[:, :, 2].transpose(1, 2).clone()
+        old_history = kv[:, :, :, frames:].clone()
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(query, expected_q, atol=2e-5, rtol=2e-5)
+        torch.testing.assert_close(kv[0, :, :, :frames], expected_k, atol=2e-5, rtol=2e-5)
+        torch.testing.assert_close(kv[1, :, :, :frames], expected_v, atol=0, rtol=0)
+        torch.testing.assert_close(kv[:, :, :, frames:], old_history, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize("qkv_bias", [False, True])
+@pytest.mark.parametrize("cached", [0, 17])
+@pytest.mark.parametrize("mask_kind", ["none", "ragged"])
+@torch.inference_mode()
+def test_fused_qkv_attention_npu_graph_preserves_cache_and_mask(monkeypatch, alias, qkv_bias, cached, mask_kind):
+    from vllm_omni.platforms.npu.models import minicpmo_fused
+
+    decoder = pytest.importorskip("cosyvoice2.flow.decoder_dit")
+    prepare_code2wav_graph_runtime()
+    torch.manual_seed(42)
+    batch, frames, heads, dim = 2, 50, 8, 64
+    gap, tail = (13, 9) if mask_kind == "ragged" else (0, 0)
+    attn = decoder.Attention(heads * dim, heads, dim, qkv_bias=qkv_bias, qk_norm=True).npu().eval()
+    x = torch.randn(batch, frames, heads * dim, device="npu")
+    kv = torch.randn(2, batch, heads, frames + cached + gap + tail, dim, device="npu")
+    cache = kv[:, :, :, frames : frames + cached] if cached else None
+    if cache is not None and not alias:
+        cache = cache.clone()
+    mask = None
+    if mask_kind == "ragged":
+        mask = torch.ones(batch, frames, frames + cached + gap, device="npu", dtype=torch.bool)
+        mask[..., frames + cached :] = False
+        mask[1, -3:, :3] = False  # Per-query masks leave other valid keys.
+
+    with npu_token2wav_sdpa_context(require_math=True):
+        monkeypatch.setattr(attn, "_npu_fused_qkv_norm", True, raising=False)
+        minicpmo_fused.attention_npu(attn, x, cache, mask, kv)
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            actual = minicpmo_fused.attention_npu(attn, x, cache, mask, kv)
+        for _ in range(2):
+            x.normal_()
+            kv.normal_()
+            if cache is not None and not alias:
+                cache.normal_()
+            expected_kv = kv.clone()
+            monkeypatch.setattr(attn, "_npu_fused_qkv_norm", False)
+            expected = minicpmo_fused.attention_npu(attn, x, cache, mask, expected_kv)
+            monkeypatch.setattr(attn, "_npu_fused_qkv_norm", True)
+            graph.replay()
+            torch.npu.synchronize()
+            torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+            torch.testing.assert_close(kv, expected_kv, atol=2e-5, rtol=2e-5)
+            assert torch.count_nonzero(kv[:, :, :, frames + cached :]).item() == 0
+
+
+@torch.inference_mode()
+def test_qkv_norm_npu_partial_affine_uses_native():
+    from vllm_omni.model_executor.models.minicpmo_4_5.ops.fused_qkv_layer_norm import (
+        _use_npu_triton,
+        qkv_head_layer_norm,
+    )
+
+    qkv = torch.randn(2, 6, 3 * 8 * 64, device="npu")
+    kv = torch.randn(2, 2, 8, 10, 64, device="npu")
+    q_norm = torch.nn.LayerNorm(64, bias=False, device="npu")
+    k_norm = torch.nn.LayerNorm(64, device="npu")
+    assert not _use_npu_triton(qkv, kv, q_norm, k_norm, 64)
+    packed = qkv.view(2, 6, 3, 8, 64)
+    old_history = kv[:, :, :, 6:].clone()
+    query = qkv_head_layer_norm(qkv, kv, num_heads=8, head_dim=64, q_norm=q_norm, k_norm=k_norm)
+    torch.testing.assert_close(query, q_norm(packed[:, :, 0].transpose(1, 2)))
+    torch.testing.assert_close(kv[0, :, :, :6], k_norm(packed[:, :, 1].transpose(1, 2)))
+    torch.testing.assert_close(kv[1, :, :, :6], packed[:, :, 2].transpose(1, 2), atol=0, rtol=0)
+    torch.testing.assert_close(kv[:, :, :, 6:], old_history, atol=0, rtol=0)
