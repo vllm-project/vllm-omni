@@ -1007,6 +1007,9 @@ def extract_mammoth_moda2_context(
         ar_image_attention_mask,
     )
 
+    context_attention_mask_mode = (
+        "none" if all(seq_len == text_attention_mask.shape[1] for seq_len in encoder_seq_lengths) else "padding"
+    )
     text_hidden_states, img_tokens = module._apply_refiners(
         text_hidden_states,
         text_attention_mask,
@@ -1015,6 +1018,7 @@ def extract_mammoth_moda2_context(
         img_mask,
         noise_rotary_emb,
         temb,
+        context_attention_mask_mode=context_attention_mask_mode,
     )
 
     max_seq_len = max(seq_lengths)
@@ -1025,10 +1029,17 @@ def extract_mammoth_moda2_context(
         joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[i, :encoder_seq_len]
         joint_hidden_states[i, encoder_seq_len : encoder_seq_len + img_len] = img_tokens[i, :img_len]
 
+    attention_mask_mode = "none" if all(seq_len == max_seq_len for seq_len in seq_lengths) else "padding"
     modulated_input = module.layers[0].norm1(joint_hidden_states, temb)[0]
 
     def run_transformer_blocks() -> tuple[torch.Tensor]:
-        h = module._apply_transformer_layers(joint_hidden_states, attention_mask, rotary_emb, temb)
+        h = module._apply_transformer_layers(
+            joint_hidden_states,
+            attention_mask,
+            rotary_emb,
+            temb,
+            attention_mask_mode=attention_mask_mode,
+        )
         return (h,)
 
     def postprocess(h: torch.Tensor) -> torch.Tensor:
