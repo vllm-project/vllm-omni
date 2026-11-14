@@ -32,7 +32,7 @@ from vllm_omni.core.sched.utils import (
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import CONTINUE_TOKEN_ID
-from vllm_omni.worker_v2.ngram_adapter import use_scheduler_ngram
+from vllm_omni.worker_v2.ngram_adapter import is_npu_thinker_ngram, use_scheduler_ngram
 
 logger = init_logger(__name__)
 
@@ -168,6 +168,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._npu_thinker_ngram = is_npu_thinker_ngram(self.vllm_config)
         self._scheduler_ngram: Callable[..., np.ndarray] | None = None
         if use_scheduler_ngram(self.vllm_config):
             from vllm.v1.spec_decode.ngram_proposer import _find_longest_matched_ngram_and_propose_tokens
@@ -731,6 +732,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # mixed batch runs without drafts.
         if any(self._uses_native_duplex_sampler(self.requests[req_id]) for req_id in num_scheduled_tokens):
             draft_limit = 0
+        elif self._scheduler_ngram is None:
+            return
         for req_id, drafts in list(spec_tokens.items()):
             num_dropped = len(drafts) - draft_limit
             if num_dropped <= 0:
@@ -764,7 +767,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         call site in ``schedule()`` below stays as a backstop for a step built
         without booking, where there is no accounting to settle.
         """
-        if getattr(self, "_scheduler_ngram", None) is not None:
+        if getattr(self, "_npu_thinker_ngram", False):
             self._limit_thinker_drafts(scheduler_output)
         self._enforce_kstep_span_uniformity(scheduler_output)
         super()._update_after_schedule(scheduler_output)

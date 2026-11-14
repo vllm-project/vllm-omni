@@ -272,7 +272,7 @@ class TestDeployTopology:
         ("filename", "devices"),
         [("minicpmo_4_5.yaml", ["0", "0", "0"]), ("minicpmo_4_5_npu_2card.yaml", ["0", "0", "1"])],
     )
-    def test_npu_default_keeps_mrv2_without_thinker_drafts(self, filename, devices, monkeypatch):
+    def test_npu_default_uses_mrv2_with_thinker_ngram(self, filename, devices, monkeypatch):
         monkeypatch.setattr(current_omni_platform, "device_name", "npu")
         monkeypatch.setattr(current_omni_platform, "device_type", "npu")
         deploy = load_deploy_config(_DEPLOY_DIR / filename)
@@ -280,7 +280,14 @@ class TestDeployTopology:
 
         assert [stage.yaml_runtime["devices"] for stage in stages] == devices
         assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
-        assert stages[0].yaml_engine_args.get("speculative_config") is None
+        thinker_args = stages[0].yaml_engine_args
+        assert thinker_args["async_scheduling"] is False
+        assert thinker_args["speculative_config"] == {
+            "method": "ngram",
+            "num_speculative_tokens": 7,
+            "prompt_lookup_min": 1,
+            "prompt_lookup_max": 1,
+        }
         assert stages[1].yaml_engine_args["speculative_config"]["method"] == "ngram"
 
     def test_pipeline_exposes_full_and_async_payload_hooks(self) -> None:

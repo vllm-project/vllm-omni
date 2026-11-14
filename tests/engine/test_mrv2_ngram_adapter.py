@@ -43,5 +43,5 @@ def test_ascend_mrv2_thinker_uses_scheduler_drafts(thinker_config):
 
 def test_ascend_mrv2_thinker_rejects_async_ngram(thinker_config):
     thinker_config.scheduler_config.async_scheduling = True
-    with pytest.raises(ValueError, match="synchronous scheduling"):
+    with pytest.raises(ValueError, match="async_scheduling: false"):
         use_scheduler_ngram(thinker_config)

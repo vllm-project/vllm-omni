@@ -24,8 +24,6 @@
         "1200",
         "--init-timeout",
         "1500",
-        "--stage-overrides",
-        "{\"0\":{\"async_scheduling\":false,\"speculative_config\":{\"method\":\"ngram\",\"num_speculative_tokens\":7,\"prompt_lookup_min\":1,\"prompt_lookup_max\":1}}}",
         "--log-stats"
       ]
     },

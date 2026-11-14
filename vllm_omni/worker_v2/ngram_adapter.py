@@ -12,16 +12,24 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
-def use_scheduler_ngram(config: VllmConfig) -> bool:
+def is_npu_thinker_ngram(config: VllmConfig) -> bool:
     spec = config.speculative_config
-    if spec is None or spec.method != "ngram" or config.device_config.device_type != "npu":
-        return False
     model = config.model_config
-    if not (
-        getattr(model, "use_v2_model_runner", False)
+    return (
+        spec is not None
+        and spec.method in ("ngram", "ngram_gpu")
+        and config.device_config.device_type == "npu"
         and getattr(model, "model_stage", None) == "llm"
         and model.architecture == "MiniCPMO45OmniForConditionalGeneration"
-    ):
+    )
+
+
+def use_scheduler_ngram(config: VllmConfig) -> bool:
+    if not is_npu_thinker_ngram(config) or not getattr(config.model_config, "use_v2_model_runner", False):
+        return False
+    spec = config.speculative_config
+    assert spec is not None
+    if spec.method != "ngram":
         return False
 
     parallel = config.parallel_config
@@ -32,7 +40,10 @@ def use_scheduler_ngram(config: VllmConfig) -> bool:
         or parallel.decode_context_parallel_size != 1
         or config.kv_transfer_config is not None
     ):
-        raise ValueError("MiniCPM-o Thinker MRv2 Ngram requires synchronous scheduling without PP, CP, or KV transfer.")
+        raise ValueError(
+            "MiniCPM-o stage 0 speculative_config.method=ngram on Ascend MRv2 requires "
+            "async_scheduling: false and does not support PP, CP, or KV transfer."
+        )
     return True
 
 

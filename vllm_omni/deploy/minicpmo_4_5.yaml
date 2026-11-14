@@ -106,8 +106,7 @@ stages:
     enforce_eager: false
     # Thinker prefix caching stays off here: this profile serves duplex, whose
     # KV window refuses the cache (duplex/window_kv.py). minicpmo_4_5_turn.yaml
-    # enables it for CUDA turn serving on both runners. Stage-0 n-gram
-    # speculation is opt-in on NPU and requires prefix caching disabled.
+    # enables it for CUDA turn serving on both runners.
     enable_prefix_caching: false
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
@@ -263,6 +262,12 @@ platforms:
           # second graph set, so stage 0 keeps the decode-only graph. Stage 1
           # below already ships FULL_DECODE_ONLY with the K-step.
           cudagraph_mode: FULL_DECODE_ONLY
+        async_scheduling: false
+        speculative_config:
+          method: ngram
+          num_speculative_tokens: 7
+          prompt_lookup_min: 1
+          prompt_lookup_max: 1
       - stage_id: 1
         # Concurrency cap raised from 4 to 8; the override block only covered
         # stages 0 and 2, so stage 1 kept the base value of 4.
