@@ -424,6 +424,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         # competes with the thinker's decode on a shared GPU.
         self._ref_prefetch_enabled = read_bool_flag(extra, "token2wav_ref_prefetch", True)
         self._ref_prefetch_setup = read_bool_flag(extra, "token2wav_ref_prefetch_setup", False)
+        self._ref_cpu_prefetch_workers = int(extra.get("token2wav_ref_cpu_prefetch_workers", 0))
+        if self._ref_cpu_prefetch_workers < 0:
+            raise ValueError("token2wav_ref_cpu_prefetch_workers must be >= 0")
         self._ref_prefetch_max_waiters = int(extra.get("token2wav_ref_prefetch_max_waiters", 1))
         if self._ref_prefetch_max_waiters < 1:
             raise ValueError("token2wav_ref_prefetch_max_waiters must be >= 1")
@@ -522,6 +525,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
+        self._ref_setup_batch_size = int(extra.get("ref_setup_batch_size", 1))
+        if self._ref_setup_batch_size < 1:
+            raise ValueError("ref_setup_batch_size must be positive")
         self._initial_batch_size = int(extra.get("code2wav_initial_batch_size", 0))
         if self._initial_batch_size < 0:
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be >= 0")
@@ -1043,6 +1049,13 @@ class MiniCPMO45Code2Wav(nn.Module):
             features.append(prompts[key])
             if states[row] is None:
                 fresh.setdefault(key, []).append(row)
+        if self._ref_setup_batch_size > 1 and fresh:
+            keys = list(fresh)
+            initial = self.backend.setup_prompts([prompts[key] for key in keys], self._ref_setup_batch_size)
+            for key, state in zip(keys, initial, strict=True):
+                for row in fresh[key]:
+                    states[row] = state
+            fresh = {}
         for key, rows in fresh.items():
             self._watchdog.phase(
                 "setup/cfm",
@@ -1635,6 +1648,17 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
                 continue
             self._prefetch_queue[state_id] = _RefPrefetch(ref_audio=ref_audio, sample_rate=sample_rate)
+            workers = getattr(self, "_ref_cpu_prefetch_workers", 0)
+            if workers and ref_audio.device.type == "cpu":
+                try:
+                    cache_key, entry = self._materialize_runtime_prompt(ref_audio, sample_rate)
+                    entry.pins.add(state_id)
+                    self._prefetch_pins[state_id] = cache_key
+                    self.backend.prefetch_prompt_cpu(entry.cache_id, entry.path, workers)
+                    self._trim_runtime_prompts()
+                except Exception:
+                    logger.exception("MiniCPM-o CPU reference prefetch failed for %s", state_id)
+                    self._drop_prefetch(state_id)
 
     @torch.inference_mode()
     def run_idle_prefetch(self) -> bool:

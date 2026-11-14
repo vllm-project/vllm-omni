@@ -571,3 +571,59 @@ Local pre-commit and `git diff --check` passed. No NPU/ROCm hardware, CUDA C32,
 or full repository suite was run for this retention change. Higher retention
 keeps more idle reference features and temporary WAVs; active/pinned ownership
 and the CFM setup-cache capacity are unchanged.
+
+## Seed-TTS experimental optimization bundle
+
+`vllm_omni/deploy/minicpmo_4_5_seedtts_experimental.yaml` reproduces the latest
+CUDA development configuration: Thinker ngram speculation, 16-frame Talker
+K-step, two Code2Wav replicas on one GPU, grouped reference setup of four,
+HiFT continuation shapes 3/43, speaker/S3 graph replay, and Flow FP16.
+The default turn deployment is unchanged. The development runs used private
+CUDA MPS on one L20X; this profile is not qualified for other platforms.
+
+The runtime bundle includes:
+
+- Nonblocking transfer of the initial host codec history to the Talker device.
+- A CUDA single-row FP32 sampler that retains exponential noise generation and
+  division, and fuses argmax with probability validation. Invalid probabilities
+  still feed an asynchronous device assertion. CPU, unsupported layouts/dtypes
+  and widths outside 1–8192 retain native multinomial. Seeded token and generator
+  parity is tested for both eager execution and CUDA graph replay. This CUDA
+  K-step sampling path is active when Triton is available, including with the
+  default deployment; other sampling paths retain their implementation.
+- `ref_setup_batch_size` (default 1): group equal-shaped reference features for
+  encoder/CFM setup, preserve voice order, separate output state ownership and
+  bounded setup-cache retention.
+- `token2wav_ref_cpu_prefetch_workers` (default 0): experimental CPU-only
+  reference extraction with at most 32 pending futures. GPU completion stays on
+  the caller thread. Eviction cancels queued work or waits for an active reader
+  before unlinking its WAV. Non-FP32 default dtype bypasses background work.
+  Four workers regressed the C16 screen, so the shipped experimental profile
+  leaves this option disabled. Worker threads live for the backend lifetime.
+
+The full development evidence and rejected variants are recorded in
+[InferRSI #435](https://github.com/InferMatrixLab/InferRSI/pull/435).
+The unchecked sampler prototype is superseded by the checked implementation;
+unpadded reference processing and batched history commits were rejected and
+are not enabled here. The earlier per-batch CPU thread-pool prototype is
+superseded by the optional bounded prefetch implementation. Initial
+chunk size, idle-prefetch waiter count, capacity and replica-count sweeps use
+existing configuration controls, not additional runtime implementations.
+
+Latest development screen: 64 tuning requests per concurrency, two repetitions,
+with disjoint `2*C` warmup requests. All measured cells completed without request
+failures. Hardware: one L20X (143771 MiB), torch 2.14.0+cu130, vLLM 0.33.0,
+published s3tokenizer 0.3.0. Flow FP16 used the immediately preceding FP32 and
+engine controls from the same allocation; no new paired control was run.
+
+| Mean per-request RTF | C1 | C16 | C32 |
+| --- | ---: | ---: | ---: |
+| Checked sampler + grouped setup, FP32 | 0.06070 | 0.23153 | 0.33311 |
+| Same runtime + Flow FP16 | 0.06069 | 0.23159 | 0.30565 |
+| Independent engine, `b6a6cb1`, `track_s_fast_r16` | 0.06424 | 0.21633 | 0.26031 |
+
+The FP16 C32 result is 8.24% lower than that FP32 control; C16/C32 remain slower
+than the engine. WER, WavLM speaker similarity and UTMOS scores were collected,
+but formal quality non-inferiority and the held-out five-fresh-server-run gate
+remain pending. These tuning results do not establish final service acceptance,
+statistical significance, or an end-to-end gain attributable to every patch.

@@ -514,8 +514,9 @@ class StepAudio2Token2WavCore(nn.Module):
                 )
             return code, code_len
 
-    def _prepare_prompt(self, prompt_wav: str):
-        """Prepare prompt audio for conditioning"""
+    @staticmethod
+    def _prepare_prompt_cpu(prompt_wav: str):
+        """Extract reference features without accessing the accelerator."""
         audio_np_raw, sample_rate = load_audio(prompt_wav, sr=None, mono=True)
         sample_rate = int(sample_rate)
 
@@ -524,29 +525,8 @@ class StepAudio2Token2WavCore(nn.Module):
         audio = torch.from_numpy(audio_16k)
         mels = s3tokenizer.log_mel_spectrogram(audio)
         mels, mels_lens = s3tokenizer.padding([mels])
-        mels_d = _h2d_async(mels, self.device)
-        mels_lens_d = _h2d_async(mels_lens, self.device)
-        if mels.shape[-1] > _S3_MAX_FRAMES:
-            # Long audio (>30 s) keeps the library call: it routes to the
-            # sliding-window mixed-batch path.
-            prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(mels_d, mels_lens_d)
-        else:
-            # Short audio: NPU graph replay of the library's else-branch
-            # (encoder + quantizer.encode). The device-side
-            # `mel_len > max_frames` check is skipped — its `.any()` forces an
-            # implicit D2H sync; the frame count is static on host
-            # (mels.shape[-1]), so the branch decision needs no sync.
-            prompt_speech_tokens, prompt_speech_tokens_lens = self._quantize_s3_graph(mels_d, mels_lens_d)
-
         spk_feat = kaldi.fbank(audio.unsqueeze(0), num_mel_bins=80, dither=0, sample_frequency=16000)
         spk_feat = spk_feat - spk_feat.mean(dim=0, keepdim=True)
-        spk_emb = self._forward_spk_embedding(spk_feat)
-        if self._spk_event is not None:
-            # Device-side join for the private campplus stream (never blocks the
-            # host); it lands here so the host-side 24 kHz mel work overlaps.
-            torch.npu.current_stream(self.device).wait_event(self._spk_event)
-            self._spk_event = None
-
         # 24 kHz branch: mel spectrogram for flow model conditioning
         # Must resample from the ORIGINAL audio, not the 16 kHz version.
         audio_24k = AudioResampler(target_sr=24000).resample(audio_np_raw.astype(np.float32), orig_sr=sample_rate)
@@ -566,6 +546,65 @@ class StepAudio2Token2WavCore(nn.Module):
             .transpose(1, 2)
             .squeeze(0)
         )  # [T, num_mels]
+        return mels, mels_lens, spk_feat, prompt_mel
+
+    def _prepare_prompt(self, prompt_wav: str, *, cpu_features=None):
+        """Prepare prompt audio for conditioning"""
+        if cpu_features is None:
+            audio_np_raw, sample_rate = load_audio(prompt_wav, sr=None, mono=True)
+            sample_rate = int(sample_rate)
+
+            # 16 kHz branch: s3tokenizer + speaker embedding
+            audio_16k = AudioResampler(target_sr=16000).resample(audio_np_raw.astype(np.float32), orig_sr=sample_rate)
+            audio = torch.from_numpy(audio_16k)
+            mels = s3tokenizer.log_mel_spectrogram(audio)
+            mels, mels_lens = s3tokenizer.padding([mels])
+        else:
+            mels, mels_lens, spk_feat, prompt_mel = cpu_features
+        mels_d = _h2d_async(mels, self.device)
+        mels_lens_d = _h2d_async(mels_lens, self.device)
+        if mels.shape[-1] > _S3_MAX_FRAMES:
+            # Long audio (>30 s) keeps the library call: it routes to the
+            # sliding-window mixed-batch path.
+            prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(mels_d, mels_lens_d)
+        else:
+            # Short audio: NPU graph replay of the library's else-branch
+            # (encoder + quantizer.encode). The device-side
+            # `mel_len > max_frames` check is skipped — its `.any()` forces an
+            # implicit D2H sync; the frame count is static on host
+            # (mels.shape[-1]), so the branch decision needs no sync.
+            prompt_speech_tokens, prompt_speech_tokens_lens = self._quantize_s3_graph(mels_d, mels_lens_d)
+
+        if cpu_features is None:
+            spk_feat = kaldi.fbank(audio.unsqueeze(0), num_mel_bins=80, dither=0, sample_frequency=16000)
+            spk_feat = spk_feat - spk_feat.mean(dim=0, keepdim=True)
+        spk_emb = self._forward_spk_embedding(spk_feat)
+        if self._spk_event is not None:
+            # Device-side join for the private campplus stream (never blocks the
+            # host); it lands here so the host-side 24 kHz mel work overlaps.
+            torch.npu.current_stream(self.device).wait_event(self._spk_event)
+            self._spk_event = None
+
+        if cpu_features is None:
+            # 24 kHz branch: mel spectrogram for flow model conditioning
+            # Must resample from the ORIGINAL audio, not the 16 kHz version.
+            audio_24k = AudioResampler(target_sr=24000).resample(audio_np_raw.astype(np.float32), orig_sr=sample_rate)
+            audio_24k_t = torch.from_numpy(audio_24k).unsqueeze(0)  # [1, T]
+            prompt_mel = (
+                mel_spectrogram(
+                    audio_24k_t,
+                    n_fft=1920,
+                    num_mels=80,
+                    sampling_rate=24000,
+                    hop_size=480,
+                    win_size=1920,
+                    fmin=0,
+                    fmax=8000,
+                    center=False,
+                )
+                .transpose(1, 2)
+                .squeeze(0)
+            )  # [T, num_mels]
         prompt_mels = _h2d_async(prompt_mel.unsqueeze(0), self.device)
         # Build on host then async-copy: torch.tensor(..., device=...) is itself
         # a synchronous H2D that blocks behind queued decode work.

@@ -2986,7 +2986,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # The prefill handoff seeds ``codes`` on the host, while the
                 # fused CUDA graph emits ``delta`` on the device. Align them
                 # before concatenating (build 19180 Stage-1 fatal error).
-                old_codes = old_codes.to(delta.device)
+                old_codes = old_codes.to(delta.device, non_blocking=True)
             # Full-width mirror; only the host-side ``_request_codec_history``
             # (flushed one step later) is exact, and it is the one readers use.
             old_codes = old_codes.reshape(-1)[-HISTORY_WINDOW:].to(delta.device)

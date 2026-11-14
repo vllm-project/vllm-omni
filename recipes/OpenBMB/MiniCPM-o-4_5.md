@@ -29,6 +29,24 @@ recommended batching deploy isolates the Thinker on GPU 0 and
 co-locates Talker and Code2Wav on GPU 1; 1-GPU, 3-GPU, and 8x4090 layouts are
 also provided.
 
+## Experimental Seed-TTS profile
+
+For CUDA development experiments, select
+[`minicpmo_4_5_seedtts_experimental.yaml`](../../vllm_omni/deploy/minicpmo_4_5_seedtts_experimental.yaml)
+with `--stage-configs-path`. It places all three stages and two Code2Wav replicas
+on logical GPU 0, enables grouped reference setup and Flow FP16, and disables
+Thinker prefix caching for ngram speculation. Measurements used private CUDA
+MPS and one large-memory L20X; this is not a qualified production preset.
+
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code \
+  --stage-configs-path vllm_omni/deploy/minicpmo_4_5_seedtts_experimental.yaml
+```
+
+See the [performance contract](../../docs/design/minicpm_o45_mrv2_performance.md#seed-tts-experimental-optimization-bundle)
+for controls, results and outstanding quality/performance gates. CPU background
+reference extraction remains disabled because it regressed the C16 screen.
+
 ## References
 
 - Default deploy configs (auto-loaded by HF `model_type=minicpmo` +

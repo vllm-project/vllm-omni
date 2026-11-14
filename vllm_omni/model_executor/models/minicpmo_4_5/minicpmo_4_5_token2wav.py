@@ -119,9 +119,12 @@ class MiniCPMO45Token2wav:
     def speech_window(self) -> torch.Tensor:
         return self._core.speech_window
 
-    def _prepare_prompt(self, prompt_wav: str):
+    def _prepare_prompt_cpu(self, prompt_wav: str):
+        return self._core._prepare_prompt_cpu(prompt_wav)
+
+    def _prepare_prompt(self, prompt_wav: str, *, cpu_features=None):
         """Delegate prompt feature extraction to the wrapped core."""
-        return self._core._prepare_prompt(prompt_wav)
+        return self._core._prepare_prompt(prompt_wav, cpu_features=cpu_features)
 
     def enable_trt_spk_embedding(self, *, cpu_reference: bool = False) -> None:
         """Run the campplus speaker-embedding model on TensorRT."""
