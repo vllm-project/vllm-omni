@@ -144,10 +144,12 @@ class TestPipelineArgumentsHandling:
         assert output.output.image is stub_image
 
     @staticmethod
-    def _make_adapter(backend: str, set_attention_backend):
+    def _make_adapter(backend: str | None, set_attention_backend):
         adapter = DiffusersAdapterPipeline(
             od_config=_make_od_config(
-                diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend=backend)),
+                diffusion_attention_config=AttentionConfig(
+                    default=AttentionSpec(backend=backend) if backend is not None else None
+                ),
             )
         )
         adapter._pipeline = SimpleNamespace(
@@ -221,6 +223,48 @@ class TestPipelineArgumentsHandling:
         adapter._set_attention_backend()
 
         assert calls == ["native"]
+
+    @staticmethod
+    def _patch_platform(monkeypatch, *, rocm: bool, major: int = 9, minor: int = 0):
+        from vllm.platforms.interface import DeviceCapability
+
+        import vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter as adapter_module
+
+        monkeypatch.setattr(
+            adapter_module,
+            "current_omni_platform",
+            SimpleNamespace(
+                is_rocm=lambda: rocm,
+                is_cuda=lambda: not rocm,
+                is_xpu=lambda: False,
+                is_musa=lambda: False,
+                get_device_capability=lambda: DeviceCapability(major, minor),
+            ),
+        )
+
+    @pytest.mark.parametrize("rocm,major,minor", [(False, 9, 0), (False, 10, 0), (True, 9, 4), (True, 11, 5)])
+    @pytest.mark.parametrize(
+        "backend", [None, "FLASH_ATTN", "FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB", "SAGE_ATTN", "TORCH_SDPA", "ASCEND"]
+    )
+    def test_attempted_backends_exist_in_installed_diffusers(self, monkeypatch, rocm, major, minor, backend):
+        # Diffusers renames backends between releases (e.g. "aiter" -> "aiter_fa2_hub");
+        # catch stale names when the diffusers pin is bumped.
+        from diffusers.models.attention_dispatch import AttentionBackendName
+
+        self._patch_platform(monkeypatch, rocm=rocm, major=major, minor=minor)
+        calls: list[str] = []
+
+        def reject_backend(name):
+            calls.append(name)
+            raise RuntimeError(f"{name} rejected")
+
+        adapter = self._make_adapter(backend, reject_backend)
+        try:
+            adapter._set_attention_backend()
+        except (ValueError, RuntimeError):
+            pass
+
+        assert set(calls) <= {b.value for b in AttentionBackendName}
 
     @pytest.mark.parametrize(
         "feature_id",

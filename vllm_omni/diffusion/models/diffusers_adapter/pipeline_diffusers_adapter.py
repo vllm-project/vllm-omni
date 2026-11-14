@@ -362,7 +362,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 attention_backend_attempts.extend(CUDA_FLASH_ATTN_HUB_ATTEMPTS)
             case "FLASH_ATTN" | None:
                 if current_omni_platform.is_rocm():
-                    attention_backend_attempts.append("aiter")
+                    attention_backend_attempts.append("aiter_fa2_hub")
                 elif current_omni_platform.is_xpu():
                     attention_backend_attempts.append("_native_xla")
                 elif current_omni_platform.is_musa():
