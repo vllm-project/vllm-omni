@@ -264,9 +264,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 getattr(self.talker, "mrv2_decode_preprocess_is_identity", False)
             )
             self.logits_vocab_size = int(self.talker.logits_vocab_size)
-            # CUDA K-step fused graph hooks live on the Talker; the runner sees
-            # this wrapper (after cudagraph unwrapping), so delegate them here.
+            # The runner sees this wrapper. The Talker owns codec state and CUDA K-step hooks.
             for hook_name in (
+                "kstep_rows_ready",
+                "prepare_kstep_inputs",
+                "rewrite_kstep_initial_embeds",
+                "flush_cuda_kstep_feedback",
                 "prepare_cuda_kstep",
                 "cuda_kstep_frame",
                 "commit_cuda_kstep",
@@ -1125,6 +1128,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # a step actually runs it is decided per deployment by stage 1's
         # speculative_config (the runner checks its num_spec_tokens for that).
         return self.model_stage == "tts"
+
+    @property
+    def kstep_continue_token_id(self) -> int:
+        return self.talker.kstep_continue_token_id
 
     @property
     def batch_stop_logits(self):
