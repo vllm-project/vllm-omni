@@ -976,6 +976,7 @@ def test_audex_cosyvoice_qwen3_weekly_pr_validation_is_focused(monkeypatch: pyte
     assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"}
     command = "\n".join(step["commands"])
     assert "tests/e2e/offline_inference/test_audex_*) runner=v1" in command
+    assert "tests/e2e/offline_inference/test_cosyvoice3_expansion.py) runner=v1" in command
     assert 'VLLM_OMNI_CI_MODEL_RUNNER="$$runner"' in command
 
     group = next(step for step in doc["steps"] if "Audex CosyVoice and Qwen3-TTS Weekly" in step.get("group", ""))

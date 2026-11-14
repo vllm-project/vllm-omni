@@ -308,10 +308,14 @@ steps:
               tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py
             do
               runner=v2
-              # Audex's CFG/RVQ processors implement vLLM's V1 contract;
-              # its ROCm owner explicitly selects the same runner.
+              # Audex's CFG/RVQ processors implement vLLM's V1 contract.
+              # CosyVoice3's full-weight weekly path also stays on V1: its
+              # vLLM 0.33 V2 sync path can exceed the generic connector wait,
+              # and the async path still sends the obsolete sampling_params
+              # payload field. The ROCm owners exercise the same V1 paths.
               case "$$f" in
                 tests/e2e/offline_inference/test_audex_*) runner=v1 ;;
+                tests/e2e/offline_inference/test_cosyvoice3_expansion.py) runner=v1 ;;
               esac
               VLLM_OMNI_CI_MODEL_RUNNER="$$runner" \
                 pytest -s -v "$$f" -m "slow and L4 and tts" --run-level "full_model" || failed=1
