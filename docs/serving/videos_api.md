@@ -442,6 +442,54 @@ Guide uploads use the same request-scoped temporary storage and cleanup as
 latent-mask editing sources. Models that do not declare timeline-guide support
 reject these fields.
 
+### MiniMax H3 Reference-Video RGB Reuse
+
+For MiniMax H3 `ref2va` requests with video references,
+`extra_params.reference_video_decode_reuse=true` makes the lossless reference
+transcode also write a raw RGB sidecar. Qwen3VL frame sampling and VAE input
+preparation consume those same RGB frames, avoiding a second decode of the
+prepared video. This changes reference preparation, not the model's sampling
+schedule or output format.
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `reference_video_decode_reuse` | boolean | false | Generate reusable RGB alongside prepared reference videos. |
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F 'prompt=Use the person in <Video 1> in a new scene.' \
+  -F 'input_references=@reference.mp4;type=video/mp4' \
+  -F 'seconds=12' -F 'width=480' -F 'height=864' \
+  -F 'extra_params={"task":"ref2va","reference_video_decode_reuse":true}' \
+  -o output.mp4
+```
+
+Offline callers set the same key in `OmniDiffusionSamplingParams.extra_args`.
+Only JSON booleans are accepted: integers, strings and `null` are rejected.
+Setting `true` for another H3 task is rejected; Ref2VA requests without video
+references perform no extra work.
+
+The option is evaluated once per request at the preparation producer. Requests
+with different values can share a server without changing process environment.
+An explicit `true` or `false` overrides the legacy experimental
+`VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE` environment variable. When the request
+omits the option, that variable remains a compatibility fallback (`0`/`1` only);
+with neither set, reuse is disabled.
+
+The sidecar needs `frame_count × height × width × 3` bytes, using the prepared
+reference's dimensions and frame count, not the generated video's dimensions.
+For example, 52 frames at 704×1280 need about 134 MiB in addition to the
+prepared MP4. Files use the request's temporary artifact lifetime and are
+removed during normal cleanup. Account for longer clips and concurrent
+requests when sizing temporary storage. This optimization can reduce
+preprocessing time; it does not guarantee an end-to-end speedup.
+
+Already-prepared reference descriptors retain their producer's data selection:
+consumers use an existing RGB sidecar even if the current request sets the
+option to `false`, and decode the prepared video for legacy descriptors without
+one. Missing or incorrectly sized sidecars fail validation; consumers do not
+silently fall back to a different decode path.
+
 ### MiniMax H3 Continuation Across Requests
 
 A MiniMax H3 job can continue a previous job's clip so picture and sound carry

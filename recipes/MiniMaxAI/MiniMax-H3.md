@@ -110,6 +110,30 @@ outputs were byte-identical and full decode passed. This is evidence for host
 CPU response encoding. Actual gains depend on the CPU and runtime, and should
 not be interpreted as GPU, DiT, or stage 0 speedups.
 
+## Optional reference-video RGB reuse
+
+For Ref2VA video references, set the request's
+`extra_params.reference_video_decode_reuse` to `true` to reuse RGB from the
+lossless preparation transcode for both Qwen3VL sampling and VAE input:
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F 'prompt=Use the person in <Video 1> in a new scene.' \
+  -F 'input_references=@reference.mp4;type=video/mp4' \
+  -F 'seconds=12' -F 'width=480' -F 'height=864' \
+  -F 'extra_params={"task":"ref2va","reference_video_decode_reuse":true}' \
+  -o output.mp4
+```
+
+The default is off. Set the request field to `false` to opt out, including when
+the legacy `VLLM_OMNI_H3_REF_VIDEO_DECODE_REUSE=1` environment fallback is set.
+Offline sampling uses `extra_args` with the same key. This setting creates
+temporary raw RGB storage: 52 prepared frames at 704×1280 need about 134 MiB.
+Size local temporary storage for the actual reference dimensions and concurrent
+requests; local preprocessing gains do not imply an end-to-end speedup.
+See [the Videos API contract](../../docs/serving/videos_api.md#minimax-h3-reference-video-rgb-reuse)
+for validation, legacy-environment precedence and already-prepared descriptors.
+
 ## Start a server
 
 Pass the repository ID directly. The pipeline uses `FL2VA` for model discovery
