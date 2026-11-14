@@ -570,8 +570,6 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         *,
         prepare_only: bool = False,
     ) -> DiffusionOutput | dict[str, Any]:
-        # TODO: In online mode, sometimes it receives [{"prompts": None}, {...}], so cannot use .get("...", "")
-        # TODO: May be some data formatting operations on the API side. Hack for now.
         prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
 
         max_hw = int(self.bagel.max_latent_size * self.bagel.latent_downsample)
