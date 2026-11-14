@@ -25,7 +25,10 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
 from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
-from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.omni_scheduler_mixin import (
+    OmniSchedulerMixin,
+    _request_finishes_on_next_stop,
+)
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
@@ -41,6 +44,7 @@ class _ChunkSaveKwargs(TypedDict, total=False):
     confirmed_num_computed_tokens: int | None
     duplex_perf_chunk: tuple[int, int]
     segment_generation: int | None
+    force_request_finished: bool
 
 
 def _should_emit_engine_output(
@@ -76,6 +80,32 @@ def _holds_payloadless_outputs(model_config: object) -> bool:
     return bool(getattr(model_config, "final_output", False)) and (
         getattr(model_config, "engine_output_type", None) == "audio"
     )
+
+
+def _streaming_update_replaces_prompt(update_infos: tuple[object, ...]) -> bool:
+    """Whether this streaming update is a new utterance, not a prompt extension.
+
+    MiniCPM sets a nested dict ``meta.replace_streaming_prompt``. Sentence TTS
+    serializes the same flag through ``serialize_payload``, so it arrives as
+    an ``AdditionalInformationPayload`` entry ``meta.replace_streaming_prompt``.
+    The dict-only check missed that wire shape and appended the next sentence
+    onto leftover Talker codec KV.
+    """
+    for info in update_infos:
+        if isinstance(info, dict):
+            meta = info.get("meta")
+            if isinstance(meta, dict) and meta.get("replace_streaming_prompt") is True:
+                return True
+            if info.get("meta.replace_streaming_prompt") is True:
+                return True
+            continue
+        entries = getattr(info, "entries", None)
+        if not isinstance(entries, dict):
+            continue
+        entry = entries.get("meta.replace_streaming_prompt")
+        if entry is not None and getattr(entry, "scalar_data", None) is True:
+            return True
+    return False
 
 
 class SampledLogprobContractError(RuntimeError):
@@ -1096,6 +1126,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             stopped = sampling_validation_failed
             is_segment_finished = False
             finished = False
+            finish_on_next_stop = False
+            enqueued_finish_on_next_stop = False
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
@@ -1184,6 +1216,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Capture before resumable stop handling can clear token history.
             num_generation_tokens = _num_generation_tokens(request)
             if stopped:
+                # Last sentence: this 2150 is the Code2Wav request terminal.
+                # Mixin copies the stamp onto the parked session; also read the
+                # last sentence's additional_information in case that copy
+                # missed the wire shape. Only this stamp may force a request
+                # finish — a bare 2150 is still a segment park for other models.
+                finish_on_next_stop = _request_finishes_on_next_stop(request)
+                logger.info(
+                    "[JoyAI] talker 2150 req=%s finish_on_next_stop=%s resumable=%s",
+                    req_id,
+                    finish_on_next_stop,
+                    getattr(request, "resumable", False),
+                )
+                if finish_on_next_stop:
+                    request.resumable = False
                 if self.chunk_transfer_adapter is not None:
                     confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
                 if (
@@ -1247,6 +1293,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.spec_token_ids = []
                     request._output_token_ids.clear()
                 if finished:
+                    # Last-sentence terminal: enqueue the vocoder chunk *before*
+                    # ``_free_request``. Saving after free drops that chunk
+                    # (#6670); Code2Wav then parks on the last segment until the
+                    # client times out. Immediate ``save_async``, not
+                    # ``batch_saves``: the batch flush runs after this loop.
+                    if finish_on_next_stop and self.chunk_transfer_adapter is not None and not omits_chunk_transfer:
+                        save_kwargs: _ChunkSaveKwargs = {
+                            "new_token_ids": new_token_ids,
+                            "confirmed_num_computed_tokens": confirmed_num_computed_tokens,
+                            "force_request_finished": True,
+                        }
+                        perf_chunk = OmniSchedulerMixin._duplex_step_chunk(self, scheduler_output, req_id)
+                        if isinstance(perf_chunk, tuple):
+                            save_kwargs["duplex_perf_chunk"] = perf_chunk
+                        self.chunk_transfer_adapter.save_async(
+                            inter_stage_output,
+                            request,
+                            is_segment_finished,
+                            **save_kwargs,
+                        )
+                        enqueued_finish_on_next_stop = True
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1331,6 +1398,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if (
                 self.chunk_transfer_adapter is not None
                 and not omits_chunk_transfer
+                and not enqueued_finish_on_next_stop
                 and (
                     inter_stage_output is not None
                     or (new_token_ids and requires_token_updates)
@@ -1620,13 +1688,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         session.mm_features.extend(update.mm_features)
                 self._finish_streaming_session_update(session, update)
                 return
-        replace_streaming_prompt = any(
-            isinstance(info, dict)
-            and isinstance(info.get("meta"), dict)
-            and info["meta"].get("replace_streaming_prompt") is True
-            for info in update_infos
-        )
-        if replace_streaming_prompt:
+        if _streaming_update_replaces_prompt(update_infos):
             self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
             return

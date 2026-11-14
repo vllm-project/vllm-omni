@@ -29,7 +29,12 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
-from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
+from vllm_omni.core.sched.omni_ar_scheduler import (
+    OmniARAsyncScheduler,
+    OmniARScheduler,
+    _streaming_update_replaces_prompt,
+)
+from vllm_omni.data_entry_keys import serialize_payload
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
@@ -123,16 +128,25 @@ def _make_talker_adapter(
     *,
     max_model_len: int = 100,
     recompute_on_capacity: bool = True,
+    receives_chunks: bool = False,
+    segment_finished_requests: set[str] | None = None,
+    requests_num_chunks_sent: dict[str, int] | None = None,
+    replaced_streaming_prompt_ids: set[str] | None = None,
+    requests_with_ready_chunks: set[str] | None = None,
 ) -> OmniChunkTransferAdapter:
     adapter = OmniChunkTransferAdapter.__new__(OmniChunkTransferAdapter)
-    adapter.receives_chunks = False
+    adapter.receives_chunks = receives_chunks
     adapter._max_model_len = max_model_len
     adapter._streaming_prompt_previous_chunks = 1
     adapter._streaming_prompt_recompute_on_capacity = recompute_on_capacity
     adapter._streaming_condition_lengths = {}
     adapter._streaming_condition_seqs = {}
-    adapter.segment_finished_requests = set()
-    adapter.requests_num_chunks_sent = {}
+    adapter.segment_finished_requests = set() if segment_finished_requests is None else segment_finished_requests
+    adapter.requests_num_chunks_sent = {} if requests_num_chunks_sent is None else requests_num_chunks_sent
+    if replaced_streaming_prompt_ids is not None:
+        adapter.replaced_streaming_prompt_ids = replaced_streaming_prompt_ids
+    if requests_with_ready_chunks is not None:
+        adapter.requests_with_ready_chunks = requests_with_ready_chunks
     return adapter
 
 
@@ -847,12 +861,90 @@ def test_stage0_window_open_start_falls_back_to_the_context_reserve_when_unset()
     assert plan["replacement_prompt_len"] == 22
 
 
+def _joyai_sentence_payload(*, replace: bool) -> object:
+    """Wire shape ``joyai_action_to_tts`` actually sends after serialize_payload."""
+    info: dict[str, object] = {
+        "task_type": ["CustomVoice"],
+        "language": ["Auto"],
+        "speaker": ["Vivian"],
+        "instruct": [""],
+        "text": ["此诚危急存亡之秋也。"],
+    }
+    if replace:
+        info["meta"] = {
+            "replace_streaming_prompt": True,
+            "replace_runtime_additional_information": True,
+            "talker_prefill_offset": 0,
+            "talker_text_offset": 0,
+        }
+        info["embed"] = {"prefill": []}
+        info["hidden_states"] = {"trailing_text": []}
+    return serialize_payload(info)
+
+
+def _parked_talker_after_first_sentence() -> Request:
+    """Talker after sentence-1 2150: prompt zeros plus leftover codec KV."""
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.prompt_token_ids = [0] * 40
+    session._all_token_ids.clear()
+    session._all_token_ids.extend(session.prompt_token_ids)
+    session._output_token_ids.clear()
+    session.append_output_token_ids([100, 101, 2150])
+    session.num_prompt_tokens = 40
+    session.num_computed_tokens = 43
+    return session
+
+
+def test_serialized_joyai_meta_is_a_replace_flag() -> None:
+    payload = _joyai_sentence_payload(replace=True)
+    assert _streaming_update_replaces_prompt((None, payload)) is True
+    assert _streaming_update_replaces_prompt((None, _joyai_sentence_payload(replace=False))) is False
+    assert _streaming_update_replaces_prompt(({"meta.replace_streaming_prompt": True}, None)) is True
+
+
+def test_joyai_serialized_payload_replaces_talker_codec_instead_of_appending() -> None:
+    """Sentence 2 must not keep sentence 1's 2150 in the Talker prompt.
+
+    The production wire has no nested dict ``meta``: only a flattened
+    AdditionalInformationPayload. The old isinstance(dict) check missed it.
+    """
+    sched = _make_scheduler(stage_id=1)
+    sched.chunk_transfer_adapter = _make_talker_adapter()
+    session = _parked_talker_after_first_sentence()
+    update = _make_update([0] * 44)
+    update.additional_information = _joyai_sentence_payload(replace=True)
+    update.model_intermediate_buffer = None
+
+    sched._update_request_as_session(session, update)
+
+    assert list(session.prompt_token_ids) == [0] * 44
+    assert list(session._all_token_ids) == [0] * 44
+    assert 2150 not in session.prompt_token_ids
+    assert 100 not in session._all_token_ids
+    assert session.num_computed_tokens == 0
+    assert session.num_prompt_tokens == 44
+    sched._free_request_blocks.assert_called_once_with(session)
+
+
+def test_talker_update_without_replace_flag_keeps_old_codec() -> None:
+    """Control: streaming-input append is unchanged when the flag is absent."""
+    sched = _make_scheduler(stage_id=1)
+    sched.chunk_transfer_adapter = _make_talker_adapter()
+    session = _parked_talker_after_first_sentence()
+    update = _make_update([0] * 44)
+    update.additional_information = _joyai_sentence_payload(replace=False)
+    update.model_intermediate_buffer = None
+
+    sched._update_request_as_session(session, update)
+
+    assert 2150 in session.prompt_token_ids or 100 in session.prompt_token_ids or 101 in session.prompt_token_ids
+    sched._free_request_blocks.assert_not_called()
+
+
 def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
     sched = _make_scheduler(stage_id=1)
-    sched.chunk_transfer_adapter = SimpleNamespace(
-        receives_chunks=False,
-        segment_finished_requests=set(),
-    )
+    sched.chunk_transfer_adapter = _make_talker_adapter()
     session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     update = _make_update([10, 20])
@@ -881,9 +973,7 @@ def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
 def test_explicit_model_intermediate_prompt_replacement_releases_cache_and_watermark() -> None:
     sched = _make_scheduler(stage_id=1)
     session = _make_request()
-    sched.chunk_transfer_adapter = SimpleNamespace(
-        receives_chunks=False,
-        segment_finished_requests=set(),
+    sched.chunk_transfer_adapter = _make_talker_adapter(
         requests_num_chunks_sent={session.external_req_id: 59},
     )
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
@@ -1213,7 +1303,7 @@ def test_ready_async_chunk_prompt_replacement_releases_stale_kv_once() -> None:
     session.spec_token_ids = [-1, -1]
     sched.requests = {session.request_id: session}
     sched._inflight_prefills.add(session)
-    sched.chunk_transfer_adapter = SimpleNamespace(
+    sched.chunk_transfer_adapter = _make_talker_adapter(
         replaced_streaming_prompt_ids={session.request_id},
         requests_with_ready_chunks={session.request_id},
         requests_num_chunks_sent={session.external_req_id: 4090},
@@ -1253,7 +1343,7 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
     sched.kv_holding_waiting = queue(session)
     sched.deferred_waiting = set()
     sched.num_waiting_for_streaming_input = 1
-    sched.chunk_transfer_adapter = SimpleNamespace(
+    sched.chunk_transfer_adapter = _make_talker_adapter(
         receives_chunks=True,
         segment_finished_requests={session.request_id},
     )
@@ -1286,7 +1376,7 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(session_mode=session_mode))
     sched.num_waiting_for_streaming_input = 1
-    sched.chunk_transfer_adapter = SimpleNamespace(
+    sched.chunk_transfer_adapter = _make_talker_adapter(
         receives_chunks=receives_chunks,
         segment_finished_requests={session.request_id},
     )

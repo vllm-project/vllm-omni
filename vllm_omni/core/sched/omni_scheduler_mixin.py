@@ -45,7 +45,9 @@ from vllm_omni.core.sched.output import (
 )
 from vllm_omni.data_entry_keys import (
     ASYNC_CHUNK_PREWARM_NS,
+    JOYAI_FINISH_ON_NEXT_STOP_KEY,
     deserialize_payload,
+    request_flag_is_set,
     returns_stage_payload,
     unflatten_payload,
 )
@@ -62,6 +64,12 @@ logger = init_logger(__name__)
 
 _STATS_INTERVAL_S = 1.0
 _ASYNC_CHUNK_PREWARM_PREFIX = f"{ASYNC_CHUNK_PREWARM_NS}."
+_FINISH_ON_NEXT_STOP_ATTR = f"_{JOYAI_FINISH_ON_NEXT_STOP_KEY}"
+
+
+def _request_finishes_on_next_stop(request: Request) -> bool:
+    return request_flag_is_set(request, JOYAI_FINISH_ON_NEXT_STOP_KEY)
+
 
 # Upper bound on how long a request may wait for stage input before the
 # scheduler force-fails it.  Defends against stuck consumer-side requests when
@@ -1326,16 +1334,22 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                 super().add_request(request)
                 self.finish_requests([request.request_id], RequestStatus.FINISHED_ERROR)
                 return
+        finishes_on_next_stop = _request_finishes_on_next_stop(request)
+        if finishes_on_next_stop:
+            setattr(request, _FINISH_ON_NEXT_STOP_ATTR, True)
         existing = self.requests.get(request.request_id)
         if existing is None:
             # Only a fresh prewarm placeholder carries the payload; streaming
             # updates re-add a live id and are left untouched.
             self._take_async_chunk_prewarm(request)
-        elif existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-            adapter = None if getattr(request, "resumable", False) else self._adapter_owing_terminal(existing)
-            if adapter is not None:
-                self._finish_parked_streaming_session(existing, adapter)
-                return
+        else:
+            if finishes_on_next_stop:
+                setattr(existing, _FINISH_ON_NEXT_STOP_ATTR, True)
+            if existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                adapter = None if getattr(request, "resumable", False) else self._adapter_owing_terminal(existing)
+                if adapter is not None:
+                    self._finish_parked_streaming_session(existing, adapter)
+                    return
         super().add_request(request)
 
     def _take_async_chunk_prewarm(self, request: Request) -> None:
@@ -1399,13 +1413,23 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         Sender ownership starts when the first chunk is queued, before the
         background thread initializes its chunk counter. A prewarmed receiver
         needs a terminal even if that first chunk has not been sent yet.
-        Final stages never queue sends, so they never match.
+
+        A 2150 segment stop may already have dropped the sender token. The
+        producer stage still owes that terminal; ``has_active_sender`` alone
+        would abort a parked close with no ``finished`` chunk, and the
+        downstream vocoder waits until the client times out. Receiver-only
+        final stages never queue sends, so they never match.
         """
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is None:
             return None
         external_req_id = getattr(request, "external_req_id", None) or request.request_id
-        return adapter if adapter.has_active_sender(external_req_id) else None
+        if adapter.has_active_sender(external_req_id):
+            return adapter
+        sends = getattr(adapter, "custom_process_next_stage_input_func", None) is not None
+        if getattr(adapter, "receives_chunks", False) and not sends:
+            return None
+        return adapter
 
     def _finish_parked_streaming_session(self, request: Request, adapter: OmniChunkTransferAdapter) -> None:
         """End a parked async-chunk session with a downstream terminal chunk."""

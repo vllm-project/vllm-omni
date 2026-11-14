@@ -95,7 +95,7 @@ from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
 from vllm_omni.tracing import RequestTrace
 
 if TYPE_CHECKING:
-    from vllm_omni.engine import OmniEngineCoreOutput
+    from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
     from vllm_omni.engine.stage_client import StagePoolClient
 
 logger = init_logger(__name__)
@@ -319,9 +319,14 @@ class OrchestratorRequestState:
     # Per-request pipeline timing accumulator (milliseconds)
     pipeline_timings: dict[str, float] = field(default_factory=dict)
     # A session-owned request's lifetime belongs to a session (duplex), not to
-    # its own ``finished`` flag: no synthetic terminal, no client emission of
-    # stage-0 segment ends, no terminal re-forward, no cleanup on finish.
+    # its own ``finished`` flag: no synthetic terminal on the client queue, no
+    # client emission of stage-0 segment ends, no terminal re-forward, no
+    # cleanup on finish. A swallowed final-stage request-end is routed through
+    # intercept instead of ``output_async_queue``.
     session_owned: bool = False
+    # Final-stage processed output kept ``finished=True`` through intercept.
+    # Session raw-terminal fallback must not emit a second empty done.
+    routed_final_finished: bool = False
     # Duplex sentence TTS already submitted this output. Do not also run the
     # legacy full-text handoff for the same stage result.
     skip_legacy_stage_forward: bool = False
@@ -1180,6 +1185,7 @@ class OrchestratorBase:
             processed = [
                 output for output in processed if getattr(output, "request_id", None) not in reported_session_errors
             ]
+        self._stamp_poll_segment_finished(stage_id, raw_outputs, processed)
 
         if self._stat_logger is not None and (raw_outputs.scheduler_stats is not None or iteration_stats is not None):
             self._stat_logger.record(
@@ -1683,6 +1689,7 @@ class OrchestratorBase:
                     stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
+            self._note_routed_stage_output(stage_id, output, req_state)
 
     async def _handle_stage_error(
         self,
@@ -2114,6 +2121,25 @@ class OrchestratorBase:
             self._shared_requests.finish(cleanup_ids, aborted=abort or trace_error is not None)
         return abort_outputs
 
+    def _stamp_poll_segment_finished(
+        self, stage_id: int, raw_outputs: OmniEngineCoreOutputs, processed: list[RequestOutput]
+    ) -> None:
+        """Bind this poll's ``is_segment_finished`` onto processed outputs.
+
+        Duplex intercept must not read a leftover ``streaming.segments[stage].finished``
+        from an earlier sentence park. Turn-based requests do not need this.
+        """
+        del stage_id, raw_outputs, processed
+
+    def _note_routed_stage_output(
+        self,
+        stage_id: int,
+        output: object,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Record that a processed output was routed; no-op outside duplex."""
+        del stage_id, output, req_state
+
     async def _apply_raw_terminal_stage_finish(
         self,
         stage_id: int,
@@ -2207,6 +2233,17 @@ class OrchestratorBase:
         )
         return True
 
+    async def _finish_session_owned_raw_terminal(
+        self,
+        stage_id: int,
+        replica_id: int,
+        request_id: str,
+        req_state: OrchestratorRequestState,
+        pool: StagePool,
+    ) -> None:
+        """Route a swallowed duplex request-end through intercept; no-op outside duplex."""
+        del stage_id, replica_id, request_id, req_state, pool
+
     async def _finish_raw_terminal_requests(
         self,
         stage_id: int,
@@ -2218,7 +2255,10 @@ class OrchestratorBase:
 
         for request_id in request_ids:
             req_state = self.request_states.get(request_id)
-            if req_state is None or req_state.session_owned:
+            if req_state is None:
+                continue
+            if req_state.session_owned:
+                await self._finish_session_owned_raw_terminal(stage_id, replica_id, request_id, req_state, pool)
                 continue
             if req_state.trace is not None:
                 req_state.trace.finish_stage(stage_id)
@@ -3597,7 +3637,13 @@ class OrchestratorBase:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-                downstream_resumable = bool(getattr(entry_request, "resumable", req_state.streaming.enabled))
+                # Turn-commit duplex (JoyAI/AURA) submits a non-resumable Stage0,
+                # but Code2Wav must stay parked across Talker 2150 so later
+                # sentences can reuse this prewarmed request. MiniCPM-style
+                # Stage0 is already resumable; turn-based HTTP is not session-owned.
+                downstream_resumable = bool(
+                    getattr(entry_request, "resumable", req_state.streaming.enabled) or req_state.session_owned
+                )
                 # Session-owned and resumable requests keep their downstream
                 # request across turns, so they stay on the chunk-0 path.
                 if attach_prewarm_payload and not req_state.session_owned and not downstream_resumable:

@@ -16,7 +16,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
 from vllm_omni.core.sched.duplex_stage_work import parse_perf_chunk, request_perf_chunk, set_request_perf_chunk
-from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.data_entry_keys import JOYAI_FINISH_ON_NEXT_STOP_KEY, MetaStruct, OmniPayloadStruct, unflatten_payload
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..connectors.shm_connector import SharedMemoryConnector
@@ -251,9 +251,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
+        if value is None:
+            return False
         if isinstance(value, torch.Tensor):
             return value.numel() == 1 and bool(value.item())
-        return bool(value) if value is not None else False
+        # Wire decode of a 0-d bool tensor can land as a 1-element list.
+        # ``bool([False])`` is True, so recurse instead of treating any
+        # non-empty container as finished.
+        if isinstance(value, (list, tuple)):
+            return len(value) == 1 and OmniChunkTransferAdapter._is_truthy_scalar(value[0])
+        return bool(value)
 
     @staticmethod
     def _confirmed_num_computed_tokens(request: Request) -> int:
@@ -730,7 +737,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         existing_sub = info.get(key)
                         merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
                         for sk, sv in value.items():
-                            if key == "meta" and sk == "finished":
+                            # Incremental chunks keep an earlier meta.finished
+                            # (diffusion and generation tests rely on this).
+                            # A request-terminal generation chunk must publish
+                            # finished=True: Code2Wav reads it from
+                            # additional_information, not from the adapter flag.
+                            if (
+                                key == "meta"
+                                and sk == "finished"
+                                and not (payload_finished and self.model_mode == "generation")
+                            ):
                                 continue
                             merged_sub[sk] = sv
                         info[key] = merged_sub
@@ -750,12 +766,35 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # Preserve an explicit scheduler boundary even when it
                     # contains no new codec frames.
                     request.prompt_token_ids = [0]
+                elif (
+                    not has_new_ids
+                    and payload_finished
+                    and not use_tensor_codes
+                    and self._is_truthy_scalar(meta.get(JOYAI_FINISH_ON_NEXT_STOP_KEY))
+                ):
+                    # Last-sentence empty finished marker after frames were
+                    # already sent. The Talker processor stamps this on meta;
+                    # leaving prompt_token_ids=[] parks Code2Wav in
+                    # WAITING_FOR_CHUNK. Independent Qwen3 never stamps it, so
+                    # it keeps [] and the existing pending_finish path. 2-D
+                    # empty windows (Fish Omni / Drama 3) stay [] via
+                    # use_tensor_codes.
+                    request.prompt_token_ids = [0]
                 if not has_new_ids and not payload_finished and not payload_segment_finished:
                     # The base recv loop treats False as "not ready yet" and
                     # requeues the request. Do not mark an empty non-terminal
                     # chunk as ready, otherwise Stage1 can consume before the
                     # first DAC frame arrives.
                     return False
+                if payload_finished or payload_segment_finished:
+                    logger.info(
+                        "[chunk] recv req=%s finished=%s segment=%s empty=%s resumable=%s",
+                        req_id,
+                        payload_finished,
+                        payload_segment_finished,
+                        not has_new_ids,
+                        getattr(request, "resumable", False),
+                    )
                 self._refresh_generation_chunk_prefill_state(request)
 
             # Mark as finished for consumption

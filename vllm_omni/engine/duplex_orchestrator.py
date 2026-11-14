@@ -45,15 +45,19 @@ from vllm_omni.engine.messages import EngineQueueMessage, OutputMessage
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
+    _build_terminal_empty_output,
     build_engine_core_request_from_tokens,
 )
 from vllm_omni.engine.stage_pool import StageUnavailableError
+from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.tracing import RequestTrace
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
     from vllm.outputs import RequestOutput
 
+    from vllm_omni.engine import OmniEngineCoreOutputs
+    from vllm_omni.engine.stage_pool import StagePool
     from vllm_omni.metrics.stats import StageRequestStats
 
 logger = init_logger(__name__)
@@ -228,11 +232,18 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             # Session gone: nothing may forward or reach a client.
             return True
         segment = req_state.streaming.segment(stage_id)
-        # A codec segment stop is not the utterance. Leave RequestOutput.finished
-        # for the real stop (is_segment_finished is false on that poll).
-        if req_state.streaming.enabled and segment.finished and getattr(output, "finished", False):
+        # A codec segment stop is not the utterance. Clear RequestOutput.finished
+        # only when THIS poll is a segment park. Leave it for a real request-end
+        # (is_segment_finished is false on that poll), including when
+        # streaming.segments still holds a leftover True from an earlier sentence.
+        poll_segment_finished = getattr(output, "is_segment_finished", None)
+        if poll_segment_finished is None:
+            poll_segment_finished = bool(req_state.streaming.enabled and segment.finished)
+        else:
+            poll_segment_finished = bool(poll_segment_finished)
+        if req_state.streaming.enabled and poll_segment_finished and getattr(output, "finished", False):
             output.finished = False
-        finished = bool(getattr(output, "finished", False)) or (req_state.streaming.enabled and segment.finished)
+        finished = bool(getattr(output, "finished", False)) or (req_state.streaming.enabled and poll_segment_finished)
         transcript = self.plugin.user_transcript(
             stage_id=stage_id,
             output=output,
@@ -330,6 +341,100 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         # ErrorMessage. Close a resident session before another append can recreate
         # its finished stage request without the model's voice/persona prefill.
         return await self._handle_forward_failure(req_state.request_id, stage_id, req_state, RuntimeError(error))
+
+    def _stamp_poll_segment_finished(
+        self, stage_id: int, raw_outputs: OmniEngineCoreOutputs, processed: list[RequestOutput]
+    ) -> None:
+        """Bind this poll's ``is_segment_finished`` onto processed outputs.
+
+        Intercept must not read a leftover ``streaming.segments[stage].finished``
+        from an earlier sentence park. A real request-end eco (``finish_reason`` set,
+        ``is_segment_finished=False``) wins over a later eco in the same poll so
+        ``RequestOutput.finished`` is not stripped before ``response.done``.
+        """
+        poll_is_segment_finished: dict[str, bool] = {}
+        poll_request_end: set[str] = set()
+        for eco in getattr(raw_outputs, "outputs", ()) or ():
+            rid = getattr(eco, "request_id", None)
+            if not isinstance(rid, str):
+                continue
+            segment_finished = bool(getattr(eco, "is_segment_finished", False))
+            poll_is_segment_finished[rid] = segment_finished
+            if getattr(eco, "finish_reason", None) is not None and not segment_finished:
+                poll_request_end.add(rid)
+
+        for output in processed:
+            rid = getattr(output, "request_id", None)
+            if not isinstance(rid, str):
+                continue
+            this_poll_segment = bool(poll_is_segment_finished.get(rid)) and rid not in poll_request_end
+            setattr(output, "is_segment_finished", this_poll_segment)
+            if rid not in poll_request_end:
+                continue
+            req_state = self.request_states.get(rid)
+            if req_state is None or not req_state.streaming.enabled:
+                continue
+            snap = req_state.streaming.segments.get(stage_id)
+            if snap is not None:
+                snap.finished = False
+
+    def _note_routed_stage_output(
+        self,
+        stage_id: int,
+        output: object,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        final_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+        if req_state.session_owned and stage_id in final_ids and getattr(output, "finished", False):
+            req_state.routed_final_finished = True
+
+    async def _finish_session_owned_raw_terminal(
+        self,
+        stage_id: int,
+        replica_id: int,
+        request_id: str,
+        req_state: OrchestratorRequestState,
+        pool: StagePool,
+    ) -> None:
+        """Route a swallowed duplex request-end through the session interceptor.
+
+        Segment parks never reach ``_finish_raw_terminal_requests``. Skip when a
+        processed final output already kept ``finished=True``. Do not put the
+        empty fallback on the client queue and do not cleanup here: the mailbox
+        still has to project ``response.done``.
+        """
+        if req_state.routed_final_finished:
+            return
+        if not pool.final_output:
+            return
+        final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+        if not final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids):
+            return
+        final_output_type = getattr(pool.stage_client, "final_output_type", None)
+        logger.info(
+            "[Orchestrator] req=%s stage-%s session raw terminal produced no processed "
+            "terminal; routing empty %s output through intercept",
+            request_id,
+            stage_id,
+            final_output_type or "text",
+        )
+        terminal_output = OmniRequestOutput.from_stage_output(
+            _build_terminal_empty_output(
+                request_id,
+                final_output_type=final_output_type,
+                audio_sample_rate=pool._infer_audio_sample_rate(),
+            ),
+            request_id=request_id,
+            finished=True,
+            stage_id=stage_id,
+            final_output_type=final_output_type if isinstance(final_output_type, str) else "audio",
+        )
+        completion = next(iter(terminal_output.outputs or ()), None)
+        mm = getattr(completion, "multimodal_output", None)
+        if mm:
+            terminal_output._multimodal_output = mm
+        setattr(terminal_output, "is_segment_finished", False)
+        await self._route_output(stage_id, replica_id, terminal_output, req_state, None)
 
     async def _handle_forward_failure(
         self,

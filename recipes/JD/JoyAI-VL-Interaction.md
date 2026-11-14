@@ -68,10 +68,11 @@ camera frame. A silent decision completes the response with empty output. A spok
 decision produces text and audio, followed by `response.done`. Playback acknowledgements,
 `response.cancel`, `session.close`, and reconnect use the shared Session lifecycle.
 
-This first profile runs observations sequentially. Incoming frames can be buffered
-while an answer is being generated. The Talker streams codec frames to Code2Wav,
-so speech audio is delivered chunk by chunk while synthesis continues. Prompts
-retain up to four recent camera frames (thumbnail size at most 448×448) and eight
+This first profile runs observations sequentially. JoyAI's action text is projected
+as it is generated, so the assistant transcript appears while the answer is still
+being produced. The Talker streams codec frames to Code2Wav, so speech audio is
+delivered chunk by chunk while synthesis continues. Incoming frames can be buffered
+while an answer is being generated. Prompts retain up to four recent camera frames (thumbnail size at most 448×448) and eight
 recent text messages. Older history/frames are evicted when the expanded
 visual-token count plus the generation budget would exceed the configured
 JoyAI-stage context limit. The active instruction and newest frame are retained;
@@ -406,7 +407,6 @@ all-sync. It currently does not include:
 - continuous frame sessions, persistent standing instructions, or session memory;
 - full-duplex interaction or barge-in;
 - background Agent execution for delegated questions;
-- async-chunk support from Talker to Code2Wav;
 - integration with the existing WebUI.
 
 For actions with spoken text, the Talker starts only after the complete JoyAI action is
@@ -414,6 +414,34 @@ available, and Code2Wav starts only after the Talker completes. Silence actions 
 TTS stages and return an empty audio output with zero samples. All three stages are placed
 on GPU 0 by the provided
 [`deploy config`](../../vllm_omni/deploy/joyai_vl_interaction.yaml).
+
+### Duplex profile: streamed text, per-sentence speech, chunked codec
+
+The duplex overlay ([`joyai_vl_interaction_duplex.yaml`](../../vllm_omni/deploy/joyai_vl_interaction_duplex.yaml))
+adds three streaming behaviors on top of the request-scoped path above, all of them
+gated by the deploy-level `async_chunk` flag:
+
+- **Action text is projected while it is generated.** The JoyAI stage runs with DELTA
+  output, so the assistant transcript reaches the client before the answer is complete.
+  Text that may still grow into an action marker (`</res`, `</deleg`) is held back.
+- **The Talker starts per sentence.** `joyai_action_to_tts` receives one confirmed
+  sentence at a time through `plan_partial_stage_output`; later sentences wait until the
+  Talker parks on codec EOS (2150), then the next one is submitted as a resumable update
+  on the same request id. The last sentence is followed by a close-only sentinel so
+  Code2Wav finishes instead of aborting a parked request.
+- **Codec frames stream into Code2Wav.** The Talker→Code2Wav edge uses
+  `talker2code2wav_async_chunk`, so audio is delivered chunk by chunk as the Talker
+  decodes rather than after the whole utterance.
+
+`async_chunk: false` turns all three off and returns the deployment to the one-shot
+behavior described above: single text projection at the segment boundary, FINAL_ONLY
+JoyAI/Talker stages, and a full-payload Code2Wav decode. The two settings are not
+independent — per-sentence handoff needs a prewarmed, connector-fed Code2Wav, so the
+plugin disables it whenever the edge is off.
+
+Silence actions still skip both TTS stages and return an empty audio output with zero
+samples. Playback acknowledgements, `response.cancel`, `session.close` and reconnect use
+the shared Session lifecycle.
 
 ### Audio input: opt-in native ASR profile
 

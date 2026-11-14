@@ -1023,21 +1023,24 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.num_computed_tokens -= num_tokens_scheduled
             elif self.chunk_transfer_adapter is not None and getattr(self, "_supports_pending_generation", False):
                 self.chunk_transfer_adapter.mark_chunk_consumed(req_id)
+            async_chunk_transport = self._async_chunk_transport_enabled()
+            input_terminal = (
+                self._input_execution_is_terminal(request.request_id, scheduler_output)
+                if async_chunk_transport
+                else False
+            )
             if (
                 request.status == RequestStatus.FINISHED_ERROR
                 or request.status == RequestStatus.FINISHED_STOPPED
                 or (
-                    not self._async_chunk_transport_enabled()
+                    not async_chunk_transport
                     and not generation_pending
                     and request.num_computed_tokens >= request.num_prompt_tokens
                 )
                 or (
-                    self._async_chunk_transport_enabled()
+                    async_chunk_transport
                     and not generation_pending
-                    and self._input_execution_is_terminal(
-                        request.request_id,
-                        scheduler_output,
-                    )
+                    and input_terminal
                     and request.num_computed_tokens >= len(request.prompt_token_ids)
                 )
             ):
@@ -1046,6 +1049,13 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Optional: set a stop_reason for front-end clarity
                 # (does not affect protocol)
                 stopped = True
+                if self._native_data_plane is True and input_terminal:
+                    # V1 ChunkTransferAdapter recv sets resumable=False on
+                    # meta.finished. MRv2 native only stamps input_terminal;
+                    # a session-owned Code2Wav would otherwise park this stop
+                    # as WAITING_FOR_STREAMING_REQ and the client never sees
+                    # response.done.
+                    request.resumable = False
 
             # Validate grammar before terminal cleanup and finish-reason capture.
             if OmniSchedulerMixin._reject_invalid_grammar_tokens(self, request, new_token_ids):
@@ -1062,6 +1072,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if prefill_stats is not None:
                     prefill_stats.finalize(self.kv_cache_manager.estimate_cached_tokens(request))
 
+            handle_stopped_finished = None
             if stopped:
                 if (
                     self.aux_output_connector is not None
@@ -1070,6 +1081,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     routed_experts = self.aux_output_connector.take_output(request, aux_output)
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
+                handle_stopped_finished = finished
                 is_segment_finished = not finished
                 if finished and self._native_data_plane:
                     self._pending_data_plane_terminal_req_ids.add(req_id)
@@ -1089,6 +1101,22 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     stopped_preempted_reqs.add(request)
                 else:
                     stopped_running_reqs.add(request)
+
+            if async_chunk_transport:
+                logger.info(
+                    "[JoyAI] code2wav stop req=%s stopped=%s handle_stopped_finished=%s "
+                    "is_segment_finished=%s resumable=%s pending=%s terminal=%s "
+                    "computed=%s prompt=%s",
+                    req_id,
+                    stopped,
+                    handle_stopped_finished,
+                    is_segment_finished,
+                    getattr(request, "resumable", False),
+                    generation_pending,
+                    input_terminal,
+                    request.num_computed_tokens,
+                    len(request.prompt_token_ids),
+                )
 
             # Extract sample logprobs if needed.
             if request.sampling_params is not None and request.sampling_params.num_logprobs is not None and logprobs:
@@ -1129,9 +1157,20 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request in stopped_running_reqs or request.is_finished():
                 continue
             request.status = RequestStatus.FINISHED_STOPPED
+            if self._native_data_plane is True:
+                # Native pending_finish is the empty last codec window after
+                # upstream meta.finished. Same V1 recv contract as above.
+                request.resumable = False
             finish_reason = request.get_finished_reason()
             finished = self._handle_stopped_request(request)
             is_segment_finished = not finished
+            logger.info(
+                "[JoyAI] code2wav pending_finish req=%s handle_stopped_finished=%s is_segment_finished=%s resumable=%s",
+                request.request_id,
+                finished,
+                is_segment_finished,
+                getattr(request, "resumable", False),
+            )
             kv_transfer_params = None
             ec_transfer_params = None
             if finished:
