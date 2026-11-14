@@ -116,11 +116,18 @@ class AudexAdapter(ARTTSAdapter):
             raise ValueError("Audex CFG requires a request id")
         stage0_params = sampling_params_list[0]
         sampling_params_list[0] = self._inject_audex_cfg_pair_args(
-            request_id=request_id, prompt=prompt, stage0_params=stage0_params
+            request_id=request_id,
+            prompt=prompt,
+            stage0_params=stage0_params,
+            explicit_temperature=(
+                request.temperature is not None or (request.extra_params or {}).get("temperature") is not None
+            ),
         )
         return apply_max_new_tokens(sampling_params_list, request)
 
-    def _inject_audex_cfg_pair_args(self, request_id: str, prompt: Any, stage0_params: Any) -> Any:
+    def _inject_audex_cfg_pair_args(
+        self, request_id: str, prompt: Any, stage0_params: Any, *, explicit_temperature: bool = False
+    ) -> Any:
         """Complete the Audex CFG contract on a CLONE of the stage-0 params.
 
         The adapter validated ``cfg_scale``; here (where the final request id
@@ -162,6 +169,8 @@ class AudexAdapter(ARTTSAdapter):
         # Guided decoding sharpens the distribution; the unguided default
         # temperature (0.1) adds excess sampling noise under CFG. Measured
         # on the en-24 gate corpus at cfg 1.5: temp 0.1 -> CER 7.31%,
-        # temp 0.05 -> CER 6.87% (unguided baseline 7.24%).
-        stage0_params.temperature = 0.05
+        # temp 0.05 -> CER 6.87% (unguided baseline 7.24%). A caller-supplied
+        # temperature wins over this tuned default.
+        if not explicit_temperature:
+            stage0_params.temperature = 0.05
         return stage0_params
