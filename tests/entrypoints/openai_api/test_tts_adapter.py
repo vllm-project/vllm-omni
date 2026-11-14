@@ -764,6 +764,23 @@ def test_moss_get_processor_places_audio_tokenizer_on_codec_stage_device(mocker)
     audio_tokenizer.to.assert_called_once()
 
 
+def test_moss_v15_delay_processor_uses_native_loader(mocker):
+    model_id = "OpenMOSS-Team/MOSS-TTS-v1.5"
+    adapter = _moss_adapter_with_stage_configs([], mocker)
+    adapter.engine_client.model_config.model = model_id
+    adapter._moss_variant = "tts"
+    processor = object()
+    native_loader = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.moss_tts.get_class_from_dynamic_module")
+    native_loader.return_value.from_pretrained.return_value = processor
+    auto_loader = mocker.patch("transformers.AutoProcessor.from_pretrained")
+
+    assert adapter._get_moss_processor() is processor
+
+    native_loader.assert_called_once_with("processing_moss_tts.MossTTSDelayProcessor", model_id)
+    native_loader.return_value.from_pretrained.assert_called_once_with(model_id, trust_remote_code=True)
+    auto_loader.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "variant,graphs_env,prepares",
     [("local", None, False), ("local", "1", True), ("local", "0", False), ("realtime", "1", False)],

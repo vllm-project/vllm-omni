@@ -1131,6 +1131,97 @@ source_file_dependencies:
     - vllm_omni/model_executor/stage_input_processors/breeze_tts_2.py
     - vllm_omni/outputs/
 
+  tts_gepard_weekly:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - tests/assets/
+    - tests/e2e/offline_inference/test_gepard_tts.py
+    - tests/e2e/online_serving/test_gepard_tts.py
+    - tests/helpers/assertions.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/gepard.yaml
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/openai/tts_adapters/gepard.py
+    - vllm_omni/metrics/utils.py
+    - vllm_omni/model_executor/models/gepard/
+    - vllm_omni/outputs/
+
+  tts_kokoro_weekly:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - tests/assets/
+    - tests/e2e/offline_inference/test_kokoro.py
+    - tests/e2e/online_serving/test_kokoro.py
+    - tests/helpers/assertions.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/kokoro.yaml
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/openai/tts_adapters/kokoro.py
+    - vllm_omni/metrics/utils.py
+    - vllm_omni/model_executor/models/kokoro/
+    - vllm_omni/outputs/
+
+  tts_moss_v15_weekly:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - tests/e2e/offline_inference/test_moss_tts_v1_5_expansion.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/moss_tts.yaml
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/openai/tts_adapters/moss_tts.py
+    - vllm_omni/metrics/utils.py
+    - vllm_omni/model_executor/models/moss_tts/
+    - vllm_omni/model_executor/stage_input_processors/moss_tts.py
+    - vllm_omni/outputs/
+
+  tts_minimax_music3_weekly:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - tests/e2e/online_serving/test_minimax_music3.py
+    - tests/helpers/assertions.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/minimax_music3.yaml
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/openai/tts_adapters/minimax_music3.py
+    - vllm_omni/metrics/utils.py
+    - vllm_omni/model_executor/models/minimax_music3/
+    - vllm_omni/model_executor/stage_input_processors/minimax_music3.py
+    - vllm_omni/outputs/
+    - vllm_omni/transformers_utils/configs/minimax_music3.py
+
+  tts_yue2_weekly:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - tests/assets/yue2/
+    - tests/e2e/features/yue2/
+    - tests/e2e/online_serving/test_yue2.py
+    - tests/helpers/assertions.py
+    - tests/helpers/media.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/
+    - vllm_omni/deploy/yue2.yaml
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/metrics/utils.py
+    - vllm_omni/model_executor/models/yue2/
+    - vllm_omni/outputs/
+    - vllm_omni/tokenizers/yue2_prompt.py
+    - vllm_omni/tokenizers/yue2_tokenizer.py
+    - vllm_omni/transformers_utils/configs/yue2.py
+
   tts_cosyvoice3_function:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - *cosyvoice3

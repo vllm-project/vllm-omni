@@ -2363,6 +2363,64 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
             "dependency": "tts_breeze_tts2_weekly",
             "files": ("tests/e2e/online_serving/test_breeze_tts_2.py",),
         },
+        "Gepard-1.0 · 1-GPU": {
+            "timeout": 360,
+            "test_timeout": 300,
+            "count": 16,
+            "artifact_name": "rocm-gepard-weekly",
+            "dependency": "tts_gepard_weekly",
+            "level_marker": "all",
+            "run_level": "full_model",
+            "setup_fragments": (
+                "nemo_toolkit[tts]==2.7.3",
+                "--overrides /tmp/gepard-overrides.txt",
+            ),
+            "files": (
+                "tests/e2e/offline_inference/test_gepard_tts.py",
+                "tests/e2e/online_serving/test_gepard_tts.py",
+            ),
+        },
+        "Kokoro-82M · 1-GPU": {
+            "timeout": 240,
+            "test_timeout": 210,
+            "count": 10,
+            "artifact_name": "rocm-kokoro-weekly",
+            "dependency": "tts_kokoro_weekly",
+            "level_marker": "advanced_model",
+            "run_level": "advanced_model",
+            "setup_fragments": (
+                '"misaki[en]>=0.9.4"',
+                "en_core_web_sm-3.8.0-py3-none-any.whl",
+            ),
+            "files": (
+                "tests/e2e/offline_inference/test_kokoro.py",
+                "tests/e2e/online_serving/test_kokoro.py",
+            ),
+        },
+        "MOSS-TTS v1.5 · 1-GPU": {
+            "timeout": 240,
+            "test_timeout": 210,
+            "count": 1,
+            "artifact_name": "rocm-moss-tts-v15-weekly",
+            "dependency": "tts_moss_v15_weekly",
+            "files": ("tests/e2e/offline_inference/test_moss_tts_v1_5_expansion.py",),
+        },
+        "MiniMax Music3 · 1-GPU": {
+            "timeout": 360,
+            "test_timeout": 330,
+            "count": 2,
+            "artifact_name": "rocm-minimax-music3-weekly",
+            "dependency": "tts_minimax_music3_weekly",
+            "files": ("tests/e2e/online_serving/test_minimax_music3.py",),
+        },
+        "YuE2 online · 1-GPU": {
+            "timeout": 480,
+            "test_timeout": 450,
+            "count": 6,
+            "artifact_name": "rocm-yue2-weekly",
+            "dependency": "tts_yue2_weekly",
+            "files": ("tests/e2e/online_serving/test_yue2.py",),
+        },
     }
     expected_env = {
         "OPENBLAS_NUM_THREADS": "1",
@@ -2381,6 +2439,9 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         artifact_name = cast(str, expected["artifact_name"])
         dependency = cast(str, expected["dependency"])
         files = cast(tuple[str, ...], expected["files"])
+        level_marker = cast(str, expected.get("level_marker", "slow"))
+        run_level = cast(str, expected.get("run_level", "full_model"))
+        setup_fragments = cast(tuple[str, ...], expected.get("setup_fragments", ()))
 
         assert step["agent_pool"] == "mi300_1"
         assert step["depends_on"] == "amd-build"
@@ -2395,11 +2456,15 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         assert "VLLM_USE_DEEP_GEMM" in command
         assert "VLLM_MOE_USE_DEEP_GEMM" in command
         assert ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh" in command
-        assert "ROCM_E2E_LEVEL_MARKER=slow" in command
+        assert f"ROCM_E2E_LEVEL_MARKER={level_marker}" in command
+        if "run_level" in expected:
+            assert f"ROCM_E2E_RUN_LEVEL={run_level}" in command
         assert f"ROCM_E2E_TIMEOUT_MINUTES={expected['test_timeout']}" in command
         assert f"{files[0]} {expected['count']} tts {artifact_name}" in command
         for path in files:
             assert path in command
+        for fragment in setup_fragments:
+            assert fragment in command
 
         dependency_paths = flatten_paths(dependencies[dependency])
         assert ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh" in dependency_paths
@@ -2449,6 +2514,13 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         "tests/e2e/offline_inference/test_indextts2_expansion.py": 1,
         "tests/e2e/online_serving/test_indextts2_expansion.py": 2,
         "tests/e2e/online_serving/test_breeze_tts_2.py": 4,
+        "tests/e2e/offline_inference/test_gepard_tts.py": 3,
+        "tests/e2e/online_serving/test_gepard_tts.py": 11,
+        "tests/e2e/offline_inference/test_kokoro.py": 2,
+        "tests/e2e/online_serving/test_kokoro.py": 5,
+        "tests/e2e/offline_inference/test_moss_tts_v1_5_expansion.py": 1,
+        "tests/e2e/online_serving/test_minimax_music3.py": 2,
+        "tests/e2e/online_serving/test_yue2.py": 3,
     }
     for path, expected_count in marker_counts.items():
         assert Path(path).read_text(encoding="utf-8").count('"rocm": "MI325"') == expected_count
@@ -2477,6 +2549,12 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
 
     runner = Path(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
     assert os.access(runner, os.X_OK)
+    runner_text = runner.read_text(encoding="utf-8")
+    assert "ROCM_E2E_RUN_LEVEL" in runner_text
+    assert '"$level_marker" == advanced_model' in runner_text
+    assert '"$level_marker" == all' in runner_text
+    assert '-m "$marker_expression"' in runner_text
+    assert '--run-level "$run_level"' in runner_text
 
 
 def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:

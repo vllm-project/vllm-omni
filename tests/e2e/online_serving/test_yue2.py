@@ -128,7 +128,7 @@ def _http_speech(omni_server, *, seed: int, frames: int) -> bytes:
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards={"cuda": 1, "rocm": 1})
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_yue2_metal_twinkle_001(omni_server, openai_client, tmp_path) -> None:
     """Heavy-metal Twinkle: ABC-conditioned request vs same-seed control.
@@ -240,7 +240,7 @@ def test_yue2_metal_twinkle_001(omni_server, openai_client, tmp_path) -> None:
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards={"cuda": 1, "rocm": 1})
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_yue2_abort_then_next_request_succeeds(omni_server) -> None:
     """Serving smoke check after a client timeout, not proof of job cleanup."""
@@ -267,7 +267,7 @@ def test_yue2_abort_then_next_request_succeeds(omni_server) -> None:
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("chunked", [True, False], ids=["chunked", "unchunked"])
 @pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "ar-graphs"])
@@ -397,7 +397,9 @@ async def test_yue2_preemption_and_synthesis_abort(chunked, enforce_eager, monke
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=600)
         observations = await probe()
         assert observations["preemptions"] > 0, observations
-        assert observations["rollbacks"] > 0, observations
+        # Rollback count is diagnostic: recompute can catch a discarded row up
+        # before the next accepted model row without truncating model history.
+        # Direct rollback behavior stays pinned in test_yue2_request_state.py.
         assert observations["checked_rows"] >= 4 * frames, observations
         assert observations["mixed_steps"] > 0, observations
         if enforce_eager:

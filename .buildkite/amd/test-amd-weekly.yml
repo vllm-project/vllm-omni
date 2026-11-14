@@ -1440,6 +1440,141 @@ steps:
             tests/e2e/online_serving/test_breeze_tts_2.py
             5 tts rocm-breeze-tts2-weekly
 
+      # These files intentionally import-skip in the base image. Mirror CUDA's
+      # bounded dependency installation while retaining AMD's collection,
+      # JUnit, cleanup, and no-retry guards.
+      - label: "Gepard-1.0 · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 360
+        source_file_dependencies: tts_gepard_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-gepard-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - printf '%s\n' "transformers>=5.5.3" "huggingface-hub>=1.0" > /tmp/gepard-overrides.txt
+          - >-
+            uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')"
+            "nemo_toolkit[tts]==2.7.3" --overrides /tmp/gepard-overrides.txt
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=all ROCM_E2E_RUN_LEVEL=full_model
+            ROCM_E2E_TIMEOUT_MINUTES=300
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_gepard_tts.py
+            16 tts rocm-gepard-weekly
+            tests/e2e/online_serving/test_gepard_tts.py
+
+      - label: "Kokoro-82M · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 240
+        source_file_dependencies: tts_kokoro_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-kokoro-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')"
+            "misaki[en]>=0.9.4"
+            "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=advanced_model ROCM_E2E_RUN_LEVEL=advanced_model
+            ROCM_E2E_TIMEOUT_MINUTES=210
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_kokoro.py
+            10 tts rocm-kokoro-weekly
+            tests/e2e/online_serving/test_kokoro.py
+
+      - label: "MOSS-TTS v1.5 · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 240
+        source_file_dependencies: tts_moss_v15_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-moss-tts-v15-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=210
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/offline_inference/test_moss_tts_v1_5_expansion.py
+            1 tts rocm-moss-tts-v15-weekly
+
+      - label: "MiniMax Music3 · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 360
+        source_file_dependencies: tts_minimax_music3_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-minimax-music3-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=330
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/online_serving/test_minimax_music3.py
+            2 tts rocm-minimax-music3-weekly
+
+      - label: "YuE2 online · 1-GPU"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 480
+        source_file_dependencies: tts_yue2_weekly
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+        artifact_paths:
+          - artifacts/rocm-yue2-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - >-
+            env ROCM_E2E_LEVEL_MARKER=slow ROCM_E2E_TIMEOUT_MINUTES=450
+            bash .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+            tests/e2e/online_serving/test_yue2.py
+            6 tts rocm-yue2-weekly
+
   - group: "HunyuanImage Expert Parallel"
     steps:
       - label: "HunyuanImage Expert Parallel Startup"

@@ -254,6 +254,7 @@ class TestOmniVoiceVoiceCloning:
             "ref_audio": REF_AUDIO_URL,
             "ref_text": REF_TEXT,
             "response_format": "wav",
+            "seed": _OMNIVOICE_REF_AUDIO_SEED,
             "timeout": 180.0,
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
             "transcript_escalation_model": "large-v3",
