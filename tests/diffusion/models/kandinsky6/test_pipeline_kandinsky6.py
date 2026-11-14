@@ -3,8 +3,75 @@
 
 import numpy as np
 import pytest
+import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize("distilled", [False, True])
+@pytest.mark.parametrize("entrypoint", ["api", "offline"])
+def test_checkpoint_defaults_reach_pipeline_from_shared_entrypoints(monkeypatch, distilled, entrypoint):
+    """Shared wrappers must leave checkpoint-dependent fields unspecified."""
+    import torch
+
+    from vllm_omni.diffusion.models.kandinsky6 import KandinskyFlowMatchScheduler, KandinskyPiFlowScheduler
+    from vllm_omni.diffusion.models.kandinsky6 import pipeline_kandinsky6 as module
+    from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_extras import get_video_generation_defaults
+
+    defaults = get_video_generation_defaults("Kandinsky6TI2VAPipeline")
+    assert defaults is not None
+    assert defaults.max_area is None
+    if entrypoint == "api":
+        request = VideoGenerationRequest(prompt="A fox runs through snow")
+        vp = request.resolve_video_params(default_fps=defaults.fps, default_num_frames=defaults.num_frames)
+        sampling = OmniDiffusionSamplingParams(height=vp.height, width=vp.width)
+        if vp.num_frames is not None:
+            sampling.num_frames = vp.num_frames
+        sampling.num_inference_steps = defaults.num_inference_steps
+    else:
+        preset = defaults.cli_defaults()
+        assert "guidance_scale" not in preset
+        sampling = OmniDiffusionSamplingParams(
+            **{key: preset[key] for key in ("height", "width", "num_frames", "num_inference_steps")}
+        )
+
+    monkeypatch.setattr(module, "get_local_device", lambda: torch.device("cpu"))
+    scheduler = (KandinskyPiFlowScheduler if distilled else KandinskyFlowMatchScheduler)()
+    pipeline = module.Kandinsky6TI2VAPipeline(
+        transformer=torch.nn.Identity(), vae=torch.nn.Identity(), text_encoder=torch.nn.Identity(), scheduler=scheduler
+    )
+    assert pipeline._resolve_generation_settings(sampling) == (
+        480,
+        864,
+        121 if distilled else 125,
+        10 if distilled else 50,
+        1.0 if distilled else 5.0,
+    )
+    explicit = OmniDiffusionSamplingParams(
+        height=320, width=512, num_frames=25, num_inference_steps=3, guidance_scale=1.0
+    )
+    # The worker marks explicit guidance before either pipeline entrypoint.
+    explicit.guidance_scale_provided = True
+    assert pipeline._resolve_generation_settings(explicit) == (320, 512, 25, 3, 1.0)
+
+
+def test_checkpoint_scheduler_config_overrides_generation_defaults(monkeypatch):
+    import torch
+
+    from vllm_omni.diffusion.models.kandinsky6 import KandinskyPiFlowScheduler
+    from vllm_omni.diffusion.models.kandinsky6 import pipeline_kandinsky6 as module
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    monkeypatch.setattr(module, "get_local_device", lambda: torch.device("cpu"))
+    scheduler = KandinskyPiFlowScheduler()
+    scheduler.default_num_frames = 97
+    scheduler.default_num_inference_steps = 6
+    pipeline = module.Kandinsky6TI2VAPipeline(
+        transformer=torch.nn.Identity(), vae=torch.nn.Identity(), text_encoder=torch.nn.Identity(), scheduler=scheduler
+    )
+    assert pipeline._resolve_generation_settings(OmniDiffusionSamplingParams()) == (480, 864, 97, 6, 1.0)
 
 
 def test_kandinsky6_pipeline_import_and_registry():
@@ -194,17 +261,47 @@ def test_postprocess_audio_normalizes_by_default_and_clips_on_request():
         postprocess_audio(bundle, vae, normalization_mode="loud")
 
 
-def test_kandinsky6_pre_process_func_is_identity_for_now():
-    """v1 scope: the pre-process hook is registered (matching the framework's
-    convention for image-conditioned models like SanaImageToVideoPipeline)
-    but does not yet validate/transform the request — documented follow-up,
-    not a silent gap."""
+@pytest.mark.parametrize(
+    "scheduler_config,expected_default",
+    [
+        ({"_class_name": "FlowMatchEulerDiscreteScheduler"}, 50),
+        ({"_class_name": "PiflowScheduler"}, 10),
+        ({"_class_name": "PiFlowScheduler", "default_num_inference_steps": 7}, 7),
+    ],
+)
+@pytest.mark.parametrize("schedule", ["default", "explicit", "timesteps", "sigmas"])
+def test_checkpoint_steps_resolve_before_step_scheduler_admission(
+    tmp_path, scheduler_config, expected_default, schedule
+):
+    import json
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.models.kandinsky6 import get_kandinsky6_pre_process_func
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    pre_process = get_kandinsky6_pre_process_func(od_config=None)
-    sentinel = object()
-
-    assert pre_process(sentinel) is sentinel
+    scheduler_dir = tmp_path / "scheduler"
+    scheduler_dir.mkdir()
+    (scheduler_dir / "scheduler_config.json").write_text(json.dumps(scheduler_config))
+    sampling = OmniDiffusionSamplingParams(num_inference_steps=None)
+    expected_steps = expected_default
+    if schedule == "explicit":
+        sampling.num_inference_steps = expected_steps = 3
+    elif schedule == "timesteps":
+        sampling.timesteps = [1000.0, 500.0]
+        expected_steps = 2
+    elif schedule == "sigmas":
+        sampling.sigmas = [1.0, 0.5, 0.1]
+        expected_steps = 3
+    request = OmniDiffusionRequest(prompt={"prompt": "A fox in snow"}, sampling_params=sampling, request_id="k6")
+    pre_process = get_kandinsky6_pre_process_func(OmniDiffusionConfig(model=str(tmp_path), step_execution=True))
+    scheduler = StepScheduler()
+    assert pre_process(request) is request
+    assert scheduler.add_request(request) == "k6"
+    assert scheduler._request_progress["k6"].total_steps == expected_steps
+    if schedule in ("timesteps", "sigmas"):
+        assert sampling.num_inference_steps is None
 
 
 def test_hub_component_keys_map_onto_pipeline_modules():
@@ -259,3 +356,27 @@ def test_hub_component_keys_map_onto_pipeline_modules():
     )
     assert _adapt_k6_weight_name("audio_vae.vocoder.conv_pre.weight") == "audio_vae.native.tod.vocoder.conv_pre.weight"
     assert _adapt_k6_weight_name("audio_vae.mel_converter.hann_window") == "audio_vae.native.mel_converter.hann_window"
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("shift", [1.0, 5.0])
+def test_piflow_rollout_matches_diffusers_reference(dtype, shift):
+    from vllm_omni.diffusion.models.kandinsky6 import KandinskyPiFlowScheduler
+    from vllm_omni.diffusion.models.kandinsky6_sr.scheduling_piflow import PiflowScheduler
+
+    generator = torch.Generator().manual_seed(42)
+    sample = torch.randn(2, 3, 4, generator=generator).to(dtype)
+    scheduler = KandinskyPiFlowScheduler(scheduler_scale=shift)
+    reference = PiflowScheduler(shift=shift)
+    scheduler.set_timesteps(10)
+    reference.set_timesteps(10)
+    for index, timestep in enumerate(reference.timesteps):
+        prediction = torch.randn(2, 3, 40, generator=generator).to(dtype)
+        expected = reference.step(prediction, timestep, sample).prev_sample
+        actual = scheduler._rollout(prediction, sample, index)
+        assert actual.dtype == dtype
+        # Equivalent FP32 interpolation expressions differ by rounding; BF16
+        # results should agree exactly after the final cast.
+        tolerance = 2e-6 if dtype == torch.float32 else 0
+        torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+        sample = expected
