@@ -1046,6 +1046,20 @@ def test_pipeline_init_selects_edge_transformer_from_backbone_type(stub_real_pip
     assert pipeline._engine_init_flow_shift == COSMOS3_EDGE_VIDEO_DEFAULT_FLOW_SHIFT
 
 
+def test_pipeline_init_uses_transformer_override(stub_real_pipeline_init) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    class CustomTransformer(Cosmos3VFMTransformer):
+        pass
+
+    class CustomPipeline(Cosmos3OmniDiffusersPipeline):
+        _transformer_cls_override = CustomTransformer
+
+    pipeline = CustomPipeline(od_config=_make_od_config(sound_gen=False))
+    assert isinstance(pipeline.transformer, CustomTransformer)
+
+
 def test_pipeline_init_does_not_select_edge_from_model_index_class_name(stub_real_pipeline_init) -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
