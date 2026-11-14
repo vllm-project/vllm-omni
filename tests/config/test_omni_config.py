@@ -1481,6 +1481,7 @@ def test_sub_config_fields_match_structured_scopes():
         "enable_multithread_weight_load",
         "enable_broadcast_weight_load",
         "num_weight_load_threads",
+        "enable_weights_prewarm",
         "disable_autocast",
         # Per-stage checkpoint resolution for repos whose stages live in
         # subfolders (e.g. Audex): mirrors StagePipelineConfig on the

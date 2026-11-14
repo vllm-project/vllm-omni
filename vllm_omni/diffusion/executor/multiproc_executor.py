@@ -14,6 +14,7 @@ import time
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from multiprocessing.synchronize import Event
 from typing import TYPE_CHECKING, Any, cast
@@ -27,6 +28,10 @@ from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
+from vllm_omni.diffusion.model_loader.prewarm import (
+    WeightsPrewarmHandoff,
+    parent_weights_prewarm,
+)
 from vllm_omni.diffusion.model_metadata import REQUEST_IDENTITY_EXTRA_ARGS
 from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
@@ -389,14 +394,68 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         sharing_registry = vars(od_config).pop("_sharing_worker_registry", None)
         logger.info("Starting server...")
 
-        num_gpus = cast(int, od_config.num_gpus)
         # Without this, every worker inherits one Torch thread per core, so an
         # N-GPU run oversubscribes the host by N x core_count. Honours a
-        # user-provided OMP_NUM_THREADS.
+        # user-provided OMP_NUM_THREADS. Capture it before vLLM's helper writes
+        # the env: a later executor in this process must not treat our
+        # auto-value as an explicit user override.
+        num_gpus = cast(int, od_config.num_gpus)
+        user_omp = os.environ.get("OMP_NUM_THREADS")
         set_multiprocessing_worker_envs()
+        # Diffusion weight loading casts fp32 checkpoints to bf16 on the CPU
+        # during pageable H2D copies; with vllm's default OMP_NUM_THREADS=1
+        # that cast is single-threaded and measured 3x slower on g7e.12xlarge
+        # (18.8s vs 5.8s resident, Wan TP=2). Size the pool from the CPUs this
+        # process may use, not os.cpu_count(), which ignores cgroup/taskset.
+        workers = max(1, int(num_gpus or 1))
+        auto_omp = None
+        if user_omp is None:
+            try:
+                cores = len(os.sched_getaffinity(0))
+            except (AttributeError, OSError):
+                cores = os.cpu_count() or 1
+            auto_omp = str(max(1, cores // workers))
+            os.environ["OMP_NUM_THREADS"] = auto_omp
         mp.set_start_method("spawn", force=True)
+
+        model_ref = getattr(od_config, "model", None)
+        load_format = getattr(od_config, "diffusion_load_format", "default")
+        prewarm_enabled = bool(getattr(od_config, "enable_weights_prewarm", False))
+        prewarm_context = (
+            parent_weights_prewarm(
+                str(model_ref),
+                revision=getattr(od_config, "revision", None),
+                cache_dir=getattr(od_config, "download_dir", None),
+            )
+            if model_ref and load_format != "dummy" and prewarm_enabled
+            else nullcontext(None)
+        )
+        try:
+            with prewarm_context as prewarm_handoff:
+                return self._spawn_worker_processes(
+                    broadcast_handle,
+                    wake_events,
+                    num_gpus,
+                    sharing_registry,
+                    prewarm_handoff,
+                )
+        finally:
+            # Spawn already copied the env. Drop the auto-value so a later
+            # executor in this process recalculates for its own worker count.
+            if auto_omp is not None:
+                os.environ.pop("OMP_NUM_THREADS", None)
+
+    def _spawn_worker_processes(
+        self,
+        broadcast_handle: Handle,
+        wake_events: list[Event],
+        num_gpus: int,
+        sharing_registry: object,
+        prewarm_handoff: WeightsPrewarmHandoff | None,
+    ) -> tuple[list[mp.Process], list[Handle]]:
+        od_config = self.od_config
         mp_context = getattr(self, "_mp_context", mp.get_context("spawn"))
-        processes = []
+        processes: list[mp.Process] = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
         worker_extension_cls = od_config.worker_extension_cls
@@ -420,7 +479,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),
-                kwargs={"sharing_registry": sharing_registry},
+                kwargs={
+                    "sharing_registry": sharing_registry,
+                    "weights_prewarm_handoff": prewarm_handoff,
+                },
                 name=f"DiffusionWorker-{i}",
                 daemon=True,
             )

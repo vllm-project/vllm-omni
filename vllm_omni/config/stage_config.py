@@ -670,6 +670,7 @@ class StageDeployConfig:
     enable_multithread_weight_load: bool | None = None
     enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
+    enable_weights_prewarm: bool | None = None
     diffusion_offload_config: dict[str, Any] | None = None
     kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage

@@ -1130,7 +1130,7 @@ def _project_omni_stage_engine_args(
         # inputs for callers using the shared model config representation.
         model_explicit = getattr(stage_config.model_config, "_omni_explicit_fields", ())
         diffusion_explicit = getattr(diffusion_stage.diffusion_config, "_omni_explicit_fields", ())
-        for name in ("moe_backend", "linear_backend"):
+        for name in ("moe_backend", "linear_backend", "enable_weights_prewarm"):
             if name not in model_explicit:
                 model_excluded_fields.add(name)
             elif name in diffusion_explicit:
@@ -1153,6 +1153,7 @@ def _project_omni_stage_engine_args(
                 "enable_multithread_weight_load",
                 "enable_broadcast_weight_load",
                 "num_weight_load_threads",
+                "enable_weights_prewarm",
             }
         )
         runtime_excluded_fields.add("log_level")
