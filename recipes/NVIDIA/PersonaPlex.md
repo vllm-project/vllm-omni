@@ -87,7 +87,10 @@ duplex (`is_enabled()` is unconditionally true). Turn-based models
 Verified on GPU (Hopper-class). The shipped deploy config runs the Stage 0
 talker with CUDA graphs and replays the streaming Mimi encode (Stage 0) and
 decode (Stage 1) frame steps from model-local CUDA graphs, bitwise equal to
-eager. Other CUDA GPUs with enough memory are expected to work.
+eager. Other CUDA GPUs with enough memory are expected to work. For a single
+16 GB consumer GPU, use the
+[RTX 5080 Laptop 16 GB profile](./PersonaPlex-RTX5080-Laptop-16GB.md), which uses
+FP8 for eligible Stage 0 layers and adjusts the memory budget to fit within the 16 GB limit.
 
 ## GPU
 
