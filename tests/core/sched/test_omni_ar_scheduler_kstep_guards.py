@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 from vllm import SamplingParams
+from vllm.sampling_params import SamplingType
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler, _reject_kstep_async_scheduling
 from vllm_omni.engine.serialization import serialize_additional_information
@@ -39,24 +40,33 @@ def test_async_scheduler_allows_unarmed_stage():
 
 
 @pytest.mark.parametrize(
-    ("scheduler_ngram", "native_duplex", "temperature", "expected"),
+    ("scheduler_ngram", "native_duplex", "sampling_params", "expected"),
     [
-        (True, False, 0.0, [1, 2]),
-        (True, True, 0.0, []),
-        (True, False, 0.7, []),
-        (False, False, 0.0, [1, 2, 3]),
-        (False, True, 0.0, []),
-        (False, False, 0.7, [1, 2, 3]),
+        (True, False, SamplingParams(temperature=0.0), [1, 2]),
+        (True, True, SamplingParams(temperature=0.0), []),
+        (True, False, SamplingParams(temperature=0.7), []),
+        # SamplingParams clamps tiny positive temperatures. Supply the
+        # sampler classification directly to check that the guard honors it.
+        pytest.param(
+            True,
+            False,
+            SimpleNamespace(temperature=1e-6, sampling_type=SamplingType.GREEDY),
+            [1, 2],
+            id="greedy-type-with-nonzero-temperature",
+        ),
+        (False, False, SamplingParams(temperature=0.0), [1, 2, 3]),
+        (False, True, SamplingParams(temperature=0.0), []),
+        (False, False, SamplingParams(temperature=0.7), [1, 2, 3]),
     ],
 )
-def test_thinker_ngram_limits_drafts_before_accounting(scheduler_ngram, native_duplex, temperature, expected):
+def test_thinker_ngram_limits_drafts_before_accounting(scheduler_ngram, native_duplex, sampling_params, expected):
     scheduler = object.__new__(OmniARScheduler)
     scheduler._scheduler_ngram = object() if scheduler_ngram else None
     scheduler.requests = {
         "chat": SimpleNamespace(resumable=False, sampling_params=SamplingParams(temperature=0.0)),
         "duplex": SimpleNamespace(
             resumable=False,
-            sampling_params=SamplingParams(temperature=temperature),
+            sampling_params=sampling_params,
             additional_information=serialize_additional_information({"duplex": {"data_plane": native_duplex}}),
         ),
     }
