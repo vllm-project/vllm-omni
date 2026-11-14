@@ -541,6 +541,45 @@ def test_decode_audio_preserves_batch_for_released_preview_shape(monkeypatch):
     stager.offload.assert_called_once_with()
 
 
+def test_text_encoder_stager_follows_installed_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _TextModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embed = nn.Linear(2, 2)
+            self.layers = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+            self.norm = nn.LayerNorm(2)
+
+    class _Encoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.text_model = _TextModel()
+
+    staged: list[object] = []
+
+    def _spy(module: nn.Module | list[nn.Module], device: torch.device, **kwargs: object) -> Mock:
+        del device, kwargs
+        staged.append(module if isinstance(module, nn.Module) else tuple(module))
+        return Mock()
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.magi2.pipeline_magi2.PinnedModuleStager",
+        _spy,
+    )
+    encoder = _Encoder()
+    component = _Magi2StagedComponent(encoder, torch.device("cpu"), pin_memory=False)
+    component.load_to_device()
+    assert getattr(component, "_omni_non_block_stager", None) is None
+    assert staged == [encoder]
+
+    component._omni_layerwise_enabled = True
+    component._omni_layerwise_hooks = [Mock(pin_memory=False)]
+    component._omni_layerwise_block_groups = [encoder.text_model.layers]
+    component.load_to_device()
+    assert staged[1] == (encoder.text_model.embed, encoder.text_model.norm)
+    assert component.is_loaded is True
+    assert _Magi2StagedComponent(nn.Identity(), torch.device("cpu"), pin_memory=False).is_loaded is False
+
+
 class _TinyMagiTransformer(nn.Module):
     _layerwise_offload_blocks_attrs = ["block"]
 

@@ -471,10 +471,41 @@ class _Magi2StagedComponent(nn.Module):
             pin_memory=pin_memory,
         )
 
+    @property
+    def is_loaded(self) -> bool:
+        return not isinstance(self.module, nn.Identity)
+
+    def _non_block_modules(self) -> list[nn.Module]:
+        group_ids = {id(group) for group in getattr(self, "_omni_layerwise_block_groups", ())}
+        text_model = getattr(self.module, "text_model", None)
+        if text_model is None:
+            return [self.module]
+        return [child for child in text_model.children() if id(child) not in group_ids]
+
     def load_to_device(self) -> None:
+        if getattr(self, "_omni_layerwise_enabled", False):
+            stager = getattr(self, "_omni_non_block_stager", None)
+            if stager is None:
+                hooks = getattr(self, "_omni_layerwise_hooks", ())
+                pin_memory = bool(getattr(hooks[0], "pin_memory", True)) if hooks else True
+                stager = PinnedModuleStager(
+                    self._non_block_modules(),
+                    self._stager.device,
+                    pin_memory=pin_memory,
+                )
+                self._omni_non_block_stager = stager
+            stager.load()
+            return
         self._stager.load()
 
     def offload_to_cpu(self) -> None:
+        if getattr(self, "_omni_layerwise_enabled", False):
+            for hook in self._omni_layerwise_hooks:
+                hook.offload_layer()
+            stager = getattr(self, "_omni_non_block_stager", None)
+            if stager is not None:
+                stager.offload()
+            return
         self._stager.offload()
 
     def to(self, *_args: object, **_kwargs: object) -> _Magi2StagedComponent:
@@ -519,6 +550,7 @@ class Magi2Pipeline(
         "audio_decoder",
     ]
     _offload_plan: ClassVar[OffloadPlan] = OffloadPlan(
+        encoder_block_attrs={"text_encoder": ("module.text_model.layers",)},
         on_demand_component_paths=frozenset(
             {
                 "text_encoder",
@@ -526,7 +558,7 @@ class Magi2Pipeline(
                 "video_decoder",
                 "audio_decoder",
             }
-        )
+        ),
     )
 
     @staticmethod
