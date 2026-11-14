@@ -18,6 +18,16 @@ SERVER_CASES = [
     )
     for name, extra in [("request", []), ("step", ["--step-execution"])]
 ]
+# Keep large reference prefixes within an H100's memory budget in step mode.
+# The default compile/graph path remains covered by SERVER_CASES above.
+MULTI_IMAGE_SERVER_CASES = [
+    pytest.param(
+        OmniServerParams(model=MODEL, server_args=["--vae-use-tiling", "--max-num-seqs", "1"] + extra),
+        id=name,
+        marks=hardware_marks(res={"cuda": "H100"}),
+    )
+    for name, extra in [("request", []), ("step-eager", ["--step-execution", "--enforce-eager"])]
+]
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.advanced_model,
@@ -61,6 +71,30 @@ def test_image_edit(omni_server: OmniServer, online_client: OnlineOmniClient):
                 "seed": 42,
                 "negative_prompt": "blurry, low quality",
                 "true_cfg_scale": 4.0,
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize("omni_server", MULTI_IMAGE_SERVER_CASES, indirect=True)
+@pytest.mark.parametrize("num_images", [5, 8, 10])
+def test_multi_image_edit(omni_server: OmniServer, online_client: OnlineOmniClient, num_images: int):
+    images = [
+        f"data:image/jpeg;base64,{generate_synthetic_image(512, 512, force_regenerate=True, seed=42 + i)['base64']}"
+        for i in range(num_images)
+    ]
+    online_client.send_diffusion_request(
+        {
+            "model": omni_server.model,
+            "messages": dummy_messages_from_mix_data(
+                content_text="Combine all reference images into a single blue scene.", image_data_url=images
+            ),
+            "extra_body": {
+                "height": 512,
+                "width": 512,
+                "num_inference_steps": 4,
+                "seed": 42,
+                "true_cfg_scale": 1.0,
             },
         }
     )

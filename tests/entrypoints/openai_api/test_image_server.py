@@ -1798,6 +1798,48 @@ def test_image_edit_rejects_model_mismatch(test_client):
     assert "model mismatch" in response.json()["detail"].lower()
 
 
+@pytest.mark.parametrize("num_images", [4, 5, 10])
+def test_image_edit_accepts_qwen_image_21_references(async_omni_test_client, num_images):
+    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+    engine = async_omni_test_client.app.state.engine_client
+    engine.od_config = get_diffusion_model_metadata("QwenImage21Pipeline")
+    sizes = [(16 + i, 16 + i) for i in range(num_images)]
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes(size)) for size in sizes],
+        data={"prompt": "Combine all reference images into one scene."},
+    )
+
+    assert response.status_code == 200
+    images = engine.captured_prompt["multi_modal_data"]["image"]
+    assert [image.size for image in images] == sizes
+
+
+def test_image_edit_rejects_eleven_qwen_image_21_references_before_loading(async_omni_test_client, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    import vllm_omni.entrypoints.openai.api_server as api_server_module
+    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+    engine = async_omni_test_client.app.state.engine_client
+    engine.od_config = get_diffusion_model_metadata("QwenImage21Pipeline")
+    load = AsyncMock(side_effect=AssertionError("Over-limit images must not be loaded"))
+    monkeypatch.setattr(api_server_module, "_load_input_images", load)
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((16, 16))) for _ in range(11)],
+        data={"prompt": "Combine all reference images into one scene."},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Received 11 input images. At most 10 images are supported by this model."
+    assert engine.captured_prompt is None
+    load.assert_not_called()
+
+
 def test_image_edit_rejects_too_many_images_for_qwen_image_edit_2511(async_omni_test_client):
     engine = async_omni_test_client.app.state.engine_client
     engine.get_diffusion_od_config = lambda: SimpleNamespace(
