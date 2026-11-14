@@ -1312,17 +1312,19 @@ guide: |
 
   | Artifact | Tasks | `num_inference_steps` | `flow_shift` | alpha |
   |---|---|---:|---:|---:|
-  | `minimax_h3_fl2v_turbo_4step_v0.1.safetensors` | T2VA / FL2VA | 5 | 12 | none → 8 |
-  | `minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 5 | 6 | 128 |
-  | `minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors` | T2VA / FL2VA | 5 | 6 | 128 |
-  | `minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors` | T2VA / FL2VA | 5 | 6 | 8 |
-  | `minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors` | T2VA / FL2VA | 9 | 12 | 8 |
-  | `minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 9 | 6 | 8 |
-  | `minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` | Ref2VA | 5 | 12 | 8 |
-  | `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors` | Ref2VA | 9 | 6 | 8 |
+  | `minimax_h3_fl2v_turbo_4step_v0.1.safetensors` | T2VA / FL2VA | 4 | 12 | none → 8 |
+  | `minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 6 | 128 |
+  | `minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 6 | 128 |
+  | `minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 6 | 8 |
+  | `minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors` | T2VA / FL2VA | 8 | 12 | 8 |
+  | `minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 8 | 6 | 8 |
+  | `minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` | Ref2VA | 4 | 12 | 8 |
+  | `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors` | Ref2VA | 8 | 12 | 8 |
 
-  Requested sigma points are always one more than the artifact's forwards, which is why a
-  four-step Turbo artifact takes `num_inference_steps=5` where FastH3 takes `4`.
+  `num_inference_steps` counts denoiser evaluations: use `4` for four-step artifacts and
+  `8` for eight-step artifacts. The internal sigma grid has one more boundary, so those
+  requests use five or nine sigma points respectively; do not pass that boundary count
+  as `num_inference_steps`.
 
   Every artifact is rank 128 and the delta is applied at `scale * alpha / 128`, with alpha
   read from the artifact's metadata — only `4step_v0.1` declares none and falls back to 8
@@ -1375,7 +1377,7 @@ guide: |
     -F 'height=768' \
     -F 'aspect_ratio=16:9' \
     -F 'fps=24' \
-    -F 'num_inference_steps=5' \
+    -F 'num_inference_steps=4' \
     -F 'flow_shift=6' \
     -F 'seed=1101' \
     -F 'extra_params={"task":"t2va","duration":10.0,"audio_flow_shift":3.0}' \
@@ -1384,9 +1386,10 @@ guide: |
   ```
 
   FL2VA artifacts serve `t2va` and `fl2va` on an FL2VA or combined server. The two `ref2v`
-  rows need `--task-type ref2va`: a combined server answers `ref2va` from a second DiT the
-  adapter cannot bind to, so loading one there is refused rather than running an undistilled
-  model on a few-step ladder. The integration is dynamic-only — no prefusion, no LoRA
+  rows need `--task-type ref2va` or a combined server: on a combined server a Ref2VA adapter
+  binds to `transformers_ref` and an FL2VA adapter to `transformer`, and switching adapter
+  families keeps their weights isolated. An FL2VA-only server still rejects Ref2VA artifacts.
+  The integration is dynamic-only — no prefusion, no LoRA
   composition. DLO works by keeping the request-switchable LoRA A/B buffers resident on the
   accelerator while DLO streams the base blocks; model-level and standard layerwise offload
   remain unsupported.
