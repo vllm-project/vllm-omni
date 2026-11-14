@@ -370,6 +370,13 @@ class OmniPlatform(Platform):
         return True
 
     @classmethod
+    def supports_device_tensor_ipc(cls) -> bool:
+        """Whether small device tensors may be pickled inline across the diffusion
+        IPC queue with their device intact. Platforms that return False have them
+        moved to CPU before pickling."""
+        return True
+
+    @classmethod
     def set_device_control_env_var(cls, devices: str | int | None) -> None:
         import os
 

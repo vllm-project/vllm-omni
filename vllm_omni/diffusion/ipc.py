@@ -292,6 +292,11 @@ def _pack_tensor_if_large(
     Pickle serializes a view's whole storage, so a batch of small views costs
     the full batch tensor once per request. Size the decision on the storage
     to keep those views off the wire; packing copies just the view.
+
+    Tensors below the threshold are pickled inline. On platforms whose
+    ``supports_device_tensor_ipc()`` is False, device tensors are moved to CPU
+    first, so the receiver gets CPU tensors for every size, as it does for SHM
+    handles, and never unpickles onto the accelerator.
     """
     view_bytes = val.nelement() * val.element_size()
     try:
@@ -300,6 +305,11 @@ def _pack_tensor_if_large(
         storage_bytes = view_bytes
     if max(view_bytes, storage_bytes) > _SHM_TENSOR_THRESHOLD:
         return _tensor_to_shm(val, d2h_stream=d2h_stream, created=created, enable_registered_shm=enable_registered_shm)
+    if val.device.type != "cpu":
+        from vllm_omni.platforms import current_omni_platform
+
+        if not current_omni_platform.supports_device_tensor_ipc():
+            return val.detach().cpu().contiguous()
     return val
 
 
