@@ -3276,6 +3276,8 @@ class TestPlatformOverrides:
         [
             ("qwen3_tts_mrv2.yaml", "qwen3_tts", "v2", ()),
             ("moss_tts_local.yaml", "moss_tts_local", "v2", ()),
+            ("chatterbox_turbo.yaml", "chatterbox_turbo", "v2", ()),
+            ("chatterbox.yaml", "chatterbox", "v2", ()),
             ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", ()),
             ("minicpmo_4_5_turn.yaml", "minicpmo_4_5", "v2", ()),
             ("minicpmo_4_5_duplex_h200.yaml", "minicpmo_4_5", "v2", ()),
