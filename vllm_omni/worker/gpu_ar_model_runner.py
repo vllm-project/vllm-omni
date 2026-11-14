@@ -450,7 +450,7 @@ class GPUARModelRunner(
         `update_async_spec_token_ids` reads the CPU copy), so sharing it is
         safe.
         """
-        from vllm_omni.platforms.npu.worker import talker_multiframe
+        from vllm_omni.worker import talker_multiframe
 
         key = (rows, drafts)
         cached = getattr(self, "_kstep_constant_draft_cache", None)
@@ -480,7 +480,7 @@ class GPUARModelRunner(
         plain Python -- the loop they feed (``talker_multiframe.run``) is the
         same one the CUDA runner calls.
         """
-        from vllm_omni.platforms.npu.worker import talker_multiframe
+        from vllm_omni.worker import talker_multiframe
 
         frames = talker_multiframe.drafts_this_step(self)
         if frames > 1:
@@ -1340,6 +1340,13 @@ class GPUARModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=False,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+            )
+            # #9865: thin hook — MammothGPUARModelRunner retargets specialty
+            # graphs; default Omni/AR implementation is a no-op.
+            batch_desc = self._select_moe_replay_batch_descriptor(
+                cudagraph_mode,
+                batch_desc,
+                num_tokens_unpadded,
             )
             num_tokens_padded = batch_desc.num_tokens
             num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
@@ -2354,7 +2361,7 @@ class GPUARModelRunner(
                 logits.shape[-1],
             )
 
-        from vllm_omni.platforms.npu.worker import talker_multiframe
+        from vllm_omni.worker import talker_multiframe
 
         if talker_multiframe.drafts_this_step(self) > 0:
             talker_multiframe.neutralize_kstep_min_tokens(self.input_batch.sampling_metadata.logitsprocs)

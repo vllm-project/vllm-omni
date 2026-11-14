@@ -1,0 +1,10 @@
+# CI image only. docker/Dockerfile.ci installs this after .[dev].
+# Do not move these lines into pyproject.toml: a direct URL in
+# optional-dependencies is copied into Requires-Dist, and PyPI rejects that
+# metadata. The release upload (python3 -m build, then twine) does not strip it.
+#
+# pan2-guardrail depends on clip @ git+https://github.com/openai/CLIP.git with
+# no commit. Pin CLIP here and install both with --no-deps so the resolve
+# cannot upgrade the image's torch, torchvision, or transformers.
+pan2-guardrail @ git+https://github.com/ifm-ai/pan2-guardrail@267f95a943162e56d835f3897217a7d14ee7edce
+clip @ git+https://github.com/openai/CLIP.git@d05afc436d78f1c48dc0dbf8e5980a9d471f35f6
