@@ -42,6 +42,19 @@ class PrefixCacheRequestEvent:
     block_ids: tuple[tuple[int, ...], ...] = ()
     scheduled_tokens: int = 0
     num_output_tokens: int = 0
+    # Duplex session a request belongs to, when the scheduler payload
+    # carries it. Absent (None) means the manager serves the request
+    # from the slot pool only; session features stay off for it.
+    session_id: str | None = None
+    # Duplex history generation (DuplexFence.epoch) stamped by the
+    # orchestrator at submit time. None when the scheduler payload
+    # carries no epoch; the manager then skips the epoch check and
+    # the request behaves as before.
+    session_epoch: int | None = None
+    # True when the request is a long-lived resumable duplex stage
+    # request: its termination ends the session (the store drops the
+    # session's rows); an ephemeral request's termination only unbinds.
+    resumable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +82,15 @@ class PrefixCacheStep:
     extended_req_ids: tuple[str, ...] = ()
     # Only produced by an adapter that tracks delivery.
     deliveries: tuple[PrefixCacheDelivery, ...] = ()
+    # Absolute prompt position where each scheduled (re-)entry's computed
+    # rows begin (num_computed_tokens at (re-)entry). The manager
+    # reconciles its per-request saved-row counter against it, so a
+    # preemption re-entry recomputing already-saved positions does not
+    # append at the stale position (A1). A step-level field, not an
+    # extended delivery: deliveries exist only on the tracked (MRv2)
+    # path, while the untracked (V1) path needs the same reconciliation
+    # and produces no deliveries.
+    absolute_starts: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +182,21 @@ class PrefixCacheSchedulerAdapter:
         return str(value)
 
     @staticmethod
+    def _session_id(data: Any) -> str | None:
+        # Tolerant read: scheduler payloads without a session carry
+        # nothing, and the duplex orchestrator's default "" is not a
+        # session. Neither case enables session features for the request.
+        value = getattr(data, "session_id", None)
+        return str(value) if value else None
+
+    @staticmethod
+    def _session_epoch(data: Any) -> int | None:
+        # Tolerant read, same as _session_id — but 0 is a valid epoch
+        # (the fence default), so only None means absent.
+        value = getattr(data, "session_epoch", None)
+        return int(value) if value is not None else None
+
+    @staticmethod
     def _blocks_value(blocks: Any) -> tuple[tuple[int, ...], ...]:
         if blocks is None:
             return ()
@@ -178,6 +215,7 @@ class PrefixCacheSchedulerAdapter:
         scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
         terminal_ids = finished | aborted
         deliveries: list[PrefixCacheDelivery] = []
+        absolute_starts: dict[str, int] = {}
 
         self._observed_req_ids.difference_update(terminal_ids)
         for req_id in sorted(terminal_ids):
@@ -198,6 +236,7 @@ class PrefixCacheSchedulerAdapter:
                 continue
             emitted.add(req_id)
             computed_tokens = int(getattr(data, "num_computed_tokens", 0) or 0)
+            absolute_starts[req_id] = computed_tokens
             if self._track:
                 self._block_ids[req_id] = self._group0(getattr(data, "block_ids", None))
             if req_id in self._observed_req_ids:
@@ -218,6 +257,9 @@ class PrefixCacheSchedulerAdapter:
                     hit_end=computed_tokens,
                     block_ids=blocks,
                     scheduled_tokens=max(0, int(scheduled_tokens.get(req_id, 0))),
+                    session_id=self._session_id(data),
+                    session_epoch=self._session_epoch(data),
+                    resumable=bool(getattr(data, "resumable", False)),
                 )
             )
 
@@ -243,6 +285,8 @@ class PrefixCacheSchedulerAdapter:
                 )
             )
             emitted.add(req_id)
+            if index < len(computed):
+                absolute_starts[req_id] = int(computed[index])
 
         # Missing payloads are tolerated for explicit resume signals, as
         # before; their order is deterministic even for a partial test stub.
@@ -278,7 +322,9 @@ class PrefixCacheSchedulerAdapter:
             counts.append((req_id, count))
             if count > 0 and req_id in self._observed_req_ids and req_id not in emitted:
                 extended.append(req_id)
-        return PrefixCacheStep(tuple(events), tuple(counts), tuple(extended), tuple(deliveries))
+        return PrefixCacheStep(
+            tuple(events), tuple(counts), tuple(extended), tuple(deliveries), tuple(absolute_starts.items())
+        )
 
     def build_write_layout(
         self,

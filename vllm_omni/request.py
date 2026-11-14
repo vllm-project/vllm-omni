@@ -45,6 +45,9 @@ class OmniRequest(Request):
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict | None = None,
         payload_sender_info: PayloadSenderInfo | None = None,
+        # Duplex history generation (DuplexFence.epoch); see
+        # OmniEngineCoreRequest. None when the request carries none.
+        session_epoch: int | None = None,
         **kwargs,
     ):
         if prompt_embeds is not None:
@@ -66,6 +69,9 @@ class OmniRequest(Request):
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
         # Sender's connector address, or the payload itself for run requests.
         self.payload_sender_info: PayloadSenderInfo | None = payload_sender_info
+        # Duplex history generation (DuplexFence.epoch); see
+        # OmniEngineCoreRequest. None when the request carries none.
+        self.session_epoch: int | None = session_epoch
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -116,6 +122,7 @@ class OmniRequest(Request):
             payload_sender_info=request.payload_sender_info,
             resumable=request.resumable,
             session_id=request.session_id,
+            session_epoch=getattr(request, "session_epoch", None),
             kv_hints=request.kv_hints,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
