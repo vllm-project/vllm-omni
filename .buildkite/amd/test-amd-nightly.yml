@@ -1939,7 +1939,7 @@ steps:
           - |
             set -euo pipefail
             bash .buildkite/amd/scripts/assert-pytest-collection.sh 40 \
-              tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py::TestQwen3OmniDuplexPlayback::test_speech_interrupts_playback_full \
+              tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py::TestQwen3OmniDuplexPlayback::test_speech_interrupts_playback_full \
               -m 'full_model and omni and rocm and MI325 and cards_2 and not nvidia_only' \
               --run-level full_model \
               --shard-id=0 --num-shards=1 \
@@ -1950,7 +1950,7 @@ steps:
               set +e
               timeout --signal=TERM --kill-after=2m 165m \
                 pytest -s -v -ra \
-                tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py::TestQwen3OmniDuplexPlayback::test_speech_interrupts_playback_full \
+                tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py::TestQwen3OmniDuplexPlayback::test_speech_interrupts_playback_full \
                 -m 'full_model and omni and rocm and MI325 and cards_2 and not nvidia_only' \
                 --run-level full_model \
                 --shard-id=0 --num-shards=1 \

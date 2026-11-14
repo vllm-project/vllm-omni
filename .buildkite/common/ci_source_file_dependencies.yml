@@ -523,6 +523,7 @@ source_file_dependencies:
     - *duplex
     - .buildkite/amd/scripts/assert-pytest-collection.sh
     - tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py
+    - tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py
     - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
     - tests/assets/minicpmo_4_5/
     - tests/assets/semantic_vad/

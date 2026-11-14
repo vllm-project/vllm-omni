@@ -88,7 +88,7 @@ ENTRYPOINTS_FULL_SELECTOR = "full_model and omni and rocm and MI325 and cards_2 
 ENTRYPOINTS_FULL_NIGHTLY_JOBS = (
     (
         "Qwen3-Omni Duplex Playback",
-        "tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py::"
+        "tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py::"
         "TestQwen3OmniDuplexPlayback::test_speech_interrupts_playback_full",
         40,
         "omni_qwen3_omni_duplex_playback_function",
@@ -3901,7 +3901,7 @@ def test_entrypoints_full_nightly_uses_focused_source_dependencies() -> None:
 
 
 def test_qwen_duplex_rocm_mark_is_limited_to_the_full_model_method() -> None:
-    source = Path("tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py").read_text(encoding="utf-8")
+    source = Path("tests/entrypoints/openai_api/test_qwen3_omni_duplex_playback.py").read_text(encoding="utf-8")
     assert ('@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)\nclass TestQwen3OmniDuplexPlayback:') in source
     assert source.count('@hardware_test(res={"rocm": "MI325"}, num_cards=2)') == 1
     full_method_prefix = source.split("def test_speech_interrupts_playback_full", maxsplit=1)[0].rsplit(
