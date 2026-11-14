@@ -91,6 +91,7 @@ def test_fastvideo_vsa_tiles_3d_sequence_and_untiles(monkeypatch):
     output = impl.forward_cuda(query, key, value, attn_metadata)
 
     assert output.shape == query.shape
+    torch.testing.assert_close(output, query + key + value, rtol=0, atol=0)
     assert calls["q_shape"] == (1, 1024, 2, 8)
     assert calls["vbs"] == [192, 48, 48, 12]
     assert calls["q_vbs"] == [192, 48, 48, 12]
