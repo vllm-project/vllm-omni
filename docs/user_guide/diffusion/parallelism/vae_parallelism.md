@@ -7,7 +7,7 @@
 - [Example Script](#example-script)
 - [Configuration Parameters](#configuration-parameters)
 - [Batch Parallel Decode](#batch-parallel-decode)
-- [Spatially-Sharded Decode (Wan)](#spatially-sharded-decode-wan)
+- [Spatially-Sharded Decode (Wan and Qwen-Image)](#spatially-sharded-decode-wan-and-qwen-image)
 - [Distributed Encode Split (Wan)](#distributed-encode-split-wan)
 - [Best Practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
@@ -111,10 +111,10 @@ vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091 \
 
 In `DiffusionParallelConfig`:
 
-| Parameter                 | Type   | Default   | Description                                                                                                                                                       |
-| ------------------------- | ------ | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `vae_patch_parallel_size` | int    | 1         | Number of ranks requested for VAE parallelism, including batch mode. Set to 2 or higher to enable. Batch mode caps this degree at the existing worker group size. |
-| `vae_parallel_mode`       | str    | `"tile"`  | `"tile"` for tile/patch decode, `"batch"` for complete-image batch decode, or `"spatial_shard_height"` / `"spatial_shard_width"` for Wan spatial-shard decode.    |
+| Parameter                 | Type   | Default   | Description                                                                                                                                                                                                                                                 |
+| ------------------------- | ------ | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `vae_patch_parallel_size` | int    | 1         | Number of ranks requested for VAE parallelism, including batch mode. Set to 2 or higher to enable. Batch mode caps this degree at the existing worker group size.                                                                                           |
+| `vae_parallel_mode`       | str    | `"tile"`  | `"tile"` for tile/patch decode, `"batch"` for complete-image batch decode, or `"spatial_shard_height"` / `"spatial_shard_width"` for Wan and Qwen-Image spatial-shard decode. See [Spatially-Sharded Decode](#spatially-sharded-decode-wan-and-qwen-image). |
 
 Additional requirements:
 
@@ -188,9 +188,9 @@ outputs when selecting a deployment configuration.
 
 ---
 
-## Spatially-Sharded Decode (Wan)
+## Spatially-Sharded Decode (Wan and Qwen-Image)
 
-The default `vae_parallel_mode="tile"` distributes whole tiles across ranks. For the **Wan** VAE there is an alternative decode strategy, **spatially-sharded decode**, selected via `vae_parallel_mode="spatial_shard_height"` or `vae_parallel_mode="spatial_shard_width"`.
+The default `vae_parallel_mode="tile"` distributes whole tiles across ranks. For **Wan** and **Qwen-Image** VAEs there is an alternative decode strategy, **spatially-sharded decode**, selected via `vae_parallel_mode="spatial_shard_height"` or `vae_parallel_mode="spatial_shard_width"`.
 
 Instead of assigning independent tiles to ranks, spatial-shard decode shards the decoder feature maps along the height (`spatial_shard_height`) or width (`spatial_shard_width`) dimension and exchanges halo rows/columns between neighboring ranks around the spatial convolutions. This keeps the receptive field correct across shard boundaries, so the result matches the single-GPU decode within numerical tolerance.
 
@@ -219,9 +219,11 @@ vllm serve Wan-AI/Wan2.1-T2V-1.3B-Diffusers --omni \
 
 **Constraints and behavior:**
 
-- Spatial-shard decode is **decode-only** and currently implemented for the **Wan** VAE. Other models ignore `spatial_shard_*` modes.
-- It requires `vae_patch_parallel_size` to **match the DiT process group size**. If it does not, the VAE logs a warning and **falls back to tile-parallel decode** at runtime for latents larger than one tile, whether or not `vae_use_tiling` is set. Chunked (streaming) decode has no tile-parallel path: there it decodes locally on every rank, or raises if `vae_use_tiling` is set.
-- `spatial_shard_height` and `spatial_shard_width` are mutually exclusive for a given VAE instance (the decoder is patched in place for a single split dimension).
+- Spatial-shard decode is **decode-only**, implemented for **Wan** and **Qwen-Image** VAEs.
+- **Wan:** `vae_patch_parallel_size` must match the DiT process group size; a mismatch logs a warning and falls back to tile-parallel decode for latents larger than one tile, whether or not `vae_use_tiling` is set. Chunked (streaming) decode has no tile-parallel path: there it decodes locally on every rank, or raises if `vae_use_tiling` is set.
+- **Qwen-Image:** the size must match the VAE executor process-group size. A mismatch raises `ValueError`; there is no tile fallback. Multiple ranks require initialized distributed execution and an explicit executor group. Single-rank execution without distributed initialization runs full, non-tiled decode.
+- After Qwen multi-rank spatial decoding patches the decoder, its direction, process group, and parallel size are bound to that instance. Use a fresh VAE to change them or return to tile mode. Wan also binds its patched decoder to one split direction.
+- Qwen support is shared by all pipelines using `DistributedAutoencoderKLQwenImage`, including Ming-Image, Qwen-Image, Krea2, and Anima. Cross-model activation is intentional when the mode is explicitly selected, but the checkpoint validation in this change covers Ming-Image only; the sibling pipelines remain unvalidated on this path. See the [Ming-Image recipe](../../../../recipes/inclusionAI/Ming-Image.md) for deployment configurations and measurement scope.
 
 For end-to-end latency/throughput, launch serving with the desired `vae_parallel_mode` and use the existing diffusion serving benchmark:
 

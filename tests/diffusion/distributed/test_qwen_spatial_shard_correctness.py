@@ -18,6 +18,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import (
     DistributedAutoencoderKLQwenImage,
 )
@@ -85,6 +86,8 @@ def _worker(rank: int, split_dim: str, return_dict: dict, master_port: str) -> N
     model = os.environ.get("VLLM_OMNI_TEST_QWEN_VAE", _QWEN_VAE_MODEL)
     try:
         for case_id, (batch, z_dim, frames, height, width) in enumerate(_LATENT_CASES):
+            # Spatial decode patches the decoder in place and binds its mode.
+            # Each case needs a fresh VAE to run the unpatched reference first.
             vae = _load_qwen_vae(model, dtype).to(device=device, dtype=dtype).eval()
             generator = torch.Generator(device=device).manual_seed(0)
             latents = torch.randn(
@@ -132,7 +135,7 @@ def _worker(rank: int, split_dim: str, return_dict: dict, master_port: str) -> N
 def test_qwen_spatial_shard_decode_matches_reference(split_dim: str) -> None:
     manager = mp.get_context("spawn").Manager()
     return_dict = manager.dict()
-    master_port = str(29600 + (1 if split_dim == "width" else 0))
+    master_port = str(get_open_port())
 
     mp.spawn(
         _worker,
@@ -179,8 +182,13 @@ def test_qwen_spatial_shard_decode_matches_reference(split_dim: str) -> None:
         assert spatial_psnr >= _TOLERANCE_PSNR_DB, (
             f"{spatial_mode} PSNR {spatial_psnr} below {_TOLERANCE_PSNR_DB} for {shape}"
         )
-        # The RGBA channel that motivated this work must stay in the same
-        # tolerance band as the RGB channels.
+        # Allow at most twice the RGB error, with a 1e-3 absolute floor
+        # for near-exact RGB. The global 1e-2 gate alone cannot detect an
+        # alpha-only regression below that threshold.
         alpha_max = return_dict[f"{case_id}:{spatial_mode}:channel_A_max_abs_diff"]
         rgb_max = max(return_dict[f"{case_id}:{spatial_mode}:channel_{name}_max_abs_diff"] for name in ("R", "G", "B"))
-        assert alpha_max <= max(rgb_max, _TOLERANCE_MAX_ABS)
+        alpha_limit = max(2 * rgb_max, 1e-3)
+        assert alpha_max <= alpha_limit, (
+            f"{spatial_mode} alpha max_abs_diff {alpha_max} exceeds RGB-relative "
+            f"limit {alpha_limit} (RGB max {rgb_max}) for {shape}"
+        )
