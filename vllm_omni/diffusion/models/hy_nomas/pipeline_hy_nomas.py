@@ -223,6 +223,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         self.sp_size = od_config.parallel_config.ulysses_degree
         self.target_dtype = torch.bfloat16
         self._cpu_offload = False
+        self._vae_offloaded = False
         root = Path(od_config.model)
         text_encoder_override = (od_config.custom_pipeline_args or {}).get("text_encoder")
         if not root.is_dir():
@@ -375,11 +376,15 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             offload_encoder_modules=selected,
         )
         self._cpu_offload = True
+        # Only the all-components profile stages the VAE; naming dit/text_encoder
+        # leaves it resident even though the pipeline as a whole is "offloaded".
+        self._vae_offloaded = offload_components is None
 
     def disable_omni_model_cpu_offload(self) -> None:
         if self._cpu_offload:
             remove_sequential_offload([self.transformer, self.text_encoder, self.vae])
             self._cpu_offload = False
+            self._vae_offloaded = False
 
     def _encode_prompt(self, prompt: str) -> dict[str, torch.Tensor | None]:
         with self._component_context(self.text_encoder):
@@ -487,6 +492,17 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         return self._ar_sessions[self._bound().session_id]
 
     @torch.no_grad()
+    def _streaming_decode_to_cpu(self) -> bool:
+        """Whether the streaming decoder must hand its pixels back on the host.
+
+        ``create_streaming_decode_session(to_cpu=True)`` copies every decoded
+        window to the CPU, so the quantize step and the pinned staging in
+        :meth:`_to_host` would both run on the host.  A resident VAE therefore
+        keeps ``to_cpu`` false and returns device tensors; a staged VAE has no
+        resident budget for the decoder's rolling buffers and decodes to the host.
+        """
+        return self._vae_offloaded
+
     def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
         del kwargs
         bound = self._ar_state
@@ -542,7 +558,9 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 request.seed,
                 noise,
                 generator,
-                self.vae.create_streaming_decode_session() if bound is not None else None,
+                self.vae.create_streaming_decode_session(to_cpu=self._streaming_decode_to_cpu())
+                if bound is not None
+                else None,
                 torch.empty((1, 0), dtype=torch.bool, device=self.device),
             )
             if recent:
@@ -896,6 +914,24 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         state.step_in_chunk += 1
         state.step_index += 1
 
+    @staticmethod
+    def _to_host(frames: torch.Tensor) -> np.ndarray:
+        """Return one quantized chunk as HWC uint8, staged through pinned memory.
+
+        A blocking ``.cpu()`` into pageable memory runs at roughly 2 GB/s.
+        Copying into a freshly allocated pinned buffer with a recorded event
+        reaches PCIe speed, and allocating per chunk leaves the returned array
+        the sole owner, so no lease or reuse protocol is needed.
+        """
+        if frames.device.type != "cuda":
+            return frames.cpu().numpy()
+        host = torch.empty(frames.shape, dtype=frames.dtype, pin_memory=True)
+        host.copy_(frames, non_blocking=True)
+        done = torch.cuda.Event()
+        done.record()
+        done.synchronize()
+        return host.numpy()
+
     def _decode_chunk(
         self, session: HyNomasSession, latents: torch.Tensor, *, pixel_frames: int, finish: bool
     ) -> np.ndarray:
@@ -911,7 +947,8 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                         pixels = torch.cat((pixels, tail), 2) if pixels.numel() else tail
             if pixels.numel():
                 pixels = (pixels * 0.5 + 0.5).clamp(0, 1)
-                video = pixels[0].permute(1, 2, 3, 0).float().mul(255).round().to(torch.uint8).cpu().numpy()
+                frames = pixels[0].permute(1, 2, 3, 0).float().mul(255).round().to(torch.uint8).contiguous()
+                video = self._to_host(frames)
             else:
                 video = np.empty((0, session.height, session.width, 3), dtype=np.uint8)
         except Exception as exc:

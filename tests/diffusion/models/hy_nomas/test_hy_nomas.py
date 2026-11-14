@@ -8,6 +8,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -352,6 +353,90 @@ def test_nonempty_negative_prompt_is_rejected(negative_prompt):
 def test_negative_prompt_requires_string(negative_prompt):
     with pytest.raises(OmniClientError, match="negative_prompt must be a string"):
         normalize_request({"prompt": "A forest", "negative_prompt": negative_prompt}, OmniDiffusionSamplingParams())
+
+
+def test_decode_chunk_matches_legacy_quantization():
+    """Decoded latents must reach the encoder as HWC uint8 the legacy formula produced."""
+    from contextlib import nullcontext
+
+    # b=1, c=1, t=2, h=1, w=2 of raw decoder samples in [-1, 1].
+    pixels = torch.tensor([-1.4, -0.2, 0.0, 0.6], dtype=torch.float32).reshape(1, 1, 2, 1, 2)
+
+    class Decoder:
+        final_segment = False
+
+        def push(self, latents, *, pixel_frames):
+            del latents, pixel_frames
+            return pixels
+
+        def finish(self):
+            return torch.empty((0,))
+
+    session = SimpleNamespace(decoder=Decoder(), height=1, width=2)
+    pipeline = object.__new__(HyNomasPipeline)
+    pipeline.vae = SimpleNamespace(
+        config=SimpleNamespace(scaling_factor=1.0, shift_factor=None),
+        parameters=lambda: iter([torch.zeros(1, dtype=torch.float32)]),
+    )
+    pipeline._component_context = lambda module: nullcontext()
+    pipeline.sp_size = 1
+    pipeline.device = torch.device("cpu")
+
+    video = pipeline._decode_chunk(session, torch.zeros(1), pixel_frames=2, finish=False)
+
+    # (v * 0.5 + 0.5) -> clamp -> * 255 -> round-half-even -> uint8, laid out as HWC.
+    # -1.4 -> -0.2 -> 0 -> 0; -0.2 -> 0.4 -> 102; 0.0 -> 0.5 -> 127.5 -> 128; 0.6 -> 0.8 -> 204.
+    expected = np.array([[[[0], [102]]], [[[128], [204]]]], dtype=np.uint8)
+    assert video.dtype == np.uint8
+    assert video.shape == (2, 1, 2, 1)
+    assert video.flags["C_CONTIGUOUS"]
+    np.testing.assert_array_equal(video, expected)
+
+
+@pytest.mark.parametrize(("vae_offloaded", "expected"), [(False, False), (True, True)])
+def test_streaming_decode_to_cpu_follows_vae_residency(vae_offloaded, expected):
+    """A resident VAE must keep decoded pixels on the device.
+
+    ``create_streaming_decode_session(to_cpu=True)`` returns CPU tensors, so the
+    ``uint8`` quantization and every subsequent op would run on the host and the
+    pinned staging in ``_to_host`` would degenerate into a plain pageable copy.
+    """
+    pipeline = object.__new__(HyNomasPipeline)
+    pipeline._vae_offloaded = vae_offloaded
+
+    assert pipeline._streaming_decode_to_cpu() is expected
+
+
+@pytest.mark.parametrize(
+    ("offload_components", "vae_offloaded"),
+    [
+        (None, True),  # every component staged, VAE included
+        (frozenset({"dit"}), False),  # only the DiT staged, so the VAE stays resident
+        (frozenset({"text_encoder"}), False),
+    ],
+)
+def test_cpu_offload_profile_tracks_vae_residency(offload_components, vae_offloaded, monkeypatch):
+    """Only the all-components profile stages the VAE; naming components leaves it resident."""
+    from vllm_omni.diffusion.models.hy_nomas import pipeline_hy_nomas as module
+
+    monkeypatch.setattr(module, "apply_sequential_offload", lambda **kwargs: None)
+    monkeypatch.setattr(module, "remove_sequential_offload", lambda modules: None)
+
+    pipeline = object.__new__(HyNomasPipeline)
+    pipeline.transformer = SimpleNamespace()
+    pipeline.text_encoder = SimpleNamespace()
+    pipeline.vae = SimpleNamespace()
+    pipeline._cpu_offload = False
+    pipeline._vae_offloaded = False
+
+    pipeline.enable_omni_model_cpu_offload(device=torch.device("cpu"), offload_components=offload_components)
+
+    assert pipeline._vae_offloaded is vae_offloaded
+    assert pipeline._streaming_decode_to_cpu() is vae_offloaded
+
+    pipeline.disable_omni_model_cpu_offload()
+    assert pipeline._vae_offloaded is False
+    assert pipeline._streaming_decode_to_cpu() is False
 
 
 @pytest.fixture
