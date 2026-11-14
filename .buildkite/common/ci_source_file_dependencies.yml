@@ -470,6 +470,7 @@ source_file_dependencies:
   diffusion_quantization:
     - tests/diffusion/quantization/
     - vllm_omni/diffusion/quantization/
+    - vllm_omni/quantization/
 
   # --- models ---
   # --- omni / tts jobs ---
