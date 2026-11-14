@@ -7,13 +7,13 @@ import math
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec
-from vllm.v1.worker import block_table as native_block_table
 
 from vllm_omni.diffusion.diffusion_kv import model_runner_backend as model_runner_backend_module
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -25,6 +25,7 @@ from vllm_omni.diffusion.diffusion_kv.metadata import (
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.worker.v1_compat import block_table as native_block_table
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -184,7 +185,7 @@ class _FakeNumBlocks:
 class _FakeBlockTables:
     instances: list[_FakeBlockTables] = []
 
-    def __init__(self, **kwargs: object) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
         self.block_sizes = list(kwargs["block_sizes"])
         self.max_num_reqs = int(kwargs["max_num_reqs"])

@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import torch
+from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.warmup.kernel_warmup import _outside_kv_cache_transient_window
 from vllm.utils.torch_utils import weak_ref_tensors
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph import MoERoutingKey
 from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph_bridge import MammothGPUARModelRunner
@@ -24,8 +25,40 @@ from vllm_omni.worker.gpu_model_runner import (
 )
 from vllm_omni.worker.lmcache_model_runner_mixin import LMCacheHiddenStateMixin
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+from vllm_omni.worker.v1_compat import gpu_model_runner as v1_runner
+from vllm_omni.worker.v1_compat.gpu_model_runner import V1GPUModelRunnerMixin as GPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_fixed_kv_cache_supports_upstream_autotune_transient_window(monkeypatch):
+    """Native kernel warmup must recognize the legacy runner's fixed cache."""
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.vllm_config = SimpleNamespace(mamba_config=None, cache_config=SimpleNamespace(use_replayssm=False))
+    runner.attn_groups = []
+    runner.speculative_config = None
+    runner.jit_warmup_registry = SimpleNamespace(activate=nullcontext)
+    for method in (
+        "may_add_encoder_only_layers_to_kv_cache_config",
+        "maybe_add_kv_sharing_layers_to_kv_cache_groups",
+        "initialize_attn_backend",
+        "initialize_metadata_builders",
+        "may_reinitialize_input_batch",
+    ):
+        monkeypatch.setattr(runner, method, Mock())
+    monkeypatch.setattr(runner, "initialize_kv_cache_tensors", Mock(return_value={}))
+    monkeypatch.setattr(v1_runner, "initialize_mamba_ssu_backend", Mock())
+    monkeypatch.setattr(v1_runner, "has_kv_transfer_group", lambda: False)
+    config = KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+
+    GPUModelRunner.initialize_kv_cache(runner, config)
+    tuned = Mock()
+    with _outside_kv_cache_transient_window(SimpleNamespace(model_runner=runner)):
+        tuned()
+
+    tuned.assert_called_once_with()
+    with pytest.raises(ValueError, match="does not support an extensible cache"):
+        GPUModelRunner.initialize_kv_cache(runner, config, extensible=True)
 
 
 @pytest.mark.parametrize(
@@ -416,6 +449,7 @@ class DummyReqState:
 
     mm_features: list[str]
     additional_information_cpu: dict
+    num_prompt_tokens: int
 
 
 def test_model_forward_passes_request_ids_to_decode_metadata(monkeypatch):
@@ -617,7 +651,7 @@ def test_load_model_caches_prefill_token_mask_capability(mocker, model, expected
     runner._maybe_enable_output_token_ids_for_model_sampler = mocker.Mock()
     runner._init_talker_mtp = mocker.Mock()
     runner._prewarm_attention_capture_workspaces = mocker.Mock()
-    mocker.patch("vllm_omni.worker.gpu_model_runner.GPUModelRunner.load_model")
+    mocker.patch("vllm_omni.worker.v1_compat.gpu_model_runner.V1GPUModelRunnerMixin.load_model")
 
     OmniGPUModelRunner.load_model(runner)
 
@@ -1426,6 +1460,7 @@ def _make_phase_runner(monkeypatch, rows, *, batched_decode):
     offsets = [0]
     for rid, prompt_len, _, scheduled in rows:
         runner.requests[rid].prompt_token_ids = list(range(prompt_len))
+        runner.requests[rid].num_prompt_tokens = prompt_len
         offsets.append(offsets[-1] + scheduled)
         # Runner-owned metadata must override stale model/intermediate state.
         runner.model_intermediate_buffer[rid] = {
@@ -1465,7 +1500,6 @@ def _make_phase_runner(monkeypatch, rows, *, batched_decode):
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         scheduled_spec_decode_tokens={},
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
     )

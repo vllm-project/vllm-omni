@@ -1,11 +1,13 @@
-# Install the final v0.33.0 package from its frozen commit index.
-# Use the matching published v0.33.0 image and verify the selected runtime
-# from its exact frozen wheel below.
-ARG VLLM_PRECOMPILED_WHEEL_COMMIT=4ba787ec9959e566d3b587a796dff07673324da5
-ARG VLLM_VERSION=0.33.0
+# Install the v0.34.0rc3 candidate package from its frozen commit index.
+# Bootstrap dependencies from the last published release image (v0.33.0,
+# digest-pinned below) until the matching v0.34.0 image is published, and
+# verify the selected runtime from its exact frozen wheel below.
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT=9950ce36a2e1f4307e99bb4972202c1618b4787e
+ARG VLLM_VERSION=0.34.0rc3
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-# Update the digest together with VLLM_VERSION; the digest selects the image bytes.
-ARG VLLM_BASE_TAG=v${VLLM_VERSION}@sha256:d825baf9ce4b1b6bfc5ecc7b79880c7e6748c65a72d697ce3d47607aafa84c6e
+# The bootstrap digest selects the image bytes independently of the target
+# wheel above. Retain the published v0.33.0 base for this candidate runtime.
+ARG VLLM_BASE_TAG=v0.33.0@sha256:d825baf9ce4b1b6bfc5ecc7b79880c7e6748c65a72d697ce3d47607aafa84c6e
 
 # We use registry-based layer caching for the dependencies,
 # where the tag is determined based on the hash of the contents

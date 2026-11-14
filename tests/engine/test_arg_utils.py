@@ -21,6 +21,7 @@ from omegaconf import OmegaConf
 from pydantic import ValidationError
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 from vllm.config import VllmConfig
+from vllm.config.utils import hash_config
 from vllm.engine.arg_utils import EngineArgs
 from vllm.exceptions import VLLMValidationError
 from vllm.v1.engine.input_processor import InputProcessor
@@ -44,34 +45,42 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 AR_WORKER_CLS = "vllm_omni.worker.gpu_ar_worker.GPUARWorker"
 
 
-@pytest.mark.parametrize("use_v2", [False, True])
-def test_stage_runner_selects_matching_input_processor_validator(monkeypatch, use_v2):
+@pytest.mark.parametrize("logits_processor", [LogitBiasState, None], ids=["logit_bias", "audex_cfg"])
+def test_stage_runner_selects_matching_input_processor_validator(logits_processor):
     from vllm.sampling_params import SamplingParams
 
     from vllm_omni.model_executor.models.audex.cfg import AudexCFGLogitsProcessor
 
-    # Upstream's process-wide preference must not override a stage's deploy choice.
-    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", not use_v2)
+    # v0.34 removed Model Runner V1 together with the VLLM_USE_V2_MODEL_RUNNER
+    # preference; every stage now validates request params through the single
+    # `build_custom_logits_processors_params_validator` path, which calls each
+    # processor class's `validate_params` (the V2 interface). AudexCFGLogitsProcessor
+    # keeps its cfg_role/cfg_scale validation there.
+    if logits_processor is None:
+        logits_processor = AudexCFGLogitsProcessor
     config = VllmConfig()
     model_config = object.__new__(OmniModelConfig)
-    model_config.use_v2_model_runner = use_v2
     model_config.runner_type = "generate"
-    model_config.logits_processors = [LogitBiasState if use_v2 else AudexCFGLogitsProcessor]
+    model_config.logits_processors = [logits_processor]
     config.model_config = model_config
-    assert config.use_v2_model_runner is use_v2
     processor = object.__new__(InputProcessor)
     processor.vllm_config, processor.model_config = config, model_config
     validator = processor._build_logits_processors_params_validator()
     validator(SamplingParams(extra_args={"cfg_role": "cond", "cfg_scale": 1.5}))
-    if not use_v2:
+    if logits_processor is AudexCFGLogitsProcessor:
         with pytest.raises(VLLMValidationError, match="cfg_role"):
             validator(SamplingParams(extra_args={"cfg_role": "invalid"}))
 
 
 @pytest.mark.parametrize("use_v2", [False, True])
-def test_plain_vllm_config_retains_upstream_runner_preference(monkeypatch, use_v2):
-    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", use_v2)
-    assert VllmConfig().use_v2_model_runner is use_v2
+def test_plain_vllm_config_retains_upstream_runner_preference(use_v2):
+    # v0.34 removed the process-wide runner preference
+    # (vllm.envs.VLLM_USE_V2_MODEL_RUNNER) with Model Runner V1; vllm-omni's
+    # patch installs VllmConfig.use_v2_model_runner itself: plain (non-omni)
+    # configs only have MRv2 upstream so they report True, while omni stages
+    # route from OmniModelConfig.use_v2_model_runner (the deploy choice).
+    assert VllmConfig().use_v2_model_runner is True
+    assert OmniEngineArgs(use_v2_model_runner=use_v2).create_model_config().use_v2_model_runner is use_v2
 
 
 def test_sync_config_is_omni():
@@ -273,7 +282,7 @@ def test_compute_hash_is_stable_across_launches(stage_id):
             omni_kv_config={"connector_config": kv_connector_config},
         ).create_engine_config()
         # vLLM keys its torch.compile and AOT caches on this hash.
-        return vllm_config.compute_hash()
+        return hash_config(vllm_config)
 
     first_hash = get_model_config_hash()
     second_hash = get_model_config_hash()
@@ -288,7 +297,7 @@ def test_compute_hash_keeps_stage_connector_settings():
             worker_cls=AR_WORKER_CLS,
             stage_connector_spec={"name": "SharedMemoryConnector", "extra": {"codec_chunk_frames": num_frames}},
         ).create_engine_config()
-        return vllm_config.compute_hash()
+        return hash_config(vllm_config)
 
     first_hash = get_model_config_hash(num_frames=25)
     second_hash = get_model_config_hash(num_frames=50)

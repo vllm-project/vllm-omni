@@ -40,8 +40,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.cache import LRUCache
 from vllm.utils.collection_utils import is_list_of
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
@@ -56,6 +54,8 @@ from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import (
 )
 from vllm_omni.model_executor.models.mimo_audio.mimo_audio_code2wav import get_tokenizer_worker
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni import OmniOutput
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
+from vllm_omni.worker.v1_compat.sampler import Sampler
 
 logger = init_logger(__name__)
 

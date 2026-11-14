@@ -24,6 +24,7 @@ from vllm_omni.core.prefix_cache.adapter import (
     PrefixCacheSchedulerAdapter,
 )
 from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError
+from vllm_omni.core.sched.output import OmniCachedRequestData
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -269,6 +270,7 @@ def test_real_vllm_scheduler_contract():
         block_ids=([2, 3, 4],),
         num_computed_tokens=8,
         lora_request=None,
+        prefill_token_ids=list(range(12)),
     )
 
     def real_output(*, new_reqs=(), cached=None, scheduled=None, finished=()):
@@ -280,7 +282,6 @@ def test_real_vllm_scheduler_contract():
             total_num_scheduled_tokens=sum(counts.values()),
             scheduled_spec_decode_tokens={},
             scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[],
             finished_req_ids=set(finished),
             free_encoder_mm_hashes=[],
         )
@@ -291,11 +292,11 @@ def test_real_vllm_scheduler_contract():
             "r", PrefixCacheEventKind.STARTED, hit_end=8, block_ids=((2, 3, 4),), scheduled_tokens=4
         ),
     )
-    cached = sched.CachedRequestData(
+    # vLLM 0.34 dropped the MRV1 resume fields from the base CachedRequestData;
+    # omni's wire object re-adds them (empty-exact for pin-built outputs).
+    cached = OmniCachedRequestData(
         req_ids=["r"],
-        resumed_req_ids=set(),
         new_token_ids=[],
-        all_token_ids={},
         new_block_ids=[None],
         num_computed_tokens=[12],
         num_output_tokens=[1],

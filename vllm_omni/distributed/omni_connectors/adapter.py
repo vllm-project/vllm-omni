@@ -389,7 +389,8 @@ def construct_next_stage_streaming_input_prompt(
         # declares that transport behavior explicitly in payload metadata.
         new_prompt = [0] * replacement_prompt_len
         request._output_token_ids.clear()
-        request._all_token_ids.clear()
+        # _all_token_ids is a TokenBuffer (array) since vLLM 0.34; no .clear().
+        del request._all_token_ids[:]
         request._all_token_ids.extend(new_prompt)
         request.prompt_token_ids = new_prompt
         request.num_computed_tokens = 0

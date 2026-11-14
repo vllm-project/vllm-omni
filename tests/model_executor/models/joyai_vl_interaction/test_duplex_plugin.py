@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.v1.engine.core_client import _with_packed_prompt
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from tests.engine.duplex.test_session_runner import (
@@ -1228,7 +1229,10 @@ async def test_asr_visuals_stay_on_raw_prompt_across_engine_wire(mocker, monkeyp
         await _submit(orchestrator, AppendAudio(audio=struct.pack("<hh", 1000, 2000), video_frames=(frame(),)))
         await _submit(orchestrator, Commit(final=True, create_response=True))
         request = clients[0].add_request_calls[-1][0]
-        restored = MsgpackDecoder(type(request)).decode(MsgpackEncoder().encode(request))
+        # EngineCoreRequest.prompt_token_ids is an int32 ndarray on the wire at
+        # this pin (the client packs the list before sending); apply the same
+        # transform the real client does, then round-trip the wire codecs.
+        restored = MsgpackDecoder(type(request)).decode(MsgpackEncoder().encode(_with_packed_prompt(request)))
         info = deserialize_additional_information(restored.additional_information)
         assert "deferred_multi_modal_data" not in info
         raw_prompt = orchestrator.request_states[request.request_id].prompt
@@ -1267,7 +1271,7 @@ async def test_async_chunk_prewarm_request_crosses_engine_wire(mocker, monkeypat
         await _submit(orchestrator, Commit(final=True, create_response=True))
         assert not clients[1].add_request_calls
         (prewarm,) = [call[0] for call in clients[2].add_request_calls]
-        MsgpackDecoder(type(prewarm)).decode(MsgpackEncoder().encode(prewarm))
+        MsgpackDecoder(type(prewarm)).decode(MsgpackEncoder().encode(_with_packed_prompt(prewarm)))
     finally:
         await orchestrator.session_manager.shutdown()
 

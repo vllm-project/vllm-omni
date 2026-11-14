@@ -943,6 +943,8 @@ def test_native_request_preserves_streaming_flag_and_reference_audio(plane, fact
         block_ids=([],),
         num_computed_tokens=0,
         lora_request=None,
+        # The pin made the full prefill token list a required field.
+        prefill_token_ids=[0, 0],
     )
     owner = SimpleNamespace(
         **vars(base),

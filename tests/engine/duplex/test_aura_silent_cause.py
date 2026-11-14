@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
 
@@ -273,7 +274,11 @@ async def test_finished_stage1_handoff_submit_path(monkeypatch: pytest.MonkeyPat
     assert kind == "initial"
     assert getattr(request, "resumable", None) is False
     assert OmniStreamingUpdate.from_request(request) is None
-    prompt_ids = list(getattr(request, "prompt_token_ids", []) or [])
+    # v0.34 packs prompt token ids as an int32 ndarray (see
+    # build_engine_core_request_from_tokens); compare in list space without
+    # truth-testing the array itself.
+    raw_ids = getattr(request, "prompt_token_ids", None)
+    prompt_ids = np.asarray([] if raw_ids is None else raw_ids).tolist()
     assert prompt_ids, "submit_initial carried an empty prompt"
 
 

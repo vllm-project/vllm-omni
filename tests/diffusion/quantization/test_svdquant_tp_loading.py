@@ -150,6 +150,7 @@ def test_qkv_parallel_loader_shards_fused_svdquant_outputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     layer = _linear_without_init(QKVParallelLinear, tp_rank=1)
+    layer.loaded_shard_ids = {}
     layer.total_num_heads = 4
     layer.total_num_kv_heads = 2
     layer.num_heads = 2

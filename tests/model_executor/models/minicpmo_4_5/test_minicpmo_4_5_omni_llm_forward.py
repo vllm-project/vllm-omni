@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner  # noqa: F401  (base of the runner below)
 
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
@@ -14,6 +14,10 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMForConditionalGeneration,
 )
+
+# The mm-input prep path omni's OmniGPUModelRunner actually uses lives in the
+# vendored V1 mixin; upstream's GPUModelRunner lost _prepare_mm_inputs at the pin.
+from vllm_omni.worker.v1_compat.gpu_model_runner import V1GPUModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -47,7 +51,7 @@ def test_multimodal_runner_preserves_forwarded_token_identities(monkeypatch):
 
     # This same upstream path prepares normal multimodal forwards and graph
     # capture inputs. Embeddings must not replace the real token identities.
-    input_ids, inputs_embeds = GPUModelRunner._prepare_mm_inputs(runner, 2)
+    input_ids, inputs_embeds = V1GPUModelRunnerMixin._prepare_mm_inputs(runner, 2)
     out = wrapper.forward(input_ids=input_ids, positions=torch.tensor([10, 11]), inputs_embeds=inputs_embeds)
 
     torch.testing.assert_close(out.multimodal_outputs["latent_input_ids"], token_buffer[:2, None])
@@ -59,7 +63,7 @@ def test_multimodal_runner_preserves_forwarded_token_identities(monkeypatch):
     config.model_config.model_stage = "tts"
     runner.model = MiniCPMO45OmniForConditionalGeneration(vllm_config=config)
     assert not runner.model.omni_pooler_payload_include_hidden
-    talker_ids, talker_embeds = GPUModelRunner._prepare_mm_inputs(runner, 2)
+    talker_ids, talker_embeds = V1GPUModelRunnerMixin._prepare_mm_inputs(runner, 2)
     assert talker_ids is None
     torch.testing.assert_close(talker_embeds, embed_buffer[:2])
 

@@ -12,7 +12,6 @@ import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import get_dcp_group
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
-from vllm.v1.worker import block_table as native_block_table
 from vllm.v1.worker.gpu.attn_utils import init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
 
@@ -31,6 +30,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRuntime,
 )
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.v1_compat import block_table as native_block_table
 
 DiffusionKVIdentity = tuple[str, int | None, str | None]
 DiffusionKVSnapshot = tuple[object, ...]

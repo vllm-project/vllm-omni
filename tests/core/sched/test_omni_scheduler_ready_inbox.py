@@ -57,6 +57,9 @@ def test_native_input_gate_parks_and_restores_kv_holders(policy, async_chunk):
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler.waiting = create_request_queue(policy)
     scheduler.kv_holding_waiting = create_request_queue(policy)
+    # Upstream _enqueue_waiting_request reads self.connector (None unless a KV
+    # connector is configured); __new__ bypasses the __init__ that sets it.
+    scheduler.connector = None
     scheduler.deferred_waiting = set()
     scheduler._outputs_awaiting_stage_payload = {}
     scheduler.running = []

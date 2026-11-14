@@ -32,6 +32,15 @@ class OmniNewRequestData(NewRequestData):
     additional_information: AdditionalInformationPayload | dict[str, object] | None = None
     model_intermediate_buffer: dict[str, object] | None = None
     resumable: bool = False
+    # vLLM 0.34 added a required ``prefill_token_ids`` positional to the base
+    # NewRequestData ("the prompt, plus any generated tokens on resume").
+    # Omni construction sites and tests predate it; keep it optional here and
+    # derive the fresh-request default (prefill == prompt) when not provided.
+    prefill_token_ids: list[int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.prefill_token_ids is None:
+            self.prefill_token_ids = list(self.prompt_token_ids or [])
 
     @classmethod
     def from_base(
@@ -95,6 +104,14 @@ class OmniCachedRequestData(CachedRequestData):
 
     prompt_token_ids: dict[str, list[int]] = field(default_factory=dict)
     additional_information: dict[str, dict | None] = field(default_factory=dict)
+    # vLLM 0.34 removed the MRV1 resume fields from the base CachedRequestData
+    # (resumed requests are re-sent in full via scheduled_new_reqs).  Omni's
+    # MRV1-style runners still speak the older wire contract, so the fields
+    # live on here.  For outputs built by the pinned upstream scheduler the
+    # resume set stays empty; Omni's shared schedule postprocessing supplies
+    # token history when a paused MRV1 request returns to the worker batch.
+    resumed_req_ids: set[str] = field(default_factory=set)
+    all_token_ids: dict[str, list[int]] = field(default_factory=dict)
 
 
 @dataclass

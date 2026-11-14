@@ -17,10 +17,22 @@ SCRIPT = Path(__file__).resolve().parents[2] / ".buildkite/cuda/scripts/check_vl
 
 
 @pytest.mark.parametrize(
-    "commit", ["g4ba787ec9", "g61cbf5429", "gcbafc4690", "g4135590ff", "g82eb574d9", "gdeadbeef0", None, "g5df6"]
+    "commit",
+    [
+        "g9950ce36a",
+        "g34b780fe6",
+        "g4ba787ec9",
+        "g61cbf5429",
+        "gcbafc4690",
+        "g4135590ff",
+        "g82eb574d9",
+        "gdeadbeef0",
+        None,
+        "g5df6",
+    ],
 )
 @pytest.mark.parametrize("lmcache_abi_error", [False, True])
-@pytest.mark.parametrize("version", ["0.33.0", "0.33.0rc3.dev3+g4ba787ec9", "0.33.0.post1"])
+@pytest.mark.parametrize("version", ["0.34.0rc3", "0.34.0rc0", "0.34.0rc3.dev1+g9950ce36a", "0.34.0rc3.post1"])
 @pytest.mark.parametrize("cudnn,cudnn_preamble", [(92501, ""), (92400, ""), (92501, "# Private runtime pin\n\n")])
 def test_release_wheel_commit_check(monkeypatch, commit, lmcache_abi_error, version, cudnn, cudnn_preamble):
     # Source and package identities are independent: RC and final wheels can
@@ -61,8 +73,8 @@ def test_release_wheel_commit_check(monkeypatch, commit, lmcache_abi_error, vers
 
         monkeypatch.setattr(importlib, "import_module", import_module)
     main = runpy.run_path(str(SCRIPT))["main"]
-    if commit == "g4ba787ec9":
-        if version != "0.33.0":
+    if commit == "g9950ce36a":
+        if version != "0.34.0rc3":
             with pytest.raises(AssertionError, match="Expected vLLM version"):
                 main()
         elif cudnn != 92501:

@@ -38,8 +38,6 @@ from vllm.multimodal.processing import (
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
@@ -73,6 +71,8 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.transformers_utils.repo_utils import hf_api
 from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache, get_speaker_cache
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
+from vllm_omni.worker.v1_compat.sampler import Sampler
 
 logger = init_logger(__name__)
 
@@ -84,8 +84,8 @@ _QWEN2_STACKED_SHARDS = {
 
 
 class _CosyVoice3RejectionSampler(RejectionSampler):
-    def __call__(self, logits, input_batch, draft_logits=None, invalid_drafts=None):
-        output = super().__call__(logits, input_batch, draft_logits, invalid_drafts)
+    def __call__(self, logits, input_batch, draft_logits=None):
+        output = super().__call__(logits, input_batch, draft_logits)
         if input_batch.num_draft_tokens > 0:
             # Startup warmup also verifies drafts; keep request-time evidence visible.
             logger.debug("CosyVoice3 Talker is verifying draft codes")

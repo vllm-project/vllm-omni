@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Stage-0 talker for higgs-audio v2 (vLLM-native, DualFFN-aware).
 
@@ -1151,7 +1152,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         """
         sampler = getattr(self, "_stock_sampler", None)
         if sampler is None:
-            from vllm.v1.sample.sampler import Sampler
+            from vllm_omni.worker.v1_compat.sampler import Sampler
 
             sampler = Sampler()
             self._stock_sampler = sampler

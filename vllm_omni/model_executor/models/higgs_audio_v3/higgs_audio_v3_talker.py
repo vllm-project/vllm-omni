@@ -35,13 +35,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.platforms import current_platform
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
     HiggsAudioV3Config,
 )
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
 
 __all__ = ["HiggsAudioV3TalkerForConditionalGeneration"]
 
@@ -1152,7 +1152,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         def run_stock_sampler() -> Any:
             sampler = getattr(self, "_stock_sampler", None)
             if sampler is None:
-                from vllm.v1.sample.sampler import Sampler
+                from vllm_omni.worker.v1_compat.sampler import Sampler
 
                 sampler = Sampler()
                 self._stock_sampler = sampler

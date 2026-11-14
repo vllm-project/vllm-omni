@@ -81,8 +81,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import get_tokenizer
 from vllm.utils.tensor_schema import TensorSchema
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.models.hunyuan_image3._hunyuan_v1_vendored import (
@@ -94,6 +92,8 @@ from vllm_omni.model_executor.models.hunyuan_image3._hunyuan_v1_vendored import 
 )
 from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import AutoencoderKLConv3D
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
+from vllm_omni.worker.v1_compat.sampler import Sampler
 
 if TYPE_CHECKING:
     from vllm_omni.distributed.weight_sharing.adapters import WeightSharingAdapter

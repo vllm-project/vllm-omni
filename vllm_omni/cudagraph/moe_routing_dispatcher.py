@@ -91,7 +91,7 @@ def patch_cudagraph_dispatcher_moe_routing() -> bool:
     FULL presets). When the attr is absent/false, behaviour is unchanged
     aside from defaulting ``moe_routing_key=0`` on created descriptors.
     """
-    from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+    from vllm_omni.worker.v1_compat.cudagraph_dispatcher import CudagraphDispatcher
 
     if getattr(CudagraphDispatcher.initialize_cudagraph_keys, "_omni_moe_routing", False):
         return False
@@ -117,10 +117,10 @@ def patch_cudagraph_dispatcher_moe_routing() -> bool:
         if not full_keys:
             return
         # Collapse to unique base keys (ignore prior moe_routing_key).
-        bases: dict[tuple, BatchDescriptor] = {}
+        bases: dict[BatchDescriptor, BatchDescriptor] = {}
         for desc in list(full_keys):
             base = replace(desc, moe_routing_key=int(MoERoutingKey.BLEND))
-            bases[(base.num_tokens, base.num_reqs, base.uniform, base.has_lora, base.num_active_loras)] = base
+            bases[base] = base
         full_keys.clear()
         for desc in expand_batch_descriptors_for_moe_routing(bases.values(), enabled=True):
             full_keys.add(desc)
@@ -167,8 +167,8 @@ def patch_cudagraph_dispatcher_moe_routing() -> bool:
         )
 
     initialize_cudagraph_keys._omni_moe_routing = True  # type: ignore[attr-defined]
-    CudagraphDispatcher._create_padded_batch_descriptor = _create_padded_batch_descriptor
-    CudagraphDispatcher.initialize_cudagraph_keys = initialize_cudagraph_keys
-    CudagraphDispatcher.get_capture_descs = get_capture_descs
-    CudagraphDispatcher.dispatch = dispatch
+    setattr(CudagraphDispatcher, "_create_padded_batch_descriptor", _create_padded_batch_descriptor)
+    setattr(CudagraphDispatcher, "initialize_cudagraph_keys", initialize_cudagraph_keys)
+    setattr(CudagraphDispatcher, "get_capture_descs", get_capture_descs)
+    setattr(CudagraphDispatcher, "dispatch", dispatch)
     return True

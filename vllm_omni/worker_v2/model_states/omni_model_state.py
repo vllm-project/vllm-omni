@@ -54,7 +54,7 @@ def _default_mrope_positions(
     self_model: Any,
     input_tokens: list[int],
     mm_features: list,
-) -> tuple[np.ndarray, int]:
+) -> tuple[torch.Tensor, int]:
     """Return 3D sequential positions with zero delta.
 
     For non-vision Omni models (e.g. TTS Talker), all 3 M-RoPE
@@ -63,8 +63,10 @@ def _default_mrope_positions(
     """
     n = len(input_tokens)
     row = _SEQUENTIAL_POSITIONS[:n] if n <= _SEQUENTIAL_POSITIONS.shape[0] else np.arange(n, dtype=np.int32)
-    # A read-only view of one row; RopeState copies it into its staged writes.
-    return np.broadcast_to(row, (3, n)), 0
+    # A read-only broadcast view; the pin's RopeState.init_prefill_positions
+    # consumes torch rows (``prefill_positions[i].numpy()``), so the shim must
+    # return a tensor like upstream's own mrope models.
+    return torch.from_numpy(np.broadcast_to(row, (3, n))), 0
 
 
 _SEQUENTIAL_POSITIONS = np.arange(1 << 16, dtype=np.int32)

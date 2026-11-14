@@ -5,9 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.config import VllmConfig
 
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.v1_compat.gpu_model_runner import V1GPUModelRunnerMixin as GPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -78,12 +79,19 @@ def test_auxiliary_capture_finishes_before_worker_readiness(monkeypatch, generat
 
     def capture():
         assert events == ["warmup"]
+        assert worker.vllm_config.kernel_config.enable_jit_warmup is True
         events.append("capture")
         if fail:
             raise RuntimeError("auxiliary capture failed")
 
-    monkeypatch.setattr(Worker, "compile_or_warm_up_model", lambda _: events.append("warmup"))
+    def warmup(worker):
+        assert worker.vllm_config.kernel_config.enable_jit_warmup is False
+        events.append("warmup")
+
+    monkeypatch.setattr(Worker, "compile_or_warm_up_model", warmup)
     worker = object.__new__(GPUGenerationWorker if generation else OmniGPUWorkerBase)
+    worker.vllm_config = VllmConfig()
+    worker.vllm_config.kernel_config.enable_jit_warmup = True
     worker.use_v2_model_runner = generation
     model = SimpleNamespace(capture_auxiliary_graphs=capture) if enabled else SimpleNamespace()
     worker.model_runner = SimpleNamespace(model=model, profile_run=lambda: events.append("warmup"))
@@ -94,3 +102,4 @@ def test_auxiliary_capture_finishes_before_worker_readiness(monkeypatch, generat
         worker.compile_or_warm_up_model()
         events.append("ready")
     assert events == ["warmup"] + (["capture"] if enabled else []) + ([] if fail else ["ready"])
+    assert worker.vllm_config.kernel_config.enable_jit_warmup is True

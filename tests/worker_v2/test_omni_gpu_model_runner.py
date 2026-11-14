@@ -472,6 +472,9 @@ def test_hybrid_state_constructs_and_reuses_request_slots(remove_by_id):
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=16),
         cache_config=SimpleNamespace(mamba_cache_mode="none", use_kda_recoverssm=False),
+        # The pin's VllmConfig grew this top-level field; the pin's
+        # MambaHybridModelState reads it unconditionally in __init__.
+        use_flashinfer_replayssm=False,
     )
     # Exercise both real parent constructors and their lifecycle methods.
     state = OmniMambaHybridModelState(config, torch.nn.Linear(8, 8), None, torch.device("cpu"))

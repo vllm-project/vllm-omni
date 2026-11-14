@@ -1,7 +1,7 @@
 # Installation
 
 !!! important
-    This source checkout targets vLLM 0.33.0 at `4ba787ec9959e566d3b587a796dff07673324da5`, with CUDA 13.0 and PyTorch 2.14.0. Full CI and ROCm/XPU runtime validation remain pending. CUDA Dockerfiles use the published 0.33.0 image and verify the frozen final wheel; ROCm builds the same commit from source on its matching 0.33.0 base. The published Omni 0.32.0 wheel instructions below retain their matching vLLM 0.32.0 dependency.
+    This source checkout targets vLLM 0.34.0rc3 at `9950ce36a2e1f4307e99bb4972202c1618b4787e`, with CUDA 13.0 and PyTorch 2.14.0. Full CI and ROCm/XPU runtime validation remain pending. CUDA Dockerfiles retain the published 0.33.0 bootstrap image and verify the frozen candidate wheel; ROCm builds the same candidate commit from source on its 0.33.0 bootstrap base. The published Omni 0.32.0 wheel instructions below retain their matching vLLM 0.32.0 dependency.
 
 The CUDA Dockerfiles rebuild LMCache 0.5.6 against Torch 2.14 because the base's
 Torch 2.13 extension fails to import. They retain its CUDA architecture coverage

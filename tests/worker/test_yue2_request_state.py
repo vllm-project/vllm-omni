@@ -7,12 +7,12 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.tts_adapters.yue2 import Yue2Adapter
 from vllm_omni.model_executor.models.yue2 import yue2 as y
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker.v1_compat.input_batch import CachedRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

@@ -665,6 +665,8 @@ def test_rope_shim_constructs_sequential_mrope_state():
     with (
         patch("vllm.platforms.current_platform", CpuPlatform()),
         patch("vllm.v1.worker.gpu.buffer_utils.is_uva_available", return_value=False),
+        # Pin-memory support is cached separately from the platform and UVA.
+        patch("vllm.v1.worker.gpu.buffer_utils.is_pin_memory_available", return_value=False),
     ):
         rope = _make_safe_get_rope(get_rope_state)(
             config,
@@ -683,7 +685,10 @@ def test_rope_shim_constructs_sequential_mrope_state():
     rope.init_prefill_positions(1, model, [11, 22, 33, 44], [])
     assert rope.prefill_delta.np[1] == 0
     assert rope.prefill_positions._staged_write_indices == [3, 4, 5]
-    assert rope.prefill_positions._staged_write_contents == [0, 1, 2, 3] * 3
+    # The pin's StagedWriteTensor keeps ndarray staged rows by reference in
+    # _staged_write_chunks instead of extending _staged_write_contents.
+    staged = rope.prefill_positions._staged_write_chunks
+    assert [np.asarray(chunk).tolist() for chunk in staged] == [[0, 1, 2, 3]] * 3
 
 
 @pytest.mark.parametrize("output_key", [None, ("only_one",)])

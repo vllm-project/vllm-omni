@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import torch
     from vllm.v1.core.sched.output import SchedulerOutput
-    from vllm.v1.sample.metadata import SamplingMetadata
+
+    from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
 
 
 @dataclass(frozen=True, slots=True)

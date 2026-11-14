@@ -49,11 +49,13 @@ def register_top_k_top_p_warmup(worker: Any) -> bool:
     if not HAS_TRITON:
         return False
     try:
-        from vllm.v1.sample.ops.topk_topp_sampler import register_top_k_top_p_warmups
+        from vllm_omni.worker.v1_compat.sample_ops.topk_topp_sampler import (
+            register_top_k_top_p_warmups,
+        )
     except ImportError:
         logger.warning_once(
             "Skipping top-k/top-p sampler warmup: "
-            "vllm.v1.sample.ops.topk_topp_sampler.register_top_k_top_p_warmups is not importable. "
+            "vllm_omni.worker.v1_compat.sample_ops.topk_topp_sampler.register_top_k_top_p_warmups is not importable. "
             "Seeded top-k/top-p requests may JIT-compile sampling kernels on the first requests."
         )
         return False

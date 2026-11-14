@@ -7,11 +7,11 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.logger import init_logger
-from vllm.v1.sample.logits_processor import LogitsProcessors
-from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
+from vllm_omni.worker.v1_compat.logits_processor import LogitsProcessors
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_sampler import OmniSampler, OmniSamplingOutput
 from vllm_omni.worker_v2.warmup import is_warmup_request

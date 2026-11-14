@@ -789,9 +789,13 @@ class MTPState:
             logger.warning("Skipping mtp graph capture because this model requires per-request req_infos.")
             return
 
-        from vllm.compilation import monitor
+        # vLLM 0.34 (aac1b2a4f3) removed the global cudagraph-capture flag from
+        # vllm.compilation.monitor; Omni's fork in v1_compat.misc preserves the
+        # save/restore bookkeeping for Omni's own MTP capture loop.
         from vllm.distributed.parallel_state import graph_capture
         from vllm.forward_context import set_forward_context
+
+        from vllm_omni.worker.v1_compat import misc as monitor
 
         compilation_config = self.owner.vllm_config.compilation_config
         capture_sizes = self._get_mtp_capture_sizes()

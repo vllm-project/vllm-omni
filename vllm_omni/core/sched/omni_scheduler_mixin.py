@@ -8,6 +8,7 @@ import os
 import queue
 import time
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import fields
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -17,7 +18,7 @@ from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import (
@@ -38,6 +39,7 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
 from vllm_omni.core.sched.output import (
+    OmniCachedRequestData,
     OmniChunkRecvHandle,
     OmniNewRequestData,
     OmniRequestPrewarm,
@@ -377,6 +379,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                 stage_id=getattr(model_config, "stage_id", 0),
             )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
+        # MRV1 needs a token-history snapshot when a paused request returns
+        # to the worker batch. Native vLLM 0.34 no longer emits this payload.
+        self.prev_step_scheduled_req_ids: set[str] = set()
         self._init_omni_connector_output_inbox()
         self._pending_data_plane_terminal_req_ids: set[str] = set()
         # Async-chunk prewarm payloads popped in add_request, keyed by request
@@ -467,7 +472,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         """Replace a downstream stage's placeholder with its next payload."""
         self._reset_streaming_session_replacement_state(session)
         session._output_token_ids.clear()
-        session._all_token_ids.clear()
+        # _all_token_ids is a TokenBuffer (array) since vLLM 0.34; it has no
+        # .clear(), so empty it with the del-slice idiom the pin uses.
+        del session._all_token_ids[:]
         new_prompt = update.prompt_token_ids or ()
         session._all_token_ids.extend(new_prompt)
         session.num_computed_tokens = 0
@@ -969,6 +976,22 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
     ) -> None:
         """Enrich new requests and apply async-chunk output bookkeeping."""
         self._rewrap_scheduled_new_reqs(scheduler_output)
+        if not getattr(self, "use_v2_model_runner", True):
+            cached = scheduler_output.scheduled_cached_reqs
+            if not isinstance(cached, OmniCachedRequestData):
+                cached = OmniCachedRequestData(
+                    **{field.name: getattr(cached, field.name) for field in fields(CachedRequestData)}
+                )
+                scheduler_output.scheduled_cached_reqs = cached
+            # Async sampling can leave the worker's saved output tokens behind
+            # the scheduler. Restore the pre-0.34 wire contract for requests
+            # that were absent from the previous step, on both schedule paths.
+            cached.all_token_ids = {
+                req_id: list(self.requests[req_id].all_token_ids)
+                for req_id in cached.req_ids
+                if req_id not in self.prev_step_scheduled_req_ids
+            }
+            self.prev_step_scheduled_req_ids = set(scheduler_output.num_scheduled_tokens)
         if not self.chunk_transfer_adapter:
             return
         if not consume_chunks:

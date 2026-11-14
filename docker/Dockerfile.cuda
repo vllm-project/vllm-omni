@@ -5,10 +5,10 @@ ARG BASE_IMAGE
 # Use the official wheel's declared NCCL dependency for the Omni runtime.
 ENV UV_OVERRIDE=""
 
-# Verify the final runtime using the same frozen wheel as CUDA CI, on the
-# matching published base image. Omni runtime qualification is pending.
-ARG VLLM_PRECOMPILED_WHEEL_COMMIT=4ba787ec9959e566d3b587a796dff07673324da5
-ARG VLLM_VERSION=0.33.0
+# Verify the candidate runtime using the same frozen wheel as CUDA CI,
+# bootstrapped from the pinned v0.33.0 base image.
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT=9950ce36a2e1f4307e99bb4972202c1618b4787e
+ARG VLLM_VERSION=0.34.0rc3
 ARG COMMON_WORKDIR=/app
 
 WORKDIR ${COMMON_WORKDIR}

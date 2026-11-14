@@ -6,6 +6,7 @@ import importlib
 import inspect
 import threading
 import time
+from array import array
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, cast
@@ -297,8 +298,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             ("_output_token_ids", "output_token_ids"),
         ):
             token_ids = getattr(request, private_name, None)
-            if isinstance(token_ids, list):
-                frozen_ids = token_ids.copy()
+            # vLLM 0.34 keeps token ids in array-backed TokenBuffers, which are
+            # not list instances; freeze them exactly like the list form or the
+            # snapshot would alias live storage.
+            if isinstance(token_ids, (list, array)):
+                frozen_ids = token_ids.copy() if isinstance(token_ids, list) else list(token_ids)
                 setattr(snapshot, private_name, frozen_ids)
                 setattr(snapshot, public_name, ConstantList(frozen_ids))
                 if public_name == "output_token_ids":
@@ -311,7 +315,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # scheduled as a fresh prefill. Keep the canonical request token
         # mirrors synchronized at the replacement point so every downstream
         # consumer observes the current prompt, regardless of its length.
-        request._all_token_ids.clear()
+        del request._all_token_ids[:]
         request._all_token_ids.extend(request.prompt_token_ids)
         request._output_token_ids.clear()
         request.num_prompt_tokens = len(request.prompt_token_ids)

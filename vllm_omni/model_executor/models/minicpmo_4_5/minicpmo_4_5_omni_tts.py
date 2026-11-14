@@ -31,11 +31,11 @@ from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext, LogitsProcessor
 from vllm.v1.worker.gpu.sample.output import SamplerOutput as Mrv2SamplerOutput
+from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
@@ -71,6 +71,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 from vllm_omni.utils.seeded_exponential import fill_exponential_rows, fill_exponential_steps
+from vllm_omni.worker.v1_compat.sampler import Sampler
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
@@ -1307,8 +1308,7 @@ class MiniCPMO45TalkerRejectionSampler(RejectionSampler):
         self,
         logits: torch.Tensor,
         input_batch: Any,
-        draft_logits: torch.Tensor | None = None,
-        invalid_drafts: torch.Tensor | None = None,
+        draft_logits: DraftLogitsCache | None = None,
     ) -> Any:
         # The runner calls this only for steps that carry draft codes. The Talker
         # DSpark e2e asserts on this exact message.
@@ -1322,7 +1322,7 @@ class MiniCPMO45TalkerRejectionSampler(RejectionSampler):
                 input_batch.expanded_idx_mapping[:num_logits].long(),
                 input_batch.expanded_local_pos[:num_logits].long(),
             ] = forced
-        return super().__call__(logits, input_batch, draft_logits, invalid_drafts)
+        return super().__call__(logits, input_batch, draft_logits)
 
 
 class _MiniCPMTTSProjector(nn.Module):

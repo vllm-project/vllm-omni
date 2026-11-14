@@ -36,16 +36,7 @@ from vllm.v1.outputs import (
     KVConnectorOutput,
     make_empty_encoder_model_runner_output,
 )
-from vllm.v1.spec_decode.dflash import DFlashProposer
-from vllm.v1.spec_decode.draft_model import DraftModelProposer
-from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
-from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
-from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
-from vllm.v1.worker.gpu_model_runner import (
-    AsyncGPUModelRunnerOutput,
-)
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.data_entry_keys import flatten_payload
@@ -77,6 +68,13 @@ from vllm_omni.worker.sampling_utils import (
     sanitize_min_tokens_stop_ids,
 )
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
+from vllm_omni.worker.v1_compat.async_output import AsyncGPUModelRunnerOutput
+from vllm_omni.worker.v1_compat.dflash import DFlashProposer
+from vllm_omni.worker.v1_compat.draft_model import DraftModelProposer
+from vllm_omni.worker.v1_compat.eagle import EagleProposer
+from vllm_omni.worker.v1_compat.extract_hidden_states import ExtractHiddenStatesProposer
+from vllm_omni.worker.v1_compat.gemma4 import Gemma4Proposer
+from vllm_omni.worker.v1_compat.misc import apply_grammar_bitmask
 
 logger = init_logger(__name__)
 
@@ -862,8 +860,9 @@ class GPUARModelRunner(
         if not self._has_talker_mtp_graphs():
             return
 
-        from vllm.compilation.monitor import set_cudagraph_capturing_enabled
         from vllm.distributed.parallel_state import graph_capture
+
+        from vllm_omni.worker.v1_compat.misc import set_cudagraph_capturing_enabled
 
         capture_sizes = self.compilation_config.cudagraph_capture_sizes
         num_warmups = self.compilation_config.cudagraph_num_of_warmups
@@ -1666,16 +1665,6 @@ class GPUARModelRunner(
             model_sample = getattr(self.model, "sample", None)
             self.input_batch.update_async_output_token_ids()
             if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
-                # Apply logit bias (min_tokens, allowed_token_ids) before
-                # the custom model sampler — the standard GPU sampler does
-                # this internally, but prefer_model_sampler bypasses it.
-                if hasattr(self.sampler, "logit_bias_state"):
-                    self.sampler.logit_bias_state.apply_logit_bias(
-                        logits,
-                        self.input_batch.expanded_idx_mapping,
-                        self.input_batch.idx_mapping_np,
-                        self.input_batch.positions[self.input_batch.logits_indices],
-                    )
                 prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
                 self._apply_duplex_sampling(logits, prepared_sampling_metadata)
                 sampler_output = call_model_sampler(
@@ -2287,7 +2276,6 @@ class GPUARModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = OmniModelRunnerOutput(
                 req_ids=req_ids_output_copy,
-                req_id_to_index=req_id_to_index_output_copy,
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
@@ -2412,7 +2400,7 @@ class GPUARModelRunner(
             input_fits_in_drafter = self._input_fits_in_drafter(spec_decode_common_attn_metadata)
             use_gpu_toks = (
                 spec_config.use_eagle() or spec_config.uses_draft_model() or spec_config.uses_extract_hidden_states()
-            ) and not spec_config.disable_padded_drafter_batch
+            )
             if use_gpu_toks:
                 assert isinstance(
                     self.drafter,

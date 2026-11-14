@@ -52,6 +52,10 @@ def _make_runner(model_output, num_reqs=1, prompt_len=10):
     runner = object.__new__(OmniGenerationModelRunner)
     runner._retains_state_across_chunks = False
     runner._remove_request = MagicMock()
+    # The pin's GPUModelRunner.__init__ always builds a DraftTokensHandler and
+    # its _remove_request discards through it; tests that bind the real method
+    # need the attribute on this bypass-__init__ stub.
+    runner.draft_tokens_handler = SimpleNamespace(discard=MagicMock())
     from vllm_omni.worker_v2.staged_writes import StagedWrites
 
     runner._staged_writes = StagedWrites()
@@ -165,7 +169,6 @@ def test_cached_chunk_updates_request_and_model_state_with_or_without_slot(slot_
         total_num_scheduled_tokens=1,
         scheduled_spec_decode_tokens={},
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[0],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
     )
@@ -350,7 +353,10 @@ def test_generation_aux_output_copies_and_materializes_without_sampling(monkeypa
     monkeypatch.setattr(torch.cuda, "Event", lambda **kw: CopyEvent())
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(module, "_async_copy_mm", lambda *a, **kw: {})
-    output = OmniModelRunnerOutput(["req-0"], {"req-0": 0}, [[]])
+    # The pin's ModelRunnerOutput field order is (req_ids, sampled_token_ids,
+    # ...); omni restores req_id_to_index as a trailing field, so the mapping
+    # must be passed by keyword.
+    output = OmniModelRunnerOutput(req_ids=["req-0"], req_id_to_index={"req-0": 0}, sampled_token_ids=[[]])
     result = module.OmniGenerationAsyncOutput(
         model_runner_output=output,
         multimodal_outputs={},
@@ -471,7 +477,6 @@ def test_prewarm_runs_after_finish_and_only_on_consecutive_idle_steps(cached):
         scheduled_cached_reqs=cached_reqs,
         scheduled_spec_decode_tokens={},
         scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[0],
         finished_req_ids={"req"},
         free_encoder_mm_hashes=[],
         pending_request_prewarms=prewarms,

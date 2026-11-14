@@ -12,10 +12,10 @@ from threading import Lock
 
 import torch
 from vllm.triton_utils import tl, triton
-from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.seeded_exponential import torch_exponential_noise, torch_exponential_policy
+from vllm_omni.worker.v1_compat.sample_ops.topk_topp_sampler import random_sample
 
 
 @triton.jit

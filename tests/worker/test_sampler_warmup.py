@@ -15,7 +15,7 @@ from vllm_omni.worker.sampler_warmup import register_top_k_top_p_warmup
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_SAMPLER_MODULE = "vllm.v1.sample.ops.topk_topp_sampler"
+_SAMPLER_MODULE = "vllm_omni.worker.v1_compat.sample_ops.topk_topp_sampler"
 
 
 class _FakeKernel:

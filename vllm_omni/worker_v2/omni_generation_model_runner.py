@@ -470,7 +470,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
         batch_descriptor = BatchDescriptor(
             num_tokens=input_batch.num_tokens_after_padding,
-            has_lora=self.lora_config is not None,
+            # vLLM 0.34 dropped BatchDescriptor.has_lora; num_active_loras
+            # carries the lora state.
             num_active_loras=batch_desc.num_active_loras,
         )
         with self._forward_context(

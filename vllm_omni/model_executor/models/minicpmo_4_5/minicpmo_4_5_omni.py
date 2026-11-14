@@ -34,7 +34,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
@@ -48,6 +47,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
 
 logger = init_logger(__name__)
 
@@ -329,7 +329,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     def sampler(self):
         if hasattr(self.model, "sampler"):
             return self.model.sampler
-        from vllm.v1.sample.sampler import Sampler
+        from vllm_omni.worker.v1_compat.sampler import Sampler
 
         return Sampler()
 

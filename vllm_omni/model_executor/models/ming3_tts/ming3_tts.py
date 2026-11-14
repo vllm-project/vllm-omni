@@ -18,7 +18,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.bailing_moe_v3 import BailingMoeV3ForCausalLM
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
@@ -37,6 +36,7 @@ from vllm_omni.model_executor.models.ming_tts.ming_tts import (
 )
 from vllm_omni.model_executor.models.ming_tts.prompt_encoder import _load_prompt_encoder, _resolve_prompt_latents
 from vllm_omni.utils.device_copy import to_device_nonblocking
+from vllm_omni.worker.v1_compat.sampler import Sampler
 
 from .batched_campplus import BatchedCampplus
 from .config_ming3_tts import Ming3TTSRuntimeConfig, get_ming3_backbone_config

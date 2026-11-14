@@ -142,7 +142,25 @@ class OmniGPUWorkerBase(GPUWorker):
         return auxiliary_graph_memory
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
-        result = super().compile_or_warm_up_model()
+        # Baseline (4ba787ec99) ran vllm/v1/worker/gpu/warmup.py:warmup_kernels
+        # only for the V2 model runner (`if self.use_v2_model_runner:`); the
+        # 0.34 pin removed that gate when it removed Model Runner V1. The
+        # synthetic scheduler-realistic steps drive the V1-style runner's
+        # forward path with shapes outside the cudagraph capture set, whose
+        # lazy per-shape capture (vllm/compilation/cuda_graph.py) then runs on
+        # the default stream and aborts the engine ("CUDA graphs must be
+        # captured on a non-default stream"). The V1 flow warms its kernels
+        # through its own dummy-run path (incl. the vendored rejection-sampler
+        # warmup), so restore the baseline gate for V1-style runners. The flag
+        # is restored afterwards; only the warmup_kernels branch reads it.
+        kernel_config = self.vllm_config.kernel_config
+        prev_jit_warmup = getattr(kernel_config, "enable_jit_warmup", False)
+        if not getattr(self, "use_v2_model_runner", True) and prev_jit_warmup:
+            kernel_config.enable_jit_warmup = False
+        try:
+            result = super().compile_or_warm_up_model()
+        finally:
+            kernel_config.enable_jit_warmup = prev_jit_warmup
         self._capture_auxiliary_graphs()
         return result
 
