@@ -589,14 +589,17 @@ class OmniARModelRunner(OmniGPUModelRunner):
         pooler: list[dict[str, Any]] = []
         for i in range(num_reqs):
             req_id = batch_req_ids[i] if batch_req_ids is not None and i < len(batch_req_ids) else None
+            if audio_sparse_output and (req_id is None or req_id not in sparse_mm_index):
+                # Match the V1 sparse-audio contract: a request that emitted no
+                # audio has no payload for this step. A hidden-only payload can
+                # otherwise be mistaken for waveform data by final audio stages.
+                pooler.append({})
+                continue
             start = int(query_start_loc_np[i])
             end = start + int(num_output_rows[i])
             payload: dict[str, Any] = {}
             if hidden_cpu is not None:
                 payload["hidden"] = hidden_cpu[start:end].clone()
-            if audio_sparse_output and (req_id is None or req_id not in sparse_mm_index):
-                pooler.append(flatten_payload(payload))
-                continue
             list_idx = sparse_mm_index[req_id] if audio_sparse_output and req_id is not None else i
             for k, v in payload_mm.items():
                 payload[k] = _slice_pooler_value(

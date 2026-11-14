@@ -647,8 +647,8 @@ def test_async_output_slices_request_payloads_with_graph_padding(
 
 @pytest.mark.parametrize("async_chunk", [False, True])
 @pytest.mark.cpu
-def test_async_output_routes_sparse_audio_by_request_id(monkeypatch, mocker, async_chunk) -> None:
-    """A one-request audio delta must not be copied to its batch neighbours."""
+def test_gepard_sparse_audio_routes_by_request_id_without_hidden_fallback(monkeypatch, mocker, async_chunk) -> None:
+    """A Gepard delta must not expose neighbour hidden state as audio."""
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
@@ -679,17 +679,17 @@ def test_async_output_routes_sparse_audio_by_request_id(monkeypatch, mocker, asy
         },
         input_batch=batch,
         async_chunk=async_chunk,
+        engine_output_type="audio",
     ).get_output()
 
     payloads = output.multimodal_outputs if async_chunk else output.inter_stage_outputs
     assert payloads is not None
+    # Gepard hidden rows are 1024 wide. Returning one without model_outputs
+    # made the speech frontend encode it as a 1024-channel audio chunk.
+    assert payloads[0] in ({}, None)
     if async_chunk:
-        assert payloads[0] in ({}, None)
         expected_keys = {"model_outputs", "sr"}
     else:
-        assert payloads[0] is not None
-        assert set(payloads[0]) == {"hidden"}
-        torch.testing.assert_close(payloads[0]["hidden"], hidden[0:1])
         expected_keys = {"hidden", "model_outputs", "sr"}
     assert payloads[1] is not None
     assert set(payloads[1]) == expected_keys
