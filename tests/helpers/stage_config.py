@@ -654,6 +654,69 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
     },
+    # All three Qwen2.5-Omni stages on ONE card, for single-card CI lanes.
+    # Validated on an Arc Pro B60 (24 GiB) with Qwen2.5-Omni-3B: the per-stage
+    # utils sum to 0.85 of the card and left 4.98 GiB of thinker KV and
+    # 2.92 GiB of talker KV. The 7B thinker needs 16.78 GiB of weights on its
+    # own, so that size still needs the two-card deploy.
+    "qwen2_5_omni_1card": {
+        "base_config": "qwen2_5_omni.yaml",
+        "async_chunk": False,
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_model_len": 16384,
+                "max_num_batched_tokens": 16384,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.45,
+                "enforce_eager": True,
+                "skip_mm_profiling": True,
+                "mm_processor_cache_gb": 0,
+                "devices": "0",
+                "default_sampling_params": {"max_tokens": 128},
+            },
+            {
+                "stage_id": 1,
+                "max_model_len": 16384,
+                "max_num_batched_tokens": 16384,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.25,
+                "enforce_eager": True,
+                "skip_mm_profiling": True,
+                "devices": "0",
+            },
+            {
+                "stage_id": 2,
+                "max_model_len": 16384,
+                "max_num_batched_tokens": 16384,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.15,
+                "enforce_eager": True,
+                "enable_flashinfer_autotune": False,
+                "async_scheduling": False,
+                "devices": "0",
+            },
+        ],
+        # The base config's own platforms: section puts the talker and code2wav
+        # on device 1 and raises the utils (0.9/0.5/0.3), which is the two-card
+        # XPU deploy. Re-pin them here so the single-card layout survives the
+        # platform merge.
+        "platforms": {
+            "xpu": {
+                "stages": [
+                    {"stage_id": 0, "gpu_memory_utilization": 0.45, "enforce_eager": True, "devices": "0"},
+                    {
+                        "stage_id": 1,
+                        "gpu_memory_utilization": 0.25,
+                        "enforce_eager": True,
+                        "devices": "0",
+                        "env": {"VLLM_XPU_USE_SAMPLER_KERNEL": "0"},
+                    },
+                    {"stage_id": 2, "gpu_memory_utilization": 0.15, "devices": "0"},
+                ],
+            },
+        },
+    },
     # Single-stage thinker-only topology for the abort test.
     "qwen2_5_omni_thinker_only": {
         "async_chunk": False,
