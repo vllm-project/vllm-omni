@@ -6,7 +6,7 @@ Deliberately shaped exactly like ``pi0/config.py``: a small dataclass that
 consumes the raw LeRobot ``config.json`` (the field surface of
 ``lerobot.policies.pi05.PI05Config``) and keeps only the runtime-relevant
 fields. Transformer dimensions are derived from ``paligemma_variant`` /
-``action_expert_variant`` inside the model via ``get_gemma_config``.
+``action_expert_variant`` via the shared Pi-family ``get_gemma_config``.
 
 What π0.5 adds on top of the π0 config surface:
 
