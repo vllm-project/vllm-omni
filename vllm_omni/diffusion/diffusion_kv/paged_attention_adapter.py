@@ -310,16 +310,58 @@ class DiffusionPagedAttentionRuntime:
     ) -> None:
         self.adapter = adapter
         self.metadata = metadata
-        self._active_phase: bool | None = None
+        self._active_key: tuple[bool, tuple[str, ...] | None, tuple[tuple[str, int | None], ...] | None] | None = None
         self._activation: Any | None = None
         self._closed = False
 
-    def ensure_active(self, step_idx: int | None) -> DiffusionPagedAttentionAdapter:
+    @staticmethod
+    def _filter_rows_for_requests(
+        rows: Sequence[DiffusionPagedAttentionRow],
+        request_ids: Sequence[str],
+    ) -> tuple[DiffusionPagedAttentionRow, ...]:
+        """Keep Scheduler order; only drop rows outside ``request_ids``."""
+        wanted = set(request_ids)
+        return tuple(row for row in rows if row.request_id in wanted)
+
+    @staticmethod
+    def _rows_for_keys(
+        rows: Sequence[DiffusionPagedAttentionRow],
+        row_keys: Sequence[tuple[str, int | None]],
+    ) -> tuple[DiffusionPagedAttentionRow, ...]:
+        """Select and order rows by caller-provided ``(request_id, sequence_id)`` keys."""
+        by_key = {(row.request_id, row.sequence_id): row for row in rows}
+        ordered: list[DiffusionPagedAttentionRow] = []
+        missing: list[tuple[str, int | None]] = []
+        for key in row_keys:
+            row = by_key.get(key)
+            if row is None:
+                missing.append(key)
+            else:
+                ordered.append(row)
+        if missing:
+            raise ValueError(f"Paged attention is missing rows for keys {missing!r}")
+        return tuple(ordered)
+
+    def ensure_active(
+        self,
+        step_idx: int | None,
+        request_ids: Sequence[str] | None = None,
+        row_keys: Sequence[tuple[str, int | None]] | None = None,
+    ) -> DiffusionPagedAttentionAdapter:
         if self._closed:
             raise RuntimeError("Paged attention runtime is already closed")
         is_prefill = step_idx == 0
         rows = self.metadata.rows_for_step(step_idx)
-        if self._active_phase == is_prefill:
+        active_ids = tuple(request_ids) if request_ids is not None else None
+        active_keys = tuple(row_keys) if row_keys is not None else None
+        if active_keys is not None:
+            rows = self._rows_for_keys(rows, active_keys)
+        elif active_ids is not None:
+            rows = self._filter_rows_for_requests(rows, active_ids)
+            if not rows:
+                raise ValueError(f"Paged attention has no rows for requests {active_ids!r} at step {step_idx}")
+        key = (is_prefill, active_ids, active_keys)
+        if self._active_key == key:
             return self.adapter
 
         self._deactivate()
@@ -327,13 +369,13 @@ class DiffusionPagedAttentionRuntime:
         activation = self.adapter.activate(batch)
         activation.__enter__()
         self._activation = activation
-        self._active_phase = is_prefill
+        self._active_key = key
         return self.adapter
 
     def _deactivate(self) -> None:
         activation = self._activation
         self._activation = None
-        self._active_phase = None
+        self._active_key = None
         if activation is not None:
             activation.__exit__(None, None, None)
 

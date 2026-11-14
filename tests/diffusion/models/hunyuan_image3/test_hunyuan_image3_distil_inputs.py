@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for HunyuanImage3 prepare_inputs_for_generation to ensure
 distilled model parameters (guidance, timesteps_r) are properly passed."""
 
@@ -292,3 +292,26 @@ def test_cfg_parallel_splits_meanflow_scatter_indices():
     )
 
     assert model_kwargs["timesteps_r_scatter_index"].tolist() == [[3], [4]]
+
+
+@pytest.mark.parametrize("cfg_rank", [0, 1], ids=["cond-rank", "uncond-rank"])
+def test_cfg_parallel_slices_paged_row_keys_and_prefix_cut(cfg_rank):
+    # CFG-major pack: cond of every request, then uncond. Rank r keeps sequence_id == r.
+    model_kwargs = {
+        "paged_row_keys": [("req-0", 0), ("req-1", 0), ("req-0", 1), ("req-1", 1)],
+        "hunyuan_paged_prefix_cut": (0, 4, 0, 4),
+        "paged_request_ids": ["req-0", "req-1"],
+    }
+
+    HunyuanImage3Text2ImagePipeline._split_model_kwargs_for_cfg_parallel(
+        model_kwargs,
+        batch_size=2,
+        cfg_rank=cfg_rank,
+    )
+
+    assert model_kwargs["paged_row_keys"] == [
+        ("req-0", cfg_rank),
+        ("req-1", cfg_rank),
+    ]
+    assert model_kwargs["hunyuan_paged_prefix_cut"] == (0, 4)
+    assert model_kwargs["paged_request_ids"] == ["req-0", "req-1"]

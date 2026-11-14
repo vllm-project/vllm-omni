@@ -62,12 +62,15 @@ class ForwardContext:
     paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None
     # Block-aligned prefix already resident in Scheduler-owned pages for the
     # active request-level prefill. Zero keeps the cold/full-prefill path.
+    # Mixed public-request hits leave this at 0; models that need per-row cuts
+    # must carry those lengths themselves (not via ForwardContext).
     paged_kv_cached_prefix_len: int = 0
     # Active Worker-side paged KV adapter.  The adapter is installed only for
     # the duration of a paged forward; dense forwards leave this as ``None``.
     # Keep the field opaque here to avoid coupling the common context module to
     # the diffusion_kv implementation.
     paged_kv_adapter: Any | None = None
+
     # Startup-only memory profiling runs before Scheduler-owned pages exist.
     # Attention layers use this explicit scope to distinguish that probe from
     # a malformed paged request whose Worker adapter was not activated.
@@ -395,15 +398,36 @@ def get_attention_schedule_profile() -> str | None:
     return ctx._attention_profile
 
 
-def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
-    """Set the current diffusion denoise step on the active ForwardContext."""
+def set_forward_context_denoise_step_idx(
+    step_idx: int | None,
+    request_ids: tuple[str, ...] | list[str] | None = None,
+    paged_step_idx: int | None = None,
+    paged_row_keys: tuple[tuple[str, int | None], ...] | list[tuple[str, int | None]] | None = None,
+) -> None:
+    """Set the current diffusion denoise step on the active ForwardContext.
+
+    ``step_idx`` stays the request's real denoise index for step-gated
+    consumers (KV-quant skip steps, W4A8 fallback steps, RAINFUSION start/end
+    windows). Paged rows are keyed only on first-step prefill versus later
+    denoise, so a caller that batches states with different real indices
+    passes the phase through ``paged_step_idx`` instead of flattening
+    ``step_idx``.
+
+    ``request_ids`` filters Scheduler rows while preserving their installed
+    order. Models that need a different activation order pass explicit
+    ``paged_row_keys`` as ``(request_id, sequence_id)`` pairs.
+    """
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
-        if step_idx is not None:
+        if step_idx is not None or paged_step_idx is not None:
             paged_kv_runtime = getattr(_forward_context, "paged_kv_runtime", None)
             ensure_active = getattr(paged_kv_runtime, "ensure_active", None)
             if callable(ensure_active):
-                ensure_active(step_idx)
+                ensure_active(
+                    paged_step_idx if paged_step_idx is not None else step_idx,
+                    request_ids=request_ids,
+                    row_keys=paged_row_keys,
+                )
 
 
 def begin_scheduled_denoise(total_steps: int) -> int | None:
@@ -600,13 +624,22 @@ class DenoiseProgressMixin:
         normalized_timestep: float | None = None,
         total_steps: int | None = None,
         sigma: float | None = None,
+        request_ids: tuple[str, ...] | list[str] | None = None,
+        paged_row_keys: tuple[tuple[str, int | None], ...] | list[tuple[str, int | None]] | None = None,
+        paged_step_idx: int | None = None,
     ) -> None:
         """Publish one denoise step's progress.
 
         ``scheduler`` defaults to ``self.scheduler``; it is read only for a ``timestep`` to normalize, or
         for sigma windows without an explicit ``sigma``, which then read ``scheduler.sigmas[step_idx]``.
         """
-        set_forward_context_denoise_step_idx(step_idx)
+        # Preserve the group's row selection when publishing either schedule.
+        set_forward_context_denoise_step_idx(
+            step_idx,
+            request_ids=request_ids,
+            paged_row_keys=paged_row_keys,
+            paged_step_idx=paged_step_idx,
+        )
         if _forward_context is None:
             return
         _forward_context.total_denoise_steps = total_steps
