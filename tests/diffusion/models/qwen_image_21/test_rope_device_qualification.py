@@ -7,6 +7,7 @@ import pytest
 import torch
 from diffusers.models.normalization import RMSNorm
 
+from tests.helpers.device import DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.layers import exact_bf16_pointwise as pointwise
 from vllm_omni.diffusion.layers import exact_bf16_qk_norm_rope as fused_qk
@@ -87,12 +88,12 @@ def test_validated_pointwise_declines_kernels_while_compiling(monkeypatch):
     )
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @torch.no_grad()
 def test_validated_pointwise_compiles_with_inductor():
     """Eager callers may validate once and pass the flag into regionally compiled blocks."""
     torch.manual_seed(0)
-    x, y, gate = (torch.randn(2, 1024, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    x, y, gate = (torch.randn(2, 1024, device=DEVICE_TYPE, dtype=torch.bfloat16) for _ in range(3))
 
     def block(x, y, gate):
         return pointwise.residual(x, pointwise.silu_mul(gate, y, _validated=True), gate, _validated=True)
@@ -110,8 +111,8 @@ def test_validated_pointwise_compiles_with_inductor():
 def test_unqualified_attention_uses_reference_norm_and_rope(monkeypatch):
     sequence = 17
     torch.manual_seed(sequence)
-    projection = torch.randn(2, sequence, 3, 32, 128, device="cuda", dtype=torch.bfloat16)
-    freqs = torch.polar(torch.ones(sequence, 64, device="cuda"), torch.randn(sequence, 64, device="cuda"))
+    projection = torch.randn(2, sequence, 3, 32, 128, device=DEVICE_TYPE, dtype=torch.bfloat16)
+    freqs = torch.polar(torch.ones(sequence, 64, device=DEVICE_TYPE), torch.randn(sequence, 64, device=DEVICE_TYPE))
     attention = object.__new__(transformer.QwenImage21Attention)
     torch.nn.Module.__init__(attention)
     attention.num_heads = attention.num_kv_heads = 32
@@ -147,6 +148,6 @@ def test_unqualified_attention_uses_reference_norm_and_rope(monkeypatch):
 
     raw = projection[:, :, 0]
     torch.testing.assert_close(transformer._apply_qwen_image21_rotary_emb(raw, freqs), reference(raw), rtol=0, atol=0)
-    result = attention(torch.empty(2, sequence, 4096, device="cuda", dtype=torch.bfloat16), freqs)
+    result = attention(torch.empty(2, sequence, 4096, device=DEVICE_TYPE, dtype=torch.bfloat16), freqs)
     assert observed == [True]
     torch.testing.assert_close(result, projection[:, :, 2].flatten(2), rtol=0, atol=0)

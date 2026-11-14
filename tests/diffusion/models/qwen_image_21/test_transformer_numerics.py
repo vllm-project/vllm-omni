@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.device import DEVICE_TYPE
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer as transformer
 
@@ -51,7 +52,7 @@ def test_rope_frequencies_do_not_depend_on_loader_device(device):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 def test_scheduler_matches_diffusers_on_latent_device():
     import numpy as np
     from diffusers import FlowMatchEulerDiscreteScheduler
@@ -60,7 +61,7 @@ def test_scheduler_matches_diffusers_on_latent_device():
 
     pipeline = object.__new__(QwenImage21Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.device = torch.device("cuda", 0)
+    pipeline.device = torch.device(DEVICE_TYPE, 0)
     pipeline.scheduler = FlowMatchEulerDiscreteScheduler(use_dynamic_shifting=True)
     timesteps, _ = pipeline.prepare_timesteps(50, None, 4096)
     reference = FlowMatchEulerDiscreteScheduler.from_config(pipeline.scheduler.config)
@@ -79,9 +80,9 @@ def test_scheduler_matches_diffusers_on_latent_device():
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_timestep_frequencies_match_cpu_initialization():
     reference = transformer.QwenImage21TemporalTimesteps(timestep_dim=256)
-    with torch.device("cuda"):
+    with torch.device(DEVICE_TYPE):
         loaded = transformer.QwenImage21TemporalTimesteps(timestep_dim=256)
     assert loaded.freqs.device.type == "cuda"
     torch.testing.assert_close(loaded.freqs.cpu(), reference.freqs, rtol=0, atol=0)
-    timesteps = torch.tensor([0.0, 0.984375, 1.0], device="cuda")
-    torch.testing.assert_close(loaded(timesteps), reference.to("cuda")(timesteps), rtol=0, atol=0)
+    timesteps = torch.tensor([0.0, 0.984375, 1.0], device=DEVICE_TYPE)
+    torch.testing.assert_close(loaded(timesteps), reference.to(DEVICE_TYPE)(timesteps), rtol=0, atol=0)

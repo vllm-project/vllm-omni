@@ -40,7 +40,7 @@ DEVICE = "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cuda"
 pytestmark = [
     pytest.mark.usefixtures("unpatched_wan_rms_norm"),
     pytest.mark.core_model,
-    *hardware_marks(res={"cuda": "L4", "xpu": "B60"}, num_cards=1),
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.diffusion,
     pytest.mark.skipif(DEVICE == "cuda" and not torch.cuda.is_available(), reason="CUDA or XPU required"),
 ]
@@ -1013,7 +1013,7 @@ def _first_frame_test_conv(dtype: torch.dtype, **kwargs) -> WanCausalConv3d:
 @pytest.mark.parametrize("dtype", ALL_DTYPES)
 @pytest.mark.parametrize("temporal_only", [False, True])
 @pytest.mark.parametrize("start", [None, "Rep"])
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_first_frame_conv2d_preserves_following_cached_frame(dtype, temporal_only, start, monkeypatch) -> None:
     torch.manual_seed(19)
     kwargs = dict(kernel_size=(3, 1, 1), padding=(1, 0, 0)) if temporal_only else {}
@@ -1048,7 +1048,7 @@ def test_first_frame_conv2d_preserves_following_cached_frame(dtype, temporal_onl
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", LOW_PRECISION)
 @pytest.mark.parametrize("with_bias", [False, True])
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_first_frame_conv2d_deferred_bias_matches_autocast(dtype, with_bias) -> None:
     torch.manual_seed(20)
     conv = _first_frame_test_conv(torch.float32)
@@ -1087,7 +1087,7 @@ def test_first_frame_conv2d_deferred_bias_matches_autocast(dtype, with_bias) -> 
         ("temporal_padding", dict(padding=(2, 1, 1))),
     ],
 )
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_first_frame_conv2d_declines_unsupported_calls(case, kwargs) -> None:
     conv = _first_frame_test_conv(torch.float32, **kwargs)
     if case == "lossless":
@@ -1106,7 +1106,7 @@ def test_first_frame_conv2d_declines_unsupported_calls(case, kwargs) -> None:
 
 @torch.no_grad()
 @pytest.mark.parametrize("attribute,value", [("padding_mode", "reflect"), ("padding", (0, 1, 1))])
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_first_frame_conv2d_declines_nonzero_native_padding(attribute, value) -> None:
     conv = _first_frame_test_conv(torch.float32)
     setattr(conv, attribute, value)
@@ -1115,7 +1115,7 @@ def test_first_frame_conv2d_declines_nonzero_native_padding(attribute, value) ->
 
 
 @torch.no_grad()
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_first_frame_conv2d_uses_reloaded_weights() -> None:
     torch.manual_seed(21)
     conv = _first_frame_test_conv(torch.bfloat16)

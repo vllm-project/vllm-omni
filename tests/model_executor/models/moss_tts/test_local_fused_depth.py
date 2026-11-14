@@ -7,11 +7,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.device import DEVICE_GRAPH, DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.core_model, pytest.mark.tts]
 
-cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+cuda_only = pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
 
 
 def _equal(actual, expected):
@@ -19,7 +20,7 @@ def _equal(actual, expected):
 
 
 @cuda_only
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.nvidia_only
 @pytest.mark.parametrize("batch", [1, 37, 128])
 @pytest.mark.parametrize("top_k,top_p", [(25, 0.8), (32, 1.0), (1, 0.8)])
@@ -32,21 +33,21 @@ def test_sample_attend_matches_sample_then_attention(batch, top_k, top_p):
     heads, dim, depth, vocab = 32, 80, 12, 1024
     hidden = heads * dim
     dtype = torch.bfloat16
-    tables = torch.randn(depth - 1, vocab, 3 * hidden, device="cuda", dtype=dtype)
-    embeddings = torch.randn(depth - 1, vocab, hidden, device="cuda", dtype=dtype)
+    tables = torch.randn(depth - 1, vocab, 3 * hidden, device=DEVICE_TYPE, dtype=dtype)
+    embeddings = torch.randn(depth - 1, vocab, hidden, device=DEVICE_TYPE, dtype=dtype)
     # Dirty storage: stale values must never leak into results.
-    key_ref = torch.full((batch, heads, depth, dim), float("nan"), device="cuda", dtype=dtype)
+    key_ref = torch.full((batch, heads, depth, dim), float("nan"), device=DEVICE_TYPE, dtype=dtype)
     value_ref = torch.full_like(key_ref, float("nan"))
     key, value = key_ref.clone(), value_ref.clone()
     for _ in range(2):
-        qkv0 = torch.randn(batch, 3 * hidden, device="cuda", dtype=dtype)
+        qkv0 = torch.randn(batch, 3 * hidden, device=DEVICE_TYPE, dtype=dtype)
         expected0, _ = lookup_attention(qkv0, key_ref, value_ref, 0)
         actual0, _ = lookup_attention(qkv0, key, value, 0, late_store=True)
         _equal(actual0, expected0)
-        uniforms = torch.rand(batch, depth, device="cuda")
-        codes = torch.full((batch, depth), -1, device="cuda", dtype=torch.long)
+        uniforms = torch.rand(batch, depth, device=DEVICE_TYPE)
+        codes = torch.full((batch, depth), -1, device=DEVICE_TYPE, dtype=torch.long)
         for channel in range(depth):
-            logits = torch.randn(batch, vocab, device="cuda", dtype=dtype) * 3
+            logits = torch.randn(batch, vocab, device=DEVICE_TYPE, dtype=dtype) * 3
             last = channel + 1 == depth
             token = fused_sample(logits, uniforms[:, channel], top_k=top_k, temperature=1.7, top_p=top_p)
             fused = sample_attend(
@@ -77,7 +78,7 @@ def test_sample_attend_matches_sample_then_attention(batch, top_k, top_p):
 
 
 @cuda_only
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.nvidia_only
 @pytest.mark.parametrize("temperature", [1.0, 1.7, 0.6])
 @pytest.mark.parametrize("top_k,top_p", [(50, 1.0), (0, 1.0), (2, 1.5)])
@@ -88,15 +89,15 @@ def test_binary_continue_matches_reference_sampler(temperature, top_k, top_p):
 
     torch.manual_seed(3)
     batch = 8192
-    logits = (torch.randn(batch, 2, device="cuda") * torch.logspace(-3, 1.5, batch, device="cuda")[:, None]).to(
-        torch.bfloat16
-    )
+    logits = (
+        torch.randn(batch, 2, device=DEVICE_TYPE) * torch.logspace(-3, 1.5, batch, device=DEVICE_TYPE)[:, None]
+    ).to(torch.bfloat16)
     logits[:64, 1] = logits[:64, 0]  # exact ties
-    reference_gen = torch.Generator(device="cuda").manual_seed(11)
-    fused_gen = torch.Generator(device="cuda").manual_seed(11)
+    reference_gen = torch.Generator(device=DEVICE_TYPE).manual_seed(11)
+    fused_gen = torch.Generator(device=DEVICE_TYPE).manual_seed(11)
     for _ in range(3):
         expected = _sample_token(logits.float(), temperature, top_k, top_p, True, generator=reference_gen).eq(0)
-        exponential = torch.empty((batch, 2), device="cuda").exponential_(generator=fused_gen)
+        exponential = torch.empty((batch, 2), device=DEVICE_TYPE).exponential_(generator=fused_gen)
         actual = binary_continue(logits, exponential, temperature)
         _equal(actual, expected)
         # Same Philox consumption as torch.multinomial.
@@ -107,7 +108,7 @@ def test_binary_continue_matches_reference_sampler(temperature, top_k, top_p):
 def _talker_stub(fused_depth, n_vq, vocab, hidden, codes, should_continue, dtype):
     from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
 
-    embeddings = torch.randn(n_vq, vocab, hidden, device="cuda", dtype=dtype)
+    embeddings = torch.randn(n_vq, vocab, hidden, device=DEVICE_TYPE, dtype=dtype)
     stub = SimpleNamespace(
         n_vq=n_vq,
         audio_vocab_size=vocab,
@@ -126,22 +127,22 @@ def _talker_stub(fused_depth, n_vq, vocab, hidden, codes, should_continue, dtype
 
 
 @cuda_only
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("batch", [1, 128])
 @torch.inference_mode()
 def test_mtp_epilogue_matches_talker_reference(batch):
     n_vq, vocab, hidden, dtype = 12, 1024, 2560, torch.bfloat16
     torch.manual_seed(batch)
-    codes = torch.randint(vocab, (batch, n_vq), device="cuda")
-    codes[torch.rand(batch, n_vq, device="cuda") < 0.2] = vocab  # pad = no contribution
-    should_continue = torch.rand(batch, device="cuda") < 0.8
-    text_step = (torch.rand(batch, 1, device="cuda") < 0.9).long()
-    input_embeds = torch.randn(batch, 2 * hidden, device="cuda", dtype=dtype)[:, :hidden]  # strided rows
+    codes = torch.randint(vocab, (batch, n_vq), device=DEVICE_TYPE)
+    codes[torch.rand(batch, n_vq, device=DEVICE_TYPE) < 0.2] = vocab  # pad = no contribution
+    should_continue = torch.rand(batch, device=DEVICE_TYPE) < 0.8
+    text_step = (torch.rand(batch, 1, device=DEVICE_TYPE) < 0.9).long()
+    input_embeds = torch.randn(batch, 2 * hidden, device=DEVICE_TYPE, dtype=dtype)[:, :hidden]  # strided rows
     outputs = []
     for fused in (False, True):
         torch.manual_seed(0)  # identical embedding tables
         talker_mtp, stub = _talker_stub(fused, n_vq, vocab, hidden, codes, should_continue, dtype)
-        hidden_in = torch.randn(batch, hidden, device="cuda", dtype=dtype)
+        hidden_in = torch.randn(batch, hidden, device=DEVICE_TYPE, dtype=dtype)
         outputs.append(talker_mtp(stub, None, input_embeds, hidden_in, text_step))
     for actual, expected in zip(outputs[1], outputs[0], strict=True):
         _equal(actual, expected)
@@ -163,12 +164,12 @@ def _cuda_models():
 def test_generate_frame_fused_depth_is_bit_identical(per_row):
     model, embeddings, heads, stop_head = _cuda_models()
     assert model._fused_attention and model._fused_sampling
-    hidden = torch.randn(16, 32, device="cuda", dtype=torch.bfloat16) * 4
+    hidden = torch.randn(16, 32, device=DEVICE_TYPE, dtype=torch.bfloat16) * 4
     results = []
     for fused in (False, True):
         model.fused_depth = fused
-        generator = torch.Generator(device="cuda").manual_seed(5)
-        generators = [torch.Generator(device="cuda").manual_seed(row) for row in range(16)] if per_row else None
+        generator = torch.Generator(device=DEVICE_TYPE).manual_seed(5)
+        generators = [torch.Generator(device=DEVICE_TYPE).manual_seed(row) for row in range(16)] if per_row else None
         results.append(
             [
                 model.generate_frame(
@@ -198,26 +199,26 @@ def test_generate_frame_fused_depth_is_bit_identical(per_row):
 def test_generate_frame_fused_depth_graph_replay_matches_eager():
     model, embeddings, heads, stop_head = _cuda_models()
     model.fused_depth = True
-    hidden = torch.randn(8, 32, device="cuda", dtype=torch.bfloat16) * 4
+    hidden = torch.randn(8, 32, device=DEVICE_TYPE, dtype=torch.bfloat16) * 4
 
     def run():
         return model.generate_frame(hidden, heads, embeddings, stop_head, n_vq=12, top_k=16, top_p=0.8, temperature=1.7)
 
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
+    stream = DEVICE_MODULE.Stream()
+    stream.wait_stream(DEVICE_MODULE.current_stream())
+    with DEVICE_MODULE.stream(stream):
         for _ in range(3):
             run()
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    DEVICE_MODULE.current_stream().wait_stream(stream)
+    graph = DEVICE_GRAPH()
+    with DEVICE_MODULE.graph(graph):
         captured = run()
     for _ in range(3):
         hidden.normal_()
-        state = torch.cuda.get_rng_state()
+        state = DEVICE_MODULE.get_rng_state()
         graph.replay()
         replayed = [tensor.clone() for tensor in captured]
-        torch.cuda.set_rng_state(state)
+        DEVICE_MODULE.set_rng_state(state)
         model.fused_depth = False
         eager = run()
         model.fused_depth = True
