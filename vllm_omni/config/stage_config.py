@@ -281,6 +281,13 @@ class DiffusionStageRole(str, Enum):
     DECODE = "decode"
 
 
+class PDRole(str, Enum):
+    """Role of an autoregressive stage in a disaggregated PD pair."""
+
+    PREFILL = "prefill"
+    DECODE = "decode"
+
+
 # Legacy ``model_stage`` strings -> ``DiffusionStageRole``. ``model_stage`` was
 # a free-form string ("text_encode"/"dit") before roles existed; keep the map so
 # older stage configs and deploy YAML keep working.
@@ -440,6 +447,8 @@ class StagePipelineConfig:
     # scheduling. The scheduler only receives its typed effects.
     scheduling_metadata_adapter: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
+    # Set on the two stages of a prefill/decode split; PD pair detection reads it.
+    pd_role: PDRole | None = None
 
 
 @dataclass(frozen=True)
@@ -1601,6 +1610,7 @@ def merge_pipeline_deploy(
                 stage_id=ps.stage_id,
                 model_stage=ps.model_stage,
                 stage_role=ps.stage_role.value if ps.stage_role is not None else None,
+                pd_role=ps.pd_role,
                 session_mode=deploy.session_mode,
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
@@ -1645,6 +1655,7 @@ class StageConfig:
     yaml_runtime: dict[str, Any] = field(default_factory=dict)
     yaml_extras: dict[str, Any] = field(default_factory=dict)
     runtime_overrides: dict[str, Any] = field(default_factory=dict)
+    pd_role: PDRole | None = None
 
     def to_omegaconf(self) -> Any:
         """TODO(@lishunyang12): remove once engine consumes ResolvedStageConfig directly."""
@@ -1737,6 +1748,8 @@ class StageConfig:
 
         if self.custom_process_input_func:
             config_dict["custom_process_input_func"] = self.custom_process_input_func
+        if self.pd_role is not None:
+            config_dict["pd_role"] = self.pd_role.value
 
         # Pass through extra YAML fields (default_sampling_params,
         # output_connectors, input_connectors, tts_args, etc.)
