@@ -5,6 +5,7 @@ import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.layers.indexed_modulation import (
     _MAX_1D_GRID_SIZE,
@@ -68,7 +69,7 @@ def test_launch_row_chunks_is_npu_only(device_type, expected_grids_and_offsets):
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
 @pytest.mark.parametrize(
     "device",
-    [pytest.param("npu", marks=hardware_marks(res={"npu": "A3"}, num_cards=1))],
+    [pytest.param("npu", marks=hardware_marks(res={"npu": "A3", "xpu": "B60"}, num_cards=1))],
 )
 def test_modulation_wrappers_match_reference_above_grid_limit(device):
     rows = 69888
@@ -152,22 +153,22 @@ def test_modulation_wrappers_match_reference_above_grid_limit(device):
         torch.testing.assert_close(actual.cpu(), expected, atol=2e-2, rtol=2e-2)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_fused_modulation_preserves_bf16_residual_boundary() -> None:
     torch.manual_seed(17)
     rows, hidden_size, conditions = 11, 3072, 4
     tensors = [
-        torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16),
-        torch.randn(conditions, hidden_size, device="cuda", dtype=torch.bfloat16),
-        torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16),
-        torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16),
-        torch.randn(conditions, hidden_size, device="cuda", dtype=torch.bfloat16),
-        torch.randn(conditions, hidden_size, device="cuda", dtype=torch.bfloat16),
+        torch.randn(rows, hidden_size, device=DEVICE_TYPE, dtype=torch.bfloat16),
+        torch.randn(conditions, hidden_size, device=DEVICE_TYPE, dtype=torch.bfloat16),
+        torch.randn(rows, hidden_size, device=DEVICE_TYPE, dtype=torch.bfloat16),
+        torch.randn(hidden_size, device=DEVICE_TYPE, dtype=torch.bfloat16),
+        torch.randn(conditions, hidden_size, device=DEVICE_TYPE, dtype=torch.bfloat16),
+        torch.randn(conditions, hidden_size, device=DEVICE_TYPE, dtype=torch.bfloat16),
     ]
     residual, gate, branch, weight, shift, scale = tensors
-    indices = torch.arange(rows, device="cuda") % conditions
+    indices = torch.arange(rows, device=DEVICE_TYPE) % conditions
     eps = 1e-6
 
     residual_out, modulated_out = indexed_gate_rms_norm_scale_shift(
@@ -192,8 +193,8 @@ def test_fused_modulation_preserves_bf16_residual_boundary() -> None:
     assert torch.equal(modulated_out, expected)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(not DEVICE_MODULE.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("fused_gate", [False, True])
 def test_fused_modulation_keeps_fp32_affine_intermediates(fused_gate: bool) -> None:

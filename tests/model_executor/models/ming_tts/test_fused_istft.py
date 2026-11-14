@@ -7,13 +7,14 @@ import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.common.ming.audio_dsp import ISTFT, ISTFTEnvelopeError
 from vllm_omni.model_executor.models.common.ming.fused_istft import deferred_envelope_checks
 
 pytestmark = [pytest.mark.core_model, pytest.mark.tts]
 cuda = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.hip is not None or not HAS_TRITON,
+    not DEVICE_MODULE.is_available() or torch.version.hip is not None or not HAS_TRITON,
     reason="NVIDIA CUDA and Triton required",
 )
 
@@ -36,9 +37,9 @@ def _assert_outputs_close(actual, expected):
 @torch.inference_mode()
 def test_fused_istft_matches_native(hop, window_dtype, batch, frames, mode, monkeypatch):
     torch.manual_seed(0)
-    module = ISTFT(4 * hop, hop, 4 * hop).to(device="cuda", dtype=window_dtype)
+    module = ISTFT(4 * hop, hop, 4 * hop).to(device=DEVICE_TYPE, dtype=window_dtype)
     # Slice a larger spectrum so irfft must handle non-contiguous inputs.
-    spec = torch.randn(batch, 2 * hop + 1, 2 * frames, device="cuda", dtype=torch.complex64)[..., ::2]
+    spec = torch.randn(batch, 2 * hop + 1, 2 * frames, device=DEVICE_TYPE, dtype=torch.complex64)[..., ::2]
     kwargs = {"streaming": mode != "offline", "last_chunk": mode in ("last", "first_last")}
     if mode in ("middle", "last"):
         _, audio, window = module.forward_native(spec, streaming=True)
@@ -57,14 +58,14 @@ def test_fused_istft_matches_native(hop, window_dtype, batch, frames, mode, monk
 
 
 @cuda
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("hop", [320, 882])
 @pytest.mark.parametrize("window_dtype", [torch.float32, torch.bfloat16, torch.float16])
 @torch.inference_mode()
 def test_fused_istft_streaming_state(hop, window_dtype):
     torch.manual_seed(1)
-    module = ISTFT(4 * hop, hop, 4 * hop).to(device="cuda", dtype=window_dtype)
-    spec = torch.randn(2, 2 * hop + 1, 40, device="cuda", dtype=torch.complex64)
+    module = ISTFT(4 * hop, hop, 4 * hop).to(device=DEVICE_TYPE, dtype=window_dtype)
+    spec = torch.randn(2, 2 * hop + 1, 40, device=DEVICE_TYPE, dtype=torch.complex64)
     # Reusing the same module for a new request must not reuse the old tails.
     for _ in range(2):
         actual_state = reference_state = (None, None)
@@ -86,12 +87,12 @@ def test_fused_istft_streaming_state(hop, window_dtype):
 
 
 @cuda
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("invalid", [False, True])
 @torch.inference_mode()
 def test_fused_istft_silence_and_invalid_envelope(invalid):
-    module = ISTFT(1280, 320, 1280).cuda()
-    spec = torch.zeros(2, 641, 25, device="cuda", dtype=torch.complex64)
+    module = ISTFT(1280, 320, 1280).to(DEVICE_TYPE)
+    spec = torch.zeros(2, 641, 25, device=DEVICE_TYPE, dtype=torch.complex64)
     if invalid:
         module.window.zero_()
         for forward in (module.forward_native, module.forward):
@@ -103,12 +104,12 @@ def test_fused_istft_silence_and_invalid_envelope(invalid):
 
 
 @cuda
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("invalid", [False, True])
 @torch.inference_mode()
 def test_fused_istft_deferred_envelope_check(invalid):
-    module = ISTFT(1280, 320, 1280).cuda()
-    spec = torch.randn(1, 641, 25, device="cuda", dtype=torch.complex64)
+    module = ISTFT(1280, 320, 1280).to(DEVICE_TYPE)
+    spec = torch.randn(1, 641, 25, device=DEVICE_TYPE, dtype=torch.complex64)
     expected = module(spec)
     if invalid:
         module.window.zero_()
@@ -127,10 +128,10 @@ def test_fused_istft_deferred_envelope_check(invalid):
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @torch.inference_mode()
 def test_deferred_envelope_check_identifies_failures_and_preserves_fatal_errors():
-    good = ISTFT(1280, 320, 1280).cuda()
-    bad = ISTFT(1280, 320, 1280).cuda()
+    good = ISTFT(1280, 320, 1280).to(DEVICE_TYPE)
+    bad = ISTFT(1280, 320, 1280).to(DEVICE_TYPE)
     bad.window.zero_()
-    spec = torch.randn(1, 641, 25, device="cuda", dtype=torch.complex64)
+    spec = torch.randn(1, 641, 25, device=DEVICE_TYPE, dtype=torch.complex64)
     with pytest.raises(ISTFTEnvelopeError) as error:
         with deferred_envelope_checks():
             for module in (good, bad, good, bad):
@@ -181,14 +182,14 @@ def test_istft_autograd_fallback(padding, device, monkeypatch):
 
 
 @cuda
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize(
     "n_fft,hop,frames,dtype", [(32, 8, 1, torch.complex64), (30, 10, 7, torch.complex64), (32, 8, 7, torch.complex128)]
 )
 @torch.inference_mode()
 def test_istft_unsupported_cuda_falls_back(n_fft, hop, frames, dtype, monkeypatch):
-    module = ISTFT(n_fft, hop, n_fft).cuda()
-    spec = torch.randn(1, n_fft // 2 + 1, frames, device="cuda", dtype=dtype)
+    module = ISTFT(n_fft, hop, n_fft).to(DEVICE_TYPE)
+    spec = torch.randn(1, n_fft // 2 + 1, frames, device=DEVICE_TYPE, dtype=dtype)
     native = module.forward_native
     calls = []
 

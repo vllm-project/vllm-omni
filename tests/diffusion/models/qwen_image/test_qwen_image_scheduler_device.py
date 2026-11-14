@@ -15,10 +15,14 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImageP
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import QwenImageEditPipeline
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit_plus import QwenImageEditPlusPipeline
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.diffusion,
+    *hardware_marks(res={"cuda": "L4", "xpu": "B60"}, num_cards=1),
+]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("pipeline_cls", [QwenImagePipeline, QwenImageEditPipeline, QwenImageEditPlusPipeline])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @torch.inference_mode()

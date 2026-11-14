@@ -14,6 +14,7 @@ from pytest_mock import MockerFixture
 from torch import nn
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer, build_time_grid
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
@@ -22,7 +23,7 @@ from vllm_omni.diffusion.models.auk.fp8_linear import Fp8Linear, fp8_supported, 
 pytestmark = [pytest.mark.core_model]
 
 _needs_fp8 = pytest.mark.skipif(
-    not (torch.cuda.is_available() and fp8_supported(torch.device("cuda"))),
+    not (DEVICE_MODULE.is_available() and fp8_supported(torch.device(DEVICE_TYPE))),
     reason="FP8 GEMMs need an NVIDIA Ada or Hopper CUDA device",
 )
 
@@ -61,7 +62,7 @@ def test_fp8_is_unsupported_on_hip(monkeypatch: pytest.MonkeyPatch, mocker: Mock
     get_capability = mocker.Mock(return_value=(9, 0))
     monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
 
-    assert not fp8_supported(torch.device("cuda"))
+    assert not fp8_supported(torch.device(DEVICE_TYPE))
     get_capability.assert_not_called()
 
 
@@ -78,7 +79,7 @@ def test_fp8_support_matches_validated_nvidia_capabilities(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     get_capability = mocker.Mock(return_value=capability)
     monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
-    device = torch.device("cuda")
+    device = torch.device(DEVICE_TYPE)
 
     assert fp8_supported(device) is supported
     get_capability.assert_called_once_with(device)
@@ -91,7 +92,7 @@ def test_fp8_is_unsupported_without_a_cuda_device(monkeypatch: pytest.MonkeyPatc
     get_capability = mocker.Mock()
     monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
 
-    assert not fp8_supported(torch.device("cuda"))
+    assert not fp8_supported(torch.device(DEVICE_TYPE))
     get_capability.assert_not_called()
 
 
@@ -183,7 +184,7 @@ def test_scales_stay_fp32_under_a_half_precision_default_dtype() -> None:
     assert quantized.out_dtype == torch.bfloat16
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @_needs_fp8
 @torch.inference_mode()
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -192,7 +193,7 @@ def test_fp8_linear_matches_the_model_dtype_linear(bias: bool, dtype: torch.dtyp
     torch.manual_seed(1)
     linear = nn.Linear(64, 96, bias=bias).to("cuda", dtype)
     quantized = Fp8Linear(linear)
-    x = torch.randn(2, 37, 64, device="cuda", dtype=dtype)
+    x = torch.randn(2, 37, 64, device=DEVICE_TYPE, dtype=dtype)
 
     # _scaled_mm only fuses the bias into half-precision outputs; fp32 adds it after the GEMM.
     out = quantized(x)
@@ -207,7 +208,7 @@ def test_fp8_linear_matches_the_model_dtype_linear(bias: bool, dtype: torch.dtyp
         torch.testing.assert_close(quantized(x.float()), out, atol=0, rtol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @_needs_fp8
 @torch.inference_mode()
 def test_fp8_step_runs_with_an_fp32_model() -> None:
@@ -217,12 +218,12 @@ def test_fp8_step_runs_with_an_fp32_model() -> None:
     assert quantize_block_linears(dit) == 24
 
     torch.manual_seed(3)
-    text = torch.randn(1, 32, 8, device="cuda")
-    c_mask = torch.ones(1, 32, dtype=torch.bool, device="cuda")
-    ref = torch.randn(1, 50, 4, device="cuda")
-    ref_mask = torch.ones(1, 50, dtype=torch.bool, device="cuda")
-    x = torch.randn(1, 64, 4, device="cuda")
-    grid = build_time_grid(nfe=4, sway_sampling_coef=-1.0, t_grid=None, device="cuda")
+    text = torch.randn(1, 32, 8, device=DEVICE_TYPE)
+    c_mask = torch.ones(1, 32, dtype=torch.bool, device=DEVICE_TYPE)
+    ref = torch.randn(1, 50, 4, device=DEVICE_TYPE)
+    ref_mask = torch.ones(1, 50, dtype=torch.bool, device=DEVICE_TYPE)
+    x = torch.randn(1, 64, 4, device=DEVICE_TYPE)
+    grid = build_time_grid(nfe=4, sway_sampling_coef=-1.0, t_grid=None, device=DEVICE_TYPE)
 
     def velocity(model: AuKTransformer) -> torch.Tensor:
         ctx = model.prepare(
@@ -235,14 +236,14 @@ def test_fp8_step_runs_with_an_fp32_model() -> None:
     assert _relative_error(fp8, velocity(reference)) < 0.05
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @_needs_fp8
 @torch.inference_mode()
 def test_out_of_range_activations_saturate() -> None:
     torch.manual_seed(2)
     linear = nn.Linear(64, 64, bias=False).to("cuda", torch.bfloat16)
     quantized = Fp8Linear(linear)
-    x = torch.randn(5, 64, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(5, 64, device=DEVICE_TYPE, dtype=torch.bfloat16)
     x[0, 0], x[1, 3] = 5000.0, -9000.0
 
     out = quantized(x)
@@ -252,7 +253,7 @@ def test_out_of_range_activations_saturate() -> None:
     assert _relative_error(out, linear(x.clamp(-limit, limit))) < 0.06
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @_needs_fp8
 @torch.inference_mode()
 @pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
@@ -263,12 +264,12 @@ def test_fp8_step_tracks_bf16_and_replays_under_the_cuda_graph(cfg_strength: flo
     wrapper = AuKCUDAGraphWrapper(dit, enabled=True)
 
     torch.manual_seed(3)
-    text = torch.randn(1, 32, 8, device="cuda", dtype=torch.bfloat16)
-    c_mask = torch.ones(1, 32, dtype=torch.bool, device="cuda")
-    ref = torch.randn(1, 50, 4, device="cuda")
-    ref_mask = torch.ones(1, 50, dtype=torch.bool, device="cuda")
-    x = torch.randn(1, 64, 4, device="cuda")
-    grid = build_time_grid(nfe=4, sway_sampling_coef=-1.0, t_grid=None, device="cuda")
+    text = torch.randn(1, 32, 8, device=DEVICE_TYPE, dtype=torch.bfloat16)
+    c_mask = torch.ones(1, 32, dtype=torch.bool, device=DEVICE_TYPE)
+    ref = torch.randn(1, 50, 4, device=DEVICE_TYPE)
+    ref_mask = torch.ones(1, 50, dtype=torch.bool, device=DEVICE_TYPE)
+    x = torch.randn(1, 64, 4, device=DEVICE_TYPE)
+    grid = build_time_grid(nfe=4, sway_sampling_coef=-1.0, t_grid=None, device=DEVICE_TYPE)
     guided = cfg_strength >= 1e-5
 
     def eager(model: AuKTransformer, step: int) -> torch.Tensor:

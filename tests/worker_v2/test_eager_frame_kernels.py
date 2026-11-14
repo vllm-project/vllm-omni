@@ -5,17 +5,18 @@
 import pytest
 import torch
 
+from tests.helpers.device import DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_test
 
 pytestmark = pytest.mark.core_model
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("step_dtype", [torch.float32, torch.bfloat16])
 def test_settled_frames_match_torch(step_dtype):
     from vllm_omni.worker_v2.model_states.eager_mtp_kernels import settled_frames
 
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     H = 2048
     eager = torch.randn(16, H, device=device).to(torch.bfloat16)
     step = torch.randn(1, H, device=device, dtype=step_dtype)
@@ -28,14 +29,14 @@ def test_settled_frames_match_torch(step_dtype):
     torch.testing.assert_close(embeds, expected, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("n,size,frames", [(3, 8, 1), (8, 8, 1), (2, 4, 25)])
 def test_codec_graph_inputs_match_the_copies(n, size, frames):
     from vllm.triton_utils import triton
 
     from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder import _graph_inputs_kernel
 
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     nq, scratch = 16, 99
     codes = torch.randint(0, 2048, (n, frames, nq), device=device, dtype=torch.int64)
     meta = torch.randint(0, 64, (5 * n,), device=device, dtype=torch.int64)
@@ -59,12 +60,12 @@ def test_codec_graph_inputs_match_the_copies(n, size, frames):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("n,size", [(3, 8), (8, 8)])
 def test_eager_post_fills_codec_graph_inputs_and_scratch(n, size):
     from vllm_omni.worker_v2.model_states.eager_mtp_kernels import eager_post
 
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     hidden, nq, scratch = 128, 16, 15
     slots = torch.arange(n, device=device).flip(0)
     pos = torch.arange(n, device=device) + 7
@@ -109,14 +110,18 @@ def test_eager_post_fills_codec_graph_inputs_and_scratch(n, size):
     assert valid.all() and valid_out.all()
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(
+    DEVICE_TYPE == "xpu",
+    reason="VLLMZ-3554: the packed metadata holds device pointers as signed int64, and XPU USM addresses do not fit",
+)
 def test_history_scatter_preserves_independent_storage_and_offsets():
     import numpy as np
 
     from vllm_omni.utils.device_copy import DeviceStager
     from vllm_omni.worker_v2.model_states.eager_mtp_kernels import record_history
 
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     inputs = torch.randn(5, 128, device=device, dtype=torch.bfloat16)
     histories = [torch.full((9, 128), -1, device=device, dtype=inputs.dtype) for _ in range(3)]
     starts, offsets, counts = [2, 0, 5], [4, 1, 0], [3, 2, 0]
@@ -132,7 +137,8 @@ def test_history_scatter_preserves_independent_storage_and_offsets():
         torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@pytest.mark.skipif(DEVICE_TYPE == "xpu", reason="VLLMZ-3554: no graph-pool handle on torch.xpu")
 @torch.inference_mode()
 def test_codec_direct_inputs_wait_for_slow_side_stream():
     from types import SimpleNamespace
@@ -140,7 +146,7 @@ def test_codec_direct_inputs_wait_for_slow_side_stream():
     from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder import StreamingDecodeGraphs
     from vllm_omni.worker_v2.model_states.mtp_model_state import FrameBatch, MTPState
 
-    device = torch.device("cuda", 0)
+    device = torch.device(DEVICE_TYPE, 0)
     hidden, n = 128, 2
 
     class Decoder:
@@ -180,8 +186,8 @@ def test_codec_direct_inputs_wait_for_slow_side_stream():
         codes = torch.full((n, 2), value, device=device, dtype=torch.long)
         frames = torch.full((n, hidden), value, device=device)
         state._mtp_forward = lambda *args, _codes=codes, _frames=frames, **kwargs: (_frames, _codes)
-        with torch.cuda.stream(state._decode_stream):
-            torch.cuda._sleep(5_000_000)
+        with DEVICE_MODULE.stream(state._decode_stream):
+            DEVICE_MODULE._sleep(5_000_000)
         out = torch.zeros(n, 4, device=device)
         state._run_mtp_fused(
             batch,
@@ -200,7 +206,7 @@ def test_codec_direct_inputs_wait_for_slow_side_stream():
         torch.testing.assert_close(out.cpu(), torch.full((n, 4), float(value)))
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 @torch.inference_mode()
 def test_batched_history_recording_preserves_ragged_reordered_requests():
     from types import SimpleNamespace
@@ -226,7 +232,7 @@ def test_batched_history_recording_preserves_ragged_reordered_requests():
         ids = [str(i) for i in (range(n - 1, -1, -1) if reverse else range(n))]
         offsets = np.array([sum(t.shape[0] for t in expected[rid]) for rid in ids])
         batch = SimpleNamespace(num_reqs=n, req_ids=ids, query_start_loc_np=starts, num_computed_tokens_np=offsets)
-        inputs = torch.randn(int(counts.sum()), hidden, device="cuda", dtype=torch.bfloat16)
+        inputs = torch.randn(int(counts.sum()), hidden, device=DEVICE_TYPE, dtype=torch.bfloat16)
         state.record_inputs(batch, inputs)
         for row, rid in enumerate(ids):
             expected[rid].append(inputs[starts[row] : starts[row + 1]].clone())

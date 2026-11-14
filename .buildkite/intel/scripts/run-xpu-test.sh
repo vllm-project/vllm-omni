@@ -102,9 +102,25 @@ HF_CACHE="${HF_CACHE:-$(realpath ~)/.cache/huggingface}"
 mkdir -p "${HF_CACHE}"
 HF_MOUNT="/root/.cache/huggingface"
 
+# Test budget inside the container; the pipeline gives the broad scope more.
+# Each stage also has its own cap, summing to 42m in the pr scope and 67m in the
+# broad scope, so one runaway stage cannot eat the whole budget. Measured in the
+# pr scope on one card: 3m02s dispatch + 23m29s core_model + <1m mxfp8 = ~27m.
+# timeout_in_minutes on the step has to cover the budget plus the image build
+# (check the "time docker build" line above when tuning either).
+XPU_TEST_BUDGET="${XPU_TEST_BUDGET:-60m}"
+
+# pr    = the no-card XPU-dispatch stage plus every core_model case, including
+#         the two that start an engine (tiny-random/Qwen-Image 30MB and
+#         riverclouds/qwen_image_random 9.9GB must be in the mounted HF cache).
+# broad = also advanced_model and omni, which load Qwen3-TTS, Z-Image, Wan2.1
+#         and Voxtral (~20m more).
+# Set XPU_TEST_SCOPE=broad on the nightly or a manually triggered build.
+export XPU_TEST_SCOPE="${XPU_TEST_SCOPE:-pr}"
+
 # Container variables below must expand in the container shell.
 # shellcheck disable=SC2016
-time timeout -k 30 30m docker run \
+time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     --device /dev/dri:/dev/dri \
     --net=host \
     --ipc=host \
@@ -115,17 +131,89 @@ time timeout -k 30 30m docker run \
     -e VLLM_LOGGING_LEVEL \
     -e VLLM_OMNI_LOGGING_LEVEL \
     -e HF_TOKEN \
+    -e HF_HUB_OFFLINE \
+    -e XPU_TEST_SCOPE \
+    -e XPU_CPU_WORKERS \
     -e ZE_AFFINITY_MASK \
     --name "${container_name}" \
     "${image_name}" \
     bash -c '
-    set -e
-    echo $ZE_AFFINITY_MASK
-    pip install tblib==3.1.0
-    cd /workspace/vllm-omni
-    XPU_TEST_PATHS="tests/diffusion tests/dfx tests/e2e tests/platforms"
-    pytest -v -s $XPU_TEST_PATHS -m "core_model and xpu and B60"
-    pytest -v -s tests/diffusion/quantization/test_mxfp8_config.py
-    pytest -v -s $XPU_TEST_PATHS -m "advanced_model and xpu and B60"
-    pytest -v -s $XPU_TEST_PATHS -m "omni and xpu and B60"
+    set -uo pipefail
+    pip install tblib==3.1.0 || exit 1
+    cd /workspace/vllm-omni || exit 1
+
+    # One card per job. The agent sets ZE_AFFINITY_MASK; keep only its first
+    # entry so a cards_2+ test cannot take cards another agent on this host is
+    # using - with a single visible device the hardware_test(num_cards>=2)
+    # skipif fires instead. Every marker expression below also pins cards_1.
+    mask="${ZE_AFFINITY_MASK:-0}"
+    export ZE_AFFINITY_MASK="${mask%%,*}"
+    echo "ZE_AFFINITY_MASK=${mask} -> using card ${ZE_AFFINITY_MASK}"
+
+    # Paths that hold XPU-tagged tests. Scoped explicitly: a bare
+    # "pytest tests/" still crashes during collection on XPU (#6175).
+    paths=(tests/diffusion tests/dfx tests/e2e tests/platforms
+           tests/model_executor tests/entrypoints tests/engine
+           tests/worker tests/worker_v2)
+
+    # Resolves a model directory at import time, so collection of the whole
+    # path list fails (pytest exit 2) whenever those weights are absent from
+    # the mounted cache. It carries no XPU marker, so skip the file outright.
+    ignore=(--ignore tests/e2e/offline_inference/test_cosyvoice3_expansion.py)
+
+
+    rc=0
+    # stage <name> <budget> <pytest args...>
+    stage() {
+        local name="$1" budget="$2"
+        shift 2
+        local t0=${SECONDS} code=0
+        echo "--- :pytest: ${name}"
+        timeout -k 30 "${budget}" pytest -v -s --durations=25 "$@" || code=$?
+        # 5 = nothing collected for this marker set, which is not a failure.
+        if [ "${code}" = 0 ] || [ "${code}" = 5 ]; then
+            echo "+++ PASS ${name} ($((SECONDS - t0))s)"
+        else
+            echo "FAIL ${name} ($((SECONDS - t0))s, rc=${code})"
+            rc=1
+        fi
+    }
+
+    # No-card stage: the cpu-marked tests that can observe which platform they
+    # run on, so they exercise XPU dispatch without taking a card. The file list
+    # is pinned rather than globbed - the rest of the cpu suite is platform
+    # independent and the CUDA and ROCm lanes already run it. Note --ignore does
+    # not apply to files named explicitly, which is why the exclusions live in
+    # the list itself. See the header of both files for the measurements.
+    mapfile -t xpu_path < <(grep -v "^#" .buildkite/intel/xpu-path-tests.txt | grep .)
+    stage "xpu dispatch (no card)" 10m -n "${XPU_CPU_WORKERS:-8}" \
+        "${xpu_path[@]}" \
+        -m "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
+
+    # core_model excludes omni: the async-omni tests carry both markers and
+    # would otherwise run twice, and they need their own process (broad scope).
+    stage "core_model" 30m "${paths[@]}" "${ignore[@]}" \
+        -m "core_model and not omni and xpu and B60 and cards_1" --run-level core_model
+    stage "mxfp8 config" 2m tests/diffusion/quantization/test_mxfp8_config.py
+
+    # Everything past this point loads a full checkpoint (Qwen3-TTS, Z-Image,
+    # Wan2.1, Voxtral) from the mounted HF cache and costs about 20 minutes, so
+    # it is off on PRs and runs on the nightly or a manually triggered build
+    # (XPU_TEST_SCOPE=broad).
+    if [ "${XPU_TEST_SCOPE:-pr}" = "broad" ]; then
+        # full_model stays out until the cache is seeded: those cases pull tens
+        # of GB of weights.
+        stage "advanced_model" 15m "${paths[@]}" "${ignore[@]}" \
+            -m "advanced_model and not full_model and xpu and B60 and cards_1" --run-level core_model
+        # The async-omni engine leaves worker VRAM mapped in the pytest parent,
+        # so a 16 GiB thinker started after the other tests in the same process
+        # fails to initialise. CUDA splits this test out for the same reason;
+        # keep it last and alone.
+        stage "omni" 10m "${paths[@]}" "${ignore[@]}" \
+            -m "omni and xpu and B60 and cards_1" --run-level core_model
+    else
+        echo "--- :pytest: skipping advanced_model and omni (XPU_TEST_SCOPE=pr)"
+    fi
+
+    exit "${rc}"
 '

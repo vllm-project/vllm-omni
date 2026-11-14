@@ -95,7 +95,7 @@ def _install_fake_ring(
     return (q, keys[rank], values[rank]), instances, attended
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @requires_cuda
 @pytest.mark.parametrize(
     "world,rank,causal,backend,hip,opt_in",
@@ -137,7 +137,7 @@ def test_native_ring_merge_dispatch(monkeypatch, world, rank, causal, backend, h
     assert instances[1].fused_results == [not hip] * merge_count
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @requires_cuda
 @pytest.mark.parametrize("fallback", ["grad", "compile", "device"])
 @torch.inference_mode()

@@ -30,7 +30,7 @@ def _assert_close(actual, expected):
         torch.testing.assert_close(tensor, reference, rtol=2e-6, atol=2e-6)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @requires_cuda
 @pytest.mark.parametrize(
     "dtype,layout,shape",
@@ -81,7 +81,7 @@ def test_ring_merge_layouts_and_input_preservation(dtype, layout, shape):
     _assert_close(fused, expected)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @requires_cuda
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @torch.inference_mode()
@@ -98,7 +98,7 @@ def test_ring_merge_eight_hops(dtype):
     _assert_close((out, lse), (expected_out.float(), expected_lse.float()))
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @requires_cuda
 @torch.inference_mode()
 def test_ring_merge_extreme_lse():
@@ -118,7 +118,7 @@ def test_ring_merge_extreme_lse():
         torch.testing.assert_close(tensor[:, 4:], reference[:, 4:], rtol=0, atol=0, equal_nan=True)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @requires_cuda
 @torch.inference_mode()
 def test_ring_merge_slice_updates_only_selected_rows():
@@ -162,7 +162,7 @@ def test_ring_merge_shared_call_does_not_opt_in(monkeypatch):
     _assert_close(actual, _reference(out, lse, block_out, block_lse))
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @requires_cuda
 def test_ring_merge_autograd_falls_back():
     torch.manual_seed(15)
@@ -178,7 +178,7 @@ def test_ring_merge_autograd_falls_back():
         torch.testing.assert_close(tensor.grad, reference.grad, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @requires_cuda
 @torch.inference_mode()
 def test_ring_merge_cuda_graph_reads_current_inputs():
@@ -196,7 +196,7 @@ def test_ring_merge_cuda_graph_reads_current_inputs():
         _assert_close(actual, _reference(out, lse, block_out, block_lse))
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @requires_cuda
 @torch.inference_mode()
 def test_ring_merge_fullgraph_compile_keeps_torch_fallback(monkeypatch):
@@ -218,7 +218,7 @@ def test_ring_merge_fullgraph_compile_keeps_torch_fallback(monkeypatch):
         _assert_close(actual, expected)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=2)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=2)
 @requires_cuda
 @torch.inference_mode()
 def test_ring_merge_other_current_device_falls_back(monkeypatch):

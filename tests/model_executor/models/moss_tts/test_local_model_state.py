@@ -13,6 +13,7 @@ import torch
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
 import vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker as talker_module
+from tests.helpers.device import DEVICE_GRAPH, DEVICE_MODULE, DEVICE_TYPE
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
@@ -32,7 +33,7 @@ pytestmark = pytest.mark.core_model
     ]
 )
 def device(request):
-    if request.param == "cuda" and not torch.cuda.is_available():
+    if request.param == "cuda" and not DEVICE_MODULE.is_available():
         pytest.skip("CUDA required")
     return torch.device(request.param)
 
@@ -262,11 +263,11 @@ def test_local_seeded_mtp_keeps_per_row_generators_in_one_batch():
     assert frame.call_args.kwargs["generator"] is None
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
 def test_slot_mtp_graph_padding_reorder_and_owned_output():
-    if not torch.cuda.is_available():
+    if not DEVICE_MODULE.is_available():
         pytest.skip("CUDA required")
-    states = [_state(cls, torch.device("cuda")) for cls in (OmniModelState, MossLocalModelState)]
+    states = [_state(cls, torch.device(DEVICE_TYPE)) for cls in (OmniModelState, MossLocalModelState)]
     for state in states:
 
         def frame(hidden, *_args, **_kwargs):
@@ -282,14 +283,14 @@ def test_slot_mtp_graph_padding_reorder_and_owned_output():
         candidate._mtp_state._mtp_hidden[:4],
         candidate._mtp_state._mtp_text_step[:4],
     ]
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream), torch.inference_mode():
+    stream = DEVICE_MODULE.Stream()
+    stream.wait_stream(DEVICE_MODULE.current_stream())
+    with DEVICE_MODULE.stream(stream), torch.inference_mode():
         for _ in range(3):
             candidate.model.mtp(*buffers)
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph), torch.inference_mode():
+    DEVICE_MODULE.current_stream().wait_stream(stream)
+    graph = DEVICE_GRAPH()
+    with DEVICE_MODULE.graph(graph), torch.inference_mode():
         graph_output = candidate.model.mtp(*buffers)
 
     def replay(*args, **kwargs):
@@ -311,7 +312,7 @@ def test_slot_mtp_graph_padding_reorder_and_owned_output():
         out = [
             _step(
                 state,
-                _batch(torch.device("cuda"), slots, [1] * len(slots)),
+                _batch(torch.device(DEVICE_TYPE), slots, [1] * len(slots)),
                 req,
                 dispatcher if state is candidate else None,
             )

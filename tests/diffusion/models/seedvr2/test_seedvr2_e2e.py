@@ -32,7 +32,7 @@ LONG_SIZE = 64
 FPS = 24
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.skipif(not os.environ.get(MODEL_DIR_ENV), reason=f"set {MODEL_DIR_ENV} to an authorized model directory")
 @pytest.mark.parametrize("method", ["lab", "wavelet", "adain", "none"])
 def test_seedvr2_native_video_e2e(method: str) -> None:
@@ -132,8 +132,8 @@ def _await_status(base: str, job_id: str, timeout: float) -> dict:
 @pytest.mark.parametrize(
     "degree",
     [
-        pytest.param(1, marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
-        pytest.param(8, marks=hardware_marks(res={"cuda": "L4"}, num_cards=8)),
+        pytest.param(1, marks=hardware_marks(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)),
+        pytest.param(8, marks=hardware_marks(res={"cuda": "L4", "xpu": "B60"}, num_cards=8)),
     ],
 )
 def test_seedvr2_long_video_route_e2e(tmp_path: Path, degree: int) -> None:
