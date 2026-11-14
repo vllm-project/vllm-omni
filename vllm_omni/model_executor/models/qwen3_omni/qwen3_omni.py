@@ -120,6 +120,7 @@ _THINKER_ENCODER_CUDAGRAPH_MEMBERS = (
     "supports_encoder_cudagraph",
     "encoder_cudagraph_single_replay",
     "encoder_cudagraph_group_eligible",
+    "encoder_cudagraph_replay_supported",
     "get_encoder_cudagraph_config",
     "get_input_modality",
     "get_max_frames_per_video",

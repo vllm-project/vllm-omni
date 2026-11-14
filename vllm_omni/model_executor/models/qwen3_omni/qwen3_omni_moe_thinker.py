@@ -534,6 +534,7 @@ class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
             "chunk_lengths": chunk_lengths,
             "valid_index": valid_index_host,
             "cu_seqlens": cu_seqlens,
+            "cu_seqlens_host": cu_seqlens_host,
             # Attention reads this scalar on the host.
             "max_seqlen": self.compute_attn_mask_seqlen(cu_seqlens_host),
             "aftercnn_lens": aftercnn_lens,
@@ -1179,6 +1180,18 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        # Only OmniModelConfig declares use_v2_model_runner. A plain vLLM serve
+        # builds the generic encoder manager, which never checks
+        # encoder_cudagraph_replay_supported. Omni V1 and V2 both install
+        # SingleReplayEncoderCudaGraphManager.
+        if vllm_config.compilation_config.cudagraph_mm_encoder and not hasattr(
+            vllm_config.model_config, "use_v2_model_runner"
+        ):
+            raise ValueError(
+                "Qwen3-Omni encoder graphs require the vLLM-Omni runner (--omni); "
+                "upstream runners do not apply the encoder replay bounds. "
+                "Set cudagraph_mm_encoder=false otherwise."
+            )
         self.vllm_config = vllm_config  # needed for torch compile forward context
         hf_config = vllm_config.model_config.hf_config
         thinker_config: Qwen3OmniMoeThinkerConfig = getattr(hf_config, "thinker_config", None) or hf_config

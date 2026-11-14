@@ -3203,8 +3203,9 @@ class TestPlatformOverrides:
 
         cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
         cuda_stages = merge_pipeline_deploy(pipeline, cuda)
-        expected = {"custom_ops": ["+rotary_embedding"]}
-        assert cuda_stages[0].yaml_engine_args["compilation_config"] == expected
+        compilation = cuda_stages[0].yaml_engine_args["compilation_config"]
+        assert compilation["custom_ops"] == ["+rotary_embedding"]
+        assert compilation["cudagraph_mm_encoder"] is False
         assert all("compilation_config" not in stage.yaml_engine_args for stage in cuda_stages[1:])
 
         for platform in ("cpu", "musa", "npu", "rocm", "xpu"):
@@ -3214,6 +3215,21 @@ class TestPlatformOverrides:
             )
             config = deploy.stages[0].compilation_config or {}
             assert "+rotary_embedding" not in config.get("custom_ops", [])
+
+    @pytest.mark.parametrize("deploy_name", ["qwen3_omni_moe.yaml", "qwen3_omni_moe_mrv2.yaml"])
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    def test_qwen3_omni_encoder_graph_defaults(self, deploy_name, platform):
+        deploy = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(deploy_name)), platform=platform)
+        config = deploy.stages[0].compilation_config
+        # NPU turns encoder graphs on. V1 and V2 both install the single-replay
+        # manager, and the NPU worker reserves them before the KV cache. CUDA
+        # stays opt-in because that reserve can crowd out KV on 80 GiB cards.
+        assert config["cudagraph_mm_encoder"] is (platform == "npu")
+        assert config["encoder_cudagraph_token_budgets"] == [256, 512, 1024, 2048, 4096]
+        if platform == "cuda":
+            assert config["custom_ops"] == ["+rotary_embedding"]
+        else:
+            assert config["cudagraph_mode"] == "PIECEWISE"
 
     def test_qwen3_omni_talker_sampling_is_seeded(self):
         """The only stochastic Qwen3-Omni stage must stay reproducible.
