@@ -148,12 +148,12 @@ Failed jobs: 1/2
     bash tools/nightly/run_nightly_jobs.sh --test-type function --model-type omni
     bash tools/nightly/run_nightly_jobs.sh --test-type perf --model-type diffusion
 
-    # Stability scripts (tests/dfx/stability/scripts/) and local marker tests
+    # Stability scripts (tests/dfx/stability/scripts/run_stability_benchmark.py) and local marker tests
     bash tools/nightly/run_nightly_jobs.sh --test-type stability --model-type omni
     bash tools/nightly/run_nightly_jobs.sh --test-type local --model-type tts
     ```
 
-    Perf steps (label contains ``Perf Test``) run before other jobs; Excel output is written under ``logs/``. Diffusion nightly steps may also appear in [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml) on CI. **Simple · CPU Coverage Test** in [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) runs when ``NIGHTLY=1`` (``pytest -m 'core_model and cpu'`` plus a Cobertura XML artifact).
+    Perf steps (label contains ``Perf Test``) run before other jobs; Excel output is written under ``logs/``. Diffusion nightly steps may also appear in [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) on CI. **Simple · CPU Coverage Test** in [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) runs when ``NIGHTLY=1`` (``pytest -m 'core_model and cpu'`` plus a Cobertura XML artifact).
 
     **Ad hoc:** run a single test file or marker expression manually:
 
@@ -174,7 +174,7 @@ Failed jobs: 1/2
     pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json
     pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
     ```
-    Nightly **Perf Test** jobs in [``test-nightly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) use ``--test-config-file`` only (no ``-m``). Weekly **Perf Test** in [``test-weekly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml) runs ``test_qwen3_omni_vllm_text.json`` and ``test_qwen3_omni_multi_replicas.json`` (JSON ``mark`` includes ``slow``). E2e L4 function tests use ``full_model`` + ``--run-level full_model``. Example:
+    Nightly **Perf Test** jobs in [``test-nightly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) use ``--test-config-file`` only (no ``-m``). E2e L4 function tests use ``full_model`` + ``--run-level full_model``. Example:
 
 === "L5 level"
 
@@ -184,10 +184,10 @@ Failed jobs: 1/2
     cd tests
 
     # Stability: Qwen3-Omni
-    pytest -s -v dfx/stability/scripts/run_stability_qwen3_omni.py -m slow
+    pytest -s -v dfx/stability/scripts/run_stability_benchmark.py --test-config-file dfx/stability/tests/test_qwen3_omni.json -m slow
 
     # Stability: Wan2.2 (v1/videos diffusion benchmark loop)
-    pytest -s -v dfx/stability/scripts/run_stability_wan22.py -m slow
+    pytest -s -v dfx/stability/scripts/run_stability_benchmark.py --test-config-file dfx/stability/tests/test_wan22.json -m slow
 
     # Reliability: Qwen3-Omni (H100 × 2)
     pytest -s -v dfx/reliability/test_qwen3_omni.py -m "slow and cards_2"

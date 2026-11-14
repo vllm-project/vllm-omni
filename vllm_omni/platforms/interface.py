@@ -18,6 +18,7 @@ logger = init_logger(__name__)
 
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 
 
@@ -91,6 +92,11 @@ class OmniPlatform(Platform):
         return None
 
     @classmethod
+    def apply_diffusion_model_patches(cls, model: nn.Module, od_config: "OmniDiffusionConfig") -> None:
+        """Apply platform-specific rewrites after common model initialization."""
+        return None
+
+    @classmethod
     def register_additional_diffusion_fused_moe_hooks(cls, moe_runner: Any) -> None:
         # One-shot lazy kernel initialisation on the first forward (no-op unless
         # the runner exposes an uninitialised quant_method). Mirrors the prior
@@ -159,12 +165,24 @@ class OmniPlatform(Platform):
 
         supported = backend_cls.supported_platforms
         platform = cls._omni_enum.value
+        out_of_tree = cls._omni_enum == OmniPlatformEnum.OOT
         if supported is not None and platform not in supported:
+            suggestion = "TORCH_SDPA" if out_of_tree else "FLASH_ATTN or TORCH_SDPA"
             raise ValueError(
                 f"The {backend_upper} diffusion attention backend runs on {', '.join(supported)} only, "
                 f"but the current platform is {platform}. Select a backend supported here, "
-                "such as FLASH_ATTN or TORCH_SDPA."
+                f"such as {suggestion}."
             )
+        if out_of_tree:
+            from vllm_omni.diffusion.attention.backends.abstract import AttentionImpl
+
+            # Out-of-tree platforms dispatch to forward_oot, which only some
+            # implementations provide; reject the others before the first forward.
+            if backend_cls.get_impl_cls().forward_oot is AttentionImpl.forward_oot:
+                raise ValueError(
+                    f"The {backend_upper} diffusion attention backend does not implement forward_oot, "
+                    "so it cannot run on out-of-tree platforms. Select a backend that does, such as TORCH_SDPA."
+                )
         backend_cls.validate_available()
 
     @classmethod
