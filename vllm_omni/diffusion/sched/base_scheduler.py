@@ -51,6 +51,7 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import per_sample_kv_count
 from vllm_omni.inputs.data import absorb_attention_schedule_extra_args
+from vllm_omni.lora.utils import build_lora_batch_key
 
 logger = init_logger(__name__)
 
@@ -64,7 +65,7 @@ _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in 
     "attention_schedule_explicit",
     "attention_sigma_schedule",
     "condition_key",
-    "lora_int_id",
+    "lora_key",
     "use_step_execution",
     "mixfusion_key",
 }
@@ -805,7 +806,7 @@ class BaseScheduler(ABC):
                 sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
             ),
             condition_key=getattr(request, "batch_compatibility_key", None),
-            lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
+            lora_key=build_lora_batch_key(lora_request, getattr(sampling, "lora_scale", None)),
             use_step_execution=getattr(request, "use_step_execution", True),
             **relaxed_key,
         )

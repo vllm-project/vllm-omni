@@ -300,6 +300,7 @@ def _sampling(**extra):
         seed=17,
         num_outputs_per_prompt=1,
         lora_request=None,
+        lora_scale=1.0,
         num_inference_steps=None,
     )
 

@@ -45,6 +45,7 @@ PLUGIN_DIR = Path(__file__).resolve().parents[4] / "apps" / "ComfyUI-vLLM-Omni"
 GUIDE_WORKFLOW = PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Timeline Guides.json"
 SCHEMA_COMPLETE_WORKFLOWS = {
     GUIDE_WORKFLOW,
+    PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Character Replacement.json",
     PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 All-in-One.json",
     PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Music Video.json",
 }
@@ -539,6 +540,23 @@ async def test_explicit_lossless_quality_is_not_duplicated(api_calls):
     assert _value(api_calls, "quality") == "lossless"
 
 
+@pytest.mark.parametrize("scales", [(0.0, 0.0), (0.0, 0.7), (0.7, 0.0), (0.0, None)])
+async def test_guides_check_each_chained_lora_scale(api_calls, scales):
+    adapters = [{"local_path": f"/{index}.safetensors", "name": f"adapter-{index}"} for index in range(len(scales))]
+    for adapter, scale in zip(adapters, scales):
+        if scale is not None:
+            adapter["scale"] = scale
+    lora = {"adapters": adapters}
+    guides = _chain((0, {"image": _image()}))
+    if all(scale == 0.0 for scale in scales):
+        await _generate(guides, lora=lora)
+        assert json.loads(_value(api_calls, "lora")) == adapters
+    else:
+        with pytest.raises(ValueError, match="disconnect the request-level LoRA"):
+            await _generate(guides, lora=lora)
+        api_calls.assert_not_called()
+
+
 async def test_zero_scale_lora_is_inactive_and_still_forwarded(api_calls):
     lora = {"local_path": "/l.safetensors", "name": "turbo", "scale": 0.0}
     await _generate(_chain((0, {"image": _image()})), lora=lora)
@@ -680,8 +698,11 @@ async def test_generate_video_node_forwards_guides(api_calls):
     assert _value(api_calls, "num_frames") == "124"
 
 
-async def test_generate_video_node_rejects_fast_h3_guides_before_upload(api_calls, encoders):
+@pytest.mark.parametrize("variant", [None, "Preview", "Omni"])
+async def test_generate_video_node_rejects_fast_h3_guides_before_upload(api_calls, encoders, variant):
     fast_h3 = {"url": "http://localhost/v1", "model": H3}
+    if variant is not None:
+        fast_h3["variant"] = variant
     chain = _chain((36, {"image": _image()}))
     validation = VLLMOmniGenerateVideo.VALIDATE_INPUTS(url="u", model="m", fast_h3=fast_h3, timeline_guides=chain)
     assert isinstance(validation, str) and "not FastH3" in validation
