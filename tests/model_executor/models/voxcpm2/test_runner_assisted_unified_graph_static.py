@@ -215,3 +215,12 @@ def test_voxcpm2_deploy_defaults_to_full_unified_graph_only():
     assert "enable_runner_assisted_unified_decode_graph" not in source
     assert "allow_unified_decode_graph_batch_attention" not in source
     assert "decode_graph_capture_policy" not in source
+
+
+def test_talker_resolves_batched_vae_decode_through_the_runtime_config():
+    source = TALKER.read_text()
+
+    # The talker must resolve the legacy path against the actual graph condition,
+    # not read the raw config flag (a revert that re-opened #9738).
+    assert "_resolve_batched_vae_decode(use_cuda_graph)" in source
+    assert "effective_batched_vae_decode(use_cuda_graph=use_cuda_graph)" in source

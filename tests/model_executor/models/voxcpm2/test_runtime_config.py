@@ -209,6 +209,27 @@ def test_mixed_graph_cache_limit_rejects_negative():
         _VoxCPM2RuntimeConfig.from_vllm_config(_VllmConfig(_ModelConfig({"mixed_graph_cache_limit": -1})))
 
 
+@pytest.mark.parametrize(
+    ("use_cuda_graph", "unified_graph", "deterministic_noise", "configured", "expected"),
+    [
+        (True, True, False, True, False),  # unified graph runs: legacy path must stay off (#9738)
+        (False, True, False, True, True),  # non-CUDA: no graph to replace it, keep the flag
+        (True, False, False, True, True),  # graph disabled by the flag: keep the flag
+        (True, True, True, True, True),  # deterministic CFM noise disables the graph: keep the flag
+        (True, True, False, False, False),  # already off stays off
+    ],
+)
+def test_effective_batched_vae_decode_follows_the_unified_graph(
+    use_cuda_graph, unified_graph, deterministic_noise, configured, expected
+) -> None:
+    config = _VoxCPM2RuntimeConfig(
+        enable_batched_vae_decode=configured,
+        enable_unified_decode_graph=unified_graph,
+        deterministic_cfm_noise=deterministic_noise,
+    )
+    assert config.effective_batched_vae_decode(use_cuda_graph=use_cuda_graph) is expected
+
+
 def test_incremental_vae_disables_legacy_batching_without_conflict_warning(monkeypatch) -> None:
     from vllm_omni.model_executor.models.voxcpm2 import runtime_config
 

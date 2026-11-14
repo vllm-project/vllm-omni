@@ -1164,7 +1164,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._enable_delayed_audio_copy = self._runtime_config.enable_delayed_audio_copy
         self._delayed_audio_copy_use_events = use_cuda_graph and self._runtime_config.delayed_audio_copy_use_events
         self._coalesce_audio_d2h = self._runtime_config.coalesce_audio_d2h
-        self._enable_batched_vae_decode = self._runtime_config.enable_batched_vae_decode
+        self._enable_batched_vae_decode = self._resolve_batched_vae_decode(use_cuda_graph)
         self._enable_batched_fsq_fusion = self._runtime_config.enable_batched_fsq_fusion
         self._batched_fsq_fusion_max_batch = self._runtime_config.batched_fsq_fusion_max_batch
         self._audio_copy_stream: torch.cuda.Stream | None = None
@@ -1201,6 +1201,25 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._active_state_warned = False
 
     # -------------------- custom voice profiles --------------------
+
+    def _resolve_batched_vae_decode(self, use_cuda_graph: bool) -> bool:
+        """Resolve the legacy latent-cohort decoder against the runtime condition.
+
+        The unified decode graph batches VAE decode itself, so the legacy path
+        must stay off whenever that graph runs (#9738). The delayed-copy and
+        VAE-graph incompatibilities only matter for a path that can actually
+        run, so they are checked on the resolved value instead of on the raw
+        flag; otherwise the default CUDA configuration warns about a decoder it
+        will never use.
+        """
+        enabled = self._runtime_config.effective_batched_vae_decode(use_cuda_graph=use_cuda_graph)
+        if enabled and (self._enable_delayed_audio_copy or self._audio_emit_every > 1 or self._enable_vae_cuda_graph):
+            logger.warning(
+                "VoxCPM2 batched VAE decode is incompatible with delayed audio copy, "
+                "audio_emit_every > 1, and VAE CUDA Graph; disabling batched VAE decode."
+            )
+            return False
+        return enabled
 
     @staticmethod
     def _clone_prompt_cache(cache: dict[str, Any]) -> dict[str, Any]:
