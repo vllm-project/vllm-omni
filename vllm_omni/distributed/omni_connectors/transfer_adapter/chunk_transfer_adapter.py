@@ -16,7 +16,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
 from vllm_omni.core.sched.duplex_stage_work import parse_perf_chunk, request_perf_chunk, set_request_perf_chunk
-from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.data_entry_keys import JOYAI_FINISH_ON_NEXT_STOP_KEY, MetaStruct, OmniPayloadStruct, unflatten_payload
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..connectors.shm_connector import SharedMemoryConnector
@@ -30,8 +30,6 @@ from .base import OmniTransferAdapterBase
 logger = get_connector_logger(__name__)
 
 _RECLAIM_WARN_INTERVAL = 1000
-_JOYAI_FINISH_ON_NEXT_STOP = "joyai_finish_on_next_stop"
-_JOYAI_FINISH_ON_NEXT_STOP_DOTTED = f"meta.{_JOYAI_FINISH_ON_NEXT_STOP}"
 
 
 class _SenderGeneration:
@@ -263,41 +261,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if isinstance(value, (list, tuple)):
             return len(value) == 1 and OmniChunkTransferAdapter._is_truthy_scalar(value[0])
         return bool(value)
-
-    @classmethod
-    def _info_has_joyai_finish_on_next_stop(cls, info: object) -> bool:
-        """True when JoyAI stamped ``joyai_finish_on_next_stop`` on this payload."""
-        if isinstance(info, dict):
-            nested = info.get("meta")
-            if isinstance(nested, dict) and cls._is_truthy_scalar(nested.get(_JOYAI_FINISH_ON_NEXT_STOP)):
-                return True
-            return cls._is_truthy_scalar(info.get(_JOYAI_FINISH_ON_NEXT_STOP)) or cls._is_truthy_scalar(
-                info.get(_JOYAI_FINISH_ON_NEXT_STOP_DOTTED)
-            )
-        entries = getattr(info, "entries", None)
-        if not isinstance(entries, dict):
-            return False
-        for key in (_JOYAI_FINISH_ON_NEXT_STOP_DOTTED, _JOYAI_FINISH_ON_NEXT_STOP):
-            entry = entries.get(key)
-            if entry is not None and cls._is_truthy_scalar(getattr(entry, "scalar_data", None)):
-                return True
-        return False
-
-    @classmethod
-    def _joyai_finish_on_next_stop(cls, request: Request, meta: Mapping[str, Any] | None = None) -> bool:
-        """JoyAI last-sentence flag: this packet's meta, or leftover request state.
-
-        Independent Qwen3-TTS never stamps this field. Qwen3's processor also
-        rebuilds ``MetaStruct`` and would drop it, so Talker send re-copies it
-        onto the wire after the processor returns.
-        """
-        if meta is not None and cls._is_truthy_scalar(meta.get(_JOYAI_FINISH_ON_NEXT_STOP)):
-            return True
-        if cls._is_truthy_scalar(getattr(request, "_joyai_finish_on_next_stop", False)):
-            return True
-        return cls._info_has_joyai_finish_on_next_stop(
-            getattr(request, "additional_information", None)
-        ) or cls._info_has_joyai_finish_on_next_stop(getattr(request, "model_intermediate_buffer", None))
 
     @staticmethod
     def _confirmed_num_computed_tokens(request: Request) -> int:
@@ -807,14 +770,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     not has_new_ids
                     and payload_finished
                     and not use_tensor_codes
-                    and self._joyai_finish_on_next_stop(request, meta)
+                    and self._is_truthy_scalar(meta.get(JOYAI_FINISH_ON_NEXT_STOP_KEY))
                 ):
-                    # JoyAI last sentence: 1-D empty finished marker after the
-                    # frames were already sent. Leaving prompt_token_ids=[]
-                    # parks Code2Wav in WAITING_FOR_CHUNK. Independent Qwen3
-                    # never stamps joyai_finish_on_next_stop, so it keeps []
-                    # and the existing pending_finish path. 2-D empty windows
-                    # (Fish Omni / Drama 3) stay [] via use_tensor_codes.
+                    # Last-sentence empty finished marker after frames were
+                    # already sent. The Talker processor stamps this on meta;
+                    # leaving prompt_token_ids=[] parks Code2Wav in
+                    # WAITING_FOR_CHUNK. Independent Qwen3 never stamps it, so
+                    # it keeps [] and the existing pending_finish path. 2-D
+                    # empty windows (Fish Omni / Drama 3) stay [] via
+                    # use_tensor_codes.
                     request.prompt_token_ids = [0]
                 if not has_new_ids and not payload_finished and not payload_segment_finished:
                     # The base recv loop treats False as "not ready yet" and
@@ -1064,13 +1028,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         perf_chunk = task.get("duplex_perf_chunk")
         if perf_chunk is not None:
             payload_data.meta.duplex_perf_chunk = list(perf_chunk)
-        # Qwen3-TTS processor rebuilds MetaStruct and drops this field.
-        # Copy it back so Code2Wav receive can gate the empty-finished [0]
-        # dummy on JoyAI only; independent Qwen3 never has the flag.
-        if not self._is_truthy_scalar(payload_data.meta.joyai_finish_on_next_stop) and self._joyai_finish_on_next_stop(
-            request
-        ):
-            payload_data.meta.joyai_finish_on_next_stop = True
 
         if sender_token is not None and not self._sender_generation_is_active(
             external_req_id, sender_token, is_terminal=is_finished

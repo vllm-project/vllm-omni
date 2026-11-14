@@ -390,3 +390,51 @@ def test_joyai_action_to_tts_stamps_finish_on_next_stop(monkeypatch: pytest.Monk
     assert _request_finishes_on_next_stop(top_level) is True
     absent = SimpleNamespace(additional_information={"meta": {}}, model_intermediate_buffer=None)
     assert _request_finishes_on_next_stop(absent) is False
+
+
+def test_talker2code2wav_empty_finished_preserves_finish_on_next_stop() -> None:
+    from collections import defaultdict
+
+    import torch
+
+    from vllm_omni.data_entry_keys import JOYAI_FINISH_ON_NEXT_STOP_KEY
+    from vllm_omni.model_executor.stage_input_processors.qwen3_tts import talker2code2wav_async_chunk
+
+    extra = {
+        "codec_chunk_frames": 25,
+        "codec_left_context_frames": 25,
+        "initial_codec_chunk_frames": 1,
+    }
+    tm = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        scheduler_max_num_seqs=1,
+        put_req_chunk=defaultdict(int),
+        ramp_chunk_count=defaultdict(int),
+        _adaptive_states={},
+        request_payload={},
+        connector=SimpleNamespace(config={"extra": extra}),
+    )
+    request = SimpleNamespace(
+        external_req_id="req-1",
+        is_finished=lambda: False,
+        additional_information=None,
+        output_token_ids=[],
+    )
+    setattr(request, f"_{JOYAI_FINISH_ON_NEXT_STOP_KEY}", True)
+    first = talker2code2wav_async_chunk(
+        tm,
+        {"codes": {"audio": torch.tensor([[1, 2, 3, 4]], dtype=torch.long)}},
+        request,
+    )
+    assert first is not None
+    tm.put_req_chunk["req-1"] += 1
+    request.is_finished = lambda: True
+    terminal = talker2code2wav_async_chunk(
+        tm,
+        {"codes": {"audio": torch.zeros((0,))}},
+        request,
+        is_finished=True,
+    )
+    assert terminal is not None
+    assert terminal.codes.audio.numel() == 0
+    assert terminal.meta.joyai_finish_on_next_stop is True
