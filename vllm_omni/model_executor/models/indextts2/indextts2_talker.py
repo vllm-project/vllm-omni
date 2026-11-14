@@ -113,11 +113,6 @@ def _require_exact_indextts_prefill_span(
     )
 
 
-def _find_most_similar_cosine(query: torch.Tensor, matrix: torch.Tensor) -> int:
-    sims = F.cosine_similarity(query.float(), matrix.float(), dim=1)
-    return int(torch.argmax(sims).item())
-
-
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -183,6 +178,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                 {
                     ("hidden_states", "latent"),
                     ("meta", "latent_acc"),
+                    ("meta", "step_latent"),
                 }
             )
 
@@ -433,7 +429,9 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                     assert _zero_codes is not None
                     mel_codes_list.append(_zero_codes)
 
-                lat_acc = info_meta.get("latent_acc")
+                lat_acc = info_meta.get("step_latent")
+                if not isinstance(lat_acc, torch.Tensor) or lat_acc.numel() == 0:
+                    lat_acc = info_meta.get("latent_acc")
                 if isinstance(lat_acc, torch.Tensor) and lat_acc.numel() > 0 and mel_len > 0:
                     lat_seq = lat_acc.reshape(-1, lat_acc.shape[-1]) if lat_acc.ndim != 2 else lat_acc
                     idx = min(max(mel_len - 1, 0), int(lat_seq.shape[0]) - 1)
@@ -533,13 +531,17 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
 
         mel_pos = input_ids.new_full((1,), decode_step)
         embeds = self.mel_embedding(input_ids) + self.mel_pos_embedding.emb(mel_pos)
+        meta_update: dict[str, Any] = {"mel_code_count": decode_step}
+        prev_latent = meta.get("latent_acc")
+        if self.use_gpt_latent and isinstance(prev_latent, torch.Tensor):
+            meta_update["step_latent"] = prev_latent
 
         return (
             input_ids,
             embeds,
             {
                 "codes": {"mel": new_codes},
-                "meta": {"mel_code_count": decode_step},
+                "meta": meta_update,
             },
         )
 
@@ -609,9 +611,10 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         w2v_proc = None
 
         if _cached is not None:
-            s_ref = _cached["S_ref"].to(device)
-            style = _cached["style"].to(device)
-            ref_mel = _cached["ref_mel"].to(device)
+            s_ref_cpu = _cached["S_ref"].detach().cpu().contiguous()
+            style_cpu = _cached["style"].detach().cpu().contiguous()
+            ref_mel_cpu = _cached["ref_mel"].detach().cpu().contiguous()
+            style = style_cpu.to(device)
             spk_cond_emb = _cached["spk_cond_emb"].to(device)
         else:
             wav_16k, wav_22k = load_reference_audio(voice_path, device, mode="speaker")
@@ -640,13 +643,17 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
 
             ref_mel = self._compute_mel_22k(wav_22k, device)  # [1, 80, T_ref]
 
+            s_ref_cpu = s_ref.detach().cpu().contiguous()
+            style_cpu = style.detach().cpu().contiguous()
+            ref_mel_cpu = ref_mel.detach().cpu().contiguous()
+
             if _speaker_cache_key is not None:
                 self._speaker_cache.put(
                     _speaker_cache_key,
                     {
-                        "S_ref": s_ref.detach().cpu().contiguous(),
-                        "style": style.detach().cpu().contiguous(),
-                        "ref_mel": ref_mel.detach().cpu().contiguous(),
+                        "S_ref": s_ref_cpu,
+                        "style": style_cpu,
+                        "ref_mel": ref_mel_cpu,
                         "spk_cond_emb": spk_cond_emb.detach().cpu().contiguous(),
                     },
                 )
@@ -737,9 +744,9 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                 "mel_start_offset": mel_start_offset,
                 "prefill_mel_index": prefill_mel_index,
                 "mel_code_count": 0,
-                "S_ref": s_ref.cpu().contiguous(),
-                "ref_mel": ref_mel.cpu().contiguous(),
-                "style": style.cpu().contiguous(),
+                "S_ref": s_ref_cpu,
+                "ref_mel": ref_mel_cpu,
+                "style": style_cpu,
                 "use_gpt_latent": self.use_gpt_latent,
                 "duration_factor": duration_factor,
             },
@@ -1021,11 +1028,17 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             weight_vector = weight_vector.squeeze(0)  # [8]
 
         if use_random:
-            indices = [int(torch.randint(0, sub.shape[0], (1,), device=device).item()) for sub in self._spk_matrix]
+            idx_tensors = [torch.randint(0, sub.shape[0], (1,), device=device) for sub in self._spk_matrix]
         else:
-            indices = [_find_most_similar_cosine(style, sub.to(device)) for sub in self._spk_matrix]
+            style_f32 = style.to(device=device, dtype=torch.float32)
+            idx_tensors = [
+                torch.argmax(F.cosine_similarity(style_f32, sub.to(device=device, dtype=torch.float32), dim=1)).reshape(
+                    1
+                )
+                for sub in self._spk_matrix
+            ]
         emo_rows = torch.cat(
-            [sub.to(device)[idx].unsqueeze(0) for idx, sub in zip(indices, self._emo_matrix)], dim=0
+            [sub.to(device).index_select(0, idx) for idx, sub in zip(idx_tensors, self._emo_matrix)], dim=0
         )  # [8, model_dim]
 
         return (weight_vector.unsqueeze(1) * emo_rows).sum(0).unsqueeze(0)  # [1, model_dim]

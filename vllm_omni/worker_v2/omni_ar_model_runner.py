@@ -40,7 +40,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import partition_flat_payload
+from vllm_omni.utils.mm_outputs import partition_flat_payload, snapshot_mm_payload
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
@@ -336,6 +336,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
         materialize_native = self._uses_native_output_materializer()
         get_request_errors = getattr(self.model_state, "get_request_errors", None)
         async_chunk = bool(getattr(self.model_config, "async_chunk", False))
+        defer_full_payload_d2h = (
+            need_pooler
+            and not async_chunk
+            and prefix_cache_rewrite is None
+            and getattr(self, "omni_prefix_cache", None) is None
+            and bool(getattr(self.model, "omni_payload_at_request_end", False))
+            and getattr(self, "_omni_data_plane", None) is not None
+            and bool(getattr(self._omni_data_plane, "_can_send", False))
+        )
         async_output = OmniAsyncOutput(
             model_runner_output=model_runner_output,
             sampler_output=sampler_output,
@@ -350,6 +359,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             # partitions latent off the client channel and publishes it once
             # through pooling_output for llm2tts.
             partition_async_payload=async_chunk and stage_sends_async_output(self.model_config),
+            defer_full_payload_d2h=defer_full_payload_d2h,
             finalize_output=self._prefix_cache_output_finalizer(
                 prefix_cache_rewrite,
                 None if materialize_native else self._finalize_native_data_plane_output,
@@ -367,8 +377,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
         _guard_graph_replay_for_pooler_copy(
             self.main_stream,
             async_output.copy_event,
-            need_pooler=need_pooler and (include_hidden or not sampling_output.owns_multimodal_outputs),
-            async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
+            need_pooler=need_pooler
+            and not defer_full_payload_d2h
+            and (include_hidden or not sampling_output.owns_multimodal_outputs),
+            async_chunk=async_chunk,
         )
 
         mm_inputs = None
@@ -505,6 +517,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         num_reqs: int,
         padded_total_tokens: int | None = None,
         num_output_rows: np.ndarray | None = None,
+        owned_snapshot: bool = False,
     ) -> list[dict[str, Any]]:
         """Build per-request payloads, excluding any CUDA Graph padding.
 
@@ -531,6 +544,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
                     end=end,
                     total_tokens=total,
                     padded_total_tokens=padded_total_tokens,
+                    owned_snapshot=owned_snapshot,
                 )
             pooler.append(flatten_payload(payload))
         return pooler
@@ -756,6 +770,7 @@ def _slice_pooler_value(
     total_tokens: int,
     padded_total_tokens: int | None = None,
     request_scoped: bool = False,
+    owned_snapshot: bool = False,
 ) -> Any:
     if isinstance(value, torch.Tensor):
         token_axis_sizes = {total_tokens}
@@ -763,7 +778,7 @@ def _slice_pooler_value(
             token_axis_sizes.add(padded_total_tokens)
         if not request_scoped and value.dim() > 0 and value.shape[0] in token_axis_sizes:
             return value[start:end].contiguous()
-        return value.clone()
+        return value if (owned_snapshot and request_scoped) else value.clone()
     if isinstance(value, dict):
         return {
             key: _slice_pooler_value(
@@ -774,6 +789,7 @@ def _slice_pooler_value(
                 total_tokens=total_tokens,
                 padded_total_tokens=padded_total_tokens,
                 request_scoped=request_scoped,
+                owned_snapshot=owned_snapshot,
             )
             for key, val in value.items()
         }
@@ -791,6 +807,7 @@ def _slice_pooler_value(
                 end=end,
                 total_tokens=total_tokens,
                 request_scoped=True,
+                owned_snapshot=owned_snapshot,
             )
             for item in values
         ]
@@ -851,6 +868,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         input_batch: Any | None = None,
         async_chunk: bool = False,
         partition_async_payload: bool | None = None,
+        defer_full_payload_d2h: bool = False,
         finalize_output: Any | None = None,
         finalize_multimodal: Any | None = None,
         check_ep_fault: bool = False,
@@ -871,6 +889,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self._partition_async_payload = (
             self._async_chunk if partition_async_payload is None else bool(partition_async_payload)
         )
+        self._defer_full_payload_d2h = bool(defer_full_payload_d2h)
         self._finalize_output = finalize_output
         self._finalize_multimodal = finalize_multimodal
         self._has_fault: torch.Tensor | None = None
@@ -1016,6 +1035,12 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                             pin_memory=pin_memory,
                         ),
                     )
+            elif self._need_pooler and self._defer_full_payload_d2h:
+                with _stream(main_stream, copy_stream):
+                    if text_hidden is not None:
+                        self._hidden_cpu = text_hidden.detach().clone()
+                    self._mm_cpu = snapshot_mm_payload(multimodal_outputs) if multimodal_outputs else {}
+                copy_stream.wait_stream(main_stream)
             elif self._need_pooler:
                 if text_hidden is not None:
                     self._hidden_cpu = _async_copy_tensor(
@@ -1127,12 +1152,15 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 self._num_reqs,
                 self._padded_total_tokens,
                 num_output_rows,
+                owned_snapshot=self._defer_full_payload_d2h,
             )
             pooler_payload = cast(list[dict[str, Any] | None], pooler_output) if pooler_output else None
             self.model_runner_output.pooler_output = pooler_payload
             self.model_runner_output.inter_stage_outputs = pooler_payload
             self.model_runner_output.multimodal_outputs = (
-                [_ensure_tensor_values(p) if p else {} for p in pooler_payload] if pooler_payload else None
+                None
+                if self._defer_full_payload_d2h
+                else ([_ensure_tensor_values(p) if p else {} for p in pooler_payload] if pooler_payload else None)
             )
 
         if self._request_errors is not None:

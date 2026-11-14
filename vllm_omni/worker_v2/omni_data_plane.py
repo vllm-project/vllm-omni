@@ -223,6 +223,14 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         # Keep independent pooling results and inline output without a send path.
         if inter_stage_outputs is not None and output.pooler_output is inter_stage_outputs and self._can_send:
             output.pooler_output = None
+            if not self._async_chunk and bool(
+                getattr(
+                    getattr(self, "_custom_process_func", None),
+                    "_suppress_client_multimodal_outputs",
+                    False,
+                )
+            ):
+                output.multimodal_outputs = None
         output.inter_stage_outputs = None
 
     def enqueue_outputs(
