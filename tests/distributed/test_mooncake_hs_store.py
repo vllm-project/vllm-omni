@@ -202,6 +202,7 @@ def test_native_batched_read_spans_batches_and_rejects_a_gap(native_store, nativ
     store, namespace, cleanup = native_store
     connector, attempt, _, _ = native_connector
     attempt.hashes = [b"prefix-0", b"prefix-1", b"prefix-2"]
+    attempt.prompt_len = 13  # Three complete blocks plus a partial tail.
     expected = [tensors(10 * index) for index in range(3)]
     for block_hash in attempt.hashes:
         key = hs_key(namespace, block_hash)
