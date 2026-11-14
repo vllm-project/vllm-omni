@@ -25,6 +25,7 @@ _EOS = 6561
 
 def _talker(max_reqs: int = 8, max_position_embeddings: int = 4096):
     talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    talker._k_step_frames = 0
     talker._codec_eos_id = _EOS
     talker._tts_config = SimpleNamespace(max_position_embeddings=max_position_embeddings)
     talker._mrv2_empty_speech = torch.zeros(max_reqs, dtype=torch.bool)

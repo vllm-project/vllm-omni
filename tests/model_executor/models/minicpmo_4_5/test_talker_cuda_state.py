@@ -484,7 +484,7 @@ def test_model_binding_commit_and_batch_compaction():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize("eos_frame", [0, 1, 2])
-@pytest.mark.parametrize("use_v2", [False, True], ids=["multinomial", "batched_noise"])
+@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
 def test_native_model_graph_eos_restores_request_rng(eos_frame, use_v2):
     from types import MethodType, SimpleNamespace
 
@@ -494,7 +494,10 @@ def test_native_model_graph_eos_restores_request_rng(eos_frame, use_v2):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         _flush_cuda_kstep_host_pending,
     )
+    from vllm_omni.platforms import current_omni_platform
     from vllm_omni.worker.talker_cuda_graph import CUDANarrowStep
+
+    batched_noise = use_v2 and current_omni_platform.is_cuda()
 
     generators = {name: torch.Generator(device="cuda").manual_seed(seed) for name, seed in (("a", 123), ("b", 456))}
     references = {name: torch.Generator(device="cuda").manual_seed(seed) for name, seed in (("a", 123), ("b", 456))}
@@ -548,7 +551,7 @@ def test_native_model_graph_eos_restores_request_rng(eos_frame, use_v2):
         )
         assert state is not None
 
-        assert bool(model._cuda_kstep_rng_increment) is use_v2
+        assert bool(model._cuda_kstep_rng_increment) is batched_noise
         graph_generators = tuple(g for g in model._cuda_kstep_generators if g is not None)
 
         def snapshot():
@@ -591,7 +594,7 @@ def test_native_model_graph_eos_restores_request_rng(eos_frame, use_v2):
         _flush_cuda_kstep_host_pending(model)
         for row, name in enumerate(order):
             draws = eos_frame + 1 if row == 0 else 3
-            if use_v2:
+            if batched_noise:
                 base = references[name].get_offset()
                 reference_noise = torch.empty(VOCAB_SIZE, device="cuda")
                 for _ in range(draws):

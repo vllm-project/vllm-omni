@@ -2840,7 +2840,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             for request_id, config in zip(request_ids, sampling)
         )
         rng_increment = 0
-        if hidden.is_cuda and getattr(self, "_use_v2_model_runner", False) and all(g is not None for g in generators):
+        if (
+            hidden.is_cuda
+            and current_omni_platform.is_cuda()
+            and getattr(self, "_use_v2_model_runner", False)
+            and all(g is not None for g in generators)
+        ):
             if workspace.exponential_noise is None:
                 workspace.exponential_noise = torch.empty(
                     (frames, len(infos), _CODEC_VOCAB_SIZE), dtype=torch.float32, device=device
