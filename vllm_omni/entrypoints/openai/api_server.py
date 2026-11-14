@@ -407,6 +407,8 @@ async def omni_run_server_worker(
     log_config = get_uvicorn_log_config(args)
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
+    if getattr(args, "disable_websocket_compression", False):
+        uvicorn_kwargs["ws_per_message_deflate"] = False
 
     async with build_async_omni(
         args,

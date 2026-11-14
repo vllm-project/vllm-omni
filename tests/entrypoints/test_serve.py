@@ -196,6 +196,22 @@ def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
     return parser.parse_args(argv)
 
 
+@pytest.mark.parametrize("api_server_count", [1, 2])
+def test_websocket_compression_is_an_opt_in_frontend_option(api_server_count: int) -> None:
+    argv = ["serve", "fake-model", "--omni", "--api-server-count", str(api_server_count)]
+    args = _parse_serve_args(argv)
+    assert args.disable_websocket_compression is False
+    assert "disable_websocket_compression" not in args.get_explicit_kwargs_dict()
+
+    args = _parse_serve_args([*argv, "--disable-websocket-compression"])
+    explicit = args.get_explicit_kwargs_dict()
+    assert explicit["disable_websocket_compression"] is True
+    normalized = normalize_and_validate_diffusion_engine_ingress_kwargs(
+        {"disable_websocket_compression": explicit["disable_websocket_compression"]}, stage_id=0
+    )
+    assert "disable_websocket_compression" not in normalized
+
+
 @pytest.mark.parametrize(
     "flags",
     [
