@@ -922,13 +922,25 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
             # inputs_embeds buffer above.
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
-            replayed = self.cudagraph_manager.run_fullgraph(batch_desc)
-            if self.use_aux_hidden_state_outputs:
-                replayed, draft_aux_hidden_states = replayed
             self._last_multimodal_outputs = None
-            hidden_states, self._last_aux_output = self._split_fullgraph_output(replayed)
-            if hasattr(self.model, "_last_captured_layers"):
-                self.model._last_captured_layers = self._last_aux_output
+            stepped = self._full_graph_step_output(
+                batch_desc,
+                model_inputs=model_inputs,
+                input_batch=input_batch,
+            )
+            if stepped is not None:
+                # The platform loop already sampled this step.
+                hidden_states = stepped.text_hidden_states
+                self._last_aux_output = None
+                if stepped.multimodal_outputs:
+                    self._last_multimodal_outputs = cast(dict[str, Any], stepped.multimodal_outputs)
+            else:
+                replayed = self.cudagraph_manager.run_fullgraph(batch_desc)
+                if self.use_aux_hidden_state_outputs:
+                    replayed, draft_aux_hidden_states = replayed
+                hidden_states, self._last_aux_output = self._split_fullgraph_output(replayed)
+                if hasattr(self.model, "_last_captured_layers"):
+                    self.model._last_captured_layers = self._last_aux_output
         else:
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
@@ -961,7 +973,11 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                             model_inputs,
                         )
                     else:
-                        model_output = self.model(**model_inputs)
+                        model_output = self._call_model(
+                            model_inputs,
+                            input_batch=input_batch,
+                            batch_desc=batch_desc,
+                        )
             finally:
                 if runner_assisted_full_attn:
                     self.model.set_runner_assisted_full_attention_metadata_context(enabled=False)
@@ -999,6 +1015,14 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
 
         assert isinstance(hidden_states, torch.Tensor)
         return None
+
+    def _full_graph_step_output(self, batch_desc, *, model_inputs, input_batch):
+        """Platform hook for FULL-graph replay; None keeps the stock replay."""
+        return None
+
+    def _call_model(self, model_inputs: dict[str, Any], *, input_batch: Any, batch_desc: Any) -> Any:
+        """Invoke the model once; platform runners may override for frame loops."""
+        return self.model(**model_inputs)
 
     # ------------------------------------------------------------------
     # Request lifecycle: update intermediate buffer from cached requests
