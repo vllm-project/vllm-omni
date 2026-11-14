@@ -567,6 +567,17 @@ source_file_dependencies:
     - tests/helpers/runtime.py
     - tests/helpers/stage_config.py
 
+  diffusion_bagel_offline_weekly:
+    - *bagel
+    - tests/e2e/offline_inference/test_bagel.py
+    - tests/e2e/offline_inference/test_bagel_expansion.py
+    - tests/conftest.py
+    - tests/helpers/fixtures/runtime.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/diffusion/lora/
+    - vllm_omni/lora/
+
   omni_qwen3_omni_shm_leak_function:
     - *qwen3_omni
     - tests/e2e/online_serving/test_qwen3_omni_shm_leak.py
