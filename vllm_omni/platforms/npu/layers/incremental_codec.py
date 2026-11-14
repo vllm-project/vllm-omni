@@ -192,9 +192,8 @@ class NPUIncrementalCodec:
         self.free = list(range(slots))
         self.graphs: dict[tuple[int, int, int], _ShapeGraph] = {}
         self.streams = [torch.npu.Stream(device=self.device) for _ in range(2)] if streams == 2 else []
-        # Only one graph per lane runs at a time and outputs are cloned before
-        # the next replay. Share scratch pools within a lane, never across the
-        # two concurrently executing lanes.
+        # Reuse the capture stream within each lane. Every captured graph owns
+        # a separate scratch pool; outputs are cloned before the next replay.
         self.capture_streams = self.streams or [torch.npu.Stream(device=self.device)]  # type: ignore[attr-defined]
         # Runtime formats are prepared by the NPU Code2Wav loader. Attention
         # selection is local to each incremental call; preserve the shared config.

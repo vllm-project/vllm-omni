@@ -611,10 +611,8 @@ This cycles through four configs (Baseline -> + Batch -> + CUDA Graph -> + Async
 
 ## Qwen3-TTS NPU codec kernels
 
-The NPU loader uses reference codebook normalization and clears any cached
-normalized embeddings after loading weights and applying the final decoder dtype.
-The optional codebook cache helper remains available to callers that explicitly
-prepare it; it is not enabled by the Qwen3-TTS NPU loader.
+The codec uses reference codebook normalization directly from the loaded weights.
+There is no normalized-embedding cache or cache-preparation helper.
 
 Qwen3-TTS keeps its Ascend SnakeBeta kernel disabled by default. It supports contiguous, nonempty NCT
 BF16 inference tensors within its validated grid size. The kernel preserves
@@ -639,7 +637,7 @@ The default NPU profile enables seven paths: Model Runner V2 with sampling
 uniforms, Talker full decode graphs, Predictor frame graphs, frame-local KV,
 fused RoPE/KV writes, incremental Codec, and fused SwiGLU. Fused sampling,
 native GQA, dual Codec streams, stateless convolution graphs and fused Snake
-require explicit opt-in. The loader leaves Codebook caching disabled; incremental
+require explicit opt-in. Codebook lookup uses reference normalization; incremental
 graphs use separate scratch pools and the selected-row kernel uses ordinary
 Triton specialization. Existing non-NPU defaults are unchanged.
 
@@ -702,7 +700,10 @@ sliding-window KV in per-request slots. It is enabled by default on NPU.
 Startup captures full chunks and single frames. Final partial chunks execute
 without live graph capture. Each captured graph owns its scratch pool, and
 outputs are copied before the next replay. Selected-row state stores retain
-Triton's default stride and alignment specialization. Request completion releases and resets the slot; loading weights or
+Triton's default stride and alignment specialization, so an unseen tail layout
+may compile a new kernel variant on a live request. Avoiding live graph capture
+does not guarantee zero live Triton compilation.
+Request completion releases and resets the slot; loading weights or
 converting the decoder releases its graphs. This path changes the streaming
 execution strategy and needs paired audio validation for the target workload.
 Its additive attention mask selects eager attention only for incremental calls;
@@ -739,7 +740,7 @@ these existing Omni owners:
 | Packed QKV / gate-up projections, native normalization / rotary | Already provided by the shared code predictor and the Talker backend |
 | Fixed predictor rotary coefficients (U002) | Predictor already uses precomputed cos/sin tables on NPU; no request-position cache or module replacement is needed |
 | Model-fixed prompt embeddings | Existing prompt builder caches projected special tokens and CustomVoice speaker/language prefixes |
-| Cached codec codebooks and fused Snake | Codebook cache helper and opt-in `npu_fused_snake`; both disabled by the default NPU loader |
+| Cached codec codebooks and fused Snake | Reference codebook normalization (no cache); opt-in `npu_fused_snake`, disabled by default |
 | Prefill/decode graphs and continuous batching | Existing vLLM scheduler, paged KV and Talker graph runner |
 | Incremental codec and convolution graphs | `npu_incremental_codec` and `npu_conv_graph_shapes` |
 | Native grouped-query predictor attention | Opt-in `code_predictor_npu_native_gqa` |

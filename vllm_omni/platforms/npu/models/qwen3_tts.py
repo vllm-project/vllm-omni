@@ -82,14 +82,9 @@ def _patched_load_weights(self, weights):
         if hasattr(self.decoder, "precompute_snake_caches"):
             self.decoder.precompute_snake_caches()
     _prepare_npu_decoder_weights(self.decoder)
-    # Clear optional codebook caches after every load, including the 310P
-    # dtype override above, before capturing graphs with reference lookup.
     from vllm.triton_utils import HAS_TRITON
 
     from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
-    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
-        EuclideanCodebook,
-    )
 
     connector = getattr(self.vllm_config.model_config, "stage_connector_config", None)
     extra = connector.get("extra", connector) if isinstance(connector, dict) else {}
@@ -100,9 +95,7 @@ def _patched_load_weights(self, weights):
     if not isinstance(fused_snake, bool):
         raise ValueError("npu_fused_snake must be a boolean")
     for module in self.decoder.modules():
-        if isinstance(module, EuclideanCodebook):
-            module._normalized_embedding = None
-        elif isinstance(module, SnakeBeta):
+        if isinstance(module, SnakeBeta):
             module.npu_fused = fused_snake and HAS_TRITON
     incremental = extra.get("npu_incremental_codec", True)
     if not isinstance(incremental, bool):

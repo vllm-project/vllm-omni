@@ -9,6 +9,9 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_marks
+from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+    EuclideanCodebook,
+)
 
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"npu": "A2"}, num_cards=1)]
 
@@ -28,9 +31,8 @@ def test_partial_chunks_do_not_capture_and_slots_reset(monkeypatch, explicit_hea
     if explicit_head_dim:
         decoder.config.head_dim = decoder.config.hidden_size // decoder.config.num_attention_heads
     for module in decoder.modules():
-        if hasattr(module, "precompute_embedding"):
+        if isinstance(module, EuclideanCodebook):
             module.embedding_sum.normal_()
-            module.precompute_embedding()
     decoder.precompute_snake_caches()
     arena = NPUIncrementalCodec(decoder, slots=2, max_batch=2, chunk_frames=4)
     codes = torch.randint(0, 32, (2, 2, 7), device="npu")
@@ -92,9 +94,8 @@ def test_dual_stream_matches_serial_state_and_owned_audio(monkeypatch):
     torch.manual_seed(318)
     decoder = _make_decoder().to(device="npu", dtype=torch.bfloat16).eval()
     for module in decoder.modules():
-        if hasattr(module, "precompute_embedding"):
+        if isinstance(module, EuclideanCodebook):
             module.embedding_sum.normal_()
-            module.precompute_embedding()
     decoder.precompute_snake_caches()
     serial = NPUIncrementalCodec(decoder, slots=6, max_batch=2, chunk_frames=4)
     parallel = NPUIncrementalCodec(decoder, slots=6, max_batch=2, chunk_frames=4, streams=2)
@@ -236,9 +237,8 @@ def test_incremental_attention_does_not_change_stateless_backend(monkeypatch):
     decoder = _make_decoder().to(device="npu", dtype=torch.bfloat16).eval()
     decoder.pre_transformer.config._attn_implementation = "sdpa"
     for module in decoder.modules():
-        if hasattr(module, "precompute_embedding"):
+        if isinstance(module, EuclideanCodebook):
             module.embedding_sum.normal_()
-            module.precompute_embedding()
     decoder.precompute_snake_caches()
     codes = torch.randint(0, 32, (1, 2, 7), device="npu")
     expected = decoder(codes)
@@ -309,12 +309,7 @@ def test_loader_defaults_and_explicit_opt_out(monkeypatch, has_triton, source):
     conv = Mock(side_effect=AssertionError("incremental or explicit [] must skip stateless capture"))
     monkeypatch.setattr(incremental_codec, "NPUIncrementalCodec", incremental)
     monkeypatch.setattr(codec_graph, "NPUCodecGraphs", conv)
-    codebooks = [module for module in decoder.modules() if hasattr(module, "precompute_embedding")]
-    assert codebooks
-    for module in codebooks:
-        module.precompute_embedding()
     qwen3_tts._patched_load_weights(model, [])
-    assert all(module._normalized_embedding is None for module in codebooks)
     if disabled:
         incremental.assert_not_called()
     else:
@@ -358,26 +353,19 @@ def test_explicit_dual_stream_conflict_fails_before_capture(monkeypatch, has_tri
 
 
 @torch.inference_mode()
-def test_tail_row_scatter_does_not_compile_for_new_strides(monkeypatch):
+def test_tail_row_scatter_preserves_selected_and_untouched_rows():
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("NPU required")
-    from vllm.triton_utils import triton
-
     from vllm_omni.platforms.npu.layers.codec_row_scatter import scatter_rows
 
-    target = torch.zeros(8, 3, 7, device="npu", dtype=torch.bfloat16)
+    target = torch.randn(8, 3, 7, device="npu", dtype=torch.bfloat16)
     indices = torch.tensor([6, 1, 4], device="npu")
-    first = torch.randn(3, 3, 8, device="npu", dtype=torch.bfloat16)[:, :, -7:]
-    scatter_rows(target, indices, first)
-    torch.npu.synchronize()
-
-    def no_compile(*args, **kwargs):
-        pytest.fail("a new tail stride must reuse the warmed scatter kernel")
-
-    monkeypatch.setattr(triton.runtime.jit.JITFunction, "_do_compile", no_compile)
-    for length in range(2, 26):
+    # Tail views vary both the source strides and starting-address alignment.
+    # Ordinary Triton specialization may compile variants for these inputs.
+    for length in range(1, 26):
         source = torch.randn(3, 3, 7 + length, device="npu", dtype=torch.bfloat16)[:, :, -7:]
+        assert not source.is_contiguous()
         expected = target.clone().index_copy_(0, indices, source)
         scatter_rows(target, indices, source)
         torch.testing.assert_close(target, expected, atol=0, rtol=0)
@@ -395,9 +383,8 @@ def test_all_tail_lengths_match_eager_state(monkeypatch):
     _prepare_npu_code2wav_runtime()
     decoder = _make_decoder().to(device="npu", dtype=torch.bfloat16).eval()
     for module in decoder.modules():
-        if hasattr(module, "precompute_embedding"):
+        if isinstance(module, EuclideanCodebook):
             module.embedding_sum.normal_()
-            module.precompute_embedding()
     decoder.precompute_snake_caches()
     arena = NPUIncrementalCodec(decoder, slots=2, max_batch=2, chunk_frames=25)
     with monkeypatch.context() as patch:

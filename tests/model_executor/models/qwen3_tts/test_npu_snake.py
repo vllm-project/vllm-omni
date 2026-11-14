@@ -42,7 +42,7 @@ def test_unsupported_layout_uses_eager(dtype):
 
 
 @torch.inference_mode()
-def test_small_decoder_combines_codebook_cache_and_snake():
+def test_small_decoder_fused_snake_matches_eager():
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("NPU required")
@@ -60,9 +60,7 @@ def test_small_decoder_combines_codebook_cache_and_snake():
     codes = torch.randint(0, 32, (1, 2, 4), device="npu")
     expected = decoder(codes)
     for module in decoder.modules():
-        if isinstance(module, EuclideanCodebook):
-            module.precompute_embedding()
-        elif isinstance(module, SnakeBeta):
+        if isinstance(module, SnakeBeta):
             module.npu_fused = True
     actual = decoder(codes)
     torch.testing.assert_close(actual, expected, atol=0.03125, rtol=0.01)
