@@ -13,6 +13,7 @@ from typing import Any, TypedDict
 import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingType
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
@@ -519,7 +520,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             or request.is_prefill_chunk
             or self._uses_native_duplex_sampler(request)
             or request.sampling_params is None
-            or request.sampling_params.temperature != 0
+            or request.sampling_params.sampling_type != SamplingType.GREEDY
             or not request.output_token_ids
         ):
             return []
@@ -736,7 +737,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # scheduler Ngram path, also keep non-greedy requests on the
             # ordinary sampler when they share a step with greedy requests.
             if self._uses_native_duplex_sampler(request) or (
-                scheduler_ngram and params is not None and params.temperature != 0
+                scheduler_ngram and params is not None and params.sampling_type != SamplingType.GREEDY
             ):
                 draft_limit = 0
                 break

@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import pytest
+from vllm import SamplingParams
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler, _reject_kstep_async_scheduling
 from vllm_omni.engine.serialization import serialize_additional_information
@@ -52,10 +53,10 @@ def test_thinker_ngram_limits_drafts_before_accounting(scheduler_ngram, native_d
     scheduler = object.__new__(OmniARScheduler)
     scheduler._scheduler_ngram = object() if scheduler_ngram else None
     scheduler.requests = {
-        "chat": SimpleNamespace(resumable=False, sampling_params=SimpleNamespace(temperature=0.0)),
+        "chat": SimpleNamespace(resumable=False, sampling_params=SamplingParams(temperature=0.0)),
         "duplex": SimpleNamespace(
             resumable=False,
-            sampling_params=SimpleNamespace(temperature=temperature),
+            sampling_params=SamplingParams(temperature=temperature),
             additional_information=serialize_additional_information({"duplex": {"data_plane": native_duplex}}),
         ),
     }
