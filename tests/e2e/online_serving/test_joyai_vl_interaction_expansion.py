@@ -209,6 +209,8 @@ async def run_continuous(url, model, output_dir):
         "interactions": [],
         "action_pauses_s": [],
         "max_outstanding": 0,
+        "committed": 0,
+        "vision_follow": 0,
         "max_pacing_lag_s": 0.0,
     }
     created: set[str] = set()
@@ -217,12 +219,19 @@ async def run_continuous(url, model, output_dir):
     texts: dict[str, str] = {}
     audio: dict[str, int] = {}
     started = time.monotonic()
+    last_progress = started
     stream = (output_dir / "events.jsonl").open("w", buffering=1)
 
     async def consume(client):
+        nonlocal last_progress
         async for event in client:
             stream.write(json.dumps({"elapsed_s": time.monotonic() - started, "event": event.raw}) + "\n")
             rid = event.response_id
+            if event.type == "input_audio_buffer.committed":
+                result["committed"] += 1
+                last_progress = time.monotonic()
+            if event.type == "overlap.decision" and event.raw.get("reason") == "vision_follow":
+                result["vision_follow"] += 1
             if event.type == "error":
                 result["errors"].append(event.raw)
             if event.type in (
@@ -238,8 +247,10 @@ async def run_continuous(url, model, output_dir):
                     texts[rid] = texts.get(rid, "") + event.raw.get("delta", "")
             if event.type == "response.created":
                 created.add(rid)
+                last_progress = time.monotonic()
             if event.type == "response.done":
                 finished.add(rid)
+                last_progress = time.monotonic()
                 status = event.raw["response"]["status"]
                 if status == "cancelled":
                     cancelled.add(rid)
@@ -267,10 +278,22 @@ async def run_continuous(url, model, output_dir):
 
     async def drain(reader):
         deadline = time.monotonic() + 180
-        while len(finished) < result["sent"] and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
             check(reader)
+            # Camera observations received during speech can be coalesced.
+            # Every commit needs an ACK, but only created responses need done.
+            if (
+                result["committed"] == result["sent"]
+                and created == finished
+                and 0 <= result["sent"] - len(finished) <= result["vision_follow"]
+                and time.monotonic() - last_progress >= 2
+            ):
+                return
             await asyncio.sleep(0.1)
-        assert len(finished) == result["sent"], "Input did not drain"
+        raise AssertionError(
+            f"Input did not drain: {result['sent']=}, {result['committed']=}, "
+            f"created={len(created)}, finished={len(finished)}, {result['vision_follow']=}"
+        )
 
     async def question(client, text, frame, *, cancel=False, expected=None):
         done = asyncio.create_task(client.wait_for("response.done", timeout_s=180))
@@ -371,8 +394,9 @@ async def run_continuous(url, model, output_dir):
                     lag = time.monotonic() - next_frame
                     next_frame += 1
                     assert lag < 2, f"Pacing lag {lag:.3f}s"
-                    outstanding = result["sent"] - len(finished)
+                    outstanding = max(result["sent"] - result["committed"], len(created - finished))
                     assert outstanding < 4, f"Backlog {outstanding}"
+                    assert result["sent"] - len(finished) <= result["vision_follow"] + 4
                     await submit(client, index)
                     result["frames"] += 1
                     result["max_outstanding"] = max(result["max_outstanding"], outstanding + 1)
