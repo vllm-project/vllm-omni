@@ -269,3 +269,61 @@ def test_logged_stage_table_has_no_phase_split_rows_when_unobserved(monkeypatch)
 
     assert "stage_gen_time_ms" in rows
     assert not set(_PHASE_FIELDS) & set(rows)
+
+
+_INPUT_SPLIT_FIELDS = ("vllm_input_wait_ms", "vllm_ready_queued_ms")
+
+
+def test_stage_table_summary_keeps_input_wait_split() -> None:
+    summary = _phase_split_summary(
+        vllm_queued_ms=3.0,
+        vllm_prefill_ms=40.0,
+        vllm_decode_ms=0.0,
+        vllm_num_preemptions=0,
+        vllm_input_wait_ms=2.25,
+        vllm_ready_queued_ms=0.75,
+    )
+
+    ar_row, diffusion_row = _get_request_entry(summary["stage_table"], "r1")["stages"]
+    assert {field: ar_row[field] for field in _INPUT_SPLIT_FIELDS} == {
+        "vllm_input_wait_ms": 2.25,
+        "vllm_ready_queued_ms": 0.75,
+    }
+    assert all(diffusion_row[field] is None for field in _INPUT_SPLIT_FIELDS)
+
+
+def _stage_chunk(**split) -> StageRequestStats:
+    return StageRequestStats(
+        batch_id=1,
+        batch_size=1,
+        num_tokens_in=0,
+        num_tokens_out=4,
+        stage_gen_time_ms=20.0,
+        rx_transfer_bytes=0,
+        rx_decode_time_ms=0.0,
+        rx_in_flight_time_ms=0.0,
+        stage_stats=StageStats(),
+        stage_id=1,
+        **split,
+    )
+
+
+def test_one_row_per_stage_takes_input_split_from_the_chunk_with_the_phase_split() -> None:
+    from vllm_omni.metrics.stats import _one_row_per_stage
+
+    split = dict(
+        vllm_queued_ms=3.0,
+        vllm_prefill_ms=40.0,
+        vllm_decode_ms=900.0,
+        vllm_num_preemptions=0,
+        vllm_input_wait_ms=2.0,
+        vllm_ready_queued_ms=1.0,
+    )
+    # The template (first) chunk has no split; the finishing chunk has it.
+    (row,) = _one_row_per_stage([_stage_chunk(), _stage_chunk(**split), _stage_chunk()])
+    assert {field: getattr(row, field) for field in split} == split
+
+    # A later split without the input fields does not keep an earlier input split.
+    later = dict(split, vllm_queued_ms=None, vllm_input_wait_ms=None, vllm_ready_queued_ms=None)
+    (row,) = _one_row_per_stage([_stage_chunk(**split), _stage_chunk(**later)])
+    assert {field: getattr(row, field) for field in later} == later

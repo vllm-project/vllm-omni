@@ -163,6 +163,9 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     # Duplex session stats (RFC #8325): [epoch, seq, start_ns, duration_ns] step
     # spans of measured duplex chunks, the producing step's chunk last.
     stage_work: list[list[int]] | None = None
+    # Engine-core monotonic time at which the stage's input gate first saw the
+    # request's input ready. Sent with the engine-core events (QUEUED, SCHEDULED).
+    input_ready_ts: float | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):
