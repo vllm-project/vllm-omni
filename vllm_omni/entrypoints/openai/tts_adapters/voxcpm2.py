@@ -122,7 +122,7 @@ class VoxCPM2Adapter(ARTTSAdapter):
                     uploaded_ref = server._load_uploaded_audio(voice_lower)
         prompt = await self._build_prompt(request, uploaded_ref=uploaded_ref)
         tts_params = {}
-        if request.voice:
+        if request.voice and not has_inline_ref_audio:
             voice_lower = request.voice.lower()
             if voice_lower in server.uploaded_speakers or voice_lower in self.capabilities.precomputed_speakers:
                 created_at = server._voice_created_at(voice_lower)

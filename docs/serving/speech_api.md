@@ -735,6 +735,10 @@ Only profiles whose safetensors payload can be loaded and validated are exposed
 by `GET /v1/audio/voices`. Valid precomputed voices can be used in
 `POST /v1/audio/speech` by passing `voice="alice"` without `ref_audio`.
 
+For VoxCPM2, an explicit `ref_audio` overrides an uploaded or precomputed
+`voice`. Such requests do not reuse the named voice's conditioning cache;
+requests without an explicit reference retain the normal named-voice cache.
+
 **Configuration (environment variables):**
 
 | Variable | Default | Description |
