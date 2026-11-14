@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.config import WatermarkConfig
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
 from vllm_omni.config.omni_config import StageConfigType
 from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
@@ -31,6 +32,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     load_deploy_config,
 )
+from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.engine.arg_utils import is_frontend_only
 from vllm_omni.engine.async_engine_utils import (
     SHUTDOWN_ENQUEUE_TIMEOUT_S,
@@ -125,6 +127,8 @@ class OmniEngineBase:
     _enable_orch_monitor: bool = False
     _client_config: OmniClientConfig | None = None
     _output_sink: OutputQueueSink | None = None
+    _watermark_config: WatermarkConfig | None = None
+    _weight_sharing_config: WeightSharingConfig | None = None
 
     def __init__(
         self,
@@ -136,11 +140,15 @@ class OmniEngineBase:
         prom_metrics: Any = None,
         log_stats: bool = False,
         collect_stage_metrics: bool = True,
+        watermark_config: WatermarkConfig | None = None,
         tokenizer: str | None = None,
         trust_remote_code: bool | None = None,
         client_config: OmniClientConfig | None = None,
+        otlp_traces_endpoint: str | None = None,
         **kwargs: Any,
     ) -> None:
+        from vllm_omni.tracing import create_tracer_provider
+
         self.model = model
         self.tokenizer = tokenizer
         # Cached by get_diffusion_od_config().
@@ -158,6 +166,7 @@ class OmniEngineBase:
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
         self._collect_stage_metrics = collect_stage_metrics
+        self._watermark_config = watermark_config
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
         self._client_config = client_config
 
@@ -265,6 +274,13 @@ class OmniEngineBase:
             trust_remote_code=trust_remote_code,
         )
 
+        resolution: OmniConfigResolution | None = getattr(self, "_config_resolution", None)
+        self._weight_sharing_config = resolution.weight_sharing if resolution is not None else None
+        if self._weight_sharing_config is not None and (
+            single_stage_mode or self._omni_master_address is not None or self._parallel_stage_init
+        ):
+            raise ValueError("weight sharing requires local two-stage ownership and sequential initialization")
+
         if self._single_stage_id_filter is not None:
             self._validate_single_stage_choice(self._single_stage_id_filter, self.stage_configs)
 
@@ -323,6 +339,7 @@ class OmniEngineBase:
         # Launch orchestrator background thread
         startup_future: concurrent.futures.Future = concurrent.futures.Future()
 
+        self.tracer_provider = create_tracer_provider(otlp_traces_endpoint)
         self.orchestrator_thread = threading.Thread(
             target=self._bootstrap_orchestrator,
             args=(
@@ -408,9 +425,13 @@ class OmniEngineBase:
             request_queue=self.request_queue,
             log_stats=self._log_stats,
             client_config=self._client_config,
+            watermark_config=self._watermark_config,
         )
-        self._runtime.initialize()
+        if self._weight_sharing_config is None:
+            self._runtime.initialize()
+            self._assign_stage_runtime_fields()
 
+    def _assign_stage_runtime_fields(self) -> None:
         self.num_stages = len(self.stage_configs)
         self.stage_pools = self._runtime.stage_pools
         self.stage_clients = [
@@ -467,6 +488,9 @@ class OmniEngineBase:
 
         async def _run_orchestrator() -> None:
             self._initialize_stages(stage_init_timeout)
+            if self._weight_sharing_config is not None:
+                await self._runtime.initialize_shared(self._weight_sharing_config)
+                self._assign_stage_runtime_fields()
 
             pd_config = self._detect_pd_config()
 
@@ -484,10 +508,13 @@ class OmniEngineBase:
                 engines_waiting_counter=self._engines_waiting_counter,
                 transfer_emitter=self._transfer_emitter,
                 prom_metrics=self._prom_metrics,
+                tracer=self.tracer_provider.get_tracer("vllm_omni") if self.tracer_provider is not None else None,
                 log_stats=self._log_stats,
                 collect_stage_metrics=self._collect_stage_metrics,
                 enable_orch_monitor=self._enable_orch_monitor,
             )
+            if self._weight_sharing_config is not None:
+                orchestrator.weight_sharing = self._runtime.sharing
             await orchestrator.publish_stage_post_warmup_memory()
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -518,6 +545,10 @@ class OmniEngineBase:
                     task.cancel()
                 if pending:
                     loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                sharing = getattr(getattr(self, "_runtime", None), "sharing", None)
+                if sharing is not None and not sharing.termination_complete:
+                    # Also covers failures between stage readiness and run().
+                    loop.run_until_complete(sharing.close())
                 loop.run_until_complete(loop.shutdown_asyncgens())
                 if hasattr(loop, "shutdown_default_executor"):
                     loop.run_until_complete(loop.shutdown_default_executor())
@@ -526,6 +557,8 @@ class OmniEngineBase:
             finally:
                 asyncio.set_event_loop(None)
                 loop.close()
+                if self.tracer_provider is not None:
+                    self.tracer_provider.shutdown()
 
     def _validate_deployment(self) -> None:
         """Seam: check ``pipeline_config`` / ``deploy_config`` before stages start (default: nothing)."""

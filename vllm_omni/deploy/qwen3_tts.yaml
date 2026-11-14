@@ -24,6 +24,12 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
+      # Opt in to the stateful streaming decoder on CUDA.
+      # New ICL reference lengths trigger lazy graph capture and may increase
+      # first-packet latency; warm up with representative references before measuring.
+      # Continuous incremental history differs from legacy window recomputation
+      # and may change WER. Validate quality on your workload before enabling.
+      decode_streaming: false
       talker_first_audio: true
       codec_streaming: true
       connector_get_sleep_s: 0.01
@@ -61,8 +67,10 @@ connectors:
       #     decode_chunk_frames + decode_left_context_frames (325 by default).
       #     Extra stateless shapes may be added (union, not intersection) with:
       #       decode_cudagraph_capture_sizes: [97, 400]
-      # Graph batch size defaults to 1. Add larger buckets only when needed:
-      #   decode_cudagraph_batch_sizes: [1, 2, 4]
+      # Graph batch size defaults to 1. Use [1, 2, 4] to cover batches up to
+      # decode_batch_max_size (B3 pads to B4). Extra buckets increase warmup
+      # time and graph memory for either backend.
+      # decode_cudagraph_batch_sizes: [1, 2, 4]
       # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.
       decode_batch_max_size: 4
 

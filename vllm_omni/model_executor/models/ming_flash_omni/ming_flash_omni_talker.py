@@ -38,7 +38,7 @@ from vllm_omni.transformers_utils.configs.ming_talker import MingFlashOmniTalker
 from .native_text_frontend import normalize_native_fragment
 from .reference_audio import has_reference_audio, unpack_reference_audio
 from .streaming import MingBatchedStreamJob, MingStreamingJob
-from .talker_batch import BatchedTalkerRequest, MingTalkerBatchEngine, TalkerSegment
+from .talker_batch import BatchedAudioVAEDecoder, BatchedTalkerRequest, MingTalkerBatchEngine, TalkerSegment
 from .talker_module import CFM, DiT, MingAudioGenerator, build_tts_input
 from .text_processing import segment_and_normalize
 from .tts_request import GenerationParams as _GenerationParams
@@ -157,6 +157,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1) or 1)
         self._batch_rows = max_num_seqs if max_num_seqs > 1 else 0
         self._batch_engine: MingTalkerBatchEngine | None = None
+        self._batch_vae: BatchedAudioVAEDecoder | None = None
 
         self.audio_generator = MingAudioGenerator(
             config=self.config,
@@ -218,7 +219,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                     scope=ModelLocalKVScope.MODEL,
                     rows=RowDriver.MAX_NUM_SEQS,
                     rows_reason="one KV row per scheduled sequence in the shared talker batch",
-                    allocation_note="allocated with the batch engine on the first request",
+                    allocation_note="allocated with the batch engine after weight loading",
                 )
             ]
         return generator.model_local_kv_specs()
@@ -418,7 +419,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         for request_id in request_ids:
             job = self._stream_jobs.pop(request_id, None)
             if isinstance(job, MingBatchedStreamJob):
-                job.close(self._batch_engine)
+                job.close(self._batch_engine, self._batch_vae)
             elif job is not None:
                 job.close()
 
@@ -461,35 +462,104 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         if engine.error is not None:
             raise RuntimeError("Ming talker batch engine failed") from engine.error
 
-        audios = []
+        audios: list[torch.Tensor | None] = [None] * len(jobs)
         finished = []
-        for request_id, job in zip(request_ids, jobs, strict=True):
+        pending = []
+        for index, (request_id, job) in enumerate(zip(request_ids, jobs, strict=True)):
             try:
-                audio, last = job.next_audio()
+                if job.decode_full is None and self._batch_vae is not None:
+                    latents, last = job.take()
+                    if latents is not None:
+                        pending.append((index, latents, last))
+                        continue
+                    audio = torch.empty(1, 1, 0, device=self.device)
+                else:
+                    audio, last = job.next_audio()
             except Exception:
                 # One bad request must not fail the whole batched step.
                 logger.exception("Ming talker request %s failed", request_id)
                 audio, last = torch.empty(1, 1, 0, device=self.device), True
-            audios.append(audio.detach().float())
+            audios[index] = audio
             if last:
                 finished.append(request_id)
-        self.on_requests_finished(finished)
+        try:
+            if pending:
+                items = [(jobs[index].vae_state, latents, last) for index, latents, last in pending]
+                decoded = self._batch_vae.decode(items)
+                for (index, _, last), audio in zip(pending, decoded, strict=True):
+                    if isinstance(audio, ValueError):
+                        logger.warning("Ming talker request %s failed: %s", request_ids[index], audio)
+                        jobs[index].fail(audio)
+                        audios[index] = torch.empty(1, 1, 0, device=self.device)
+                        finished.append(request_ids[index])
+                        continue
+                    jobs[index].mark_decoded(audio, last)
+                    audios[index] = audio
+                    if last:
+                        finished.append(request_ids[index])
+        except BaseException:
+            # A device/internal failure cannot be retried after advancing KV.
+            self.on_requests_finished(request_ids)
+            raise
+        finally:
+            self.on_requests_finished(finished)
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"audio": audios, "sr": torch.tensor(self.audio_vae.config.sample_rate)},
+            multimodal_outputs={
+                "audio": [audio.detach().float() for audio in audios],
+                "sr": torch.tensor(self.audio_vae.config.sample_rate),
+            },
         )
 
     def _ensure_batch_engine(self) -> MingTalkerBatchEngine:
+        self.capture_auxiliary_graphs()
+        assert self._batch_engine is not None
+        self._batch_engine.start()
+        return self._batch_engine
+
+    def capture_auxiliary_graphs(self) -> None:
+        """Build the batched runtime after weight processing and eval."""
+        if not self._batch_rows or self.device.type != "cuda":
+            return
+        if self.training:
+            raise RuntimeError("Ming Talker graphs require eval mode")
         if self._batch_engine is None:
-            engine = MingTalkerBatchEngine(
-                self.audio_generator,
-                max_rows=self._batch_rows,
-                device=self.device,
+            try:
+                self._batch_engine = self._build_batch_engine()
+            except BaseException:
+                self._batch_vae = None
+                raise
+
+    def release_auxiliary_graphs(self) -> None:
+        """Release the worker's profiling runtime only when no jobs own it."""
+        if self._stream_jobs:
+            raise RuntimeError("Cannot release Ming Talker graphs with active requests")
+        if self._batch_engine is not None:
+            self._batch_engine.close()
+            self._batch_engine = None
+        self._batch_vae = None
+
+    def _build_batch_engine(self) -> MingTalkerBatchEngine:
+        compile_flow = bool(getattr(self.config, "compile_flow", False)) and self._use_cuda_graphs
+        engine = MingTalkerBatchEngine(
+            self.audio_generator,
+            max_rows=self._batch_rows,
+            device=self.device,
+            use_cuda_graphs=self._use_cuda_graphs,
+            compile_flow=compile_flow,
+        )
+        backbone = getattr(getattr(self.audio_vae, "decoder", None), "decoder", None)
+        if getattr(getattr(backbone, "config", None), "sliding_window", None):
+            # Captured before the engine thread starts, so that no other
+            # thread touches CUDA during a capture.
+            self._batch_vae = BatchedAudioVAEDecoder(
+                self.audio_vae,
+                rows=self._batch_rows,
+                compile_layers=compile_flow,
                 use_cuda_graphs=self._use_cuda_graphs,
             )
-            engine.start()
-            self._batch_engine = engine
-        return self._batch_engine
+        engine.capture()
+        return engine
 
     def _start_batched_job(self, info, input_ids, inputs_embeds) -> MingBatchedStreamJob:
         params = self._resolve_generation_params(info)
@@ -505,7 +575,6 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         job = MingBatchedStreamJob(
             self.audio_vae,
             self.device,
-            low_latency_streaming=self.config.low_latency_streaming,
             decode_full=None if streaming else decode_full,
         )
         if inputs_embeds is not None:

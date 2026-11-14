@@ -63,12 +63,62 @@ def test_runner_assisted_mixed_batch_has_independent_token_and_request_capacity(
 def _make_runner():
     """Create an OmniGPUModelRunner without calling __init__."""
     runner = object.__new__(OmniGPUModelRunner)
+    runner.vllm_config = SimpleNamespace(additional_config={})
     runner._staged_writes = staged_writes.StagedWrites()
     runner.model = MagicMock()
     runner.model_config = SimpleNamespace(logits_processors=None)
     runner.req_states = SimpleNamespace(req_id_to_index={"r1": 0, "r2": 1})
     runner.execute_model_state = None
     return runner
+
+
+@pytest.mark.parametrize("hook_fails", [False, True])
+def test_load_model_captures_custom_sampler_warmups_without_leaking_context(monkeypatch, hook_fails):
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.v1.worker.gpu import model_runner as upstream_model_runner
+
+    from vllm_omni.worker_v2 import omni_model_runner
+
+    runner = _make_runner()
+    runner.jit_warmup_registry = JitWarmupRegistry(SimpleNamespace())
+    runner.use_aux_hidden_state_outputs = False
+    runner.model = SimpleNamespace(has_preprocess=False)
+    state = object.__new__(OmniModelState)
+    state.model = runner.model
+    sampler_kernel = object()
+    outer_kernel = object()
+    outer_registry = JitWarmupRegistry(SimpleNamespace())
+
+    def custom_sampler(sampler):
+        JitWarmupRegistry.register(sampler_kernel)
+        if hook_fails:
+            raise RuntimeError("custom sampler initialization failed")
+        return sampler, None
+
+    runner.model.mrv2_custom_sampler = custom_sampler
+
+    def upstream_load(self):
+        # Match the target's ordering: model state and its sampler hook are
+        # initialized after the model-construction registry context ends.
+        self.model_state = upstream_model_runner.init_model_state(None, self.model, None, None)
+        self.model_state.custom_sampler(object())
+
+    monkeypatch.setattr(GPUModelRunner, "load_model", upstream_load)
+    monkeypatch.setattr(omni_model_runner, "init_omni_model_state", lambda *args: state)
+    monkeypatch.setattr(runner, "_configure_cudagraph_output_contract", lambda: None)
+
+    original_init_model_state = upstream_model_runner.init_model_state
+    with outer_registry.activate():
+        if hook_fails:
+            with pytest.raises(RuntimeError, match="custom sampler initialization failed"):
+                runner.load_model()
+        else:
+            runner.load_model()
+        JitWarmupRegistry.register(outer_kernel)
+
+    assert set(runner.jit_warmup_registry._registrations) == {sampler_kernel}
+    assert set(outer_registry._registrations) == {outer_kernel}
+    assert upstream_model_runner.init_model_state is original_init_model_state
 
 
 @pytest.mark.parametrize("moss", [False, True])
@@ -225,6 +275,8 @@ def test_duplex_kv_reanchor_runs_after_block_table_writes():
         apply_duplex_kv_reanchor=lambda r, scheduler_output: order.append(("reanchor", r, scheduler_output))
     )
     runner.aux_output_connector = None
+    # Encoder payload updates are disabled in this fixture.
+    runner.encoder_cache = None
     output = object()
     runner.kv_connector = SimpleNamespace(no_forward=lambda _s: output)
     runner._merge_ec_connector_no_forward = lambda _s, value: value
@@ -336,6 +388,107 @@ def test_auxiliary_default_state_has_omni_lifecycle_but_preserves_upstream_state
         assert state is upstream_state
 
 
+@pytest.mark.parametrize("lifecycle", [False, True])
+def test_hybrid_omni_stage_keeps_recurrent_state_and_omni_lifecycle(monkeypatch, lifecycle):
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+    from vllm_omni.worker_v2.model_states.omni_mamba_hybrid import OmniMambaHybridModelState
+
+    class HybridConfig(OmniModelConfig):
+        is_hybrid = True
+
+    upstream = MagicMock(side_effect=AssertionError("hybrid Omni stage used the upstream state"))
+    monkeypatch.setattr("vllm_omni.worker_v2.model_states._upstream_init_model_state", upstream)
+    monkeypatch.setattr(OmniMambaHybridModelState, "__init__", lambda *_args: None)
+    model = SimpleNamespace(**({"have_multimodal_outputs": True} if lifecycle else {}))
+    state = init_omni_model_state(
+        SimpleNamespace(model_config=object.__new__(HybridConfig)), model, None, torch.device("cpu")
+    )
+    assert isinstance(state, OmniModelState) and isinstance(state, MambaHybridModelState)
+    mro = type(state).__mro__
+    # Omni hooks wrap the hybrid state's add_request/prepare_attn via super().
+    assert mro.index(OmniModelState) < mro.index(MambaHybridModelState) < mro.index(DefaultModelState)
+    assert callable(state.run_preprocess) and callable(state.postprocess_state)
+
+
+def test_hybrid_model_keeps_its_mrv2_state_factory():
+    """Drama 3 is hybrid and owns create_mrv2_model_state.
+
+    The generic hybrid state has no Ascend attention metadata, so the NPU
+    runner exits before it is ready. The model's factory must win.
+    """
+    from vllm.v1.worker.gpu.model_states.interface import ModelState
+
+    class HybridConfig(OmniModelConfig):
+        is_hybrid = True
+
+    class DramaState(ModelState):
+        uses_ascend_attn_metadata = True
+
+        def prepare_inputs_embeds(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def prepare_inputs(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def prepare_dummy_inputs(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def prepare_attn(self, *args, **kwargs):
+            raise NotImplementedError
+
+    sentinel = object.__new__(DramaState)
+    seen = {}
+
+    class DramaModel:
+        have_multimodal_outputs = True
+
+        def create_mrv2_model_state(self, vllm_config, encoder_cache, device):
+            seen["device"] = device
+            return sentinel
+
+    state = init_omni_model_state(
+        SimpleNamespace(model_config=object.__new__(HybridConfig)),
+        DramaModel(),
+        None,
+        torch.device("cpu"),
+    )
+    assert state is sentinel
+    assert seen["device"] == torch.device("cpu")
+    assert state.uses_ascend_attn_metadata is True
+
+
+@pytest.mark.parametrize("remove_by_id", [False, True])
+def test_hybrid_state_constructs_and_reuses_request_slots(remove_by_id):
+    from vllm_omni.worker_v2.model_states.omni_mamba_hybrid import OmniMambaHybridModelState
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_inputs_embeds_size=lambda: 8,
+            dtype=torch.float32,
+            max_model_len=32,
+            enable_prompt_embeds=False,
+            uses_mrope=False,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=16),
+        cache_config=SimpleNamespace(mamba_cache_mode="none", use_kda_recoverssm=False),
+    )
+    # Exercise both real parent constructors and their lifecycle methods.
+    state = OmniMambaHybridModelState(config, torch.nn.Linear(8, 8), None, torch.device("cpu"))
+    for index, req_id in enumerate(("finished", "peer")):
+        state.add_request(index, SimpleNamespace(req_id=req_id, mm_features=[]))
+    state.num_accepted_tokens_gpu.copy_(torch.tensor([7, 3], dtype=torch.int32))
+    state.intermediate_buffer.buffers[0]["old_audio"] = torch.ones(4)
+    state.remove_request("finished" if remove_by_id else 0)
+    assert state.intermediate_buffer.buffers[0] == {}
+    assert state.intermediate_buffer.req_id_to_index == {"peer": 1}
+    state.add_request(0, SimpleNamespace(req_id="replacement", mm_features=[]))
+    state.apply_staged_writes()
+    assert state.num_accepted_tokens_gpu.tolist() == [1, 3]
+    assert state.intermediate_buffer.buffers == [{"req_id": "replacement"}, {"req_id": "peer"}]
+    assert state.intermediate_buffer.req_id_to_index == {"replacement": 0, "peer": 1}
+
+
 def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch):
     runner = _make_runner()
     calls = []
@@ -438,10 +591,15 @@ def test_full_graph_output_without_contract_is_hidden_only():
     assert runner._split_fullgraph_output(hidden) == (hidden, None)
 
 
-@pytest.mark.parametrize("runner_kind", ["gpu", "ar", "generation"])
+@pytest.mark.parametrize(
+    "runner_kind,omni_aux_outputs",
+    [("gpu", False), ("ar", False), ("generation", False), ("gpu", True), ("ar", True)],
+)
 @pytest.mark.parametrize("randomize_inputs", [False, True])
 @pytest.mark.parametrize("is_profile", [False, True])
-def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inputs, is_profile, monkeypatch):
+def test_dummy_forward_uses_upstream_execution_state(
+    runner_kind, omni_aux_outputs, randomize_inputs, is_profile, monkeypatch
+):
     from vllm.v1.worker.gpu.input_batch import InputBatch
     from vllm.v1.worker.gpu.model_runner import ExecuteModelState
 
@@ -452,11 +610,21 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
         runner_kind
     ]
     runner = object.__new__(runner_cls)
+    if runner_kind == "generation":
+        # __new__ bypasses initialization; model an idle step before this dummy.
+        runner._prev_step_idle = True
     runner._staged_writes = staged_writes.StagedWrites()
     hidden = torch.ones(1, 2)
+    aux_hidden = [hidden + 1, hidden + 2] if omni_aux_outputs else None
+    # These are Omni-owned tuples, not the drafter's outer target-layer tuple.
+    runner.use_aux_hidden_state_outputs = False
+    if runner_kind != "generation":
+        runner._last_aux_output = [torch.full_like(hidden, -99)]
     runner.model = MagicMock(
         return_value=OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
         if runner_kind == "generation"
+        else (hidden, aux_hidden)
+        if omni_aux_outputs
         else hidden
     )
     runner._dummy_hidden = hidden
@@ -473,6 +641,7 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
     runner.is_encoder_decoder = False
     runner.eplb = MagicMock()
     runner.kv_connector = MagicMock()
+    runner.pcp_manager = None
     runner.input_buffers = object()
     runner.kv_cache_config = object()
     runner.attn_groups = []
@@ -491,6 +660,8 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
     runner._dispatch_batch_descriptor = MagicMock(return_value=(batch_desc, None))
     make_dummy = MagicMock(return_value=input_batch)
     monkeypatch.setattr(InputBatch, "make_dummy", make_dummy)
+    platform_dummy = MagicMock(wraps=runner._make_dummy_input_batch)
+    monkeypatch.setattr(runner, "_make_dummy_input_batch", platform_dummy)
     randomized = []
 
     def randomize(tensor, low, high):
@@ -499,8 +670,8 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
 
     monkeypatch.setattr(torch.Tensor, "random_", randomize)
     monkeypatch.setattr("vllm_omni.worker_v2.omni_model_runner.build_slot_mappings_by_layer", lambda *args: {})
-    for module in ("omni_model_runner", "omni_generation_model_runner"):
-        monkeypatch.setattr(f"vllm_omni.worker_v2.{module}.set_forward_context", lambda *args, **kwargs: nullcontext())
+    platform_context = MagicMock(return_value=nullcontext())
+    monkeypatch.setattr(runner, "_forward_context", platform_context)
     scheduled = SchedulerOutput.make_empty()
     scheduled.num_scheduled_tokens = {"_dummy_req_0": 1}
     scheduled.total_num_scheduled_tokens = 1
@@ -517,6 +688,8 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
         )
         is None
     )
+    platform_dummy.assert_called_once()
+    platform_context.assert_called_once()
     assert make_dummy.call_args.kwargs["is_padding"] is not is_profile
     should_randomize = randomize_inputs and runner_kind != "generation"
     assert randomized == ([(0, 32)] if should_randomize else [])
@@ -524,5 +697,83 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
     assert isinstance(runner.execute_model_state, ExecuteModelState)
     assert runner.execute_model_state.input_batch is input_batch
     assert runner.execute_model_state.cudagraph_stats is None
+    assert runner.execute_model_state.aux_hidden_states is None
     if runner_kind != "generation":
+        assert runner._last_aux_output is aux_hidden
+    if runner_kind == "generation":
+        assert not runner._prev_step_idle
+    else:
         runner.prepare_dummy_attn.assert_called_once_with(input_batch, True)
+    if omni_aux_outputs:
+        runner.model.return_value = hidden
+        runner.execute_model(scheduled, dummy_run=True, valid_dummy_state_slots=True)
+        assert runner._last_aux_output is None
+        assert runner.execute_model_state.aux_hidden_states is None
+
+
+@pytest.mark.parametrize("cg_mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
+def test_drafter_target_layers_reach_execute_state(cg_mode, monkeypatch):
+    """Layers a drafter reads leave the forward tuple; the Omni aux slot stays empty."""
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._staged_writes = staged_writes.StagedWrites()
+    hidden, aux = torch.ones(1, 2), [torch.full((1, 2), 3.0)]
+    runner.model = MagicMock(return_value=(hidden, aux))
+    runner.cudagraph_manager = MagicMock()
+    runner.cudagraph_manager.run_fullgraph.return_value = (hidden, aux)
+    # This separate test enables the drafter tuple, unlike Omni-owned aux above.
+    runner.use_aux_hidden_state_outputs = True
+    runner.pcp_manager = None
+    runner.model_config = SimpleNamespace()
+    runner.vllm_config = SimpleNamespace()
+    runner.req_states = SimpleNamespace()
+    runner.model_state = MagicMock()
+    runner.model_state.prepare_inputs.return_value = {}
+    runner._omni_data_plane = object()
+    runner.supports_mm_inputs = False
+    runner.lora_config = None
+    runner.is_encoder_decoder = False
+    runner.eplb = MagicMock()
+    runner.kv_connector = MagicMock()
+    runner.input_buffers = object()
+    runner.kv_cache_config = object()
+    runner.attn_groups = []
+    input_batch = SimpleNamespace(
+        input_ids=torch.tensor([1]),
+        positions=torch.tensor([0]),
+        num_tokens=1,
+        num_tokens_after_padding=1,
+        is_padding=None,
+    )
+    monkeypatch.setattr(InputBatch, "make_dummy", MagicMock(return_value=input_batch))
+    runner.prepare_dummy_attn = MagicMock(return_value=((), torch.empty(0)))
+    runner.gather_batch_req_state = MagicMock(return_value=(None, 1))
+    batch_desc = SimpleNamespace(cg_mode=cg_mode, num_reqs=1, num_tokens=1, num_active_loras=0, max_query_len=1)
+    runner._dispatch_batch_descriptor = MagicMock(return_value=(batch_desc, None))
+    monkeypatch.setattr("vllm_omni.worker_v2.omni_model_runner.build_slot_mappings_by_layer", lambda *args: {})
+    monkeypatch.setattr(
+        "vllm_omni.worker_v2.omni_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext()
+    )
+    scheduled = SchedulerOutput.make_empty()
+    scheduled.num_scheduled_tokens = {"_dummy_req_0": 1}
+    scheduled.total_num_scheduled_tokens = 1
+
+    runner.execute_model(scheduled, dummy_run=True, valid_dummy_state_slots=True)
+
+    assert runner.execute_model_state.hidden_states is hidden
+    assert runner.execute_model_state.aux_hidden_states is aux
+    assert runner._last_aux_output is None
+    if cg_mode == CUDAGraphMode.FULL:
+        runner.model.assert_not_called()
+    else:
+        runner.cudagraph_manager.run_fullgraph.assert_not_called()
+
+    previous_state = runner.execute_model_state
+    current_aux = [aux[0] + 1]
+    runner.model.return_value = (hidden, current_aux)
+    runner.cudagraph_manager.run_fullgraph.return_value = (hidden, current_aux)
+    runner.execute_model(scheduled, dummy_run=True, valid_dummy_state_slots=True)
+    assert runner.execute_model_state.aux_hidden_states is current_aux
+    assert runner._last_aux_output is None
+    assert previous_state.aux_hidden_states is aux

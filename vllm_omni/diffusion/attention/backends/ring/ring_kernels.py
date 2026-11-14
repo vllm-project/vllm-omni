@@ -3,6 +3,7 @@
 # Copyright (c) 2024, Jiarui Fang.
 # Adapted from https://github.com/feifeibear/long-context-attention
 
+import functools
 import math
 
 import torch
@@ -41,6 +42,55 @@ if HAS_FLASHINFER:
     from flashinfer.prefill import single_prefill_with_kv_cache
 
     _LOG2_E = math.log2(math.e)
+
+
+@functools.cache
+def _xpu_has_aten_flash() -> bool:
+    """Whether this torch build has the XPU aten flash SDPA op (it needs SYCL-TLA; some builds lack it)."""
+    q = torch.zeros(1, 1, 16, 64, device="xpu", dtype=torch.bfloat16)
+    try:
+        _scaled_dot_product_flash_attention(q, q, q)
+    except RuntimeError:
+        return False
+    return True
+
+
+def _xpu_sdpa_op_type(
+    op_type: str, dtype: torch.dtype, causal: bool, q_len: int, kv_len: int, has_flash: bool = True
+) -> str:
+    """Pick the aten SDPA op that returns a usable LSE on XPU.
+
+    XPU's ``_scaled_dot_product_efficient_attention`` returns a correct output but an all-zero
+    log-sum-exp, which silently breaks the ring merge. Its flash op returns the right fp32 LSE, but
+    only for fp16/bf16, aligns a causal mask to the bottom-right when ``q_len != kv_len`` (the
+    efficient op aligns it to the top-left), and is missing from torch builds without SYCL-TLA.
+    Those cases use the fp32 ``"math"`` path instead.
+    """
+    if op_type != "efficient":
+        return op_type
+    if has_flash and dtype in (torch.float16, torch.bfloat16) and (not causal or q_len == kv_len):
+        return "flash"
+    return "math"
+
+
+def _math_attn_with_lse(q, k, v, softmax_scale, causal, q_chunk: int = 1024):
+    """Reference attention in fp32 on (B, H, S, D) tensors: returns (out, lse) like the aten SDPA ops.
+
+    Query rows are processed ``q_chunk`` at a time, so the fp32 score block stays at
+    ``B * H * q_chunk * kv_len`` instead of the full ``q_len * kv_len``.
+    """
+    q_len, kv_len = q.shape[-2], k.shape[-2]
+    kf, vf = k.float(), v.float()
+    outs, lses = [], []
+    for start in range(0, q_len, q_chunk):
+        scores = torch.matmul(q[..., start : start + q_chunk, :].float(), kf.transpose(-2, -1)) * softmax_scale
+        if causal:
+            rows = torch.arange(start, start + scores.shape[-2], device=scores.device).view(-1, 1)
+            keep = rows >= torch.arange(kv_len, device=scores.device).view(1, -1)  # top-left, like the efficient op
+            scores = scores.masked_fill(~keep, float("-inf"))
+        lses.append(torch.logsumexp(scores, dim=-1))
+        outs.append(torch.matmul(torch.softmax(scores, dim=-1), vf).to(q.dtype))
+    return torch.cat(outs, dim=-2), torch.cat(lses, dim=-1)
 
 
 def pytorch_attn_forward(
@@ -97,7 +147,16 @@ def pytorch_attn_forward(
         k = k.repeat_interleave(n_rep, dim=1)
         v = v.repeat_interleave(n_rep, dim=1)
 
-    if op_type == "flash":
+    if q.device.type == "xpu":
+        op_type = _xpu_sdpa_op_type(op_type, q.dtype, causal, q.shape[2], k.shape[2], _xpu_has_aten_flash())
+
+    if op_type == "math":
+        if dropout_p:
+            raise ValueError("The math ring kernel does not support dropout.")
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** -0.5
+        out, lse = _math_attn_with_lse(q, k, v, softmax_scale, causal)
+    elif op_type == "flash":
         out, lse = _scaled_dot_product_flash_attention(
             q,
             k,

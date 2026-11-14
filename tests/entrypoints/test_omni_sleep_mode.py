@@ -537,7 +537,9 @@ async def bagel_diffusion_engine():
     engine = AsyncOmni(
         model=MODEL_BAGEL,
         deploy_config=_bagel_diffusion_deploy_config(),
-        init_timeout=600,
+        # A cold ROCm AITER build can consume almost the entire default
+        # 600-second orchestrator startup budget before the stage reports ready.
+        init_timeout=1200,
         enable_sleep_mode=True,
     )
     yield engine
@@ -548,7 +550,11 @@ async def bagel_diffusion_engine():
 @pytest.mark.omni
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 class TestBagelDiffusionSleepMode:
-    """BAGEL diffusion sleep/wake on a class-scoped TP=2 BagelPipeline."""
+    """BAGEL diffusion sleep/wake on a class-scoped TP=2 BagelPipeline.
+
+    AMD nightly runs these three methods separately from the intentionally
+    skipped coordinated-sleep class below.
+    """
 
     @pytest.mark.asyncio(loop_scope="class")
     async def test_diffusion_sleep_handshake(self, bagel_diffusion_engine: AsyncOmni):

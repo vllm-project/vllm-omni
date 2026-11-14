@@ -37,7 +37,10 @@ class MultiHeadAttention(nn.Module):
 
         if use_flash_attn and not HAS_FLASH_ATTN:
             logger.warning_once("flash-attn is unavailable; packed Ming audio uses a PyTorch fallback")
-        self.use_flash_attn = use_flash_attn and HAS_FLASH_ATTN
+        # HAS_FLASH_ATTN can be true while only the optional dense FA3 binding
+        # was found, with no varlen callable to call: the packed path would
+        # then call None instead of falling back to the PyTorch implementation.
+        self.use_flash_attn = use_flash_attn and HAS_FLASH_ATTN and flash_attn_varlen_func is not None
 
     def forward(
         self,
@@ -81,14 +84,19 @@ class MultiHeadAttention(nn.Module):
 
         if self.use_flash_attn and q.dtype in (torch.float16, torch.bfloat16):
             max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
+            # Pass every argument by name: the classic FlashAttention signature
+            # takes the cumulative lengths first, while vLLM's dispatcher takes
+            # ``max_seqlen_q`` before ``cu_seqlens_q``. The positional order
+            # differs between the two, so binding by name is what keeps this
+            # call correct for whichever implementation is selected.
             output = flash_attn_varlen_func(
                 q,
                 k,
                 v,
-                cu_seqlens,
-                cu_seqlens,
-                max_seqlen,
-                max_seqlen,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
             )
         else:
             output = self._manual_packed_attention(q, k, v, cu_seqlens)

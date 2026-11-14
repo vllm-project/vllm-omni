@@ -3,6 +3,7 @@
 
 import asyncio
 import threading
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -45,10 +46,17 @@ class _RealtimeCodec(torch.nn.Module):
     ],
     ids=["default-codec", "configured-codec"],
 )
+@pytest.mark.parametrize(
+    ("device_override", "expected_codec_device"),
+    [(None, torch.device("cuda:2")), ("cpu", torch.device("cpu"))],
+    ids=["codec-stage-device", "cpu-override"],
+)
 def test_realtime_components_use_the_realtime_model_and_codec(
     monkeypatch: pytest.MonkeyPatch,
     hf_config: SimpleNamespace,
     expected_codec_path: str,
+    device_override: str | None,
+    expected_codec_device: torch.device,
 ) -> None:
     engine_client = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -58,9 +66,24 @@ def test_realtime_components_use_the_realtime_model_and_codec(
     )
 
     server = MossTTSAdapter(SpeechServingContext(server=object(), engine_client=engine_client))
+    monkeypatch.setattr(server, "_resolve_ref_encoder_device", lambda: torch.device("cuda:2"))
+    if device_override is None:
+        monkeypatch.delenv(adapter_module._MOSS_REALTIME_REF_ENCODER_DEVICE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(adapter_module._MOSS_REALTIME_REF_ENCODER_DEVICE_ENV, device_override)
 
     tokenizer = object()
-    codec = type("Codec", (), {"to": lambda self, device: self, "eval": lambda self: self})()
+    codec_devices: list[torch.device] = []
+
+    class Codec:
+        def to(self, device):
+            codec_devices.append(device)
+            return self
+
+        def eval(self):
+            return self
+
+    codec = Codec()
     processor_calls = []
 
     class Processor:
@@ -100,7 +123,25 @@ def test_realtime_components_use_the_realtime_model_and_codec(
     ]
     assert tokenizer_calls == [("OpenMOSS-Team/MOSS-TTS-Realtime", True)]
     assert codec_calls == [(expected_codec_path, True)]
+    assert codec_devices == [expected_codec_device]
     assert processor_calls == [tokenizer]
+
+
+def test_realtime_components_reject_unsupported_device_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine_client = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="OpenMOSS-Team/MOSS-TTS-Realtime",
+            hf_config=SimpleNamespace(),
+        )
+    )
+    server = MossTTSAdapter(SpeechServingContext(server=object(), engine_client=engine_client))
+    monkeypatch.setenv(adapter_module._MOSS_REALTIME_REF_ENCODER_DEVICE_ENV, "gpu")
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{adapter_module._MOSS_REALTIME_REF_ENCODER_DEVICE_ENV} only supports 'cpu'",
+    ):
+        server._get_moss_realtime_components()
 
 
 def test_realtime_serving_builds_the_talker_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -293,6 +334,39 @@ def test_realtime_reference_batch_trims_each_item():
             await encoder.aclose()
 
     asyncio.run(run())
+
+
+def test_realtime_reference_batch_uses_the_codec_device():
+    seen_devices: list[torch.device] = []
+
+    @dataclass
+    class EncodedBatch:
+        audio_codes: torch.Tensor
+        audio_codes_lengths: torch.Tensor
+
+    class Codec(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.device_anchor = torch.nn.Parameter(torch.empty(0, device="meta"))
+
+        def batch_encode(self, wavs, *, num_quantizers):
+            assert num_quantizers == 16
+            seen_devices.extend(wav.device for wav in wavs)
+            return EncodedBatch(
+                audio_codes=torch.arange(16 * 3).reshape(16, 1, 3),
+                audio_codes_lengths=torch.tensor([3]),
+            )
+
+    encoder = reference_encoder.build_reference_encoder(
+        Codec(),
+        variant="realtime",
+        speaker_cache=SpeakerEmbeddingCache(),
+    )
+
+    (codes,) = encoder._encode_prepared([torch.ones(1, 8)])
+
+    assert seen_devices == [torch.device("meta")]
+    assert codes.shape == (3, 16)
 
 
 def test_failed_realtime_reference_encoding_does_not_populate_cache():

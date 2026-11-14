@@ -22,6 +22,7 @@ from tests.dfx.reliability.scenarios import (
     ProcessKillWorkerWithLoad,
 )
 from tests.helpers.mark import hardware_marks
+from vllm_omni.platforms import current_omni_platform
 
 _IMAGE_FAST_FAIL_HTTP_TIMEOUT_SEC = 30
 _DEPLOY_DIR = Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy"
@@ -58,6 +59,26 @@ def _fast_fail_body(model: str) -> dict[str, Any]:
     }
 
 
+def _reliability_server_params() -> dict[str, Any]:
+    """Disable expert parallel only for ROCm fault-injection coverage."""
+    params: dict[str, Any] = {
+        "model": "tencent/HunyuanImage-3.0-Instruct",
+        "stage_config_name": "hunyuan_image3_dit.yaml",
+    }
+    if current_omni_platform.is_rocm():
+        params["update"] = {
+            "stages": {
+                0: {"parallel_config.enable_expert_parallel": False},
+            }
+        }
+        # A cold or contended MI325 restart can still be loading the 32-shard
+        # checkpoint after the 900-second fixture default. Keep the bounded
+        # startup deadline, but leave enough headroom for observed progress.
+        params["stage_init_timeout"] = 1800
+        params["init_timeout"] = 2100
+    return params
+
+
 FAULT_ERROR_KEYWORDS = (
     "oom",
     "out of memory",
@@ -78,10 +99,7 @@ class HunyuanImage(FaultModel):
     scenarios = [
         {
             "test_name": "hunyuan_image_dit_reliability_default",
-            "server_params": {
-                "model": "tencent/HunyuanImage-3.0-Instruct",
-                "stage_config_name": "hunyuan_image3_dit.yaml",
-            },
+            "server_params": _reliability_server_params(),
         }
     ]
     deploy_dir = _DEPLOY_DIR

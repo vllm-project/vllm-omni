@@ -8,11 +8,11 @@ Upstream keeps the same tests in ``test_moss_tts.py``; this branch uses the
 
 MOSS-VoiceGenerator synthesizes speech from a text *instruction* that describes
 the desired voice (e.g. "a warm female voice with an American accent").  It does
-NOT accept a reference audio clip.  The request format requires running
-AutoProcessor.from_pretrained once per call to encode the (text, instruction)
-pair into the (prompt_token_ids, codes.ref) grid that the MossTTSDelayModel
-talker expects — same as examples/offline_inference/text_to_speech/moss_tts/
-end2end.py:_build_unified_codes.
+NOT accept a reference audio clip.  The request format requires loading the
+checkpoint's ``MossTTSDelayProcessor`` once per call to encode the (text,
+instruction) pair into the (prompt_token_ids, codes.ref) grid that the
+MossTTSDelayModel talker expects — same as examples/offline_inference/
+text_to_speech/moss_tts/end2end.py:_build_unified_codes.
 
 Realtime coverage: ``test_moss_tts_realtime_expansion.py``.
 
@@ -84,13 +84,17 @@ pytestmark = [
 
 
 def _build_request(text: str, instruction: str) -> dict:
-    """Build a VoiceGenerator request using AutoProcessor."""
-    from transformers import AutoProcessor
+    """Build a VoiceGenerator request using its custom delay processor."""
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
     try:
-        proc = AutoProcessor.from_pretrained(MODEL, trust_remote_code=True)
+        processor_cls = get_class_from_dynamic_module(
+            "processing_moss_tts.MossTTSDelayProcessor",
+            MODEL,
+        )
+        proc = processor_cls.from_pretrained(MODEL, trust_remote_code=True)
     except Exception as exc:
-        msg = f"Cannot load AutoProcessor for {MODEL}: {exc}"
+        msg = f"Cannot load MossTTSDelayProcessor for {MODEL}: {exc}"
         if os.environ.get("MOSS_TTS_SKIP_ON_NET_FAIL"):
             pytest.skip(msg)
         pytest.fail(msg)

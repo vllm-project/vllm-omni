@@ -70,7 +70,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     resolve_adapter,
     tts_entry_stage_archs,
 )
-from vllm_omni.entrypoints.openai.tts_adapters.base import validate_tts_request
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, conditioning_cache_salt, validate_tts_request
 from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.metrics.modality import observe_audio_first_packet, observe_audio_streaming_finalize
@@ -361,6 +361,19 @@ class _SpeechStreamingResponse(StreamingResponse):
             # Close it explicitly, even inside Starlette's cancelled scope.
             with anyio.CancelScope(shield=True):
                 await cast(Any, self.body_iterator).aclose()
+
+
+def _ensure_cache_salt(adapter, request, prompt: dict, tts_params: dict | None) -> None:
+    # Placeholder-token prompts collide in the prefix cache across different
+    # inputs unless salted; diffusion pipelines never reach here. Base
+    # identity is whatever build() already set, else the derived default.
+    # Compose with a caller salt rather than replace, so narrowing by
+    # tenant/session doesn't lose voice/input isolation.
+    if not isinstance(adapter, ARTTSAdapter):
+        return
+    derived = prompt.get("cache_salt") or conditioning_cache_salt(request, tts_params)
+    client_salt = request.cache_salt
+    prompt["cache_salt"] = f"{client_salt}:{derived}" if client_salt else derived
 
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
@@ -1208,10 +1221,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 mime_type = "audio/aac"
             elif filename_lower.endswith(".webm"):
                 mime_type = "audio/webm"
-            elif filename_lower.endswith(".mp4"):
+            elif filename_lower.endswith((".mp4", ".m4a")):
                 mime_type = "audio/mp4"
             else:
                 mime_type = "audio/wav"  # Default
+
+        # MP4/M4A (the same ISO-BMFF container) is accepted upstream as a
+        # transfer format but soundfile cannot decode it, so an upload would
+        # pass the MIME whitelist below and then die at the decode step with
+        # a misleading "Could not decode audio file". Reject it here with the
+        # actual fix instead.
+        if mime_type in ("audio/mp4", "audio/x-m4a", "video/mp4"):
+            raise ValueError(
+                "MP4/M4A uploads are not supported for voice registration: the "
+                "audio decoder cannot read the MP4 container. Extract the audio "
+                "track as WAV first, e.g. `ffmpeg -i clip.mp4 -vn -ar 48000 -ac 1 "
+                "-sample_fmt s16 clip.wav`, then upload the WAV."
+            )
 
         # Validate MIME type
         allowed_mime_types = {
@@ -1222,7 +1248,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "audio/aac",
             "audio/flac",
             "audio/webm",
-            "audio/mp4",
         }
 
         if mime_type not in allowed_mime_types:
@@ -2279,6 +2304,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # in place. The builders need to know whether the caller supplied audio
         # inline vs. via an uploaded voice.
         model_type: str | None = None
+        additional_prompts: list[dict[str, Any]] = []
+        segment_silence_ms = 200
         has_inline_ref_audio = (request.ref_audio is not None) if has_inline_ref_audio is None else has_inline_ref_audio
         if (adapter := self._get_tts_adapter()) is not None:
             adapter.normalize(request)
@@ -2290,6 +2317,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = prepared.tts_params
             model_type = prepared.model_type
             output_policy = prepared.output_policy
+            _ensure_cache_salt(adapter, request, prompt, tts_params)
+            additional_prompts = prepared.additional_prompts
+            for segment_prompt in additional_prompts:
+                _ensure_cache_salt(adapter, request, segment_prompt, segment_prompt.get("additional_information"))
+            segment_silence_ms = prepared.segment_silence_ms
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
@@ -2309,6 +2341,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             tts_params = {}
             prompt = {"prompt": request.input}
+            if request.cache_salt is not None:
+                # No adapter identity to compose with; forward as-is,
+                # matching serving_chat.py's cache_salt passthrough.
+                prompt["cache_salt"] = request.cache_salt
             output_policy = OutputPolicy()
 
         if model_type is None:
@@ -2376,13 +2412,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     if isinstance(sp, SamplingParams):
                         sp.output_kind = RequestOutputKind.CUMULATIVE
 
-        generator = self.engine_client.generate(
-            prompt=prompt,
-            request_id=request_id,
-            sampling_params_list=sampling_params_list,
-            output_modalities=output_modalities,
-            arrival_time=arrival_time,
-        )
+        if additional_prompts:
+            from vllm_omni.entrypoints.openai.speech_segments import generate_speech_segments
+
+            if request.is_streaming() or request.word_timestamps:
+                raise ValueError("Segmented speech requires non-streaming audio without word timestamps")
+            generator = generate_speech_segments(
+                self.engine_client,
+                prompts=[prompt, *additional_prompts],
+                request_id=request_id,
+                sampling_params_list=sampling_params_list,
+                silence_ms=segment_silence_ms,
+                extract_audio=self._extract_audio_output,
+                arrival_time=arrival_time,
+                watermarking=request.watermarking,
+            )
+        else:
+            generator = self.engine_client.generate(
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params_list=sampling_params_list,
+                output_modalities=output_modalities,
+                arrival_time=arrival_time,
+                watermarking=request.watermarking,
+            )
         # Only the non-streaming path consumes output policies (in
         # `_generate_audio_bytes`); streaming never reads them. Store late —
         # after every fallible step above — and skip streaming requests
@@ -2390,6 +2443,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # unique per request, so a stranded entry would never be reclaimed).
         if not request.is_streaming():
             self._speech_output_policies[request_id] = output_policy
+
         return request_id, generator, tts_params
 
     async def _generate_pcm_chunks(
@@ -2727,6 +2781,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request_id=request_id,
                 sampling_params_list=sampling_params_list,
                 output_modalities=["audio"],
+                watermarking=request.watermarking,
             )
 
             final_output: OmniRequestOutput | None = None
@@ -3105,6 +3160,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             max_new_tokens=_pick("max_new_tokens"),
             initial_codec_chunk_frames=_pick("initial_codec_chunk_frames"),
             non_streaming_mode=_pick("non_streaming_mode"),
+            watermarking=_pick("watermarking"),
         )
 
     async def create_speech_batch(

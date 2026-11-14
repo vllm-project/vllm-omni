@@ -285,6 +285,32 @@ stops retaining output PCM for calibration. Broader language, boundary and
 sustained-load validation is still needed before enabling either strategy by
 default.
 
+## Qwen3-Omni L1 history views
+
+The deployment setting `duplex_session.context_keep_media_turns` opts the
+Qwen3-Omni Thinker (stage 0) into L1 history views. Its default, `null`, preserves
+the existing prompt construction. Set a nonnegative integer in the deployment
+configuration, for example:
+
+```yaml
+duplex_session:
+  context_keep_media_turns: 2
+```
+
+This keeps the two most recent user runs verbatim. Eligible older user messages
+use their text and available transcripts instead of resubmitting audio and image
+parts. Consecutive user messages form one run. Setting `0` makes all older runs
+eligible, while the Qwen consumer still protects the current input's media,
+including during tool continuations. If dropping media would empty a whole user
+run, that run is kept unchanged.
+
+Lower values trade older media access for text-only context. This does not add
+ASR, create captions or preserve an old image's meaning without an existing text
+representation. The setting changes the Thinker's prompt view, not authoritative
+history; it does not bound total session memory. The existing 16-message prompt
+window, retained-audio slot count and byte limits remain in effect. Clients
+cannot override this deployment-owned policy through session updates.
+
 ## JoyAI visual and conversation memory
 
 JoyAI keeps three levels of visual memory: accepted observation frames, summaries
@@ -382,11 +408,11 @@ backlog remains in the session ledger for successive summary requests to process
 
 Standing instructions and the current user query remain explicit in the normal
 interaction prompt. Summary input contains committed conversation text, not
-unplayed generated speech or retained image/audio payloads. With JoyAI's current
-all-sync audio output, the assistant transcript becomes eligible only after the
-complete audio has been acknowledged. Playback corrections and conversation
-edits invalidate summaries derived from the changed text; newer appended turns
-can coexist with consolidation of an unchanged older prefix.
+unplayed generated speech or retained image/audio payloads. A JoyAI assistant
+transcript becomes eligible only after its complete audio has been acknowledged.
+Playback corrections and conversation edits invalidate summaries derived from
+the changed text; newer appended turns can coexist with consolidation of an
+unchanged older prefix.
 
 The text summary and model-input context are bounded; the underlying Session
 conversation ledger retains its source items. Visual facts can also enter the
@@ -432,9 +458,25 @@ for the command and configuration requirements.
 
 The default `minicpmo_4_5.yaml` selects Triton attention for the CUDA Thinker
 (stage 0). The Talker's backend selection and graph settings are unchanged.
-The vision tower defaults to SDPA on all platforms; explicit engine or
-vision overrides still win. The turn-mode profile inherits this CUDA default
-from the base deployment too. NPU backend selection is unchanged.
+The vision tower defaults to reference attention for CUDA BF16 duplex sessions to
+preserve long-video scene recognition. Turn-mode and non-CUDA vision use
+SDPA by default; explicit engine or vision overrides still win. The turn-mode
+profile also inherits the CUDA Thinker's Triton backend from the base
+deployment. NPU backend selection is unchanged.
+
+The reference vision path fuses scaling and softmax for unmasked CUDA BF16
+inputs, preserving BF16 score/probability rounding and FP32 accumulation.
+Encoder CUDA graphs remain enabled. This avoids the full FP32 probability
+buffer used by eager attention, but still materializes attention scores and
+can reduce vision throughput compared with SDPA at larger image batches.
+An explicit `vision_config._attn_implementation="sdpa"` keeps the SDPA path.
+
+With reference vision attention, `vision_fused_layers: true` does not enable
+fused encoder layers: `supports_fused_layers()` excludes this attention backend.
+This also applies to the `minicpmo_4_5_duplex_h200.yaml` profile. Packed encoding,
+vision CUDA graphs and the fused scaled softmax remain enabled in that profile.
+Selecting SDPA explicitly allows fused encoder layers, but can change BF16 vision
+outputs and requires rechecking long-video recognition for the workload.
 
 To compare vLLM's automatic Thinker backend selection, save the following as
 `minicpmo_thinker_auto.yaml`, replacing the base path with your checkout:
@@ -502,9 +544,12 @@ record rejection and retry counts when measuring service capacity.
 
 PersonaPlex startup warmup is opt-in: set `duplex_session.warmup_frames` to a
 positive frame count to enable it. Frontends with nonzero admission budgets
-then warm their owned groups locally and gate their own duplex connections
-until warmup completes; clients wait at most `DUPLEX_WARMUP_CLIENT_WAIT_S` (180 s)
-before being admitted, as in single-frontend mode.
+then warm their owned groups locally. Native duplex endpoints accept the
+WebSocket transport immediately, then hold session configuration and engine
+admission until warmup completes; clients wait at most
+`DUPLEX_WARMUP_CLIENT_WAIT_S` (180 s) before session admission, as in
+single-frontend mode. The warmup wait does not consume the WebSocket opening
+handshake deadline.
 `/health` retains the engine-health check; it is not an
 all-frontend warmup barrier, and a 200 response does not mean that the accepting
 frontend has free admission slots.
@@ -877,7 +922,7 @@ through a `DuplexSessionHandle`.
 
 ```python
 from vllm_omni.engine.duplex.commands import AppendAudio, Commit
-from vllm_omni.engine.duplex.events import AudioDelta, SessionClosed
+from vllm_omni.engine.duplex.events import AudioDelta, ResponseDone, SessionClosed
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 
 omni = DuplexOmni(model="openbmb/MiniCPM-o-4_5", trust_remote_code=True)
@@ -1150,6 +1195,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | --- | --- | --- |
 | `session.update` | 2 | Open handshake on first send (creates the session); later sends reconfigure it. OpenAI name; `session` object carries vLLM-Omni keys (`ref_audio`, `overlap_policy`, `playback_commit_policy`, `extra_body`, ...). |
 | `session.heartbeat` | 3 | Keepalive; refreshes the engine session lease. |
+| `session.stats.get` | 3 | Ask for the session's server-side stage work and audio by turn (no fields; returns every retained turn, up to the last 256); answered with `session.stats`. Needs `capabilities.supports_session_stats` (deploy `duplex_session.collect_stats: true`, single-host deployments only), otherwise `error` `session_stats_disabled`. |
 | `session.event_ack` | 3 | Acknowledges received server events by `server_event_seq`; trims the resume replay journal. |
 | `session.close` | 3 | Graceful close; answered with `session.closed`. |
 | `session.resume` | 3 | Re-attach a live session on a new socket (`session_id`, `resume_token`, `last_received_server_event_seq`). |
@@ -1177,6 +1223,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `session.created` | 2 | Session opened. OpenAI name; adds `attachment_generation`, `resume_token` and vLLM-Omni keys inside `session` (`id` is the server-allocated session id, `epoch`, `turn_id`, `playback`, `capabilities`, ...). |
 | `session.updated` | 2 | Echo of the effective session config after every `session.update` (same extended `session` object). |
 | `session.heartbeat_ack` | 3 | Reply to `session.heartbeat`. |
+| `session.stats` | 3 | Reply to `session.stats.get`: `request_event_id` and a raw `stats` document (per turn: `status`, `final`, `late_spans`, chunks with `submitted_ns`, `done_ns`, `complete` and per-stage `[start_ns, duration_ns]` spans, plus the turn's audio pieces; times relative to the session open). Not journaled, so never replayed on resume. |
 | `session.closed` | 3 | Last event on the socket, emitted once the engine released the session; `reason` ∈ `client_close`, `disconnect`, `timeout`, `transport_error`, `shutdown`, `output_backpressure`, `close_details_exceed_output_limit`, ... |
 | `session.resumed` | 3 | Resume accepted; carries the new `attachment_generation` and rotated `resume_token`; journaled events are replayed after it. |
 | `session.replaced` | 3 | Sent to the superseded socket when another socket resumes the session. |
@@ -1325,6 +1372,38 @@ additionally carries `"server_event_seq": <int>` (omitted below for brevity).
 
 ```json
 {"type": "session.heartbeat_ack", "session_id": "duplex-5f2a…"}
+```
+
+`C→S session.stats.get` / `S→C session.stats`
+
+Clients derive per-turn busy RTF (union of all stage spans / emitted audio) and
+stall ratio from the raw document with
+`vllm_omni.benchmarks.duplex_session_metrics.session_stats_turn_metrics`; a turn
+counts only once the server marks it `final` (RFC #8325): the model turn completed,
+every response bound to it ended (a draining TTS response included) and every
+chunk was handled. A cancelled turn (barge-in, session close) never becomes final,
+and spans that arrive after a turn is final are counted in `late_spans` instead of
+changing it. A chunk's `done_ns` is the end of its last stage span: the wait for
+the next input is not engine time. Given the snapshot's `stages`, the helper also
+withholds numbers for a turn that emitted audio but has no spans from some stage
+(`missing_stage_ids`). The server still answers while the session closes. Times are
+comparable only when every stage runs on the API server's
+host.
+
+```json
+{"type": "session.stats.get", "event_id": "evt_42"}
+```
+
+```json
+{"type": "session.stats", "session_id": "duplex-5f2a…", "request_event_id": "evt_42",
+ "stats": {"schema_version": 1, "clock": {"source": "CLOCK_MONOTONIC", "unit": "ns", "origin": "session_opened"},
+  "stages": [{"stage_id": 0, "name": "thinker"}, {"stage_id": 1, "name": "talker"}, {"stage_id": 2, "name": "code2wav"}],
+  "turns": [{"epoch": 0, "turn_id": 0, "status": "done", "final": true, "late_spans": 0, "response_ids": ["resp-…"],
+   "chunks": [{"seq": 1, "turn_seq": 1, "submitted_ns": 4000312000, "done_ns": 4291000000,
+    "complete": true, "truncated": false,
+    "stage_work": [{"stage_id": 0, "spans": [[4001100000, 48000000]]}]}],
+   "audio": [{"response_id": "resp-…", "emitted_ns": 4215000000, "duration_ms": 520.0}]}],
+  "dropped_turns": 0, "dropped_spans": 0}}
 ```
 
 `C→S session.event_ack`
