@@ -1,0 +1,15 @@
+# Opt-in request batching on one 80GB GPU. Keep the base/Flash sampling recipe
+# and encoder configuration from auk.yaml; the larger graph buckets use more
+# startup time and memory. Other batch/length combinations capture on demand.
+base_config: auk.yaml
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 128
+    max_num_batched_tokens: 65536
+  - stage_id: 1
+    max_num_seqs: 128
+    request_batch_max_wait_ms: 200
+    model_config:
+      auk_vae_warmup_batches: [1, 64, 128]
+      auk_dit_warmup_batches: [1, 64, 128]
