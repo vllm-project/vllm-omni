@@ -71,6 +71,12 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     seq_lens: torch.Tensor
     max_query_len: int
     max_seq_len: int
+    # Visible KV length (video + action tokens) as a 0-dim CPU tensor, NOT a
+    # python int: the value changes as the window grows, and an int graph input
+    # becomes a dynamo value guard (a recompile per distinct length). The
+    # Ascend branch needs it to skip the per-layer .item() host sync when
+    # slicing the gathered window to the kernel-visible length.
+    kv_len: torch.Tensor | None = None
     # Contiguous K/V staging for this layer, when reuse_history_staging is on. ``reuse_history`` is a host
     # bool decided once per forward (``_prepare_history_staging``): it selects one of two compiled variants.
     stage_key: torch.Tensor | None = None
@@ -583,6 +589,7 @@ class ARDiffusionPagedForwardContext:
             seq_lens=self.seq_lens,
             max_query_len=int(self.max_query_len),
             max_seq_len=int(self.max_seq_len),
+            kv_len=torch.tensor(int(self.kv_len)),
             stage_key=stage_key,
             stage_value=stage_value,
             reuse_history=self.reuse_history,
@@ -783,6 +790,7 @@ def ar_diffusion_paged_attention(
     max_seq_len: int,
     softmax_scale: float,
     causal: bool = False,
+    kv_len: int | None = None,
     stage_key: torch.Tensor | None = None,
     stage_value: torch.Tensor | None = None,
     reuse_history: bool = False,
@@ -814,21 +822,31 @@ def ar_diffusion_paged_attention(
         # (-4.1% full 40-chunk request at SP4, -7.3% steady chunk interval at
         # SP8 on 910C; 477-frame precodec output bit-identical).
         block_size = key_cache.shape[1]
-        num_blocks = (int(max_seq_len) + block_size - 1) // block_size
+        # kv_len may arrive as a host int (AR-Diffusion path, threaded through
+        # the custom op) or None (NoisyLayerContext / lingbot direct-replay
+        # path). Normalize to a host int; the None case pays the pre-diff
+        # .item() sync once instead of silently dropping to the fp32 reference
+        # implementation, which would break direct replay's documented
+        # contract of sharing the realtime path's fused kernel.
+        if kv_len is None:
+            kv_len = int(seq_lens[0].item())
+        else:
+            kv_len = int(kv_len)
+        num_blocks = (kv_len + block_size - 1) // block_size
         block_ids = block_table[0, :num_blocks].long()
-        gathered_k = key_cache.index_select(0, block_ids).flatten(0, 1)[: int(max_seq_len)]
-        gathered_v = value_cache.index_select(0, block_ids).flatten(0, 1)[: int(max_seq_len)]
-        kv_len = int(seq_lens[0].item())
-        packed_k = gathered_k[:kv_len]
-        packed_v = gathered_v[:kv_len]
-        # TND layout: per-sequence lengths and their cu_seqlens prefixes.
-        q_lens_per_seq = query_start_loc[1:] - query_start_loc[:-1]
-        actual_seq_q = q_lens_per_seq.to(torch.int32).cpu().tolist()
-        actual_seq_kv = seq_lens.to(torch.int32).cpu().tolist()
+        gathered_k = key_cache.index_select(0, block_ids).flatten(0, 1)[:kv_len]
+        gathered_v = value_cache.index_select(0, block_ids).flatten(0, 1)[:kv_len]
+        # Both lengths are host ints now, so the per-layer .item() +
+        # .cpu().tolist() host syncs the original branch paid (3 per layer
+        # per forward = 600 per AR block at 40 layers) are gone on the
+        # threaded path. The query length is known statically from the
+        # flattened shape.
+        actual_seq_q = [int(query_flat.shape[0])]
+        actual_seq_kv = [kv_len]
         out = torch_npu.npu_fusion_attention(
             query_flat.contiguous(),
-            packed_k.contiguous(),
-            packed_v.contiguous(),
+            gathered_k.contiguous(),
+            gathered_v.contiguous(),
             head_num=query_flat.shape[1],
             input_layout="TND",
             actual_seq_qlen=actual_seq_q,
@@ -1007,6 +1025,7 @@ def _paged_write_attn_impl(
     seq_lens: torch.Tensor,
     max_query_len: int,
     max_seq_len: int,
+    kv_len: torch.Tensor | None,
     softmax_scale: float,
     stage_key: torch.Tensor | None = None,
     stage_value: torch.Tensor | None = None,
@@ -1036,6 +1055,7 @@ def _paged_write_attn_impl(
         max_seq_len=max_seq_len,
         softmax_scale=softmax_scale,
         causal=False,
+        kv_len=int(kv_len) if kv_len is not None else None,
         stage_key=stage_key,
         stage_value=stage_value,
         reuse_history=reuse_history,
@@ -1070,6 +1090,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         seq_lens: torch.Tensor,
         max_query_len: int,
         max_seq_len: int,
+        kv_len: torch.Tensor | None,
         softmax_scale: float,
         stage_key: torch.Tensor | None,
         stage_value: torch.Tensor | None,
@@ -1093,6 +1114,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
             seq_lens,
             max_query_len,
             max_seq_len,
+            kv_len,
             softmax_scale,
             stage_key,
             stage_value,
@@ -1118,6 +1140,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         seq_lens,
         max_query_len,
         max_seq_len,
+        kv_len,
         softmax_scale,
         stage_key=None,
         stage_value=None,
@@ -1148,6 +1171,7 @@ def paged_write_attn(
         inputs.seq_lens,
         inputs.max_query_len,
         inputs.max_seq_len,
+        inputs.kv_len,
         softmax_scale,
         inputs.stage_key,
         inputs.stage_value,
