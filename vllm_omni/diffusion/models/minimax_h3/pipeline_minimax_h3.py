@@ -747,6 +747,8 @@ class MiniMaxH3Pipeline(
     _fasth3_checkpoint: FastH3CheckpointSpec | None = None
     # Set from --lora-path when it names an Open-H3-Regenerate release.
     _regenerate: MiniMaxH3RegenerateAdapter | None = None
+    # Set when ``od_config.model`` is VideoRebirth HyperFlow H3 Flash (RFC #10179).
+    _hyperflow_layout: Any = None
 
     def _load_diffusion_lora_adapter(
         self,
@@ -1013,6 +1015,14 @@ class MiniMaxH3Pipeline(
             self._PROFILER_TARGETS.remove("encode_prompt")
         if not self.load_vae_encoder:
             self._PROFILER_TARGETS.remove("_encode_local_media")
+        # HyperFlow H3 Flash: same MiniMaxH3Pipeline serve path as FastH3 full
+        # checkpoints; only the DiT weights + few-step schedule differ.
+        from vllm_omni.diffusion.models.hyperflow_h3_flash.prepare import (
+            apply_hyperflow_runtime_pins,
+            prepare_hyperflow_on_od_config,
+        )
+
+        self._hyperflow_layout = prepare_hyperflow_on_od_config(od_config)
         modular = is_minimax_h3_modular(str(od_config.model), od_config.revision)
         self.partition = _minimax_h3_partition_for_task(
             getattr(od_config, "task_type", None),
@@ -1103,6 +1113,8 @@ class MiniMaxH3Pipeline(
         self._base_schedule_by_partition = {expected_partition: _read_base_schedule(release)}
         if ref2va_model_path is not None:
             self._base_schedule_by_partition["ref2va"] = _read_base_schedule(ref2va_release)
+        if self._hyperflow_layout is not None:
+            apply_hyperflow_runtime_pins(self, self._hyperflow_layout)
 
         encoder_model_path = (
             vae_model_path
@@ -1176,10 +1188,14 @@ class MiniMaxH3Pipeline(
                 ),
             )
         transformer_cls = type(self)._transformer_cls or MiniMaxH3DiTModel
+        if self._hyperflow_layout is not None:
+            from vllm_omni.diffusion.models.hyperflow_h3_flash.transformer import HyperFlowH3FlashDiTModel
+
+            transformer_cls = HyperFlowH3FlashDiTModel
         self.transformer = transformer_cls(
             od_config,
             quant_config=transformer_quant_config,
-            diffusers_weights=modular,
+            diffusers_weights=True if self._hyperflow_layout is not None else modular,
         )
         if self._fasth3_checkpoint is not None:
             spec = self._fasth3_checkpoint
@@ -1555,6 +1571,10 @@ class MiniMaxH3Pipeline(
         derived from the step count, together with the count the rest of the
         request speaks in.
         """
+        if self._hyperflow_layout is not None:
+            from vllm_omni.diffusion.models.hyperflow_h3_flash.prepare import resolve_hyperflow_sigma_positions
+
+            return resolve_hyperflow_sigma_positions(sampling)
         if self._fasth3 is not None:
             # A fused student carries its own positions; the checkpoint
             # underneath it is the many-step teacher, whose schedule does not
