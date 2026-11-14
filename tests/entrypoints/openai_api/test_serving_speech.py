@@ -33,6 +33,7 @@ from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.outputs import CompletionOutput
+from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.config.stage_config import StagePipelineConfig
@@ -6274,6 +6275,229 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._adapter._build_tts_params.assert_called_once()
         qwen3_tts_server._adapter._estimate_prompt_len_async.assert_awaited_once()
 
+    def test_drvexo_standard_speech_dispatch_skips_thinker(self, drvexo_tts_server, mocker):
+        server = drvexo_tts_server
+        server.engine_client.default_sampling_params_list[1].seed = 17
+        apply_overrides = mocker.spy(server._adapter, "apply_sampling_overrides")
+        request = OpenAICreateSpeechRequest(input="hello", max_new_tokens=80, seed=42)
+        _, _, params = asyncio.run(server._prepare_speech_generation(request))
+        # The adapter receives the full stage-0-indexed pipeline even though
+        # generation enters at Talker. It must not receive an already sliced list.
+        assert [p.max_tokens for p in apply_overrides.call_args.args[0]] == [100, 400, 500]
+        call = server.engine_client.generate.call_args.kwargs
+        assert call["entry_stage_id"] == 1
+        assert call["prompt"]["additional_information"]["drvexo_fixed_reply"] is True
+        assert [p.max_tokens for p in call["sampling_params_list"]] == [100, 80, 500]
+        assert call["sampling_params_list"][1].seed == 42
+        assert call["sampling_params_list"][1].extra_args["tts_local_seed"] == 42
+        assert call["sampling_params_list"][0].extra_args is None
+        assert params["text"] == ["hello"]
+
+    @pytest.fixture(params=["DRVEXOSpeech8BTalker", "DRVEXOUnifiedTalker"])
+    def drvexo_tts_server(self, qwen3_tts_server, request, tmp_path, mocker):
+        from tokenizers import Tokenizer, decoders, normalizers, pre_tokenizers
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        from vllm_omni.entrypoints.openai.tts_adapters import detect_tts_model_type, resolve_adapter
+        from vllm_omni.entrypoints.openai.tts_adapters.base import TTSCapabilities
+
+        # Both directories are valid tokenizers, but have different segmentation.
+        # A root tokenizer accidentally selected in admission/estimation is observable.
+        vocab = {char: index for index, char in enumerate("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ .\n")}
+        vocab["[UNK]"] = len(vocab)
+        for directory, normalizer in (
+            (tmp_path, normalizers.Replace("hello", "h")),
+            (tmp_path / "talker", normalizers.Sequence([normalizers.Replace("  ", " "), normalizers.NFKC()])),
+        ):
+            native = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+            native.normalizer = normalizer
+            native.pre_tokenizer = pre_tokenizers.Split("", behavior="isolated")
+            native.decoder = decoders.Fuse()
+            tokenizer = PreTrainedTokenizerFast(
+                tokenizer_object=native,
+                unk_token="[UNK]",
+                additional_special_tokens=["<|im_start|>", "<|im_end|>"],
+            )
+            tokenizer.save_pretrained(directory)
+        server = qwen3_tts_server
+        server.engine_client.model_config.model = str(tmp_path)
+        talker_config = server.engine_client.model_config.hf_config.talker_config
+        talker_config.codec_language_id = {}
+        talker_config.spk_is_dialect = {}
+        server._tts_model_type = detect_tts_model_type("qwen3_tts", request.param)
+        server._adapter = resolve_adapter(server._tts_model_type)(
+            SpeechServingContext(server=server, engine_client=server.engine_client)
+        )
+        server._adapter.capabilities = TTSCapabilities(
+            supported_speakers=frozenset({"vivian"}), default_speaker="vivian"
+        )
+        server._resolve_ref_audio_array = mocker.AsyncMock(
+            return_value=(np.zeros(1600, dtype=np.float32), 16000, "ref")
+        )
+        server._get_resolved_ref_audio_artifact_key = lambda _: None
+        server.engine_client.default_sampling_params_list = [
+            SamplingParams(max_tokens=100),
+            SamplingParams(max_tokens=400),
+            SamplingParams(max_tokens=500),
+        ]
+
+        async def generate(**kwargs):
+            yield create_mock_audio_output_for_test(kwargs["request_id"])
+
+        server.engine_client.generate.side_effect = generate
+        return server
+
+    @pytest.mark.parametrize(
+        "text,error",
+        [
+            ("Say <|im_start|> aloud.", "control tokens"),
+            ("hello  world", "changed the reply"),
+            ("hello    world", "changed the reply"),
+            ("ｈｅｌｌｏ world", "changed the reply"),
+        ],
+    )
+    def test_drvexo_standard_speech_rejects_then_recovers(self, drvexo_tts_server, text, error):
+        server = drvexo_tts_server
+        app = FastAPI()
+        app.state.openai_serving_speech = server
+        app.add_api_route("/v1/audio/speech", api_server_module.create_speech, methods=["POST"])
+        payload = {
+            "input": text,
+            "task_type": "Base",
+            "ref_audio": "data:audio/wav;base64,AAAA",
+            "x_vector_only_mode": True,
+            "response_format": "wav",
+        }
+        with TestClient(app) as client:
+            response = client.post("/v1/audio/speech", json=payload)
+            assert response.status_code == 400
+            assert error in response.json()["error"]["message"]
+            server.engine_client.generate.assert_not_called()
+            server._resolve_ref_audio_array.assert_not_awaited()
+            response = client.post("/v1/audio/speech", json={**payload, "input": "hello world"})
+        assert response.status_code == 200, response.text
+        assert response.content[:4] == b"RIFF"
+        server.engine_client.generate.assert_called_once()
+        assert server.engine_client.generate.call_args.kwargs["entry_stage_id"] == 1
+
+    def test_drvexo_tokenizer_load_failure_recovers_without_audio_or_engine_dispatch(self, drvexo_tts_server, mocker):
+        from vllm_omni.entrypoints.openai.drvexo_speech import load_speech_tokenizer
+
+        server = drvexo_tts_server
+        native = load_speech_tokenizer(server.engine_client.model_config.model)
+        loader = mocker.patch(
+            "vllm_omni.entrypoints.openai.tts_adapters.drvexo.load_speech_tokenizer",
+            side_effect=[OSError("Tokenizer disk unavailable"), native],
+        )
+        request = OpenAICreateSpeechRequest(
+            input="hello world",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,AAAA",
+            x_vector_only_mode=True,
+        )
+
+        async def exercise():
+            with pytest.raises(OSError, match="Tokenizer disk unavailable"):
+                await server._prepare_speech_generation(request)
+            assert server._tts_tokenizer is None
+            server._resolve_ref_audio_array.assert_not_awaited()
+            server.engine_client.generate.assert_not_called()
+            await server._prepare_speech_generation(request)
+
+        asyncio.run(exercise())
+        assert loader.call_count == 2
+        assert server._tts_tokenizer is native
+        server._resolve_ref_audio_array.assert_awaited_once()
+        server.engine_client.generate.assert_called_once()
+
+    @pytest.mark.parametrize("cancel_first", [False, True])
+    def test_drvexo_concurrent_cold_requests_load_tokenizer_once_off_loop(
+        self, drvexo_tts_server, mocker, cancel_first
+    ):
+        import threading
+
+        from vllm_omni.entrypoints.openai.drvexo_speech import load_speech_tokenizer
+
+        server = drvexo_tts_server
+        native = load_speech_tokenizer(server.engine_client.model_config.model)
+        loop_thread = threading.get_ident()
+        loading = threading.Event()
+        release = threading.Event()
+
+        def load(model_path):
+            assert threading.get_ident() != loop_thread, "Tokenizer disk load blocked the event loop"
+            loading.set()
+            assert release.wait(timeout=5), "Event loop could not progress during tokenizer loading"
+            return native
+
+        loader = mocker.patch(
+            "vllm_omni.entrypoints.openai.tts_adapters.drvexo.load_speech_tokenizer", side_effect=load
+        )
+
+        async def exercise():
+            requests = [
+                OpenAICreateSpeechRequest(
+                    input="hello world",
+                    task_type="Base",
+                    ref_audio="data:audio/wav;base64,AAAA",
+                    x_vector_only_mode=True,
+                )
+                for _ in range(2)
+            ]
+            tasks = [asyncio.create_task(server._prepare_speech_generation(req)) for req in requests]
+            try:
+                assert await asyncio.to_thread(loading.wait, 2), "Tokenizer load never reached a worker thread"
+                # This coroutine must run while disk loading is still blocked.
+                server._resolve_ref_audio_array.assert_not_awaited()
+                server.engine_client.generate.assert_not_called()
+                if cancel_first:
+                    tasks[0].cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await tasks[0]
+            finally:
+                release.set()
+                await asyncio.gather(*(tasks[1:] if tasks[0].cancelled() else tasks))
+            # Later requests also use the same successfully loaded tokenizer.
+            await server._prepare_speech_generation(requests[0])
+
+        asyncio.run(exercise())
+        loader.assert_called_once_with(server.engine_client.model_config.model)
+        assert server._tts_tokenizer is native
+        assert server.engine_client.generate.call_count == (2 if cancel_first else 3)
+
+    @pytest.mark.parametrize("non_streaming_mode", [False, True])
+    def test_drvexo_standard_speech_uses_native_talker_prompt_length(self, drvexo_tts_server, non_streaming_mode):
+        from vllm_omni.entrypoints.openai.drvexo_speech import load_speech_tokenizer
+        from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+            PRECOMPUTED_TEXT_IDS_KEY,
+            Qwen3TTSPromptEmbedsBuilder,
+            build_assistant_text,
+        )
+
+        server = drvexo_tts_server
+        request = OpenAICreateSpeechRequest(
+            input="hello world",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,AAAA",
+            x_vector_only_mode=True,
+            non_streaming_mode=non_streaming_mode,
+        )
+        _, _, params = asyncio.run(server._prepare_speech_generation(request))
+        native = load_speech_tokenizer(server.engine_client.model_config.model)
+        expected = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
+            params,
+            task_type="Base",
+            tokenize_prompt=lambda text: native(text)["input_ids"],
+            codec_language_id={},
+            spk_is_dialect={},
+        )
+        prompt = server.engine_client.generate.call_args.kwargs["prompt"]
+        assert len(prompt["prompt_token_ids"]) == expected
+        assert params[PRECOMPUTED_TEXT_IDS_KEY] == [native.encode(build_assistant_text(request.input))]
+        assert server._tts_tokenizer.get_vocab() == native.get_vocab()
+        assert server._tts_tokenizer.encode(request.input) == native.encode(request.input)
+
     def test_prepare_speech_generation_qwen3_default_seed_sets_tts_local_seed(
         self, qwen3_tts_server, mocker: MockerFixture
     ):
@@ -6305,6 +6529,8 @@ class TestTTSAsyncOffloading:
         adapter_model_type = "adapter_dummy_tts"
 
         class FakeAdapter:
+            entry_stage_id = 0
+
             def normalize(self, request):
                 return
 

@@ -1,0 +1,73 @@
+pipeline: drvexo_speech_8b
+async_chunk: true
+distributed_executor_backend: mp
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait: 60
+      codec_streaming: true
+      codec_chunk_frames: 8
+      codec_left_context_frames: 72
+      initial_codec_chunk_frames: 8
+      decode_batch_max_size: 1
+stages:
+- stage_id: 0
+  load_format: drvexo_unified
+  devices: '0'
+  max_num_batched_tokens: 2048
+  max_model_len: 32768
+  max_num_seqs: 1
+  gpu_memory_utilization: 0.2
+  kv_cache_memory_bytes: 6442450944
+  enforce_eager: true
+  enable_prefix_caching: false
+  async_scheduling: false
+  enable_chunked_prefill: true
+  limit_mm_per_prompt:
+    audio: 1
+  default_sampling_params:
+    temperature: 0.0
+    max_tokens: 192
+- stage_id: 1
+  load_format: drvexo_unified
+  devices: '0'
+  max_num_batched_tokens: 512
+  max_model_len: 2048
+  max_num_seqs: 1
+  gpu_memory_utilization: 0.08
+  kv_cache_memory_bytes: 536870912
+  enforce_eager: true
+  enable_prefix_caching: false
+  async_scheduling: false
+  output_connectors:
+    to_stage_2: connector_of_shared_memory
+  default_sampling_params:
+    temperature: 0.9
+    top_k: 50
+    min_tokens: 2
+    max_tokens: 384
+    repetition_penalty: 1.05
+  subtalker_sampling_params:
+    do_sample: true
+    temperature: 0.9
+    top_k: 50
+- stage_id: 2
+  load_format: drvexo_unified
+  dtype: bfloat16
+  engine_extras:
+    model_subdir: codec
+  devices: '0'
+  max_num_batched_tokens: 8192
+  max_model_len: 8192
+  max_num_seqs: 1
+  gpu_memory_utilization: 0.05
+  enforce_eager: true
+  enable_prefix_caching: false
+  async_scheduling: false
+  input_connectors:
+    from_stage_1: connector_of_shared_memory
+  default_sampling_params:
+    temperature: 0.0
+    max_tokens: 8192

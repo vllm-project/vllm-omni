@@ -81,6 +81,22 @@ class _FakeVllmConfig:
     parallel_config: _FakeParallelConfig
 
 
+@dataclass
+class _FakeHFConfig:
+    model_type: str
+
+
+@dataclass
+class _FakeChatModelConfig:
+    hf_config: _FakeHFConfig
+    model: str = "local-bundle"
+
+
+@dataclass
+class _FakeServingChat:
+    model_config: _FakeChatModelConfig
+
+
 def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
     args = _minimal_args(_omni_stage_client_configs=[{"stage_addresses": {}}])
     death_signal = mocker.patch.object(api_server, "set_death_signal")
@@ -97,8 +113,9 @@ def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model_type", ["dummy", "drvexo_speech_8b", "drvexo_speech_qwen35_4b"])
 @pytest.mark.parametrize("tracing_mode", ["enabled", "disabled", "no-engine", "no-provider"])
-async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracing_mode):
+async def test_omni_run_server_worker_forwards_client_config(monkeypatch, model_type, tracing_mode):
     import httpx
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -127,6 +144,7 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracin
     async def fake_build_async_omni(*_args, **kwargs):
         captured.update(kwargs)
         engine = _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
+        engine.num_stages = 3
         if tracing_mode == "no-engine":
             del engine.engine
         elif tracing_mode == "no-provider":
@@ -137,7 +155,21 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracin
 
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
     monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: app)
-    monkeypatch.setattr(api_server, "omni_init_app_state", lambda *_args: asyncio.sleep(0))
+    from vllm_omni.entrypoints.openai import drvexo_speech
+
+    tokenizer = object()
+    loaded = []
+
+    def load_tokenizer(path):
+        loaded.append(path)
+        return tokenizer
+
+    monkeypatch.setattr(drvexo_speech, "load_speech_tokenizer", load_tokenizer)
+
+    async def fake_init_app_state(_engine, state, _args):
+        state.openai_serving_chat = _FakeServingChat(_FakeChatModelConfig(_FakeHFConfig(model_type)))
+
+    monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
     monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_args: None)
 
     async def fake_storage_start() -> None:
@@ -147,6 +179,13 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracin
 
     async def fake_serve_http(app, **_kwargs):
         assert app.state.api_server_count == 2
+        if model_type in ("drvexo_speech_8b", "drvexo_speech_qwen35_4b"):
+            assert app.state.drvexo_decision_limiter.total_tokens == 1
+            assert app.state.drvexo_speech_tokenizer is tokenizer
+            assert loaded == ["local-bundle"]
+        else:
+            assert not hasattr(app.state, "drvexo_decision_limiter")
+            assert loaded == []
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
             for sampled in ("01", "00"):
                 parent = f"00-12345678901234567890123456789012-1234567890123456-{sampled}"
@@ -431,6 +470,7 @@ class _FakeSocket:
 
 class _FakeEngineClient:
     config_path: str | None = None
+    num_stages: int = 0
 
     def __init__(self, *, stage_configs=None, endpoint_restrictions=None, vllm_config=None) -> None:
         self.engine = object.__new__(OmniEngineBase)

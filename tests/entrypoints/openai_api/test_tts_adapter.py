@@ -39,6 +39,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import ming3_tts as ming3_tts_mod
 from vllm_omni.entrypoints.openai.tts_adapters.auk import AuKAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import TTSCapabilities, resolve_stage_model_path
 from vllm_omni.entrypoints.openai.tts_adapters.covo_audio import CovoAudioAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.drvexo import DRVEXOTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v2 import HiggsAudioV2Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
     IndexTTS2Adapter,
@@ -830,6 +831,59 @@ def test_qwen3_tts_build_constructs_prepared_request():
     assert prepared.tts_params["text"] == ["hello"]
     assert prepared.tts_params["speaker"] == ["vivian"]
     assert prepared.model_type == "CustomVoice"
+
+
+@pytest.mark.parametrize("arch", ["DRVEXOSpeech8BTalker", "DRVEXOUnifiedTalker"])
+@pytest.mark.parametrize("reference", [False, True])
+@pytest.mark.asyncio
+async def test_drvexo_families_build_standard_speech_at_talker_stage(arch, reference, mocker):
+    tokenizer = mocker.Mock(all_special_ids=[], added_tokens_decoder={})
+    tokenizer.encode.return_value = [1]
+    tokenizer.decode.return_value = "hello"
+    server = SimpleNamespace(_tts_executor=None, _tts_tokenizer=tokenizer, uploaded_speakers={})
+    server._resolve_ref_audio_array = mocker.AsyncMock(return_value=(np.zeros(1600, dtype=np.float32), 16000, "ref"))
+    server._get_resolved_ref_audio_artifact_key = lambda _: None
+    adapter_type = resolve_adapter(detect_tts_model_type("qwen3_tts", arch))
+    adapter = adapter_type(
+        SimpleNamespace(server=server, engine_client=SimpleNamespace(model_config=SimpleNamespace()))
+    )
+    adapter.capabilities = TTSCapabilities(supported_speakers=frozenset({"vivian"}), default_speaker="vivian")
+    adapter._estimate_prompt_len_async = mocker.AsyncMock(return_value=3)
+    request = OpenAICreateSpeechRequest(
+        input="hello",
+        max_new_tokens=80,
+        task_type="Base" if reference else "CustomVoice",
+        ref_audio="data:audio/wav;base64,AAAA" if reference else None,
+    )
+    prepared = await adapter.build(request, [], reference)
+    assert adapter.entry_stage_id == 1
+    assert prepared.tts_params["drvexo_fixed_reply"] is True
+    assert "drvexo_generated_token_ids" not in prepared.tts_params
+    if reference:
+        wire = prepared.tts_params["ref_audio"][0][0]
+        assert wire["shape"] == [1600]
+        assert np.frombuffer(wire["data"], dtype=np.float32).shape == (1600,)
+        assert prepared.tts_params["ref_audio"][0][1] == 16000
+        server._resolve_ref_audio_array.assert_awaited_once()
+    else:
+        assert prepared.tts_params["speaker"] == ["vivian"]
+        server._resolve_ref_audio_array.assert_not_awaited()
+    defaults = [SamplingParams(max_tokens=100), SamplingParams(max_tokens=400, seed=17), SamplingParams(max_tokens=500)]
+    overridden = adapter.apply_sampling_overrides(defaults, request, prepared.prompt)
+    assert [p.max_tokens for p in overridden] == [100, 80, 500]
+    assert [p.max_tokens for p in defaults] == [100, 400, 500]
+    assert overridden[1].extra_args["tts_local_seed"] == 17
+    assert overridden[0].extra_args is None
+
+
+def test_drvexo_sampling_slice_follows_declared_entry_stage(mocker):
+    server = mocker.Mock()
+    adapter = DRVEXOTTSAdapter(SpeechServingContext(server=server))
+    adapter.entry_stage_id = 2
+    defaults = [SamplingParams(max_tokens=value) for value in (100, 200, 300, 400)]
+    overridden = adapter.apply_sampling_overrides(defaults, OpenAICreateSpeechRequest(input="hello", max_new_tokens=80))
+    assert [p.max_tokens for p in overridden] == [100, 200, 80, 400]
+    assert [p.max_tokens for p in defaults] == [100, 200, 300, 400]
 
 
 def test_covo_audio_build_constructs_tokenized_prompt():

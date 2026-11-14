@@ -160,6 +160,7 @@ from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, DiffusionMetadataValue
+from vllm_omni.transformers_utils.configs.drvexo import DRVEXO_MODEL_TYPES
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
 from vllm_omni.utils.speakers import (
     get_supported_speakers_from_hf_config,
@@ -252,7 +253,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         """
         # parser_cls may be None (no tool parser configured); guard accordingly
         tp_cls = self.parser_cls.tool_parser_cls if self.parser_cls is not None else None
-        return request.tools and tp_cls is not None and self.enable_auto_tools and request.tool_choice in ["auto", None]
+        hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
+        native_forced = (
+            getattr(hf_config, "model_type", None) in DRVEXO_MODEL_TYPES
+            and tp_cls is not None
+            and not getattr(tp_cls, "supports_required_and_named", True)
+            and (
+                isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam) or request.tool_choice == "required"
+            )
+        )
+        return bool(
+            request.tools
+            and tp_cls is not None
+            and self.enable_auto_tools
+            and (request.tool_choice in ["auto", None] or native_forced)
+        )
 
     @staticmethod
     def _stage_get(obj: Any, key: str, default: Any = None) -> Any:
@@ -673,6 +688,31 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
+        if getattr(hf_config, "model_type", None) in DRVEXO_MODEL_TYPES:
+            from .drvexo_decision import validate_chat_request
+
+            try:
+                validate_chat_request(request)
+            except (ValueError, TypeError) as exc:
+                return self._create_error_response(str(exc), status_code=400)
+            if getattr(hf_config, "drvexo_text_intermediate", False):
+                from .drvexo_transcription import attach_transcription, current_audio_to_text
+
+                error = await self._check_model(request)
+                if error is not None:
+                    return error
+                try:
+                    converted, transcription = await current_audio_to_text(self, request)
+                except ValueError as exc:
+                    return self._create_error_response(str(exc), status_code=400)
+                except RuntimeError as exc:
+                    return self._create_error_response(str(exc), status_code=503)
+                if transcription is not None:
+                    # Internal serving failures must keep their server-error
+                    # identity, rather than being recast as request validation.
+                    response = await self._create_chat_completion(converted, raw_request)
+                    return attach_transcription(response, transcription)
         stage_configs = getattr(self.engine_client, "stage_configs", ()) or ()
         serves_diffusion = self._diffusion_mode or any(
             get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs
@@ -1063,7 +1103,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Streaming response
         if request.stream:
-            return self.chat_completion_stream_generator(
+            from .stream_lifecycle import owned_chat_stream
+
+            response_stream = self.chat_completion_stream_generator(
                 request,
                 result_generator,
                 request_id,
@@ -1075,6 +1117,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 mm_token_counts=mm_token_counts,
                 raw_request=raw_request,
             )
+            if getattr(self.model_config.hf_config, "model_type", None) in DRVEXO_MODEL_TYPES:
+                return owned_chat_stream(response_stream, result_generator, self.engine_client, request_id)
+            return response_stream
 
         try:
             return await self.chat_completion_full_generator(
@@ -1111,6 +1156,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     ) -> tuple[list[ConversationMessage], list[TokPrompt]]:
         if renderer is None:
             renderer = self.renderer
+
+        # Fail validation explicitly even with python -O. This happens before
+        # rendering or dispatch, so an inconsistent server parser cannot turn
+        # a tools request into an assertion failure/engine request.
+        should_parse_tools = (
+            tool_parser is not None and hasattr(request, "tool_choice") and request.tool_choice != "none"
+        )
+        parser_cls = self.parser_cls
+        if should_parse_tools and parser_cls is None:
+            raise ValueError("Tool parsing was requested but no chat parser is configured")
 
         # Keep OMNI compatibility args wired while delegating rendering
         # to the upstream async renderer pipeline.
@@ -1160,18 +1215,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
         # is set, we want to prevent parsing a tool_call hallucinated by the LLM
-        should_parse_tools = tool_parser is not None and (
-            hasattr(request, "tool_choice") and request.tool_choice != "none"
-        )
-
-        if should_parse_tools:
+        if should_parse_tools and parser_cls is not None:
             if not isinstance(request, ChatCompletionRequest):
                 msg = "Tool usage is only supported for Chat Completions API"
                 raise NotImplementedError(msg)
 
-            request = tool_parser(tokenizer).adjust_request(  # type: ignore
-                request=request
-            )
+            request = parser_cls(tokenizer, request.tools).adjust_request(request=request)
 
         # Preserve a clean text prompt for downstream stages (e.g., GLM-Image diffusion).
         # For image generation, we want the raw user caption instead of a rendered template.
@@ -1549,6 +1598,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if "max_completion_tokens" in explicit_fields and request.max_completion_tokens is not None:
             overrides["max_tokens"] = request.max_completion_tokens
 
+        constraints = request.extract_structured_outputs()
+        if constraints is not None:
+            # Response formats and tool-parser constraints belong only to the
+            # comprehension stage, just like the explicit sampling overrides.
+            overrides["structured_outputs"] = constraints
+
         return overrides
 
     @staticmethod
@@ -1702,7 +1757,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             harmony_tools_streamed = [False] * num_choices
         tools_streamed = [False] * num_choices
 
-        if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
+        native_tool_parsing = self._should_stream_with_auto_tool_parsing(request)
+        if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam) and not native_tool_parsing:
             tool_choice_function_name = request.tool_choice.function.name
         else:
             tool_choice_function_name = None
@@ -2028,11 +2084,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 )
                                 tools_streamed[i] = True
 
-                        elif request.tool_choice == "required":
+                        elif request.tool_choice == "required" and not tool_choice_auto:
                             assert previous_texts is not None
                             previous_text = previous_texts[i]
                             current_text = previous_text + delta_text
-                            fn_name_returned = function_name_returned[i]
                             output_token_ids = as_list(output.token_ids)
 
                             if (
@@ -2068,17 +2123,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 delta_message, function_name_returned[i] = extract_required_tool_call_streaming(
                                     previous_text=previous_text,
                                     current_text=content,
-                                    delta_text=delta_text,
-                                    function_name_returned=fn_name_returned,
                                     tool_call_idx=history_tool_call_cnt,
                                     tool_call_id_type=self.tool_call_id_type,
                                 )
-                                if (
-                                    delta_message
-                                    and delta_message.tool_calls
-                                    and delta_message.tool_calls[0].id is not None
-                                ):
-                                    history_tool_call_cnt += 1
+                                if delta_message and delta_message.tool_calls:
+                                    # A single delta can announce several calls,
+                                    # or continue one before announcing another.
+                                    history_tool_call_cnt += sum(
+                                        call.id is not None for call in delta_message.tool_calls
+                                    )
                                     tools_streamed[i] = True
 
                         # handle streaming deltas for tools with "auto" tool choice
@@ -2630,6 +2683,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         prompt_token_ids = None
         kv_transfer_params = None
         response_metrics: dict[str, Any] | None = None
+        combine_text_audio = getattr(self.model_config.hf_config, "combine_text_audio_response", False) is True
+        spoken_text: dict[int, str] = {}
 
         # For text+audio requests the audio final output shares output
         # indexes with the text final output. Collect audio choices and
@@ -2646,6 +2701,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             choices_data = []
             if not omni_outputs.finished:
                 continue
+
+            if combine_text_audio and omni_outputs.final_output_type == "text":
+                for output in omni_outputs.outputs:
+                    text = getattr(output, "cumulative_text", None) or output.text
+                    if isinstance(text, str):
+                        spoken_text[output.index] = text
 
             # Filter outputs based on requested modalites
             if requested_modalities is not None and omni_outputs.final_output_type not in requested_modalities:
@@ -2711,6 +2772,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         if pending_audio_choices:
             choices = self._merge_audio_choices(choices, pending_audio_choices)
+        if combine_text_audio:
+            from .text_audio_response import combine_text_audio_choices
+
+            choices = combine_text_audio_choices(choices, spoken_text)
 
         response_metrics = self._filter_stage_metrics_detail(response_metrics, request)
 
@@ -2877,7 +2942,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 message = ChatMessage(role=role, reasoning=reasoning, content=content)
 
             # if the request uses tools and specified a tool choice
-            elif request.tool_choice and type(request.tool_choice) is ChatCompletionNamedToolChoiceParam:
+            elif type(
+                request.tool_choice
+            ) is ChatCompletionNamedToolChoiceParam and not self._should_stream_with_auto_tool_parsing(request):
                 tool_call_class = MistralToolCall if isinstance(tokenizer, MistralTokenizer) else ToolCall
                 message = ChatMessage(
                     role=role,
@@ -2893,7 +2960,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     ],
                 )
 
-            elif request.tool_choice and request.tool_choice == "required":
+            elif request.tool_choice == "required" and not self._should_stream_with_auto_tool_parsing(request):
                 tool_call_class = MistralToolCall if isinstance(tokenizer, MistralTokenizer) else ToolCall
 
                 # the fields of FunctionDefinition are a superset of the
@@ -2934,7 +3001,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # handle when there are tools and tool choice is auto
             elif (
                 request.tools
-                and (request.tool_choice == "auto" or request.tool_choice is None)
+                and self._should_stream_with_auto_tool_parsing(request)
                 and self.enable_auto_tools
                 and self.parser_cls is not None
                 and self.parser_cls.tool_parser_cls is not None
