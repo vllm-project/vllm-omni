@@ -35,6 +35,7 @@ import math
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from http import HTTPStatus
 from typing import Any, cast
 
@@ -851,18 +852,38 @@ class OmniStreamingVideoOutputHandler:
         )
         pacing = request.streaming_pacing
         max_output_bytes = pacing.max_output_bytes if pacing is not None and pacing.enabled else None
-        completed = False
+        # Encoding must not block playback feedback, interactions, or stop.
+        # One worker also serializes close behind an encode that is still
+        # running when its asyncio waiter is cancelled.
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-stream-encoder")
+        loop = asyncio.get_running_loop()
+        close_future: Future[bytes] | None = None
+
+        def close_encoder() -> bytes:
+            try:
+                return encoder.close()
+            except Exception:
+                logger.exception("Failed to close streaming video encoder for %s", request_id)
+                raise
+
         try:
             async for result in self._iter_generation_outputs(prompt, gen_params, request_id, progress):
                 if result.error:
                     raise RuntimeError(str(result.error))
-                for chunk, metadata in self._encode_generation_result(result, request_id, encoder):
+                encoded_chunks = await loop.run_in_executor(
+                    executor, lambda: list(self._encode_generation_result(result, request_id, encoder))
+                )
+                for chunk, metadata in encoded_chunks:
                     if max_output_bytes is not None and len(chunk) > max_output_bytes:
                         raise ValueError("encoded streaming chunk exceeds streaming_pacing.max_output_bytes")
                     yield (chunk, metadata)
 
-            completed = True
-            final_chunk = encoder.close()
+            close_future = executor.submit(close_encoder)
+            # Shield the queued close: cancelling the session must not cancel
+            # the cleanup operation before the encoder thread gets to it.
+            close_waiter = asyncio.wrap_future(close_future)
+            close_waiter.add_done_callback(lambda future: None if future.cancelled() else future.exception())
+            final_chunk = await asyncio.shield(close_waiter)
             if max_output_bytes is not None and len(final_chunk or b"") > max_output_bytes:
                 raise ValueError("encoded streaming trailer exceeds streaming_pacing.max_output_bytes")
             if final_chunk:
@@ -877,8 +898,11 @@ class OmniStreamingVideoOutputHandler:
                     ),
                 )
         finally:
-            if not completed:
-                encoder.close()
+            if close_future is None:
+                executor.submit(close_encoder)
+            # Do not join a running encode on the event-loop thread. The
+            # executor drains its queued close and then releases its worker.
+            executor.shutdown(wait=False)
 
     def _encode_generation_result(
         self,
