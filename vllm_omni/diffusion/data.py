@@ -2341,6 +2341,19 @@ class RainFusionPrecision(str, Enum):
     MIX = "mix"
 
 
+@dataclass(frozen=True)
+class MindIEParallelConfig:
+    """Controls for the complete MindIE-SD executor and request-level RF reorder."""
+
+    overlap_comm: bool = True
+    reorder_hoist: bool = True
+
+    def __post_init__(self) -> None:
+        for name in ("overlap_comm", "reorder_hoist"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"MindIE parallel {name} must be a boolean and agree across ranks")
+
+
 @dataclass
 class BlockSparseSpec:
     """User-facing controls shared by block-sparse attention backends.
@@ -2358,8 +2371,14 @@ class BlockSparseSpec:
     precision: str = RainFusionPrecision.BF16.value
     skip_layers: str | list[int] | None = None
     skip_layer_indices: set[int] | None = field(default=None, repr=False)
+    sparse_type: str = "rf_v2"
+    parallel: dict | None = None
 
     def __post_init__(self) -> None:
+        if self.sparse_type not in ("rf_v2", "rf_v3"):
+            raise ValueError("block_sparse.sparse_type must be rf_v2 or rf_v3")
+        if self.parallel is not None:
+            MindIEParallelConfig(**self.parallel)
         self.sparsity = _in_range(self.sparsity, "block_sparse.sparsity", 0.0, 1.0) or 0.0
         if self.start_step < 0:
             raise ValueError(f"block_sparse.start_step must be >= 0; got {self.start_step!r}.")
@@ -2487,6 +2506,10 @@ class AttentionSpec:
             kw["start_step"] = bs.start_step
             kw["end_step"] = bs.end_step
             kw["precision"] = bs.precision
+            if bs.sparse_type != "rf_v2":
+                kw["sparse_type"] = bs.sparse_type
+            if bs.parallel is not None:
+                kw["parallel"] = dict(bs.parallel)
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
 
