@@ -56,6 +56,7 @@ class _FakeToken2Wav:
 
     def enable_speaker_cuda_graph(self, config):
         self.speaker_graph_config = config
+        return True
 
     def enable_trt_spk_embedding(self, *, cpu_reference=False):
         self.trt_spk_calls += 1
@@ -233,6 +234,7 @@ def test_cuda_speaker_backend_preserves_lazy_model_loading(tmp_path, monkeypatch
 
 
 _OTHER_DEFAULTS = {
+    "token2wav_s3_cuda_graph",
     "token2wav_spk_cuda_graph",
     "token2wav_spk_cpu_reference",
     "token2wav_float16",
@@ -358,6 +360,56 @@ def test_speaker_graph_flag_reaches_selected_backend(tmp_path, monkeypatch, valu
     model, speaker = _build_backend(tmp_path, monkeypatch, {"token2wav_spk_cuda_graph": value})
     assert speaker.device_spk_calls == 1
     assert speaker.speaker_graph_config is (model.vllm_config if enabled else None)
+
+
+@pytest.mark.parametrize("platform", ["cuda", "npu"])
+@pytest.mark.parametrize("selection", ["torch", "cpu", "trt-env", "trt-config", "trt-speaker"])
+def test_reference_graphs_respect_selected_backend(tmp_path, monkeypatch, mocker, platform, selection):
+    from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_torch import CampplusTorch
+    from vllm_omni.model_executor.models.minicpmo_4_5 import s3_cuda_graph, speaker_cuda_graph
+    from vllm_omni.model_executor.models.step_audio2 import step_audio2_dit_trt
+
+    _force_platform(monkeypatch, platform)
+    monkeypatch.setenv("MINICPMO_TOKEN2WAV_TRT", "1" if selection == "trt-env" else "0")
+    mocker.patch.object(step_audio2_dit_trt, "build_dit_trt_stepper", return_value=object())
+    speaker_wrapper = mocker.patch.object(speaker_cuda_graph, "SpeakerCudaGraph")
+    s3_wrapper = mocker.patch.object(s3_cuda_graph, "S3CudaGraph")
+    original_init = _FakeToken2Wav.__init__
+    device = torch.device("cuda" if platform == "cuda" else "privateuseone")
+
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        tokenizer = mocker.Mock()
+        tokenizer.parameters = lambda: iter([mocker.Mock(device=device)])
+        self._core = mocker.Mock(device=device, _spk_model=None, audio_tokenizer=tokenizer)
+
+    def device_speaker(self, *, use_trt):
+        speaker = CampplusTorch.__new__(CampplusTorch)
+        speaker.device = device
+        self._core._spk_model = speaker
+
+    def trt_speaker(self, **kwargs):
+        self._core._spk_model = object()
+
+    monkeypatch.setattr(_FakeToken2Wav, "__init__", init)
+    monkeypatch.setattr(_FakeToken2Wav, "enable_device_spk_embedding", device_speaker)
+    monkeypatch.setattr(_FakeToken2Wav, "enable_trt_spk_embedding", trt_speaker)
+    for name in ("enable_speaker_cuda_graph", "enable_s3_cuda_graph"):
+        monkeypatch.setattr(_FakeToken2Wav, name, getattr(token2wav_module.MiniCPMO45Token2wav, name), raising=False)
+
+    _build_backend(
+        tmp_path,
+        monkeypatch,
+        {
+            "token2wav_spk_cuda_graph": True,
+            "token2wav_s3_cuda_graph": True,
+            "token2wav_device_spk": selection != "cpu",
+            "token2wav_trt": selection == "trt-config",
+            "token2wav_spk_cpu_reference": selection == "trt-speaker",
+        },
+    )
+    assert speaker_wrapper.call_count == int(platform == "cuda" and selection == "torch")
+    assert s3_wrapper.call_count == int(platform == "cuda")
 
 
 def test_cpu_reference_speaker_accepts_the_default_six_second_window(tmp_path, monkeypatch):

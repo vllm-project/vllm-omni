@@ -1210,6 +1210,8 @@ def _apply_platform_overrides(
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
     platform_section = (deploy.platforms or {}).get(platform) if platform is not None else None
+    if platform_section is not None and "connectors" in platform_section:
+        deploy.connectors = _merge_connectors(deploy.connectors, platform_section["connectors"])
     if platform_section is not None and "cuda_mps" in platform_section:
         cuda_mps = platform_section["cuda_mps"]
         if not isinstance(cuda_mps, bool):

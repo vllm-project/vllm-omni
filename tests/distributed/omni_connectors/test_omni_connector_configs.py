@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,35 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
 from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("platform", ["cuda", "npu", None])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_platform_connector_overrides_merge_without_mutating_input(monkeypatch, platform, legacy):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_name", platform)
+    connectors = {"shm": {"name": "SharedMemoryConnector", "extra": {"common": 1, "tuned": False}}}
+    stages = [
+        {"stage_id": 0, "output_connectors": {"to_stage_1": "shm"}},
+        {"stage_id": 1, "input_connectors": {"from_stage_0": "shm"}},
+    ]
+    config = (
+        {"runtime": {"connectors": connectors}, "stage_args": stages}
+        if legacy
+        else {
+            "connectors": connectors,
+            "stages": stages,
+        }
+    )
+    config["platforms"] = {"cuda": {"connectors": {"shm": {"extra": {"tuned": True}}}}}
+    original = deepcopy(config)
+    transfer = load_omni_transfer_config(config_dict=config)
+    spec = transfer.connectors[("0", "1")]
+    assert spec.name == "SharedMemoryConnector"
+    assert spec.extra["common"] == 1
+    assert spec.extra["tuned"] is (platform == "cuda")
+    assert config == original
 
 
 def get_config_files():

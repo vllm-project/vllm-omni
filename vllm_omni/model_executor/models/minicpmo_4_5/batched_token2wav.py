@@ -9,6 +9,7 @@ import math
 import time
 from collections import OrderedDict
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, cast
@@ -721,6 +722,31 @@ class BatchedToken2Wav(nn.Module):
             next_mel = torch.cat((old_mel[..., -(keep - chunk_mel.shape[2]) :], chunk_mel), dim=2)
         return speech, source, next_mel.detach()
 
+    def prefetch_prompt_cpu(self, prompt_cache_id: str, prompt_wav: str, workers: int) -> bool:
+        """Queue bounded CPU extraction; accelerator work stays on the caller."""
+        if workers <= 0 or torch.get_default_dtype() != torch.float32:
+            return False
+        key = (prompt_cache_id, prompt_wav)
+        if key in self._prompt_features:
+            return False
+        if not hasattr(self, "_cpu_prompt_futures"):
+            self._cpu_prompt_futures = {}
+            self._cpu_prompt_pool = ThreadPoolExecutor(max_workers=min(workers, 32))
+        if key in self._cpu_prompt_futures or len(self._cpu_prompt_futures) >= 32:
+            return False
+
+        def extract():
+            with torch.inference_mode():
+                if torch.get_default_dtype() != torch.float32:
+                    return None
+                return self._token2wav._prepare_prompt_cpu(prompt_wav)
+
+        self._cpu_prompt_futures[key] = self._cpu_prompt_pool.submit(extract)
+        if not getattr(self, "_cpu_prefetch_submitted_logged", False):
+            logger.debug("[CPU prefetch] queued reference features with %d workers", min(workers, 32))
+            self._cpu_prefetch_submitted_logged = True
+        return True
+
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
         cached = self._prompt_features.get(cache_key)
@@ -732,7 +758,15 @@ class BatchedToken2Wav(nn.Module):
             try:
                 torch.set_default_dtype(torch.float32)
                 with _autocast_disabled(self.speech_window.device):
-                    values = self._token2wav._prepare_prompt(prompt_wav)
+                    pending = getattr(self, "_cpu_prompt_futures", {}).pop(cache_key, None)
+                    cpu_features = pending.result() if pending is not None else None
+                    if cpu_features is None:
+                        values = self._token2wav._prepare_prompt(prompt_wav)
+                    else:
+                        values = self._token2wav._prepare_prompt(prompt_wav, cpu_features=cpu_features)
+                        if not getattr(self, "_cpu_prefetch_consumed_logged", False):
+                            logger.debug("[CPU prefetch] consumed background reference features")
+                            self._cpu_prefetch_consumed_logged = True
             finally:
                 torch.set_default_dtype(previous_dtype)
             cached = PromptFeatures(
@@ -747,6 +781,13 @@ class BatchedToken2Wav(nn.Module):
     def evict_prompt(self, prompt_cache_id: str, prompt_wav: str) -> None:
         """Release all cached artifacts associated with one prompt."""
         prompt_key = (prompt_cache_id, prompt_wav)
+        pending = getattr(self, "_cpu_prompt_futures", {}).pop(prompt_key, None)
+        if pending is not None and not pending.cancel():
+            # The caller may unlink the WAV immediately after eviction.
+            try:
+                pending.result()
+            except Exception:
+                logger.debug("Abandoned reference extraction failed", exc_info=True)
         self._prompt_features.pop(prompt_key, None)
         for setup_key in list(self._setup_cache):
             if setup_key[0] == prompt_key:
@@ -2042,6 +2083,47 @@ class BatchedToken2Wav(nn.Module):
                 while len(self._setup_cache) > self._setup_cache_size:
                     self._setup_cache.popitem(last=False)
         return [state] * batch_size
+
+    def setup_prompts(self, features: list[PromptFeatures], max_batch: int) -> list[BatchedToken2WavState]:
+        """Experimental equal-shape reference setup, preserving voice order."""
+        if max_batch < 1:
+            raise ValueError("max_batch must be positive")
+        states: list[BatchedToken2WavState | None] = [None] * len(features)
+        groups: dict[tuple, list[int]] = {}
+        for row, feature in enumerate(features):
+            key = self._setup_cache_key(feature)
+            cached = self._setup_cache.get(key)
+            if cached is not None:
+                self._setup_cache.move_to_end(key)
+                states[row] = cached
+            else:
+                signature = tuple(
+                    (tuple(t.shape[1:]), t.dtype, t.device)
+                    for t in (feature.speech_tokens, feature.speaker_embedding, feature.mels)
+                )
+                groups.setdefault(signature, []).append(row)
+        for rows in groups.values():
+            for start in range(0, len(rows), max_batch):
+                selected = rows[start : start + max_batch]
+                group = [features[row] for row in selected]
+                if len(group) == 1:
+                    created = self._create_initial_states(group[0], 1)
+                else:
+                    combined = PromptFeatures(
+                        cache_key=("", ""),
+                        speech_tokens=torch.cat([f.speech_tokens for f in group]),
+                        speaker_embedding=torch.cat([f.speaker_embedding for f in group]),
+                        mels=torch.cat([f.mels for f in group]),
+                    )
+                    created = self._create_initial_states(combined, len(group))
+                for row, state in zip(selected, created, strict=True):
+                    states[row] = state
+                    if self._setup_cache_size > 0:
+                        self._setup_cache[self._setup_cache_key(features[row])] = state
+                        while len(self._setup_cache) > self._setup_cache_size:
+                            self._setup_cache.popitem(last=False)
+        assert all(state is not None for state in states)
+        return cast(list[BatchedToken2WavState], states)
 
     @staticmethod
     def _fade_in_out(

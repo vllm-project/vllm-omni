@@ -2,14 +2,12 @@
 
 The default `minicpmo_4_5.yaml` selects MRv2 for all three CUDA stages
 and FlashAttention for the Talker. All three duplex stages keep
-`async_chunk: true`. The CUDA turn profiles use the same runner and Talker
-backend. They enable Thinker prefix caching and send its completed payload
-to the Talker. Both V1 and MRv2 restore cached Thinker outputs for the Talker. MRv2 uses
-the shared stage-output prefix cache to restore `latent`, `latent_input_ids`
-and `latent_positions` together before publishing the llm2tts payload. Changing
-the CUDA runner to V1 preserves the enabled cache. NPU, ROCm, XPU and MUSA keep
-their existing disabled overrides; duplex profiles also keep caching disabled
-because their mutable KV window cannot reuse prefix blocks.
+`async_chunk: true`. CUDA turn serving sends the completed Thinker payload
+to the Talker. Turn profiles inherit Thinker ngram speculation and disabled
+prefix caching. Both V1 and MRv2 can restore cached Thinker outputs when an
+overlay disables speculation and enables caching. MRv2 restores `latent`,
+`latent_input_ids` and `latent_positions` together. Duplex profiles keep
+caching disabled for their mutable KV window.
 
 The MRv2 output-cache opt-in requires an explicit `session_mode: turn` on
 the Thinker model config. A missing mode does not advertise output-cache
@@ -106,12 +104,23 @@ rounding and requires speech-quality and service validation; it is off by
 default and does not reduce the number of flow steps.
 
 `token2wav_spk_cuda_graph: true` opts the CUDA Torch CAM++ backend into
-exact-shape graph replay. It requires the Torch speaker backend and rejects
-CPU/NPU or TensorRT speaker configurations. Up to four feature shapes are
+exact-shape graph replay. CPU/NPU or TensorRT speaker configurations keep their
+selected backend and skip this option. Up to four feature shapes are
 captured without padding; additional shapes use the existing eager forward.
 Autocast or a changed precision policy also uses the eager path. Each replay
-returns an owned embedding. This option is off by default and does not expand
-the reference-audio cache or batch reference extraction.
+returns an owned embedding. The backend option is off by default; the shipped
+CUDA deployment enables it. It does not expand the reference-audio cache or
+batch reference extraction.
+
+`token2wav_s3_cuda_graph: true` opts CUDA Code2Wav into exact-shape replay
+of the S3 reference tokenizer. Non-CUDA tokenizers skip this option. CUDA replay
+requires the S3 `AudioEncoderV2` and keeps
+the pinned `s3tokenizer==0.3.0` encoder and quantizer without reimplementing
+their arithmetic. Up to two repeated shapes are
+captured; additional shapes run eagerly. Long references retain the library's
+sliding-window path. Replay owns its returned codes and lengths, and a changed
+precision policy uses the original eager encoder. The backend option is off by
+default; the shipped CUDA deployment enables it.
 
 ## Turn-mode conditioning transport
 
@@ -562,3 +571,66 @@ Local pre-commit and `git diff --check` passed. No NPU/ROCm hardware, CUDA C32,
 or full repository suite was run for this retention change. Higher retention
 keeps more idle reference features and temporary WAVs; active/pinned ownership
 and the CFM setup-cache capacity are unchanged.
+
+## Seed-TTS experimental optimization bundle
+
+`vllm_omni/deploy/minicpmo_4_5.yaml` reproduces the latest
+CUDA development configuration: Thinker ngram speculation, 16-frame Talker
+K-step, two Code2Wav replicas on one GPU, grouped reference setup of four,
+HiFT continuation shapes 3/43, speaker/S3 graph replay, and Flow FP16.
+The existing turn deployment inherits these defaults. Connector tuning is scoped
+to `platforms.cuda.connectors` in the existing YAML; other platforms retain their
+shared defaults, including FP32 Flow for NPU cross-reference CFM batching.
+Speaker replay also checks the selected backend, so CPU ONNX Runtime and
+TensorRT overrides remain usable. The development runs used private CUDA MPS
+on one L20X; the CUDA tuning is not qualified for other platforms.
+
+The runtime bundle includes:
+
+- Nonblocking transfer of the initial host codec history to the Talker device.
+- A CUDA single-row FP32 sampler that retains exponential noise generation and
+  division, and fuses argmax with probability validation. Invalid probabilities
+  still feed an asynchronous device assertion. CPU, unsupported layouts/dtypes
+  and widths outside 1–8192 retain native multinomial. Seeded token and generator
+  parity is tested for both eager execution and CUDA graph replay. This CUDA
+  K-step sampling path is active when Triton is available, including with the
+  default deployment; other sampling paths retain their implementation.
+- `ref_setup_batch_size` (backend default 1; deployment default 4): group equal-shaped reference features for
+  encoder/CFM setup, preserve voice order, separate output state ownership and
+  bounded setup-cache retention.
+- `token2wav_ref_cpu_prefetch_workers` (default 0): experimental CPU-only
+  reference extraction with at most 32 pending futures. Before materializing a
+  WAV, CPU submission shares the idle-prefetch pin limit of
+  `max(1, runtime_prompt_cache_size)` requests. A rejected submission releases
+  its pin and leaves reference preparation to chunk 0. GPU completion stays on
+  the caller thread. Eviction cancels queued work or waits for an active reader
+  before unlinking its WAV. Non-FP32 default dtype bypasses background work.
+  Four workers regressed the C16 screen, so the default profile
+  leaves this option disabled. Worker threads live for the backend lifetime.
+
+The full development evidence and rejected variants are recorded in
+[InferRSI #435](https://github.com/InferMatrixLab/InferRSI/pull/435).
+The unchecked sampler prototype is superseded by the checked implementation;
+unpadded reference processing and batched history commits were rejected and
+are not enabled here. The earlier per-batch CPU thread-pool prototype is
+superseded by the optional bounded prefetch implementation. Initial
+chunk size, idle-prefetch waiter count, capacity and replica-count sweeps use
+existing configuration controls, not additional runtime implementations.
+
+Latest development screen: 64 tuning requests per concurrency, two repetitions,
+with disjoint `2*C` warmup requests. All measured cells completed without request
+failures. Hardware: one L20X (143771 MiB), torch 2.14.0+cu130, vLLM 0.33.0,
+published s3tokenizer 0.3.0. Flow FP16 used the immediately preceding FP32 and
+engine controls from the same allocation; no new paired control was run.
+
+| Mean per-request RTF | C1 | C16 | C32 |
+| --- | ---: | ---: | ---: |
+| Checked sampler + grouped setup, FP32 | 0.06070 | 0.23153 | 0.33311 |
+| Same runtime + Flow FP16 | 0.06069 | 0.23159 | 0.30565 |
+| Independent engine, `b6a6cb1`, `track_s_fast_r16` | 0.06424 | 0.21633 | 0.26031 |
+
+The FP16 C32 result is 8.24% lower than that FP32 control; C16/C32 remain slower
+than the engine. WER, WavLM speaker similarity and UTMOS scores were collected,
+but formal quality non-inferiority and the held-out five-fresh-server-run gate
+remain pending. These tuning results do not establish final service acceptance,
+statistical significance, or an end-to-end gain attributable to every patch.

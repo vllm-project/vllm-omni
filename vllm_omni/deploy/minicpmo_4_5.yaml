@@ -89,12 +89,8 @@ connectors:
       # startup instead of the first request. Overlays that still set
       # cfm_graph_precapture_after_load get a warning; it no longer has any effect.
       cfm_graph_precapture_at_init: true
-      # Default CUDA speaker path: CPU-reference TensorRT, not full DiT TensorRT.
-      # Missing TensorRT falls back to the Torch speaker. Non-CUDA ignores the
-      # flag. Set false in an overlay to keep Torch. token2wav_trt /
-      # MINICPMO_TOKEN2WAV_TRT and token2wav_device_spk: false win when both
-      # are set.
-      token2wav_spk_cpu_reference: true
+      # Non-CUDA retains FP32 Flow (required for NPU cross-reference CFM).
+      # CUDA reference and flow tuning is scoped in platforms.cuda.connectors.
       token2wav_n_timesteps: 5
 
 stages:
@@ -104,11 +100,7 @@ stages:
     # The NPU block below overrides this with measured single-card budgets.
     gpu_memory_utilization: 0.55
     enforce_eager: false
-    # Thinker prefix caching stays off here: this profile serves duplex, whose
-    # KV window refuses the cache (duplex/window_kv.py). minicpmo_4_5_turn.yaml
-    # enables it for CUDA turn serving on both runners. Stage-0 n-gram
-    # speculation stays off either way -- the omni prefix cache refuses it next
-    # to enable_prefix_caching.
+    # Duplex requires the cache off; CUDA ngram speculation also excludes it.
     enable_prefix_caching: false
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
@@ -185,6 +177,20 @@ stages:
 platforms:
   cuda:
     model_runner: v2
+    connectors:
+      connector_of_shared_memory:
+        extra:
+          # Seed-TTS tuning; retain shared connector options on every platform.
+          hift_graph_continuation_frames: [3, 43]
+          hift_graph_capture_batch_sizes: [1, 2, 4, 8, 16]
+          token2wav_spk_cpu_reference: false
+          token2wav_spk_cuda_graph: true
+          token2wav_s3_cuda_graph: true
+          initial_codec_chunk_frames: 0
+          ref_setup_batch_size: 4
+          token2wav_float16: true
+          # Four-worker CPU prefetch regressed C16; keep it disabled.
+          token2wav_ref_cpu_prefetch_workers: 0
     # Private MPS for colocated CUDA stages. NPU does not read this block.
     # A missing or failing nvidia-cuda-mps-control daemon, parallel stage
     # init, or a stage that is not one numeric GPU disables MPS and continues. Set false
@@ -192,6 +198,13 @@ platforms:
     cuda_mps: true
     stages:
       - stage_id: 0
+        kv_cache_memory_bytes: 8589934592
+        enable_prefix_caching: false
+        speculative_config:
+          method: ngram
+          num_speculative_tokens: 7
+          prompt_lookup_min: 1
+          prompt_lookup_max: 4
         # Use native normalization for the CUDA duplex accuracy profile.
         # Keep Q/K normalization on this path by disabling its RoPE fusion.
         kernel_config:
@@ -212,16 +225,21 @@ platforms:
         attention_backend: FLASH_ATTN
         # Cover 16 full 4096-token requests while leaving room for Code2Wav.
         kv_cache_memory_bytes: 4294967296  # 4 GiB
-        # Seven continuation drafts reserve eight codec positions per step.
+        # Fifteen continuation drafts reserve sixteen codec positions per step.
         # K-step requires synchronous scheduling and the control stop ID.
         speculative_config:
           method: ngram
-          num_speculative_tokens: 7
+          num_speculative_tokens: 15
           prompt_lookup_min: 1
           prompt_lookup_max: 1
         async_scheduling: false
         default_sampling_params:
           stop_token_ids: [1]
+      - stage_id: 2
+        num_replicas: 2
+        devices: "0,0"
+        gpu_memory_utilization: 0.15
+        max_num_seqs: 8
 
   npu:
     # All three stages run MRv2. Same-card A/B (910B3 card 7, 2026-11-10,
