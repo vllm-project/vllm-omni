@@ -765,35 +765,30 @@ def test_moss_get_processor_places_audio_tokenizer_on_codec_stage_device(mocker)
     audio_tokenizer.to.assert_called_once()
 
 
-class _StrictMossProcessor:
-    """Like the checkpoint processors, rejects any loader kwarg but ``trust_remote_code``."""
-
-    @classmethod
-    def from_pretrained(cls, model: str, *, trust_remote_code: bool) -> "_StrictMossProcessor":
-        return cls()
-
-
 @pytest.mark.parametrize(
     ("model", "class_reference"),
     [
-        ("OpenMOSS-Team/MOSS-TTS", moss_processor_loading.MOSS_DELAY_PROCESSOR),
-        ("OpenMOSS-Team/MOSS-TTS-v1.5", moss_processor_loading.MOSS_DELAY_PROCESSOR),
-        ("OpenMOSS-Team/MOSS-TTSD-v1.0", moss_processor_loading.MOSS_DELAY_PROCESSOR),
-        ("OpenMOSS-Team/MOSS-SoundEffect", moss_processor_loading.MOSS_DELAY_PROCESSOR),
-        ("OpenMOSS-Team/MOSS-VoiceGenerator", moss_processor_loading.MOSS_DELAY_PROCESSOR),
-        ("OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5", moss_processor_loading.MOSS_LOCAL_PROCESSOR),
+        ("OpenMOSS-Team/MOSS-TTS", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-TTS-v1.5", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-TTSD-v1.0", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-SoundEffect", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-VoiceGenerator", "processing_moss_tts.MossTTSDelayProcessor"),
+        ("OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5", "processing_moss_tts.MossTTSLocalProcessor"),
     ],
 )
 def test_moss_get_processor_loads_checkpoint_class_not_auto_processor(mocker, model, class_reference):
-    # AutoProcessor hands the checkpoint loaders a ``revision`` kwarg they reject (#9717).
+    # AutoProcessor passes these checkpoints a ``revision`` kwarg that they reject (#9717).
     adapter = _moss_adapter_with_stage_configs([], mocker, model=model)
     auto_processor = mocker.patch("transformers.AutoProcessor.from_pretrained")
-    class_lookup = mocker.patch.object(
-        moss_processor_loading, "get_class_from_dynamic_module", return_value=_StrictMossProcessor
-    )
+    class_lookup = mocker.patch.object(moss_processor_loading, "get_class_from_dynamic_module")
+    checkpoint_from_pretrained = class_lookup.return_value.from_pretrained
+    processor = object()
+    checkpoint_from_pretrained.return_value = processor
 
-    assert isinstance(adapter._get_moss_processor(), _StrictMossProcessor)
+    assert adapter._get_moss_processor() is processor
     class_lookup.assert_called_once_with(class_reference, model)
+    # Any other kwarg would reach ProcessorMixin.__init__ through the checkpoint's from_pretrained.
+    checkpoint_from_pretrained.assert_called_once_with(model, trust_remote_code=True)
     auto_processor.assert_not_called()
 
 
