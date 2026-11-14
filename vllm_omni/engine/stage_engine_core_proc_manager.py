@@ -20,6 +20,7 @@ Liveness monitoring and shutdown are inherited from
 from __future__ import annotations
 
 import contextlib
+import copy
 import threading
 import weakref
 from multiprocessing.process import BaseProcess
@@ -43,6 +44,24 @@ logger = init_logger(__name__)
 # guard at the call-site (vllm_config is not None and ... is not None)
 # skips the call transparently.
 set_device_control_env_var = None
+
+
+def _with_stage_numa_nodes(vllm_config: VllmConfig) -> VllmConfig:
+    """Return a config whose auto-detected NUMA nodes match this stage's devices.
+
+    vLLM detects the GPU NUMA nodes once per process and writes them into the
+    parallel config. Omni spawns every stage and replica from one process, each
+    under its own device visibility, and replicas of a stage share one config,
+    so each spawn detects again and keeps the result on a private copy.
+    """
+    parallel_config = vllm_config.parallel_config
+    if not parallel_config.numa_bind or parallel_config.numa_bind_nodes is not None:
+        return vllm_config
+    numa_utils.get_auto_numa_nodes.cache_clear()
+    stage_config = copy.copy(vllm_config)
+    stage_config.parallel_config = copy.copy(parallel_config)
+    stage_config.parallel_config.numa_bind_nodes = numa_utils.get_auto_numa_nodes()
+    return stage_config
 
 
 class StageEngineCoreProcManager(CoreEngineProcManager):
@@ -89,6 +108,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         # shutdown raise AttributeError, which leaves the engine core
         # subprocesses alive and hangs interpreter exit until the job timeout.
         self._request_shutdown_timeout = vllm_config.shutdown_timeout
+        vllm_config = _with_stage_numa_nodes(vllm_config)
 
         context = get_mp_context()
         common_kwargs: dict[str, object] = {

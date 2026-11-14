@@ -6,6 +6,7 @@ from multiprocessing.process import BaseProcess
 
 import pytest
 from vllm.config import ParallelConfig, VllmConfig
+from vllm.platforms import current_platform
 from vllm.utils import numa_utils
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
@@ -32,6 +33,7 @@ def spawn_boundary(mocker, monkeypatch):
     def make_process(**kwargs):
         process = mocker.Mock(spec=BaseProcess)
         process.exitcode = None
+        process.child_kwargs = kwargs["kwargs"]
         process.start.side_effect = lambda: observed.append(
             {
                 "stage": kwargs["kwargs"]["omni_stage_id"],
@@ -47,7 +49,23 @@ def spawn_boundary(mocker, monkeypatch):
     return observed
 
 
-def start_manager(executor_class, *, stage_id, cpus, numa_bind=True, dp_size=1, tp_size=1):
+@pytest.fixture
+def auto_numa(monkeypatch):
+    """Detect two GPUs per NUMA node through the visibility a stage spawns under."""
+    monkeypatch.setattr(numa_utils, "_is_auto_numa_available", lambda: True)
+    monkeypatch.setattr(numa_utils, "_maybe_get_pct_cpu_binding", lambda numa_nodes: None)
+    monkeypatch.setattr(
+        current_platform,
+        "get_all_device_numa_nodes",
+        lambda: [int(device) // 2 for device in os.environ["CUDA_VISIBLE_DEVICES"].split(",")],
+        raising=False,
+    )
+    numa_utils.get_auto_numa_nodes.cache_clear()
+    yield
+    numa_utils.get_auto_numa_nodes.cache_clear()
+
+
+def make_config(executor_class, *, cpus=None, numa_bind=True, dp_size=1, tp_size=1, auto_nodes=False):
     # No model is constructed: the manager consumes only these config fields.
     config = VllmConfig.__new__(VllmConfig)
     config.parallel_config = ParallelConfig(
@@ -56,10 +74,16 @@ def start_manager(executor_class, *, stage_id, cpus, numa_bind=True, dp_size=1, 
         distributed_executor_backend="mp" if executor_class is MultiprocExecutor else "uni",
         data_parallel_size=dp_size,
         numa_bind=numa_bind,
-        numa_bind_nodes=[0] * max(dp_size, 2) if numa_bind else None,
+        numa_bind_nodes=[0] * max(dp_size, 2) if numa_bind and not auto_nodes else None,
         numa_bind_cpus=cpus if numa_bind else None,
     )
     config.shutdown_timeout = 5.0
+    return config
+
+
+def start_manager(executor_class, *, stage_id, cpus=None, numa_bind=True, dp_size=1, tp_size=1, config=None):
+    if config is None:
+        config = make_config(executor_class, cpus=cpus, numa_bind=numa_bind, dp_size=dp_size, tp_size=tp_size)
     manager = module.StageEngineCoreProcManager(
         local_engine_count=dp_size,
         start_index=0,
@@ -73,6 +97,7 @@ def start_manager(executor_class, *, stage_id, cpus, numa_bind=True, dp_size=1, 
     )
     # Fake processes need no finalizer; all patches are fixture-scoped.
     manager._finalizer.detach()
+    return manager
 
 
 @pytest.mark.parametrize("executor_class", [UniProcExecutor, CustomUniProcExecutor])
@@ -108,3 +133,34 @@ def test_in_process_binding_restores_the_parent_environment(spawn_boundary, monk
     assert spawn_boundary[0]["binding"] == "--physcpubind=2 --membind=0"
     assert os.environ[numa_utils._NUMACTL_ARGS_ENV] == "--cpunodebind=1"
     assert os.environ[numa_utils._NUMACTL_PYTHON_EXECUTABLE_ENV] == "/parent/python"
+
+
+@pytest.mark.parametrize("executor_class", [UniProcExecutor, MultiprocExecutor])
+def test_auto_numa_nodes_follow_each_stage_devices(spawn_boundary, auto_numa, monkeypatch, executor_class):
+    managers = []
+    for stage_id, devices in [(0, "0"), (1, "2")]:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", devices)
+        config = make_config(executor_class, auto_nodes=True)
+        managers.append(start_manager(executor_class, stage_id=stage_id, config=config))
+
+    assert [spawn["binding"] for spawn in spawn_boundary] == [
+        "--cpunodebind=0 --membind=0",
+        "--cpunodebind=1 --membind=1",
+    ]
+    # A multiprocess stage binds its workers from the nodes its EngineCore receives.
+    child_configs = [manager.processes[0].child_kwargs["vllm_config"] for manager in managers]
+    assert [config.parallel_config.numa_bind_nodes for config in child_configs] == [[0], [1]]
+
+
+@pytest.mark.parametrize("executor_class", [UniProcExecutor, MultiprocExecutor])
+def test_replicas_sharing_a_config_detect_their_own_numa_nodes(spawn_boundary, auto_numa, monkeypatch, executor_class):
+    config = make_config(executor_class, auto_nodes=True)
+    for devices in ["0", "2"]:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", devices)
+        start_manager(executor_class, stage_id=0, config=config)
+
+    assert [spawn["binding"] for spawn in spawn_boundary] == [
+        "--cpunodebind=0 --membind=0",
+        "--cpunodebind=1 --membind=1",
+    ]
+    assert config.parallel_config.numa_bind_nodes is None
