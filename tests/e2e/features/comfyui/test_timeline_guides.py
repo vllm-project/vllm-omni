@@ -45,6 +45,7 @@ PLUGIN_DIR = Path(__file__).resolve().parents[4] / "apps" / "ComfyUI-vLLM-Omni"
 GUIDE_WORKFLOW = PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Timeline Guides.json"
 SCHEMA_COMPLETE_WORKFLOWS = {
     GUIDE_WORKFLOW,
+    PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Character Replacement.json",
     PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 All-in-One.json",
     PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Music Video.json",
 }

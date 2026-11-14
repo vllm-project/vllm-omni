@@ -1537,6 +1537,11 @@ class TestRunner:
         monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _FakeLoader)
         monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _FakeProfiler)
         monkeypatch.setattr(
+            model_runner_module.current_omni_platform,
+            "init_diffusion_model_runner_runtime",
+            MagicMock(return_value=None),
+        )
+        monkeypatch.setattr(
             model_runner_module,
             "enable_offload_backend",
             lambda _config, pipeline, **_kwargs: (pipeline, None),
