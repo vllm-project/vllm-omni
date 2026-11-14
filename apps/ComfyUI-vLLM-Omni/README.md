@@ -371,6 +371,15 @@ model. Neither replaces a real-model run: generate against H3, save with
 `ffprobe -v error -count_frames -show_streams -show_format -of json "$OUTPUT"`
 and `ffmpeg -v error -i "$OUTPUT" -f null -`, and watch and listen to it.
 
+#### H3 multiframe reference (WF-04)
+
+The [MiniMax-H3 Multiframe Reference](example_workflows/vLLM-Omni%20MiniMax-H3%20Multiframe%20Reference.json)
+template recreates the official ComfyUI Multiframe Reference workflow remotely:
+one image goes to **Video References** as `<Picture 1>`, and three images are
+chained as timeline guides at frames 36, 72 and 120 (1.5 s, 3.0 s and 5.0 s) of
+a 124-frame, 24 FPS Ref2VA clip. See the [workflow guide](docs/minimax-h3-multiframe.md)
+for inputs, the prompt adaptation and validation.
+
 ### TTS (e.g., Qwen TTS series)
 
 (Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni TTS**)
