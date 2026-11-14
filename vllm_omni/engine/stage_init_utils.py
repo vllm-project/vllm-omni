@@ -44,6 +44,7 @@ from vllm_omni.config.omni_config import (
     _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS,
     _DIFFUSION_SCHEDULER_STAGE_ENGINE_FIELD_MAP,
     _LOAD_STAGE_ENGINE_FIELD_MAP,
+    _LORA_CONFIG_ENGINE_FIELD_MAP,
     _PARALLEL_CONFIG_ENGINE_FIELD_MAP,
     _SCHEDULER_STAGE_ENGINE_FIELD_MAP,
     BaseVllmOmniStageConfig,
@@ -1253,6 +1254,9 @@ def _project_omni_stage_engine_args(
                 _PARALLEL_CONFIG_ENGINE_FIELD_MAP,
             )
         )
+        if stage_config.lora_config is not None:
+            engine_args["enable_lora"] = True
+            engine_args.update(_project_upstream_config_fields(stage_config.lora_config, _LORA_CONFIG_ENGINE_FIELD_MAP))
 
     quantization_config = stage_config.quantization_config
     if quantization_config is not None:
@@ -2121,6 +2125,9 @@ def initialize_diffusion_stage(
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
+    # Startup-only carrier: the manager retains ownership and the executor
+    # removes this registry before od_config is serialized in request RPCs.
+    setattr(od_config, "_sharing_worker_registry", getattr(stage_cfg, "_sharing_worker_registry", None))
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, use_inline)
 
 

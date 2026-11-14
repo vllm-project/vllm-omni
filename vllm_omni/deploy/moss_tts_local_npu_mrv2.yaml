@@ -1,0 +1,8 @@
+# MOSS-TTS-Local-Transformer-v1.5 on Ascend NPU: both stages on MRV2.
+# Opt-in: select with --deploy-config (vllm-omni#9446).
+# Inherits the NPU codec graph configuration from moss_tts_local.yaml.
+base_config: moss_tts_local.yaml
+
+platforms:
+  npu:
+    model_runner: v2

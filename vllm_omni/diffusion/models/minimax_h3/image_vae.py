@@ -29,6 +29,8 @@ from safetensors.torch import load_file
 from torch import nn
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from vllm_omni.platforms import current_omni_platform
+
 MINIMAX_H3_IMAGE_VAE_RATIO = 16
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -522,7 +524,11 @@ class MiniMaxH3ImageVAE(nn.Module):
             dist.broadcast(raw, src=dist.get_global_rank(group, 0), group=group)
         self.prepare_decoder_weights(torch.bfloat16)
         decode_tile = self._decode_tile
-        if use_cuda_graph and raw.device.type == "cuda":
+        if (
+            use_cuda_graph
+            and current_omni_platform.is_cuda_alike()
+            and raw.device.type == current_omni_platform.device_type
+        ):
             if getattr(self, "_decode_graphs", None) is None:
                 self._decode_graphs = _TileGraphs(self._decode_tile, autocast_dtype=torch.bfloat16)
             decode_tile = self._decode_graphs

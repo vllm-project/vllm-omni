@@ -188,6 +188,10 @@ class PreparedRequest:
     tts_params: dict[str, Any] = field(default_factory=dict)
     model_type: str = "generic"
     output_policy: OutputPolicy = field(default_factory=OutputPolicy)
+    #: Additional complete prompts, executed in order after ``prompt``. Only
+    #: non-streaming audio without word timestamps supports this path.
+    additional_prompts: list[dict[str, Any]] = field(default_factory=list)
+    segment_silence_ms: int = 200
 
 
 @dataclass

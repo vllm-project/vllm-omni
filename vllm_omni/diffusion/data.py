@@ -295,11 +295,12 @@ class DiffusionParallelConfig:
     """
 
     ulysses_a2a_permute: bool = False
-    """Use fused permute-free all-to-all for eligible strict Ulysses exchanges.
+    """Use platform symmetric memory for eligible strict Ulysses exchanges.
 
-    Uses platform symmetric memory on CUDA and NPU. NPU currently requires
-    eager inference and pure Ulysses over WORLD in one HCCS domain, with
-    TorchNPU's NPUSHMEM allocator, Triton-Ascend and a symmetric-memory runtime.
+    On CUDA, enables CE (copy engines) on a single NVLink-connected node;
+    when disabled, Ulysses uses NCCL. NPU retains its eager, pure Ulysses
+    implementation over WORLD in one HCCS domain, using TorchNPU's NPUSHMEM
+    allocator, Triton-Ascend and a symmetric-memory runtime.
     """
 
     cfg_parallel_size: int = 1
@@ -1170,6 +1171,11 @@ class OmniDiffusionConfig:
     # does not enable FP8 by itself; it only selects CUTLASS once the checkpoint
     # has already resolved to vLLM's ModelOpt FP8 linear method.
     force_cutlass_fp8: bool = False
+    # FlashInfer autotune for diffusion GEMMs: the first request of each new shape runs in FlashInfer's tune mode
+    # and later ones reuse the tactics, cached per rank across restarts. Without it the stage keeps FlashInfer's
+    # heuristic tactics, because vLLM autotunes FlashInfer only in its LLM worker warm-up. None (default) = auto:
+    # on for CUDA SM100+ with FlashInfer installed; True / False force it. The first request of a new shape is slower.
+    diffusion_flashinfer_autotune: bool | None = None
 
     # Runtime diffusion attention method (not vLLM's --kv-cache-dtype for AR models).
     # None/"auto" keeps native dtype; other values are validated by the selected backend.
@@ -1183,6 +1189,13 @@ class OmniDiffusionConfig:
 
     # Diffusion pipeline Profiling config
     enable_diffusion_pipeline_profiler: bool = False
+
+    # Mixed-resolution batch packing (MixFusion). Server-level default for the
+    # scheduler shape-relaxation and the pipeline ragged-latent pass; requests
+    # can still opt in/out per-request via extra_args.
+    enable_mixfusion: bool = False
+    mixfusion_min_chunk_tokens: int = 256
+    mixfusion_max_chunks: int = 128
 
     # Step mode settings
     step_execution: bool = False

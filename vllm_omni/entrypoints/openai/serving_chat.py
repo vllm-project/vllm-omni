@@ -52,6 +52,7 @@ from vllm_omni.metrics.modality import (
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 from vllm_omni.model_extras import (
     build_text_to_image_prompt,
+    get_ar_max_tokens_builder,
     get_extra_body_params,
     get_extra_output_params,
     should_init_extra_args_for_non_diffusion_stages,
@@ -541,6 +542,35 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             self._multistage_model_class_name = model_class_name
         return model_class_name
 
+    def _cap_ar_stage_max_tokens(
+        self,
+        engine: AsyncOmni,
+        sampling_params_list: list[Any],
+        ar_idx: int | None,
+        height: int | None,
+        width: int | None,
+        is_i2i: bool = False,
+    ) -> None:
+        """Cap a multistage request's AR-stage ``max_tokens`` at the model's grid budget.
+
+        Models whose AR stage emits a size-dependent token count (GLM-Image:
+        preview + target + 1, the count the reference implementation truncates
+        at) declare an ``ar_max_tokens_builder``. Calling it here matches the
+        reference's truncation budget, so generation stops at the grid's token
+        count instead of running to the deploy-YAML ceiling. A size-less
+        request is capped at the model's default grid budget — the builder
+        resolves the absent size itself. Models without a builder keep their
+        configured ceiling.
+        """
+        if ar_idx is None or ar_idx >= len(sampling_params_list):
+            return
+        builder = get_ar_max_tokens_builder(self._resolve_multistage_model_class_name(engine))
+        if builder is None:
+            return
+        sp = sampling_params_list[ar_idx]
+        if hasattr(sp, "max_tokens"):
+            sp.max_tokens = builder(height, width, is_i2i=is_i2i)
+
     def _normalize_diffusion_request_args(
         self,
         request: ChatCompletionRequest,
@@ -927,10 +957,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # Store height/width for applying to diffusion stage sampling params later
                 _image_gen_height = height
                 _image_gen_width = width
+                _image_gen_is_i2i = is_img2img
             except Exception as e:
                 logger.warning("Failed to build image-generation prompt for omni multistage: %s", e)
                 _image_gen_height = None
                 _image_gen_width = None
+                _image_gen_is_i2i = False
         elif request.modalities and ("text" in request.modalities) and is_single_stage_diffusion(self.engine_client):
             # Single-stage diffusion text output (img2text / text2text).
             # Build a diffusion-style prompt with modalities=["text"] so the
@@ -958,9 +990,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logger.warning("Failed to build text-output prompt for single-stage diffusion: %s", e)
             _image_gen_height = None
             _image_gen_width = None
+            _image_gen_is_i2i = False
         else:
             _image_gen_height = None
             _image_gen_width = None
+            _image_gen_is_i2i = False
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
@@ -989,15 +1023,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         request.modalities,
                     )
 
+                # The AR stage index does not depend on the request size;
+                # only the extra_args write below does. Size-less multistage
+                # requests still cap their AR budget — the registered
+                # builder resolves the absent size to the model's default
+                # grid. Single-stage engines have no AR stage to cap.
+                # Multi-stage pipelines that mark no comprehension stage get
+                # None, which the AR cap treats as a no-op.
                 comprehension_idx = (
-                    self._get_comprehension_stage_index()
-                    if _image_gen_height is not None and _image_gen_width is not None
-                    else None
+                    None
+                    if is_single_stage_diffusion(self.engine_client)
+                    else self._find_comprehension_stage_index(self.engine_client.stage_configs)
                 )
                 self._apply_text_chat_ar_task_mode(sampling_params_list, request)
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
-                    if idx == comprehension_idx:
+                    has_image_size = _image_gen_height is not None and _image_gen_width is not None
+                    if idx == comprehension_idx and has_image_size:
                         extra_args = dict(getattr(sp, "extra_args", {}) or {})
                         extra_args["target_h"] = int(_image_gen_height)
                         extra_args["target_w"] = int(_image_gen_width)
@@ -1021,6 +1063,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             self._get_diffusion_extra_body_params(),
                             extra_body,
                         )
+
+                # GLM-Image-style AR stages stop at the grid's exact token
+                # budget instead of running every request to the deploy-YAML
+                # max_tokens ceiling (see _cap_ar_stage_max_tokens).
+                self._cap_ar_stage_max_tokens(
+                    self.engine_client,
+                    sampling_params_list,
+                    comprehension_idx,
+                    _image_gen_height,
+                    _image_gen_width,
+                    is_i2i=_image_gen_is_i2i,
+                )
 
                 self._log_inputs(
                     request_id,
@@ -1488,14 +1542,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return new_messages
 
-    def _get_comprehension_stage_index(self) -> int:
-        for idx, stage in enumerate(self.engine_client.stage_configs):
+    @staticmethod
+    def _find_comprehension_stage_index(stage_configs: Sequence[Any]) -> int | None:
+        """Return the first ``is_comprehension`` stage index, or None if no stage is marked."""
+        for idx, stage in enumerate(stage_configs):
             is_comprehension = (
-                stage.get("is_comprehension", False) if isinstance(stage, Mapping) else stage.is_comprehension
+                stage.get("is_comprehension", False)
+                if isinstance(stage, Mapping)
+                else getattr(stage, "is_comprehension", False)
             )
             if is_comprehension:
                 return idx
-        raise ValueError("No comprehension stage (is_comprehension=True) found in stage configs")
+        return None
+
+    def _get_comprehension_stage_index(self) -> int:
+        idx = self._find_comprehension_stage_index(self.engine_client.stage_configs)
+        if idx is None:
+            raise ValueError("No comprehension stage (is_comprehension=True) found in stage configs")
+        return idx
 
     # OpenAI API standard sampling parameters that can be safely overridden.
     # These are the most commonly used parameters with compatible types
@@ -1617,7 +1681,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             List of SamplingParams, one for each stage.
         """
         default_params_list = self.engine_client.default_sampling_params_list
-        comprehension_idx = self._get_comprehension_stage_index()
+        # Without a comprehension stage every stage keeps its YAML defaults.
+        comprehension_idx = self._find_comprehension_stage_index(self.engine_client.stage_configs)
 
         sampling_params_list = []
         for idx, default_params in enumerate(default_params_list):
@@ -3441,11 +3506,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if engine_prompt_data is not None:
             engine_prompt["multi_modal_data"] = engine_prompt_data
 
-        comprehension_idx = None
-        for idx, stage in enumerate(stage_configs):
-            if getattr(stage, "is_comprehension", False):
-                comprehension_idx = idx
-                break
+        comprehension_idx = self._find_comprehension_stage_index(stage_configs)
 
         sampling_params_list = build_stage_sampling_params_list(
             stage_configs,
@@ -3461,6 +3522,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if stage_type == "llm" and ar_stop_token_ids is not None:
                 setattr(default_stage_params, "stop_token_ids", ar_stop_token_ids)
 
+            # A prompt-grid budget (below) is request-specific; the builder
+            # cap later in this iteration only applies when it did not fire.
+            ar_budget_applied = False
             if stage_type == "llm" and idx == 0 and ar_prompt_info is not None:
                 if should_init_extra_args_for_non_diffusion_stages(model_class_name):
                     extra_args = getattr(default_stage_params, "extra_args", None)
@@ -3480,6 +3544,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 ar_grid_budget = ar_grid_max_tokens(ar_width, ar_height)
                 if ar_grid_budget is not None and hasattr(default_stage_params, "max_tokens"):
                     default_stage_params.max_tokens = ar_grid_budget
+                    ar_budget_applied = True
+
+            # GLM-Image-style AR stages stop at the grid's exact token budget
+            # instead of running every request to the deploy-YAML max_tokens
+            # ceiling (see _cap_ar_stage_max_tokens). Skipped when the
+            # prompt-grid budget above already set one.
+            if not ar_budget_applied:
+                self._cap_ar_stage_max_tokens(
+                    engine,
+                    sampling_params_list,
+                    idx if stage_type == "llm" and idx == 0 else None,
+                    height,
+                    width,
+                    is_i2i=bool(reference_images),
+                )
 
             if (
                 comprehension_idx is not None

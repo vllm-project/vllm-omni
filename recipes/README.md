@@ -95,6 +95,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`MiniMaxAI/MiniMax-H3-Image-AMD.md`](./MiniMaxAI/MiniMax-H3-Image-AMD.md) | Six-step text-to-image and image editing HTTP serving | 1x–8x AMD Instinct MI325X or MI350X (measured) |
 | [`MiniMaxAI/MiniMax-H3-Spark-GB10.md`](./MiniMaxAI/MiniMax-H3-Spark-GB10.md) | MiniMax H3 T2VA and Ref2VA on DGX Spark | 1x or 2x DGX Spark (GB10) |
 | [`MiniMaxAI/MiniMax-H3-MUSA.md`](./MiniMaxAI/MiniMax-H3-MUSA.md) | MiniMax H3 T2VA, FL2VA, and Ref2VA on MUSA | 4x MTT S5000 (TP4 Ref2VA profile) |
+| [`MiniMaxAI/MiniMax-H3-Image-4090.md`](./MiniMaxAI/MiniMax-H3-Image-4090.md) | MiniMax-H3-Image text-to-image serving with layerwise offload | 1x RTX 4090 24GB (community deployment) |
 | [`MiniMaxAI/MiniMax-H3-Image-H200.md`](./MiniMaxAI/MiniMax-H3-Image-H200.md) | MiniMax-H3-Image text-to-image and reference editing | 1x (offload), 2x or 4x H200 141GB (measured) |
 | [`MiniMaxAI/MiniMax-H3-Image-H100.md`](./MiniMaxAI/MiniMax-H3-Image-H100.md) | MiniMax-H3-Image text-to-image and reference editing | 1x or 2x with DLO, 4x H100 80GB (configuration-only) |
 | [`MiniMaxAI/MiniMax-H3-Image-B200.md`](./MiniMaxAI/MiniMax-H3-Image-B200.md) | MiniMax-H3-Image text-to-image and reference editing | 1x, 2x or 4x B200 180GB (configuration-only) |
