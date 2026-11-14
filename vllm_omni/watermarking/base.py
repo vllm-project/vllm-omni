@@ -10,6 +10,7 @@ from typing import ClassVar, Generic, TypeVar
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.sample_rate import get_sampling_rate
 from vllm_omni.watermarking.types import AudioTensor
 
 logger = init_logger(__name__)
@@ -60,9 +61,10 @@ class Watermarker(ABC, Generic[MediaT, RequestStateT]):
         metadata: Mapping[str, object],
     ) -> torch.Tensor:
         """Watermark a generated tensor using its output metadata."""
-        # NOTE: We currently have a layer of canonicalization in the watermarker
-        # to ensure formats are standardized. This is arguable the wrong place to do
-        # this in the long term (i.e., the output format of models should be consistent).
+        # NOTE: Metadata canonicalization (e.g. resolving the sampling rate,
+        # including legacy spellings) lives in vllm_omni.sample_rate so every
+        # consumer resolves model outputs the same way. Models standardize on
+        # SAMPLE_RATE_KEY to shrink that shim over time.
         std_tensor = self._from_output(data, metadata)
         wm_tensor = self.watermark(request_id, std_tensor)
         return self._to_output(wm_tensor)
@@ -151,15 +153,13 @@ class AudioWatermarkerBase(Watermarker[AudioTensor, _AudioRequestState[AudioImpl
     supports_stereo: ClassVar[bool]
 
     def _from_output(self, data: torch.Tensor, metadata: Mapping[str, object]) -> AudioTensor:
-        """Attach the sampling rate to the generated audio."""
-        sample_rate = metadata.get("sr")
-        if isinstance(sample_rate, torch.Tensor):
-            if sample_rate.numel() != 1:
-                raise ValueError("audio sample rate must be scalar")
-            sample_rate = sample_rate.item()
-        if isinstance(sample_rate, bool) or not isinstance(sample_rate, int):
-            raise TypeError("audio output requires integer 'sr' metadata")
-        return AudioTensor(data, sample_rate)
+        """Attach the sampling rate, resolved via :func:`get_sampling_rate`.
+
+        Missing/invalid rates raise :class:`SampleRateError` (a
+        ``ValueError``); ``watermark_media`` wraps it into
+        :class:`WatermarkFailureError`.
+        """
+        return AudioTensor(data, get_sampling_rate(metadata))
 
     def _to_output(self, data: AudioTensor) -> torch.Tensor:
         """Return the watermarked audio samples."""

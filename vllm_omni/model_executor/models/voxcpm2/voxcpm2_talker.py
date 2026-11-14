@@ -41,6 +41,7 @@ from vllm.sequence import IntermediateTensors
 
 import vllm_omni.platforms as omni_platform
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
@@ -1051,6 +1052,17 @@ def _resolve_cfg_value(config_value: float) -> float:
     return value
 
 
+def _resolve_output_sample_rate(native_tts: nn.Module) -> int:
+    """The rate the emitted waveform is actually decoded at.
+
+    The AudioVAE is conditioned on its own ``out_sample_rate`` at decode time
+    (see ``_get_vae_decode_sr_cond``), so that — not the top-level config's
+    ``sample_rate``, which describes the reference/input side and can
+    disagree — is the rate the talker must advertise.
+    """
+    return int(native_tts.audio_vae.out_sample_rate)
+
+
 class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1113,7 +1125,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         _install_dtype_aware_encode(self._tts, self._vae_dtype)
         self._patch_size = self._tts.patch_size
         self._feat_dim = self._tts.feat_dim
-        self._sample_rate = getattr(self.config, "sample_rate", 48000)
+        self._sample_rate = _resolve_output_sample_rate(self._tts)
 
         # base_lm/residual_lm in native tts_model duplicate self.model and
         # self.residual_model: copy residual weights over, drop both submodules.
@@ -3877,7 +3889,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 else:
                     audio_by_req[req_id] = audio
             if audio_by_req:
-                sr = torch.tensor(self._sample_rate, dtype=torch.int32)
                 if self._uses_sparse_audio_outputs():
                     ready_req_ids = list(audio_by_req)
                     chunks = [audio_by_req[req_id].reshape(-1) for req_id in ready_req_ids]
@@ -3890,7 +3901,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                         mm["model_outputs"] = list(merged_cpu.split(sizes))
                     else:
                         mm["model_outputs"] = chunks
-                    mm["sr"] = [sr for _ in ready_req_ids]
+                    mm[SAMPLE_RATE_KEY] = make_sample_rate_tensors(self._sample_rate, len(ready_req_ids))
                     mm["meta"] = {"req_id": ready_req_ids, "sparse_audio": ["1"]}
                 elif self._coalesce_audio_d2h and any(
                     audio.device.type == omni_platform.current_omni_platform.device_type
@@ -3902,7 +3913,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     merged = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
                     merged_cpu = merged.detach().cpu().float()
                     mm["model_outputs"] = list(merged_cpu.split(sizes))
-                    mm["sr"] = [sr for _ in ready_req_ids]
+                    mm[SAMPLE_RATE_KEY] = make_sample_rate_tensors(self._sample_rate, len(ready_req_ids))
                     # Dense mode still yields a strict SUBSET of the batch when
                     # some requests emit no audio this step (e.g. prefill
                     # phase). Without the marker the runner indexes these
@@ -3912,12 +3923,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     mm["meta"] = {"req_id": ready_req_ids, "sparse_audio": ["1"]}
                 else:
                     mm["model_outputs"] = list(audio_by_req.values())
-                    mm["sr"] = [sr for _ in audio_by_req]
+                    mm[SAMPLE_RATE_KEY] = make_sample_rate_tensors(self._sample_rate, len(audio_by_req))
                     # Same subset hazard as the coalesce branch above.
                     mm["meta"] = {"req_id": list(audio_by_req), "sparse_audio": ["1"]}
             elif self._uses_sparse_audio_outputs():
                 mm["model_outputs"] = []
-                mm["sr"] = []
+                mm[SAMPLE_RATE_KEY] = []
                 mm["meta"] = {"req_id": [], "sparse_audio": ["1"]}
             self._audio_queue.clear()
 

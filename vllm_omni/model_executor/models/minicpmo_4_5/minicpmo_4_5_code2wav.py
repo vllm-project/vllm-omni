@@ -24,6 +24,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 from vllm_omni.utils.device_copy import to_device_nonblocking
 
 from .batched_token2wav import (
@@ -1214,14 +1215,17 @@ class MiniCPMO45Code2Wav(nn.Module):
         ids = input_ids if isinstance(input_ids, torch.Tensor) else torch.empty(0, dtype=torch.long)
         segments = self._split_segments(ids, kwargs.get("seq_token_counts"))
         empty = torch.empty(0, dtype=torch.float32, device=ids.device)
-        sample_rate = torch.tensor(24000, dtype=torch.int32)
         if not runtime_additional_information:
             count = len(segments)
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
                     "model_outputs": [empty for _ in range(count)],
-                    "sr": [sample_rate for _ in range(count)],
+                    # The token2wav stage runs at `_REF_TARGET_SAMPLE_RATE`
+                    # (its loader resamples reference audio to it and the
+                    # vocoder emits at it), so the rate is derived, not a
+                    # fresh literal.
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(_REF_TARGET_SAMPLE_RATE, count),
                 },
             )
         if len(runtime_additional_information) != len(segments):
@@ -1561,12 +1565,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                 self._states.pop(request_id, None)
             else:
                 self._states[request_id] = state
-        sample_rate_tensor = torch.as_tensor(sample_rate, dtype=torch.int32)
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={
                 "model_outputs": outputs,
-                "sr": [sample_rate_tensor.clone() for _ in outputs],
+                # Same stage operating rate as the warmup path above.
+                SAMPLE_RATE_KEY: make_sample_rate_tensors(_REF_TARGET_SAMPLE_RATE, len(outputs)),
                 # Generation runner wire payloads are flat and tensor-only.
                 # Dotted metadata keys are unflattened again by the output
                 # processor before the full-duplex data plane consumes them.

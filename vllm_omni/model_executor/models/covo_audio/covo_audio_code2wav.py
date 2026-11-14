@@ -51,6 +51,7 @@ class CovoAudioCode2WavForConditionalGeneration(nn.Module):
         self.decoder.load_state_dict(ckpt, strict=False)
         self.decoder.eval()
         self.infer_config = code2wav_config.inference
+        self.sample_rate = code2wav_config.wav_input_sr
         self._decoder_moved = False
         self._sampler = Sampler()
 
@@ -74,7 +75,7 @@ class CovoAudioCode2WavForConditionalGeneration(nn.Module):
         self._ensure_on_device(input_ids.device)
         data = {
             "target_token": input_ids.unsqueeze(0),
-            "sample_rate": 24000,
+            "sample_rate": self.sample_rate,
             "prompt_token": self._prompt_token,
             "prompt_latent": self._prompt_latent,
             "spkr_embed": self._spkr_embed,

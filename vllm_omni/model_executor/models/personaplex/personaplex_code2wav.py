@@ -40,6 +40,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 from vllm_omni.utils.device_copy import HostCopyBatch
 
 logger = init_logger(__name__)
@@ -204,14 +205,15 @@ class PersonaPlexCode2Wav(nn.Module):
         request of the step is decoded in the same shared-decoder pass (see
         ``_decode_pending``).
         """
-        sr_val = int(self._output_sample_rate)
-        sr_tensor = torch.tensor(sr_val, dtype=torch.int32)
         empty = torch.zeros((0,), dtype=torch.float32)
 
         if input_ids is None or input_ids.numel() == 0:
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
+                multimodal_outputs={
+                    "model_outputs": [empty],
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(int(self._output_sample_rate)),
+                },
             )
 
         ids = input_ids.reshape(-1).to(dtype=torch.long)
@@ -228,7 +230,7 @@ class PersonaPlexCode2Wav(nn.Module):
                 text_hidden_states=None,
                 multimodal_outputs={
                     "model_outputs": [empty if wav is None else wav for wav in batched],
-                    "sr": [sr_tensor] * len(batched),
+                    SAMPLE_RATE_KEY: make_sample_rate_tensors(int(self._output_sample_rate), len(batched)),
                 },
             )
 
@@ -242,7 +244,7 @@ class PersonaPlexCode2Wav(nn.Module):
 
         k = int(self._num_codebooks)
         audios: list[torch.Tensor] = [empty] * num_req
-        srs = [sr_tensor] * num_req
+        srs = make_sample_rate_tensors(int(self._output_sample_rate), num_req)
         # (output index, request id, new codes [k, F]) of every request with frames to decode.
         pending: list[tuple[int, str | None, torch.Tensor]] = []
 
@@ -280,7 +282,7 @@ class PersonaPlexCode2Wav(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs},
+            multimodal_outputs={"model_outputs": audios, SAMPLE_RATE_KEY: srs},
         )
 
     def _decode_input_id_spans(
@@ -512,7 +514,7 @@ class PersonaPlexCode2Wav(nn.Module):
             text_hidden_states=None,
             multimodal_outputs={
                 "model_outputs": audio_tensor,
-                "sr": sr,
+                SAMPLE_RATE_KEY: sr,
             },
         )
 
