@@ -942,6 +942,10 @@ def test_fish_kvcache_decode_reuses_long_workspace(monkeypatch):
 
 def test_fish_kvcache_decode_workspace_miss_rejects_cuda_graph_capture(monkeypatch):
     fish_kvcache_attn._WORKSPACE_CACHE.clear()
+    # ``_is_cuda_graph_capturing`` short-circuits on ``torch.cuda.is_available()``
+    # before reading the capture flag, so both must report True to reach the
+    # guard on a host without a CUDA device.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     q = torch.zeros((2, 4, 128), dtype=torch.float16)
