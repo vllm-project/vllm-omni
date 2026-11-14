@@ -2164,6 +2164,36 @@ stages:
         assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [runner == "v2"] * 3
         assert stages[0].yaml_engine_args["enable_prefix_caching"] is (not disable_prefix_cache)
 
+    @pytest.mark.parametrize(
+        "yaml_name",
+        [
+            "minicpmo_4_5_turn.yaml",
+            "minicpmo_4_5_turn_mrv2.yaml",
+        ],
+    )
+    def test_minicpmo_turn_npu_stage1_turn_contract(self, monkeypatch, yaml_name: str):
+        """NPU turn sessions must not inherit the duplex K-step Talker block.
+
+        The base NPU block pins ``model_runner: v2`` for every stage, so each
+        turn profile resolves the Talker to MRv2, and a v2 Talker cannot book
+        the K-step frame loop outside duplex sessions -- the model fails
+        closed at sampler install if the ngram speculative_config survives.
+        The turn profiles reset that block and re-arm async scheduling,
+        which the base sets ``false`` only for the removed K-step contract.
+        """
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", "npu")
+        deploy = _apply_platform_overrides(load_deploy_config(Path(get_deploy_config_path(yaml_name))), platform="npu")
+        stages = merge_pipeline_deploy(resolve_pipeline_config(deploy.pipeline), deploy)
+        stage1 = next(stage for stage in stages if stage.stage_id == 1)
+        assert stage1.yaml_engine_args["use_v2_model_runner"] is True
+        assert stage1.yaml_engine_args.get("speculative_config") is None
+        assert stage1.yaml_engine_args["async_scheduling"] is True
+        # The deploy-side two-wide stop id is dropped; only the pipeline's
+        # codec-EOS default survives the union.
+        assert stage1.yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
+
     def test_step_audio2_online_ci_deploy_is_single_thinker(self):
         deploy = load_deploy_config(Path(get_deploy_config_path("step_audio2_ci.yaml")))
 

@@ -19,6 +19,21 @@ platforms:
     stages:
       - stage_id: 0
         enable_prefix_caching: false
+  npu:
+    stages:
+      - stage_id: 1
+        # The base NPU block pins model_runner: v2 for every stage, so this
+        # turn profile resolves the Talker to MRv2 as well, and a v2 Talker
+        # cannot book the K-step frame loop outside duplex sessions (the
+        # model fails closed at sampler install). Clear the ngram
+        # speculative_config inherited from the duplex profile -- and drop
+        # the two-wide stop id with it: one frame per step.
+        # async_scheduling mirrors the MRv2 CUDA block: the base's `false`
+        # is the K-step synchronous contract, which this reset removes.
+        speculative_config: null
+        async_scheduling: true
+        default_sampling_params:
+          stop_token_ids: []
   xpu:
     stages:
       - stage_id: 0
