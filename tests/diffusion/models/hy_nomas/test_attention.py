@@ -65,6 +65,59 @@ def test_prebuilt_block_mask_preserves_compact_gqa():
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
+@torch.no_grad()
+def test_resolve_masks_and_block_masks_bit_exact_parity_and_lru(mocker):
+    import vllm_omni.diffusion.models.hy_nomas.attention as attn_mod
+
+    assert getattr(RangeAttention.forward, "_torchdynamo_disable", False) is True
+    torch.manual_seed(17)
+    attn = RangeAttention(8**-0.5)
+    q, k, v = torch.randn(2, 4, 4, 8), torch.randn(2, 6, 2, 8), torch.randn(2, 6, 2, 8)
+    qm = torch.tensor([[True, False, True, True], [True, True, False, True]])
+    km = torch.tensor([[True, False, True, True, False, True], [False, True, True, False, True, True]])
+    ranges = [[(0, 2, 0, 3), (2, 4, 3, 6)], [(0, 3, 0, 4), (3, 4, 4, 6)]]
+
+    expected = attn(q, k, v, ranges=ranges, query_mask=qm, key_mask=km)
+    assert len(attn.masks) == 2
+
+    spy_build = mocker.spy(attn_mod, "build_range_mask")
+    resolved = attn.resolve_masks(
+        q.shape[1], k.shape[1], q.device, batch_size=2, ranges=ranges, query_mask=qm, key_mask=km
+    )
+    assert isinstance(resolved, tuple) and len(resolved) == 2 and spy_build.call_count == 0
+
+    actual = attn(q, k, v, block_masks=resolved)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    compiled_attn = torch.compile(attn, backend="aot_eager", dynamic=True)
+    torch.testing.assert_close(compiled_attn(q, k, v, block_masks=resolved), expected, rtol=0, atol=0)
+    assert spy_build.call_count == 0
+
+    empty_resolved = attn.resolve_masks(0, 6, q.device, batch_size=2)
+    assert empty_resolved == (None, None)
+    assert attn(torch.empty(2, 0, 4, 8), k, v, block_masks=empty_resolved).shape == (2, 0, 4, 8)
+
+    hot_key, evicted_key = list(attn.masks.keys())
+    attn.resolve_masks(
+        q.shape[1], k.shape[1], q.device, batch_size=1, ranges=ranges[:1], query_mask=qm[:1], key_mask=km[:1]
+    )
+    assert list(attn.masks.keys())[-1] == hot_key
+    for extra_q in range(5, 36):
+        attn.resolve_masks(extra_q, k.shape[1], q.device, batch_size=1)
+    assert len(attn.masks) == 32 and hot_key in attn.masks and evicted_key not in attn.masks
+
+
+@torch.no_grad()
+def test_block_masks_rejects_conflicting_or_mismatched_arguments():
+    attn = RangeAttention(8**-0.5)
+    q, k, v = torch.randn(2, 4, 2, 8), torch.randn(2, 4, 2, 8), torch.randn(2, 4, 2, 8)
+    masks = attn.resolve_masks(4, 4, q.device, batch_size=2)
+    with pytest.raises(ValueError, match="Boolean visibility masks"):
+        attn.resolve_masks(4, 4, q.device, batch_size=1, query_mask=torch.ones(1, 4, dtype=torch.int64))
+    for kw in ({"block_masks": masks, "ranges": [[(0, 4, 0, 4)]] * 2}, {"block_masks": masks[:1]}):
+        with pytest.raises(ValueError, match="Prebuilt Flex BlockMask"):
+            attn(q, k, v, **kw)
+
+
 @pytest.mark.parametrize("cache_text", [False, True])
 @pytest.mark.parametrize("update", [False, True])
 def test_contiguous_kv_preserves_history_and_condition_order(cache_text, update):
