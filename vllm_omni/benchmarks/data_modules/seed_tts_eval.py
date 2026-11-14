@@ -31,10 +31,11 @@ https://github.com/zhaochenyang20/seed-tts-eval):
   process whose ``ASCEND_RT_VISIBLE_DEVICES`` is only that physical card and the constants
   are rewritten onto ``npu:0`` there. Set ``SEED_TTS_UTMOS_DEVICE``. When it is unset, a
   ``cuda:N`` or ``npu:N`` ``SEED_TTS_EVAL_DEVICE`` is reused; otherwise the scorer uses
-  ``cuda:0``. Forward uses **float32** waveform in ``[-1, 1]`` (same as the WER resampled
-  array) so tensor dtypes match JIT weights; using int16 triggers
-  ``RuntimeError: input type and weight type should be same`` on common exports. Disable
-  with ``SEED_TTS_UTMOS_EVAL=0``.
+  ``cuda:0``. The scorer accepts a **float32** waveform in ``[-1, 1]`` (same as WER).
+  The shared JIT loader restores int16-scale amplitude when the archive divides its
+  waveform input by 32768, as ``balacoon/utmos`` does. Other input contracts are left
+  unchanged. The tensor stays float32 to match the JIT weights. UTMOS is opt-in:
+  enable with ``SEED_TTS_UTMOS_EVAL=1``; ``--seed-tts-wer-eval`` alone does not enable it.
 
 Enable with ``SEED_TTS_WER_EVAL=1`` or ``--seed-tts-wer-eval``. Install optional deps::
 
@@ -561,9 +562,9 @@ def _utmos_score_in_npu_worker(wav_f32: np.ndarray) -> float | None:
 def _utmos_predict_f32_16k(wav_f32: np.ndarray) -> float | None:
     """MOS from the JIT; input is float32 mono @ 16 kHz in ``[-1, 1]``.
 
-    ``balacoon/utmos`` demos sometimes use int16 numpy, but the exported ``.jit`` weights are
-    float32; passing int16 tensors causes: "RuntimeError: ... input type and weight type
-    should be same".
+    The callable returned by ``load_utmos_jit`` adapts amplitude to the archive's
+    input contract, on both the in-process path and in the NPU worker. Keep the
+    shared waveform in [-1, 1] and its tensor dtype float32.
     """
     if len(wav_f32) == 0:
         return None
