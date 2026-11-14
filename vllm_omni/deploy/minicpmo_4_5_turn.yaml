@@ -4,9 +4,8 @@ session_mode: turn
 
 stages:
   - stage_id: 0
-    # CUDA V1 and MRv2 restore cached Thinker outputs for the Talker.
-    # Other platforms keep their existing overrides below and in the base.
-    enable_prefix_caching: true
+    # Inherit CUDA ngram speculation; it requires prefix caching disabled.
+    enable_prefix_caching: false
 
 platforms:
   cuda:

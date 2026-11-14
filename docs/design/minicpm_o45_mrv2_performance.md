@@ -2,14 +2,12 @@
 
 The default `minicpmo_4_5.yaml` selects MRv2 for all three CUDA stages
 and FlashAttention for the Talker. All three duplex stages keep
-`async_chunk: true`. The CUDA turn profiles use the same runner and Talker
-backend. They enable Thinker prefix caching and send its completed payload
-to the Talker. Both V1 and MRv2 restore cached Thinker outputs for the Talker. MRv2 uses
-the shared stage-output prefix cache to restore `latent`, `latent_input_ids`
-and `latent_positions` together before publishing the llm2tts payload. Changing
-the CUDA runner to V1 preserves the enabled cache. NPU, ROCm, XPU and MUSA keep
-their existing disabled overrides; duplex profiles also keep caching disabled
-because their mutable KV window cannot reuse prefix blocks.
+`async_chunk: true`. CUDA turn serving sends the completed Thinker payload
+to the Talker. Turn profiles inherit Thinker ngram speculation and disabled
+prefix caching. Both V1 and MRv2 can restore cached Thinker outputs when an
+overlay disables speculation and enables caching. MRv2 restores `latent`,
+`latent_input_ids` and `latent_positions` together. Duplex profiles keep
+caching disabled for their mutable KV window.
 
 The MRv2 output-cache opt-in requires an explicit `session_mode: turn` on
 the Thinker model config. A missing mode does not advertise output-cache
@@ -574,11 +572,11 @@ and the CFM setup-cache capacity are unchanged.
 
 ## Seed-TTS experimental optimization bundle
 
-`vllm_omni/deploy/minicpmo_4_5_seedtts_experimental.yaml` reproduces the latest
+`vllm_omni/deploy/minicpmo_4_5.yaml` reproduces the latest
 CUDA development configuration: Thinker ngram speculation, 16-frame Talker
 K-step, two Code2Wav replicas on one GPU, grouped reference setup of four,
 HiFT continuation shapes 3/43, speaker/S3 graph replay, and Flow FP16.
-The default turn deployment is unchanged. The development runs used private
+The existing turn deployment inherits these defaults. The development runs used private
 CUDA MPS on one L20X; this profile is not qualified for other platforms.
 
 The runtime bundle includes:
@@ -591,14 +589,14 @@ The runtime bundle includes:
   parity is tested for both eager execution and CUDA graph replay. This CUDA
   K-step sampling path is active when Triton is available, including with the
   default deployment; other sampling paths retain their implementation.
-- `ref_setup_batch_size` (default 1): group equal-shaped reference features for
+- `ref_setup_batch_size` (backend default 1; deployment default 4): group equal-shaped reference features for
   encoder/CFM setup, preserve voice order, separate output state ownership and
   bounded setup-cache retention.
 - `token2wav_ref_cpu_prefetch_workers` (default 0): experimental CPU-only
   reference extraction with at most 32 pending futures. GPU completion stays on
   the caller thread. Eviction cancels queued work or waits for an active reader
   before unlinking its WAV. Non-FP32 default dtype bypasses background work.
-  Four workers regressed the C16 screen, so the shipped experimental profile
+  Four workers regressed the C16 screen, so the default profile
   leaves this option disabled. Worker threads live for the backend lifetime.
 
 The full development evidence and rejected variants are recorded in
