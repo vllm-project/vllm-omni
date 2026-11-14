@@ -270,9 +270,33 @@ def _ensure_recv_buf(recv_buf: torch.Tensor | None, reference: torch.Tensor) -> 
 
 
 def _halo_exchange_uses_all_gather() -> bool:
-    # On XCCL a batched isend/irecv of one halo costs ~1.3 ms against ~0.1-0.2 ms
-    # for an all-gather of the same rows (Arc Pro B70, 4 ranks); a Wan encode at
-    # 720p/81f runs ~500 exchanges. Other backends keep the point-to-point path.
+    """Whether to exchange halos with one all-gather instead of batched point-to-point.
+
+    An all-gather moves strictly more data -- every rank receives ``2 * world_size`` halo
+    rows and keeps two of them -- so it only pays off where point-to-point latency, not
+    halo bandwidth, dominates. That is the case on XCCL and is not the case on NCCL.
+
+    Per exchange of one 720p/81f halo, ``(1, 96, 6, 722, 1)`` bf16, 100 iterations after 10
+    warm-up (one 720p encode runs ~525 exchanges)::
+
+        ranks | XCCL (Arc Pro B70)        | NCCL (RTX PRO 6000)
+              | p2p    all-gather  a2a    | p2p    all-gather  a2a
+        ------+---------------------------+--------------------------
+            2 | 0.438  0.099      0.122   | 0.053  0.082      0.054
+            4 | 1.435  0.126      0.142   | 0.093  0.199      0.121
+            8 | 2.528  0.388      1.008   | 0.143  0.502      0.373
+
+    XCCL point-to-point costs 8-18x NCCL's and is dominated by per-exchange setup, not by
+    the 55 KB payload: it is already 0.44 ms between two ranks, and with ``CCL_ZE_CACHE=0``
+    it reaches 130 ms. No oneCCL topology or transport setting changed it
+    (``CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK=0`` made no difference). An all-gather
+    sidesteps that per-exchange cost, which is why XPU takes it.
+
+    On NCCL point-to-point is already fast, so an all-gather would cost 1.5-3.5x as much and
+    the end-to-end VAE agrees: at 8 NCCL ranks, forcing all-gather moves encode from 0.62 s
+    to 0.71 s and decode from 0.99 s to 1.36 s. All-to-all was measured on both backends and
+    never wins.
+    """
     return current_omni_platform.is_xpu()
 
 
