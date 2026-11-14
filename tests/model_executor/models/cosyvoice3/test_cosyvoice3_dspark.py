@@ -75,7 +75,7 @@ def test_verification_logits_apply_constraints_and_ras_before_native_rejection(m
     sampler = SimpleNamespace(
         logits_processors=[StopMask(), Penalties()],
         sampling_states=SimpleNamespace(
-            get_top_k_top_p=lambda *_: (None, None),
+            get_top_k_top_p=lambda *_: (None, None, False),
             temperature=SimpleNamespace(gpu=torch.ones(1)),
         ),
         req_states=SimpleNamespace(
@@ -196,7 +196,7 @@ def test_ras_rejects_foreign_generated_history_but_excludes_reference_prompt(mon
     sampler = SimpleNamespace(
         logits_processors=[],
         sampling_states=SimpleNamespace(
-            get_top_k_top_p=lambda *_: (None, None), temperature=SimpleNamespace(gpu=torch.ones(1))
+            get_top_k_top_p=lambda *_: (None, None, False), temperature=SimpleNamespace(gpu=torch.ones(1))
         ),
         req_states=SimpleNamespace(
             all_token_ids=SimpleNamespace(gpu=table), prompt_len=SimpleNamespace(gpu=torch.tensor([2]))

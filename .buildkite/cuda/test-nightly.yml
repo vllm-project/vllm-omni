@@ -23,7 +23,7 @@ steps:
           - omni_joyai_duplex_function
         timeout_in_minutes: 120
         commands:
-          - pytest -sv tests/e2e --run-level "full_model" -m "full_model and H100 and B200 and omni and cards_1" --ignore=tests/e2e/accuracy --ignore=tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py --ignore=tests/e2e/online_serving/test_minicpmo_4_5_window.py --ignore=tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py
+          - pytest -sv tests/e2e --run-level "full_model" -m "full_model and H100 and B200 and omni and cards_1" --ignore=tests/e2e/accuracy --ignore=tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py --ignore=tests/e2e/online_serving/test_minicpmo_4_5_window.py
 
       - label: ":full_moon: Omni · Function Test with H100 · 2-GPU"
         source_file_dependencies:
@@ -36,10 +36,7 @@ steps:
       - label: ":full_moon: Omni · MiniCPM-o 4.5 Duplex Test"
         source_file_dependencies: omni_minicpmo_4_5_duplex_function
         timeout_in_minutes: 120
-        artifact_paths:
-          - tests/e2e/online_serving/results/minicpmo_duplex_recognition/**/*
         commands:
-          - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py -m "full_model and cuda and H100 and B200 and omni and cards_1" --run-level "full_model"
           - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py -m "full_model and cuda and H100 and B200 and omni and cards_1" --run-level "full_model"
           - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_window.py -m "full_model and cuda and H100 and B200 and omni and cards_1" --run-level "full_model"
 
@@ -84,7 +81,7 @@ steps:
           - export SEED_TTS_UTMOS_DEVICE=cuda:1
           - pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and H100 and B200 and cuda and (cards_1 or cards_2)" --run-level full_model
 
-      - label: ":full_moon: Omni · Omni-DuplexEval CI Guard"
+      - label: ":full_moon: Omni · Minicpm-o 4.5 · Duplex Omni-DuplexEval Accuracy and Perf Test"
         source_file_dependencies: omni_duplex_eval_ci
         timeout_in_minutes: 240
         artifact_paths:
@@ -265,8 +262,7 @@ steps:
             bash -c 'source tests/e2e/accuracy/qwen_image_21/setup_reference.sh &&
             exec pytest -sv tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py
             -m "full_model and diffusion and H100 and cards_1"
-            --run-level full_model
-            --junitxml=tests/e2e/accuracy/artifacts/qwen_image_21/pytest.xml'
+            --run-level full_model'
 
       - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
         source_file_dependencies: diffusion_hunyuan_image3_accuracy
@@ -385,18 +381,6 @@ steps:
             VLLM_OMNI_DEVICE_POSTPROCESS_MODEL=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
               pytest -s -v tests/e2e/offline_inference/test_device_postprocess_equivalence.py -m "full_model and H100 and B200 and cuda and cards_1" --run-level "full_model"
 
-      - label: ":full_moon: Diffusion Image · Flux3 Single-GPU Function Test"
-        source_file_dependencies: diffusion_flux3_function
-        timeout_in_minutes: 90
-        commands:
-          - FLUX3_MODEL_PATH=PLACEHOLDER_MODEL_PATH pytest -s -v tests/e2e/online_serving/test_flux3_expansion.py -k "cpu_offload or cache_dit" -m "full_model and diffusion" --run-level "full_model"
-        mirror_hardwares: h100_1
-      - label: ":full_moon: Diffusion Image · Flux3 Multi-GPU Function Test"
-        source_file_dependencies: diffusion_flux3_function
-        timeout_in_minutes: 90
-        commands:
-          - FLUX3_MODEL_PATH=PLACEHOLDER_MODEL_PATH pytest -s -v tests/e2e/online_serving/test_flux3_expansion.py -k "cfg_parallel or tp_2 or hsdp" -m "full_model and diffusion" --run-level "full_model"
-        mirror_hardwares: h100_1
       - label: ":full_moon: Diffusion X2V · Wan2.2 Accuracy Test"
         source_file_dependencies: diffusion_wan22_accuracy
         timeout_in_minutes: 180

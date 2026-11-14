@@ -21,7 +21,11 @@ from vllm_omni.diffusion.attention.backends.fastvideo_vsa import FastVideoVSABac
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNAttentionBackend
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
-from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, resolve_request_attention_schedule
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionScheduleRange,
+    parse_attention_sigma_schedule,
+    resolve_request_attention_schedule,
+)
 from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig
 from vllm_omni.diffusion.forward_context import (
     bind_attention_schedule,
@@ -33,6 +37,7 @@ from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
 from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
 from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+from vllm_omni.diffusion.models.minimax_h3.latent_upscaler import MiniMaxH3LatentRefineSpec
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -589,6 +594,7 @@ def test_both_modes_publish_denoise_progress_for_gated_attention():
         def __init__(self):
             self.denoise_step_idx = None
             self.denoise_timestep = None
+            self.attention_sigma_schedule = None
 
         def __setattr__(self, name, value):
             object.__setattr__(self, name, value)
@@ -644,7 +650,7 @@ def test_mixed_step_batch_leaves_gated_attention_dense():
     ]
     _set_step_index(states[1], 2)  # admitted later, so it trails the batch
 
-    recorder = SimpleNamespace(denoise_step_idx="unset", denoise_timestep="unset")
+    recorder = SimpleNamespace(denoise_step_idx="unset", denoise_timestep="unset", attention_sigma_schedule=None)
     original = fc._forward_context
     fc._forward_context = recorder
     try:
@@ -733,6 +739,45 @@ def test_scheduled_mixed_step_batch_runs_each_request_under_its_own_progress():
     _assert_same_committed_rows(states, packed_states)
 
 
+def test_sigma_step_batch_isolates_equal_step_requests_with_different_noise():
+    seen = []
+
+    class _SigmaModel(_ProgressRecordingModel):
+        def __call__(self, **kwargs):
+            ctx = get_forward_context()
+            seen.append(
+                (
+                    ctx.denoise_step_idx,
+                    ctx.denoise_sigma,
+                    get_attention_schedule_profile(),
+                    kwargs["packed_seq_params"].get("num_requests", 1),
+                )
+            )
+            return super().__call__(**kwargs)
+
+    model = _SigmaModel()
+    states = []
+    for index, sigma in enumerate([0.8, 0.2]):
+        branch, video, audio = _make_branch(
+            text_len=9 - 4 * index, latent_t=2 + index, latent_h=4, latent_w=6, audio_t=3, seed=41 + index
+        )
+        # Both requests are at step 1, but their ladders put them at different noise levels.
+        state = _make_state(f"req-{index}", model, branch, video, audio, [1.0, sigma, 0.0], _sigmas(2, 3.0))
+        _set_step_index(state, 1)
+        states.append(state)
+    windows = parse_attention_sigma_schedule(
+        [
+            {"low": 0.0, "high": 0.3, "profile": "low"},
+            {"low": 0.3, "high": 1.0, "profile": "high"},
+        ]
+    )
+    with set_forward_context(), bind_attention_schedule(None, windows):
+        _step_pipeline(model).denoise_step(InputBatch.make_batch(states), states=states)
+        assert get_forward_context().denoise_sigma is None
+        assert get_attention_schedule_profile() is None
+    assert seen == [(1, 0.8, "high", 1), (1, 0.2, "low", 1)]
+
+
 def test_scheduled_request_loop_restarts_progress_for_each_denoise_sequence():
     """forward() runs one request-mode loop per seed and per window; each selects from step 0 of its own total."""
     model = _ProgressRecordingModel()
@@ -754,6 +799,56 @@ def test_scheduled_request_loop_restarts_progress_for_each_denoise_sequence():
             )
             assert model.progress == [(step, sigmas_video[step], total, "sparse", 1) for step in range(total)]
             assert _denoise_progress(get_forward_context()) == (None, None, None, None)
+
+
+def test_sigma_windows_select_the_latent_refine_pass_by_its_own_tail_sigma():
+    """latent_refine denoises the tail of the main sigma list as a second call that restarts at step 0.
+
+    Each refine step must select its profile from the absolute sigma it publishes, not from its step
+    index and not from a sigma relative to the refine pass's first sigma.
+    """
+    seen = []
+
+    class _SigmaModel(_ProgressRecordingModel):
+        def __call__(self, **kwargs):
+            ctx = get_forward_context()
+            progress = (ctx.denoise_step_idx, ctx.total_denoise_steps, ctx.denoise_sigma)
+            seen.append((*progress, get_attention_schedule_profile()))
+            return super().__call__(**kwargs)
+
+    model = _SigmaModel()
+    branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=24)
+    main_video, main_audio = _sigmas(8, 12.0), _sigmas(8, 3.0)
+    # _build_denoise_inputs slices the refine schedule at this same start index.
+    start = MiniMaxH3LatentRefineSpec(strength=0.5).start_index(len(main_video))
+    tail_video, tail_audio = main_video[start:], main_audio[start:]
+    assert start > 0 and tail_video[0] < 1.0  # the refine pass starts below full noise
+    windows = parse_attention_sigma_schedule(
+        [
+            {"low": 0.0, "high": 0.85, "profile": "low"},
+            {"low": 0.85, "high": 1.0, "profile": "high"},
+        ]
+    )
+    expected_profiles = ["low" if sigma < 0.85 else "high" for sigma in tail_video[:-1]]
+    # Noise relative to the refine pass's first sigma would select differently, so this run tells them apart.
+    assert expected_profiles != ["low" if sigma / tail_video[0] < 0.85 else "high" for sigma in tail_video[:-1]]
+
+    with set_forward_context(), bind_attention_schedule(None, windows):
+        minimax_h3_denoise_loop(
+            model=model,
+            positive=branch,
+            initial_video_rows=video_rows,
+            initial_audio_rows=audio_rows,
+            keyframe_cond_rows=None,
+            sigmas_video=tail_video,
+            sigmas_audio=tail_audio,
+            device=torch.device("cpu"),
+        )
+        assert get_forward_context().denoise_sigma is None
+        assert get_attention_schedule_profile() is None
+
+    total = len(tail_video) - 1
+    assert seen == [(step, total, pytest.approx(tail_video[step]), expected_profiles[step]) for step in range(total)]
 
 
 @pytest.mark.parametrize("sampler", ["euler", "res_multistep"])
@@ -1057,6 +1152,42 @@ def test_packed_gate_sees_the_profile_selected_for_the_published_step(schedule, 
 
     profile = "sparse" if packed else "dense"
     assert [(entry[3], entry[-1]) for entry in model.progress] == ([(profile, 2)] if packed else [(profile, 1)] * 2)
+
+
+@pytest.mark.parametrize("case", ["one-progress", "mixed-progress", "different-windows"])
+def test_sigma_scheduled_step_batch_packs_only_at_one_step_and_sigma(case):
+    """Under sigma windows, requests at one step and sigma with equal windows select one profile and share
+    a packed forward; requests at different steps, or with different windows, run one forward each."""
+    windows = parse_attention_sigma_schedule([{"low": 0.0, "high": 1.0, "profile": "sparse"}])
+    other_windows = parse_attention_sigma_schedule([{"low": 0.0, "high": 1.0, "profile": "dense"}])
+    seen_sigmas = []
+
+    class _SigmaModel(_ProgressRecordingModel):
+        def __call__(self, **kwargs):
+            seen_sigmas.append(get_forward_context().denoise_sigma)
+            return super().__call__(**kwargs)
+
+    model = _SigmaModel()
+    states = _same_progress_states(model, [(), ()])
+    for state in states:
+        state.attention_sigma_schedule = windows
+    if case == "mixed-progress":
+        _set_step_index(states[1], 2)
+    if case == "different-windows":
+        states[1].attention_sigma_schedule = other_windows
+    with set_forward_context(), bind_attention_schedule(None, windows):
+        result = _step_pipeline(model).denoise_step(InputBatch.make_batch(states), states=states)
+    assert result == {state.request_id: None for state in states}
+
+    sigmas = states[0].extra[pipeline_minimax_h3._STEP_SAMPLING_STATE].sigmas[0]
+    if case == "one-progress":
+        assert [(entry[0], entry[3], entry[-1]) for entry in model.progress] == [(1, "sparse", 2)]
+    elif case == "mixed-progress":
+        assert [(entry[0], entry[3], entry[-1]) for entry in model.progress] == [(1, "sparse", 1), (2, "sparse", 1)]
+        assert seen_sigmas == pytest.approx([sigmas[1], sigmas[2]])
+    else:
+        # The bound windows select the profile; the split only keeps different windows out of one forward.
+        assert [(entry[0], entry[-1]) for entry in model.progress] == [(1, 1), (1, 1)]
 
 
 def test_locked_driving_audio_is_clean_and_unchanged_during_denoising():

@@ -1,5 +1,22 @@
 # CUDA CI L2 (`core_model` e2e) plus L1 CPU Simple Test (`core_model and cpu`).
 # Uploaded by Upload Ready Pipeline: PR label `ready`, or main+WEEKLY=1 with --e2e.
+#
+# Directory sweeps set `automatic_shard: true`. The uploader reads a per-step
+# profile from the last 20 passed non-main builds of this pipeline
+# (or VLLM_OMNI_SHARD_TIMINGS). Those builds are other pull requests, so the
+# estimate includes whatever those pull requests changed. The profile is a
+# greedy packing of measured files into bins that fit 80% of
+# `timeout_in_minutes`. The remaining 20% covers checkout, collection, and
+# startup, which are not in the file durations.
+# Each bin is a file list and that shard runs only those files. No usable
+# timings opens the smaller of MAX_AUTOMATIC_SHARDS and the files whose marks
+# satisfy the command's -m. A file that cannot be checked, or whose static
+# marks do not show a match, is dealt across bins that already hold a match
+# and does not open a bin by itself. No confirmed match
+# keeps the step at one job, so a shard cannot collect zero tests. The YAML
+# does not set parallelism; the uploader does. Enrolled steps always write
+# `timings/jobs/*.json`. A one-node process (the entrypoint VRAM workaround)
+# runs when BUILDKITE_PARALLEL_JOB is unset or 0.
 
 env:
   VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -10,46 +27,12 @@ steps:
   - group: ":card_index_dividers: Simple Test"
     depends_on: upload-ready-pipeline
     steps:
-      - label: "Simple · Model Executor Test"
-        timeout_in_minutes: 20
-        env:
-          QWEN3_OMNI_PROCESSOR_REQUIRED: "1"
-        commands:
-          # Cache only the pinned processor/tokenizer; pytest stays local-only.
-          - |
-            python - <<'PY'
-            from transformers import AutoProcessor
-            from tests.model_executor.models.qwen3_omni.test_duplex_context_view_processor import (
-                PROCESSOR_MODEL,
-                PROCESSOR_REVISION,
-            )
-
-            AutoProcessor.from_pretrained(
-                PROCESSOR_MODEL,
-                revision=PROCESSOR_REVISION,
-                local_files_only=False,
-                trust_remote_code=False,
-            )
-            PY
-          - "pytest -sv tests/model_executor -m 'core_model and cpu'"
-        mirror_hardwares: l4_1
-
-      - label: "Simple · Diffusion Models Test"
-        timeout_in_minutes: 20
-        commands:
-          - "pytest -sv tests/diffusion/models -m 'core_model and cpu'"
-        mirror_hardwares: l4_1
-
-      - label: "Simple · Engine&Entrypoints&Diffusion Test"
+      # One sweep. Split when measured durations exceed timeout_in_minutes.
+      - label: "Simple Test"
         timeout_in_minutes: 25
+        automatic_shard: true
         commands:
-          - "pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
-        mirror_hardwares: l4_1
-
-      - label: "Simple · Other Test"
-        timeout_in_minutes: 20
-        commands:
-          - "pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine"
+          - "pytest -sv tests/ -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
       # AMD READY R2-01 is non-blocking, so fail the change that moves its
@@ -70,56 +53,65 @@ steps:
         commands:
           - uv pip install --system --no-deps 'fastvideo-kernel==0.3.4'
           - python3 -c 'from fastvideo_kernel.block_sparse_attn import block_sparse_attn_triton'
-          - timeout 15m pytest -s -v tests/diffusion/attention/ tests/diffusion/utils/test_chunked_transfer.py -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
+          - pytest -s -v tests/diffusion/attention/ tests/diffusion/utils/test_chunked_transfer.py -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Offloader Test"
+        timeout_in_minutes: 15
+        automatic_shard: true
         commands:
-          - timeout 40m pytest -s -v tests/diffusion/offloader -m "core_model and cuda" --run-level "core_model"
+          - pytest -s -v tests/diffusion/offloader -m "core_model and cuda" --run-level "core_model"
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Cache Test"
+        timeout_in_minutes: 15
         commands:
-          - timeout 15m pytest -sv tests/diffusion/cache -m 'core_model and cuda' --run-level "core_model"
+          - pytest -sv tests/diffusion/cache -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Batch Test"
+        timeout_in_minutes: 15
         commands:
-          - timeout 15m pytest -sv tests/diffusion/batching -m 'core_model and cuda' --run-level "core_model"
+          - pytest -sv tests/diffusion/batching -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Distributed Test · Single-GPU"
         source_file_dependencies: diffusion_distributed_attention
+        timeout_in_minutes: 15
+        automatic_shard: true
         commands:
-          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
+          - pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Distributed Test · 2-GPU"
         timeout_in_minutes: 65
         source_file_dependencies: diffusion_distributed_attention
         commands:
-          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
-          - timeout 10m pytest -sv tests/diffusion/attention/test_ulysses_uaa.py -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
-          - timeout 20m pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
+          - pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
+          - pytest -sv tests/diffusion/attention/test_ulysses_uaa.py -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
+          - pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
         mirror_hardwares: l4_2
 
       - label: "Diffusion · Distributed & Attention Test · 4-GPU"
         timeout_in_minutes: 65
         source_file_dependencies: diffusion_distributed_attention
         commands:
-          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
-          - timeout 20m pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
-          - timeout 20m pytest -sv tests/diffusion/attention/test_ulysses_uaa.py -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
+          - pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
+          - pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
+          - pytest -sv tests/diffusion/attention/test_ulysses_uaa.py -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
         mirror_hardwares: l4_4
 
       - label: "Diffusion · Model Test"
+        timeout_in_minutes: 15
+        automatic_shard: true
         commands:
-          - timeout 15m pytest -sv tests/diffusion/models/ -m 'core_model and cuda' --run-level "core_model"
+          - pytest -sv tests/diffusion/models/ -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Other Test"
+        timeout_in_minutes: 15
         commands:
-          - timeout 15m pytest -sv tests/diffusion/*.py tests/diffusion/ar_diffusion tests/diffusion/layers/test_adalayernorm_*.py -m 'core_model and cuda' --run-level "core_model"
+          - pytest -sv tests/diffusion/*.py tests/diffusion/ar_diffusion tests/diffusion/layers/test_adalayernorm_*.py -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Tiny Model Tests [Single GPU]"
@@ -127,62 +119,62 @@ steps:
     steps:
 
       - label: "Tiny Model Tests · Diffusion (base)"
+        timeout_in_minutes: 15
         commands:
-          - timeout 15m pytest -sv -n 4 tests/model_tests/diffusion -m 'core_model and cuda' --run-level "core_model"
+          - pytest -sv -n 4 tests/model_tests/diffusion -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Engine&Model Executor&Work Test"
     depends_on: upload-ready-pipeline
     steps:
       - label: "Engine&Model Executor&Work Test · L4"
-        timeout_in_minutes: 30
+        timeout_in_minutes: 15
+        automatic_shard: true
         commands:
           - "pytest -sv tests/engine/ tests/model_executor/ tests/worker_v2/ tests/worker/ -m 'core_model and cuda and L4' --run-level 'core_model'"
         mirror_hardwares: l4_1
 
       - label: "Engine&Model Executor&Work Test · H100"
-        timeout_in_minutes: 20
+        timeout_in_minutes: 15
+        automatic_shard: true
         source_file_dependencies: engine_model_executor_worker_function
         commands:
           - "pytest -sv tests/engine/ tests/model_executor/ tests/worker_v2/ tests/worker/ -m 'core_model and cuda and H100' --run-level 'core_model'"
         mirror_hardwares: h100_1
 
-  - label: "Distributed Test"
+  - group: ":card_index_dividers: Distributed Test"
     depends_on: upload-ready-pipeline
-    commands:
-      - |
-        timeout 20m bash -c "
-          pytest -sv tests/distributed/ -m 'core_model and cuda and L4' --run-level 'core_model'
-        "
-    mirror_hardwares: l4_1
+    steps:
+      - label: "Distributed Test · 1GPU"
+        timeout_in_minutes: 15
+        automatic_shard: true
+        commands:
+          - pytest -sv tests/distributed/ -m 'core_model and cuda and L4 and not cards_2' --run-level 'core_model'
+        mirror_hardwares: l4_1
 
-  - label: "CUDA IPC Weight Sharing · 2-GPU"
-    depends_on: upload-ready-pipeline
-    timeout_in_minutes: 15
-    source_file_dependencies:
-      - "vllm_omni/distributed/weight_sharing/"
-      - "tests/distributed/weight_sharing/"
-      - "tests/helpers/mark.py"
-      - ".buildkite/cuda/test-ready.yml"
-    commands:
-      - pytest -sv tests/distributed/weight_sharing/test_cuda_ipc_pairing.py -m 'core_model and cuda and L4 and cards_2' --run-level 'core_model'
-    mirror_hardwares: l4_2
+      - label: "Distributed Test · 2GPU"
+        timeout_in_minutes: 15
+        commands:
+          - pytest -sv tests/distributed/ -m 'core_model and cuda and L4 and cards_2' --run-level 'core_model'
+        mirror_hardwares: l4_2
 
   - label: "Entrypoints Test"
     depends_on: upload-ready-pipeline
+    automatic_shard: true
+    timeout_in_minutes: 15
     # Workaround https://github.com/vllm-project/vllm-omni/issues/8016: shutdown()
     # leaves inline UniProc DiffusionWorker VRAM mapped in the pytest parent.
     # Isolate that leftover case in its own process so the driver drops the
     # mapping; the rest stays a directory sweep with --deselect. Revert to a
-    # single sweep after the product shutdown fix.
+    # single sweep after the product shutdown fix. An unsplit step leaves
+    # BUILDKITE_PARALLEL_JOB unset, which the default treats as shard 0.
     commands:
+      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - |
-        timeout 30m bash -c "
-          set -eu
-          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        if [ "$${BUILDKITE_PARALLEL_JOB:-0}" = "0" ]; then
           pytest -sv tests/entrypoints/test_async_omni.py::test_diffusion_generate_request_id -m 'core_model and cuda' --run-level 'core_model'
-          pytest -sv tests/entrypoints/ -m 'core_model and cuda' --run-level 'core_model' --deselect tests/entrypoints/test_async_omni.py::test_diffusion_generate_request_id
-        "
+        fi
+      - pytest -sv tests/entrypoints/ -m 'core_model and cuda' --run-level 'core_model' --deselect tests/entrypoints/test_async_omni.py::test_diffusion_generate_request_id
     mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: E2E Test"
@@ -190,63 +182,66 @@ steps:
     steps:
       - label: "Custom Pipeline Test"
         source_file_dependencies: custom_pipeline
+        timeout_in_minutes: 20
         commands:
-          - timeout 20m pytest -s -v tests/e2e/features/custom_pipeline/ -m "core_model"
+          - pytest -s -v tests/e2e/features/custom_pipeline/ -m "core_model"
         mirror_hardwares: l4_1
 
 
       - label: "RLHF · VeRL-Omni E2E Test"
         source_file_dependencies: rlhf_verl_omni
+        timeout_in_minutes: 20
         commands:
-          - |
-            timeout 20m bash -c "
-              pytest -s -v tests/e2e/features/rlhf_test/test_verl_omni_e2e.py
-            "
+          - pytest -s -v tests/e2e/features/rlhf_test/test_verl_omni_e2e.py
         mirror_hardwares: l4_1
 
       - label: "Omni · Qwen3-Omni Test"
         source_file_dependencies: omni_qwen3_omni_function
         timeout_in_minutes: 40
         commands:
-          - |
-            timeout 35m bash -c "
-              pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni_thinking.py tests/e2e/features/rlhf_test/test_qwen3_omni_merged_lora.py -m 'core_model' --run-level 'core_model'
-            "
+          - pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni_thinking.py tests/e2e/features/rlhf_test/test_qwen3_omni_merged_lora.py -m 'core_model' --run-level 'core_model'
         mirror_hardwares: h100_2
 
       - label: "Omni · MiniCPM-o 4.5 Offline Test"
         source_file_dependencies: omni_minicpmo_4_5_function
+        timeout_in_minutes: 20
         commands:
-          - |
-            timeout 20m bash -c "
-              pytest -s -v tests/e2e/offline_inference/test_minicpmo_4_5.py -m 'core_model' --run-level 'core_model'
-            "
+          - pytest -s -v tests/e2e/offline_inference/test_minicpmo_4_5.py -m 'core_model' --run-level 'core_model'
         mirror_hardwares: h100_1
 
       - label: "Omni · MiniCPM-o 4.5 Online Test"
         source_file_dependencies: omni_minicpmo_4_5_function
+        timeout_in_minutes: 20
         commands:
-          - |
-            timeout 20m bash -c "
-              pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5.py -m 'core_model' --run-level 'core_model'
-            "
+          - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5.py -m 'core_model' --run-level 'core_model'
         mirror_hardwares: h100_1
 
-      # The live client waits for a learned turn terminator; use real weights.
+      # CUDA defaults to MRv2. The live client checks the protocol lifecycle;
+      # keep 1/4-session overlap, staggered sessions, image chat and recognition.
+      # Omit the standalone handshake smoke and intermediate 2-session overlap
+      # to avoid duplicate coverage and another module-scoped model startup.
       - label: "Omni · MiniCPM-o 4.5 Duplex Test"
-        source_file_dependencies: omni_minicpmo_4_5_duplex_function
+        source_file_dependencies:
+          - omni_minicpmo_4_5_duplex_function
+          - omni_minicpmo_4_5_duplex_mrv2_function
+        timeout_in_minutes: 60
+        artifact_paths:
+          - tests/e2e/online_serving/results/minicpmo_duplex_recognition/**/*
+          - tests/e2e/online_serving/results/minicpmo_duplex/junit.xml
         commands:
           - |
-            timeout 35m bash -c "
-              pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py tests/e2e/online_serving/test_duplex_client_live.py -m 'core_model and cuda' --run-level 'advanced_model'
-            "
-        mirror_hardwares: h100_1
-
-      - label: "Omni · MiniCPM-o 4.5 MRv2 Duplex Test"
-        source_file_dependencies: omni_minicpmo_4_5_duplex_mrv2_function
-        timeout_in_minutes: 40
-        commands:
-          - timeout 35m pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py -m 'advanced_model and cuda' --run-level advanced_model
+            bash -e <<'BASH'
+            mkdir -p tests/e2e/online_serving/results/minicpmo_duplex
+            timeout 55m pytest -s -v \
+              tests/e2e/online_serving/test_duplex_client_live.py \
+              'tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[1-mrv2-real-weights]' \
+              'tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[4-mrv2-real-weights]' \
+              tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_new_session_during_long_response \
+              tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_server_answers_image_chat_from_the_image \
+              tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py \
+              -m '(core_model or advanced_model) and cuda' --run-level advanced_model \
+              --junitxml=tests/e2e/online_serving/results/minicpmo_duplex/junit.xml
+            BASH
         mirror_hardwares: h100_1
 
       - label: "Omni · MiniCPM-o 4.5 Perf Test"
@@ -276,86 +271,40 @@ steps:
 
       - label: "TTS · Qwen3-TTS CustomVoice Test"
         source_file_dependencies: tts_qwen3_tts_function
+        timeout_in_minutes: 20
         commands:
-          - |
-            timeout 20m bash -c "
-              export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-              pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m 'core_model' --run-level 'core_model'
-            "
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+          - pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m 'core_model' --run-level 'core_model'
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Wan22 Test"
         source_file_dependencies: diffusion_wan22_function
+        timeout_in_minutes: 40
         commands:
-          - |
-            timeout 40m bash -c "
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m 'core_model and cuda' --run-level 'core_model'
-            "
+          - export VLLM_IMAGE_FETCH_TIMEOUT=60
+          - pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m 'core_model and cuda' --run-level 'core_model'
         mirror_hardwares: h100_1
 
       - label: "Diffusion · MiniMax-H3 DLO DP2 T2VA Test"
         timeout_in_minutes: 90
         source_file_dependencies: diffusion_minimax_h3_function
         commands:
-          - |
-            timeout 80m bash -c "
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py -m 'core_model and cuda and diffusion' --run-level 'core_model'
-            "
+          - export VLLM_IMAGE_FETCH_TIMEOUT=60
+          - pytest -s -v tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py -m 'core_model and cuda and diffusion' --run-level 'core_model'
         mirror_hardwares: h100_2
 
       - label: "Diffusion · HunyuanVideo-1.5 Test"
         source_file_dependencies: diffusion_hunyuan_video_function
+        timeout_in_minutes: 40
         commands:
-          - |
-            timeout 40m bash -c "
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_hunyuan_video_15_expansion.py -m 'core_model and diffusion' --run-level 'core_model'
-            "
+          - export VLLM_IMAGE_FETCH_TIMEOUT=60
+          - pytest -s -v tests/e2e/online_serving/test_hunyuan_video_15_expansion.py -m 'core_model and diffusion' --run-level 'core_model'
         mirror_hardwares: h100_1
 
       - label: "Diffusion · LingBot-Video Test"
         source_file_dependencies: diffusion_lingbot_function
+        timeout_in_minutes: 40
         commands:
-          - |
-            timeout 40m bash -c "
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_lingbot_video.py -m 'core_model and cuda' --run-level 'core_model'
-            "
-        mirror_hardwares: h100_1
-
-      # TODO: replace FLUX3_MODEL_PATH with the real checkpoint path/secret once
-      # the model is available in CI (no public HF repo yet).
-      - label: "Diffusion · Flux3 Test (T2I, L4)"
-        source_file_dependencies: diffusion_flux3_function
-        commands:
-          - |
-            timeout 40m bash -c "
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_flux3.py::test_t2i_001 -m 'core_model' --run-level 'core_model'
-            "
-        agents:
-          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
-        plugins:
-          - docker#v5.2.0:
-              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-              always-pull: true
-              propagate-environment: true
-              environment:
-                - "HF_HOME=/fsx/hf_cache"
-                - "HF_TOKEN"
-              volumes:
-                - "/fsx/hf_cache:/fsx/hf_cache"
-
-      # TODO: replace FLUX3_MODEL_PATH with the real checkpoint path/secret once
-      # the model is available in CI (no public HF repo yet).
-      - label: "Diffusion · Flux3 Test (T2I, H100)"
-        source_file_dependencies: diffusion_flux3_function
-        commands:
-          - |
-            timeout 40m bash -c "
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_flux3.py::test_t2i_001 -m 'core_model' --run-level 'core_model'
-            "
+          - export VLLM_IMAGE_FETCH_TIMEOUT=60
+          - pytest -s -v tests/e2e/online_serving/test_lingbot_video.py -m 'core_model and cuda' --run-level 'core_model'
         mirror_hardwares: h100_1

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """E2E expansion tests for Ming-omni-tts offline inference (nightly CI)."""
 
@@ -160,7 +160,7 @@ def _extract_multimodal_output(output) -> Mapping[str, Any]:
     raise AssertionError("No multimodal audio output found in Ming generate results")
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_ming_tts_offline_basic(ming_engine, ming_tokenizer) -> None:
     """Test blocking Ming generation through Omni."""
     outputs = ming_engine.generate(
@@ -180,7 +180,7 @@ def test_ming_tts_offline_basic(ming_engine, ming_tokenizer) -> None:
     assert sample_rate == SAMPLE_RATE, f"Expected Ming output sample rate {SAMPLE_RATE}, got {sample_rate}"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_ming_tts_speaker_conditioning_differs(ming_engine, ming_tokenizer) -> None:
     """Test that different Ming speaker controls produce different waveform outputs."""
     style_outputs = ming_engine.generate(
@@ -213,7 +213,7 @@ def test_ming_tts_speaker_conditioning_differs(ming_engine, ming_tokenizer) -> N
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_ming_tts_multiple_prompts_queued(ming_engine, ming_tokenizer) -> None:
     """Regression: supported max_num_seqs=1 config must still drain queued prompts."""
     prompts = [
@@ -242,7 +242,7 @@ def test_ming_tts_multiple_prompts_queued(ming_engine, ming_tokenizer) -> None:
         assert np.max(np.abs(waveform.numpy())) > 0.01, f"Request {i} audio appears silent"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_ming_tts_offline_streaming(async_omni_engine, ming_tokenizer) -> None:
     """Test async_chunk streaming Ming generation through AsyncOmni."""
 

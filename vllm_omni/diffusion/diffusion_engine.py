@@ -47,6 +47,7 @@ from vllm_omni.diffusion.io_support import (
     supports_audio_output,
     supports_multimodal_input,
 )
+from vllm_omni.diffusion.mixfusion.setup import validate_mixfusion_config
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     any_selected_component_uses_allgather,
@@ -63,6 +64,7 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
     get_diffusion_prefix_cache_func,
+    supports_mixfusion,
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
@@ -88,6 +90,7 @@ from vllm_omni.metrics.utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability
     from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -281,6 +284,7 @@ class DiffusionEngine:
     #: engine class itself, and ``od_config.diffusion_model_runner_cls``
     #: remains a pure explicit user override (never mutated by engines).
     default_diffusion_model_runner_cls: str | None = None
+    mixfusion_capability: MixFusionCapability
 
     # Class-level defaults so tests using object.__new__ (without __init__)
     # don't hit AttributeError when _busy_loop accesses them.
@@ -317,6 +321,9 @@ class DiffusionEngine:
         self.execution_mode = self._resolve_execution_mode(od_config)
         self._init_executor(od_config)
         try:
+            from vllm_omni.diffusion.mixfusion.setup import initialize_mixfusion_admission
+
+            initialize_mixfusion_admission(self)
             profile_requests = self._prepare_diffusion_kv_profile_requests()
             kv_control_plane = initialize_diffusion_kv_control_plane(
                 self.executor,
@@ -372,7 +379,13 @@ class DiffusionEngine:
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
 
     def _resolve_execution_mode(self, od_config: OmniDiffusionConfig) -> DiffusionExecutionMode:
+        mixfusion_needs_steps = validate_mixfusion_config(od_config, supported=supports_mixfusion)
+
         self.step_execution = bool(getattr(od_config, "step_execution", False))
+        if mixfusion_needs_steps and not self.step_execution:
+            logger.warning("enable_mixfusion=True requires step_execution=True; enabling step execution.")
+            od_config.step_execution = True
+            self.step_execution = True
         if od_config.streaming_output and not self.step_execution:
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
             od_config.step_execution = True
@@ -1408,6 +1421,9 @@ class DiffusionEngine:
         pre_process_func = getattr(self, "pre_process_func", None)
         if pre_process_func is not None:
             request = pre_process_func(request)
+        from vllm_omni.diffusion.mixfusion.setup import prepare_mixfusion_admission
+
+        prepare_mixfusion_admission(self, request)
         self._validate_diffusion_kv_profile_limits(request)
         # Gate cache-input preparation itself: disabled caching must not inspect
         # tensors / RNG state or copy token IDs just to discard their hashes.
@@ -1776,9 +1792,11 @@ class DiffusionEngine:
                 guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
                 extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
-                # Warm up the base attention only: service ranges are sized for real
-                # requests, not for the fixed short warm-up sequence.
+                # Warm up the base attention only. Service step ranges are sized for real requests, not for the
+                # fixed short warm-up sequence, and a service sigma window that covers the first step's sigma
+                # would select its profile on the warm-up step.
                 attention_schedule=(),
+                attention_sigma_schedule=(),
             ),
         )
 

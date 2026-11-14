@@ -438,10 +438,28 @@ def test_native_duplex_ledger_without_forwarded_terminator() -> None:
     assert torch.equal(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[3:5])
 
 
+@pytest.mark.parametrize("boundary", [9308, 9309])
+def test_native_duplex_empty_speech_chunk_preserves_segment_boundary(boundary: int) -> None:
+    # A speech unit can contain only the speak decision and chunk terminator.
+    # Dropping this handoff loses the TTS boundary that drives silence continuation.
+    source, _ = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, boundary],
+        row_ids=[101, 102, 9304],
+    )
+    info = _native_handoff(source)
+    assert info["ids"]["tts"] == []
+    assert torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])).numel() == 0
+    assert info["meta"]["segment_end"] is True
+    assert info["meta"]["turn_end"] is False
+    assert info["meta"]["next_stage_prompt_len"] == 2
+    assert info["meta"]["streaming_condition_seq"] == 0
+
+
 def test_native_duplex_turn_eos_row_is_handed_to_talker() -> None:
     """<|turn_eos|> is forwarded (it is not a stop token) and the model keeps
-    sampling until a chunk terminator; the Talker gets the turn_eos row and
-    nothing after it."""
+    sampling until a chunk terminator; the Talker gets every forwarded row
+    before that boundary, including text that reopens the turn."""
     source, latent = _native_source(
         prompt_ids=[101, 102],
         output_ids=[9304, 21, 9310, 77, 9308],
@@ -450,9 +468,9 @@ def test_native_duplex_turn_eos_row_is_handed_to_talker() -> None:
 
     info = _native_handoff(source)
 
-    assert info["ids"]["tts"] == [21, 9310]
-    assert torch.equal(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[3:5])
-    assert info["meta"]["turn_end"] is True
+    assert info["ids"]["tts"] == [21, 9310, 77]
+    assert torch.equal(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[3:6])
+    assert info["meta"]["turn_end"] is False
 
 
 def test_native_duplex_ledger_anchors_on_unit_after_reinjected_listens() -> None:
@@ -767,19 +785,22 @@ def test_native_duplex_turn_end_closes_text_only_after_a_sentence_end(text, comp
 
 
 @pytest.mark.parametrize(
-    "unit_text,after_turn_eos,complete",
+    "unit_text,after_turn_eos,terminal_eos,complete",
     [
-        # The period sampled after <|turn_eos|> never reaches the Talker: the turn stops mid-sentence.
-        ("So the", ".", False),
-        # The word sampled after <|turn_eos|> is dropped from the handoff: the turn ends a sentence.
-        ("Sure, here it is.", "And", True),
+        ("So the", ".", False, False),
+        ("Sure, here it is.", "And", False, False),
+        ("So the", ".", True, True),
+        ("Sure, here it is.", "And", True, False),
     ],
 )
-def test_native_duplex_turn_end_reads_only_the_text_handed_to_the_talker(unit_text, after_turn_eos, complete) -> None:
-    source, _ = _native_source(
+def test_native_duplex_turn_end_follows_last_forwarded_token(unit_text, after_turn_eos, terminal_eos, complete) -> None:
+    # An intermediate turn_eos does not end the unit. Later tokens reopen the
+    # turn, and must keep their text and own-token hidden rows for the Talker.
+    content = [21, 9310, 22, *([9310] if terminal_eos else [])]
+    source, latent = _native_source(
         prompt_ids=[101, 102],
-        output_ids=[9304, 21, 9310, 22, 9308],
-        row_ids=[101, 102, 9304, 21, 9310, 22],
+        output_ids=[9304, *content, 9308],
+        row_ids=[101, 102, 9304, *content],
     )
     token_text = {21: unit_text, 22: after_turn_eos}
     context = StreamingInputState(
@@ -789,10 +810,46 @@ def test_native_duplex_turn_end_reads_only_the_text_handed_to_the_talker(unit_te
 
     info = llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
 
-    assert info["ids"]["tts"] == [21, 9310]
-    assert info["meta"]["turn_end"] is True
+    assert info["ids"]["tts"] == content
+    torch.testing.assert_close(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[3:])
+    assert info["meta"]["native_duplex_segment_text"] == unit_text + after_turn_eos
+    assert info["meta"]["turn_end"] is terminal_eos
     assert info["meta"]["turn_text_ends_sentence"] is complete
     assert info["meta"]["next_stage_prompt_len"] == len(info["ids"]["tts"]) + (2 if complete else 1)
+    assert context.bridge_states["duplex"]["model_turn_id"] == 7 + terminal_eos
+
+
+def test_native_duplex_preserves_ci19446_mid_unit_turn_eos() -> None:
+    # CI 19446 unit 159: the model recognized the color, but the first EOS
+    # used to discard "是一个绿色的正" and close the response before unit 160.
+    speak, turn_eos, chunk_eos = 151706, 151717, 151718
+    content = [turn_eos, speak, 101909, 100706, 9370, 36556]
+    output_ids = [speak, *content, chunk_eos]
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=output_ids,
+        # The extra forwarded row is async lookahead after the real boundary.
+        row_ids=[101, 102, *output_ids, 999],
+    )
+    source.outputs[0].multimodal_output["meta"].update(
+        speak_token_id=speak, turn_eos_token_id=turn_eos, chunk_eos_token_id=chunk_eos
+    )
+    token_text = {101909: "是一个", 100706: "绿色", 9370: "的", 36556: "正"}
+    context = StreamingInputState(
+        bridge_states={"duplex": {"epoch": 0, "model_turn_id": 10}},
+        source_token_decoder=lambda ids, **_: "".join(token_text.get(int(i), "") for i in ids),
+    )
+
+    info = llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == content
+    torch.testing.assert_close(
+        torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[3 : 3 + len(content)]
+    )
+    assert info["meta"]["native_duplex_segment_text"] == "是一个绿色的正"
+    assert info["meta"]["segment_end"] is True
+    assert info["meta"]["turn_end"] is False
+    assert context.bridge_states["duplex"]["model_turn_id"] == 10
 
 
 def test_native_duplex_turn_end_uses_the_last_text_of_the_turn() -> None:

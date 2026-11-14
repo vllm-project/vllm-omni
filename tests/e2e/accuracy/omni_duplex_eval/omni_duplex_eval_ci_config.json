@@ -90,8 +90,20 @@
     ]
   },
   "baseline": {
-    "min_rtd_mean_content_score": 1.8,
-    "min_rtd_mean_temporal_score": 1.4,
-    "min_pr_mean_all_success": 0.28
+    "H100": {
+      "min_rtd_mean_content_score": 1.8,
+      "min_rtd_mean_temporal_score": 1.4,
+      "min_pr_mean_all_success": 0.28
+    },
+    "B200": {
+      "min_rtd_mean_content_score": 1.8,
+      "min_rtd_mean_temporal_score": 1.4,
+      "min_pr_mean_all_success": 0.28
+    },
+    "A3": {
+      "min_rtd_mean_content_score": 1.8,
+      "min_rtd_mean_temporal_score": 1.4,
+      "min_pr_mean_all_success": 0.28
+    }
   }
 }

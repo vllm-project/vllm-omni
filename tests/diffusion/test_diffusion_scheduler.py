@@ -36,6 +36,7 @@ from vllm_omni.diffusion.sched import (
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData, SchedulerRequestState
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_COUNT_KEY
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -393,6 +394,57 @@ class TestGetStepBatchSamplingParamsKey:
         b.batch_compatibility_key = ("bagel_cfg", 4.0)
 
         assert scheduler._build_sampling_params_key(a) != scheduler._build_sampling_params_key(b)
+
+    @staticmethod
+    def _make_stacked(
+        lora_int_ids: list[int],
+        lora_scales: list[float],
+    ) -> OmniDiffusionRequest:
+        from vllm_omni.lora.request import LoRARequest
+
+        sp = OmniDiffusionSamplingParams(num_inference_steps=2)
+        sp.lora_request = [
+            LoRARequest(
+                lora_name=f"adapter-{lora_int_id}",
+                lora_int_id=lora_int_id,
+                lora_path=f"/tmp/lora-{lora_int_id}",
+            )
+            for lora_int_id in lora_int_ids
+        ]
+        sp.lora_scale = lora_scales
+        return OmniDiffusionRequest(
+            prompt="prompt",
+            sampling_params=sp,
+            request_id=f"req-stacked-{'-'.join(map(str, lora_int_ids))}",
+        )
+
+    def test_stacked_lora_list_order_invariant(self) -> None:
+        """The same adapter combination in different list order batches together."""
+        scheduler = _ConcreteScheduler()
+        a = scheduler._build_sampling_params_key(self._make_stacked([1, 2], [0.5, 1.0]))
+        b = scheduler._build_sampling_params_key(self._make_stacked([2, 1], [1.0, 0.5]))
+        assert a == b
+
+    def test_stacked_lora_matches_equivalent_single(self) -> None:
+        """A single-element LoRA list batches together with the scalar form."""
+        scheduler = _ConcreteScheduler()
+        a = scheduler._build_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
+        b = scheduler._build_sampling_params_key(self._make_stacked([1], [0.5]))
+        assert a == b
+
+    def test_stacked_lora_distinguishes_combination_and_scale(self) -> None:
+        scheduler = _ConcreteScheduler()
+        base = scheduler._build_sampling_params_key(self._make_stacked([1, 2], [0.5, 1.0]))
+        assert base != scheduler._build_sampling_params_key(self._make_stacked([1, 3], [0.5, 1.0]))
+        assert base != scheduler._build_sampling_params_key(self._make_stacked([1, 2], [0.6, 1.0]))
+        assert base != scheduler._build_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
+
+    def test_stacked_lora_scale_rounding(self) -> None:
+        """Scales are rounded to 4 decimals before grouping."""
+        scheduler = _ConcreteScheduler()
+        a = scheduler._build_sampling_params_key(self._make_stacked([1], [0.50001]))
+        b = scheduler._build_sampling_params_key(self._make_stacked([1], [0.50002]))
+        assert a == b
 
     @pytest.mark.parametrize(("first", "second", "same_batch"), _ATTENTION_SCHEDULE_KEY_CASES)
     def test_attention_schedule_identity(self, first, second, same_batch) -> None:
@@ -2375,6 +2427,33 @@ class TestStepScheduler:
         assert req_without not in admitted
         assert sched_output.num_waiting_reqs == 1
 
+    def test_step_batch_co_schedules_requests_sharing_lora_stack(self) -> None:
+        """Requests with the same stacked LoRA combination co-batch, regardless of list order."""
+        from vllm_omni.lora.request import LoRARequest
+
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
+
+        lora_a = LoRARequest(lora_name="adapter-A", lora_int_id=1, lora_path="/tmp/lora-a")
+        lora_b = LoRARequest(lora_name="adapter-B", lora_int_id=2, lora_path="/tmp/lora-b")
+
+        def _with_loras(req_id: str, loras: list, scales: list[float]) -> OmniDiffusionRequest:
+            sp = OmniDiffusionSamplingParams(num_inference_steps=4)
+            sp.lora_request = loras
+            sp.lora_scale = scales
+            return _make_step_request(req_id, sampling_params=sp)
+
+        req_ab = scheduler.add_request(_with_loras("ab", [lora_a, lora_b], [0.5, 1.0]))
+        req_ba = scheduler.add_request(_with_loras("ba", [lora_b, lora_a], [1.0, 0.5]))
+        req_a = scheduler.add_request(_with_loras("a-only", [lora_a], [0.5]))
+
+        sched_output = scheduler.schedule()
+
+        admitted = _new_ids(sched_output)
+        assert admitted == [req_ab, req_ba]
+        assert req_a not in admitted
+        assert sched_output.num_waiting_reqs == 1
+
     def test_preempt_request_preserves_step_index(self) -> None:
         request = _make_step_request("preempt", num_inference_steps=3)
         req_id = self.scheduler.add_request(request)
@@ -2492,14 +2571,27 @@ def test_decode_only_stage_drops_the_request_schedule_copied_to_it(model_class_n
         ),
         request_id="req",
     )
+    sigma_request = OmniDiffusionRequest(
+        prompt="prompt",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=1,
+            extra_args={"attention_sigma_schedule": [{"low": 0.0, "high": 1.0, "profile": "sparse"}]},
+        ),
+        request_id="sigma-req",
+    )
 
     if admitted:
         scheduler.add_request(request)
         assert request.sampling_params.attention_schedule is None
         assert "attention_schedule" not in request.sampling_params.extra_args
+        scheduler.add_request(sigma_request)
+        assert sigma_request.sampling_params.attention_sigma_schedule is None
+        assert "attention_sigma_schedule" not in sigma_request.sampling_params.extra_args
     else:
         with pytest.raises(ValueError, match="unknown profile"):
             scheduler.add_request(request)
+        with pytest.raises(ValueError, match="unknown profile"):
+            scheduler.add_request(sigma_request)
 
 
 # (stage_role, model_stage) of the Wan2.2 topology stages, plus deploy configs that set only the
@@ -2571,3 +2663,21 @@ def test_denoising_wan_stage_keeps_and_validates_the_request_schedule(stage_role
     assert known.sampling_params.attention_schedule == (AttentionScheduleRange(start=0, end=None, profile="sparse"),)
     with pytest.raises(InvalidAttentionScheduleError, match="unknown profile"):
         scheduler.add_request(unknown)
+
+
+@pytest.mark.parametrize(("count", "prefetched"), [(1, True), (3, False)])
+def test_per_sample_kv_request_is_not_prefetched(count: int, prefetched: bool) -> None:
+    scheduler = RequestScheduler()
+    scheduler.initialize(
+        SimpleNamespace(request_batch_max_wait_ms=0.0, omni_kv_config={"enable_kv_async_prefetch": True})
+    )
+    for req_id in ("first", "next"):
+        request = _make_request(req_id)
+        request.kv_sender_info = {0: {"host": "127.0.0.1"}}
+        request.sampling_params.extra_args = {PER_SAMPLE_KV_COUNT_KEY: count}
+        scheduler.add_request(request)
+
+    job = scheduler.schedule().kv_prefetch_job
+
+    # Per-sample KV is received in the forward, one transfer per sample.
+    assert (job is not None and job["request_id"] == "next") is prefetched

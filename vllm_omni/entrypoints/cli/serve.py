@@ -785,8 +785,8 @@ class OmniServeCommand(CLISubcommand):
             action=argparse.BooleanOptionalAction,
             default=None,
             help=(
-                "Enable fused permute-free Ulysses all-to-all using platform-specific symmetric memory "
-                "(NCCL on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
+                "Enable Ulysses all-to-all over platform symmetric memory "
+                "(CUDA copy engines on CUDA, TorchNPU on NPU). Only strict Ulysses layouts are eligible. "
                 "NPU currently requires --enforce-eager, pure Ulysses over all ranks in one HCCS domain, "
                 "TorchNPU NPUSHMEM and Triton-Ascend, "
                 "with libshmem.so on LD_LIBRARY_PATH. Defaults to disabled."
@@ -826,6 +826,17 @@ class OmniServeCommand(CLISubcommand):
                 "Diffusion-only runtime override for ModelOpt FP8 checkpoints: "
                 "force CUTLASS FP8 linear kernels on CUDA SM89+ devices. "
                 "Ignored for BF16, non-ModelOpt FP8, ROCm, and older CUDA GPUs."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusion-flashinfer-autotune",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Diffusion-only: autotune FlashInfer GEMMs (on SM100+: MXFP8 and per-tensor FP8 linears) so they use "
+                "tuned tactics instead of heuristics. Default: on for CUDA SM100+ with FlashInfer, off elsewhere; "
+                "--no-diffusion-flashinfer-autotune disables it. The first request of each new shape pays the tuning; "
+                "tactics are cached per rank under VLLM_CACHE_ROOT and reused after a restart."
             ),
         )
 
@@ -887,11 +898,15 @@ class OmniServeCommand(CLISubcommand):
             "--diffusion-attention-schedule",
             type=_json_object,
             default=None,
-            help="Startup attention profiles and default step ranges as JSON or dotted flags. "
-            "Each profile is an independent attention config; ranges use zero-based [start, end) steps, "
-            "with null end meaning the actual sequence end. "
+            help="Startup attention profiles with either default step ranges or sigma noise windows, as JSON "
+            "or dotted flags. Each profile is an independent attention config. Step ranges use zero-based "
+            "[start, end), with null end meaning the actual sequence end. Sigma windows use scheduler "
+            "sigma in [0, 1] as [low, high); a high of 1 includes 1. Non-empty default and sigma lists "
+            "are mutually exclusive. "
             'Example: \'{"profiles": {"dense": {"default": "TORCH_SDPA"}}, '
-            '"default": [{"start": 3, "end": null, "profile": "dense"}]}\'.',
+            '"default": [{"start": 3, "end": null, "profile": "dense"}]}\'. Sigma example: '
+            '\'{"profiles": {"dense": {"default": "TORCH_SDPA"}}, '
+            '"sigma": [{"low": 0.0, "high": 0.3, "profile": "dense"}]}\'.',
         )
 
         # Cache optimization parameters
@@ -941,6 +956,39 @@ class OmniServeCommand(CLISubcommand):
             help="Request-mode batch admission: max milliseconds to wait for compatible "
             "requests to accumulate before scheduling a fused forward wave. "
             "0 disables admission (default).",
+        )
+        # Server-level MixFusion defaults. Unset flags leave the deploy YAML's
+        # per-stage ``enable_mixfusion`` / ``mixfusion_min_chunk_tokens`` /
+        # ``mixfusion_max_chunks`` values in force; per-request extra_args still
+        # take precedence over this server default.
+        omni_config_group.add_argument(
+            "--enable-mixfusion",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Enable mixed-resolution batch packing (MixFusion) in the diffusion scheduler "
+                "as the server-level default (default: disabled). MixFusion requires step "
+                "execution, which is enabled automatically when this flag is set. "
+                "--no-enable-mixfusion overrides a deploy YAML stage enabled with enable_mixfusion."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--mixfusion-min-chunk-tokens",
+            type=int,
+            default=None,
+            help=(
+                "MixFusion packing: minimum token budget per ragged-latent chunk (default: 256). "
+                "Unset leaves the deploy YAML value in force."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--mixfusion-max-chunks",
+            type=int,
+            default=None,
+            help=(
+                "MixFusion packing: maximum number of chunks packed into one fused forward "
+                "(default: 128). Unset leaves the deploy YAML value in force."
+            ),
         )
 
         # VAE memory optimization parameters
@@ -1280,6 +1328,9 @@ def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
 
+    if resolved.weight_sharing is not None:
+        raise ValueError("weight sharing requires one API server with local stage ownership")
+
     sleep_stages = [
         int(getattr(stage_config, "stage_id", stage_index))
         for stage_index, stage_config in enumerate(stage_configs)
@@ -1532,6 +1583,9 @@ def run_headless(args: TrackingNamespace) -> None:
     )
     config_path = resolved.config_path
     stage_configs = list(resolved.stage_configs)
+
+    if resolved.weight_sharing is not None:
+        raise ValueError("weight sharing does not support headless stages; launch both stages in one local server")
 
     try:
         stage_cfg = resolved.stage_by_id(stage_id)

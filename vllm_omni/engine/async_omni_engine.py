@@ -315,6 +315,7 @@ class AsyncOmniEngine(OmniEngineBase):
                     copy.copy(prompt),
                     effective_sampling_params_list,
                 )
+                params = effective_sampling_params_list[0]
                 if isinstance(prompt, dict):
                     raw_dirs = prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None)
                     if isinstance(raw_dirs, list) and all(isinstance(path, str) for path in raw_dirs):
@@ -668,6 +669,7 @@ class AsyncOmniEngine(OmniEngineBase):
                     companions = self._build_cfg_companions(
                         request_id, msg.original_prompt, stage0_params, effective_spl
                     )
+            msg.cfg_companion_ids = {companion.role: companion.companion_id for companion in companions} or None
         except BaseException:
             # Companion construction runs under this guard too: a failure after
             # the ADD message exists must still release its preprocessed
