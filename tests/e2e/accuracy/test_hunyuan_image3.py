@@ -239,27 +239,20 @@ _DEPLOY_CONFIG = {
 # fmt: on
 
 _QUANT_DIT_CONFIG = {
-    "pipeline": "hunyuan_image_3_moe",
+    "pipeline": "hunyuan_image3_dit",
     "async_chunk": False,
     "trust_remote_code": True,
     "stages": [
         {
             "stage_id": 0,
-            "model_stage": "dit",
             "enforce_eager": True,
             "trust_remote_code": True,
             "devices": "0,1",
-            "distributed_executor_backend": "mp",
             "force_cutlass_fp8": True,
-            "moe_backend": "cutlass",
             "parallel_config": {
                 "tensor_parallel_size": 2,
                 "enable_expert_parallel": True,
             },
-            "omni_kv_config": {"need_recv_cache": True},
-            "final_output": True,
-            "final_output_type": "image",
-            "is_comprehension": False,
             "default_sampling_params": {"seed": SEED},
         }
     ],
@@ -271,12 +264,15 @@ class _QuantAccuracyCase:
     name: str
     model_env: str
     nvfp4_backend: str | None = None
+    moe_backend: str = "auto"
 
 
 def _quant_accuracy_cases() -> list[pytest.ParameterSet]:
     cases = [
         _QuantAccuracyCase(name="fp8", model_env=QUANT_FP8_ENV),
-        _QuantAccuracyCase(name="mixed_nvfp4", model_env=QUANT_NVFP4_ENV, nvfp4_backend="cutlass"),
+        _QuantAccuracyCase(
+            name="mixed_nvfp4", model_env=QUANT_NVFP4_ENV, nvfp4_backend="cutlass", moe_backend="cutlass"
+        ),
     ]
     params: list[pytest.ParameterSet] = []
     run_quant_accuracy = os.environ.get(QUANT_RUN_ENV, "").lower() in _TRUE_ENV_VALUES
@@ -307,8 +303,9 @@ def _quant_tensor_parallel_size() -> int:
     return int(os.environ.get("HUNYUAN_IMAGE3_QUANT_TP", str(len(_quant_devices().split(",")))))
 
 
-def _make_quant_dit_config(path: Path) -> None:
+def _make_quant_dit_config(path: Path, moe_backend: str = "auto") -> None:
     config = cast(dict[str, Any], copy.deepcopy(_QUANT_DIT_CONFIG))
+    config["stages"][0]["moe_backend"] = moe_backend
     config["stages"][0]["devices"] = _quant_devices()
     config["stages"][0]["parallel_config"]["tensor_parallel_size"] = _quant_tensor_parallel_size()
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
@@ -564,7 +561,6 @@ def _run_dit_model(
         with OmniRunner(
             model,
             deploy_config=deploy_config_path,
-            mode="text-to-image",
             trust_remote_code=True,
         ) as runner:
             generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
@@ -689,8 +685,10 @@ def test_quantized_dit_matches_bf16_accuracy(
     quant_model = os.environ[case.model_env]
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        deploy_config_path = Path(tmpdir) / "hunyuan_image3_quant_dit.yaml"
+        deploy_config_path = Path(tmpdir) / "hunyuan_image3_bf16_dit.yaml"
         _make_quant_dit_config(deploy_config_path)
+        quant_config_path = Path(tmpdir) / "hunyuan_image3_quant_dit.yaml"
+        _make_quant_dit_config(quant_config_path, case.moe_backend)
 
         bf16_image, bf16_time = _run_dit_model(
             bf16_model,
@@ -699,7 +697,7 @@ def test_quantized_dit_matches_bf16_accuracy(
         )
         quant_image, quant_time = _run_dit_model(
             quant_model,
-            str(deploy_config_path),
+            str(quant_config_path),
             output_dir / f"{case.name}.png",
             nvfp4_backend=case.nvfp4_backend,
         )
