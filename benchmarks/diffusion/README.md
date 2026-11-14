@@ -33,13 +33,46 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
 - By default, image tasks talk to `http://<host>:<port>/v1/chat/completions`; video tasks talk to `/v1/videos`.
 - If you run the server on another host or port, pass `--base-url` accordingly.
 
-## 2. Supported Datasets
+## 2. Supported endpoints
 
-The benchmark supports three dataset modes via `--dataset`:
+The script drives the OpenAI-compatible endpoints of a running server, so it
+measures the deployed service rather than an in-process pipeline.
+
+| `--endpoint` | Tasks | Request shape | Notes |
+| --- | --- | --- | --- |
+| `/v1/videos` | `t2v`, `i2v`, `ti2v`, `v2v` | Multipart form upload, then poll | Asynchronous: the script creates the job and polls it until it finishes. |
+| `/v1/chat/completions` | `t2i`, `i2i`, `ti2i`, `it2i` | OpenAI chat request | The image comes back in the chat response. Input images are sent as `image_url` content parts. |
+| `/v1/images/edits` | `i2i`, `ti2i`, `it2i` | Multipart form upload | Needs at least one input image. Supports `--bot-task` for image-conditioned models. |
+| `/v1/images/generations` | `t2i` | OpenAI image request | Text-to-image only: input images are not sent. |
+
+`--endpoint` is optional. When it is omitted, the endpoint follows the task:
+
+| Task | Endpoint |
+| --- | --- |
+| `t2v`, `i2v`, `ti2v`, `v2v` | `/v1/videos` |
+| `i2i`, `ti2i`, `it2i` | `/v1/images/edits` |
+| `t2i` | `/v1/chat/completions` |
+
+Pass `--endpoint` explicitly to use an endpoint the task default does not
+select, for example `--endpoint /v1/images/generations --task t2i`.
+
+The endpoint has to match the task family: the image tasks (`t2i`, `i2i`,
+`ti2i`, `it2i`) use the image endpoints, the video tasks (`t2v`, `i2v`, `ti2v`,
+`v2v`) use `/v1/videos`. A mismatch fails with the list of endpoints that fit
+the task. `/v1/images/edits` additionally needs an image-conditioned task,
+because it uploads the input image as a file.
+
+The legacy `--backend vllm-omni` and `--backend openai` values are aliases for
+`/v1/chat/completions` and `/v1/images/generations`.
+
+## 3. Supported Datasets
+
+The benchmark supports four dataset modes via `--dataset`:
 
 - `vbench`: Built-in prompt/data loader.
 - `trace`: Heterogeneous request traces (each request can have different resolution/frames/steps).
-- `random`: Synthetic prompts for quick smoke tests.
+- `random`: Synthetic requests, optionally mixed from several request profiles.
+- `custom`: Requests replayed from a local JSONL file.
 
 ### VBench dataset
 
@@ -91,21 +124,94 @@ Current defaults:
 
 You can point to your own trace using `--dataset-path`.
 
-## 3. Benchmark Parameters
+### Random dataset
+
+`--dataset random` synthesizes requests from `--random-request-config`, a JSON
+list of request profiles. Each profile may set `width`, `height`,
+`num_inference_steps`, `num_frames`, `fps` and `prompt`; the `weight` field is
+required for every profile and controls how often the profile is drawn, so one
+run can mix several resolutions and step counts. The seed comes from `--seed`,
+not from the profile.
+
+```bash
+python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+    --endpoint /v1/videos --dataset random --task t2v --num-prompts 10 \
+    --random-request-config '[
+        {"width":854,"height":480,"num_inference_steps":18,"num_frames":120,"fps":24,"weight":1}
+    ]'
+```
+
+Image-conditioned tasks (`i2v`, `ti2v`, `ti2i`, `i2i`, `it2i`) need input
+media. With `--dataset random` the script synthesizes it, and
+`--num-input-images` sets how many input images are attached per request
+(default: 1). `--enable-negative-prompt` adds a negative prompt to the
+generated requests.
+
+### Custom dataset
+
+`--dataset custom` replays requests from a JSONL file given by
+`--dataset-path`, with one JSON object per line:
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `prompt` | yes | The text prompt. |
+| `width`, `height` | no | Requested output size. |
+| `num_inference_steps` | no | Diffusion steps. |
+| `seed` | no | Random seed. |
+| `image_paths` | no | Input image paths, for the image-conditioned tasks (`i2i` / `i2v` / `ti2i` / `it2i`). |
+| `image_urls` | no | Input image URLs, as an alternative to `image_paths`. |
+| `video_paths` | no | Input video paths, for `v2v`. |
+| `video_urls` | no | Input video URLs, as an alternative to `video_paths`. |
+
+```bash
+python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+    --endpoint /v1/images/edits --dataset custom \
+    --dataset-path custom_requests.jsonl --task ti2i --bot-task think
+```
+
+## 4. Benchmark Parameters
 
 ### Basic flags
 
-- `--base-url`: Server address; `--endpoint` selects the path appended to this base URL.
-- `--model`: The OpenAI-compatible `model` field.
-- `--endpoint`: API endpoint path. Leading `/` is optional, e.g. `/v1/videos` or `v1/videos`.
-- `--task`: Task type (e.g., `t2i`, `t2v`, `i2i`, `i2v`).
-- `--dataset`: Dataset mode (`vbench` / `trace` / `random`).
-- `--num-prompts`: Number of requests to send.
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--base-url` | `http://<host>:<port>` | Server address; overrides `--host` and `--port`. |
+| `--host` | `localhost` | Server host. |
+| `--port` | `8091` | Server port. |
+| `--model` | `default` | The OpenAI-compatible `model` field. |
+| `--endpoint` | from `--task` | API endpoint path. Leading `/` is optional, e.g. `/v1/videos` or `v1/videos`. |
+| `--task` | `t2v` | Task type (`t2v`, `i2v`, `ti2v`, `v2v`, `t2i`, `i2i`, `ti2i`, `it2i`). |
+| `--dataset` | `vbench` | Dataset mode (`vbench` / `trace` / `random` / `custom`). |
+| `--dataset-path` | none | Local dataset file (`custom`) or trace root (`trace`). |
+| `--num-prompts` | `10` | Number of requests to send. |
+| `--max-concurrency` | `1` | Maximum number of in-flight requests. |
+| `--request-rate` | `inf` | Request rate. `inf` sends every request at time 0; otherwise arrivals follow a Poisson process. |
+| `--output-file` | none | Write the metrics to a JSON file. |
+| `--save-dir` | none | Save the generated outputs for inspection. Without it the outputs are discarded after the metrics are collected. |
+| `--disable-tqdm` | off | Disable the progress bar. |
 
-Common optional flags:
+### Request shaping
 
-- `--output-file`: Write metrics to a JSON file.
-- `--disable-tqdm`: Disable the progress bar.
+- `--width`, `--height`: Output size. Pass them together; one of them alone
+  cannot be resolved.
+- `--num-frames`: Number of frames, for video tasks.
+- `--num-inference-steps`: Number of diffusion steps (default: 50).
+- `--fps`: Frames per second, for video tasks.
+- `--seed`: Random seed, for diffusion models.
+- `--extra-body`: JSON object merged into every generated request body or form.
+- `--enable-negative-prompt`: Generate negative prompts, with the `random`
+  dataset.
+- `--random-request-config`: JSON list of request profiles, with the `random`
+  dataset.
+- `--num-input-images`: Number of synthetic input images per request, for
+  image-conditioned tasks with the `random` dataset (default: 1).
+- `--bot-task`: `bot_task` form field for `/v1/images/edits` (`think`,
+  `recaption`, `think_recaption`, `vanilla`).
+- `--return-stage-metrics`: Ask the server for per-stage durations. The flag only
+  adds the request field on `/v1/chat/completions`. `/v1/videos` returns stage
+  durations in its job-status response instead, and only when the server runs
+  with `--enable-diffusion-pipeline-profiler`; the image endpoints do not report
+  them.
 
 ### Resolution / frames / steps: CLI defaults vs dataset fields
 
@@ -168,6 +274,88 @@ batch may still pay compile or CUDA-graph capture cost.
 
 For a Qwen-Image continuous-batching replay example, see
 [`performance_dashboard/qwen_image_serving_performance.md`](./performance_dashboard/qwen_image_serving_performance.md).
+
+## 5. Sample commands
+
+One runnable command per supported endpoint. They assume a server started with
+`vllm serve <model> --omni --port 8091`; adjust `--base-url` and `--model` for
+your deployment.
+
+`/v1/videos` (text-to-video):
+
+```bash
+python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+    --base-url http://localhost:8091 --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+    --endpoint /v1/videos --dataset vbench --task t2v --num-prompts 10 \
+    --width 640 --height 480 --fps 16 --num-frames 80 --num-inference-steps 40
+```
+
+`/v1/chat/completions` (text-to-image):
+
+```bash
+python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+    --base-url http://localhost:8091 --model Qwen/Qwen-Image \
+    --endpoint /v1/chat/completions --dataset vbench --task t2i --num-prompts 10 \
+    --width 1024 --height 1024
+```
+
+`/v1/images/generations` (text-to-image):
+
+```bash
+python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+    --base-url http://localhost:8091 --model Qwen/Qwen-Image \
+    --endpoint /v1/images/generations --dataset vbench --task t2i --num-prompts 10 \
+    --width 1024 --height 1024
+```
+
+`/v1/images/edits` (image-conditioned edit):
+
+```bash
+python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+    --base-url http://localhost:8091 --model tencent/HunyuanImage-3.0 \
+    --endpoint /v1/images/edits --dataset random --task ti2i --num-prompts 10 \
+    --bot-task think --num-input-images 1
+```
+
+## 6. Using `vllm bench serve --omni` instead
+
+The unified `vllm bench serve --omni` runner covers the same endpoints and
+does not need this script. It registers an OpenAI-compatible client per
+endpoint:
+
+| Endpoint | How to select it |
+| --- | --- |
+| `/v1/videos` | `--endpoint /v1/videos` with `--dataset-name random-mm` |
+| `/v1/images/generations` | `--endpoint /v1/images/generations` |
+| `/v1/images/edits` | `--endpoint /v1/images/edits`, or `--backend openai-image-edits-omni` |
+| `/v1/chat/completions` | `--backend openai-chat-omni` |
+
+For example, the text-to-video case above becomes:
+
+```bash
+vllm bench serve --omni \
+    --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+    --endpoint /v1/videos \
+    --dataset-name random-mm \
+    --tokenizer gpt2 \
+    --num-prompts 10 \
+    --max-concurrency 1 \
+    --random-input-len 8 \
+    --random-output-len 1 \
+    --extra-body '{"width":640,"height":480,"num_inference_steps":40,"num_frames":80,"fps":16,"seed":42}'
+```
+
+The `random-mm` dataset builds synthetic prompts, so it needs a `--tokenizer`;
+the `extra-body` values override the generated request's size, frame count and
+seed.
+
+The two runners report different metric sets, and the perf-test suites pick
+between them by config schema: `benchmark_params[].dataset_name` selects
+`vllm bench serve --omni`, while `benchmark_params[].dataset` without a
+`dataset_name` selects this script. The configs live in
+[tests/dfx/perf](../../tests/dfx/perf/), and the
+[CLI guide](../../docs/cli/bench/serve.md) documents the
+`vllm bench serve --omni` arguments.
 
 ## HunyuanImage3 reference-prefix reuse
 
