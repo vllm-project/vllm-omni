@@ -71,6 +71,10 @@ def _minimaxh3_params_builder(
     for key in ("audio_flow_shift",):
         if key in params:
             merged_extra_params[key] = params.pop(key)
+    # "native" is the server default; omit it so ordinary requests are unchanged.
+    audio_mode = params.pop("audio_mode", "native")
+    if audio_mode != "native":
+        merged_extra_params["audio_mode"] = audio_mode
     if params:
         logger.warning("Unused MiniMax-H3 model params ignored: %s", sorted(params))
 

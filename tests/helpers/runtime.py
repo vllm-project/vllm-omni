@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -43,6 +44,16 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 SERVER_STARTUP_TIMEOUT_S = 2400
+# AMD build 15260 already auto-prefetched its 65.68 GiB NFS checkpoint;
+# sibling SHM stages spent about 578s loading weights near the 600s deadline.
+# Start with a bounded 900s stage allowance. Direct/online test paths use a
+# 1200s overall bound; offline OmniRunner tests retain their 1800s default.
+# These are ROCm Qwen3-Omni test settings, pending cold-storage qualification.
+QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S = 900
+QWEN3_OMNI_COLD_INIT_TIMEOUT_S = 1200
+# Diffusion workers alone may need 15s + 5s + 5s for cooperative cleanup
+# and signal escalation. Keep their tracker alive while the API owns teardown.
+SERVER_SHUTDOWN_TIMEOUT_S = 60
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
@@ -80,6 +91,20 @@ def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
     raise RuntimeError(
         f"Could not obtain a free TCP port on {host!r} after {max_attempts} attempts (last error: {last_exc!r})"
     ) from last_exc
+
+
+def assign_ephemeral_master_port() -> int:
+    """Point ``MASTER_ADDR`` / ``MASTER_PORT`` at a free local port.
+
+    A literal port is shared by every xdist worker, so concurrent
+    ``init_process_group(env://)`` calls fail with ``EADDRINUSE``.
+    ``setdefault`` does not help: the first test on a worker leaves
+    ``MASTER_PORT`` set, and every later test keeps that occupied port.
+    """
+    port = get_open_port()
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    return port
 
 
 def dummy_messages_from_mix_data(
@@ -181,6 +206,9 @@ class OmniServer:
         self._auto_port = port is None
         self._port_lock: FileLock | None = None
         self.port = get_open_port() if port is None else port
+        # Bounded ring buffer of child stderr for early-exit diagnostics.
+        self._server_error_lines: deque[str] = deque(maxlen=100)
+        self._server_log_thread: threading.Thread | None = None
 
     def _reserve_port(self) -> None:
         # bind(0)/close does not reserve a port across concurrent pytest workers.
@@ -190,7 +218,9 @@ class OmniServer:
         for attempt in range(128):
             if attempt:
                 self.port = get_open_port(self.host)
-            lock_path = Path(tempfile.gettempdir()) / f"vllm-omni-test-port-{os.getuid()}-{self.port}.lock"
+            # Windows has no uid; one shared owner keeps the port lock name stable.
+            owner_id = getattr(os, "getuid", lambda: 0)()
+            lock_path = Path(tempfile.gettempdir()) / f"vllm-omni-test-port-{owner_id}-{self.port}.lock"
             lock = FileLock(lock_path)
             try:
                 lock.acquire(timeout=0)
@@ -247,11 +277,34 @@ class OmniServer:
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         startup_t0 = time.perf_counter()
+        # Inherit stdout (INFO still shows in CI); capture stderr only for the
+        # exited-before-ready RuntimeError message. errors=replace keeps the
+        # reader alive on undecodable bytes so a full pipe cannot hang serve.
+        self._server_error_lines = deque(maxlen=100)
+        self._server_log_thread = None
         self.proc = subprocess.Popen(
             cmd,
             env=env,
             cwd=_omni_subprocess_cwd(),
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
         )
+        stderr = getattr(self.proc, "stderr", None)
+        # Test doubles may omit a pipe; skip capture rather than asserting.
+        if stderr is not None:
+            error_lines = self._server_error_lines
+
+            def _drain_stderr() -> None:
+                try:
+                    for line in stderr:
+                        error_lines.append(line)
+                except Exception:
+                    pass
+
+            self._server_log_thread = threading.Thread(target=_drain_stderr, name="omni-server-stderr", daemon=True)
+            self._server_log_thread.start()
 
         max_wait = self.startup_timeout
         # System clock corrections must not shorten or extend startup waits.
@@ -259,13 +312,17 @@ class OmniServer:
         while time.monotonic() - start_time < max_wait:
             ret = self.proc.poll()
             if ret is not None:
-                raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
+                raise RuntimeError(
+                    f"Server processes exited with code {ret} before becoming ready.{self._server_error_tail()}"
+                )
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
                 if sock.connect_ex((self.host, self.port)) == 0 and self._owns_listening_port():
                     ret = self.proc.poll()
                     if ret is not None:
-                        raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
+                        raise RuntimeError(
+                            f"Server processes exited with code {ret} before becoming ready.{self._server_error_tail()}"
+                        )
                     startup_s = time.perf_counter() - startup_t0
                     if self.log_stats:
                         print(
@@ -274,7 +331,7 @@ class OmniServer:
                         )
                     return
             time.sleep(2)
-        raise RuntimeError(f"Server failed to start within {max_wait} seconds")
+        raise RuntimeError(f"Server failed to start within {max_wait} seconds{self._server_error_tail()}")
 
     @staticmethod
     def _reap_zombie(proc: "psutil.Process") -> bool:
@@ -340,7 +397,7 @@ class OmniServer:
             # 2. Give the parent time to shut down its children cleanly.
             parent_exited = False
             try:
-                parent.wait(timeout=15)
+                parent.wait(timeout=SERVER_SHUTDOWN_TIMEOUT_S)
                 parent_exited = True
             except psutil.NoSuchProcess:
                 parent_exited = True
@@ -414,12 +471,38 @@ class OmniServer:
         except psutil.NoSuchProcess:
             pass
 
+    def _server_error_tail(self) -> str:
+        if self._server_log_thread is not None:
+            self._server_log_thread.join(timeout=2)
+        if not self._server_error_lines:
+            return ""
+        return "\n=== OmniServer stderr ===\n{}".format("".join(self._server_error_lines))
+
+    def _stop_stderr_reader(self) -> None:
+        """Join the drain thread; close stderr only if the reader has stopped.
+
+        Closing the pipe from this thread while the reader is blocked in
+        ``readline`` can hang (e.g. a descendant still holds the write end).
+        Prefer abandoning a stuck daemon reader over blocking ``__exit__``.
+        """
+        thread = self._server_log_thread
+        if thread is not None:
+            thread.join(timeout=2)
+        if thread is None or not thread.is_alive():
+            stderr = getattr(self.proc, "stderr", None) if self.proc is not None else None
+            if stderr is not None:
+                try:
+                    stderr.close()
+                except Exception:
+                    pass
+        self._server_log_thread = None
+
     def __enter__(self):
         try:
             self._start_server()
         except BaseException:
             # ``__exit__`` is not invoked when ``__enter__`` raises; roll back
-            # any processes / log handles already launched.
+            # any process already launched.
             self.__exit__(None, None, None)
             raise
         return self
@@ -429,6 +512,7 @@ class OmniServer:
             if self.proc:
                 self._kill_process_tree(self.proc.pid)
         finally:
+            self._stop_stderr_reader()
             if self._port_lock is not None:
                 self._port_lock.release()
                 self._port_lock = None
@@ -468,12 +552,12 @@ class OmniServerStageCli(OmniServer):
         if 0 not in self.stage_ids:
             raise ValueError(f"Stage CLI test requires stage_id=0 in config: {stage_config_path}")
         self.stage_replica_counts = load_stage_replica_counts(resolved_cfg)
-        self.stage_procs: dict[tuple[int, int], subprocess.Popen] = {}
-        self._stage_log_paths: dict[tuple[int, int], Path] = {}
-        self._stage_log_files: dict[tuple[int, int], Any] = {}
+        self.stage_procs: dict[int, subprocess.Popen] = {}
+        self._stage_log_paths: dict[int, Path] = {}
+        self._stage_log_files: dict[int, Any] = {}
         self.proc = None
 
-    def _build_stage_cmd(self, stage_id: int, *, headless: bool, replica_id: int = 0) -> list[str]:
+    def _build_stage_cmd(self, stage_id: int, *, headless: bool) -> list[str]:
         cmd = [
             sys.executable,
             "-m",
@@ -489,9 +573,14 @@ class OmniServerStageCli(OmniServer):
             self.host,
             "--omni-master-port",
             str(self.master_port),
-            "--replica-id",
-            str(replica_id),
         ]
+
+        # One process owns all local replicas of a stage: serve ignores
+        # ``--replica-id``, and only ``--omni-dp-size-local`` splits the stage
+        # ``devices`` pool so each replica gets its own card.
+        num_local_replicas = self.stage_replica_counts.get(stage_id, 1)
+        if num_local_replicas > 1:
+            cmd += ["--omni-dp-size-local", str(num_local_replicas)]
 
         if headless:
             cmd.append("--headless")
@@ -501,21 +590,20 @@ class OmniServerStageCli(OmniServer):
         cmd += self.serve_args
         return cmd
 
-    def _launch_stage(self, stage_id: int, *, headless: bool, replica_id: int = 0) -> None:
+    def _launch_stage(self, stage_id: int, *, headless: bool) -> None:
         env = os.environ.copy()
         if self.env_dict is not None:
             env.update(self.env_dict)
 
-        cmd = self._build_stage_cmd(stage_id, headless=headless, replica_id=replica_id)
-        print(f"Launching OmniServerStageCli stage {stage_id} replica {replica_id}: {' '.join(cmd)}")
+        cmd = self._build_stage_cmd(stage_id, headless=headless)
+        print(f"Launching OmniServerStageCli stage {stage_id}: {' '.join(cmd)}")
         # Capture each subprocess's stdout+stderr to a per-stage log file so
         # debugging "Stage N exited before API server ready" doesn't rely on
         # guessing; the file is surfaced in the RuntimeError message.
-        log_path = Path(tempfile.gettempdir()) / f"omni_stage_{stage_id}_replica_{replica_id}_{self.master_port}.log"
-        stage_key = (stage_id, replica_id)
-        self._stage_log_paths[stage_key] = log_path
+        log_path = Path(tempfile.gettempdir()) / f"omni_stage_{stage_id}_{self.master_port}.log"
+        self._stage_log_paths[stage_id] = log_path
         log_fh = open(log_path, "w", buffering=1)  # noqa: SIM115 - closed in ``__exit__``
-        self._stage_log_files[stage_key] = log_fh
+        self._stage_log_files[stage_id] = log_fh
         proc = subprocess.Popen(
             cmd,
             env=env,
@@ -526,40 +614,37 @@ class OmniServerStageCli(OmniServer):
             stdout=log_fh,
             stderr=subprocess.STDOUT,
         )
-        self.stage_procs[stage_key] = proc
-        if stage_id == 0 and replica_id == 0:
+        self.stage_procs[stage_id] = proc
+        if stage_id == 0:
             self.proc = proc
 
     def _ensure_stage_processes_alive(self) -> None:
-        for (stage_id, replica_id), proc in self.stage_procs.items():
+        for stage_id, proc in self.stage_procs.items():
             ret = proc.poll()
             if ret is not None:
-                log_path = self._stage_log_paths.get((stage_id, replica_id))
+                log_path = self._stage_log_paths.get(stage_id)
                 tail = ""
                 if log_path and log_path.exists():
                     try:
                         with open(log_path, encoding="utf-8", errors="replace") as f:
                             lines = f.readlines()
-                        tail = "\n=== Last 60 lines of stage {} replica {} log ({}) ===\n{}".format(
-                            stage_id, replica_id, log_path, "".join(lines[-60:]) or "<empty>"
+                        tail = "\n=== Last 60 lines of stage {} log ({}) ===\n{}".format(
+                            stage_id, log_path, "".join(lines[-60:]) or "<empty>"
                         )
                     except Exception as exc:  # pragma: no cover - diagnostic only
                         tail = f"\n<failed to read stage log {log_path}: {exc}>"
-                raise RuntimeError(
-                    f"Stage {stage_id} replica {replica_id} exited with code {ret} before API server became ready.{tail}"
-                )
+                raise RuntimeError(f"Stage {stage_id} exited with code {ret} before API server became ready.{tail}")
 
     def _start_server(self) -> None:
         startup_t0 = time.perf_counter()
         ordered_stage_ids = [0, *[stage_id for stage_id in self.stage_ids if stage_id != 0]]
 
-        self._launch_stage(0, headless=False, replica_id=0)
+        self._launch_stage(0, headless=False)
         time.sleep(2)
         self._ensure_stage_processes_alive()
 
         for stage_id in ordered_stage_ids[1:]:
-            for replica_id in range(self.stage_replica_counts.get(stage_id, 1)):
-                self._launch_stage(stage_id, headless=True, replica_id=replica_id)
+            self._launch_stage(stage_id, headless=True)
 
         max_wait = self.startup_timeout
         # System clock corrections must not shorten or extend startup waits.
@@ -582,6 +667,14 @@ class OmniServerStageCli(OmniServer):
 
         raise RuntimeError(f"OmniServerStageCli failed to start within {max_wait} seconds")
 
+    def read_stage_logs(self) -> dict[int, str]:
+        """Return the log each stage subprocess has written so far, keyed by stage id."""
+        logs: dict[int, str] = {}
+        for stage_id, log_path in self._stage_log_paths.items():
+            if log_path and log_path.exists():
+                logs[stage_id] = log_path.read_text(encoding="utf-8", errors="replace")
+        return logs
+
     def _dump_stage_logs_for_debug(self, head_lines: int = 300, tail_lines: int = 500) -> None:
         """Tail each stage's subprocess log back to stdout on teardown.
 
@@ -593,15 +686,15 @@ class OmniServerStageCli(OmniServer):
         whatever state the stage was in when it was torn down.
         """
         log_paths = self._stage_log_paths
-        for stage_id, replica_id in sorted(log_paths):
-            log_path = log_paths[(stage_id, replica_id)]
+        for stage_id in sorted(log_paths):
+            log_path = log_paths[stage_id]
             if not log_path or not log_path.exists():
                 continue
             try:
                 with open(log_path, encoding="utf-8", errors="replace") as f:
                     lines = f.readlines()
             except Exception as exc:  # pragma: no cover - diagnostic only
-                print(f"[OmniServerStageCli] stage {stage_id} replica {replica_id} log read failed: {exc}", flush=True)
+                print(f"[OmniServerStageCli] stage {stage_id} log read failed: {exc}", flush=True)
                 continue
             total = len(lines)
             if total <= head_lines + tail_lines:
@@ -612,18 +705,18 @@ class OmniServerStageCli(OmniServer):
                 head_chunk = lines[:head_lines]
                 tail_chunk = lines[-tail_lines:]
                 elided = total - head_lines - tail_lines
-            print(f"\n=== stage {stage_id} replica {replica_id} log HEAD ({log_path}) ===", flush=True)
+            print(f"\n=== stage {stage_id} log HEAD ({log_path}) ===", flush=True)
             print("".join(head_chunk).rstrip("\n"), flush=True)
             if tail_chunk:
                 print(f"\n... [{elided} lines elided] ...", flush=True)
-                print(f"\n=== stage {stage_id} replica {replica_id} log TAIL ({log_path}) ===", flush=True)
+                print(f"\n=== stage {stage_id} log TAIL ({log_path}) ===", flush=True)
                 print("".join(tail_chunk).rstrip("\n"), flush=True)
-            print(f"=== end stage {stage_id} replica {replica_id} log ===\n", flush=True)
+            print(f"=== end stage {stage_id} log ===\n", flush=True)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._dump_stage_logs_for_debug()
-        for stage_key in sorted(self.stage_procs, reverse=True):
-            proc = self.stage_procs[stage_key]
+        for stage_id in sorted(self.stage_procs, reverse=True):
+            proc = self.stage_procs[stage_id]
             if proc.poll() is None:
                 self._kill_process_tree(proc.pid)
 
@@ -631,15 +724,15 @@ class OmniServerStageCli(OmniServer):
         keep_logs = os.environ.get("VLLM_OMNI_KEEP_LOG", "").lower() in ("1", "true", "yes")
         log_files = self._stage_log_files
         log_paths = self._stage_log_paths
-        for stage_key in set(log_files) | set(log_paths):
-            log_fh = log_files.get(stage_key)
+        for stage_id in set(log_files) | set(log_paths):
+            log_fh = log_files.get(stage_id)
             if log_fh is not None:
                 try:
                     log_fh.close()
                 except Exception:
                     pass
             if not keep_logs:
-                log_path = log_paths.get(stage_key)
+                log_path = log_paths.get(stage_id)
                 if log_path is not None:
                     try:
                         Path(log_path).unlink(missing_ok=True)
@@ -1167,14 +1260,59 @@ def get_model_prefix() -> str:
     return f"{prefix.rstrip('/')}/" if prefix else ""
 
 
+def _deploy_config_arg_index(server_args: list[str]) -> int | None:
+    for index, arg in enumerate(server_args):
+        if arg == "--deploy-config" or arg.startswith("--deploy-config="):
+            return index
+    return None
+
+
+def _deploy_config_value(server_args: list[str], index: int) -> str:
+    arg = server_args[index]
+    if arg.startswith("--deploy-config="):
+        return arg.split("=", 1)[1]
+    if index + 1 >= len(server_args):
+        raise ValueError("--deploy-config requires a path")
+    return server_args[index + 1]
+
+
+def _resolve_server_deploy_args(
+    server_args: list[str] | None,
+    stage_config_path: str | None,
+    run_level: str,
+) -> tuple[list[str], str | None, bool]:
+    """Return launch args, the deploy path, and whether args already carry it.
+
+    A ``--deploy-config`` that exists only in ``server_args`` is rewritten when
+    the weekly runner override is set. Otherwise that argument, including its
+    ``load_format``, is left as the test wrote it.
+    """
+    from tests.helpers.stage_config import _ci_model_runner_override, stage_config_path_for_run_level
+
+    args = list(server_args or [])
+    deploy_arg_index = None
+    deploy_path = stage_config_path
+    if deploy_path is None and _ci_model_runner_override() is not None:
+        deploy_arg_index = _deploy_config_arg_index(args)
+        if deploy_arg_index is not None:
+            deploy_path = _deploy_config_value(args, deploy_arg_index)
+    resolved = stage_config_path_for_run_level(deploy_path, run_level)
+    replaced = False
+    if deploy_arg_index is not None and resolved is not None:
+        if args[deploy_arg_index].startswith("--deploy-config="):
+            args[deploy_arg_index] = f"--deploy-config={resolved}"
+        else:
+            args[deploy_arg_index + 1] = resolved
+        replaced = True
+    return args, resolved, replaced
+
+
 def iter_omni_server(
     request: Any,
     run_level: str,
     omni_fixture_lock: threading.Lock,
 ) -> Generator[Any, Any, None]:
     """Start/stop an Omni HTTP server; used by ``omni_server`` / ``omni_server_function`` fixtures."""
-    from tests.helpers.stage_config import stage_config_path_for_run_level
-
     model_prefix = get_model_prefix()
     with omni_fixture_lock, _whisper_device_free_around():
         params: OmniServerParams = request.param
@@ -1191,22 +1329,23 @@ def iter_omni_server(
         if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
             model = resolve_tiny_model_path(model)
         port = params.port
-        stage_config_path = stage_config_path_for_run_level(params.stage_config_path, run_level)
-
-        server_args = params.server_args or []
+        server_args, stage_config_path, deploy_arg_replaced = _resolve_server_deploy_args(
+            params.server_args, params.stage_config_path, run_level
+        )
         if model != original_model:
             server_args = [*server_args, "--served-model-name", original_model]
-        if params.use_omni and params.stage_init_timeout is not None:
-            server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
-        else:
-            server_args = [*server_args, "--stage-init-timeout", "600"]
-        if params.init_timeout is not None:
-            server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
-        else:
-            server_args = [*server_args, "--init-timeout", "900"]
-        # ``omni_server`` / ``omni_server_function``: match ``serve`` (``--disable-log-stats`` wins).
-        if "--disable-log-stats" not in server_args and "--log-stats" not in server_args:
-            server_args = [*server_args, "--log-stats"]
+        if params.use_omni:
+            if params.stage_init_timeout is not None:
+                server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
+            else:
+                server_args = [*server_args, "--stage-init-timeout", "600"]
+            if params.init_timeout is not None:
+                server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
+            else:
+                server_args = [*server_args, "--init-timeout", "900"]
+            # ``omni_server`` / ``omni_server_function``: match ``serve`` (``--disable-log-stats`` wins).
+            if "--disable-log-stats" not in server_args and "--log-stats" not in server_args:
+                server_args = [*server_args, "--log-stats"]
         if params.use_stage_cli:
             if not params.use_omni:
                 raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
@@ -1227,7 +1366,7 @@ def iter_omni_server(
                 yield server
                 print("OmniServer stopping...")
         else:
-            if stage_config_path is not None:
+            if stage_config_path is not None and not deploy_arg_replaced:
                 server_args += ["--deploy-config", stage_config_path]
 
             with (

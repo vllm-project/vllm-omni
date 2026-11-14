@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
 from pathlib import Path
@@ -32,6 +33,8 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 _MIN_FREE_VRAM = 16 * 1024**3
+WHISPER_TEMPERATURE_FALLBACK = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+WHISPER_TEMPERATURE_FALLBACK_SEED = 0
 
 
 _synthetic_media_fallback_dir: Path | None = None
@@ -308,16 +311,12 @@ def _mux_mp4_bytes_with_synthetic_audio(
     duration_sec = num_frames / fps if fps > 0 else 0.0
     duration_int = max(1, int(math.ceil(duration_sec)))
 
-    try:
-        audio_result = generate_synthetic_audio(
-            duration=duration_int,
-            num_channels=1,
-            sample_rate=sample_rate,
-        )
-        audio_pcm = audio_result["np_array"]
-    except Exception as e:
-        logger.warning("Synthetic video: generate_synthetic_audio failed (%s); using video-only MP4.", e)
-        return video_mp4_bytes
+    audio_result = generate_synthetic_audio(
+        duration=duration_int,
+        num_channels=1,
+        sample_rate=sample_rate,
+    )
+    audio_pcm = audio_result["np_array"]
 
     try:
         import imageio_ffmpeg
@@ -326,47 +325,38 @@ def _mux_mp4_bytes_with_synthetic_audio(
     except Exception:
         ffmpeg_exe = "ffmpeg"
 
-    try:
-        with tempfile.TemporaryDirectory(prefix="syn_vid_mux_") as tmp:
-            vid_path = os.path.join(tmp, "video.mp4")
-            wav_path = os.path.join(tmp, "audio.wav")
-            out_path = os.path.join(tmp, "out.mp4")
-            with open(vid_path, "wb") as f:
-                f.write(video_mp4_bytes)
-            sf.write(wav_path, audio_pcm, sample_rate, format="WAV", subtype="PCM_16")
-            cmd = [
-                ffmpeg_exe,
-                "-y",
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                vid_path,
-                "-i",
-                wav_path,
-                "-c:v",
-                "copy",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-shortest",
-                "-movflags",
-                "+faststart",
-                out_path,
-            ]
-            subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, timeout=300)
-            with open(out_path, "rb") as f:
-                return f.read()
-    except (
-        FileNotFoundError,
-        subprocess.CalledProcessError,
-        subprocess.TimeoutExpired,
-        OSError,
-    ) as e:
-        logger.warning("Synthetic video: audio mux failed (%s); using video-only MP4.", e)
-        return video_mp4_bytes
+    with tempfile.TemporaryDirectory(prefix="syn_vid_mux_") as tmp:
+        vid_path = os.path.join(tmp, "video.mp4")
+        wav_path = os.path.join(tmp, "audio.wav")
+        out_path = os.path.join(tmp, "out.mp4")
+        with open(vid_path, "wb") as f:
+            f.write(video_mp4_bytes)
+        sf.write(wav_path, audio_pcm, sample_rate, format="WAV", subtype="PCM_16")
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            vid_path,
+            "-i",
+            wav_path,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            out_path,
+        ]
+        subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, timeout=300)
+        with open(out_path, "rb") as f:
+            return f.read()
 
 
 def generate_synthetic_video(
@@ -383,6 +373,10 @@ def generate_synthetic_video(
     ``width`` / ``height`` / ``num_frames`` / ``embed_audio`` unless
     ``force_regenerate`` is true. Cache root: ``cache_dir`` if given, else the
     default temp subdirectory.
+
+    ``embed_audio=True`` requires successful TTS generation and FFmpeg muxing.
+    Cached MP4s with corrupt/incomplete media or without the requested audio
+    stream are regenerated. Cache files are published atomically.
     """
     root = _resolve_synthetic_media_cache_dir(cache_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -390,11 +384,38 @@ def generate_synthetic_video(
 
     if not force_regenerate and cache_path.is_file():
         video_bytes = cache_path.read_bytes()
-        return {
-            "np_array": _np_array_from_mp4_bytes(video_bytes),
-            "base64": base64.b64encode(video_bytes).decode("utf-8"),
-            "file_path": str(cache_path.resolve()),
-        }
+        has_required_audio = True
+        if embed_audio:
+            import av
+
+            try:
+                with av.open(io.BytesIO(video_bytes)) as container:
+                    has_required_audio = False
+                    if container.streams.audio:
+                        audio_stream = container.streams.audio[0]
+                        samples = sum(frame.samples for frame in container.decode(audio=0))
+                        expected_samples = 0
+                        if audio_stream.duration is not None and audio_stream.time_base is not None:
+                            expected_samples = math.ceil(
+                                audio_stream.duration * audio_stream.time_base * audio_stream.codec_context.sample_rate
+                            )
+                        has_required_audio = samples > 0 and samples >= expected_samples
+            except av.error.FFmpegError:
+                has_required_audio = False
+        if has_required_audio:
+            try:
+                cached_frames = _np_array_from_mp4_bytes(video_bytes)
+            except RuntimeError:
+                cached_frames = None
+            if cached_frames is not None and len(cached_frames) == num_frames:
+                return {
+                    "np_array": cached_frames,
+                    "base64": base64.b64encode(video_bytes).decode("utf-8"),
+                    "file_path": str(cache_path.resolve()),
+                }
+        logger.warning(
+            "Cached synthetic video %s is incomplete or lacks the requested audio; regenerating.", cache_path
+        )
 
     import cv2
     import imageio
@@ -475,7 +496,15 @@ def generate_synthetic_video(
         else video_only_bytes
     )
 
-    cache_path.write_bytes(video_bytes)
+    temp_cache_path = root / f".{cache_path.name}.{uuid.uuid4().hex}.tmp"
+    # Exclusive creation preserves the normal 0666 & ~umask cache permissions.
+    temp_cache = temp_cache_path.open("xb")
+    try:
+        with temp_cache:
+            temp_cache.write(video_bytes)
+        os.replace(temp_cache_path, cache_path)
+    finally:
+        temp_cache_path.unlink(missing_ok=True)
 
     return {
         "np_array": np.array(video_frames),
@@ -495,7 +524,8 @@ def generate_synthetic_image(
     """
     Random colored squares on white background. Caches JPEG by ``width`` /
     ``height`` unless ``force_regenerate`` is true. Cache root: ``cache_dir``
-    if given, else the default temp subdirectory.
+    if given, else the default temp subdirectory. Incomplete cached images are
+    regenerated, and complete JPEGs are published atomically for parallel readers.
     """
     if seed is not None:
         random.seed(seed)
@@ -505,16 +535,21 @@ def generate_synthetic_image(
     cache_path = root / f"synth_image_w{width}_h{height}.jpg"
 
     if not force_regenerate and cache_path.is_file():
-        from PIL import Image as PILImage
-
-        image = PILImage.open(cache_path)
-        image.load()
+        # Decode the same snapshot that is returned, even if another worker
+        # replaces the cache between decoding and payload construction.
         image_bytes = cache_path.read_bytes()
-        return {
-            "np_array": np.array(image).copy(),
-            "base64": base64.b64encode(image_bytes).decode("utf-8"),
-            "file_path": str(cache_path.resolve()),
-        }
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as image:
+                image.load()
+                cached_pixels = np.array(image).copy()
+        except OSError:
+            logger.warning("Cached synthetic image %s is incomplete; regenerating.", cache_path)
+        else:
+            return {
+                "np_array": cached_pixels,
+                "base64": base64.b64encode(image_bytes).decode("utf-8"),
+                "file_path": str(cache_path.resolve()),
+            }
 
     from PIL import ImageDraw
 
@@ -529,8 +564,17 @@ def generate_synthetic_image(
         border_width = random.randint(1, 5)
         draw.rectangle([x, y, x + square_size, y + square_size], fill=color, outline=(0, 0, 0), width=border_width)
 
-    image.save(str(cache_path), format="JPEG", quality=85, optimize=True)
-    image_bytes = cache_path.read_bytes()
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=85, optimize=True)
+    image_bytes = buffer.getvalue()
+    temp_cache_path = root / f".{cache_path.name}.{uuid.uuid4().hex}.tmp"
+    temp_cache = temp_cache_path.open("xb")
+    try:
+        with temp_cache:
+            temp_cache.write(image_bytes)
+        os.replace(temp_cache_path, cache_path)
+    finally:
+        temp_cache_path.unlink(missing_ok=True)
 
     return {
         "np_array": np.array(image).copy(),
@@ -781,12 +825,21 @@ def _whisper_process_reserved_gib() -> float:
 
 
 def _whisper_transcribe_in_current_process(
-    output_path: str, model_size: str = "small", language: str | None = None
+    output_path: str,
+    model_size: str = "small",
+    language: str | None = None,
+    temperature_fallback: bool = False,
 ) -> tuple[str, str, float]:
     model = _get_whisper_model(model_size)
+    if temperature_fallback:
+        import torch
+
+        # Seed only the isolated ASR worker. This keeps fallback sampling
+        # reproducible without modifying the model server or pytest RNG state.
+        torch.manual_seed(WHISPER_TEMPERATURE_FALLBACK_SEED)
     text = model.transcribe(
         output_path,
-        temperature=0.0,
+        temperature=WHISPER_TEMPERATURE_FALLBACK if temperature_fallback else 0.0,
         word_timestamps=True,
         condition_on_previous_text=False,
         # None keeps whisper's auto-detection. Do not default this to a
@@ -910,7 +963,13 @@ def _unpack_transcribe_worker_result(result: object) -> tuple[str, str, float]:
     return str(text), str(device), reserved
 
 
-def convert_audio_file_to_text(output_path: str, model_size: str = "small", language: str | None = None) -> str:
+def convert_audio_file_to_text(
+    output_path: str,
+    model_size: str = "small",
+    language: str | None = None,
+    *,
+    temperature_fallback: bool = False,
+) -> str:
     """Convert an audio file to text in a reused, isolated subprocess.
 
     The worker outlives the call so its Whisper model is loaded once rather than
@@ -933,7 +992,13 @@ def convert_audio_file_to_text(output_path: str, model_size: str = "small", lang
             executor = _get_transcriber()
             try:
                 text, device, reserved_gib = _unpack_transcribe_worker_result(
-                    executor.submit(_whisper_transcribe_in_current_process, output_path, model_size, language).result()
+                    executor.submit(
+                        _whisper_transcribe_in_current_process,
+                        output_path,
+                        model_size,
+                        language,
+                        temperature_fallback,
+                    ).result()
                 )
                 with _TRANSCRIBER_LOCK:
                     _TRANSCRIBER_DEVICE = device
@@ -969,6 +1034,8 @@ def convert_audio_bytes_to_text(raw_bytes: bytes, model_size: str = "small", lan
 
 
 __all__ = [
+    "WHISPER_TEMPERATURE_FALLBACK",
+    "WHISPER_TEMPERATURE_FALLBACK_SEED",
     "_merge_base64_audio_to_segment",
     "concat_audio",
     "convert_audio_bytes_to_text",

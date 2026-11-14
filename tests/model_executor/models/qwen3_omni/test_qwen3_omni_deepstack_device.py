@@ -46,6 +46,9 @@ def test_deepstack_buffers_use_execution_device(mocker, vision_limit, num_tokens
         device_config=DeviceConfig(device="cpu"),
         scheduler_config=mocker.Mock(spec=SchedulerConfig, max_num_batched_tokens=4),
         quant_config=None,
+        # Disabled-feature default. A spec Mock otherwise returns a truthy
+        # child mock, and _mark_tower_model then requires a PP group.
+        use_v2_model_runner=False,
     )
     vllm_config.with_hf_config.return_value = vllm_config
 
@@ -67,6 +70,7 @@ def test_deepstack_buffers_use_execution_device(mocker, vision_limit, num_tokens
     model.start_layer = 0
     model.end_layer = 2
     model.norm = _Norm()
+    model.hf_numerics = False
     mocker.patch.object(thinker_module, "get_pp_group", return_value=mocker.Mock(is_first_rank=True, is_last_rank=True))
     inputs = torch.ones(num_tokens, 8)
     # Before the fix, audio-only construction reaches this actual forward

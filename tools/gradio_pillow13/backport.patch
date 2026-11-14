@@ -1,0 +1,21 @@
+--- official6.31/requirements.txt
++++ 6.31.0+omni.pillow13/requirements.txt
+@@ -16 +16 @@
+-pillow>=8.0,<13.0
++pillow>=8.0,<14.0
+--- official6.31/gradio/processing_utils.py
++++ 6.31.0+omni.pillow13/gradio/processing_utils.py
+@@ -134 +134,8 @@
+ def encode_pil_to_bytes(pil_image, format="png"):
++    if format.lower() == "png" and pil_image.mode == "I":
++        raise OSError(
++            "Cannot save a 32-bit integer (I-mode) image as PNG without losing data. "
++            "If all pixel values are between 0 and 65535, explicitly convert the "
++            "image with image.convert('I;16') before returning it. Otherwise, use "
++            "a format such as TIFF to preserve the 32-bit integer values."
++        )
+--- official6.31/gradio/package.json
++++ 6.31.0+omni.pillow13/gradio/package.json
+@@ -3 +3 @@
+-	"version": "6.31.0",
++	"version": "6.31.0+omni.pillow13",

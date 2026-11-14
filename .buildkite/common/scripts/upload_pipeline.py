@@ -14,15 +14,23 @@ Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
   - Drop steps whose ``source_file_dependencies`` do not match changed files
     (string/list keys from ci_source_file_dependencies.yml, or inline path
     prefixes). Filtering applies on **PR label** uploads and on post-merge
-    ``main`` L3 uploads. Scheduled ``main`` uploads that pass ``--all``
-    (NIGHTLY/WEEKLY) or ``--e2e`` keep every selected job and still strip
+    release-line L3 uploads (``main`` or a ``release/vX.Y.Z`` branch). Scheduled
+    release-line uploads that pass ``--all`` (NIGHTLY/WEEKLY) or ``--e2e``
+    keep every selected job and still strip
     the field. A diff limited to the pipeline YAML being uploaded or to paths
     under ``source_filter_fallback`` keeps every job, even if a job lists a
     shared path. For mixed diffs, narrow coverage only when a non-fallback file
     matches a job-key prefix; unrelated files must not reduce fallback coverage.
     List used shared helpers in job dependencies so mixed diffs retain their consumers.
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
-    for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
+    for NPU) + ``plugins`` + ``retry`` (see ci_mirror_hardwares.yml).
+  - ``automatic_shard: true`` is uploader-only. Before planning, the uploader
+    tries to build a per-step profile from recent passed ``timings/jobs``
+    artifacts (or ``VLLM_OMNI_SHARD_TIMINGS``). Ready excludes ``main`` and uses
+    pull-request builds; merge stays on ``main``. That profile packs measured
+    files into bins that fit ``timeout_in_minutes``. Each bin is uploaded as a
+    file list and the shard runs only that list. With no profile the step stays
+    one job and still records ``timings/jobs/*.json``.
   - Omit ``mirror_hardwares`` to compose ``{chip}_{n}`` from pytest ``-m`` SKU
     markers plus ``cards_n`` (max of several positives; ``not cards_1`` with no
     positive ``cards_*`` uses that chip's highest existing preset). An explicit
@@ -62,10 +70,28 @@ except ModuleNotFoundError:
     )
     import yaml
 
-from skip_ci import (
+from ci_conditions import (
+    BOOTSTRAP_DISABLED_IF,
+    BOOTSTRAP_ENABLED_IF,
+    BOOTSTRAP_IMAGE_BUILD_KEYS,
+    BOOTSTRAP_STEPS_FILENAME,
+    BOOTSTRAP_UPLOAD_IF_KEYS,
+    CI_MIRROR_HARDWARES_PATH,
+    CI_SOURCE_FILE_DEPENDENCIES_PATH,
+    CUDA_HF_TOKEN_EXPORT,
+    E2E_GROUP_MARKER,
+    MERGE_UPLOAD_IF,
+    NIGHTLY_LABEL_IF,
+    NIGHTLY_MAIN_IF,
+    READY_LABEL_IF,
+    READY_UPLOAD_IF,
     ROOT,
-    resolve_ci_context_from_git,
+    SOURCE_FILTER_FALLBACK_KEY,
+    WEEKLY_E2E_IF,
+    WEEKLY_LABEL_IF,
+    WEEKLY_MAIN_IF,
 )
+from skip_ci import resolve_ci_context_from_git
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -78,53 +104,7 @@ from tests.helpers.mark import (  # noqa: E402
 # --- Constants ---
 
 LOG = "upload_pipeline"
-BOOTSTRAP_STEPS_FILENAME = "bootstrap-upload-steps.yml"
-BOOTSTRAP_IMAGE_BUILD_KEYS = frozenset(
-    {
-        "image-build",
-        "image-build-a2",
-        "image-build-a3",
-        "image-build-a5",
-        "image-build-310p",
-    }
-)
-BOOTSTRAP_UPLOAD_IF_KEYS = {
-    "upload-ready-pipeline": "ready",
-    "upload-merge-pipeline": "merge",
-    "upload-nightly-pipeline": "nightly",
-    "upload-weekly-pipeline": "weekly",
-}
-E2E_GROUP_MARKER = "E2E Test"
-CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
-CI_SOURCE_FILE_DEPENDENCIES_PATH = ROOT / ".buildkite/common/ci_source_file_dependencies.yml"
-# Registry key whose prefixes bypass source filtering. Paths live in
-# ci_source_file_dependencies.yml; do not attach this key to a job.
-SOURCE_FILTER_FALLBACK_KEY = "source_filter_fallback"
-CUDA_HF_TOKEN_ENV = "VLLM_CI_HF_TOKEN"
-CUDA_HF_TOKEN_EXPORT = f'if [ -n "$${{{CUDA_HF_TOKEN_ENV}:-}}" ]; then export HF_TOKEN="$${{{CUDA_HF_TOKEN_ENV}}}"; fi'
 CUDA_RUNTIME_CHECK = "python3 .buildkite/cuda/scripts/check_vllm_runtime.py"
-
-# Bootstrap Buildkite ``if`` expressions.
-# ``*_MAIN_IF``: main + env schedule. ``*_LABEL_IF``: PR label (and/or composed with MAIN).
-# ``*_UPLOAD_IF``: full gate for uploading that child pipeline.
-NIGHTLY_MAIN_IF = 'build.branch == "main" && build.env("NIGHTLY") == "1"'
-NIGHTLY_LABEL_IF = (
-    f'({NIGHTLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "nightly-test")'
-)
-WEEKLY_E2E_IF = 'build.branch == "main" && build.env("WEEKLY") == "1"'
-WEEKLY_MAIN_IF = 'build.branch == "main" && (build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1")'
-WEEKLY_LABEL_IF = f'({WEEKLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "weekly-test")'
-READY_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "ready"'
-MERGE_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
-MERGE_MAIN_IF = (
-    'build.branch == "main" && build.env("NIGHTLY") != "1" && '
-    'build.env("WEEKLY") != "1" && build.env("NON_CRITICAL") != "1"'
-)
-READY_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || ({READY_LABEL_IF})"
-MERGE_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || (({MERGE_MAIN_IF}) || ({MERGE_LABEL_IF}))"
-BOOTSTRAP_DISABLED_IF = "false"
-BOOTSTRAP_ENABLED_IF = "true"
-
 
 # --- Logging ---
 
@@ -252,7 +232,7 @@ def _render_bootstrap_pipeline(
     platform = _get_bootstrap_platform(path)
     if_exprs = _compute_bootstrap_if_exprs(decision=decision, platform=platform)
     doc["steps"] = _apply_bootstrap_if(steps, if_exprs)
-    return yaml.safe_dump(doc, sort_keys=False)
+    return yaml.safe_dump(doc, sort_keys=False, width=4096)
 
 
 # --- Test pipeline (test-ready.yml, test-merge.yml, test-nightly.yml) ---
@@ -626,7 +606,8 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
             merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK]
         else:
             merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK, commands]
-    # Preset retry (K8S_RETRY on l4_*) must not clobber a step that opted out.
+    # A step-level retry fully replaces the preset retry. It is not merged, so a
+    # step that sets only automatic drops manual.permit_on_passed.
     if "retry" in step:
         merged["retry"] = step["retry"]
     return merged
@@ -645,14 +626,80 @@ def _get_step_label(step: dict[str, Any]) -> str:
     return str(step.get("group") or step.get("label") or "<step>")
 
 
+_shard_timings_prepared = False
+_shard_timings_pipeline: Path | None = None
+
+
+def _history_selection(pipeline_path: Path | None) -> tuple[str, frozenset[str]]:
+    """Ready uses non-main PR builds; merge keeps main."""
+    if pipeline_path is not None and pipeline_path.name == "test-ready.yml":
+        return "", frozenset({"main"})
+    return "main", frozenset()
+
+
+def _ensure_shard_timings_env() -> None:
+    """Populate ``VLLM_OMNI_SHARD_TIMINGS`` from recent Buildkite artifacts when unset."""
+    global _shard_timings_prepared
+    if _shard_timings_prepared:
+        return
+    _shard_timings_prepared = True
+    if os.environ.get("VLLM_OMNI_SHARD_TIMINGS", "").strip():
+        return
+    if os.environ.get("VLLM_OMNI_SKIP_SHARD_TIMINGS_DOWNLOAD", "").strip() in {"1", "true", "yes"}:
+        return
+    # Local import: AMD source filtering loads this module and must not require
+    # the shard planner. Only the CUDA uploader reaches a download.
+    from merge_shard_timings import prepare_profile_from_history
+
+    output = ROOT / "timings" / "upload-profile.json"
+    branch, exclude_branches = _history_selection(_shard_timings_pipeline)
+    try:
+        path = prepare_profile_from_history(
+            output,
+            branch=branch,
+            exclude_branches=exclude_branches,
+        )
+    except Exception as exc:  # noqa: BLE001 - planning must not fail the upload
+        _log(f"automatic-shard: timing download skipped ({exc})")
+        return
+    if path is None:
+        _log("automatic-shard: no historical timings; enrolled steps use the no-profile fallback")
+        return
+    os.environ["VLLM_OMNI_SHARD_TIMINGS"] = str(path)
+    _log(f"automatic-shard: using timing profile {path}")
+
+
+def _shard_timings() -> dict[str, float] | None:
+    from runtime_shard import load_shard_timings
+
+    _ensure_shard_timings_env()
+    raw = os.environ.get("VLLM_OMNI_SHARD_TIMINGS", "").strip()
+    timings = load_shard_timings()
+    if raw and timings is None and not Path(raw).is_file() and getattr(_shard_timings, "warned", None) != raw:
+        _shard_timings.warned = raw  # type: ignore[attr-defined]
+        _log(f"automatic-shard: {raw!r} is not a file; steps use the no-profile fallback")
+    return timings
+
+
+def _plan_automatic_shard(step: dict[str, Any]) -> dict[str, Any]:
+    from runtime_shard import apply_automatic_shard
+
+    return apply_automatic_shard(step, timings=_shard_timings(), root=ROOT, log=_log)
+
+
 def _process_test_steps(
     steps: list[Any],
     changed_files: list[str] | None,
+    *,
+    expand_mirror_hardwares: bool = True,
 ) -> list[Any]:
     """Drop steps by ``source_file_dependencies`` when *changed_files* is set; always strip that field."""
     processed: list[Any] = []
     for step in steps:
         if not isinstance(step, dict):
+            processed.append(step)
+            continue
+        if "wait" in step:
             processed.append(step)
             continue
 
@@ -663,7 +710,11 @@ def _process_test_steps(
 
         nested = step.get("steps")
         if nested is not None:
-            kept_nested = _process_test_steps(nested, changed_files)
+            kept_nested = _process_test_steps(
+                nested,
+                changed_files,
+                expand_mirror_hardwares=expand_mirror_hardwares,
+            )
             if not kept_nested:
                 _log(f"omit empty group {_get_step_label(step)!r}")
                 continue
@@ -673,10 +724,15 @@ def _process_test_steps(
             continue
 
         leaf = {key: value for key, value in step.items() if key != "source_file_dependencies"}
+        # AMD nightly filtering uses this mode. It must not plan CUDA shards or
+        # download timing artifacts; the CUDA uploader does that while rendering.
+        if not expand_mirror_hardwares:
+            processed.append(leaf)
+            continue
         expanded = _expand_mirror_hardwares(leaf)
         if expanded is None:
             continue
-        processed.append(expanded)
+        processed.append(_plan_automatic_shard(expanded))
 
     return processed
 
@@ -720,27 +776,19 @@ def _render_test_pipeline(
     # Validate MIRROR_HW once up front. Per-step skip must not run for typos
     # (e.g. b20o), or a pipeline can shrink to leftover CPU-only steps and
     # still upload successfully.
+    global _shard_timings_pipeline
+    _shard_timings_pipeline = pipeline_path
     _get_mirror_hw_selector()
     steps = doc.get("steps")
     if not isinstance(steps, list):
         return doc
     if e2e_only:
         steps = _select_e2e_group_steps(steps)
-    # Shared dependencies must not suppress fallback coverage unless a
-    # non-fallback change matches a job. Unrelated files do not narrow coverage.
-    if changed_files is not None and pipeline_path is not None:
-        bypass = _source_filter_fallback_reason(changed_files, pipeline_path)
-        if bypass is not None:
-            pipeline_rel = _repo_relative_posix(pipeline_path)
-            fallback_prefixes = _source_filter_fallback_prefixes()
-            non_fallback_files = [
-                path
-                for path in changed_files
-                if path != pipeline_rel and not _match_source_file([path], fallback_prefixes)
-            ]
-            if not _any_source_dependency_match(steps, non_fallback_files):
-                _log(f"keep all jobs (no non-fallback source_file_dependencies match; bypassed by {bypass})")
-                changed_files = None
+    changed_files = _apply_source_filter_fallback(
+        steps,
+        changed_files,
+        pipeline_path=pipeline_path,
+    )
     steps = _process_test_steps(steps, changed_files)
     return {**doc, "steps": steps}
 
@@ -768,7 +816,12 @@ def _source_filter_fallback_prefixes() -> list[str]:
     return prefixes
 
 
-def _source_filter_fallback_reason(changed_files: list[str] | None, pipeline_path: Path) -> str | None:
+def _source_filter_fallback_reason(
+    changed_files: list[str] | None,
+    pipeline_path: Path,
+    *,
+    extra_fallback_prefixes: tuple[str, ...] = (),
+) -> str | None:
     """Return the changed path that should disable source filtering, if any."""
     if not changed_files:
         return None
@@ -776,11 +829,69 @@ def _source_filter_fallback_reason(changed_files: list[str] | None, pipeline_pat
     pipeline_rel = _repo_relative_posix(pipeline_path)
     if pipeline_rel in changed:
         return pipeline_rel
-    prefixes = _source_filter_fallback_prefixes()
+    prefixes = [*_source_filter_fallback_prefixes(), *extra_fallback_prefixes]
     for path in changed_files:
         if _match_source_file([path], prefixes):
             return path
     return None
+
+
+def _apply_source_filter_fallback(
+    steps: list[Any],
+    changed_files: list[str] | None,
+    *,
+    pipeline_path: Path | None,
+    extra_fallback_prefixes: tuple[str, ...] = (),
+) -> list[str] | None:
+    """Keep all jobs for routing-only diffs unless another changed path selects a job."""
+    if changed_files is None or pipeline_path is None:
+        return changed_files
+
+    bypass = _source_filter_fallback_reason(
+        changed_files,
+        pipeline_path,
+        extra_fallback_prefixes=extra_fallback_prefixes,
+    )
+    if bypass is None:
+        return changed_files
+
+    pipeline_rel = _repo_relative_posix(pipeline_path)
+    fallback_prefixes = [*_source_filter_fallback_prefixes(), *extra_fallback_prefixes]
+    non_fallback_files = [
+        path for path in changed_files if path != pipeline_rel and not _match_source_file([path], fallback_prefixes)
+    ]
+    if _any_source_dependency_match(steps, non_fallback_files):
+        return changed_files
+
+    _log(f"keep all jobs (no non-fallback source_file_dependencies match; bypassed by {bypass})")
+    return None
+
+
+def filter_pipeline_by_source_dependencies(
+    doc: dict[str, Any],
+    changed_files: list[str] | None,
+    *,
+    pipeline_path: Path | None = None,
+    extra_fallback_prefixes: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Filter and strip source dependency metadata without expanding hardware presets."""
+    steps = doc.get("steps")
+    if not isinstance(steps, list):
+        return doc
+    changed_files = _apply_source_filter_fallback(
+        steps,
+        changed_files,
+        pipeline_path=pipeline_path,
+        extra_fallback_prefixes=extra_fallback_prefixes,
+    )
+    return {
+        **doc,
+        "steps": _process_test_steps(
+            steps,
+            changed_files,
+            expand_mirror_hardwares=False,
+        ),
+    }
 
 
 def _changed_files_for_source_filter(
@@ -792,8 +903,8 @@ def _changed_files_for_source_filter(
     """Return the diff to filter against, or None to keep every step.
 
     ``--all`` / ``--e2e`` disable filtering (scheduled NIGHTLY/WEEKLY full
-    uploads and weekly E2E sweeps). Post-merge ``main`` L3 and PR-label
-    uploads filter against the commit/PR diff. Pipeline YAML /
+    uploads and weekly E2E sweeps). Post-merge release-line L3 (``main`` or
+    ``release/vX.Y.Z``) and PR-label uploads filter against the commit/PR diff. Pipeline YAML /
     ``source_filter_fallback`` matches are applied later in
     ``_render_test_pipeline`` when no non-fallback file matches a job-key prefix.
     Otherwise, normal filtering uses all changed files, including shared helpers.
@@ -832,7 +943,7 @@ def _render_pipeline(
         pipeline_path=path,
         e2e_only=e2e_only,
     )
-    return yaml.safe_dump(doc, sort_keys=False)
+    return yaml.safe_dump(doc, sort_keys=False, width=4096)
 
 
 def _upload_to_buildkite(content: str) -> None:
@@ -882,10 +993,24 @@ def main() -> int:
 
     rendered = _render_pipeline(path, force_all=args.all, e2e_only=args.e2e)
     if args.upload:
+        _upload_shard_file_lists()
         _upload_to_buildkite(rendered)
     else:
         sys.stdout.write(rendered)
     return 0
+
+
+def _upload_shard_file_lists() -> None:
+    """Publish packed file lists before shard jobs start."""
+    root = ROOT / "timings" / "file-shards"
+    if not root.is_dir() or not any(root.rglob("*.txt")):
+        return
+    _log(f"automatic-shard: uploading file lists from {root}")
+    subprocess.run(
+        ["buildkite-agent", "artifact", "upload", "timings/file-shards/**/*.txt"],
+        cwd=ROOT,
+        check=True,
+    )
 
 
 if __name__ == "__main__":

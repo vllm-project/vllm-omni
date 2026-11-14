@@ -4,11 +4,14 @@
 import json
 import math
 import os
+import tempfile
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager
+from datetime import datetime
 from pathlib import Path
-from typing import Any, TypeGuard
+from tempfile import TemporaryDirectory
+from typing import Any, NamedTuple, TypeGuard
 
 import pytest
 
@@ -21,6 +24,7 @@ from tests.dfx.conftest import (
     load_benchmark_configs,
     run_benchmark,
 )
+from tests.helpers.assertions import assert_duplex_artifact_publication
 from tests.helpers.runtime import OmniServer
 
 # Optional JSON field ``mark`` is applied as pytest marks via
@@ -119,45 +123,47 @@ def _judge_server_params_for_test(test_name: str) -> dict[str, object] | None:
     return raw
 
 
-def _resolve_judge_cuda_visible_devices(configured: object) -> str:
-    """Map a judge card index onto the process-visible CUDA device list.
+def _resolve_judge_visible_devices(configured: object, device_env: str) -> str:
+    """Map a judge card index onto the process-visible device list.
 
-    ``judge_server_params.cuda_visible_devices`` is an index into
-    ``CUDA_VISIBLE_DEVICES`` when that env is set (``1`` with
-    ``CUDA_VISIBLE_DEVICES=2,3`` selects physical GPU 3). Without the env it
+    ``device_index`` is an index into the platform visibility environment:
+    ``1`` with ``CUDA_VISIBLE_DEVICES=2,3`` selects physical GPU 3. Without the env it
     is used as a raw device list.
     """
     if not isinstance(configured, str) or not configured:
-        raise ValueError("judge_server_params.cuda_visible_devices must be a non-empty string")
-    parent = os.environ.get("CUDA_VISIBLE_DEVICES")
+        raise ValueError("judge_server_params.device_index must be a non-empty string")
+    parent = os.environ.get(device_env)
     if parent is None or not parent.strip():
         return configured
     visible = [part.strip() for part in parent.split(",") if part.strip()]
     if configured.isdigit():
         index = int(configured)
         if index < 0 or index >= len(visible):
-            raise ValueError(
-                f"judge_server_params.cuda_visible_devices={configured!r} is outside CUDA_VISIBLE_DEVICES={parent!r}"
-            )
+            raise ValueError(f"judge_server_params.device_index={configured!r} is outside {device_env}={parent!r}")
         return visible[index]
     return configured
 
 
 @contextmanager
 def _start_judge_server(judge_params: dict[str, object]):
+    from vllm_omni.platforms import current_omni_platform
+
     model = judge_params.get("model")
     if not isinstance(model, str) or not model:
         raise ValueError("judge_server_params.model must be a non-empty string")
     extra = judge_params.get("extra_cli_args") or ()
     if not isinstance(extra, list | tuple):
         raise TypeError("judge_server_params.extra_cli_args must be a list")
-    visible = _resolve_judge_cuda_visible_devices(judge_params.get("cuda_visible_devices", "1"))
-    print(f"Starting benchmark judge with model: {model} on CUDA_VISIBLE_DEVICES={visible}")
+    device_env = current_omni_platform.device_control_env_var
+    # Existing CUDA-only configurations retain their device selection.
+    device_index = judge_params.get("device_index", judge_params.get("cuda_visible_devices", "1"))
+    visible = _resolve_judge_visible_devices(device_index, device_env)
+    print(f"Starting benchmark judge with model: {model} on {device_env}={visible}")
     with OmniServer(
         model,
         [str(item) for item in extra],
         use_omni=bool(judge_params.get("use_omni", False)),
-        env_dict={"CUDA_VISIBLE_DEVICES": visible},
+        env_dict={device_env: visible},
     ) as judge:
         print(f"Benchmark judge started on {judge.host}:{judge.port}")
         yield judge
@@ -317,19 +323,27 @@ def benchmark_params(request):
     total = len(all_params)
     print(f"\n  Running benchmark {current}/{total} for {test_name}")
 
-    return {
-        "test_name": test_name,
-        "params": all_params[param_index],
-    }
+    params = dict(all_params[param_index])
+    with ExitStack() as stack:
+        if params.get("duplex_eval_accuracy_config"):
+            # The judge reads these files during evaluation. Keep the temporary
+            # directory under the configured root, within its allowed media path.
+            root = Path(params.get("duplex_eval_response_root", "omni-duplex-eval-output")).expanduser().resolve()
+            root.mkdir(parents=True, exist_ok=True)
+            params["duplex_eval_response_root"] = stack.enter_context(TemporaryDirectory(prefix="tmp-", dir=root))
+        yield {"test_name": test_name, "params": params}
 
 
-def _resolve_num_warmups(params: dict[str, Any], *, default: int) -> int:
+def _resolve_num_warmups(params: dict[str, Any], *, default: int, sweep_index: int = 0, sweep_size: int = 1) -> int:
     value = params.get("num_warmups")
     if value is None:
         return default
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError("num_warmups must be a non-negative integer")
-    return value
+    values = value if isinstance(value, list) else [value]
+    if isinstance(value, list) and len(values) != sweep_size:
+        raise ValueError("num_warmups must contain one value per sweep point")
+    if any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in values):
+        raise ValueError("num_warmups must be a non-negative integer or a list of them")
+    return values[sweep_index] if isinstance(value, list) else value
 
 
 def _assert_fixed_stage_workloads(result: dict[str, Any], params: dict[str, Any], num_prompts: int) -> None:
@@ -369,8 +383,30 @@ def _is_finite_number(value: object) -> TypeGuard[int | float]:
 _OMNIINTERACT_AGGREGATE_MIN_IA_QTF1 = "omniinteract_aggregate_min_ia_qtf1"
 _OMNIINTERACT_AGGREGATE_SUBSETS = "omniinteract_aggregate_subsets"
 _OMNIINTERACT_AGGREGATE_GROUP = "omniinteract_aggregate_group"
-_OMNIINTERACT_AGGREGATE_COUNTS: dict[tuple[str, str], tuple[float, float, float]] = {}
+_OMNIINTERACT_PERSIST_ARTIFACTS = "omniinteract_persist_artifacts"
 _OMNIINTERACT_MIN_EVALUATED_CASES = 1
+
+
+class _OmniInteractSubsetCounts(NamedTuple):
+    tp: float
+    fp: float
+    fn: float
+    num_prompts: int
+    completed: int
+    failed: int
+
+
+class _OmniInteractPooledAggregate(NamedTuple):
+    tp: float
+    fp: float
+    fn: float
+    ia_qtf1: float
+    num_prompts: int
+    completed: int
+    failed: int
+
+
+_OMNIINTERACT_AGGREGATE_COUNTS: dict[tuple[str, str], _OmniInteractSubsetCounts] = {}
 
 
 def _reset_omniinteract_aggregate_counts() -> None:
@@ -437,7 +473,18 @@ def _aggregate_accuracy_params_for_test(test_name: str) -> dict[str, object]:
     }
 
 
-def _maybe_assert_aggregate_ia_qtf1(params: dict[str, object], acc_summary: dict[str, object]) -> None:
+def _request_count(value: object, fallback: int) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return fallback
+
+
+def _maybe_assert_aggregate_ia_qtf1(
+    params: dict[str, object],
+    acc_summary: dict[str, object],
+    result: Mapping[str, object],
+    num_prompt: int,
+) -> None:
     min_ia_qtf1 = params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
     if min_ia_qtf1 is None:
         return
@@ -460,30 +507,155 @@ def _maybe_assert_aggregate_ia_qtf1(params: dict[str, object], acc_summary: dict
     tp = _finite_accuracy_count(acc_summary.get("Global_TP"), "Global_TP")
     fp = _finite_accuracy_count(acc_summary.get("Global_FP"), "Global_FP")
     fn = _finite_accuracy_count(acc_summary.get("Global_FN"), "Global_FN")
-    _OMNIINTERACT_AGGREGATE_COUNTS[(group, subset)] = (tp, fp, fn)
-    recorded = [_OMNIINTERACT_AGGREGATE_COUNTS.get((group, name)) for name in subsets]
-    present = [counts for counts in recorded if counts is not None]
-    if len(present) != len(subsets):
-        return
-    total_tp = sum(counts[0] for counts in present)
-    total_fp = sum(counts[1] for counts in present)
-    total_fn = sum(counts[2] for counts in present)
-    ia_qtf1 = _ia_qtf1_from_counts(total_tp, total_fp, total_fn)
-    print(
-        f"OmniInteract aggregate All Global IA-QTF1: {ia_qtf1:.6f} "
-        f"(TP={total_tp:.6f} / FP={total_fp:.6f} / FN={total_fn:.6f})"
+    _OMNIINTERACT_AGGREGATE_COUNTS[(group, subset)] = _OmniInteractSubsetCounts(
+        tp,
+        fp,
+        fn,
+        num_prompt,
+        _request_count(result.get("completed"), num_prompt),
+        _request_count(result.get("failed"), 0),
     )
-    assert ia_qtf1 >= float(min_ia_qtf1), f"OmniInteract aggregate All Global IA-QTF1 {ia_qtf1} is below {min_ia_qtf1}"
+    pooled = _pooled_omniinteract_aggregate(params)
+    if pooled is None:
+        return
+    print(
+        f"OmniInteract aggregate All Global IA-QTF1: {pooled.ia_qtf1:.6f} "
+        f"(TP={pooled.tp:.6f} / FP={pooled.fp:.6f} / FN={pooled.fn:.6f})"
+    )
+    assert pooled.ia_qtf1 >= float(min_ia_qtf1), (
+        f"OmniInteract aggregate All Global IA-QTF1 {pooled.ia_qtf1} is below {min_ia_qtf1}"
+    )
+
+
+def _pooled_omniinteract_aggregate(params: Mapping[str, object]) -> _OmniInteractPooledAggregate | None:
+    subsets = params.get(_OMNIINTERACT_AGGREGATE_SUBSETS)
+    group = params.get(_OMNIINTERACT_AGGREGATE_GROUP)
+    if not isinstance(subsets, list | tuple) or not subsets or not isinstance(group, str) or not group:
+        return None
+    recorded = [_OMNIINTERACT_AGGREGATE_COUNTS.get((group, name)) for name in subsets]
+    if any(counts is None for counts in recorded):
+        return None
+    present = [counts for counts in recorded if counts is not None]
+    total_tp = sum(counts.tp for counts in present)
+    total_fp = sum(counts.fp for counts in present)
+    total_fn = sum(counts.fn for counts in present)
+    return _OmniInteractPooledAggregate(
+        total_tp,
+        total_fp,
+        total_fn,
+        _ia_qtf1_from_counts(total_tp, total_fp, total_fn),
+        sum(counts.num_prompts for counts in present),
+        sum(counts.completed for counts in present),
+        sum(counts.failed for counts in present),
+    )
+
+
+def _omniinteract_accuracy_baseline(params: Mapping[str, object], test_name: str) -> dict[str, object]:
+    baseline: dict[str, object] = {}
+    min_ia_qtf1 = params.get("omniinteract_min_ia_qtf1")
+    if min_ia_qtf1 is not None:
+        baseline["omniinteract_min_ia_qtf1"] = min_ia_qtf1
+    aggregate = _aggregate_accuracy_params_for_test(test_name)
+    aggregate_floor = aggregate.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
+    if aggregate_floor is not None:
+        baseline[_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1] = aggregate_floor
+    return baseline
+
+
+def _maybe_write_omniinteract_aggregate_accuracy_result(
+    result: Mapping[str, object],
+    params: Mapping[str, object],
+) -> Path | None:
+    if not params.get("omniinteract_evaluate"):
+        return None
+    pooled = _pooled_omniinteract_aggregate(params)
+    if pooled is None:
+        return None
+    from tests.e2e.accuracy.helpers import (
+        _OMNIINTERACT_AGGREGATE_SUITE,
+        _OMNIINTERACT_DATASET,
+        _acc_result_filename,
+        omniinteract_accuracy_result_dir,
+        write_dfx_accuracy_result,
+    )
+
+    model_id = result.get("model_id") or "model"
+    when = datetime.now()
+    accuracy_path = omniinteract_accuracy_result_dir() / _acc_result_filename(
+        str(model_id),
+        _OMNIINTERACT_AGGREGATE_SUITE,
+        when=when,
+    )
+    subsets = params.get(_OMNIINTERACT_AGGREGATE_SUBSETS)
+    min_ia_qtf1 = params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
+    passed = not _is_finite_number(min_ia_qtf1) or pooled.ia_qtf1 >= float(min_ia_qtf1)
+    write_dfx_accuracy_result(
+        accuracy_path,
+        test_name=str(result.get("test_name") or params.get(_OMNIINTERACT_AGGREGATE_GROUP) or ""),
+        name="aggregate",
+        model_id=str(model_id),
+        dataset=_OMNIINTERACT_DATASET,
+        dataset_path=str(params.get("dataset_path") or _OMNIINTERACT_DATASET),
+        date=str(result.get("date") or when.strftime("%Y%m%d-%H%M%S")),
+        hardware=str(result.get("Hardware") or ""),
+        baseline={
+            key: value
+            for key, value in (
+                ("omniinteract_min_ia_qtf1", params.get("omniinteract_min_ia_qtf1")),
+                (_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1, min_ia_qtf1),
+            )
+            if value is not None
+        },
+        branch=str(result.get("branch") or os.environ.get("BUILDKITE_BRANCH", "")),
+        num_prompts=pooled.num_prompts,
+        max_concurrency=int(result["max_concurrency"]) if isinstance(result.get("max_concurrency"), int) else None,
+        benchmark_exit_code=0 if passed else 1,
+        generation={
+            "completed": pooled.completed,
+            "failed": pooled.failed,
+            "subsets": list(subsets) if isinstance(subsets, list | tuple) else [],
+        },
+        accuracy={
+            "status": "ok" if passed else "failed",
+            "IA_QTF1": pooled.ia_qtf1,
+            "Global_TP": pooled.tp,
+            "Global_FP": pooled.fp,
+            "Global_FN": pooled.fn,
+        },
+    )
+    print(f"Accuracy result saved to {accuracy_path}")
+    return accuracy_path
 
 
 def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> None:
-    summary = result.get("omni_duplex_eval")
-    assert isinstance(summary, dict), "Omni-DuplexEval summary is missing"
-    assert summary.get("published") == num_prompt, "Omni-DuplexEval artifacts are incomplete"
-    assert summary.get("artifact_errors") == [], "Omni-DuplexEval artifact publication failed"
-    assert summary.get("published_with_unfinished_responses") == 0, "Omni-DuplexEval responses are unfinished"
+    summary = result["omni_duplex_eval"]
     sessions = result.get("duplex_session_metrics")
     assert isinstance(sessions, list) and len(sessions) == num_prompt, "Omni-DuplexEval session metrics are missing"
+    if path := params.get("duplex_eval_accuracy_config"):
+        from tests.e2e.accuracy.omni_duplex_eval.validation import (
+            assert_accuracy_result,
+            load_accuracy_config,
+            select_duplex_eval_baseline,
+        )
+
+        # The accuracy suite scores collected output, including silence and
+        # close-boundary responses. Preserve its eligibility policy; missing
+        # client measurements and unfinished counts remain visible in artifacts.
+        config = load_accuracy_config(path, params)
+        selected = select_duplex_eval_baseline(config, result.get("Hardware"))
+        assert_accuracy_result(
+            result,
+            {**config, "baseline": selected},
+            enforce_score_floors=bool(selected),
+        )
+        # Allow individual silent sessions, but fail a batch-wide audio outage
+        # even when the text-only RTD/PR judge accepts the responses.
+        audio_metrics = (session.get("client_ttfp_ms", {}) for session in sessions)
+        assert any(metric.get("count", 0) > 0 and _is_finite_number(metric.get("mean")) for metric in audio_metrics), (
+            "Omni-DuplexEval accuracy run has no measured client audio"
+        )
+        return
+    assert summary.get("published_with_unfinished_responses") == 0, "Omni-DuplexEval responses are unfinished"
     for session in sessions:
         for name in ("client_ttft_ms", "client_ttfp_ms"):
             metric = session.get(name, {})
@@ -494,34 +666,66 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
         accuracy = summary.get("accuracy")
         assert isinstance(accuracy, dict), "Omni-DuplexEval accuracy is missing"
         assert accuracy.get("status") == "completed", "Omni-DuplexEval accuracy did not complete"
+        assert all(
+            isinstance(accuracy.get(field), int) and not isinstance(accuracy[field], bool)
+            for field in ("total", "evaluated", "failed", "skipped")
+        ), "Omni-DuplexEval accuracy coverage is incomplete"
         assert (accuracy.get("total"), accuracy.get("evaluated"), accuracy.get("failed"), accuracy.get("skipped")) == (
             num_prompt,
             num_prompt,
             0,
             0,
         ), "Omni-DuplexEval accuracy coverage is incomplete"
+        if params.get("duplex_eval_split") == "PR_correction":
+            scores = accuracy.get("pr")
+            assert isinstance(scores, dict) and scores.get("samples") == num_prompt, (
+                "Omni-DuplexEval correction scores are incomplete"
+            )
+            score = scores.get("mean_all_success")
+            assert _is_finite_number(score) and 0 <= score <= 1, "Omni-DuplexEval correction score is invalid"
 
 
 def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     _assert_fixed_stage_workloads(result, params, num_prompt)
+    assert_duplex_artifact_publication(result, params, num_prompt)
+    for metric in params.get("required_duplex_metrics", []):
+        count = result.get(f"num_{metric}_samples")
+        assert isinstance(count, int) and not isinstance(count, bool) and count > 0, f"No measured {metric} samples"
+        for stat in ("mean", "median", "p99"):
+            value = result.get(f"{stat}_{metric}")
+            assert _is_finite_number(value) and value >= 0, f"Missing or invalid {stat} {metric}"
+    if params.get("duplex_performance_only") or params.get("duplex_metric_aggregation") == "response":
+        assert result.get("duplex_metric_aggregation") == "response", "Wrong duplex measurement unit"
+        for metric in ("ttft", "audio_ttfp", "audio_rtf"):
+            assert result.get(f"num_{metric}_samples", 0) > 0, f"No measured {metric} samples"
+            suffix = "" if metric == "audio_rtf" else "_ms"
+            for percentile in (50, 95):
+                assert _is_finite_number(result.get(f"p{percentile}_{metric}{suffix}")), (
+                    f"Missing or invalid P{percentile} {metric}"
+                )
+    if params.get("duplex_performance_only"):
+        return
     if params.get("dataset_name") == "omni-duplex-eval":
         _assert_duplex_eval_result(result, params, num_prompt)
     if params.get("dataset_name") == "omniinteract":
-        summary = result.get("omniinteract")
-        assert isinstance(summary, dict), "OmniInteract summary is missing"
-        assert (summary.get("total"), summary.get("success"), summary.get("failed")) == (
-            num_prompt,
-            num_prompt,
-            0,
-        ), "OmniInteract requests did not all succeed"
-        assert summary.get("artifacts_complete") is True, "OmniInteract artifacts are incomplete"
+        summary = result["omniinteract"]
         if params.get("omniinteract_evaluate"):
             accuracy = summary.get("accuracy")
             assert isinstance(accuracy, dict), "OmniInteract accuracy is missing"
             assert accuracy.get("status") == "ok", "OmniInteract accuracy did not complete"
             assert accuracy.get("failed") == 0, "OmniInteract accuracy reported failed cases"
             _assert_subset_evaluated(accuracy)
+            if params.get("duplex_metric_aggregation") == "response":
+                evaluated, skipped = accuracy.get("evaluated"), accuracy.get("skipped")
+                assert (
+                    accuracy.get("total") == num_prompt
+                    and isinstance(evaluated, int)
+                    and isinstance(skipped, int)
+                    and not isinstance(skipped, bool)
+                    and skipped >= 0
+                    and evaluated + skipped == num_prompt
+                ), "OmniInteract accuracy coverage is incomplete"
             acc_summary = accuracy.get("summary")
             assert isinstance(acc_summary, dict), "OmniInteract accuracy summary is missing"
             ia_qtf1 = acc_summary.get("IA_QTF1")
@@ -532,7 +736,7 @@ def assert_result(result, params, num_prompt) -> None:
                 assert float(ia_qtf1) >= float(min_ia_qtf1), (
                     f"OmniInteract All Global IA-QTF1 {ia_qtf1} is below {min_ia_qtf1}"
                 )
-            _maybe_assert_aggregate_ia_qtf1(params, acc_summary)
+            _maybe_assert_aggregate_ia_qtf1(params, acc_summary, result, num_prompt)
     baseline = params.get("baseline")
     hardware = result.get("Hardware")
     hardware_baseline = baseline.get(hardware) if isinstance(baseline, dict) and isinstance(hardware, str) else None
@@ -568,12 +772,25 @@ def test_performance_benchmark(omni_server, benchmark_params):
     test_name = benchmark_params["test_name"]
     params = dict(benchmark_params["params"])
     dataset_name = params.get("dataset_name", "")
+    resource_label = get_runtime_resource_label()
+    accuracy_baseline = None
+    if path := params.get("duplex_eval_accuracy_config"):
+        from tests.e2e.accuracy.omni_duplex_eval.validation import load_accuracy_config, select_duplex_eval_baseline
+
+        accuracy_config = load_accuracy_config(path, params)
+        accuracy_baseline = select_duplex_eval_baseline(accuracy_config, resource_label)
+    elif params.get("omniinteract_evaluate"):
+        accuracy_baseline = _omniinteract_accuracy_baseline(params, test_name)
     for dataset_prefix in ("omniinteract", "duplex_eval"):
         if params.get(f"{dataset_prefix}_evaluate"):
             judge_base_url = getattr(omni_server, "judge_base_url", None)
             if not isinstance(judge_base_url, str) or not judge_base_url:
                 raise ValueError(f"{dataset_prefix}_evaluate requires top-level judge_server_params to start a judge")
             params[f"{dataset_prefix}_judge_base_url"] = judge_base_url
+    artifact_root: tempfile.TemporaryDirectory[str] | None = None
+    if dataset_name == "omniinteract" and not params.get(_OMNIINTERACT_PERSIST_ARTIFACTS, True):
+        artifact_root = tempfile.TemporaryDirectory(prefix="omniinteract-artifacts-")
+        params["omniinteract_output_dir"] = artifact_root.name
 
     host = omni_server.host
     port = omni_server.port
@@ -581,8 +798,6 @@ def test_performance_benchmark(omni_server, benchmark_params):
 
     print(f"Running benchmark for model: {model}")
     print(f"Benchmark parameters: {benchmark_params}")
-
-    resource_label = get_runtime_resource_label()
 
     def to_list(value, default=None):
         if value is None:
@@ -621,7 +836,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
         _OMNIINTERACT_AGGREGATE_MIN_IA_QTF1,
         _OMNIINTERACT_AGGREGATE_SUBSETS,
         _OMNIINTERACT_AGGREGATE_GROUP,
+        _OMNIINTERACT_PERSIST_ARTIFACTS,
         "judge_server_params",
+        "duplex_eval_accuracy_config",
+        "duplex_eval_score_floor_hardware",
+        "duplex_performance_only",
+        "required_duplex_metrics",
         "name",
         "enable_negative_prompt",
         "random_request_config",
@@ -648,6 +868,8 @@ def test_performance_benchmark(omni_server, benchmark_params):
         elif isinstance(value, dict):
             json_str = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
             args.extend([arg_name, json_str])
+        elif isinstance(value, (list, tuple)):
+            args.extend([arg_name, *map(str, value)])
         elif not isinstance(value, bool):
             args.extend([arg_name, str(value)])
 
@@ -659,40 +881,66 @@ def test_performance_benchmark(omni_server, benchmark_params):
             args.append("--trust-remote-code")
         break
 
-    # QPS / request-rate sweep
-    for sweep_index, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
-        args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
-        result = run_benchmark(
-            args=args,
-            test_name=test_name,
-            flow=qps,
-            dataset_name=dataset_name,
-            num_prompt=num_prompt,
-            baseline_config=params.get("baseline"),
-            sweep_index=sweep_index,
-            random_input_len=params.get("random_input_len"),
-            random_output_len=params.get("random_output_len"),
-            resource_label=resource_label,
-            num_warmups=_resolve_num_warmups(params, default=2),
-            benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
-        )
-        assert_result(result, {**params, **_aggregate_accuracy_params_for_test(test_name)}, num_prompt)
+    try:
+        # QPS / request-rate sweep
+        for sweep_index, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
+            args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
+            result = run_benchmark(
+                args=args,
+                test_name=test_name,
+                flow=qps,
+                dataset_name=dataset_name,
+                num_prompt=num_prompt,
+                baseline_config=params.get("baseline"),
+                sweep_index=sweep_index,
+                random_input_len=params.get("random_input_len"),
+                random_output_len=params.get("random_output_len"),
+                resource_label=resource_label,
+                num_warmups=_resolve_num_warmups(params, default=2, sweep_index=sweep_index, sweep_size=len(qps_list)),
+                benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
+                accuracy_baseline=accuracy_baseline,
+            )
+            assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
+            try:
+                assert_result(result, assert_params, num_prompt)
+            finally:
+                _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
 
-    # concurrency test
-    for sweep_index, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
-        args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
-        result = run_benchmark(
-            args=args,
-            test_name=test_name,
-            flow=concurrency,
-            dataset_name=dataset_name,
-            num_prompt=num_prompt,
-            baseline_config=params.get("baseline"),
-            sweep_index=sweep_index,
-            random_input_len=params.get("random_input_len"),
-            random_output_len=params.get("random_output_len"),
-            resource_label=resource_label,
-            num_warmups=_resolve_num_warmups(params, default=max(2, int(concurrency))),
-            benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
-        )
-        assert_result(result, {**params, **_aggregate_accuracy_params_for_test(test_name)}, num_prompt)
+        # concurrency test
+        for sweep_index, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
+            args = args + [
+                "--max-concurrency",
+                str(concurrency),
+                "--num-prompts",
+                str(num_prompt),
+                "--request-rate",
+                "inf",
+            ]
+            result = run_benchmark(
+                args=args,
+                test_name=test_name,
+                flow=concurrency,
+                dataset_name=dataset_name,
+                num_prompt=num_prompt,
+                baseline_config=params.get("baseline"),
+                sweep_index=sweep_index,
+                random_input_len=params.get("random_input_len"),
+                random_output_len=params.get("random_output_len"),
+                resource_label=resource_label,
+                num_warmups=_resolve_num_warmups(
+                    params,
+                    default=max(2, int(concurrency)),
+                    sweep_index=sweep_index,
+                    sweep_size=len(max_concurrency_list),
+                ),
+                benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
+                accuracy_baseline=accuracy_baseline,
+            )
+            assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
+            try:
+                assert_result(result, assert_params, num_prompt)
+            finally:
+                _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
+    finally:
+        if artifact_root is not None:
+            artifact_root.cleanup()

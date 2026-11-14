@@ -4,15 +4,22 @@
 import copy
 import math
 import pprint
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, TypeVar, cast
 
+import msgspec
 import torch
 from typing_extensions import NotRequired, TypedDict
 from vllm.inputs import EmbedsPrompt, PromptType, TextPrompt, TokensPrompt
 from vllm.inputs.engine import TokensInput
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionSchedule,
+    InvalidAttentionScheduleError,
+    parse_attention_schedule,
+)
 from vllm_omni.lora.request import LoRARequest
 
 DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
@@ -56,6 +63,7 @@ class OmniInteractionPrompt(TypedDict):
     event_id: str
     event: OmniInteractionEvent
     transition_chunks: NotRequired[int]
+    received_at: NotRequired[float]  # Internal engine-clock ingress stamp; never trusted from clients.
 
 
 class OmniTokensPrompt(TokensPrompt):
@@ -136,6 +144,12 @@ class OmniCustomPrompt(TypedDict, total=False):
     Allows users to pass pre-tokenized prompt IDs, attention masks, and extra
     arguments directly, bypassing the tokenization stage in the pipeline.
 
+    ``prompt_ids`` / ``negative_prompt_ids`` are honored only by pipelines that
+    declare ``supports_pre_tokenized_prompt_ids = True``. The diffusion engine
+    rejects a request that sets them for any other in-tree pipeline (HTTP 400)
+    instead of silently generating from an empty or text-only condition. A
+    user-supplied custom pipeline is not checked unless it declares the flag.
+
     Attributes:
         prompt_ids: Pre-tokenized prompt token IDs (single or batched)
         negative_prompt_ids: Pre-tokenized negative prompt token IDs
@@ -211,6 +225,9 @@ class OmniDiffusionSamplingParams:
     to manage numerous individual parameters.
     """
 
+    # Whether final outputs should be watermarked (when configured).
+    watermarking: bool | None = None
+
     # Additional text-related parameters
     max_sequence_length: int | None = None
     prompt_template: dict[str, Any] | None = None
@@ -272,6 +289,8 @@ class OmniDiffusionSamplingParams:
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
     boundary_ratio: float | None = None
+    # None inherits the service default; an empty schedule disables it.
+    attention_schedule: AttentionSchedule | list[dict[str, Any]] | None = None
 
     # Scheduler parameters – ``None`` means "not explicitly set by the caller";
     # each pipeline's ``forward()`` decides its own model-specific default.
@@ -388,6 +407,13 @@ class OmniDiffusionSamplingParams:
             raise ValueError("streaming_idle_timeout_s must be finite and positive")
         if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
+        # Request dicts become params here (chat sampling_params_list, the process stage client),
+        # so a malformed schedule must surface as a client error (HTTP 400), not a TypeError.
+        try:
+            self.attention_schedule = parse_attention_schedule(self.attention_schedule)
+            absorb_attention_schedule_extra_args(self)
+        except (TypeError, ValueError) as exc:
+            raise InvalidAttentionScheduleError(str(exc)) from exc
 
     @property
     def batch_size(self):
@@ -443,11 +469,60 @@ class OmniDiffusionSamplingParams:
             seed = getattr(params, "seed", None)
             if seed is not None:
                 mapped.setdefault("seed", seed)
+            mapped["watermarking"] = params.watermarking
             return cls(**mapped)
         raise TypeError(
             "Diffusion stage requires OmniDiffusionSamplingParams or vllm.SamplingParams, "
             f"got {type(params).__name__!r}."
         )
 
+    @classmethod
+    def from_dict(cls, params: dict[str, Any]) -> "OmniDiffusionSamplingParams":
+        """Reconstruct params from a dict decoded after IPC, handling LoRA."""
+        lora_request = params.get("lora_request")
+        if lora_request is not None and not isinstance(lora_request, LoRARequest):
+            params["lora_request"] = msgspec.convert(lora_request, LoRARequest)
+        return cls(**params)
+
+
+def absorb_attention_schedule_extra_args(params: OmniDiffusionSamplingParams, *, override: bool = False) -> None:
+    """Move an extra_args schedule onto the typed field without dropping other extra args.
+
+    ``__post_init__`` calls this at construction; ``clone()`` and pickling do not re-run it, so a
+    value written into ``extra_args`` afterwards needs another call. Entrypoints pass
+    ``override=True``: the request value then replaces a schedule that stage default sampling params
+    put on the typed field. Without it both values come from one caller, so a mismatch is rejected.
+    A null value means the same as leaving the key out, so the typed field keeps its value.
+    """
+    extra = params.extra_args or {}
+    if "attention_schedule" not in extra:
+        return
+    extra_schedule = parse_attention_schedule(extra["attention_schedule"])
+    schedule = params.attention_schedule
+    if extra_schedule is not None:
+        if not override:
+            current = parse_attention_schedule(schedule)
+            if current is not None and current != extra_schedule:
+                raise ValueError("conflicting attention_schedule values in sampling params and extra_args")
+        schedule = extra_schedule
+    params.attention_schedule = schedule
+    params.extra_args = {key: value for key, value in extra.items() if key != "attention_schedule"}
+
 
 OmniSamplingParams: TypeAlias = SamplingParams | OmniDiffusionSamplingParams
+
+StageParamsT = TypeVar("StageParamsT")
+
+
+def disable_watermarking(params_list: Sequence[StageParamsT]) -> list[StageParamsT]:
+    """Copy each stage's sampling params with watermarking disabled."""
+    disabled_params_list: list[StageParamsT] = []
+    for params in params_list:
+        if isinstance(params, OmniSamplingParams):
+            disabled = copy.copy(params)
+            disabled.watermarking = False
+            # copy.copy preserves the concrete type, which mypy loses through the isinstance narrowing
+            disabled_params_list.append(cast(StageParamsT, disabled))
+        else:
+            disabled_params_list.append(params)
+    return disabled_params_list

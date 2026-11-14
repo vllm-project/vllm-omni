@@ -17,6 +17,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ARDiffusionPagedForwardContext,
     ARDiffusionPagedLayerContext,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.segmented import ARDiffusionSegmentedKVState
 
 if TYPE_CHECKING:
     from vllm_omni.experimental.ar_diffusion.kv_cache.manager import (
@@ -57,7 +58,15 @@ class ARDiffusionKVState:
         self._committed: dict[str, int] = dict.fromkeys(expected, 0)
         self._paged_pending: dict[str, ARDiffusionPagedForwardContext | None] = dict.fromkeys(expected)
         self._closed = False
+        self._segments: dict[str, ARDiffusionSegmentedKVState] = {}
         self.conditioning_kv = ConditioningKVScope(kv_cache, session_id, num_layers)
+
+    def segmented(self, kv_branch: str) -> ARDiffusionSegmentedKVState:
+        """Return this branch's runner-owned exact-token segment state."""
+        adapter = self.adapter(kv_branch)
+        if kv_branch not in self._segments:
+            self._segments[kv_branch] = ARDiffusionSegmentedKVState(self.kv_cache, adapter.request_id, kv_branch)
+        return self._segments[kv_branch]
 
     @property
     def kv_branch_names(self) -> tuple[str, ...]:
@@ -93,6 +102,8 @@ class ARDiffusionKVState:
         Allocation is lazy so distributed workers allocate only for KV branches
         they actually execute.
         """
+        if self.kv_cache.segmented_spec is not None:
+            raise RuntimeError("Segmented KV capabilities must use segmented() instead of frame-window contexts")
         cs = self.kv_cache.spec.chunk_size
         if int(seq_len) % cs != 0:
             raise AssertionError(
@@ -246,6 +257,9 @@ class ARDiffusionKVState:
         """Release all self- and cross-attention storage owned by this session."""
         if self._closed:
             return
+        for segments in self._segments.values():
+            segments.close()
+        self._segments.clear()
         errors: list[Exception] = []
         for adapter in self.adapters.values():
             try:
@@ -271,6 +285,9 @@ class ARDiffusionKVState:
             raise KeyError(f"Unknown AR-Diffusion cross-attention caches to keep: {sorted(unknown)}")
         request_ids = {kv_branch: adapter.request_id for kv_branch, adapter in self.adapters.items()}
         if keep_cross_attention:
+            for segments in self._segments.values():
+                segments.close()
+            self._segments.clear()
             for adapter in self.adapters.values():
                 self.kv_cache.end_request(adapter)
             self.kv_cache.retain_cross_attention(self.session_id, keep_cross_attention)

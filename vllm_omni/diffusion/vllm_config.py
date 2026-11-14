@@ -10,11 +10,18 @@ from typing import Any, cast
 
 import torch
 from vllm.config import CompilationConfig, DeviceConfig, KernelConfig, KVTransferConfig, VllmConfig
+from vllm.config.lora import LoRAConfig
+from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.platforms import current_omni_platform
+
+# Dense diffusion has no native scheduler token budget to inherit.
+DEFAULT_DIFFUSION_MOE_LORA_MAX_TOKENS = 65536
+
+logger = init_logger(__name__)
 
 
 def resolve_diffusion_max_model_len(od_config: OmniDiffusionConfig) -> int:
@@ -75,6 +82,9 @@ class _DiffusionVllmModelConfig:
     hf_text_config: Any | None = None
     multimodal_config: Any | None = None
     enforce_eager: bool = False
+    # Omni manages diffusion sleep/offload itself; native attention still
+    # queries this flag when selecting its CUDA graph pool.
+    sleep_mode_offload_cudagraph: bool = False
     disable_cascade_attn: bool = False
     enable_return_routed_experts: bool = False
     enable_prompt_embeds: bool = False
@@ -86,6 +96,9 @@ class _DiffusionVllmModelConfig:
     # narrow compatibility surface here instead of manufacturing a second
     # model configuration object in the Worker backend.
     is_mm_prefix_lm: bool = False
+    # Diffusion supplies attention specs directly and uses native default
+    # grouping rather than a registered model's SupportsKVCacheGrouping hook.
+    supports_kv_cache_grouping: bool = False
     rswa_window: int | None = None
     _attention_num_heads: int | None = field(default=None, init=False, repr=False)
     _attention_num_kv_heads: int | None = field(default=None, init=False, repr=False)
@@ -190,6 +203,66 @@ def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _Diffus
     )
 
 
+def resolve_diffusion_moe_lora_token_capacity(
+    od_config: OmniDiffusionConfig,
+    vllm_config: VllmConfig,
+) -> int | None:
+    """Resolve the preallocated token-mapping capacity for dynamic MoE LoRA."""
+    if not od_config.is_moe:
+        return None
+    if od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER:
+        capacity = vllm_config.scheduler_config.max_num_batched_tokens
+    else:
+        capacity = od_config.max_num_batched_tokens
+        if capacity is None:
+            capacity = DEFAULT_DIFFUSION_MOE_LORA_MAX_TOKENS
+    if type(capacity) is not int or capacity <= 0:
+        raise ValueError("MoE LoRA requires a positive token capacity")
+    return capacity
+
+
+def _supports_native_online_mxfp4_moe() -> bool:
+    """Return whether this device has a native online-MXFP4 MoE backend."""
+    if current_omni_platform.is_xpu():
+        return True
+    if not current_omni_platform.is_cuda():
+        return False
+
+    capability = current_omni_platform.get_device_capability()
+    if capability is None:
+        return False
+
+    from vllm import _custom_ops as ops
+
+    return ops.mxfp4_experts_quant_supported(capability.to_int())
+
+
+def _uses_explicit_lora_capable_moe_backend(od_config: OmniDiffusionConfig) -> bool:
+    """Return whether the requested MoE backend keeps LoRA available."""
+    moe_backend = getattr(od_config, "moe_backend", "auto")
+    moe_backend = getattr(moe_backend, "value", moe_backend)
+    return moe_backend == "marlin"
+
+
+def _is_accelerator_online_mxfp4_moe(od_config: OmniDiffusionConfig) -> bool:
+    """Return whether the model uses online MXFP4 MoE on a native backend."""
+    if not od_config.is_moe:
+        return False
+    if _uses_explicit_lora_capable_moe_backend(od_config):
+        return False
+
+    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Static
+
+    quant_config = getattr(od_config, "quantization_config", None)
+    if not isinstance(quant_config, OnlineQuantizationConfig):
+        return False
+    moe_spec = getattr(getattr(quant_config, "args", None), "moe", None)
+    if moe_spec is None or moe_spec.weight != kMxfp4Static:
+        return False
+    return _supports_native_online_mxfp4_moe()
+
+
 def create_base_diffusion_vllm_config(
     device: torch.device,
     od_config: OmniDiffusionConfig,
@@ -219,6 +292,29 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     vllm_config.parallel_config.enable_expert_parallel = parallel_config.enable_expert_parallel
 
     vllm_config.model_config = _make_diffusion_vllm_model_config(od_config)  # type: ignore[assignment]
+    lora_backend = getattr(od_config, "lora_backend", "peft")
+    lora_backend = getattr(lora_backend, "value", lora_backend)
+    moe_lora_enabled = od_config.is_moe and lora_backend == "peft"
+    if moe_lora_enabled and not getattr(od_config, "lora_path", None) and _is_accelerator_online_mxfp4_moe(od_config):
+        # vLLM rejects native MXFP4 MoE kernels while LoRA is enabled.
+        # Keep the baseline on those kernels. Startup adapters keep LoRA enabled;
+        # CUDA can fall back to W4A16 MARLIN, while XPU has no LoRA MXFP4 backend.
+        logger.info(
+            "Disabling MoE LoRA for online MXFP4 on a native-capable CUDA/XPU device "
+            "without a startup adapter; "
+            "this enables the native MXFP4 MoE backend."
+        )
+        moe_lora_enabled = False
+    if moe_lora_enabled:
+        vllm_config.lora_config = LoRAConfig(
+            max_lora_rank=512,
+            max_loras=1,
+            max_cpu_loras=getattr(od_config, "max_cpu_loras", 1) or 1,
+            lora_dtype=od_config.dtype,
+            fully_sharded_loras=False,
+        )
+    else:
+        vllm_config.lora_config = None
     vllm_config.quant_config = od_config.quantization_config
     vllm_config.profiler_config = od_config.profiler_config
     if (
@@ -241,6 +337,16 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     kv_transfer_config = getattr(od_config, "kv_transfer_config", None)
     if kv_transfer_config is not None:
         vllm_config.kv_transfer_config = cast(KVTransferConfig, kv_transfer_config)
+
+    # Weight transfer (RL training). Accepts the raw deploy dict or a
+    # pre-built config, mirroring upstream EngineArgs' dict coercion.
+    weight_transfer_config = getattr(od_config, "weight_transfer_config", None)
+    if weight_transfer_config is not None:
+        from vllm.config.weight_transfer import WeightTransferConfig
+
+        if isinstance(weight_transfer_config, dict):
+            weight_transfer_config = WeightTransferConfig(**weight_transfer_config)
+        vllm_config.weight_transfer_config = weight_transfer_config
     return vllm_config
 
 

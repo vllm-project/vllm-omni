@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from vllm_omni.config.omni_config import (
     normalize_and_validate_diffusion_engine_ingress_kwargs,
 )
 from vllm_omni.config.resolver import OmniConfigResolution
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.engine.arg_utils import FRONTEND_ONLY_ID_FILTER
 from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 from vllm_omni.engine.stage_runtime import StageEngineLaunch
@@ -27,8 +29,10 @@ from vllm_omni.entrypoints.cli.serve import (
     OmniServeCommand,
     _parse_stage_id,
     _parse_stage_overrides,
+    _parse_watermark_config,
     run_headless,
 )
+from vllm_omni.entrypoints.omni_base import OmniBase
 from vllm_omni.entrypoints.utils import parse_stage_overrides
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -62,6 +66,87 @@ class _FakeStageConfig:
 
 def _resolved(*stages: SimpleNamespace) -> OmniConfigResolution:
     return OmniConfigResolution(config_path="/fake/stages.yaml", stage_configs=tuple(stages))
+
+
+def test_serve_parser_accepts_nested_watermark_config() -> None:
+    """Ensure the CLI parses Omni's nested watermark config."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        ["serve", "fake-model", "--omni", "--watermark-config", '{"modalities":{"audio":{"algorithm":"audioseal"}}}']
+    )
+
+    assert args.watermark_config == WatermarkConfig({"audio": {"algorithm": "audioseal"}})
+    assert args.get_explicit_kwargs_dict()["watermark_config"] == args.watermark_config
+
+
+def test_watermark_config_collision_uses_omni_validation(capsys: pytest.CaptureFixture[str]) -> None:
+    """Ensure an upstream watermark argument is extended without a duplicate flag."""
+    parser = TrackingArgumentParser()
+    parser.add_argument("--watermark-config", type=json.loads)
+    parser.maybe_override_argument(
+        parser.add_argument_group("OmniConfig"),
+        "--watermark-config",
+        argument_type=_parse_watermark_config,
+        default=None,
+        help="test",
+    )
+
+    args = parser.parse_args(["--watermark-config", '{"modalities":{"audio":{"algorithm":"audioseal"}}}'])
+    assert args.watermark_config == WatermarkConfig({"audio": {"algorithm": "audioseal"}})
+    assert args.get_explicit_kwargs_dict()["watermark_config"] == args.watermark_config
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--watermark-config", '{"algorithm":"gumbel","key":123}'])
+    error = capsys.readouterr().err
+    assert "configured per modality" in error
+
+
+@pytest.mark.parametrize(
+    "value",
+    ['{"modalities": {"audio": null}}', '{"modalities": {"audio": "audioseal"}}', '{"modalities": []}'],
+)
+def test_watermark_config_requires_modality_config_object(value: str) -> None:
+    """Ensure a modality value uses the nested config shape."""
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_watermark_config(value)
+
+
+def test_serve_parser_accepts_strict_watermark_config() -> None:
+    """Ensure strict mode is a global watermark setting."""
+    config = _parse_watermark_config('{"strict": true, "modalities": {"audio": {"algorithm": "audioseal"}}}')
+
+    assert config == WatermarkConfig({"audio": {"algorithm": "audioseal"}}, strict=True)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        # Modality settings placed at the top level point at the nested shape
+        ('{"algorithm": "audioseal"}', "configured per modality"),
+        ('{"audio": {"algorithm": "audioseal"}}', "configured per modality"),
+        ('{"stirct": true, "modalities": {}}', "Unexpected keyword argument"),
+        ('{"strict": "maybe", "modalities": {}}', "Input should be a valid boolean"),
+    ],
+)
+def test_watermark_config_rejects_invalid_top_level(value: str, message: str) -> None:
+    """Ensure invalid top-level watermark configs explain the expected shape."""
+    with pytest.raises(argparse.ArgumentTypeError, match=message):
+        _parse_watermark_config(value)
+
+
+def test_watermark_config_lists_registry_algorithms() -> None:
+    """Ensure invalid algorithms report the modality's registered choices."""
+    with pytest.raises(argparse.ArgumentTypeError, match="unsupported watermark algorithm"):
+        _parse_watermark_config('{"modalities": {"audio": {"algorithm": "unknown"}}}')
+
+
+def test_omni_rejects_untyped_watermark_config() -> None:
+    """Ensure direct Omni use rejects transport mappings before startup."""
+    with pytest.raises(TypeError, match="watermark_config must be a WatermarkConfig"):
+        OmniBase("fake-model", watermark_config={"audio": {"algorithm": "audioseal"}})  # type: ignore[arg-type]
 
 
 def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
@@ -522,7 +607,6 @@ def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(moc
 
     manager = mocker.Mock()
     manager.processes = [mocker.Mock()]
-    manager.gather_actual_addresses.return_value = (primary_addresses.inputs, primary_addresses.outputs)
 
     mocker.patch.object(serve_module, "_build_multi_api_stage_runtime", return_value=runtime)
     mocker.patch.object(serve_module, "_wait_for_multi_api_server_completion")
@@ -536,9 +620,9 @@ def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(moc
     assert args._omni_stage_client_configs is engine_launch.client_configs
     start_manager.assert_called_once()
     manager_kwargs = start_manager.call_args.kwargs
-    assert manager_kwargs["cleanup_timeout"] == 1
     assert manager_kwargs["num_servers"] == 2
-    assert manager_kwargs["input_addresses"] == ["ipc://input-0", "ipc://input-1"]
+    assert [listener.address for listener in manager_kwargs["input_listeners"]] == ["ipc://input-0", "ipc://input-1"]
+    assert [listener.address for listener in manager_kwargs["output_listeners"]] == ["ipc://output-0", "ipc://output-1"]
     assert manager_kwargs["target_server_fn"] is serve_module.run_omni_api_server_worker_proc
     assert engine_launch.watched_frontend_processes == manager.processes
     runtime.shutdown.assert_called_once_with()
@@ -550,34 +634,36 @@ def test_start_api_server_process_manager_cleans_up_partial_start(mocker: Mocker
 
     first_process = mocker.Mock(name="first_process")
     second_process = mocker.Mock(name="second_process")
-    first_process.pid = 1234
-    second_process.pid = None
     second_process.start.side_effect = RuntimeError("spawn failed")
-    parent_pipes = [mocker.Mock(name="parent_pipe_0"), mocker.Mock(name="parent_pipe_1")]
-    child_pipes = [mocker.Mock(name="child_pipe_0"), mocker.Mock(name="child_pipe_1")]
     spawn_context = mocker.Mock()
     spawn_context.Process.side_effect = [first_process, second_process]
-    spawn_context.Pipe.side_effect = list(zip(parent_pipes, child_pipes))
     mocker.patch("vllm.v1.utils.multiprocessing.get_context", return_value=spawn_context)
     shutdown = mocker.patch("vllm.v1.utils.shutdown")
 
+    def _listener(address: str):
+        return mocker.Mock(address=address, socket=None)
+
+    input_listeners = [_listener("ipc://input-0"), _listener("ipc://input-1")]
+    output_listeners = [_listener("ipc://output-0"), _listener("ipc://output-1")]
+
     with pytest.raises(RuntimeError, match="spawn failed"):
         serve_module._start_api_server_process_manager(
-            cleanup_timeout=1.5,
             listen_address="127.0.0.1:8000",
             sock=mocker.Mock(),
             args=argparse.Namespace(),
             num_servers=2,
-            input_addresses=["ipc://input-0", "ipc://input-1"],
-            output_addresses=["ipc://output-0", "ipc://output-1"],
+            input_listeners=input_listeners,
+            output_listeners=output_listeners,
             target_server_fn=mocker.Mock(),
         )
 
     first_process.start.assert_called_once_with()
     second_process.start.assert_called_once_with()
-    for pipe in parent_pipes:
-        pipe.close.assert_called_once_with()
-    shutdown.assert_called_once_with([first_process], timeout=1.5)
+    # Since upstream f226af0e11 the manager owns the rollback: it shuts down
+    # the processes it recorded and cleans every listener up.
+    shutdown.assert_called_once_with([first_process, second_process], timeout=None)
+    for listener in [*input_listeners, *output_listeners]:
+        listener.cleanup.assert_called_once_with()
 
 
 def test_wait_for_multi_api_server_completion_rejects_engine_failure(
@@ -648,6 +734,80 @@ def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
     assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
 
 
+def test_serve_parser_accepts_server_level_mixfusion_flags() -> None:
+    """The server-level MixFusion knobs are modeled on ``OrchestratorArgs`` and
+    ``StageDeployConfig`` but must also be registered in the serve parser, so
+    ``vllm serve ... --omni --enable-mixfusion`` parses and the explicit values
+    reach a diffusion stage's runtime overrides."""
+    from vllm_omni.config.omni_config import StageExecutionType, _stage_cli_overrides
+
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subparser")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "fake-model",
+            "--omni",
+            "--enable-mixfusion",
+            "--mixfusion-min-chunk-tokens",
+            "512",
+            "--mixfusion-max-chunks",
+            "64",
+        ]
+    )
+
+    assert args.enable_mixfusion is True
+    assert args.mixfusion_min_chunk_tokens == 512
+    assert args.mixfusion_max_chunks == 64
+
+    # The explicit flags survive the orchestrator blacklist (they are
+    # deploy-schema keys) and the diffusion stage's CLI field gate.
+    explicit = args.get_explicit_kwargs_dict()
+    stage_overrides = _stage_cli_overrides(0, explicit, execution_type=StageExecutionType.DIFFUSION)
+    assert stage_overrides["enable_mixfusion"] is True
+    assert stage_overrides["mixfusion_min_chunk_tokens"] == 512
+    assert stage_overrides["mixfusion_max_chunks"] == 64
+
+
+def test_serve_parser_mixfusion_flags_absent_leave_deploy_yaml_in_force() -> None:
+    """Unset MixFusion flags must stay out of the explicit kwargs dict so the
+    deploy YAML's per-stage ``enable_mixfusion`` values apply unchanged."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subparser")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni"])
+
+    assert args.enable_mixfusion is None
+    assert args.mixfusion_min_chunk_tokens is None
+    assert args.mixfusion_max_chunks is None
+    explicit = args.get_explicit_kwargs_dict()
+    assert "enable_mixfusion" not in explicit
+    assert "mixfusion_min_chunk_tokens" not in explicit
+    assert "mixfusion_max_chunks" not in explicit
+
+
+def test_serve_parser_accepts_no_enable_mixfusion() -> None:
+    """``--no-enable-mixfusion`` carries an explicit False so a deploy YAML
+    stage enabled with ``enable_mixfusion: true`` can be disabled from the CLI."""
+    from vllm_omni.config.omni_config import StageExecutionType, _stage_cli_overrides
+
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subparser")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--no-enable-mixfusion"])
+
+    assert args.enable_mixfusion is False
+    explicit = args.get_explicit_kwargs_dict()
+    assert explicit["enable_mixfusion"] is False
+
+    stage_overrides = _stage_cli_overrides(0, explicit, execution_type=StageExecutionType.DIFFUSION)
+    assert stage_overrides["enable_mixfusion"] is False
+
+
 def test_serve_parser_accepts_diffusion_quantization_config() -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
@@ -683,6 +843,7 @@ def _make_headless_args(*, explicit_keys: frozenset[str] | None = None, **kwargs
         "disable_log_stats": False,
         "stage_init_timeout": 600,
         "tokenizer": None,
+        "watermark_config": None,
     }
     ns_kwargs = {**defaults, **kwargs}
     ns = argparse.Namespace(**ns_kwargs)
@@ -1295,3 +1456,13 @@ def test_tracking_namespace_copy_preserves_tracking(deep):
     restored = copy.deepcopy(namespace) if deep else copy.copy(namespace)
     assert restored.get_explicit_kwargs_dict() == {"api_server_count": 2}
     assert restored.model == "example"
+
+
+def test_serve_parser_rejects_removed_shm_threshold_bytes() -> None:
+    """``--shm-threshold-bytes`` has no reader left in the tree; the serve
+    parser must reject it instead of accepting a value that is dropped."""
+    args = _parse_serve_args(["serve", "fake-model", "--omni"])
+    assert not hasattr(args, "shm_threshold_bytes")
+
+    with pytest.raises(SystemExit):
+        _parse_serve_args(["serve", "fake-model", "--omni", "--shm-threshold-bytes", "1048576"])

@@ -51,12 +51,17 @@ def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARS
     )
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
+    # Upstream Scheduler.__init__ resolves hash_block_size = block_size (16 by
+    # default); the super()._update_request_as_session call at the pinned
+    # target truncates session.block_hashes with it.
+    sched.hash_block_size = 16
     sched.chunk_transfer_adapter = None
     sched.kv_holding_waiting = set()
     sched.deferred_waiting = set()
     sched._free_request_blocks = MagicMock()
     sched.encoder_cache_manager = MagicMock()
     sched._inflight_prefills = set()
+    sched._outputs_awaiting_stage_payload = {}
     return sched
 
 
@@ -160,6 +165,7 @@ def _run_resumable_segment_stop(
     inter_stage_output=None,
 ):
     sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
@@ -299,7 +305,11 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
     )
 
 
-@pytest.mark.parametrize("processor", [None, talker2code2wav_async_chunk], ids=["no_opt_in", "cosyvoice3"])
+@pytest.mark.parametrize(
+    "processor",
+    [None, talker2code2wav_async_chunk, SimpleNamespace(_requires_full_token_history=True)],
+    ids=["no_opt_in", "cosyvoice3", "full_token_history"],
+)
 @pytest.mark.parametrize("new_token_ids", [[], [42]], ids=["no_tokens", "sampled_token"])
 @pytest.mark.parametrize("omit_chunk_transfer", [False, True], ids=["downstream", "stage0_final"])
 def test_running_decode_step_without_inter_stage_payload_does_not_raise(
@@ -316,6 +326,7 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise(
     session.additional_information = {"omni_final_stage_id": 0} if omit_chunk_transfer else None
 
     sched = mocker.MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
@@ -410,6 +421,7 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     num_output_placeholders = session.num_output_placeholders
 
     sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
@@ -577,6 +589,40 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
 
 
+def test_stage0_streaming_update_keeps_full_hash_block() -> None:
+    """A fully computed length that is a multiple of hash_block_size must keep that block.
+
+    The pin deletes ``block_hashes[keep_end // hash_block_size:]`` with
+    ``keep_end = num_tokens - 1``. Clamping the computed frontier to
+    ``num_tokens - 1`` before that delete drops hash 0 when the length is 16.
+    """
+    sched = _make_scheduler(stage_id=0)
+    # Request stores this list. Compare against a copy so the extension
+    # inside _update_request_as_session does not rewrite the expected prefix.
+    prompt = list(range(16))
+    expected_prefix = list(prompt)
+    session = Request(
+        request_id="req-ar-hash-block",
+        prompt_token_ids=prompt,
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        arrival_time=100.0,
+        block_hasher=None,
+    )
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.num_computed_tokens = 16
+    session.block_hashes.append("h0")
+
+    sched._update_request_as_session(session, _make_update([10, 20]))
+
+    assert session.prompt_token_ids[:16] == expected_prefix
+    assert list(session._all_token_ids[:16]) == expected_prefix
+    assert session.prompt_token_ids[-2:] == [10, 20]
+    assert list(session._all_token_ids[-2:]) == [10, 20]
+    assert session.block_hashes[0] == "h0"
+    assert session.num_computed_tokens >= 16
+
+
 def test_stage0_basic_window_rebuilds_below_low_watermark() -> None:
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
@@ -642,9 +688,10 @@ def test_stage0_context_window_compacts_dropped_speech() -> None:
     assert getattr(session, "_minicpmo45_window_previous_len") == 3
 
 
+@pytest.mark.parametrize("mode", ["off", "basic"])
 @pytest.mark.parametrize("cleared_outputs", [False, True])
 @pytest.mark.parametrize("in_flight", [0, 1])
-def test_stage0_window_uses_confirmed_span_and_terminator(cleared_outputs, in_flight) -> None:
+def test_stage0_window_uses_confirmed_span_and_terminator(cleared_outputs, in_flight, mode) -> None:
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
     session.prompt_token_ids = [0] * 9
@@ -657,15 +704,19 @@ def test_stage0_window_uses_confirmed_span_and_terminator(cleared_outputs, in_fl
     if cleared_outputs:
         # A stop without a queued append clears this before the next update.
         session._output_token_ids.clear()
-    update = _make_minicpm_window_update(seq=2, mode="basic")
+    update = _make_minicpm_window_update(seq=2, mode=mode)
 
     sched._update_request_as_session(session, update)
 
     plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
     assert plan["completed_token_ids"] == [40]
     assert plan["completed_terminator_token_id"] == 99
-    assert plan["replacement_prompt_len"] == 9
-    assert plan["dropped_tokens"] == 9
+    if mode == "off":
+        assert "replace" not in plan
+        assert session.prompt_token_ids[:10] == [0] * 9 + [40]
+    else:
+        assert plan["replacement_prompt_len"] == 9
+        assert plan["dropped_tokens"] == 9
 
 
 def test_stage0_window_rebuild_that_overflows_max_model_len_finishes_the_session() -> None:
@@ -1396,6 +1447,8 @@ def test_overflow_guard_survives_eager_abort_until_fifo_cleanup(mocker, fifo_pub
     other.status = RequestStatus.RUNNING
     sched.running.append(other)
     engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    # EngineCore.__init__ sets this; __new__ skips it. False is the unpaused default.
+    engine.reject_new_requests = False
     engine.scheduler = sched
     engine.engines_running = False
     engine.batch_queue = None

@@ -150,7 +150,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
         <strong>Stability:</strong><br>
         <code>tests/dfx/stability/tests/</code><br>
         <strong>Reliability:</strong><br>
-        <code>tests/dfx/reliability/test_reliability_{model}.py</code>
+        <code>tests/dfx/reliability/test_{model}.py</code>
       </td>
       <td>
         <a href="test_writing_guide.md#l5-level-testing-stability-and-reliability-testing">L5</a><br>

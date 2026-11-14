@@ -6,66 +6,89 @@ import socket
 
 import pytest
 
-from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+# Distinct from each other and from a single +37 settle step.
+_ENV_PORT = 41017
+_KWARG_PORT = 42019
+_EXPLICIT_PORT = 43013
 
-def _bind_available_port_below(max_port: int, port_inc: int) -> socket.socket:
-    for _ in range(100):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            sock.bind(("", 0))
-            port = sock.getsockname()[1]
-            if port >= max_port - port_inc:
-                sock.close()
-                continue
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as next_sock:
-                next_sock.bind(("", port + port_inc))
-            return sock
-        except OSError:
-            sock.close()
-    raise RuntimeError(f"Failed to reserve an available port below {max_port - port_inc}")
+
+def _stub_port_availability(monkeypatch: pytest.MonkeyPatch, *, unavailable: frozenset[int] = frozenset()) -> list[int]:
+    """Control the check ``settle_port`` uses, instead of a live bind.
+
+    ``settle_port`` calls ``is_port_available`` through the name imported in
+    ``vllm_omni.diffusion.data``. A port returned by ``get_open_port()`` is not
+    reserved, so under CI contention the real check can fail and the resolver
+    steps forward by 37. That fallback is intended. Tests of which candidate
+    was selected stub the check so they do not depend on the port staying free.
+
+    The returned list is every port the stub was asked about, so a test fails
+    if resolution stops consulting this check.
+    """
+    checked: list[int] = []
+
+    def _is_available(port: int) -> bool:
+        checked.append(port)
+        return port not in unavailable
+
+    monkeypatch.setattr("vllm_omni.diffusion.data.is_port_available", _is_available)
+    return checked
 
 
 class TestOmniDiffusionConfigMasterPort:
     def test_honors_master_port_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        port = get_open_port()
-        monkeypatch.setenv("MASTER_PORT", str(port))
+        checked = _stub_port_availability(monkeypatch)
+        monkeypatch.setenv("MASTER_PORT", str(_ENV_PORT))
         config = OmniDiffusionConfig(model="test")
-        assert config.master_port == port
+        assert config.master_port == _ENV_PORT
+        assert checked == [_ENV_PORT]
 
     def test_honors_explicit_master_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("MASTER_PORT", raising=False)
-        port = get_open_port()
-        config = OmniDiffusionConfig(model="test", master_port=port)
-        assert config.master_port == port
+        checked = _stub_port_availability(monkeypatch)
+        config = OmniDiffusionConfig(model="test", master_port=_EXPLICIT_PORT)
+        assert config.master_port == _EXPLICIT_PORT
+        assert checked == [_EXPLICIT_PORT]
 
     def test_master_port_env_takes_precedence_over_kwarg(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        env_port = get_open_port()
-        kwarg_port = get_open_port()
-        monkeypatch.setenv("MASTER_PORT", str(env_port))
-        config = OmniDiffusionConfig(model="test", master_port=kwarg_port)
-        assert config.master_port == env_port
+        checked = _stub_port_availability(monkeypatch)
+        monkeypatch.setenv("MASTER_PORT", str(_ENV_PORT))
+        config = OmniDiffusionConfig(model="test", master_port=_KWARG_PORT)
+        assert config.master_port == _ENV_PORT
+        assert checked == [_ENV_PORT]
 
     def test_explicit_master_port_is_stable_without_jitter(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("MASTER_PORT", raising=False)
-        port = get_open_port()
-        ports = {OmniDiffusionConfig(model="test", master_port=port).master_port for _ in range(5)}
-        assert ports == {port}
+        checked = _stub_port_availability(monkeypatch)
+        ports = {OmniDiffusionConfig(model="test", master_port=_EXPLICIT_PORT).master_port for _ in range(5)}
+        assert ports == {_EXPLICIT_PORT}
+        assert checked == [_EXPLICIT_PORT] * 5
 
     def test_default_master_port_is_available(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("MASTER_PORT", raising=False)
-        config = OmniDiffusionConfig(model="test")
-        assert config.master_port is not None
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("", config.master_port))
+        # The default port still comes from live get_open_port(), which does
+        # not reserve it, so retry the resolve-and-bind. Bind loopback only;
+        # CodeQL flags a wildcard bind.
+        last_error: Exception | None = None
+        for _ in range(10):
+            try:
+                config = OmniDiffusionConfig(model="test")
+                assert config.master_port is not None
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.bind(("127.0.0.1", config.master_port))
+                return
+            except OSError as exc:
+                last_error = exc
+        pytest.fail(f"default master_port was not bindable in 10 attempts: {last_error}")
 
     def test_settle_port_steps_when_port_is_busy(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("MASTER_PORT", raising=False)
-        with _bind_available_port_below(max_port=60000, port_inc=37) as sock:
-            busy_port = sock.getsockname()[1]
-            config = OmniDiffusionConfig(model="test", master_port=busy_port)
-            assert config.master_port == busy_port + 37
+        busy_port = _EXPLICIT_PORT
+        checked = _stub_port_availability(monkeypatch, unavailable=frozenset({busy_port}))
+        config = OmniDiffusionConfig(model="test", master_port=busy_port)
+        assert config.master_port == busy_port + 37
+        assert checked == [busy_port, busy_port + 37]

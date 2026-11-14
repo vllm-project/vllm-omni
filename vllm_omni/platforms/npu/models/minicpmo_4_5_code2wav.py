@@ -53,12 +53,19 @@ def _pad_rows(value: torch.Tensor, target_batch: int) -> torch.Tensor:
     return torch.cat((value, value.new_zeros((missing, *value.shape[1:]))), dim=0)
 
 
-def _pad_cache_rows(value: torch.Tensor, target_batch: int) -> torch.Tensor:
-    """Append all-zero request slots to a packed cache (batch is dim 1)."""
-    missing = target_batch - int(value.shape[1])
+def _pad_cache_rows(value: torch.Tensor, target_batch: int, *, batch_dim: int = 1) -> torch.Tensor:
+    """Append all-zero request slots to a packed cache along ``batch_dim``.
+
+    The CNN cache is ``(depth, rows, ...)``, while the estimator attention
+    cache keeps the K/V half on dim 1 (``(depth, 2, rows, heads, frames,
+    head_dim)``), so its request slots sit on dim 2.
+    """
+    missing = target_batch - int(value.shape[batch_dim])
     if missing <= 0:
         return value
-    return torch.cat((value, value.new_zeros((value.shape[0], missing, *value.shape[2:]))), dim=1)
+    shape = list(value.shape)
+    shape[batch_dim] = missing
+    return torch.cat((value, value.new_zeros(shape)), dim=batch_dim)
 
 
 def _parse_batch_buckets(raw: object) -> tuple[int, ...]:
@@ -140,15 +147,27 @@ def _graphable_estimator_step(
     cnn_out, att_out = backend._estimator_buffers(estimator, estimator_input, att_cache)
     old_cnn = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
     old_att = att_cache if att_cache is not None else [None] * len(estimator.blocks)
+    # Upstream walks the layers itself and needs ``[K | V]`` packed per layer,
+    # while the buffers kept across steps split K/V on a leading axis: pack on
+    # the way in and unpack the result back into ``att_out``, so the graph's
+    # output placeholder stays on the split layout the next step expects.
+    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+        _pack_att_cache,
+        _packed_att_buffer,
+        _unpack_att_cache,
+    )
+
+    packed_out = _packed_att_buffer(att_out)
     result = estimator.blocks_forward_chunk(
         estimator_input,
         time_embedding,
         attn_mask,
         old_cnn,
-        old_att,
+        _pack_att_cache(old_att),
         cnn_out,
-        att_out,
+        packed_out,
     )
+    _unpack_att_cache(packed_out, att_out)
     return result, cnn_out, att_out
 
 
@@ -202,10 +221,10 @@ def _patched_estimator_step(
     # padding feature keep working with the old signature.
     graphable_kwargs = {"valid_frames": valid_frames} if valid_frames is not None else {}
 
-    # The upstream embedder creates a frequency tensor on the host. Keep it
-    # outside capture while retaining the tensor-only estimator body in graph.
+    # Reuse the shared device frequency table: the upstream embedder uploads
+    # a host tensor on every Euler step. Keep embedding outside body capture.
     if time_embedding is None:
-        time_embedding = estimator.t_embedder(time).unsqueeze(1)
+        time_embedding = self._time_embedding(estimator, time).unsqueeze(1)
     # A bucketing mask travels as a graph input: the capture key only covers
     # shapes, so replaying an existing graph must copy the current mask in.
     # Like `valid_frames`, it is forwarded only when present, so graphable
@@ -244,20 +263,22 @@ def _patched_estimator_step(
                 mask_inputs = (attn_mask,)
             if cnn_cache is not None:
                 cnn_cache = _pad_cache_rows(cnn_cache, padded_batch)
-                att_cache = _pad_cache_rows(att_cache, padded_batch)
+                # The attention cache splits K/V on dim 1, so its request rows
+                # are one axis further out than the CNN cache's.
+                att_cache = _pad_cache_rows(att_cache, padded_batch, batch_dim=2)
 
     def _unpad(outputs):
         if padded_batch == live_batch:
             return outputs
         result, new_cnn, new_att = outputs
-        return (result[:live_batch], new_cnn[:, :live_batch], new_att[:, :live_batch])
+        return (result[:live_batch], new_cnn[:, :live_batch], new_att[:, :, :live_batch])
 
     if cnn_cache is None:
         return _unpad(
             graph_runner.run(
                 "cfm_estimator",
                 (x, mu, time_embedding, speakers, cond, *mask_inputs),
-                ((False, has_mask) if has_mask else (False,)),
+                (False, valid_frames),
                 lambda step_x, step_mu, step_time, step_speakers, step_cond, *rest: _graphable_estimator_step(
                     self,
                     estimator,
@@ -277,7 +298,7 @@ def _patched_estimator_step(
         graph_runner.run(
             "cfm_estimator",
             (x, mu, time_embedding, speakers, cond, cnn_cache, att_cache, *mask_inputs),
-            ((True, has_mask) if has_mask else (True,)),
+            (True, valid_frames),
             lambda step_x,
             step_mu,
             step_time,

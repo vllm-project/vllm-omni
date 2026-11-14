@@ -28,12 +28,24 @@ The variants above share the same codec (`OpenMOSS-Team/MOSS-Audio-Tokenizer`, ~
 output 24 kHz mono audio.
 
 MOSS-TTS-Local-Transformer-v1.5 uses MOSS-Audio-Tokenizer-v2 and outputs 48 kHz
-stereo audio. For Local voice cloning through `/v1/audio/speech`, provide an
+stereo audio. Reference audio is resampled directly to the model's configured
+48 kHz rate before encoding. For Local voice cloning through `/v1/audio/speech`, provide an
 accurate `ref_text` transcript alongside `ref_audio`. The adapter uses the
 reference transcript and audio as a continuation prefix, then generates only
 the requested `input` speech. Without a nonblank `ref_text`, Local uses
 audio-reference generation. Reference transcripts must match the reference
 audio; they are not style instructions.
+
+In continuation mode the codec decodes the reference codes before the new
+codes, preserves that causal state across chunks, and removes only reference
+PCM from the response. Generation mode decodes the new assistant segment
+without that prefix. The isolated Stage0 first-frame shortcut is therefore
+used only for generation. Local enables codec ring headroom by default so a
+chunk cannot overwrite keys within its own causal attention window. Reference
+prefill still uses the regular codec chunk size; decoder prefix state is not
+cached across requests.
+With `async_chunk: false`, codec v2 uses eager whole-sequence decoding; the
+legacy offline CUDA Graph wrapper supports codec v1 only.
 
 For the CUDA MRV2 runner and platform fallbacks, see the
 [Local 1.5 deployment profile](../../docs/configuration/stage_configs.md#moss-tts-local-15-with-model-runner-v2).
@@ -157,6 +169,37 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 - Input field maps to the `ambient_sound` parameter in the upstream processor.
 - Rate: ~12.5 tokens per second; longer descriptions produce longer audio.
 
+### NPU
+
+#### 1x Ascend A3 — MOSS-TTS-Local-Transformer-v1.5 on Model Runner V2
+
+`moss_tts_local_npu_mrv2.yaml` is an opt-in profile with both stages on
+Model Runner V2. Stage0 (Talker) uses ACL graphs and builds Ascend attention
+metadata; Stage1 (codec) uses streaming NPUGraphs. Stage0 does not send the
+first audio frame itself on NPU; Stage1 delivers every chunk.
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni --port 8091 \
+  --deploy-config vllm_omni/deploy/moss_tts_local_npu_mrv2.yaml \
+  --stage-init-timeout 1200 --init-timeout 1500
+```
+
+The startup log contains `NPU Model Runner V2 loaded
+MossTTSLocalTalkerForGeneration with Ascend attention metadata`. The speech
+request is the same as for GPU; Local 1.5 returns 48 kHz stereo audio.
+
+The two-stage MRV2 profile is validated on Atlas A3 (910C) with vLLM v0.33.0,
+CANN 9.2.1 and torch_npu 2.10.0.post7. Codec warmup captures all 21 configured
+graphs, and speech requests use NPUGraph replay. Validation requests set
+`seed: 42`; non-streaming WAV and streaming PCM return 48 kHz stereo audio
+and pass transcription checks.
+
+The default NPU profile continues to use V1 for Stage0. Historical vLLM
+v0.32.0 validation and benchmark results, including the V1 graph-mode
+comparison, are recorded in the
+[PR evidence](https://github.com/vllm-project/vllm-omni/pull/9953#issuecomment-6676396983).
+
 ## Local 1.5 unified deployment and slot attention
 
 `OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5` uses one single-GPU deploy
@@ -164,8 +207,9 @@ file, `moss_tts_local.yaml`. The CUDA settings use MRV2, 128 stream slots per
 stage, full-quota private MPS, prefix caching and Triton backbone attention.
 These settings replace the former C64, high-concurrency, low-latency and
 optimized presets. Pipeline selection no longer probes GPU memory or MPS.
-Non-CUDA platforms retain V1 through the same file's platform overrides;
-the separate 2/3-NPU files describe different device placements.
+Non-CUDA platforms retain V1 through the same file's platform overrides, and
+NPU has an opt-in MRV2 profile (see the NPU section above); the separate 2/3-NPU
+files describe different device placements.
 
 Both stages share one GPU, with a 32 GiB Talker KV budget. The CUDA settings
 are validated on H200 and require room for codec state and graphs, plus
@@ -192,6 +236,25 @@ vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
   --deploy-config vllm_omni/deploy/moss_tts_local.yaml \
   --stage-init-timeout 1200 --init-timeout 1500
 ```
+
+For Local, `token_count` optionally sets a target for new audio, in codec frames
+(12.5 frames/s). Continuation adds the actual reference-prefix frames before
+writing the official prompt's total `Tokens` target. It is separate from
+the hard `max_new_tokens` limit; omitting it leaves duration conditioning unset.
+To reproduce SGLang-Omni's `--token-count auto` benchmark behavior, estimate on
+the client and send the resulting positive integer, not the string `"auto"`:
+
+```python
+zh_chars = sum("\u4e00" <= ch <= "\u9fff" for ch in text)
+en_chars = sum("A" <= ch <= "Z" or "a" <= ch <= "z" for ch in text)
+factor = 3.098411951313033 if zh_chars and zh_chars >= en_chars else 0.8673376262755219
+token_count = max(32, int(max(len(text), 1) * factor))
+# Include token_count in the /v1/audio/speech JSON alongside input and ref_audio.
+```
+
+This heuristic can reduce long outputs but does not guarantee complete or
+correct speech. Compare the same ASR model, text normalization and WER
+aggregation when evaluating it; corpus WER and mean per-utterance WER differ.
 
 Evaluate WER, speaker similarity and streaming latency for your workload;
 throughput gains do not establish quality equivalence. Do not apply partial
