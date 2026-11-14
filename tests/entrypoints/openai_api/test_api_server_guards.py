@@ -441,6 +441,60 @@ class _FakeSocket:
         self.closed = True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("warmup", ["disabled", "success", "failure", "unsupported"])
+async def test_video_output_warmup_gates_http_startup(monkeypatch, warmup):
+    events = []
+    app = FastAPI()
+
+    @asynccontextmanager
+    async def build_engine(*_args, **_kwargs):
+        try:
+            yield _FakeEngineClient()
+        finally:
+            events.append("engine_closed")
+
+    async def run_warmup(path, *, timeout):
+        assert path == "warmup.json"
+        assert timeout == 90
+        events.append("warmup_started")
+        await asyncio.sleep(0)
+        if warmup == "failure":
+            raise RuntimeError("warmup failed")
+        events.append("warmup_done")
+
+    async def init_state(engine, state, args):
+        state.engine_client = engine
+        state.openai_streaming_video_output = None if warmup == "unsupported" else SimpleNamespace(warmup=run_warmup)
+
+    async def serve(app, **kwargs):
+        events.append("http_started")
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(api_server, "build_async_omni", build_engine)
+    monkeypatch.setattr(api_server, "build_openai_app", lambda *_: app)
+    monkeypatch.setattr(api_server, "omni_init_app_state", init_state)
+    monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_: None)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(api_server, "serve_http", serve)
+    args = _minimal_args(
+        video_output_warmup=None if warmup == "disabled" else "warmup.json",
+        video_output_warmup_timeout=90,
+    )
+    if warmup in {"failure", "unsupported"}:
+        with pytest.raises((RuntimeError, ValueError)):
+            await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args)
+        assert "http_started" not in events
+    else:
+        await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args)
+        assert events == (
+            ["http_started", "engine_closed"]
+            if warmup == "disabled"
+            else ["warmup_started", "warmup_done", "http_started", "engine_closed"]
+        )
+    assert events[-1] == "engine_closed"
+
+
 class _FakeEngineClient:
     config_path: str | None = None
 

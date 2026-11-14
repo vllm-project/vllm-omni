@@ -36,7 +36,9 @@ import time
 import uuid
 from collections.abc import AsyncGenerator, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import aclosing
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any, cast
 
 import anyio
@@ -114,6 +116,54 @@ class OmniStreamingVideoOutputHandler:
         self._stage_configs = stage_configs
         self._stall_timeout = stall_timeout
         self._start_timeout = start_timeout
+
+    async def warmup(self, request_path: str, *, timeout: float = 180.0) -> None:
+        """Drain a configured generation and its encoder before HTTP admission.
+
+        The file uses the session.start schema, with an explicit finite frame
+        count and no playback pacing: this internal consumer has no player.
+        Model-specific inputs and dimensions belong in the request, not here.
+        """
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("video output warmup timeout must be finite and positive")
+        raw = await asyncio.to_thread(Path(request_path).read_text, encoding="utf-8")
+        message = json.loads(raw)
+        if not isinstance(message, dict) or message.get("type", "session.start") != "session.start":
+            raise ValueError("video output warmup must be a session.start JSON object")
+        output_format = self._coerce_output_format(message.get("format", "m4s"))
+        request = VideoGenerationRequest(**self._coerce_request_data(message))
+        if request.resolve_video_params().num_frames is None:
+            raise ValueError("video output warmup requires an explicit num_frames")
+        if request.streaming_buffer_seconds is not None:
+            raise ValueError("video output warmup does not support playback pacing")
+        if request.model is not None and self._model_name is not None and request.model != self._model_name:
+            raise ValueError("video output warmup model does not match the served model")
+
+        request_id = f"video_warmup-{uuid.uuid4().hex}"
+        started = time.monotonic()
+        complete = False
+
+        async def drain() -> None:
+            frames = 0
+            byte_count = 0
+            async with aclosing(
+                self._stream_video_bytes(request, request_id, output_format, _SessionProgress())
+            ) as stream:
+                async for chunk, metadata in stream:
+                    frames += metadata["num_frames"]
+                    byte_count += len(chunk)
+            if frames == 0 or byte_count == 0:
+                raise RuntimeError("video output warmup completed without encoded video")
+
+        logger.info("Running streaming video startup warmup from %s", request_path)
+        try:
+            await asyncio.wait_for(drain(), timeout=timeout)
+            complete = True
+        finally:
+            if not complete:
+                with anyio.CancelScope(shield=True):
+                    await self._abort_request(request_id)
+        logger.info("Streaming video startup warmup completed in %.2f seconds", time.monotonic() - started)
 
     async def handle_session(self, websocket: WebSocket) -> None:
         await websocket.accept()

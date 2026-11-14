@@ -30,6 +30,151 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.asyncio
+async def test_startup_warmup_drains_generation_and_encoder(mocker, tmp_path):
+    released = []
+    submitted = []
+
+    async def generate(**kwargs):
+        submitted.append(kwargs)
+        yield OmniRequestOutput.from_diffusion(
+            request_id=kwargs["request_id"],
+            images=[_fake_video_frames(2)],
+            finished=True,
+        )
+        released.append(kwargs["request_id"])
+
+    _, handler, engine = _build_test_app(
+        mocker=mocker, streaming_chunks=[(b"video", True)], mock_generate=generate, final_chunk=b"trailer"
+    )
+    closed = threading.Event()
+    factory = engine.streaming_encoder_factory.side_effect
+
+    def make_encoder(**kwargs):
+        encoder = factory(**kwargs)
+        close = encoder.close
+
+        def finish():
+            trailer = close()
+            closed.set()
+            return trailer
+
+        encoder.close = finish
+        return encoder
+
+    engine.streaming_encoder_factory.side_effect = make_encoder
+    from vllm_omni.entrypoints.openai.stage_params import build_stage_sampling_params_list
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video_output_stream.build_stage_sampling_params_list",
+        side_effect=build_stage_sampling_params_list,
+    )
+    engine.default_sampling_params_list[0].num_inference_steps = 4
+    path = tmp_path / "warmup.json"
+    path.write_text(json.dumps({"type": "session.start", "prompt": "warmup", "num_frames": 2, "seed": 42}))
+
+    await handler.warmup(str(path), timeout=1)
+
+    assert len(submitted) == 1
+    assert released == [submitted[0]["request_id"]]
+    assert closed.is_set()
+    params = submitted[0]["sampling_params_list"][0]
+    assert params.num_frames == 2
+    assert params.seed == 42
+    assert params.num_inference_steps == 4
+    assert params.streaming_buffer_seconds is None
+    engine.abort.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+async def test_startup_warmup_rejects_invalid_deadline(mocker, tmp_path, timeout):
+    generate = mocker.MagicMock()
+    _, handler, engine = _build_test_app(mocker=mocker, streaming_chunks=[], mock_generate=generate)
+    with pytest.raises(ValueError, match="timeout"):
+        await handler.warmup(str(tmp_path / "unused.json"), timeout=timeout)
+    generate.assert_not_called()
+    engine.abort.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["encode", "close", "no_bytes"])
+async def test_startup_warmup_encoder_failure_aborts(mocker, tmp_path, failure):
+    async def generate(**kwargs):
+        yield OmniRequestOutput.from_diffusion(
+            request_id=kwargs["request_id"], images=[_fake_video_frames(2)], finished=True
+        )
+
+    _, handler, engine = _build_test_app(mocker=mocker, streaming_chunks=[], mock_generate=generate)
+
+    class Encoder:
+        def encode(self, *args, **kwargs):
+            if failure == "encode":
+                raise RuntimeError("encode failed")
+            return b"" if failure == "no_bytes" else b"media"
+
+        def close(self):
+            if failure == "close":
+                raise RuntimeError("close failed")
+            return b""
+
+    engine.streaming_encoder_factory.side_effect = lambda **kwargs: Encoder()
+    path = tmp_path / "warmup.json"
+    path.write_text(json.dumps({"prompt": "warmup", "num_frames": 2}))
+    with pytest.raises(RuntimeError):
+        await handler.warmup(str(path), timeout=1)
+    engine.abort.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["empty", "error", "timeout", "cancel"])
+async def test_startup_warmup_failure_aborts_request(mocker, tmp_path, failure):
+    entered = asyncio.Event()
+
+    async def generate(**kwargs):
+        entered.set()
+        if failure in {"timeout", "cancel"}:
+            await asyncio.Event().wait()
+        if failure == "error":
+            raise RuntimeError("generation failed")
+        if False:
+            yield
+
+    _, handler, engine = _build_test_app(mocker=mocker, streaming_chunks=[], mock_generate=generate)
+    path = tmp_path / "warmup.json"
+    path.write_text(json.dumps({"prompt": "warmup", "num_frames": 2}))
+    task = asyncio.create_task(handler.warmup(str(path), timeout=0.1 if failure == "timeout" else 1))
+    if failure == "cancel":
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel()
+    expected = {"timeout": asyncio.TimeoutError, "cancel": asyncio.CancelledError}.get(failure, RuntimeError)
+    with pytest.raises(expected):
+        await task
+    engine.abort.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"num_frames": None},
+        {"streaming_buffer_seconds": 1},
+        {"model": "wrong-model"},
+        {"format": "mp4"},
+        {"type": "session.stop"},
+    ],
+)
+async def test_startup_warmup_rejects_invalid_requests_before_generation(mocker, tmp_path, overrides):
+    generate = mocker.MagicMock()
+    _, handler, engine = _build_test_app(mocker=mocker, streaming_chunks=[], mock_generate=generate)
+    path = tmp_path / "warmup.json"
+    path.write_text(json.dumps({"prompt": "warmup", "num_frames": 2, **overrides}))
+    with pytest.raises(ValueError):
+        await handler.warmup(str(path), timeout=1)
+    generate.assert_not_called()
+    engine.abort.assert_not_awaited()
+
+
 @pytest.mark.parametrize("sample_rate", [32000, np.int32(32000), np.int64(32000)])
 def test_extract_audio_preserves_integer_sample_rate(sample_rate):
     audio = np.zeros((1000, 2), dtype=np.float32)

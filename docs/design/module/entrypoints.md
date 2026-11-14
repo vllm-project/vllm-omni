@@ -101,6 +101,14 @@ optional `/tokenizer_info` routes when no tokenization handler is configured
 (including pure diffusion mode). These endpoints return HTTP 404 and are absent
 from OpenAPI in that mode; configured handlers retain upstream vLLM routing.
 
+An optional `--video-output-warmup` request runs through the streaming video
+handler before HTTP serving starts. The frontend owns request validation,
+draining generation and encoding, and the startup deadline. It does not expose
+`/health` or admit traffic until that request completes successfully. Failure
+aborts the internal request and unwinds engine startup. The request explicitly
+supplies model-specific inputs and a finite frame count; playback pacing is
+rejected because there is no player. Omitting the option skips this warmup.
+
 When `--api-server-count` is greater than one, the serve composition root
 starts the frontend process manager while a parent-owned `StageRuntime`
 launches the shared local stage engines. Each frontend receives only its own
