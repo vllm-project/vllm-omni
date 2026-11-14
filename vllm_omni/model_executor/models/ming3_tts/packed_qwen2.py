@@ -40,7 +40,18 @@ class PackedQwen2:
     """Causal (sliding-window) Qwen2 forward over packed sequences."""
 
     def __init__(self, model: nn.Module, max_positions: int):
-        from vllm.vllm_flash_attn import flash_attn_varlen_func, is_fa_version_supported
+        from vllm.platforms import current_platform
+
+        # XPU binds vllm._xpu_ops; its varlen args are not in CUDA's positional order.
+        if current_platform.is_xpu():
+            from vllm._xpu_ops import xpu_ops
+
+            flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func
+            fa_version = 2
+        else:
+            from vllm.vllm_flash_attn import flash_attn_varlen_func, is_fa_version_supported
+
+            fa_version = 3 if is_fa_version_supported(3) else 2
 
         cfg = model.config
         self.model = model
@@ -81,7 +92,7 @@ class PackedQwen2:
         self.cos_sin_cache = torch.cat([cos[0, :, :half], sin[0, :, :half]], dim=-1).contiguous()
         self._unit_scale = torch.ones((), device=param.device, dtype=torch.float32)
         self._attn = flash_attn_varlen_func
-        self._fa_version = 3 if is_fa_version_supported(3) else 2
+        self._fa_version = fa_version
 
     def new_paged_caches(self, blocks: int, block_size: int) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         param = next(self.model.parameters())
@@ -113,12 +124,12 @@ class PackedQwen2:
             v = v.view(tokens, self.num_kv_heads, self.head_dim)
             if kv is None:
                 attn = self._attn(
-                    q,
-                    k,
-                    v,
-                    max_seqlen,
-                    cu_seqlens,
-                    max_seqlen,
+                    q=q,
+                    k=k,
+                    v=v,
+                    max_seqlen_q=max_seqlen,
+                    cu_seqlens_q=cu_seqlens,
+                    max_seqlen_k=max_seqlen,
                     cu_seqlens_k=cu_seqlens,
                     softmax_scale=scale,
                     causal=True,
@@ -131,12 +142,12 @@ class PackedQwen2:
                     k, v, key_cache, value_cache, kv.slot_mapping, "auto", self._unit_scale, self._unit_scale
                 )
                 attn = self._attn(
-                    q,
-                    key_cache,
-                    value_cache,
-                    max_seqlen,
-                    cu_seqlens,
-                    kv.max_seqlen_k,
+                    q=q,
+                    k=key_cache,
+                    v=value_cache,
+                    max_seqlen_q=max_seqlen,
+                    cu_seqlens_q=cu_seqlens,
+                    max_seqlen_k=kv.max_seqlen_k,
                     seqused_k=kv.seqused_k,
                     block_table=kv.block_table,
                     softmax_scale=scale,
