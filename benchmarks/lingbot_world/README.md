@@ -25,6 +25,10 @@ finished video" and reports request throughput. LingBot-World has neither shape:
 Serve the model, then point the benchmark at it. The benchmark never starts a
 server.
 
+The benchmark disables WebSocket compression to avoid recompressing MP4 chunks
+on the delivery path. Record this transport setting when comparing results
+with older benchmark versions or browser clients.
+
 ```bash
 # Terminal 1 — one GPU, eager (portable smoke configuration)
 vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers \

@@ -35,7 +35,10 @@ import math
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import aclosing
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any, cast
 
 import anyio
@@ -113,6 +116,54 @@ class OmniStreamingVideoOutputHandler:
         self._stage_configs = stage_configs
         self._stall_timeout = stall_timeout
         self._start_timeout = start_timeout
+
+    async def warmup(self, request_path: str, *, timeout: float = 180.0) -> None:
+        """Drain a configured generation and its encoder before HTTP admission.
+
+        The file uses the session.start schema, with an explicit finite frame
+        count and no playback pacing: this internal consumer has no player.
+        Model-specific inputs and dimensions belong in the request, not here.
+        """
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("video output warmup timeout must be finite and positive")
+        raw = await asyncio.to_thread(Path(request_path).read_text, encoding="utf-8")
+        message = json.loads(raw)
+        if not isinstance(message, dict) or message.get("type", "session.start") != "session.start":
+            raise ValueError("video output warmup must be a session.start JSON object")
+        output_format = self._coerce_output_format(message.get("format", "m4s"))
+        request = VideoGenerationRequest(**self._coerce_request_data(message))
+        if request.resolve_video_params().num_frames is None:
+            raise ValueError("video output warmup requires an explicit num_frames")
+        if request.streaming_buffer_seconds is not None:
+            raise ValueError("video output warmup does not support playback pacing")
+        if request.model is not None and self._model_name is not None and request.model != self._model_name:
+            raise ValueError("video output warmup model does not match the served model")
+
+        request_id = f"video_warmup-{uuid.uuid4().hex}"
+        started = time.monotonic()
+        complete = False
+
+        async def drain() -> None:
+            frames = 0
+            byte_count = 0
+            async with aclosing(
+                self._stream_video_bytes(request, request_id, output_format, _SessionProgress())
+            ) as stream:
+                async for chunk, metadata in stream:
+                    frames += metadata["num_frames"]
+                    byte_count += len(chunk)
+            if frames == 0 or byte_count == 0:
+                raise RuntimeError("video output warmup completed without encoded video")
+
+        logger.info("Running streaming video startup warmup from %s", request_path)
+        try:
+            await asyncio.wait_for(drain(), timeout=timeout)
+            complete = True
+        finally:
+            if not complete:
+                with anyio.CancelScope(shield=True):
+                    await self._abort_request(request_id)
+        logger.info("Streaming video startup warmup completed in %.2f seconds", time.monotonic() - started)
 
     async def handle_session(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -851,18 +902,38 @@ class OmniStreamingVideoOutputHandler:
         )
         pacing = request.streaming_pacing
         max_output_bytes = pacing.max_output_bytes if pacing is not None and pacing.enabled else None
-        completed = False
+        # Encoding must not block playback feedback, interactions, or stop.
+        # One worker also serializes close behind an encode that is still
+        # running when its asyncio waiter is cancelled.
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-stream-encoder")
+        loop = asyncio.get_running_loop()
+        close_future: Future[bytes] | None = None
+
+        def close_encoder() -> bytes:
+            try:
+                return encoder.close()
+            except Exception:
+                logger.exception("Failed to close streaming video encoder for %s", request_id)
+                raise
+
         try:
             async for result in self._iter_generation_outputs(prompt, gen_params, request_id, progress):
                 if result.error:
                     raise RuntimeError(str(result.error))
-                for chunk, metadata in self._encode_generation_result(result, request_id, encoder):
+                encoded_chunks = await loop.run_in_executor(
+                    executor, lambda: list(self._encode_generation_result(result, request_id, encoder))
+                )
+                for chunk, metadata in encoded_chunks:
                     if max_output_bytes is not None and len(chunk) > max_output_bytes:
                         raise ValueError("encoded streaming chunk exceeds streaming_pacing.max_output_bytes")
                     yield (chunk, metadata)
 
-            completed = True
-            final_chunk = encoder.close()
+            close_future = executor.submit(close_encoder)
+            # Shield the queued close: cancelling the session must not cancel
+            # the cleanup operation before the encoder thread gets to it.
+            close_waiter = asyncio.wrap_future(close_future)
+            close_waiter.add_done_callback(lambda future: None if future.cancelled() else future.exception())
+            final_chunk = await asyncio.shield(close_waiter)
             if max_output_bytes is not None and len(final_chunk or b"") > max_output_bytes:
                 raise ValueError("encoded streaming trailer exceeds streaming_pacing.max_output_bytes")
             if final_chunk:
@@ -877,8 +948,11 @@ class OmniStreamingVideoOutputHandler:
                     ),
                 )
         finally:
-            if not completed:
-                encoder.close()
+            if close_future is None:
+                executor.submit(close_encoder)
+            # Do not join a running encode on the event-loop thread. The
+            # executor drains its queued close and then releases its worker.
+            executor.shutdown(wait=False)
 
     def _encode_generation_result(
         self,

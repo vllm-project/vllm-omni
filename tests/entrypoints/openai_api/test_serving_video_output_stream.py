@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import queue
+import threading
 from collections.abc import AsyncGenerator, Callable
 from http import HTTPStatus
 from types import SimpleNamespace
@@ -27,6 +28,151 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.asyncio
+async def test_startup_warmup_drains_generation_and_encoder(mocker, tmp_path):
+    released = []
+    submitted = []
+
+    async def generate(**kwargs):
+        submitted.append(kwargs)
+        yield OmniRequestOutput.from_diffusion(
+            request_id=kwargs["request_id"],
+            images=[_fake_video_frames(2)],
+            finished=True,
+        )
+        released.append(kwargs["request_id"])
+
+    _, handler, engine = _build_test_app(
+        mocker=mocker, streaming_chunks=[(b"video", True)], mock_generate=generate, final_chunk=b"trailer"
+    )
+    closed = threading.Event()
+    factory = engine.streaming_encoder_factory.side_effect
+
+    def make_encoder(**kwargs):
+        encoder = factory(**kwargs)
+        close = encoder.close
+
+        def finish():
+            trailer = close()
+            closed.set()
+            return trailer
+
+        encoder.close = finish
+        return encoder
+
+    engine.streaming_encoder_factory.side_effect = make_encoder
+    from vllm_omni.entrypoints.openai.stage_params import build_stage_sampling_params_list
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video_output_stream.build_stage_sampling_params_list",
+        side_effect=build_stage_sampling_params_list,
+    )
+    engine.default_sampling_params_list[0].num_inference_steps = 4
+    path = tmp_path / "warmup.json"
+    path.write_text(json.dumps({"type": "session.start", "prompt": "warmup", "num_frames": 2, "seed": 42}))
+
+    await handler.warmup(str(path), timeout=1)
+
+    assert len(submitted) == 1
+    assert released == [submitted[0]["request_id"]]
+    assert closed.is_set()
+    params = submitted[0]["sampling_params_list"][0]
+    assert params.num_frames == 2
+    assert params.seed == 42
+    assert params.num_inference_steps == 4
+    assert params.streaming_buffer_seconds is None
+    engine.abort.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+async def test_startup_warmup_rejects_invalid_deadline(mocker, tmp_path, timeout):
+    generate = mocker.MagicMock()
+    _, handler, engine = _build_test_app(mocker=mocker, streaming_chunks=[], mock_generate=generate)
+    with pytest.raises(ValueError, match="timeout"):
+        await handler.warmup(str(tmp_path / "unused.json"), timeout=timeout)
+    generate.assert_not_called()
+    engine.abort.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["encode", "close", "no_bytes"])
+async def test_startup_warmup_encoder_failure_aborts(mocker, tmp_path, failure):
+    async def generate(**kwargs):
+        yield OmniRequestOutput.from_diffusion(
+            request_id=kwargs["request_id"], images=[_fake_video_frames(2)], finished=True
+        )
+
+    _, handler, engine = _build_test_app(mocker=mocker, streaming_chunks=[], mock_generate=generate)
+
+    class Encoder:
+        def encode(self, *args, **kwargs):
+            if failure == "encode":
+                raise RuntimeError("encode failed")
+            return b"" if failure == "no_bytes" else b"media"
+
+        def close(self):
+            if failure == "close":
+                raise RuntimeError("close failed")
+            return b""
+
+    engine.streaming_encoder_factory.side_effect = lambda **kwargs: Encoder()
+    path = tmp_path / "warmup.json"
+    path.write_text(json.dumps({"prompt": "warmup", "num_frames": 2}))
+    with pytest.raises(RuntimeError):
+        await handler.warmup(str(path), timeout=1)
+    engine.abort.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["empty", "error", "timeout", "cancel"])
+async def test_startup_warmup_failure_aborts_request(mocker, tmp_path, failure):
+    entered = asyncio.Event()
+
+    async def generate(**kwargs):
+        entered.set()
+        if failure in {"timeout", "cancel"}:
+            await asyncio.Event().wait()
+        if failure == "error":
+            raise RuntimeError("generation failed")
+        if False:
+            yield
+
+    _, handler, engine = _build_test_app(mocker=mocker, streaming_chunks=[], mock_generate=generate)
+    path = tmp_path / "warmup.json"
+    path.write_text(json.dumps({"prompt": "warmup", "num_frames": 2}))
+    task = asyncio.create_task(handler.warmup(str(path), timeout=0.1 if failure == "timeout" else 1))
+    if failure == "cancel":
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel()
+    expected = {"timeout": asyncio.TimeoutError, "cancel": asyncio.CancelledError}.get(failure, RuntimeError)
+    with pytest.raises(expected):
+        await task
+    engine.abort.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"num_frames": None},
+        {"streaming_buffer_seconds": 1},
+        {"model": "wrong-model"},
+        {"format": "mp4"},
+        {"type": "session.stop"},
+    ],
+)
+async def test_startup_warmup_rejects_invalid_requests_before_generation(mocker, tmp_path, overrides):
+    generate = mocker.MagicMock()
+    _, handler, engine = _build_test_app(mocker=mocker, streaming_chunks=[], mock_generate=generate)
+    path = tmp_path / "warmup.json"
+    path.write_text(json.dumps({"prompt": "warmup", "num_frames": 2, **overrides}))
+    with pytest.raises(ValueError):
+        await handler.warmup(str(path), timeout=1)
+    generate.assert_not_called()
+    engine.abort.assert_not_awaited()
 
 
 @pytest.mark.parametrize("sample_rate", [32000, np.int32(32000), np.int64(32000)])
@@ -1332,6 +1478,119 @@ class TestStreamingVideoOutputExtraParams:
         _, gen_params, _ = await self._handler()._build_prompt_and_sampling_params(request)
 
         assert gen_params.extra_args["flow_shift"] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_blocked_encoder_allows_controls_and_serializes_cancel_cleanup(mocker: MockerFixture):
+    """Stop remains responsive and close never races a cancelled encode."""
+    encoding = asyncio.Event()
+    closed = asyncio.Event()
+    aborted = asyncio.Event()
+    release_encode = threading.Event()
+    operations = []
+    threads = []
+    loop = asyncio.get_running_loop()
+
+    class BlockingEncoder:
+        def encode(self, video, audio=None, *, audio_sample_rate=None):
+            operations.append("encode.start")
+            threads.append(threading.get_ident())
+            loop.call_soon_threadsafe(encoding.set)
+            assert release_encode.wait(5), "test did not release encoder"
+            operations.append("encode.end")
+            return b"media"
+
+        def close(self):
+            operations.append("close")
+            threads.append(threading.get_ident())
+            loop.call_soon_threadsafe(closed.set)
+            return b""
+
+    async def generate(*_args, **_kwargs):
+        yield OmniRequestOutput.from_diffusion(
+            request_id="req-ws", images=[_fake_video_frames(2)], final_output_type="image", finished=True
+        )
+
+    handler, engine, ws = _build_handler_for_async_tests(mocker, mock_generate=generate)
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video_output_stream.create_streaming_video_encoder",
+        return_value=BlockingEncoder(),
+    )
+    engine.update_streaming_playback = mocker.AsyncMock()
+    engine.abort = mocker.AsyncMock(side_effect=lambda *_, **__: aborted.set())
+    session = asyncio.create_task(handler.handle_session(ws))
+    try:
+        await asyncio.wait_for(encoding.wait(), 1)
+        ws.enqueue(json.dumps({"type": "session.ping"}))
+        ws.enqueue(json.dumps({"type": "session.playback", "position_seconds": 0.25}))
+        ws.enqueue(json.dumps({"type": "session.stop"}))
+        await asyncio.wait_for(aborted.wait(), 1)
+        engine.update_streaming_playback.assert_awaited_once()
+        assert not release_encode.is_set()
+        session.cancel()
+        await asyncio.wait_for(asyncio.gather(session, return_exceptions=True), 1)
+        assert operations == ["encode.start"]
+    finally:
+        session.cancel()
+        release_encode.set()
+        await asyncio.gather(session, return_exceptions=True)
+        await asyncio.wait_for(closed.wait(), 1)
+    assert operations == ["encode.start", "encode.end", "close"]
+    assert len(set(threads)) == 1
+    assert threads[0] != threading.get_ident()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_encoder_close_preserves_cleanup_and_observes_failure(mocker: MockerFixture):
+    closing = asyncio.Event()
+    closed = asyncio.Event()
+    failure_logged = asyncio.Event()
+    release_close = threading.Event()
+    close_calls = []
+    loop = asyncio.get_running_loop()
+    logged = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video_output_stream.logger.exception",
+        side_effect=lambda *_args, **_kwargs: loop.call_soon_threadsafe(failure_logged.set),
+    )
+
+    class BlockingCloseEncoder:
+        def encode(self, video, audio=None, *, audio_sample_rate=None):
+            return b"media"
+
+        def close(self):
+            close_calls.append(threading.get_ident())
+            loop.call_soon_threadsafe(closing.set)
+            try:
+                assert release_close.wait(5), "test did not release close"
+                raise RuntimeError("close failed")
+            finally:
+                loop.call_soon_threadsafe(closed.set)
+
+    async def generate(*_args, **_kwargs):
+        yield OmniRequestOutput.from_diffusion(
+            request_id="req-ws", images=[_fake_video_frames(2)], final_output_type="image", finished=True
+        )
+
+    handler, _, ws = _build_handler_for_async_tests(mocker, mock_generate=generate)
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video_output_stream.create_streaming_video_encoder",
+        return_value=BlockingCloseEncoder(),
+    )
+    session = asyncio.create_task(handler.handle_session(ws))
+    try:
+        await asyncio.wait_for(closing.wait(), 1)
+        session.cancel()
+        await asyncio.wait_for(asyncio.gather(session, return_exceptions=True), 1)
+        assert not release_close.is_set()
+    finally:
+        session.cancel()
+        release_close.set()
+        await asyncio.gather(session, return_exceptions=True)
+        await asyncio.wait_for(closed.wait(), 1)
+        await asyncio.wait_for(failure_logged.wait(), 1)
+    assert len(close_calls) == 1
+    assert close_calls[0] != threading.get_ident()
+    logged.assert_called_once()
 
 
 @pytest.mark.asyncio
