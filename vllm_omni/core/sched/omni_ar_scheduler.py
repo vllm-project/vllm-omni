@@ -728,12 +728,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         draft_limit = scheduler_output.num_spec_tokens_to_schedule
-        # The native duplex policy requires one logit per request, so a
-        # mixed batch runs without drafts.
-        if any(self._uses_native_duplex_sampler(self.requests[req_id]) for req_id in num_scheduled_tokens):
-            draft_limit = 0
-        elif self._scheduler_ngram is None:
-            return
+        scheduler_ngram = self._scheduler_ngram is not None
+        for req_id in num_scheduled_tokens:
+            request = self.requests[req_id]
+            params = request.sampling_params
+            # Native duplex needs one logit row per request. On the MRv2
+            # scheduler Ngram path, also keep non-greedy requests on the
+            # ordinary sampler when they share a step with greedy requests.
+            if self._uses_native_duplex_sampler(request) or (
+                scheduler_ngram and params is not None and params.temperature != 0
+            ):
+                draft_limit = 0
+                break
+        else:
+            if not scheduler_ngram:
+                return
         for req_id, drafts in list(spec_tokens.items()):
             num_dropped = len(drafts) - draft_limit
             if num_dropped <= 0:

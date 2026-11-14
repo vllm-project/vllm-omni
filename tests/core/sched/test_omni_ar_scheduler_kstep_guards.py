@@ -38,16 +38,24 @@ def test_async_scheduler_allows_unarmed_stage():
 
 
 @pytest.mark.parametrize(
-    ("scheduler_ngram", "native_duplex", "expected"),
-    [(True, False, [1, 2]), (True, True, []), (False, False, [1, 2, 3]), (False, True, [])],
+    ("scheduler_ngram", "native_duplex", "temperature", "expected"),
+    [
+        (True, False, 0.0, [1, 2]),
+        (True, True, 0.0, []),
+        (True, False, 0.7, []),
+        (False, False, 0.0, [1, 2, 3]),
+        (False, True, 0.0, []),
+        (False, False, 0.7, [1, 2, 3]),
+    ],
 )
-def test_thinker_ngram_limits_drafts_before_accounting(scheduler_ngram, native_duplex, expected):
+def test_thinker_ngram_limits_drafts_before_accounting(scheduler_ngram, native_duplex, temperature, expected):
     scheduler = object.__new__(OmniARScheduler)
     scheduler._scheduler_ngram = object() if scheduler_ngram else None
     scheduler.requests = {
-        "chat": SimpleNamespace(resumable=False),
+        "chat": SimpleNamespace(resumable=False, sampling_params=SimpleNamespace(temperature=0.0)),
         "duplex": SimpleNamespace(
             resumable=False,
+            sampling_params=SimpleNamespace(temperature=temperature),
             additional_information=serialize_additional_information({"duplex": {"data_plane": native_duplex}}),
         ),
     }
