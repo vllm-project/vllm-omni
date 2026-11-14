@@ -113,6 +113,10 @@ start with `.` or `omni_shm_key_`, and the lock file name fits the 255-byte
 file-name limit. Keys embed request ids, which clients can choose, so any other
 key is mapped to `omni_shm_key_{sha256(key)}`. Hashing keys that start with
 `omni_shm_key_` keeps a plain key from aliasing a hashed name.
+The character set is narrower than what POSIX allows, so some keys that main
+used unchanged are hashed too, e.g. keys with a space, `:`, `;`, `=`, `@` or a
+leading `.`. Both sides of one deployment hash the same way, but tools that look
+for a request id in `/dev/shm` will not find these segments by name.
 The segment and its lock file both use this name; `_pending_keys`, `cleanup()`
 and `cleanup_prefix()` keep using the original key.
 

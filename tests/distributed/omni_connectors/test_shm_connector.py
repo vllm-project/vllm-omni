@@ -312,8 +312,9 @@ def test_reap_rotates_past_unread_keys(connector):
         receiver.close()
 
 
-def test_consumed_bad_payload_removes_lock_file(connector, monkeypatch):
-    key = f"bad_payload_{uuid.uuid4().hex}"
+@pytest.mark.parametrize("key_template", ["bad_payload_{u}", "chatcmpl-tenant/bad-payload-{u}_0_0"])
+def test_consumed_bad_payload_removes_lock_file(connector, monkeypatch, key_template):
+    key = key_template.format(u=uuid.uuid4().hex)
     assert connector.put("0", "1", key, "payload")[0]
 
     def fail_deserialize(_data):
@@ -366,6 +367,16 @@ _UNSAFE_REQUEST_KEYS = [
     pytest.param("chatcmpl-tenant/trace-{u}_0_0", id="slash"),
     pytest.param("chatcmpl-" + "r" * 240 + "-{u}_0_0", id="too-long"),
 ]
+
+
+def test_segment_name_mapping_is_pinned():
+    # Producer and consumer stages derive the name in separate processes, so
+    # the mapping must not depend on the interpreter (no hash(), no salt).
+    from vllm_omni.distributed.omni_connectors.connectors.shm_connector import _segment_name
+
+    assert _segment_name("a/b") == "omni_shm_key_c14cddc033f64b9dea80ea675cf280a015e672516090a5626781153dc68fea11"
+    assert _segment_name("r" * 237) == "r" * 237
+    assert _segment_name("r" * 238).startswith("omni_shm_key_")
 
 
 def _segment_files(metadata):
@@ -444,6 +455,20 @@ def test_unsafe_request_id_unread_segments_are_reclaimed(key_template):
     finally:
         sender.close()
         receiver.close()
+
+
+@pytest.mark.parametrize("key_template", _UNSAFE_REQUEST_KEYS)
+def test_unsafe_request_id_cleanup_prefix_reclaims_hashed_segments(connector, key_template):
+    prefix = key_template.format(u=uuid.uuid4().hex[:8]).removesuffix("0")
+    keys = [f"{prefix}{i}" for i in range(3)]
+    metadata = {key: connector.put("0", "1", key, key)[2] for key in keys}
+    assert all(metadata.values())
+    assert connector.get("0", "1", keys[0])[0] == keys[0]
+
+    assert connector.cleanup_prefix(prefix) == 2
+    assert not connector._pending_keys
+    for key in keys:
+        assert not any(os.path.exists(path) for path in _segment_files(metadata[key]))
 
 
 # ── Arrival wakeups ───────────────────────────────────────────────────
