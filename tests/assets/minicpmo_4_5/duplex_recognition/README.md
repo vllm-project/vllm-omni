@@ -21,7 +21,9 @@ labels and exact prompt. The reference voice is the checkpoint's
 The core-model test uses the existing three-stage `omni_server` fixture
 and default `minicpmo_4_5.yaml`. It sends 200 ms chunks at realtime pace, window
 off, temperature zero, one frame per second, followed by 8 seconds of silence
-holding the last frame. The existing demo client handles the real WebSocket
+plus one 200 ms residual holding the last frame. The residual gives the final
+forced commit retained input to answer if the streamed scene response sampled
+an incomplete ending. The existing demo client handles the real WebSocket
 session, playback acknowledgements, input commit and a bounded 90-second drain.
 Only media decoding is replaced with the pinned bytes; inference is not mocked.
 
