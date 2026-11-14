@@ -96,15 +96,13 @@ def _cfg_sampling_params(runner: OmniRunner, cfg_scale: float, pair_id: str, con
     """Stage sampling params carrying the CFG pair contract for one request."""
     import copy
 
-    from transformers import AutoTokenizer
-
-    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+    from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot, load_audex_tokenizer
     from vllm_omni.model_executor.models.audex.prompt import build_null_prompt
 
     # Resolve the ACTIVE param's model (2B or 30B), not the module default:
     # the null prompt must be built with the same tokenizer the engine uses.
     root = ensure_audex_snapshot(runner.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, "checkpoint_folder_audiogen"), trust_remote_code=True)
+    tokenizer = load_audex_tokenizer(os.path.join(root, "checkpoint_folder_audiogen"))
     params = copy.deepcopy(runner.omni.resolve_sampling_params_list(None))
     stage0 = params[0]
     if stage0.extra_args is None:

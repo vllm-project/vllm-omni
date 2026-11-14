@@ -967,11 +967,16 @@ def test_audex_cosyvoice_qwen3_weekly_pr_validation_is_focused(monkeypatch: pyte
     label = "TTS · Audex · CosyVoice · Qwen3-TTS · L4"
     matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
     assert len(matching_steps) == 1
-    assert matching_steps[0]["source_file_dependencies"] == [
+    step = matching_steps[0]
+    assert step["source_file_dependencies"] == [
         "tts_audex_weekly",
         "tts_cosyvoice3_function",
         "tts_qwen3_tts_function",
     ]
+    assert step["env"] == {"VLLM_OMNI_CI_MODEL_RUNNER": "v2"}
+    command = "\n".join(step["commands"])
+    assert "tests/e2e/offline_inference/test_audex_*) runner=v1" in command
+    assert 'VLLM_OMNI_CI_MODEL_RUNNER="$$runner"' in command
 
     group = next(step for step in doc["steps"] if "Audex CosyVoice and Qwen3-TTS Weekly" in step.get("group", ""))
     assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
