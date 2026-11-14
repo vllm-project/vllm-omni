@@ -2442,6 +2442,71 @@ def test_session_epoch_advance_drops_stale_queued_reservations():
         mgr.shutdown()
 
 
+def test_drain_skips_stale_head_and_lands_current_entry(monkeypatch):
+    """The drain's stale-head skip unblocks the current entry behind it.
+
+    An old-generation row can be queued after the advance-time drop
+    already ran: the manager's epoch check passes, then the generation
+    advances before the queue-or-append decision. That window is
+    reproduced here by advancing the epoch from inside the decision's
+    stored_tokens read (and recording the new generation for the
+    request, as the concurrent STARTED would have). A current-generation
+    entry queued behind the stale one must still land once the stream
+    is rebuilt past it: the old drain stopped at the head (the stale
+    append was refused, so it broke) and the current entry stayed
+    queued with its reservation held. The new drain drops the stale
+    head and releases it, then lands the current entry.
+    """
+    mgr, view = make_manager()
+    try:
+        # Epoch-0 prefill, saved but not materialized: binds "a" -> "S".
+        run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S", session_epoch=0)
+        # Decode rows [8, 12) queue behind the unmaterialized prefill.
+        s_gap = run_decode_step(mgr, view, "a", [0, 1, 2, 3, 4], 8, 4)
+        store = mgr._session_store
+        real_stored_tokens = store.stored_tokens
+        advanced: list[bool] = []
+
+        def racing_stored_tokens(session_id, key):
+            n = real_stored_tokens(session_id, key)
+            if not advanced:
+                advanced.append(True)
+                store.compare_and_set_epoch(session_id, 1)
+                mgr._req_session_epoch["a"] = 1
+            return n
+
+        monkeypatch.setattr(store, "stored_tokens", racing_stored_tokens)
+        mgr.discard_step(s_gap)
+        assert advanced == [True]  # the race window was actually taken
+        assert store.pending_bytes() > 0
+        assert store.stored_tokens("S", HIDDEN_KEY) == 0
+        # A current-generation entry for the same request queues behind it.
+        s_cur = run_decode_step(mgr, view, "a", [0, 1, 2, 3, 4], 12, 4)
+        mgr.discard_step(s_cur)
+        # Rebuild the [0, 16) stream under the new generation via "a2".
+        s2 = run_session_step(mgr, view, "a2", [0, 1, 2, 3, 4], 0, 8, session="S", session_epoch=1)
+        mgr.materialize(s2, ["a2"])
+        assert store.stored_tokens("S", HIDDEN_KEY) == 8
+        s2b = run_decode_step(mgr, view, "a2", [0, 1, 2, 3, 4], 8, 4)
+        mgr.discard_step(s2b)
+        s2c = run_decode_step(mgr, view, "a2", [0, 1, 2, 3, 4], 12, 4)
+        mgr.discard_step(s2c)
+        assert store.stored_tokens("S", HIDDEN_KEY) == 16
+        # A further decode for "a" appends [16, 20) and triggers its drain:
+        # the stale head must be dropped and released, the current entry lands.
+        s3 = run_decode_step(mgr, view, "a", [0, 1, 2, 3, 4], 16, 4)
+        mgr.discard_step(s3)
+        assert store.stored_tokens("S", HIDDEN_KEY) == 20
+        assert store.pending_bytes() == 0
+        assert mgr._pending_appends.get(("a", HIDDEN_KEY)) is None
+        assert torch.equal(
+            store.fetch("S", HIDDEN_KEY, 20),
+            expected_rows(view.slots_for("a", 0, 20)),
+        )
+    finally:
+        mgr.shutdown()
+
+
 def test_session_out_of_order_append_is_thread_safe():
     """B4 (threaded): concurrent discard/materialize converge in order.
 
