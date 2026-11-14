@@ -294,6 +294,48 @@ def test_decode_cohort_uses_batch_hook(hook_name):
     assert torch.equal(seen_text_steps[0], torch.tensor([[51.0, 52.0], [61.0, 62.0]]))
 
 
+def test_decode_cohort_accepts_three_value_hook_without_mtp():
+    # preprocess_phase_contract.md: without talker_mtp the hook returns
+    # (input_ids, inputs_embeds, updates), as Voxtral TTS does.
+    state = _make_state(max_num_reqs=2, has_preprocess=True)
+    state.intermediate_buffer.buffers[0] = {"req_id": "r1", "meta": {"step": 1}}
+    state.intermediate_buffer.buffers[1] = {"req_id": "r2", "meta": {"step": 2}}
+    new_embeds = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+
+    def preprocess_decode_batch(*, input_ids, req_infos):
+        assert [info["req_id"] for info in req_infos] == ["r1", "r2"]
+        return input_ids, new_embeds, [{"meta": {"step": 11}}, {"meta": {"step": 12}}]
+
+    state.model.preprocess_decode_batch = preprocess_decode_batch
+    state.model.preprocess = MagicMock(side_effect=AssertionError("decode requests must use the batch hook"))
+    model_inputs = {
+        "input_ids": torch.tensor([101, 202], dtype=torch.long),
+        "inputs_embeds": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+    }
+    state.run_preprocess(
+        _DummyInputBatch([0, 1], num_computed_tokens_cpu=[1, 1]),
+        model_inputs,
+        SimpleNamespace(prompt_len=np.array([1, 1], dtype=np.int32)),
+    )
+    state.model.preprocess.assert_not_called()
+    assert torch.equal(model_inputs["input_ids"], torch.tensor([101, 202]))
+    assert torch.equal(model_inputs["inputs_embeds"], new_embeds)
+    assert state.intermediate_buffer.buffers[1]["meta"]["step"] == 12
+
+
+def test_decode_cohort_rejects_three_value_hook_with_mtp():
+    state = _make_state(max_num_reqs=1, has_preprocess=True)
+    state.intermediate_buffer.buffers[0] = {"req_id": "r1"}
+    state.model.preprocess_decode_batch = lambda *, input_ids, req_infos: (input_ids, torch.zeros(1, 2), [{}])
+    state._has_mtp = True
+    with pytest.raises(RuntimeError, match="five values"):
+        state.run_preprocess(
+            _DummyInputBatch([0], num_computed_tokens_cpu=[1]),
+            {"input_ids": torch.tensor([101], dtype=torch.long), "inputs_embeds": torch.zeros(1, 2)},
+            SimpleNamespace(prompt_len=np.array([1], dtype=np.int32)),
+        )
+
+
 def test_static_decode_embeddings_refresh_from_input_ids():
     # FULL-graph replay reads the static buffer: it must hold fresh embeddings.
     state = _make_state(has_preprocess=True)
