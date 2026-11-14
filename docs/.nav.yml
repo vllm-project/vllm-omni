@@ -51,6 +51,7 @@ nav:
   - Models:
     - models/supported_models.md
     - SeedVR2: models/seedvr2.md
+    - Praxis-1: models/praxis1.md
   - Features:
     - Overview: features/README.md
     - Runtime and Stage Execution:

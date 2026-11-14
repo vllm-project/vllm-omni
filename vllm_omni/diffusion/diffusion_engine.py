@@ -1581,6 +1581,7 @@ class DiffusionEngine:
                             describe(async_output_id) if describe else "unavailable",
                         )
                         raise
+                output._wait_device_ready()
                 finished = output.finished
                 yield output
                 with self._cv:
