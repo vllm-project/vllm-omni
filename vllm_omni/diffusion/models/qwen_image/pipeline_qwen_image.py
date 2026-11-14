@@ -433,18 +433,10 @@ class QwenImagePipeline(
                 f" {negative_prompt_embeds}. Please make sure to only forward one of the two."
             )
 
-        if prompt_embeds is not None and prompt_embeds_mask is None:
-            raise ValueError(
-                "If `prompt_embeds` are provided, `prompt_embeds_mask` also have to be passed. "
-                "Make sure to generate `prompt_embeds_mask` from the same text encoder "
-                "that was used to generate `prompt_embeds`."
-            )
-        if negative_prompt_embeds is not None and negative_prompt_embeds_mask is None:
-            raise ValueError(
-                "If `negative_prompt_embeds` are provided, `negative_prompt_embeds_mask` also have to be passed. "
-                "Make sure to generate `negative_prompt_embeds_mask` from the same text encoder "
-                "that was used to generate `negative_prompt_embeds`."
-            )
+        # NOTE: prompt_embeds_mask=None is valid and means "all tokens are
+        # valid" (matching the diffusers convention set by encode_prompt when
+        # all mask elements are True).  We therefore no longer reject
+        # prompt_embeds without an accompanying mask.
 
         if max_sequence_length is not None and max_sequence_length > self.tokenizer_max_length:
             raise ValueError(
@@ -536,6 +528,8 @@ class QwenImagePipeline(
             prompt_embeds (`torch.Tensor`, *optional*):
                 Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
                 provided, text embeddings will be generated from `prompt` input argument.
+            prompt_embeds_mask (`torch.Tensor`, *optional*):
+                Attention mask for `prompt_embeds`. `None` means all tokens are valid.
         """
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
@@ -549,13 +543,15 @@ class QwenImagePipeline(
             )
 
         prompt_embeds = prompt_embeds[:, :max_sequence_length]
-        prompt_embeds_mask = prompt_embeds_mask[:, :max_sequence_length]
+        if prompt_embeds_mask is not None:
+            prompt_embeds_mask = prompt_embeds_mask[:, :max_sequence_length]
 
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
-        prompt_embeds_mask = prompt_embeds_mask.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds_mask = prompt_embeds_mask.view(batch_size * num_images_per_prompt, seq_len)
+        if prompt_embeds_mask is not None:
+            prompt_embeds_mask = prompt_embeds_mask.repeat(1, num_images_per_prompt, 1)
+            prompt_embeds_mask = prompt_embeds_mask.view(batch_size * num_images_per_prompt, seq_len)
 
         return prompt_embeds, prompt_embeds_mask
 
@@ -594,7 +590,6 @@ class QwenImagePipeline(
         generator,
         latents=None,
     ) -> torch.Tensor:
-        # generator=torch.Generator(device="cuda").manual_seed(42)
         # VAE applies 8x compression on images but we must also account for packing which requires
         # latent height and width to be divisible by 2.
         token_height, token_width = image_token_grid(height, width, self.vae_scale_factor, patch_size=2)
@@ -720,9 +715,7 @@ class QwenImagePipeline(
         else:
             batch_size = 1
 
-        has_neg_prompt = negative_prompt is not None or (
-            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
-        )
+        has_neg_prompt = negative_prompt is not None or negative_prompt_embeds is not None
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
         self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
 
