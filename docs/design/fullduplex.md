@@ -250,8 +250,8 @@ vllm_omni/
 │   └── openai/api_server.py         builds DuplexOmni for duplex models; session-backed app state
 ├── protocol/                        SHARED WIRE CODEC (no engine / no model / no transport)
 │   ├── realtime/                    the OpenAI Realtime API itself
-│   │   ├── events.py                RealtimeEvent + OpenAI's 30 server events (22 ship as Tier 1;
-│   │   │                            8 have a Tier 2 twin in protocol/duplex)
+│   │   ├── events.py                RealtimeEvent + OpenAI's 30 server events (21 ship as Tier 1;
+│   │   │                            9 have a Tier 2 twin in protocol/duplex)
 │   │   ├── commands.py              RealtimeCommand + OpenAI's 10 client commands (8 Tier 1,
 │   │   │                            2 with a Tier 2 twin) --- wire_type + fields, no payload()
 │   │   ├── formats.py               audio format spellings, what is supported, per-session validation
@@ -384,9 +384,12 @@ for queue updates and the final validity check before delivery.
   runner. Inputs reach the runner through one mailbox in this order: client
   commands (from `_request_handler`, in request-queue order), stage outputs
   (`on_stage_output` enqueues an internal item; it does not mutate the session
-  inline), timers (silence continuation, bounded auto-response) and internal
-  items (deferred overlap promotion, VAD-synthesized commits). The mailbox
-  worker processes items one at a time.
+  inline), timers (silence continuation, bounded auto-response, the input
+  clock's timeout check) and internal items (deferred overlap promotion,
+  VAD-synthesized commits; in an input-clocked session also the
+  `StageProgress` record queued behind each stage output, the marker of an
+  input refused at admission, and the settling of an append task). The
+  mailbox worker processes items one at a time.
 - **Slow work is not awaited inline.** An `AppendAudio` handler reserves
   bytes, then schedules a tracked append task on the per-session append tail:
   the task awaits `_offload(decode/resample/VAD)` on a dedicated
@@ -801,9 +804,10 @@ What a plugin must guarantee before it opts in:
   segment end before the next unit's begins). A model whose final stage
   streams across unit boundaries must override it. Turns never overlap in
   an input-clocked session: the session is created without
-  `supports_concurrent_turn_requests` (`apply_input_clock_capabilities`)
-  and the runner does not open the concurrent-turn gate for it, so a commit
-  during a response waits for that response (the deferred-turn path),
+  `supports_concurrent_turn_requests` (`apply_input_clock_capabilities`,
+  the one place that decides it, so the advertised value and the runner's
+  check cannot disagree), so a commit during a response waits for that
+  response (the deferred-turn path),
   because the clock credits outputs to the speaking units in order.
   Crediting by request, which would let turns overlap, is future work.
 - A unit is complete when everything the model emits for it has been

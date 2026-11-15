@@ -1438,6 +1438,7 @@ Semantic divergences hidden behind shared names:
 | Session lifetime | `session.heartbeat` / `session.heartbeat_ack`, `session.event_ack`, `session.close` / `session.closed`, `session.resume` / `session.resumed` / `session.replaced` / `session.expired` / `session.resync_required`; `server_event_seq`, `resume_token`, `attachment_generation`; query params `?duplex=1`, `autostart`, `resume` |
 | Turn-taking | `response.speak`, `response.listen`, `overlap.decision`, `overlap_policy`, `barge_in`, `turn.signal`, `input.cancel`, `input.text.append`, `epoch` / `turn_id` fencing, `force_listen` |
 | Playback truth | `playback.ack` / `playback.acknowledged`, `playback_commit_policy` (`ack_only` \| `commit_all_on_done`), `playback{generated_ms, sent_ms, played_ms, committed_ms}`, `history_committed`, `audio_text_marks` |
+| Model time | `input_audio_buffer.processed`, `extra_body` (`silence_continuation`, `clock`, `input_clock_unit_timeout_s`, `input_clock_unit_max_s`), `session.input_index` on `session.resumed` (see [Session options that control model time](#session-options-that-control-model-time)) |
 | Model negotiation | `capabilities{implementation_level, supports_input_append, supports_barge_in, supports_session_resume, chunk_period_ms, input_modes, …}`, `ref_audio`, `extra_body` (`auto_response`, `force_listen_count`, `duplex_initial_user_text`) |
 | Diagnostics | `duplex.function_call.done`, the full error-code vocabulary (`REALTIME_ERROR_TYPES_BY_CODE` in `vllm_omni/engine/duplex/events.py`) |
 
@@ -1502,8 +1503,8 @@ remains an approximation, not word-level audio alignment.
 
 ### Event catalogue
 
-Every event type the Realtime route accepts or emits, with a worked example in the next section: 21
-client→server and 42 server→client. Aliases (`input_text.append`,
+Every event type the Realtime route accepts or emits, with a worked example in the next section: 22
+client→server and 44 server→client. Aliases (`input_text.append`,
 `push_text`, `signal_turn`, `audio.playback_ack`, `close_session`, `close`)
 share the payload of their canonical event and are not listed
 separately; the alias table is `translate_realtime_command` in
@@ -1772,6 +1773,10 @@ events with `server_event_seq > 40` are replayed in order)
 }
 ```
 
+In an input-clocked session the `session` object also carries
+`input_index`, the index of the latest input that reached the session (see
+*Input-clocked sessions*).
+
 `S→C session.replaced` (sent to the superseded socket, which is then closed)
 
 ```json
@@ -1923,6 +1928,23 @@ deferred commit during an active response (`event.response_create_deferred`)
 
 ```json
 {"type": "input_audio_buffer.cleared"}
+```
+
+`S→C input_audio_buffer.processed` (input-clocked sessions only: one per
+`input_audio_buffer.append`, `input_audio_buffer.commit` and
+`response.create`, in input order, after every output the input caused; see
+[Input-clocked sessions](#input-clocked-sessions))
+
+```json
+{
+  "type": "input_audio_buffer.processed",
+  "event_id": "event_5c1e…",
+  "audio_end_ms": 3200,
+  "unit_end_ms": 3000,
+  "input_index": 16,
+  "trigger": "input_audio_buffer.append",
+  "units": [{"end_ms": 3000, "decision": "speak"}]
+}
 ```
 
 `C→S input.cancel` (advances `epoch`; also answered with `input_audio_buffer.cleared`)

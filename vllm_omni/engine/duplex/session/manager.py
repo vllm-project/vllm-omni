@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import time
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -476,11 +476,20 @@ class DuplexSessionManager:
         ok: bool,
         session: DuplexEngineSession | None = None,
         error: BaseException | None = None,
-        public_extra: Mapping[str, object] | None = None,
+        input_index: int | None = None,
     ) -> None:
+        """Answer a control message on the result sink.
+
+        A successful answer carries the session's capabilities and public
+        session object; ``input_index`` (a resume of an input-clocked session)
+        is added to that object as ``session.input_index``.
+        """
         error_code, error_message, error_retryable = (
             self._control_error(error) if error is not None else (None, None, False)
         )
+        public_session = session.as_public_dict() if session is not None and ok else None
+        if public_session is not None and input_index is not None:
+            public_session["input_index"] = input_index
         result = DuplexControlResultMessage(
             control_id=message.control_id,
             operation=operation,
@@ -488,9 +497,7 @@ class DuplexSessionManager:
             ok=ok,
             lease_generation=session.lease_generation if session is not None else None,
             capabilities=session.capabilities if session is not None and ok else None,
-            public_session=(
-                {**session.as_public_dict(), **(public_extra or {})} if session is not None and ok else None
-            ),
+            public_session=public_session,
             error_code=error_code,
             error_message=error_message,
             error_retryable=error_retryable,
@@ -913,13 +920,12 @@ class DuplexSessionManager:
             # An input-clocked client learns how many of its inputs reached the
             # session (``input_index`` of the latest), so it can resend exactly
             # those lost with the old connection.
-            admitted = runner.admitted_inputs
             await self._put_result(
                 message,
                 operation="resume",
                 ok=True,
                 session=session,
-                public_extra={"input_index": admitted} if admitted is not None else None,
+                input_index=runner.admitted_inputs,
             )
         except Exception as exc:
             logger.exception("resume_duplex_session failed: %s", exc)

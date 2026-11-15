@@ -41,7 +41,7 @@ SESSION = "sess-clock"
 
 
 class _DefaultHooksPlugin(MiniCPMO45DuplexPlugin):
-    """A real plugin with the contract's default input-clock hooks (whatever the model overrides)."""
+    """A real plugin pinned to the contract's default input-clock hooks (MiniCPM-o overrides neither today)."""
 
     unit_decision = DuplexModelPlugin.unit_decision
     unit_output_complete = DuplexModelPlugin.unit_output_complete

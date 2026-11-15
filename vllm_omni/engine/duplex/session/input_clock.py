@@ -137,10 +137,12 @@ def _positive_seconds(extra_body: object, key: str, default: float) -> float:
 
 
 def unit_timeout_s(extra_body: object) -> float:
+    """The session's ``input_clock_unit_timeout_s`` (liveness valve), or the default."""
     return _positive_seconds(extra_body, UNIT_TIMEOUT_KEY, DEFAULT_UNIT_TIMEOUT_S)
 
 
 def unit_max_age_s(extra_body: object) -> float:
+    """The session's ``input_clock_unit_max_s`` (maximum unit age), or the default."""
     return _positive_seconds(extra_body, UNIT_MAX_AGE_KEY, DEFAULT_UNIT_MAX_AGE_S)
 
 
@@ -235,9 +237,12 @@ class InputClockUnit:
 
 @dataclass(slots=True)
 class PendingAck:
+    """One owed ``input_audio_buffer.processed``: the ledger record of a client input until it is acknowledged."""
+
     index: int
     trigger: str
-    audio_end_us: int
+    #: ``audio_end_ms`` the acknowledgement reports; stamped when the input is handled (and at teardown).
+    audio_end_us: int = 0
     #: Units created before this input was handled; ``None`` until then.
     watermark: int | None = None
     #: Error code of an input refused before (the rest of) it reached the model (acknowledged as ``rejected``).
@@ -249,7 +254,25 @@ class PendingAck:
 
 
 class InputClock:
-    """Unit tracking and input acknowledgements for one session."""
+    """Unit tracking and input acknowledgements for one input-clocked session.
+
+    The runner creates one per clocked session and drives it from the
+    mailbox: inputs (``admit_input`` / ``begin_input`` / ``end_input``), units
+    (``new_unit`` and its settling calls), stage progress
+    (``on_stage_progress``) and the timeouts (``expire``). Invariants:
+
+    - Acknowledgements go out strictly in input order: an input's
+      acknowledgement waits until every unit created before it was handled
+      (its watermark) is complete, however those units complete.
+    - ``_units`` is the un-acknowledged suffix in creation order; a unit is
+      complete once its output is out or it is settled (dropped, cancelled,
+      aborted, timed out), and ``unit_end_ms`` advances over the completed
+      prefix only.
+    - A settled unit stays matchable in the pipeline (acceptance, segment
+      ends, final output) so its late output is never credited to a later
+      unit; only its acknowledgement no longer waits for it.
+    - Every mutation runs on the session's event loop; the clock never awaits.
+    """
 
     def __init__(
         self,
@@ -314,10 +337,12 @@ class InputClock:
 
     @property
     def audio_end_us(self) -> int:
+        """Client audio counted so far (``audio_end_ms`` of the next acknowledgement), in microseconds."""
         return math.floor(self._audio_end)
 
     @property
     def unit_end_us(self) -> int:
+        """Client audio covered by the completed units (``unit_end_ms``), in microseconds."""
         return math.floor(self._unit_end)
 
     @property
@@ -339,7 +364,7 @@ class InputClock:
         that code as ``reason``.
         """
         self._input_count += 1
-        ack = PendingAck(index=self._input_count, trigger=trigger, audio_end_us=self.audio_end_us, refused=refused)
+        ack = PendingAck(index=self._input_count, trigger=trigger, refused=refused)
         if not self._closed:
             self._acks.append(ack)
         return ack
@@ -478,6 +503,7 @@ class InputClock:
                 return
 
     def placeholder_turns(self) -> list[str | None]:
+        """Turns of the reserved slots (deferred committed turns not yet submitted), oldest first."""
         return [unit.turn for unit in self._units if unit.placeholder]
 
     def release_placeholder(self, turn: str | None, reason: str) -> None:
@@ -548,6 +574,12 @@ class InputClock:
     # ------------------------------------------------------------------ #
 
     def _settle(self, unit: InputClockUnit, decision: str, reason: str | None) -> None:
+        """Complete ``unit`` without output, with the given decision; idempotent.
+
+        A reserved slot settled before its turn was submitted is remembered in
+        ``_settled_turns``: the submission of that turn at the end of the
+        response takes the settled unit instead of creating a new one.
+        """
         if unit.complete:
             return
         if unit.placeholder and unit.turn is not None and not self._closed:
@@ -656,6 +688,7 @@ class InputClock:
         self.flush()
 
     def _on_later_stage_progress(self, progress: StageProgress) -> None:
+        """Route an output of a stage after Stage 0: upstream progress, or final-stage output of the oldest speaker."""
         if progress.stage_id < progress.final_stage_id:
             self._on_upstream_progress(progress)
             return
@@ -752,6 +785,16 @@ class InputClock:
                 self._on_later_stage_progress(progress)
 
     def _on_stage0_segment_end(self, progress: StageProgress) -> None:
+        """Match a Stage-0 segment end to its unit and apply its decision.
+
+        The ``ordinal``-th segment end of an epoch belongs to the
+        ``ordinal``-th accepted submission of that epoch (one segment end per
+        submission, in order); a segment end that overtakes its acceptance
+        callback claims the oldest unaccepted submission. A decision that
+        ends the unit completes it; otherwise the unit is speaking until its
+        final-stage output is complete. Progress held for this unit (final
+        ends that arrived before its decision) is then replayed.
+        """
         epoch = progress.epoch
         ordinal = self._segment_ends.get(epoch, 0) + 1
         self._segment_ends[epoch] = ordinal
@@ -904,6 +947,7 @@ class InputClock:
         logger.warning(message, *args)
 
     def _complete(self, unit: InputClockUnit) -> None:
+        """Mark ``unit`` complete and advance the acknowledged prefix, recording each unit it passes for ``units[]``."""
         unit.complete = True
         # Units are acknowledged in order: advance over the completed prefix.
         while self._units and self._units[0].complete:
@@ -946,6 +990,7 @@ class InputClock:
         )
 
     def flush(self) -> None:
+        """Emit every acknowledgement whose input has been handled and whose watermark the completed units reached."""
         if self._closed:
             return
         events: list[DuplexEvent] = []
@@ -959,6 +1004,7 @@ class InputClock:
             self._emit(events)
 
     def has_open_units(self) -> bool:
+        """Whether any unit still waits to be acknowledged (the timer keeps running while this holds)."""
         return bool(self._units)
 
     def timeout_due(self, units: Collection[InputClockUnit]) -> bool:
@@ -977,6 +1023,7 @@ class InputClock:
         return any(unit in units for unit, _ in self._due(now))
 
     def _due(self, now: float) -> list[tuple[InputClockUnit, str]]:
+        """The units a check at ``now`` would time out, with the reason, oldest first (no side effects)."""
         if self._closed or not self._units:
             return []
         expired: list[tuple[InputClockUnit, str]] = []
@@ -1042,7 +1089,6 @@ __all__ = [
     "StageProgress",
     "check_input_clock_supported",
     "check_input_clock_unchanged",
-    "input_clocked",
     "unit_max_age_s",
     "unit_timeout_s",
 ]

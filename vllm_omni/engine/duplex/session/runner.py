@@ -62,6 +62,7 @@ from vllm_omni.engine.duplex.config import (
     DuplexPlaybackCommitPolicy,
     DuplexSessionState,
     ResponseCreateOptions,
+    input_clocked,
     resolve_tool_result_timeout_s,
 )
 from vllm_omni.engine.duplex.contracts import (
@@ -119,7 +120,6 @@ from vllm_omni.engine.duplex.session.input_clock import (
     InputClockUnit,
     PendingAck,
     StageProgress,
-    input_clocked,
     unit_max_age_s,
     unit_timeout_s,
 )
@@ -336,6 +336,7 @@ class DuplexSessionRunner:
                 runtime_config=self._input_clock_runtime_config,
                 unit_timeout_s=unit_timeout_s(session.config.extra_body),
                 unit_max_age_s=unit_max_age_s(session.config.extra_body),
+                clock=session._clock,
             )
         #: Acknowledgement owed for the client input being handled right now.
         self._current_input_ack: PendingAck | None = None
@@ -445,14 +446,12 @@ class DuplexSessionRunner:
             # Optional mid-pipeline projection: client sees this stage; TTS still runs.
             if decision is None:
                 project = self.model.project_intermediate_output(stage_id, output, context)
-        if (
-            self._input_clock is None
-            and self.session.capabilities.supports_concurrent_turn_requests
-            and self.model.release_concurrent_turn_requests(stage_id, output, context)
+        if self.session.capabilities.supports_concurrent_turn_requests and self.model.release_concurrent_turn_requests(
+            stage_id, output, context
         ):
-            # An input-clocked session never overlaps turns: the clock credits
-            # progress to units in order, so a commit during a response waits
-            # for it (the deferred-turn path).
+            # Never true in an input-clocked session: ``apply_input_clock_capabilities``
+            # clears the capability at creation, so a commit during a response waits
+            # for it (the deferred-turn path) and the clock credits outputs in order.
             self.run.concurrent_turn_requests_released = True
         progress = self._input_clock_progress(stage_id, output, decision, context)
         consume = decision is not None or stage_id >= context.final_stage_id
@@ -514,6 +513,7 @@ class DuplexSessionRunner:
         return self._input_clock.input_count if self._input_clock is not None else None
 
     def _input_clock_runtime_config(self) -> Mapping[str, object]:
+        """The session's runtime configuration for the clock's plugin hooks, re-read after a ``session.update``."""
         # ``session.runtime_config`` copies; take a new copy only after a session.update replaced it.
         generation = self.session.config_generation
         cached = self._input_clock_config
@@ -530,10 +530,12 @@ class DuplexSessionRunner:
         self._input_clock_timer = loop.call_later(_INPUT_CLOCK_CHECK_INTERVAL_S, self._on_input_clock_timer)
 
     def _on_input_clock_timer(self) -> None:
+        """The once-a-second timer fired (off the mailbox): queue the check, which runs on it."""
         self._input_clock_timer = None
         self._queue_input_clock_expire()
 
     def _queue_input_clock_expire(self) -> None:
+        """Queue one timeout check (at most one is queued at a time; none once the session is closing)."""
         # Checked on the mailbox, behind the outputs already queued: a timeout
         # never overtakes an output (or its acknowledgement) that arrived first.
         if self._input_clock_expire_queued or self.run.closing or self.session.state == DuplexSessionState.CLOSED:
@@ -542,6 +544,7 @@ class DuplexSessionRunner:
         self._mailbox.put_nowait(_Internal("input_clock_expire"))
 
     def _on_input_clock_expire(self) -> None:
+        """Run the queued timeout check: settle the units that are due and re-arm the timer while units are open."""
         self._input_clock_expire_queued = False
         clock = self._input_clock
         if clock is None or self.run.closing or self.session.state == DuplexSessionState.CLOSED:
@@ -579,6 +582,11 @@ class DuplexSessionRunner:
             clock.end_input(ack)
 
     def _track_input_clock_append(self, task: asyncio.Task[bool], unit: InputClockUnit) -> None:
+        """Settle ``unit`` from the outcome of the append task that carries its Stage-0 submission.
+
+        The task's done callback only queues an ``input_clock_settle`` item;
+        ``_on_input_clock_settle`` does the settling on the mailbox.
+        """
         self._input_clock_appends[task] = unit
 
         def _append_done(done: asyncio.Task[bool]) -> None:
@@ -638,6 +646,12 @@ class DuplexSessionRunner:
             clock.close(reason)
 
     async def _on_stage_progress(self, progress: StageProgress) -> None:
+        """Credit one stage output to the input clock, behind the events that output emitted.
+
+        Queued by ``on_stage_output`` right after the output's events, so an
+        acknowledgement the record releases follows them. Waits (bounded) for
+        a response continuation the output's handler spawned, see below.
+        """
         clock = self._input_clock
         if clock is None:
             return
@@ -690,6 +704,10 @@ class DuplexSessionRunner:
         if clock is None:
             return None
         clock.note_progress(context.identity.fence.epoch)
+        if stage_id == 0 and not context.segment_finished:
+            # Only a Stage-0 segment end decides a unit (``supports_input_clock``):
+            # the outputs before it owe the clock nothing but the liveness note.
+            return None
         final_stage_id = context.final_stage_id
         final = stage_id >= final_stage_id
         if not (context.segment_finished or final or decision is not None):
@@ -901,6 +919,7 @@ class DuplexSessionRunner:
                         self.spawn(self._rearm_deferred_silence(), name="duplex-continue")
 
     def _report_handler_failure(self, item: object, exc: Exception) -> None:
+        """Log a command handler's exception and answer the command with an ``internal_error`` carrying its id."""
         logger.exception("Duplex session %s failed handling %r: %s", self.session.session_id, item, exc)
         # The serving reader waits for this command's id. An unstamped
         # internal_error never matches, so the connection parks forever.
@@ -2206,7 +2225,7 @@ class DuplexSessionRunner:
             # The committed payload is padded to a whole unit; count the client's audio only.
             byte_count = model_state.committed_audio_reserved_bytes
         else:
-            byte_count = helpers.base64_payload_size_bytes(retained_committed_payload or payload)
+            byte_count = helpers.audio_payload_size_bytes(retained_committed_payload or payload)
         return Fraction(byte_count // helpers.pcm_bytes_per_sample(payload.get("format")) * 1_000_000, int(sample_rate))
 
     def _fail_session_from_append(self, reason: str) -> None:

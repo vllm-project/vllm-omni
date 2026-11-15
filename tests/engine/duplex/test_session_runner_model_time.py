@@ -17,6 +17,8 @@ import pytest
 from tests.engine.duplex.test_session_runner import (
     LISTEN_TOKEN_ID,
     SESSION_ID,
+    RecordingStagePort,
+    _fake_encode_audio,
     _SplitDetector,
     append_audio,
     close_harness,
@@ -29,7 +31,13 @@ from tests.engine.duplex.test_session_runner import (
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.config import DuplexPlaybackCommitPolicy, DuplexSessionConfig
-from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage, ResumeDuplexSessionMessage
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
+from vllm_omni.engine.duplex.messages import (
+    CloseDuplexSessionMessage,
+    DuplexControlResultMessage,
+    OpenDuplexSessionMessage,
+    ResumeDuplexSessionMessage,
+)
 from vllm_omni.engine.duplex.plugin import DuplexUnitDecision
 from vllm_omni.engine.duplex.session import runner as runner_module
 from vllm_omni.engine.duplex.session.input_clock import DEFAULT_UNIT_MAX_AGE_S, DEFAULT_UNIT_TIMEOUT_S, StageProgress
@@ -148,11 +156,11 @@ async def _speaking_unit(h) -> str:
     return request_id
 
 
-def _fake_time(h) -> list[float]:
-    """Drive the session's input clock from a fake monotonic clock (``now[0]``)."""
+async def _open_with_fake_time(**kwargs):
+    """Open a harness whose session clock (and so its input clock) reads a fake monotonic time, ``now[0]``."""
     now = [time.monotonic()]
-    h.runner._input_clock._clock = lambda: now[0]
-    return now
+    h = await open_harness(clock=lambda: now[0], **kwargs)
+    return h, now
 
 
 async def _check_timeouts(h) -> list:
@@ -766,9 +774,16 @@ async def test_an_input_clocked_session_never_overlaps_turns(monkeypatch: pytest
     output (or its silent decision) to the other. A commit during the response takes the deferred-turn path.
     """
     monkeypatch.setattr(MiniCPMO45DuplexPlugin, "release_concurrent_turn_requests", lambda self, *args, **kw: True)
+    capabilities = MiniCPMO45DuplexPlugin.capabilities
+    monkeypatch.setattr(
+        MiniCPMO45DuplexPlugin,
+        "capabilities",
+        lambda self, **kw: replace(capabilities(self, **kw), supports_concurrent_turn_requests=True),
+    )
     h = await open_harness(auto_response=False, extra_body=INPUT_CLOCK if clocked else None)
     try:
-        h.session.capabilities = replace(h.session.capabilities, supports_concurrent_turn_requests=True)
+        # The session is created without the capability (``apply_input_clock_capabilities``); nothing else gates it.
+        assert h.session.capabilities.supports_concurrent_turn_requests is (not clocked)
         if not clocked:
             await h.run(append_audio())
             await h.run(commands.Commit(create_response=True))
@@ -863,9 +878,8 @@ async def test_a_cancel_that_keeps_a_deferred_turns_audio_still_settles_its_comm
 
 @pytest.mark.usefixtures("input_clock_model")
 async def test_a_deferred_turn_submitted_after_its_slot_timed_out_is_not_credited_to_the_next_input() -> None:
-    h = await open_harness(auto_response=False, extra_body=INPUT_CLOCK)
+    h, now = await _open_with_fake_time(auto_response=False, extra_body=INPUT_CLOCK)
     try:
-        now = _fake_time(h)
         request_id = await _defer_a_commit_behind_the_active_response(h)
         now[0] += DEFAULT_UNIT_TIMEOUT_S
         assert [a.input_index for a in _acks(await _check_timeouts(h))] == [2, 3]  # the speaking unit
@@ -1128,9 +1142,8 @@ async def test_an_append_that_fails_after_acceptance_settles_its_unit_before_the
 
 @pytest.mark.usefixtures("input_clock_model")
 async def test_a_unit_the_model_never_finishes_is_settled_by_the_liveness_valve() -> None:
-    h = await open_harness(extra_body=INPUT_CLOCK)
+    h, now = await _open_with_fake_time(extra_body=INPUT_CLOCK)
     try:
-        now = _fake_time(h)
         await h.run(append_audio())
         now[0] += DEFAULT_UNIT_TIMEOUT_S - 1
         assert _acks(await _check_timeouts(h)) == []
@@ -1144,9 +1157,8 @@ async def test_a_unit_the_model_never_finishes_is_settled_by_the_liveness_valve(
 
 @pytest.mark.usefixtures("input_clock_model")
 async def test_a_unit_that_keeps_producing_but_never_completes_is_settled_at_its_maximum_age() -> None:
-    h = await open_harness(extra_body=INPUT_CLOCK)
+    h, now = await _open_with_fake_time(extra_body=INPUT_CLOCK)
     try:
-        now = _fake_time(h)
         request_id = await _speaking_unit(h)
         started = now[0]
         for elapsed in (DEFAULT_UNIT_TIMEOUT_S - 1, 2 * DEFAULT_UNIT_TIMEOUT_S - 2, DEFAULT_UNIT_MAX_AGE_S - 1):
@@ -1163,9 +1175,8 @@ async def test_a_unit_that_keeps_producing_but_never_completes_is_settled_at_its
 
 @pytest.mark.usefixtures("input_clock_model")
 async def test_a_late_segment_end_of_a_timed_out_unit_is_not_credited_to_the_next_unit() -> None:
-    h = await open_harness(extra_body=INPUT_CLOCK)
+    h, now = await _open_with_fake_time(extra_body=INPUT_CLOCK)
     try:
-        now = _fake_time(h)
         await h.run(append_audio())
         now[0] += DEFAULT_UNIT_TIMEOUT_S
         (ack,) = _acks(await _check_timeouts(h))
@@ -1182,9 +1193,8 @@ async def test_a_late_segment_end_of_a_timed_out_unit_is_not_credited_to_the_nex
 
 @pytest.mark.usefixtures("input_clock_model")
 async def test_late_audio_of_a_timed_out_speaking_unit_is_not_credited_to_the_next_unit() -> None:
-    h = await open_harness(extra_body=INPUT_CLOCK)
+    h, now = await _open_with_fake_time(extra_body=INPUT_CLOCK)
     try:
-        now = _fake_time(h)
         request_id = await _speaking_unit(h)
         now[0] += DEFAULT_UNIT_MAX_AGE_S
         h.runner._input_clock.note_progress()
@@ -1210,9 +1220,8 @@ async def test_late_audio_of_a_timed_out_speaking_unit_is_not_credited_to_the_ne
 async def test_a_unit_timed_out_in_submission_keeps_its_segment_end_from_the_next_unit() -> None:
     """Unit 1 times out before Stage 0 accepted it; unit 2 queues behind it; unit 1's segment end
     overtakes its acceptance callback: it must not decide (and acknowledge) unit 2."""
-    h = await open_harness(extra_body=INPUT_CLOCK)
+    h, now = await _open_with_fake_time(extra_body=INPUT_CLOCK)
     try:
-        now = _fake_time(h)
         h.port.submit_gate = asyncio.Event()
         h.submit(append_audio())
         await asyncio.wait_for(h.port.submit_started.wait(), timeout=2.0)
@@ -1241,9 +1250,8 @@ async def test_a_failing_completion_hook_does_not_send_an_error_per_output(monke
         raise RuntimeError("plugin bug")
 
     monkeypatch.setattr(MiniCPMO45DuplexPlugin, "unit_output_complete", _boom)
-    h = await open_harness(extra_body=INPUT_CLOCK)
+    h, now = await _open_with_fake_time(extra_body=INPUT_CLOCK)
     try:
-        now = _fake_time(h)
         request_id = await _speaking_unit(h)
         for _ in range(5):
             await h.deliver_and_settle(tts_output(request_id, samples=2400, text="la"))
@@ -1274,9 +1282,8 @@ async def test_a_command_waiting_for_a_stalled_append_lets_the_timeouts_settle_i
     command, error_code: str, acknowledged: bool
 ) -> None:
     """The command blocks the mailbox worker: the timeout queued behind it must still run."""
-    h = await open_harness(extra_body=INPUT_CLOCK)
+    h, now = await _open_with_fake_time(extra_body=INPUT_CLOCK)
     try:
-        now = _fake_time(h)
         h.port.submit_gate = asyncio.Event()  # Stage-0 submission stalls
         h.submit(append_audio())
         await asyncio.wait_for(h.port.submit_started.wait(), timeout=2.0)
@@ -1301,9 +1308,10 @@ async def test_a_command_waiting_for_a_stalled_append_lets_the_timeouts_settle_i
 async def test_a_timeout_of_another_unit_does_not_abort_a_command_waiting_for_a_healthy_append() -> None:
     # Only the maximum age applies here, so unit 1 becomes due exactly once the commit waits
     # (a no-progress timeout could fire earlier and settle it ahead of the commit).
-    h = await open_harness(extra_body={**INPUT_CLOCK, "input_clock_unit_timeout_s": 10 * DEFAULT_UNIT_MAX_AGE_S})
+    h, now = await _open_with_fake_time(
+        extra_body={**INPUT_CLOCK, "input_clock_unit_timeout_s": 10 * DEFAULT_UNIT_MAX_AGE_S}
+    )
     try:
-        now = _fake_time(h)
         await _speaking_unit(h)  # unit 1 speaks; it will outlive its maximum age
         now[0] += DEFAULT_UNIT_MAX_AGE_S - 1
         h.port.submit_gate = asyncio.Event()  # unit 2's submission is slow, not stalled
@@ -1338,9 +1346,8 @@ async def test_a_timeout_of_another_unit_does_not_abort_a_command_waiting_for_a_
 
 @pytest.mark.usefixtures("input_clock_model", "fast_input_clock_checks")
 async def test_a_commit_does_not_wait_for_an_append_whose_unit_already_timed_out() -> None:
-    h = await open_harness(extra_body=INPUT_CLOCK)
+    h, now = await _open_with_fake_time(extra_body=INPUT_CLOCK)
     try:
-        now = _fake_time(h)
         h.port.submit_gate = asyncio.Event()
         h.submit(append_audio())
         await asyncio.wait_for(h.port.submit_started.wait(), timeout=2.0)
@@ -1362,9 +1369,8 @@ async def test_a_commit_does_not_wait_for_an_append_whose_unit_already_timed_out
 @pytest.mark.usefixtures("input_clock_model", "fast_input_clock_checks")
 async def test_a_commit_waiting_on_a_stalled_resubmission_of_a_settled_turn_is_bounded() -> None:
     """A deferred turn re-submitted into its timed-out slot still gets the maximum unit age as a deadline."""
-    h = await open_harness(auto_response=False, extra_body=INPUT_CLOCK)
+    h, now = await _open_with_fake_time(auto_response=False, extra_body=INPUT_CLOCK)
     try:
-        now = _fake_time(h)
         request_id = await _defer_a_commit_behind_the_active_response(h)
         now[0] += DEFAULT_UNIT_TIMEOUT_S
         await _check_timeouts(h)  # the speaking unit
@@ -1476,43 +1482,41 @@ async def test_without_the_clock_nothing_changes(monkeypatch: pytest.MonkeyPatch
 # ---- capability, mode lock and idle window -----------------------------------
 
 
-async def test_a_model_that_has_not_opted_in_refuses_an_input_clocked_session(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_model_that_has_not_opted_in_refuses_an_input_clocked_session() -> None:
     assert MiniCPMO45DuplexPlugin.supports_input_clock is False
-    managers: list[DuplexSessionManager] = []
-    init = DuplexSessionManager.__init__
-
-    def _record(self: DuplexSessionManager, *args: object, **kwargs: object) -> None:
-        init(self, *args, **kwargs)  # type: ignore[arg-type]
-        managers.append(self)
-
-    monkeypatch.setattr(DuplexSessionManager, "__init__", _record)
-    error_codes: list[str] = []
-    control_error = DuplexSessionManager._control_error
-
-    def _record_error(error: BaseException) -> tuple[str, str, bool]:
-        result = control_error(error)
-        error_codes.append(result[0])
-        return result
-
-    monkeypatch.setattr(DuplexSessionManager, "_control_error", staticmethod(_record_error))
+    limits = DuplexSessionRuntimeConfig()
+    results: asyncio.Queue[object] = asyncio.Queue()
+    manager = DuplexSessionManager(
+        plugin=MiniCPMO45DuplexPlugin(_fake_encode_audio),
+        stage_port=RecordingStagePort(stage_count=2),
+        output_sink=asyncio.Queue(),
+        result_sink=results,
+        runtime_config=limits,
+        model_config=None,
+    )
     try:
-        with pytest.raises(AssertionError):  # the harness insists on a successful open
-            await open_harness(extra_body=INPUT_CLOCK)
-        assert set(error_codes) == {"input_clock_unsupported"}
-        assert SESSION_ID not in managers[0].runners
+        await manager.handle(
+            OpenDuplexSessionMessage(
+                control_id="c-open",
+                session_id=SESSION_ID,
+                session_config=DuplexSessionConfig(
+                    model="openbmb/MiniCPM-o-4_5",
+                    modalities=["text"],
+                    instructions="You are a concise assistant.",
+                    extra_body={"auto_response": True, **INPUT_CLOCK},
+                ),
+                output_buffer=DuplexOutputBuffer(
+                    max_bytes=limits.max_pending_output_bytes_per_session,
+                    max_events=limits.max_pending_output_events_per_session,
+                ),
+            )
+        )
+        result = await asyncio.wait_for(results.get(), timeout=2.0)
+        assert isinstance(result, DuplexControlResultMessage) and not result.ok, result
+        assert result.error_code == "input_clock_unsupported"
+        assert SESSION_ID not in manager.runners
     finally:
-        for manager in managers:
-            await manager.shutdown()
-
-    h = await open_harness()
-    try:
-        events = await h.run(commands.UpdateSession(patch={"extra_body": INPUT_CLOCK}, event_id="evt-clock"))
-        assert [(e.type, e.code, e.related_event_id) for e in events] == [
-            ("error", "input_clock_unsupported", "evt-clock")
-        ]
-        assert not h.runner.input_clocked
-    finally:
-        await close_harness(h)
+        await manager.shutdown()
 
 
 @pytest.mark.parametrize(

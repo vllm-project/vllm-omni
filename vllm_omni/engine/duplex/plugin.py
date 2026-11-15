@@ -766,10 +766,12 @@ class DuplexModelPlugin(ABC):
         The input clock tracks every model unit (one Stage-0 submission) until
         all of its output has been emitted, so it can acknowledge the client
         input that caused it. Called when a stage output arrives (so it reads
-        the live output at that moment), for every output of a stage before
-        the final one that carries a decision, and for every segment end of
-        such a stage without a decision (``decision is None``; ``output`` and
-        ``context`` are that stage output). ``runtime_config`` is the
+        the live output at that moment): for a Stage-0 segment end (the one
+        output of a submission the clock consults, ``supports_input_clock``),
+        and for every output of a later stage before the final one that
+        carries a decision or ends a segment (``decision is None`` for a
+        segment end without one; ``output`` and ``context`` are that stage
+        output). ``runtime_config`` is the
         session's runtime configuration (passed by the engine; the default
         only keeps direct calls short). Decisions taken on the final stage are
         not consulted. Default: no classification without a decision;
