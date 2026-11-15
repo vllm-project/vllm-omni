@@ -1009,6 +1009,16 @@ def ar_diffusion_paged_attention(
     return out
 
 
+def _write_kv_slots(pool: torch.Tensor, slots: torch.Tensor, values: torch.Tensor) -> None:
+    if values.dtype != pool.dtype:
+        values = values.to(pool.dtype)
+    if pool.device.type in ("npu", "privateuseone"):
+        # The cache planner supplies distinct physical rows for each write.
+        pool.index_copy_(0, slots, values)
+    else:
+        pool[slots] = values
+
+
 # ── Fused write+attend custom op (torch.compile-safe) ──────────────────────
 #
 # One opaque op per layer keeps the compiled DiT block fullgraph: dynamo treats
@@ -1041,11 +1051,11 @@ def _paged_write_attn_impl(
     private_slots: torch.Tensor | None = None,
     npu_lengths: tuple[int, int] | None = None,
 ) -> torch.Tensor:
-    key_pool[video_slots] = k_curr.to(key_pool.dtype)
-    value_pool[video_slots] = v_curr.to(value_pool.dtype)
+    _write_kv_slots(key_pool, video_slots, k_curr)
+    _write_kv_slots(value_pool, video_slots, v_curr)
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:
-        key_pool[action_slots] = k_act.to(key_pool.dtype)
-        value_pool[action_slots] = v_act.to(value_pool.dtype)
+        _write_kv_slots(key_pool, action_slots, k_act)
+        _write_kv_slots(value_pool, action_slots, v_act)
     if private_slots is not None:
         count = private_slots.shape[0]
         torch.index_select(key_pool[:-count], 0, private_slots, out=key_pool[-count:])
