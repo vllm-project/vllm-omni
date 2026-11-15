@@ -135,14 +135,18 @@ def has_tts_text_conditioning(
     That is ``text`` as a non-empty list with a truthy first item, precomputed
     text ids, or a trailing-text hidden state. The Talker's ``preprocess`` raises
     when this is false. ``allow_blank_text=False`` also rejects whitespace-only
-    text, for the stage-0 check.
+    text and precomputed ids that :func:`coerce_token_ids` would discard, for
+    the stage-0 check.
     """
     text_list = info_dict.get("text")
     if isinstance(text_list, list) and text_list and text_list[0]:
         first = text_list[0]
         if allow_blank_text or not isinstance(first, str) or first.strip():
             return True
-    if info_dict.get(PRECOMPUTED_TEXT_IDS_KEY) is not None:
+    text_ids = info_dict.get(PRECOMPUTED_TEXT_IDS_KEY)
+    if text_ids is not None and (
+        allow_blank_text or coerce_token_ids(text_ids, device=torch.device("cpu")) is not None
+    ):
         return True
     return isinstance(hidden_states, dict) and isinstance(hidden_states.get("trailing_text"), torch.Tensor)
 

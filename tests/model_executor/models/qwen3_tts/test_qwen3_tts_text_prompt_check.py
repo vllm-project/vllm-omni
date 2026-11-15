@@ -34,6 +34,10 @@ _REJECTED = {
     "missing": _prompt(),
     "base-missing": _prompt(task_type="Base"),
     "none-text-ids": _prompt([""], **{PRECOMPUTED_TEXT_IDS_KEY: None}),
+    # Ids that coerce_token_ids discards; the Talker would tokenize the blank text instead.
+    "empty-text-ids": _prompt(["   "], **{PRECOMPUTED_TEXT_IDS_KEY: []}),
+    "nested-empty-text-ids": _prompt(["   "], **{PRECOMPUTED_TEXT_IDS_KEY: [[]]}),
+    "empty-tensor-text-ids": _prompt(["   "], **{PRECOMPUTED_TEXT_IDS_KEY: torch.zeros(0, dtype=torch.long)}),
     "blank-trailing-hidden": _prompt([""], hidden_states={"trailing_text": None}),
     "plain-string": "Hello.",
     "text-prompt-dict": {"prompt": "Hello."},
@@ -48,6 +52,7 @@ _ACCEPTED = {
     "first-item-only": _prompt(["Hello.", ""]),
     # Precomputed text ids carry the text; the raw string is not used.
     "text-ids": _prompt([""], **{PRECOMPUTED_TEXT_IDS_KEY: [[1, 2, 3]]}),
+    "tensor-text-ids": _prompt([""], **{PRECOMPUTED_TEXT_IDS_KEY: torch.tensor([[1, 2, 3]])}),
     "trailing-hidden": _prompt([""], hidden_states={"trailing_text": torch.zeros(1)}),
 }
 
@@ -81,6 +86,8 @@ def test_talker_check_keeps_accepting_blank_text():
     assert has_tts_text_conditioning({"text": ["  "]})
     assert not has_tts_text_conditioning({"text": ["  "]}, allow_blank_text=False)
     assert not has_tts_text_conditioning({"text": []})
+    # Likewise, the Talker keeps accepting ids it would discard and falls back to the text.
+    assert has_tts_text_conditioning({"text": ["  "], PRECOMPUTED_TEXT_IDS_KEY: [[]]})
 
 
 @pytest.mark.parametrize("pipeline", [QWEN3_TTS_PIPELINE, QWEN3_TTS_FUSED_PIPELINE])
