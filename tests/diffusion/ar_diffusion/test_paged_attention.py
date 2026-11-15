@@ -101,9 +101,7 @@ def test_npu_host_lengths_preserve_gather_without_device_readback(monkeypatch, b
     with monkeypatch.context() as guard:
         for name in ("item", "cpu", "tolist"):
             guard.setattr(torch.Tensor, name, readback)
-        actual = ar_diffusion_paged_attention(
-            _MockNPUQuery(query), keys, values, **kwargs, npu_lengths=(3, 5)
-        )
+        actual = ar_diffusion_paged_attention(_MockNPUQuery(query), keys, values, **kwargs, npu_lengths=(3, 5))
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
     assert seen[0] == seen[1]
     assert seen[1]["actual_seq_qlen"] == [3]

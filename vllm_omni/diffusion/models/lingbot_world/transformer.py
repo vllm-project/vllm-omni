@@ -411,9 +411,7 @@ class LingBotSelfAttention(nn.Module):
                     max_query_len=query.shape[1],
                     max_seq_len=visible_key.shape[1],
                     softmax_scale=self.head_dim**-0.5,
-                    npu_lengths=(query.shape[1], visible_key.shape[1])
-                    if query.device.type == "npu"
-                    else None,
+                    npu_lengths=(query.shape[1], visible_key.shape[1]) if query.device.type == "npu" else None,
                 )
             else:
                 output = self.attn(query, visible_key, visible_value)
