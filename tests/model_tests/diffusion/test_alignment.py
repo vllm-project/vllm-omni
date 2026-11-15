@@ -122,6 +122,9 @@ EXCLUDED_MODELS = [
     "DiffusersAdapterPipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
+    # Robot observations require local policy/VAE/text weights; dedicated CPU
+    # contracts and the checkpoint-gated GPU E2E cover this integration.
+    "Praxis1Pipeline",
     # Experimental Noisy PP / cell path; covered by tests/diffusion/models/causvid_wan
     # and tests/diffusion/ar_diffusion instead of the tiny-model offline suite.
     "CausVidWanPipeline",
