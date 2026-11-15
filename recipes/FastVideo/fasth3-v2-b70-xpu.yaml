@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+trust-remote-code: true
+enforce-eager: false
+num-gpus: 4
+task-type: fl2va
+usp: 4
+text-encoder-tp-size: 4
+vae-patch-parallel-size: 4
+vae-use-tiling: true
+diffusion-offload-config:
+  mode: layer
+  components: [dit, text_encoder]
+  layer_options:
+    dit:
+      weight_transfer: allgather
+    text_encoder:
+      weight_transfer: rank-local
+diffusion-attention-config:
+  default:
+    backend: FASTVIDEO_VSA
+    fastvideo_vsa_provider: ark
+default-sampling-params:
+  "0":
+    num_inference_steps: 8
+    guidance_scale: 1
+init-timeout: 3600
+stage-init-timeout: 3600

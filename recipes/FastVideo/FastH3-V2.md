@@ -45,3 +45,24 @@ curl --fail-with-body -sS http://localhost:8000/v1/videos/sync \
 Open `output.mp4` to play the video with audio. For a smaller output, use
 `size=832x480`. Keep the configuration's sampling defaults; this model is
 trained for eight steps.
+
+## Intel Arc Pro B70 (XPU)
+
+Use the B70 config to run the checkpoint with 4x Arc Pro B70, Ulysses-4,
+layer offload, the ARK block-sparse attention provider, and regional
+`torch.compile`:
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_OMNI_VIDEO_SYNC_TIMEOUT=7200 \
+vllm serve FastVideo/FastVideo-FastH3-8-Step-V2 --omni \
+  --config recipes/FastVideo/fasth3-v2-b70-xpu.yaml
+```
+
+The checkpoint-pinned 80% VSA sparsity is unchanged. Compiled execution is
+enabled by `enforce-eager: false`; the first request pays the compilation cost.
+On 4x B70 at 832x480 and 5 seconds, measured warm latency was 43.45 s compiled
+versus 46.54 s eager, with the first compiled request taking 73.81 s.
+
+The current ARK package may fall back to its B70-qualified Q64 path and executes
+partial edge blocks with zero-padded keys until `k_block_valid` support is
+available.
