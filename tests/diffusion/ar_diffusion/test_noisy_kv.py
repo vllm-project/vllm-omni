@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     CellPlan,
     CellSchedule,
     Inflight,
@@ -289,3 +289,130 @@ def test_begin_request_rejects_invalid_chunk_length(chunk_tokens):
     with pytest.raises(ValueError, match="chunk_tokens"):
         state.begin_request("A", _vertical_plan(), chunk_tokens=chunk_tokens)
     assert state.resident_versions == 0
+
+
+@pytest.mark.parametrize("history", [0, 1, 3])
+def test_same_step_sink_cache_lifetime_and_attention_window(history):
+    # Simulate all ranks and explicit P2P payload copies. This checks actual
+    # pool allocation, table width, last-use eviction and final cleanup.
+    steps, blocks, chunks = 2, 2, 12
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=chunks,
+            num_denoise_steps=steps,
+            step_replicas=steps,
+            layer_groups=1,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=history,
+            blocks=blocks,
+        )
+    )
+    states = []
+    for rank in range(plan.world):
+        spec = ARDiffusionNoisyKVSpec(
+            num_layers=blocks,
+            num_kv_heads=2,
+            head_size=4,
+            block_size=4,
+            max_chunk_tokens=4,
+            max_history_chunks=max(1, history),
+        )
+        cache = NoisyKVCache(
+            spec, dtype=torch.float32, device=torch.device("cpu"), layer_groups=1, max_batch_size=1, step_replicas=steps
+        )
+        state = NoisyKVState(cache)
+        state.bind_rank(rank, None)
+        state.begin_request("A", plan, chunk_tokens=4)
+        states.append(state)
+    for tick in range(plan.num_slots):
+        for rank, state in enumerate(states):
+            task = plan.task(tick, rank)
+            if task is None:
+                continue
+            context = state.prepare((("A", task),))[0][0]
+            pool = state.cache.pool
+            for src in plan.sources(task, rank):
+                key = ("A", *src.version)
+                k, v = pool.kv_block_views(key, 1)
+                expected = 1000 + 100 * src.version[0] + 10 * src.version[1] + src.version[2]
+                torch.testing.assert_close(k, torch.full_like(k, expected))
+                torch.testing.assert_close(v, torch.full_like(v, -expected))
+            assert context.seq_len == (len(plan.sources(task, rank)) + 1) * 4
+            key = ("A", *task)
+            k, v = pool.kv_block_views(key, 1)
+            value = 1000 + 100 * task[0] + 10 * task[1] + task[2]
+            k.fill_(value)
+            v.fill_(-value)
+        for xfer in plan.transfers(tick):
+            key = ("A", *xfer.version)
+            source = states[xfer.src].cache.pool
+            target = states[xfer.dst].cache.pool
+            target.alloc(key)
+            target.copy_into(key, source.tensor_dict(key, 1))
+        for state in states:
+            state.evict(tick)
+    for state in states:
+        state.end_request("A")
+        assert state.resident_versions == 0
+
+
+@pytest.mark.parametrize("groups", [1, 2, 4])
+def test_same_step_all_live_history_versions_fit_capacity(groups):
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=24,
+            num_denoise_steps=4,
+            step_replicas=4,
+            layer_groups=groups,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=18,
+            blocks=2 * groups,
+        )
+    )
+    spec = ARDiffusionNoisyKVSpec(
+        num_layers=2,
+        num_kv_heads=1,
+        head_size=4,
+        block_size=4,
+        max_chunk_tokens=4,
+        max_history_chunks=18,
+    )
+    states = []
+    for rank in range(plan.world):
+        cache = NoisyKVCache(
+            spec,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            layer_groups=groups,
+            max_batch_size=2,
+            step_replicas=4,
+            layer_offset=2 * (rank % groups),
+        )
+        state = NoisyKVState(cache)
+        state.bind_rank(rank, None)
+        for req in ("A", "B"):
+            state.begin_request(req, plan, chunk_tokens=4)
+        states.append(state)
+    peaks = {rank: [0] * spec.num_layers for rank in range(plan.world)}
+    for tick in range(plan.num_ticks):
+        for rank, state in enumerate(states):
+            task = plan.task(tick, rank)
+            if task is not None:
+                contexts = state.prepare(tuple((req, task) for req in ("A", "B")))
+                assert all(context[0].seq_len == (len(plan.sources(task, rank)) + 1) * 4 for context in contexts)
+        for transfer in plan.transfers(tick):
+            for req in ("A", "B"):
+                key = (req, *transfer.version)
+                source = states[transfer.src].cache.pool
+                target = states[transfer.dst].cache.pool
+                target.alloc(key)
+                target.copy_into(key, source.tensor_dict(key, 1))
+        for rank, state in enumerate(states):
+            for layer in range(spec.num_layers):
+                live = state.cache.capacity - len(state.cache.pool.free[layer])
+                peaks[rank][layer] = max(peaks[rank][layer], live)
+                assert live <= state.cache.capacity
+            state.evict(tick)
+    for rank, state in enumerate(states):
+        assert not state.cache.pool.keys
+        assert all(peak > 0 for peak in peaks[rank])

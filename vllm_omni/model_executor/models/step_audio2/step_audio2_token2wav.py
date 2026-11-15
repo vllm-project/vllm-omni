@@ -272,6 +272,16 @@ class StepAudio2Token2WavCore(nn.Module):
         }
         self._hift.load_state_dict(hift_state_dict, strict=True)
         self._hift.to(self.device).eval()
+        # Fold after loading and device placement so the normalized weight is
+        # computed once instead of on every chunk. Folding rewrites
+        # ``state_dict`` keys, so reloading the original checkpoint into this
+        # instance is unsupported. ``CosyVoice3Code2Wav`` already does this;
+        # MiniCPM-o and StepAudio2 reach HiFT through this core.
+        folded = self._hift.remove_weight_norm()
+        if folded:
+            logger.info("Folded %d HiFT weight-norm layers", folded)
+        else:
+            logger.warning("HiFT generator had no weight-norm layers to fold; check config drift")
 
         self._models_loaded = True
         logger.info("Token2Wav models loaded successfully")

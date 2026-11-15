@@ -19,14 +19,14 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.models.magi2.fused_moe_kernels import (
+from vllm_omni.diffusion.models.magi2.layers.cuda.fused_moe_kernels import (
     _reference_global_sort_routes,
     global_sort_routes,
-    torch_mh_moe_forward,
 )
-from vllm_omni.diffusion.models.magi2.mh_moe import (
+from vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe import compute_topk_probs_and_indices
+from vllm_omni.diffusion.models.magi2.layers.native.mh_moe import (
     _reference_topk_probs_and_indices,
-    compute_topk_probs_and_indices,
+    torch_mh_moe_forward,
 )
 from vllm_omni.platforms import current_omni_platform
 
@@ -105,7 +105,7 @@ def _resolvable_rows(
     return ((ordered[..., :-1] - ordered[..., 1:]).abs() > margin).all(dim=-1)
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(("heads", "tokens", "experts", "top_k"), ROUTING_SHAPES)
 @pytest.mark.parametrize("route_norm", [True, False])
 def test_fused_routing_matches_reference(heads: int, tokens: int, experts: int, top_k: int, route_norm: bool) -> None:
@@ -134,7 +134,7 @@ def test_fused_routing_matches_reference(heads: int, tokens: int, experts: int, 
     )
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 def test_fused_routing_without_bias_matches_reference() -> None:
     logits, _ = _router_inputs(12, 512, 256, device="cuda", with_bias=False)
     reference = _reference_topk_probs_and_indices(logits, 6)
@@ -144,7 +144,7 @@ def test_fused_routing_without_bias_matches_reference() -> None:
     torch.testing.assert_close(fused[0], reference[0], rtol=ROUTE_WEIGHT_RTOL, atol=ROUTE_WEIGHT_ATOL)
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 def test_selection_bias_does_not_reach_the_route_weight() -> None:
     """A bias large enough to reorder selection must not change the weights."""
 
@@ -178,7 +178,7 @@ def test_fused_routing_ties_break_towards_the_lowest_expert() -> None:
     )
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("bias_shape", [(4, 1), (4,), (4, 1, 1)])
 def test_broadcast_expert_bias_matches_reference(bias_shape: tuple[int, ...]) -> None:
     """A per-head scalar bias broadcasts in the reference and must in the kernel.
@@ -202,7 +202,7 @@ def test_broadcast_expert_bias_matches_reference(bias_shape: tuple[int, ...]) ->
     )
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float16])
 def test_narrow_dtype_expert_bias_matches_reference(bias_dtype: torch.dtype) -> None:
     """Upcasting a narrow bias is exactly the promotion the reference performs."""
@@ -288,7 +288,7 @@ def test_nan_router_logits_rank_first_and_stay_in_range(route_norm: bool) -> Non
     )
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(("heads", "tokens", "experts", "top_k"), ROUTING_SHAPES)
 def test_global_sort_routes_is_bit_identical_to_reference(heads: int, tokens: int, experts: int, top_k: int) -> None:
     logits, expert_bias = _router_inputs(heads, tokens, experts, device="cuda")
@@ -300,7 +300,7 @@ def test_global_sort_routes_is_bit_identical_to_reference(heads: int, tokens: in
         assert torch.equal(candidate, reference_tensor), name
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 def test_global_sort_routes_layout_invariants() -> None:
     heads, tokens, experts, top_k = 6, 333, 64, 3
     logits, expert_bias = _router_inputs(heads, tokens, experts, device="cuda")
@@ -325,7 +325,7 @@ def test_global_sort_routes_layout_invariants() -> None:
         assert torch.equal(bucket, expected_tokens.to(bucket.dtype))
 
 
-@hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
+@hardware_test(res={"cuda": ["B200", "H100", "L4"], "rocm": "MI325"}, num_cards=1)
 def test_routes_drive_the_expert_kernel_identically() -> None:
     """The two route builders must produce interchangeable expert inputs."""
 
@@ -392,6 +392,9 @@ def test_routing_rejects_malformed_inputs() -> None:
 # in-process would pass no matter what, because Triton is loaded for real by
 # then.
 _STUBBED_TRITON_IMPORT = """
+import importlib
+import sys
+
 import vllm.triton_utils as triton_utils
 from vllm.triton_utils.importing import TritonLanguagePlaceholder, TritonPlaceholder
 
@@ -399,19 +402,32 @@ triton_utils.HAS_TRITON = False
 triton_utils.triton = TritonPlaceholder()
 triton_utils.tl = TritonLanguagePlaceholder()
 
-import vllm_omni.diffusion.models.magi2.mh_moe  # noqa: F401
+for module_name in sys.argv[1:]:
+    importlib.import_module(module_name)
+
+import vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe  # noqa: F401
+
+kernels = importlib.import_module("vllm_omni.diffusion.models.magi2.layers.cuda.fused_moe_kernels")
+native = importlib.import_module("vllm_omni.diffusion.models.magi2.layers.native.mh_moe")
+musa = importlib.import_module("vllm_omni.diffusion.models.magi2.layers.musa.mh_moe")
+assert kernels.torch_mh_moe_forward is native.torch_mh_moe_forward
+assert musa.triton_mh_moe_forward is kernels.triton_mh_moe_forward
 """
 
 
 @pytest.mark.cpu
-def test_module_imports_without_an_active_triton_driver() -> None:
-    """``mh_moe`` must load on the vLLM Triton placeholder, not just on a GPU."""
+@pytest.mark.parametrize("import_order", ["kernel-first", "layers-first"])
+def test_module_imports_without_an_active_triton_driver(import_order: str) -> None:
+    """Both entry orders must load with placeholders and share native/MUSA owners."""
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ""
     env["HIP_VISIBLE_DEVICES"] = ""
+    layers = "vllm_omni.diffusion.models.magi2.layers"
+    kernel = layers + ".cuda.fused_moe_kernels"
+    modules = (kernel, layers) if import_order == "kernel-first" else (layers, kernel)
     result = subprocess.run(
-        [sys.executable, "-c", _STUBBED_TRITON_IMPORT],
+        [sys.executable, "-c", _STUBBED_TRITON_IMPORT, *modules],
         cwd=REPO_ROOT,
         env=env,
         capture_output=True,

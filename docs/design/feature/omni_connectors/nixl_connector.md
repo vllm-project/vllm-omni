@@ -36,6 +36,13 @@ metadata query per scheduler poll (10ms by default), which prevents an unavailab
 producer from blocking unrelated requests. The regular transfer-completion handshake
 keeps the configured transfer timeout.
 
+NIXL READs are not ordered with PyTorch streams. Before publishing, `put()`
+synchronizes the current stream of each accelerator device in the payload, so
+the kernels that wrote it have finished. Before a READ, `get()` does the same
+for the freshly allocated receive buffers, whose memory the caching allocator
+may hand back while queued kernels still use it. A caller that writes a payload
+on another stream must finish those writes before calling `put()`.
+
 ## Installation
 
 CUDA hosts can install the published wheel:

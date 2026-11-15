@@ -63,12 +63,24 @@ def test_resolve_speaker(requested, expected) -> None:
 def test_talker_prefill_uses_each_request_speaker(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _bare_model("talker")
     model.model = nn.Linear(2, 2)
+    model.embed_text_eos_token = torch.zeros(1, 2)
+    model.embed_text_pad_token = torch.zeros(1, 2)
     speakers: list[str] = []
+
+    def fake_conditioning(
+        hidden_states: torch.Tensor,
+        _token_ids: list[int] | torch.Tensor,
+        *,
+        mask_multimodal_tokens: bool,
+    ) -> torch.Tensor:
+        del mask_multimodal_tokens
+        return hidden_states
 
     def fake_prefill(*, speaker, **kwargs):
         speakers.append(speaker)
         return torch.zeros(1, dtype=torch.long), torch.zeros(1, 2)
 
+    monkeypatch.setattr(model, "_condition_thinker_hidden_states", fake_conditioning)
     monkeypatch.setattr(model, "_thinker_to_talker_prefill", fake_prefill)
     payload = {
         "embed": {"prefill": torch.zeros(3, 2)},

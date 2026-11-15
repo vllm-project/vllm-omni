@@ -1,5 +1,8 @@
+# vLLM-Ascend v0.33.0 runtime matching the vLLM v0.33.0 alignment. Set
+# VLLM_ASCEND_DEVICE_SUFFIX to -a3/-a5/-310p for device-specific images; the
+# unsuffixed tag is the generic A2 image.
 ARG VLLM_ASCEND_IMAGE=quay.io/atlas-ci/vllm-ascend
-ARG VLLM_ASCEND_VERSION=v0.32.0
+ARG VLLM_ASCEND_VERSION=v0.33.0
 ARG VLLM_ASCEND_DEVICE_SUFFIX=
 FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_VERSION}${VLLM_ASCEND_DEVICE_SUFFIX}
 
@@ -18,7 +21,7 @@ RUN export PIP_EXTRA_INDEX_URL=https://mirrors.huaweicloud.com/ascend/repos/pypi
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/`uname -i`-linux/devlib && \
-    python3 -m pip install -v "mindiesd==3.1.0" && \
+    python3 -m pip install -v "mindiesd==3.2.0" && \
     python3 -m pip install -v -e /vllm-workspace/vllm-omni/ --no-build-isolation
 
 RUN python3 -m pip install -v --no-deps \

@@ -143,7 +143,8 @@ def test_distributed_tile_hooks_match_tiled_decode():
         tiled = vae.tiled_decode(z, return_dict=False)[0]
 
         tasks, grid_spec = DistributedAutoencoderKLQwenImage21.tile_split(distributed, z)
-        # 16x16 latent, 8x8 latent tiles, stride 6 -> range(0, 16, 6) = 3 stops/axis.
+        # 16x16 latent, 8x8 latent tiles, stride 6 -> _tile_starts spreads the
+        # 8-cell span evenly: [0, 4, 8], so still 3 stops per axis.
         assert len(tasks) == 9
         assert grid_spec.grid_shape == (3, 3)
         assert grid_spec.split_dims == (3, 4)
@@ -155,6 +156,58 @@ def test_distributed_tile_hooks_match_tiled_decode():
 
     assert merged.shape == tiled.shape
     torch.testing.assert_close(merged, tiled)
+
+
+def test_trailing_tile_keeps_the_full_decode_window():
+    """Regression: a clipped trailing tile leaves a visible seam (vllm-omni#8850).
+
+    Tiles are placed at a fixed stride, so a size that is not a multiple of the
+    stride used to clip the trailing tile at the image border (4 latent cells
+    instead of 8 here). A clipped tile decodes with less context than its
+    neighbours, which leaves a seam that the blend does not hide. The layout must
+    snap the trailing tile back so every tile keeps the full decode window.
+    """
+    torch.manual_seed(0)
+    vae = _make_vae(DistributedAutoencoderKLQwenImage21)
+    vae.enable_tiling(
+        tile_sample_min_height=32,
+        tile_sample_min_width=32,
+        tile_sample_stride_height=24,
+        tile_sample_stride_width=24,
+    )
+    tile_latent = 32 // vae.spatial_compression_ratio  # 8 latent cells
+
+    # 16 and 22 are not multiples of the latent stride (6), so the trailing tile
+    # is clipped under the old layout.
+    for height, width in ((16, 22), (22, 16), (16, 16)):
+        z = torch.randn(1, 4, 1, height, width)
+        tasks, _ = DistributedAutoencoderKLQwenImage21.tile_split(vae, z)
+        windows = {(task.tensor[0].shape[-2], task.tensor[0].shape[-1]) for task in tasks}
+        assert windows == {(tile_latent, tile_latent)}, (
+            f"latent {height}x{width}: decoded tiles with a clipped window {windows}; "
+            f"every tile must keep the full {tile_latent}x{tile_latent} window"
+        )
+
+
+def test_tile_starts_spread_evenly_and_keep_full_windows():
+    """The layout invariant behind vllm-omni#8850, over every plausible axis size.
+
+    Every start must leave room for the full window, the trailing tile must end
+    on the border (so nothing is clipped), the spacing must never exceed the
+    configured stride, and the spacing must be as even as integer cells allow.
+    """
+    stride, tile_min = 24, 32
+    for size in range(1, 257):
+        starts = AutoencoderKLQwenImage21._tile_starts(size, tile_min, stride)
+        assert starts[0] == 0
+        assert starts == sorted(set(starts)), f"size {size}: starts not strictly increasing"
+        if size <= tile_min:
+            assert starts == [0], f"size {size}: a single tile should cover the axis"
+            continue
+        assert starts[-1] == size - tile_min, f"size {size}: trailing tile must end on the border"
+        gaps = [starts[i + 1] - starts[i] for i in range(len(starts) - 1)]
+        assert all(1 <= gap <= stride for gap in gaps), f"size {size}: gaps {gaps}"
+        assert max(gaps) - min(gaps) <= 1, f"size {size}: spacing must be even, got {gaps}"
 
 
 def test_tiled_encode_output_shape_and_closeness():

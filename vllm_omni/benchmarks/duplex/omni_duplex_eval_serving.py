@@ -31,6 +31,7 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import (
     PreparedReferenceAudio,
     PreparedSample,
     prepare_sample,
+    write_failed_sample_diagnostics,
     write_sample_result,
 )
 from vllm_omni.benchmarks.duplex_session_inputs import TURN_DETECTION_NONE
@@ -208,9 +209,19 @@ def finalize_duplex_eval(samples: list[SampleRequest], outputs: list[RequestFunc
     errors: list[str] = []
     published: list[OmniDuplexEvalSampleRequest] = []
     published_with_unfinished_responses = 0
+    failed_diagnostics = 0
     for sample, output in rows:
         result = getattr(output, "duplex_eval_result", None)
-        if not output.success or not isinstance(result, GenerateSampleResult):
+        if not isinstance(result, GenerateSampleResult):
+            continue
+        if not output.success:
+            try:
+                write_failed_sample_diagnostics(result)
+                failed_diagnostics += 1
+            except OSError as exc:
+                message = f"Cannot publish failed-session diagnostics for {result.output}: {exc}"
+                errors.append(message)
+                logger.exception(message)
             continue
         request_metrics.extend(result.request_metrics)
         session_metrics.append(result.session_metrics)
@@ -234,6 +245,7 @@ def finalize_duplex_eval(samples: list[SampleRequest], outputs: list[RequestFunc
         "response_root": str(root),
         "published": len(published),
         "published_with_unfinished_responses": published_with_unfinished_responses,
+        "failed_diagnostics": failed_diagnostics,
         "artifact_errors": errors,
     }
     if published_with_unfinished_responses:
