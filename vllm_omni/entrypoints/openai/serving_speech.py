@@ -2440,10 +2440,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # seeded-request isolation policy, not a client knob: copying it
             # from extra_params would let a request serialize the engine without
             # asking for reproducibility.
-            sampling_params_list[0].extra_args.update(
-                {key: value for key, value in request.extra_params.items() if key != "omni_user_seed"}
-            )
-            logger.info("Applied extra_params: %s", request.extra_params)
+            applied_extra_params = {
+                key: value for key, value in request.extra_params.items() if key != "omni_user_seed"
+            }
+            sampling_params_list[0].extra_args.update(applied_extra_params)
+            logger.info("Applied extra_params: %s", applied_extra_params)
 
         # Apply adapter-owned sampling overrides, including request-level token
         # limits and model-specific dynamic token or stop-token configuration.
