@@ -8,6 +8,7 @@ from vllm.tracing import instrument
 from vllm.v1.worker.gpu_worker import CompilationTimes
 from vllm.v1.worker.xpu_worker import XPUWorker
 
+from vllm_omni.platforms.xpu.worker.xpu_omni_v2_model_runner import XPUOmniGenerationModelRunner
 from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
@@ -17,11 +18,11 @@ logger = init_logger(__name__)
 class XPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase, XPUWorker):
     """XPU generation worker for the code2wav (non-AR waveform generation) stage in the Omni model."""
 
-    def _make_model_runner(self):
-        from vllm_omni.platforms.xpu.worker.xpu_omni_v2_model_runner import XPUOmniGenerationModelRunner
+    model_runner_cls = XPUOmniGenerationModelRunner
 
+    def _make_model_runner(self):
         logger.info("Using MR v2 XPUOmniGenerationModelRunner.")
-        return XPUOmniGenerationModelRunner(self.vllm_config, self.device)
+        return self.model_runner_cls(self.vllm_config, self.device)
 
     @instrument(span_name="Compile/warmup")
     def compile_or_warm_up_model(self) -> CompilationTimes:

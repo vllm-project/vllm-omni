@@ -9,7 +9,6 @@ import torch
 from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
     HiggsAudioV3TalkerForConditionalGeneration as C,
 )
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -43,6 +42,9 @@ def test_two_inflight_steps_keep_owned_codes_and_masks():
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_whole_output_explicit_opt_in(enabled):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="ModelRunnerV1 async output is unsupported")
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
     r = object.__new__(GPUARModelRunner)
     r.use_async_scheduling = True
     r.speculative_config = None

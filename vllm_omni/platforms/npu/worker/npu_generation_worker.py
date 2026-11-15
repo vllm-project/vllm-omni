@@ -9,6 +9,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.platforms.npu.ascend_warmup_patch import apply_ascend_warmup_patch
 from vllm_omni.platforms.npu.worker.base import OmniNPUWorkerBase
+from vllm_omni.platforms.npu.worker.npu_generation_model_runner_v2 import NPUGenerationModelRunnerV2
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
 # See npu_ar_worker: install before the worker is used, so the guard is in
@@ -20,15 +21,15 @@ logger = init_logger(__name__)
 class NPUGenerationWorker(OmniWorkerMixin, OmniNPUWorkerBase):
     """NPU generation worker for code2wav stage in Omni model."""
 
+    model_runner_cls = NPUGenerationModelRunnerV2
+
     def init_device(self):
         self.device = self._init_device()
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)
 
-        from vllm_omni.platforms.npu.worker.npu_generation_model_runner_v2 import NPUGenerationModelRunnerV2
-
         logger.info("Using MR v2 NPUGenerationModelRunnerV2.")
-        self.model_runner = NPUGenerationModelRunnerV2(self.vllm_config, self.device)
+        self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Skip language-model warmup for codec IDs and retain inner graphs."""

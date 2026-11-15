@@ -21,6 +21,7 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.memory_utils import request_memory_tolerant
 from vllm_omni.worker.mixins import OmniWorkerMixin
+from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
 
 logger = init_logger(__name__)
 
@@ -31,6 +32,8 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     Selected for stages whose pipeline topology uses
     ``execution_type=StageExecutionType.LLM_GENERATION``.
     """
+
+    model_runner_cls = OmniGenerationModelRunner
 
     @instrument(span_name="Init device")
     def init_device(self):
@@ -99,10 +102,8 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
-        from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
-
         logger.info("Using MR v2 OmniGenerationModelRunner for generation stage.")
-        self.model_runner = OmniGenerationModelRunner(self.vllm_config, self.device)
+        self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

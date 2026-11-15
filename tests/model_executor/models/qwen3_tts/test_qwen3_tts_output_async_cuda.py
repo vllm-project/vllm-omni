@@ -11,7 +11,6 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
     Qwen3TTSTalkerForConditionalGeneration,
 )
-from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
 
 pytestmark = [pytest.mark.core_model]
 
@@ -20,6 +19,9 @@ pytestmark = [pytest.mark.core_model]
 @pytest.mark.parametrize("validity_device", ["cpu", "cuda"])
 @torch.inference_mode()
 def test_output_validity_preserves_values_without_waiting_for_forward(validity_device):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="ModelRunnerV1 async snapshot is unsupported")
+    from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
+
     talker = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
     talker.vllm_config = SimpleNamespace(model_config=SimpleNamespace(async_chunk=True))
     hidden = torch.zeros((3, 8), device="cuda")
