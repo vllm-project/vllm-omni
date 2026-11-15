@@ -12,9 +12,21 @@
 #   broad  also advanced_model on one and two cards (Qwen3-TTS, Z-Image, Wan2.1,
 #          Voxtral, and BAGEL-7B-MoT for sleep mode), hence its larger budget.
 #
-# The agents should expose at least two cards (ZE_AFFINITY_MASK=0,1 or wider):
-# the script pins the first card for the cards_1 stages and the first two for
-# the cards_2 ones, and skips the 2-card stages when it is handed a single card.
+# Card budget. The script pins the first card of the agent's ZE_AFFINITY_MASK
+# for the cards_1 stages and the first two for the cards_2 ones, and XPU_REQUIRE_CARDS
+# makes it fail rather than quietly drop a stage: a step asking for 2 cards that
+# lands on a single-card agent is an error, not a green build with less coverage.
+#
+# Today's agents hand over four cards each, so both steps get what they ask for.
+# When the agents are re-cut, tag them with their card count and target it here,
+# for example:
+#
+#   agents:
+#     queue: "intel-gpu-omni"
+#     cards: "2"          # on the agent: --tags cards=2, ZE_AFFINITY_MASK=0,1
+#
+# A single-card queue can run the smaller lane by setting XPU_REQUIRE_CARDS: "1"
+# on its own step; it then skips the cards_2 stages deliberately and says so.
 #
 # Exactly one step runs per build, so the image is built once either way. To
 # get the broad scope on demand: new build with NIGHTLY=1, or label the PR
@@ -42,6 +54,7 @@ steps:
         env:
           <<: *common_xpu_env
           XPU_TEST_SCOPE: "pr"
+          XPU_REQUIRE_CARDS: "2"
         priority: 100
         timeout_in_minutes: 80
         soft_fail: false
@@ -54,6 +67,7 @@ steps:
         env:
           <<: *common_xpu_env
           XPU_TEST_SCOPE: "broad"
+          XPU_REQUIRE_CARDS: "2"
           # The extra stages do not fit the pr budget.
           XPU_TEST_BUDGET: "95m"
         priority: 100

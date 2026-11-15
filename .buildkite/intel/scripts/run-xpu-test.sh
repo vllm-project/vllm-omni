@@ -156,6 +156,19 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     two_cards="${mask_cards[0]}${mask_cards[1]+,${mask_cards[1]}}"
     echo "ZE_AFFINITY_MASK=${mask} -> cards_1 on ${one_card}, cards_2 on ${two_cards}"
 
+    # How many cards this lane is entitled to. The pipeline asks for 2 so the
+    # cards_2 stages always run; an agent that hands over fewer fails the step
+    # instead of quietly dropping those stages. Set XPU_REQUIRE_CARDS=1 on a
+    # single-card queue to opt out of the 2-card stages on purpose.
+    require_cards="${XPU_REQUIRE_CARDS:-2}"
+    if [ "${#mask_cards[@]}" -lt "${require_cards}" ]; then
+        echo "ERROR: this step wants ${require_cards} cards but the agent gave" \
+             "${#mask_cards[@]} (ZE_AFFINITY_MASK=${mask}). Point the step at an" \
+             "agent with ${require_cards} cards, or set XPU_REQUIRE_CARDS to" \
+             "${#mask_cards[@]} to run the smaller lane deliberately." >&2
+        exit 1
+    fi
+
     # Paths that hold XPU-tagged tests. Scoped explicitly: a bare
     # "pytest tests/" still crashes during collection on XPU (#6175).
     paths=(tests/diffusion tests/dfx tests/e2e tests/platforms
@@ -237,7 +250,7 @@ PY
         stage "core_model · 2 cards" 8m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
             -m "core_model and xpu and (B60 or B70) and cards_2" --run-level core_model
     else
-        echo "--- :pytest: skipping the 2-card stages (ZE_AFFINITY_MASK has one card)"
+        echo "--- :pytest: 2-card stages skipped on purpose (XPU_REQUIRE_CARDS=1)"
     fi
 
     # advanced_model loads the larger checkpoints (Qwen3-TTS, Z-Image, Wan2.1,
