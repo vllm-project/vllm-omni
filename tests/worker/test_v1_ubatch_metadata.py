@@ -6,6 +6,7 @@ import torch
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.worker.ubatch_utils import UBatchSlice
 
+from vllm_omni.worker.v1_compat import misc
 from vllm_omni.worker.v1_compat.misc import split_attn_metadata
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -108,3 +109,30 @@ def test_split_preserves_graph_padding_slots():
 def test_split_rejects_invalid_microbatches(request_slice, token_slice, message):
     with pytest.raises(AssertionError, match=message):
         split_attn_metadata([UBatchSlice(request_slice, token_slice)], _metadata())
+
+
+def test_layerwise_nvtx_hooks_use_torch_provider(monkeypatch):
+    events = []
+    markers = []
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: events.append("pop"))
+
+    def construct_marker(module_name, module_obj, *, in_tensor, kwargs, out_tensor):
+        events.append("marker")
+        markers.append((module_name, module_obj, in_tensor, kwargs, out_tensor))
+
+    monkeypatch.setattr(misc, "construct_marker_dict_and_push", construct_marker)
+    model = torch.nn.ReLU()
+    misc.PytHooks().register_hooks(model, module_prefix="activation")
+    inputs = torch.tensor([-1.0, 2.0])
+
+    output = model(inputs)
+
+    assert misc.nvtx is torch.cuda.nvtx
+    assert events == ["marker", "pop", "marker", "pop"]
+    assert markers[0][:2] == ("activation", model)
+    assert markers[0][2][0] is inputs
+    assert markers[0][3] == {}
+    assert markers[0][4] is None
+    assert markers[1][:2] == ("activation", model)
+    assert markers[1][2:4] == (None, None)
+    assert markers[1][4] is output

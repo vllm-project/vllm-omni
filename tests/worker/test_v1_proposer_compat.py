@@ -10,6 +10,7 @@ from transformers import PretrainedConfig
 from vllm.config import CUDAGraphMode, SpeculativeConfig, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionBackend
+from vllm.utils import torch_utils
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -17,9 +18,11 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.v1_compat import gpu_model_runner as v1_runner
+from vllm_omni.worker.v1_compat import llm_base_proposer
+from vllm_omni.worker.v1_compat.eagle import EagleProposer
 from vllm_omni.worker.v1_compat.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm_omni.worker.v1_compat.gemma4 import Gemma4Proposer
-from vllm_omni.worker.v1_compat.input_batch import InputBatch
+from vllm_omni.worker.v1_compat.input_batch import CachedRequestState, InputBatch
 from vllm_omni.worker.v1_compat.llm_base_proposer import SpecDecodeBaseProposer
 from vllm_omni.worker.v1_compat.ngram_proposer import NgramProposer
 from vllm_omni.worker.v1_compat.sampler import Sampler
@@ -367,3 +370,92 @@ def test_parallel_drafting_config_error_names_supported_fields():
 
     with pytest.raises(ValueError, match="pard_token.*ptd_token_id"):
         proposer._init_parallel_drafting_params()
+
+
+@pytest.mark.parametrize("disable_padding", [True, False, None], ids=["legacy-unpadded", "padded", "target-default"])
+def test_eagle_drafter_preserves_unpadded_flag_and_default_routing(monkeypatch, disable_padding):
+    monkeypatch.setattr(llm_base_proposer, "PIN_MEMORY", False)
+    monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
+    spec_config = SimpleNamespace(
+        method="eagle", use_ngram_gpu=lambda: False, uses_extract_hidden_states=lambda: False, use_eagle=lambda: True
+    )
+    if disable_padding is not None:
+        spec_config.disable_padded_drafter_batch = disable_padding
+    runner = object.__new__(v1_runner.V1GPUModelRunnerMixin)
+    runner.speculative_config = spec_config
+    runner.input_batch = SimpleNamespace(req_ids=["a", "b"])
+    runner.requests = {
+        "b": CachedRequestState(
+            req_id="b",
+            prompt_token_ids=[8, 9, 10],
+            mm_features=[],
+            sampling_params=None,
+            generator=None,
+            block_ids=([],),
+            num_computed_tokens=0,
+            output_token_ids=[],
+        )
+    }
+    runner.input_ids = SimpleNamespace(gpu=torch.tensor([10, 11, 12, 13], dtype=torch.int32))
+    positions = torch.tensor([20, 21, 22, 23])
+    runner._get_positions = lambda indices: positions[:indices] if isinstance(indices, int) else positions[indices]
+    runner.get_model = lambda: torch.nn.Module()
+    runner.use_aux_hidden_state_outputs = runner.supports_mm_inputs = False
+    runner.discard_request_mask = SimpleNamespace(gpu=torch.zeros(2, dtype=torch.bool))
+    runner.drafter = object.__new__(EagleProposer)
+    runner.drafter.input_ids = torch.empty(4, dtype=torch.int32)
+    runner.drafter._last_draft_probs = None
+    runner.drafter.token_arange_np = np.arange(4, dtype=np.int32)
+    calls = []
+    prepared = {}
+    sampled = [[7], []] if disable_padding else torch.tensor([[7, -1], [8, 9]])
+    counts = torch.tensor([1, 0], dtype=torch.int32)
+
+    def padded_next(*args):
+        calls.append("padded-next")
+        assert args[0] is sampled
+        return torch.tensor([7, 10], dtype=torch.int32), counts
+
+    def padded_inputs(attn_metadata, spec_metadata, valid_counts):
+        calls.append("padded-inputs")
+        assert valid_counts is counts
+        return attn_metadata, None, None
+
+    def capture_proposal(**kwargs):
+        prepared.update(kwargs)
+        return [[31], [32]]
+
+    # Padded helpers launch GPU work; retain the real CPU/list helpers and
+    # replace only padded-device preparation and the model-forward boundary.
+    monkeypatch.setattr(runner.drafter, "prepare_next_token_ids_padded", padded_next)
+    monkeypatch.setattr(runner.drafter, "prepare_inputs_padded", padded_inputs)
+    monkeypatch.setattr(runner.drafter, "propose", capture_proposal)
+    runner._copy_valid_sampled_token_count = lambda *args: calls.append("copy-count")
+    metadata = _draft_attention_metadata()
+    metadata.query_start_loc = metadata.query_start_loc_cpu = torch.tensor([0, 2, 4], dtype=torch.int32)
+    metadata.seq_lens_cpu_upper_bound = metadata.seq_lens.clone()
+    metadata.num_actual_tokens = 4
+    metadata.slot_mapping = torch.tensor([11, 12, 13, 14])
+    scheduled = SchedulerOutput.make_empty()
+    scheduled.total_num_scheduled_tokens = 4
+    scheduled.num_scheduled_tokens = {"a": 2, "b": 2}
+    scheduled.num_spec_tokens_to_schedule = 1
+    hidden = torch.arange(8).reshape(4, 2).float()
+
+    result = runner.propose_draft_token_ids(
+        scheduled, sampled, None, hidden, hidden, None, SimpleNamespace(num_draft_tokens=[1, 0]), metadata, None
+    )
+
+    assert result == [[31], [32]]
+    assert prepared["next_token_ids"].tolist() == [7, 10]
+    indices = [0, 2, 3] if disable_padding else [0, 1, 2, 3]
+    assert prepared["target_token_ids"].tolist() == runner.input_ids.gpu[indices].tolist()
+    assert prepared["target_positions"].tolist() == positions[indices].tolist()
+    torch.testing.assert_close(prepared["target_hidden_states"], hidden[indices])
+    if disable_padding:
+        assert calls == []
+        assert prepared["common_attn_metadata"].query_start_loc.tolist() == [0, 1, 3]
+        assert prepared["common_attn_metadata"].slot_mapping.tolist() == [11, 13, 14]
+    else:
+        assert calls == ["padded-next", "copy-count", "padded-inputs"]
+        assert prepared["common_attn_metadata"] is metadata

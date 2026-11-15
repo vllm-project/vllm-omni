@@ -1190,7 +1190,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
                 or self.speculative_config.use_ngram_gpu()
-            )
+            ) and not getattr(self.speculative_config, "disable_padded_drafter_batch", False)
             early_pp_padded_drafter = use_pp_spec_decode and not self.use_async_scheduling and use_padded_batch
             if early_pp_padded_drafter:
                 self._draft_token_ids = None

@@ -2401,7 +2401,7 @@ class GPUARModelRunner(
             input_fits_in_drafter = self._input_fits_in_drafter(spec_decode_common_attn_metadata)
             use_gpu_toks = (
                 spec_config.use_eagle() or spec_config.uses_draft_model() or spec_config.uses_extract_hidden_states()
-            )
+            ) and not getattr(spec_config, "disable_padded_drafter_batch", False)
             if use_gpu_toks:
                 assert isinstance(
                     self.drafter,

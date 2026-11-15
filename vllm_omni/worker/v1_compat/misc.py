@@ -25,8 +25,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 import numpy as np
-import nvtx
 import torch
+import torch.cuda.nvtx as nvtx
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.nvtx_pytorch_hooks import construct_marker_dict_and_push
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
