@@ -33,6 +33,7 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
+from vllm_omni.diffusion.models.lingbot_vla_v2_pipeline_config import LINGBOT_VLA_V2_PIPELINE
 from vllm_omni.diffusion.models.mossimage_pipeline_config import MOSS_IMAGE_PIPELINE
 from vllm_omni.diffusion.models.physis.h3.pipeline_config import PHYSIS_H3_PIPELINE
 from vllm_omni.diffusion.models.physis.ltx.pipeline_config import PHYSIS_LTX_PIPELINE
@@ -207,6 +208,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "lfm3_audio_text": LFM3_AUDIO_TEXT_PIPELINE,
     "lfm3_omni": LFM3_OMNI_PIPELINE,
     "lfm3_omni_text": LFM3_OMNI_TEXT_PIPELINE,
+    "lingbot_vla_v2": LINGBOT_VLA_V2_PIPELINE,
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
     # Public Ming-3.0-tts-tiny still serializes the former config name.
     "lingv3_tts": MING3_TTS_PIPELINE,
