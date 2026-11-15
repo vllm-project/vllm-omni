@@ -17,16 +17,21 @@
 # makes it fail rather than quietly drop a stage: a step asking for 2 cards that
 # lands on a single-card agent is an error, not a green build with less coverage.
 #
-# Today's agents hand over four cards each, so both steps get what they ask for.
-# When the agents are re-cut, tag them with their card count and target it here,
-# for example:
+# Both steps target agents tagged cards=2, so the agent side needs, per
+# instance:
 #
-#   agents:
-#     queue: "intel-gpu-omni"
-#     cards: "2"          # on the agent: --tags cards=2, ZE_AFFINITY_MASK=0,1
+#   buildkite-agent start --tags "queue=intel-gpu-omni,cards=2"
+#   ZE_AFFINITY_MASK=0,1        # two cards, disjoint between instances
 #
-# A single-card queue can run the smaller lane by setting XPU_REQUIRE_CARDS: "1"
-# on its own step; it then skips the cards_2 stages deliberately and says so.
+# The tag is the promise and the mask is the reality; XPU_REQUIRE_CARDS checks
+# the second. An 8-card host therefore carries four such instances.
+#
+# NOTE: this targeting only schedules once the agents carry the tag. Tag them
+# before merging, or the Intel steps sit unscheduled.
+#
+# A single-card queue can run the smaller lane with its own step: target
+# cards: "1" and set XPU_REQUIRE_CARDS: "1", which skips the cards_2 stages
+# deliberately and says so in the log.
 #
 # Exactly one step runs per build, so the image is built once either way. To
 # get the broad scope on demand: new build with NIGHTLY=1, or label the PR
@@ -51,6 +56,7 @@ steps:
         command: "bash .buildkite/intel/scripts/run-xpu-test.sh"
         agents:
           queue: "intel-gpu-omni"
+          cards: "2"
         env:
           <<: *common_xpu_env
           XPU_TEST_SCOPE: "pr"
@@ -64,6 +70,7 @@ steps:
         command: "bash .buildkite/intel/scripts/run-xpu-test.sh"
         agents:
           queue: "intel-gpu-omni"
+          cards: "2"
         env:
           <<: *common_xpu_env
           XPU_TEST_SCOPE: "broad"
