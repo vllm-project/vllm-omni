@@ -83,8 +83,9 @@ logger = init_logger(__name__)
 _ACTIVE_HWR_REGISTRATIONS: list[tuple[HostRegistration, HostWeightLease]] = []
 _ACTIVE_HWR_REGISTRATIONS_LOCK = threading.Lock()
 
-# XCCL rejects E8M0 scales as a collective element type.  Their one-byte
-# storage is identical to uint8, so all-gather the underlying bytes instead.
+# XCCL and NCCL reject E8M0 scales as a collective element type. E8M0 is one
+# byte wide and bit-preserving under a uint8 reinterpretation, so collect the
+# underlying byte storage and view the output back as E8M0.
 _BYTE_VIEW_ALLGATHER_DTYPES = {dtype for dtype in (getattr(torch, "float8_e8m0fnu", None),) if dtype is not None}
 
 
