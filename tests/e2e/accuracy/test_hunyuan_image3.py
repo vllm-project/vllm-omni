@@ -74,10 +74,14 @@ def _assert_cot_structural_markers(cot_text: str, label: str) -> None:
     )
 
 
-os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
-os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
-
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
+
+
+@pytest.fixture(autouse=True)
+def _accuracy_env(monkeypatch):
+    monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
+    monkeypatch.setenv("VLLM_LOGGING_LEVEL", "DEBUG")
+
 
 # ============================================================================
 # Configurable Parameters

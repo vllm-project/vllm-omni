@@ -28,9 +28,8 @@ def _resolve_cuda_stages(monkeypatch):
 def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
     config, stages = _resolve_cuda_stages(monkeypatch)
     assert config.session_mode == "duplex"
-    # Thinker and Code2Wav use MRv2. The Talker stays on V1 because its
-    # multi-frame decode re-embeds the previous codec frame only there.
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, False, True]
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
+    assert stages[1].yaml_engine_args["attention_backend"] == "FLASH_ATTN"
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [True, True, True]
     assert stages[0].yaml_engine_args["async_scheduling"] is True
     # K-step books its span with the synchronous runner contract.
@@ -42,9 +41,18 @@ def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
     assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
 
 
-@pytest.mark.parametrize("platform", ["npu", "xpu", "rocm", "musa"])
+@pytest.mark.parametrize("platform", ["xpu", "rocm", "musa"])
 def test_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
     stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
+    # The non-CUDA, non-NPU platforms still resolve to the v1 data plane.
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [False, False, False]
+
+
+def test_duplex_mrv2_profile_npu_full_mrv2(monkeypatch) -> None:
+    # PR #10062 enables full-MRv2 three-stage serving on NPU.
+    monkeypatch.setattr(current_omni_platform, "device_name", "npu")
+    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform="npu")
+    stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
