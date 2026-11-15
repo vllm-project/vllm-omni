@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import time as _time
 from collections.abc import Callable, Mapping
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -15,11 +16,13 @@ from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.output_processor import RequestState
+from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.watermarking import ALGORITHM_KEY, WatermarkConfig
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_full_payload_input_coordinator
 from vllm_omni.data_entry_keys import flatten_payload
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_CONFIG_KEY, per_sample_kv_request_id
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
     OmniCoordClientForHub,
@@ -27,7 +30,13 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, PayloadSenderInfo
+from vllm_omni.engine import (
+    AdditionalInformationEntry,
+    AdditionalInformationPayload,
+    OmniEngineCoreOutput,
+    OmniEngineCoreOutputs,
+    PayloadSenderInfo,
+)
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     DiffusionSubmitKwargs,
@@ -48,6 +57,7 @@ from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import (
     coerce_positive_int_scalar,
     iter_mm_outputs,
+    iter_request_output_items,
 )
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.watermarking import WATERMARKER_REGISTRY, Watermarker
@@ -79,6 +89,20 @@ class _ReplicaMetrics:
     batch_seq: int = 0
     agg_total_tokens: int = 0
     agg_total_gen_time_ms: float = 0.0
+
+
+def _set_sample_global_request_id(request: Any, sample_request_id: str) -> None:
+    """Give one sample of an ``n > 1`` request its own ``global_request_id``.
+
+    The AR runners send a finished request's KV under its ``global_request_id``,
+    so each sample's KV arrives under its own key. The request's other
+    additional information is shared, not copied.
+    """
+    if not hasattr(request, "additional_information"):
+        return  # a plain EngineCoreRequest: the runner keys its KV by the engine request id
+    entries = dict(request.additional_information.entries) if request.additional_information else {}
+    entries["global_request_id"] = AdditionalInformationEntry(list_data=[sample_request_id])
+    request.additional_information = AdditionalInformationPayload(entries=entries)
 
 
 class StagePool:
@@ -136,6 +160,12 @@ class StagePool:
     # Only these EngineCore helpers may skip collective_rpc_async. A generic
     # ``{method}_async`` on AsyncMPClient must not silently drop timeout.
     _CACHE_RESET_METHODS = frozenset({"reset_prefix_cache", "reset_encoder_cache", "reset_mm_cache"})
+    # Helpers whose argument is a typed object instead of a scalar. They cannot
+    # ride the generic ``collective_rpc`` path: the msgpack codec decodes a
+    # nested dataclass (``LoRARequest``) back as a plain list, so the worker
+    # fails on ``lora_request.lora_int_id``. Each one is dispatched through its
+    # typed ``{method}_async`` client helper instead.
+    _TYPED_ARG_ASYNC_METHODS = frozenset({"add_lora"})
     _ENGINE_CORE_CONTROL_ASYNC_METHODS = frozenset(
         {
             "pause_scheduler",
@@ -245,6 +275,12 @@ class StagePool:
     def stage_type(self) -> str | None:
         client = self.stage_client
         return None if client is None else client.stage_type
+
+    @property
+    def per_sample_kv(self) -> bool:
+        """Whether each sample of an ``n > 1`` request sends its own KV (``omni_kv_config["per_sample_kv"]``)."""
+        omni_kv_config = getattr(getattr(self._stage_vllm_config, "model_config", None), "omni_kv_config", None)
+        return isinstance(omni_kv_config, dict) and bool(omni_kv_config.get(PER_SAMPLE_KV_CONFIG_KEY))
 
     @property
     def final_output(self) -> bool:
@@ -571,6 +607,12 @@ class StagePool:
         self._request_bindings[request_id] = replica_id
         return replica_id
 
+    def parallel_sample_parent_id(self, request_id: str) -> str | None:
+        """The id of the n > 1 request whose sample (child request) is ``request_id``, else None."""
+        request_states = getattr(self._output_processor, "request_states", None) or {}
+        parent = getattr(request_states.get(request_id), "parent_req", None)
+        return None if parent is None else parent.external_req_id
+
     def _local_replica_unavailability_reason(self, replica_id: int) -> str | None:
         """Return why a local replica slot cannot accept work, if any.
 
@@ -855,7 +897,7 @@ class StagePool:
             (
                 str(reason)
                 for request_output in reversed(request_outputs)
-                for completion in reversed(getattr(request_output, "outputs", []) or [])
+                for completion in reversed(iter_request_output_items(request_output))
                 if (reason := getattr(completion, "finish_reason", None)) is not None
             ),
             None,
@@ -1122,7 +1164,7 @@ class StagePool:
         if final_output_type is None:
             final_output_type = getattr(self.stage_client, "final_output_type", None)
         if final_output_type == "text":
-            return any(bool(getattr(output, "text", "")) for output in getattr(request_output, "outputs", None) or [])
+            return any(bool(getattr(output, "text", "")) for output in iter_request_output_items(request_output))
 
         if getattr(request_output, "images", None):
             return True
@@ -1136,8 +1178,10 @@ class StagePool:
         for mm_output in iter_mm_outputs(request_output):
             if isinstance(mm_output, Mapping) and any(self._is_non_empty_value(value) for value in mm_output.values()):
                 return True
-        for output in getattr(request_output, "outputs", None) or []:
+        for output in iter_request_output_items(request_output):
             if getattr(output, "text", None):
+                return True
+            if self._is_non_empty_value(getattr(output, "data", None)):
                 return True
             token_ids = getattr(output, "token_ids", None)
             if self._is_non_empty_value(token_ids):
@@ -1207,10 +1251,13 @@ class StagePool:
             if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
                 self._audio_sample_rate_by_request[rid] = audio_sample_rate
 
+    def will_watermark(self, params: OmniSamplingParams | PoolingParams) -> bool:
+        """Whether this stage watermarks the outputs of a request with these params."""
+        return bool(self._watermarkers) and not isinstance(params, PoolingParams) and params.watermarking is not False
+
     def maybe_update_watermarking_state(self, request_id: str, params: OmniSamplingParams | PoolingParams) -> None:
-        should_watermark = not isinstance(params, PoolingParams) and params.watermarking is not False
         if self._watermarkers:
-            self._request_watermarking[request_id] = should_watermark
+            self._request_watermarking[request_id] = self.will_watermark(params)
 
     # ---- Stage-local admission ----
 
@@ -1298,20 +1345,43 @@ class StagePool:
         if req_state.trace is not None:
             req_state.trace.start_stage(self.stage_id, replica_id, "llm")
         self.maybe_update_watermarking_state(request_id, params)
+        # SamplingParams.n > 1 fans out into child requests, as in vLLM's AsyncLLM.
+        # Children keep the parent's external id, so aborting request_id reaches all.
+        engine_requests = [request]
+        parent_request = None
+        if (getattr(params, "n", 1) or 1) > 1:
+            parent_request = ParentRequest(request)
+            engine_requests = []
+            for index in range(params.n):
+                child_request_id, child_params = parent_request.get_child_info(index)
+                child_request = copy(request)
+                child_request.request_id = child_request_id
+                child_request.sampling_params = child_params
+                if self.per_sample_kv:
+                    _set_sample_global_request_id(child_request, per_sample_kv_request_id(request_id, index))
+                engine_requests.append(child_request)
+        added: list[str] = []
         try:
-            self.output_processor.add_request(
-                request=request,
-                prompt=prompt_text,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
+            for index, engine_request in enumerate(engine_requests):
+                self.output_processor.add_request(
+                    request=engine_request,
+                    prompt=prompt_text,
+                    parent_req=parent_request,
+                    request_index=index,
+                    queue=None,
+                )
+                added.append(engine_request.request_id)
         except Exception:
             self.release_binding(request_id)
+            rollback = getattr(self.output_processor, "remove_request", None)
+            if callable(rollback):
+                for added_request_id in added:
+                    rollback(added_request_id)
             raise
 
         try:
-            await self._llm_client(replica_id).add_request_async(request)
+            for engine_request in engine_requests:
+                await self._llm_client(replica_id).add_request_async(engine_request)
         except BaseException:
             # Sending can fail or be cancelled after the engine accepted the
             # request. Abort while its replica binding is still available.
@@ -1330,15 +1400,16 @@ class StagePool:
                 self.release_binding(request_id)
                 rollback = getattr(self.output_processor, "remove_request", None)
                 if callable(rollback):
-                    try:
-                        rollback(request_id)
-                    except Exception as rollback_error:
-                        logger.warning(
-                            "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
-                            request_id,
-                            self.stage_id,
-                            rollback_error,
-                        )
+                    for added_request_id in added:
+                        try:
+                            rollback(added_request_id)
+                        except Exception as rollback_error:
+                            logger.warning(
+                                "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
+                                added_request_id,
+                                self.stage_id,
+                                rollback_error,
+                            )
             raise
         return replica_id
 
@@ -1767,11 +1838,23 @@ class StagePool:
         EngineCore control methods (``pause_scheduler``, ``resume_scheduler``,
         ``sleep``, ``wake_up``) propagate worker exceptions. Capability probes
         and other RPCs still return ``{"supported": False, "error": ...}``.
+        Typed-argument helpers (``add_lora``) use their client helper and report
+        a plain ``bool`` like the diffusion subprocess path. They never return an
+        error dict: ``AsyncOmni._coerce_stage_bool`` reduces a non-empty dict to
+        ``True``, so a failed load would otherwise be reported as success.
         """
         args = tuple(args or ())
         kwargs = dict(kwargs or {})
         client = self.clients[replica_id]
         if client is None:
+            if method in self._TYPED_ARG_ASYNC_METHODS:
+                logger.warning(
+                    "[StagePool] stage=%s replica=%s is not attached; %s reported as failed",
+                    self.stage_id,
+                    replica_id,
+                    method,
+                )
+                return False
             return {
                 "supported": False,
                 "error": f"stage {self.stage_id} replica {replica_id} is not attached",
@@ -1786,6 +1869,29 @@ class StagePool:
                     return await result
                 if method in self._CACHE_RESET_METHODS or method == "release_kv_cache_memory":
                     return {"supported": False, "error": f"EngineCore helper {method}_async is unavailable"}
+
+            if self.stage_type != "diffusion" and method in self._TYPED_ARG_ASYNC_METHODS:
+                # ``add_lora`` carries a LoRARequest dataclass; msgpack turns it
+                # into a list on the generic path and the worker then raises
+                # ``'list' object has no attribute 'lora_int_id'``.
+                # These helpers report a plain bool like the diffusion path, so
+                # every failure returns False: an error dict would be reduced to
+                # True by ``AsyncOmni._coerce_stage_bool`` and report a load
+                # that never happened.
+                client_method = getattr(client, f"{method}_async", None)
+                if not callable(client_method):
+                    logger.warning(
+                        "[StagePool] stage=%s replica=%s does not expose %s_async; %s reported as failed",
+                        self.stage_id,
+                        replica_id,
+                        method,
+                        method,
+                    )
+                    return False
+                result = client_method(*args, **kwargs)
+                if timeout is not None:
+                    return await asyncio.wait_for(result, timeout=timeout)
+                return await result
 
             return await client.collective_rpc_async(
                 method=method,
@@ -1802,6 +1908,10 @@ class StagePool:
             )
             if method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS and method not in self._CACHE_RESET_METHODS:
                 raise
+            if method in self._TYPED_ARG_ASYNC_METHODS:
+                # Same bool contract as above; the reason is in the log line
+                # emitted just above this branch.
+                return False
             if isinstance(exc, TimeoutError):
                 error = f"{type(exc).__name__}: {method} timed out after {timeout}s"
             else:
