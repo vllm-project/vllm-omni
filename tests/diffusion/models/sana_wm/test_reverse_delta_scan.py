@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.models.sana_wm.sana_wm_transformer as sana_wm
+from tests.helpers.mark import hardware_test
 
 pytestmark = [
     pytest.mark.core_model,
@@ -432,7 +433,7 @@ def test_cpu_batched_gradients_match_materialized_scan(skip_z: bool) -> None:
 
 @pytest.mark.parametrize("frames", [1, 2, 4, 21])
 @pytest.mark.parametrize("skip_z", [False, True], ids=["main", "camera"])
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @_CUDA_ONLY
 @torch.inference_mode()
 def test_matches_materialized_scan_at_real_shape_and_strides(
@@ -464,7 +465,7 @@ def test_matches_materialized_scan_at_real_shape_and_strides(
 @pytest.mark.parametrize("layout", ["contiguous", "projected"])
 @pytest.mark.parametrize("mode", ["zeros", "extreme"])
 @pytest.mark.parametrize("skip_z", [False, True], ids=["main", "camera"])
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @_CUDA_ONLY
 @torch.inference_mode()
 def test_matches_zero_and_extreme_inputs(
@@ -489,7 +490,7 @@ def test_matches_zero_and_extreme_inputs(
 
 
 @pytest.mark.parametrize("skip_z", [False, True], ids=["main", "camera"])
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @_CUDA_ONLY
 @torch.inference_mode()
 def test_t1_retains_nonfinite_query_matmuls(skip_z: bool) -> None:
@@ -519,7 +520,7 @@ def test_t1_retains_nonfinite_query_matmuls(skip_z: bool) -> None:
 
 
 @pytest.mark.parametrize("skip_z", [False, True], ids=["main", "camera"])
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @_CUDA_ONLY
 @torch.inference_mode()
 def test_t1_does_not_consume_a_nonexistent_future_source(skip_z: bool) -> None:
@@ -546,7 +547,7 @@ def test_t1_does_not_consume_a_nonexistent_future_source(skip_z: bool) -> None:
         assert torch.count_nonzero(actual[1]) == 0
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @_CUDA_ONLY
 @torch.inference_mode()
 def test_bidirectional_route_hits_direct_reverse_scan_with_original_inputs(mocker) -> None:
