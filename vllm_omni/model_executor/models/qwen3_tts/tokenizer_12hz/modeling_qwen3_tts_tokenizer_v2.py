@@ -1758,17 +1758,24 @@ class Qwen3TTSTokenizerV2Encoder(MimiModel):
         config = copy.deepcopy(config)
         config.decoder_config = None
         super().__init__(config)
+        if not hasattr(self.encoder, "encoder_seanet"):
+            # Flat Mimi constructs the unused decoder unconditionally.
+            self.decoder = None
+            self.decoder_transformer = None
+            self.upsample = None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Speech checkpoints retain Mimi's flat names; Transformers 5.22
         # groups the SEANet, transformer and downsample under the encoder.
-        mapper = WeightsMapper(
-            orig_to_new_prefix={
-                "encoder.layers.": "encoder.encoder_seanet.layers.",
-                "encoder_transformer.": "encoder.encoder_transformer.",
-                "downsample.": "encoder.downsample.",
-            }
-        )
+        mapper = None
+        if hasattr(self.encoder, "encoder_seanet"):
+            mapper = WeightsMapper(
+                orig_to_new_prefix={
+                    "encoder.layers.": "encoder.encoder_seanet.layers.",
+                    "encoder_transformer.": "encoder.encoder_transformer.",
+                    "downsample.": "encoder.downsample.",
+                }
+            )
         return AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
 
 
