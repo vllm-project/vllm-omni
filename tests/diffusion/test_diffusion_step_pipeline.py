@@ -1594,6 +1594,8 @@ class _RecordingLoRAManager:
 def _make_step_worker(lora_manager=None, *, expected_output=None):
     """Build a bare DiffusionWorker primed for execute_stepwise tests."""
     worker = object.__new__(DiffusionWorker)
+    # load_model() resolves this on a real worker; a bare worker would auto-enable FlashInfer autotune on SM100+.
+    worker._flashinfer_autotune_on = False
     worker.lora_manager = lora_manager
     worker._step_lora_state = {}
     output = expected_output if expected_output is not None else RunnerOutput(request_id="req-1")

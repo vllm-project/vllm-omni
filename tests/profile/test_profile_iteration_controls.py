@@ -130,6 +130,8 @@ def test_worker_profile_forwards_controls_and_preserves_default_call(
 def test_diffusion_execution_advances_native_iteration_schedule(execution, mocker):
     profiler = RecordingProfiler()
     worker = object.__new__(DiffusionWorker)
+    # load_model() resolves this on a real worker; a bare worker would auto-enable FlashInfer autotune on SM100+.
+    worker._flashinfer_autotune_on = False
     worker.profiler = profiler
     worker.lora_manager = None
     worker._step_lora_state = {}
