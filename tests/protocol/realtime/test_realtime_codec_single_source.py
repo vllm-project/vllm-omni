@@ -120,7 +120,7 @@ def test_the_duplex_capabilities_reject_unimplemented_turn_detection() -> None:
     # The duplex answer comes from engine.duplex.turn_detection, reached through
     # the capability object rather than imported by the codec.
     rejection = protocol.validate_session_payload(
-        {"turn_detection": {"type": "semantic_vad"}},
+        {"turn_detection": {"type": "foo_vad"}},
         capabilities=duplex_codec.DUPLEX_REALTIME_CAPABILITIES,
     )
 
@@ -148,10 +148,10 @@ _TIER2_EVENTS = (
     "ItemTruncated",
     "ErrorEvent",
 )
-_TIER3_EVENTS = ("Listen", "Speak", "OverlapDecision", "PlaybackAcknowledged", "SessionResumed")
+_TIER3_EVENTS = ("Listen", "Speak", "OverlapDecision", "PlaybackAcknowledged", "SessionResumed", "SessionStats")
 _TIER1_COMMANDS = ("UpdateSession", "CreateItem", "CancelResponse", "ClearInput")
 _TIER2_COMMANDS = ("AppendAudio", "Commit")
-_TIER3_COMMANDS = ("BargeIn", "AckPlayback", "Heartbeat", "SignalTurn", "CloseSession")
+_TIER3_COMMANDS = ("BargeIn", "AckPlayback", "Heartbeat", "SignalTurn", "CloseSession", "GetSessionStats")
 
 
 @pytest.mark.parametrize("name", _TIER1_EVENTS)

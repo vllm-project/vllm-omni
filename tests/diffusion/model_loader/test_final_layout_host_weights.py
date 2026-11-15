@@ -302,6 +302,9 @@ class _FakeH3Attention(nn.Module):
         del kwargs
         super().__init__()
 
+    def add_schedule_candidate_check(self, check: object) -> None:
+        del check
+
 
 class _FakeFluxLinear(_FakeH3Linear):
     def __init__(
@@ -1239,13 +1242,16 @@ def test_reduced_minimax_h3_satisfies_real_tensor_ownership_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 
     monkeypatch.setattr(h3, "ColumnParallelLinear", _FakeH3Linear)
-    monkeypatch.setattr(h3, "MergedColumnParallelLinear", _FakeH3Linear)
-    monkeypatch.setattr(h3, "QKVParallelLinear", _FakeH3Linear)
     monkeypatch.setattr(h3, "RowParallelLinear", _FakeH3Linear)
-    monkeypatch.setattr(h3, "Attention", _FakeH3Attention)
+    monkeypatch.setattr(blocks, "ColumnParallelLinear", _FakeH3Linear)
+    monkeypatch.setattr(blocks, "MergedColumnParallelLinear", _FakeH3Linear)
+    monkeypatch.setattr(blocks, "QKVParallelLinear", _FakeH3Linear)
+    monkeypatch.setattr(blocks, "RowParallelLinear", _FakeH3Linear)
+    monkeypatch.setattr(blocks, "Attention", _FakeH3Attention)
     monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
 
     transformer = h3.MiniMaxH3DiTModel(_small_h3_config(), quant_config=None)

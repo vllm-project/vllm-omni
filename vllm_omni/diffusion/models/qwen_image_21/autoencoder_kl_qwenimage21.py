@@ -19,6 +19,7 @@
 
 
 import functools
+import math
 from contextlib import contextmanager
 
 import torch
@@ -33,6 +34,8 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import logging
 from diffusers.utils.accelerate_utils import apply_forward_hook
 
+from vllm_omni.diffusion.layers.vae_rms_norm import kernels_allowed, rms_norm_fastpath
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 CACHE_T = 2
@@ -46,7 +49,17 @@ def _cudnn_deterministic():
     pressure cuDNN may fall back to workspace-limited or non-deterministic
     algorithms, which makes tiled decode results vary run-to-run on shared
     GPUs. Pinning deterministic algorithms removes that source of variance.
+
+    ``torch.backends.cudnn`` also controls MIOpen convolution policy in ROCm
+    builds. Do not force cuDNN's deterministic policy there: MIOpen does not
+    provide a suitable deterministic algorithm for every Qwen-Image 2.1 VAE
+    shape, and the independent Diffusers reference uses MIOpen's default
+    policy as well.
     """
+    if torch.version.hip is not None:
+        yield
+        return
+
     previous = torch.backends.cudnn.deterministic
     torch.backends.cudnn.deterministic = True
     try:
@@ -197,13 +210,26 @@ class QwenImage21CausalConv3d(nn.Conv2d):
         self.padding = (0, 0)
 
     def forward(self, x, cache_x=None):
-        padding = list(self._padding)
         assert cache_x is None
-        x = x.squeeze(2)  # Remove the temporal dimension
-        x = F.pad(x, padding)
-        x = super().forward(x)
-        x = x.unsqueeze(2)  # Add the temporal dimension back
-        return x
+        x = x.squeeze(2)  # Single-frame tensors have a unit time axis.
+        left, right, top, bottom = self._padding
+        if x.device.type == "npu" and left == right and top == bottom:
+            # Symmetric pad matches Conv2d padding, so skip the extra pad kernel.
+            # Other devices keep the explicit pad: built-in padding selects
+            # different cuDNN BF16 kernels and drifts from the Diffusers reference.
+            x = F.conv2d(
+                x,
+                self.weight,
+                self.bias,
+                self.stride,
+                padding=(top, left),
+                dilation=self.dilation,
+                groups=self.groups,
+            )
+        else:
+            x = F.pad(x, (left, right, top, bottom))
+            x = super().forward(x)
+        return x.unsqueeze(2)
 
 
 class QwenImage21RMS_norm(nn.Module):
@@ -229,12 +255,42 @@ class QwenImage21RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
     def forward(self, x):
+        if kernels_allowed(x):
+            # This VAE uses the same F.normalize + rounded scale/gamma/bias
+            # contract as Wan. Reuse its exact reduction and fused epilogue.
+            output = rms_norm_fastpath(self, x)
+            if output is not None:
+                return output
         needs_fp32_normalize = x.dtype in (torch.float16, torch.bfloat16) or any(
             t in str(x.dtype) for t in ("float4_", "float8_")
         )
-        normalized = F.normalize(x.float() if needs_fp32_normalize else x, dim=(1 if self.channel_first else -1)).to(
-            x.dtype
+        reuse_normalization = (
+            x.device.type == "npu"
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
         )
+        dim = 1 if self.channel_first else -1
+        if reuse_normalization:
+            # The dtype conversion owns this buffer; never overwrite the input.
+            normalized = x.float()
+            denominator = normalized.norm(p=2, dim=dim, keepdim=True).clamp_min_(1e-12)
+            normalized = normalized.div_(denominator).to(x.dtype)
+        else:
+            normalized = F.normalize(x.float() if needs_fp32_normalize else x, dim=dim).to(x.dtype)
+        if (
+            x.device.type == "npu"
+            and normalized.dtype == self.gamma.dtype
+            and (not isinstance(self.bias, torch.Tensor) or self.bias.dtype == normalized.dtype)
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            # Reuse the fresh normalization output, preserving each rounding step.
+            normalized.mul_(self.scale).mul_(self.gamma)
+            # bias=False stores a Python zero, not a trainable tensor.
+            if not isinstance(self.bias, torch.Tensor) and self.bias == 0.0:
+                return normalized
+            return normalized.add_(self.bias)
         return normalized * self.scale * self.gamma + self.bias
 
 
@@ -1219,7 +1275,8 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
         self.tile_sample_min_width = 512
 
         # The minimal distance between two spatial tiles (75% of the tile
-        # size, i.e. 25% overlap)
+        # size, i.e. 25% overlap). At decode time it is an upper bound on the
+        # spacing: the actual starts are spread evenly, see _tile_starts.
         self.tile_sample_stride_height = 384
         self.tile_sample_stride_width = 384
 
@@ -1287,15 +1344,10 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
 
             iter_ = 1 + (num_frame - 1) // 4
             for i in range(iter_):
-                self._enc_conv_idx = [0]
                 if i == 0:
-                    out = self.encoder(x[:, :, :1, :, :], feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
+                    out = self.encoder(x[:, :, :1, :, :])
                 else:
-                    out_ = self.encoder(
-                        x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :],
-                        feat_cache=self._enc_feat_map,
-                        feat_idx=self._enc_conv_idx,
-                    )
+                    out_ = self.encoder(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :])
                     out = torch.cat([out, out_], 2)
 
             return self.quant_conv(out)
@@ -1342,14 +1394,12 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
         self.clear_cache()
         try:
             x = self.post_quant_conv(z)
+            # No feature cache: the 2D causal convs never read it, it would only pin a clone of each conv input.
             for i in range(num_frame):
-                self._conv_idx = [0]
                 if i == 0:
-                    out = self.decoder(
-                        x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=True
-                    )
+                    out = self.decoder(x[:, :, i : i + 1, :, :], first_chunk=True)
                 else:
-                    out_ = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                    out_ = self.decoder(x[:, :, i : i + 1, :, :])
                     out = torch.cat([out, out_], 2)
 
             if self.config.patch_size is not None:
@@ -1391,18 +1441,23 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
 
     def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
         blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
+        # Every tile overlap is at least one cell (see _tile_starts), and an
+        # empty range would leave b untouched, so the window never divides by zero.
         for y in range(blend_extent):
-            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, :, y, :] * (
-                y / blend_extent
-            )
+            # Raised-cosine window: its slope vanishes at both ends, so the
+            # cross-fade does not leave a luma step where it meets a single
+            # tile. A linear ramp does, because its slope jumps there
+            # (vllm-omni#8850).
+            weight = 0.5 - 0.5 * math.cos(math.pi * (y + 0.5) / blend_extent)
+            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (1 - weight) + b[:, :, :, y, :] * weight
         return b
 
     def blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
         blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
         for x in range(blend_extent):
-            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, :, x] * (
-                x / blend_extent
-            )
+            # Raised-cosine window, see blend_v.
+            weight = 0.5 - 0.5 * math.cos(math.pi * (x + 0.5) / blend_extent)
+            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (1 - weight) + b[:, :, :, :, x] * weight
         return b
 
     @_with_cudnn_deterministic
@@ -1444,7 +1499,6 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
                 time = []
                 frame_range = 1 + (num_frames - 1) // 4
                 for k in range(frame_range):
-                    self._enc_conv_idx = [0]
                     if k == 0:
                         tile = x[:, :, :1, i : i + self.tile_sample_min_height, j : j + self.tile_sample_min_width]
                     else:
@@ -1455,7 +1509,7 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
                             i : i + self.tile_sample_min_height,
                             j : j + self.tile_sample_min_width,
                         ]
-                    tile = self.encoder(tile, feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
+                    tile = self.encoder(tile)
                     tile = self.quant_conv(tile)
                     time.append(tile)
                 row.append(torch.cat(time, dim=2))
@@ -1525,6 +1579,33 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
                 self.tile_sample_stride_width,
             ) = saved
 
+    @staticmethod
+    def _tile_starts(size: int, tile_min: int, stride: int) -> list[int]:
+        r"""Start offset of every tile that covers a ``size``-cell axis.
+
+        The starts are spread evenly over ``[0, size - tile_min]``: every tile
+        keeps the full decode window, and each pair of neighbours overlaps by
+        roughly the same amount. ``stride`` is therefore an upper bound on the
+        spacing, not the exact spacing.
+
+        Two layouts are wrong here (vllm-omni#8850). Stepping by ``stride`` until
+        it runs out of axis clips the trailing tile at the border; a tile
+        narrower than ``tile_min`` decodes with less context than its neighbours
+        and leaves a seam the blend cannot hide. Snapping only the trailing tile
+        fixes that but leaves one unusually wide cross-fade and can make the last
+        blend read a region that was already blended.
+        """
+        if size <= tile_min:
+            return [0]
+        span = size - tile_min
+        count = math.ceil(span / stride) + 1  # fewest tiles whose spacing stays <= stride
+        base, extra = divmod(span, count - 1)
+        starts, offset = [0], 0
+        for n in range(count - 1):
+            offset += base + (1 if n < extra else 0)
+            starts.append(offset)
+        return starts
+
     @_with_cudnn_deterministic
     def tiled_decode(self, z: torch.Tensor, return_dict: bool = True) -> DecoderOutput | torch.Tensor:
         r"""
@@ -1548,34 +1629,45 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
         tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
         tile_latent_stride_height = self.tile_sample_stride_height // self.spatial_compression_ratio
         tile_latent_stride_width = self.tile_sample_stride_width // self.spatial_compression_ratio
-        tile_sample_stride_height = self.tile_sample_stride_height
-        tile_sample_stride_width = self.tile_sample_stride_width
         if self.config.patch_size is not None:
             sample_height = sample_height // self.config.patch_size
             sample_width = sample_width // self.config.patch_size
-            tile_sample_stride_height = tile_sample_stride_height // self.config.patch_size
-            tile_sample_stride_width = tile_sample_stride_width // self.config.patch_size
-            blend_height = self.tile_sample_min_height // self.config.patch_size - tile_sample_stride_height
-            blend_width = self.tile_sample_min_width // self.config.patch_size - tile_sample_stride_width
-        else:
-            blend_height = self.tile_sample_min_height - tile_sample_stride_height
-            blend_width = self.tile_sample_min_width - tile_sample_stride_width
 
-        # Split z into overlapping tiles and decode them separately.
-        # The tiles have an overlap to avoid seams between tiles.
+        # Split z into overlapping tiles and decode them separately. The starts
+        # are spread evenly so every tile keeps the full decode window and the
+        # blends stay similar in width (see _tile_starts).
+        starts_height = self._tile_starts(height, tile_latent_min_height, tile_latent_stride_height)
+        starts_width = self._tile_starts(width, tile_latent_min_width, tile_latent_stride_width)
+        # Decoded cells contributed by one latent cell, before unpatchify.
+        cells_per_latent = self.spatial_compression_ratio // (self.config.patch_size or 1)
+        # A tile contributes up to the start of the next one; the trailing tile
+        # contributes the rest and is trimmed by the final crop.
+        keep_height = [
+            (starts_height[n + 1] - starts_height[n]) * cells_per_latent for n in range(len(starts_height) - 1)
+        ]
+        keep_width = [(starts_width[n + 1] - starts_width[n]) * cells_per_latent for n in range(len(starts_width) - 1)]
+        # Neighbours are cross-faded over their real overlap. Snapping the
+        # trailing tile makes that overlap wider than the nominal blend extent,
+        # and blending a fixed extent would mix non-corresponding columns.
+        overlap_height = [
+            (starts_height[n] + tile_latent_min_height - starts_height[n + 1]) * cells_per_latent
+            for n in range(len(starts_height) - 1)
+        ]
+        overlap_width = [
+            (starts_width[n] + tile_latent_min_width - starts_width[n + 1]) * cells_per_latent
+            for n in range(len(starts_width) - 1)
+        ]
+
         rows = []
-        for i in range(0, height, tile_latent_stride_height):
+        for i in starts_height:
             row = []
-            for j in range(0, width, tile_latent_stride_width):
+            for j in starts_width:
                 self.clear_cache()
                 time = []
                 for k in range(num_frames):
-                    self._conv_idx = [0]
                     tile = z[:, :, k : k + 1, i : i + tile_latent_min_height, j : j + tile_latent_min_width]
                     tile = self.post_quant_conv(tile)
-                    decoded = self.decoder(
-                        tile, feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=(k == 0)
-                    )
+                    decoded = self.decoder(tile, first_chunk=(k == 0))
                     time.append(decoded)
                 row.append(torch.cat(time, dim=2))
             rows.append(row)
@@ -1588,10 +1680,12 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
                 # blend the above tile and the left tile
                 # to the current tile and add the current tile to the result row
                 if i > 0:
-                    tile = self.blend_v(rows[i - 1][j], tile, blend_height)
+                    tile = self.blend_v(rows[i - 1][j], tile, overlap_height[i - 1])
                 if j > 0:
-                    tile = self.blend_h(row[j - 1], tile, blend_width)
-                result_row.append(tile[:, :, :, :tile_sample_stride_height, :tile_sample_stride_width])
+                    tile = self.blend_h(row[j - 1], tile, overlap_width[j - 1])
+                keep_h = keep_height[i] if i < len(keep_height) else tile.shape[-2]
+                keep_w = keep_width[j] if j < len(keep_width) else tile.shape[-1]
+                result_row.append(tile[:, :, :, :keep_h, :keep_w])
             result_rows.append(torch.cat(result_row, dim=-1))
         dec = torch.cat(result_rows, dim=3)[:, :, :, :sample_height, :sample_width]
 

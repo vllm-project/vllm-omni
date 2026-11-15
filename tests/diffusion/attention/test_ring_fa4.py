@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -16,7 +17,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 def test_fa4_wrapper_returns_lse_and_normalizes_unbounded_window(monkeypatch):
     expected_out = object()
     expected_lse = object()
-    captured = {}
+    captured: dict[str, Any] = {}
 
     def fake_fa4(q, k, v, **kwargs):
         captured.update(q=q, k=k, v=v, **kwargs)
@@ -48,7 +49,7 @@ def test_fa4_wrapper_returns_lse_and_normalizes_unbounded_window(monkeypatch):
 
 
 def test_ring_prefers_fa4_on_blackwell(monkeypatch):
-    captured = {}
+    captured: dict[str, Any] = {}
 
     def fake_ring_flash_attn_func(*args, **kwargs):
         captured.update(kwargs)
@@ -56,6 +57,7 @@ def test_ring_prefers_fa4_on_blackwell(monkeypatch):
 
     monkeypatch.setattr(ring_parallel, "HAS_FA4", True)
     monkeypatch.setattr(ring_parallel, "HAS_FA3", True)
+    monkeypatch.setattr(ring_parallel, "_can_use_vllm_flash_attn", lambda _device: False)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 3))
 
     from vllm_omni.diffusion.attention.backends import ring_flash_attn

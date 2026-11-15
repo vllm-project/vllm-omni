@@ -35,7 +35,7 @@ WAN22_INIT_TIMEOUT_S = 35 * 60
 # CUDA / ROCm: single card, no extra server_args — behavior unchanged.
 # Skip on NPU, where a single A3 (64 GB HBM) cannot hold Wan2.2-T2V-A14B.
 CUDA_SINGLE_CARD_FEATURE_MARKS = [
-    *hardware_marks(res={"cuda": "H100"}, num_cards=1),
+    *hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1),
     pytest.mark.skipif(
         current_omni_platform.is_npu(),
         reason="CUDA/ROCm single-card path; skip on NPU",

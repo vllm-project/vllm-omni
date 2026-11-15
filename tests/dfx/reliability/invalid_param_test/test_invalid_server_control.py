@@ -25,7 +25,7 @@ _QWEN_IMAGE = [
             server_args=["--enable-sleep-mode"],
         ),
         id="qwen_image",
-        marks=hardware_marks(res={"cuda": "H100"}),
+        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}),
     ),
 ]
 

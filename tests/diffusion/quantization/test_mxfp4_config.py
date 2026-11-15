@@ -1112,7 +1112,9 @@ def test_single_scale_prepares_one_weight_for_both_activation_precisions(online,
     )
     cls = mxfp4_config.NPUMxfp4OnlineLinearMethod if online else mxfp4_config.NPUMxfp4LinearMethod
     method = cls(config, prefix="blocks.0.attn1.to_qkv")
-    layer = torch.nn.Linear(64, 2, bias=False, dtype=torch.bfloat16)
+    # Match create_weights' inference parameters: native replacement preserves
+    # the existing parameter's requires_grad flag when packing integer weights.
+    layer = torch.nn.Linear(64, 2, bias=False, dtype=torch.bfloat16).requires_grad_(False)
     layer.orig_dtype = torch.bfloat16
     if not online:
         layer.register_parameter("weight_scale", torch.nn.Parameter(torch.full((2, 2), 127, dtype=torch.uint8), False))
@@ -1201,3 +1203,14 @@ def test_dualscale_without_fallback_keeps_original_a4_path(online, monkeypatch):
     method.apply(layer, torch.ones(2, 512, dtype=torch.bfloat16))
     assert len(calls) == 1 + int(online)
     torch.testing.assert_close(calls[-1], layer.mul_scale)
+
+
+def test_xpu_online_method_keeps_vllm_weight_lifecycle():
+    """XPU online MXFP4 must not replace vLLM's create_weights (meta-device weight,
+    layer-by-layer quantization); only the 3-D activation reshape is added."""
+    from vllm.model_executor.layers.quantization.online.mxfp4 import Mxfp4OnlineLinearMethod
+
+    from vllm_omni.quantization.mxfp4_config import VllmMxfp4OnlineLinearMethod
+
+    for name in ("create_weights", "process_weights_after_loading"):
+        assert getattr(VllmMxfp4OnlineLinearMethod, name) is getattr(Mxfp4OnlineLinearMethod, name)

@@ -59,10 +59,9 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
   --port 8091
 ```
 
-This profile inherits the default model and stage settings and overrides only
-`session_mode`. It supports ordinary HTTP requests without creating a duplex
-session handler. Mode selection happens at startup; a WebSocket query parameter
-does not switch engines. The Python `Omni` / `AsyncOmni` APIs are unchanged.
+This profile selects the turn engine for ordinary HTTP requests and inherits
+the default CUDA MRv2 Talker with K-step. Mode selection happens at startup.
+WebSocket query parameters cannot switch engines.
 
 !!! warning
 
@@ -75,8 +74,11 @@ does not switch engines. The Python `Omni` / `AsyncOmni` APIs are unchanged.
 **MiniCPM-o 4.5** (`vllm_omni/deploy/minicpmo_4_5.yaml`), **Qwen3-Omni**
 (`vllm_omni/deploy/qwen3_omni_duplex.yaml`), and **Nemotron VoiceChat**
 (`vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml`) are served
-over this endpoint today. PersonaPlex still carries its pre-framework duplex
-code: its pipeline declares no `duplex_plugin`, so it runs turn-based until the
+over this endpoint today. CUDA Qwen3-Omni deployments can use
+`vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml` to run the same duplex session
+on Model Runner V2; non-CUDA platforms in that profile stay on V1. PersonaPlex
+carries its pre-framework duplex code: its pipeline declares no `duplex_plugin`,
+so it runs turn-based until the
 follow-up PR ports it to the plugin contract
 (RFC [vllm-omni#7181](https://github.com/vllm-project/vllm-omni/issues/7181)).
 

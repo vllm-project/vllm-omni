@@ -2,12 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import argparse
 import copy
-import functools
-import json
 import os
 import urllib.request
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import soundfile as sf
@@ -16,6 +13,7 @@ from vllm.multimodal.media.audio import load_audio
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.model_executor.models.cosyvoice3.utils import extract_text_token
+from vllm_omni.utils.profiler import add_profiler_config_arg
 
 # Upstream zero-shot reference clip
 ZERO_SHOT_PROMPT_URL = "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav"
@@ -29,20 +27,6 @@ def _default_ref_audio() -> str:
         urllib.request.urlretrieve(ZERO_SHOT_PROMPT_URL, dest)
 
     return str(dest)
-
-
-def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]:
-    """Parse a CLI value as a JSON object, attributing errors to ``flag_name``."""
-    try:
-        config = json.loads(value)
-    except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"{flag_name} must be valid JSON: {e}") from e
-    if not isinstance(config, dict):
-        raise argparse.ArgumentTypeError(f"{flag_name} must be a JSON object")
-    return config
-
-
-parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
 
 
 def run_e2e():
@@ -79,12 +63,7 @@ def run_e2e():
         required=True,
         help="Path to tokenizer directory (e.g., <model_path>/CosyVoice-BlankEN).",
     )
-    parser.add_argument(
-        "--profiler-config",
-        type=parse_profiler_config,
-        default=None,
-        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
-    )
+    add_profiler_config_arg(parser)
     args = parser.parse_args()
     # Ensure tokenizer directory exists
     if not os.path.exists(args.tokenizer):
