@@ -1537,6 +1537,11 @@ class TestRunner:
         monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _FakeLoader)
         monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _FakeProfiler)
         monkeypatch.setattr(
+            model_runner_module.current_omni_platform,
+            "init_diffusion_model_runner_runtime",
+            MagicMock(return_value=None),
+        )
+        monkeypatch.setattr(
             model_runner_module,
             "enable_offload_backend",
             lambda _config, pipeline, **_kwargs: (pipeline, None),
@@ -1553,6 +1558,9 @@ class _RecordingLoRAManager:
 
     def set_request_adapter(self, adapter, scale: float = 1.0) -> None:
         self.calls.append((adapter, scale))
+
+    def set_request_adapters(self, adapters, scales=1.0) -> None:
+        self.calls.append((adapters, scales))
 
 
 def _make_step_worker(lora_manager=None, *, expected_output=None):

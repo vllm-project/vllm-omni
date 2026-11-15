@@ -154,6 +154,23 @@ Duplex sessions keep their own sampler and are not covered, and platforms
 whose profiles fall back to V1 (NPU, XPU, ROCm, MUSA) do not run this path.
 Greedy text can differ from decoding without drafts at near-tied tokens.
 
+The default single-card and two-card Ascend profiles use synchronous MRv2
+with seven Ngram draft tokens for greedy Thinker requests. The scheduler
+drafts from committed token history and the NPU verifies the drafts. When
+a Thinker decode batch includes non-greedy sampling, MRv2 scheduler Ngram
+skips drafts for that step so sampled requests use the ordinary sampler.
+Native duplex batches use ordinary decoding on both runners so the duplex
+sampler receives one logit row per request. Ascend's `ngram_gpu` proposer uses MRv1
+and the same native duplex guard. Use `ngram` for MRv2.
+
+To disable Thinker Ngram, set `speculative_config: null` for stage 0 under
+`platforms.npu.stages` in a deploy overlay. Use `async_scheduling: true` there
+to restore asynchronous scheduling for ordinary decoding.
+
+The Ascend `minicpmo_4_5_npu_2card.yaml` profile colocates Thinker and
+Talker and gives Code2Wav its own NPU. The `minicpmo_4_5_2gpu.yaml`
+profile gives Thinker its own device and colocates Talker and Code2Wav.
+
 ## Thinker prefix cache with drafts
 
 With a stage-0 `speculative_config` the MRv2 Thinker does not set
