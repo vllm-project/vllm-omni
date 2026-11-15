@@ -78,6 +78,12 @@ predicted frames.
 
 ### Deployment settings
 
+The shipped deployments, `vllm_omni/deploy/praxis1.yaml` (DROID) and
+`vllm_omni/deploy/praxis1_yam.yaml` (YAM), select the pipeline on one GPU and
+carry the `policy_server_config` handshake that the robot-policy servers
+advertise to clients. The worker refuses a handshake that does not match the
+checkpoint.
+
 Set these under `model_config` in a copy of the deployment:
 
 | Setting | Default |
