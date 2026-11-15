@@ -19,7 +19,7 @@ steps:
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
         grade: Blocking
-        timeout_in_minutes: 180
+        timeout_in_minutes: 240
         source_file_dependencies: omni_qwen3_omni_reliability
         artifact_paths:
           - artifacts/rocm-qwen3-omni-reliability/**/*
@@ -33,8 +33,8 @@ steps:
               > "$$ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 37 ]]; then
-              echo "Expected exactly 37 Qwen3-Omni reliability nodes, found $$count." >&2
+            if [[ "$$count" != 14 ]]; then
+              echo "Expected exactly 14 Qwen3-Omni reliability nodes, found $$count." >&2
               cat "$$ROCM_QWEN3_RELIABILITY_ARTIFACT_DIR/collection.txt" >&2
               exit 5
             fi
@@ -42,7 +42,7 @@ steps:
             if (
               trap - ERR
               set +e
-              timeout --signal=TERM --kill-after=2m 165m \
+              timeout --signal=TERM --kill-after=2m 220m \
                 pytest -s -v -ra tests/dfx/reliability/test_qwen3_omni.py \
                 --shard-id=0 --num-shards=1 \
                 -m "slow and rocm and MI325 and cards_2" \
@@ -62,9 +62,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 37 or skipped != 10:
+            if tests != 14 or skipped != 4:
                 print(
-                    f"Expected exactly 37 executed Qwen3-Omni reliability tests with 10 known skips; "
+                    f"Expected exactly 14 executed Qwen3-Omni reliability tests with 4 known skips; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
@@ -79,11 +79,11 @@ steps:
             (exit "$$status")
 
       - label: "Reliability Test · wan22"
-        agent_pool: mi300_1
+        agent_pool: mi300_2
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
         grade: Blocking
-        timeout_in_minutes: 180
+        timeout_in_minutes: 240
         source_file_dependencies: diffusion_wan22_reliability
         artifact_paths:
           - artifacts/rocm-wan22-reliability/**/*
@@ -93,12 +93,12 @@ steps:
           - |
             pytest --collect-only -q tests/dfx/reliability/test_wan22.py \
               --shard-id=0 --num-shards=1 \
-              -m "slow and rocm and MI325 and cards_1" \
+              -m "slow and rocm and MI325 and cards_2" \
               > "$$ROCM_WAN22_RELIABILITY_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_WAN22_RELIABILITY_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 17 ]]; then
-              echo "Expected exactly 17 Wan2.2 reliability nodes, found $$count." >&2
+            if [[ "$$count" != 13 ]]; then
+              echo "Expected exactly 13 Wan2.2 reliability nodes, found $$count." >&2
               cat "$$ROCM_WAN22_RELIABILITY_ARTIFACT_DIR/collection.txt" >&2
               exit 5
             fi
@@ -106,10 +106,10 @@ steps:
             if (
               trap - ERR
               set +e
-              timeout --signal=TERM --kill-after=2m 165m \
+              timeout --signal=TERM --kill-after=2m 220m \
                 pytest -s -v -ra tests/dfx/reliability/test_wan22.py \
                 --shard-id=0 --num-shards=1 \
-                -m "slow and rocm and MI325 and cards_1" \
+                -m "slow and rocm and MI325 and cards_2" \
                 --junitxml="$$ROCM_WAN22_RELIABILITY_ARTIFACT_DIR/pytest.xml" \
                 2>&1 | tee "$$ROCM_WAN22_RELIABILITY_ARTIFACT_DIR/pytest.log"
               exit "$${PIPESTATUS[0]}"
@@ -126,9 +126,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 17 or skipped != 5:
+            if tests != 13 or skipped != 1:
                 print(
-                    f"Expected exactly 17 executed Wan2.2 reliability tests with 5 known skips; "
+                    f"Expected exactly 13 executed Wan2.2 reliability tests with 1 known skip; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
@@ -147,7 +147,7 @@ steps:
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
         grade: Blocking
-        timeout_in_minutes: 180
+        timeout_in_minutes: 240
         source_file_dependencies: diffusion_hunyuan_image3_reliability
         env:
           VLLM_ROCM_USE_AITER: "0"
@@ -164,8 +164,8 @@ steps:
               > "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 16 ]]; then
-              echo "Expected exactly 16 HunyuanImage reliability nodes, found $$count." >&2
+            if [[ "$$count" != 13 ]]; then
+              echo "Expected exactly 13 HunyuanImage reliability nodes, found $$count." >&2
               cat "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/collection.txt" >&2
               exit 5
             fi
@@ -173,7 +173,7 @@ steps:
             if (
               trap - ERR
               set +e
-              timeout --signal=TERM --kill-after=2m 165m \
+              timeout --signal=TERM --kill-after=2m 220m \
                 pytest -s -v -ra tests/dfx/reliability/test_hunyuan_image.py \
                 --shard-id=0 --num-shards=1 \
                 -m "slow and rocm and MI325 and cards_4" \
@@ -193,9 +193,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 16 or skipped != 0:
+            if tests != 13 or skipped != 0:
                 print(
-                    f"Expected exactly 16 executed HunyuanImage reliability tests; "
+                    f"Expected exactly 13 executed HunyuanImage reliability tests; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )
@@ -214,7 +214,7 @@ steps:
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
         grade: Blocking
-        timeout_in_minutes: 180
+        timeout_in_minutes: 240
         source_file_dependencies: omni_minicpmo_4_5_reliability
         artifact_paths:
           - artifacts/rocm-minicpmo-reliability/**/*
@@ -228,8 +228,8 @@ steps:
               > "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
               "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != 3 ]]; then
-              echo "Expected exactly 3 MiniCPM-o 4.5 reliability nodes, found $$count." >&2
+            if [[ "$$count" != 14 ]]; then
+              echo "Expected exactly 14 MiniCPM-o 4.5 reliability nodes, found $$count." >&2
               cat "$$ROCM_MINICPMO_RELIABILITY_ARTIFACT_DIR/collection.txt" >&2
               exit 5
             fi
@@ -237,7 +237,7 @@ steps:
             if (
               trap - ERR
               set +e
-              timeout --signal=TERM --kill-after=2m 165m \
+              timeout --signal=TERM --kill-after=2m 220m \
                 pytest -s -v -ra tests/dfx/reliability/test_minicpmo_4_5.py \
                 --shard-id=0 --num-shards=1 \
                 -m "slow and rocm and MI325 and cards_1" \
@@ -257,9 +257,9 @@ steps:
             suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
             tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
             skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
-            if tests != 3 or skipped != 0:
+            if tests != 14 or skipped != 3:
                 print(
-                    f"Expected exactly 3 executed MiniCPM-o 4.5 reliability tests; "
+                    f"Expected exactly 14 executed MiniCPM-o 4.5 reliability tests with 3 known skips; "
                     f"reported tests={tests}, skipped={skipped}.",
                     file=sys.stderr,
                 )

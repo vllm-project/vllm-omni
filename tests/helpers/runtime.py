@@ -193,8 +193,13 @@ class OmniServer:
         env_dict: dict[str, str] | None = None,
         use_omni: bool = True,
         startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
+        wait_for_device_memory: bool = True,
     ) -> None:
-        cleanup_test_environment()
+        self.wait_for_device_memory = wait_for_device_memory
+        if self.wait_for_device_memory:
+            cleanup_test_environment()
+        else:
+            cleanup_test_environment(wait_for_device_memory=False)
         self.startup_timeout = startup_timeout
         self.model = model
         self.serve_args = list(serve_args)
@@ -516,7 +521,10 @@ class OmniServer:
             if self._port_lock is not None:
                 self._port_lock.release()
                 self._port_lock = None
-            cleanup_test_environment()
+            if self.wait_for_device_memory:
+                cleanup_test_environment()
+            else:
+                cleanup_test_environment(wait_for_device_memory=False)
 
 
 class OmniServerStageCli(OmniServer):
