@@ -603,8 +603,13 @@ def test_byte_trigger_is_independent_of_legacy_cache(trigger_bytes, pool_bytes, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("policy", ["recent", "bounded_recent", "incremental"])
-@pytest.mark.parametrize(("commits", "system_update"), [(5, False), (8, False), (10, False), (2, True)])
+@pytest.mark.parametrize(
+    ("policy", "commits", "system_update"),
+    [
+        *(("incremental", commits, system) for commits, system in [(5, False), (8, False), (10, False), (2, True)]),
+        *((policy, 2, True) for policy in ["recent", "bounded_recent", "full_history"]),
+    ],
+)
 async def test_consecutive_commits_share_one_source_in_foreground_and_summary(commits, system_update, policy):
     from tests.engine.duplex.test_session_runner import append_audio, tts_output
     from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen

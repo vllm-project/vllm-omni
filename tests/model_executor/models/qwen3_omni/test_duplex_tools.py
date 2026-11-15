@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
@@ -519,6 +520,7 @@ def _tool_call_id_from_turn(turn: dict[str, object]) -> str | None:
 
 def test_expired_id_window_advances_in_order_through_reconcile():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "prompt")
     live = [f"e{index}" for index in range(1, 65)]
     plan = plugin.plan_append(
@@ -557,6 +559,7 @@ def test_expired_id_window_advances_in_order_through_reconcile():
 
 def test_yield_expiries_stay_ahead_of_ids_the_snapshot_already_evicted():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "prompt")
     snapshot = [f"e{index}" for index in range(1, 65)]
     plan = plugin.plan_append(
@@ -618,6 +621,7 @@ def test_stream_and_session_close_drop_thinker_cursors():
 
 def test_call_anchors_older_than_the_prompt_window_are_dropped():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "prompt")
     published = plugin.note_published_function_call({}, call_id="call_old", history_len=1)
     assert published is not None
@@ -677,6 +681,7 @@ def test_call_anchors_older_than_the_prompt_window_are_dropped():
 
 def test_expired_call_ids_keep_only_the_newest_window():
     plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.configure_server(DuplexSessionRuntimeConfig(model_custom_options={"history_policy": "recent"}))
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "prompt")
     oldest = [f"call_{index:03d}" for index in range(64)]
     conversation = [{"role": "user", "content": f"q{index}"} for index in range(20)]

@@ -31,10 +31,11 @@ from vllm_omni.engine.duplex.plugin import (
     DuplexAuxiliaryPolicy,
     DuplexAuxiliaryRequest,
     DuplexDataPlane,
+    DuplexInputCapacityError,
     DuplexModelPlugin,
     DuplexRuntimeConfigError,
 )
-from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import Message
+from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import DEFAULT_HISTORY_POLICY, Message
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_runtime import HISTORY_PROMPT, QwenHistoryRuntime
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
@@ -53,10 +54,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-#: Mirrors ``limit_mm_per_prompt.image`` in ``deploy/qwen3_omni_duplex.yaml``.
-#: The session already refuses a ninth stored image, but that budget lives in
-#: the engine and this one in the deploy config; the prompt is the only place
-#: that can keep them from drifting apart into a rejected submission.
+#: Legacy recent-policy clipping cap, matching the base deployment profile.
+#: Full history uses resolved model limits and rejects overflow without trimming.
 MAX_PROMPT_IMAGES = 8
 # Same window ``prepare_prompt_config`` keeps. Anchors older than this cannot
 # still point at a message the next prompt will retain.
@@ -84,15 +83,17 @@ def _anchored_history_len(
     return 0
 
 
-def _split_call_anchors(anchors: Mapping[str, object], *, history_len: int) -> tuple[dict[str, int], list[str]]:
-    """Keep anchors inside the prompt window. The rest were published and expired."""
-    floor = history_len - _TOOL_ANCHOR_WINDOW
+def _split_call_anchors(
+    anchors: Mapping[str, object], *, history_len: int, window: int | None = _TOOL_ANCHOR_WINDOW
+) -> tuple[dict[str, int], list[str]]:
+    """Expire anchors outside the window; None retains all pending positions."""
+    floor = history_len - window if window is not None else None
     kept: dict[str, int] = {}
     expired: list[str] = []
     for key, value in anchors.items():
         if not isinstance(key, str):
             continue
-        if isinstance(value, int) and value > floor:
+        if isinstance(value, int) and (floor is None or value > floor):
             kept[key] = value
         else:
             expired.append(key)
@@ -356,7 +357,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         self.processor = None
         self._processor_lock = asyncio.Lock()
         self._history_calibrator = None
-        self._history_runtime = QwenHistoryRuntime("recent", {})
+        self._history_runtime = QwenHistoryRuntime(DEFAULT_HISTORY_POLICY, {})
         self._history_configuration = None
         # Checkpoint speaker names, loaded once from the stage-0 model config.
         # ``None`` means "not attempted" (no validation); an empty set means the
@@ -366,7 +367,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     def configure_server(self, runtime_config: DuplexSessionRuntimeConfig) -> None:
         """Load trusted server history settings before binding the model processor."""
         custom_options = dict(runtime_config.model_custom_options)
-        policy_name = custom_options.pop("history_policy", "recent")
+        policy_name = custom_options.pop("history_policy", DEFAULT_HISTORY_POLICY)
         history_limits = custom_options.pop("history_limits", {})
         if custom_options or not isinstance(policy_name, str) or not isinstance(history_limits, dict):
             raise DuplexRuntimeConfigError("Invalid Qwen server model_custom_options")
@@ -375,6 +376,11 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         self._history_runtime = QwenHistoryRuntime(policy_name, history_limits)
         self._history_configuration = (policy_name, dict(history_limits))
         self.supports_auxiliary_requests = self._history_runtime.policy is not None
+
+    @property
+    def _tool_anchor_window(self) -> int | None:
+        """Pending calls expire by position only under the legacy window."""
+        return None if self._history_runtime.full_history else _TOOL_ANCHOR_WINDOW
 
     @property
     def uses_history_context(self) -> bool:
@@ -420,7 +426,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         return self._history_runtime.apply(state.history_policy_state, request, output)
 
     def image_history_limits(self) -> tuple[int, int]:
-        if self._history_runtime.policy is None:
+        if self._history_runtime.policy is None and not self._history_runtime.full_history:
             return super().image_history_limits()
         limits = self._history_runtime.limits
         return limits.max_session_images, limits.max_session_image_bytes
@@ -456,7 +462,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         self, *, stage_id: int, runtime_config: DuplexSessionRuntimeConfig
     ) -> DuplexContextViewPolicy | None:
         # Only the Thinker (stage 0) formats conversation history.
-        if stage_id != 0 or runtime_config.context_keep_media_turns is None:
+        if self._history_runtime.full_history or stage_id != 0 or runtime_config.context_keep_media_turns is None:
             return None
         return DuplexContextViewPolicy(keep_media_user_turns=runtime_config.context_keep_media_turns)
 
@@ -535,7 +541,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                     trust_remote_code=model_config.trust_remote_code,
                     revision=getattr(model_config, "revision", None),
                 )
-        if self._history_runtime.policy is not None:
+        if self._history_runtime.full_history or self._history_runtime.policy is not None:
             self._history_runtime.bind(self.processor, model_config)
         return self.runtime_config_for_update(config, {})
 
@@ -587,7 +593,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         anchors = updated.get("qwen_call_anchors")
         copied = dict(anchors) if isinstance(anchors, Mapping) else {}
         copied[call_id] = history_len
-        kept, expired = _split_call_anchors(copied, history_len=history_len)
+        kept, expired = _split_call_anchors(copied, history_len=history_len, window=self._tool_anchor_window)
         updated["qwen_call_anchors"] = kept
         _remember_expired(updated, expired)
         return updated
@@ -936,7 +942,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             }
             expired: list[str] = []
             if receipt_len is not None:
-                kept, expired = _split_call_anchors(kept, history_len=receipt_len)
+                kept, expired = _split_call_anchors(kept, history_len=receipt_len, window=self._tool_anchor_window)
             _remember_expired(updated, expired)
             if kept:
                 updated["qwen_call_anchors"] = kept
@@ -961,7 +967,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     ) -> dict[str, object]:
         """Capture effective input on the session loop before offloading rendering."""
         if self._history_runtime.policy is None:
-            return self._prepare_recent_prompt_config(config, state=state, payload=payload)
+            return self._prepare_original_prompt_config(config, state=state, payload=payload)
         self._history_runtime.validate_history(config.get("conversation", ()))
         previous_audio = list(state.audio_history)
         self._bind_audio_history(config, state=state, payload=payload)
@@ -972,6 +978,162 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         logger.debug("Qwen history memory counts=%s retained_audio_bytes=%d", dict(memory.counts), memory.audio_bytes)
         return {**config, HISTORY_PROMPT: prompt}
 
+    @staticmethod
+    def _select_full_audio_sources(
+        payload: dict[str, object], item_ids: set[str]
+    ) -> tuple[dict[str, object], tuple[str, ...]] | None:
+        """Select committed PCM segments by engine-owned item provenance.
+
+        None means provenance is absent. A known but deleted input returns no
+        sources, so it must never be appended again as anonymous current audio.
+        """
+        segments = payload.get("committed_audio_segments")
+        if segments is None:
+            item_id = payload.get("realtime_item_id")
+            if not isinstance(item_id, str):
+                return None
+            return (payload, (item_id,)) if item_id in item_ids else ({}, ())
+        if (
+            not isinstance(segments, list)
+            or not segments
+            or any(
+                not isinstance(segment, dict)
+                or not isinstance(segment.get("item_id"), str)
+                or type(segment.get("byte_count")) is not int
+                or segment["byte_count"] <= 0
+                or segment["byte_count"] % 4
+                for segment in segments
+            )
+        ):
+            raise DuplexInputCapacityError("Full history audio has invalid committed-source boundaries")
+        kept = [segment for segment in segments if segment["item_id"] in item_ids]
+        if not kept:
+            return {}, ()
+        source_ids = tuple(dict.fromkeys(segment["item_id"] for segment in kept))
+        if len(kept) == len(segments):
+            return payload, source_ids
+        raw = base64.b64decode(payload["audio"], validate=True)
+        if sum(segment["byte_count"] for segment in segments) != len(raw):
+            raise DuplexInputCapacityError("Full history audio does not match its committed-source boundaries")
+        chunks, offset = [], 0
+        for segment in segments:
+            end = offset + segment["byte_count"]
+            if segment["item_id"] in item_ids:
+                chunks.append(raw[offset:end])
+            offset = end
+        return {
+            **payload,
+            "audio": base64.b64encode(b"".join(chunks)).decode("ascii"),
+            "committed_audio_segments": kept,
+            "realtime_item_id": source_ids[-1],
+        }, source_ids
+
+    def on_history_item_deleted(self, *, state: QwenDuplexSessionState, item_id: str) -> int:
+        """Remove deleted idle commits before a reused item ID can merge with them."""
+        if not self._history_runtime.full_history or state.committed_audio_consume_started:
+            return 0
+        payload = state.committed_audio_payload
+        if payload is None:
+            return 0
+        segments = payload.get("committed_audio_segments")
+        source_ids = (
+            {
+                segment["item_id"]
+                for segment in segments
+                if isinstance(segment, dict) and isinstance(segment.get("item_id"), str)
+            }
+            if isinstance(segments, list)
+            else {payload.get("realtime_item_id")}
+        )
+        if item_id not in source_ids:
+            return 0
+        selected = self._select_full_audio_sources(
+            payload, {value for value in source_ids if isinstance(value, str) and value != item_id}
+        )
+        if selected is None:
+            return 0
+        retained, ids = selected
+        if not ids:
+            return state.clear_committed_audio()
+        old_bytes = state.committed_audio_reserved_bytes
+        kept_bytes = sum(segment["byte_count"] for segment in retained["committed_audio_segments"])
+        # A queued append may already own this exact dictionary. Preserve its
+        # compare-before-clear identity while the idle source data is updated.
+        payload.clear()
+        payload.update(retained)
+        state.committed_audio_reserved_bytes = min(old_bytes, kept_bytes)
+        return old_bytes - state.committed_audio_reserved_bytes
+
+    def _bind_full_audio_history(
+        self, config: dict[str, object], *, state: QwenDuplexSessionState, payload: dict[str, object]
+    ) -> bool:
+        """Retain live originals and bind only the commits in this payload."""
+        history = config.get("conversation", [])
+        source_ids = config.get("conversation_item_ids", ())
+        live = {id(message.get("content")) for message in history}
+        by_item = {
+            item_id: message["content"]
+            for message, item_id in zip(history, source_ids)
+            if isinstance(item_id, str)
+            and message.get("role") == "user"
+            and isinstance(message.get("content"), list)
+            and any(part.get("type") == "audio_url" for part in message["content"])
+        }
+        retained = []
+        for keys, value in state.audio_history:
+            surviving = tuple(key for key in keys if id(key) in live)
+            if not surviving:
+                continue
+            if len(surviving) != len(keys):
+                allowed = {item_id for item_id, content in by_item.items() if any(content is key for key in surviving)}
+                selected = self._select_full_audio_sources(value, allowed)
+                if selected is None or not selected[1]:
+                    raise DuplexInputCapacityError("Cannot separate a deleted audio source without commit provenance")
+                value, ids = selected
+                surviving = tuple(by_item[item_id] for item_id in ids)
+            retained.append((surviving, value))
+        state.audio_history = retained
+        if not payload.get("audio"):
+            return False
+        has_source_ids = isinstance(config.get("conversation_item_ids"), (list, tuple)) and len(source_ids) == len(
+            history
+        )
+        selected = self._select_full_audio_sources(payload, set(by_item)) if has_source_ids else None
+        if selected is not None:
+            value, ids = selected
+            keys = tuple(by_item[item_id] for item_id in ids)
+            if not keys:
+                return True  # All known current sources were explicitly deleted.
+        else:
+            pending = [
+                message["content"]
+                for message in history[unanswered_turn_start(history) :]
+                if message.get("role") == "user"
+                and isinstance(message.get("content"), list)
+                and any(part.get("type") == "audio_url" for part in message["content"])
+            ]
+            keys = tuple(
+                content
+                for content in pending
+                if not any(content is old for old_keys, _ in retained for old in old_keys)
+            )
+            if not keys:
+                if any(value.get("audio") == payload["audio"] for _, value in retained):
+                    return True
+                if pending:
+                    raise DuplexInputCapacityError(
+                        "Full history cannot rebind retained audio without commit provenance"
+                    )
+                return False
+            value = payload
+        state.audio_history = [
+            (old_keys, old_value)
+            for old_keys, old_value in retained
+            if not any(key is old for key in keys for old in old_keys)
+        ]
+        state.audio_history.append((keys, value))
+        return True
+
     def _bind_audio_history(
         self, config: dict[str, object], *, state: QwenDuplexSessionState, payload: dict[str, object]
     ) -> bool:
@@ -980,6 +1142,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         Return whether the submitted audio has source items in Session history.
         Prompt selection is performed separately by each history policy.
         """
+        if self._history_runtime.full_history:
+            return self._bind_full_audio_history(config, state=state, payload=payload)
         history = config.get("conversation", [])
         bind_from = 0
         lengths = []
@@ -1032,19 +1196,19 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         state.audio_history = retained
         return current_is_in_history
 
-    def _prepare_recent_prompt_config(self, config, *, state, payload):
+    def _prepare_original_prompt_config(self, config, *, state, payload):
+        """Prepare raw source items; only explicit recent enables legacy clipping."""
         current_is_in_history = self._bind_audio_history(config, state=state, payload=payload)
         history = config.get("conversation", [])
         # Formatting may read the L1 view; audio binding stays on ``history``.
         view = config.get("conversation_view")
-        if not isinstance(view, list) or len(view) != len(history):
+        if self._history_runtime.full_history or not isinstance(view, list) or len(view) != len(history):
             view = None
         current_turn_start = unanswered_turn_start(history)
         has_audio = bool(payload.get("audio"))
         retained = state.audio_history
-        # Match the official demo's unit of history: consecutive user items
-        # followed by their assistant reply(s). Prune whole turns, before
-        # formatting, so a camera item cannot rescue an orphaned answer.
+        # The recent policy clips these legacy groups before formatting.
+        # Full history traverses every group, including assistant-only records.
         turns = []
         for index, message in enumerate(history):
             role = message.get("role")
@@ -1055,11 +1219,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         messages = []
         included_audio = set()
         for index, turn in turns:
-            # Keep the existing recent-message window, rounded outwards to a
-            # complete turn. Never retain an answer whose input was cut off.
-            if index + len(turn) <= len(history) - 16:
+            # Only explicit recent uses the legacy complete-group window.
+            if not self._history_runtime.full_history and index + len(turn) <= len(history) - 16:
                 continue
-            if turn[0].get("role") == "assistant":
+            if not self._history_runtime.full_history and turn[0].get("role") == "assistant":
                 continue
             resolved = []
             turn_audio = set()
@@ -1077,6 +1240,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                             (entry for entry in retained if any(key is source_content for key in entry[0])), None
                         )
                         if binding is None:
+                            if self._history_runtime.full_history:
+                                raise DuplexInputCapacityError(
+                                    "Full history contains an unavailable audio source; restore or delete its item"
+                                )
                             # The clip left the audio slots. Keep the turn as
                             # the view's text instead of dropping it.
                             text = [] if view is None else self._view_text_parts(view[src])
@@ -1272,6 +1439,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             # preparation ran and found nothing to say.
             history = [{"role": "user", "audio_payload": payload}]
         if not history:
+            if self._history_runtime.full_history:
+                raise DuplexInputCapacityError(
+                    "Full history has no effective input after source deletion", code="response_create_without_input"
+                )
             raise DuplexRuntimeConfigError("Qwen generation requires committed audio or conversation history")
         # A pair still in flight belongs to a response whose answer is not in
         # history yet. Put it back on the waiting list so this prompt uses the
@@ -1310,7 +1481,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             content, audio = self._audio_content(message["audio_payload"])
             audios.append((audio, 16000))
             rendered.append({"role": "user", "content": content})
-        rendered, images = self._trim_prompt_images(rendered, images)
+        if not self._history_runtime.full_history:
+            rendered, images = self._trim_prompt_images(rendered, images)
         messages.extend(self.format_history(rendered))
         tools = chat_template_tools(runtime_config.get("qwen_tools"))
         if not tools:
@@ -1321,6 +1493,13 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         if tools:
             template_kwargs["tools"] = tools
         prompt = self.processor.apply_chat_template(messages, **template_kwargs)
+        if self._history_runtime.full_history:
+            self._history_runtime.validate_full_prompt(
+                prompt,
+                [audio for audio, _ in audios],
+                images,
+                output_tokens=getattr(sampling_params, "max_tokens", None) or 2048,
+            )
         mm = {"audio": audios} if audios else {}
         if images:
             mm["image"] = images
@@ -1368,7 +1547,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         anchors = runtime_config.get("qwen_call_anchors")
         if isinstance(conversation, list) and isinstance(anchors, Mapping):
             # Drop anchors whose user turn has already left the prompt window.
-            kept_anchors, expired_anchors = _split_call_anchors(anchors, history_len=len(conversation))
+            kept_anchors, expired_anchors = _split_call_anchors(
+                anchors, history_len=len(conversation), window=self._tool_anchor_window
+            )
             prompt_payload["_qwen_call_anchors"] = kept_anchors
             if expired_anchors:
                 expired_state: dict[str, object] = {

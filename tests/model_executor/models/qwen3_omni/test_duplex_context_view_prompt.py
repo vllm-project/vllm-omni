@@ -49,7 +49,9 @@ async def _open(keep: int | None) -> Harness:
         auto_response=False,
         stage_count=3,
         modalities=("text",),
-        runtime_config=DuplexSessionRuntimeConfig(context_keep_media_turns=keep),
+        runtime_config=DuplexSessionRuntimeConfig(
+            context_keep_media_turns=keep, model_custom_options={"history_policy": "recent"}
+        ),
     )
 
 

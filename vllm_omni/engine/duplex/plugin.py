@@ -520,6 +520,14 @@ class DuplexModelPlugin(ABC):
         """Plan bounded background work from committed text; default opt-out."""
         return None
 
+    def on_history_item_deleted(self, *, state: DuplexModelSessionState, item_id: str) -> int:
+        """Release idle model input after source deletion; return reserved bytes freed.
+
+        Called synchronously on the Session owner after a user item is removed.
+        In-flight input remains owned by its append until that operation settles.
+        """
+        return 0
+
     def image_history_limits(self) -> tuple[int, int]:
         """Maximum stored image count and encoded URL bytes in Session records.
 

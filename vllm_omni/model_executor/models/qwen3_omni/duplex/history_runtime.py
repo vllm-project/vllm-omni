@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Qwen rendering and source checks for SessionMemoryRuntime requests."""
+"""Qwen original-history capacity checks and bounded-history request rendering."""
 
 from __future__ import annotations
 
@@ -12,14 +12,21 @@ from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
 import numpy as np
 import pybase64
+from PIL import Image
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
-from vllm_omni.engine.duplex.plugin import DuplexAuxiliaryPolicy, DuplexAuxiliaryRequest, DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.plugin import (
+    DuplexAuxiliaryPolicy,
+    DuplexAuxiliaryRequest,
+    DuplexInputCapacityError,
+    DuplexRuntimeConfigError,
+)
 from vllm_omni.engine.duplex.session.visual_history import VisualWork
 from vllm_omni.engine.duplex.text_folding import fit_text_excerpt
 from vllm_omni.engine.duplex.visual_memory import EncodedVisualImage, VisualFrame, VisualSummary
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
+    DEFAULT_HISTORY_POLICY,
     AudioEntry,
     CompressionAudioRef,
     CompressionImageRef,
@@ -103,6 +110,7 @@ class QwenHistoryRuntime:
 
     def __init__(self, name: str, options: Mapping[str, object]) -> None:
         """Load the configured strategy and reject invalid resource limits."""
+        self.full_history = name == DEFAULT_HISTORY_POLICY
         self.policy = load_history_policy(name)
         self.limits = HistoryLimits(**dict(options))
         self.processor: ProcessorMixin | None = None
@@ -117,8 +125,10 @@ class QwenHistoryRuntime:
             self.max_model_len = int(model_config.max_model_len)
             mm = getattr(model_config, "multimodal_config", None)
             if mm is not None:
-                self.max_audio = min(4, mm.get_limit_per_prompt("audio"))
-                self.max_images = min(8, mm.get_limit_per_prompt("image"))
+                audio_limit = mm.get_limit_per_prompt("audio")
+                image_limit = mm.get_limit_per_prompt("image")
+                self.max_audio = audio_limit if self.full_history else min(4, audio_limit)
+                self.max_images = image_limit if self.full_history else min(8, image_limit)
         if self.limits.max_context_tokens is not None:
             self.max_model_len = min(self.max_model_len, self.limits.max_context_tokens)
         if self.policy is not None and self.max_model_len <= self.limits.summary_tokens:
@@ -288,22 +298,49 @@ class QwenHistoryRuntime:
         # Use the model processor's expanded audio tokens, not the single
         # placeholder token. Run in a worker: feature extraction is CPU work.
         decoded_images = [decode_image(value) if isinstance(value, str) else value.decode() for value in images]
-        if audios or decoded_images:
-            media = {}
-            if audios:
-                media["audio"] = audios
-            if decoded_images:
-                media["images"] = decoded_images
-            processed = self.processor(text=[prompt], **media, return_tensors="np")
-            count = len(processed["input_ids"][0])
-        else:
-            count = len(self.processor.tokenizer(text=[prompt])["input_ids"][0])
+        count = self._input_tokens(prompt, audios, decoded_images)
         mm = {}
         if audios:
             mm["audio"] = [(a, 16000) for a in audios]
         if decoded_images:
             mm["image"] = decoded_images
         return {"prompt": prompt, "multi_modal_data": mm}, count
+
+    def _input_tokens(self, prompt: str, audio: Sequence[np.ndarray], images: Sequence[Image.Image]) -> int:
+        """Count the exact rendered template and processor-expanded media."""
+        assert self.processor is not None
+        if audio or images:
+            media = {}
+            if audio:
+                media["audio"] = audio
+            if images:
+                media["images"] = images
+            processed = self.processor(text=[prompt], **media, return_tensors="np")
+            return len(processed["input_ids"][0])
+        return len(self.processor.tokenizer(text=[prompt])["input_ids"][0])
+
+    def validate_full_prompt(
+        self, prompt: str, audio: Sequence[np.ndarray], images: Sequence[Image.Image], *, output_tokens: int
+    ) -> None:
+        """Reject the entire input instead of clipping sources to satisfy capacity.
+
+        Uses the resolved deployment limits. Direct plugin users without a bound
+        model configuration still receive the downstream engine's context check.
+        """
+        if self.max_model_len <= 0:
+            return  # No resolved capacity for direct plugin users; the engine validates it.
+        if len(audio) > self.max_audio or len(images) > self.max_images:
+            raise DuplexInputCapacityError(
+                f"Full history has {len(audio)} audio inputs and {len(images)} images; "
+                f"request limits are {self.max_audio} audio inputs and {self.max_images} images. "
+                "Delete source items or select an explicit history policy."
+            )
+        count = self._input_tokens(prompt, audio, images)
+        if count + output_tokens > self.max_model_len:
+            raise DuplexInputCapacityError(
+                f"Full history context needs {count} input tokens and {output_tokens} reserved output tokens; "
+                f"the context limit is {self.max_model_len}. Delete source items or select a history policy."
+            )
 
     def build_foreground(self, context: HistoryPrompt, runtime: Mapping[str, object], output_tokens: int) -> dict:
         """Fit old turns behind current input and report clipping once per build.
@@ -526,6 +563,8 @@ class QwenHistoryRuntime:
         for start, end in turn_ranges(state.history):
             if end <= work.start:
                 continue
+            # A later assistant item can extend an already summarized turn.
+            # Count only its unprocessed suffix, never the published prefix.
             start = max(start, work.start)
             if self.limits.recent_tokens is None and end > work.end:
                 break

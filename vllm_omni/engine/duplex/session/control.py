@@ -527,7 +527,7 @@ class SessionControl:
             session.register_history_item(item_id if isinstance(item_id, str) else None, message)
             if message.get("role") == "user":
                 # A later response.create may answer this without any audio.
-                session.notify_new_user_item()
+                session.notify_new_user_item(message)
         self._out.emit(
             {
                 "type": "conversation.item.created",

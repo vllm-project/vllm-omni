@@ -100,9 +100,53 @@ without calibration release stopped output immediately.
 
 ## Experimental Qwen history policy
 
-Qwen can opt into a bounded history policy through server-owned
-`duplex_session.model_custom_options`. `recent` preserves the default clipping path;
-`bounded_recent` provides an equal-context/media-budget clipping control;
+Qwen defaults to `full_history` when `history_policy` is omitted from server-owned
+`duplex_session.model_custom_options`. It sends all effective Session messages and
+retained original input audio/images, without a recent-message window, automatic
+summaries, media substitution or oldest-first eviction. Source deletion and
+playback calibration still determine the effective Session records.
+
+| `history_policy` | Model input | Capacity behavior |
+| --- | --- | --- |
+| `full_history` (default) | All effective original messages and media. | Reject the request if the complete input plus reserved output exceeds resolved token or per-request media limits. |
+| `recent` | The legacy 16-message window and bounded input-audio cache. | Preserve the previous clipping behavior. |
+| `bounded_recent` | Recent complete turns under the configured context/media budget. | Remove older turns until the request fits. |
+| `incremental` | Published memory plus selected uncompressed turns. | Compress older sources and fit the foreground request to budget. |
+
+The default now changes from `recent` to `full_history`. Deployments that need the
+previous bounded window must explicitly set `history_policy: recent`. Full-history
+requests preserve system-message order and the existing tool-call protocol. They
+keep pending tool-call anchors beyond the legacy 16-message window. Full history
+uses original sources even when `context_keep_media_turns` is configured; select
+`recent` to use that policy's media-dropped view.
+
+The plugin validates processor-expanded input tokens and the reserved foreground
+output against the resolved context limit, including `max_context_tokens` when
+configured. It uses the deployment's per-request audio/image counts. Overflow
+raises a recoverable `input_capacity_exceeded` error without submitting a partial
+request or deleting history. Clients can delete source items and retry. Session
+input-admission limits still reject additional material before it is accepted.
+The base deployment permits four audio inputs and eight images per request;
+full history does not raise these deployment limits automatically. Direct plugin
+calls without a resolved model configuration leave validation to the downstream
+engine.
+
+Session-owned input readiness records authoritative history source IDs, including
+rejected requests; unbound seed text keeps its existing notification count.
+Deleting/recreating an item cannot rearm its old identity, while transcript
+corrections retain that identity. Text and speech arriving during preparation
+remain independently pending. The model deletion hook removes idle committed
+PCM before a reused item ID can merge with the deleted source, and the Session
+releases the corresponding reserved input bytes. A queued append retains the
+same payload identity until consumption settles.
+
+Full history retains original input PCM without the recent cache's item/byte
+evictions. Merged commits preserve their item boundaries: deleting one source
+removes only its PCM segment during the next prompt preparation. New commits
+remain separate from previously rejected input. Closing the Session releases its
+state. Storage can grow with the conversation, and the original history is counted
+again for each request.
+
 `incremental` folds older text and original audio into a bounded text memory,
 and images into intermediate and long-term visual memories.
 Model-specific selection, source retention, compression prompts and token budgets
@@ -132,7 +176,7 @@ when those positions move.
 
 Unanswered user items and intervening system messages form one protected turn.
 Multiple audio commits within that turn share one merged payload in the prompt,
-including on the default `recent` path. Distinct audio source bindings remain
+including on the explicit `recent` path. Distinct audio source bindings remain
 separate even when their payload objects or PCM values are identical.
 Foreground fitting preserves that complete turn, including original media, or
 returns an explicit capacity error. Background dialogue and visual compression
@@ -235,7 +279,7 @@ Pass the overlay with `vllm serve ... --omni --deploy-config /path/to/history.ya
 Set `history_policy` to `bounded_recent` for clipping, or to
 `your_package.policy:YourPolicy` for a server-importable class with a no-argument
 constructor. Subclass `IncrementalHistoryPolicy` to reuse its selection and
-batching while overriding compression. The default policy remains `recent`.
+batching while overriding compression. Omitting the policy selects `full_history`.
 The optional `history_limits.max_context_tokens` caps context below the resolved
 model limit, including reserved output; omitting it uses the model limit.
 
@@ -350,9 +394,10 @@ Image edits or deletions revoke derived visual memory and stale results. Worker
 cancellation joins decoding/rendering before another preparation can own its
 materials.
 
-The plugin separately provides Session image admission limits. Opt-in Qwen
-policies default to 200 stored images / 32 MiB of encoded image URLs; default
-`recent` retains the original Session defaults of 8 images / 4 MiB, named
+The plugin separately provides Session image admission limits. `full_history`,
+`bounded_recent` and `incremental` default to 200 stored images / 32 MiB of encoded
+image URLs. Explicit `recent` retains the original Session defaults of 8 images /
+4 MiB, named
 `DEFAULT_IMAGE_HISTORY_MAX_ITEMS` and `DEFAULT_IMAGE_HISTORY_MAX_BYTES` in
 `engine/duplex/config.py`. These records are not deleted by summarization.
 Reaching this limit rejects additional images; deleting source items also revokes
@@ -360,8 +405,8 @@ memory derived from them. The visual preparation store has its own configurable
 image count, encoded PNG byte and decoded pixel byte bounds. These are not
 process RSS limits.
 
-Opt-in policies accept text/audio/images and reject tools. The default policy
-retains existing image/tool support.
+`bounded_recent` and `incremental` accept text/audio/images and reject tools.
+`full_history` and `recent` retain the original image/tool rendering path.
 
 ## Architecture
 

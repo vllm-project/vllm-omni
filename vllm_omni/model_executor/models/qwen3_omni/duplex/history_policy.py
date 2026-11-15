@@ -25,6 +25,8 @@ from vllm_omni.engine.duplex.session.source_costs import SourceTokenCache
 from vllm_omni.engine.duplex.session.visual_history import SessionVisualHistory, VisualWork
 from vllm_omni.engine.duplex.visual_memory import VisualMemory
 
+DEFAULT_HISTORY_POLICY = "full_history"
+
 Message = Mapping[str, object]
 AudioEntry = tuple[tuple[object, ...], Mapping[str, object]]
 
@@ -584,18 +586,19 @@ class IncrementalHistoryPolicy(QwenHistoryPolicy):
 def load_history_policy(name: str) -> QwenHistoryPolicy | None:
     """Load a server-selected ABC implementation, rejecting incomplete classes.
 
-    ``recent`` preserves the legacy path. External imports and constructor
+    ``full_history`` and ``recent`` share the original/tool-capable renderer;
+    only ``recent`` enables its legacy clipping. External imports and constructor
     failures propagate at configuration time; clients cannot select import paths.
     """
-    if name == "recent":
-        return None  # Preserve the existing default exactly.
+    if name in {DEFAULT_HISTORY_POLICY, "recent"}:
+        return None
     if name == "bounded_recent":
         return BoundedRecentPolicy()
     if name == "incremental":
         return IncrementalHistoryPolicy()
     module, separator, attribute = name.partition(":")
     if not separator:
-        raise ValueError("history policy must be recent, bounded_recent, incremental, or module:Class")
+        raise ValueError("history policy must be full_history, recent, bounded_recent, incremental, or module:Class")
     policy = getattr(importlib.import_module(module), attribute)()
     if not isinstance(policy, QwenHistoryPolicy):
         raise TypeError("history policy must inherit QwenHistoryPolicy and implement all four policy methods")
