@@ -288,9 +288,10 @@ class FlashInferAttentionImpl(AttentionImpl):
             )
         except Exception:
             return "fa2"
-        if major >= 10:
+        # cute-dsl uses tcgen05, which SM 12.x (consumer Blackwell) lacks.
+        if major in (10, 11):
             return "cute-dsl"
-        if major >= 9:
+        if major == 9:
             return "fa3"
         return "fa2"
 
