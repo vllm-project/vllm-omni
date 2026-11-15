@@ -22,6 +22,14 @@ gpu_available = pytest.mark.skipif(
     not (current_omni_platform.is_cuda() or current_omni_platform.is_rocm()),
     reason="CUDA or ROCm platform not available.",
 )
+# vLLM selects its CUTLASS kernel for int8 GEMMs on every CUDA device, but CUTLASS
+# rejects int8 on SM100 and newer (for example SM120 cards).
+cutlass_int8_supported = pytest.mark.skipif(
+    current_omni_platform.is_cuda()
+    and current_omni_platform.get_device_count() > 0
+    and current_omni_platform.get_device_capability().major >= 10,
+    reason="vLLM CUTLASS int8 scaled_mm does not support SM100+ GPUs.",
+)
 
 
 def test_int8_config_creation():
@@ -681,6 +689,7 @@ class TestGPUInt8Smoke:
         assert real_layer.weight.dtype == torch.int8
         assert hasattr(real_layer, "weight_scale")
 
+    @cutlass_int8_supported
     def test_real_gpu_int8_apply_forward(self, quant_config):
         """Smoke test: batched forward pass with the real GPU INT8 kernel."""
         from vllm import _custom_ops as ops

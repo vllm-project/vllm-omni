@@ -26,6 +26,14 @@ from vllm_omni.quantization.factory import SUPPORTED_QUANTIZATION_METHODS
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 cuda_available = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="GPU platform not available.")
+# ConvRot runs its INT8 and W4A4 GEMMs through vLLM's cutlass_scaled_mm, which
+# rejects int8 on SM100 and newer (for example SM120 RTX 50xx cards).
+cutlass_int8_supported = pytest.mark.skipif(
+    current_omni_platform.is_cuda()
+    and current_omni_platform.get_device_count() > 0
+    and current_omni_platform.get_device_capability().major >= 10,
+    reason="vLLM CUTLASS int8 scaled_mm does not support SM100+ GPUs.",
+)
 
 
 @pytest.mark.parametrize("size", [4, 16, 64, 256, 1024])
@@ -128,6 +136,7 @@ def test_layers_route_to_int4_int8_or_unquantized(mocker: MockerFixture, monkeyp
 
 
 @cuda_available
+@cutlass_int8_supported
 class TestCudaConvRot:
     """Real kernels: rotated quantization tracks BF16 and beats unrotated quantization on outliers."""
 

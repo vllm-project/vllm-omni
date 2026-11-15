@@ -873,6 +873,9 @@ def _minimax_h3_small_od_config():
     return SimpleNamespace(
         tf_model_config=arch,
         parallel_config=SimpleNamespace(ulysses_degree=1),
+        # The model enables AdaLN offload by default when the host GPU is SM120,
+        # but offload needs CUDA and these tests run the model on CPU.
+        cache_config={"minimax_h3_adaln_offload": False},
     )
 
 
