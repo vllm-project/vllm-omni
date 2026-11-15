@@ -621,9 +621,10 @@ QWEN_IMAGE_21_TEST_MODEL="$MODEL_PATH" QWEN_IMAGE_21_TEST_TEACACHE=1 \
 
 Provision the pinned base snapshot and a suitable single CUDA GPU first. This
 smoke checks response count, RGBA mode and dimensions; it does not measure
-quality, speed or cache-hit counts. CI collects this module in the Qwen Image
-functional job, but skips it unless the checkpoint environment is supplied;
-the TeaCache cases additionally require `QWEN_IMAGE_21_TEST_TEACACHE=1`.
+quality, speed or cache-hit counts. The module skips unless the checkpoint
+environment is supplied, and the TeaCache cases additionally require
+`QWEN_IMAGE_21_TEST_TEACACHE=1`; no CI job sets that variable, so run the
+TeaCache cases manually.
 
 ## Known Limitations
 
