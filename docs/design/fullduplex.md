@@ -1151,10 +1151,8 @@ See [Disaggregated Inference](feature/disaggregated_inference.md) for transport
 configuration. Control-plane registration alone does not validate a connector's
 cross-host data path.
 
-The completed MiniCPM-o 4.5 GPU E2E covers four runtimes and five engines on one
-server, concurrent audio sessions, resume, takeover, admission and reservation
-cleanup. Separate-host transport and node-failure E2E remain unverified; the
-single-server result must not be interpreted as that verification.
+For MiniCPM-o 4.5 on CUDA, keep the deploy profile's native MRv2 runner on all
+three stages when selecting `NixlConnector` for remote payload transfer.
 
 ### Multiple frontends
 
