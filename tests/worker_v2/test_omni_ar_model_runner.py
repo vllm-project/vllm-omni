@@ -24,6 +24,121 @@ from vllm_omni.worker_v2.output_snapshot import pack_output_snapshot
 pytestmark = [pytest.mark.core_model]
 
 
+@pytest.mark.cpu
+def test_bagel_img2img_kv_transfer_preserves_compressed_rope(monkeypatch):
+    from vllm_omni.diffusion.models.bagel.bagel_transformer import Bagel, get_flattened_position_ids_extrapolate
+    from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
+    from vllm_omni.distributed.omni_connectors.kv_transfer_manager import KVCacheTransferData, OmniKVTransferManager
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_executor.models.bagel.bagel import OmniBagelForConditionalGeneration
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    model = object.__new__(OmniBagelForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model._pending_img2img_info = [(6, 4, 32, 32)] * 2
+    model._last_img2img_info = (6, 4, 32, 32)
+    model._ropes_pending, model._ropes_metadata = [], {}
+    model._img2img_token_id = 99
+    # Substitute only the attention kernels; keep Bagel's real position rewrite.
+    model._mot_forward = lambda *args, **kwargs: torch.zeros(29, 2)
+    req_ids = ["cfg_text", "cfg_img", "gen"]
+    lengths = [12, 3, 14]
+    positions = torch.cat([torch.arange(n) for n in lengths])
+    input_ids = torch.tensor([99] * 11 + [1] + [2] * 3 + [99] * 11 + [3] * 3)
+    runner = object.__new__(OmniARModelRunner)
+    runner.model, runner.execute_model_state = model, None
+    runner.kv_caches = [(torch.zeros(1, 32, 1, 2), torch.ones(1, 32, 1, 2))]
+    runner.cache_config = SimpleNamespace(block_size=32, cache_dtype="auto")
+    runner.req_states = SimpleNamespace(req_id_to_index={})
+    manager = object.__new__(OmniKVTransferManager)
+    received = {}
+
+    def transfer(*, finished_reqs, kv_caches, block_size, cache_dtype, request_id_resolver):
+        for req_id, data in finished_reqs.items():
+            payload = manager._extract_kv_cache(
+                req_id,
+                data["block_ids"],
+                data["seq_len"],
+                kv_caches,
+                block_size,
+                cache_dtype,
+                data.get("custom_metadata"),
+            )
+            received[req_id] = KVCacheTransferData.from_bytes(bytearray(payload.to_bytes()))
+        return list(finished_reqs)
+
+    monkeypatch.setattr(
+        runner, "_ensure_kv_transfer_manager", lambda: SimpleNamespace(handle_finished_requests_kv_transfer=transfer)
+    )
+
+    def forward(_runner, *_args, **_kwargs):
+        model(input_ids, positions, inputs_embeds=torch.zeros(29, 2))
+        runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=req_ids))
+        return None
+
+    monkeypatch.setattr(OmniGPUModelRunner, "execute_model", forward)
+    runner.execute_model(SimpleNamespace(finished_requests_needing_kv_transfer={}))
+    # Transfer order differs from the forward order. Metadata must remain request-local.
+    finished = {rid: {"seq_len": n, "block_ids": [0]} for rid, n in zip(req_ids, lengths)}
+    runner._handle_kv_transfer_pre(
+        SimpleNamespace(finished_requests_needing_kv_transfer={rid: finished[rid] for rid in reversed(req_ids)})
+    )
+    assert model._ropes_pending == []
+
+    bagel = object.__new__(Bagel)
+    torch.nn.Module.__init__(bagel)
+    bagel.max_latent_size, bagel.latent_downsample = 64, 16
+    bagel.latent_channel, bagel.latent_patch_size = 16, 2
+    bagel.get_flattened_position_ids = get_flattened_position_ids_extrapolate
+    bagel.config = SimpleNamespace(llm_config=SimpleNamespace(num_hidden_layers=1))
+    pipeline = object.__new__(BagelPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.bagel, pipeline.device = bagel, torch.device("cpu")
+    pipeline.language_model = SimpleNamespace(vocab_size=100)
+    pipeline.new_token_ids = {"start_of_image": 1, "end_of_image": 2}
+    sampling = OmniDiffusionSamplingParams(height=32, width=32, seed=52, num_inference_steps=15)
+    sampling.past_key_values = SimpleNamespace(**received["gen"]["layer_blocks"])
+    sampling.kv_metadata = received["gen"]["metadata"]
+    for role in ("cfg_text", "cfg_img"):
+        setattr(sampling, role + "_past_key_values", SimpleNamespace(**received[role]["layer_blocks"]))
+        setattr(sampling, role + "_kv_metadata", received[role]["metadata"])
+    prepared = pipeline._forward_single({"prompt": "edit", "modalities": ["img2img"]}, sampling, prepare_only=True)
+    assert prepared["gen_context"]["ropes"] == [5]
+    assert prepared["cfg_text_context"]["ropes"] == [3]
+    assert prepared["cfg_img_context"]["ropes"] == [3]
+    assert prepared["generation_input"]["packed_position_ids"].tolist() == [5] * 6
+    assert prepared["cfg_text_packed_position_ids"].tolist() == [3] * 6
+    assert sampling.kv_metadata["image_shape"] == [32, 32]
+
+
+@pytest.mark.parametrize("step", ["dummy", "empty", "failed", "no_hook"])
+@pytest.mark.cpu
+def test_pending_metadata_only_flushes_after_a_real_successful_forward(monkeypatch, step):
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    runner = object.__new__(OmniARModelRunner)
+    flush = MagicMock()
+    runner.model = SimpleNamespace(**({} if step == "no_hook" else {"flush_pending_metadata": flush}))
+    runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=["previous"]))
+    monkeypatch.setattr(runner, "_handle_kv_transfer_pre", lambda _: None)
+    output = object()
+
+    def forward(_runner, *_args, **_kwargs):
+        if step == "failed":
+            raise RuntimeError("forward failed")
+        if step != "empty":
+            runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=["current"]))
+        return output
+
+    monkeypatch.setattr(OmniGPUModelRunner, "execute_model", forward)
+    if step == "failed":
+        with pytest.raises(RuntimeError, match="forward failed"):
+            runner.execute_model(SimpleNamespace())
+    else:
+        assert runner.execute_model(SimpleNamespace(), dummy_run=step == "dummy") is output
+    flush.assert_not_called()
+
+
 class _FakeStream:
     def wait_stream(self, _stream) -> None:
         pass

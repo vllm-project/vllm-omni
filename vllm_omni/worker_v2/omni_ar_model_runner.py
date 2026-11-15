@@ -194,7 +194,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
     ) -> Any:
         if not dummy_run:
             self._handle_kv_transfer_pre(scheduler_output)
-        return super().execute_model(
+        previous_state = self.execute_model_state if not dummy_run else None
+        output = super().execute_model(
             scheduler_output,
             intermediate_tensors,
             dummy_run=dummy_run,
@@ -204,6 +205,14 @@ class OmniARModelRunner(OmniGPUModelRunner):
             valid_dummy_state_slots=valid_dummy_state_slots,
             randomize_inputs=randomize_inputs,
         )
+        state = self.execute_model_state
+        if not dummy_run and state is not None and state is not previous_state:
+            # Preserve model-owned RoPE metadata in the actual forward order
+            # before the next step exports the finished requests' KV caches.
+            flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
+            if callable(flush_pending_metadata):
+                flush_pending_metadata(state.input_batch.req_ids)
+        return output
 
     # ------------------------------------------------------------------
     # sample_tokens: OmniOutput handling + pooler_output + async D2H
