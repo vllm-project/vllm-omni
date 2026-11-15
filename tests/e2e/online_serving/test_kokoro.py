@@ -75,7 +75,7 @@ def _wav_seconds(audio_bytes: bytes) -> float:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_server, openai_client) -> None:
     """Baseline smoke: default deploy and voice, non-streaming WAV, concurrent.
@@ -99,7 +99,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
 
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_long_text_streaming_002(omni_server, openai_client) -> None:
     """Multi-chunk input streamed as raw PCM, one network pass per chunk.
@@ -124,7 +124,7 @@ def test_long_text_streaming_002(omni_server, openai_client) -> None:
 
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_british_voice_003(omni_server, openai_client) -> None:
     """A ``b*`` voice selects British English G2P from the voice name."""
@@ -142,7 +142,7 @@ def test_british_voice_003(omni_server, openai_client) -> None:
 
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_native_speed_004(omni_server, openai_client) -> None:
     """``speed`` scales predicted durations once (no extra server-side stretch)."""
@@ -165,7 +165,7 @@ def test_native_speed_004(omni_server, openai_client) -> None:
 
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 @pytest.mark.parametrize(
     ("extra", "err_message"),
