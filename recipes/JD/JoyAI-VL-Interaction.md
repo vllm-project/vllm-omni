@@ -32,7 +32,18 @@ framework internals and how to add another full-duplex model, see
 ## Unified Realtime Session (text/video)
 
 An opt-in profile connects JoyAI to the shared Session runtime and Realtime
-client. It uses the existing JoyAI → Qwen3-TTS CustomVoice → Code2Wav pipeline:
+client. It uses the existing JoyAI → Qwen3-TTS CustomVoice → Code2Wav pipeline.
+
+The native turn and duplex profiles use Model Runner V2 for every stage on CUDA,
+including Qwen3-ASR in the speech-input profile. Other platforms retain Model
+Runner V1. Text/video duplex streams Talker codec chunks into Code2Wav; the ASR
+profiles pass complete stage outputs. Session memory and tool delegation use the
+same JoyAI plugin with either runner. To compare against V1 on CUDA, set
+`model_runner: v1` on each stage in a deploy override.
+
+The Talker follows Qwen3-TTS's `recompute_preemption: fail` policy: a request
+whose KV is preempted fails explicitly, since replaying its codec IDs cannot
+reconstruct the MTP embeddings used to generate the speech.
 
 ```bash
 vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \

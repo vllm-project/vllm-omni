@@ -64,6 +64,37 @@ def test_default_adapter_does_not_leak_codec_metadata_to_scheduler() -> None:
     assert update is None
 
 
+@pytest.mark.parametrize("window_codes_as_placeholder,prompt", [(False, (1, 2)), (True, (0,))])
+def test_default_adapter_extracts_duplex_perf_chunk_with_codes(window_codes_as_placeholder, prompt) -> None:
+    update = DefaultSchedulingMetadataAdapter(window_codes_as_placeholder=window_codes_as_placeholder).extract(
+        {"codes": {"audio": torch.tensor([[1, 2]])}, "meta": {"duplex_perf_chunk": [0, 2]}},
+        model_mode="generation",
+    )
+
+    assert update == SchedulingMetadataUpdate(
+        prompt_token_ids=prompt,
+        duplex_perf_chunk=(0, 2),
+    )
+
+
+def test_default_adapter_extracts_duplex_perf_chunk_without_codes() -> None:
+    update = DefaultSchedulingMetadataAdapter().extract(
+        {"meta": {"duplex_perf_chunk": [1, 3]}},
+        model_mode="generation",
+    )
+
+    assert update == SchedulingMetadataUpdate(duplex_perf_chunk=(1, 3))
+
+
+def test_default_adapter_ignores_invalid_duplex_perf_chunk() -> None:
+    update = DefaultSchedulingMetadataAdapter().extract(
+        {"meta": {"duplex_perf_chunk": [0]}},
+        model_mode="generation",
+    )
+
+    assert update is None
+
+
 def test_default_adapter_keeps_ar_prompt_tokens_unchanged() -> None:
     update = DefaultSchedulingMetadataAdapter().extract(
         {"codes": {"audio": [1, 2]}, "meta": {"next_stage_prompt_len": 2}},
