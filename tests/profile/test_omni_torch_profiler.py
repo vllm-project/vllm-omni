@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # tests/test_omni_torch_profiler.py
 from __future__ import annotations
 
 import gzip
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -151,8 +155,9 @@ def fake_config(tmp_path):
 
 @pytest.fixture
 def fake_profiler_factory(monkeypatch):
-    created = {}
+    created: dict[str, object] = {}
 
+    @wraps(profiler_mod.torch.profiler.profile)
     def fake_profile(*args, **kwargs):
         profiler = FakeTorchProfiler(on_trace_ready=kwargs.get("on_trace_ready"))
         created["profiler"] = profiler
@@ -172,6 +177,131 @@ def wrapper(fake_config, fake_profiler_factory):
         local_rank=0,
         activities=["CPU", "CUDA"],
     )
+
+
+def test_session_profiler_kwargs_override_and_reset_defaults(wrapper, fake_profiler_factory):
+    wrapper._active = False
+    overrides = {"record_shapes": False, "with_stack": False}
+    wrapper.set_profiler_kwargs(overrides)
+    assert fake_profiler_factory["kwargs"]["record_shapes"] is False
+    assert fake_profiler_factory["kwargs"]["with_stack"] is False
+    assert fake_profiler_factory["kwargs"]["on_trace_ready"] == wrapper._on_trace_ready
+    assert overrides == {"record_shapes": False, "with_stack": False}
+
+    wrapper.set_profiler_kwargs(None)
+    assert fake_profiler_factory["kwargs"]["record_shapes"] is True
+    assert fake_profiler_factory["kwargs"]["with_stack"] is True
+
+
+def test_session_profiler_kwargs_do_not_replace_an_active_profiler(wrapper):
+    wrapper._active = True
+    original = wrapper.profiler
+    wrapper.set_profiler_kwargs({"record_shapes": False})
+    assert wrapper.profiler is original
+
+
+@pytest.mark.parametrize("overrides", [[], "record_shapes"])
+def test_session_profiler_kwargs_reject_non_mapping_without_changing_state(wrapper, overrides):
+    wrapper._active = False
+    original = wrapper.profiler
+    with pytest.raises(TypeError, match="profiler_kwargs must be a mapping"):
+        wrapper.set_profiler_kwargs(overrides)
+    assert wrapper.profiler is original
+    assert wrapper._profiler_kwargs == {}
+
+
+def test_session_profiler_kwargs_reject_unknown_keyword_before_construction(wrapper, fake_profiler_factory):
+    wrapper._active = False
+    original = wrapper.profiler
+    with pytest.raises(TypeError, match="Invalid profiler_kwargs.*record_shape"):
+        wrapper.set_profiler_kwargs({"record_shape": True})
+    assert wrapper.profiler is original
+    assert fake_profiler_factory["profiler"] is original
+    assert wrapper._profiler_kwargs == {}
+
+
+def test_session_profiler_kwargs_reuse_unchanged_scalar_options_and_defaults(wrapper):
+    wrapper._active = False
+    original = wrapper.profiler
+    wrapper.set_profiler_kwargs(None)
+    assert wrapper.profiler is original
+
+    wrapper.set_profiler_kwargs({"record_shapes": False})
+    changed = wrapper.profiler
+    assert changed is not original
+    wrapper.set_profiler_kwargs({"record_shapes": False})
+    assert wrapper.profiler is changed
+
+    wrapper.set_profiler_kwargs(None)
+    restored = wrapper.profiler
+    assert restored is not changed
+    wrapper.set_profiler_kwargs({})
+    assert wrapper.profiler is restored
+
+
+@pytest.mark.parametrize("acc_events", [False, True])
+def test_session_profiler_kwargs_reused_cpu_profiler_keeps_sessions_separate(fake_config, monkeypatch, acc_events):
+    traces = []
+
+    def capture(_self, profiler):
+        traces.append({event.key for event in profiler.key_averages()})
+
+    monkeypatch.setattr(OmniTorchProfilerWrapper, "_on_trace_ready", capture)
+    wrapper = OmniTorchProfilerWrapper(fake_config, "worker0", 0, activities=["CPU"])
+    wrapper._active = False
+    profilers = []
+    for factory in (profiler_mod.torch.ones, profiler_mod.torch.zeros):
+        wrapper.set_profiler_kwargs({"acc_events": True} if acc_events else None)
+        profilers.append(wrapper.profiler)
+        with wrapper.profiler:
+            factory(2)
+    assert "aten::ones" in traces[0] and "aten::zeros" not in traces[0]
+    assert "aten::zeros" in traces[1] and "aten::ones" not in traces[1]
+    assert (profilers[0] is profilers[1]) is not acc_events
+
+
+def test_session_profiler_kwargs_preserve_callbacks_activities_and_mutable_options(wrapper, fake_profiler_factory):
+    wrapper._active = False
+    activities = [profiler_mod.torch.profiler.ProfilerActivity.CPU]
+
+    def callback(_profiler):
+        pass
+
+    options = {"activities": activities, "on_trace_ready": callback, "acc_events": True}
+    wrapper.set_profiler_kwargs(options)
+    assert fake_profiler_factory["kwargs"]["activities"] is activities
+    assert fake_profiler_factory["kwargs"]["on_trace_ready"] is callback
+    assert fake_profiler_factory["kwargs"]["acc_events"] is True
+    original = wrapper.profiler
+    activities.append(profiler_mod.torch.profiler.ProfilerActivity.CUDA)
+    wrapper.set_profiler_kwargs(options)
+    assert wrapper.profiler is not original
+    assert fake_profiler_factory["kwargs"]["activities"] == activities
+
+
+def test_session_profiler_kwargs_restore_state_when_backend_construction_fails(wrapper, monkeypatch):
+    wrapper._active = False
+    wrapper.set_profiler_kwargs({"record_shapes": False})
+    original = wrapper.profiler
+
+    def fail(*_args):
+        raise RuntimeError("profiler backend unavailable")
+
+    monkeypatch.setattr(wrapper, "_create_profiler", fail)
+    with pytest.raises(RuntimeError, match="profiler backend unavailable"):
+        wrapper.set_profiler_kwargs({"record_shapes": True})
+    assert wrapper.profiler is original
+    assert wrapper._profiler_kwargs == {"record_shapes": False}
+
+
+def test_session_profiler_kwargs_log_active_overrides_without_changing_state(wrapper, caplog):
+    wrapper._active = True
+    original = wrapper.profiler
+    with caplog.at_level("WARNING"):
+        wrapper.set_profiler_kwargs({"record_shapes": False})
+    assert "Ignoring profiler_kwargs" in caplog.text
+    assert wrapper.profiler is original
+    assert wrapper._profiler_kwargs == {}
 
 
 def test_set_trace_filename_creates_timestamped_session_dir(wrapper, monkeypatch, tmp_path):

@@ -278,7 +278,8 @@ class DiffusionKVModelRunnerBackend:
                     max_num_batched_tokens=max_num_batched_tokens,
                     max_num_blocks_per_group=max_num_blocks_per_group,
                     device=self.device,
-                    kernel_block_sizes=kernel_block_sizes,
+                    # 02e55d2af3 (#57169): BlockTables derives the packed
+                    # layout from block_sizes; kernel_block_sizes is gone.
                     cp_size=cp_size,
                     cp_rank=cp_rank,
                     cp_interleave=cp_interleave,

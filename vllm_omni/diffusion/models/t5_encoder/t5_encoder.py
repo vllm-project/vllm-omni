@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -21,6 +22,9 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
 
 class T5SelfAttention(nn.Module):
     def __init__(
@@ -28,6 +32,7 @@ class T5SelfAttention(nn.Module):
         config: T5Config,
         has_relative_attention_bias: bool = False,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.d_model = config.d_model
@@ -51,6 +56,8 @@ class T5SelfAttention(nn.Module):
             total_num_heads=self.n_heads,
             total_num_kv_heads=self.n_heads,  # T5 uses MHA
             bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
 
         # Output projection: all-reduce back to full d_model
@@ -61,6 +68,8 @@ class T5SelfAttention(nn.Module):
             bias=False,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o",
         )
 
         if has_relative_attention_bias:
@@ -166,13 +175,15 @@ class T5SelfAttention(nn.Module):
 
 
 class T5DenseGatedActDense(nn.Module):
-    def __init__(self, config: T5Config, prefix: str = ""):
+    def __init__(self, config: T5Config, prefix: str = "", quant_config: QuantizationConfig | None = None):
         super().__init__()
         self.wi = MergedColumnParallelLinear(
             config.d_model,
             [config.d_ff, config.d_ff],
             bias=False,
             gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wi",
         )
         self.wo = RowParallelLinear(
             config.d_ff,
@@ -180,6 +191,8 @@ class T5DenseGatedActDense(nn.Module):
             bias=False,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wo",
         )
         self.act = get_act_fn(config.dense_act_fn)
 
@@ -193,7 +206,7 @@ class T5DenseGatedActDense(nn.Module):
 
 
 class T5DenseActDense(nn.Module):
-    def __init__(self, config: T5Config, prefix: str = ""):
+    def __init__(self, config: T5Config, prefix: str = "", quant_config: QuantizationConfig | None = None):
         super().__init__()
         self.wi = ColumnParallelLinear(
             config.d_model,
@@ -201,6 +214,8 @@ class T5DenseActDense(nn.Module):
             bias=False,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wi",
         )
         self.wo = RowParallelLinear(
             config.d_ff,
@@ -208,6 +223,8 @@ class T5DenseActDense(nn.Module):
             bias=False,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wo",
         )
         self.act = get_act_fn(config.dense_act_fn)
 
@@ -219,9 +236,20 @@ class T5DenseActDense(nn.Module):
 
 
 class T5LayerSelfAttention(nn.Module):
-    def __init__(self, config: T5Config, has_relative_attention_bias: bool = False, prefix: str = ""):
+    def __init__(
+        self,
+        config: T5Config,
+        has_relative_attention_bias: bool = False,
+        prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
-        self.SelfAttention = T5SelfAttention(config, has_relative_attention_bias, prefix=f"{prefix}.SelfAttention")
+        self.SelfAttention = T5SelfAttention(
+            config,
+            has_relative_attention_bias,
+            prefix=f"{prefix}.SelfAttention",
+            quant_config=quant_config,
+        )
         self.layer_norm = RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
 
     def forward(
@@ -243,12 +271,14 @@ class T5LayerSelfAttention(nn.Module):
 
 
 class T5LayerFF(nn.Module):
-    def __init__(self, config: T5Config, prefix: str = ""):
+    def __init__(self, config: T5Config, prefix: str = "", quant_config: QuantizationConfig | None = None):
         super().__init__()
         if config.is_gated_act:
-            self.DenseReluDense = T5DenseGatedActDense(config, prefix=f"{prefix}.DenseReluDense")
+            self.DenseReluDense = T5DenseGatedActDense(
+                config, prefix=f"{prefix}.DenseReluDense", quant_config=quant_config
+            )
         else:
-            self.DenseReluDense = T5DenseActDense(config, prefix=f"{prefix}.DenseReluDense")
+            self.DenseReluDense = T5DenseActDense(config, prefix=f"{prefix}.DenseReluDense", quant_config=quant_config)
         self.layer_norm = RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -264,12 +294,20 @@ class T5LayerFF(nn.Module):
 
 
 class T5Block(nn.Module):
-    def __init__(self, config: T5Config, has_relative_attention_bias: bool = False, prefix: str = ""):
+    def __init__(
+        self,
+        config: T5Config,
+        has_relative_attention_bias: bool = False,
+        prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         self.layer = nn.ModuleList(
             [
-                T5LayerSelfAttention(config, has_relative_attention_bias, prefix=f"{prefix}.layer.0"),
-                T5LayerFF(config, prefix=f"{prefix}.layer.1"),
+                T5LayerSelfAttention(
+                    config, has_relative_attention_bias, prefix=f"{prefix}.layer.0", quant_config=quant_config
+                ),
+                T5LayerFF(config, prefix=f"{prefix}.layer.1", quant_config=quant_config),
             ]
         )
 
@@ -285,12 +323,23 @@ class T5Block(nn.Module):
 
 
 class T5Stack(nn.Module):
-    def __init__(self, config: T5Config, shared: nn.Embedding, prefix: str = ""):
+    def __init__(
+        self,
+        config: T5Config,
+        shared: nn.Embedding,
+        prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         self.embed_tokens = shared
         self.block = nn.ModuleList(
             [
-                T5Block(config, has_relative_attention_bias=(i == 0), prefix=f"{prefix}.block.{i}")
+                T5Block(
+                    config,
+                    has_relative_attention_bias=(i == 0),
+                    prefix=f"{prefix}.block.{i}",
+                    quant_config=quant_config,
+                )
                 for i in range(config.num_layers)
             ]
         )
@@ -325,12 +374,12 @@ class T5Stack(nn.Module):
 class T5EncoderModel(nn.Module):
     """T5 encoder model applying upstream vLLM layers"""
 
-    def __init__(self, config: T5Config, prefix: str = ""):
+    def __init__(self, config: T5Config, prefix: str = "", quant_config: QuantizationConfig | None = None):
         super().__init__()
         self.config = config
         self.prefix = prefix
         self.shared = VocabParallelEmbedding(config.vocab_size, config.d_model)
-        self.encoder = T5Stack(config, self.shared, prefix=f"{prefix}.encoder")
+        self.encoder = T5Stack(config, self.shared, prefix=f"{prefix}.encoder", quant_config=quant_config)
 
     @property
     def dtype(self) -> torch.dtype:

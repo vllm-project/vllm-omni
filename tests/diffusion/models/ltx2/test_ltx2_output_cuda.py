@@ -17,7 +17,7 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("do_normalize", [True, False])
 def test_ltx_uint8_output_runs_on_cuda_with_bounded_rounding_drift(dtype, do_normalize):
@@ -51,7 +51,7 @@ def test_ltx_uint8_output_runs_on_cuda_with_bounded_rounding_drift(dtype, do_nor
     assert delta.max() <= 1
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_ltx_uint8_output_defensively_clamps_unnormalized_values_on_cuda():
     source = (
         torch.tensor([-0.2, 0.0, 0.5, 1.0, 1.2], device="cuda", dtype=torch.bfloat16)
@@ -68,7 +68,7 @@ def test_ltx_uint8_output_defensively_clamps_unnormalized_values_on_cuda():
     assert torch.equal(prepared[..., 2], expected)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("use_diffusion_decoder", [False, True], ids=["conv-vae", "diff-vae"])
 def test_ltx_bf16_decoder_output_uses_cuda_transport_path(use_diffusion_decoder):
     decoded_video = torch.linspace(

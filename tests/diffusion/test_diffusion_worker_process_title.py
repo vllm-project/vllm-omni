@@ -202,6 +202,27 @@ def test_missing_setproctitle_is_non_fatal(mocker: MockerFixture) -> None:
     decorate_logs.assert_called_once_with("DiffusionWorker")
 
 
+def test_setup_keeps_log_prefix_but_skips_title_when_disabled(mocker: MockerFixture) -> None:
+    """``set_proc_title=False`` must not rename the current process (UniProc inline worker)."""
+    mocker.patch.object(
+        worker_module,
+        "model_parallel_is_initialized",
+        return_value=False,
+    )
+    _patch_groups(mocker, {})
+    set_process_title = mocker.patch.object(worker_module, "set_process_title")
+    decorate_logs = mocker.patch.object(worker_module, "decorate_logs")
+
+    worker_module._setup_diffusion_worker_proc_title_and_log_prefix(
+        enable_ep=True,
+        use_hsdp=True,
+        set_proc_title=False,
+    )
+
+    set_process_title.assert_not_called()
+    decorate_logs.assert_called_once_with("DiffusionWorker")
+
+
 @pytest.mark.skipif(
     sys.platform != "linux" or shutil.which("ps") is None or importlib.util.find_spec("setproctitle") is None,
     reason="requires Linux ps and setproctitle",

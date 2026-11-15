@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Multimodal output data structures for vLLM-Omni.
 
 This module defines structured types for multimodal outputs.

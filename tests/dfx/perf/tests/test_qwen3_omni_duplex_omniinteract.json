@@ -1,0 +1,85 @@
+[
+  {
+    "test_name": "test_qwen3_omni_duplex_omniinteract",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 3
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/qwen3_omni_duplex.yaml"
+      ],
+      "update": {
+        "model_runner": "v2",
+        "async_chunk": true,
+        "stages": {
+          "0": {
+            "enable_prefix_caching": true
+          }
+        },
+        "duplex_session.max_sessions": 8,
+        "duplex_session.collect_stats": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "omniinteract",
+        "dataset_path": "lucky-lance/OmniInteract@e195f75fe2666fcc5fe74f537ae49ca143a79969",
+        "backend": "openai-realtime-duplex",
+        "endpoint": "/v1/realtime",
+        "num_prompts": [
+          60
+        ],
+        "max_concurrency": [
+          8
+        ],
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "omniinteract_subsets": "1q1a_math",
+        "omniinteract_turn_detection": "server_vad",
+        "omniinteract_instructions": "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences, in the language the user speaks.",
+        "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract_qwen3_omni/1q1a_math",
+        "omniinteract_max_video_duration_s": 600,
+        "percentile-metrics": "ttft,audio_ttfp,audio_rtf,e2el,audio_duration",
+        "name": "c8_accuracy_response_stats_v5",
+        "duplex_metric_aggregation": "response",
+        "metric-percentiles": "50,95",
+        "ready_check_timeout_sec": 0,
+        "num_warmups": 8,
+        "save_detailed": true,
+        "omniinteract_evaluate": true,
+        "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
+        "omniinteract_require_response": true,
+        "required_duplex_metrics": [
+          "duplex_client_rtf",
+          "duplex_client_ttfp_ms",
+          "duplex_client_ttft_ms",
+          "duplex_busy_rtf",
+          "duplex_stall_ratio"
+        ]
+      }
+    ],
+    "judge_server_params": {
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "use_omni": false,
+      "device_index": "2",
+      "extra_cli_args": [
+        "--served-model-name",
+        "Qwen2.5-7B-Instruct"
+      ]
+    }
+  }
+]

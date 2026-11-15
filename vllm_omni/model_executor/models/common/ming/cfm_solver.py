@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
+
+DEFAULT_CFM_STEPS = 10
 
 
 def get_epss_timesteps(n, device, dtype):
@@ -37,11 +39,13 @@ def build_timesteps(steps, device, dtype, use_epss=True, sway_sampling_coef=-1.0
 
 
 class Solver:
-    def __init__(self, func, y0, sigma=0.25, temperature=1.5) -> None:
+    def __init__(self, func, y0, sigma=0.25, temperature=1.5, generator=None, noise=None) -> None:
         self.func = func
         self.y0 = y0
         self.sigma = sigma
         self.temperature = temperature
+        self.generator = generator
+        self.noise = noise
 
     def integrate(self, t):
         solution = torch.empty(len(t), *self.y0.shape, dtype=self.y0.dtype, device=self.y0.device)
@@ -49,7 +53,7 @@ class Solver:
 
         j = 1
         y0 = self.y0
-        for t0, t1 in zip(t[:-1], t[1:]):
+        for step, (t0, t1) in enumerate(zip(t[:-1], t[1:])):
             dt = t1 - t0
             f0 = self.func(t0, y0)
             dy = dt * f0
@@ -59,7 +63,16 @@ class Solver:
                 solution[j] = self._linear_interp(t0, t1, y0, y1, t[j])
                 j += 1
 
-            noise = torch.randn_like(y0)
+            noise = (
+                self.noise[step]
+                if self.noise is not None
+                else torch.randn(
+                    y0.shape,
+                    device=y0.device,
+                    dtype=y0.dtype,
+                    generator=self.generator,
+                )
+            )
             shift = self.sigma * (self.temperature**0.5) * (abs(dt) ** 0.5) * noise
             y0 = y1 + shift
 
