@@ -27,11 +27,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     apply_max_new_tokens,
     conditioning_cache_salt,
 )
-from vllm_omni.model_executor.models.moss_tts.processor_loading import (
-    MOSS_DELAY_PROCESSOR,
-    MOSS_LOCAL_PROCESSOR,
-    load_moss_processor,
-)
+from vllm_omni.model_executor.models.moss_tts.processor_loading import load_moss_processor
 from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realtime_prompt
 
 if TYPE_CHECKING:
@@ -374,10 +370,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         cached = getattr(self, "_moss_processor_cache", None)
         if cached is not None:
             return cached
-        proc = load_moss_processor(
-            self.engine_client.model_config.model,
-            MOSS_LOCAL_PROCESSOR if self._moss_variant == "local" else MOSS_DELAY_PROCESSOR,
-        )
+        proc = load_moss_processor(self.engine_client.model_config.model)
         if hasattr(proc, "audio_tokenizer"):
             device = self._resolve_ref_encoder_device()
             proc._vllm_omni_ref_encoder_device = device
