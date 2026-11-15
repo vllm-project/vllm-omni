@@ -55,6 +55,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
 from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
 from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 
 logger = init_logger(__name__)
@@ -193,6 +194,146 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
     # ------------------------------------------------------------------ #
     #  Shared scheduler/output helpers (lift the AR / generation duplicates)
     # ------------------------------------------------------------------ #
+
+    def _talker_kstep_armed(self) -> bool:
+        """True when this scheduler drives the Talker multi-frame decode.
+
+        Both conditions come off the engine config: the stage must be the
+        Talker (``model_config.model_stage == "tts"``) and it must carry the
+        injected n-gram config whose ``num_speculative_tokens`` is exactly
+        ``K - 1``. Interpretation is delegated to the shared
+        ``talker_kstep_contract`` module -- the model-side gate resolves the
+        same config through it, so the scheduler and the model cannot drift
+        apart (a missing ``method`` is disabled on both sides, and the frame
+        ceiling is enforced once).
+        """
+        cache = getattr(self, "_omni_talker_kstep_cache", None)
+        if cache is None:
+            # vLLM's Scheduler does not expose speculative_config as an
+            # attribute and SchedulerConfig has no num_speculative_tokens
+            # either, so the canonical engine-side source is vllm_config.
+            # Reading anything else silently yields 0 drafts and this whole
+            # guard never arms.
+            vllm_cfg = getattr(self, "vllm_config", None)
+            spec = getattr(self, "speculative_config", None)
+            if spec is None:
+                spec = getattr(vllm_cfg, "speculative_config", None) if vllm_cfg is not None else None
+            model_cfg = getattr(vllm_cfg, "model_config", None)
+            cache = self._omni_talker_kstep_cache = (
+                talker_kstep_frames(getattr(model_cfg, "model_stage", None), spec) > 0
+            )
+        return cache
+
+    def _enforce_kstep_span_uniformity(self, scheduler_output: SchedulerOutput) -> None:
+        """Book uniform spans on the *scheduled* output before dispatch.
+
+        The pre-schedule guard above reasons about request state, but the
+        actual per-request frame count is only fixed inside upstream
+        ``schedule()``: vllm v1/core/sched/scheduler.py derives each
+        request's ``num_scheduled_spec_tokens`` from its own token budget
+        (streaming placeholders, remaining budget), so one step can leave
+        the scheduler with span widths like 4/5/5/6/6 -- which the talker
+        multi-frame loop refuses, fatally.
+
+        Exactly two booked shapes are executable on the static-shape decode
+        backend -- q_len=1 and q_len=1+num_spec rows (the captured FULL
+        graphs book exactly those two) -- so this pass rewrites the
+        schedule into the one that needs no drafts:
+
+        * single-frame: drop every draft so all decode rows book one row.
+          A narrower multi-frame step is NOT a fallback: trimming to the
+          batch minimum (10-09: a uniform 3-frame batch) leaves the runner
+          no graph to replay and it stalls silently -- stage 1 emitted no
+          chunks and stage 2 errored every request after a 600s wait. On a
+          draftless step ``constant_drafts`` re-arms the full K-step, so
+          one single-frame step is all the recovery the pipeline needs.
+
+        CUDA eager execution with a dynamic draft lookup is the exception:
+        for a pure decode batch, trim every row to the requested width before
+        upstream books computed/in-flight tokens. Static graphs and NPU keep
+        the full-or-single-frame guard above.
+
+        Rows wider than 1 without drafts are prefill/extend rows; they may
+        only coexist with single-frame decode rows, so any drafts go.
+        """
+        if not self._talker_kstep_armed():
+            return
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not num_scheduled_tokens:
+            return
+        dynamic_lookup = getattr(self, "dynamic_sd_lookup", None)
+        vllm_config = getattr(self, "vllm_config", None)
+        device_config = getattr(vllm_config, "device_config", None)
+        model_config = getattr(vllm_config, "model_config", None)
+        dynamic_cuda = (
+            dynamic_lookup is not None
+            and getattr(device_config, "device_type", None) == "cuda"
+            and getattr(model_config, "enforce_eager", False)
+        )
+        if dynamic_cuda:
+            # The table is built for ``max_num_batched_tokens`` worth of rows
+            # and its last entry carries forward; clamp so a batch larger than
+            # the table cannot index past it.
+            assert dynamic_lookup is not None  # narrowed by dynamic_cuda
+            batch_index = min(len(num_scheduled_tokens), len(dynamic_lookup) - 1)
+            target = int(dynamic_lookup[batch_index])
+            max_drafts = int(getattr(self, "num_spec_tokens", 0) or 0)
+            if not 0 <= target <= max_drafts:
+                raise ValueError(f"Dynamic Talker draft count {target} is outside [0, {max_drafts}]")
+            uniform_decode = len(spec_tokens) == len(num_scheduled_tokens) and all(
+                len(drafts) >= target and num_scheduled_tokens[rid] == len(drafts) + 1
+                for rid, drafts in spec_tokens.items()
+            )
+            if uniform_decode:
+                for rid, drafts in list(spec_tokens.items()):
+                    num_scheduled_tokens[rid] = target + 1
+                    if target:
+                        spec_tokens[rid] = drafts[:target]
+                    else:
+                        del spec_tokens[rid]
+                scheduler_output.total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+                scheduler_output.num_spec_tokens_to_schedule = target
+                return
+        changed = False
+        min_frames = None
+        if any(n > 1 and rid not in spec_tokens for rid, n in num_scheduled_tokens.items()):
+            # Mixed step: a prefill/extend row next to a drafted decode row
+            # is exactly the non-uniform shape the runner dies on.
+            if spec_tokens:
+                for rid in spec_tokens:
+                    num_scheduled_tokens[rid] = 1
+                spec_tokens.clear()
+                changed = True
+                min_frames = 0
+        elif spec_tokens:
+            num_spec_tokens = int(getattr(self, "num_spec_tokens", 0) or 0)
+            uniform_full = len(spec_tokens) == len(num_scheduled_tokens) and {len(v) for v in spec_tokens.values()} == {
+                num_spec_tokens
+            }
+            if not uniform_full:
+                # A narrower K-step is not executable: the static-shape decode
+                # backend has no graph for q_len in (1, 1+num_spec), so a
+                # trim-to-minimum rewrite stalls the runner silently. Drop
+                # every draft and let the single-frame step re-arm the K-step
+                # (constant_drafts re-drafts after a draftless step).
+                for rid, v in spec_tokens.items():
+                    if v:
+                        num_scheduled_tokens[rid] -= len(v)
+                spec_tokens.clear()
+                changed = True
+                min_frames = 0
+        if changed:
+            scheduler_output.total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+            logger.warning(
+                "[kstep] booked spans were non-uniform; rewrote the step to a "
+                "uniform %d-frame batch (%d rows, total=%d, per_req=%s) instead of "
+                "feeding the multi-frame loop spans it declines",
+                min_frames,
+                len(num_scheduled_tokens),
+                scheduler_output.total_num_scheduled_tokens,
+                dict(num_scheduled_tokens),
+            )
 
     def _init_omni_io_scheduling_state(self) -> None:
         """Initialize scheduler state shared by AR and generation stages."""
@@ -1169,8 +1310,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         # silently. Honoring them needs a LogitBiasState-style per-request
         # machine the codec path does not have; finish the request as
         # FINISHED_ERROR instead of letting it diverge unnoticed.
-        kstep_armed = getattr(self, "_talker_kstep_armed", None)
-        if kstep_armed is not None and kstep_armed():
+        if self._talker_kstep_armed():
             sp = getattr(request, "sampling_params", None)
             unsupported = [
                 name for name in ("logit_bias", "allowed_token_ids") if sp is not None and getattr(sp, name, None)

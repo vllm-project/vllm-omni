@@ -489,8 +489,13 @@ def _run(coro):
 def test_session_records_one_chunk_per_block_and_ignores_the_trailer() -> None:
     workload = _workload(num_chunks=4)
 
+    async def uncompressed_rollout(websocket, payload) -> None:
+        # Encoded MP4 chunks must not negotiate transport recompression.
+        assert websocket.protocol.extensions == []
+        await _emit_rollout(websocket, payload)
+
     async def scenario() -> None:
-        server = _serve(_emit_rollout)
+        server = _serve(uncompressed_rollout)
         url = await server.__aenter__()
         try:
             result = await run_session(

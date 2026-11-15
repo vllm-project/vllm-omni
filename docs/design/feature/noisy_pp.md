@@ -286,9 +286,54 @@ GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 - Paged session vs NoisyKV still separate prealloc; no TP × Noisy PP yet.
 - Multi-session NoisyKV pool admission / bounded eviction (single-session is the
   current contract).
-- Micro-batch packing (`R`): varlen vs pad.
+- Micro-batch packing (`R`): attention still loops per-member paged-KV views;
+  DiT FFN/embed/unembed pack via executor-organized ``ComputeBatch`` +
+  ``CellAdapter.forward`` when ``max_batch_size>1``. Varlen / pad merge
+  and Legacy step Batch remain open.
 - Plan with `K>1` multiplies ticks; activation inbox is keyed by
   `(chunk, step)` (R=1 friendly).
+
+## Cell Batch (Noisy KV)
+
+Batch is a Noisy PP execution contract, not a model feature. Same boundary as
+Stepwise: the generic runtime organizes compute; the model consumes a batch.
+Pipeline admits requests and passes a ``kv_id → CellAdapter`` map; it does not
+own batch policy.
+
+Per slot, ``run_cell_pipeline`` collects ready tasks, groups them with
+``organize_batches`` (``compatibility_key`` + ``max_batch_size`` split, no
+deferral to a later plan slot), maps each member's activation by request
+identity for the consumer ``(chunk, step)``, then calls ``CellAdapter.forward``.
+
+``ComputeBatch`` requires a shared DiT ``block`` only; each member keeps its
+own ``(chunk, step, block)``, KV view, and output row. CausVid's ``WanCell``
+keys on ``(block, latent_shape, dtype)``; chunk / step / timestep are member
+inputs. ``forward`` packs per-member noise levels and chunk RoPE (e.g.
+``timesteps=[800, 500]``, ``chunks=[0, 3]``) into embed / block / unembed.
+
+Each member contributes exactly one tensor row and one KV view. Activation
+payloads and model outputs validate that row count rather than broadcasting a
+mismatched tensor. Local activation retention and PP boundary sends are decided
+per member, independently of other requests in the slot. Local handoffs record
+the expected consumer Cell and reject a different consumer. A missing send payload
+is an execution error.
+
+CausVid reuses conditioning and RoPE across blocks while the ordered prompt
+tensors stay unchanged. Changing the member composition invalidates the caches;
+noise levels remain part of the embedding key. Only the current noise-level embedding is cached; CPU noise levels form the
+key before any device transfer, so cache hits need no GPU readback. RoPE
+retention is bounded by the current pack size and refreshed on access.
+Prompt tensors must remain immutable during execution. Physis continues to run
+one member at a time through the same explicit member-map runtime entry.
+
+Async VAE decode retains a separate temporal state per member. Each request in
+an execution wave receives a deterministic Gloo tag from its input position;
+sender and VAE owner use the same tag, so interleaved member chunks cannot match
+another request's receives. Single-request execution uses tag 0. The Pipeline
+joins all decode jobs before returning and cancels them on admission, compute,
+or output failure. Cancellation drains posted latent transfers before the next
+wave reuses tags; a failed drain stops the Worker rather than reusing an unsafe
+communication group. This does not change Engine dispatch or Request completion.
 
 ## Related
 
@@ -296,5 +341,5 @@ GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 - [AR-Diffusion pipeline capability](../ar_diffusion_pipeline_capability.md)
 - [Pipeline Parallel](pipeline_parallel.md)
 - Recipe: [`recipes/Physis-AI/CausVid-Wan.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Physis-AI/CausVid-Wan.md)
-- Code: `vllm_omni/diffusion/distributed/noisy_pipeline_parallel/{noisy_pp_plan,noisy_pp_executor}.py`;
+- Code: `vllm_omni/diffusion/distributed/noisy_pipeline_parallel/{batch,noisy_pp_plan,noisy_pp_executor}.py`;
   NoisyKV: `vllm_omni/experimental/ar_diffusion/kv_cache/noisy.py`

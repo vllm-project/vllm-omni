@@ -1,10 +1,10 @@
 # MiniMax-H3-Image for text-to-image and image editing — Ascend NPU
 
-> Ascend NPU deployment guide covering **Atlas 800T A3**, **Atlas 800I A2**
+> Ascend NPU deployment guide covering **Atlas 800I A2**, **Atlas 800T A3**,
 > and **Atlas 350 (A5)**. It covers checkpoint preparation, the official
 > image and container, deployment commands, request parameters, supported
-> image sizes and supported features, plus the measured Atlas 350
-> performance.
+> image sizes and supported features, plus the measured Atlas 800I A2,
+> Atlas 800T A3 and Atlas 350 (A5) performance.
 
 ## Summary
 
@@ -142,12 +142,12 @@ matching the platform from the
 
 | Platform | Image |
 | --- | --- |
-| Atlas 800I A2 | `quay.io/ascend/vllm-omni:v0.33.0rc1` |
-| Atlas 800T A3 | `quay.io/ascend/vllm-omni:v0.33.0rc1-a3` |
-| Atlas 350 (A5) | `quay.io/ascend/vllm-omni:v0.33.0rc1-a5` |
+| Atlas 800I A2 | `quay.io/ascend/vllm-omni:minimax-h3-image` |
+| Atlas 800T A3 | `quay.io/ascend/vllm-omni:minimax-h3-image-a3` |
+| Atlas 350 (A5) | `quay.io/ascend/vllm-omni:minimax-h3-image-a5` |
 
 ```bash
-export IMAGE=quay.io/ascend/vllm-omni:v0.33.0rc1-a3
+export IMAGE=quay.io/ascend/vllm-omni:minimax-h3-image-a3
 export CONTAINER_NAME=h3-image
 
 docker run -it -u root --name ${CONTAINER_NAME} \
@@ -371,6 +371,33 @@ reference, structured prompt and CPU generator with seed 1234.
 | 4 NPUs, Ulysses SP4, text encoder TP4, fully resident | 1.52 s | 1.49 s | 2.47 s | 8.56 s | 85.61 GiB |
 | 2 NPUs, Ulysses SP2, text encoder TP2, DiT DLO with AllGather | 6.45 s | 6.45 s | 7.27 s | 18.89 s | 39.65 GiB |
 | 1 NPU, DiT layer offload | 7.79 s | 7.76 s | 8.36 s | 31.10 s | 64.20 GiB |
+
+### Atlas 800T A3 performance
+
+Verified on Atlas 800T A3 (128 GiB per card as 2 × 64 GiB dies). The 1- and
+2-die profiles ran on one card, 4 dies on two cards, and 8 dies on four
+cards. The test case is the same as the Atlas 350 table: BF16, eager, six
+denoising steps, concurrency 1. Image:
+`quay.io/ascend/vllm-omni:minimax-h3-image-a3` (vLLM-Omni `eb8b991`).
+
+The 8-die profile uses DiT TP8 and text-encoder TP8 with all weights
+resident. The 4-die profile uses Ulysses SP4, text-encoder TP4 and DiT
+distributed layerwise offload with AllGather: keeping every weight resident
+does not fit in 64 GiB per die. The 2-die profile uses Ulysses SP2,
+text-encoder TP2 (the encoder stays resident on the dies) and the same DiT
+offload. The 1-die profile offloads both DiT and text encoder to host
+memory, so it holds much less HBM per die.
+
+The 4- and 8-die runs shared their cards with idle neighbour processes that
+held up to 10 GiB per die at 0% AICore. The reported peak excludes that
+baseline, and the timings were taken while those processes stayed idle.
+
+| Profile | T2I 1024² | T2I 2048² | Edit 2048² | Edit 4096² | Peak HBM / die |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8 dies (4 cards), DiT TP8, text encoder TP8, fully resident | 2.12 s | 2.10 s | 3.36 s | 9.65 s | 19.45 GiB |
+| 4 dies (2 cards), Ulysses SP4, text encoder TP4, DiT DLO with AllGather | 4.48 s | 4.47 s | 5.31 s | 14.87 s | 20.32 GiB |
+| 2 dies, Ulysses SP2, text encoder TP2, DiT DLO with AllGather | 6.30 s | 6.10 s | 8.71 s | 28.09 s | 36.20 GiB |
+| 1 die, DiT + text encoder layer offload | 10.86 s | 10.79 s | 14.87 s | 54.59 s | 12.26 GiB |
 
 ### Atlas 800I A2 performance
 

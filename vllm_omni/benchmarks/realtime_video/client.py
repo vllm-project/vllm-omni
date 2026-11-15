@@ -117,7 +117,8 @@ async def run_session(
         except ImportError as exc:
             raise BenchmarkError("This benchmark needs the websockets package: pip install websockets") from exc
 
-    connect_options: dict[str, Any] = {"max_size": None, "ping_interval": None}
+    # Avoid recompressing encoded MP4 chunks on the delivery critical path.
+    connect_options: dict[str, Any] = {"max_size": None, "ping_interval": None, "compression": None}
     if extra_headers:
         connect_options[header_option] = dict(extra_headers)
     if insecure and url.startswith("wss://"):

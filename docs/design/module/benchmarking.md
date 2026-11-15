@@ -54,7 +54,9 @@ The packaged `realtime-video` backend uses the existing `vllm bench serve
 warmup/frame/playback policies. Typed video workload/results keep frames
 separate from tokens. The common result retains `realtime_video` raw records;
 the legacy script translates flags and projects that result without a separate
-request loop.
+request loop. WebSocket compression is disabled to avoid recompressing encoded
+MP4 chunks on the delivery path. Record this transport setting when comparing
+results with older benchmark versions or browser clients.
 
 Realtime-video observations enter the shared `MultiModalsBenchmarkMetrics`
 aggregation with their native populations: one full request latency, TTFC,
