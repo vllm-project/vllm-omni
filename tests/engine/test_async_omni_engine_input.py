@@ -436,7 +436,9 @@ def test_only_the_qwen3_tts_check_changes_its_streaming_update_transform():
         if hasattr(resolve_obj_by_qualname(path), STREAMING_UPDATE_TRANSFORM_ATTR)
     }
     assert marked == {
-        f"{_QWEN3_TTS_CHECKS}.check_text_prompt": resolve_obj_by_qualname(f"{_QWEN3_TTS_CHECKS}.check_text_update")
+        "vllm_omni.model_executor.models.qwen3_tts.prompt_checks.check_tts_prompt": resolve_obj_by_qualname(
+            f"{_QWEN3_TTS_CHECKS}.check_text_update"
+        )
     }
 
 
