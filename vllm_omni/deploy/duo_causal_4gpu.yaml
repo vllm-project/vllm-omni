@@ -1,0 +1,39 @@
+# Duo 1.0 causal-base on 4 GPUs: Realization TP4 only, no duplex session.
+#
+# This is the smallest topology that exercises the ported Realization stage
+# against the released causal-base bundle; it is not the online duplex
+# deployment (see duo_dmd.yaml / duo_tp8_shared.yaml for that).
+#
+# Differences from duo_dmd.yaml all follow from causal-base not being the DMD
+# release: Euler-equivalent `causal` sampling at flow shift 1.0 and 50 steps
+# (what realization/complete.json records), no staged 4NFE adapter because the
+# bundle folds it into the backbone, and no online FP8 conversion.
+#
+# The Realization backbone ships a Diffusers-style config.json carrying only
+# `_class_name`. Add `model_type` and a single `architectures` entry pointing at
+# DuoPipeline, or the native loader cannot route the checkpoint:
+#
+#   {"_class_name": "MiniMaxH3DiTModel", "model_type": "minimax_h3_dit",
+#    "architectures": ["DuoPipeline"], ...}
+pipeline: duo
+async_chunk: false
+trust_remote_code: true
+distributed_executor_backend: mp
+stages:
+- stage_id: 1
+  model: /path/to/Duo-1.0-causal-base/realization/backbone
+  devices: '0,1,2,3'
+  dtype: bfloat16
+  step_execution: true
+  streaming_output: false
+  diffusion_model_runner_cls: vllm_omni.diffusion.models.duo.model_runner.DuoModelRunner
+  parallel_config:
+    tensor_parallel_size: 4
+    sequence_parallel_size: 1
+  default_sampling_params:
+    num_inference_steps: 50
+    seed: 42
+  max_num_seqs: 1
+# Stage options live on the engine args (see examples/offline_inference/duo),
+# because StageDeployConfig has no model_config field: a `model_config` block in
+# a deploy YAML is silently dropped.

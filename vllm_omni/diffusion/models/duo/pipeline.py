@@ -208,6 +208,21 @@ class DuoPipeline(nn.Module):
     def _load_fixed_adapter(self):
         adapter = self.options.get("adapter_path")
         if not adapter:
+            # The released causal-base bundle ships the adapter already folded
+            # into the backbone; `realization/complete.json` records that as
+            # "mode": "lora" and no staged adapter file exists. The DMD release
+            # is the one that ships a separate adapter. Require an explicit
+            # opt-in so a genuinely missing adapter still fails loudly instead
+            # of silently running an untrained projection path.
+            if self.options.get("backbone_includes_adapter", False):
+                if getattr(self.transformer, "_realization_base_loaded", False) is not True:
+                    raise ValueError("Backbone-includes-adapter requires a fully loaded base")
+                if self.options.get("role_embedding", False):
+                    raise ValueError("Backbone-includes-adapter cannot enable role embeddings")
+                return (
+                    {"source": "backbone", "folded": True},
+                    {"source": "backbone", "folded": True},
+                )
             raise ValueError("Explicit fixed Realization trainables adapter required")
         adapter_format = self.options.get("adapter_format", "native")
         if adapter_format == "torchtitan_split_qkv":
