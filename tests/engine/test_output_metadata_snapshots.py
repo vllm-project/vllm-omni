@@ -159,3 +159,55 @@ def test_minicpmo_finished_snapshot_preserves_all_codec_frames(kind):
     assert payload["meta"]["finished"].ndim == 0
     assert payload["meta"]["finished"].item() is True
     torch.testing.assert_close(payload["codes"]["audio"], torch.tensor([10, 11, 12]))
+
+
+@pytest.mark.parametrize("modality", [OutputModality.AUDIO, OutputModality.TEXT])
+def test_per_step_scalar_tensors_are_latest_snapshot_not_concatenated(modality):
+    # Any model that streams a per-step scalar (e.g. a flattened ``meta.*``
+    # flag or counter) without deferring its payload to request end yields
+    # 0-d tensor lists, which torch.cat rejects (CONCAT_DIM0) or flattens
+    # into a bogus vector (CONCAT_LAST); later keys must still consolidate.
+    payload = MultimodalPayload()
+    for step in range(3):
+        incoming = MultimodalPayload.from_dict(
+            {
+                "meta.use_gpt_latent": torch.tensor(True),
+                "codes.mel": torch.full((1, 1), step),
+                "meta.step": torch.tensor(step),
+            }
+        )
+        assert incoming is not None
+        payload = payload.merged_with(incoming)
+    # 0-d scalars are replaced as snapshots at merge time, never accumulated.
+    assert "meta.use_gpt_latent" not in payload.tensors
+
+    payload.consolidate_tensors(modality)
+    payload.consolidate_metadata()
+
+    assert "meta.use_gpt_latent" not in payload.tensors
+    assert bool(payload["meta.use_gpt_latent"]) is True
+    assert int(payload["meta.step"]) == 2
+    # Content after the scalar keys is still consolidated (dim per modality).
+    torch.testing.assert_close(payload["codes.mel"].reshape(-1), torch.arange(3))
+
+
+@pytest.mark.parametrize("modality", [OutputModality.AUDIO, OutputModality.TEXT])
+def test_cumulative_scalar_counter_stays_latest_across_interleaved_consolidation(modality):
+    # A cumulative scalar (meta.step = 0, 1, 2, ...) must keep one
+    # classification no matter how often consolidation runs between merges;
+    # otherwise a stale metadata value shadows the newest tensor.
+    payload = MultimodalPayload()
+    for step in range(5):
+        incoming = MultimodalPayload.from_dict({"meta.step": torch.tensor(step), "codes.mel": torch.full((1, 1), step)})
+        assert incoming is not None
+        payload = payload.merged_with(incoming)
+        if step in (1, 3):
+            payload.consolidate_tensors(modality)
+            payload.consolidate_metadata()
+
+    payload.consolidate_tensors(modality)
+    payload.consolidate_metadata()
+
+    assert "meta.step" not in payload.tensors
+    assert int(payload["meta.step"]) == 4
+    torch.testing.assert_close(payload["codes.mel"].reshape(-1), torch.arange(5))
