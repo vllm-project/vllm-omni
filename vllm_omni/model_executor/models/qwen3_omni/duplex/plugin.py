@@ -1035,7 +1035,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
 
     def on_history_item_deleted(self, *, state: QwenDuplexSessionState, item_id: str) -> int:
         """Remove deleted idle commits before a reused item ID can merge with them."""
-        if self._history_runtime.behavior.audio_cache_items is not None or state.committed_audio_consume_started:
+        if self._history_runtime.behavior.audio_retention != "original" or state.committed_audio_consume_started:
             return 0
         payload = state.committed_audio_payload
         if payload is None:
@@ -1147,7 +1147,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         Return whether the submitted audio has source items in Session history.
         Prompt selection is performed separately by each history policy.
         """
-        if self._history_runtime.behavior.audio_cache_items is None:
+        if self._history_runtime.behavior.audio_retention == "original":
             return self._bind_original_audio_history(config, state=state, payload=payload)
         history = config.get("conversation", [])
         bind_from = 0
@@ -1229,6 +1229,21 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             for offset, message in enumerate(turn):
                 src = index + offset
                 source_content = message.get("content")
+                binding = None
+                if (
+                    message.get("role") == "user"
+                    and isinstance(source_content, list)
+                    and any(part.get("type") == "audio_url" for part in source_content)
+                ):
+                    binding = next(
+                        (entry for entry in retained if any(key is source_content for key in entry[0])), None
+                    )
+                    # Validate the selected source, before an L1 transcript can
+                    # hide its audio part. Views do not release original PCM.
+                    if binding is None and self._history_runtime.behavior.audio_retention == "original":
+                        raise DuplexInputCapacityError(
+                            "Original history contains an unavailable audio source; restore or delete its item"
+                        )
                 # The view formats older context. The unanswered user run is
                 # request input even when the policy keeps zero media turns.
                 if view is not None and src < current_turn_start and message.get("role") == "user":
@@ -1236,11 +1251,8 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 content = message.get("content")
                 if message.get("role") == "user" and isinstance(content, list):
                     if any(part.get("type") == "audio_url" for part in content):
-                        binding = next(
-                            (entry for entry in retained if any(key is source_content for key in entry[0])), None
-                        )
                         if binding is None:
-                            if self._history_runtime.behavior.overflow == "reject":
+                            if self._history_runtime.behavior.audio_retention == "original":
                                 raise DuplexInputCapacityError(
                                     "Full history contains an unavailable audio source; restore or delete its item"
                                 )

@@ -22,7 +22,7 @@ import threading
 import time as _time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager, nullcontext
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, cast
 
@@ -31,13 +31,11 @@ import torch
 from opentelemetry.trace import Tracer
 from vllm.config import ModelConfig
 from vllm.exceptions import VLLMClientError
-from vllm.inputs import split_enc_dec_input
 from vllm.logger import init_logger
 from vllm.multimodal.cache import LruKeyReplicatedSenderCache
 from vllm.multimodal.cache.shm import ShmObjectStoreSenderCache
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
-from vllm.renderers.inputs.preprocess import parse_model_prompt
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest, FinishReason
@@ -193,14 +191,17 @@ def build_engine_core_request_from_tokens(
     if arrival_time is None:
         arrival_time = _time.time()
 
-    prompt_token_ids = prompt["prompt_token_ids"]
+    prompt_token_ids = prompt.get("prompt_token_ids")
+    prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
 
     sampling_params = None
     pooling_params = None
     if isinstance(params, SamplingParams):
         sampling_params = params.clone()
         if model_config is not None:
-            remaining = model_config.max_model_len - len(prompt_token_ids)
+            remaining = model_config.max_model_len - length_from_prompt_token_ids_or_embeds(
+                prompt_token_ids, prompt_embeds
+            )
             if sampling_params.max_tokens is None:
                 sampling_params.max_tokens = remaining
             # ``check_stop`` returns early while ``min_tokens`` is unmet, so a
@@ -212,7 +213,6 @@ def build_engine_core_request_from_tokens(
     else:
         pooling_params = params.clone()
 
-    prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
     raw_additional_information = prompt.get("additional_information")
     model_intermediate_buffer = prompt.get("model_intermediate_buffer")
     wire_payload: dict[str, Any] | None = None
@@ -2524,43 +2524,33 @@ class OrchestratorBase:
             model_intermediate_buffer=model_intermediate_buffer,
         )
 
+    def _process_stage_inputs_in_worker(
+        self, stage_id: int, *, validate_input_tokens: Callable[[int], None] | None = None, **kwargs: Any
+    ) -> EngineCoreRequest:
+        """Process inputs under the shared lock; subclasses may prepare them first.
+
+        Called only from the joined CPU worker. Generic stages use the ordinary
+        processor; duplex specializes preparation before backend admission.
+        """
+        request = self._get_stage_input_processor(stage_id).process_inputs(**kwargs)
+        if validate_input_tokens is not None:
+            validate_input_tokens(
+                length_from_prompt_token_ids_or_embeds(
+                    request.prompt_token_ids, getattr(request, "prompt_embeds", None)
+                )
+            )
+        return request
+
     async def _process_stage_inputs(
         self, stage_id: int, *, validate_input_tokens: Callable[[int], None] | None = None, **kwargs: Any
     ) -> Any:
-        """Process once; optionally validate expanded tokens before backend limits.
-
-        Rendering supplies reusable multimodal features. Passing that typed
-        engine input to InputProcessor avoids a second renderer/processor pass.
-        The same worker join and sender-cache guard cover rendering and rejection.
-        """
+        """Join serialized CPU input processing on success, rejection or cancellation."""
 
         def process() -> Any:
             with self._prompt_processing_lock:
-                processor = self._get_stage_input_processor(stage_id)
-                inputs = kwargs
-                if validate_input_tokens is not None:
-                    prompt = kwargs["prompt"]
-                    if isinstance(prompt, dict) and "type" in prompt:
-                        engine_input = prompt
-                    else:
-                        parsed = parse_model_prompt(processor.model_config, prompt)
-                        params = processor.renderer.default_cmpl_tok_params.with_kwargs(
-                            **(kwargs.get("tokenization_kwargs") or {})
-                        )
-                        # The renderer's early length check would hide our
-                        # recoverable error (and can truncate counting at cap+1).
-                        # Change only this request; the callback checks the full
-                        # expanded count before normal backend validation.
-                        params = replace(params, max_total_tokens=None)
-                        (engine_input,) = processor.renderer.render_cmpl([parsed], params)
-                    _, decoder = split_enc_dec_input(engine_input)
-                    validate_input_tokens(
-                        length_from_prompt_token_ids_or_embeds(
-                            decoder.get("prompt_token_ids"), decoder.get("prompt_embeds")
-                        )
-                    )
-                    inputs = {**kwargs, "prompt": engine_input}
-                return processor.process_inputs(**inputs)
+                return self._process_stage_inputs_in_worker(
+                    stage_id, validate_input_tokens=validate_input_tokens, **kwargs
+                )
 
         worker = asyncio.create_task(asyncio.to_thread(process))
         try:

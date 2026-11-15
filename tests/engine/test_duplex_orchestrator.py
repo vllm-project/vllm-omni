@@ -1811,7 +1811,7 @@ async def test_repeated_replica_failure_reports_session_error_and_close_once(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("input_tokens", [15, 16, 100])
+@pytest.mark.parametrize("input_tokens", [15, 16])
 async def test_capacity_validation_reuses_engine_expansion_and_recovers_after_rejection(mocker, input_tokens):
     from vllm.renderers import BaseRenderer
     from vllm.renderers.params import TokenizeParams
@@ -1923,3 +1923,37 @@ async def test_real_renderer_preserves_exact_recoverable_capacity_rejection(mock
     processor.process_inputs.assert_called_once()
     assert len(processor.process_inputs.call_args.kwargs["prompt"]["prompt_token_ids"]) == 15
     assert renderer.default_cmpl_tok_params.max_total_tokens == 20
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("input_tokens", [15, 16])
+async def test_resumable_capacity_counts_prompt_embeddings(input_tokens):
+    import torch
+    from vllm.sampling_params import SamplingParams
+
+    orchestrator, clients, _, _ = _build()
+    context = DuplexStageRequestContext(
+        request_id="embedded",
+        session_id="embedded",
+        fence=DuplexFence("embedded"),
+        stage_id=0,
+        final_stage_id=0,
+        config_generation=0,
+        sampling_params=(SamplingParams(max_tokens=5),),
+    )
+    orchestrator.ensure_request(context)
+    embeddings = torch.zeros((input_tokens, 4), device="cpu")
+    submission = DuplexStageSubmission(
+        context=context,
+        prompt={"prompt_token_ids": None, "prompt_embeds": embeddings},
+        already_submitted=False,
+        resumable=True,
+        input_capacity=DuplexInputCapacity(20, 5),
+    )
+    if input_tokens > 15:
+        with pytest.raises(DuplexInputCapacityError, match="needs 16 input tokens"):
+            await orchestrator.submit(submission)
+        assert not clients[0].add_request_calls
+    else:
+        await orchestrator.submit(submission)
+        assert clients[0].add_request_calls[0][0].prompt_embeds is embeddings

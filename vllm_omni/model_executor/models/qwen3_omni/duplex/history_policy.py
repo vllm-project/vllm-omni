@@ -455,12 +455,15 @@ class HistoryBehavior:
 
     Original rendering preserves the existing tool protocol. Budgeted rendering
     uses Session summaries. A rejected overflow never drops accepted sources.
-    None disables the corresponding legacy window or media eviction limit.
+    Original audio is retained until source deletion and requires both cache
+    limits to be None. Bounded audio requires an item cap and has an optional
+    byte target, retaining at least the newest binding for legacy compatibility.
     """
 
     original_messages: bool = False
     overflow: Literal["fit", "reject"] = "fit"
     message_window: int | None = RECENT_MESSAGE_WINDOW
+    audio_retention: Literal["original", "bounded"] = "bounded"
     audio_cache_items: int | None = RECENT_AUDIO_ITEMS
     audio_cache_bytes: int | None = RECENT_AUDIO_BYTES
     prompt_images: int | None = RECENT_PROMPT_IMAGES
@@ -474,6 +477,14 @@ class HistoryBehavior:
             value = getattr(self, name)
             if value is not None and (type(value) is not int or value <= 0):
                 raise ValueError(f"history behavior {name} must be positive or None")
+        if self.audio_retention == "original":
+            if self.audio_cache_items is not None or self.audio_cache_bytes is not None:
+                raise ValueError("original audio retention does not accept cache limits; select bounded retention")
+        elif self.audio_retention == "bounded":
+            if self.audio_cache_items is None:
+                raise ValueError("bounded audio retention requires audio_cache_items")
+        else:
+            raise ValueError("audio_retention must be original or bounded")
 
 
 def original_turn_ranges(history: Sequence[Message]) -> list[tuple[int, int]]:
@@ -559,6 +570,7 @@ class FullHistoryPolicy(NonCompressingHistoryPolicy):
         original_messages=True,
         overflow="reject",
         message_window=None,
+        audio_retention="original",
         audio_cache_items=None,
         audio_cache_bytes=None,
         prompt_images=None,

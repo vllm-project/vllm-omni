@@ -551,3 +551,43 @@ def test_custom_recent_policy_reserves_its_only_audio_slot_for_current_input(mon
     audio = prompt["multi_modal_data"]["audio"]
     assert len(audio) == 1 and not state.audio_history
     np.testing.assert_array_equal(audio[0][0], np.full(160, 3, dtype="<f4"))
+
+
+@pytest.mark.parametrize("kind", ["original_bytes", "original_items", "bounded_without_items"])
+def test_audio_retention_rejects_limits_that_would_be_ignored(kind):
+    from dataclasses import replace
+
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import FullHistoryPolicy, HistoryBehavior
+
+    with pytest.raises(ValueError, match="audio"):
+        if kind == "original_bytes":
+            replace(FullHistoryPolicy.behavior, audio_cache_bytes=64)
+        elif kind == "original_items":
+            replace(FullHistoryPolicy.behavior, audio_cache_items=1)
+        else:
+            HistoryBehavior(original_messages=True, audio_cache_items=None, audio_cache_bytes=64)
+
+
+@pytest.mark.parametrize("use_view", [False, True])
+def test_original_audio_retention_rejects_missing_pcm_even_when_overflow_can_fit(monkeypatch, use_view):
+    import sys
+    from dataclasses import replace
+
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import FullHistoryPolicy
+
+    class OriginalFit(FullHistoryPolicy):
+        behavior = replace(FullHistoryPolicy.behavior, overflow="fit", use_media_view=use_view)
+
+    monkeypatch.setattr(sys.modules[__name__], "OriginalFit", OriginalFit, raising=False)
+    plugin = plugin_for(f"{__name__}:OriginalFit")
+    missing, payload = audio_message(0)
+    history = [missing, {"role": "assistant", "content": "old answer"}, {"role": "user", "content": "recall"}]
+    view = [{"role": "user", "content": "old transcript"}, *history[1:]] if use_view else None
+    state = plugin.create_session_state()
+    with pytest.raises(DuplexInputCapacityError, match="unavailable audio"):
+        plan(plugin, history, state=state, view=view)
+    plan(plugin, [missing], state=state, payload=payload)
+    shown = plan(plugin, history, state=state, view=view)
+    assert len(shown["multi_modal_data"].get("audio", ())) == int(not use_view)
+    assert len(state.audio_history) == 1
+    assert plan(plugin, history, state=state)["multi_modal_data"]["audio"][0][0][0] == 1

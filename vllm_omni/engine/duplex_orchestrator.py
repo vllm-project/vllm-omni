@@ -15,11 +15,14 @@ from __future__ import annotations
 import time as _time
 from collections.abc import Callable, Coroutine
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
+from vllm.inputs import split_enc_dec_input
 from vllm.logger import init_logger
-from vllm.v1.engine import FinishReason
+from vllm.renderers.inputs.preprocess import parse_model_prompt
+from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.v1.engine import EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
@@ -567,6 +570,35 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             kwargs["replica_id"] = replica_id
         return await super()._build_next_stage_request(req_id, next_stage_id, next_input, params, **kwargs)
 
+    def _process_stage_inputs_in_worker(
+        self, stage_id: int, *, validate_input_tokens: Callable[[int], None] | None = None, **kwargs: Any
+    ) -> EngineCoreRequest:
+        """Own duplex renderer adaptation inside the shared, joined worker.
+
+        Render once before backend length admission, preserving exact recoverable
+        capacity errors and reusing the engine input's multimodal features.
+        """
+        if validate_input_tokens is None:
+            return super()._process_stage_inputs_in_worker(stage_id, **kwargs)
+        processor = self._get_stage_input_processor(stage_id)
+        prompt = kwargs["prompt"]
+        if isinstance(prompt, dict) and "type" in prompt:
+            engine_input = prompt
+        else:
+            parsed = parse_model_prompt(processor.model_config, prompt)
+            params = processor.renderer.default_cmpl_tok_params.with_kwargs(**(kwargs.get("tokenization_kwargs") or {}))
+            # The renderer's early length check would hide our
+            # recoverable error (and can truncate counting at cap+1).
+            # Change only this request; the callback checks the full
+            # expanded count before normal backend validation.
+            params = replace(params, max_total_tokens=None)
+            (engine_input,) = processor.renderer.render_cmpl([parsed], params)
+        _, decoder = split_enc_dec_input(engine_input)
+        validate_input_tokens(
+            length_from_prompt_token_ids_or_embeds(decoder.get("prompt_token_ids"), decoder.get("prompt_embeds"))
+        )
+        return processor.process_inputs(**{**kwargs, "prompt": engine_input})
+
     @staticmethod
     def _input_capacity_validator(capacity: DuplexInputCapacity) -> Callable[[int], None]:
         """Enforce model-supplied limits on already expanded engine input."""
@@ -603,7 +635,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                     resumable=True,
                 )
                 if submission.input_capacity is not None:
-                    self._input_capacity_validator(submission.input_capacity)(len(request.prompt_token_ids or ()))
+                    self._input_capacity_validator(submission.input_capacity)(
+                        length_from_prompt_token_ids_or_embeds(request.prompt_token_ids, request.prompt_embeds)
+                    )
             else:
                 # Keep raw Stage0 prompt (additional_information / multi_modal_data) for
                 # stage input processors via process_engine_inputs. Resumable requests

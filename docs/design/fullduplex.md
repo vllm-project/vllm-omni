@@ -161,11 +161,22 @@ Custom original-history strategies can subclass either and override selection
 or behavior. Session image admission is supplied by `session_image_limits`.
 Existing custom bounded/compression strategies retain the four required hooks.
 
+Audio retention is selected explicitly with `audio_retention`. `original` keeps
+PCM until source deletion and requires both audio cache limits to be `None`.
+`bounded` requires a positive `audio_cache_items` limit and accepts an optional
+`audio_cache_bytes` target; it keeps at least the newest binding, including when
+that binding exceeds the byte target. Unsupported combinations fail at policy
+construction. With original-message rendering, `original` also rejects selected
+sources whose PCM is unavailable, independently of the context overflow action.
+This check uses the selected source before L1 view formatting; a transcript view
+cannot hide missing PCM and does not release retained original audio.
+
 `DuplexAppendPlan.input_capacity` carries model-owned context and output limits
-through `DuplexStageSubmission`. The shared stage-input worker checks the expanded
-input before ordinary backend length validation and submission. Capacity
-rejection and cancellation use the existing worker join and sender-cache cleanup;
-other plugins leave this optional field unset.
+through `DuplexStageSubmission`. `DuplexOrchestrator` owns renderer adaptation and
+checks expanded input before ordinary backend length validation and submission.
+The shared worker delegates input processing and retains its serialization,
+cancellation join and sender-cache cleanup. Capacity checks count prompt
+embeddings as well as token IDs. Other plugins leave this optional field unset.
 
 `incremental` folds older text and original audio into a bounded text memory,
 and images into intermediate and long-term visual memories.
