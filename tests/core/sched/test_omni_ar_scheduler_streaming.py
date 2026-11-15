@@ -608,9 +608,9 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
 
 
 def test_stage0_plain_streaming_update_keeps_the_first_chunk_text() -> None:
-    # Qwen3-TTS skips its stage-0 text check on streaming updates, so a plain
-    # stage-0 extension must keep the first chunk's additional_information:
-    # the re-admitted request carries it to the Talker's preprocess.
+    # Qwen3-TTS's stage-0 update check ignores a plain update's
+    # additional_information, so a plain stage-0 extension must keep the first
+    # chunk's: the re-admitted request carries it to the Talker's preprocess.
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ

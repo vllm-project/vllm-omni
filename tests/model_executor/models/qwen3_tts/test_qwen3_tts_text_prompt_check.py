@@ -12,6 +12,7 @@ from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_P
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
     check_text_prompt,
+    check_text_update,
     has_tts_text_conditioning,
 )
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -84,6 +85,44 @@ def test_prompt_without_usable_text_is_rejected(prompt):
 @pytest.mark.parametrize("prompt", list(_ACCEPTED.values()), ids=list(_ACCEPTED))
 def test_prompt_with_usable_text_passes_through_unchanged(prompt):
     assert check_text_prompt(prompt, []) is prompt
+
+
+def _update(info=None, buffer=None):
+    prompt = {"prompt_token_ids": [0] * 4, "additional_information": {"global_request_id": ["r"], **(info or {})}}
+    if buffer is not None:
+        prompt["model_intermediate_buffer"] = buffer
+    return prompt
+
+
+_REPLACE = {"meta": {"replace_streaming_prompt": True}}
+_REJECTED_UPDATES = {
+    # A plain stage-0 update installs its model_intermediate_buffer on the session.
+    "buffer-blank-text": _update(buffer={"text": [""]}),
+    "buffer-none-text-ids": _update(buffer={PRECOMPUTED_TEXT_IDS_KEY: None}),
+    # A replacing update installs both payloads, so it needs a first chunk's text.
+    "replace-blank-text": _update({"text": [""], **_REPLACE}),
+    "buffer-replace-blank-text": _update({"text": ["  "]}, buffer=_REPLACE),
+}
+_ACCEPTED_UPDATES = {
+    # AsyncOmni closes every stream with TokensPrompt([0]); the engine stamps the request id.
+    "stream-close": {"prompt_token_ids": [0], "additional_information": {"global_request_id": ["r"]}},
+    "text-less": _update(),
+    # A plain update keeps the first chunk's additional_information.
+    "plain-blank-text": _update({"text": ["  "]}),
+    "buffer-text": _update(buffer={"text": ["Hello."]}),
+    "replace-text": _update({"text": ["Hello."], **_REPLACE}),
+}
+
+
+@pytest.mark.parametrize("prompt", list(_REJECTED_UPDATES.values()), ids=list(_REJECTED_UPDATES))
+def test_streaming_update_that_blanks_the_text_is_rejected(prompt):
+    with pytest.raises(ValueError, match=_ERROR):
+        check_text_update(prompt, [])
+
+
+@pytest.mark.parametrize("prompt", list(_ACCEPTED_UPDATES.values()), ids=list(_ACCEPTED_UPDATES))
+def test_streaming_update_that_keeps_the_text_passes_through_unchanged(prompt):
+    assert check_text_update(prompt, []) is prompt
 
 
 def _mrv2_talker_info(new_req):

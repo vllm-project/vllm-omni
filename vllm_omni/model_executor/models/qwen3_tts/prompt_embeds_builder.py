@@ -41,7 +41,7 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
 
-from vllm_omni.config.stage_config import skip_on_streaming_updates
+from vllm_omni.config.stage_config import on_streaming_updates
 from vllm_omni.utils.audio import mel_filter_bank
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
@@ -173,7 +173,34 @@ def _talker_info_views(info: object, buffer: object) -> tuple[dict[str, Any], di
     return {**info, **buffer}, {**buffer, **info}
 
 
-@skip_on_streaming_updates
+def check_text_update(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
+    """Reject streaming-input updates that would blank a request's text (stage-0 update transform).
+
+    A plain stage-0 update keeps the first chunk's ``additional_information``
+    but installs its own ``model_intermediate_buffer``, which Model Runner V2
+    lays over it when it re-admits the request. An update that sets
+    ``meta.replace_streaming_prompt`` replaces both payloads, so it gets the
+    first-submission check. ``AsyncOmni`` closes every stream with a text-less
+    ``TokensPrompt([0])`` update, which passes.
+    """
+    for item in prompt if isinstance(prompt, list) else (prompt,):
+        if not isinstance(item, dict):
+            continue
+        buffer = item.get("model_intermediate_buffer")
+        if any(
+            isinstance(payload, dict)
+            and isinstance(payload.get("meta"), dict)
+            and payload["meta"].get("replace_streaming_prompt") is True
+            for payload in (buffer, item.get("additional_information"))
+        ):
+            check_text_prompt(item, sampling_params_list)
+        elif isinstance(buffer, dict) and ("text" in buffer or PRECOMPUTED_TEXT_IDS_KEY in buffer):
+            if not has_tts_text_conditioning(buffer, allow_blank_text=False):
+                raise ValueError(_TEXT_ERROR)
+    return prompt
+
+
+@on_streaming_updates(check_text_update)
 def check_text_prompt(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
     """Reject requests without usable text before submission (stage-0 prompt transform).
 
@@ -186,9 +213,9 @@ def check_text_prompt(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
     payloads; a client ``trailing_text`` hidden state does not count, since the
     Talker writes its own at first prefill.
 
-    Streaming-input updates skip this check: the Talker builds its prompt from
-    the first chunk only, and ``AsyncOmni`` closes the stream with a text-less
-    ``TokensPrompt([0])`` update.
+    Streaming-input updates run :func:`check_text_update` instead: the Talker
+    builds its prompt from the first chunk only, and ``AsyncOmni`` closes the
+    stream with a text-less ``TokensPrompt([0])`` update.
     """
     for item in prompt if isinstance(prompt, list) else (prompt,):
         fields = item if isinstance(item, dict) else {}
