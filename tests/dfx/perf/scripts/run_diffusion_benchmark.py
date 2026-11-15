@@ -888,7 +888,7 @@ def assert_result(
     """Assert that the expected number of requests completed.
 
     When ``check_baseline`` is set, metrics in the current hardware bucket must
-    stay within 20% of the sweep-resolved baseline in the worse direction.
+    stay within 10% of the sweep-resolved baseline in the worse direction.
     """
     completed = result.get("completed_requests", result.get("completed", 0))
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"

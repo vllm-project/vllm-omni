@@ -45,11 +45,11 @@ both runners call `assert_baseline_within_tolerance()` in
 - Compare only the bucket whose key is the runtime `Hardware` value. Another
   device's bucket is recorded and not compared.
 - Throughput and QPS (`throughput`, `qps` in the metric name) fail when the
-  measured value is **more than 20% below** the baseline (`measured < baseline * 0.8`).
+  measured value is **more than 10% below** the baseline (`measured < baseline * 0.8`).
 - Latency, memory, and real-time factor (`latency`, `ttft`, `tpot`, `itl`,
   `e2el`, `ttfp`, `rtf`, `memory`) fail when the measured value is **more than
-  20% above** the baseline (`measured > baseline * 1.2`).
-- An exact 20% boundary passes. A metric name that matches neither family fails
+  10% above** the baseline (`measured > baseline * 1.2`).
+- An exact 10% boundary passes. A metric name that matches neither family fails
   the case instead of being skipped.
 - Omitting `baseline`, or leaving it empty, still runs the case with no
   threshold assertion. The existing TPOT finiteness check still runs whenever

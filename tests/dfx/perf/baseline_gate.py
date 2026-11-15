@@ -3,17 +3,18 @@
 
 """Compare a perf result with the hardware baseline for the machine that ran it.
 
-``--assert-baseline`` turns this on. A metric fails when it is more than 20%
+``--assert-baseline`` turns this on. A metric fails when it is more than 10%
 worse than the baseline for the current hardware bucket. Throughput and QPS are
 worse when they fall. Latency, memory, and real-time factor are worse when they
 rise. A bucket for some other device is recorded and not compared.
 """
 
+import logging
 import math
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, TypeGuard
 
-BASELINE_REGRESSION_TOLERANCE = 0.20
+BASELINE_REGRESSION_TOLERANCE = 0.10
 
 # Substrings, not a closed metric list. ``throughput_qps`` matches the higher
 # group only; ``mean_audio_rtf`` and ``peak_memory_mb_mean`` match the lower group.
@@ -38,7 +39,7 @@ def metric_lower_is_better(name: str) -> bool:
     )
 
 
-def _is_finite_number(value: Any) -> bool:
+def _is_finite_number(value: object) -> TypeGuard[int | float]:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
@@ -57,7 +58,7 @@ def _worse_ratio(measured: float, baseline: float, *, lower_is_better: bool) -> 
 
 
 def _regressed(worse_ratio: float, tolerance: float) -> bool:
-    # ``超过 20%`` is strict. Float noise around an exact 20% boundary still passes.
+    # ``超过 10%`` is strict. Float noise around an exact 10% boundary still passes.
     if worse_ratio <= tolerance:
         return False
     return not math.isclose(worse_ratio, tolerance, rel_tol=1e-9, abs_tol=1e-12)
@@ -78,8 +79,12 @@ def assert_baseline_within_tolerance(
     """
     if not isinstance(baseline, dict) or not baseline:
         return
+    # TODO: Remove this temporary H100 fallback after local validation.
     if not isinstance(hardware, str) or not hardware or hardware not in baseline:
-        return
+        logging.getLogger(__name__).error("No baseline for hardware %r; falling back to H100", hardware)
+        hardware = "H100"
+    if hardware not in baseline:
+        raise AssertionError("H100 fallback baseline is missing")
     bucket = baseline[hardware]
     if not isinstance(bucket, dict) or not bucket:
         raise AssertionError(f"baseline[{hardware!r}] must be a non-empty metric map, got {bucket!r}")

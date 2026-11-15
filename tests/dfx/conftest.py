@@ -855,9 +855,9 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store_true",
         default=False,
         help=(
-            "Fail a perf case when a metric is more than 20% worse than the baseline for this hardware. "
-            "Throughput and QPS fail when they fall below 80% of the baseline. "
-            "Latency, memory, and real-time factor fail when they rise above 120% of the baseline. "
+            "Fail a perf case when a metric is more than 10% worse than the baseline for this hardware. "
+            "Throughput and QPS fail when they fall below 90% of the baseline. "
+            "Latency, memory, and real-time factor fail when they rise above 110% of the baseline. "
             "A hardware bucket that does not match this machine is not compared (default: off)."
         ),
     )

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Regression direction and 20% baseline tolerance for perf runners."""
+"""Regression direction and 10% baseline tolerance for perf runners."""
 
 import math
 
@@ -52,7 +52,8 @@ def test_conflicting_metric_direction_is_rejected() -> None:
         metric_lower_is_better("latency_throughput")
 
 
-def test_exact_20_percent_boundary_passes() -> None:
+def test_exact_10_percent_boundary_passes() -> None:
+    assert BASELINE_REGRESSION_TOLERANCE == 0.10
     tolerance = BASELINE_REGRESSION_TOLERANCE
     measured = {
         "request_throughput": 1.0 * (1 - tolerance),
@@ -62,14 +63,14 @@ def test_exact_20_percent_boundary_passes() -> None:
     assert_baseline_within_tolerance(measured, baseline, "H100")
 
 
-def test_throughput_drop_beyond_20_percent_fails() -> None:
-    measured = {"request_throughput": 0.79}
+def test_throughput_drop_beyond_10_percent_fails() -> None:
+    measured = {"request_throughput": 0.89}
     baseline = {"H100": {"request_throughput": 1.0}}
     with pytest.raises(AssertionError, match="below baseline 1.0"):
         assert_baseline_within_tolerance(measured, baseline, "H100")
 
 
-def test_latency_increase_beyond_20_percent_fails_and_improvement_passes() -> None:
+def test_latency_increase_beyond_10_percent_fails_and_improvement_passes() -> None:
     baseline = {"A3": {"latency_mean": 10.0, "peak_memory_mb_mean": 1000.0}}
     assert_baseline_within_tolerance(
         {"latency_mean": 8.0, "peak_memory_mb_mean": 900.0},
@@ -78,17 +79,21 @@ def test_latency_increase_beyond_20_percent_fails_and_improvement_passes() -> No
     )
     with pytest.raises(AssertionError, match="latency_mean"):
         assert_baseline_within_tolerance(
-            {"latency_mean": 12.01, "peak_memory_mb_mean": 1000.0},
+            {"latency_mean": 11.01, "peak_memory_mb_mean": 1000.0},
             baseline,
             "A3",
         )
 
 
-def test_unmatched_hardware_and_empty_baseline_are_not_gated() -> None:
+def test_unmatched_hardware_uses_temporary_fallback_and_empty_baseline_is_not_gated(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     measured = {"throughput_qps": 0.01}
     baseline = {"H100": {"throughput_qps": 1.0}}
-    assert_baseline_within_tolerance(measured, baseline, "B200")
-    assert_baseline_within_tolerance(measured, baseline, None)
+    for hardware in ("B200", None):
+        with pytest.raises(AssertionError, match="on H100"):
+            assert_baseline_within_tolerance(measured, baseline, hardware)
+    assert any(record.levelname == "ERROR" and "falling back to H100" in record.message for record in caplog.records)
     assert_baseline_within_tolerance(measured, {}, "H100")
     assert_baseline_within_tolerance(measured, None, "H100")
 
@@ -143,6 +148,7 @@ def test_diffusion_assert_result_checks_named_hardware_only_when_enabled() -> No
         "baseline": {"H100": {"throughput_qps": 1.0, "latency_mean": 1.0}},
     }
     assert_result(result, 1)
-    assert_result(result, 1, check_baseline=True, hardware="B200")
+    with pytest.raises(AssertionError, match="throughput_qps"):
+        assert_result(result, 1, check_baseline=True, hardware="B200")
     with pytest.raises(AssertionError, match="throughput_qps"):
         assert_result(result, 1, check_baseline=True, hardware="H100")
