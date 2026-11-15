@@ -570,6 +570,65 @@ def test_conditioning_cache_reuses_blocks_and_invalidates_member_order(monkeypat
         assert len(tf._embeddings) == 1
 
 
+def _tick_request(*, session_id: str, chunk_index: int, request_id: str = "turn-5", **tick) -> OmniDiffusionRequest:
+    """A request whose session identity lives only in the typed streaming tick."""
+    payload = {
+        "session_id": session_id,
+        "request_id": request_id,
+        "chunk_index": chunk_index,
+        **tick,
+    }
+    return OmniDiffusionRequest(
+        prompt="x",
+        request_id=request_id,
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"ar_diffusion_tick": payload}),
+    )
+
+
+def test_noisy_lifecycle_agrees_with_the_shared_binding_for_typed_ticks():
+    """CausVid must resolve session ownership the same way the Runner does.
+
+    A streaming tick puts the session in ``ar_diffusion_tick``. Reading only the
+    legacy top-level ``session_id`` made CausVid fall back to the request id, drop
+    history retention and restart at chunk 0 while the Runner used the session --
+    the same request, two different answers.
+    """
+    from vllm_omni.experimental.ar_diffusion.request_binding import kv_request_binding
+
+    req = _tick_request(session_id="s", chunk_index=5)
+
+    kv_id, persist, reset, close = CausVidWanPipeline._noisy_request_lifecycle(req)
+    binding = kv_request_binding(req)
+
+    assert kv_id == binding.owner == "s"
+    assert persist is binding.persist is True
+    assert reset is binding.reset is False
+    assert close is binding.close is False
+
+
+def test_noisy_lifecycle_agrees_with_the_shared_binding_for_reset_and_close():
+    """Reset/close ticks must also reach the model layer unchanged."""
+    from vllm_omni.experimental.ar_diffusion.request_binding import kv_request_binding
+
+    for tick_kwargs in ({"reset": True}, {"close_session": True}):
+        req = _tick_request(session_id="s", chunk_index=5, **tick_kwargs)
+        kv_id, persist, reset, close = CausVidWanPipeline._noisy_request_lifecycle(req)
+        binding = kv_request_binding(req)
+
+        assert (kv_id, persist, reset, close) == (binding.owner, binding.persist, binding.reset, binding.close)
+
+
+def test_noisy_lifecycle_keeps_the_legacy_fields_working():
+    """A request with no tick still resolves from the legacy top-level fields."""
+    legacy = OmniDiffusionRequest(
+        prompt="x",
+        request_id="turn-5",
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"session_id": "s", "reset": True}),
+    )
+
+    assert CausVidWanPipeline._noisy_request_lifecycle(legacy) == ("s", True, True, False)
+
+
 @pytest.mark.parametrize("texts", [(torch.zeros(2, 3, 4),), (torch.zeros(1, 3, 4), torch.zeros(1, 5, 4))])
 def test_conditioning_rejects_invalid_member_shapes(texts):
     tf = StageWanTransformer.__new__(StageWanTransformer)

@@ -62,6 +62,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     NoisyKVState,
     clean_history_cells,
 )
+from vllm_omni.experimental.ar_diffusion.request_binding import kv_request_binding
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 
 logger = init_logger(__name__)
@@ -549,17 +550,16 @@ class CausVidWanPipeline(nn.Module):
     def _noisy_request_lifecycle(
         req: OmniDiffusionRequest,
     ) -> tuple[str, bool, bool, bool]:
-        """Return ``(kv_id, persist, reset, close_session)`` — shared by batch and single paths."""
-        req_id = str(getattr(req, "request_id", None) or "")
-        sp = req.sampling_params
-        extra = dict(sp.extra_args or {}) if sp is not None else {}
-        raw_session = extra.get("session_id")
-        explicit_session = raw_session is not None and str(raw_session) != ""
-        reset = bool(extra.get("reset", False))
-        close_session = bool(extra.get("close_session", False))
-        persist = explicit_session and not close_session
-        kv_id = str(raw_session) if explicit_session else req_id
-        return kv_id, persist, reset, close_session
+        """Compatibility projection of the runner/model shared KV binding.
+
+        The session identity may travel as a typed streaming tick
+        (``ar_diffusion_tick``) rather than the legacy top-level fields. Reading
+        only the legacy ones lets the model disagree with the Runner about the
+        owner, history retention and the starting chunk of the very same request,
+        so both sides resolve it through one binding.
+        """
+        binding = kv_request_binding(req)
+        return binding.owner, binding.persist, binding.reset, binding.close
 
     def admit_cell_request(
         self, req: OmniDiffusionRequest, *, decode_tag: int = 0
@@ -575,15 +575,12 @@ class CausVidWanPipeline(nn.Module):
         param = next(self.transformer.parameters())
         device, dtype = param.device, param.dtype
 
-        kv_id, persist, _reset, _close_session = self._noisy_request_lifecycle(req)
+        binding = kv_request_binding(req)
+        kv_id = binding.owner
         if not kv_id:
             raise ValueError("CausVidWan path requires a non-empty request_id or session_id")
-        sp = req.sampling_params
-        extra_peek = dict(sp.extra_args or {}) if sp is not None else {}
-        chunk_base = int(extra_peek.get("chunk_base", 0) or 0)
-        if chunk_base < 0:
-            raise ValueError(f"chunk_base must be non-negative, got {chunk_base}")
-        plan, extra, denoise = self._plan_for(req, chunk_base=chunk_base)
+        persist = binding.persist
+        plan, extra, denoise = self._plan_for(req, chunk_base=binding.chunk_base)
         schedule = plan.schedule
         if persist:
             ctx.kv.cache.bind_session_structure(kv_id, schedule.structural_key())
@@ -597,7 +594,7 @@ class CausVidWanPipeline(nn.Module):
             ]
             if missing_owned:
                 raise ValueError(
-                    f"session continuation chunk_base={chunk_base} for {kv_id!r} missing owned "
+                    f"session continuation chunk_base={binding.chunk_base} for {kv_id!r} missing owned "
                     f"prior cells {sorted(missing_owned)!r} on rank {pp_rank}; "
                     "restart with chunk_base=0 or fix retain/release"
                 )
