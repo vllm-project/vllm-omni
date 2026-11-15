@@ -672,17 +672,19 @@ async def test_a_segment_end_the_plugin_says_hands_nothing_on_ends_its_unit(monk
         await close_harness(h)
 
 
+def _whole_unit_backlog(self, *, operation_id, chunk_period_ms):
+    """A buffer hook that hands out one more whole unit while the buffer holds one (no model's buffer does yet)."""
+    if self._sample_rate_hz is None or len(self._buffer) // 4 < self._sample_rate_hz * chunk_period_ms // 1000:
+        return None
+    payload = {"type": "audio", "audio": "", "format": "pcm_f32le", "sample_rate_hz": self._sample_rate_hz}
+    return self.prepare_append(payload, operation_id=operation_id, chunk_period_ms=chunk_period_ms)
+
+
 @pytest.mark.usefixtures("input_clock_model")
 async def test_an_append_longer_than_a_unit_submits_every_whole_unit_it_completed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def _prepare_backlog(self, *, operation_id, chunk_period_ms):
-        if self._sample_rate_hz is None or len(self._buffer) // 4 < self._sample_rate_hz * chunk_period_ms // 1000:
-            return None
-        payload = {"type": "audio", "audio": "", "format": "pcm_f32le", "sample_rate_hz": self._sample_rate_hz}
-        return self.prepare_append(payload, operation_id=operation_id, chunk_period_ms=chunk_period_ms)
-
-    monkeypatch.setattr(MiniCPMO45PcmAppendBuffer, "prepare_backlog", _prepare_backlog, raising=False)
+    monkeypatch.setattr(MiniCPMO45PcmAppendBuffer, "prepare_backlog", _whole_unit_backlog, raising=False)
     h = await open_harness(extra_body=INPUT_CLOCK)
     try:
         events = await h.run(append_audio(samples=16000 * 3 + 3200))  # 3.2 s: three whole 1 s units
@@ -1691,6 +1693,72 @@ async def test_an_append_refused_from_its_first_vad_segment_keeps_nothing_and_tr
         await close_harness(h)
 
 
+class _StatefulSpeechDetector:
+    """A detector whose speech state spans appends: ``speech_started`` once per turn, until a reset.
+
+    ``unreadable_next`` makes it fail to read the next append (what the batcher
+    raises for audio that is not a whole number of frames).
+    """
+
+    def __init__(self) -> None:
+        self.speech_active = False
+        self.resets = 0
+        self.unreadable_next = False
+
+    def segment_steps(self, base64_audio, *, fmt, sample_rate_hz):
+        from vllm_omni.engine.duplex.turn_detection import TurnDetectionResult, TurnDetectionSegment
+
+        del fmt, sample_rate_hz
+        if self.unreadable_next:
+            self.unreadable_next = False
+            raise ValueError("audio is not a whole number of frames")
+        yield from ()
+        started = not self.speech_active
+        self.speech_active = True
+        result = TurnDetectionResult(is_speech=True, speech_active=True, speech_started=started, speech_probability=0.9)
+        return [TurnDetectionSegment(base64_audio, result)]
+
+    def reset(self) -> None:
+        self.speech_active = False
+        self.resets += 1
+
+
+@pytest.mark.parametrize("refused_in", ["decoding", "turn-detection"])
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_refusal_before_turn_detection_heard_the_audio_keeps_the_detectors_speech_state(
+    refused_in: str,
+) -> None:
+    """One bad append inside an utterance: the detector heard none of it, so no second ``speech_started``.
+
+    Only a refusal after detection scored the audio (``input_backpressure`` in
+    ``_append_detected_audio``) resets the detector, so a resend is not heard twice.
+    """
+    h = await open_harness(auto_response=False, extra_body=INPUT_CLOCK)
+    detector = h.runner.control._detector = _StatefulSpeechDetector()
+    try:
+        first = await h.run(append_audio(samples=3200))
+        assert types(first).count("input_audio_buffer.speech_started") == 1
+
+        if refused_in == "decoding":
+            bad = commands.AppendAudio(audio=b"\x00" * 3, format="pcm16", sample_rate_hz=16000, event_id="evt-bad")
+        else:
+            detector.unreadable_next = True
+            bad = append_audio(samples=3200, event_id="evt-bad")
+        refused = await h.run(bad)
+
+        assert [(e.code, e.related_event_id) for e in refused if e.type == "error"] == [("bad_audio", "evt-bad")]
+        (ack,) = _acks(refused)
+        assert (ack.decision, ack.reason, ack.audio_end_ms) == ("rejected", "bad_audio", 200)
+        assert detector.resets == 0, "turn detection never heard the refused audio"
+
+        third = await h.run(append_audio(samples=3200))
+        assert "input_audio_buffer.speech_started" not in types(third), "still the same utterance"
+        (ack,) = _acks(third)
+        assert (ack.input_index, ack.audio_end_ms) == (3, 400)
+    finally:
+        await close_harness(h)
+
+
 @pytest.mark.usefixtures("input_clock_model")
 async def test_closing_with_nothing_owed_adds_no_acknowledgement() -> None:
     h = await open_harness(extra_body=INPUT_CLOCK)
@@ -1831,14 +1899,6 @@ async def test_with_three_stages_a_middle_stage_decision_ends_the_unit() -> None
         assert (ack.input_index, ack.unit_end_ms, _units(ack)) == (1, 1000, [("listen", None)])
     finally:
         await close_harness(h)
-
-
-def _whole_unit_backlog(self, *, operation_id, chunk_period_ms):
-    """A buffer hook that hands out one more whole unit while the buffer holds one (no model's buffer does yet)."""
-    if self._sample_rate_hz is None or len(self._buffer) // 4 < self._sample_rate_hz * chunk_period_ms // 1000:
-        return None
-    payload = {"type": "audio", "audio": "", "format": "pcm_f32le", "sample_rate_hz": self._sample_rate_hz}
-    return self.prepare_append(payload, operation_id=operation_id, chunk_period_ms=chunk_period_ms)
 
 
 @pytest.mark.usefixtures("input_clock_model")

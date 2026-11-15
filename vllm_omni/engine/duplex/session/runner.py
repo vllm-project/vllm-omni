@@ -1345,7 +1345,9 @@ class DuplexSessionRunner:
             return
         discard_pending_commit_item(projector, realtime_item_id)
 
-    def _refuse_append(self, code: str, message: str, event: Mapping[str, object]) -> None:
+    def _refuse_append(
+        self, code: str, message: str, event: Mapping[str, object], *, reset_detector: bool = False
+    ) -> None:
         """Reject an append, or the rest of one, before that audio reaches the model.
 
         The error carries the client's ``event_id``. In an input-clocked
@@ -1354,16 +1356,21 @@ class DuplexSessionRunner:
         its ``audio_end_ms`` says where the audio the session kept ends (the
         segments server VAD split off before the refused one stay buffered,
         ``_on_append_audio``).
+
+        ``reset_detector`` is for a refusal after turn detection scored the
+        audio (``_append_detected_audio``): the client sends it again from
+        ``audio_end_ms``, and the detector must not hear it twice. A refusal
+        before detection (modality, decoding, unreadable audio) leaves the
+        detector alone: it heard none of the refused audio, and its speech
+        state belongs to the appends accepted before it.
         """
         self._emit_error(code, message, event_id=event.get("realtime_event_id"))
         ack = self._current_input_ack
         if self._input_clock is not None and ack is not None:
             # Rejected, and the refused audio no longer counts in ``audio_end_ms``.
             self._input_clock.refuse_input(ack, code)
-            # Turn detection may already have scored the refused audio; the
-            # client sends it again from ``audio_end_ms``, so the detector must
-            # not hear it twice.
-            self.control.reset_vad()
+            if reset_detector:
+                self.control.reset_vad()
 
     def _require_projector(self) -> RealtimeProjectionState:
         return self.out.require_projector()
@@ -1934,7 +1941,12 @@ class DuplexSessionRunner:
             release_queued_input()
         try:
             if not session.reserve_input_bytes(raw_audio_bytes, limit=limit):
-                self._refuse_append("input_backpressure", "Duplex session pending input exceeds server limit", event)
+                self._refuse_append(
+                    "input_backpressure",
+                    "Duplex session pending input exceeds server limit",
+                    event,
+                    reset_detector=True,
+                )
                 return
             # Full-duplex: emit each ~chunk_period of audio so the model runs
             # per-chunk generation without an explicit response.create.
@@ -1947,7 +1959,7 @@ class DuplexSessionRunner:
             )
         except ValueError as exc:
             session.release_input_bytes(raw_audio_bytes)
-            self._refuse_append("bad_event", str(exc), event)
+            self._refuse_append("bad_event", str(exc), event, reset_detector=True)
             return
         # Only audio the buffer actually took counts as input for the next commit.
         model_state.input_since_commit = True
