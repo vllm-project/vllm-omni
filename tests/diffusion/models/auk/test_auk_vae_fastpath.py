@@ -436,7 +436,12 @@ def test_batched_graph_reuses_a_larger_batch_without_mixing_outputs() -> None:
         latents = torch.randn(batch, 8, vae.latent_dim, device="cuda")
         actual = wrapper(latents)
         expected = vae.decode(latents)
-        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+        pad = wrapper.pad_for(latents.device).expand(4 - batch, 8, -1)
+        expected_padded = vae.decode(torch.cat([latents, pad], dim=0))[:batch]
+        torch.testing.assert_close(actual, expected_padded, atol=1e-5, rtol=1e-5)
+        # cuDNN allow_tf32=True (default on Ampere/Ada GPUs such as L4) can pick
+        # different Conv1d algorithms across batch=4 vs batch=2 (~3e-4 delta).
+        torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
         for previous, snapshot in snapshots:
             torch.testing.assert_close(previous, snapshot, atol=0, rtol=0)
         snapshots.append((actual, actual.clone()))
