@@ -236,9 +236,9 @@ URL access policy.
 ### MiniMax H3 Samplers
 
 Set `"sampler"` in `extra_params` to select the sampler. Supported values are
-`euler` (default) and `res_multistep`. Both request and step execution support
-them, and compatible requests share packed model evaluations. Fixed distilled
-schedules remain Euler-only.
+`euler` (default), `res_multistep`, and `dpmpp_2m`. Both request and step
+execution support them, and compatible requests share packed model evaluations.
+Fixed distilled schedules remain Euler-only.
 
 ### MiniMax H3 control and inpainting
 

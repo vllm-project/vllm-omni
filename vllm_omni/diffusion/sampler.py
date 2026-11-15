@@ -6,7 +6,9 @@ KSAMPLER wraps an algorithm function that owns model evaluation and integration.
 Models supply an x0 callable; schedules and history live in request-local states.
 
 RES coefficients follow ComfyUI_RH_MinMaxH3 sampler_core.py at
-6abdf97ae8cdce548c751ce850adc5010b583b7c. Euler preserves the original
+6abdf97ae8cdce548c751ce850adc5010b583b7c. DPM++ 2M follows ComfyUI
+comfy/k_diffusion/sampling.py sample_dpmpp_2m at
+c844cb672186f187bf9455e2808821417a10d296. Euler preserves the original
 floating-point operation order.
 """
 
@@ -38,8 +40,8 @@ def _validate_sigma(value: float, name: str) -> float:
 def resolve_sampler_name(name: str | None) -> str:
     if name is None:
         return "euler"
-    if name not in ("euler", "res_multistep"):
-        raise ValueError(f"Unsupported sampler: {name!r}; expected euler or res_multistep")
+    if name not in ("euler", "res_multistep", "dpmpp_2m"):
+        raise ValueError(f"Unsupported sampler: {name!r}; expected euler, res_multistep or dpmpp_2m")
     return name
 
 
@@ -103,6 +105,27 @@ def res_multistep_coefficients(sigmas: Sequence[float]) -> list[tuple[float, flo
     return coeffs
 
 
+def dpmpp_2m_coefficients(sigmas: Sequence[float]) -> list[tuple[float, float] | None]:
+    """Per-step DPM++ 2M weights on (x0, previous x0); None where the step is first order.
+
+    Like ComfyUI, the step size is measured in t = -log(sigma). This is the
+    log-sigma form of the x0 ODE dx/dsigma = (x - x0) / sigma, which flow
+    matching shares with variance-exploding models. The first-order update
+    equals Euler; the first and zero-sigma steps use it.
+    """
+    values = _validate_sigmas(sigmas)
+    coeffs: list[tuple[float, float] | None] = []
+    for i, (curr, nxt) in enumerate(zip(values, values[1:])):
+        if i == 0 or nxt == 0:
+            coeffs.append(None)
+            continue
+        h = math.log(curr / nxt)
+        r = math.log(values[i - 1] / curr) / h
+        weight = -math.expm1(-h)
+        coeffs.append((weight * (1 + 1 / (2 * r)), -weight / (2 * r)))
+    return coeffs
+
+
 def _res_multistep_step(
     state: torch.Tensor,
     denoised: torch.Tensor,
@@ -111,7 +134,7 @@ def _res_multistep_step(
     sigma_curr: float,
     sigma_next: float,
 ) -> torch.Tensor:
-    """One RES update for one latent stream; Euler at the first/zero-sigma step."""
+    """One two-term multistep update (RES or DPM++ 2M); Euler where coeff is None."""
     if coeff is None:
         return euler_eta0_step(state, denoised, sigma_curr=sigma_curr, sigma_next=sigma_next)
     if old_denoised is None or state.shape != denoised.shape or old_denoised.shape != state.shape:
@@ -138,6 +161,11 @@ class ResMultistepHistory:
 
     coeffs: tuple[list[tuple[float, float] | None], ...]
     old_denoised: tuple[torch.Tensor | None, ...]
+
+
+@dataclass(frozen=True)
+class Dpmpp2mHistory(ResMultistepHistory):
+    """The same layout as ResMultistepHistory, holding DPM++ 2M coefficients."""
 
 
 @dataclass(eq=False)
@@ -264,15 +292,18 @@ def sample_euler(
             _commit(active, outputs, callback)
 
 
-def sample_res_multistep(
+def _sample_multistep(
     model: DenoiseModel,
     states: Sequence[SamplingState],
     *,
-    num_steps: int | None = None,
-    callback: SampleCallback | None = None,
-    step_context: StepContext | None = None,
+    label: str,
+    history_type: type[ResMultistepHistory],
+    coefficients: Callable[[Sequence[float]], list[tuple[float, float] | None]],
+    num_steps: int | None,
+    callback: SampleCallback | None,
+    step_context: StepContext | None,
 ) -> None:
-    """RES integration with request-local, transactional prediction history."""
+    """Two-term multistep integration with request-local, transactional prediction history."""
     for active in _sampling_steps(states, num_steps):
         with step_context(active) if step_context else nullcontext():
             histories = []
@@ -280,12 +311,10 @@ def sample_res_multistep(
                 history = state.history
                 if history is None:
                     if state.step_index != 0:
-                        raise ValueError("RES history is required to resume sampling")
-                    history = ResMultistepHistory(
-                        tuple(res_multistep_coefficients(s) for s in state.sigmas), (None,) * len(state.sigmas)
-                    )
-                elif not isinstance(history, ResMultistepHistory):
-                    raise ValueError("RES sampling requires ResMultistepHistory")
+                        raise ValueError(f"{label} history is required to resume sampling")
+                    history = history_type(tuple(coefficients(s) for s in state.sigmas), (None,) * len(state.sigmas))
+                elif type(history) is not history_type:
+                    raise ValueError(f"{label} sampling requires {history_type.__name__}")
                 histories.append(history)
             predictions = _evaluate(model, _current_evaluations(active))
             outputs, new_histories = [], []
@@ -302,11 +331,51 @@ def sample_res_multistep(
                 # A new history object; the committed one stays intact if this step fails.
                 keep = i + 1 < len(state.sigmas[0]) - 1
                 new_histories.append(
-                    ResMultistepHistory(
-                        history.coeffs, tuple(x0.detach().clone() if keep else None for x0 in prediction)
-                    )
+                    history_type(history.coeffs, tuple(x0.detach().clone() if keep else None for x0 in prediction))
                 )
             _commit(active, outputs, callback, histories=new_histories)
+
+
+def sample_res_multistep(
+    model: DenoiseModel,
+    states: Sequence[SamplingState],
+    *,
+    num_steps: int | None = None,
+    callback: SampleCallback | None = None,
+    step_context: StepContext | None = None,
+) -> None:
+    """RES integration with request-local, transactional prediction history."""
+    _sample_multistep(
+        model,
+        states,
+        label="RES",
+        history_type=ResMultistepHistory,
+        coefficients=res_multistep_coefficients,
+        num_steps=num_steps,
+        callback=callback,
+        step_context=step_context,
+    )
+
+
+def sample_dpmpp_2m(
+    model: DenoiseModel,
+    states: Sequence[SamplingState],
+    *,
+    num_steps: int | None = None,
+    callback: SampleCallback | None = None,
+    step_context: StepContext | None = None,
+) -> None:
+    """DPM++ 2M integration; one model call per step and one previous x0 per stream."""
+    _sample_multistep(
+        model,
+        states,
+        label="DPM++ 2M",
+        history_type=Dpmpp2mHistory,
+        coefficients=dpmpp_2m_coefficients,
+        num_steps=num_steps,
+        callback=callback,
+        step_context=step_context,
+    )
 
 
 class Sampler(ABC):
@@ -349,5 +418,5 @@ class KSAMPLER(Sampler):
 
 
 def sampler_object(name: str | None = None) -> KSAMPLER:
-    functions = {"euler": sample_euler, "res_multistep": sample_res_multistep}
+    functions = {"euler": sample_euler, "res_multistep": sample_res_multistep, "dpmpp_2m": sample_dpmpp_2m}
     return KSAMPLER(functions[resolve_sampler_name(name)])
