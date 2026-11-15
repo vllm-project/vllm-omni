@@ -34,7 +34,7 @@ from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
 from .ar_config import Zonos3Architecture
-from .modeling_zonos3_mini import Zonos3Backbone, Zonos3BackboneBatch, Zonos3PrefillSpan
+from .modeling_zonos3_mini import Zonos3BackboneBatch, Zonos3ForCausalLM, Zonos3PrefillSpan
 from .sampling_state import EOS, Zonos3ARSamplingState
 
 
@@ -156,7 +156,11 @@ class Zonos3ARModelState(OmniModelState):
     sample_determined_tokens_during_warmup = True
 
     def __init__(
-        self, vllm_config: VllmConfig, model: Zonos3Backbone, encoder_cache: EncoderCache | None, device: torch.device
+        self,
+        vllm_config: VllmConfig,
+        model: Zonos3ForCausalLM,
+        encoder_cache: EncoderCache | None,
+        device: torch.device,
     ) -> None:
         if vllm_config.model_config.enable_prompt_embeds or encoder_cache is not None:
             raise ValueError("Zonos3 conditioning must use its request metadata, not generic prompt/MM embeddings")
@@ -283,7 +287,7 @@ class Zonos3ARModelState(OmniModelState):
         del req_index
         raise RuntimeError(f"Zonos3 AR does not support preemption/state recomputation: {req_id}")
 
-    def _compile_prompt(self, req_id: str, info: dict[str, Any]) -> _Prompt:
+    def build_prompt(self, req_id: str, info: dict[str, Any]) -> _Prompt:
         length = self._lengths[req_id]
         if is_warmup_request(req_id):
             return _Prompt(torch.zeros((length, self._embed_dim), dtype=self.dtype, device=self.device), False)
@@ -328,7 +332,7 @@ class Zonos3ARModelState(OmniModelState):
                     "Zonos3 raw speaker reference must be non-empty and no longer than "
                     f"{self.model.config.speaker_reference_max_seconds:g} seconds"
                 )
-            # _compile_prompt runs once per request; chunked prefill slices the
+            # build_prompt runs once per request; chunked prefill slices the
             # cached embeddings and never repeats this expensive extraction.
             speaker = encoder(waveform, sample_rate).squeeze(0)
         if speaker is not None:
@@ -429,7 +433,7 @@ class Zonos3ARModelState(OmniModelState):
                     raise RuntimeError("Zonos3 cannot resume prefill after AR decode")
                 prompt = self._prompts.get(req_id)
                 if prompt is None:
-                    prompt = self._compile_prompt(req_id, self.intermediate_buffer.buffers[slot])
+                    prompt = self.build_prompt(req_id, self.intermediate_buffer.buffers[slot])
                     self._prompts[req_id] = prompt
                     self.sampling_state.has_audio_prefix[slot] = prompt.has_audio_prefix
                 offset = int(input_batch.num_computed_prefill_tokens_np[row])

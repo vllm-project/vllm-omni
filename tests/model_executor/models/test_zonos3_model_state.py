@@ -16,11 +16,10 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import SamplingStates
 from vllm.v1.worker.gpu.states import RequestState
 
-from tests.model_executor.models.test_zonos3_modeling import CPUAttentionOracle, small_ar_config, valid_runtime
+from tests.model_executor.models.test_zonos3_modeling import make_cpu_lm, small_ar_config, valid_runtime
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.model_executor.models.zonos3.model_state import Zonos3ARModelState
-from vllm_omni.model_executor.models.zonos3.modeling_zonos3_mini import Zonos3Backbone
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -36,11 +35,7 @@ def make_owner(capacity=4, device="cpu", dtype=torch.float32):
     device = torch.device(device)
     torch.manual_seed(31)
     architecture = small_ar_config()
-    model = (
-        Zonos3Backbone(architecture, lambda config, index: CPUAttentionOracle(config))
-        .eval()
-        .to(device=device, dtype=dtype)
-    )
+    model = make_cpu_lm(architecture).eval().to(device=device, dtype=dtype)
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.normal_(std=0.1)
@@ -150,7 +145,9 @@ def step(owner, data):
     state, sampler, requests = owner
     inputs = state.prepare_inputs(data, requests)
     state.run_preprocess(data, inputs, requests)
-    hidden = state.model(inputs["inputs_embeds"], data.positions, inputs["zonos3_batch"])
+    hidden = state.model(
+        inputs_embeds=inputs["inputs_embeds"], positions=data.positions, zonos3_batch=inputs["zonos3_batch"]
+    )
     state.postprocess_model_output(hidden, data, requests)
     return state.sample_determined_tokens(data, sampler), inputs
 
@@ -163,13 +160,13 @@ def test_conditioning_once_chunked_mixed_prefill_feedback_and_static_bucket(owne
     add(owner, "a", 0, 6)
     add(owner, "b", 1, 5)
     compiled = []
-    original = state._compile_prompt
+    original = state.build_prompt
 
     def compile_once(req_id, info):
         compiled.append(req_id)
         return original(req_id, info)
 
-    monkeypatch.setattr(state, "_compile_prompt", compile_once)
+    monkeypatch.setattr(state, "build_prompt", compile_once)
     first, _ = step(owner, batch(owner, [("a", 0, 2, 0, True), ("b", 1, 5, 0, True)]))
     assert first.num_sampled.tolist() == [0, 1]
     feedback = state.next_embeddings[1].clone()
@@ -219,7 +216,7 @@ def test_raw_speaker_reference_enforces_checkpoint_duration_limit(owner):
     payload.pop("speaker_embedding")
     payload.update(reference_waveform=torch.zeros(30 * 16000 + 1), reference_sample_rate=16000)
     with pytest.raises(ValueError, match="no longer than 30 seconds"):
-        state._compile_prompt("long-reference", state.intermediate_buffer.buffers[0])
+        state.build_prompt("long-reference", state.intermediate_buffer.buffers[0])
     state.model.speaker_encoder.assert_not_called()
 
 
@@ -278,7 +275,9 @@ def test_request_owned_codes_survive_mixed_prefill_partition_and_later_steps(own
     data = batch(owner, [("partial", 0, 2, 0, True), ("complete", 1, 5, 0, True)])
     inputs = state.prepare_inputs(data, requests)
     state.run_preprocess(data, inputs, requests)
-    hidden = state.model(inputs["inputs_embeds"], data.positions, inputs["zonos3_batch"])
+    hidden = state.model(
+        inputs_embeds=inputs["inputs_embeds"], positions=data.positions, zonos3_batch=inputs["zonos3_batch"]
+    )
     _, snapshot = state.postprocess_model_output(hidden, data, requests)
     tokens = state.sample_determined_tokens(data, native)
     assert tokens.num_sampled.tolist() == [0, 1]

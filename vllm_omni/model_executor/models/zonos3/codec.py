@@ -13,7 +13,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,23 +43,120 @@ class ZACTransformerSpec(TypedDict):
 
 
 @dataclass
-class ZACAttentionState:
+class ZACPackedRingState:
+    """Tensor-ring storage, with distinct non-leaseable padding rows.
+
+    ``max_chunk`` is expressed in this layer's tokens. The extra rows are not
+    slots: each padding token has its own destination, avoiding scatter races.
+    """
+
     keys: torch.Tensor
     values: torch.Tensor
+    capacity: int
+    ring_capacity: int
+    max_chunk: int
 
-    def reset(self, slots: torch.Tensor) -> None:
-        self.keys.index_fill_(0, slots, 0)
-        self.values.index_fill_(0, slots, 0)
+
+def zac_packed_ring_attention(
+    layer: ZACMossLayer,
+    x: torch.Tensor,
+    slot_ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    rvq_lengths: torch.Tensor,
+    state: ZACPackedRingState,
+    *,
+    scale: int = 1,
+) -> torch.Tensor:
+    """Packed-Q sliding-window attention; no per-request attention execution.
+
+    Metadata and cumulative RVQ lengths stay on device. Only trailing capacity
+    rows are padding. The caller validates each CPU chunk against max_chunk
+    before mutation. A layer's offsets and absolute positions derive from its
+    fixed RVQ upsampling scale. This does not advance the shared RVQ cursor.
+
+    Writing the complete chunk first is safe: R >= W-1+M, hence the last
+    new key cannot alias the earliest query's oldest required key.
+    """
+    rows, width = x.shape
+    if state.ring_capacity < layer.context - 1 + state.max_chunk:
+        raise ValueError("Packed ring cannot retain a full multi-Q causal window")
+    if state.keys.shape[0] < state.capacity * state.ring_capacity + rows:
+        raise ValueError("Packed ring needs a distinct scratch row per capacity token")
+    row = torch.arange(rows, device=x.device)
+    offsets = cu_seqlens * scale
+    torch._assert_async(
+        ((offsets[1:] - offsets[:-1]) <= state.max_chunk).all(),
+        "Packed ring chunk exceeds the layer max_chunk; split before decoding",
+    )
+    if x.device.type == "cuda":
+        from .packed_kernels import segment_layout
+
+        request, local, valid = segment_layout(offsets, rows)
+    else:
+        request = torch.searchsorted(offsets[1:], row, right=True).clamp_max(slot_ids.numel() - 1)
+        valid = row < offsets[-1]
+        local = row - offsets[request]
+    slot = slot_ids[request]
+    origin = rvq_lengths[slot] * scale
+    position = origin + local
+    q, k, v = layer.qkv(layer.norm1(x)).reshape(rows, 3, layer.heads, layer.head_dim).unbind(1)
+    frequency = torch.exp(
+        torch.arange(layer.head_dim // 2, device=x.device, dtype=torch.float32)
+        * (-math.log(10000.0) * 2 / layer.head_dim)
+    )
+    phase = position.float()[:, None] * frequency
+    cos, sin = phase.cos()[:, None], phase.sin()[:, None]
+
+    def rope(z: torch.Tensor) -> torch.Tensor:
+        real, imag = z.float().reshape(rows, layer.heads, layer.head_dim // 2, 2).unbind(-1)
+        return torch.stack((real * cos - imag * sin, real * sin + imag * cos), -1).flatten(-2).to(z.dtype)
+
+    q, k = rope(q), rope(k)
+    address = torch.where(
+        valid,
+        slot * state.ring_capacity + position.remainder(state.ring_capacity),
+        state.capacity * state.ring_capacity + row,
+    )
+    if x.device.type == "cuda":
+        from .packed_kernels import packed_ring_attention
+
+        attention = packed_ring_attention(
+            q,
+            k,
+            v,
+            address,
+            state.keys,
+            state.values,
+            slot,
+            position,
+            origin,
+            valid,
+            state.ring_capacity,
+            layer.context,
+        )
+    else:
+        attention = _zac_packed_ring_reference(layer, q, k, v, slot, position, valid, address, state)
+    x = x + layer.attention_scale * layer.attention_out(attention.reshape(rows, width))
+    result = x + layer.ffn_scale * layer.ffn(layer.norm2(x))
+    return torch.where(valid[:, None], result, 0.0)
+
+
+def _zac_packed_ring_reference(layer, q, k, v, slot, position, valid, address, state):
+    """CPU reference; materializes one fixed window per packed Q."""
+    state.keys.index_copy_(0, address, k.to(state.keys.dtype))
+    state.values.index_copy_(0, address, v.to(state.values.dtype))
+    age = torch.arange(layer.context - 1, -1, -1, device=q.device)
+    key_position = position[:, None] - age
+    read = slot[:, None] * state.ring_capacity + key_position.remainder(state.ring_capacity)
+    keys = state.keys[read].to(q.dtype).permute(0, 2, 1, 3)
+    values = state.values[read].to(q.dtype).permute(0, 2, 1, 3)
+    mask = (key_position >= 0) & valid[:, None]
+    attention = F.scaled_dot_product_attention(q[:, :, None], keys, values, attn_mask=mask[:, None, None])
+    return attention
 
 
 class ZACMossLayer(nn.Module):
-    """One real B>1 neural forward over equal-length chunks at different positions.
-
-    Past keys are right-aligned in a fixed ``context-1`` window. A row's
-    absolute position masks uninitialized entries, including after slot reuse.
-    Eager groups use exact lengths. Graph groups pass device valid lengths so
-    padded frames never advance persistent history.
-    """
+    """Moss projections and feed-forward modules for packed ring attention."""
 
     def __init__(self, spec: ZACTransformerSpec) -> None:
         super().__init__()
@@ -84,58 +180,6 @@ class ZACMossLayer(nn.Module):
         self.attention_scale = nn.Parameter(torch.full((d,), spec["layer_scale"]))
         self.ffn_scale = nn.Parameter(torch.full((d,), spec["layer_scale"]))
 
-    def allocate_state(self, capacity: int, dtype: torch.dtype, device: torch.device | str) -> ZACAttentionState:
-        shape = (capacity, self.heads, self.context - 1, self.head_dim)
-        return ZACAttentionState(
-            torch.zeros(shape, dtype=dtype, device=device), torch.zeros(shape, dtype=dtype, device=device)
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        slots: torch.Tensor,
-        positions: torch.Tensor,
-        state: ZACAttentionState,
-        lengths: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        b, t, d = x.shape
-        q, k, v = self.qkv(self.norm1(x)).reshape(b, t, 3, self.heads, self.head_dim).unbind(2)
-        steps = torch.arange(t, device=x.device)
-        frequency = torch.exp(
-            torch.arange(self.head_dim // 2, device=x.device, dtype=torch.float32)
-            * (-math.log(10000.0) * 2 / self.head_dim)
-        )
-        phase = (positions[:, None] + steps).float()[:, :, None] * frequency[None, None, :]
-        cos, sin = phase.cos()[:, :, None], phase.sin()[:, :, None]
-
-        def rope(z: torch.Tensor) -> torch.Tensor:
-            real, imag = z.float().reshape(b, t, self.heads, self.head_dim // 2, 2).unbind(-1)
-            return torch.stack((real * cos - imag * sin, real * sin + imag * cos), -1).flatten(-2).to(z.dtype)
-
-        q = rope(q).transpose(1, 2)
-        k = torch.cat((state.keys.index_select(0, slots).to(k.dtype), rope(k).transpose(1, 2)), dim=2)
-        v = torch.cat((state.values.index_select(0, slots).to(v.dtype), v.transpose(1, 2)), dim=2)
-        past = self.context - 1
-        key_index = torch.arange(past + t, device=x.device)
-        delta = (steps + past)[:, None] - key_index[None, :]
-        valid = (delta >= 0) & (delta < self.context)
-        initialized = key_index[None, :] >= (past - positions.clamp(max=past))[:, None]
-        mask = valid[None, None, :, :] & initialized[:, None, None, :]
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        # The cache is bounded. Rows at different chunk indices share the GEMMs
-        # but never their keys or conv histories. No padded token advances state.
-        if past:
-            if lengths is None:
-                next_k, next_v = k[:, :, -past:], v[:, :, -past:]
-            else:
-                indices = lengths[:, None] + torch.arange(past, device=x.device)
-                indices = indices[:, None, :, None].expand(b, self.heads, past, self.head_dim)
-                next_k, next_v = k.gather(2, indices), v.gather(2, indices)
-            state.keys.index_copy_(0, slots, next_k.to(state.keys.dtype))
-            state.values.index_copy_(0, slots, next_v.to(state.values.dtype))
-        x = x + self.attention_scale * self.attention_out(out.transpose(1, 2).reshape(b, t, d))
-        return x + self.ffn_scale * self.ffn(self.norm2(x))
-
 
 class ZACMossStage(nn.Module):
     def __init__(self, spec: ZACTransformerSpec, *, omit_output_projection: bool = False) -> None:
@@ -147,19 +191,6 @@ class ZACMossStage(nn.Module):
             if omit_output_projection
             else nn.Linear(spec["d_model"], spec["output_dimension"], bias=False)
         )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        slots: torch.Tensor,
-        positions: torch.Tensor,
-        states: list[ZACAttentionState],
-        lengths: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        x = self.input_proj(x.transpose(1, 2))
-        for layer, state in zip(self.layers, states, strict=True):
-            x = layer(x, slots, positions, state, lengths)
-        return self.output_proj(x).transpose(1, 2)
 
 
 class ZACPatch(nn.Module):
@@ -184,20 +215,6 @@ class ZACConvNeXt(nn.Module):
 
     def allocate_state(self, capacity: int, dtype: torch.dtype, device: torch.device | str) -> torch.Tensor:
         return torch.zeros((capacity, self.dwconv.in_channels, 6), dtype=dtype, device=device)
-
-    def forward(
-        self, x: torch.Tensor, slots: torch.Tensor, history: torch.Tensor, lengths: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        joined = torch.cat((history.index_select(0, slots).to(x.dtype), x), -1)
-        h = self.dwconv(joined).transpose(1, 2)
-        h = self.pwconv2(F.gelu(self.pwconv1(self.norm(h))))
-        if lengths is None:
-            next_history = joined[..., -6:]
-        else:
-            indices = lengths[:, None, None] + torch.arange(6, device=x.device)
-            next_history = joined.gather(2, indices.expand(-1, x.shape[1], -1))
-        history.index_copy_(0, slots, next_history.to(history.dtype))
-        return x + h.transpose(1, 2)
 
 
 @dataclass(frozen=True)
@@ -320,19 +337,57 @@ class ZACSpectralHead(nn.Module):
 
 
 @dataclass
-class ZACDecoderState:
+class ZACPackedDecoderState:
     frames: torch.Tensor
     semantic_history: list[torch.Tensor]
-    stage_history: list[list[ZACAttentionState]]
+    stage_history: list[list[ZACPackedRingState]]
     head_history: list[torch.Tensor]
 
-    def reset(self, slots: torch.Tensor) -> None:
-        self.frames.index_fill_(0, slots, 0)
-        for history in self.semantic_history + self.head_history:
-            history.index_fill_(0, slots, 0)
-        for stage in self.stage_history:
-            for layer in stage:
-                layer.reset(slots)
+
+def _packed_convnext(
+    block: ZACConvNeXt, x: torch.Tensor, slots: torch.Tensor, offsets: torch.Tensor, history: torch.Tensor
+) -> torch.Tensor:
+    """Segmented depthwise convolution: only finite boundary context is gathered.
+
+    The [tokens, 7, channels] stencil never introduces a batch time dimension.
+    History is committed after every stencil has read the previous snapshot.
+    """
+    rows = x.shape[0]
+    if x.device.type == "cuda":
+        from .packed_kernels import segment_layout
+
+        request, local, valid = segment_layout(offsets, rows)
+    else:
+        row = torch.arange(rows, device=x.device)
+        request = torch.searchsorted(offsets[1:], row, right=True).clamp_max(slots.numel() - 1)
+        valid = row < offsets[-1]
+        local = row - offsets[request]
+    old = history.transpose(1, 2)
+    if x.device.type == "cuda":
+        from .packed_kernels import segmented_depthwise
+
+        h = segmented_depthwise(x, history, block.dwconv.weight, block.dwconv.bias, slots, request, local, valid)
+    else:
+        taps = torch.arange(7, device=x.device)
+        source = row[:, None] + taps - 6
+        from_history = local[:, None] + taps < 6
+        boundary = old[slots[request, None], (local[:, None] + taps).clamp(0, 5)]
+        fresh = x[source.clamp(0, rows - 1)]
+        stencil = torch.where(from_history[:, :, None], boundary, fresh)
+        h = (stencil * block.dwconv.weight[:, 0].T[None]).sum(1) + block.dwconv.bias
+    result = x + block.pwconv2(F.gelu(block.pwconv1(block.norm(h))))
+    if x.device.type == "cuda":
+        from .packed_kernels import commit_conv_history
+
+        commit_conv_history(x, history, slots, offsets)
+    else:
+        lengths = offsets[1:] - offsets[:-1]
+        u = lengths[:, None] + torch.arange(6, device=x.device)
+        previous = old[slots[:, None], u.clamp(0, 5)]
+        current = x[(offsets[:-1, None] + u - 6).clamp(0, rows - 1)]
+        next_history = torch.where((u < 6)[:, :, None], previous, current)
+        history.index_copy_(0, slots, next_history.transpose(1, 2))
+    return torch.where(valid[:, None], result, 0.0)
 
 
 class ZACDecoderNetwork(nn.Module):
@@ -363,58 +418,81 @@ class ZACDecoderNetwork(nn.Module):
             device=next(self.parameters()).device
         )
 
-    def allocate_state(self, capacity: int) -> ZACDecoderState:
+    def allocate_packed_state(self, capacity: int, max_chunk: int, token_capacity: int) -> ZACPackedDecoderState:
         parameter = next(self.parameters())
         device = parameter.device
         cache_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-        return ZACDecoderState(
-            frames=torch.zeros(capacity, dtype=torch.int64, device=device),
-            semantic_history=[
-                block.allocate_state(capacity, torch.float32, device) for block in self.semantic_head[:-1]
-            ],
-            stage_history=[
-                [layer.allocate_state(capacity, cache_dtype, device) for layer in stage.layers]
-                if isinstance(stage, ZACMossStage)
-                else []
-                for stage in self.stages
-            ],
-            head_history=[block.allocate_state(capacity, torch.float32, device) for block in self.head.blocks],
+        stages = []
+        scale = 1
+        for stage in self.stages:
+            layers = []
+            if isinstance(stage, ZACPatch):
+                scale *= stage.size
+            else:
+                for layer in stage.layers:
+                    ring = layer.context - 1 + max_chunk * scale
+                    shape = (capacity * ring + token_capacity * scale, layer.heads, layer.head_dim)
+                    layers.append(
+                        ZACPackedRingState(
+                            torch.zeros(shape, dtype=cache_dtype, device=device),
+                            torch.zeros(shape, dtype=cache_dtype, device=device),
+                            capacity,
+                            ring,
+                            max_chunk * scale,
+                        )
+                    )
+            stages.append(layers)
+        return ZACPackedDecoderState(
+            torch.zeros(capacity, dtype=torch.long, device=device),
+            [block.allocate_state(capacity, torch.float32, device) for block in self.semantic_head[:-1]],
+            stages,
+            [block.allocate_state(capacity, torch.float32, device) for block in self.head.blocks],
         )
 
-    def forward(
-        self, codes: torch.Tensor, slots: torch.Tensor, state: ZACDecoderState, lengths: torch.Tensor | None = None
+    def forward_packed(
+        self, codes: torch.Tensor, slots: torch.Tensor, cu_seqlens: torch.Tensor, state: ZACPackedDecoderState
     ) -> list[torch.Tensor]:
-        """One neural batch, [B, new_frames, 10] → two [B, head_frames, bins] branches.
+        """Continuous RVQ → continuous spectra, with padding only at capacity tail.
 
-        The manager validates codes on CPU and stages the batch once. Optional
-        device lengths exclude RVQ padding from all KV/conv and position commits.
+        All sequences share every projection, convolution stencil and attention
+        launch. Each attention layer reads the original cumulative RVQ cursor;
+        the cursor is committed once, after the complete neural forward.
         """
-        positions = state.frames.index_select(0, slots)
         device_type = codes.device.type
         with torch.autocast(device_type, enabled=False):
-            x = self.quantizer.semantic_quantizer.quantizers[0](codes[:, :, 0])
+            # The pointwise checkpoint projections retain weight-norm prehooks.
+            x = self.quantizer.semantic_quantizer.quantizers[0](codes[None, :, 0])[0].T
             for block, history in zip(self.semantic_head[:-1], state.semantic_history, strict=True):
-                x = block(x, slots, history, lengths)
-            z = self.semantic_head[-1](x).float()
+                x = _packed_convnext(block, x, slots, cu_seqlens, history)
+            z = self.semantic_head[-1](x.T[None])[0].T.float()
             for i, quantizer in enumerate(self.quantizer.quantizer.quantizers):
-                code = codes[:, :, i + 1]
-                contribution = quantizer(code.clamp(min=0))
-                z = z + torch.where(code[:, None, :] >= 0, contribution, 0.0)
+                code = codes[:, i + 1]
+                contribution = quantizer(code.clamp_min(0)[None])[0].T
+                z = z + torch.where(code[:, None] >= 0, contribution, 0.0)
         x, scale = z, 1
         with torch.autocast(device_type, dtype=torch.bfloat16, enabled=device_type == "cuda"):
             for stage, history in zip(self.stages, state.stage_history, strict=True):
                 if isinstance(stage, ZACPatch):
-                    x = stage(x)
+                    x = x.reshape(x.shape[0], -1, stage.size).transpose(1, 2).reshape(x.shape[0] * stage.size, -1)
                     scale *= stage.size
                 else:
-                    x = stage(x, slots, positions * scale, history, None if lengths is None else lengths * scale)
+                    # Legacy pointwise/stage projections consume column-major
+                    # token matrices. Preserve that GEMM layout across packed
+                    # patch stages: identical-value release experiments show
+                    # row-major selection changes BF16 reduction substantially.
+                    # This transposes one packed slab, never pads per request.
+                    x = x.T.contiguous().T
+                    x = stage.input_proj(x)
+                    for layer, ring in zip(stage.layers, history, strict=True):
+                        x = zac_packed_ring_attention(layer, x, slots, cu_seqlens, state.frames, ring, scale=scale)
+                    x = stage.output_proj(x)
         with torch.autocast(device_type, enabled=False):
             x = x.float()
             for block, history in zip(self.head.blocks, state.head_history, strict=True):
-                x = block(x, slots, history, None if lengths is None else lengths * scale)
-            x = self.head.norm(x.transpose(1, 2))
+                x = _packed_convnext(block, x, slots, cu_seqlens * scale, history)
+            x = self.head.norm(x)
             output = [linear(x).float() for linear in self.head.outs]
-        state.frames.index_copy_(0, slots, positions + (codes.shape[1] if lengths is None else lengths))
+        state.frames.index_add_(0, slots, cu_seqlens[1:] - cu_seqlens[:-1])
         return output
 
     def load_release_weights(
@@ -508,281 +586,239 @@ class Zonos3CodecFiles:
         network.load_release_weights(generator["generator"], head["trainable"])
 
 
-class ZACISTFTStream:
-    def __init__(
-        self,
-        n_ffts: Sequence[int],
-        hop: int,
-        windows: Sequence[torch.Tensor],
-        mixer: torch.Tensor,
-        max_log_magnitude: float,
-    ) -> None:
-        if len(n_ffts) != 2 or len(windows) != 2:
-            raise ValueError("ZAC-1 requires two iSTFT branches")
-        if hop <= 0 or any(n % hop or n < 2 * hop for n in n_ffts):
-            raise ValueError("iSTFT window sizes must be multiples of hop")
-        if mixer.ndim != 2 or mixer.shape[0] != 2 or mixer.shape[1] % 2 != 1:
-            raise ValueError("ZAC mixer must have two branches and an odd FIR kernel")
-        self.n_ffts, self.hop = tuple(n_ffts), hop
-        self.device = mixer.device
-        self.windows = [w.to(device=self.device, dtype=torch.float64) for w in windows]
-        if any(w.shape != (n,) for w, n in zip(self.windows, n_ffts, strict=True)):
-            raise ValueError("iSTFT window shape mismatch")
-        self.mixer = mixer.to(torch.float64)
-        self.max_log_magnitude = max_log_magnitude
-        self.kernel = mixer.shape[1]
-        self.half_kernel = self.kernel // 2
-        self.ola = [self._zeros(0), self._zeros(0)]
-        self.envelope = [self._zeros(0), self._zeros(0)]
-        self.ola_base = [0, 0]
-        self.mix_input = [self._zeros(self.half_kernel), self._zeros(self.half_kernel)]
-        self.mix_base = 0
-        self.frames = 0
-        self.done = False
+class ZACPackedOLA:
+    """Incremental packed iFFT/OLA with finite *time-domain* history.
 
-    def _zeros(self, n: int) -> torch.Tensor:
-        return torch.zeros(n, device=self.device, dtype=torch.float64)
-
-    def _overlap_add(self, frames: torch.Tensor, n_fft: int) -> torch.Tensor:
-        span = (frames.shape[0] - 1) * self.hop + n_fft
-        return F.fold(
-            frames.T.unsqueeze(0), output_size=(1, span), kernel_size=(1, n_fft), stride=(1, self.hop)
-        ).reshape(span)
-
-    def push(self, spectra: Sequence[torch.Tensor]) -> torch.Tensor:
-        if self.done:
-            raise RuntimeError("iSTFT stream already flushed")
-        if len(spectra) != 2:
-            raise ValueError("Expected two spectral branches")
-        cols = spectra[0].shape[0]
-        for y, n in zip(spectra, self.n_ffts, strict=True):
-            if y.ndim != 2 or y.shape != (cols, n + 2):
-                raise ValueError("Expected aligned [frames, n_fft+2] spectral branches")
-        if cols == 0:
-            return self._zeros(0).float()
-        for i, (y, n_fft) in enumerate(zip(spectra, self.n_ffts, strict=True)):
-            y = y.to(device=self.device, dtype=torch.float64)
-            bins = n_fft // 2 + 1
-            magnitude = y[:, :bins].clamp(max=self.max_log_magnitude).exp()
-            phase = y[:, bins:]
-            imaginary = magnitude * phase.sin()
-            imaginary[:, 0] = imaginary[:, -1] = 0
-            window = self.windows[i]
-            frames = torch.fft.irfft(torch.complex(magnitude * phase.cos(), imaginary), n_fft, dim=-1) * window
-            add = self._overlap_add(frames, n_fft)
-            envelope = self._overlap_add(window.square().expand(cols, n_fft), n_fft)
-            offset = self.frames * self.hop - self.ola_base[i]
-            needed = offset + add.shape[0]
-            grow = max(0, needed - self.ola[i].shape[0])
-            if grow:
-                self.ola[i] = torch.cat((self.ola[i], self._zeros(grow)))
-                self.envelope[i] = torch.cat((self.envelope[i], self._zeros(grow)))
-            self.ola[i][offset:needed] += add
-            self.envelope[i][offset:needed] += envelope
-        self.frames += cols
-        for i in range(2):
-            self._finalize(i, self.frames * self.hop)
-        return self._mix_emit()
-
-    def _finalize(self, branch: int, end: int) -> None:
-        n = end - self.ola_base[branch]
-        if n <= 0:
-            return
-        skip = min(n, max(0, self.n_ffts[branch] // 2 - self.ola_base[branch]))
-        samples = self.ola[branch][skip:n] / self.envelope[branch][skip:n]
-        self.mix_input[branch] = torch.cat((self.mix_input[branch], samples))
-        self.ola[branch] = self.ola[branch][n:]
-        self.envelope[branch] = self.envelope[branch][n:]
-        self.ola_base[branch] = end
-
-    def _mix_emit(self) -> torch.Tensor:
-        end = min(x.shape[0] for x in self.mix_input) + self.mix_base - self.kernel + 1
-        if end <= self.mix_base:
-            return self._zeros(0).float()
-        take = end - self.mix_base + self.kernel - 1
-        x = torch.stack([y[:take] for y in self.mix_input]).unsqueeze(0)
-        output = F.conv1d(x, self.mixer.unsqueeze(0)).reshape(-1)
-        drop = end - self.mix_base
-        self.mix_input = [x[drop:] for x in self.mix_input]
-        self.mix_base = end
-        return output.float()
-
-    def flush(self) -> torch.Tensor:
-        if self.done:
-            return self._zeros(0).float()
-        self.done = True
-        if self.frames == 0:
-            return self._zeros(0).float()
-        length = self.frames * self.hop
-        for i in range(2):
-            self._finalize(i, self.ola_base[i] + self.ola[i].shape[0])
-            keep = self.half_kernel + length - self.mix_base
-            x = self.mix_input[i]
-            x = x[:keep] if x.shape[0] >= keep else torch.cat((x, self._zeros(keep - x.shape[0])))
-            self.mix_input[i] = torch.cat((x, self._zeros(self.half_kernel)))
-        return self._mix_emit()
-
-
-class ZACResamplerStream:
-    """Finite-lookahead stream using torchaudio's stored 44160→44100 kernel."""
-
-    def __init__(self, kernel: torch.Tensor, orig: int, new: int, width: int) -> None:
-        if orig <= 0 or new <= 0 or width < 0 or kernel.shape != (new, 2 * width + orig):
-            raise ValueError("Invalid ZAC resampling kernel")
-        self.orig, self.new, self.width = orig, new, width
-        self.kernel_length = 2 * width + orig
-        self.kernel = kernel.to(torch.float64).unsqueeze(1)
-        self.buffer = kernel.new_zeros(0, dtype=torch.float64)
-        self.base = 0
-        self.n_input = 0
-        self.next_block = 0
-        self.done = False
-
-    def push(self, x: torch.Tensor) -> torch.Tensor:
-        if self.done:
-            raise RuntimeError("Resampler already flushed")
-        self.buffer = torch.cat((self.buffer, x.to(self.kernel).reshape(-1)))
-        self.n_input += x.numel()
-        return self._run(False)
-
-    def flush(self) -> torch.Tensor:
-        if self.done:
-            return self.buffer.new_zeros(0, dtype=torch.float32)
-        self.done = True
-        return self._run(True)
-
-    def _run(self, flush: bool) -> torch.Tensor:
-        total = -(-self.new * self.n_input // self.orig)
-        reach = self.n_input + self.width - self.kernel_length
-        end = -(-total // self.new) if flush else (reach // self.orig + 1 if reach >= 0 else 0)
-        output = self.buffer.new_zeros(0, dtype=torch.float32)
-        if end > self.next_block:
-            lo = self.next_block * self.orig - self.width
-            hi = (end - 1) * self.orig - self.width + self.kernel_length
-            a, b = max(lo, 0), min(hi, self.n_input)
-            if b > a:
-                segment = F.pad(self.buffer[a - self.base : b - self.base], (a - lo, hi - b))
-            else:
-                segment = self.buffer.new_zeros(hi - lo)
-            y = F.conv1d(segment.view(1, 1, -1), self.kernel, stride=self.orig)[0].T.reshape(-1)
-            if flush:
-                y = y[: total - self.next_block * self.new]
-            output = y.float()
-            self.next_block = end
-        keep_from = min(self.n_input, max(0, self.next_block * self.orig - self.width))
-        if keep_from > self.base:
-            self.buffer = self.buffer[keep_from - self.base :]
-            self.base = keep_from
-        return output
-
-
-class ZACBatchedSynthesis:
-    """Fixed per-slot spectral history and GPU sample cursors for graph replay.
-
-    Reconstruct only the finite overlap needed by the next resampling blocks.
-    Centered iSTFT, FIR zero padding and resampler final boundaries are expressed
-    in absolute sample coordinates. Padded spectra never contribute an envelope
-    or waveform sample. Returned audio has static width and a device valid count.
+    Each new spectrum is transformed once. The normalized branch outputs have
+    shared packed offsets, retaining the larger FFT's lookahead until final.
     """
 
-    def __init__(self, network: ZACDecoderNetwork, capacity: int) -> None:
-        cfg, head, resampler = network.config, network.head, network.to_external
+    def __init__(self, network: ZACDecoderNetwork, capacity: int, max_columns: int, token_capacity: int) -> None:
         self.device = next(network.parameters()).device
-        self.n_ffts, self.hop = cfg.n_ffts, cfg.hop
-        self.scale = math.prod(stage.size for stage in network.stages if isinstance(stage, ZACPatch))
-        self.orig, self.new = resampler.orig_freq // resampler.gcd, resampler.new_freq // resampler.gcd
-        self.width = resampler.width
-        self.windows = [getattr(head, f"window_{i}").double() for i in range(2)]
-        self.mixer = head.mixer.weight.detach().double()
-        self.kernel = resampler.kernel.detach().double()
-        self.half_fir = self.mixer.shape[-1] // 2
-        self.half_fft = max(self.n_ffts) // 2
-        self.max_log_magnitude = head.max_log_magnitude
-        # Include iSTFT overlap, FIR context, resampler lookahead and the
-        # un-emitted polyphase block. This bound is independent of audio length.
-        span = max(self.n_ffts) + self.half_fft + 2 * self.half_fir + self.orig + 2 * self.width
-        self.history_columns = math.ceil(span / self.hop) + 2
+        self.capacity, self.max_columns = capacity, max_columns
+        self.n_ffts, self.hop = network.config.n_ffts, network.config.hop
+        self.lookahead = max(self.n_ffts) // 2
+        self.ring = max_columns * self.hop + 2 * max(self.n_ffts)
+        self.windows = [getattr(network.head, f"window_{i}").double() for i in range(2)]
+        self.maximum = network.head.max_log_magnitude
         self.columns = torch.zeros(capacity, dtype=torch.long, device=self.device)
         self.emitted = torch.zeros_like(self.columns)
-        self.history = [
-            torch.zeros(capacity, self.history_columns, n + 2, device=self.device, dtype=torch.float32)
+        self.ola = [
+            torch.zeros(capacity * self.ring + token_capacity * n, dtype=torch.float64, device=self.device)
             for n in self.n_ffts
         ]
+        self.envelope = [torch.zeros_like(x) for x in self.ola]
+
+    def __call__(self, spectra, slots, offsets, final):
+        count = offsets[1:] - offsets[:-1]
+        torch._assert_async((count <= self.max_columns).all(), "Packed OLA chunk exceeds capacity")
+        old = self.columns[slots]
+        new = old + count
+        start = self.emitted[slots]
+        end = torch.where(final, new * self.hop, (new * self.hop - self.lookahead).clamp_min(0))
+        lengths = end - start
+        pcm_offsets = torch.cat((lengths.new_zeros(1), lengths.cumsum(0)))
+        # Only one trailing capacity pad, including bounded per-sequence flush.
+        output_capacity = spectra[0].shape[0] * self.hop + slots.numel() * self.lookahead
+        output_row = torch.arange(output_capacity, device=self.device)
+        output_request = torch.searchsorted(pcm_offsets[1:], output_row, right=True).clamp_max(slots.numel() - 1)
+        output_valid = output_row < pcm_offsets[-1]
+        wave_position = start[output_request] + output_row - pcm_offsets[output_request]
+        rows = spectra[0].shape[0]
+        row = torch.arange(rows, device=self.device)
+        request = torch.searchsorted(offsets[1:], row, right=True).clamp_max(slots.numel() - 1)
+        valid = row < offsets[-1]
+        column = old[request] + row - offsets[request]
+        ring_position = torch.arange(self.ring, device=self.device)
+        outputs = []
+        for branch, (y, n, window) in enumerate(zip(spectra, self.n_ffts, self.windows, strict=True)):
+            # Clear only newly exposed coordinates, before adding new frames.
+            # Previous finalized samples remain available until shared lookahead
+            # permits their emission. No historical spectrum is transformed.
+            clear_lo = torch.where(old > 0, old * self.hop + n - self.hop, 0)
+            clear_hi = torch.where(new > 0, new * self.hop + n - self.hop, 0)
+            delta = (ring_position[None] - clear_lo[:, None]).remainder(self.ring)
+            clear = delta < (clear_hi - clear_lo)[:, None]
+            addresses = slots[:, None] * self.ring + ring_position
+            for history in (self.ola[branch], self.envelope[branch]):
+                previous = history[addresses]
+                history[addresses] = torch.where(clear, 0.0, previous)
+            log_mag, phase = y.double().split(n // 2 + 1, -1)
+            magnitude = log_mag.clamp_max(self.maximum).exp()
+            imaginary = magnitude * phase.sin()
+            imaginary[:, 0] = imaginary[:, -1] = 0
+            frames = torch.fft.irfft(torch.complex(magnitude * phase.cos(), imaginary), n, dim=-1) * window
+            sample = torch.arange(n, device=self.device)
+            destination = slots[request, None] * self.ring + (column[:, None] * self.hop + sample).remainder(self.ring)
+            scratch = self.capacity * self.ring + row[:, None] * n + sample
+            destination = torch.where(valid[:, None], destination, scratch)
+            self.ola[branch].scatter_add_(0, destination.flatten(), torch.where(valid[:, None], frames, 0.0).flatten())
+            envelope = window.square()[None].expand(rows, -1)
+            self.envelope[branch].scatter_add_(
+                0, destination.flatten(), torch.where(valid[:, None], envelope, 0.0).flatten()
+            )
+            source = slots[output_request] * self.ring + (wave_position + n // 2).remainder(self.ring)
+            denominator = self.envelope[branch][source]
+            waveform = self.ola[branch][source] / denominator.clamp_min(torch.finfo(torch.float64).tiny)
+            outputs.append(torch.where(output_valid, waveform, 0.0))
+        self.columns.index_copy_(0, slots, new)
+        self.emitted.index_copy_(0, slots, end)
+        return outputs, pcm_offsets, lengths
+
+
+class ZACPackedSynthesis:
+    """Complete packed synthesis, preserving FP64/FP32 boundaries.
+
+    OLA retains raw time-domain contributions, waveform rings retain normalized
+    samples and FIR output. CUDA FIR/resampling reduce taps inside segmented
+    kernels, with linear global workspace. CPU uses the tensor reference.
+    """
+
+    def __init__(self, network: ZACDecoderNetwork, capacity: int, max_columns: int, token_capacity: int) -> None:
+        self.ola = ZACPackedOLA(network, capacity, max_columns, token_capacity)
+        self.device, self.capacity = self.ola.device, capacity
+        rs = network.to_external
+        self.orig, self.new, self.width = rs.orig_freq // rs.gcd, rs.new_freq // rs.gcd, rs.width
+        self.kernel = rs.kernel[:, 0].detach().double()
+        self.mixer = network.head.mixer.weight[0].detach().double()
+        self.half_fir = self.mixer.shape[-1] // 2
+        self.ring = self.ola.ring + 2 * (self.orig + self.width + self.mixer.shape[-1])
+        self.wave_capacity = token_capacity * self.ola.hop + capacity * self.ola.lookahead
+        self.mix_capacity = self.wave_capacity + capacity * self.half_fir
+        self.wave = [
+            torch.zeros(capacity * self.ring + self.wave_capacity, dtype=torch.float64, device=self.device)
+            for _ in range(2)
+        ]
+        self.mixed = torch.zeros(capacity * self.ring + self.mix_capacity, dtype=torch.float64, device=self.device)
+        self.mixed_end = torch.zeros(capacity, dtype=torch.long, device=self.device)
+        self.emitted = torch.zeros_like(self.mixed_end)
+
+    def _layout(self, starts, ends, capacity):
+        lengths = ends - starts
+        offsets = torch.cat((lengths.new_zeros(1), lengths.cumsum(0)))
+        row = torch.arange(capacity, device=self.device)
+        if self.device.type == "cuda":
+            from .packed_kernels import segment_layout
+
+            request, local, valid = segment_layout(offsets, capacity)
+            position = starts[request] + local
+        else:
+            request = torch.searchsorted(offsets[1:], row, right=True).clamp_max(starts.numel() - 1)
+            valid = row < offsets[-1]
+            position = starts[request] + row - offsets[request]
+        return offsets, row, request, valid, position
+
+    def _store(self, target, values, slots, layout):
+        _, row, request, valid, position = layout
+        address = torch.where(
+            valid, slots[request] * self.ring + position.remainder(self.ring), self.capacity * self.ring + row
+        )
+        target.index_copy_(0, address, values)
+
+    def __call__(self, spectra, slots, offsets, final):
+        wave_start = self.ola.emitted[slots].clone()
+        waves, _, _ = self.ola(spectra, slots, offsets, final)
+        wave_end = self.ola.emitted[slots]
+        total = self.ola.columns[slots] * self.ola.hop
+        wave_capacity = spectra[0].shape[0] * self.ola.hop + slots.numel() * self.ola.lookahead
+        mix_capacity = wave_capacity + slots.numel() * self.half_fir
+        wave_layout = self._layout(wave_start, wave_end, wave_capacity)
+        for target, values in zip(self.wave, waves, strict=True):
+            self._store(target, values, slots, wave_layout)
+        mix_start = self.mixed_end[slots]
+        mix_end = torch.where(final, total, (wave_end - self.half_fir).clamp_min(0))
+        mix_layout = self._layout(mix_start, mix_end, mix_capacity)
+        _, _, request, valid, position = mix_layout
+        if self.device.type == "cuda":
+            from .packed_kernels import segmented_fir
+
+            mixed = segmented_fir(self.wave, self.mixer, slots, request, valid, position, total, self.ring)
+        else:
+            taps = torch.arange(self.mixer.shape[-1], device=self.device)
+            source = position[:, None] + taps - self.half_fir
+            mask = valid[:, None] & (source >= 0) & (source < total[request, None])
+            address = slots[request, None] * self.ring + source.remainder(self.ring)
+            mixed = torch.zeros(mix_capacity, dtype=torch.float64, device=self.device)
+            for branch in range(2):
+                mixed = mixed + (torch.where(mask, self.wave[branch][address], 0.0) * self.mixer[branch]).sum(-1)
+            # CPU reference retains the official FIR rounding boundary.
+            mixed = mixed.float().double()
+        self._store(self.mixed, mixed, slots, mix_layout)
+        pcm_start = self.emitted[slots]
+        stable_end = ((mix_end - self.width - self.orig) // self.orig + 1).clamp_min(0) * self.new
+        final_end = (total * self.new + self.orig - 1) // self.orig
+        pcm_end = torch.where(final, final_end, stable_end)
+        pcm_capacity = math.ceil(mix_capacity * self.new / self.orig) + slots.numel() * self.new
+        pcm_layout = self._layout(pcm_start, pcm_end, pcm_capacity)
+        pcm_offsets, _, request, valid, position = pcm_layout
+        if self.device.type == "cuda":
+            from .packed_kernels import segmented_resample
+
+            audio = segmented_resample(
+                self.mixed,
+                self.kernel,
+                slots,
+                request,
+                valid,
+                position,
+                total,
+                self.ring,
+                self.orig,
+                self.new,
+                self.width,
+            )
+        else:
+            taps = torch.arange(self.kernel.shape[-1], device=self.device)
+            source = (position // self.new)[:, None] * self.orig - self.width + taps
+            mask = valid[:, None] & (source >= 0) & (source < total[request, None])
+            address = slots[request, None] * self.ring + source.remainder(self.ring)
+            values = torch.where(mask, self.mixed[address], 0.0)
+            audio = (values * self.kernel[position.remainder(self.new)]).sum(-1).float()
+        self.mixed_end.index_copy_(0, slots, mix_end)
+        self.emitted.index_copy_(0, slots, pcm_end)
+        return audio, pcm_offsets, pcm_end - pcm_start
+
+
+class ZACPackedCodec(nn.Module):
+    """Complete pack→pack Codec shared by eager execution and graph capture.
+
+    The manager owns slot initialization and output copies.
+    """
+
+    def __init__(self, network: ZACDecoderNetwork, capacity: int, max_chunk: int, token_capacity: int) -> None:
+        super().__init__()
+        self.network = network
+        self.state = network.allocate_packed_state(capacity, max_chunk, token_capacity)
+        self.scale = math.prod(stage.size for stage in network.stages if isinstance(stage, ZACPatch))
+        self.synthesis = ZACPackedSynthesis(network, capacity, max_chunk * self.scale, token_capacity * self.scale)
+
+    def forward(self, codes, slots, cu_seqlens, final):
+        spectra = self.network.forward_packed(codes, slots, cu_seqlens, self.state)
+        return self.synthesis(spectra, slots, cu_seqlens * self.scale, final)
 
     def reset(self, slots: torch.Tensor) -> None:
-        """Clear recycled or capture-only slots without touching other streams."""
-        self.columns.index_fill_(0, slots, 0)
-        self.emitted.index_fill_(0, slots, 0)
-        for history in self.history:
+        """Recycle slots. KV is lazy: position zero only reads newly written KV."""
+        self.state.frames.index_fill_(0, slots, 0)
+        for history in self.state.semantic_history + self.state.head_history:
             history.index_fill_(0, slots, 0)
+        synthesis, ola = self.synthesis, self.synthesis.ola
+        for counter in (ola.columns, ola.emitted, synthesis.mixed_end, synthesis.emitted):
+            counter.index_fill_(0, slots, 0)
+        for tensor in ola.ola + ola.envelope:
+            tensor[: ola.capacity * ola.ring].view(ola.capacity, ola.ring).index_fill_(0, slots, 0)
+        for tensor in synthesis.wave + [synthesis.mixed]:
+            tensor[: synthesis.capacity * synthesis.ring].view(synthesis.capacity, synthesis.ring).index_fill_(
+                0, slots, 0
+            )
 
-    def output_end(self, code_frames: int, final: bool) -> int:
-        """Host-side coverage calculation, using only CPU request progress."""
-        samples = code_frames * self.scale * self.hop
+    def output_end(self, frames: int, final: bool) -> int:
+        """CPU-known PCM frontier; avoids reading device offsets to split output."""
+        s = self.synthesis
+        samples = frames * self.scale * s.ola.hop
         if final:
-            return (samples * self.new + self.orig - 1) // self.orig
-        mixed = max(0, samples - self.half_fft - self.half_fir)
-        return max(0, (mixed - self.width - self.orig) // self.orig + 1) * self.new
-
-    def _fold(self, frames: torch.Tensor) -> torch.Tensor:
-        batch, cols, n_fft = frames.shape
-        span = (cols - 1) * self.hop + n_fft
-        return F.fold(frames.transpose(1, 2), (1, span), (1, n_fft), stride=(1, self.hop)).reshape(batch, span)
-
-    def __call__(
-        self, spectra: list[torch.Tensor], slots: torch.Tensor, lengths: torch.Tensor, final: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch, padded_cols, _ = spectra[0].shape
-        old = self.columns.index_select(0, slots)
-        count = lengths * self.scale
-        total = (old + count) * self.hop
-        emitted = self.emitted.index_select(0, slots)
-        stable = (total - self.half_fft - self.half_fir).clamp_min(0)
-        regular_end = ((stable - self.width - self.orig) // self.orig + 1).clamp_min(0) * self.new
-        final_end = (total * self.new + self.orig - 1) // self.orig
-        end = torch.where(final, final_end, regular_end)
-        # Static upper bound includes a final tail, even for zero valid frames.
-        blocks = (
-            math.ceil((padded_cols * self.hop + self.half_fft + self.half_fir + 2 * self.orig + self.width) / self.orig)
-            + 1
-        )
-        mixed_length = (blocks - 1) * self.orig + self.kernel.shape[-1]
-        wave = (emitted // self.new)[:, None] * self.orig - self.width - self.half_fir
-        wave = wave + torch.arange(mixed_length + 2 * self.half_fir, device=self.device)
-        raw_base = (old - self.history_columns) * self.hop
-        frame_indices = torch.arange(self.history_columns + padded_cols, device=self.device)
-        valid_frames = (frame_indices[None] >= (self.history_columns - old)[:, None]) & (
-            frame_indices[None] < (self.history_columns + count)[:, None]
-        )
-        aligned = []
-        for i, (y, n_fft, window) in enumerate(zip(spectra, self.n_ffts, self.windows, strict=True)):
-            joined = torch.cat((self.history[i].index_select(0, slots), y), 1)
-            bins = n_fft // 2 + 1
-            log_mag, phase = joined.double().split(bins, -1)
-            magnitude = log_mag.clamp(max=self.max_log_magnitude).exp()
-            imaginary = magnitude * phase.sin()
-            imaginary[..., 0] = imaginary[..., -1] = 0
-            frames = torch.fft.irfft(torch.complex(magnitude * phase.cos(), imaginary), n_fft, dim=-1) * window
-            ola = self._fold(torch.where(valid_frames[..., None], frames, 0.0))
-            envelope = self._fold(window.square()[None, None] * valid_frames[..., None])
-            index = wave + n_fft // 2 - raw_base[:, None]
-            safe = index.clamp(0, ola.shape[-1] - 1)
-            denominator = envelope.gather(1, safe)
-            values = ola.gather(1, safe) / denominator.clamp_min(torch.finfo(torch.float64).tiny)
-            valid = (wave >= 0) & (wave < total[:, None]) & (index >= 0) & (index < ola.shape[-1])
-            aligned.append(torch.where(valid & (denominator > 0), values, 0.0))
-            keep = count[:, None, None] + torch.arange(self.history_columns, device=self.device)[None, :, None]
-            self.history[i].index_copy_(0, slots, joined.gather(1, keep.expand(batch, -1, n_fft + 2)))
-        # Match the reference rounding boundary between FIR and resampling.
-        mixed = F.conv1d(torch.stack(aligned, 1), self.mixer).float().double()
-        mixed_positions = wave[:, :mixed_length] + self.half_fir
-        mixed = torch.where(((mixed_positions >= 0) & (mixed_positions < total[:, None]))[:, None], mixed, 0.0)
-        audio = F.conv1d(mixed, self.kernel, stride=self.orig).transpose(1, 2).reshape(batch, -1).float()
-        indices = (emitted // self.new)[:, None] * self.new + torch.arange(audio.shape[1], device=self.device)
-        audio = torch.where((indices >= emitted[:, None]) & (indices < end[:, None]), audio, 0.0)
-        self.columns.index_copy_(0, slots, old + count)
-        self.emitted.index_copy_(0, slots, end)
-        return audio, end - emitted
+            return (samples * s.new + s.orig - 1) // s.orig
+        mixed = max(0, samples - s.ola.lookahead - s.half_fir)
+        return max(0, (mixed - s.width - s.orig) // s.orig + 1) * s.new
 
 
 @dataclass(frozen=True)
@@ -806,8 +842,6 @@ class ZACPCMOutput:
 @dataclass
 class _Stream:
     slot: int
-    head: ZACISTFTStream
-    resampler: ZACResamplerStream
     chunk_seq: int = 0
     frames: int = 0
     skip_samples: int = 0
@@ -822,21 +856,23 @@ class CodecManager:
         *,
         graph_batch_sizes: tuple[int, ...] = (),
         graph_frame_sizes: tuple[int, ...] = (),
+        max_chunk: int = 31,
     ) -> None:
         from .cuda_graph_wrapper import ZACCodecGraphWrapper
 
         if capacity < 1:
             raise ValueError("Codec request capacity must be positive")
         self.network = network
-        scratch = max(graph_batch_sizes, default=0)
-        self.state = network.allocate_state(capacity + scratch)
         self.device = next(network.parameters()).device
-        self.graph = (
-            ZACCodecGraphWrapper(network, self.state, capacity, graph_batch_sizes, graph_frame_sizes)
-            if graph_batch_sizes or graph_frame_sizes
-            else None
+        self.max_chunk = max_chunk
+        self.graph = ZACCodecGraphWrapper(
+            network,
+            capacity,
+            max_chunk,
+            [(b, b * t) for b in graph_batch_sizes for t in graph_frame_sizes],
         )
-        if self.graph is not None and self.device.type == "cuda":
+        self.state = self.graph.codec.state
+        if graph_batch_sizes and self.device.type == "cuda":
             self.graph.capture()
         self._free = list(range(capacity - 1, -1, -1))
         self._streams: dict[str, _Stream] = {}
@@ -844,30 +880,8 @@ class CodecManager:
 
     def _allocate(self, chunk: ZACCodecChunk) -> _Stream:
         slot = self._free[-1]
-        cfg = self.network.config
-        head = self.network.head
-        resampler = self.network.to_external
-        slots = index_to_device([slot], self.device)
-        self.state.reset(slots)
-        if self.graph is not None:
-            self.graph.reset(slots)
-        stream = _Stream(
-            slot=slot,
-            head=ZACISTFTStream(
-                cfg.n_ffts,
-                cfg.hop,
-                [getattr(head, f"window_{i}") for i in range(2)],
-                head.mixer.weight[0].detach(),
-                head.max_log_magnitude,
-            ),
-            resampler=ZACResamplerStream(
-                resampler.kernel[:, 0].detach(),
-                resampler.orig_freq // resampler.gcd,
-                resampler.new_freq // resampler.gcd,
-                resampler.width,
-            ),
-            skip_samples=chunk.skip_samples,
-        )
+        self.graph.codec.reset(index_to_device([slot], self.device))
+        stream = _Stream(slot=slot, skip_samples=chunk.skip_samples)
         self._free.pop()
         self._streams[chunk.request_id] = stream
         return stream
@@ -913,82 +927,59 @@ class CodecManager:
     @torch.inference_mode()
     def decode(self, chunks: Sequence[ZACCodecChunk]) -> list[ZACPCMOutput]:
         self._validate(chunks)
-        outputs: list[ZACPCMOutput | None] = [None] * len(chunks)
-        groups: dict[int, list[int]] = defaultdict(list)
+        if any(len(chunk.codes) > self.max_chunk for chunk in chunks):
+            raise ValueError(f"Packed Codec input exceeds configured {self.max_chunk} RVQ frames per chunk")
+        if not chunks:
+            return []
         succeeded = False
         try:
-            for i, chunk in enumerate(chunks):
+            for chunk in chunks:
                 if chunk.request_id not in self._streams:
                     self._allocate(chunk)
-                frames = chunk.codes.shape[0]
-                groups[self.graph.frame_bucket(frames) if self.graph is not None else frames].append(i)
-            for length, indices in groups.items():
-                streams = [self._streams[chunks[i].request_id] for i in indices]
-                if self.graph is not None:
-                    batch = torch.zeros(len(indices), max(1, length), 10, dtype=torch.long, device="cpu")
-                    actual_lengths = [chunks[i].codes.shape[0] for i in indices]
-                    for row, i in enumerate(indices):
-                        batch[row, : actual_lengths[row]] = chunks[i].codes
-                    slots = index_to_device([stream.slot for stream in streams], self.device)
-                    lengths = index_to_device(actual_lengths, self.device)
-                    final = to_device_nonblocking(
-                        torch.tensor([chunks[i].finished for i in indices], dtype=torch.bool, device="cpu"), self.device
+            lengths = [len(chunk.codes) for chunk in chunks]
+            codes = torch.cat([chunk.codes.to(torch.long) for chunk in chunks])
+            if not codes.numel():
+                codes = torch.zeros(1, 10, dtype=torch.long, device="cpu")
+            slots = index_to_device([self._streams[c.request_id].slot for c in chunks], self.device)
+            audio, _, _ = self.graph(
+                to_device_nonblocking(codes, self.device),
+                slots,
+                index_to_device(lengths, self.device),
+                to_device_nonblocking(torch.tensor([c.finished for c in chunks], device="cpu"), self.device),
+            )
+            counts = [
+                self.graph.codec.output_end(self._streams[c.request_id].frames + n, c.finished)
+                - self._streams[c.request_id].emitted_samples
+                for c, n in zip(chunks, lengths, strict=True)
+            ]
+            # Graph outputs alias bucket storage. One owning copy survives later
+            # replays and asynchronous PCM materialization for the whole cohort.
+            owned = audio[: sum(counts)].clone()
+            outputs = []
+            offset = 0
+            for chunk, n, count in zip(chunks, lengths, counts, strict=True):
+                stream = self._streams[chunk.request_id]
+                skip = min(count, stream.skip_samples)
+                outputs.append(
+                    ZACPCMOutput(
+                        chunk.request_id, chunk.chunk_seq, owned[offset + skip : offset + count], chunk.finished
                     )
-                    audio, _ = self.graph(to_device_nonblocking(batch, self.device), slots, lengths, final)
-                    for row, (i, stream) in enumerate(zip(indices, streams, strict=True)):
-                        chunk = chunks[i]
-                        valid = actual_lengths[row]
-                        end = self.graph.synthesis.output_end(stream.frames + valid, chunk.finished)
-                        take = end - stream.emitted_samples
-                        skip = min(take, stream.skip_samples)
-                        stream.skip_samples -= skip
-                        stream.frames += valid
-                        stream.chunk_seq += 1
-                        stream.emitted_samples = end
-                        # A later replay overwrites bucket storage; published
-                        # audio must own its bytes through async materialization.
-                        outputs[i] = ZACPCMOutput(
-                            chunk.request_id, chunk.chunk_seq, audio[row, skip:take].clone(), chunk.finished
-                        )
-                        if chunk.finished:
-                            self.release(chunk.request_id)
-                            self._finished.add(chunk.request_id)
-                    continue
-                spectra = None
-                if length:
-                    batch = torch.stack([chunks[i].codes.to(torch.int64) for i in indices])
-                    slots = index_to_device([stream.slot for stream in streams], self.device)
-                    # One real batched neural network forward per compatible
-                    # chunk shape. Different cache positions remain per slot.
-                    spectra = self.network(to_device_nonblocking(batch, self.device), slots, self.state)
-                for row, (i, stream) in enumerate(zip(indices, streams, strict=True)):
-                    chunk = chunks[i]
-                    parts = []
-                    if spectra is not None:
-                        parts.append(stream.resampler.push(stream.head.push([branch[row] for branch in spectra])))
-                    if chunk.finished:
-                        parts.extend((stream.resampler.push(stream.head.flush()), stream.resampler.flush()))
-                    audio = torch.cat(parts) if parts else torch.empty(0, device=self.device, dtype=torch.float32)
-                    skip = min(audio.numel(), stream.skip_samples)
-                    stream.skip_samples -= skip
-                    stream.frames += length
-                    stream.chunk_seq += 1
-                    outputs[i] = ZACPCMOutput(chunk.request_id, chunk.chunk_seq, audio[skip:], chunk.finished)
-                    if chunk.finished:
-                        self.release(chunk.request_id)
-                        self._finished.add(chunk.request_id)
+                )
+                offset += count
+                stream.skip_samples -= skip
+                stream.frames += n
+                stream.emitted_samples += count
+                stream.chunk_seq += 1
+                if chunk.finished:
+                    self.release(chunk.request_id)
+                    self._finished.add(chunk.request_id)
             succeeded = True
+            return outputs
         finally:
             if not succeeded:
-                # A partially executed cohort cannot be retried against mutated
-                # recurrent state. Propagate the error and reclaim its slots.
+                # Reclaim every slot in a partially mutated cohort before retry.
                 for chunk in chunks:
                     self.release(chunk.request_id)
-        result = []
-        for output in outputs:
-            assert output is not None
-            result.append(output)
-        return result
 
 
 if TYPE_CHECKING:
@@ -1055,21 +1046,26 @@ class Zonos3CodecModel(nn.Module):
     def _codec_manager(self) -> CodecManager:
         if self._manager is None:
             capacity = self.vllm_config.scheduler_config.max_num_seqs
-            batches: tuple[int, ...] = ()
-            frames: tuple[int, ...] = ()
-            if not self.vllm_config.model_config.enforce_eager:
-                connector = self.vllm_config.model_config.stage_connector_config
-                extra = connector.get("extra", connector) if isinstance(connector, dict) else connector.extra
-                chunk_size = extra.get("codec_chunk_frames", 15)
-                ramp = extra.get("codec_chunk_ramp", (1, 2, 4, 8, 15))
-                # Empty final inputs use the one-frame bucket with length zero;
-                # short tails round up. Per-request overrides beyond these
-                # shared connector buckets use the wrapper's eager path.
-                frames = tuple(sorted({1, chunk_size, *ramp}))
-                if any(type(size) is not int or size < 1 for size in frames):
-                    raise ValueError("Zonos3 Codec chunk sizes must be positive integers")
-                batches = tuple(1 << i for i in range((capacity - 1).bit_length())) + (capacity,)
-            self._manager = CodecManager(self.network, capacity, graph_batch_sizes=batches, graph_frame_sizes=frames)
+            connector = self.vllm_config.model_config.stage_connector_config
+            extra = connector.get("extra", connector) if isinstance(connector, dict) else connector.extra
+            chunk_size = extra.get("codec_chunk_frames", 15)
+            ramp = extra.get("codec_chunk_ramp", (1, 2, 4, 8, 15))
+            frames = tuple(sorted({1, chunk_size, *ramp}))
+            if any(type(size) is not int or size < 1 for size in frames):
+                raise ValueError("Zonos3 Codec chunk sizes must be positive integers")
+            # The first transport chunk can include up to 30 silence-primer
+            # frames. Ring capacity must cover them even without graph capture.
+            max_chunk = max(chunk_size, *ramp, (ramp[0] if ramp else chunk_size) + 30)
+            batches = tuple(1 << i for i in range((capacity - 1).bit_length())) + (capacity,)
+            if self.vllm_config.model_config.enforce_eager:
+                batches, frames = (), ()
+            self._manager = CodecManager(
+                self.network,
+                capacity,
+                graph_batch_sizes=batches,
+                graph_frame_sizes=frames,
+                max_chunk=max_chunk,
+            )
         return self._manager
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: object = None) -> None:

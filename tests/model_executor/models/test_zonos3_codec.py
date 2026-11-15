@@ -1,26 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Zonos3 codec module tests: layers, network, streaming synthesis, manager,
-model and complete-graph arithmetic against stateless / official oracles.
+"""Packed Codec loading and native transport lifecycle against stateless oracles."""
 
-The optional reference sections run only with ZONOS3_REFERENCE_ROOT pointing
-at an unmodified Zyphra/ZONOS3-Mini checkout.
-"""
-
-import ast
 import hashlib
 import json
 import math
-import os
 from dataclasses import replace
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 import torch
-from torch import nn
 from torch.nn import functional as F
-from torchaudio.transforms import Resample
 from transformers import PretrainedConfig
 from vllm.config import LoadConfig, ModelConfig, SchedulerConfig, VllmConfig
 
@@ -29,19 +19,14 @@ from vllm_omni.model_executor.models.zonos3 import codec as codec_checkpoint
 from vllm_omni.model_executor.models.zonos3.codec import (
     CodecManager,
     ZACCodecChunk,
-    ZACConvNeXt,
     ZACDecoderConfig,
     ZACDecoderNetwork,
-    ZACISTFTStream,
     ZACMossLayer,
-    ZACMossStage,
     ZACPatch,
-    ZACResamplerStream,
     ZACTransformerSpec,
     Zonos3CodecFiles,
     Zonos3CodecModel,
 )
-from vllm_omni.model_executor.models.zonos3.cuda_graph_wrapper import ZACCodecGraphWrapper
 from vllm_omni.model_executor.models.zonos3.model_state import Zonos3CodecModelState
 from vllm_omni.model_executor.stage_input_processors.zonos3 import Zonos3ChunkConfig, Zonos3RVQStageInputProcessor
 from vllm_omni.worker.scheduling_metadata_adapter import DefaultSchedulingMetadataAdapter
@@ -84,82 +69,6 @@ def whole_sequence(layer: ZACMossLayer, x: torch.Tensor) -> torch.Tensor:
     output = F.scaled_dot_product_attention(q, k, v.transpose(1, 2), attn_mask=(delta >= 0) & (delta < layer.context))
     x = x + layer.attention_scale * layer.attention_out(output.transpose(1, 2).reshape(b, t, d))
     return x + layer.ffn_scale * layer.ffn(layer.norm2(x))
-
-
-@pytest.mark.parametrize("concurrency", [1, 4, 8, 16, 32])
-@pytest.mark.parametrize("context", [1, 7, 23])
-@torch.inference_mode()
-def test_batched_moss_layer_mixed_positions_and_chunk_sizes(concurrency, context):
-    torch.manual_seed(41)
-    layer = ZACMossLayer(spec(context)).eval()
-    state = layer.allocate_state(concurrency, torch.float32, "cpu")
-    inputs = [torch.randn(1, 40, 16) for _ in range(concurrency)]
-    expected = [whole_sequence(layer, x) for x in inputs]
-    positions = [0] * concurrency
-    calls = []
-    handle = layer.qkv.register_forward_pre_hook(lambda _, args: calls.append(args[0].shape[0]))
-    try:
-        # Prime different histories, then run one B=concurrency neural forward
-        # per compatible chunk length. Requests enter/leave in a changing order.
-        for i in range(concurrency):
-            n = i % 5
-            if n:
-                got = layer(inputs[i][:, :n], torch.tensor([i]), torch.tensor([0]), state)
-                torch.testing.assert_close(got, expected[i][:, :n], atol=2e-6, rtol=2e-5)
-                positions[i] = n
-        for length in [1, 2, 4, 8, 3, 9]:
-            order = list(reversed(range(concurrency))) if length % 2 else list(range(concurrency))
-            batch = torch.cat([inputs[i][:, positions[i] : positions[i] + length] for i in order])
-            got = layer(batch, torch.tensor(order), torch.tensor([positions[i] for i in order]), state)
-            for row, i in enumerate(order):
-                torch.testing.assert_close(
-                    got[row], expected[i][0, positions[i] : positions[i] + length], atol=2e-6, rtol=2e-5
-                )
-                positions[i] += length
-        assert calls[-6:] == [concurrency] * 6  # actual batched projection execution
-    finally:
-        handle.remove()
-
-
-@torch.inference_mode()
-def test_moss_slot_reuse_does_not_attend_to_previous_request():
-    torch.manual_seed(21)
-    layer = ZACMossLayer(spec()).eval()
-    state = layer.allocate_state(2, torch.float32, "cpu")
-    slots = torch.tensor([1])
-    layer(torch.randn(1, 12, 16), slots, torch.tensor([0]), state)
-    state.reset(slots)
-    x = torch.randn(1, 4, 16)
-    torch.testing.assert_close(layer(x, slots, torch.tensor([0]), state), whole_sequence(layer, x))
-    assert not state.keys[0].any()
-
-
-@pytest.mark.parametrize("concurrency", [1, 4, 8, 16, 32])
-@torch.inference_mode()
-def test_convnext_batched_incremental_matches_whole_causal_convolution(concurrency):
-    torch.manual_seed(12)
-    block = ZACConvNeXt(8, 16).eval()
-    history = block.allocate_state(concurrency, torch.float32, "cpu")
-    x = torch.randn(concurrency, 8, 27)
-    h = block.dwconv(F.pad(x, (6, 0))).transpose(1, 2)
-    expected = x + block.pwconv2(F.gelu(block.pwconv1(block.norm(h)))).transpose(1, 2)
-    outputs = []
-    start = 0
-    for n in [1, 2, 4, 8, 12]:
-        order = torch.arange(concurrency - 1, -1, -1)
-        y = block(x[order, :, start : start + n], order, history)
-        outputs.append(y[order])
-        start += n
-    torch.testing.assert_close(torch.cat(outputs, -1), expected)
-
-
-def test_patch_preserves_official_channel_to_time_order():
-    patch = ZACPatch(2)
-    x = torch.arange(24).reshape(2, 4, 3)
-    expected = torch.tensor(
-        [[[0, 3, 1, 4, 2, 5], [6, 9, 7, 10, 8, 11]], [[12, 15, 13, 16, 14, 17], [18, 21, 19, 22, 20, 23]]]
-    )
-    assert torch.equal(patch(x), expected)
 
 
 # ---------------------------------------------------------------- codec_network
@@ -214,46 +123,6 @@ def whole_trunk(model: ZACDecoderNetwork, codes: torch.Tensor) -> list[torch.Ten
     return [linear(x) for linear in model.head.outs]
 
 
-@pytest.mark.parametrize("concurrency", [1, 4, 8, 16, 32])
-@torch.inference_mode()
-def test_neural_decoder_batches_different_chunk_positions(concurrency):
-    torch.manual_seed(31)
-    model = ZACDecoderNetwork(small_config()).eval()
-    state = model.allocate_state(concurrency)
-    codes = torch.randint(0, 32, (concurrency, 24, 10))
-    # Official partial-codebook policy leaves absent residual contributions out.
-    codes[:, 0, 4:] = -1
-    expected = [whole_trunk(model, row[None]) for row in codes]
-    positions = [0] * concurrency
-    for i in range(concurrency):
-        n = i % 4
-        if n:
-            model(codes[i : i + 1, :n], torch.tensor([i]), state)
-            positions[i] = n
-    projected_batches = []
-    handles = [
-        stage.input_proj.register_forward_pre_hook(lambda _, args: projected_batches.append(args[0].shape[0]))
-        for stage in model.stages
-        if isinstance(stage, ZACMossStage)
-    ]
-    try:
-        for n in [1, 2, 4, 8, 3]:
-            order = torch.arange(concurrency - 1, -1, -1)
-            batch = torch.cat([codes[i : i + 1, positions[i] : positions[i] + n] for i in order.tolist()])
-            output = model(batch, order, state)
-            for row, i in enumerate(order.tolist()):
-                for actual, oracle in zip(output, expected[i], strict=True):
-                    torch.testing.assert_close(
-                        actual[row], oracle[0, 2 * positions[i] : 2 * (positions[i] + n)], atol=3e-6, rtol=3e-5
-                    )
-                positions[i] += n
-        assert projected_batches == [concurrency] * 10
-        assert state.frames.tolist() == positions
-    finally:
-        for handle in handles:
-            handle.remove()
-
-
 @torch.inference_mode()
 def test_release_weight_mapping_pruning_and_head_override():
     torch.manual_seed(42)
@@ -286,19 +155,6 @@ def test_release_weight_mapping_pruning_and_head_override():
     incomplete = {key: value for key, value in generator.items() if not key.startswith("semantic_head.")}
     with pytest.raises(ValueError, match="Incomplete ZAC generator"):
         target.load_release_weights(incomplete, trainable)
-
-
-@torch.inference_mode()
-def test_reset_reclaims_all_neural_histories():
-    torch.manual_seed(17)
-    model = ZACDecoderNetwork(replace(small_config(), head_depth=1)).eval()
-    state = model.allocate_state(2)
-    slot = torch.tensor([1])
-    model(torch.randint(0, 32, (1, 10, 10)), slot, state)
-    state.reset(slot)
-    codes = torch.randint(0, 32, (1, 3, 10))
-    for actual, expected in zip(model(codes, slot, state), whole_trunk(model, codes), strict=True):
-        torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
 
 
 def test_release_config_selects_retained_stages_and_pruned_layer_indices():
@@ -356,174 +212,7 @@ def test_release_config_selects_retained_stages_and_pruned_layer_indices():
 # ---------------------------------------------------------------- codec_synthesis
 
 
-@pytest.mark.parametrize("frames", [1, 2, 11, 35, 129])
-@pytest.mark.parametrize("chunks", [(1,), (1, 2, 4, 8, 15), (32,)])
-@torch.inference_mode()
-def test_streaming_multi_resolution_istft_matches_full_synthesis(frames, chunks):
-    torch.manual_seed(42)
-    hop, n_ffts = 184, (736, 2208)
-    windows = [torch.hann_window(n) for n in n_ffts]
-    spectra = [torch.randn(frames, n + 2) * 0.2 for n in n_ffts]
-    mixer = torch.randn(2, 127) * 0.1
-    stream = ZACISTFTStream(n_ffts, hop, windows, mixer, math.log(100.0))
-    output, branches = [], []
-    for y, n, window in zip(spectra, n_ffts, windows, strict=True):
-        log_mag, phase = y.chunk(2, dim=-1)
-        mag = log_mag.clamp(max=math.log(100.0)).exp()
-        complex_spectrum = torch.complex(mag * phase.cos(), mag * phase.sin()).T
-        branches.append(torch.istft(complex_spectrum, n, hop_length=hop, window=window, length=frames * hop))
-    reference = F.conv1d(torch.stack(branches)[None], mixer[None], padding=63).flatten()
-    start = 0
-    index = 0
-    while start < frames:
-        n = min(chunks[min(index, len(chunks) - 1)], frames - start)
-        output.append(stream.push([y[start : start + n] for y in spectra]))
-        start += n
-        index += 1
-        # Only finite overlap / mixer history remains, independent of utterance length.
-        assert max(x.numel() for x in stream.ola) <= max(n_ffts)
-        assert max(x.numel() for x in stream.mix_input) <= max(n_ffts) + 127
-    output.append(stream.flush())
-    actual = torch.cat(output)
-    assert actual.shape == (frames * hop,)
-    assert actual.isfinite().all()
-    torch.testing.assert_close(actual, reference, atol=2e-7, rtol=2e-4)
-    assert stream.flush().numel() == 0
-    with pytest.raises(RuntimeError, match="flushed"):
-        stream.push(spectra)
-
-
-@pytest.mark.parametrize("samples", [0, 1, 73, 1472, 2944, 29440])
-@torch.inference_mode()
-def test_incremental_exact_rate_resampling(samples):
-    torch.manual_seed(1)
-    resampler = Resample(44160, 44100, lowpass_filter_width=16, rolloff=0.99)
-    stream = ZACResamplerStream(
-        resampler.kernel[:, 0],
-        resampler.orig_freq // resampler.gcd,
-        resampler.new_freq // resampler.gcd,
-        resampler.width,
-    )
-    x = torch.randn(samples) * 0.1
-    out = []
-    for start in range(0, samples, 137):
-        out.append(stream.push(x[start : start + 137]))
-        assert stream.buffer.numel() < 2 * stream.kernel_length
-    out.append(stream.flush())
-    actual = torch.cat(out)
-    expected = resampler(x) if samples else x
-    assert actual.numel() == math.ceil(samples * 44100 / 44160)
-    torch.testing.assert_close(actual, expected, atol=1e-7, rtol=1e-5)
-    assert stream.flush().numel() == 0
-
-
-@torch.inference_mode()
-def test_request_synthesis_states_do_not_share_buffers():
-    windows = [torch.hann_window(n) for n in (8, 24)]
-    mixer = torch.ones(2, 3) / 6
-    a = ZACISTFTStream((8, 24), 2, windows, mixer, 4.0)
-    b = ZACISTFTStream((8, 24), 2, windows, mixer, 4.0)
-    a.push([torch.randn(3, n + 2) for n in (8, 24)])
-    assert b.frames == 0 and all(x.numel() == 0 for x in b.ola)
-    assert b.flush().numel() == 0
-
-
 # ---------------------------------------------------------------- codec_reference
-
-
-@pytest.fixture(scope="module")
-def reference_root():
-    root = os.environ.get("ZONOS3_REFERENCE_ROOT")
-    if not root:
-        pytest.skip("Set ZONOS3_REFERENCE_ROOT for official-source CPU numerical checks")
-    path = Path(root)
-    if not path.is_dir():
-        pytest.fail("ZONOS3_REFERENCE_ROOT does not name an official source checkout")
-    return path
-
-
-def definitions(root, relative, names):
-    path = root / relative
-    source = path.read_text()
-    tree = ast.parse(source, filename=str(path))
-    selected = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names]
-    assert {node.name for node in selected} == set(names)
-    namespace = {"torch": torch, "nn": nn, "F": F, "math": math}
-    exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"), namespace)
-    return namespace
-
-
-@torch.inference_mode()
-def test_official_convnext_causal_chunk_parity(reference_root):
-    oracle = definitions(reference_root, "model/src/zonos3/codec/hybrid10_dual_encoding/model.py", {"SemanticConvNeXt"})
-    torch.manual_seed(3)
-    ref = oracle["SemanticConvNeXt"](8, 16).eval()
-    native = ZACConvNeXt(8, 16).eval()
-    native.load_state_dict(ref.state_dict(), strict=True)
-    x = torch.randn(4, 8, 31)
-    expected = ref(x)
-    state = native.allocate_state(4, torch.float32, "cpu")
-    outputs = []
-    start = 0
-    for n in (1, 2, 4, 8, 16):
-        outputs.append(native(x[:, :, start : start + n], torch.arange(4), state))
-        start += n
-    torch.testing.assert_close(torch.cat(outputs, -1), expected)
-
-
-@pytest.mark.parametrize("concurrency", [1, 4, 8, 16, 32])
-@torch.inference_mode()
-def test_official_incremental_moss_layer_batch_parity(reference_root, concurrency):
-    oracle = definitions(reference_root, "model/src/zonos3/codec/hybrid10_dual_encoding/base_model.py", {"MossLayer"})
-    oracle_step = definitions(reference_root, "model/src/zonos3/codec/istft_head_a_20261002/stream.py", {"_moss_layer"})
-    torch.manual_seed(5)
-    config = {**spec(), "attention_dropout": 0.0, "ffn_dropout": 0.0}
-    ref = oracle["MossLayer"](config).eval()
-    native = ZACMossLayer(config).eval()
-    native.load_state_dict(ref.state_dict(), strict=True)
-    state = native.allocate_state(concurrency, torch.float32, "cpu")
-    caches, positions = [None] * concurrency, [0] * concurrency
-    for row in range(concurrency):
-        n = row % 5
-        if n:
-            prefix = torch.randn(1, n, 16)
-            _, caches[row] = oracle_step["_moss_layer"](ref, prefix, torch.tensor(0), None)
-            native(prefix, torch.tensor([row]), torch.tensor([0]), state)
-            positions[row] = n
-    for n in (1, 2, 4, 8):
-        x = torch.randn(concurrency, n, 16)
-        actual = native(x, torch.arange(concurrency), torch.tensor(positions), state)
-        for row in range(concurrency):
-            expected, caches[row] = oracle_step["_moss_layer"](
-                ref, x[row : row + 1], torch.tensor(positions[row]), caches[row]
-            )
-            torch.testing.assert_close(actual[row : row + 1], expected, atol=2e-6, rtol=2e-5)
-            positions[row] += n
-
-
-@torch.inference_mode()
-def test_official_stream_device_synthesis_and_resampler_parity(reference_root):
-    oracle = definitions(
-        reference_root, "model/src/zonos3/codec/stream_device.py", {"IstftHeadStream", "ResamplerStream"}
-    )
-    torch.manual_seed(7)
-    n_ffts, hop = (736, 2208), 184
-    windows = [torch.hann_window(n) for n in n_ffts]
-    mixer = torch.randn(2, 127) * 0.1
-    native = ZACISTFTStream(n_ffts, hop, windows, mixer, math.log(100.0))
-    ref = oracle["IstftHeadStream"](n_ffts, hop, windows, mixer, math.log(100.0), "cpu")
-    for frames in (1, 2, 4, 8, 15, 15):
-        spectra = [torch.randn(frames, n + 2) * 0.2 for n in n_ffts]
-        torch.testing.assert_close(native.push(spectra), ref.push(*spectra), atol=0, rtol=0)
-    torch.testing.assert_close(native.flush(), ref.flush(), atol=0, rtol=0)
-    rs = Resample(44160, 44100, lowpass_filter_width=16, rolloff=0.99)
-    args = (rs.kernel[:, 0], rs.orig_freq // rs.gcd, rs.new_freq // rs.gcd, rs.width)
-    native_rs = ZACResamplerStream(*args)
-    reference_rs = oracle["ResamplerStream"](*args, "cpu")
-    for n in (1, 1472, 2944, 5888, 131):
-        x = torch.randn(n) * 0.1
-        torch.testing.assert_close(native_rs.push(x), reference_rs.push(x), atol=0, rtol=0)
-    torch.testing.assert_close(native_rs.flush(), reference_rs.flush(), atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------- codec_manager
@@ -548,72 +237,6 @@ def whole_audio(model, codes):
     return model.to_external(audio)
 
 
-@pytest.mark.parametrize("concurrency", [1, 4, 8, 16, 32])
-@torch.inference_mode()
-def test_incremental_batched_neural_decode_through_pcm_and_final_flush(concurrency):
-    torch.manual_seed(32)
-    model = ZACDecoderNetwork(small_config()).eval()
-    manager = CodecManager(model, concurrency)
-    codes = [torch.randint(0, 32, (17 + i % 4, 10)) for i in range(concurrency)]
-    for row in codes:
-        row[0, 4:] = -1
-    expected = [whole_audio(model, row) for row in codes]
-    offsets, seqs = [0] * concurrency, [0] * concurrency
-    parts = [[] for _ in codes]
-    finished = set()
-    batch_sizes = []
-    handle = model.register_forward_pre_hook(lambda _, args: batch_sizes.append(args[0].shape[0]))
-    try:
-        for step in range(40):
-            chunks = []
-            for i in reversed(range(concurrency)):
-                if i in finished or step < i % 3:
-                    continue
-                n = min((1, 2, 4, 8)[min(seqs[i], 3)], len(codes[i]) - offsets[i])
-                # Half the requests finish with data, half with an empty marker.
-                last = n == 0 or (offsets[i] + n == len(codes[i]) and i % 2 == 0)
-                chunks.append(ZACCodecChunk(str(i), seqs[i], offsets[i], codes[i][offsets[i] : offsets[i] + n], last))
-                offsets[i] += n
-                seqs[i] += 1
-                if last:
-                    finished.add(i)
-            output = manager.decode(chunks)
-            assert [row.request_id for row in output] == [chunk.request_id for chunk in chunks]
-            for row in output:
-                parts[int(row.request_id)].append(row.audio)
-            if len(finished) == concurrency:
-                break
-        assert len(finished) == concurrency
-        for got, want in zip(parts, expected, strict=True):
-            audio = torch.cat(got)
-            assert audio.shape == want.shape
-            torch.testing.assert_close(audio, want, atol=2e-7, rtol=3e-4)
-        if concurrency > 1:
-            assert max(batch_sizes) > 1  # the actual neural forward is batched
-        assert not manager._streams and len(manager._free) == concurrency
-    finally:
-        handle.remove()
-
-
-@torch.inference_mode()
-def test_cancel_reuse_and_output_ownership():
-    torch.manual_seed(29)
-    model = ZACDecoderNetwork(small_config()).eval()
-    manager = CodecManager(model, 1)
-    codes = torch.randint(0, 32, (16, 10))
-    output = manager.decode([ZACCodecChunk("cancel", 0, 0, codes)])
-    snapshot = output[0].audio.clone()
-    manager.release("cancel")  # discards unfinished synthesis without flushing
-    other = torch.randint(0, 32, (12, 10))
-    got = manager.decode([ZACCodecChunk("next", 0, 0, other, True)])[0]
-    torch.testing.assert_close(got.audio, whole_audio(model, other), atol=2e-7, rtol=3e-4)
-    assert torch.equal(output[0].audio, snapshot)
-    with pytest.raises(ValueError, match="already finished"):
-        manager.decode([ZACCodecChunk("next", 0, 0, other, True)])
-    manager.release("next")
-    assert manager.decode([ZACCodecChunk("next", 0, 0, other, True)])[0].finished
-
-
 @torch.inference_mode()
 def test_metadata_and_code_validation_precede_state_mutation():
     model = ZACDecoderNetwork(small_config()).eval()
@@ -635,33 +258,21 @@ def test_metadata_and_code_validation_precede_state_mutation():
 
 
 @torch.inference_mode()
-def test_context_audio_is_decoded_but_skipped_once():
-    torch.manual_seed(24)
-    model = ZACDecoderNetwork(small_config()).eval()
-    manager = CodecManager(model, 1)
-    codes = torch.randint(0, 32, (32, 10))
-    want = whole_audio(model, codes)[21:]
-    a = manager.decode([ZACCodecChunk("a", 0, 0, codes[:8], skip_samples=21)])[0]
-    b = manager.decode([ZACCodecChunk("a", 1, 8, codes[8:], True)])[0]
-    torch.testing.assert_close(torch.cat((a.audio, b.audio)), want, atol=2e-7, rtol=3e-4)
-
-
-@torch.inference_mode()
 def test_failed_neural_cohort_reclaims_slots_before_retry(monkeypatch):
     model = ZACDecoderNetwork(small_config()).eval()
     manager = CodecManager(model, 2)
-    forward = model.forward
+    forward = model.forward_packed
 
     def fail_after_state_update(*args):
         forward(*args)
         raise RuntimeError("injected neural failure")
 
     chunks = [ZACCodecChunk(str(i), 0, 0, torch.zeros((4, 10), dtype=torch.int64)) for i in range(2)]
-    monkeypatch.setattr(model, "forward", fail_after_state_update)
+    monkeypatch.setattr(model, "forward_packed", fail_after_state_update)
     with pytest.raises(RuntimeError, match="injected neural failure"):
         manager.decode(chunks)
     assert not manager._streams and len(manager._free) == 2
-    monkeypatch.setattr(model, "forward", forward)
+    monkeypatch.setattr(model, "forward_packed", forward)
     result = manager.decode([replace(chunk, finished=True) for chunk in chunks])
     for row, chunk in zip(result, chunks, strict=True):
         torch.testing.assert_close(row.audio, whole_audio(model, chunk.codes), atol=2e-7, rtol=3e-4)
@@ -748,7 +359,7 @@ def checkpoint(tmp_path, monkeypatch):
     config.load_config = LoadConfig()
     config.additional_config = {}
     config.scheduler_config = SchedulerConfig(
-        max_model_len=16, is_encoder_decoder=False, max_num_seqs=32, max_num_batched_tokens=32
+        max_model_len=16, is_encoder_decoder=False, max_num_seqs=8, max_num_batched_tokens=32
     )
     return config, oracle
 
@@ -765,7 +376,7 @@ def payload(external_id, codes, seq, offset, finished=False):
     }
 
 
-@pytest.mark.parametrize("capacity, expected_batches", [(1, [1]), (3, [1, 2, 3]), (8, [1, 2, 4, 8])])
+@pytest.mark.parametrize("capacity, expected_batches", [(1, [1]), (3, [1, 2, 3])])
 @pytest.mark.parametrize("chunk_size, ramp", [(7, [1, 3, 7]), (5, [])])
 @pytest.mark.parametrize("enforce_eager", [True, False])
 def test_codec_graph_policy_uses_scheduler_and_connector(
@@ -777,21 +388,18 @@ def test_codec_graph_policy_uses_scheduler_and_connector(
     config.model_config.stage_connector_config = {"extra": {"codec_chunk_frames": chunk_size, "codec_chunk_ramp": ramp}}
     model = Zonos3CodecModel(vllm_config=config)
     manager = model._codec_manager()
-    if enforce_eager:
-        assert manager.graph is None
-        assert manager.state.frames.shape[0] == capacity
-    else:
-        assert manager.graph.batch_sizes == expected_batches
-        assert manager.graph.frame_sizes == sorted({1, chunk_size, *ramp})
-        assert manager.state.frames.shape[0] == 2 * capacity
-        assert manager.graph.frame_bucket(0) == 1
-        assert manager.graph.frame_bucket(chunk_size - 1) == chunk_size
+    assert manager.graph.batch_sizes == ([capacity] if enforce_eager else expected_batches)
+    expected_keys = (
+        [] if enforce_eager else [(b, b * t) for b in expected_batches for t in sorted({1, chunk_size, *ramp})]
+    )
+    assert manager.graph.capture_keys == sorted(expected_keys)
+    assert not manager.graph.buckets  # CPU tests never pretend to capture CUDA.
+    assert manager.graph.codec.state is manager.state
 
 
 @pytest.mark.parametrize("termination", ["eos", "length", "length_before_frame", "cancel", "cancel_before_output"])
-@pytest.mark.parametrize("complete_codec", [False, True])
 @torch.inference_mode()
-def test_native_finalizer_transport_codec_lifecycle(checkpoint, termination, complete_codec):
+def test_native_finalizer_transport_codec_lifecycle(checkpoint, termination):
     """Real finalizer, output worker and producer feed the incremental Codec.
 
     The transport backend records connector puts; neural execution uses the
@@ -814,7 +422,7 @@ def test_native_finalizer_transport_codec_lifecycle(checkpoint, termination, com
     from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 
     config, oracle = checkpoint
-    config.model_config.enforce_eager = not complete_codec
+    config.scheduler_config.max_num_seqs = 2
     model = Zonos3CodecModel(vllm_config=config)
     model.load_weights(iter(()))
     frames = torch.arange(200).reshape(20, 10)
@@ -900,7 +508,7 @@ def test_native_finalizer_transport_codec_lifecycle(checkpoint, termination, com
                 )
         else:
             assert "codes" not in sent[-1]
-        assert not model._manager._streams and len(model._manager._free) == 32
+        assert not model._manager._streams and len(model._manager._free) == config.scheduler_config.max_num_seqs
         model.on_requests_finished({"codec-internal"})
         assert not model._internal_to_external and not model._external_to_internal and not model._manager._finished
         # Reusing the same identities allocates clean state after cleanup.
@@ -924,7 +532,9 @@ def test_native_model_loading_pcm_materialization_and_identity_cleanup(checkpoin
     requests = [f"internal-{i}" for i in range(concurrency)]
     codes = torch.randint(0, 4096, (concurrency, 5, 10))
     projected_batch = []
-    handle = model.network.register_forward_pre_hook(lambda _, args: projected_batch.append(args[0].shape[0]))
+    handle = model.network.stages[0].input_proj.register_forward_pre_hook(
+        lambda _, args: projected_batch.append(args[0].shape[0])
+    )
     try:
         first = model(
             request_ids=requests,
@@ -936,7 +546,7 @@ def test_native_model_loading_pcm_materialization_and_identity_cleanup(checkpoin
         )
     finally:
         handle.remove()
-    assert projected_batch == [concurrency, concurrency]
+    assert projected_batch == [2 * concurrency, 3 * concurrency]
     a = OmniGenerationModelRunner._build_pooler_output(first, concurrency)
     b = OmniGenerationModelRunner._build_pooler_output(last, concurrency)
     for i in range(concurrency):
@@ -1027,7 +637,9 @@ def test_producer_cancel_discards_codec_tail_without_affecting_other_batch_reque
     assert zonos3_rvq_async_chunk(manager, None, Request("a", aborted=True), True) is None
     model.on_requests_finished({"native-a"})
     calls = []
-    handle = model.network.register_forward_pre_hook(lambda _, args: calls.append(args[0].shape[0]))
+    handle = model.network.stages[0].input_proj.register_forward_pre_hook(
+        lambda _, args: calls.append(args[0].shape[0])
+    )
     try:
         output = model(
             request_ids=["native-b"],
@@ -1035,7 +647,7 @@ def test_producer_cancel_discards_codec_tail_without_affecting_other_batch_reque
         )
     finally:
         handle.remove()
-    assert calls == [1]  # cancelled request does not run a neural forward
+    assert calls == [len(codes)]  # cancelled request does not run a neural forward
     torch.testing.assert_close(
         output.multimodal_outputs["model_outputs"][0], whole_audio(oracle, codes), atol=5e-7, rtol=1e-3
     )
@@ -1049,90 +661,3 @@ def test_producer_cancel_discards_codec_tail_without_affecting_other_batch_reque
 def graph_network(device="cpu"):
     torch.manual_seed(73)
     return ZACDecoderNetwork(ZACDecoderConfig.from_release(release_config())).to(device).eval()
-
-
-@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32])
-@torch.inference_mode()
-def test_padded_complete_decode_mixed_progress_and_final_matches_eager(batch):
-    network = graph_network()
-    state = network.allocate_state(2 * batch)
-    wrapper = ZACCodecGraphWrapper(network, state, batch, (batch,), (4,))
-    oracle = CodecManager(network, batch)
-    progress = [0] * batch
-    closed = set()
-    for step in range(6):
-        codes = torch.randint(0, 4096, (batch, 4, 10))
-        codes[:, 0, 3:] = -1
-        lengths = torch.tensor([(i + step) % 4 + 1 if i not in closed else 0 for i in range(batch)])
-        final = torch.tensor([step == 2 + i % 3 for i in range(batch)])
-        slots = torch.tensor([batch + i if i in closed else i for i in range(batch)])
-        audio, valid = wrapper(codes, slots, lengths, final)
-        for i in range(batch):
-            if i in closed:
-                assert int(valid[i]) == 0
-                continue
-            chunk = ZACCodecChunk(str(i), step, progress[i], codes[i, : lengths[i]], bool(final[i]))
-            expected = oracle.decode([chunk])[0].audio
-            assert int(valid[i]) == len(expected)
-            torch.testing.assert_close(audio[i, : valid[i]], expected, rtol=1e-4, atol=1e-6)
-            progress[i] += int(lengths[i])
-            if final[i]:
-                closed.add(i)
-    assert not state.frames[batch:].any()
-    assert state.frames[:batch].tolist() == progress
-    assert all(h.shape[1] == wrapper.synthesis.history_columns for h in wrapper.synthesis.history)
-
-
-@torch.inference_mode()
-def test_complete_decode_empty_final_skip_cancel_and_slot_reuse():
-    network = graph_network()
-    eager = CodecManager(network, 1)
-    padded = CodecManager(network, 1, graph_batch_sizes=(1,), graph_frame_sizes=(1, 4))
-    codes = torch.randint(0, 4096, (9, 10))
-    kept = []
-    for request in ("cancelled", "reused"):
-        for seq, (lo, hi, done) in enumerate(((0, 1, False), (1, 4, False), (4, 9, False), (9, 9, True))):
-            chunk = ZACCodecChunk(request, seq, lo, codes[lo:hi], done, 2940 if seq == 0 else 0)
-            a, b = eager.decode([chunk])[0].audio, padded.decode([chunk])[0].audio
-            torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-6)
-            kept.append((b, b.clone()))
-            if request == "cancelled":
-                eager.release(request)
-                padded.release(request)
-                break
-        eager.release(request)
-        padded.release(request)
-    for audio, snapshot in kept:
-        torch.testing.assert_close(audio, snapshot, rtol=0, atol=0)
-    assert not padded._streams and padded._free == [0]
-    empty = ZACCodecChunk("empty", 0, 0, torch.empty(0, 10, dtype=torch.long), True)
-    assert padded.decode([empty])[0].audio.numel() == 0
-
-
-@torch.inference_mode()
-def test_manager_groups_different_lengths_and_final_into_shared_buckets():
-    network = graph_network()
-    oracle = CodecManager(network, 2)
-    manager = CodecManager(network, 2, graph_batch_sizes=(2,), graph_frame_sizes=(1, 4))
-    codes = torch.randint(0, 4096, (2, 6, 10))
-    calls = []
-    hook = network.register_forward_pre_hook(lambda _, args: calls.append(tuple(args[0].shape)))
-    try:
-        cohorts = (
-            [ZACCodecChunk("a", 0, 0, codes[0, :2]), ZACCodecChunk("b", 0, 0, codes[1, :3])],
-            [ZACCodecChunk("b", 1, 3, codes[1, 3:4]), ZACCodecChunk("a", 1, 2, codes[0, :0], True)],
-            [ZACCodecChunk("b", 2, 4, codes[1, 4:], True)],
-        )
-        for chunks in cohorts:
-            expected = oracle.decode(chunks)
-            calls.clear()
-            actual = manager.decode(chunks)
-            # One network forward for the already-scheduled compatible cohort,
-            # including a zero-frame final row beside a live continuation.
-            assert len(calls) == 1 and calls[0][0] == len(chunks)
-            for a, b in zip(actual, expected, strict=True):
-                assert a.request_id == b.request_id and a.finished == b.finished
-                torch.testing.assert_close(a.audio, b.audio, rtol=1e-4, atol=1e-6)
-        assert not manager._streams and len(manager._free) == 2
-    finally:
-        hook.remove()

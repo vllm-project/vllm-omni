@@ -17,7 +17,7 @@
 | Provided profile | `vllm_omni/deploy/zonos3_mini.yaml`, 32 request slots, AR context 2048 tokens |
 | Precision | AR BF16; speaker encoder and Codec weights FP32 |
 | Execution | Eager AR prefill, graph AR decode, model-owned Codec graphs |
-| Qualified scope | Single-GPU startup and one online WAV case with ASR content validation |
+| Qualified scope | Single-GPU default-voice serving; 128 requests per concurrency at 1/4/8/16/32, with WER evaluation |
 | Voice cloning / other topologies | Not qualified by this recipe |
 
 For generic API fields, see the [Speech API](../../docs/serving/speech_api.md).
@@ -91,9 +91,14 @@ vllm serve "$ZONOS3_MODEL_PATH" \
 
 The deploy sets Stage 0 KV cache to **128 MiB**. GDN recurrent/conv/window state
 is separately preallocated. Stage 1 `enforce_eager: false` enables complete Codec
-graphs; set it to `true` for eager Codec execution. Graph buckets derive from
-`max_num_seqs` and connector chunk sizes; no separate graph-bucket configuration
-is needed.
+graphs; set it to `true` for eager execution of the same packed Codec core.
+Both paths consume packed RVQ and produce packed PCM. Graph keys contain only
+`(num_seqs_bucket, total_RVQ_tokens_bucket)`; per-request lengths and final flags
+are device inputs. Only the global token slab tail is padded. Buckets derive
+from `max_num_seqs` and connector chunk sizes, without a separate opt-in flag.
+The ring reserves room for the configured chunk/ramp and up to 30 silence-primer
+frames in the first chunk. Requests exceeding that per-request chunk bound are
+rejected before state changes; increase the shared connector chunk size if needed.
 
 ## Decoder variants and launch adjustments
 
@@ -200,6 +205,34 @@ The test starts its own server and checks the synthesized text through ASR.
 It uses real weights: the `core_model` harness's dummy-weight path is not
 supported by the strict Zonos3 companion loaders.
 
+## Performance and WER measurement
+
+Start the server with the default YAML above. With Seed-TTS English data and
+the benchmark's ASR dependencies installed, run the shared TTS benchmark:
+
+```bash
+export VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=44100
+export SEED_TTS_EVAL_DEVICE=cuda:0
+export SEED_TTS_UTMOS_EVAL=0
+export SEED_TTS_HF_WHISPER_MODEL=/path/to/whisper-large-v3
+
+python benchmarks/tts/bench_tts.py \
+  --host 127.0.0.1 --port 8000 \
+  --model Zyphra/ZONOS3-Mini --task default_voice --locale en \
+  --dataset-path /path/to/seedtts_testset \
+  --num-prompts 128 --num-warmups 32 --request-seed 42 \
+  --concurrency 1 4 8 16 32 --wer-eval \
+  --output-dir results/zonos3-packed \
+  -- --tokenizer /path/to/benchmark-tokenizer
+```
+
+The tokenizer is used for benchmark input-token accounting, not Zonos3 speech
+generation. Keep the dataset, tokenizer and request seed fixed when comparing
+runs. Report audio throughput, first-packet latency, RTF, request failures and
+WER separately for each concurrency. Warmup requests are excluded from the
+timed workload. ASR evaluation on the serving GPU is a separate phase; distinguish
+its memory usage from the server's steady-state and request-processing peaks.
+
 ## Qualification evidence
 
 | Environment | Validated value |
@@ -208,13 +241,34 @@ supported by the strict Zonos3 companion loaders.
 | OS / Python | Ubuntu 22.04.5 LTS / Python 3.12.3 |
 | PyTorch / CUDA build | 2.14.0+cu130 / 13.0 |
 | NVIDIA driver | 595.71.05 |
-| vLLM / Omni revision | 0.33.0 / `a3a8759dc` |
+| vLLM / Omni source | 0.33.0 / uncommitted packed-only working tree, measured 2026-11-15 |
 | Checkpoint | Revision pinned above, default `keep2_plain` decoder |
-| Online case | One English WAV request, seed 42; ASR text matched the input |
-| Graph capture | All 30 default Codec keys captured: B=1/2/4/8/16/32 × frames=1/2/4/8/15 |
-| Process GPU memory | After startup, NVML reported Stage 0: 2674 MiB; Stage 1: 5078 MiB |
+| Workload | Seed-TTS English default voice; seed 42; 32 warmups and 128 timed requests per concurrency |
+| Quality evaluation | Whisper large-v3; mean per-request WER; 128 evaluated outputs per concurrency |
+| Codec graph capture | 30 packed keys: B=1/2/4/8/16/32, sumT=B × {1,2,4,8,15}; captured before serving |
+| Process GPU memory | After startup, before ASR loading: Stage 0 2684 MiB; Stage 1 6044 MiB (NVML) |
+| Device steady-state memory | Approximately 8755 MiB before ASR loading; excludes Whisper; a serving-only peak was not isolated |
 
-These are bounded startup/smoke observations, not peak-memory or throughput
-benchmarks. They include runtime state and graph pools, not only weights.
-The verification command above covers the online case. See the
+| Concurrency | Audio seconds / wall second | TTFP p50 (ms) | TTFP p99 (ms) | Mean RTF | Mean WER |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 6.915 | 252 | 331 | 0.149 | 1.904% |
+| 4 | 9.842 | 597 | 1021 | 0.425 | 1.666% |
+| 8 | 11.468 | 851 | 2042 | 0.711 | 1.018% |
+| 16 | 13.031 | 1079 | 3800 | 1.241 | 0.940% |
+| 32 | 15.722 | 2053 | 6711 | 2.059 | 2.601% |
+
+All 640 timed requests and their ASR evaluations succeeded, with no missing PCM.
+These measurements cover the default packed-only YAML, AR BF16 and Codec FP32,
+with both stages on the same GPU. They are one bounded measurement run, not a
+statistical no-regression claim. Warmups and subsequent ASR evaluation are outside
+the timed serving workload. High-concurrency RTF exceeds 1, so successful request
+completion does not imply uninterrupted real-time playback. Graph replay was
+observed, but aggregate eager-fallback counts were not collected.
+
+The measured Codec source SHA-256 is
+`d3973c718a45f8cde4b476abbb7fee8b4223cd0110fcbb3aa5c2af813fe14a93`;
+the graph wrapper SHA-256 is
+`94e0b55fdd1c19eed2c3d12cef2bff4105ab7b5fc9cbbc579edca3f497c74d0f`.
+Process memory includes runtime state and graph pools, not only weights.
+See the
 [upstream source](https://github.com/Zyphra/ZONOS3-Mini) for model details.

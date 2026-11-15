@@ -14,8 +14,9 @@ import os
 import sys
 from dataclasses import fields, replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import ModuleType
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -46,7 +47,6 @@ from vllm_omni.model_executor.models.zonos3.modeling_zonos3_mini import (
     MultiEmbedding,
     MultiOutputHead,
     Zonos3AttentionProjection,
-    Zonos3Backbone,
     Zonos3BackboneBatch,
     Zonos3DenseFFN,
     Zonos3ForCausalLM,
@@ -55,7 +55,6 @@ from vllm_omni.model_executor.models.zonos3.modeling_zonos3_mini import (
     Zonos3PrefillSpan,
     Zonos3QuantileRouter,
     full_attnres_route,
-    native_attention_factory,
     validate_zonos3_ar_runtime,
 )
 from vllm_omni.worker_v2.model_states import init_omni_model_state
@@ -237,7 +236,7 @@ def test_latent_moe_cpu_batches_have_independent_rows():
 @torch.inference_mode()
 def test_flat_ar_checkpoint_requires_every_parameter_and_preserves_runtime_buffers():
     c = small_ar_config()
-    model = Zonos3Backbone(c, lambda config, index: Zonos3AttentionProjection(config))
+    model = make_cpu_lm(c)
     # A native attention backend can add non-checkpoint cache scale buffers.
     model.layers[3].attention.register_buffer("runtime_scale", torch.ones(1))
     weights = {name: torch.randn_like(parameter) for name, parameter in model.named_parameters()}
@@ -268,7 +267,7 @@ def test_native_attention_binding_requires_complete_gdn_cache_semantics():
     config = valid_runtime()
     config.cache_config.enable_prefix_caching = True
     with pytest.raises(ValueError, match="KV-only hits cannot restore GDN"):
-        native_attention_factory(config)
+        validate_zonos3_ar_runtime(config)
 
 
 @pytest.mark.parametrize(
@@ -283,7 +282,7 @@ def test_unsupported_graph_modes_fail_instead_of_downgrading(mode):
 
 def test_native_full_decode_mode_is_accepted_before_backend_construction():
     config = valid_runtime()
-    assert callable(native_attention_factory(config))
+    validate_zonos3_ar_runtime(config)
     config.model_config.enforce_eager = True
     with pytest.raises(ValueError, match="requires FULL_DECODE_ONLY"):
         validate_zonos3_ar_runtime(config)
@@ -516,6 +515,25 @@ def test_official_gdn_batched_decode_independent_chunk_positions(official_lm, or
             torch.testing.assert_close(actual[row : row + 1], expected, atol=2e-7, rtol=3e-5)
 
 
+def make_cpu_lm(architecture):
+    """Construct the actual GPU model entry with a test-only CPU KV backend."""
+    config = valid_runtime()
+    with TemporaryDirectory() as directory:
+        Path(directory, "params.json").write_text("{}")
+        config.model_config.model = directory
+        config.model_config.hf_config = PretrainedConfig()
+        config.model_config.revision = None
+        with (
+            patch.object(modeling_zonos3_mini.Zonos3Architecture, "from_params", return_value=architecture),
+            patch.object(
+                modeling_zonos3_mini, "Zonos3GlobalAttention", side_effect=lambda arch, *_: CPUAttentionOracle(arch)
+            ),
+        ):
+            model = Zonos3ForCausalLM(vllm_config=config)
+    model._weights_loaded = True
+    return model
+
+
 class CPUAttentionOracle(Zonos3AttentionProjection):
     """Test-only KV backend; CUDA serving uses Zonos3GlobalAttention/vLLM Attention."""
 
@@ -558,7 +576,7 @@ class CPUAttentionOracle(Zonos3AttentionProjection):
 @torch.inference_mode()
 def test_complete_backbone_hidden_logits_mixed_prefill_decode_and_conditioning(official_lm, oracle):
     config = small_ar_config()
-    native = Zonos3Backbone(config, lambda c, index: CPUAttentionOracle(c)).eval()
+    native = make_cpu_lm(config).eval()
     native.load_release_state(oracle.state_dict())
     states = native.allocate_gdn_states(2)
     workspace = native.allocate_workspace(10)
@@ -605,7 +623,7 @@ def test_complete_backbone_hidden_logits_mixed_prefill_decode_and_conditioning(o
             decode_only,
         )
         before = len(head_calls)
-        hidden = native(embeddings, torch.tensor(positions), batch)
+        hidden = native(inputs_embeds=embeddings, positions=torch.tensor(positions), zonos3_batch=batch)
         assert len(head_calls) == before  # Backbone forward never invokes the RVQ head
         torch.testing.assert_close(hidden, torch.cat(expected_hidden), atol=2e-6, rtol=3e-4)
         torch.testing.assert_close(native.multi_output(hidden), torch.cat(expected_logits), atol=2e-6, rtol=3e-4)
@@ -629,12 +647,12 @@ def test_complete_backbone_hidden_logits_mixed_prefill_decode_and_conditioning(o
 
 
 @torch.inference_mode()
-def test_release_checkpoint_native_factory_and_parallel_codebook_sampling(tmp_path, monkeypatch):
+def test_release_checkpoint_native_model_and_parallel_codebook_sampling(tmp_path, monkeypatch):
     monkeypatch.setattr("vllm.v1.worker.gpu.buffer_utils.is_uva_available", lambda: False)
     monkeypatch.setattr(
         modeling_zonos3_mini,
-        "native_attention_factory",
-        lambda config, prefix: lambda arch, index: CPUAttentionOracle(arch),
+        "Zonos3GlobalAttention",
+        lambda arch, *_: CPUAttentionOracle(arch),
     )
     params = {
         **release_params(),
@@ -653,6 +671,7 @@ def test_release_checkpoint_native_factory_and_parallel_codebook_sampling(tmp_pa
     config.model_config.model = str(tmp_path)
     config.model_config.revision = None
     config.model_config.hf_config = PretrainedConfig(hidden_size=16)
+    config.model_config.enforce_eager = False
     config.model_config.enable_prompt_embeds = False
     config.model_config.uses_mrope = False
     config.model_config.get_inputs_embeds_size.return_value = 16

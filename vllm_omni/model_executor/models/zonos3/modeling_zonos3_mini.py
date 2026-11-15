@@ -557,21 +557,64 @@ class Zonos3GlobalAttention(Zonos3AttentionProjection):
         return self.output(self.attn(qkv.query, qkv.key, qkv.value), qkv.gate)
 
 
-AttentionFactory = Callable[[Zonos3Architecture, int], nn.Module]
-
-
 class Zonos3TransformerBlock(nn.Module):
-    def __init__(self, config: Zonos3Architecture, index: int, attention_factory: AttentionFactory) -> None:
+    def __init__(self, config: Zonos3Architecture, index: int, vllm_config: VllmConfig, prefix: str) -> None:
         super().__init__()
         self.attention_norm = Zonos3RMSNorm(config.dim, config.norm_eps)
         self.ffn_norm = Zonos3RMSNorm(config.dim, config.norm_eps)
-        self.attention = Zonos3GDN(config.dim) if config.uses_gdn(index) else attention_factory(config, index)
+        self.attention = (
+            Zonos3GDN(config.dim)
+            if config.uses_gdn(index)
+            else Zonos3GlobalAttention(config, vllm_config, f"{prefix}.attention")
+        )
         self.feed_forward = Zonos3DenseFFN(config) if index == 0 else Zonos3MoEFFN(config)
 
 
-class Zonos3Backbone(nn.Module):
-    def __init__(self, config: Zonos3Architecture, attention_factory: AttentionFactory) -> None:
+def validate_zonos3_ar_runtime(vllm_config: VllmConfig) -> None:
+    """Reject configurations whose state/graph semantics V1 cannot preserve."""
+    if vllm_config.cache_config.enable_prefix_caching:
+        raise ValueError(
+            "Zonos3 V1 requires prefix caching disabled: KV-only hits cannot restore GDN conv/recurrent state"
+        )
+    if (
+        vllm_config.model_config.enforce_eager
+        or vllm_config.compilation_config.cudagraph_mode is not CUDAGraphMode.FULL_DECODE_ONLY
+    ):
+        raise ValueError("Zonos3 AR requires FULL_DECODE_ONLY: native FULL decode graphs and eager prefill")
+    parallel = vllm_config.parallel_config
+    if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1 or parallel.enable_expert_parallel:
+        raise ValueError("Zonos3 V1 supports one tensor/pipeline rank per stage without expert parallelism")
+
+
+class Zonos3ForCausalLM(nn.Module):
+    has_preprocess = True
+    has_postprocess = False
+    have_multimodal_outputs = False
+    requires_raw_input_tokens = False
+    omni_pooler_payload_include_hidden = False
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        model_config = vllm_config.model_config
+        reference = model_config.model
+        subdir = getattr(model_config.hf_config, "zonos3_lm_subdir", "lm/zonos3_mini")
+        root = Path(reference)
+        if not root.is_dir():
+            root = Path(
+                download_weights_from_hf_specific(
+                    reference,
+                    vllm_config.load_config.download_dir,
+                    [f"{subdir}/params.json"],
+                    revision=model_config.revision,
+                    require_all=True,
+                )
+            )
+        direct = (root / "params.json").is_file()
+        directory = root if direct else root / subdir
+        with (directory / "params.json").open() as handle:
+            architecture = Zonos3Architecture.from_params(json.load(handle))
         super().__init__()
+        config = architecture
+        validate_zonos3_ar_runtime(vllm_config)
         self.config = config
         # Keep the release's flat module names, including conditioning modules.
         self.multi_embedder = MultiEmbedding(config)
@@ -580,11 +623,19 @@ class Zonos3Backbone(nn.Module):
             [nn.Embedding(count + 1, config.dim) for count in config.condition_bucket_counts]
         )
         self.layers = nn.ModuleList(
-            [Zonos3TransformerBlock(config, i, attention_factory) for i in range(config.n_layers)]
+            [
+                Zonos3TransformerBlock(config, i, vllm_config, f"{prefix}.layers.{i}" if prefix else f"layers.{i}")
+                for i in range(config.n_layers)
+            ]
         )
         self.block_attnres_queries = nn.Parameter(torch.empty(config.n_sources, config.dim), requires_grad=False)
         self.out_norm = Zonos3RMSNorm(config.dim, config.norm_eps)
         self.multi_output = MultiOutputHead(config)
+        self.vllm_config = vllm_config
+        self.model_dir = directory
+        self.allow_patterns_overrides = ["model.pth" if direct else f"{subdir}/model.pth"]
+        self._weights_loaded = False
+        self.speaker_encoder = None
 
     def allocate_gdn_states(self, capacity: int) -> dict[int, Zonos3GDNState]:
         return {
@@ -638,88 +689,6 @@ class Zonos3Backbone(nn.Module):
             output[span.start : end].copy_(prefilling)
         return output
 
-    def forward(self, inputs_embeds: torch.Tensor, positions: torch.Tensor, batch: Zonos3BackboneBatch) -> torch.Tensor:
-        config = self.config
-        tokens = inputs_embeds.shape[0]
-        workspace = batch.workspace
-        if workspace.bank.shape[1] < tokens or positions.shape[0] != tokens:
-            raise ValueError("Zonos3 Backbone workspace/position shape does not match the scheduled rows")
-        # Speaker/condition substitution happens in ModelState before this norm.
-        x = F.rms_norm(inputs_embeds, (config.dim,), eps=config.norm_eps)
-        workspace.write(0, x)
-        for i, layer in enumerate(self.layers):
-            mixed = workspace.route(2 * i + 1, tokens, self.block_attnres_queries[2 * i], config.norm_eps)
-            attention_input = layer.attention_norm(mixed)
-            if isinstance(layer.attention, Zonos3GDN):
-                attention_output = self._gdn_forward(layer.attention, attention_input, batch, batch.gdn_states[i])
-            else:
-                attention_output = layer.attention(attention_input, positions, batch)
-            workspace.write(2 * i + 1, attention_output)
-            mixed = workspace.route(2 * i + 2, tokens, self.block_attnres_queries[2 * i + 1], config.norm_eps)
-            workspace.write(2 * i + 2, layer.feed_forward(layer.ffn_norm(mixed)))
-        mixed = workspace.route(config.n_sources, tokens, self.block_attnres_queries[-1], config.norm_eps)
-        return self.out_norm(mixed)
-
-
-def native_attention_factory(vllm_config: VllmConfig, prefix: str = "") -> AttentionFactory:
-    validate_zonos3_ar_runtime(vllm_config)
-
-    def construct(config: Zonos3Architecture, index: int) -> nn.Module:
-        name = f"layers.{index}.attention"
-        return Zonos3GlobalAttention(config, vllm_config, f"{prefix}.{name}" if prefix else name)
-
-    return construct
-
-
-def validate_zonos3_ar_runtime(vllm_config: VllmConfig) -> None:
-    """Reject configurations whose state/graph semantics V1 cannot preserve."""
-    if vllm_config.cache_config.enable_prefix_caching:
-        raise ValueError(
-            "Zonos3 V1 requires prefix caching disabled: KV-only hits cannot restore GDN conv/recurrent state"
-        )
-    if (
-        vllm_config.model_config.enforce_eager
-        or vllm_config.compilation_config.cudagraph_mode is not CUDAGraphMode.FULL_DECODE_ONLY
-    ):
-        raise ValueError("Zonos3 AR requires FULL_DECODE_ONLY: native FULL decode graphs and eager prefill")
-    parallel = vllm_config.parallel_config
-    if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1 or parallel.enable_expert_parallel:
-        raise ValueError("Zonos3 V1 supports one tensor/pipeline rank per stage without expert parallelism")
-
-
-class Zonos3ForCausalLM(Zonos3Backbone):
-    has_preprocess = True
-    has_postprocess = False
-    have_multimodal_outputs = False
-    requires_raw_input_tokens = False
-    omni_pooler_payload_include_hidden = False
-
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        model_config = vllm_config.model_config
-        reference = model_config.model
-        subdir = getattr(model_config.hf_config, "zonos3_lm_subdir", "lm/zonos3_mini")
-        root = Path(reference)
-        if not root.is_dir():
-            root = Path(
-                download_weights_from_hf_specific(
-                    reference,
-                    vllm_config.load_config.download_dir,
-                    [f"{subdir}/params.json"],
-                    revision=model_config.revision,
-                    require_all=True,
-                )
-            )
-        direct = (root / "params.json").is_file()
-        directory = root if direct else root / subdir
-        with (directory / "params.json").open() as handle:
-            architecture = Zonos3Architecture.from_params(json.load(handle))
-        super().__init__(architecture, native_attention_factory(vllm_config, prefix))
-        self.vllm_config = vllm_config
-        self.model_dir = directory
-        self.allow_patterns_overrides = ["model.pth" if direct else f"{subdir}/model.pth"]
-        self._weights_loaded = False
-        self.speaker_encoder = None
-
     def create_mrv2_model_state(
         self, vllm_config: VllmConfig, encoder_cache: EncoderCache | None, device: torch.device
     ) -> Zonos3ARModelState:
@@ -769,7 +738,27 @@ class Zonos3ForCausalLM(Zonos3Backbone):
             raise RuntimeError("Zonos3 AR release weights have not been loaded")
         if inputs_embeds is None or positions is None or zonos3_batch is None:
             raise ValueError("Zonos3 AR requires native ModelState-prepared embeddings, positions and state")
-        return super().forward(inputs_embeds, positions, zonos3_batch)
+        batch = zonos3_batch
+        config = self.config
+        tokens = inputs_embeds.shape[0]
+        workspace = batch.workspace
+        if workspace.bank.shape[1] < tokens or positions.shape[0] != tokens:
+            raise ValueError("Zonos3 Backbone workspace/position shape does not match the scheduled rows")
+        # Speaker/condition substitution happens in ModelState before this norm.
+        x = F.rms_norm(inputs_embeds, (config.dim,), eps=config.norm_eps)
+        workspace.write(0, x)
+        for i, layer in enumerate(self.layers):
+            mixed = workspace.route(2 * i + 1, tokens, self.block_attnres_queries[2 * i], config.norm_eps)
+            attention_input = layer.attention_norm(mixed)
+            if isinstance(layer.attention, Zonos3GDN):
+                attention_output = self._gdn_forward(layer.attention, attention_input, batch, batch.gdn_states[i])
+            else:
+                attention_output = layer.attention(attention_input, positions, batch)
+            workspace.write(2 * i + 1, attention_output)
+            mixed = workspace.route(2 * i + 2, tokens, self.block_attnres_queries[2 * i + 1], config.norm_eps)
+            workspace.write(2 * i + 2, layer.feed_forward(layer.ffn_norm(mixed)))
+        mixed = workspace.route(config.n_sources, tokens, self.block_attnres_queries[-1], config.norm_eps)
+        return self.out_norm(mixed)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         if self._weights_loaded:
