@@ -22,8 +22,7 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.tts]
 
-# Separately initialized ROCm BF16 code2wav engines can produce isolated
-# same-code differences up to about 0.045 while retaining >30 dB SNR.
+# Retain the existing localized and aggregate ROCm waveform bounds.
 _ROCM_MAX_AUDIO_ABS_DIFF = 5.0e-2
 _ROCM_MIN_AUDIO_SNR_DB = 30.0
 
@@ -60,6 +59,12 @@ async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path, monkeypa
     prompt = {"prompt_token_ids": [0] * prompt_len, "additional_information": info}
     observations = []
     audios = []
+    code2wav_updates: dict[str, bool | str] = {"enforce_eager": True, "async_scheduling": False}
+    if current_omni_platform.is_rocm():
+        # Independent BF16 decoders can exceed the waveform bounds for identical
+        # codec tokens. Use FP32 here to isolate prefill parity from that drift;
+        # the talker keeps its deployment dtype and exact-token assertions.
+        code2wav_updates["dtype"] = "float32"
     for chunked in (False, True):
         deploy = modify_stage_config(
             get_deploy_config_path("qwen3_tts.yaml"),
@@ -78,7 +83,7 @@ async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path, monkeypa
                         "default_sampling_params.max_tokens": 128,
                         "subtalker_sampling_params": {"do_sample": False},
                     },
-                    1: {"enforce_eager": True, "async_scheduling": False},
+                    1: code2wav_updates,
                 },
             },
         )
@@ -125,6 +130,7 @@ async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path, monkeypa
         max_audio_difference = None
     evidence = {
         "prompt_len": prompt_len,
+        "code2wav_dtype_override": code2wav_updates.get("dtype"),
         "observations": observations,
         "audio_samples": audios[0].numel(),
         "chunked_audio_samples": audios[1].numel(),
@@ -145,9 +151,8 @@ async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path, monkeypa
     assert chunked_probe["codes"] == baseline["codes"]
     assert same_audio_shape
     if current_omni_platform.is_rocm():
-        # Exact codes are the prefill contract. The separately initialized ROCm
-        # BF16 code2wav engines can have low-amplitude numeric drift for those
-        # same codes, so retain strict localized and aggregate waveform bounds.
+        # Exact codes are the prefill contract. Retain both waveform bounds
+        # with FP32 decoding so localized and aggregate audio regressions fail.
         assert max_audio_difference is not None
         assert max_audio_difference < _ROCM_MAX_AUDIO_ABS_DIFF, (
             f"ROCm waveform max difference {max_audio_difference:.8f} exceeds "

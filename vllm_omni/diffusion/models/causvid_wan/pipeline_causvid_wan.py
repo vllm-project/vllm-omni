@@ -561,7 +561,9 @@ class CausVidWanPipeline(nn.Module):
         kv_id = str(raw_session) if explicit_session else req_id
         return kv_id, persist, reset, close_session
 
-    def admit_cell_request(self, req: OmniDiffusionRequest) -> tuple[Any, str, bool, Any | None]:
+    def admit_cell_request(
+        self, req: OmniDiffusionRequest, *, decode_tag: int = 0
+    ) -> tuple[Any, str, bool, Any | None]:
         """Admit CellPlan and build WanCell under the bound context.
 
         Returns ``(adapter, kv_id, persist, stream_job)``.
@@ -646,6 +648,7 @@ class CausVidWanPipeline(nn.Module):
             pp_rank=pp_rank,
             pp_group=pp_group,
             timeline_file=extra.get("chunk_timeline_file"),
+            decode_tag=decode_tag,
         )
         return adapter, kv_id, persist, stream_job
 
@@ -666,6 +669,7 @@ class CausVidWanPipeline(nn.Module):
         pp_rank: int,
         pp_group: Any,
         timeline_file: Any,
+        decode_tag: int = 0,
     ) -> tuple[Any, Any | None]:
         """Start stream_decode (if any) then build WanCell; cancel the job on build failure.
 
@@ -689,6 +693,7 @@ class CausVidWanPipeline(nn.Module):
                 source_rank=source_rank,
                 pp_group=pp_group,
                 stream_group=stream_group,
+                decode_tag=decode_tag,
             )
             on_finished = stream_job.on_finished
         on_finished = self._maybe_timeline(on_finished, timeline_file, finish_rank=finish_rank, pp_rank=pp_rank)
@@ -731,23 +736,36 @@ class CausVidWanPipeline(nn.Module):
     def forward(self, req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[DiffusionOutput]:
         """Mainline request entry: plan, run the Cell executor, then emit.
 
-        Session reset and release stay on the runner. This method only advances
-        the request with the KV pool bound for the call.
+        Compatible requests admitted into the same Cell context share one
+        ``run_cell_pipeline`` so same-cell members can compute together.
+        Session reset and release stay on the runner.
         """
         ctx = self._execution_context()
         previous = getattr(self, "_chunk_ctx", None)
         self._chunk_ctx = ctx
-        outputs: list[DiffusionOutput] = []
+        stream_jobs: list[Any | None] = []
         try:
-            for item in _as_request_list(req):
-                adapter, kv_id, _persist, stream_job = self.admit_cell_request(item)
-                try:
-                    run_cell_pipeline(ctx=ctx, adapter=adapter)
-                except Exception:
-                    if stream_job is not None:
-                        stream_job.cancel()
-                    raise
-                outputs.append(self.emit_cell_output(adapter, kv_id, stream_job))
-            return outputs
+            members: dict[str, WanCell] = {}
+            # Stable wave-local member identity, shared by sender and VAE owner.
+            for decode_tag, item in enumerate(_as_request_list(req)):
+                adapter, kv_id, _persist, stream_job = self.admit_cell_request(item, decode_tag=decode_tag)
+                # Record before type checks so a later admit/type failure still cancels.
+                stream_jobs.append(stream_job)
+                if not isinstance(adapter, WanCell):
+                    raise TypeError(f"expected WanCell adapter, got {type(adapter).__name__}")
+                if kv_id in members:
+                    raise ValueError(f"duplicate cell-batch member id {kv_id!r}")
+                members[kv_id] = adapter
+            # Batch organization lives in run_cell_pipeline; Pipeline only supplies members.
+            run_cell_pipeline(ctx=ctx, members=members)
+            return [
+                self.emit_cell_output(adapter, kv_id, stream_job)
+                for (kv_id, adapter), stream_job in zip(members.items(), stream_jobs, strict=True)
+            ]
+        except Exception:
+            for stream_job in stream_jobs:
+                if stream_job is not None:
+                    stream_job.cancel()
+            raise
         finally:
             self._chunk_ctx = previous

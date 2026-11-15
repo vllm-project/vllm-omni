@@ -355,6 +355,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return scheduler_output
 
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        self._enforce_kstep_span_uniformity(scheduler_output)
+        super()._update_after_schedule(scheduler_output)
+
     def _is_done_receiving_chunks(self, request_id: str) -> bool:
         if self.chunk_transfer_adapter is not None:
             return self.chunk_transfer_adapter.is_done_receiving_chunks(request_id)

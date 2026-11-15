@@ -12,6 +12,7 @@ from typing import Any, Protocol, cast
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.core.sched.duplex_stage_work import parse_perf_chunk
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.outputs import SchedulingMetadataUpdate
 
@@ -66,11 +67,13 @@ class DefaultSchedulingMetadataAdapter:
             prompt_token_ids = self._extract_prompt_token_ids(
                 payload, window_codes_as_placeholder=self._window_codes_as_placeholder
             )
-        if resize_prompt_to is None and prompt_token_ids is None:
+        duplex_perf_chunk = parse_perf_chunk(meta.get("duplex_perf_chunk"))
+        if resize_prompt_to is None and prompt_token_ids is None and duplex_perf_chunk is None:
             return None
         return SchedulingMetadataUpdate(
             prompt_token_ids=prompt_token_ids,
             resize_prompt_to=resize_prompt_to,
+            duplex_perf_chunk=duplex_perf_chunk,
         )
 
     @staticmethod

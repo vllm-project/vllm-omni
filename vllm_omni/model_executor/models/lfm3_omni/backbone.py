@@ -39,20 +39,36 @@ class RequestState:
 
 
 def causal_conv(
-    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, previous: torch.Tensor | None
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    previous: torch.Tensor | None,
+    reference: ModuleType | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """A single request, including a chunk continuing an existing prompt.
 
     Keep K-1 inputs; this produces the same causal windows as the reference's
     K-element cache (which discards its oldest element on the next step).
+    Where the checkpoint dispatches to its own width-7 kernels (CUDA), use
+    them with the reference's K-element cache: their decode rounding depends
+    on the cache width, and differs from a prompt's.
     """
     width = weight.shape[-1]
     x = x.transpose(0, 1).unsqueeze(0)
+    kernels = reference is not None and reference.can_use_lfm3_conv(x, weight)
+    if kernels and previous is not None and x.shape[-1] == 1:
+        # Shifts the request-owned state in place, like the reference cache.
+        result = reference.lfm3_causal_conv1d_update(x, previous, weight.squeeze(1), bias)
+        return result.squeeze(0).transpose(0, 1), previous
     prefix = x.new_zeros((1, x.shape[1], width - 1)) if previous is None else previous
     window = torch.cat((prefix, x), dim=-1)
-    result = F.conv1d(window, weight, bias, groups=x.shape[1])
+    if kernels:
+        # Zero taps are exact in its fp32 sum, so the padded window matches.
+        result = reference.lfm3_causal_conv1d(window, weight.squeeze(1), bias)[..., -x.shape[-1] :]
+    else:
+        result = F.conv1d(window, weight, bias, groups=x.shape[1])
     # The prefix must own its storage: retaining a view keeps the entire prompt.
-    state = window[..., -(width - 1) :].contiguous()
+    state = window[..., -(width if kernels else width - 1) :].contiguous()
     return result.squeeze(0).transpose(0, 1), state
 
 
@@ -66,6 +82,7 @@ class Lfm3TemporalModel(nn.Module):
         if self.attention_mode not in ("reference", "paged"):
             raise ValueError("lfm3_attention_backend must be reference or paged")
         self._reference_attention = reference.eager_attention_forward
+        self._conv_kernels = reference if hasattr(reference, "can_use_lfm3_conv") else None
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.layers = nn.ModuleList(reference.Lfm3DecoderLayer(config, i) for i in range(config.num_hidden_layers))
         self.embedding_norm = reference.Lfm3RMSNorm(config.hidden_size, eps=config.norm_eps)
@@ -197,7 +214,7 @@ class Lfm3TemporalModel(nn.Module):
                 convolved = torch.zeros_like(gated)
                 for start, end, state in requests:
                     convolved[start:end], state.conv[index] = causal_conv(
-                        gated[start:end], conv.conv.weight, conv.conv.bias, state.conv.get(index)
+                        gated[start:end], conv.conv.weight, conv.conv.bias, state.conv.get(index), self._conv_kernels
                     )
                 x = conv.out_proj(c * convolved)
             if layer.use_sandwich_norm:

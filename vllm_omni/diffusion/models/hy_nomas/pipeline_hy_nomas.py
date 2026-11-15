@@ -37,7 +37,9 @@ from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import (
     REQUIRED_FILES,
     HyNomasARConfig,
 )
+from vllm_omni.diffusion.models.hy_nomas.decoder import PixelUMMDecoder
 from vllm_omni.diffusion.models.hy_nomas.history import HyNomasHistoryFrame, action_tails, recent_history
+from vllm_omni.diffusion.models.hy_nomas.history_archive import HyNomasHistoryArchive
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
     build_transformer,
     load_component_weights,
@@ -45,8 +47,6 @@ from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
     validate_sequence_parallelism,
 )
 from vllm_omni.diffusion.models.hy_nomas.interaction import HyNomasInteractionSession, validate_camera_payload
-from vllm_omni.diffusion.models.hy_nomas.pixelumm import PixelUMMDCAELatentDecoder
-from vllm_omni.diffusion.models.hy_nomas.pixelumm_model import DCAEVPixelUMMDecoder, GenExpertArch
 from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import (
     action_conditioning,
     normalize_request,
@@ -110,29 +110,11 @@ def read_component_config(root: Path, component: str, filename: str, class_name:
 
 
 def build_decoder(config: dict[str, Any], device: torch.device) -> nn.Module:
-    arch = GenExpertArch(**{name: config[name] for name in GenExpertArch.__dataclass_fields__})
-    local_pixels = config["local_attention_tile_pixels"]
-    if type(local_pixels) is not int or local_pixels < 0 or local_pixels % 16:
-        raise ValueError("Hy-Nomas local_attention_tile_pixels must be a nonnegative multiple of 16.")
+    """Construct the native PixelUMM decoder in BF16, excluding checkpoint metadata."""
+    kwargs = {name: value for name, value in config.items() if not name.startswith("_")}
     with set_default_torch_dtype(torch.bfloat16), torch.device(device):
-        decoder = DCAEVPixelUMMDecoder(arch, local_attention_tile=local_pixels // 16)
-    vae = PixelUMMDCAELatentDecoder(
-        decoder,
-        **{
-            name: config[name]
-            for name in (
-                "denoising_step_list",
-                "num_steps",
-                "seed",
-                "temporal_window_latents",
-                "temporal_overlap_latents",
-                "decoder_tile_pixels",
-                "decoder_tile_overlap_pixels",
-                "tail_hold_latents",
-            )
-        },
-    )
-    return vae.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
+        vae = PixelUMMDecoder(**kwargs)
+    return vae.eval().requires_grad_(False)
 
 
 def validate_config(config: OmniDiffusionConfig) -> None:
@@ -199,6 +181,7 @@ class HyNomasSession:
     offline_cache: list[dict[str, torch.Tensor]] | None = None
     noise_generator: torch.Generator | None = None
     history_frames: list[HyNomasHistoryFrame] = field(default_factory=list)
+    history_archive: HyNomasHistoryArchive | None = None
 
 
 class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
@@ -303,8 +286,15 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             if component in components:
                 raise ValueError(f"Duplicate Hy-Nomas component weight stream: {component}")
             components.add(component)
-            loader = load_transformer_weights if component == "transformer" else load_component_weights
-            names = loader(getattr(self, component), ((name.partition(".")[2], value) for name, value in entries))
+            module = getattr(self, component)
+            stream = ((name.partition(".")[2], value) for name, value in entries)
+            if component == "transformer":
+                names = load_transformer_weights(module, stream)
+            elif hasattr(module, "load_weights"):
+                # The native decoder stacks the checkpoint's q/k/v and gate/up projections.
+                names = module.load_weights(stream)
+            else:
+                names = load_component_weights(module, stream)
             loaded.update(f"{component}.{name}" for name in names)
         if components != {"transformer", "vae"}:
             raise ValueError(
@@ -467,7 +457,9 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             self._ar_state = None
 
     def reset_ar_diffusion_session(self, session_id: str) -> None:
-        self._ar_sessions.pop(session_id, None)
+        session = self._ar_sessions.pop(session_id, None)
+        if session is not None and session.history_archive is not None:
+            session.history_archive.clear()
 
     def close_ar_diffusion_session(self, session_id: str) -> None:
         self.reset_ar_diffusion_session(session_id)
@@ -544,6 +536,11 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             if recent:
                 session.noise_generator = torch.Generator(device="cpu").manual_seed(request.seed)
                 session.generator = torch.Generator(device="cpu").manual_seed(request.seed ^ 0x4E4F4D4153)
+                if config.history_archive_max_bytes:
+                    session.history_archive = HyNomasHistoryArchive(
+                        max_bytes=config.history_archive_max_bytes,
+                        max_frames=config.history_archive_max_frames,
+                    )
             if bound is not None:
                 self._ar_sessions[bound.session_id] = session
             else:
@@ -804,10 +801,23 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                         for layer in range(self.num_double_blocks):
                             cache.stage(layer)
                         cache.validate_commit(retain=retained)
+                        if session.history_archive is not None:
+                            session.history_archive.stage(
+                                cache.pending_layer_views(),
+                                mask[:, history:],
+                                frame_start=session.latent_frames,
+                                frame_count=latents.shape[2],
+                                tokens_per_frame=image_tokens // latents.shape[2],
+                                segment=state.extra["hy_nomas_segment_id"],
+                                text_tokens=state.prompt_embeds.shape[1] if first else 0,
+                                action_start=state.extra["hy_nomas_action_start"] if first else -1,
+                            )
                     except Exception as exc:
                         error = exc
                     self._check_sp_error(error, "KV staging")
                     cache.commit(retain=retained)
+                    if session.history_archive is not None:
+                        session.history_archive.publish()
                     if recent:
                         session.history_frames = frames
                         session.history_mask = torch.cat((session.history_mask, mask[:, history:]), 1)[:, cut:].clone()
@@ -834,6 +844,8 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         except BaseException:
             if commit and cache is not None:
                 cache.rollback()
+                if session.history_archive is not None:
+                    session.history_archive.rollback()
             raise
 
     def _check_sp_error(self, error: Exception | None, operation: str) -> None:
@@ -969,6 +981,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                         "segments": session.segments,
                         "history_tokens": session.history_mask.shape[1],
                         "history_mode": self.ar_config.history_mode,
+                        "archive_payload_bytes": session.history_archive.payload_bytes
+                        if session.history_archive
+                        else 0,
+                        "archive_latent_frames": session.history_archive.frames if session.history_archive else 0,
                         "sampling_version": "incremental_v1" if session.noise_generator is not None else "legacy_v1",
                     },
                 },
