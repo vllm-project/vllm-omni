@@ -11,6 +11,8 @@ import pytest
 
 from vllm_omni.benchmarks.data_modules import long_video_source as source
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
+
 
 def _archive(root, *, name="src_videos/Ego4D/example.mp4", symlink=False):
     stream = io.BytesIO()
