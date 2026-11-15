@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 from collections import Counter, deque
 from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import InitVar, dataclass, field
+from typing import Literal
 
 import regex as re
 
@@ -25,7 +26,12 @@ from vllm_omni.engine.duplex.session.source_costs import SourceTokenCache
 from vllm_omni.engine.duplex.session.visual_history import SessionVisualHistory, VisualWork
 from vllm_omni.engine.duplex.visual_memory import VisualMemory
 
-DEFAULT_HISTORY_POLICY = "full_history"
+FULL_HISTORY_POLICY = "full_history"
+DEFAULT_HISTORY_POLICY = FULL_HISTORY_POLICY
+RECENT_MESSAGE_WINDOW = 16
+RECENT_AUDIO_ITEMS = 4
+RECENT_AUDIO_BYTES = 8 * 1024 * 1024
+RECENT_PROMPT_IMAGES = 8
 
 Message = Mapping[str, object]
 AudioEntry = tuple[tuple[object, ...], Mapping[str, object]]
@@ -443,6 +449,43 @@ def audio_pressure_cutoff(state: QwenHistoryState, limits: HistoryLimits, max_au
     return cutoff
 
 
+@dataclass(frozen=True)
+class HistoryBehavior:
+    """Policy choices consumed by Qwen's original and budgeted renderers.
+
+    Original rendering preserves the existing tool protocol. Budgeted rendering
+    uses Session summaries. A rejected overflow never drops accepted sources.
+    None disables the corresponding legacy window or media eviction limit.
+    """
+
+    original_messages: bool = False
+    overflow: Literal["fit", "reject"] = "fit"
+    message_window: int | None = RECENT_MESSAGE_WINDOW
+    audio_cache_items: int | None = RECENT_AUDIO_ITEMS
+    audio_cache_bytes: int | None = RECENT_AUDIO_BYTES
+    prompt_images: int | None = RECENT_PROMPT_IMAGES
+    use_media_view: bool = True
+
+    def __post_init__(self) -> None:
+        """Reject invalid custom retention choices before serving a request."""
+        if self.overflow not in {"fit", "reject"}:
+            raise ValueError("history overflow must be fit or reject")
+        for name in ("message_window", "audio_cache_items", "audio_cache_bytes", "prompt_images"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"history behavior {name} must be positive or None")
+
+
+def original_turn_ranges(history: Sequence[Message]) -> list[tuple[int, int]]:
+    """Keep original system/tool boundaries and assistant-only source groups."""
+    starts = []
+    for index, message in enumerate(history):
+        role = message.get("role")
+        if not starts or role == "system" or (role == "user" and history[index - 1].get("role") != "user"):
+            starts.append(index)
+    return list(zip(starts, [*starts[1:], len(history)]))
+
+
 class QwenHistoryPolicy(ABC):
     """Server-loaded, stateless policy. Ranges refer to effective Session items.
 
@@ -452,6 +495,11 @@ class QwenHistoryPolicy(ABC):
     """
 
     compress_visual_history = True
+    behavior = HistoryBehavior()
+
+    def session_image_limits(self, limits: HistoryLimits) -> tuple[int, int]:
+        """Admission limits for authoritative Session image records."""
+        return limits.max_session_images, limits.max_session_image_bytes
 
     @abstractmethod
     def select(self, state: QwenHistoryState, limits: HistoryLimits) -> list[tuple[int, int]]:
@@ -476,10 +524,26 @@ class QwenHistoryPolicy(ABC):
         """
 
 
-class BoundedRecentPolicy(QwenHistoryPolicy):
-    """Equal-budget clipping control: retain media, but never summarize it."""
+class NonCompressingHistoryPolicy(QwenHistoryPolicy):
+    """Shared no-compression operations for original and clipping policies."""
 
     compress_visual_history = False
+
+    def next_batch(self, state: QwenHistoryState, limits: HistoryLimits, *, max_audio: int) -> tuple[int, int] | None:
+        """These policies never schedule summary work."""
+        return None
+
+    def build_compression(
+        self, batch: tuple[CompressionMessage, ...], previous_memory: str, limits: HistoryLimits
+    ) -> CompressionPrompt:
+        raise NotImplementedError("This history policy does not schedule compression")
+
+    def parse_compression(self, text: str) -> str | None:
+        raise NotImplementedError("This history policy does not schedule compression")
+
+
+class BoundedRecentPolicy(NonCompressingHistoryPolicy):
+    """Equal-budget clipping control: retain media, but never summarize it."""
 
     def select(self, state: QwenHistoryState, limits: HistoryLimits) -> list[tuple[int, int]]:
         """Offer all turns; the renderer fits the most recent ones to context."""
@@ -487,17 +551,45 @@ class BoundedRecentPolicy(QwenHistoryPolicy):
         # legacy 16-message cap. Rendering removes oldest complete turns.
         return turn_ranges(state.history)
 
-    def next_batch(self, state: QwenHistoryState, limits: HistoryLimits, *, max_audio: int) -> tuple[int, int] | None:
-        """The clipping control never generates memory."""
-        return None
 
-    def build_compression(
-        self, batch: tuple[CompressionMessage, ...], previous_memory: str, limits: HistoryLimits
-    ) -> CompressionPrompt:
-        raise NotImplementedError("BoundedRecentPolicy does not schedule compression")
+class FullHistoryPolicy(NonCompressingHistoryPolicy):
+    """Preserve every original source; reject capacity overflow without clipping."""
 
-    def parse_compression(self, text: str) -> str | None:
-        raise NotImplementedError("BoundedRecentPolicy does not schedule compression")
+    behavior = HistoryBehavior(
+        original_messages=True,
+        overflow="reject",
+        message_window=None,
+        audio_cache_items=None,
+        audio_cache_bytes=None,
+        prompt_images=None,
+        use_media_view=False,
+    )
+
+    def select(self, state: QwenHistoryState, limits: HistoryLimits) -> list[tuple[int, int]]:
+        """Select all original groups, including leading assistant records."""
+        return original_turn_ranges(state.history)
+
+
+class RecentHistoryPolicy(FullHistoryPolicy):
+    """Explicit legacy window, audio eviction and media-dropped view support."""
+
+    behavior = HistoryBehavior(original_messages=True)
+
+    def select(self, state: QwenHistoryState, limits: HistoryLimits) -> list[tuple[int, int]]:
+        """Round the legacy message window out to original complete groups."""
+        window = self.behavior.message_window
+        floor = len(state.history) - window if window is not None else -1
+        return [
+            (start, end)
+            for start, end in original_turn_ranges(state.history)
+            if end > floor and state.history[start].get("role") != "assistant"
+        ]
+
+    def session_image_limits(self, limits: HistoryLimits) -> tuple[int, int]:
+        """Keep pre-policy Session admission defaults for explicit legacy users."""
+        from vllm_omni.engine.duplex.config import DEFAULT_IMAGE_HISTORY_MAX_BYTES, DEFAULT_IMAGE_HISTORY_MAX_ITEMS
+
+        return DEFAULT_IMAGE_HISTORY_MAX_ITEMS, DEFAULT_IMAGE_HISTORY_MAX_BYTES
 
 
 class IncrementalHistoryPolicy(QwenHistoryPolicy):
@@ -583,15 +675,17 @@ class IncrementalHistoryPolicy(QwenHistoryPolicy):
         return memory
 
 
-def load_history_policy(name: str) -> QwenHistoryPolicy | None:
+def load_history_policy(name: str) -> QwenHistoryPolicy:
     """Load a server-selected ABC implementation, rejecting incomplete classes.
 
-    ``full_history`` and ``recent`` share the original/tool-capable renderer;
-    only ``recent`` enables its legacy clipping. External imports and constructor
+    Every built-in returns an explicit policy object. Full and recent select
+    original groups and declare their retention/overflow rules. External imports and constructor
     failures propagate at configuration time; clients cannot select import paths.
     """
-    if name in {DEFAULT_HISTORY_POLICY, "recent"}:
-        return None
+    if name == FULL_HISTORY_POLICY:
+        return FullHistoryPolicy()
+    if name == "recent":
+        return RecentHistoryPolicy()
     if name == "bounded_recent":
         return BoundedRecentPolicy()
     if name == "incremental":

@@ -496,6 +496,7 @@ class ModelChannel:
                     prompt=prompt,
                     already_submitted=already_submitted,
                     resumable=resumable,
+                    input_capacity=append_plan.input_capacity,
                 )
                 if remaining_transcription_input is not None:
                     self._input_transcriptions[request_id] = remaining_transcription_input

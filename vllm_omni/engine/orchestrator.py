@@ -21,7 +21,7 @@ import threading
 import time as _time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, cast
 
@@ -30,12 +30,15 @@ import torch
 from opentelemetry.trace import Tracer
 from vllm.config import ModelConfig
 from vllm.exceptions import VLLMClientError
+from vllm.inputs import split_enc_dec_input
 from vllm.logger import init_logger
 from vllm.multimodal.cache import LruKeyReplicatedSenderCache
 from vllm.multimodal.cache.shm import ShmObjectStoreSenderCache
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
+from vllm.renderers.inputs.preprocess import parse_model_prompt
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
@@ -2433,10 +2436,43 @@ class OrchestratorBase:
             additional_information=additional_information,
         )
 
-    async def _process_stage_inputs(self, stage_id: int, **kwargs: Any) -> Any:
+    async def _process_stage_inputs(
+        self, stage_id: int, *, validate_input_tokens: Callable[[int], None] | None = None, **kwargs: Any
+    ) -> Any:
+        """Process once; optionally validate expanded tokens before backend limits.
+
+        Rendering supplies reusable multimodal features. Passing that typed
+        engine input to InputProcessor avoids a second renderer/processor pass.
+        The same worker join and sender-cache guard cover rendering and rejection.
+        """
+
         def process() -> Any:
             with self._prompt_processing_lock:
-                return self._get_stage_input_processor(stage_id).process_inputs(**kwargs)
+                processor = self._get_stage_input_processor(stage_id)
+                inputs = kwargs
+                if validate_input_tokens is not None:
+                    prompt = kwargs["prompt"]
+                    if isinstance(prompt, dict) and "type" in prompt:
+                        engine_input = prompt
+                    else:
+                        parsed = parse_model_prompt(processor.model_config, prompt)
+                        params = processor.renderer.default_cmpl_tok_params.with_kwargs(
+                            **(kwargs.get("tokenization_kwargs") or {})
+                        )
+                        # The renderer's early length check would hide our
+                        # recoverable error (and can truncate counting at cap+1).
+                        # Change only this request; the callback checks the full
+                        # expanded count before normal backend validation.
+                        params = replace(params, max_total_tokens=None)
+                        (engine_input,) = processor.renderer.render_cmpl([parsed], params)
+                    _, decoder = split_enc_dec_input(engine_input)
+                    validate_input_tokens(
+                        length_from_prompt_token_ids_or_embeds(
+                            decoder.get("prompt_token_ids"), decoder.get("prompt_embeds")
+                        )
+                    )
+                    inputs = {**kwargs, "prompt": engine_input}
+                return processor.process_inputs(**inputs)
 
         worker = asyncio.create_task(asyncio.to_thread(process))
         try:
@@ -2611,6 +2647,7 @@ class OrchestratorBase:
         resumable: bool = False,
         payload_sender_info: PayloadSenderInfo | None = None,
         replica_id: int | None = None,
+        validate_input_tokens: Callable[[int], None] | None = None,
     ) -> EngineCoreRequest:
         next_pool = self.stage_pools[next_stage_id]
         if self._next_stage_input_is_tokens(next_input):
@@ -2624,6 +2661,10 @@ class OrchestratorBase:
             )
             request.external_req_id = request.request_id
             request.payload_sender_info = payload_sender_info
+            if validate_input_tokens is not None:
+                validate_input_tokens(
+                    length_from_prompt_token_ids_or_embeds(request.prompt_token_ids, request.prompt_embeds)
+                )
             return request
 
         if replica_id is not None:
@@ -2638,6 +2679,7 @@ class OrchestratorBase:
             supported_tasks = tuple(getattr(model_cfg, "supported_tasks", ()) or ()) or (params.task,)
         else:
             supported_tasks = ("generate",)
+        validation = {} if validate_input_tokens is None else {"validate_input_tokens": validate_input_tokens}
         request = await self._process_stage_inputs(
             next_stage_id,
             request_id=req_id,
@@ -2646,6 +2688,7 @@ class OrchestratorBase:
             supported_tasks=supported_tasks,
             arrival_time=_time.time(),
             resumable=resumable,
+            **validation,
         )
         request = self._upgrade_processed_stage_request(request, next_input)
         request.external_req_id = req_id

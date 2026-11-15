@@ -16,6 +16,7 @@ from PIL import Image
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from vllm_omni.engine.duplex.contracts import DuplexInputCapacity
 from vllm_omni.engine.duplex.plugin import (
     DuplexAuxiliaryPolicy,
     DuplexAuxiliaryRequest,
@@ -26,7 +27,6 @@ from vllm_omni.engine.duplex.session.visual_history import VisualWork
 from vllm_omni.engine.duplex.text_folding import fit_text_excerpt
 from vllm_omni.engine.duplex.visual_memory import EncodedVisualImage, VisualFrame, VisualSummary
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
-    DEFAULT_HISTORY_POLICY,
     AudioEntry,
     CompressionAudioRef,
     CompressionImageRef,
@@ -42,6 +42,7 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
     has_audio,
     has_unanswered_user_input,
     load_history_policy,
+    original_turn_ranges,
     turn_ranges,
 )
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_visual import decode_image, visual_summary_text
@@ -110,8 +111,8 @@ class QwenHistoryRuntime:
 
     def __init__(self, name: str, options: Mapping[str, object]) -> None:
         """Load the configured strategy and reject invalid resource limits."""
-        self.full_history = name == DEFAULT_HISTORY_POLICY
         self.policy = load_history_policy(name)
+        self.behavior = self.policy.behavior
         self.limits = HistoryLimits(**dict(options))
         self.processor: ProcessorMixin | None = None
         self.max_model_len = 0
@@ -127,12 +128,32 @@ class QwenHistoryRuntime:
             if mm is not None:
                 audio_limit = mm.get_limit_per_prompt("audio")
                 image_limit = mm.get_limit_per_prompt("image")
-                self.max_audio = audio_limit if self.full_history else min(4, audio_limit)
-                self.max_images = image_limit if self.full_history else min(8, image_limit)
+                audio_cap = self.behavior.audio_cache_items
+                image_cap = self.behavior.prompt_images
+                self.max_audio = audio_limit if audio_cap is None else min(audio_cap, audio_limit)
+                self.max_images = image_limit if image_cap is None else min(image_cap, image_limit)
         if self.limits.max_context_tokens is not None:
             self.max_model_len = min(self.max_model_len, self.limits.max_context_tokens)
-        if self.policy is not None and self.max_model_len <= self.limits.summary_tokens:
+        if self.uses_history_context and self.max_model_len <= self.limits.summary_tokens:
             raise DuplexRuntimeConfigError("Qwen history policy requires a context limit larger than the summary")
+
+    @property
+    def uses_history_context(self) -> bool:
+        """Whether rendering requires the Session's summary/source context."""
+        return not self.behavior.original_messages
+
+    def select_original(self, state: QwenHistoryState, history: Sequence[Message]) -> list[tuple[int, int]]:
+        """Run original-history selection on the Session owner without copying media."""
+        state.history = tuple(history)
+        selected = self.policy.select(state, self.limits)
+        valid, last = set(original_turn_ranges(history)), 0
+        for start, end in selected:
+            if (start, end) not in valid or start < last:
+                raise ValueError("History policy selected invalid or unordered original groups")
+            last = end
+        if has_unanswered_user_input(history) and last != len(history):
+            raise ValueError("History policy must preserve the current turn")
+        return selected
 
     @staticmethod
     def validate_history(history: Sequence[Message]) -> None:
@@ -234,7 +255,6 @@ class QwenHistoryRuntime:
         The current payload need not fit the background retention pool. It is
         still subject to the actual foreground model context/audio limits.
         """
-        assert self.policy is not None
         groups = []
         last = 0
         encoded = payload.get("audio")
@@ -319,28 +339,21 @@ class QwenHistoryRuntime:
             return len(processed["input_ids"][0])
         return len(self.processor.tokenizer(text=[prompt])["input_ids"][0])
 
-    def validate_full_prompt(
-        self, prompt: str, audio: Sequence[np.ndarray], images: Sequence[Image.Image], *, output_tokens: int
-    ) -> None:
-        """Reject the entire input instead of clipping sources to satisfy capacity.
+    def input_capacity(self, *, audio_count: int, image_count: int, output_tokens: int) -> DuplexInputCapacity | None:
+        """Check media counts and request one exact check after engine preprocessing.
 
-        Uses the resolved deployment limits. Direct plugin users without a bound
-        model configuration still receive the downstream engine's context check.
+        No feature extraction is performed here. The engine checks its expanded
+        input before submission, reusing the features it will send to the model.
         """
-        if self.max_model_len <= 0:
-            return  # No resolved capacity for direct plugin users; the engine validates it.
-        if len(audio) > self.max_audio or len(images) > self.max_images:
+        if self.behavior.overflow != "reject" or self.max_model_len <= 0:
+            return None
+        if audio_count > self.max_audio or image_count > self.max_images:
             raise DuplexInputCapacityError(
-                f"Full history has {len(audio)} audio inputs and {len(images)} images; "
+                f"Original history has {audio_count} audio inputs and {image_count} images; "
                 f"request limits are {self.max_audio} audio inputs and {self.max_images} images. "
                 "Delete source items or select an explicit history policy."
             )
-        count = self._input_tokens(prompt, audio, images)
-        if count + output_tokens > self.max_model_len:
-            raise DuplexInputCapacityError(
-                f"Full history context needs {count} input tokens and {output_tokens} reserved output tokens; "
-                f"the context limit is {self.max_model_len}. Delete source items or select a history policy."
-            )
+        return DuplexInputCapacity(self.max_model_len, output_tokens)
 
     def build_foreground(self, context: HistoryPrompt, runtime: Mapping[str, object], output_tokens: int) -> dict:
         """Fit old turns behind current input and report clipping once per build.
@@ -410,7 +423,6 @@ class QwenHistoryRuntime:
 
     def work(self, state: QwenHistoryState) -> HistoryWork | None:
         """Validate a policy-selected prefix and bind it to the current sources."""
-        assert self.policy is not None
         batch = self.policy.next_batch(state, self.limits, max_audio=self.max_audio)
         if batch is None:
             return None
@@ -430,7 +442,6 @@ class QwenHistoryRuntime:
         Called afresh for every capacity-reduced batch, in the joined CPU
         worker. Policies receive references, never retained media payloads.
         """
-        assert self.policy is not None
         batch = []
         audio_index = image_index = 0
         for message in group.messages:
@@ -709,7 +720,6 @@ class QwenHistoryRuntime:
         return prompt, count, temperature, replace(work, end_offset=stop, complete=stop == len(transcript))
 
     def _visual_work(self, state: QwenHistoryState, work: HistoryWork | None) -> VisualWork | None:
-        assert self.policy is not None
         if not self.policy.compress_visual_history or self.max_images <= 0:
             return None
         completed_end = len(state.history)
@@ -1087,7 +1097,6 @@ class QwenHistoryRuntime:
         if len(self.processor.tokenizer(text=[text])["input_ids"][0]) > self.limits.summary_tokens:
             state.counts["rejected_summaries"] += 1
             return False
-        assert self.policy is not None
         try:
             memory = self.policy.parse_compression(text)
         except ValueError:

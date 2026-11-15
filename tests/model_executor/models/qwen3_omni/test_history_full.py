@@ -11,11 +11,14 @@ import pytest
 from vllm.config import ModelConfig
 from vllm.sampling_params import SamplingParams
 
+from tests.engine.duplex.test_session_runner import Harness
 from tests.model_executor.models.qwen3_omni.test_history_multimodal import image_message
 from tests.model_executor.models.qwen3_omni.test_history_policy import Processor, audio_message, text_history
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
+from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, DuplexStageSubmission
 from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError
+from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 from vllm_omni.protocol.duplex.events import ErrorEvent
 
@@ -32,7 +35,32 @@ def plugin_for(policy=None, *, max_audio=8, max_images=12):
     return plugin
 
 
-def plan(plugin, history, *, state=None, payload=None, view=None, runtime=None):
+def validate_engine_capacity(value: DuplexAppendPlan | DuplexStageSubmission, processor: Processor) -> None:
+    """Stand in for engine expansion; exercise the production capacity validator."""
+    if value.input_capacity is None:
+        return
+    media = value.prompt["multi_modal_data"]
+    processed = processor(
+        text=[value.prompt["prompt"]],
+        audio=[audio for audio, _ in media.get("audio", ())],
+        images=media.get("image", ()),
+        return_tensors="np",
+    )
+    DuplexOrchestrator._input_capacity_validator(value.input_capacity)(len(processed["input_ids"][0]))
+
+
+def enable_engine_capacity(h: Harness) -> None:
+    """Let the recording port reject expanded inputs like the real stage port."""
+    submit = h.port.submit
+
+    async def checked_submit(submission):
+        validate_engine_capacity(submission, h.runner.plugin.processor)
+        return await submit(submission)
+
+    h.port.submit = checked_submit
+
+
+def plan(plugin, history, *, state=None, payload=None, view=None, runtime=None, validate=True):
     if state is None:
         state = plugin.create_session_state()
     payload = payload or {"type": "conversation"}
@@ -40,7 +68,7 @@ def plan(plugin, history, *, state=None, payload=None, view=None, runtime=None):
     if view is not None:
         config["conversation_view"] = view
     config = plugin.prepare_prompt_config(config, state=state, payload=payload)
-    return plugin.plan_append(
+    prepared = plugin.plan_append(
         request_id="full-history",
         fence=None,
         session_config=config,
@@ -50,7 +78,10 @@ def plan(plugin, history, *, state=None, payload=None, view=None, runtime=None):
         payload=payload,
         final=True,
         sampling_params=SamplingParams(max_tokens=64),
-    ).prompt
+    )
+    if validate:
+        validate_engine_capacity(prepared, plugin.processor)
+    return prepared.prompt
 
 
 @pytest.mark.parametrize("policy", [None, "full_history", "recent"])
@@ -173,6 +204,7 @@ async def test_full_history_capacity_error_preserves_session_and_can_retry_after
         plugin._history_runtime.bind(
             plugin.processor, Mock(spec=ModelConfig, max_model_len=4096, multimodal_config=None)
         )
+        enable_engine_capacity(h)
         await h.run(
             CreateItem(
                 item={
@@ -273,6 +305,7 @@ async def test_full_history_new_audio_after_capacity_rejection_keeps_original_pc
         plugin._history_runtime.bind(
             plugin.processor, Mock(spec=ModelConfig, max_model_len=4096, multimodal_config=None)
         )
+        enable_engine_capacity(h)
         await h.run(append_audio(value=0.1))
         await h.run(Commit(final=True, create_response=False))
         await h.run(
@@ -312,6 +345,7 @@ async def test_full_history_retry_tracks_interleaved_text_and_committed_audio(re
         plugin._history_runtime.bind(
             plugin.processor, Mock(spec=ModelConfig, max_model_len=4096, multimodal_config=None)
         )
+        enable_engine_capacity(h)
         await h.run(
             CreateItem(
                 item={
@@ -456,3 +490,64 @@ async def test_full_history_queued_append_keeps_ownership_when_sources_are_delet
     finally:
         release.set()
         await h.manager.shutdown()
+
+
+def test_original_policy_identity_is_independent_of_the_configured_default(monkeypatch):
+    from vllm_omni.model_executor.models.qwen3_omni.duplex import history_policy
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.history_runtime import QwenHistoryRuntime
+
+    monkeypatch.setattr(history_policy, "DEFAULT_HISTORY_POLICY", "recent")
+    full = QwenHistoryRuntime("full_history", {})
+    recent = QwenHistoryRuntime("recent", {})
+    assert isinstance(full.policy, history_policy.FullHistoryPolicy)
+    assert isinstance(recent.policy, history_policy.RecentHistoryPolicy)
+    assert full.behavior.overflow == "reject" and recent.behavior.overflow == "fit"
+    assert not hasattr(full, "full_history")
+
+
+def test_original_custom_policy_controls_selection_without_plugin_branches():
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import FullHistoryPolicy
+
+    class LastTurn(FullHistoryPolicy):
+        def select(self, state, limits):
+            return super().select(state, limits)[-1:]
+
+    plugin = plugin_for()
+    plugin._history_runtime.policy = LastTurn()
+    prompt = plan(plugin, text_history(21))["prompt"]
+    assert "message 0" not in prompt and "message 20" in prompt
+
+
+def test_full_history_planning_does_not_extract_media_features(mocker):
+    plugin = plugin_for()
+    state = plugin.create_session_state()
+    audio, payload = audio_message(0)
+    history = [audio, image_message()]
+    extract = mocker.patch.object(Processor, "__call__", side_effect=AssertionError("unexpected feature extraction"))
+    prompt = plan(plugin, history, state=state, payload=payload, validate=False)
+    assert len(prompt["multi_modal_data"]["audio"]) == 1
+    assert len(prompt["multi_modal_data"]["image"]) == 1
+    history.extend([{"role": "assistant", "content": "heard"}, {"role": "user", "content": "recall"}])
+    assert "recall" in plan(plugin, history, state=state, validate=False)["prompt"]
+    extract.assert_not_called()
+
+
+def test_custom_recent_policy_reserves_its_only_audio_slot_for_current_input(monkeypatch):
+    import sys
+    from dataclasses import replace
+
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import RecentHistoryPolicy
+
+    class OneAudio(RecentHistoryPolicy):
+        behavior = replace(RecentHistoryPolicy.behavior, audio_cache_items=1)
+
+    monkeypatch.setattr(sys.modules[__name__], "OneAudio", OneAudio, raising=False)
+    plugin = plugin_for(f"{__name__}:OneAudio")
+    state = plugin.create_session_state()
+    first, first_payload = audio_message(1)
+    plan(plugin, [first], state=state, payload=first_payload)
+    _, current_payload = audio_message(2)
+    prompt = plan(plugin, [first, {"role": "assistant", "content": "heard"}], state=state, payload=current_payload)
+    audio = prompt["multi_modal_data"]["audio"]
+    assert len(audio) == 1 and not state.audio_history
+    np.testing.assert_array_equal(audio[0][0], np.full(160, 3, dtype="<f4"))

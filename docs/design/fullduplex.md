@@ -120,9 +120,12 @@ keep pending tool-call anchors beyond the legacy 16-message window. Full history
 uses original sources even when `context_keep_media_turns` is configured; select
 `recent` to use that policy's media-dropped view.
 
-The plugin validates processor-expanded input tokens and the reserved foreground
-output against the resolved context limit, including `max_context_tokens` when
-configured. It uses the deployment's per-request audio/image counts. Overflow
+The plugin checks the deployment's per-request audio/image counts and passes its
+context limit and reserved output to the stage submission. The engine renders
+the input once, checks those actual expanded tokens before backend admission,
+then passes the same rendered input and media features to `InputProcessor`.
+Full-history validation does not run a separate HF processor pass. The context
+limit includes `max_context_tokens` when configured. Overflow
 raises a recoverable `input_capacity_exceeded` error without submitting a partial
 request or deleting history. Clients can delete source items and retry. Session
 input-admission limits still reject additional material before it is accepted.
@@ -146,6 +149,23 @@ removes only its PCM segment during the next prompt preparation. New commits
 remain separate from previously rejected input. Closing the Session releases its
 state. Storage can grow with the conversation, and the original history is counted
 again for each request.
+
+Every built-in, including `full_history` and `recent`, is a `QwenHistoryPolicy`
+object. Their `select` methods choose the original groups to render.
+`HistoryBehavior` declares original versus summary-aware rendering, the overflow
+action, message and media retention limits, and whether an L1 media view applies.
+The plugin consumes these choices without comparing the configured policy name.
+`FullHistoryPolicy` selects all original groups and rejects overflow;
+`RecentHistoryPolicy` selects the legacy window and declares its cache limits.
+Custom original-history strategies can subclass either and override selection
+or behavior. Session image admission is supplied by `session_image_limits`.
+Existing custom bounded/compression strategies retain the four required hooks.
+
+`DuplexAppendPlan.input_capacity` carries model-owned context and output limits
+through `DuplexStageSubmission`. The shared stage-input worker checks the expanded
+input before ordinary backend length validation and submission. Capacity
+rejection and cancellation use the existing worker join and sender-cache cleanup;
+other plugins leave this optional field unset.
 
 `incremental` folds older text and original audio into a bounded text memory,
 and images into intermediate and long-term visual memories.

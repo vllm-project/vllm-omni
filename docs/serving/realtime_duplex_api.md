@@ -33,8 +33,14 @@ and images. It does not discard old turns or substitute transcripts for their
 media. Playback acknowledgement, interruption handling and explicit deletion
 still determine which source records are effective.
 
+!!! note "Qwen default history policy changed"
+    The default changes from `recent` to `full_history`. Existing deployments
+    that need the previous automatic clipping must explicitly configure `recent`.
+    Full history can reach the deployment's token or media limits sooner.
+
 The complete request must fit the deployed model's token and media limits,
-including reserved output tokens. Overflow returns the recoverable
+including reserved output tokens. The engine validates its processed input and
+reuses those media features for inference. Overflow returns the recoverable
 `input_capacity_exceeded` error and preserves history; clients can delete source
 items and retry. It does not silently switch to a smaller history window. Original
 input audio remains retained while its source items exist, so session storage can
