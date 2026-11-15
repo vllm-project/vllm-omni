@@ -1053,12 +1053,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
 
         extra = attn_metadata.extra if attn_metadata else {}
         method = extra.get("kv_cache_dtype")
-        logger.warning_once(
-            "ATTN_DISPATCH method=%s quant_options=%s q_dtype=%s",
-            method,
-            self.quant_options,
-            query.dtype,
-        )
         if method not in (None, "float", "auto"):
             return self.forward_fa_quant_npu(query, key, value, attn_metadata)
         return self.forward_fa_npu(query, key, value, attn_metadata)
