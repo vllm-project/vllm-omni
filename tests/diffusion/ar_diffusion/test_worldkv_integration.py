@@ -80,7 +80,10 @@ class LifecycleCache:
     def begin_request(self, request_id):
         return Adapter(request_id)
 
-    def end_request(self, adapter):
+    def _require_current_adapter(self, adapter):
+        pass
+
+    def release_history(self, adapter):
         pass
 
     def release_cross_attention(self, session_id):
