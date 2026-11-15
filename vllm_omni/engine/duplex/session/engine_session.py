@@ -39,6 +39,13 @@ from vllm_omni.engine.duplex.config import (
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import TurnEvent
+from vllm_omni.engine.duplex.memory_types import (
+    DuplexContextAuxiliaryInput,
+    DuplexMemoryAdmission,
+    DuplexMemoryCardBatch,
+    DuplexMemoryProposalBatch,
+)
+from vllm_omni.engine.duplex.session.auxiliary_budget import DuplexAuxiliaryBudget, DuplexAuxiliaryBudgetLimits
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
 from vllm_omni.engine.duplex.session.context_view import DuplexHistoryView
 from vllm_omni.engine.duplex.session.context_view import render_history_view as render_context_view
@@ -48,6 +55,9 @@ from vllm_omni.engine.duplex.session.lease import (
     DuplexLeaseConfig,
     DuplexLeaseState,
 )
+from vllm_omni.engine.duplex.session.memory_context import DuplexMemoryContextState
+from vllm_omni.engine.duplex.session.memory_prompt import DuplexMemoryPromptCapture, DuplexMemoryPromptState
+from vllm_omni.engine.duplex.session.memory_retrieval import DuplexMemorySuppression
 from vllm_omni.engine.duplex.session.perf_ledger import SessionPerfLedger
 from vllm_omni.metrics.stats import (
     DUPLEX_STAGE_TABLE_EXCLUDE,
@@ -139,6 +149,7 @@ class HistorySource:
     source_id: int
     # Keep identity alive until the source is explicitly forgotten.
     message: dict[str, object] = field(repr=False, compare=False)
+    slot_order: int = 0
     revision: int = 0
     item_id: str | None = None
     # Authoritative playback metadata also versions assistant-derived context,
@@ -152,6 +163,7 @@ class ConversationHistory:
     messages: list[dict[str, object]] = field(default_factory=list)
     revision: int = 0
     next_source_id: int = 0
+    next_slot_order: int = 0
     # Keys are identities of live message dictionaries, never public item IDs.
     # Every non-placeholder insertion must call _track_history_message;
     # removing one must call _forget_history_message. Placeholders are untracked.
@@ -162,6 +174,7 @@ class ConversationHistory:
     unanswered_user_items: int = 0
     item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
     history_item_placeholders: dict[str, dict[str, object]] = field(default_factory=dict)
+    placeholder_slot_orders: dict[str, int] = field(default_factory=dict)
     item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
     # Preserve audio provenance with stored history after releasing its cursor.
     retired_audio_item_ids: set[str] = field(default_factory=set)
@@ -247,6 +260,11 @@ class DuplexEngineSession:
     _playback: PlaybackLedger = field(default_factory=PlaybackLedger, repr=False)
     _conversation: ConversationHistory = field(default_factory=ConversationHistory, repr=False)
     _context_ledger: DuplexContextLedger = field(default_factory=DuplexContextLedger, repr=False)
+    _memory_suppression: DuplexMemorySuppression = field(default_factory=DuplexMemorySuppression, repr=False)
+    _memory_context: DuplexMemoryContextState | None = field(default=None, repr=False)
+    _memory_prompt_state: DuplexMemoryPromptState | None = field(default=None, repr=False)
+    _memory_compute_budget: DuplexAuxiliaryBudget | None = field(default=None, repr=False)
+    _memory_compute_limits: DuplexAuxiliaryBudgetLimits | None = field(default=None, repr=False)
     model_state: DuplexModelSessionState | None = field(default=None, repr=False)
     projector: RealtimeProjectionState | None = field(default=None, repr=False)
     created_monotonic: float = field(default_factory=time.monotonic)
@@ -465,6 +483,7 @@ class DuplexEngineSession:
     def begin_close(self, *, reason: str) -> bool:
         """Make close irreversible while retaining stage resources for cleanup retry."""
         self.accept_fence(self.fence)
+        self._context_ledger.close_retrieval_cache()
         if self.lease.terminal_reason is not None:
             return True
         return self.lease.mark_terminal(reason)
@@ -533,6 +552,78 @@ class DuplexEngineSession:
         """Derived context nodes; they live and die with this session object."""
         return self._context_ledger
 
+    def admit_memory_cards(self, batch: DuplexMemoryCardBatch) -> DuplexMemoryAdmission:
+        """Admit owner-bound card candidates against current session authority."""
+        snapshot = self.history_snapshot()
+        self._context_ledger.refresh(snapshot)
+        orders = {source.source_id: source.slot_order for source in self._conversation.sources.values()}
+        return self._context_ledger.admit_card_batch(snapshot, source_orders=orders, batch=batch)
+
+    @property
+    def memory_suppression(self) -> DuplexMemorySuppression:
+        """Pending-correction eligibility, preserved with this live session."""
+        return self._memory_suppression
+
+    def context_compute_budget(self, limits: DuplexAuxiliaryBudgetLimits) -> DuplexAuxiliaryBudget:
+        """Retain one account across live leases; never reset spent history."""
+        if not isinstance(limits, DuplexAuxiliaryBudgetLimits):
+            raise ValueError("invalid_auxiliary_budget_limits")
+        if self._memory_compute_budget is None:
+            if self.state != DuplexSessionState.OPEN:
+                raise ValueError("closed_session_auxiliary_budget")
+            self._memory_compute_budget = DuplexAuxiliaryBudget(limits, now=self._clock())
+            self._memory_compute_limits = limits
+        elif limits != self._memory_compute_limits:
+            raise ValueError("auxiliary_budget_limits_are_session_fixed")
+        return self._memory_compute_budget
+
+    def note_auxiliary_activity(self) -> None:
+        if self._memory_compute_budget is not None:
+            self._memory_compute_budget.note_activity(now=self._clock())
+
+    def capture_memory_context(
+        self, *, max_sources: int = 8, max_chars: int = 8192, excluded_item_ids: frozenset[str] = frozenset()
+    ) -> DuplexContextAuxiliaryInput | None:
+        if self._memory_context is None:
+            self._memory_context = DuplexMemoryContextState()
+        return self._memory_context.capture(
+            self, max_sources=max_sources, max_chars=max_chars, excluded_item_ids=excluded_item_ids
+        )
+
+    def memory_context_matches(self, context: DuplexContextAuxiliaryInput) -> bool:
+        return self._memory_context is not None and self._memory_context.matches(self, context)
+
+    def capture_memory_prompt(self, *, query: str, max_candidates: int = 16) -> DuplexMemoryPromptCapture:
+        if self._memory_prompt_state is None:
+            self._memory_prompt_state = DuplexMemoryPromptState()
+        return self._memory_prompt_state.capture(self, query=query, max_candidates=max_candidates)
+
+    def memory_prompt_matches(
+        self,
+        capture: DuplexMemoryPromptCapture,
+        node_ids: tuple[int, ...],
+        *,
+        omitted_source_ids: tuple[int, ...] = (),
+    ) -> bool:
+        return self._memory_prompt_state is not None and self._memory_prompt_state.matches(
+            self, capture, node_ids, omitted_source_ids=omitted_source_ids
+        )
+
+    def rechunk_memory_context(self, context: DuplexContextAuxiliaryInput) -> bool:
+        return self._memory_context is not None and self._memory_context.rechunk(self, context)
+
+    def restart_memory_reconciliation(self) -> None:
+        if self._memory_context is None:
+            self._memory_context = DuplexMemoryContextState()
+        self._memory_context.restart_reconciliation()
+
+    def admit_memory_result(
+        self, *, context: DuplexContextAuxiliaryInput, proposal: DuplexMemoryProposalBatch
+    ) -> DuplexMemoryAdmission:
+        if self._memory_context is None:
+            return DuplexMemoryAdmission("stale", reason_code="memory_context_changed")
+        return self._memory_context.admit(self, context=context, proposal=proposal)
+
     def render_history_view(
         self, policy: DuplexContextViewPolicy, *, snapshot: DuplexHistorySnapshot | None = None
     ) -> DuplexHistoryView:
@@ -548,13 +639,19 @@ class DuplexEngineSession:
         return source
 
     def _track_history_message(
-        self, message: dict[str, object], *, item_id: str | None = None, changed: bool = False
+        self,
+        message: dict[str, object],
+        *,
+        item_id: str | None = None,
+        changed: bool = False,
+        slot_order: int | None = None,
     ) -> None:
         source = self._conversation.sources.get(id(message))
         if source is None:
             source = HistorySource(
                 source_id=self._conversation.next_source_id,
                 message=message,
+                slot_order=self._allocate_history_slot() if slot_order is None else slot_order,
                 item_id=item_id,
                 hard_cutoff_ms=self._conversation.hard_truncations_ms.get(item_id) if item_id is not None else None,
             )
@@ -571,11 +668,21 @@ class DuplexEngineSession:
             source.revision += 1
         self._conversation.revision += 1
 
+        if self._memory_context is not None:
+            self._memory_context.note_change(source.slot_order)
+
+    def _allocate_history_slot(self) -> int:
+        order = self._conversation.next_slot_order
+        self._conversation.next_slot_order += 1
+        return order
+
     def _forget_history_message(self, message: dict[str, object]) -> None:
         if id(message) in self._conversation.sources:
-            self._history_source(message)
+            source = self._history_source(message)
             del self._conversation.sources[id(message)]
             self._conversation.revision += 1
+            if self._memory_context is not None:
+                self._memory_context.note_change(source.slot_order)
 
     def _history_item_metadata_changed(self, item_id: str) -> None:
         message = self._conversation.item_ids.get(item_id)
@@ -659,6 +766,7 @@ class DuplexEngineSession:
             return
         placeholder: dict[str, object] = {}
         self._conversation.history_item_placeholders[item_id] = placeholder
+        self._conversation.placeholder_slot_orders[item_id] = self._allocate_history_slot()
         self._conversation.messages.append(placeholder)
 
     def _store_history_item_message(
@@ -677,6 +785,7 @@ class DuplexEngineSession:
             return existing
 
         placeholder = self._conversation.history_item_placeholders.pop(item_id, None)
+        slot_order = self._conversation.placeholder_slot_orders.pop(item_id, None)
         if placeholder is not None:
             for index, candidate in enumerate(self._conversation.messages):
                 if candidate is placeholder:
@@ -687,11 +796,12 @@ class DuplexEngineSession:
         elif not any(candidate is message for candidate in self._conversation.messages):
             self._conversation.messages.append(message)
         self._conversation.item_ids[item_id] = message
-        self._track_history_message(message, item_id=item_id)
+        self._track_history_message(message, item_id=item_id, slot_order=slot_order)
         return message
 
     def _discard_history_item_placeholder(self, item_id: str) -> bool:
         placeholder = self._conversation.history_item_placeholders.pop(item_id, None)
+        self._conversation.placeholder_slot_orders.pop(item_id, None)
         if placeholder is None:
             return False
         self._conversation.messages = [
@@ -2092,6 +2202,8 @@ class DuplexEngineSession:
             self.state = DuplexSessionState.CLOSING
 
     def close(self) -> None:
+        if self._memory_compute_budget is not None:
+            self._memory_compute_budget.close(now=self._clock())
         self._log_response_aggregator()
         if self.perf is not None:
             self.perf.close_all()

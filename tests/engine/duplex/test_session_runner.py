@@ -25,6 +25,7 @@ from typing import Any
 import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
+from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
@@ -55,7 +56,6 @@ from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import RESPONSE_REQUEST_MEASUREMENT_ORIGIN
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
-from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 
@@ -97,12 +97,16 @@ class RecordingStagePort(DuplexStagePort):
     def ensure_request(self, context: DuplexStageRequestContext) -> None:
         self.ensured.append(context)
 
-    async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
+    async def submit(self, submission: DuplexStageSubmission, *, before_accept=None) -> DuplexStageSubmissionResult:
         if self.fail_submit is not None:
             raise self.fail_submit
         if self.submit_gate is not None:
             self.submit_started.set()
             await self.submit_gate.wait()
+        if before_accept is not None:
+            from vllm_omni.engine.stage_pool import validate_stage_admission
+
+            validate_stage_admission(before_accept, submission.prompt)
         self.submissions.append(submission)
         return DuplexStageSubmissionResult(
             request_id=submission.context.request_id,
@@ -255,6 +259,7 @@ async def open_harness(
     log_stats: bool = False,
     plugin: DuplexModelPlugin | None = None,
     model: str = "openbmb/MiniCPM-o-4_5",
+    model_config: Any = None,
 ) -> Harness:
     if plugin is None:
         plugin = MiniCPMO45DuplexPlugin(_fake_encode_audio)
@@ -272,7 +277,7 @@ async def open_harness(
         output_sink=output,
         result_sink=results,
         runtime_config=limits,
-        model_config=None,
+        model_config=model_config,
         log_stats=log_stats,
         clock=clock,
     )
@@ -423,10 +428,12 @@ async def test_spans_reported_while_the_append_submit_awaits_are_kept() -> None:
         assert ledger is not None
         submit = h.port.submit
 
-        async def submit_and_report(submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
+        async def submit_and_report(
+            submission: DuplexStageSubmission, *, before_accept=None
+        ) -> DuplexStageSubmissionResult:
             # A live resumable request steps on the update before submit returns.
             h.runner.on_stage_work([(0, 0, 1, ledger.now_ns(), 1_000_000)])
-            return await submit(submission)
+            return await submit(submission, before_accept=before_accept)
 
         h.port.submit = submit_and_report  # type: ignore[method-assign]
         await h.run(append_audio())

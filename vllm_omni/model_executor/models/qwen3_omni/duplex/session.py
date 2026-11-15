@@ -7,6 +7,7 @@ import asyncio
 from dataclasses import dataclass, field
 
 from vllm_omni.engine.duplex.plugin import DuplexModelSessionState
+from vllm_omni.model_executor.models.qwen3_omni.duplex.context_memory import QwenContextMemory
 from vllm_omni.model_executor.models.qwen3_omni.duplex.input import (
     QwenPcmBuffer,
 )
@@ -16,6 +17,7 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.input import (
 class QwenDuplexSessionState(DuplexModelSessionState):
     """Mutable model-owned state of one Qwen duplex session (owned by the session runner)."""
 
+    context_memory: QwenContextMemory = field(default_factory=QwenContextMemory)
     audio_buffer: QwenPcmBuffer = field(default_factory=QwenPcmBuffer)
     # Each payload can combine several audio commits from one pending turn.
     # Keep their content objects so associations survive shallow history copies.

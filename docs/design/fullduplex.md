@@ -411,6 +411,163 @@ nodes, so a preparation failure leaves the graph and next node ID unchanged.
 The ledger owns admitted message containers; node readers must treat them and
 opaque payloads as read-only. Rendered views are detached from ledger messages.
 
+`discard(node_id)` explicitly retires a derived node and all of its descendants,
+returning their IDs in insertion order. Unknown or already retired IDs are a
+no-op. Retirement clears affected L1 lookups and card terms, leaves tombstones
+for retired card heads, and advances the card catalogue revision once when an
+active card is removed. It never edits authoritative history or reuses node IDs.
+
+Memory cards use the same ledger, with one active head per fact key. The
+session admits a complete candidate batch against a fresh snapshot and its
+private history-slot order. Slot order is allocated when a history position is
+reserved, including an assistant placeholder; filling or editing that position
+does not make it a newer fact. A batch with stale sources, stale head generations,
+invalid parents or conflicting operations creates no nodes and consumes no IDs.
+
+A correction replaces the active card and retires its dependent nodes.
+Supersession is separate from parent dependencies: a replacement supported by new
+evidence does not inherit the old card's sources. Empty heads retain a generation
+and evidence-order floor, so deleting a replacement cannot restore its predecessor,
+and freshly re-extracting older evidence cannot overwrite a later fact.
+
+Lexical retrieval refreshes source validity before selecting bounded candidates.
+Normalized terms may be retained for active immutable card nodes within their
+own session. Retirement and source invalidation release the corresponding
+terms; closing a session releases the index and disables further retention.
+The index is lazy, does not replace source validation, and does not share
+historical text between sessions.
+Retained term objects have a per-session 4 MiB accounting budget; candidates
+beyond it are scored without caching. The bounded mapping and Python allocator
+overheads are separate, so this is not a process memory limit.
+Pending corrections are session-owned barriers, scoped to known keys or all cards
+when the affected key is unknown. Explicit reconciliation must cover the captured
+trigger text and every required key; an empty extraction does not clear a barrier.
+Partial reconciliation is discarded for keys whose head generation changes.
+Recognizing a natural-language correction is a model-policy responsibility,
+separate from these deterministic validity rules.
+
+Plugins can opt into owner-bound auxiliary work with
+`supports_context_auxiliary_requests` and `context_auxiliary_policy`. The default
+is disabled. In context-only mode the policy gate runs before capturing history,
+and an idle policy does not fall back to the other memory hooks. With both
+capabilities and an explicit common account, eligible summary and card work
+alternate on the same private slot. Each kind retains one stable work identity
+and finite retry state across temporary policy idleness, kind switches and pure
+epoch changes. New source or settings identities permit new work. A kind waiting
+for resources retains the next admission opportunity instead of losing it to
+continuously ready work. Existing auxiliary plugins retain their prepare,
+source-validation and apply contracts.
+
+The session captures bounded, detached text evidence, stable source identity and
+revisions. Pending user input and unsettled assistant speech are excluded;
+accepted heard prefixes constrain assistant evidence. The plugin prepares a
+request and decodes local evidence handles without receiving live session state.
+The existing private request slot, preemption and mailbox own its execution.
+After successful resource cleanup, the owner binds those handles and validates
+epoch, settings, source, catalogue and suppression fences before admission.
+
+Qwen3-Omni text-card extraction is experimental and opt-in through the server's
+`duplex_session.context_memory` deployment mapping. An absent or null mapping
+disables extraction before history capture; clients cannot enable it through
+`session.update`. Other plugins reject this deployment setting. The mapping
+bounds captured sources and characters, request input/output tokens, deadlines
+and the session's rolling auxiliary compute allowance. Token counts include the
+real Thinker template and are checked against the deployed model context limit.
+Extraction uses only private stage-0 requests. A separate, default-zero
+`context_memory_tokens` allowance enables Qwen's experimental prompt consumer
+with `budget` or `budget_summary` and enabled extraction. It fits a ranked card
+prefix after the original history/summary selection, within both its formatted
+block allowance (at most 256 tokens) and the existing total input/output budget.
+Cards follow configured instructions and precede summaries/history. Their text
+is encoded as historical data; node references remain outside the model prompt.
+Retrieval uses current text or an already available transcript. Audio-only
+input without a transcript gets no cards and triggers no additional ASR.
+
+If captured work cannot fit, the plugin asks the owner to recapture a smaller
+range. Resizing neither admits nodes nor advances coverage. Every new range
+receives a fresh descriptor and the usual admission fences. If even the minimum
+range cannot fit, that work parks without a model forward or a repeating retry.
+
+Prompt preparation can obtain session-scoped card candidates and retain a
+selection receipt on the owner. Validation checks active heads, transitive
+source validity, execution/settings fences, and pending correction or recovery.
+Explicit recovery blocks retrieval before its next extraction capture. The
+stage port supports a local synchronous acceptance guard after input
+preprocessing and replica selection, before registration and transport handoff.
+Removed or replaced requests are rejected at that point. Changes after local
+acceptance follow the existing cancellation lifecycle. This interface does not
+provide remote execution atomicity. Qwen retains receipts on the owner and
+returns selected node references separately from the model prompt. Its final
+guard checks history, settings, epoch, response/request identity and selected
+summary validity, then the materialized input tokens plus generation reserve.
+The formatter also returns omitted source IDs. Before consuming cards, the
+owner requires completed background coverage of omitted user text/transcripts.
+Pending windows, partially covered sources and edits awaiting a coverage rewind
+do not establish freshness. Retained user input does not invalidate an unchanged
+card merely by being appended. When omitted user evidence is still unprocessed,
+the existing no-card rebuild applies; it does not spend extra auxiliary budget
+or change the base history/summary selection. This conservative fallback can
+reduce recall while processing lags and does not guarantee a correction becomes
+answerable within a fixed number of seconds.
+Only a stale card selection with an unchanged base can trigger one complete
+no-card rebuild, after successful cleanup of the unaccepted attempt. History,
+summary or lifecycle changes remain errors. Empty selections validate the base
+without requiring reconciliation to finish. Cleanup failures and uncertain
+transport outcomes never trigger this retry. Sequence, runtime/tool writeback
+and performance acceptance commit only for the accepted attempt.
+
+Progress covers text fragments and bounded catalogue pages. A successful empty
+result advances only its coverage unit. Own card admissions retain the current
+page pass; external catalogue changes discard it. New keys require extension
+coverage, and earlier source edits requeue their slots. Unrelated tail appends
+do not invalidate captured evidence or replenish a failed unit's retry budget.
+Epoch changes fence in-flight results while preserving completed coverage and
+the failure budget of unchanged work. Foreground input and temporary policy
+idleness pause scheduling without replenishing that budget. Context work stops
+after its finite retry delays; recurring legacy cooldown remains specific to
+the original auxiliary path.
+Explicit barrier resolutions and card mutations are preflighted together;
+rejection commits neither. A partial page or text fragment cannot clear a global
+barrier.
+
+Stale trigger references and suppression overflow start a recovery scan with a
+fixed source horizon. Each legal text fragment and catalogue page needs an
+explicit reconciliation declaration; an empty extraction alone is insufficient.
+Target rewrites and external catalogue changes invalidate completed recovery
+coverage. New keys require replay against earlier evidence before recovery can
+finish. Ordinary tail appends stay outside the current horizon, and barriers
+created after its cutoff survive completion. A pass missing confirmation stays
+blocked and parks until a relevant rewrite or explicit owner rescheduling.
+These checks authorize declared coverage, not the semantic correctness of a
+model's declaration. Optional context compute accounting charges measured text
+token IDs and reserved generation at dispatch, including failed or cancelled
+submissions. The session retains its account across live leases. Pre-dispatch
+failure refunds once; resource deferral does not spend retries. Manager-local
+private admission is released only for request IDs whose cleanup succeeded;
+failed cleanup retains the permit for teardown retry. Waiting work wakes through
+the existing mailbox and stops with its session. These internal limits are fixed
+for the session lifetime and default to disabled. Qwen can configure this account
+through the deployment-owned `context_auxiliary_budget`. Summary work then uses
+measured token IDs and records its attempted identity only after resource
+admission. A temporary allowance shortage leaves that work eligible for the
+next window. Legacy summary preparation retains its existing contract when no
+common account is configured. Card prompt consumption is controlled separately;
+the L1 view policy below does not enable memory extraction.
+
+Qwen's memory codec renders captured text as quoted JSON data with local
+evidence and barrier handles. Its strict output schema accepts upsert/retract
+proposals, explicit resolutions and a scoped reconciliation declaration;
+unknown or duplicate fields, invalid references and oversized output are refused.
+Decoding never changes session state. An empty valid result differs from invalid
+output, and only the owner can authorize mutations. Formatting preserves the
+entire captured scope, including literal media or template delimiters as data.
+A separate request adapter counts the complete template against an explicit
+caller allowance and the deployed context length. It defers oversized captures
+without trimming their scope and targets only Thinker stage 0. Only a single
+successfully stopped text completion is decoded against the retained capture;
+session admission still checks its current authority. These helpers allocate no
+shared compute allowance and enable no live policy or stage consumption.
+
 A plugin opts a stage in by returning a `DuplexContextViewPolicy` from
 `context_view_policy(stage_id=..., runtime_config=...)`. The default is `None`:
 the prompt config is built exactly as before and no L1 view is rendered. With a
@@ -1114,3 +1271,49 @@ cancels its tasks and releases its recordings.
   during playback; `--inline` drives the same scenario through
   `InlineDuplexClient`), `tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py`
   (admission, resume, takeover, expiry).
+
+## Qwen budget selection and summary memory
+
+Qwen's deployment-owned context policy defaults to `legacy`. Opt-in `budget`
+selection operates on complete exchanges after media binding and candidate L1
+rendering. System messages remain mandatory without separating a user from its
+answer. Rendering preserves source order. The final template, tools, media
+expansion and actual output-token reserve share one deployment context budget.
+A mandatory-input overflow is an explicit error. Pending tool continuations pin
+their source turn; published anchors expire according to selected context
+rather than the legacy fixed message count.
+
+For plugins declaring `uses_context_ledger`, ModelChannel calls
+`observe_history_context` synchronously with the captured versioned snapshot
+and session-owned ledger. Qwen uses that hook to invalidate memory and capture
+source references without passing a mutable ledger to prompt worker threads.
+A history revision change during prompt preparation prevents stale submission.
+The auxiliary runtime refreshes the same context before selecting background
+work and before accepting an asynchronous result.
+
+`budget_summary` reuses SessionMemoryRuntime's single private request slot.
+Successful prompt submission records omitted source references in model runtime
+state. Qwen selects complete text-bearing exchanges from that committed history,
+combines them with any valid previous summary, and renders a bounded stage-0
+request outside the session event loop. It captures source revisions before
+yielding. The request must pass both the runtime epoch/configuration fences and
+Qwen's source/previous-summary check before mailbox publication.
+
+Summary prompts use the checkpoint's ordinary assistant prefix and separate the
+extraction task from quoted conversation instructions. Empty, truncated,
+acknowledgment-only and explicit no-memory results cannot replace a valid
+summary. These checks reject known degenerate outputs; source validity alone
+does not establish the factual accuracy of model-generated memory.
+
+Summary nodes use flat source references instead of an ever-growing parent
+chain. Publication admits the replacement before retiring its predecessor.
+`DuplexContextLedger.discard` removes a derived node and its descendants, without
+changing authoritative history or reusing node IDs. The active summary and one
+attempted-work identity live in Qwen's session state, so unrelated history
+appends do not reset failed-work deduplication. Failed work leaves any valid
+previous summary available. Session re-leasing preserves valid memory; process
+recovery is outside this contract.
+
+The context budget bounds submitted tokens, and summary limits bound generated
+text and active work. Neither mechanism bounds resident authoritative history
+or the number of source references needed to validate a long-lived summary.

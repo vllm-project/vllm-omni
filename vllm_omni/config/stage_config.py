@@ -19,6 +19,7 @@ from vllm.config import KernelConfig
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
+from vllm_omni.config.context_memory import DuplexAuxiliaryBudgetConfig, DuplexContextMemoryConfig
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.weight_sharing import WeightSharingConfig, parse_weight_sharing
@@ -757,14 +758,60 @@ class DuplexSessionRuntimeConfig:
     # (Qwen3-Omni): user turns before the N most recent user runs drop their
     # audio and image parts there. ``None`` leaves every prompt unchanged.
     context_keep_media_turns: int | None = None
+    # Experimental text-only extraction; configured only by the deployment.
+    context_memory: DuplexContextMemoryConfig | None = None
+    # Optional formatted card block, within the existing total prompt budget.
+    context_memory_tokens: int = 0
+    # Shared summary/card allowance; mixed execution requires explicit limits.
+    context_auxiliary_budget: DuplexAuxiliaryBudgetConfig | None = None
+    qwen_context_policy: Literal["legacy", "budget", "budget_summary"] = "legacy"
+    qwen_context_max_tokens: int | None = None
+    qwen_summary_max_tokens: int = 512
+    qwen_summary_input_max_tokens: int = 8192
+    qwen_summary_timeout_s: float = 30.0
     # Record per-turn stage work and emitted audio and answer the client's
     # ``session.stats.get`` (RFC #8325). Off: nothing is recorded or attached.
     # Single-host only: stage and API timestamps share one CLOCK_MONOTONIC.
     collect_stats: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.context_memory_tokens) is not int or not 0 <= self.context_memory_tokens <= 256:
+            raise ValueError("duplex_session.context_memory_tokens must be an integer from 0 to 256")
+        if isinstance(self.context_memory, Mapping):
+            try:
+                memory = DuplexContextMemoryConfig(**self.context_memory)
+            except TypeError as exc:
+                raise ValueError("invalid duplex_session.context_memory fields") from exc
+            object.__setattr__(self, "context_memory", memory)
+        elif self.context_memory is not None and not isinstance(self.context_memory, DuplexContextMemoryConfig):
+            raise ValueError("duplex_session.context_memory must be a mapping or null")
+        if isinstance(self.context_auxiliary_budget, Mapping):
+            try:
+                budget = DuplexAuxiliaryBudgetConfig(**self.context_auxiliary_budget)
+            except TypeError as exc:
+                raise ValueError("invalid duplex_session.context_auxiliary_budget fields") from exc
+            object.__setattr__(self, "context_auxiliary_budget", budget)
+        elif self.context_auxiliary_budget is not None and not isinstance(
+            self.context_auxiliary_budget, DuplexAuxiliaryBudgetConfig
+        ):
+            raise ValueError("duplex_session.context_auxiliary_budget must be a mapping or null")
         if not isinstance(self.collect_stats, bool):
             raise ValueError("duplex_session.collect_stats must be a boolean")
+        if self.qwen_context_policy not in ("legacy", "budget", "budget_summary"):
+            raise ValueError("Unknown duplex_session.qwen_context_policy")
+        for name in ("qwen_context_max_tokens", "qwen_summary_max_tokens", "qwen_summary_input_max_tokens"):
+            value = getattr(self, name)
+            if value is None and name == "qwen_context_max_tokens":
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"duplex_session.{name} must be a positive integer")
+        if (
+            isinstance(self.qwen_summary_timeout_s, bool)
+            or not isinstance(self.qwen_summary_timeout_s, (int, float))
+            or not math.isfinite(self.qwen_summary_timeout_s)
+            or self.qwen_summary_timeout_s <= 0
+        ):
+            raise ValueError("duplex_session.qwen_summary_timeout_s must be finite and positive")
         if self.replica_policy not in ("legacy", "least_sessions"):
             raise ValueError("duplex_session.replica_policy must be 'legacy' or 'least_sessions'")
         if self.max_sessions_per_replica is not None and (

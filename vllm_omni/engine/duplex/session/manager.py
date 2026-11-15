@@ -34,6 +34,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexStagePort,
     DuplexStageRequestContext,
+    duplex_is_auxiliary_request,
     duplex_resource_request_belongs_to_session,
     duplex_resource_request_id,
 )
@@ -59,6 +60,7 @@ from vllm_omni.engine.duplex.messages import (
     TouchDuplexSessionMessage,
 )
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfigError, validate_duplex_plugin_sampling
+from vllm_omni.engine.duplex.session.auxiliary_budget import DuplexAuxiliaryPermit, DuplexAuxiliaryPermitPool
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.session.perf_ledger import SessionPerfLedger
@@ -124,6 +126,7 @@ class DuplexSessionManager:
         tracer: trace.Tracer | None = None,
     ) -> None:
         validate_duplex_plugin_sampling(plugin, sampling_defaults=tuple(stage_port.sampling_defaults()))
+        plugin.configure_session_runtime(runtime_config)
         self.plugin = plugin
         self.tracer = tracer
         self.session_traces: dict[str, SessionTrace] = {}
@@ -180,6 +183,44 @@ class DuplexSessionManager:
         self._request_cleanups_in_progress: set[tuple[str, int]] = set()
         #: Sessions retained for cleanup retry after their runner is gone.
         self._session_snapshots: dict[str, DuplexEngineSession] = {}
+        self._auxiliary_permits: DuplexAuxiliaryPermitPool | None = None
+        self._auxiliary_request_permits: dict[str, DuplexAuxiliaryPermit] = {}
+        self._auxiliary_closed = False
+
+    def try_acquire_auxiliary_permit(self, request_id: str) -> bool:
+        """One manager-local private forward; no waiter queue or foreground gate."""
+        if not duplex_is_auxiliary_request(request_id) or request_id in self._auxiliary_request_permits:
+            raise ValueError("invalid_auxiliary_permit_request")
+        if self._auxiliary_closed:
+            return False
+        if self._auxiliary_permits is None:
+            self._auxiliary_permits = DuplexAuxiliaryPermitPool()
+        permit = self._auxiliary_permits.try_acquire()
+        if permit is None:
+            return False
+        self._auxiliary_request_permits[request_id] = permit
+        return True
+
+    def mark_auxiliary_submitted(self, request_id: str) -> bool:
+        permit = self._auxiliary_request_permits.get(request_id)
+        return (
+            permit is not None
+            and self._auxiliary_permits is not None
+            and self._auxiliary_permits.mark_submitted(permit)
+        )
+
+    def release_auxiliary_permits(self, request_ids: Iterable[str]) -> None:
+        """Called only after successful stage cleanup, including teardown retry."""
+        released = False
+        for request_id in request_ids:
+            permit = self._auxiliary_request_permits.get(request_id)
+            if permit is not None and self._auxiliary_permits is not None:
+                if self._auxiliary_permits.release(permit, cleanup_succeeded=True):
+                    self._auxiliary_request_permits.pop(request_id)
+                    released = True
+        if released and not self._auxiliary_closed:
+            for runner in tuple(self.runners.values()):
+                runner.memory.resources_available()
 
     # ------------------------------------------------------------------ #
     # Views                                                              #
@@ -868,6 +909,7 @@ class DuplexSessionManager:
             await self.stage_port.cleanup(list(pending.submitted_request_ids), abort=True)
         if pending.reserved_request_ids:
             await self.stage_port.cleanup(list(pending.reserved_request_ids))
+        self.release_auxiliary_permits((*pending.submitted_request_ids, *pending.reserved_request_ids))
         if session is not None:
             session.release_all_requests()
         if self.runtime_config.replica_policy != "legacy" and self._closing.get(pending.session_id) is not pending:
@@ -1095,6 +1137,7 @@ class DuplexSessionManager:
 
     async def _run_request_cleanup(self, key: tuple[str, int], pending: _PendingRequestCleanup) -> None:
         await self.stage_port.cleanup(list(pending.request_ids), abort=pending.abort)
+        self.release_auxiliary_permits(pending.request_ids)
         is_current = self._pending_request_cleanups.get(key) is pending
         if is_current:
             self._pending_request_cleanups.pop(key, None)
@@ -1112,6 +1155,9 @@ class DuplexSessionManager:
     # ------------------------------------------------------------------ #
 
     async def shutdown(self) -> None:
+        self._auxiliary_closed = True
+        if self._auxiliary_permits is not None:
+            self._auxiliary_permits.close()
         session_ids = set(self.runners) | set(self._closing) | self._admitting
         runners = list(self.runners.values())
         self.runners.clear()
