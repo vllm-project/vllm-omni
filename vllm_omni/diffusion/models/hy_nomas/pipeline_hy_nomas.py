@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from itertools import groupby
 from pathlib import Path
@@ -516,6 +516,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
 
     @torch.no_grad()
     def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
+        with self._decoder_guard("request preparation"):
+            return self._prepare_encode_local(state, **kwargs)
+
+    def _prepare_encode_local(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
         del kwargs
         bound = self._ar_state
         tick = ARDiffusionTickRequest.from_extra_args(state.sampling.extra_args)
@@ -916,9 +920,6 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             error = exc
         self._check_sp_error(error, operation)
 
-    def request_preparation_context(self) -> AbstractContextManager[None]:
-        return self._decoder_guard("request preparation")
-
     def _decoder_is_output_rank(self) -> bool:
         return self.decoder_parallel_mode == "none" or get_sp_group().ulysses_rank == 0
 
@@ -1094,12 +1095,11 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
         if request.num_reqs != 1:
             raise ValueError("Hy-Nomas processes one request at a time.")
+        req = request.requests[0]
+        state = StepRequestState(request_id=req.request_id, sampling=req.sampling_params, prompt=req.prompt)
+        state.extra["hy_nomas_request_mode"] = True
         try:
-            with self.request_preparation_context():
-                req = request.requests[0]
-                state = StepRequestState(request_id=req.request_id, sampling=req.sampling_params, prompt=req.prompt)
-                state.extra["hy_nomas_request_mode"] = True
-                self.prepare_encode(state)
+            self.prepare_encode(state)
             chunks = []
             frame_start = self._session().emitted_frames
             while not state.request_denoise_completed:

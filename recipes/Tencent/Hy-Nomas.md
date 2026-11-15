@@ -256,6 +256,9 @@ Ulysses rank and uses the same group as the DiT. Rank 0 merges and emits the
 decoded frames; decoder weights remain replicated. The DiT head and spatial-token
 divisibility constraints still apply. Real-model correctness and performance
 for this native window mode must be validated for each deployment configuration.
+Error synchronization covers model request preparation and guarded decode
+stages. A rank-local failure before all ranks enter model preparation, or during
+subsequent chunk preparation, may still leave peers waiting for a collective.
 
 For example, an SP4 streaming deployment selects four devices:
 

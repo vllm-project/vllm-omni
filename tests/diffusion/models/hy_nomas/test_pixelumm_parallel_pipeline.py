@@ -24,7 +24,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion, pytest.mark.parallel]
+pytestmark = [pytest.mark.cpu, pytest.mark.diffusion, pytest.mark.parallel]
 
 
 def make_request(index, *, frames=9, session="s", close=False):
@@ -43,10 +43,10 @@ def make_request(index, *, frames=9, session="s", close=False):
     )
 
 
-def make_group(rank, world_size):
+def make_group(rank, world_size, *, timeout=timedelta(seconds=120)):
     ranks = list(range(world_size))
-    device_group = dist.new_group(ranks, backend="gloo")
-    ulysses_group = dist.new_group(ranks, backend="gloo")
+    device_group = dist.new_group(ranks, backend="gloo", timeout=timeout)
+    ulysses_group = dist.new_group(ranks, backend="gloo", timeout=timeout)
 
     def all_reduce(value):
         dist.all_reduce(value, group=device_group)
@@ -208,6 +208,7 @@ def _pipeline_worker(rank, world_size, rendezvous):
         dist.destroy_process_group()
 
 
+@pytest.mark.core_model
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_pipeline_window_parallel_matches_serial_and_recovers(tmp_path, monkeypatch, world_size):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[4]))
@@ -215,13 +216,12 @@ def test_pipeline_window_parallel_matches_serial_and_recovers(tmp_path, monkeypa
 
 
 def _prepare_failure_worker(rank, world_size, rendezvous):
-    dist.init_process_group(
-        "gloo", init_method=rendezvous, rank=rank, world_size=world_size, timeout=timedelta(seconds=20)
-    )
+    timeout = timedelta(seconds=60 if world_size > 4 else 20)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size, timeout=timeout)
     try:
         torch.set_num_threads(1)
 
-        group = make_group(rank, world_size)
+        group = make_group(rank, world_size, timeout=timeout)
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr("vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas.get_sp_group", lambda: group)
             patch.setattr("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", lambda: group)
@@ -254,15 +254,16 @@ def _prepare_failure_worker(rank, world_size, rendezvous):
                 "vllm_omni.diffusion.worker.diffusion_model_runner.current_omni_platform",
                 SimpleNamespace(
                     is_available=lambda: False,
+                    reset_peak_memory_stats=lambda: None,
                     max_memory_reserved=lambda: 0,
                     max_memory_allocated=lambda: 0,
                 ),
             )
             cases = (
-                ("forward-runner", "runner", world_size - 1),
+                ("forward-runner", "noise", world_size - 1),
                 ("forward", "noise", 0),
                 ("forward", "decoder", world_size - 1),
-                ("step", "runner", 0),
+                ("step", "session", 0),
                 ("step", "noise", world_size - 1),
                 ("step", "decoder", 0),
             )
@@ -279,10 +280,15 @@ def _prepare_failure_worker(rank, world_size, rendezvous):
 
                 with pytest.MonkeyPatch.context() as failure_patch:
                     if rank == failure_rank:
-                        if point == "runner":
-                            failure_patch.setattr(runner, "_initialize_generator", fail)
-                        elif point == "noise":
+                        if point == "noise":
                             failure_patch.setattr(torch, "randn", fail)
+                        elif point == "session":
+
+                            class FailingSessionStore(dict):
+                                def __setitem__(self, key, value):
+                                    fail()
+
+                            failure_patch.setattr(pipeline, "_ar_sessions", FailingSessionStore(pipeline._ar_sessions))
                         else:
                             failure_patch.setattr(pipeline.vae, "create_streaming_decode_session", fail)
                     if mode == "forward-runner":
@@ -320,6 +326,10 @@ def _prepare_failure_worker(rank, world_size, rendezvous):
                     assert len(recovered.result.output["payload"]["video"]) == (9 if rank == 0 else 0)
                     assert session_id not in runner._sessions and session_id not in pipeline._ar_sessions
                     assert session_id not in runner.state_cache
+                elif mode == "forward-runner":
+                    recovered = runner.execute_model(request.requests[0])
+                    assert len(recovered.output["payload"]["video"]) == (9 if rank == 0 else 0)
+                    assert session_id not in runner._sessions and session_id not in pipeline._ar_sessions
                 else:
                     with runner._bound_ar_session(session_id, description="prepare recovery"):
                         recovered = pipeline.forward(request)
@@ -329,7 +339,14 @@ def _prepare_failure_worker(rank, world_size, rendezvous):
         dist.destroy_process_group()
 
 
+@pytest.mark.core_model
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_prepare_failure_is_synchronized_and_recovers(tmp_path, monkeypatch, world_size):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[4]))
     mp.spawn(_prepare_failure_worker, args=(world_size, (tmp_path / "prepare-rendezvous").as_uri()), nprocs=world_size)
+
+
+@pytest.mark.slow
+def test_prepare_failure_larger_group(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[4]))
+    mp.spawn(_prepare_failure_worker, args=(8, (tmp_path / "prepare-rendezvous").as_uri()), nprocs=8)
