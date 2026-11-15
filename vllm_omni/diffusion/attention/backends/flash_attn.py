@@ -1100,6 +1100,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         self,
         method: str,
         query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
     ) -> None:
         extra = attn_metadata.extra if attn_metadata else {}
@@ -1125,6 +1127,12 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             query.ndim != 4 or query.shape[-1] <= 0 or query.shape[-1] & (query.shape[-1] - 1)
         ):
             reason = "generated Hadamard rotations require a four-dimensional input and power-of-two head size"
+        elif (
+            method == "fp8"
+            and self.quant_options.get("fp8_fa_mode") == "C8V16_TILING512"
+            and any(tensor.shape[0] != 1 or tensor.shape[-1] != 128 for tensor in (query, key, value))
+        ):
+            reason = "C8V16_TILING512 requires Q/K/V batch size 1 and head dimensions of 128"
         elif packed is not None and (self.qkv_layout not in (None, "BSND") or query.shape[0] != 1):
             reason = "packed padding requires a single BSND sequence"
         if reason is not None:
@@ -1144,7 +1152,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         extra = attn_metadata.extra if attn_metadata else {}
         method = extra.get("kv_cache_dtype", "fp8")
         layout = self.qkv_layout or "BSND"
-        self._validate_quant_request(method, query, attn_metadata)
+        self._validate_quant_request(method, query, key, value, attn_metadata)
         query_padding = None
         packed = attn_metadata.packed_padding if attn_metadata else None
         if packed is not None:
@@ -1181,6 +1189,13 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         logger.info_once("NPU attention uses MindIE-SD %s Runtime, layout=%s.", method, layout)
         # Execution errors propagate. Never retry with another precision.
         out = runtime(query, key, value, **kwargs)
+        if packed is not None and (out.shape[1] != query.shape[1] or out.dtype != query.dtype):
+            raise ValueError(
+                "MindIE-SD quant_attention must preserve the original query sequence length and dtype, "
+                "including when applying internal alignment padding. "
+                f"Expected length={query.shape[1]}, dtype={query.dtype}; "
+                f"got length={out.shape[1]}, dtype={out.dtype}."
+            )
         # Restore the Q shape before the reverse Ulysses exchange by reusing the
         # query suffix; pad rows are outside the real document and are not consumed.
         return torch.cat((out, query_padding), dim=1) if query_padding is not None else out

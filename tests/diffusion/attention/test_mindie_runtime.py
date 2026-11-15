@@ -127,6 +127,41 @@ def test_quant_options_do_not_enable_quantization(runtime, mocker, method):
     runtime.quant_attention.assert_not_called()
 
 
+@pytest.mark.parametrize("layout", ["BSND", "BNSD"])
+@pytest.mark.parametrize("tensor_index", [0, 1, 2], ids=["query", "key", "value"])
+@pytest.mark.parametrize("invalid_dimension", ["batch", "head"])
+def test_c8v16_rejects_unsupported_shapes(runtime, layout, tensor_index, invalid_dimension):
+    tensors = [torch.randn(1, 8, 2, 128, dtype=torch.bfloat16) for _ in range(3)]
+    shape = list(tensors[tensor_index].shape)
+    shape[0 if invalid_dimension == "batch" else -1] = 2 if invalid_dimension == "batch" else 64
+    tensors[tensor_index] = torch.randn(shape, dtype=torch.bfloat16)
+    if layout == "BNSD":
+        tensors = [tensor.transpose(1, 2) for tensor in tensors]
+    impl = flash(layout=layout, head_size=128, quant={"fp8_fa_mode": "C8V16_TILING512"})
+    with pytest.raises(ValueError, match="C8V16_TILING512 requires.*batch size 1.*128"):
+        impl.forward_npu(*tensors, AttentionMetadata(extra={"kv_cache_dtype": "fp8"}))
+    runtime.quant_attention.assert_not_called()
+
+
+@pytest.mark.parametrize("layout", ["BSND", "BNSD"])
+def test_c8v16_accepts_supported_shapes(runtime, layout):
+    query = torch.randn(1, 5, 2, 128, dtype=torch.bfloat16)
+    key = torch.randn(1, 8, 2, 128, dtype=torch.bfloat16)
+    if layout == "BNSD":
+        query, key = query.transpose(1, 2), key.transpose(1, 2)
+    impl = flash(layout=layout, head_size=128, quant={"fp8_fa_mode": "C8V16_TILING512"})
+    assert impl.forward_npu(query, key, key, AttentionMetadata(extra={"kv_cache_dtype": "fp8"})) is query
+    assert runtime.quant_attention.call_args.kwargs["fp8_fa_mode"] == "C8V16_TILING512"
+
+
+@pytest.mark.parametrize("method", ["mxfp8", "mxfp4"])
+def test_inactive_c8v16_mode_does_not_restrict_shapes(runtime, method):
+    query = torch.randn(2, 8, 2, 64, dtype=torch.bfloat16)
+    impl = flash(quant={"fp8_fa_mode": "C8V16_TILING512"})
+    assert impl.forward_npu(query, query, query, AttentionMetadata(extra={"kv_cache_dtype": method})) is query
+    assert "fp8_fa_mode" not in runtime.quant_attention.call_args.kwargs
+
+
 def test_missing_runtime_requires_config_change(runtime):
     q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16)
     del runtime.quant_attention
@@ -234,6 +269,24 @@ def test_quant_packed_padding_matches_masked_attention(runtime, method, quant, q
     torch.testing.assert_close(updated_output[:, q_length:], query[:, q_length:])
     assert metadata.extra["cu_seqlens_q"].tolist() == [0, q_length, query.shape[1]]
     assert metadata.packed_padding.q_length == q_length
+
+
+@pytest.mark.parametrize("q_padding", [0, 3])
+@pytest.mark.parametrize("mismatch", ["shorter", "longer", "dtype"])
+def test_quant_packed_padding_rejects_runtime_output_mismatch(runtime, q_padding, mismatch):
+    query = torch.randn(1, 5 + q_padding, 2, 128, dtype=torch.bfloat16)
+    metadata = packed_metadata(5, 5, query.shape[1], query.shape[1], "mxfp4")
+
+    def incompatible_output(q, k, v, **kwargs):
+        if mismatch == "dtype":
+            return q.float()
+        length = q.shape[1] + (1 if mismatch == "longer" else -1)
+        return q.new_empty((q.shape[0], length, *q.shape[2:]))
+
+    runtime.quant_attention.side_effect = incompatible_output
+    with pytest.raises(ValueError, match="MindIE-SD.*original query sequence length and dtype"):
+        flash(head_size=128).forward_npu(query, query, query, metadata)
+    runtime.quant_attention.assert_called_once()
 
 
 @pytest.mark.parametrize("q_length,kv_length", [(0, 5), (5, 0), (9, 5), (5, 9)])
