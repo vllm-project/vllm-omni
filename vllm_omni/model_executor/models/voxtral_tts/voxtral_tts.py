@@ -17,8 +17,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -31,6 +29,8 @@ from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation im
     VoxtralTTSProcessingInfo,
 )
 from vllm_omni.transformers_utils.repo_utils import hf_api
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
+from vllm_omni.worker.v1_compat.sampler import Sampler
 
 logger = init_logger(__name__)
 

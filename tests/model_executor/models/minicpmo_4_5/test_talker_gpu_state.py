@@ -382,15 +382,15 @@ def test_sampler_fast_path_preserves_seeded_tokens_and_auxiliary_penalties(aux_p
     from types import SimpleNamespace
 
     from vllm.sampling_params import SamplingParams
-    from vllm.v1.sample.logits_processor import LogitsProcessors
-    from vllm.v1.sample.metadata import SamplingMetadata
-    from vllm.v1.sample.sampler import Sampler
 
     from vllm_omni.model_executor.models.minicpmo_4_5.codec_state import apply_window_penalty
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
     from vllm_omni.worker.sampling_utils import call_model_sampler
+    from vllm_omni.worker.v1_compat.logits_processor import LogitsProcessors
+    from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
+    from vllm_omni.worker.v1_compat.sampler import Sampler
 
     batch, vocab = 3, 64
     params = [

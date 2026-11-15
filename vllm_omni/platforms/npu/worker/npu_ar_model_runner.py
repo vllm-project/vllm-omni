@@ -28,11 +28,7 @@ from vllm.v1.outputs import (
     ECConnectorOutput,
     make_empty_encoder_model_runner_output,
 )
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
-from vllm.v1.worker import mamba_utils
-from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -58,6 +54,10 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
     needs_omni_connector,
 )
 from vllm_omni.worker.sampling_utils import call_model_sampler, sanitize_min_tokens_stop_ids
+from vllm_omni.worker.v1_compat import mamba_utils
+from vllm_omni.worker.v1_compat.async_output import AsyncGPUModelRunnerOutput
+from vllm_omni.worker.v1_compat.misc import PerLayerAttnMetadata, apply_grammar_bitmask
+from vllm_omni.worker.v1_compat.spec_decode import SpecDecodeMetadata
 
 
 def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
@@ -110,6 +110,7 @@ class ExecuteModelState(NamedTuple):
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
     multimodal_outputs: Any # Omni-Specific
+    slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
     # Omni: prefix-cache step id; its context must be consumed exactly
     # once (materialize or discard_step) in sample_tokens.
     prefix_cache_step_id: int | None = None
@@ -215,7 +216,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 with static_shape_decode.capturing_bucket(capacity):
                     super()._capture_cudagraphs(*args, **kwargs)
 
-    def propose_draft_token_ids(self, valid_sampled_token_ids, *args, **kwargs):
+    def propose_draft_token_ids(self, scheduler_output, sampled_token_ids, *args, **kwargs):
         """Carry the Talker's frame count to the scheduler, not a prediction.
 
         Stage 1 declares a speculative_config so that vLLM knows the request
@@ -232,21 +233,18 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         config's speculative_config. Reading it off the model instead would
         depend on wrappers we do not control.
 
-        NOTE: the NPU draft call site passes ``sampled_token_ids`` first
-        (vllm-ascend ``NPUModelRunner.propose_draft_token_ids``); the upstream
-        GPU signature has ``scheduler_output`` first instead.
+        The retained V1 runner consumes the scheduler output first, followed
+        by sampled rows and the same per-layer slot mappings used by forward.
         """
         from vllm_omni.worker import talker_multiframe
 
+        valid_sampled_token_ids = sampled_token_ids
         frames = talker_multiframe.drafts_this_step(self)
         if frames > 1:
             # How many draft positions each request actually ran with in this
             # step -- the scheduler's own account, and the only reliable way to
             # tell a truncated K-frame row apart from an ordinary one-token
-            # result (prefill, or a step the loop intentionally sat out). The
-            # vllm-ascend call site passes (sampling_metadata, scheduler_output,
-            # spec_decode_metadata, ...) positionally after the sampled ids.
-            scheduler_output = next((a for a in args if hasattr(a, "scheduled_spec_decode_tokens")), None)
+            # result (prefill, or a step the loop intentionally sat out).
             scheduled = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
             req_ids = list(getattr(self.input_batch, "req_ids", []) or [])
             scheduled_draft_counts = [len(scheduled.get(req_id, ())) for req_id in req_ids[: self.input_batch.num_reqs]]
@@ -286,12 +284,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 logger.error(
                     "[kstep] propose received %s (expected list); "
                     "constant_drafts will emit no drafts this step "
-                    "(use_ngram_gpu=%s, padded_drafter_disabled=%s)",
+                    "(use_ngram_gpu=%s)",
                     type(valid_sampled_token_ids).__name__,
                     self.speculative_config.use_ngram_gpu()
-                    if self.speculative_config is not None
-                    else None,
-                    self.speculative_config.disable_padded_drafter_batch
                     if self.speculative_config is not None
                     else None,
                 )
@@ -341,7 +336,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         _desc,
                     )
             return drafts
-        return super().propose_draft_token_ids(valid_sampled_token_ids, *args, **kwargs)
+        return super().propose_draft_token_ids(scheduler_output, sampled_token_ids, *args, **kwargs)
 
     def initialize_kv_cache(self, *args, **kwargs) -> None:
         super().initialize_kv_cache(*args, **kwargs)
@@ -381,7 +376,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if not self.has_talker_mtp or not isinstance(self.talker_mtp, ACLGraphWrapper):
             return
 
-        from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+        from vllm_omni.worker.v1_compat.misc import set_cudagraph_capturing_enabled
 
         capture_sizes = sorted(self.compilation_config.cudagraph_capture_sizes, reverse=True)
         num_warmups = self.compilation_config.cudagraph_num_of_warmups
@@ -693,7 +688,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
                         num_scheduled_tokens_np,
                         self.input_batch.num_computed_tokens_cpu[:num_reqs],
-                        scheduler_output.num_common_prefix_blocks,
+                        getattr(scheduler_output, "num_common_prefix_blocks", ()),
                     )
 
                 (
@@ -798,6 +793,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         batch_desc.num_reqs,
                     )
 
+                # Shared V1 metadata consumes per-group slot mappings; the drafter
+                # consumes the corresponding per-layer views of the same buffers.
+                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs_padded=num_reqs_padded,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    ubatch_slices=ubatch_slices_attn,
+                )
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,
@@ -808,8 +811,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     logits_indices=logits_indices,
                     use_spec_decode=use_spec_decode,
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                    num_scheduled_tokens_np=num_scheduled_tokens_np,
-                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    slot_mappings=slot_mappings_by_group,
                 )
 
             (
@@ -996,7 +998,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 cudagraph_stats,
                 batch_desc,
                 multimodal_outputs, # Omni-specific
-                prefix_cache_step_id,
+                slot_mappings=slot_mappings,
+                prefix_cache_step_id=prefix_cache_step_id,
             )
             self.kv_connector_output = kv_connector_output
 
@@ -1093,6 +1096,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             cudagraph_stats,
             batch_desc,
             multimodal_outputs, # Omni-Specific
+            slot_mappings,
             prefix_cache_step_id,
         ) = self.execute_model_state
         pending_aux_output = self._prepare_omni_aux_output()
@@ -1165,17 +1169,15 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             self._draft_token_ids = self.propose_draft_token_ids(
+                scheduler_output,
                 sampled_token_ids,
                 self.input_batch.sampling_metadata,
-                scheduler_output,
+                hidden_states,
+                sample_hidden_states,
+                aux_hidden_states,
                 spec_decode_metadata,
                 spec_decode_common_attn_metadata,
-                positions,
-                scheduler_output.total_num_scheduled_tokens,
-                hidden_states,
-                aux_hidden_states,
-                sample_hidden_states,
-                batch_desc,
+                slot_mappings,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -1188,7 +1190,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
                 or self.speculative_config.use_ngram_gpu()
-            ) and not self.speculative_config.disable_padded_drafter_batch
+            )
             early_pp_padded_drafter = use_pp_spec_decode and not self.use_async_scheduling and use_padded_batch
             if early_pp_padded_drafter:
                 self._draft_token_ids = None
@@ -1211,7 +1213,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             logits,
             hidden_states,
             scheduler_output.total_num_scheduled_tokens,
-            spec_decode_metadata,
         )
 
 

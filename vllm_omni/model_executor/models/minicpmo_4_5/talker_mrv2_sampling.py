@@ -16,7 +16,11 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sample
+
+from vllm_omni.worker.v1_compat.sample_ops.topk_topp_sampler import (
+    apply_top_k_top_p,
+    random_sample,
+)
 
 # Same cutoff vLLM's V1 sampler uses to treat a row as greedy.
 _SAMPLING_EPS = 1e-5

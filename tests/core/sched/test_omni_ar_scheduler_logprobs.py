@@ -343,7 +343,6 @@ def test_fixed_token_scores_reach_engine_output(scored) -> None:
     scores = torch.tensor([[-0.5, -1.5], [-0.2, -2.2]])
     model_runner_output = OmniModelRunnerOutput(
         req_ids=["req"],
-        req_id_to_index={"req": 0},
         sampled_token_ids=[[7]],
         prompt_logprobs_dict={},
         prompt_token_id_logprobs_dict={"req": scores} if scored else {},

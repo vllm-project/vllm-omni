@@ -44,9 +44,10 @@ def test_shared_generator_keeps_ordered_torch_draws(monkeypatch) -> None:
 @pytest.mark.parametrize("seeded_rows", [(0, 1, 2), (0, 2)], ids=["all_seeded", "mixed"])
 @pytest.mark.parametrize("use_fp64_gumbel", [False, True])
 def test_torch_fallback_preserves_samples_and_generator_state(monkeypatch, seeded_rows, use_fp64_gumbel) -> None:
-    from vllm.v1.sample.ops import topk_topp_sampler as sampler_ops
-
+    # The seeded-sampling patch wraps the vendored V1 sampler ops omni runs
+    # (upstream moved v1.sample.ops at the pin).
     import vllm_omni.patch  # noqa: F401
+    from vllm_omni.worker.v1_compat.sample_ops import topk_topp_sampler as sampler_ops
 
     original = sampler_ops.random_sample.__wrapped__
     monkeypatch.setattr(seeded_exponential.current_platform, "is_cuda", lambda: False)

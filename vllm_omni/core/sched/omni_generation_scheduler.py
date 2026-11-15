@@ -749,9 +749,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         cached_reqs_data = OmniCachedRequestData(
             req_ids=cached_reqs_data.req_ids,
-            resumed_req_ids=cached_reqs_data.resumed_req_ids,
+            resumed_req_ids=set(getattr(cached_reqs_data, "resumed_req_ids", ()) or ()),
             new_token_ids=cached_reqs_data.new_token_ids,
-            all_token_ids=cached_reqs_data.all_token_ids,
+            all_token_ids=getattr(cached_reqs_data, "all_token_ids", {}),
             new_block_ids=cached_reqs_data.new_block_ids,
             num_computed_tokens=cached_reqs_data.num_computed_tokens,
             num_output_tokens=cached_reqs_data.num_output_tokens,
@@ -760,10 +760,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-
-        # Record request ids scheduled in this step for the next update.
-        self.prev_step_scheduled_req_ids.clear()
-        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         scheduler_output = self._build_generation_scheduler_output(
             new_reqs_data,

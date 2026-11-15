@@ -622,8 +622,9 @@ def cleanup_mamba_state_idx(
     """
     finished_req_ids = scheduler_output.finished_req_ids
     preempted_req_ids = scheduler_output.preempted_req_ids or set()
+    resumed_req_ids = getattr(scheduler_output.scheduled_cached_reqs, "resumed_req_ids", ())
     full_resend_req_ids = (req.req_id for req in scheduler_output.scheduled_new_reqs)
-    for req_id in itertools.chain(finished_req_ids, preempted_req_ids, full_resend_req_ids):
+    for req_id in itertools.chain(finished_req_ids, preempted_req_ids, resumed_req_ids, full_resend_req_ids):
         mamba_state_idx.pop(req_id, None)
 
 

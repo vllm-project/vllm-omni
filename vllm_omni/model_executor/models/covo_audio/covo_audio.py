@@ -25,12 +25,12 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
 
 # Max tokens per audio: Whisper 30s → 3000 mel frames → encoder 2x + adapter 8x = 16x → 188
 MAX_AUDIO_TOKENS = 188

@@ -14,7 +14,6 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
-from vllm.v1.worker.gpu_model_runner import PerLayerAttnMetadata
 from vllm_ascend.ascend_forward_context import get_forward_context, set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import using_paged_attention
@@ -28,6 +27,7 @@ from vllm_omni.platforms.npu._310p import is_310p
 from vllm_omni.platforms.npu.native_rejection_sampler import restore_native_rejection_sampler
 from vllm_omni.platforms.npu.worker.aux_output import NPUAuxOutputMixin
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.v1_compat.misc import PerLayerAttnMetadata
 
 logger = init_logger(__name__)
 
@@ -40,12 +40,20 @@ else:
 
 class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
     def initialize_kv_cache(
-        self, kv_cache_config, kv_cache_allocation_context: AbstractContextManager | None = None
+        self,
+        kv_cache_config,
+        is_profiling: bool = False,
+        kv_cache_allocation_context: AbstractContextManager | None = None,
+        extensible: bool = False,
     ) -> None:
         """Stage the omni prefix-cache config (hidden / mm tensors reused on hits)."""
         # vllm-ascend's override only grew the ``kv_cache_allocation_context``
         # parameter on the 0.30 line; probe the signature so one omni build
         # drives both the 0.29 and the 0.30 vllm-ascend.
+        if extensible:
+            raise ValueError("The retained NPU V1 runner only supports fixed KV caches")
+        if is_profiling:
+            raise NotImplementedError("NPU V1 profiling KV initialization is not supported")
         params = inspect.signature(NPUModelRunner.initialize_kv_cache).parameters
         accepts_ctx = "kv_cache_allocation_context" in params
         NPUModelRunner.initialize_kv_cache(
@@ -53,6 +61,7 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
             kv_cache_config,
             **({"kv_cache_allocation_context": kv_cache_allocation_context} if accepts_ctx else {}),
         )
+        self.extensible_kv_cache = None
         self._init_omni_aux_output(kv_cache_config)
         if getattr(self, "_omni_prefix_cache_cfg", None) is None:
             # Same gate as the GPU runner (pooling stage, kv_consumer /
@@ -309,6 +318,12 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
                         blk_table.slot_mapping.gpu.fill_(-1)
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+                slot_mappings_by_group, _ = self._get_slot_mappings(
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs_padded=num_reqs_padded,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
+                )
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,
@@ -317,10 +332,7 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
                     max_query_len=max_query_len,
                     ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                     for_cudagraph_capture=is_graph_capturing,
-                    num_scheduled_tokens_np=num_scheduled_tokens,
-                    cudagraph_runtime_mode=cudagraph_runtime_mode,
-                    batch_descriptor=batch_desc,
-                    skip_gdn_state_update=skip_gdn_state_update,
+                    slot_mappings=slot_mappings_by_group,
                 )
 
         with self.maybe_dummy_run_with_lora(
@@ -395,7 +407,11 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
             def dummy_drafter_compute_logits(hidden_states):
                 if not need_dummy_logits or self.drafter is None:
                     return
-                if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
+                if (
+                    hasattr(self.drafter, "model")
+                    and self.drafter.model is not None
+                    and hasattr(self.drafter.model, "compute_logits")
+                ):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
             with (

@@ -16,7 +16,6 @@ from vllm.model_executor.models.qwen2 import Qwen2Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
 from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import (
@@ -28,6 +27,7 @@ from vllm_omni.model_executor.models.common.ming.cfm_solver import DEFAULT_CFM_S
 from vllm_omni.model_executor.models.common.ming.continuous_tts import STOP_REASON_CODES
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
 
 from .config_ming_tts import (
     KEY_CFG,

@@ -69,9 +69,14 @@ def test_stage_runner_selects_matching_input_processor_validator(monkeypatch, us
 
 
 @pytest.mark.parametrize("use_v2", [False, True])
-def test_plain_vllm_config_retains_upstream_runner_preference(monkeypatch, use_v2):
-    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", use_v2)
-    assert VllmConfig().use_v2_model_runner is use_v2
+def test_plain_vllm_config_retains_upstream_runner_preference(use_v2):
+    # v0.34 removed the process-wide runner preference
+    # (vllm.envs.VLLM_USE_V2_MODEL_RUNNER) with Model Runner V1; vllm-omni's
+    # patch installs VllmConfig.use_v2_model_runner itself: plain (non-omni)
+    # configs only have MRv2 upstream so they report True, while omni stages
+    # route from OmniModelConfig.use_v2_model_runner (the deploy choice).
+    assert VllmConfig().use_v2_model_runner is True
+    assert OmniEngineArgs(use_v2_model_runner=use_v2).create_model_config().use_v2_model_runner is use_v2
 
 
 def test_sync_config_is_omni():

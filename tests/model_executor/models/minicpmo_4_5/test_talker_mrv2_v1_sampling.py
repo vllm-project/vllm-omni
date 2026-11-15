@@ -9,13 +9,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from vllm.v1.sample.logits_processor.state import LogitsProcessors
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops import topk_topp_sampler
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import SamplingStates
 
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_mrv2_sampling import draw_v1_codec_ids
+from vllm_omni.worker.v1_compat.logits_processor.state import LogitsProcessors
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
+from vllm_omni.worker.v1_compat.sample_ops import topk_topp_sampler
+from vllm_omni.worker.v1_compat.sampler import Sampler
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

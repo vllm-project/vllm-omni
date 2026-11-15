@@ -11,9 +11,9 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.model_executor.models import SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
+from vllm_omni.worker.v1_compat.sampler import Sampler
 
 from .audio_prep import (
     _find_audio_placeholder_positions,

@@ -13,13 +13,13 @@ the engine dies with a CUDA device-side assert.
 import pytest
 import torch
 from vllm import SamplingParams
-from vllm.v1.sample.logits_processor import (
+
+from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids, sanitize_sampling_params_min_tokens_stop_ids
+from vllm_omni.worker.v1_compat.logits_processor import (
     BatchUpdate,
     LogitsProcessors,
     MinTokensLogitsProcessor,
 )
-
-from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids, sanitize_sampling_params_min_tokens_stop_ids
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

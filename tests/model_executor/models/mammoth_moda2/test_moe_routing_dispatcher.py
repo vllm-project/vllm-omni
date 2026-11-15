@@ -59,6 +59,58 @@ def test_with_moe_routing_key_replace() -> None:
     assert keyed != replace(desc, moe_routing_key=int(MoERoutingKey.BLEND))
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_v1_dispatcher_captures_and_replays_moe_specialties_with_lora(enabled: bool) -> None:
+    """The MRv1 dispatcher keeps every LoRA key when expanding FULL graphs."""
+    from vllm_omni.worker.v1_compat.cudagraph_dispatcher import CudagraphDispatcher
+
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL,
+            cudagraph_capture_sizes=[1, 2, 4],
+            max_cudagraph_capture_size=4,
+            compile_sizes=[],
+            cudagraph_specialize_lora=True,
+            cudagraph_specialize_moe_routing=enabled,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        num_speculative_tokens=0,
+        lora_config=SimpleNamespace(max_loras=2, specialize_active_lora=True),
+    )
+    dispatcher = CudagraphDispatcher(config)
+    dispatcher.initialize_cudagraph_keys(CUDAGraphMode.FULL)
+
+    capture_modes = dispatcher.get_capture_descs()
+    assert len(capture_modes) == 1
+    mode, captured = capture_modes[0]
+    assert mode is CUDAGraphMode.FULL
+    specialties = set(MoERoutingKey) if enabled else {MoERoutingKey.BLEND}
+    # Upstream also captures max_loras + 1 as a generic LoRA fallback.
+    lora_counts = [0, 1, 2, 3]
+    assert len(captured) == 3 * len(lora_counts) * len(specialties)
+    assert {(desc.num_tokens, desc.num_active_loras, desc.moe_routing_key) for desc in captured} == {
+        (size, loras, int(key)) for size in [1, 2, 4] for loras in lora_counts for key in specialties
+    }
+
+    for loras in [0, 1, 2]:
+        for key in MoERoutingKey:
+            replay_mode, desc = dispatcher.dispatch(
+                3,
+                has_lora=loras > 0,
+                num_active_loras=loras,
+                moe_routing_key=int(key),
+            )
+            assert replay_mode is CUDAGraphMode.FULL
+            assert desc.num_tokens == 4
+            assert desc.num_active_loras == loras
+            assert desc.moe_routing_key == int(key if enabled else MoERoutingKey.BLEND)
+            assert desc in dispatcher.cudagraph_keys[replay_mode]
+
+    eager_mode, eager = dispatcher.dispatch(5, moe_routing_key=int(MoERoutingKey.ALL_GEN))
+    assert eager_mode is CUDAGraphMode.NONE
+    assert eager.moe_routing_key == int(MoERoutingKey.BLEND)
+
+
 def _captured(*descriptors: BatchDescriptor) -> set[BatchDescriptor]:
     return set(descriptors)
 

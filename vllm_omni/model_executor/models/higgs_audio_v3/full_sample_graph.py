@@ -257,8 +257,8 @@ def capture_sample_graphs(model, max_num_reqs):
     """Warm the MRv2 sampler without consuming request RNG or decode state."""
     if not model._sample_graph_enabled or getattr(model, "_sample_graphs_ready", False):
         return
-    from vllm.v1.sample.logits_processor import LogitsProcessors
-    from vllm.v1.sample.metadata import SamplingMetadata
+    from vllm_omni.worker.v1_compat.logits_processor import LogitsProcessors
+    from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
 
     device = model.model.embed_tokens.weight.device
     if device.type != "cuda":

@@ -117,11 +117,11 @@ def test_mrv2_talker_sampler_follows_v1_streams_across_preemption_without_host_s
 
     from vllm.config import VllmConfig
     from vllm.sampling_params import SamplingParams
-    from vllm.v1.sample.ops.topk_topp_sampler import random_sample
     from vllm.v1.worker.gpu.sample.sampler import Sampler
     from vllm.v1.worker.gpu.states import RequestState
 
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import _install_mrv2_talker_sampler
+    from vllm_omni.worker.v1_compat.sample_ops.topk_topp_sampler import random_sample
 
     device, vocab = torch.device("cuda"), 64
     reqs = RequestState(4, 64, 64, 0, vocab, device)

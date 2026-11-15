@@ -15,11 +15,6 @@ from vllm.config import VllmConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.logits_processor.state import LogitsProcessors
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops.topk_topp_sampler import random_sample
-from vllm.v1.worker.gpu_input_batch import InputBatch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.data_entry_keys import to_struct
@@ -29,6 +24,11 @@ from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.worker import gpu_ar_model_runner
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.v1_compat.gpu_model_runner import V1GPUModelRunnerMixin
+from vllm_omni.worker.v1_compat.input_batch import InputBatch
+from vllm_omni.worker.v1_compat.logits_processor.state import LogitsProcessors
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
+from vllm_omni.worker.v1_compat.sample_ops.topk_topp_sampler import random_sample
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1134,7 +1134,7 @@ def test_full_response_adapter_uses_live_prefill_then_empty_decode(monkeypatch):
     runner.model = model
     runner._build_model_kwargs_extra = lambda: {}
     # Replay the same graph tensor while the live conditioning changes.
-    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: hidden)
+    monkeypatch.setattr(V1GPUModelRunnerMixin, "_model_forward", lambda *_args, **_kwargs: hidden)
     model._conditioning_request_rows = [1]
     model._conditioning_request_count = 2
     prompt = torch.tensor([[7, 8]])
@@ -1357,7 +1357,7 @@ def test_runner_commits_deferred_rng_once_before_sampling(mocker, route, has_com
     runner.sampler = fallback
     runner._sampling_metadata_for_model_sampler = lambda smd: smd
     runner._apply_duplex_sampling = lambda *args: events.append("duplex")
-    mocker.patch.object(GPUModelRunner, "_sample", side_effect=speculative)
+    mocker.patch.object(V1GPUModelRunnerMixin, "_sample", side_effect=speculative)
     result = runner._sample(torch.zeros(1, 2), object() if route == "speculative" else None)
     expected_events = ["commit"] if has_commit else []
     if route == "speculative":

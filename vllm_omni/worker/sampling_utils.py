@@ -7,7 +7,8 @@ from typing import Any, Protocol
 import torch
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.logits_processor import LogitsProcessors, MinTokensLogitsProcessor
+
+from vllm_omni.worker.v1_compat.logits_processor import LogitsProcessors, MinTokensLogitsProcessor
 
 logger = init_logger(__name__)
 

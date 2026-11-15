@@ -7,11 +7,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.v1.worker import gpu_input_batch
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.v1_compat import input_batch as gpu_input_batch
+from vllm_omni.worker.v1_compat.gpu_model_runner import V1GPUModelRunnerMixin as GPUModelRunner
+from vllm_omni.worker.v1_compat.input_batch import CachedRequestState, InputBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

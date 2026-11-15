@@ -52,10 +52,17 @@ apply_img2img_mm_prefix_patch()
 # Omni's deploy config selects a runner per stage. vLLM 0.31's config property
 # otherwise defaults to v2 independently of the runner selected by our workers,
 # making shared consumers such as InputProcessor choose the wrong API.
-_runner_property = _OriginalVllmConfig.use_v2_model_runner
-if not getattr(_runner_property.fget, "_omni_stage_runner", False):
+# vLLM 0.34 (aac1b2a4f3, Remove Model Runner V1) deleted the upstream flag:
+# when it is gone, Omni installs the property itself. Non-omni configs only
+# have MRv2 upstream, so they report True; omni stages keep routing from
+# OmniModelConfig.use_v2_model_runner, which stage_config derives from
+# DeployConfig.model_runner — one source of truth, no drift possible.
+_runner_property = getattr(_OriginalVllmConfig, "use_v2_model_runner", None)
+_original_runner_fget = _runner_property.fget if _runner_property is not None else None
 
-    def _patched_use_v2_model_runner(self, _upstream=_runner_property.fget):
+if _original_runner_fget is not None and not getattr(_original_runner_fget, "_omni_stage_runner", False):
+
+    def _patched_use_v2_model_runner(self, _upstream=_original_runner_fget):
         # Lazy import keeps the package's patch/config initialization acyclic.
         from vllm_omni.config.model import OmniModelConfig
 
@@ -65,6 +72,55 @@ if not getattr(_runner_property.fget, "_omni_stage_runner", False):
 
     setattr(_patched_use_v2_model_runner, "_omni_stage_runner", True)
     _OriginalVllmConfig.use_v2_model_runner = property(_patched_use_v2_model_runner)
+elif _runner_property is None and not hasattr(_OriginalVllmConfig, "use_v2_model_runner"):
+
+    def _omni_only_use_v2_model_runner(self):
+        from vllm_omni.config.model import OmniModelConfig
+
+        if isinstance(self.model_config, OmniModelConfig):
+            return self.model_config.use_v2_model_runner
+        return True
+
+    setattr(_omni_only_use_v2_model_runner, "_omni_stage_runner", True)
+    _OriginalVllmConfig.use_v2_model_runner = property(_omni_only_use_v2_model_runner)
+
+
+# =============================================================================
+# Patch VllmConfig._resolve_extensible_kv_cache for Omni's V1-compat stages
+# =============================================================================
+# WHY: v0.34 auto-enables the extensible KV cache on CUDA when unset
+# (`VllmConfig._resolve_extensible_kv_cache`). The extensible cache is a
+# Model Runner V2 feature (driver-mapped cache, `extensible_kv_cache`,
+# block-committing warmup); Omni's V1-compat stages (use_v2_model_runner
+# False) allocate the KV cache upfront in the vendored V1 runner and would
+# die at `initialize_kv_cache(..., extensible=True)`. Settle it off for
+# those stages when it was only auto-enabled; an explicit request fails
+# loudly like any other unsupported combination upstream.
+_resolve_extensible = getattr(_OriginalVllmConfig, "_resolve_extensible_kv_cache", None)
+
+if _resolve_extensible is not None and not getattr(_resolve_extensible, "_omni_v1_stage_guard", False):
+
+    def _patched_resolve_extensible_kv_cache(self, _upstream=_resolve_extensible):
+        # Lazy import keeps the package's patch/config initialization acyclic.
+        from vllm_omni.config.model import OmniModelConfig
+
+        requested = self.cache_config.enable_extensible_kv_cache
+        _upstream(self)
+        if (
+            isinstance(self.model_config, OmniModelConfig)
+            and not self.model_config.use_v2_model_runner
+            and self.cache_config.enable_extensible_kv_cache
+        ):
+            if requested is not None:
+                raise ValueError(
+                    "enable_extensible_kv_cache: the V1 model runner allocates the "
+                    "KV cache upfront and does not support an extensible cache."
+                )
+            self.cache_config.enable_extensible_kv_cache = False
+
+    setattr(_patched_resolve_extensible_kv_cache, "_omni_v1_stage_guard", True)
+    _OriginalVllmConfig._resolve_extensible_kv_cache = _patched_resolve_extensible_kv_cache
+
 
 # =============================================================================
 # Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
@@ -773,7 +829,9 @@ def _patch_batched_seeded_random_sample() -> None:
     try:
         import inspect
 
-        from vllm.v1.sample.ops import topk_topp_sampler as sampler_ops
+        # Upstream dropped v1.sample.ops.random_sample at the pin; omni's V1
+        # sample stack runs from the vendored v1_compat module.
+        from vllm_omni.worker.v1_compat.sample_ops import topk_topp_sampler as sampler_ops
     except ImportError:
         return
     original = getattr(sampler_ops, "random_sample", None)

@@ -6,8 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.worker.gpu_input_batch import InputBatch
-from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
 
 from tests.helpers.mark import hardware_test
 from tests.model_executor.models.cosyvoice3.test_cosyvoice3_model_helpers import (
@@ -21,6 +19,8 @@ from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Mode
 from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import commit_rejection_rng, conditional_sample
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.gpu_ar_model_runner import _SamplingFeedbackOutput
+from vllm_omni.worker.v1_compat.async_output import AsyncGPUModelRunnerOutput
+from vllm_omni.worker.v1_compat.input_batch import InputBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA")]
 

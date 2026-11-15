@@ -19,7 +19,7 @@ import torch
 from vllm_omni.core.prefix_cache.interface import ModelCachePolicy, OmniPrefixCacheUnmatchError, PrefixCacheConfig
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.gpu_input_batch import InputBatch
+    from vllm_omni.worker.v1_compat.input_batch import InputBatch
 
 
 class FullAttentionGroupView:

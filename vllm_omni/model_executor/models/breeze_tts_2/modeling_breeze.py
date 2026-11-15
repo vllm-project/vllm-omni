@@ -13,7 +13,6 @@ from vllm.config import VllmConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.sequence import IntermediateTensors
-from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_omni.config.model import OmniModelConfig
@@ -27,6 +26,7 @@ from vllm_omni.model_executor.models.breeze_tts_2.text_encoder_graph import (
     BreezeTextEncoderGraph,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
 
 
 class BreezeSampling(TypedDict):

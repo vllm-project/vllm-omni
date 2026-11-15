@@ -44,8 +44,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import Embeddings, HiddenStates, Ids, OmniPayload, OmniPayloadMeta
 from vllm_omni.metrics import definitions as defs
@@ -69,6 +67,8 @@ from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, 
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import to_device_nonblocking
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
+from vllm_omni.worker.v1_compat.sampler import Sampler
 
 # Voice used when a request names no speaker. Matches the reference
 # ``Qwen3OmniMoeForConditionalGeneration.generate(speaker="Ethan")``; the

@@ -29,7 +29,6 @@ from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_p
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni import Qwen2_5OmniForConditionalGeneration
@@ -40,6 +39,7 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerProcessingInfo,
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
+from vllm_omni.worker.v1_compat.sampler import Sampler
 
 logger = init_logger(__name__)
 

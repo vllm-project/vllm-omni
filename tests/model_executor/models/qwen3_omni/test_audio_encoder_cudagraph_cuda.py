@@ -190,11 +190,11 @@ def test_replay_metadata_does_not_read_the_device(encoder):
 
 
 def test_captured_graphs_match_eager_and_keep_previous_outputs(encoder):
-    from vllm.compilation.monitor import set_cudagraph_capturing_enabled
     from vllm.distributed.parallel_state import graph_capture
     from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 
     from vllm_omni.worker.encoder_cudagraph import SingleReplayEncoderCudaGraphManager
+    from vllm_omni.worker.v1_compat.misc import set_cudagraph_capturing_enabled
 
     assert supports_encoder_cudagraph(encoder)
     manager = SingleReplayEncoderCudaGraphManager(encoder.vllm_config, torch.device("cuda"), DTYPE, encoder)

@@ -17,13 +17,13 @@ import pytest
 import torch
 import vllm.config
 import vllm.v1.worker.gpu.model_runner as upstream_v2
-import vllm.v1.worker.gpu_model_runner as upstream_v1
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
 
 import vllm_omni.worker.gpu_ar_model_runner as ar_runner_module
+import vllm_omni.worker.v1_compat.gpu_model_runner as upstream_v1
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner as OmniV1Runner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner as OmniV2Runner
@@ -93,7 +93,7 @@ class _NullContext:
 
 def test_v1_profile_adds_the_talker_mtp_graphs_and_restores_the_runner(monkeypatch, device_memory):
     runner, wrapper, events = _make_v1_runner(monkeypatch, device_memory, mtp_size=GIB // 2)
-    monkeypatch.setattr(upstream_v1.GPUModelRunner, "profile_cudagraph_memory", lambda self: 3 * GIB)
+    monkeypatch.setattr(upstream_v1.V1GPUModelRunnerMixin, "profile_cudagraph_memory", lambda self: 3 * GIB)
     captured_before = compilation_counter.num_cudagraph_captured
 
     assert runner.profile_cudagraph_memory() == 3 * GIB + GIB // 2
@@ -142,7 +142,7 @@ def test_v1_profile_leaves_the_full_sizes_to_upstream_for_talker_models(monkeypa
 
 def test_v1_capture_reports_the_talker_mtp_graphs(monkeypatch, device_memory):
     runner, _, events = _make_v1_runner(monkeypatch, device_memory, mtp_size=GIB // 4)
-    monkeypatch.setattr(upstream_v1.GPUModelRunner, "capture_model", lambda self: 2 * GIB)
+    monkeypatch.setattr(upstream_v1.V1GPUModelRunnerMixin, "capture_model", lambda self: 2 * GIB)
 
     assert runner.capture_model() == 2 * GIB + GIB // 4
     assert events == [("capture", "global-pool", False)]
@@ -151,7 +151,7 @@ def test_v1_capture_reports_the_talker_mtp_graphs(monkeypatch, device_memory):
 def test_v1_capture_without_talker_mtp_graphs_measures_nothing(monkeypatch, device_memory):
     runner, _, events = _make_v1_runner(monkeypatch, device_memory, mtp_size=GIB)
     runner.has_talker_mtp = False
-    monkeypatch.setattr(upstream_v1.GPUModelRunner, "capture_model", lambda self: 2 * GIB)
+    monkeypatch.setattr(upstream_v1.V1GPUModelRunnerMixin, "capture_model", lambda self: 2 * GIB)
     monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *args, **kwargs: pytest.fail("nothing to measure"))
 
     assert runner.capture_model() == 2 * GIB
@@ -165,8 +165,9 @@ class _RecordingWrapper(CUDAGraphWrapper):
 
 def _make_capture_runner(monkeypatch, *, model=None, entries=()):
     """Sizes 1 and 2 dispatch to FULL graphs here, size 4 does not."""
-    import vllm.compilation.monitor as monitor
     import vllm.distributed.parallel_state as parallel_state
+
+    import vllm_omni.worker.v1_compat.misc as monitor
 
     runner = object.__new__(GPUARModelRunner)
     wrapper = object.__new__(_RecordingWrapper)
@@ -314,10 +315,10 @@ def test_v2_mtp_capture_restores_the_capturing_flag_while_profiling(
     """MRv2 leaves CUDA graph capturing enabled for its own capture. The MTP
     capture also runs inside the profiling pass, before that real capture, so
     there it restores the flag; after the real capture it disables it as before."""
-    import vllm.compilation.monitor as monitor
     import vllm.distributed.parallel_state as parallel_state
     import vllm.forward_context as forward_context
 
+    import vllm_omni.worker.v1_compat.misc as monitor
     from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
     from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 

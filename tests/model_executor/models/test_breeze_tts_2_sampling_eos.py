@@ -9,10 +9,10 @@ import yaml
 from vllm import SamplingParams
 from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.request import Request, RequestStatus
-from vllm.v1.sample.logits_processor import BatchUpdate, MinTokensLogitsProcessor
 
 from vllm_omni.config.stage_config import merge_sampling_constraints
 from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
+from vllm_omni.worker.v1_compat.logits_processor import BatchUpdate, MinTokensLogitsProcessor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

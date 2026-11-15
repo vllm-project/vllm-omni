@@ -7,7 +7,6 @@ from unittest.mock import patch
 
 import pytest
 from vllm.config import CUDAGraphMode
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.cudagraph.moe_routing_compat import ensure_moe_specialty_runner_compatible
 from vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2 import (
@@ -20,6 +19,7 @@ from vllm_omni.worker.gpu_ar_worker import (
     resolve_gpu_ar_model_runner_cls,
 )
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.v1_compat.gpu_model_runner import V1GPUModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -135,7 +135,7 @@ def test_v1_load_model_ensures_compat_after_model_sets_flag(monkeypatch):
         order.append("ensure")
         ensure_moe_specialty_runner_compatible(self)
 
-    monkeypatch.setattr(GPUModelRunner, "load_model", _super_load)
+    monkeypatch.setattr(V1GPUModelRunnerMixin, "load_model", _super_load)
     monkeypatch.setattr(OmniGPUModelRunner, "_ensure_moe_specialty_runner_compatible", _ensure)
     for name in (
         "_snapshot_prefix_cache_model_policy",

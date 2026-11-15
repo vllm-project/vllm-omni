@@ -94,6 +94,16 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     invalid_logits_req_ids: set[str] = field(default_factory=set)
     # Request-local model failures, materialized after asynchronous D2H.
     request_errors: dict[str, str] | None = None
+    # The baseline ModelRunnerOutput carried req_id -> index; vLLM 0.34 removed
+    # it (the scheduler derives the mapping from req_ids). Omni's MRv1 stage
+    # runners and consumers still build and read the explicit mapping, so the
+    # omni subclass restores the field: explicit values win, otherwise it is
+    # derived from req_ids (the pin's invariant).
+    req_id_to_index: dict[str, int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.req_id_to_index is None:
+            self.req_id_to_index = {req_id: index for index, req_id in enumerate(self.req_ids)}
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":

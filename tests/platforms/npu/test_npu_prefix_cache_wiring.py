@@ -74,6 +74,7 @@ def test_execute_model_state_keeps_prefix_cache_sid_last():
         "cudagraph_stats",
         "batch_desc",
         "multimodal_outputs",
+        "slot_mappings",
         "prefix_cache_step_id",
     ]
     gpu_fields = _named_tuple_fields(_GPU_RUNNER, "ExecuteModelState")

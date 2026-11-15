@@ -13,7 +13,7 @@ import torch
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.gpu_input_batch import InputBatch
+    from vllm_omni.worker.v1_compat.input_batch import InputBatch
 
 logger = init_logger(__name__)
 

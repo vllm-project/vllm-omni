@@ -31,7 +31,6 @@ from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext, LogitsProcessor
@@ -71,6 +70,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 from vllm_omni.utils.seeded_exponential import fill_exponential_rows, fill_exponential_steps
+from vllm_omni.worker.v1_compat.sampler import Sampler
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 from vllm_omni.worker_v2.warmup import is_warmup_request
 

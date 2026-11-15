@@ -1723,6 +1723,7 @@ def test_context_overflow_emits_an_error_output_with_the_reason() -> None:
 @pytest.mark.parametrize("native", [True, False])
 def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, native) -> None:
     sched = _make_scheduler(stage_id=1)
+    sched.prev_step_scheduled_req_ids = set()
     parked = SimpleNamespace(request_id="parked")
     sched.requests = {"parked": parked}
     sched.waiting = []
@@ -1757,7 +1758,7 @@ def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, nati
 
     def fake_schedule(self, _throttle_prefills=False):
         observed_limits.append(self.max_num_active_reqs)
-        return SimpleNamespace(scheduled_new_reqs=[])
+        return SchedulerOutput.make_empty()
 
     monkeypatch.setattr(VLLMScheduler, "schedule", fake_schedule)
 

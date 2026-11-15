@@ -29,7 +29,7 @@ def prepare_mamba_prefix_cache(
     if not getattr(policy, "native_kv_cache_only", False) or runner.cache_config.mamba_cache_mode != "align":
         return deferred_state_corrections_fn
 
-    from vllm.v1.worker import mamba_utils
+    from vllm_omni.worker.v1_compat import mamba_utils
 
     if deferred_state_corrections_fn:
         deferred_state_corrections_fn()

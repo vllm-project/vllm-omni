@@ -30,8 +30,6 @@ from vllm.multimodal.audio import AudioResampler
 from vllm.multimodal.media.audio import load_audio
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
@@ -42,6 +40,8 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     STEP_AUDIO2_DEFAULT_PROMPT_WAV,
     STREAM_SOURCE_CACHE_LEN,
 )
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
+from vllm_omni.worker.v1_compat.sampler import Sampler
 
 logger = init_logger(__name__)
 

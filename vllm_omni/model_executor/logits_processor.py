@@ -3,7 +3,7 @@
 
 """Request-controlled logits processors."""
 
-from vllm.v1.sample.logits_processor.interface import (
+from vllm_omni.worker.v1_compat.logits_processor.interface import (
     LogitsProcessor,
     MoveDirectionality,
 )

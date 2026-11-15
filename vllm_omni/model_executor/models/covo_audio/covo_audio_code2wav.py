@@ -10,8 +10,9 @@ import torch
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
+
+from vllm_omni.worker.v1_compat.metadata import SamplingMetadata
+from vllm_omni.worker.v1_compat.sampler import Sampler
 
 from .config_covo_audio import CovoAudioCode2WavConfig
 from .token2wav import JsonHParams, Token2WavDecoder

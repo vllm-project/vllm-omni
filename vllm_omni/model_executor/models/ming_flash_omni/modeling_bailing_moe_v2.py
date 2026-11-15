@@ -59,10 +59,10 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMoeV2Config
+from vllm_omni.worker.v1_compat.sampler import Sampler
 
 logger = init_logger(__name__)
 
