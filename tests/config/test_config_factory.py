@@ -3318,7 +3318,7 @@ class TestPlatformOverrides:
             ("fish_qwen3_omni.yaml", "fish_qwen3_omni", "v2", ()),
             ("fish_qwen3_omni_2gpu.yaml", "fish_qwen3_omni", "v2", ()),
             ("fish_qwen3_omni_high_concurrency_single_gpu.yaml", "fish_qwen3_omni", "v2", ()),
-            ("fish_qwen3_omni_high_concurrency_dual_gpu.yaml", "fish_qwen3_omni", "v2", ()) ,
+            ("fish_qwen3_omni_high_concurrency_dual_gpu.yaml", "fish_qwen3_omni", "v2", ()),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
