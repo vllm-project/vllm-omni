@@ -75,7 +75,7 @@ def _assert_text_200(client: Any, model: str) -> None:
 
 class MiniCPMO45(FaultModel):
     model_id = "minicpmo_4_5"
-    res = {"cuda": "H100"}
+    res = {"cuda": "H100", "rocm": "MI325"}
     num_cards = 1
     extra_marks = (pytest.mark.omni,)
     scenarios = [

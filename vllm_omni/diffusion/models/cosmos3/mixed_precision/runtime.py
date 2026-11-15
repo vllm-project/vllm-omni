@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Literal
 
 import torch
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.models.utils import PPMissingLayer
 
@@ -17,6 +19,8 @@ from .strategy import (
     Fp8W8A8W8A16Strategy,
     Nvfp4W4A4W4A16Strategy,
 )
+
+logger = init_logger(__name__)
 
 PrecisionPath = Literal["reasoner", "generation"]
 _STRATEGIES: tuple[Cosmos3PrecisionStrategy, ...] = (
@@ -91,7 +95,7 @@ class Cosmos3MixedPrecisionRuntime:
         if self.config.reasoner == "a16" and not isinstance(transformer.language_model, PPMissingLayer):
             components["reasoner"] = transformer.language_model.layers
 
-        wrapped_count = 0
+        wrapped_counts: Counter[str] = Counter()
         for path, component in components.items():
             for local_name, layer in component.named_modules():
                 if not isinstance(layer, LinearBase):
@@ -108,10 +112,16 @@ class Cosmos3MixedPrecisionRuntime:
                     module_name,
                     path,
                 )
-                wrapped_count += 1
+                wrapped_counts[strategy.format_name] += 1
 
-        if not wrapped_count:
+        if not wrapped_counts:
             raise ValueError("Cosmos3 mixed precision found no compatible FP8 or NVFP4 ModelOpt linears")
+
+        logger.info(
+            "Cosmos3 mixed precision wrapped linears: fp8=%d, nvfp4=%d",
+            wrapped_counts["fp8"],
+            wrapped_counts["nvfp4"],
+        )
 
     def use_high_precision(self, path: PrecisionPath) -> bool:
         return self.config.reasoner == "a16" if path == "reasoner" else self._generation_high_precision

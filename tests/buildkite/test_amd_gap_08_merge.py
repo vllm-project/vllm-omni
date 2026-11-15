@@ -23,7 +23,7 @@ GROUPS = (("voice-clone", 4),)
 def test_gap_08_selects_bounded_advanced_rocm_cases() -> None:
     step = _find_step(LABEL, AMD_MERGE_PIPELINE)
     assert step["agent_pool"] == "mi300_1"
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 75
     assert step["source_file_dependencies"]
     assert step["artifact_paths"] == ["artifacts/rocm-merge-drama3-voice-clone/**/*"]
@@ -32,7 +32,7 @@ def test_gap_08_selects_bounded_advanced_rocm_cases() -> None:
     assert len(executions) == len(GROUPS)
     assert "diff -u" in collection
     for command in [collection, *executions]:
-        assert "-m 'advanced_model and tts and rocm and MI325 and cards_1'" in command
+        assert "-m 'slow and tts and rocm and MI325 and cards_1'" in command
         assert "--run-level advanced_model" in command
         assert "--shard-id=0 --num-shards=1" in command
     for node in NODES:

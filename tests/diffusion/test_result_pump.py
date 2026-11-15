@@ -27,6 +27,8 @@ def _make_executor(step_execution=False):
     """Create a minimal MultiprocDiffusionExecutor-like object with pump state."""
     od_config = MagicMock()
     od_config.step_execution = step_execution
+    # OmniDiffusionConfig defaults this to None; a MagicMock attribute would be parsed as a schedule.
+    od_config.diffusion_attention_schedule = None
 
     executor = object.__new__(MultiprocDiffusionExecutor)
     executor.od_config = od_config
@@ -1002,3 +1004,49 @@ def test_request_rpc_exception_keeps_metadata_for_every_request(monkeypatch, moc
         assert item.result.error_status_code == status_code
         assert item.result.error_type == ("ScheduleError" if status_code is not None else None)
     assert executor.collective_rpc.call_count == (1 if dp_wave else 2)
+
+
+def test_dp_wave_key_resolves_attention_schedules_against_the_service(monkeypatch, mocker):
+    """The wave check must build the scheduler's key, which resolves each request's schedule.
+
+    Without the service config, explicit ranges would be resolved against no profiles and rejected,
+    failing a wave the scheduler formed. Mirrors the Ray executor test of the same name.
+    """
+    executor = _make_executor()
+    service = object()
+    executor.od_config.diffusion_attention_schedule = service
+    monkeypatch.setattr(executor_module, "any_selected_component_uses_allgather", lambda config: True)
+    monkeypatch.setattr(executor_module, "_uses_text_encoder_allgather", lambda config: False)
+    received: list[object] = []
+
+    def _recording_key(req, attention_schedule_config=None):
+        received.append(attention_schedule_config)
+        return ()
+
+    monkeypatch.setattr(executor_module, "build_request_batch_sampling_params_key", _recording_key)
+    # The wave fails after the compatibility check; only the key builder's arguments matter here.
+    executor.collective_rpc = mocker.Mock(side_effect=RuntimeError("worker failed"))
+    new_reqs = [
+        NewRequestData(
+            request_id=name,
+            req=OmniDiffusionRequest(
+                request_id=name,
+                prompt={"prompt": "a test"},
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4),
+            ),
+        )
+        for name in ("first", "second")
+    ]
+    sched = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=new_reqs,
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=len(new_reqs),
+        num_waiting_reqs=0,
+    )
+
+    executor.execute_request(sched)
+
+    assert received == [service, service]
+    executor.collective_rpc.assert_called_once()

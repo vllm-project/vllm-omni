@@ -261,6 +261,11 @@ has a single live owner at a time, so concurrent same-shape requests never
 overwrite each other's prefix. Those buffers require additional memory; graph
 entries are bounded by the transformer's cache limit.
 
+Each captured graph owns its private memory pool, so dropping idle entries
+cannot leave later captures reusing a pool whose last graph was destroyed.
+Capture failures restore the caller's CUDA stream before falling back to
+eager decode, preserving output ordering across consecutive requests.
+
 ### Verification
 
 For a direct API smoke test:
@@ -352,6 +357,15 @@ all-layer FP8. On H200, all-layer FP8 is both leaner and faster than BF16
 at this shape.
 
 ## Quantization
+
+For attention MXFP8 on Ascend, explicitly retain BF16 structural prefill with
+`diffusion_kv_cache_skip_steps: "0"` alongside
+`diffusion_kv_cache_dtype: mxfp8` in a deploy YAML. Pass the file to the
+offline script with `--deploy-config`. The skip selector applies to zero-based
+denoising steps in both whole-request and step-wise execution. See the
+[attention quantization configuration](../../docs/user_guide/quantization/quantized_kvcache.md#qwen-image-21-on-ascend)
+for a complete command and the mask, runtime and quality limitations. This
+setting is independent of the Linear quantization below.
 
 Online FP8 is supported per component via `quantization_config`:
 

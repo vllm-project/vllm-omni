@@ -1,14 +1,14 @@
-# CausVid Wan 2.1 1.3B (Noisy KV)
+# CausVid Wan 2.1 1.3B (Noisy PP)
 
 > Experimental: run [CausVid](https://github.com/tianweiy/CausVid) Wan 2.1 T2V
-> 1.3B student weights on Omni's Cell / Noisy KV path (Self-Forcing / Latest-KV).
+> 1.3B student weights on Omni's Cell / Noisy PP path (Self-Forcing / Latest-KV).
 
 ## Summary
 
 - Student DiT: `tianweiy/CausVid` → `autoregressive_checkpoint/model.pt`
 - Codec (T5 / VAE): official `Wan-AI/Wan2.1-T2V-1.3B` via Diffusers layout
   `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` (Omni needs Diffusers; same Wan-AI weights)
-- Engine: `ARDiffusionEngine` + `CausVidWanPipeline` (Cell / Noisy KV stack)
+- Engine: `ARDiffusionEngine` + `CausVidWanPipeline` (Cell / Noisy PP stack)
 - Defaults: `num_denoise_steps=3` (`D`), `shift=8.0`
 - Schedule ↔ topology:
 
