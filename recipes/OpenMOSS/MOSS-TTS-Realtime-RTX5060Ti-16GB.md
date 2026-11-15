@@ -38,9 +38,11 @@ One desktop GPU, 16,311MiB; native Linux, 28GiB container RAM limit.
 
 ## Checkpoints and deployment
 
-Apply #10345 before using this configuration until that prerequisite is merged.
-The results below belong to the pinned source and evidence patch; GPU inference
-has not been rerun on the current rebased PR head.
+The concurrency, memory and quality tables below were measured on `0c6328ed`
+plus the frozen evidence patch. A separate c1 smoke tested `e058eca1` with
+PR #10345 at `c8ed377d` applied (`ad9c3c28` combined): 20/20 requests completed,
+with first-audio p50 1.388 s and EOF RTF p50 1.044. See the
+[smoke results and logs](https://github.com/RongHuang14/vllm-omni/releases/download/a7-moss-realtime-16gb-evidence-v1/moss-a7-current-head-c1-smoke-c8ed377.tar.gz).
 
 Run from the repository root in a matching vLLM environment. Pin the Talker
 and codec so the API reference encoder and worker use identical weights:
