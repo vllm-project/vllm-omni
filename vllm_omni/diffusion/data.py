@@ -2404,11 +2404,16 @@ class AttentionSpec:
                 f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
                 f"backend={self.backend!r}. Remove quant or set a supported backend."
             )
-        if self.fastvideo_vsa_provider not in ("auto", "fastvideo", "flashinfer", "cudnn", "triton"):
-            raise ValueError("fastvideo_vsa_provider must be auto, fastvideo, flashinfer, cudnn or triton")
+        if self.fastvideo_vsa_provider not in ("auto", "fastvideo", "flashinfer", "cudnn", "triton", "ark"):
+            raise ValueError("fastvideo_vsa_provider must be auto, fastvideo, flashinfer, cudnn, triton or ark")
         if self.fastvideo_vsa_precision not in ("bf16", "sage"):
             raise ValueError("fastvideo_vsa_precision must be bf16 or sage")
-        if self.fastvideo_vsa_precision == "sage" and self.fastvideo_vsa_provider in ("fastvideo", "cudnn", "triton"):
+        if self.fastvideo_vsa_precision == "sage" and self.fastvideo_vsa_provider in (
+            "fastvideo",
+            "cudnn",
+            "triton",
+            "ark",
+        ):
             raise ValueError("Sage VSA precision requires the FlashInfer provider")
         if self.backend.upper() != "FASTVIDEO_VSA" and (
             self.fastvideo_vsa_provider not in ("auto", "fastvideo") or self.fastvideo_vsa_precision != "bf16"

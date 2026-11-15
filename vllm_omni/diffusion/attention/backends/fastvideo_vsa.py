@@ -119,19 +119,26 @@ class FastVideoVSABackend(AttentionBackend):
         # FastVideo accepts variable-sized edge blocks. This lets packed
         # [real, pad] inputs run on their valid prefix without materializing an
         # attention mask; the implementation restores the ignored pad rows.
-        # Only forward_cuda honours packed_padding: every other platform hands
-        # the tensors straight to SDPA, which reads attn_mask and nothing else,
-        # so the pad rows would be attended as real keys.
+        # CUDA FastVideo, the XPU ARK path, and the XPU SDPA fallback honour
+        # packed_padding. NPU/MUSA still hand the tensors straight to SDPA,
+        # which reads attn_mask and nothing else, so pad rows would be attended
+        # as real keys there.
+        if current_omni_platform.is_xpu():
+            from vllm_omni.diffusion.attention.ops.ark_block_sparse import supports_ark_sparse
+
+            return supports_ark_sparse()
         return current_omni_platform.is_cuda()
 
     @classmethod
     def validate_available(cls) -> None:
-        if all(importlib.util.find_spec(name) is None for name in ("fastvideo_kernel", "flashinfer", "cudnn")):
+        if all(
+            importlib.util.find_spec(name) is None
+            for name in ("fastvideo_kernel", "flashinfer", "cudnn", "auto_round_kernel")
+        ):
             raise ImportError(
-                "FASTVIDEO_VSA requires the optional fastvideo-kernel package "
-                "included in vllm-omni[vsa]. Install with `uv pip install 'vllm-omni[vsa]'` "
-                "(from source: `uv pip install -e '.[vsa]'`). "
-                "Prebuilt kernels require Linux, Python 3.12 and glibc >= 2.34."
+                "FASTVIDEO_VSA requires fastvideo-kernel on CUDA or auto-round-lib with "
+                "block_sparse_sdpa on XPU. Install the `vsa` extra on CUDA "
+                "(`uv pip install -e '.[vsa]'`) or install auto-round-lib for XPU."
             )
 
     @staticmethod
@@ -175,16 +182,16 @@ class FastVideoVSAImpl(AttentionImpl):
 
         self.provider = backend_kwargs.get("provider", "auto")
         self.precision = backend_kwargs.get("precision", "bf16")
-        if self.provider not in ("auto", "fastvideo", "flashinfer", "cudnn", "triton") or self.precision not in (
+        if self.provider not in ("auto", "fastvideo", "flashinfer", "cudnn", "triton", "ark") or self.precision not in (
             "bf16",
             "sage",
         ):
-            raise ValueError("VSA requires provider auto/fastvideo/flashinfer/cudnn/triton and precision bf16/sage")
-        if self.provider in ("cudnn", "triton") and not self._supports_tile64_provider:
+            raise ValueError("VSA requires provider auto/fastvideo/flashinfer/cudnn/triton/ark and precision bf16/sage")
+        if self.provider in ("cudnn", "triton", "ark") and not self._supports_tile64_provider:
             raise ValueError(f"{self.provider} VSA requires an implementation with explicit block routing")
         if self.provider == "auto" and not self._supports_tile64_provider:
             self.provider = "fastvideo"
-        if self.precision == "sage" and self.provider in ("fastvideo", "cudnn", "triton"):
+        if self.precision == "sage" and self.provider in ("fastvideo", "cudnn", "triton", "ark"):
             raise ValueError("Sage VSA requires the FlashInfer provider")
         if self.provider == "flashinfer":
             from vllm_omni.diffusion.attention.ops.flashinfer_block_sparse import require_flashinfer_sparse
@@ -446,7 +453,7 @@ class FastVideoVSAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        return self.sdpa_fallback.forward_xpu(query, key, value, attn_metadata)
+        return self._fallback(query, key, value, attn_metadata, "XPU VSA execution is using SDPA")
 
     def forward_musa(
         self,

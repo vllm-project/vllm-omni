@@ -256,3 +256,32 @@ def test_sdpa_fallback_never_attends_the_structural_padding(monkeypatch):
     assert baseline.shape == query.shape
     torch.testing.assert_close(baseline[:, :valid], perturbed[:, :valid])
     assert torch.count_nonzero(baseline[:, valid:]) == 0
+
+
+def test_xpu_sdpa_fallback_never_attends_the_structural_padding(monkeypatch):
+    impl = FastVideoVSAImpl(
+        num_heads=2,
+        head_size=8,
+        softmax_scale=8**-0.5,
+        backend_kwargs={"topk": 1, "min_seq_len": 4096},
+    )
+    valid = 40
+    torch.manual_seed(0)
+    query = torch.randn(1, 64, 2, 8)
+    padding = PackedPaddingMetadata(
+        q_length=valid,
+        kv_length=valid,
+        cu_seqlens_q=torch.tensor([0, valid], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, valid], dtype=torch.int32),
+    )
+    monkeypatch.setattr(impl.sdpa_fallback, "forward", impl.sdpa_fallback.forward_cuda)
+
+    baseline = impl.forward_xpu(query, query, query, AttentionMetadata(packed_padding=padding, extra={}))
+    perturbed_input = query.clone()
+    perturbed_input[:, valid:] += 100.0
+    perturbed = impl.forward_xpu(
+        perturbed_input, perturbed_input, perturbed_input, AttentionMetadata(packed_padding=padding, extra={})
+    )
+
+    torch.testing.assert_close(baseline[:, :valid], perturbed[:, :valid])
+    assert torch.count_nonzero(baseline[:, valid:]) == 0

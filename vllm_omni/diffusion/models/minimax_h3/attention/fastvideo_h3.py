@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import math
+from collections.abc import Callable
 
 import torch
 from vllm.logger import init_logger
@@ -268,12 +269,14 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
             ).view_as(output)
         return output[:, untile].contiguous()
 
-    def forward_cuda(
+    def _forward_h3_device(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
+        *,
+        fallback: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, AttentionMetadata | None], torch.Tensor],
     ) -> torch.Tensor:
         requires_tile128 = attn_metadata is not None and attn_metadata.extra.get("vsa_h3_tile_size", 64) == 128
         requires_sparse = requires_tile128 or (
@@ -282,7 +285,7 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
         if _get_h3_layout(attn_metadata) is None:
             if requires_sparse:
                 raise ValueError("FastH3 requires complete packed video layout metadata")
-            return super().forward_cuda(query, key, value, attn_metadata)
+            return fallback(query, key, value, attn_metadata)
 
         provider = resolve_block_sparse_provider(
             self.provider,
@@ -325,3 +328,21 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
             return self._fallback(
                 original_query, original_key, original_value, attn_metadata, f"VSA-H3 kernel failed: {exc}"
             )
+
+    def forward_cuda(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        return self._forward_h3_device(query, key, value, attn_metadata, fallback=super().forward_cuda)
+
+    def forward_xpu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        return self._forward_h3_device(query, key, value, attn_metadata, fallback=super().forward_xpu)

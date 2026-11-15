@@ -128,7 +128,7 @@ class TestAttentionSpec:
         spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=96)
         assert spec.backend_kwargs() == {"topk": 96}
 
-    @pytest.mark.parametrize("provider", ["auto", "fastvideo", "flashinfer"])
+    @pytest.mark.parametrize("provider", ["auto", "fastvideo", "flashinfer", "ark"])
     def test_vsa_provider_round_trip_preserves_explicit_selection(self, provider):
         spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_provider=provider)
         assert spec.backend_kwargs() == (None if provider == "auto" else {"provider": provider})

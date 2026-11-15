@@ -218,6 +218,58 @@ def test_h3_forward_restores_rows_the_packed_padding_excludes(monkeypatch):
     assert torch.count_nonzero(output[:, valid:]) == 0
 
 
+@pytest.mark.parametrize(("tile_size", "sparsity"), [(64, 0.8), (128, 0.9)])
+def test_h3_forward_xpu_uses_ark_and_honours_packed_padding(monkeypatch, tile_size, sparsity):
+    calls: dict[str, Any] = {}
+
+    def fake_block_sparse(q, k, v, block_map, block_sizes, softmax_scale, *, provider, precision, block_size):
+        calls.update(
+            q_shape=tuple(q.shape),
+            block_size=block_size,
+            provider=provider,
+            precision=precision,
+            block_sizes=block_sizes.tolist(),
+        )
+        return q + k + v
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.minimax_h3.attention.fastvideo_h3.block_sparse_attn_bshd",
+        fake_block_sparse,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.minimax_h3.attention.fastvideo_h3.resolve_block_sparse_provider",
+        lambda provider, precision, device, dtype, head_size, *, block_size: "ark",
+    )
+    impl = _h3_impl()
+    prefix_segments, video_shape = (5,), (2, 4, 4)
+    valid = sum(prefix_segments) + math.prod(video_shape)
+    padding = PackedPaddingMetadata(
+        q_length=valid,
+        kv_length=valid,
+        cu_seqlens_q=torch.tensor([0, valid], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, valid], dtype=torch.int32),
+    )
+    metadata = _h3_metadata(prefix_segments, video_shape, packed_padding=padding)
+    metadata.extra.update(
+        vsa_h3_tile_size=tile_size,
+        vsa_h3_sparsity=sparsity,
+        vsa_h3_ref_policy="p2_multi_region" if tile_size == 128 else None,
+    )
+    torch.manual_seed(0)
+    query = torch.randn(1, valid + 24, 2, 8, dtype=torch.bfloat16)
+
+    output = impl.forward_xpu(query, query, query, metadata)
+
+    assert output.shape == query.shape
+    assert torch.count_nonzero(output[:, valid:]) == 0
+    assert calls["q_shape"][0] == 1 and calls["q_shape"][2:] == (2, 8)
+    assert calls["q_shape"][1] >= valid and calls["q_shape"][1] % tile_size == 0
+    assert calls["block_size"] == tile_size
+    assert calls["provider"] == "ark"
+    assert calls["precision"] == "bf16"
+    assert all(size <= tile_size for size in calls["block_sizes"])
+
+
 def test_h3_geometry_keeps_prefix_segments_pure_and_tiles_video_3d():
     partition, sizes, non_pad, untile, prefix_blocks, video_blocks = _get_h3_tile_metadata(
         (5, 70, 9), (5, 6, 6), torch.device("cpu")
