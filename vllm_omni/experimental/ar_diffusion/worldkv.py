@@ -133,7 +133,7 @@ class WorldKVConfig:
         if not self.retrieval_frames:
             return
         tokens = tokens_per_frame + math.ceil((chunk_frames - 1) * tokens_per_frame * self.world_keep_ratio)
-        required = 128 + layers * tokens * (2 * heads * dim * itemsize + 16)
+        required = 128 + layers * tokens * 2 * heads * dim * itemsize
         if self.bank_bytes < required:
             raise ValueError(f"worldkv.bank_bytes={self.bank_bytes} cannot fit one compressed chunk ({required} bytes)")
 
@@ -158,14 +158,13 @@ class WorldKVConfig:
         capacity = self.window_frames - self.retrieval_frames
         history = capacity
         publication = 2 * capacity
-        kv = 2 * heads * dim * itemsize
-        row = kv + 16
+        row = 2 * heads * dim * itemsize
         noisy_or_clean = layers * tokens_per_frame * (history + chunk + self.retrieval_frames) * row
         publishing = layers * tokens_per_frame * publication * row
         if self.layerwise_bank_copy and self.retrieval_frames and self.world_keep_ratio == 1:
             # Early D2H borrows pending clones rather than the replacement tail.
             # Their storage may remain in flight while both histories are live.
-            publishing += layers * tokens_per_frame * chunk * kv
+            publishing += layers * tokens_per_frame * chunk * row
         if self.retrieval_frames and self.world_keep_ratio != 1:
             # Uncompressed D2H borrows canonical history. Compressed rows own
             # separate storage until the single in-flight copy completes.
@@ -176,37 +175,32 @@ class WorldKVConfig:
         # Four full-width fp32/fp64 K/V windows bound one layer's gathered
         # rows, scoring intermediates and concatenated attention view.
         # Model activations/backend workspace are charged by the runner.
-        scratch = 4 * self.window_frames * tokens_per_frame * (2 * heads * dim * max(4, itemsize) + 16)
+        scratch = 4 * self.window_frames * tokens_per_frame * 2 * heads * dim * max(4, itemsize)
         if self.reuse_attention_kv:
-            resident += layers * self.window_frames * tokens_per_frame * kv
+            resident += layers * self.window_frames * tokens_per_frame * row
         return resident + scratch
 
 
 @dataclass(frozen=True)
 class MemoryRows:
+    """Attention payload only. Keys already carry their RoPE positions, and
+    frame boundaries of history and bank chunks are known on the host."""
+
     key: torch.Tensor
     value: torch.Tensor
-    positions: torch.Tensor
-    token_ids: torch.Tensor
+
+    @property
+    def tokens(self) -> int:
+        return self.key.shape[1]
 
     def select(self, indices: torch.Tensor) -> MemoryRows:
-        return MemoryRows(
-            self.key[:, indices], self.value[:, indices], self.positions[indices], self.token_ids[indices]
-        )
+        return MemoryRows(self.key[:, indices], self.value[:, indices])
 
     def to_kv_device(self, device: torch.device) -> MemoryRows:
-        """Move attention payload only; retrieval metadata stays on its source device."""
-        return MemoryRows(
-            self.key.to(device, non_blocking=True),
-            self.value.to(device, non_blocking=True),
-            self.positions,
-            self.token_ids,
-        )
+        return MemoryRows(self.key.to(device, non_blocking=True), self.value.to(device, non_blocking=True))
 
     def slice(self, start: int, end: int | None = None) -> MemoryRows:
-        return MemoryRows(
-            self.key[:, start:end], self.value[:, start:end], self.positions[start:end], self.token_ids[start:end]
-        )
+        return MemoryRows(self.key[:, start:end], self.value[:, start:end])
 
 
 def world_compress(rows: MemoryRows, tokens_per_frame: int, keep_ratio: float, score: str) -> MemoryRows:
@@ -216,7 +210,7 @@ def world_compress(rows: MemoryRows, tokens_per_frame: int, keep_ratio: float, s
     dotted with the mean *normalized* anchor. centroid reproduces the released
     code's normalized raw-anchor centroid. Neither materializes T x T scores.
     """
-    count = rows.positions.numel()
+    count = rows.tokens
     if count <= tokens_per_frame or keep_ratio == 1:
         return rows
     dtype = torch.float64 if rows.key.dtype == torch.float64 else torch.float32
@@ -245,9 +239,7 @@ class BankChunk:
     @property
     def nbytes(self) -> int:
         return self.pose.numel() * self.pose.element_size() + sum(
-            tensor.numel() * tensor.element_size()
-            for rows in self.layers
-            for tensor in (rows.key, rows.value, rows.positions, rows.token_ids)
+            tensor.numel() * tensor.element_size() for rows in self.layers for tensor in (rows.key, rows.value)
         )
 
 
@@ -407,7 +399,7 @@ class WorldKV:
         if previous is None or self.config.world_keep_ratio != 1:
             return None
         sink = min(self.config.sink_frames, self.next_frame) * self.tokens_per_frame
-        tail_start = self.next_frame - (previous.positions.numel() - sink) // self.tokens_per_frame
+        tail_start = self.next_frame - (previous.tokens - sink) // self.tokens_per_frame
         if chunk.start < tail_start or chunk.start + chunk.frames > self.next_frame:
             return None
         start = sink + (chunk.start - tail_start) * self.tokens_per_frame
@@ -449,7 +441,7 @@ class WorldKV:
         selected = []
         for index in ranked:
             chunk = candidates[index]
-            cost = max(rows.positions.numel() for rows in chunk.layers)
+            cost = max(rows.tokens for rows in chunk.layers)
             if cost <= budget:
                 selected.append(chunk)
                 budget -= cost
@@ -540,17 +532,8 @@ class WorldKV:
             count = math.prod(shape)
             targets.append(storage[dtype].narrow(0, offsets[dtype], count).view(shape))
             offsets[dtype] += count
-        positions = torch.arange(self.next_frame, self.next_frame + self._frames, device="cpu").repeat_interleave(
-            self.tokens_per_frame
-        )
-        token_ids = torch.arange(
-            self.next_frame * self.tokens_per_frame,
-            (self.next_frame + self._frames) * self.tokens_per_frame,
-            device="cpu",
-        )
         self._staged_bank = tuple(
-            MemoryRows(targets[2 * layer], targets[2 * layer + 1], positions, token_ids)
-            for layer in range(self.num_layers)
+            MemoryRows(targets[2 * layer], targets[2 * layer + 1]) for layer in range(self.num_layers)
         )
 
     def _stage_bank_layer(self, layer: int, source: MemoryRows) -> None:
@@ -632,28 +615,7 @@ class WorldKV:
             offset = offsets[tensor.dtype]
             targets.append(storage[tensor.dtype].narrow(0, offset, tensor.numel()).view(tensor.shape))
             offsets[tensor.dtype] += tensor.numel()
-        # Uncompressed publication is a contiguous current chunk. Build its
-        # immutable metadata once on CPU instead of synchronously reading it
-        # back from every layer. Compressed selections remain layer-specific.
-        positions = token_ids = None
-        if self.config.world_keep_ratio == 1:
-            positions = torch.arange(self.next_frame, self.next_frame + self._frames, device="cpu").repeat_interleave(
-                self.tokens_per_frame
-            )
-            token_ids = torch.arange(
-                self.next_frame * self.tokens_per_frame,
-                (self.next_frame + self._frames) * self.tokens_per_frame,
-                device="cpu",
-            )
-        layers = tuple(
-            MemoryRows(
-                targets[2 * layer],
-                targets[2 * layer + 1],
-                positions if positions is not None else rows.positions.to(device="cpu", copy=True),
-                token_ids if token_ids is not None else rows.token_ids.to(device="cpu", copy=True),
-            )
-            for layer, rows in enumerate(sources)
-        )
+        layers = tuple(MemoryRows(targets[2 * layer], targets[2 * layer + 1]) for layer in range(len(sources)))
         ready = None
         if asynchronous:
             if self._copy_stream is None:
@@ -741,8 +703,8 @@ class WorldKV:
         if previous is None:
             return current
         capacity = (self.config.window_frames - self.config.retrieval_frames) * self.tokens_per_frame
-        previous_capacity = capacity - current.positions.numel()
-        count = previous.positions.numel()
+        previous_capacity = capacity - current.tokens
+        count = previous.tokens
         if count <= previous_capacity:
             slices = [slice(None)]
         else:
@@ -757,8 +719,6 @@ class WorldKV:
         return MemoryRows(
             torch.cat([*(previous.key[:, part] for part in slices), current.key], 1),
             torch.cat([*(previous.value[:, part] for part in slices), current.value], 1),
-            torch.cat([*(previous.positions[part] for part in slices), current.positions]),
-            torch.cat([*(previous.token_ids[part] for part in slices), current.token_ids]),
         )
 
     def assemble(
@@ -777,14 +737,7 @@ class WorldKV:
         if self._commit:
             # These slices must own storage: QKV projections otherwise keep Q
             # and the unselected tokens alive after a compression/commit.
-            positions = torch.arange(self.next_frame, self.next_frame + self._frames, device=key.device)
-            positions = positions.repeat_interleave(self.tokens_per_frame)
-            token_ids = torch.arange(
-                self.next_frame * self.tokens_per_frame,
-                (self.next_frame + self._frames) * self.tokens_per_frame,
-                device=key.device,
-            )
-            self._pending[layer] = MemoryRows(key.detach().clone(), value.detach().clone(), positions, token_ids)
+            self._pending[layer] = MemoryRows(key.detach().clone(), value.detach().clone())
             self._stage_bank_layer(layer, self._pending[layer])
         previous = self.history[layer]
         if previous is None:
@@ -808,7 +761,7 @@ class WorldKV:
             + self.config.retrieval_frames,
         )
         tail_count = min(
-            previous.positions.numel() - sink_count,
+            previous.tokens - sink_count,
             max(0, self.next_frame - tail_start) * self.tokens_per_frame,
         )
         keys, values = [previous.key[:, :sink_count]], [previous.value[:, :sink_count]]

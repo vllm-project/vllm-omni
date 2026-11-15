@@ -98,7 +98,7 @@ def test_long_rollout_matches_explicit_sink_recent_attention():
                     assert torch.equal(rows.key, previous[layer])
         torch.testing.assert_close(outputs[0], outputs[2])
         append(state, start)
-        assert all(rows.positions.numel() <= 12 for rows in state.history)
+        assert all(rows.tokens <= 12 for rows in state.history)
 
 
 def test_failed_forward_and_failed_publication_leave_history_unchanged(monkeypatch):
@@ -168,6 +168,14 @@ def test_real_lingbot_attention_uses_memory_view():
     module = _load_module()
     attention = module.LingBotSelfAttention(8, 2)
     state = worldkv.WorldKV(worldkv.WorldKVConfig(window_frames=4, sink_frames=1), num_layers=1, tokens_per_frame=1)
+    committed = []
+    assemble = state.assemble
+
+    def record(layer, query, key, value):
+        committed.append(key.clone())
+        return assemble(layer, query, key, value)
+
+    state.assemble = record
     with torch.inference_mode():
         for start in range(7):
             hidden = torch.randn(1, 1, 8)
@@ -176,7 +184,9 @@ def test_real_lingbot_attention_uses_memory_view():
             assert output.shape == hidden.shape
             assert torch.isfinite(output).all()
     assert state.next_frame == 7
-    assert state.history[0].positions.tolist() == [0, 4, 5, 6]
+    # Sink frame 0 followed by the three most recent frames.
+    expected = torch.cat([committed[frame] for frame in (0, 4, 5, 6)], 1)
+    assert torch.equal(state.history[0].key, expected)
 
 
 def test_full_lingbot_transformer_matches_legacy_and_rolls_back_head_failure(monkeypatch):
@@ -246,15 +256,11 @@ def test_publication_concatenates_only_retained_slices(monkeypatch, start):
     for offset in range(0, start, 2):
         append(state, offset)
     previous = state.history[0]
-    current = worldkv.MemoryRows(
-        raw(start),
-        raw(start),
-        torch.arange(start, start + 2).repeat_interleave(2),
-        torch.arange(start * 2, (start + 2) * 2),
-    )
-    ids = torch.cat((previous.token_ids, current.token_ids))
-    keep = torch.cat((torch.arange(min(4, ids.numel())), torch.arange(max(4, ids.numel() - 8), ids.numel())))
+    current = worldkv.MemoryRows(raw(start), raw(start) * 3)
+    count = previous.tokens + current.tokens
+    keep = torch.cat((torch.arange(min(4, count)), torch.arange(max(4, count - 8), count)))
     expected_k = torch.cat((previous.key, current.key), 1)[:, keep]
+    expected_v = torch.cat((previous.value, current.value), 1)[:, keep]
 
     def forbidden(*args, **kwargs):
         pytest.fail("publication must not copy an assembled window again")
@@ -262,7 +268,7 @@ def test_publication_concatenates_only_retained_slices(monkeypatch, start):
     monkeypatch.setattr(worldkv.MemoryRows, "select", forbidden)
     result = state._retained(0, current)
     torch.testing.assert_close(result.key, expected_k)
-    assert torch.equal(result.token_ids, ids[keep])
+    torch.testing.assert_close(result.value, expected_v)
     assert result.key.untyped_storage().nbytes() == result.key.numel() * result.key.element_size()
 
 

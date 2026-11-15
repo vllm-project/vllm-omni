@@ -17,7 +17,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 def rows(count=12, dtype=torch.float64):
     key = torch.randn(1, count, 2, 8, generator=torch.Generator().manual_seed(71), dtype=dtype)
-    return worldkv.MemoryRows(key, key + 20, torch.arange(count) // 4, torch.arange(count))
+    return worldkv.MemoryRows(key, key + 20)
 
 
 @pytest.mark.parametrize("score", ["pairwise_mean", "centroid"])
@@ -35,7 +35,6 @@ def test_world_selection_equals_dense_oracle_and_owns_exact_storage(score, ratio
     indices = torch.cat((torch.arange(4), selected))
     assert torch.equal(output.key, source.key[:, indices])
     assert torch.equal(output.value, source.value[:, indices])
-    assert torch.equal(output.positions, source.positions[indices])
     assert output.key.untyped_storage().nbytes() == output.key.numel() * output.key.element_size()
     assert output.value.untyped_storage().nbytes() == output.value.numel() * output.value.element_size()
 
@@ -50,9 +49,7 @@ def test_paper_and_centroid_scores_are_distinct_not_silently_interchanged():
 
 
 def test_zero_keys_ties_preserve_anchor_and_stable_original_order():
-    source = worldkv.MemoryRows(
-        torch.zeros(1, 12, 1, 4), torch.arange(48.0).view(1, 12, 1, 4), torch.arange(12) // 4, torch.arange(12)
-    )
+    source = worldkv.MemoryRows(torch.zeros(1, 12, 1, 4), torch.arange(48.0).view(1, 12, 1, 4))
     output = worldkv.world_compress(source, 4, 0.25, "pairwise_mean")
     assert torch.equal(output.value, source.value[:, :6])
     assert torch.isfinite(output.key).all()

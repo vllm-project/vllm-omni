@@ -7,10 +7,15 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tests.diffusion.ar_diffusion.test_worldkv import worldkv
+from tests.diffusion.ar_diffusion.test_worldkv import absolute_keys, raw, worldkv
 from tests.diffusion.ar_diffusion.test_worldkv_retrieval import append, pose
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def committed_key(start, layer):
+    """The key ``append`` commits for the 2-frame chunk at ``start``."""
+    return absolute_keys(raw(start) + layer, torch.arange(start, start + 2).repeat_interleave(2))
 
 
 @pytest.mark.parametrize(
@@ -47,15 +52,15 @@ def test_retrieval_and_compression_switches_execute_only_when_enabled(retrieval,
         for start in range(0, 40, 2):
             append(memory, start, camera=pose())
             assert memory.bank_nbytes <= config.bank_bytes
-            # Local canonical KV retains absolute positions regardless of bank policy.
+            # Local canonical KV keeps the uncompressed sink and newest chunk regardless of bank policy.
             for layer, rows in enumerate(memory.history):
-                assert rows.positions[:4].tolist() == [0, 0, 1, 1]
-                assert rows.positions[-4:].tolist() == [start, start, start + 1, start + 1]
-                assert rows.positions.numel() <= (8 - retrieval) * 2
+                assert torch.equal(rows.key[:, :4], committed_key(0, layer))
+                assert torch.equal(rows.key[:, -4:], committed_key(start, layer))
+                assert rows.tokens <= (8 - retrieval) * 2
                 for entry in memory.bank.values():
                     bank_rows = entry.layers[layer]
                     expected = 4 if ratio == 1 else 3
-                    assert bank_rows.positions.numel() == expected
+                    assert bank_rows.tokens == expected
         assert bool(rank.call_count) == bool(retrieval)
         assert bool(normalize.call_count) == (ratio < 1)
     assert bool(memory.bank) == bool(retrieval)

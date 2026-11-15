@@ -229,7 +229,7 @@ def test_worldkv_small_fifo_bank_retrieves_over_long_rollout():
         window_frames=18,
         sink_frames=3,
         retrieval_frames=3,
-        bank_bytes=4 * (2 * 24 * (2 * 8 * 4 + 16) + 128),
+        bank_bytes=4 * (2 * 24 * (2 * 8 * 4) + 128),
         world_keep_ratio=0.25,
     )
     memory = worldkv.WorldKV(config, num_layers=2, tokens_per_frame=16)
@@ -243,18 +243,17 @@ def test_worldkv_small_fifo_bank_retrieves_over_long_rollout():
                 hits += len(memory._retrieved) if not commit else 0
                 for layer, x in enumerate(data):
                     memory.assemble(layer, x, x, x)
-                    previous = memory.history[layer]
-                    if previous is not None:
+                    if memory.history[layer] is not None:
+                        # Visible history is frames [0, 3) and [tail_start, start).
                         tail_start = max(3, start + 3 - 18 + 3 + 3)
-                        visible_ids = previous.token_ids[(previous.positions < 3) | (previous.positions >= tail_start)]
                         for chunk in memory._retrieved:
-                            assert not torch.isin(chunk.layers[layer].token_ids, visible_ids).any()
+                            assert chunk.start >= 3 and chunk.start + chunk.frames <= tail_start
         assert len(memory.bank) <= 4
     assert hits > 0
 
 
 @pytest.mark.parametrize("ratio", [0.0, 0.25, 1.0])
-def test_bank_capacity_exact_boundary_includes_ids_and_pose(ratio):
+def test_bank_capacity_exact_boundary_includes_pose(ratio):
     sample = state(world_keep_ratio=ratio)
     append(sample, 0)
     append(sample, 2)
@@ -291,7 +290,7 @@ def test_retrieved_rows_transfer_once_per_chunk_and_clear_on_commit(monkeypatch)
     original = worldkv.MemoryRows.to_kv_device
 
     def record(rows, device):
-        transfers.append(rows.token_ids.tolist())
+        transfers.append(rows.tokens)
         return original(rows, device)
 
     monkeypatch.setattr(worldkv.MemoryRows, "to_kv_device", record)
@@ -384,7 +383,7 @@ def test_recent_retrieval_reuses_history_without_host_roundtrip(monkeypatch):
         for layer in range(2):
             retrieved = memory._retrieved_rows(layer, torch.device("cpu"))[0]
             expected = memory.bank[4].layers[layer]
-            for name in ("key", "value", "positions", "token_ids"):
+            for name in ("key", "value"):
                 actual = getattr(retrieved, name)
                 assert torch.equal(actual, getattr(expected, name))
                 assert (
@@ -445,8 +444,8 @@ def test_reservation_accounts_for_compressed_async_sources_only(ratio):
     )
     layers, tokens, heads, dim, itemsize, chunk = 40, 960, 40, 128, 2, 3
     reserve = config.reservation_bytes(layers, tokens, heads, dim, itemsize, chunk_frames=chunk)
-    row = 2 * heads * dim * itemsize + 16
-    scratch = 4 * config.window_frames * tokens * (2 * heads * dim * max(4, itemsize) + 16)
+    row = 2 * heads * dim * itemsize
+    scratch = 4 * config.window_frames * tokens * 2 * heads * dim * max(4, itemsize)
     extra = 0 if ratio == 1 else tokens + math.ceil((chunk - 1) * tokens * ratio)
     assert reserve - scratch == layers * (2 * (config.window_frames - config.retrieval_frames) * tokens + extra) * row
 
@@ -468,6 +467,10 @@ def test_assembly_matches_position_mask_across_sink_and_chunk_boundaries(sink_fr
         tokens_per_frame=2,
     )
     start = 0
+    # Test-side oracle: the frame of each canonical history token, retained as
+    # the uncompressed sink plus the newest tokens that fit the local capacity.
+    positions = None
+    capacity = (12 - retrieval_frames) * 2
     for frames in [1, 3, 2, 1] * 5:
         memory.set_pose(pose(start // 3))
         for commit in (False, True):
@@ -477,10 +480,11 @@ def test_assembly_matches_position_mask_across_sink_and_chunk_boundaries(sink_fr
                     previous = memory.history[layer]
                     expected_k, expected_v = current, current * 2
                     if previous is not None:
+                        assert previous.tokens == positions.numel()
                         recent_start = max(sink_frames, start + frames - 12 + sink_frames + retrieval_frames)
-                        mask = (previous.positions < sink_frames) | (previous.positions >= recent_start)
+                        mask = (positions < sink_frames) | (positions >= recent_start)
                         visible = previous.select(torch.where(mask)[0])
-                        sink_count = int((visible.positions < sink_frames).sum())
+                        sink_count = int((positions[mask] < sink_frames).sum())
                         retrieved = [chunk.layers[layer] for chunk in memory._retrieved]
                         expected_k = torch.cat(
                             [
@@ -503,6 +507,12 @@ def test_assembly_matches_position_mask_across_sink_and_chunk_boundaries(sink_fr
                     actual_k, actual_v = memory.assemble(layer, current, current, current * 2)
                     assert torch.equal(actual_k, expected_k)
                     assert torch.equal(actual_v, expected_v)
+        new = torch.arange(start, start + frames).repeat_interleave(2)
+        if positions is not None and positions.numel() > capacity - new.numel():
+            sink = min(sink_frames * 2, positions.numel())
+            tail = capacity - new.numel() - sink
+            positions = torch.cat((positions[:sink], positions[positions.numel() - tail :] if tail else new[:0]))
+        positions = new if positions is None else torch.cat((positions, new))
         start += frames
     memory.close()
 
@@ -521,8 +531,7 @@ def test_bank_storage_is_packed_without_aliasing_across_layers_or_chunks(ratio, 
                 # Different geometry must not imply equal layer sizes.
                 key = raw(start, dtype=dtype)[:, :, : layer + 1]
                 value = key * 2
-                positions = torch.arange(start, start + 2).repeat_interleave(2)
-                rows = worldkv.MemoryRows(key, value, positions, torch.arange(start * 2, (start + 2) * 2))
+                rows = worldkv.MemoryRows(key, value)
                 layers.append(worldkv.world_compress(rows, 2, ratio, "pairwise_mean"))
                 memory.assemble(layer, key, key, value)
             expected[start] = layers
@@ -530,7 +539,7 @@ def test_bank_storage_is_packed_without_aliasing_across_layers_or_chunks(ratio, 
         for chunk in memory.bank.values():
             by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
             for actual, reference in zip(chunk.layers, expected[chunk.start]):
-                for name in ("key", "value", "positions", "token_ids"):
+                for name in ("key", "value"):
                     assert torch.equal(getattr(actual, name), getattr(reference, name))
                 for tensor in (actual.key, actual.value):
                     by_dtype.setdefault(tensor.dtype, []).append(tensor)

@@ -319,7 +319,7 @@ class LingBotSelfAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs,
+        cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs | None,
         current_start: int,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         sink_tokens: int,
@@ -373,6 +373,8 @@ class LingBotSelfAttention(nn.Module):
                 self.head_dim**-0.5,
             ).unsqueeze(0)
         else:
+            if cache is None:
+                raise ValueError("LingBot self-attention requires a cache unless WorldKV owns the history.")
             # The direct path sees history + current K/V even when the caller
             # asks not to mutate persistent cache state.
             visible_key, visible_value = self._update_cache(
@@ -642,7 +644,7 @@ class LingBotAttentionBlock(nn.Module):
         timestep_projection: torch.Tensor,
         camera_hidden_states: torch.Tensor,
         *,
-        self_cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs,
+        self_cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs | None,
         cross_cache: LingBotAttentionCache | None,
         current_start: int,
         sink_tokens: int,

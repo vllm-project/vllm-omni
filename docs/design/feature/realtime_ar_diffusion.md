@@ -264,9 +264,11 @@ model_config:
     # host_bank_limit_bytes: process-wide cap, defaults to physical memory
 ```
 
-- **Retrieval:** evicted chunks go to the bank, keyed by their middle-frame
-  C2W pose. Each chunk ranks bank chunks by translation plus rotation distance
-  and fits whole chunks into the budget, in time order with original RoPE.
+- **Retrieval:** every chunk committed after the sink is copied to the bank
+  at commit, keyed by its middle-frame C2W pose, while it may still be in the
+  local window. Only chunks that have left the visible sink and recent window
+  are retrieval candidates. Each chunk ranks them by translation plus rotation
+  distance and fits whole chunks into the budget, in time order with original RoPE.
 - **Compression:** only bank rows; the anchor frame is kept in full.
 - **Assembly:** canonical GPU history contains an uncompressed sink and a
   contiguous recent suffix. Host-known frame boundaries select views of these
@@ -284,9 +286,8 @@ model_config:
   owned compressed source storage is included in the GPU reservation.
   Each publication packs K/V into one host allocation per dtype, with disjoint
   views for individual layers. Live chunks never share backing storage.
-  Host-bank retrieval transfers only K/V; its metadata remains on the host. Uncompressed
-  publication constructs contiguous frame/token metadata directly on CPU;
-  compressed per-layer selections retain their original metadata.
+  History and bank rows store only K/V. Keys already carry their RoPE
+  positions, and frame boundaries come from host-side chunk bookkeeping.
   With `prefetch_kv`, the first layer queues selected K/V for all layers on a
   dedicated CUDA stream. Each consumer waits for its own layer event and records
   destination storage on the compute stream. Cancellation drains outstanding
