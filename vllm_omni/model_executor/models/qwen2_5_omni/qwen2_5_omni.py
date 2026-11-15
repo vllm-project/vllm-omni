@@ -354,11 +354,8 @@ class Qwen2_5OmniForConditionalGeneration(
             else:
                 text_hidden_states = thinker_output
 
-            # Text-only path
-            return OmniOutput(
-                text_hidden_states=(text_hidden_states.reshape(-1, text_hidden_states.shape[-1])),
-                multimodal_outputs=None,
-            )
+            # AR stages expose tensors to native CUDA graph capture/replay.
+            return text_hidden_states.reshape(-1, text_hidden_states.shape[-1])
 
         # 2) Talker (if codec not provided)
         if self.model_stage == "talker":
@@ -384,10 +381,7 @@ class Qwen2_5OmniForConditionalGeneration(
                 # which do not match with the talker model's word embedding size
                 sampling_metadata.prompt_token_ids[sampling_metadata.prompt_token_ids == 152064] = 8448
 
-            return OmniOutput(
-                text_hidden_states=talker_hidden,
-                multimodal_outputs=None,
-            )
+            return talker_hidden
 
         if self.model_stage == "code2wav":
             code = (

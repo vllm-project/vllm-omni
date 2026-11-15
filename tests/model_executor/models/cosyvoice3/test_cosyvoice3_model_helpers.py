@@ -8,6 +8,8 @@ from threading import Lock
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import msgspec
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -18,9 +20,11 @@ from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.data_entry_keys import to_struct
+from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3, cosyvoice3_talker
 from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model, _normalize_request_conditioning
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1355,6 +1359,75 @@ def test_request_conditioning_reaches_code2wav_with_true_prompt_length():
     assert call["prompt_token"].shape == (1, 2)
     assert call["prompt_feat"].shape == (1, 4, 80)
     assert output.multimodal_outputs
+
+
+def test_code2wav_consumes_v2_conditioning_without_mutating_runner_state():
+    model = _make_code2wav_model()
+    buffers = OmniIntermediateBuffer(2)
+    params = [SamplingParams(seed=11), SamplingParams(seed=22)]
+    for i in range(2):
+        payload = {
+            "embed": {
+                "speech_token": torch.tensor([[3, 2, 0, 0]], dtype=torch.int32),
+                "speech_feat": torch.full((1, 8, 80), float(i + 1)),
+                "embedding": torch.full((1, 192), float(i + 1)),
+                "speech_token_len": torch.tensor([[2]], dtype=torch.int32),
+            },
+            "meta": {"req_id": [f"voice-{i}"], "talker_prefill_offset": i},
+            "request_id": f"upstream-{i}",
+        }
+        buffers.add_request(
+            i,
+            SimpleNamespace(
+                req_id=f"runner-{i}",
+                additional_information=payload if i == 0 else serialize_additional_information(payload),
+                sampling_params=params[i],
+                mm_features=["feature-0"] if i == 0 else [],
+                prompt_embeds=torch.ones(1, 2) if i == 0 else None,
+            ),
+        )
+    # The payload's own request identity and conditioning follow batch order,
+    # independently of the runner's slot and sampling metadata.
+    runtime_info = buffers.gather(SimpleNamespace(idx_mapping_np=np.array([1, 0])))
+    output = model.forward(
+        torch.tensor([1, 2, 3]),
+        torch.arange(3),
+        seq_token_counts=[1, 2],
+        model_intermediate_buffer=runtime_info,
+    )
+    for row, index in enumerate((1, 0)):
+        info = runtime_info[row]
+        assert info is buffers.buffers[index]
+        assert info["sampling_params"] is params[index]
+        assert info["sampling_params"].seed == (11, 22)[index]
+        assert info["req_id"] == f"runner-{index}"
+        if index == 0:
+            assert info["mm_features"] == ["feature-0"]
+            assert info["prompt_embeds_cpu"].shape == (1, 2)
+        else:
+            assert "mm_features" not in info and "prompt_embeds_cpu" not in info
+        conditioning = to_struct(_normalize_request_conditioning(info))
+        assert conditioning.request_id == f"upstream-{index}"
+        assert conditioning.meta.req_id == [f"voice-{index}"]
+        call = model.code2wav.forward_calls[row]
+        assert call["token"].tolist() == [([1], [2, 3])[row]]
+        assert call["token_offset_tokens"] == index
+        assert call["prompt_token"].tolist() == [[3, 2]]
+        assert call["prompt_feat"].shape == (1, 4, 80)
+        torch.testing.assert_close(call["embedding"], torch.full((1, 192), float(index + 1)))
+        torch.testing.assert_close(output.multimodal_outputs["audio"][row], torch.linspace(-1, 1, row + 1))
+
+
+@pytest.mark.parametrize(
+    "payload,unknown_field",
+    [
+        ({"unknown_runner_option": None}, "unknown_runner_option"),
+        ({"embed": {"unknown_conditioning": torch.ones(1, 192)}}, "unknown_conditioning"),
+    ],
+)
+def test_request_conditioning_keeps_unknown_fields_strict(payload, unknown_field):
+    with pytest.raises(msgspec.ValidationError, match=f"unknown field `{unknown_field}`"):
+        to_struct(_normalize_request_conditioning({"sampling_params": SamplingParams(), **payload}))
 
 
 @pytest.mark.parametrize("stage", ["cosyvoice3_talker", "cosyvoice3_code2wav"])

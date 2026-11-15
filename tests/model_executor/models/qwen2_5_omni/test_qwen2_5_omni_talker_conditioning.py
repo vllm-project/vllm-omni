@@ -2,11 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression coverage for Qwen2.5-Omni thinker-to-talker conditioning."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
+from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu import cudagraph_utils
 
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni import (
     Qwen2_5OmniForConditionalGeneration,
@@ -14,6 +18,7 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni import (
 from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import (
     thinker2talker_full_payload,
 )
+from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -166,3 +171,86 @@ def test_length_capped_completion_appends_text_eos_and_pad() -> None:
         output_token_ids=[2, 3, 4],
         expected_output_ids=[2, 3],
     )
+
+
+@pytest.mark.parametrize("stage", ["thinker", "talker"])
+def test_ar_forward_supports_native_capture_and_replay(stage: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep native persistent output allocation/copy and replay view handling real.
+
+    GPU capture is replaced with CPU calls, and fake replay updates the native
+    buffer without re-entering Python forward, as a captured graph would.
+    """
+
+    class HiddenModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, input_ids, **kwargs):
+            self.calls += 1
+            hidden = input_ids.float().reshape(-1, 1).expand(-1, 2).clone()
+            # The thinker may also return its input embeddings.
+            return (torch.zeros_like(hidden), hidden) if stage == "thinker" else hidden
+
+        def compute_logits(self, hidden):
+            return hidden + 1
+
+    child = HiddenModel()
+    model = object.__new__(Qwen2_5OmniForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.model_stage = stage
+    model.model = child
+    setattr(model, stage, child)
+    small, large = [cudagraph_utils.BatchExecutionDescriptor(CUDAGraphMode.FULL, n, n) for n in (2, 4)]
+    manager = object.__new__(cudagraph_utils.ModelCudaGraphManager)
+    manager.__dict__.update(
+        use_breakable_cg=False,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        _capture_descs={CUDAGraphMode.FULL: [small, large]},
+        max_num_reqs=4,
+        is_first_pp_rank=True,
+        is_last_pp_rank=True,
+        vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=1)),
+        hidden_states=None,
+        aux_hidden_states=[],
+        graphs={},
+    )
+
+    def cpu_capture(self, create_forward_fn, progress_bar_desc):
+        for desc in (small, large):
+            for warmup in (True, False):
+                create_forward_fn(desc, warmup)(CUDAGraphMode.NONE)
+            self.graphs[desc] = SimpleNamespace(replay=lambda: self.hidden_states.add_(10))
+
+    monkeypatch.setattr(cudagraph_utils.CudaGraphManager, "capture", cpu_capture)
+    monkeypatch.setattr(cudagraph_utils, "prepare_inputs_to_capture", lambda *args, **kwargs: (None, {}))
+    monkeypatch.setattr(cudagraph_utils, "set_forward_context", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(cudagraph_utils, "get_offloader", lambda: SimpleNamespace(sync_prev_onload=lambda: None))
+    manager.capture(
+        model,
+        SimpleNamespace(prepare_dummy_inputs=lambda nr, nt: {"positions": torch.arange(nt).expand(3, -1)}),
+        SimpleNamespace(
+            input_ids=torch.arange(4), positions=torch.arange(4), is_padding=torch.zeros(4, dtype=torch.bool)
+        ),
+        None,
+        None,
+        [],
+        None,
+    )
+    # A smaller first capture must still allocate for the largest descriptor.
+    assert manager.hidden_states.shape == (4, 2)
+    torch.testing.assert_close(manager.hidden_states, torch.arange(4).float().reshape(-1, 1).expand(-1, 2))
+    assert child.calls == 4
+    replayed = manager.run_fullgraph(small)
+    assert child.calls == 4
+    torch.testing.assert_close(replayed, torch.tensor([[10.0, 10.0], [11.0, 11.0]]))
+    assert replayed.data_ptr() == manager.hidden_states.data_ptr()
+    state = object.__new__(OmniModelState)
+    state.model = model
+    hidden, multimodal = state.postprocess_model_output(replayed, None, None)
+    assert hidden is replayed
+    assert multimodal == {}
+    torch.testing.assert_close(model.compute_logits(hidden), hidden + 1)
+    manager.run_fullgraph(large)
+    # Native output views are borrowed: the next replay overwrites them.
+    torch.testing.assert_close(replayed, torch.tensor([[20.0, 20.0], [21.0, 21.0]]))
