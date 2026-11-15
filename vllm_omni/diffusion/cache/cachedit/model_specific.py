@@ -840,26 +840,24 @@ class SensenovaCachedAdapter(CachedAdapter):
         return total_cached_blocks
 
 
-def _get_sensenova_u1_transformer(pipeline: SupportsComponentDiscovery) -> torch.nn.Module:
-    language_model = getattr(pipeline, "language_model")
-    return cast(torch.nn.Module, getattr(language_model, "model"))
-
-
 def enable_cache_for_sensenova_u1(
     pipeline: SupportsComponentDiscovery, cache_config: DiffusionCacheConfig
 ) -> CacheDiTEnableResult:
-    """Enable Cache-DiT on SenseNova-U1's nested decoder model."""
-    get_transformer = _get_sensenova_u1_transformer
-    block_adapter = _maybe_build_block_adapter(pipeline, get_transformer)
-    adapter_cls = _maybe_get_cached_adapter_cls(pipeline, get_transformer)
+    """Enable Cache-DiT on SenseNova-U1's nested decoder model.
+
+    Component discovery intentionally exposes ``language_model`` for CPU
+    offload, while Cache-DiT must wrap its ``pipeline.transformer`` decoder
+    alias (``language_model.model``).
+    """
+    block_adapter = _maybe_build_block_adapter(pipeline)
+    adapter_cls = _maybe_get_cached_adapter_cls(pipeline)
     refresh = enable_cache_for_dit(
         pipeline,
         cache_config,
         block_adapter=block_adapter,
         adapter_cls=adapter_cls,
-        get_pipeline_transformer=get_transformer,
     )
-    target = get_transformer(pipeline) if block_adapter is None else block_adapter
+    target = _default_get_pipeline_transformer(pipeline) if block_adapter is None else block_adapter
     return CacheDiTEnableResult(refresh=refresh, targets=(target,))
 
 

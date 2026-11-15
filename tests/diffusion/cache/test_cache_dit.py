@@ -106,17 +106,17 @@ def test_cosmos3_aliases_use_cosmos3_custom_cache_dit_enabler(pipeline_name: str
 
 
 def test_sensenova_cache_dit_targets_nested_decoder_model(mocker):
-    cached_adapter_cls = type("FakeSensenovaCachedAdapter", (), {})
     adapter_config = CacheDiTAdapterConfig(
-        block_forward_patterns={"layers": object()},
+        block_forward_patterns={"layers": ForwardPattern.Pattern_3},
         has_separate_cfg=True,
-        cached_adapter_cls=cached_adapter_cls,
+        cached_adapter_cls=cd_model_specific.SensenovaCachedAdapter,
     )
-    decoder_model = Mock()
+    decoder_model = mocker.Mock()
     decoder_model.layers = object()
     decoder_model._cache_dit_adapter_config = adapter_config
-    pipeline = Mock()
-    pipeline.language_model.model = decoder_model
+    pipeline = mocker.Mock()
+    pipeline.language_model = mocker.Mock()
+    pipeline.transformer = decoder_model
     block_adapter = mocker.Mock()
     block_adapter.pipe = object()
     build_block_adapter = mocker.patch(
@@ -138,8 +138,7 @@ def test_sensenova_cache_dit_targets_nested_decoder_model(mocker):
     assert adapter_kwargs["has_separate_cfg"] is True
     enable_kwargs = enable_cache.call_args.kwargs
     assert enable_kwargs["block_adapter"] is block_adapter
-    assert enable_kwargs["adapter_cls"] is cached_adapter_cls
-    assert enable_kwargs["get_pipeline_transformer"](pipeline) is decoder_model
+    assert enable_kwargs["adapter_cls"] is cd_model_specific.SensenovaCachedAdapter
     assert result.refresh is refresh
     assert result.targets == (block_adapter,)
 
