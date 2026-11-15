@@ -1312,12 +1312,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # missed the wire shape. Only this stamp may force a request
                 # finish — a bare 2150 is still a segment park for other models.
                 finish_on_next_stop = _request_finishes_on_next_stop(request)
-                logger.info(
-                    "[JoyAI] talker 2150 req=%s finish_on_next_stop=%s resumable=%s",
-                    req_id,
-                    finish_on_next_stop,
-                    getattr(request, "resumable", False),
-                )
                 if finish_on_next_stop:
                     request.resumable = False
                 if self.chunk_transfer_adapter is not None:

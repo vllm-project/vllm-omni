@@ -5,7 +5,6 @@
 from collections.abc import Sequence
 from typing import Any
 
-from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.processor import cached_processor_from_config
@@ -31,8 +30,6 @@ from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
     Qwen3TTSPromptEmbedsBuilder,
     first_value,
 )
-
-logger = init_logger(__name__)
 
 # Match the standalone Qwen3-TTS default attributes
 _DEFAULT_TTS_TASK_TYPE = "CustomVoice"
@@ -369,13 +366,6 @@ def joyai_action_to_tts(
                 tts_metadata["meta"][JOYAI_TTS_FINISH_ON_NEXT_STOP_KEY] = True
             tts_metadata["embed"] = {"prefill": []}
             tts_metadata["hidden_states"] = {"trailing_text": []}
-        logger.info(
-            "[JoyAI] talker submit close_only=%s finish_on_next_stop=%s text_len=%d prompt_len=%d",
-            close_only,
-            finish_on_next_stop,
-            len(spoken_text),
-            talker_prompt_length,
-        )
         talker_inputs.append(
             OmniTokensPrompt(
                 # OmniTokensPrompt reserves vllm scheduler positions with zero IDs;

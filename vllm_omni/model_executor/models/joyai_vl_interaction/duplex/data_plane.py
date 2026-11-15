@@ -127,9 +127,6 @@ class Observation:
     # the running buffer that ``</response>`` and the spoken text are read from.
     raw_text: str = ""
     absorbed_key: tuple[object, ...] | None = None
-    logged_first_text: bool = False
-    logged_held_text: bool = False
-    text_events: int = 0
     stage0_outputs: int = 0
     stage0_first_at: float = 0.0
     begin_at: float = 0.0
@@ -250,14 +247,6 @@ class JoyAIDataPlane(DuplexDataPlane):
                 # Mid-generation only a ready action may be shown; at finish the
                 # silence/delegation terminal paths still have to run.
                 if not finished and not spoken_text_ready(raw, finished=False):
-                    if not observation.logged_held_text:
-                        observation.logged_held_text = True
-                        logger.info(
-                            "[JoyAI] text held req=%s raw_len=%d raw_head=%r",
-                            request_id,
-                            len(raw),
-                            raw[:60],
-                        )
                     continue
                 action = observation.parse(output)
                 if observation.delegation_tools and action.action is Action.DELEGATE:
@@ -350,23 +339,6 @@ class JoyAIDataPlane(DuplexDataPlane):
                 event["text"] = delta
                 if finished:
                     event["model_context_text"] = spoken
-                observation.text_events += 1
-                if not observation.logged_first_text:
-                    observation.logged_first_text = True
-                    logger.info(
-                        "[JoyAI] text delta req=%s first finished=%s raw_len=%d delta_len=%d",
-                        request_id,
-                        finished,
-                        len(raw),
-                        len(delta),
-                    )
-                if finished:
-                    logger.info(
-                        "[JoyAI] text delta req=%s last raw_len=%d events=%d",
-                        request_id,
-                        len(raw),
-                        observation.text_events,
-                    )
                 event["text_requires_complete_audio"] = "audio" in context.modalities
                 if finished and "audio" not in observation.modalities:
                     event["end_of_turn"] = True

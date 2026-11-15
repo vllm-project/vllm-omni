@@ -787,15 +787,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # chunk as ready, otherwise Stage1 can consume before the
                     # first DAC frame arrives.
                     return False
-                if payload_finished or payload_segment_finished:
-                    logger.info(
-                        "[chunk] recv req=%s finished=%s segment=%s empty=%s resumable=%s",
-                        req_id,
-                        payload_finished,
-                        payload_segment_finished,
-                        not has_new_ids,
-                        getattr(request, "resumable", False),
-                    )
                 self._refresh_generation_chunk_prefill_state(request)
 
             # Mark as finished for consumption

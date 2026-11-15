@@ -31,7 +31,6 @@ import asyncio
 import time
 
 import regex as re
-from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import JOYAI_FINISH_ON_NEXT_STOP_KEY
 from vllm_omni.engine.duplex.plugin import PartialStageForward
@@ -43,8 +42,6 @@ from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import (
     parse_action,
 )
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import USER_QUERY_HEADER
-
-logger = init_logger(__name__)
 
 _DELEGATION_MARKERS = (DELEGATION_TAG, "<delegation>")
 _LEADING_MARKERS = (SILENCE_TOKEN, RESPONSE_TOKEN)
@@ -493,13 +490,6 @@ def _plan_after_talker_park(
         enable_talker_streaming(req_state)
         queued = _queued_sentences(bridge)
         close_after = bool(bridge.get("closed")) and not queued
-        logger.info(
-            "[JoyAI] sentence TTS park-follow req=%s text_len=%d queued=%d close_after=%s",
-            request_id,
-            len(chunk),
-            len(queued),
-            close_after,
-        )
         # Last sentence stays resumable so this 2150 unpark is spoken. Stamp
         # finish-on-next-stop so that utterance's 2150 is Code2Wav's request
         # terminal. A later parked close_only is too late: the vocoder already
@@ -522,7 +512,6 @@ def _plan_after_talker_park(
     bridge["releasing"] = True
     mark_close_sent(req_state)
     enable_talker_streaming(req_state)
-    logger.info("[JoyAI] sentence TTS park-close req=%s", request_id)
     _schedule_talker_followup(
         orchestrator,
         joyai_stage_id,
@@ -588,12 +577,6 @@ def plan_partial_stage_output(
     talker_busy = bool(bridge.get("talker_busy"))
     if chunk and talker_busy:
         queued.append(chunk)
-        logger.info(
-            "[JoyAI] sentence TTS hold req=%s text_len=%d queued=%d — Talker busy",
-            request_id,
-            len(chunk),
-            len(queued),
-        )
         chunk = ""
     if finished:
         bridge["closed"] = True
@@ -604,11 +587,6 @@ def plan_partial_stage_output(
     if talker_busy:
         if not finished:
             return None
-        logger.info(
-            "[JoyAI] sentence TTS skip-legacy req=%s queued=%d — Talker still in-flight",
-            request_id,
-            len(queued),
-        )
         mark_talker_prompt_flags(req_state, close_only=False)
         enable_talker_streaming(req_state)
         return _skip_legacy_plan(request_id)
@@ -625,15 +603,6 @@ def plan_partial_stage_output(
         # utterance is the Code2Wav request terminal (finish_on_next_stop).
         queue_close_after = bool(finished and prior_emits and not queued)
         mark_talker_prompt_flags(req_state, close_only=False, finish_on_next_stop=queue_close_after)
-        logger.info(
-            "[JoyAI] sentence TTS req=%s finished=%s close_only=%s text_len=%d queued=%d close_after=%s",
-            request_id,
-            finished,
-            False,
-            len(chunk),
-            len(queued),
-            queue_close_after,
-        )
         is_final_update = finished and not queued and not queue_close_after
         if is_final_update or queue_close_after:
             # ``is_final_update=True`` submits non-resumable, so this chunk *is*
@@ -652,7 +621,6 @@ def plan_partial_stage_output(
         mark_talker_prompt_flags(req_state, close_only=True)
         enable_talker_streaming(req_state)
         mark_close_sent(req_state)
-        logger.info("[JoyAI] sentence TTS close_only req=%s — Talker idle", request_id)
         return PartialStageForward(
             output=SentenceTtsOutput(request_id, ""),
             is_final_update=True,

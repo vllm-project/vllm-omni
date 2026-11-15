@@ -1072,7 +1072,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if prefill_stats is not None:
                     prefill_stats.finalize(self.kv_cache_manager.estimate_cached_tokens(request))
 
-            handle_stopped_finished = None
             if stopped:
                 if (
                     self.aux_output_connector is not None
@@ -1081,7 +1080,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     routed_experts = self.aux_output_connector.take_output(request, aux_output)
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
-                handle_stopped_finished = finished
                 is_segment_finished = not finished
                 if finished and self._native_data_plane:
                     self._pending_data_plane_terminal_req_ids.add(req_id)
@@ -1101,22 +1099,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     stopped_preempted_reqs.add(request)
                 else:
                     stopped_running_reqs.add(request)
-
-            if async_chunk_transport:
-                logger.info(
-                    "[JoyAI] code2wav stop req=%s stopped=%s handle_stopped_finished=%s "
-                    "is_segment_finished=%s resumable=%s pending=%s terminal=%s "
-                    "computed=%s prompt=%s",
-                    req_id,
-                    stopped,
-                    handle_stopped_finished,
-                    is_segment_finished,
-                    getattr(request, "resumable", False),
-                    generation_pending,
-                    input_terminal,
-                    request.num_computed_tokens,
-                    len(request.prompt_token_ids),
-                )
 
             # Extract sample logprobs if needed.
             if request.sampling_params is not None and request.sampling_params.num_logprobs is not None and logprobs:
@@ -1164,13 +1146,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = request.get_finished_reason()
             finished = self._handle_stopped_request(request)
             is_segment_finished = not finished
-            logger.info(
-                "[JoyAI] code2wav pending_finish req=%s handle_stopped_finished=%s is_segment_finished=%s resumable=%s",
-                request.request_id,
-                finished,
-                is_segment_finished,
-                getattr(request, "resumable", False),
-            )
             kv_transfer_params = None
             ec_transfer_params = None
             if finished:
