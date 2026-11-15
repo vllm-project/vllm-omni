@@ -499,12 +499,14 @@ class TestPromptUpdateExecution:
             max_sequence_length=226,
             fps=None,
             attention_schedule=None,
+            attention_sigma_schedule=None,
         )
         req = SimpleNamespace(
             request_id="req",
             prompt="a prompt",
             sampling_params=sampling,
             kv_sender_info=None,
+            mixfusion_info=None,
         )
 
         @contextmanager

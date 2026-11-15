@@ -15,6 +15,7 @@ from typing import Any
 from vllm.logger import init_logger
 from vllm.v1.request import Request, RequestStatus
 
+from vllm_omni.core.sched.duplex_stage_work import set_request_perf_chunk
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 from vllm_omni.outputs import SchedulingMetadataUpdate
 
@@ -341,6 +342,7 @@ class OmniSchedulingCoordinator:
             request._all_token_ids.extend(prompt_token_ids)
             request._output_token_ids.clear()
             request.num_computed_tokens = 0
+        set_request_perf_chunk(request, update.duplex_perf_chunk)
 
     def postprocess_scheduler_output(
         self,

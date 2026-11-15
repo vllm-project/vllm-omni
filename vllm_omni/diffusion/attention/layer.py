@@ -7,23 +7,30 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 
+import functools
+import itertools
 import json
+import weakref
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, cast
+from dataclasses import MISSING, dataclass, fields, replace
+from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 import torch
 import torch.nn as nn
+from torch.library import Library
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
+    VideoTokenLayout,
 )
+from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
     calibration_for_candidate,
@@ -48,11 +55,16 @@ from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.layout import assert_backend_layout_supported
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
 from vllm_omni.diffusion.forward_context import (
     get_attention_schedule_profile,
     get_forward_context,
     get_ulysses_mode,
     is_forward_context_available,
+)
+from vllm_omni.diffusion.mixfusion.packed_attention import (
+    MIXFUSION_PLAN_KEY,
+    run_mixfusion_packed_attention,
 )
 from vllm_omni.platforms import current_omni_platform
 
@@ -82,15 +94,38 @@ def _attention_identity(
 ) -> tuple:
     """Backend name, explicit-vs-default selection and canonical backend kwargs.
 
-    The ring runner is bound to the baseline's backend preference and ignores backend kwargs, so
-    a candidate can run on the ring path only when this identity equals the baseline's. An
-    unserializable kwargs value never matches.
+    The ring runner is bound to the baseline's backend preference and ignores backend kwargs, and
+    paged attention runs the native implementation bound to the baseline, so a candidate can run
+    on the ring or paged path only when this identity equals the baseline's. An unserializable
+    kwargs value never matches.
     """
     return (
         backend_cls.get_name() if backend_cls is not None else None,
         bool(backend_explicit),
         _canonical_json(spec.backend_kwargs() if spec is not None else None),
     )
+
+
+def _promote_marked_paged_default(
+    backend_cls: type[AttentionBackend],
+    spec: "AttentionSpec | None",
+    *,
+    scheduler_paged_kv: bool,
+    paged_kv_cache_role: str | None,
+) -> type[AttentionBackend]:
+    """Return FLASH_ATTN for a marked paged layer whose platform default lacks paged KV support.
+
+    The promotion applies only when the Scheduler owns paged KV (PAGED_SCHEDULER mode), the layer has
+    a paged KV cache role and no explicit spec chose ``backend_cls``; otherwise ``backend_cls`` is
+    returned unchanged.
+    """
+    if scheduler_paged_kv and paged_kv_cache_role is not None and spec is None and not backend_cls.supports_paged_kv:
+        # FLASH_ATTN is the only selector that advertises paged KV; see
+        # docs/design/feature/diffusion_paged_kv_cache.md#platform-matrix. It comes from the registry
+        # because the user did not request it, so the platform's explicit-backend check (CuTe FA4 on
+        # Blackwell) does not apply.
+        return DiffusionAttentionBackendEnum.FLASH_ATTN.get_class()
+    return backend_cls
 
 
 def _reject_allgather_trtllm(
@@ -119,6 +154,256 @@ def _select_impl_cls(
             f"for backend {backend_cls.__qualname__}"
         )
     return override
+
+
+# Layers built with a startup schedule, keyed by the integer id the scheduled-attention op carries.
+# Weak values, so the registry never keeps a dropped model alive.
+_SCHEDULED_ATTENTION_LAYERS: "weakref.WeakValueDictionary[int, Attention]" = weakref.WeakValueDictionary()
+_SCHEDULED_ATTENTION_IDS = itertools.count()
+
+# AttentionMetadata fields the scheduled-attention op carries (see _encode_scheduled_op_metadata).
+_SCHEDULED_OP_CARRIED_FIELDS = frozenset({"attn_mask", "extra", "video_layout"})
+# A field without a declared default never matches, so it keeps the eager boundary.
+_NO_FIELD_DEFAULT = object()
+
+
+def _scheduled_op_field_defaults() -> tuple[tuple[str, object], ...]:
+    """Every other AttentionMetadata field with its declared default.
+
+    Derived from the dataclass, so a field added later keeps the eager boundary until the op carries
+    it, instead of being dropped by ``_decode_scheduled_op_metadata``.
+    """
+    defaults = []
+    for metadata_field in fields(AttentionMetadata):
+        if metadata_field.name in _SCHEDULED_OP_CARRIED_FIELDS:
+            continue
+        if metadata_field.default is not MISSING:
+            default = metadata_field.default
+        elif metadata_field.default_factory is not MISSING:
+            default = metadata_field.default_factory()
+        else:
+            default = _NO_FIELD_DEFAULT
+        defaults.append((metadata_field.name, default))
+    return tuple(defaults)
+
+
+# Uncarried fields that must hold their default for a compiled call to use the scheduled-attention
+# op; any other value keeps the eager boundary.
+_SCHEDULED_OP_FIELD_DEFAULTS = _scheduled_op_field_defaults()
+
+
+def _holds_field_default(value: object, default: object) -> bool:
+    if value is default:
+        return True
+    # A tensor never compares equal to a default; the type check also keeps bool apart from int.
+    return (
+        default is not _NO_FIELD_DEFAULT
+        and type(value) is type(default)
+        and not isinstance(value, torch.Tensor)
+        and value == default
+    )
+
+
+# Spec of a call without metadata; any other spec starts with "M".
+_NO_METADATA_SPEC = "-"
+
+
+def _is_op_int(value: object) -> TypeGuard[int | torch.SymInt]:
+    # A bool is an int subclass; bools travel in the spec instead.
+    return (isinstance(value, int) and not isinstance(value, bool)) or isinstance(value, torch.SymInt)
+
+
+def _encode_scheduled_op_metadata(
+    attn_metadata: AttentionMetadata | None,
+) -> tuple[str, list[int | torch.SymInt]] | None:
+    """Split metadata into a structure string and its integers for ``vllm_omni::scheduled_attention``.
+
+    Runs while tracing. The string holds only names, types and booleans, which are the same on every
+    call from one call site, so it never adds a guard that a new shape or step would fail. The
+    integers may be symbolic sizes; they become ``SymInt[]`` operands, so a new resolution does not
+    recompile the block either. ``attn_mask`` travels as its own tensor operand.
+
+    Carried: ``video_layout`` with plain ``prefix_len``/``latent_grid``/``used_len`` and no
+    ``video_spans``, and ``extra`` entries whose values are None, a bool, an int or a tuple/list of
+    ints. Returns None for anything else (tensors, floats or strings in ``extra``, video spans, joint
+    tensors, packed padding, ranges, cross-attention mask metadata, a non-default ``joint_strategy``, any
+    other field off its declared default, a metadata subclass), which keeps the eager boundary.
+    """
+    if attn_metadata is None:
+        return _NO_METADATA_SPEC, []
+    if type(attn_metadata) is not AttentionMetadata:
+        return None
+    for name, default in _SCHEDULED_OP_FIELD_DEFAULTS:
+        if not _holds_field_default(getattr(attn_metadata, name), default):
+            return None
+    spec = "M"
+    ints: list[int | torch.SymInt] = []
+    layout = attn_metadata.video_layout
+    if layout is not None:
+        if type(layout) is not VideoTokenLayout or layout.video_spans:
+            return None
+        spec += ";L"
+        for field_value in (layout.prefix_len, layout.used_len):
+            if field_value is None:
+                spec += "n"
+            elif _is_op_int(field_value):
+                spec += "i"
+                ints.append(field_value)
+            else:
+                return None
+        grid = layout.latent_grid
+        if grid is None:
+            spec += "n"
+        elif isinstance(grid, tuple) and len(grid) == 3 and all(_is_op_int(dim) for dim in grid):
+            spec += "g"
+            ints.extend(grid)
+        else:
+            return None
+    for key in sorted(attn_metadata.extra):
+        if not isinstance(key, str) or not key or ";" in key or "=" in key:
+            return None
+        value = attn_metadata.extra[key]
+        if value is None:
+            kind = "n"
+        elif isinstance(value, bool):
+            kind = "b1" if value else "b0"
+        elif _is_op_int(value):
+            kind = "i"
+            ints.append(value)
+        elif isinstance(value, (tuple, list)) and all(_is_op_int(item) for item in value):
+            kind = ("t" if isinstance(value, tuple) else "l") + str(len(value))
+            ints.extend(value)
+        else:
+            return None
+        spec += ";X" + key + "=" + kind
+    return spec, ints
+
+
+@functools.lru_cache(maxsize=256)
+def _parse_scheduled_op_spec(spec: str) -> tuple[tuple[str, ...] | None, tuple[tuple[str, str, int], ...]]:
+    """Parse a spec from ``_encode_scheduled_op_metadata`` once per call site.
+
+    Returns the layout field codes (or None) and, per ``extra`` key, ``(key, kind, int count)``.
+    """
+    if not spec.startswith("M"):
+        raise RuntimeError(f"malformed scheduled attention metadata spec {spec!r}")
+    layout: tuple[str, ...] | None = None
+    extra: list[tuple[str, str, int]] = []
+    for part in spec[1:].split(";")[1:]:
+        if part.startswith("L") and len(part) == 4 and layout is None:
+            layout = tuple(part[1:])
+            continue
+        key, sep, kind = part[1:].partition("=")
+        if not part.startswith("X") or not sep:
+            raise RuntimeError(f"malformed scheduled attention metadata spec {spec!r}")
+        if kind == "i":
+            count = 1
+        elif kind[:1] in ("t", "l"):
+            count = int(kind[1:])
+        else:
+            count = 0
+        extra.append((key, kind, count))
+    return layout, tuple(extra)
+
+
+def _decode_scheduled_op_metadata(
+    attn_mask: torch.Tensor | None, spec: str, ints: list[int]
+) -> AttentionMetadata | None:
+    """Rebuild the metadata ``_encode_scheduled_op_metadata`` split, with fresh containers."""
+    if spec == _NO_METADATA_SPEC:
+        return None
+    layout_codes, extra_codes = _parse_scheduled_op_spec(spec)
+    # Check the count first, so a short list raises this error instead of StopIteration.
+    layout_count = 0
+    if layout_codes is not None:
+        layout_count = layout_codes[:2].count("i") + (3 if layout_codes[2] == "g" else 0)
+    expected = layout_count + sum(count for _, _, count in extra_codes)
+    if len(ints) != expected:
+        raise RuntimeError(f"scheduled attention metadata spec {spec!r} does not match {len(ints)} integers")
+    values = iter(ints)
+    video_layout = None
+    if layout_codes is not None:
+        prefix_code, used_code, grid_code = layout_codes
+        prefix_len = next(values) if prefix_code == "i" else None
+        used_len = next(values) if used_code == "i" else None
+        grid = (next(values), next(values), next(values)) if grid_code == "g" else None
+        video_layout = VideoTokenLayout(prefix_len=prefix_len, latent_grid=grid, used_len=used_len)
+    extra: dict[str, Any] = {}
+    for key, kind, count in extra_codes:
+        if kind == "n":
+            extra[key] = None
+        elif kind in ("b0", "b1"):
+            extra[key] = kind == "b1"
+        elif kind == "i":
+            extra[key] = next(values)
+        else:
+            items = [next(values) for _ in range(count)]
+            extra[key] = tuple(items) if kind[0] == "t" else items
+    return AttentionMetadata(attn_mask=attn_mask, extra=extra, video_layout=video_layout)
+
+
+def _run_scheduled_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+    layer_id: torch.Tensor,
+    metadata_spec: str,
+    metadata_ints: list[int],
+) -> torch.Tensor:
+    """Eager body of ``vllm_omni::scheduled_attention``: the layer's full ``_forward_impl``.
+
+    Candidate selection, capability checks, backend-private gates and the parallel strategy run
+    here at execution time, exactly as behind ``_forward_schedule_compile_boundary``, so the step,
+    sigma and timestep never reach Dynamo.
+    """
+    layer = _SCHEDULED_ATTENTION_LAYERS.get(int(layer_id))
+    if layer is None:
+        raise RuntimeError(f"scheduled attention layer {int(layer_id)} is not registered")
+    metadata = _decode_scheduled_op_metadata(attn_mask, metadata_spec, metadata_ints)
+    out = layer._forward_impl(query, key, value, metadata)
+    expected = (*query.shape[:-1], value.shape[-1])
+    if tuple(out.shape) != expected or out.dtype != query.dtype or out.device != query.device:
+        raise RuntimeError(
+            f"scheduled attention on layer {layer.prefix!r} returned {tuple(out.shape)} {out.dtype} on {out.device}; "
+            f"the compiled graph expects {expected} {query.dtype} on {query.device}"
+        )
+    # Compiled code relies on the fake's contiguous strides, and a custom op may not return a view
+    # of one of its inputs.
+    out = out.contiguous()
+    if any(out.untyped_storage().data_ptr() == t.untyped_storage().data_ptr() for t in (query, key, value)):
+        out = out.clone()
+    return out
+
+
+def _scheduled_attention_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+    layer_id: torch.Tensor,
+    metadata_spec: str,
+    metadata_ints: list[int],
+) -> torch.Tensor:
+    return query.new_empty((*query.shape[:-1], value.shape[-1]))
+
+
+# direct_register_custom_op skips torch.library.custom_op's Python dispatch (~21us/call).
+# CompositeExplicitAutograd stays device-agnostic (CPU layer id beside device Q/K/V).
+# No autograd formula; Attention._schedule_op_eligible keeps gradient calls eager.
+_SCHEDULED_ATTENTION_LIB = Library("vllm_omni", "FRAGMENT")
+if not hasattr(torch.ops.vllm_omni, "scheduled_attention"):
+    direct_register_custom_op(
+        op_name="scheduled_attention",
+        op_func=_run_scheduled_attention,
+        mutates_args=[],
+        fake_impl=_scheduled_attention_fake,
+        target_lib=_SCHEDULED_ATTENTION_LIB,
+        dispatch_key="CompositeExplicitAutograd",
+    )
+
+
+_scheduled_attention_op = torch.ops.vllm_omni.scheduled_attention
 
 
 def _try_extract_layer_index(prefix: str) -> int | None:
@@ -153,6 +438,8 @@ class Attention(nn.Module):
     # diffusion config, and such a layer legitimately prepares no candidates, so startup
     # validation must not report it as a missing profile.
     _schedule_configured = False
+    # Id the compiled scheduled-attention op uses to find this layer (see _register_scheduled_op).
+    _schedule_op_id: torch.Tensor | None = None
 
     def __init__(
         self,
@@ -281,39 +568,26 @@ class Attention(nn.Module):
         self.attention: AttentionImpl | nn.Module
         self.sdpa_fallback: SDPAImpl | None
         if custom_attention is None:
-            attn_backend_cls, spec = get_attn_backend_for_role(
+            selected_backend_cls, spec = get_attn_backend_for_role(
                 role=role,
                 head_size=head_size,
                 attention_config=attention_config,
                 role_category=role_category,
                 allow_trtllm_default=allow_trtllm_default,
             )
-            if (
-                scheduler_paged_kv
-                and paged_kv_cache_role is not None
-                and spec is None
-                and not attn_backend_cls.supports_paged_kv
-            ):
-                # FLASH_ATTN is an Omni selector, not a device-specific kernel.
-                # vLLM resolves it to CUDA FlashAttention on GPU and Ascend native
-                # attention on NPU. A platform may legitimately default dense
-                # attention to CUDNN/SDPA (for example when optional dense FA
-                # extras are absent), but a paged layer must advertise the
-                # capability so the Worker can register its native cache view.
-                # Load that selector from the registry: this is not a user-explicit
-                # dense FLASH_ATTN request, so skip platform explicit-backend
-                # validation (Blackwell would otherwise require CuTe FA4). Formal
-                # paged execution still delegates to vLLM's native paged backend.
-                from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
-
-                dense_backend_name = attn_backend_cls.get_name()
-                attn_backend_cls = DiffusionAttentionBackendEnum.FLASH_ATTN.get_class()
+            attn_backend_cls = _promote_marked_paged_default(
+                selected_backend_cls,
+                spec,
+                scheduler_paged_kv=scheduler_paged_kv,
+                paged_kv_cache_role=paged_kv_cache_role,
+            )
+            if attn_backend_cls is not selected_backend_cls:
                 logger.info(
                     "Resolved marked paged diffusion attention role=%r to %r because the platform default %r "
                     "does not support Scheduler-owned KV",
                     role,
                     attn_backend_cls.get_name(),
-                    dense_backend_name,
+                    selected_backend_cls.get_name(),
                 )
             allgather_degree = getattr(parallel_config, "allgather_degree", 1)
             _reject_allgather_trtllm(attn_backend_cls, skip_sequence_parallel, allgather_degree)
@@ -363,6 +637,7 @@ class Attention(nn.Module):
             schedule_config = getattr(config, "diffusion_attention_schedule", None)
             if schedule_config is not None:
                 self._schedule_configured = True
+                self._register_scheduled_op()
                 self._prepare_schedule_candidates(
                     schedule_config,
                     impl_kwargs,
@@ -472,11 +747,11 @@ class Attention(nn.Module):
         not referenced by the service default schedule are still prepared, because
         startup compatibility validation covers every configured profile.
 
-        The baseline AllGather-KV + TRTLLM_ATTN rejection and implementation overrides apply to
-        candidates too, so a candidate is never prepared with that backend. Per-candidate
-        KV-cache-quantization and capability/layout validation (ring, kv dtype support) remain in
-        the post-load startup traversal (``validate_attention_schedule_candidates``) and are not
-        duplicated here.
+        The baseline guards that decide which backend a layer uses apply to candidates too: the
+        marked-paged default->FLASH_ATTN promotion, the AllGather-KV + TRTLLM_ATTN rejection and
+        implementation overrides. Per-candidate capability checks (paged KV, SP auto-pad, ring, kv
+        dtype support) run in the post-load startup traversal
+        (``validate_attention_schedule_candidates``).
 
         Identical effective identities for this role share one record. The dedup key carries the
         backend name, explicit-vs-default selection, the impl class object, and canonical JSON of
@@ -507,6 +782,12 @@ class Attention(nn.Module):
                 attention_config=profiles[name],
                 role_category=role_category,
                 allow_trtllm_default=allow_trtllm_default,
+            )
+            backend_cls = _promote_marked_paged_default(
+                backend_cls,
+                spec,
+                scheduler_paged_kv=self._scheduler_paged_kv,
+                paged_kv_cache_role=self.paged_kv_cache_role,
             )
             _reject_allgather_trtllm(backend_cls, skip_sequence_parallel, allgather_degree)
             impl_cls = _select_impl_cls(backend_cls, impl_overrides)
@@ -615,13 +896,23 @@ class Attention(nn.Module):
                 return False
         return True
 
+    def _effective_kv_cache_dtype(self) -> str | None:
+        """The quantization policy this forward would run attention with.
+
+        None means dequantized (unset, "float" or "auto"); a policy disabled
+        by ``_disable_kv_quant`` or the skip rules reports "float". Mirrors
+        what ``_with_kv_cache_dtype`` would inject, without touching metadata,
+        so capability checks can gate on the same policy.
+        """
+        dtype = getattr(self, "_kv_cache_dtype", None)
+        if dtype in (None, "float", "auto"):
+            return None
+        if getattr(self, "_disable_kv_quant", False) or not self._should_apply_kv_cache_quant():
+            return "float"
+        return dtype
+
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
-        disabled = self._disable_kv_quant or not self._should_apply_kv_cache_quant()
-        dtype = self._kv_cache_dtype
-        if dtype in (None, "float"):
-            dtype = None
-        elif disabled:
-            dtype = "float"
+        dtype = self._effective_kv_cache_dtype()
         if dtype is None and (attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra):
             return attn_metadata
         extra = dict(attn_metadata.extra) if attn_metadata is not None else {}
@@ -640,6 +931,49 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if attn_metadata is not None and attn_metadata.extra.get(MIXFUSION_PLAN_KEY) is not None:
+            # MixFusion chunked layout: recover each request to
+            # ``text + full image`` right before the kernel and scatter back
+            # after it, at the same pre/post boundary the sequence-parallel
+            # strategies use around their all-to-all.
+            if torch.compiler.is_compiling():
+                return run_mixfusion_packed_attention(self, query, key, value, attn_metadata)
+            # The packed path and its dense fallbacks call back into forward()
+            # with fresh metadata. Metadata that still carries the plan key
+            # would recurse, so a nested plan-keyed call fails loudly instead.
+            if getattr(self, "_mixfusion_packed_active", False):
+                raise RuntimeError(
+                    "Attention.forward re-entered with MIXFUSION_PLAN_KEY while a packed "
+                    "MixFusion call is running; inner forwards must not carry the plan."
+                )
+            self._mixfusion_packed_active = True
+            try:
+                return run_mixfusion_packed_attention(self, query, key, value, attn_metadata)
+            finally:
+                self._mixfusion_packed_active = False
+
+        if torch.compiler.is_compiling() and self._schedule_configured:
+            # Selecting a scheduled candidate reads the bound schedule from the forward context,
+            # with the step and total for step ranges or the denoise sigma for sigma windows, and
+            # backend-private gates read the step or timestep. Traced, those values would become
+            # guards and each new step or sigma value would recompile the enclosing graph. The
+            # decision uses only the construction-time flag, so a layer without a startup schedule
+            # adds no boundary.
+            encoded = (
+                _encode_scheduled_op_metadata(attn_metadata) if self._schedule_op_eligible(query, key, value) else None
+            )
+            if encoded is not None:
+                # One opaque node: the enclosing block stays a single graph, and the selection
+                # runs when the op executes.
+                return _scheduled_attention_op(
+                    query,
+                    key,
+                    value,
+                    None if attn_metadata is None else attn_metadata.attn_mask,
+                    self._schedule_op_id,
+                    *encoded,
+                )
+            return self._forward_schedule_compile_boundary(query, key, value, attn_metadata)
         if torch.compiler.is_compiling() and self._uses_hsdp_compile_boundary():
             # Keep HSDP/FSDP2 parameter all-gather outside Inductor's
             # attention graph; otherwise scheduler dependency analysis can
@@ -647,6 +981,132 @@ class Attention(nn.Module):
             return self._forward_hsdp_compile_boundary(query, key, value, attn_metadata)
 
         return self._forward_impl(query, key, value, attn_metadata)
+
+    def supports_multi_doc_packed_varlen(self, kv_cache_dtype: str | None = None) -> bool:
+        """Whether one forward can isolate N packed documents via cu_seqlens.
+
+        Delegates to the selected backend class. Custom attention modules
+        carry no backend, so they conservatively report ``False`` and
+        ``forward_packed`` serves them through the dense fallback.
+        ``kv_cache_dtype`` is the effective quantization policy of the planned
+        forward; backends whose quantized kernel cannot consume packed
+        cu_seqlens metadata report ``False`` for it.
+        """
+        _, backend, _ = self.effective_attention()
+        if backend is None:
+            return False
+        return bool(backend.supports_multi_doc_packed_varlen(kv_cache_dtype=kv_cache_dtype))
+
+    def forward_packed(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """Run attention over a flat ``[total_tokens, heads, head_dim]`` packing.
+
+        ``cu_seqlens`` are the cumulative document boundaries; documents never
+        attend across them. Backends advertising
+        ``supports_multi_doc_packed_varlen`` for the effective quantization
+        policy receive one varlen forward; every other backend is served by
+        mask-free equal-length dense buckets with the same isolation.
+        """
+        if self.supports_multi_doc_packed_varlen(kv_cache_dtype=self._effective_kv_cache_dtype()):
+            metadata = AttentionMetadata(
+                extra={
+                    "cu_seqlens_q": cu_seqlens,
+                    "cu_seqlens_k": cu_seqlens,
+                    "max_seqlen_q": max_seqlen,
+                    "max_seqlen_k": max_seqlen,
+                    "attention_mask_mode": "none",
+                }
+            )
+            # Varlen backends run the packed row as [1, total_tokens, heads,
+            # head_dim] (TRTLLM's forward_cuda unpacks a 4-D query; Flash
+            # accepts either layout and returns the one it got), and the
+            # result returns to the flat packing.
+            out = self.forward(query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0), metadata)
+            return out.reshape(query.shape)
+        return self._forward_packed_dense_buckets(query, key, value, cu_seqlens)
+
+    def _forward_packed_dense_buckets(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Serve packed documents with mask-free dense attention, by length.
+
+        Documents sharing a sequence length are stacked into one dense
+        ``[m, L, heads, head_dim]`` forward; the outputs scatter back into
+        the flat layout, so no attention crosses a document boundary even
+        though the underlying backend never sees cu_seqlens.
+        """
+        seqlens = cu_seqlens.diff().tolist()
+        buckets: dict[int, list[int]] = {}
+        for segment, length in enumerate(seqlens):
+            if length > 0:
+                buckets.setdefault(length, []).append(segment)
+        cu = cu_seqlens.to(device=query.device, dtype=torch.long)
+        out = torch.empty_like(query)
+        for length, segments in buckets.items():
+            rows = cu[segments].unsqueeze(1) + torch.arange(length, device=query.device)
+            flat_rows = rows.reshape(-1)
+            # Q and K/V may carry different head counts; each gets its own
+            # bucket shape and scatters back to its own flat layout.
+            bucket_out = self.forward(
+                query.index_select(0, flat_rows).reshape(len(segments), length, *query.shape[1:]),
+                key.index_select(0, flat_rows).reshape(len(segments), length, *key.shape[1:]),
+                value.index_select(0, flat_rows).reshape(len(segments), length, *value.shape[1:]),
+                AttentionMetadata(),
+            )
+            out.index_copy_(0, flat_rows, bucket_out.reshape(flat_rows.shape[0], *query.shape[1:]))
+        return out
+
+    def _register_scheduled_op(self) -> None:
+        """Give this layer the id the compiled scheduled-attention op carries.
+
+        The id is a plain CPU tensor attribute, not a buffer: ``Module.to()`` leaves it on the CPU,
+        so reading it never synchronizes a device, and ``state_dict`` is unchanged. Dynamo passes it
+        as a graph input, so repeated blocks share one graph instead of guarding on a per-layer
+        constant (a string or int attribute would recompile once per block).
+        """
+        op_id = next(_SCHEDULED_ATTENTION_IDS)
+        _SCHEDULED_ATTENTION_LAYERS[op_id] = self
+        # Keep the id on the CPU even under ``with torch.device(...)``: reading a
+        # device tensor here would force a host sync on every attention call.
+        self._schedule_op_id = torch.tensor(op_id, dtype=torch.int64, device="cpu")
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # copy.copy, copy.deepcopy and unpickling all restore through here. The copied id would still
+        # resolve to the original layer, so a copy that carries one registers its own.
+        super().__setstate__(state)
+        if self._schedule_op_id is not None:
+            self._register_scheduled_op()
+
+    def _schedule_op_eligible(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> bool:
+        """Whether this layer and call can use the scheduled-attention op instead of the eager boundary.
+
+        Evaluated while tracing, on structure only (never on the step). HSDP (its own boundary),
+        Scheduler-managed paged KV and autograd (the op has no backward) keep
+        ``_forward_schedule_compile_boundary``, as does metadata that ``_encode_scheduled_op_metadata``
+        cannot carry.
+
+        The op is registered with ``mutates_args=[]``, so Inductor may reorder it against other reads
+        of state it writes outside its arguments. Paged KV writes the Scheduler's cache through the
+        Worker adapter, so it stays behind the boundary. KV-cache quantization quantizes per call into
+        fresh tensors and keeps no state between calls. Prompt K/V capture (HunyuanImage-3.0) runs in
+        the model's attention module around this call, not inside ``_forward_impl``.
+        """
+        if self._schedule_op_id is None or self._uses_hsdp_compile_boundary():
+            return False
+        if self._scheduler_paged_kv and self.paged_kv_cache_role is not None:
+            return False
+        return not (torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad))
 
     def _uses_hsdp_compile_boundary(self) -> bool:
         if self._hsdp_compile_boundary_enabled:
@@ -728,6 +1188,18 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        return self._forward_impl(query, key, value, attn_metadata)
+
+    @torch.compiler.disable
+    def _forward_schedule_compile_boundary(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        # Runs eagerly: candidate selection, capability checks, backend-private gates and the
+        # parallel strategy of this layer. Projections, norms and RoPE outside it stay compiled.
         return self._forward_impl(query, key, value, attn_metadata)
 
     def _forward_impl(
@@ -943,18 +1415,47 @@ class Attention(nn.Module):
         if mask.device.type == "cpu" and not attn_metadata.cross_kv_rows_validated and not bool(mask.any(dim=1).all()):
             raise ValueError("Each cross-attention batch row must contain at least one valid K/V position")
 
-    def _cross_backend_limitation(self, attn_metadata: AttentionMetadata | None) -> str | None:
-        if self._cross_head_limitation is not None:
-            return self._cross_head_limitation
-        if attn_metadata is not None and attn_metadata.attn_mask is not None:
-            return self._cross_mask_limitation
+    def _cross_backend_limitation(
+        self,
+        attn_metadata: AttentionMetadata | None,
+        *,
+        backend: type[AttentionBackend] | None = None,
+        spec: "AttentionSpec | None" = None,
+    ) -> str | None:
+        """Return what the selected backend cannot do for this cross call.
+
+        ``backend`` and ``spec`` name a scheduled candidate; without them the baseline's limitations,
+        resolved once at construction, apply.
+        """
+        if backend is None:
+            if self._cross_head_limitation is not None:
+                return self._cross_head_limitation
+            if attn_metadata is not None and attn_metadata.attn_mask is not None:
+                return self._cross_mask_limitation
+            return None
+        if not backend.supports_cross_head_geometry(self.num_heads, self.num_kv_heads):
+            return f"Q/KV head geometry {self.num_heads}/{self.num_kv_heads}"
+        if attn_metadata is None or attn_metadata.attn_mask is None:
+            return None
+        if self.cross_mask_kind == "kv" and not backend.supports_cross_kv_mask(spec):
+            return "KV-only validity mask"
+        if self.cross_mask_kind == "pair" and not backend.supports_cross_pair_mask(spec):
+            return "pair restrictions"
         return None
 
-    def _cross_fallback_blocker(self, attn_metadata: AttentionMetadata | None) -> str | None:
-        if self.backend_explicit:
+    def _cross_fallback_blocker(
+        self,
+        attn_metadata: AttentionMetadata | None,
+        *,
+        backend: type[AttentionBackend] | None = None,
+        spec: "AttentionSpec | None" = None,
+    ) -> str | None:
+        explicit = self.backend_explicit if backend is None else spec is not None
+        if explicit:
+            selected = self.attn_backend if backend is None else backend
             return (
-                f"Explicit backend {self.attn_backend.get_name()} does not support "
-                f"{self._cross_backend_limitation(attn_metadata)}"
+                f"Explicit backend {selected.get_name()} does not support "
+                f"{self._cross_backend_limitation(attn_metadata, backend=backend, spec=spec)}"
             )
         if attn_metadata is not None and attn_metadata.extra.get("kv_cache_dtype") not in (None, "float"):
             return (
@@ -982,9 +1483,14 @@ class Attention(nn.Module):
 
         effective_impl, effective_backend, effective_spec = self.effective_attention()
         if getattr(self, "_explicit_cross_contract", False):
-            reason = self._cross_backend_limitation(attn_metadata)
+            # A scheduled candidate is checked against its own backend; the baseline keeps the
+            # limitations resolved at construction.
+            cross_backend, cross_spec = (
+                (None, None) if effective_impl is self.attention else (effective_backend, effective_spec)
+            )
+            reason = self._cross_backend_limitation(attn_metadata, backend=cross_backend, spec=cross_spec)
             if reason is not None:
-                blocked = self._cross_fallback_blocker(attn_metadata)
+                blocked = self._cross_fallback_blocker(attn_metadata, backend=cross_backend, spec=cross_spec)
                 if blocked is not None:
                     raise NotImplementedError(blocked)
                 return self.sdpa_fallback.forward(query, key, value, attn_metadata)
@@ -1171,6 +1677,31 @@ class Attention(nn.Module):
         raise RuntimeError("Ring attention is enabled but strategy is not RingParallelAttention")
 
 
+def _plans_auto_pad(value: object) -> bool:
+    """Whether one SP plan value declares ``auto_pad`` at any nesting level.
+
+    Plan values nest dicts and lists, e.g. ``{"rope": {0: SequenceParallelInput(..., auto_pad=True)}}``.
+    """
+    if isinstance(value, dict):
+        return any(_plans_auto_pad(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_plans_auto_pad(item) for item in value)
+    return isinstance(value, SequenceParallelInput) and value.auto_pad
+
+
+def _sp_auto_pad_roots(model: nn.Module) -> tuple[str, ...]:
+    """Qualified names of the components whose own ``_sp_plan`` declares ``auto_pad``.
+
+    SP hooks are applied per component, so one component's plan does not require mask
+    support from another component's layers. The root module has the empty name.
+    """
+    return tuple(
+        name
+        for name, module in model.named_modules()
+        if isinstance(getattr(module, "_sp_plan", None), dict) and _plans_auto_pad(module._sp_plan)
+    )
+
+
 def _validate_candidate_calibration(
     layer_name: str,
     profile_name: str,
@@ -1206,9 +1737,15 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
     WHICH backend a layer uses. The checks here need the loaded model and the resolved parallel
     plan instead. The checks that run without this traversal do not read each prepared candidate,
     so an incompatible candidate would surface inside the first kernel after the layer switches to
-    it, be ignored on a ring layer, or run dense when its calibration curve is missing:
+    it, be ignored on a paged KV or ring layer, or run dense when its calibration curve is missing:
 
+    * paged KV: ``_forward_impl`` checks only the baseline backend for paged support, and paged
+      forward runs the native implementation bound to the baseline, so a candidate must support
+      paged KV and match the baseline backend, explicit selection and backend kwargs;
     * KV-cache quantization: ``_init_kv_cache_quantization`` probes the baseline impl only;
+    * SP auto-pad: the pad-time mask probe checks only the baseline, so when the model masks SP
+      padding (``mask_sp_padding``), a self-attention layer in a component that plans auto_pad
+      needs mask-capable candidates;
     * ring: the ring path bypasses the backend and the ring runner is bound to the baseline backend
       preference and explicit flag, and ignores backend kwargs, so a candidate carrying skip_softmax
       or differing from the baseline in backend name, explicit selection or backend kwargs cannot be
@@ -1232,6 +1769,11 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
         # configuration that loads fine without a schedule.
         kv_dtype = None
     platform_key = current_omni_platform.device_name
+    sp_size = od_config.parallel_config.sequence_parallel_size
+    # mask_sp_padding turns on the SP padding mask in Wan2.2 T2V, I2V and VACE; without it, padded tokens are unmasked.
+    # HunyuanImage-3.0 masks its own padding either way; its image attention layer registers its own profile check.
+    masks_sp_padding = sp_size is not None and sp_size > 1 and od_config.parallel_config.mask_sp_padding
+    auto_pad_roots = _sp_auto_pad_roots(model) if masks_sp_padding else ()
     ring_degree = od_config.parallel_config.ring_degree
     skip_layers = od_config.diffusion_kv_cache_skip_layer_indices
     effective_calibration = resolve_effective_calibration(od_config.diffusion_attention_config, schedule)
@@ -1246,6 +1788,11 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
         if not module._schedule_configured:
             continue  # built with no current diffusion config; it can never take part in a schedule
         schedule_aware_layers += 1
+        # Only self-attention sees the SP padding mask; cross-attention keys come from the unpadded context.
+        requires_mask = module.computation is AttentionComputation.SELF and any(
+            root == "" or layer_name == root or layer_name.startswith(root + ".") for root in auto_pad_roots
+        )
+        paged = module._scheduler_paged_kv and module.paged_kv_cache_role is not None
         # Construction prepares a candidate for every configured profile, and only from a backend:
         # custom-attention layers never take part in a schedule.
         baseline_backend = cast(type[AttentionBackend], module.attn_backend).get_name()
@@ -1256,6 +1803,23 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
             matches_baseline = (
                 _attention_identity(record.backend_cls, record.backend_explicit, record.spec) == baseline_identity
             )
+            if paged and not record.backend_cls.supports_paged_kv:
+                raise ValueError(
+                    f"attention schedule profile {name!r} selects backend {backend_name} which does not "
+                    f"support Scheduler-managed paged KV (layer {layer_name!r}, role "
+                    f"{module.paged_kv_cache_role!r}). Select a paged-capable backend for that profile "
+                    f"or disable scheduler paged KV."
+                )
+            if paged and not matches_baseline:
+                raise ValueError(
+                    f"attention schedule profile {name!r} selects backend {backend_name} "
+                    f"(explicit={record.backend_explicit}) on a Scheduler-managed paged KV layer "
+                    f"(layer {layer_name!r}, role {module.paged_kv_cache_role!r}), but paged attention runs "
+                    f"the native implementation bound to the baseline {baseline_backend!r} "
+                    f"(explicit={module.backend_explicit}) and cannot represent a candidate whose backend, "
+                    f"explicit selection or backend kwargs differ from it. Align that profile with the "
+                    f"baseline or disable scheduler paged KV."
+                )
             # Layers that can run ring: use_ring at construction (never explicit cross-attention), minus
             # layers that skip sequence parallelism, which always run local attention.
             if ring_degree > 1 and not module._explicit_cross_contract and not module.skip_sequence_parallel:
@@ -1292,6 +1856,13 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
                     f"not support kv_cache_dtype={kv_dtype!r} on {platform_key} (layer {layer_name!r}). "
                     f"Select a compatible backend for that profile or set "
                     f"diffusion_kv_cache_dtype='auto'."
+                )
+            if requires_mask and not record.backend_cls.supports_attention_mask(record.spec):
+                raise ValueError(
+                    f"attention schedule profile {name!r} selects backend {backend_name} which does not "
+                    f"support attention_mask, but this model plans SP auto_pad with sequence_parallel_size="
+                    f"{sp_size} and mask_sp_padding=True (layer {layer_name!r}). Remove that profile, select "
+                    f"a mask-capable backend for it, or disable mask_sp_padding."
                 )
             for check in module._schedule_candidate_checks:
                 reason = check(record)
