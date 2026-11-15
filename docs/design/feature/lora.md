@@ -20,7 +20,7 @@ applied to. User-facing configuration is in
 | --- | --- | --- |
 | Which models | The model class the stage loads must implement vLLM's `SupportsLoRA`; vLLM checks this when the stage engine starts. Examples: BAGEL stage 0 (`OmniBagelForConditionalGeneration`, run on GPU in [#8196](https://github.com/vllm-project/vllm-omni/pull/8196)) and the HunyuanImage-3 AR stage. The Qwen2.5-Omni and Qwen3-Omni pipelines load `Qwen2_5OmniForConditionalGeneration` / `Qwen3OmniMoeForConditionalGeneration` on stage 0, which do not implement it, and neither do talker or code2wav stages. | Pipelines listed in the [Diffusion LoRA guide](../../user_guide/diffusion/lora.md) |
 | Enabled by | `enable_lora` on that stage (stage-scoped key in multi-stage pipelines) | `lora_path` / `lora_backend` on the diffusion config |
-| Adapters per request | One, on the entry stage only | One (PEFT backend); the distill backend fuses its weights once at initialization |
+| Adapters per request | One, on the entry stage only | One or multiple with independent strengths (PEFT backend); the distill backend fuses its weights once at initialization |
 | Limits | vLLM's `LoRAConfig` options of that stage (`max_loras`, `max_lora_rank`, `max_cpu_loras`, target modules) | `max_cpu_loras` of the diffusion config |
 | Runtime adapter management | `AsyncOmni.add_lora` / `remove_lora` / `list_loras` / `pin_lora`, sent to every stage | The same calls; the diffusion worker implements `add_lora`, `remove_lora`, `list_loras` and `pin_lora` |
 
@@ -86,11 +86,27 @@ that implement it.
 
 Diffusion LoRA options are fields of `OmniDiffusionConfig`: `lora_path`,
 `lora_scale`, `lora_backend` (`peft` or `distill`) and `max_cpu_loras`. The
-PEFT backend caches adapters and activates one per request from the request's
-`LoRARequest`; the distill backend fuses weights once at initialization. See
+PEFT backend caches adapters and activates the request's adapter group with
+independent strengths; the distill backend fuses weights once at initialization. See
 the [Diffusion LoRA guide](../../user_guide/diffusion/lora.md) for formats,
 supported pipelines and checkpoint name mapping
 ([#8001](https://github.com/vllm-project/vllm-omni/issues/8001)).
+
+### Deployment-default request adapters
+
+Deployment defaults let clients focus on the model, prompt and required
+input media. Sampling settings, adapter selection and adapter strengths can
+be configured once by the deployment owner and omitted from ordinary
+requests, while explicit per-request overrides remain available.
+
+Diffusion stage `default_sampling_params` may define `lora_request` and
+`lora_scale` as a single adapter/strength or parallel lists. Configured adapter
+dictionaries are normalized into `LoRARequest` objects by
+`OmniDiffusionSamplingParams`. Serving code starts from a request-local copy:
+omitted HTTP `lora` inherits the default group, an explicit adapter object or
+non-empty list replaces the group, and `[]` clears it for that request.
+Overrides do not change later requests. The existing worker and LoRA manager
+own loading and activation; fixed policies and fused weights remain separate.
 
 ## Not supported
 
@@ -102,5 +118,3 @@ supported pipelines and checkpoint name mapping
 - LoRA on an LLM stage whose model class does not implement `SupportsLoRA`.
 - Applying a request's adapter to its CFG companion requests, or to the decode
   stage of a prefill-decode disaggregated pipeline.
-- Stacking several adapters in one diffusion request (proposed in
-  [#9058](https://github.com/vllm-project/vllm-omni/pull/9058)).

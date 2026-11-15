@@ -1150,3 +1150,29 @@ def test_multistage_diffusion_preserves_each_stage_defaults(
         assert stage_params.seed == default.seed
         assert stage_params.num_outputs_per_prompt == default.num_outputs_per_prompt
         assert stage_params is not default
+
+
+@pytest.mark.parametrize("disable", [False, True])
+def test_multistage_chat_default_loras_are_request_local(
+    mock_engine_client, mocker: MockerFixture, disable: bool
+) -> None:
+    default = OmniDiffusionSamplingParams(
+        lora_request=[{"lora_name": "default", "lora_int_id": 1, "lora_path": "/models/default"}],
+        lora_scale=[0.7],
+    )
+    engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="diffusion", is_comprehension=False)],
+        default_sampling_params_list=[default],
+    )
+    server = build_serving_chat(engine_client=mock_engine_client)
+    server._diffusion_engine = engine
+    mocker.patch.object(server, "_resolve_multistage_model_class_name", return_value=None)
+    extra_body = {"lora": []} if disable else {}
+    _, _, request_params, _ = server._prepare_diffusion_image_request(prompt="cat", extra_body=extra_body)
+    _, params = server._build_multistage_generation_inputs(
+        engine=engine, prompt="cat", extra_body=extra_body, reference_images=[], gen_params=request_params
+    )
+    assert params[0].lora_request == ([] if disable else default.lora_request)
+    assert params[0].lora_scale == ([] if disable else [0.7])
+    assert default.lora_request[0].lora_name == "default"
+    assert default.lora_scale == [0.7]

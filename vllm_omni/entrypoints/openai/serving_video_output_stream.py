@@ -1001,7 +1001,7 @@ class OmniStreamingVideoOutputHandler:
                 detail=str(e),
             ) from e
 
-        if not lora_requests:
+        if lora_requests is None:
             return
 
         gen_params.lora_request = lora_requests

@@ -4477,3 +4477,36 @@ def test_video_routes_inherit_engine_defaults(test_client, mocker: MockerFixture
         assert params.extra_args["stage_default"] == "keep"
         params.extra_args["stage_default"] = "mutated"
     assert defaults.extra_args == {"stage_default": "keep"}
+
+
+@pytest.mark.parametrize("adapter_count", [1, 2])
+def test_video_default_loras_inherit_replace_disable_and_isolate(
+    test_client: TestClient, mocker: MockerFixture, adapter_count: int
+) -> None:
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"fake-video")
+    engine = test_client.app.state.openai_serving_video._engine_client
+    configured = [
+        {"lora_name": f"default-{index}", "lora_int_id": index + 1, "lora_path": f"/models/default-{index}"}
+        for index in range(adapter_count)
+    ]
+    defaults = OmniDiffusionSamplingParams(lora_request=configured, lora_scale=[0.6, 0.4][:adapter_count])
+    engine.default_sampling_params_list = [defaults]
+    for lora, expected_names, expected_scales in (
+        (None, [item["lora_name"] for item in configured], [0.6, 0.4][:adapter_count]),
+        ({"name": "override", "path": "/models/override", "scale": 0.0}, ["override"], 0.0),
+        ([], [], []),
+        (None, [item["lora_name"] for item in configured], [0.6, 0.4][:adapter_count]),
+    ):
+        data = {"prompt": "default adapters"}
+        if lora is not None:
+            data["lora"] = json.dumps(lora)
+        response = test_client.post("/v1/videos", data=data)
+        assert response.status_code == 200, response.text
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+        captured = engine.captured_sampling_params_list[0]
+        requests = captured.lora_request if isinstance(captured.lora_request, list) else [captured.lora_request]
+        assert [request.lora_name for request in requests] == expected_names
+        assert captured.lora_scale == expected_scales
+        assert captured is not defaults
+    assert defaults.lora_scale == [0.6, 0.4][:adapter_count]
+    assert [request.lora_name for request in defaults.lora_request] == [item["lora_name"] for item in configured]

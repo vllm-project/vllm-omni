@@ -387,6 +387,12 @@ class OmniDiffusionSamplingParams:
     streaming_output_ack: bool = False
 
     def __post_init__(self) -> None:
+        if isinstance(self.lora_request, dict):
+            self.lora_request = LoRARequest(**self.lora_request)
+        elif isinstance(self.lora_request, list):
+            self.lora_request = [
+                LoRARequest(**request) if isinstance(request, dict) else request for request in self.lora_request
+            ]
         buffer = self.streaming_buffer_seconds
         if buffer is not None and (
             isinstance(buffer, bool)
@@ -488,9 +494,10 @@ class OmniDiffusionSamplingParams:
         # A stack serializes as a list of those arrays (or in-process requests).
         if isinstance(lora_request, list) and (not lora_request or not isinstance(lora_request[0], str)):
             params["lora_request"] = [
-                req if isinstance(req, LoRARequest) else msgspec.convert(req, LoRARequest) for req in lora_request
+                req if isinstance(req, (dict, LoRARequest)) else msgspec.convert(req, LoRARequest)
+                for req in lora_request
             ]
-        elif lora_request is not None and not isinstance(lora_request, LoRARequest):
+        elif lora_request is not None and not isinstance(lora_request, (dict, LoRARequest)):
             params["lora_request"] = msgspec.convert(lora_request, LoRARequest)
         return cls(**params)
 

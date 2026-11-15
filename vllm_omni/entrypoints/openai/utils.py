@@ -128,7 +128,8 @@ def parse_lora_requests(
     """Parse a request-level LoRA object or array of objects.
 
     Accepts the legacy single-object shape (see ``parse_lora_request``) or a
-    non-empty list of such objects to stack multiple adapters on one request.
+    list of such objects to stack multiple adapters on one request. An empty
+    list explicitly disables deployment-default request adapters.
     A single object (or a one-element array) keeps the legacy scalar
     ``(LoRARequest, float)`` shape; only a genuine stack of 2+ adapters
     produces lists. Per-adapter scales default to 1.0 when omitted.
@@ -142,7 +143,7 @@ def parse_lora_requests(
 
     items = lora_body if isinstance(lora_body, list) else [lora_body]
     if not items:
-        raise ValueError("Invalid lora field: expected a non-empty array of objects.")
+        return [], []
 
     lora_requests: list[LoRARequest] = []
     lora_scales: list[float] = []

@@ -15,6 +15,7 @@ from vllm.sampling_params import SamplingParams
 
 from vllm_omni.diffusion.attention.schedule import InvalidAttentionScheduleError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.request import LoRARequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -179,3 +180,20 @@ def test_null_extra_args_schedule_keeps_the_typed_value(field, kind):
 def test_attention_schedule_rejects_request_profile_definitions():
     with pytest.raises(InvalidAttentionScheduleError, match="attention_schedule"):
         OmniDiffusionSamplingParams(extra_args={"attention_schedule": {"profiles": {"new": {}}}})
+
+
+@pytest.mark.parametrize("stacked", [False, True])
+def test_lora_defaults_normalize_config_dicts(stacked: bool) -> None:
+    configured = [
+        {"lora_name": "first", "lora_int_id": 1, "lora_path": "/models/first"},
+        {"lora_name": "second", "lora_int_id": 2, "lora_path": "/models/second"},
+    ]
+    raw = configured if stacked else configured[0]
+    for params in (
+        OmniDiffusionSamplingParams(lora_request=raw),
+        OmniDiffusionSamplingParams.from_dict({"lora_request": raw}),
+    ):
+        requests = params.lora_request if stacked else [params.lora_request]
+        assert all(isinstance(request, LoRARequest) for request in requests)
+        assert [request.lora_name for request in requests] == (["first", "second"] if stacked else ["first"])
+    assert isinstance(configured[0], dict)
