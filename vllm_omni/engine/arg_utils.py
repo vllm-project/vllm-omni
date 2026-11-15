@@ -457,6 +457,7 @@ class OmniEngineArgs(EngineArgs):
     cfg_parallel_size: int | None = None
     vae_patch_parallel_size: int | None = None
     vae_parallel_mode: str | None = None
+    mask_sp_padding: bool | None = None
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -869,6 +870,7 @@ class OrchestratorArgs:
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
     vae_parallel_mode: str = "tile"
+    mask_sp_padding: bool = False
     default_sampling_params: str | None = None
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None
@@ -963,6 +965,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "cfg_parallel_size",
         "vae_patch_parallel_size",
         "vae_parallel_mode",
+        "mask_sp_padding",
     }
 )
 

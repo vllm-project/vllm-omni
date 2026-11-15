@@ -800,6 +800,7 @@ DIFFUSION_PARALLEL_KNBS = [
     ("cfg_parallel_size", 2),
     ("vae_patch_parallel_size", 2),
     ("vae_parallel_mode", "spatial_shard_height"),
+    ("mask_sp_padding", True),
 ]
 
 

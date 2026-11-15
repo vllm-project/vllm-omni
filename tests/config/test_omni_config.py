@@ -514,6 +514,17 @@ def test_diffusion_cli_parallel_overrides_beat_nested_deploy_parallel_config():
     assert stage.parallel_config.world_size == 4
 
 
+@pytest.mark.parametrize("model_type", ["wan2_2", "wan2_2_ti2v"])
+def test_registry_pipeline_keeps_flat_mask_sp_padding(model_type):
+    """A flat mask_sp_padding override must reach a registry pipeline's parallel config."""
+    omni_config = _from_pipeline_key(model_type, cli_overrides={"ulysses_degree": 2, "mask_sp_padding": True})
+
+    stage = omni_config.stage_by_id(0)
+
+    assert stage.parallel_config.ulysses_degree == 2
+    assert stage.parallel_config.mask_sp_padding is True
+
+
 @pytest.mark.parametrize(
     "cli_overrides",
     [
