@@ -236,11 +236,11 @@ URL access policy.
 ### MiniMax H3 Samplers
 
 Set `"sampler"` in `extra_params` to select the sampler. Supported values are
-`euler` (default), `res_multistep`, and `heun`. Both request and step execution
-support them, and compatible requests share packed model evaluations, including
-Heun's correction stage. An N-step schedule ending at zero uses `2N - 1` model
-evaluations with Heun. Fixed distilled schedules remain Euler-only. Disable cache
-acceleration, including `quality=high`, when using Heun.
+`euler` (default), `res_multistep`, `heun`, and `dpmpp_2m`. Both request and
+step execution support them, and compatible requests share packed model
+evaluations, including Heun's correction stage. An N-step schedule ending at zero
+uses `2N - 1` model evaluations with Heun. Fixed distilled schedules remain
+Euler-only. Disable cache acceleration, including `quality=high`, when using Heun.
 
 ### MiniMax H3 control and inpainting
 

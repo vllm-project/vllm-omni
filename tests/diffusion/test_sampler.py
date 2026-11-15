@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU numerical and model-call contracts for sampler-owned integration."""
 
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -11,11 +12,15 @@ import torch
 from vllm_omni.diffusion import sampler as sampler_module
 from vllm_omni.diffusion.sampler import (
     KSAMPLER,
+    Dpmpp2mHistory,
+    MultistepHistory,
     ResMultistepHistory,
     Sampler,
     SamplingState,
     _commit,
+    dpmpp_2m_coefficients,
     res_multistep_coefficients,
+    sample_dpmpp_2m,
     sample_heun,
     sample_res_multistep,
     sampler_object,
@@ -33,6 +38,7 @@ def test_sampler_wraps_algorithm_function():
     assert isinstance(sampler, Sampler)
     assert isinstance(sampler, KSAMPLER)
     assert sampler.sampler_function is sample_res_multistep
+    assert sampler_object("dpmpp_2m").sampler_function is sample_dpmpp_2m
     with pytest.raises(TypeError):
         Sampler()
     with pytest.raises(ValueError, match="Unsupported sampler"):
@@ -40,7 +46,7 @@ def test_sampler_wraps_algorithm_function():
     assert sampler_object("heun").sampler_function is sample_heun
 
 
-@pytest.mark.parametrize("name", ["euler", "res_multistep", "heun"])
+@pytest.mark.parametrize("name", ["euler", "res_multistep", "heun", "dpmpp_2m"])
 def test_full_loop_matches_resumed_steps(name):
     full, stepped = _state(), _state()
 
@@ -53,7 +59,7 @@ def test_full_loop_matches_resumed_steps(name):
     assert torch.equal(full.latents[0], stepped.latents[0])
 
 
-@pytest.mark.parametrize("name", ["euler", "res_multistep", "heun"])
+@pytest.mark.parametrize("name", ["euler", "res_multistep", "heun", "dpmpp_2m"])
 def test_failure_does_not_publish_any_state_or_history(name):
     states = [_state(), _state()]
     originals = [s.latents for s in states]
@@ -138,7 +144,7 @@ def test_res_invalid_update_preserves_batch_history_and_allows_retry(monkeypatch
         sampler.sample(model, states, num_steps=1)
     originals = [(s.latents, s.history) for s in states]
     previous = [s.history.old_denoised[0].clone() if s.history else None for s in states]
-    step = sampler_module._res_multistep_step
+    step = sampler_module._multistep_step
     calls = 0
 
     def invalid_second_update(*args):
@@ -148,7 +154,7 @@ def test_res_invalid_update_preserves_batch_history_and_allows_retry(monkeypatch
         return out if calls == 1 else torch.full_like(out, float("nan"))
 
     with monkeypatch.context() as patch:
-        patch.setattr(sampler_module, "_res_multistep_step", invalid_second_update)
+        patch.setattr(sampler_module, "_multistep_step", invalid_second_update)
         with pytest.raises(ValueError, match="Sampler output must be finite"):
             sampler.sample(model, states, num_steps=1)
     for state, (latents, history), prediction in zip(states, originals, previous):
@@ -194,16 +200,24 @@ def test_custom_algorithm_can_keep_multiple_predictions_in_its_own_history():
     assert second.history is None
 
 
-@pytest.mark.parametrize("history,step_index", [(object(), 0), (None, 1)])
-def test_res_rejects_incompatible_or_missing_history_before_model(history, step_index):
+_OTHER_HISTORY = {
+    "res_multistep": Dpmpp2mHistory(((None, None, None),), (None,)),
+    "dpmpp_2m": ResMultistepHistory(((None, None, None),), (None,)),
+}
+
+
+@pytest.mark.parametrize("name,label", [("res_multistep", "RES"), ("dpmpp_2m", r"DPM\+\+ 2M")])
+@pytest.mark.parametrize("history,step_index", [(object(), 0), (None, 1), ("other", 0)])
+def test_multistep_rejects_incompatible_or_missing_history_before_model(name, label, history, step_index):
     state = _state()
-    state.history, state.step_index = history, step_index
+    state.history = _OTHER_HISTORY[name] if history == "other" else history
+    state.step_index = step_index
 
     def model(es):
         pytest.fail("Invalid history must be rejected before model evaluation")
 
-    with pytest.raises(ValueError, match="RES"):
-        sampler_object("res_multistep").sample(model, [state], num_steps=1)
+    with pytest.raises(ValueError, match=label):
+        sampler_object(name).sample(model, [state], num_steps=1)
 
 
 @pytest.mark.parametrize("sigmas", [(), (1.0,), (1.0, 1.0), (0.5, 1.0), (1.0, float("nan"))])
@@ -212,11 +226,9 @@ def test_invalid_schedule_fails_before_model(sigmas):
         _state(sigmas)
 
 
-# Expected values come from running ``res_multistep_coeffs``, ``res_multistep_eta0_step``
-# and ``euler_eta0_step`` of ComfyUI_RH_MinMaxH3 minimax_h3_nodes/runtime/sampler_core.py
-# at 6abdf97ae8cdce548c751ce850adc5010b583b7c (the commit cited in sampler.py) in float64.
-# They pin the RES math independently of this implementation, so a wrong coefficient
-# formula or a dropped history term fails here.
+# Expected values come from an independent float64 reference implementation.
+# They pin the sampler math independently of this implementation, so a wrong
+# coefficient formula or a dropped history term fails here.
 _REF_VIDEO_SIGMAS = (1.0, 0.8, 0.55, 0.3, 0.1, 0.0)
 _REF_AUDIO_SIGMAS = (1.0, 0.95, 0.7, 0.4, 0.05, 0.0)
 _REF_COEFFS = {
@@ -245,6 +257,11 @@ _REF_FINAL = {
         (0.14573506828754482, -0.028911832422266616, 0.06471211385286005),
         (-0.08913371131450108, 0.05127898030681008),
     ),
+    # DPM++ 2M reference, run per stream in float64.
+    "dpmpp_2m": (
+        (0.1512313510351679, -0.030122559589970732, 0.06780526634329226),
+        (-0.10197562634476447, 0.07205982894020445),
+    ),
 }
 
 
@@ -262,7 +279,7 @@ def test_res_coefficients_match_reference_implementation(sigmas):
             assert sum(coeff) == pytest.approx(1 - sigmas[i + 1] / sigmas[i], rel=1e-12)
 
 
-@pytest.mark.parametrize("name", ["euler", "res_multistep"])
+@pytest.mark.parametrize("name", ["euler", "res_multistep", "dpmpp_2m"])
 def test_full_coupled_run_matches_reference_implementation(name):
     """Coupled video/audio streams on different schedules, including history and the terminal Euler step."""
     state = SamplingState(
@@ -353,3 +370,36 @@ def test_heun_correction_evaluates_proposal_at_next_sigma_and_batches_only_non_t
     torch.testing.assert_close(late.latents[0], torch.full((3,), 0.25))
     assert early.step_index == late.step_index == 1
     assert early.history is None and late.history is None
+
+
+@pytest.mark.parametrize("sigmas", [_REF_VIDEO_SIGMAS, _REF_AUDIO_SIGMAS, (1.0, 0.6, 0.3, 0.1)])
+def test_dpmpp_2m_coefficients_extrapolate_in_log_sigma(sigmas):
+    """First and zero-sigma steps are Euler; others extrapolate x0 linearly in -log(sigma)."""
+    coeffs = dpmpp_2m_coefficients(sigmas)
+    for i, coeff in enumerate(coeffs):
+        if i == 0 or sigmas[i + 1] == 0:
+            assert coeff is None
+            continue
+        h = math.log(sigmas[i] / sigmas[i + 1])
+        r = math.log(sigmas[i - 1] / sigmas[i]) / h
+        weight = 1 - sigmas[i + 1] / sigmas[i]
+        assert coeff == pytest.approx((weight * (1 + 1 / (2 * r)), -weight / (2 * r)), rel=1e-12)
+        # Equal predictions reduce to Euler.
+        assert sum(coeff) == pytest.approx(weight, rel=1e-12)
+    assert coeffs != res_multistep_coefficients(sigmas)
+
+
+def test_dpmpp_2m_history_is_per_request_and_released_when_finished():
+    first, second = _state(), _state()
+    sampler = sampler_object("dpmpp_2m")
+    for value in (2.0, 3.0):
+        sampler.sample(lambda es: [(torch.full((3,), value),)], [first], num_steps=1)
+        assert type(first.history) is Dpmpp2mHistory
+        assert first.history.old_denoised[0][0] == value
+    assert second.history is None
+    # Sibling history types: neither sampler accepts the other's history.
+    assert isinstance(first.history, MultistepHistory)
+    assert not isinstance(first.history, ResMultistepHistory)
+    sampler.sample(lambda es: [(torch.full((3,), 4.0),)], [first], num_steps=1)
+    assert first.finished
+    assert first.history.old_denoised == (None,)

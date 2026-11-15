@@ -1225,7 +1225,7 @@ full and windowed latents.
 
 ## Request-scoped sampler
 
-H3 supports `euler` (the default), `res_multistep`, and `heun`. Select the sampler per
+H3 supports `euler` (the default), `res_multistep`, `heun`, and `dpmpp_2m`. Select the sampler per
 request; it applies to both video and audio, using their separate sigma schedules.
 For the HTTP examples above, set `num_inference_steps=20` and add
 `"sampler":"res_multistep"` to the existing `extra_params` object. For example,
@@ -1248,20 +1248,22 @@ sampling_params = OmniDiffusionSamplingParams(
 )
 ```
 
-`euler` and `res_multistep` use one DiT evaluation per step in request mode and
-step execution. `heun` evaluates the DiT a second time at the Euler proposal and
-averages the two derivatives, so an N-step schedule ending at zero uses `2N - 1`
-evaluations; the final step to zero is a plain Euler update. Heun needs uncached
-model runs, so it is rejected with `quality=high` or a server-wide cache backend.
-`res_multistep` retains the previous denoised prediction independently for each
-request and each stream; its first and final updates use Euler. Omitting `sampler`
-or selecting `euler` preserves the existing Euler update. Reducing the step count
-reduces model evaluations, but quality depends on the prompt and configuration;
-20 RES steps are a candidate to compare against an Euler-50 reference.
+`euler`, `res_multistep`, and `dpmpp_2m` use one DiT evaluation per step in
+request mode and step execution. `heun` evaluates the DiT a second time at the
+Euler proposal and averages the two derivatives, so an N-step schedule ending at
+zero uses `2N - 1` evaluations; the final step to zero is a plain Euler update.
+Heun needs uncached model runs, so it is rejected with `quality=high` or a
+server-wide cache backend. `res_multistep` and `dpmpp_2m` retain the previous
+denoised prediction independently for each request and each stream; their first
+and final updates use Euler. `dpmpp_2m` extrapolates the prediction linearly in
+`-log(sigma)`. Omitting `sampler` or selecting `euler` preserves the existing
+Euler update. Reducing the step count reduces model evaluations, but quality
+depends on the prompt and configuration; 20 RES steps are a candidate to compare
+against an Euler-50 reference.
 
 Requests using a fixed distilled `base_schedule` from a checkpoint or adapter
-must keep `sampler="euler"`. RES and Heun sampling with those schedules have not
-been validated and are rejected with `ValueError`.
+must keep `sampler="euler"`. RES, Heun, and DPM++ 2M sampling with those
+schedules have not been validated and are rejected with `ValueError`.
 
 ## Request-scoped quality
 
@@ -1752,7 +1754,7 @@ Select a specific file when a directory contains multiple adapters. General Diff
 | `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |
 | `fps` | `24` | H3 output FPS is fixed |
 | `num_inference_steps` | `50` | Matches the reference accuracy workloads |
-| `extra_params.sampler` | `euler` | Per-request `euler`, `res_multistep`, or `heun` for both streams; fixed distilled schedules require Euler; Heun requires uncached runs |
+| `extra_params.sampler` | `euler` | Per-request `euler`, `res_multistep`, `heun`, or `dpmpp_2m` for both streams; fixed distilled schedules require Euler; Heun requires uncached runs |
 | `flow_shift` | `12` | Video sigma shift |
 | `audio_flow_shift` | `3` | Audio sigma shift, passed in `extra_params` |
 | `seed` | Task-specific | Use a fixed value for reproducibility |
