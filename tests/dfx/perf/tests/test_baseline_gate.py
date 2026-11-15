@@ -85,17 +85,17 @@ def test_latency_increase_beyond_10_percent_fails_and_improvement_passes() -> No
         )
 
 
-def test_unmatched_hardware_uses_temporary_fallback_and_empty_baseline_is_not_gated(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    measured = {"throughput_qps": 0.01}
-    baseline = {"H200": {"throughput_qps": 1.0}}
-    for hardware in ("B200", None):
-        with pytest.raises(AssertionError, match="on H200"):
-            assert_baseline_within_tolerance(measured, baseline, hardware)
-    assert any(record.levelname == "ERROR" and "falling back to H200" in record.message for record in caplog.records)
-    assert_baseline_within_tolerance(measured, {}, "H200")
-    assert_baseline_within_tolerance(measured, None, "H200")
+@pytest.mark.parametrize("hardware", ["B200", None, ""])
+def test_unmatched_hardware_fails(hardware: str | None, caplog: pytest.LogCaptureFixture) -> None:
+    baseline = {"H100": {"throughput_qps": 1.0}}
+    with pytest.raises(AssertionError, match="No matching baseline for hardware"):
+        assert_baseline_within_tolerance({"throughput_qps": 1.0}, baseline, hardware)
+    assert any(record.levelname == "ERROR" and "No matching baseline" in record.message for record in caplog.records)
+
+
+def test_empty_baseline_is_not_gated() -> None:
+    assert_baseline_within_tolerance({}, {}, "H100")
+    assert_baseline_within_tolerance({}, None, "H100")
 
 
 def test_missing_nonfinite_negative_and_unresolved_baselines_fail() -> None:
@@ -145,10 +145,10 @@ def test_diffusion_assert_result_checks_named_hardware_only_when_enabled() -> No
         "completed": 1,
         "throughput_qps": 0.5,
         "latency_mean": 1.0,
-        "baseline": {"H100": {"throughput_qps": 1.0, "latency_mean": 1.0}, "H200": {"throughput_qps": 1.0}},
+        "baseline": {"H100": {"throughput_qps": 1.0, "latency_mean": 1.0}},
     }
     assert_result(result, 1)
-    with pytest.raises(AssertionError, match="throughput_qps"):
+    with pytest.raises(AssertionError, match="No matching baseline for hardware"):
         assert_result(result, 1, check_baseline=True, hardware="B200")
     with pytest.raises(AssertionError, match="throughput_qps"):
         assert_result(result, 1, check_baseline=True, hardware="H100")
