@@ -21,6 +21,7 @@ from ..utils.memory_pool import BufferAllocator, ManagedBuffer
 from ..utils.serialization import OmniSerializer
 from ..utils.tensor_payload import (
     PreparedTensorPayload,
+    TensorPayloadPlan,
     UnsupportedTensorPayloadError,
     decode_tensor_payload,
     plan_tensor_payload,
@@ -486,21 +487,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     except UnsupportedTensorPayloadError:
                         pass  # Preserve legacy support for other object types.
                 is_fast_path = False  # Receiver decodes either frame or msgpack.
-                if plan is not None:
-                    size = plan.size
-                    offset = self.allocator.alloc(size)
-                    holder = ManagedBuffer(self.allocator, offset, size, self.pool)
-                    should_release_holder = True
-                    try:
-                        plan.pack_into(holder.tensor)
-                    except Exception:
-                        # A failed copy may still have queued device work.
-                        synchronize_device(self.pool.device)
-                        holder.release()
-                        raise
-                    src_addr = self.base_ptr + offset
-                else:
-                    data = OmniSerializer.serialize(data)
+                data = plan if plan is not None else OmniSerializer.serialize(data)
 
             if isinstance(data, ManagedBuffer):
                 # Zero-Copy Path
@@ -517,50 +504,50 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     holder = data  # Keep the buffer alive
                     should_release_holder = False  # Caller owns it
 
-            # Use 'if' (not 'elif') so the ManagedBuffer fallback above can
-            # convert to Tensor and flow into this branch seamlessly.
-            if isinstance(data, (torch.Tensor, bytes)):
-                # Copy Path
-                # 1. Determine size
-                if isinstance(data, torch.Tensor):
+            # A foreign ManagedBuffer falls through to the same owned-copy
+            # path as raw data and packed containers.
+            if isinstance(data, (TensorPayloadPlan, torch.Tensor, bytes)):
+                if isinstance(data, TensorPayloadPlan):
+                    size = data.size
+                elif isinstance(data, torch.Tensor):
                     size = data.nbytes
-                    tensor_data = data
                 else:
                     size = len(data)
-                    # Convert bytes to tensor for copy
-                    tensor_data = torch.frombuffer(data, dtype=torch.uint8)
 
-                # 2. Alloc from pool
                 try:
                     offset = self.allocator.alloc(size)
                     holder = ManagedBuffer(self.allocator, offset, size, self.pool)
-                    should_release_holder = True  # We created it, we release it
+                    should_release_holder = True
                 except MemoryError:
+                    self._metrics["errors"] += 1
                     logger.error(f"Pool exhausted, cannot put data size {size}")
                     return False, 0, None
 
-                # 3. Copy data to pool
-                # Handle device mismatch for copy
                 try:
                     dst_tensor = holder.tensor
-                    if isinstance(data, torch.Tensor):
-                        src_view = data.detach().contiguous().reshape(-1).view(torch.uint8)
-                        dst_tensor.copy_(src_view)
+                    if isinstance(data, TensorPayloadPlan):
+                        data.pack_into(dst_tensor)
                     else:
-                        dst_tensor.copy_(tensor_data)
-                    # Preserve stream-local completion on the legacy path.
-                    # Prepared frames already waited for their producer event.
-                    synchronize_stream(dst_tensor.device)
-                    if isinstance(data, torch.Tensor) and data.device != dst_tensor.device:
-                        synchronize_stream(data.device)
-                except Exception as e:
+                        src_view = (
+                            data.detach().contiguous().reshape(-1).view(torch.uint8)
+                            if isinstance(data, torch.Tensor)
+                            else torch.frombuffer(data, dtype=torch.uint8)
+                        )
+                        dst_tensor.copy_(src_view)
+                        # Prepared frames already waited for their producer event.
+                        synchronize_stream(dst_tensor.device)
+                        if src_view.device != dst_tensor.device:
+                            synchronize_stream(src_view.device)
+                except Exception:
                     # Drain queued copies before returning this pool range.
-                    synchronize_stream(dst_tensor.device)
-                    if isinstance(data, torch.Tensor) and data.device != dst_tensor.device:
-                        synchronize_stream(data.device)
+                    if isinstance(data, TensorPayloadPlan):
+                        synchronize_device(self.pool.device)
+                    else:
+                        synchronize_stream(self.pool.device)
+                        if isinstance(data, torch.Tensor) and data.device != self.pool.device:
+                            synchronize_stream(data.device)
                     holder.release()
-                    logger.error(f"Failed to copy data to pool: {e}")
-                    return False, 0, None
+                    raise
 
                 src_addr = self.base_ptr + offset
 

@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Versioned tensor frames for the opt-in Mooncake device payload path.
 
-Only the bounded header crosses the host. Tensor bytes are packed into the
-registered pool and cloned on the destination before the pool is released.
+Device tensor bodies stay on device; headers and CPU tensor fields use the host.
+Received storage is cloned before the registered pool is released.
 This is a value transport: strides and storage aliasing are not preserved.
 """
 

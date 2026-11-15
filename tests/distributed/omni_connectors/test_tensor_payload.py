@@ -234,18 +234,24 @@ def test_connector_legacy_object_fallback(connector, enabled):
     assert torch.equal(result["tensor"], value["tensor"])
 
 
-def test_connector_pack_failure_and_pool_exhaustion(connector, monkeypatch):
-    from vllm_omni.distributed.omni_connectors.utils.tensor_payload import TensorPayloadPlan
-
-    def fail_pack(*args, **kwargs):
+@pytest.mark.parametrize(
+    "wrap",
+    [lambda tensor: {"x": tensor}, lambda tensor: tensor, lambda tensor: tensor.numpy().tobytes()],
+    ids=["packed", "tensor", "bytes"],
+)
+def test_connector_copy_failure_and_pool_exhaustion(connector, monkeypatch, wrap):
+    def fail_copy(*args, **kwargs):
         raise RuntimeError("copy failed")
 
+    value = wrap(torch.ones(4))
     with monkeypatch.context() as patch:
-        patch.setattr(TensorPayloadPlan, "pack_into", fail_pack)
-        assert connector.put("A", "B", "bad-copy", {"x": torch.ones(4)}) == (False, 0, None)
+        patch.setattr(torch.Tensor, "copy_", fail_copy)
+        assert connector.put("A", "B", "bad-copy", value) == (False, 0, None)
     assert connector.allocator.free_blocks == [(0, 4096)]
-    assert connector.put("A", "B", "too-big", {"x": torch.ones(4096)}) == (False, 0, None)
+    assert connector._metrics["errors"] == 1
+    assert connector.put("A", "B", "too-big", wrap(torch.ones(4096))) == (False, 0, None)
     assert connector.allocator.free_blocks == [(0, 4096)]
+    assert connector._metrics["errors"] == 2
     assert not connector._local_buffers
 
 
