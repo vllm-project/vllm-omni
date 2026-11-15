@@ -266,7 +266,11 @@ def test_full_payload_qwen_builder_receives_complete_codec(raw_plane, monkeypatc
 def _gated_connector():
     # put() blocks its first call until released (or forever without release).
     conn = SimpleNamespace(
-        put_keys=[], put_started=threading.Event(), release=threading.Event(), close_called=threading.Event()
+        put_keys=[],
+        put_started=threading.Event(),
+        release=threading.Event(),
+        close_called=threading.Event(),
+        prepare_payload=lambda payload: payload,
     )
 
     def put(**kwargs):
@@ -502,7 +506,7 @@ def test_permanent_put_failure_quarantines_and_holds_state(raw_plane):
         puts.append(1)
         return False, 0, None
 
-    connector = SimpleNamespace(put=put, close=lambda: None)
+    connector = SimpleNamespace(put=put, close=lambda: None, prepare_payload=lambda payload: payload)
     _start_save_thread(raw_plane, connector)
     raw_plane.register_request(_new_request())
     raw_plane.reserve_outputs(["internal"])
@@ -1009,3 +1013,18 @@ def test_release_reclaims_segments_no_downstream_stage_consumed(plane):
         assert plane.release_shm_resources([ext_id, "unknown"]) == 1
     finally:
         connector.close()
+
+
+def test_payload_preparation_failure_does_not_reserve_delivery(raw_plane, monkeypatch):
+    def fail_prepare(payload):
+        raise MemoryError("snapshot budget exhausted")
+
+    def unexpected_ticket(**kwargs):
+        raise AssertionError("delivery reserved before payload preparation")
+
+    raw_plane._omni_connector = SimpleNamespace(prepare_payload=fail_prepare)
+    monkeypatch.setattr(raw_plane, "_create_send_completion", unexpected_ticket)
+    with pytest.raises(MemoryError, match="snapshot budget"):
+        raw_plane._enqueue_chunk_payload(_new_request(), {"x": torch.ones(1)}, wait_for_delivery=True)
+    assert not raw_plane._put_req_chunk
+    assert not raw_plane._ramp_chunk_count

@@ -54,7 +54,7 @@ stages:
 ### Required
 
 | Parameter | Description |
-|---|---|
+| --- | --- |
 | `role` | **Internal, do not set manually.** Auto-injected by the orchestration layer (`"sender"` for `output_connectors`, `"receiver"` for `input_connectors`). Defaults to `"sender"` if omitted. |
 | `host` | Local IP address for RDMA. `"auto"` detects from network interfaces. |
 | `protocol` | Transport protocol: `"rdma"` (InfiniBand/RoCE) or `"tcp"`. |
@@ -62,14 +62,15 @@ stages:
 ### Memory Pool
 
 | Parameter | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `memory_pool_size` | 4 GB (CPU) / 2 GB (GPU) | Total size of the RDMA-registered memory pool in bytes. Recommended 4 GB for CPU pinned memory; 2 GB for GPU VRAM to conserve device memory. |
-| `memory_pool_device` | `"cpu"` | `"cpu"`: pinned host memory (recommended, works on all topologies). `"cuda"`: GPU VRAM for GPUDirect RDMA (requires NIC-GPU direct PCIe connectivity, PIX topology). |
+| `memory_pool_device` | `"cpu"` | `"cpu"`: pinned host memory (recommended, works on all topologies). `"cuda"`: GPU VRAM for GPUDirect RDMA (requires NIC-GPU direct PCIe connectivity, PIX topology). MLU device pools use `"mlu:0"` and require a compatible PyTorch-MLU and Mooncake build. |
+| `tensor_payload` | `false` | Pack supported nested tensor containers into the pool without staging device tensor bodies through CPU. Enable on both peers. |
 
 ### Networking
 
 | Parameter | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `zmq_port` | 50051 | ZMQ **base** port. The orchestration layer computes the actual port as `base + purpose_offset + stage_offset` (see table below). Users only set this base value. |
 | `sender_host` | `None` | **Internal.** Receiver-side only — dynamically resolved via `update_sender_info()`. Not needed in YAML. |
 | `sender_zmq_port` | `None` | **Internal.** Receiver-side only — defaults to the sender's adjusted port. Not needed in YAML. |
@@ -79,14 +80,14 @@ stages:
 
 To avoid port conflicts when multiple edges, purposes, DP replicas, or TP ranks share the same node, the actual ZMQ port is computed as:
 
-```
+```text
 side_channel_port = zmq_port + purpose_offset + stage_offset + dp_index * tp_size
 sender_listen     = side_channel_port + tp_rank
 receiver_connect  = remote_side_channel_port + tp_rank
 ```
 
 | Component | Value | Description |
-|---|---|---|
+| --- | --- | --- |
 | `zmq_port` | 50051 (default) | Base port from YAML config |
 | `purpose_offset` | `request_forwarding` = 0, `kv_transfer` = 100 | Separates control-plane vs KV-cache connections |
 | `stage_offset` | `int(from_stage)` (0, 1, 2...) | Separates edges from different source stages |
@@ -97,7 +98,7 @@ receiver_connect  = remote_side_channel_port + tp_rank
 **Example** (base=50051, stage 0→1, DP=2, TP=2, kv_transfer):
 
 | Caller | DP | TP rank | Port |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Stage worker | DP0 | rank 0 | `50051 + 100 + 0 + 0×2 + 0 = 50151` |
 | Stage worker | DP0 | rank 1 | `50051 + 100 + 0 + 0×2 + 1 = 50152` |
 | Stage worker | DP1 | rank 0 | `50051 + 100 + 0 + 1×2 + 0 = 50153` |
@@ -107,7 +108,7 @@ receiver_connect  = remote_side_channel_port + tp_rank
 ## Memory Pool Modes
 
 | Mode | Config | Recommended Pool Size | Data Flow | Best For |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | CPU Pinned | `memory_pool_device: "cpu"` | 4 GB | GPU → CPU pool → RDMA → CPU pool → GPU | Most hardware topologies (recommended) |
 | GPUDirect | `memory_pool_device: "cuda"` | 2 GB | GPU → GPU pool → RDMA (NIC reads GPU BAR1) → GPU pool | NIC-GPU direct PCIe (PIX topology) |
 
@@ -115,10 +116,59 @@ receiver_connect  = remote_side_channel_port + tp_rank
 > switch (PIX topology). On systems where they are connected via PXB or NODE,
 > CPU pinned memory is faster due to GPU BAR1 bandwidth limitations.
 
+## Nested Tensor Payloads
+
+Set `tensor_payload: true` on **both peers** to transfer a `dict`, `list`, or
+`tuple` containing tensors as one versioned frame. With a device memory pool,
+tensor bodies stay on the device during packing and RDMA transfer. The receiver
+reads the bounded header on CPU and returns tensors backed by an owned device
+copy, so later pool reuse cannot overwrite the result.
+
+```yaml
+extra:
+  protocol: "rdma"
+  memory_pool_device: "mlu:0"  # or "cuda:0" with the matching native build
+  memory_pool_size: 1073741824
+  tensor_payload: true
+```
+
+The frame supports dense plain PyTorch tensors on CPU or the sender pool's
+resolved device, string-keyed dictionaries, lists, tuples, and scalar metadata.
+It preserves dtype, shape, values, and repeated references to the same tensor.
+Non-contiguous tensors are packed contiguously; strides, storage aliasing between
+views, and autograd history are not preserved. CPU tensor fields remain on CPU;
+other tensors are reconstructed on the receiver pool's device. A CPU receive
+pool therefore returns CPU tensors. Metadata is limited to 1 MiB, 4,096 distinct
+tensors, and 64 nesting levels. Unsupported objects use the existing serializer.
+The option defaults to `false`; raw Tensor, bytes, and ManagedBuffer inputs retain
+their existing fast-path contract and receiver release requirement.
+
+### Producer Readiness and Ownership
+
+Model-runner payload queues call `prepare_payload(payload)` before enqueueing.
+For a supported container, Mooncake captures an owned frame on the producer's
+current stream and records a device event. The background sender waits for that
+event before copying to the registered pool. Call preparation on the stream that
+produced the tensors, or establish a stream dependency first. Inputs may then be
+reused on that same producer stream. Queued snapshot bytes are bounded separately
+by `memory_pool_size`; exceeding the budget raises `MemoryError` before reserving
+chunk IDs or delivery tickets. Other connectors retain identity preparation.
+
+Direct calls to `put()` with an unprepared container conservatively synchronize
+the device before packing; the caller must keep inputs immutable until it
+returns. Stream synchronization uses the PyTorch device module, including MLU.
+The registered pool is allocated outside inference mode so background sender
+threads can write it even when the model created the connector in inference mode.
+
+This option does not install an MLU model runtime or remove `.cpu()` calls in
+model-specific producers. It changes payload encoding and device readiness;
+Mooncake's existing transfer statuses, timeout handling, TTL, and close behavior
+are unchanged. IPv6 endpoints are bracketed and enable IPv6 on ZMQ sockets.
+
 ## Environment Variables
 
 | Variable | Description |
-|---|---|
+| --- | --- |
 | `RDMA_DEVICE_NAME` | Override RDMA device name (e.g., `mlx5_0`). |
 | `MC_IB_PCI_RELAXED_ORDERING` | Set to `1` to enable PCIe relaxed ordering for GPUDirect. |
 
@@ -142,7 +192,7 @@ docker run -it \
 Benchmark results on H800 GPUs with mlx5_0 RDMA NIC (~186 MB KV cache):
 
 | Metric | MooncakeStoreConnector | MooncakeTransferEngineConnector (CPU) |
-|---|---|---|
+| --- | --- | --- |
 | KV transfer wall time | ~810 ms | **~14 ms** |
 | RDMA throughput | N/A (TCP) | ~22 GB/s |
 | Speedup | 1x | **58x** |
@@ -175,7 +225,7 @@ echo "MC_IB_PCI_RELAXED_ORDERING=${MC_IB_PCI_RELAXED_ORDERING:-<not set>}"
 ### Common Issues
 
 | Symptom | Cause | Fix |
-|---|---|---|
+| --- | --- | --- |
 | `Failed to modify QP to RTR` | Cross-NIC QP handshake failure (multi-NIC DGX) | Set `device_name` to a single RoCE NIC (e.g., `mlx5_2`) or set `RDMA_DEVICE_NAME` env var |
 | `transport retry counter exceeded` | RDMA path between incompatible NICs | Same as above — restrict to one NIC |
 | `zmq.error.Again: Resource temporarily unavailable` | ZMQ recv timeout (transfer took too long) | Check NIC selection; increase data may need longer timeout |
@@ -195,6 +245,7 @@ ibdev2netdev | grep -v "ib[0-9]"
 ```
 
 Then configure the connector:
+
 ```yaml
 device_name: "mlx5_2"  # or set RDMA_DEVICE_NAME=mlx5_2
 ```
@@ -378,10 +429,10 @@ Two helper classes control local memory ownership:
 
 - `ManagedBuffer`
   Represents one live slice of the pool and exposes:
-  - `.tensor`
-  - `.as_tensor(dtype, shape)`
-  - `.to_bytes()`
-  - `.release()`
+    - `.tensor`
+    - `.as_tensor(dtype, shape)`
+    - `.to_bytes()`
+    - `.release()`
 
 #### 4.4 ZMQ Side Channel
 
@@ -502,7 +553,7 @@ These payloads are copied into the local pool and marked as fast-path data:
 - no Omni object serialization is required
 - receiver can get a `ManagedBuffer` back
 
-**C. Generic Python object**
+##### C. Generic Python object
 
 Any other payload is serialized via `OmniSerializer.serialize(...)` and then copied into the pool.
 
@@ -558,7 +609,7 @@ This table is the sender-side truth source for both metadata queries and pull re
 
 The `metadata` parameter in `get()` is optional. The connector supports two resolution modes depending on whether the caller supplies it.
 
-**With metadata**
+##### With metadata
 
 When the caller passes metadata, the connector uses it directly. The metadata carries:
 
@@ -568,7 +619,7 @@ When the caller passes metadata, the connector uses it directly. The metadata ca
 
 This mode is suitable when the control plane already forwards the sender's `put()` output to the receiver.
 
-**Without metadata**
+##### Without metadata
 
 When `get(metadata=None)` is called, the connector queries the sender over ZMQ to discover the same fields (`data_size`, `is_fast_path`). The caller must first call:
 
@@ -605,7 +656,7 @@ The receiver then sends the pull request over ZMQ and waits for:
 If the transfer succeeds:
 
 - for `is_fast_path=True`, the receiver returns `(ManagedBuffer, size)`
-- for `is_fast_path=False`, the receiver copies to bytes, deserializes, releases the buffer, and returns `(object, size)`
+- for `is_fast_path=False`, the receiver decodes an enabled tensor frame or copies to bytes and deserializes the legacy object, releases the pool buffer, and returns `(object, size)`
 
 ### 9. Sender-Side Listener Design
 
@@ -670,6 +721,12 @@ For `torch.Tensor`, `bytes`, or pool-local `ManagedBuffer`:
 - caller is responsible for calling `release()`
 
 This avoids an unnecessary copy on the receiver side.
+
+#### Packed Tensor Container Path
+
+With `tensor_payload: true`, supported containers use one packed frame with
+`is_fast_path=False`. The receiver owns the decoded storage and releases its pool
+slice internally. See [Nested Tensor Payloads](#nested-tensor-payloads).
 
 #### Serialized Object Path
 

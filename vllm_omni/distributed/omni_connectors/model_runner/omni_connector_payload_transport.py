@@ -845,6 +845,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     meta.get("left_context_size"),
                 )
 
+            prepared_payload = self._omni_connector.prepare_payload(payload)
             external_req_id = self._resolve_external_req_id(request, req_id)
             chunk_id = self._put_req_chunk[req_id]
             self._put_req_chunk[req_id] += 1
@@ -862,7 +863,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 "stage_id": self._stage_id,
                 "next_stage_id": next_stage_id,
                 "put_key": connector_put_key,
-                "data": payload,
+                "data": prepared_payload,
                 "request_id": req_id,
             }
             with self._lock:
@@ -1632,6 +1633,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         wait_for_delivery: bool = False,
     ) -> tuple[bool, Any | None]:
         """Enqueue an already-built payload under its per-request chunk key."""
+        # Preparation can fail (for example on a bounded snapshot budget).
+        # Do it before reserving chunk ids or a delivery completion ticket.
+        prepared_payload = self._omni_connector.prepare_payload(payload_data)
         raw_req_id = getattr(request, "request_id", None) or getattr(request, "req_id", None)
         request_id = self._resolve_external_req_id(request, raw_req_id)
         if raw_req_id and raw_req_id != request_id:
@@ -1662,7 +1666,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             "stage_id": self._stage_id,
             "next_stage_id": next_stage_id,
             "put_key": connector_put_key,
-            "data": payload_data,
+            "data": prepared_payload,
             "request_id": request_id,
             "completion": completion,
         }

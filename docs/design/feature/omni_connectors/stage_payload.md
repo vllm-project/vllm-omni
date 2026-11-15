@@ -34,6 +34,11 @@ metadata-query loop.
 The synchronous runtime borrows the manager's connector. It does not create
 background AR receive/save loops or replace the manager's KV key callbacks.
 The asynchronous AR path continues using `get()` through its existing poller.
+Before enqueueing a payload, its producer calls `prepare_payload()` on the
+connector. The default returns the input unchanged; Mooncake can capture an
+owned device frame when its [tensor payload option](mooncake_transfer_engine_connector.md#nested-tensor-payloads)
+is enabled. Preparation precedes chunk counters and delivery-ticket reservation
+so a failed snapshot does not leave an unsent delivery pending.
 Both paths share the descriptor and fanout helpers; their scheduling policies
 are deliberately different.
 

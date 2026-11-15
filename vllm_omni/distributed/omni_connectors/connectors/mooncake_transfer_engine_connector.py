@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 import queue
@@ -7,6 +7,7 @@ import socket
 import threading
 import time as _time_mod
 import uuid
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -18,6 +19,14 @@ import zmq
 from ..utils.logging import get_connector_logger
 from ..utils.memory_pool import BufferAllocator, ManagedBuffer
 from ..utils.serialization import OmniSerializer
+from ..utils.tensor_payload import (
+    PreparedTensorPayload,
+    UnsupportedTensorPayloadError,
+    decode_tensor_payload,
+    plan_tensor_payload,
+    synchronize_device,
+    synchronize_stream,
+)
 from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
@@ -39,6 +48,10 @@ TRANS_DONE = b"trans_done"
 TRANS_ERROR = b"trans_error"
 QUERY_INFO = b"query_info"
 INFO_NOT_FOUND = b"info_not_found"
+
+
+def _endpoint(host: str, port: int) -> str:
+    return f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
 
 
 @dataclass
@@ -118,6 +131,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._local_buffers: dict[str, Any] = {}
         self._local_buffers_lock = threading.Lock()
         self._put_lock = threading.Lock()
+        self._snapshot_lock = threading.Lock()
+        self._snapshot_bytes = 0
         self._req_local = threading.local()
         self._worker_local = threading.local()
         self._last_ttl_check: float = _time_mod.monotonic()
@@ -160,6 +175,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # --- Memory Pool Configuration ---
         self.pool_size = config.get("memory_pool_size", 1024**3)  # Default 1GB
         self.pool_device = config.get("memory_pool_device", "cpu")
+        # Both peers must opt in; legacy serialization stays the default.
+        self.tensor_payload = bool(config.get("tensor_payload", False))
         self.buffer_ttl_seconds = float(config.get("buffer_ttl_seconds", _BUFFER_TTL_SECONDS))
 
         # --- Sender Configuration (for receiver to query without metadata) ---
@@ -197,6 +214,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self.rpc_port = self.engine.get_rpc_port()
         logger.info(f"MooncakeTransferEngineConnector initialized at {self.host}:{self.rpc_port}")
 
+    @torch.inference_mode(False)
     def _init_pool(self) -> None:
         """Allocate and register the memory pool used by TransferEngine."""
         logger.info(f"Allocating RDMA Memory Pool: {self.pool_size / 1024**2:.2f} MB on {self.pool_device}")
@@ -349,6 +367,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         sock = cache.get(zmq_addr)
         if sock is None:
             sock = self.zmq_ctx.socket(zmq.REQ)
+            if "[" in zmq_addr:
+                sock.setsockopt(zmq.IPV6, 1)
             sock.connect(zmq_addr)
             cache[zmq_addr] = sock
         # Set timeouts per-call (safe to change between send/recv cycles).
@@ -370,6 +390,37 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             except Exception:
                 pass  # Best-effort; zmq_ctx.term() will reclaim if needed
 
+    def prepare_payload(self, data: Any) -> Any:
+        if not self.tensor_payload or type(data) not in (dict, list, tuple):
+            return data
+        with self._snapshot_lock:
+            if self._closed:
+                raise RuntimeError("Cannot prepare payload: connector is closed")
+            device = self.pool.device
+        try:
+            plan = plan_tensor_payload(data, device)
+        except UnsupportedTensorPayloadError:
+            return data
+        # Bound device memory held by queued snapshots independently of the
+        # registered transfer pool. Fail before allocating or capturing data.
+        with self._snapshot_lock:
+            if self._closed:
+                raise RuntimeError("Cannot prepare payload: connector is closed")
+            if self._snapshot_bytes + plan.size > self.pool_size:
+                raise MemoryError("Mooncake queued tensor snapshots exceed memory_pool_size")
+            self._snapshot_bytes += plan.size
+        try:
+            prepared = plan.snapshot(device)
+        except Exception:
+            self._release_snapshot_bytes(plan.size)
+            raise
+        weakref.finalize(prepared, self._release_snapshot_bytes, plan.size)
+        return prepared
+
+    def _release_snapshot_bytes(self, size: int) -> None:
+        with self._snapshot_lock:
+            self._snapshot_bytes -= size
+
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """
         Producer Side.
@@ -379,6 +430,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         - ManagedBuffer (from this pool): Zero-copy, is_fast_path=True
         - ManagedBuffer (different pool): Fallback to tensor copy path
         - torch.Tensor / bytes: Copy to pool, is_fast_path=True
+        - Supported containers with tensor_payload enabled: Pack on device
         - Other (dict, etc.): Serialize to bytes, copy to pool, is_fast_path=False
           (receiver will deserialize automatically)
         """
@@ -408,6 +460,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             holder = None
             is_fast_path = True
             should_release_holder = False
+            if isinstance(data, PreparedTensorPayload):
+                data.wait()
+                data = data.frame
+                is_fast_path = False
 
             # Reject empty data early — alloc(0) has undefined behaviour and
             # would leave a zombie entry in _local_buffers that the receiver
@@ -423,8 +479,28 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             # This avoids the previous recursive put() pattern and keeps
             # _local_buffers writes atomic (single write, no override needed).
             if not isinstance(data, (ManagedBuffer, torch.Tensor, bytes)):
-                data = OmniSerializer.serialize(data)
-                is_fast_path = False  # Receiver must deserialize
+                plan = None
+                if self.tensor_payload:
+                    try:
+                        plan = plan_tensor_payload(data, self.pool.device)
+                    except UnsupportedTensorPayloadError:
+                        pass  # Preserve legacy support for other object types.
+                is_fast_path = False  # Receiver decodes either frame or msgpack.
+                if plan is not None:
+                    size = plan.size
+                    offset = self.allocator.alloc(size)
+                    holder = ManagedBuffer(self.allocator, offset, size, self.pool)
+                    should_release_holder = True
+                    try:
+                        plan.pack_into(holder.tensor)
+                    except Exception:
+                        # A failed copy may still have queued device work.
+                        synchronize_device(self.pool.device)
+                        holder.release()
+                        raise
+                    src_addr = self.base_ptr + offset
+                else:
+                    data = OmniSerializer.serialize(data)
 
             if isinstance(data, ManagedBuffer):
                 # Zero-Copy Path
@@ -468,35 +544,20 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 try:
                     dst_tensor = holder.tensor
                     if isinstance(data, torch.Tensor):
-                        if not data.is_contiguous():
-                            data = data.contiguous()
-
-                        # View as flat uint8
-                        src_view = data.view(torch.uint8).flatten()
-                        if src_view.device != dst_tensor.device:
-                            dst_tensor.copy_(src_view, non_blocking=True)
-                            # Ensure copy is complete before exposing buffer to RDMA
-                            # Must sync on SOURCE device for D2H copies, or DST for H2D
-                            if src_view.is_cuda:
-                                with torch.cuda.device(src_view.device):
-                                    torch.cuda.current_stream().synchronize()
-                            elif dst_tensor.is_cuda:
-                                with torch.cuda.device(dst_tensor.device):
-                                    torch.cuda.current_stream().synchronize()
-                        else:
-                            dst_tensor.copy_(src_view)
-                            if dst_tensor.is_cuda:
-                                with torch.cuda.device(dst_tensor.device):
-                                    torch.cuda.current_stream().synchronize()
+                        src_view = data.detach().contiguous().reshape(-1).view(torch.uint8)
+                        dst_tensor.copy_(src_view)
                     else:
-                        # bytes -> tensor copy
-                        # torch.frombuffer creates CPU tensor. If pool is GPU, copy_ handles H2D.
                         dst_tensor.copy_(tensor_data)
-                        if dst_tensor.is_cuda:
-                            with torch.cuda.device(dst_tensor.device):
-                                torch.cuda.current_stream().synchronize()
+                    # Preserve stream-local completion on the legacy path.
+                    # Prepared frames already waited for their producer event.
+                    synchronize_stream(dst_tensor.device)
+                    if isinstance(data, torch.Tensor) and data.device != dst_tensor.device:
+                        synchronize_stream(data.device)
                 except Exception as e:
-                    # Copy failed, release the allocated buffer to prevent leak
+                    # Drain queued copies before returning this pool range.
+                    synchronize_stream(dst_tensor.device)
+                    if isinstance(data, torch.Tensor) and data.device != dst_tensor.device:
+                        synchronize_stream(data.device)
                     holder.release()
                     logger.error(f"Failed to copy data to pool: {e}")
                     return False, 0, None
@@ -572,7 +633,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         Returns ``{source_host, source_port, data_size, is_fast_path}``
         or ``None`` when the key is not found / the query fails.
         """
-        zmq_addr = f"tcp://{host}:{port}"
+        zmq_addr = f"tcp://{_endpoint(host, port)}"
         req_socket = self._get_req_socket(zmq_addr, timeout_ms=5000)
         try:
             req_socket.send(QUERY_INFO + msgspec.msgpack.encode(QueryRequest(request_id=get_key)))
@@ -706,7 +767,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         rdma_ms = (_t3 - _t2) * 1000
         if resp != TRANS_DONE:
             self._metrics["errors"] += 1
-            logger.error(f"RDMA Get failed: received {resp} instead of TRANS_DONE")
+            logger.error(f"RDMA Get failed: received {resp!r} instead of TRANS_DONE")
             recv_buffer.release()
             return None
 
@@ -797,7 +858,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # Timeout scales with data size: base 30s + 5s per 100MB.
         size_timeout_ms = (data_size // _TRANSFER_TIMEOUT_STEP_BYTES) * _TRANSFER_TIMEOUT_PER_STEP_MS
         total_timeout_ms = _BASE_TRANSFER_TIMEOUT_MS + size_timeout_ms
-        zmq_addr = f"tcp://{source_host}:{source_port}"
+        zmq_addr = f"tcp://{_endpoint(source_host, source_port)}"
         req_socket = self._get_req_socket(zmq_addr, timeout_ms=total_timeout_ms)
         try:
             req_socket.send(msgspec.msgpack.encode(agent_meta))
@@ -810,9 +871,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
     def _sync_receive_buffer_if_needed(self) -> float:
         """Synchronize GPU-visible receive memory until Mooncake exposes a finer fence."""
         t0 = _time_mod.perf_counter()
-        if self.pool.is_cuda:
-            with torch.cuda.device(self.pool.device):
-                torch.cuda.current_stream().synchronize()
+        synchronize_stream(self.pool.device)
         return (_time_mod.perf_counter() - t0) * 1000
 
     def _decode_result(
@@ -845,6 +904,12 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 raise
 
         try:
+            if self.tensor_payload:
+                value = decode_tensor_payload(recv_buffer.tensor[:data_size])
+                if value is not None:
+                    self._metrics["gets"] += 1
+                    self._metrics["bytes_transferred"] += data_size
+                    return value, data_size
             copy_start = _time_mod.perf_counter()
             raw_bytes = recv_buffer.to_bytes()
             copy_ms = (_time_mod.perf_counter() - copy_start) * 1000
@@ -1018,7 +1083,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
     def _zmq_listener_loop(self):
         socket = self.zmq_ctx.socket(zmq.ROUTER)
         try:
-            socket.bind(f"tcp://{self.host}:{self.zmq_port}")
+            if ":" in self.host:
+                socket.setsockopt(zmq.IPV6, 1)
+            socket.bind(f"tcp://{_endpoint(self.host, self.zmq_port)}")
         except zmq.ZMQError as exc:
             # Any bind failure (EADDRINUSE, EADDRNOTAVAIL, EACCES, etc.)
             # is fatal for a sender — fail fast so __init__ propagates the error.
@@ -1078,6 +1145,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                         frames = socket.recv_multipart()
                         if len(frames) >= 2:
                             # Submit to thread pool
+                            assert self._sender_executor is not None
                             self._sender_executor.submit(
                                 self._handle_pull_request,
                                 response_queue,
@@ -1122,7 +1190,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
             try:
                 src_addrs, src_lengths, _, _, _, _ = item
-                remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                remote_session = _endpoint(meta.remote_hostname, meta.remote_port)
 
                 # RDMA Write
                 ret = self.engine.batch_transfer_sync_write(remote_session, src_addrs, meta.dst_addrs, src_lengths)

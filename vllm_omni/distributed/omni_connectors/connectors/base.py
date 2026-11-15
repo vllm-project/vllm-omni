@@ -17,6 +17,15 @@ class OmniConnectorBase(ABC):
     # payloads directly (e.g. RDMA) should override this to True.
     supports_raw_data: bool = False
 
+    def prepare_payload(self, data: Any) -> Any:
+        """Capture producer-owned data before asynchronous sender handoff.
+
+        The default preserves existing connector behavior. A device-aware
+        connector may return an owned snapshot with producer readiness attached.
+        Call on the stream that produced the payload, before reusing its buffers.
+        """
+        return data
+
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """Store Python object, internal serialization handled by connector.
