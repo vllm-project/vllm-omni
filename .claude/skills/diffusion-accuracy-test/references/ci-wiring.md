@@ -350,7 +350,7 @@ calibration-only or inactive CI case.
 For a later change, rerun only the affected checks:
 
 | Change | Minimum follow-up |
-|---|---|
+| --- | --- |
 | Skill/documentation only | Format and link checks; no accuracy rerun |
 | Model-directory move only | Migration checks above; reuse numerical evidence if the effective execution contract is unchanged |
 | CI routing/markers/artifact paths only | Collection/rendering, dependency selection and retention checks; reuse numerical evidence if the execution contract is unchanged |
