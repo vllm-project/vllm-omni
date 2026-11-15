@@ -33,6 +33,7 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
 from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
     is_pipeline_first_stage,
@@ -42,7 +43,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
-from vllm_omni.diffusion.forward_context import build_local_sp_padding_mask, get_forward_context
+from vllm_omni.diffusion.forward_context import ForwardContext, get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
@@ -352,6 +353,29 @@ class OutputScaleShiftPrepare(nn.Module):
             shift = shift.squeeze(1)
             scale = scale.squeeze(1)
         return shift, scale
+
+
+def _build_sp_padding_mask(
+    parallel_config: DiffusionParallelConfig,
+    ctx: ForwardContext,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Key mask for SP auto-padding, or None when nothing is padded.
+
+    SP attention sees the full padded sequence (e.g. after the Ulysses
+    all-to-all), so the mask covers all ranks, not the local shard.
+    """
+    if parallel_config.sequence_parallel_size <= 1 or ctx.sp_original_seq_len is None or ctx.sp_padding_size <= 0:
+        return None
+    mask = torch.ones(
+        batch_size,
+        ctx.sp_original_seq_len + ctx.sp_padding_size,
+        dtype=torch.bool,
+        device=device,
+    )
+    mask[:, ctx.sp_original_seq_len :] = False
+    return mask
 
 
 def _reject_vsa_candidate_without_gate(record: ScheduleCandidate) -> str | None:
@@ -1182,18 +1206,10 @@ class WanTransformer3DModel(nn.Module):
         hidden_states_mask = None
         ctx = get_forward_context()
         parallel_config = ctx.omni_diffusion_config.parallel_config
-        if (
-            parallel_config is not None
-            and parallel_config.sequence_parallel_size > 1
-            and parallel_config.mask_sp_padding
-        ):
-            hidden_states_mask = build_local_sp_padding_mask(
-                hidden_states.shape[0],
-                hidden_states.shape[1],
-                hidden_states.device,
+        if parallel_config is not None and parallel_config.mask_sp_padding:
+            hidden_states_mask = _build_sp_padding_mask(
+                parallel_config, ctx, hidden_states.shape[0], hidden_states.device
             )
-            if hidden_states_mask.all():
-                hidden_states_mask = None
         elif (
             parallel_config is not None
             and parallel_config.sequence_parallel_size > 1
