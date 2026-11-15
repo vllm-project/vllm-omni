@@ -328,6 +328,7 @@ class OmniEngineArgs(EngineArgs):
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
+    diffusion_flashinfer_autotune: bool | None = None
     worker_type: str | None = None
     scheduling_metadata_adapter: str | None = None
     # Dotted path of a per-stage pooling-output decoder applied worker-side.
@@ -369,9 +370,11 @@ class OmniEngineArgs(EngineArgs):
     diffusion_attention_backend: str | None = None
     fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: str | None = None
+    diffusion_attention_schedule: dict[str, Any] | None = None
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
     enable_cuda_graph_decode: bool | None = None
+    enable_cfg_batching: bool | None = None
     cache_backend: str | None = None
     cache_config: str | None = None
     video_output_transport: dict[str, object] | None = None
@@ -791,12 +794,18 @@ class OrchestratorArgs:
     diffusion_attention_backend: str | None = None
     fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: str | None = None
+    diffusion_attention_schedule: dict[str, Any] | None = None
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
     # CUDA graph capture of fixed-shape KV-cache decode steps (Qwen-Image-2.1
     # today). None defers to the OmniDiffusionConfig default (enabled);
     # --enforce-eager also disables it.
     enable_cuda_graph_decode: bool | None = None
+    diffusion_use_graph: bool = False
+    diffusion_graph_release_after_denoise: bool = False
+    # Run both CFG branches as one batched denoiser call on pipelines that
+    # support it. None defers to the OmniDiffusionConfig default (disabled).
+    enable_cfg_batching: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
     video_output_transport: dict[str, object] | None = None
@@ -834,6 +843,9 @@ class OrchestratorArgs:
     tts_max_instructions_length: int | None = None
     enable_diffusion_pipeline_profiler: bool = False
     enable_ar_profiler: bool = False
+    enable_mixfusion: bool = False
+    mixfusion_min_chunk_tokens: int = 256
+    mixfusion_max_chunks: int = 128
     log_file: str | None = None
     replica_id: int | None = None
     omni_replica_address: str | None = None
@@ -872,9 +884,11 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "diffusion_attention_backend",
         "fastvideo_vsa_topk",
         "diffusion_attention_config",
+        "diffusion_attention_schedule",
         "diffusion_compile_granularity",
         "diffusion_compile_dynamic",
         "enable_cuda_graph_decode",
+        "enable_cfg_batching",
         "cache_backend",
         "cache_config",
         "video_output_transport",

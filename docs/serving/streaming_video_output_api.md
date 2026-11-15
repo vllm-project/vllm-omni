@@ -29,6 +29,93 @@ python examples/online_serving/streaming_video_generation/streaming_video_client
   --output output.mp4
 ```
 
+## Startup Warmup
+
+Use `--video-output-warmup REQUEST_JSON` to complete a short generation and
+fragmented-MP4 encode before the HTTP server starts. This moves first-request
+initialization into startup: `/health` and user routes become available only
+after the warmup succeeds. It increases startup time and does not promise higher
+steady-state generation throughput. The option is disabled when omitted.
+
+The JSON file uses the `session.start` fields below. Supply an explicit
+`num_frames` (preferably one native generation chunk), the deployment's output
+dimensions, and any model-required image or camera inputs. Omit playback pacing:
+the internal consumer drains output immediately and has no player to send
+feedback. Model sampling defaults are inherited unless the request overrides
+them. Use a synthetic image and prompt rather than private user content.
+
+For example, create a one-chunk request for the LingBot-World stepwise deployment:
+
+```python
+import json
+from io import BytesIO
+from pathlib import Path
+
+import pybase64
+from PIL import Image
+
+# Match ar_diffusion_width/height in the deployment configuration.
+width, height = 832, 480
+image = Image.new("RGB", (width, height), (80, 120, 160))
+image.paste((160, 120, 80), (width // 2, 0, width, height))
+buffer = BytesIO()
+image.save(buffer, format="PNG")
+request = {
+    "type": "session.start",
+    "prompt": "A quiet landscape in daylight.",
+    "image_reference": {
+        "image_url": "data:image/png;base64," + pybase64.b64encode(buffer.getvalue()).decode("ascii")
+    },
+    "width": width,
+    "height": height,
+    "num_frames": 9,
+    "fps": 12,
+    "seed": 42,
+    "extra_params": {"camera_action_script": [[["w"], ["w"], ["w"]]]},
+}
+Path("video-warmup.json").write_text(json.dumps(request), encoding="utf-8")
+```
+
+Then add the warmup file to the server command:
+
+```bash
+vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers --omni \
+  --deploy-config vllm_omni/deploy/lingbot_world_v2_stepwise.yaml \
+  --disable-websocket-compression \
+  --video-output-warmup video-warmup.json \
+  --video-output-warmup-timeout 180
+```
+
+The generation/encoding deadline defaults to 180 seconds and must be finite and
+positive. Invalid requests, missing encoded video, generation errors, and
+timeouts fail startup instead of advertising readiness. Failure cleanup also
+uses the normal bounded request-abort timeout. Adjust the deployment's startup
+probe budget to include model loading and warmup. The warmup exercises generation
+and the encoder directly; it does not open a WebSocket or warm network transport.
+One request warms the selected execution path, not every shape, LoRA or replica.
+
+## Client Frame Diagnostics
+
+The generic streaming client counts decoded frames on a background worker so
+accounting does not hold up reception or scheduled controls. Its chunk log
+fields have distinct meanings:
+
+- `frames` is the server-declared `num_frames`, or `unknown` when absent.
+- `total_frames` is an asynchronous snapshot of frames actually decoded so far.
+  It may lag reception; differences between snapshots are not per-chunk frame
+  counts or instantaneous generation FPS.
+
+The final `[decode]` line follows end-of-input draining and includes decodable
+trailer frames. For interrupted streams it counts only decodable received media.
+Its elapsed time includes reception and draining, rather than model inference
+alone. Accounting failure, a 64 MiB pending-input overflow, cancellation during
+the drain, or a five-second worker shutdown timeout reports
+`total_frames=unknown` with a status reason. These accounting limits do not bound
+the whole-session bytes retained for saving or change the final save path.
+
+See the [streaming video example README](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/streaming_video_generation/README.md#run-the-client)
+for commands, buffering, and cancellation details.
+
 ## Protocol
 
 Control events are JSON text frames. Each `video.chunk_metadata` event is
@@ -228,6 +315,12 @@ continues to reject repeated IDs with `event_id_conflict`.
 
 This feature is pipeline-dependent. An enabled endpoint does not imply that
 the loaded model supports midway prompt or camera updates.
+
+`session.interaction.queued` confirms only that the server accepted the
+message. If the model rejects the interaction later, for example because the
+modality is unsupported or the payload is invalid, the server sends an `error`
+with `"code": "interaction_failed"` and the same `event_id`. Generation keeps
+streaming, and the `event_id` may be reused.
 
 The default start timeout is 10 seconds and the server reports a stall after
 about 60 seconds without generation progress or a `session.ping`. See the

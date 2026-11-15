@@ -9,6 +9,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
+    ARDiffusionCellContext,
+    CellRunSpec,
+    CellTopology,
+)
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Ordering
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
     CAUSVID_DEFAULT_DENOISE_STEPS,
     CAUSVID_DEFAULT_SHIFT,
@@ -17,8 +24,7 @@ from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import (
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer, stage_layer_range
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.experimental.ar_diffusion.cell_executor import ARDiffusionCellContext, CellRunSpec, CellTopology
-from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -87,8 +93,8 @@ def test_causvid_wan_chunk_noise_matches_reference_seed():
     torch.testing.assert_close(adapter._init_noise(chunk), reference)
 
 
-def test_resolve_latent_reuses_live_tensor_without_bool_check():
-    """S=1 path clears pending_hidden; live latent must use ``is None``, not ``or``."""
+def test_resolve_member_input_reuses_live_tensor_without_bool_check():
+    """Executor may clear pending input; live latent must use ``is None``, not ``or``."""
     shape = (1, 4, 2, 2, 2)
     adapter = WanCell(
         SimpleNamespace(prepare_cell=lambda *_a, **_k: None),  # type: ignore[arg-type]
@@ -100,9 +106,7 @@ def test_resolve_latent_reuses_live_tensor_without_bool_check():
         dtype=torch.float32,
     )
     live = {0: torch.ones(shape)}
-    latent, tokens = adapter._resolve_latent_hidden(
-        req="r0", chunk=0, step=1, index=0, n_tasks=1, hidden=None, live=live
-    )
+    latent, tokens = adapter._resolve_member_input(req="r0", chunk=0, member_input=None, live=live)
     assert tokens is None
     assert latent is live[0]
     torch.testing.assert_close(latent, torch.ones(shape))
@@ -139,6 +143,9 @@ def test_rotary_emb_applies_chunk_temporal_offset():
     cos1, _ = tf._rotary_emb(1, latent)
     assert cos0.shape == cos1.shape
     assert not torch.equal(cos0, cos1)
+    swapped, _ = tf._rotary_emb(1, torch.zeros(1, 4, 3, 4, 1))
+    assert not torch.equal(swapped, cos1)
+    assert len(tf._rotary) == 1
     # After even-dim slice (Wan rotary packs cos[..., 0::2]), temporal axis still differs.
     assert cos1.mean().item() > cos0.mean().item()
 
@@ -156,7 +163,7 @@ def test_cell_schedule_rejects_unknown_values():
 
 @pytest.mark.parametrize(("name", "step_replicas"), [("self_forcing", 1), ("latest_kv", 4)])
 def test_cell_schedule_accepts_known_values(name, step_replicas):
-    from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import Ordering
 
     pipeline = _bare_pipeline(step_replicas=step_replicas, history=6)
     req = OmniDiffusionRequest(
@@ -346,7 +353,7 @@ def test_pipeline_rejects_token_count_change_before_admission(shape):
         request_id="different-shape",
         sampling_params=OmniDiffusionSamplingParams(extra_args={"latent_shape": shape, "num_denoise_steps": 1}),
     )
-    with pipeline.bind_ar_diffusion_cell_context(ctx):
+    with pipeline.bind_ar_diffusion_noisy_kv(ctx.kv):
         with pytest.raises(ValueError, match="does not match preallocated NoisyKV"):
             pipeline.forward(req)
     assert pipeline.block_size == pipeline.max_chunk_tokens == cache.spec.max_chunk_tokens == 16
@@ -354,7 +361,7 @@ def test_pipeline_rejects_token_count_change_before_admission(shape):
 
 
 def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
-    """Non-last groups forward tokens; only stage-last runs FlowEuler."""
+    """Non-last groups emit tokens; only stage-last runs FlowEuler."""
     shape = (1, 4, 1, 2, 2)
     device = torch.device("cpu")
     dtype = torch.float32
@@ -403,21 +410,192 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
         dtype=dtype,
     )
 
-    tasks = [("r0", (0, 0, 0))]
-    mid_out = mid.forward(tasks, [None], hidden=None)
+    from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.batch import (
+        ComputeBatch,
+        MemberRef,
+    )
+
+    def _compute(adapter, req, cell, member_input=None):
+        chunk, step, block = cell
+        batch = ComputeBatch(
+            members=(MemberRef(req, chunk=chunk, step=step, block=block, task_index=0),),
+            kv_views=(None,),
+        )
+        return adapter.forward(batch, [adapter], member_inputs=[member_input])
+
+    mid_out = _compute(mid, "r0", (0, 0, 0))
     assert {"latent", "hidden_states"} <= set(mid_out)
     packed = mid.pack_activation(mid_out)
     assert "latent" in packed and "hidden_states" in packed
 
     last_in = last.unpack_activation(packed)
-    last_out = last.forward(tasks, [None], hidden=last_in)
+    last_out = _compute(last, "r0", (0, 0, 0), member_input=last_in)
     assert "latent" in last_out
     assert 0 not in last.finished.get("r0", {})
     # Next denoise step on a non-first group still needs peer hidden_states.
-    last_out2 = last.forward(
-        [("r0", (0, 1, 0))],
-        [None],
-        hidden={"latent": last_out["latent"], "hidden_states": packed["hidden_states"]},
+    last_out2 = _compute(
+        last,
+        "r0",
+        (0, 1, 0),
+        member_input={"latent": last_out["latent"], "hidden_states": packed["hidden_states"]},
     )
     assert 0 in last.finished["r0"]
     assert last_out2["latent"].shape == shape
+
+
+def test_pipeline_forward_passes_members_map_once(monkeypatch):
+    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
+    pipeline._chunk_ctx = SimpleNamespace()
+    calls: list[dict] = []
+    tags: dict[str, int] = {}
+    cells = {"A": WanCell.__new__(WanCell), "B": WanCell.__new__(WanCell)}
+
+    def _admit(req: OmniDiffusionRequest, *, decode_tag=0):
+        tags[req.request_id] = decode_tag
+        return cells[req.request_id], req.request_id, False, None
+
+    monkeypatch.setattr(pipeline, "_execution_context", lambda: pipeline._chunk_ctx)
+    monkeypatch.setattr(pipeline, "admit_cell_request", _admit)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.run_cell_pipeline",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    emitted: list[str] = []
+
+    def _emit(adapter, kv_id, stream_job=None):
+        del adapter, stream_job
+        emitted.append(kv_id)
+        return DiffusionOutput(finished=True)
+
+    monkeypatch.setattr(pipeline, "emit_cell_output", _emit)
+    batch = DiffusionRequestBatch(
+        [
+            OmniDiffusionRequest(prompt="a", request_id="A", sampling_params=OmniDiffusionSamplingParams()),
+            OmniDiffusionRequest(prompt="b", request_id="B", sampling_params=OmniDiffusionSamplingParams()),
+        ]
+    )
+    outs = pipeline.forward(batch)
+    assert len(calls) == 1
+    assert set(calls[0]["members"]) == {"A", "B"}
+    assert calls[0]["members"]["A"] is cells["A"]
+    assert calls[0]["members"]["B"] is cells["B"]
+    assert calls[0]["ctx"] is pipeline._chunk_ctx
+    assert tags == {"A": 0, "B": 1}
+    assert emitted == ["A", "B"]
+    assert len(outs) == 2
+
+
+@pytest.mark.parametrize("failure_stage", ["admit", "compute", "output"])
+def test_pipeline_forward_cancels_stream_jobs_on_failure(monkeypatch, failure_stage):
+    pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
+    pipeline._chunk_ctx = SimpleNamespace()
+    cancelled: list[str] = []
+
+    class _Job:
+        def __init__(self, rid: str) -> None:
+            self.rid = rid
+
+        def cancel(self) -> None:
+            cancelled.append(self.rid)
+
+    cells = {rid: WanCell.__new__(WanCell) for rid in ("A", "B")}
+
+    def _admit(req: OmniDiffusionRequest, *, decode_tag=0):
+        if req.request_id == "B" and failure_stage == "admit":
+            raise ValueError("decode wave failed")
+        return cells[req.request_id], req.request_id, False, _Job(req.request_id)
+
+    monkeypatch.setattr(pipeline, "_execution_context", lambda: pipeline._chunk_ctx)
+    monkeypatch.setattr(pipeline, "admit_cell_request", _admit)
+
+    def run(**kwargs):
+        if failure_stage == "compute":
+            raise ValueError("decode wave failed")
+
+    def emit(*args):
+        raise ValueError("decode wave failed")
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan.run_cell_pipeline", run)
+    monkeypatch.setattr(pipeline, "emit_cell_output", emit)
+    batch = DiffusionRequestBatch(
+        [
+            OmniDiffusionRequest(prompt="a", request_id="A", sampling_params=OmniDiffusionSamplingParams()),
+            OmniDiffusionRequest(prompt="b", request_id="B", sampling_params=OmniDiffusionSamplingParams()),
+        ]
+    )
+    with pytest.raises(ValueError, match="decode wave failed"):
+        pipeline.forward(batch)
+    assert cancelled == (["A"] if failure_stage == "admit" else ["A", "B"])
+
+
+def test_conditioning_cache_reuses_blocks_and_invalidates_member_order(monkeypatch):
+    """Exercise real StageWanTransformer caching, not the WanCell test double."""
+    tf = StageWanTransformer.__new__(StageWanTransformer)
+    torch.nn.Module.__init__(tf)
+    calls = []
+
+    def condition(timestep, text, *_args, **_kwargs):
+        calls.append((timestep.clone(), text.clone()))
+        value = text.mean(dim=1) + timestep[:, None]
+        return value, value, text, None
+
+    tf._wan = SimpleNamespace(condition_embedder=condition, timestep_proj_prepare=lambda value, _: value)
+    a, b = torch.ones(1, 3, 4), torch.full((1, 3, 4), 7.0)
+    timestep = torch.tensor([800.0, 500.0])
+    tf.prepare_cell((a, b))
+    first = tf._embedding((0, 1), timestep, batch_size=2, device=a.device, dtype=a.dtype)
+    tf._rotary[0] = (a, b)
+    tf.prepare_cell((a, b))
+    second = tf._embedding((0, 1), timestep, batch_size=2, device=a.device, dtype=a.dtype)
+    assert second is first
+    with monkeypatch.context() as patch:
+
+        def no_transfer(*_args, **_kwargs):
+            raise AssertionError("cache hit must not copy timestep to the device")
+
+        patch.setattr(torch.Tensor, "to", no_transfer)
+        assert tf._embedding((0, 1), timestep, batch_size=2, device=a.device, dtype=a.dtype) is first
+    assert len(calls) == 1
+    assert 0 in tf._rotary
+    tf.prepare_cell((b, a))
+    assert not tf._rotary
+    third = tf._embedding((0, 1), timestep, batch_size=2, device=a.device, dtype=a.dtype)
+    assert len(calls) == 2
+    torch.testing.assert_close(third[2], torch.cat([b, a]))
+    assert not torch.equal(third[2], first[2])
+    tf._embedding((0, 1), timestep + 1, batch_size=2, device=a.device, dtype=a.dtype)
+    assert len(calls) == 3
+    for offset in range(2, 12):
+        tf._embedding((0, 1), timestep + offset, batch_size=2, device=a.device, dtype=a.dtype)
+        assert len(tf._embeddings) == 1
+
+
+@pytest.mark.parametrize("texts", [(torch.zeros(2, 3, 4),), (torch.zeros(1, 3, 4), torch.zeros(1, 5, 4))])
+def test_conditioning_rejects_invalid_member_shapes(texts):
+    tf = StageWanTransformer.__new__(StageWanTransformer)
+    torch.nn.Module.__init__(tf)
+    with pytest.raises(ValueError, match="conditioning requires"):
+        tf.prepare_cell(texts)
+
+
+def test_rotary_cache_refreshes_hot_member_before_eviction():
+    tf = StageWanTransformer.__new__(StageWanTransformer)
+    torch.nn.Module.__init__(tf)
+    tf._wan = SimpleNamespace()
+    tf._text = torch.zeros(2, 3, 4)
+    tf._rotary = {}
+    calls = []
+
+    def rope(latent, *, start_frame):
+        calls.append(start_frame)
+        return torch.zeros(1, 4, 1, 8), torch.zeros(1, 4, 1, 8)
+
+    tf._rope_with_temporal_offset = rope
+    latent = torch.zeros(1, 4, 1, 2, 2)
+    first = tf._rotary_emb(0, latent)
+    tf._rotary_emb(1, latent)
+    assert tf._rotary_emb(0, latent) is first
+    tf._rotary_emb(2, latent)
+    assert {key[0] for key in tf._rotary} == {0, 2}
+    assert tf._rotary_emb(0, latent) is first
+    assert calls == [0, 1, 2]
