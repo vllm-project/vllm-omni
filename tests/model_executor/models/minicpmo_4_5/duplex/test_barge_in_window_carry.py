@@ -204,6 +204,7 @@ def test_context_window_keeps_the_carried_previous_text() -> None:
 
 
 def test_window_mode_off_drops_the_carried_window() -> None:
+    """Mode off still emits the boundary plan that consumes the carried window."""
     sched = _scheduler()
     session = _new_request(_stage0_id("s", 1))
     session._minicpmo45_carried_window = {"units": [dict(unit) for unit in CARRIED], "previous": []}
