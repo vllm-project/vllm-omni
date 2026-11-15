@@ -432,11 +432,16 @@ def _frame_statistics(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor) -> t
 def _delta_factors(a: torch.Tensor, b: torch.Tensor, alpha: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """S' = (S diag(alpha) + B)(I + A)^-1 as S' = S @ transition + injection (a, b = A, B)."""
     eye = torch.eye(a.shape[-1], device=a.device, dtype=a.dtype).expand_as(a)
-    # I + A is SPD by construction; the _ex form skips the error check's host sync.
-    lower = torch.linalg.cholesky_ex(a + eye).L
-    # (I + A)^-1 = L^-T L^-1: one triangular solve and a matmul.
-    lower_inv = torch.linalg.solve_triangular(lower, eye, upper=False)
-    inverse = lower_inv.transpose(-1, -2) @ lower_inv
+    if a.device.type == "xpu":
+        # XPU has no native triangular solve in this stack; solve() is native.
+        inverse = torch.linalg.solve(a + eye, eye)
+        inverse = 0.5 * (inverse + inverse.transpose(-1, -2))
+    else:
+        # I + A is SPD by construction; the _ex form skips the error check's host sync.
+        lower = torch.linalg.cholesky_ex(a + eye).L
+        # (I + A)^-1 = L^-T L^-1: one triangular solve and a matmul.
+        lower_inv = torch.linalg.solve_triangular(lower, eye, upper=False)
+        inverse = lower_inv.transpose(-1, -2) @ lower_inv
     return alpha.unsqueeze(-1) * inverse, b @ inverse
 
 
