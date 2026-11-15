@@ -70,8 +70,9 @@ def request_is_seeded(sampling_params: object | None) -> bool:
     extra_args = getattr(sampling_params, "extra_args", None)
     if not isinstance(extra_args, dict):
         return False
-    # Only an explicit client marker opts in. Every other path - stage defaults,
-    # realtime responses, offline fallbacks - leaves the seed unmarked and keeps
-    # normal batching, so one entrypoint forgetting to mark cannot serialize an
-    # engine.
-    return bool(extra_args.get("omni_user_seed"))
+    # Only an explicit client marker opts in, and only together with a seed:
+    # every other path - stage defaults, realtime responses, offline fallbacks -
+    # leaves the seed unmarked and keeps normal batching, so one entrypoint
+    # forgetting to mark cannot serialize an engine. Requiring the seed also
+    # rejects a marker smuggled through ``extra_params`` without one.
+    return bool(extra_args.get("omni_user_seed")) and getattr(sampling_params, "seed", None) is not None

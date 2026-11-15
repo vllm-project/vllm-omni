@@ -46,5 +46,7 @@ def test_request_is_seeded_requires_the_client_marker() -> None:
     # A stage-default seed is unmarked and must keep normal batching.
     assert request_is_seeded(_Params(42)) is False
     assert request_is_seeded(_Params(42, {"omni_user_seed": True})) is True
+    # A marker without a seed must not opt in (extra_params can smuggle it).
+    assert request_is_seeded(_Params(None, {"omni_user_seed": True})) is False
     # An explicit seed of 0 is still explicit when the client marked it.
     assert request_is_seeded(_Params(0, {"omni_user_seed": True})) is True

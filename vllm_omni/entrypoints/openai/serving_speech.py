@@ -2436,7 +2436,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     setattr(sampling_params_list[0], name, value)
             if sampling_params_list[0].extra_args is None:
                 sampling_params_list[0].extra_args = {}
-            sampling_params_list[0].extra_args.update(request.extra_params)
+            # ``omni_user_seed`` is a serving-layer marker for the
+            # seeded-request isolation policy, not a client knob: copying it
+            # from extra_params would let a request serialize the engine without
+            # asking for reproducibility.
+            sampling_params_list[0].extra_args.update(
+                {key: value for key, value in request.extra_params.items() if key != "omni_user_seed"}
+            )
             logger.info("Applied extra_params: %s", request.extra_params)
 
         # Apply adapter-owned sampling overrides, including request-level token
