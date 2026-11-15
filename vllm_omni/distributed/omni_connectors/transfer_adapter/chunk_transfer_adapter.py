@@ -257,7 +257,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return value.numel() == 1 and bool(value.item())
         # Wire decode of a 0-d bool tensor can land as a 1-element list.
         # ``bool([False])`` is True, so recurse instead of treating any
-        # non-empty container as finished.
+        # non-empty container as finished. Producers never send ``finished`` as
+        # a multi-element list/tuple; ``len != 1`` is not a scalar.
         if isinstance(value, (list, tuple)):
             return len(value) == 1 and OmniChunkTransferAdapter._is_truthy_scalar(value[0])
         return bool(value)

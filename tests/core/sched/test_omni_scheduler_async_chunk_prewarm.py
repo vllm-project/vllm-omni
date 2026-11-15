@@ -209,7 +209,17 @@ def test_adapter_owing_terminal_without_sender_on_producer(scheduler_cls) -> Non
     adapter = _producer_adapter(active_sender=False)
     scheduler.chunk_transfer_adapter = adapter
     request = _StubRequest("req-1")
+    request._joyai_finish_on_next_stop = True
     assert scheduler._adapter_owing_terminal(request) is adapter
+
+
+@_SCHEDULERS
+def test_adapter_owing_terminal_without_sender_without_stamp_is_none(scheduler_cls) -> None:
+    """Unstamped MiniCPM-style parks keep the has_active_sender-only owing path."""
+    scheduler = _make_scheduler(scheduler_cls)
+    adapter = _producer_adapter(active_sender=False)
+    scheduler.chunk_transfer_adapter = adapter
+    assert scheduler._adapter_owing_terminal(_StubRequest("req-1")) is None
 
 
 @_SCHEDULERS
@@ -294,6 +304,7 @@ def test_parked_non_resumable_without_sender_finishes_session(scheduler_cls, bas
     first = _StubRequest("req-1", _placeholder_info())
     scheduler.add_request(first)
     first.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    first._joyai_finish_on_next_stop = True
     adapter = _producer_adapter(active_sender=False)
     scheduler.chunk_transfer_adapter = adapter
     finished_calls: list[tuple[object, object]] = []
@@ -305,6 +316,25 @@ def test_parked_non_resumable_without_sender_finishes_session(scheduler_cls, bas
 
     assert finished_calls == [(first, adapter)]
     assert base_scheduler == [first]
+
+
+@_SCHEDULERS
+def test_parked_non_resumable_without_sender_without_stamp_falls_through(scheduler_cls, base_scheduler) -> None:
+    scheduler = _make_scheduler(scheduler_cls)
+    first = _StubRequest("req-1", _placeholder_info())
+    scheduler.add_request(first)
+    first.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    adapter = _producer_adapter(active_sender=False)
+    scheduler.chunk_transfer_adapter = adapter
+    finished_calls: list[tuple[object, object]] = []
+    scheduler._finish_parked_streaming_session = lambda request, owner: finished_calls.append((request, owner))
+    update = _StubRequest("req-1")
+    update.resumable = False
+
+    scheduler.add_request(update)
+
+    assert finished_calls == []
+    assert base_scheduler == [first, update]
 
 
 def _bad_ref_audio(**entry_fields) -> dict:

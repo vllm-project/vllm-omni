@@ -1422,8 +1422,11 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         A 2150 segment stop may already have dropped the sender token. The
         producer stage still owes that terminal; ``has_active_sender`` alone
         would abort a parked close with no ``finished`` chunk, and the
-        downstream vocoder waits until the client times out. Receiver-only
-        final stages never queue sends, so they never match.
+        downstream vocoder waits until the client times out. That no-sender
+        fallback is only for a parked request already stamped
+        finish-on-next-stop. Unstamped MiniCPM-style sessions keep the old
+        ``has_active_sender``-only behavior. Receiver-only final stages never
+        queue sends, so they never match.
         """
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is None:
@@ -1431,6 +1434,8 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         external_req_id = getattr(request, "external_req_id", None) or request.request_id
         if adapter.has_active_sender(external_req_id):
             return adapter
+        if not _request_finishes_on_next_stop(request):
+            return None
         sends = getattr(adapter, "custom_process_next_stage_input_func", None) is not None
         if getattr(adapter, "receives_chunks", False) and not sends:
             return None
