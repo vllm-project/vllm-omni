@@ -3,6 +3,7 @@
 # Adapted from Tencent-Hunyuan/Hy-Nomas@911cea6458 (Copyright 2026 Tencent).
 
 import math
+import os
 
 import torch
 from torch import nn
@@ -164,6 +165,12 @@ def rotary_tables(sizes, dimensions, theta, *, time_offset=0, device=None):
 
 
 def apply_rotary(x, tables):
+    if os.environ.get("VLLM_OMNI_HY_NOMAS_B3_ROPE_FUSION") == "1":
+        from .fused_rope import try_apply_rotary
+
+        result = try_apply_rotary(x, tables)
+        if result is not None:
+            return result
     cos, sin = (part.to(x.device).view(1, x.shape[1], 1, x.shape[-1]) for part in tables)
     real, imag = x.float().reshape(*x.shape[:-1], -1, 2).unbind(-1)
     rotated = torch.stack((-imag, real), dim=-1).flatten(3)

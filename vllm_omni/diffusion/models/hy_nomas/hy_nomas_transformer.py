@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from Tencent-Hunyuan/Hy-Nomas@911cea6458 (Copyright 2026 Tencent).
 
+import os
 from collections.abc import Iterable
 from functools import partial
 from types import SimpleNamespace
@@ -117,6 +118,8 @@ class MMDoubleStreamBlock(nn.Module):
         offsets,
         windows,
         tokens_per_frame,
+        forward_masks=None,
+        forward_visibility=None,
     ):
         streams = []
         for name, x in (("img", img), ("txt", txt)):
@@ -137,16 +140,21 @@ class MMDoubleStreamBlock(nn.Module):
         cache_dtype = cache.cache.dtype if isinstance(cache, ARDiffusionSegmentedKVState) else cache["k"].dtype
         iq, ik, iv, tq, tk, tv = [value.to(cache_dtype) for value in (iq, ik, iv, tq, tk, tv)]
         image_tokens = img.shape[1] * sp_size
-        image_mask = torch.ones((img.shape[0], image_tokens), dtype=torch.bool, device=ik.device)
-        current_mask = torch.cat((image_mask, text_mask.bool()), 1)
-        history_mask = cache_mask[:, :history]
-        if update:
-            count = image_tokens + (text_mask.shape[1] if cache_txt else 0)
-            cache_mask[:, history : history + count] = current_mask if cache_txt else image_mask
-        key_mask = torch.cat((history_mask, current_mask if cache_txt or update else image_mask), 1)
-        ranges = None
-        if cache_txt and offsets is not None and windows:
-            ranges = action_ranges(history_mask, text_mask.bool(), image_tokens, offsets, windows, tokens_per_frame)
+        if forward_visibility is not None and "inputs" in forward_visibility:
+            current_mask, key_mask, ranges = forward_visibility["inputs"]
+        else:
+            image_mask = torch.ones((img.shape[0], image_tokens), dtype=torch.bool, device=ik.device)
+            current_mask = torch.cat((image_mask, text_mask.bool()), 1)
+            history_mask = cache_mask[:, :history]
+            if update:
+                count = image_tokens + (text_mask.shape[1] if cache_txt else 0)
+                cache_mask[:, history : history + count] = current_mask if cache_txt else image_mask
+            key_mask = torch.cat((history_mask, current_mask if cache_txt or update else image_mask), 1)
+            ranges = None
+            if cache_txt and offsets is not None and windows:
+                ranges = action_ranges(history_mask, text_mask.bool(), image_tokens, offsets, windows, tokens_per_frame)
+            if forward_visibility is not None:
+                forward_visibility["inputs"] = (current_mask, key_mask, ranges)
         metadata = AttentionMetadata(
             joint_query=tq if sp_size > 1 else None,
             joint_key=tk if sp_size > 1 else None,
@@ -166,7 +174,8 @@ class MMDoubleStreamBlock(nn.Module):
             cache, layer_idx, k, v, history=history, media_tokens=image_tokens, cache_text=cache_txt, update=update
         )
         hidden = strategy.post_attention(
-            attention(q, k, v, ranges=ranges, query_mask=current_mask, key_mask=key_mask), context
+            attention(q, k, v, ranges=ranges, query_mask=current_mask, key_mask=key_mask, _forward_masks=forward_masks),
+            context,
         )
         image_attention, text_attention = hidden[:, : img.shape[1]], hidden[:, img.shape[1] :]
         results = []
@@ -327,8 +336,27 @@ class HyNomasTransformer(nn.Module):
             rank = get_sp_group().rank_in_group
             img = torch.chunk(img, self.sp_size, 1)[rank]
             tables = tuple(torch.chunk(value, self.sp_size, 0)[rank] for value in tables)
+        if os.environ.get("VLLM_OMNI_HY_NOMAS_B3_ROPE_UPLOAD_REUSE") == "1":
+            # Keep CPU-generated offset tables bitwise unchanged, but upload
+            # each rank-local table once instead of once per Q/K and layer.
+            tables = tuple(value.to(hidden_states.device) for value in tables)
         vec = self.time_in(timestep)
         txt = self.txt_in(text_states, timestep, text_mask)
+        # All layers of the segmented session share the same history visibility.
+        # The memo lives for one forward only; denoise/commit and later prompts
+        # always prepare their own masks. Separate per-layer masks keep the old path.
+        forward_masks = None
+        if (
+            os.environ.get("VLLM_OMNI_HY_NOMAS_B3_MASK_REUSE") == "1"
+            and cache_mask_list
+            and all(mask is cache_mask_list[0] for mask in cache_mask_list)
+        ):
+            forward_masks = {}
+        forward_visibility = (
+            {}
+            if forward_masks is not None and os.environ.get("VLLM_OMNI_HY_NOMAS_B3_VISIBILITY_REUSE") == "1"
+            else None
+        )
         for index, block in enumerate(self.double_blocks):
             img, txt = block(
                 img,
@@ -347,6 +375,8 @@ class HyNomasTransformer(nn.Module):
                 intra_seg_txt_offsets,
                 intra_seg_vid_windows,
                 height * width,
+                forward_masks,
+                forward_visibility,
             )
             if camera_embedding is not None:
                 img = self.action_modules[index](
