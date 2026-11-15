@@ -99,6 +99,13 @@ class SupportsStepExecution(Protocol):
     serving-scheduler cycle in between (a capability, not a policy: the runner
     that owns the scheduling decision chooses whether to group steps). It is
     optional so it does not become part of the runtime protocol check.
+
+    Likewise, a pipeline may set the optional class attribute
+    ``supports_mixfusion = True`` to declare that it can denoise a batch of
+    mixed-resolution requests (ragged/packed latents), which lets the
+    scheduler relax height/width out of the batch key when MixFusion is
+    enabled. It is read via ``getattr`` and is likewise not part of the
+    runtime protocol check.
     """
 
     supports_step_execution: ClassVar[bool] = True

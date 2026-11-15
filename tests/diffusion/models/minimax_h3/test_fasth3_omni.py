@@ -3,14 +3,20 @@
 
 import json
 import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
+from PIL import Image
 
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, OmniDiffusionConfig
 from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import FastH3CheckpointSpec, FastH3OmniCheckpointSpec
+from vllm_omni.diffusion.models.minimax_h3.lora import TurboSpec
+from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.request import LoRARequest
 from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
     minimax_h3_transformer_subfolder,
     resolve_minimax_h3_encoder_model_root,
@@ -92,7 +98,6 @@ def test_omni_rejects_incompatible_metadata(field, value):
         {"extra_args": {"task": "t2va"}},
         {"extra_args": {"pdd_steps": 16}},
         {"extra_args": {"latent_refine": {"steps": 2}}},
-        {"lora_request": object()},
     ],
 )
 def test_omni_rejects_incompatible_requests(kwargs):
@@ -195,3 +200,92 @@ def test_omni_serving_checks_flashinfer_on_the_worker_device(monkeypatch, mocker
     FastH3OmniCheckpointSpec().check_serving_contract(partition="ref2va", od_config=config)
     capability.assert_called_once_with(3)
     require_kernel.assert_called_once_with("bf16", device)
+
+
+def test_omni_accepts_one_ordinary_lora():
+    request = LoRARequest("ordinary", 1, "/models/ordinary.safetensors")
+    spec = FastH3CheckpointSpec.from_metadata(omni_metadata())
+    spec.check_request(sampling(lora_request=request, lora_scale=0.85))
+
+
+def test_omni_accepts_lora_composition():
+    requests = [LoRARequest("one", 1, "/models/one"), LoRARequest("two", 2, "/models/two")]
+    spec = FastH3CheckpointSpec.from_metadata(omni_metadata())
+    spec.check_request(sampling(lora_request=requests, lora_scale=[1.0, 0.5]))
+
+
+@pytest.fixture
+def ref2va_turbo_spec() -> TurboSpec:
+    return TurboSpec(
+        filename="minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors",
+        task_family="ref2v",
+        denoise_steps=8,
+        video_shift=6.0,
+        audio_shift=3.0,
+        rank=128,
+        alpha=8.0,
+    )
+
+
+@pytest.mark.parametrize("adapter_kind", ["turbo", "distilled"])
+def test_omni_rejects_distilled_adapter_schedule(adapter_kind, ref2va_turbo_spec):
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace()
+    pipeline._fasth3_checkpoint = FastH3OmniCheckpointSpec()
+    pipeline._turbo_lora_specs = {1: ref2va_turbo_spec} if adapter_kind == "turbo" else {}
+    pipeline._native_distilled_lora_adapter_ids = {1} if adapter_kind == "distilled" else set()
+    conditioning = SimpleNamespace(task="ref2va", num_frames=56, video_edit_clean_rows=None, audio_edit_clean_rows=None)
+    request = LoRARequest(adapter_kind, 1, f"/models/{adapter_kind}")
+    with pytest.raises(OmniClientError, match="not Turbo or distilled adapters"):
+        pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling(lora_request=request))
+
+
+@pytest.mark.parametrize("variant", ["omni", "ordinary", "turbo_first", "turbo_last"])
+def test_local_encoder_accepts_lora_composition(variant, ref2va_turbo_spec):
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._fasth3_checkpoint = FastH3OmniCheckpointSpec() if variant == "omni" else None
+    pipeline.partition = "ref2va"
+    pipeline.supported_tasks = frozenset({"ref2va"})
+    pipeline.device = torch.device("cpu")
+    pipeline.load_text_encoder = pipeline.load_vae_encoder = True
+    pipeline._turbo_lora_specs = {2: ref2va_turbo_spec} if variant.startswith("turbo") else {}
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
+    pipeline._native_distilled_lora_adapter_ids = set()
+    pipeline.encode_prompt = Mock(return_value=(torch.ones(2, 5120, dtype=torch.bfloat16), torch.tensor([0, 1])))
+    pipeline.video_vae = Mock()
+    pipeline.audio_vae = Mock()
+    pipeline.video_vae.is_distributed_enabled.return_value = False
+    pipeline.video_vae.encode_image.return_value = torch.ones(64, 96)
+    requests = [LoRARequest("one", 1, "/models/one"), LoRARequest("two", 2, "/models/two")]
+    if variant == "turbo_first":
+        requests.reverse()
+    params = sampling(
+        height=32,
+        width=32,
+        num_frames=96,
+        lora_request=requests,
+        lora_scale=[0.8, 0.3],
+        extra_args={"task": "ref2va", "flow_shift": 6.0 if variant.startswith("turbo") else 12.0},
+    )
+    conditioning, window_text = pipeline._prepare_local_conditioning(
+        {"prompt": "Replace the person.", "multi_modal_data": {"image": Image.new("RGB", (256, 256))}}, params
+    )
+    assert conditioning.task == "ref2va"
+    assert conditioning.visual_condition.shape == (64, 96)
+    assert window_text is None
+    pipeline.encode_prompt.assert_called_once()
+
+
+@pytest.mark.parametrize("kind", ["two_turbo", "distilled_with_swap"])
+def test_lora_composition_rejects_conflicting_schedules(kind, ref2va_turbo_spec):
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._turbo_lora_specs = {1: ref2va_turbo_spec, 2: ref2va_turbo_spec} if kind == "two_turbo" else {}
+    pipeline._native_distilled_lora_adapter_ids = {1} if kind == "distilled_with_swap" else set()
+    requests = [LoRARequest("one", 1, "/models/one"), LoRARequest("two", 2, "/models/two")]
+    message = "at most one Turbo" if kind == "two_turbo" else "cannot be composed"
+    with pytest.raises(OmniClientError, match=message):
+        pipeline._active_turbo_spec(sampling(lora_request=requests, lora_scale=[1.0, 0.8]))
