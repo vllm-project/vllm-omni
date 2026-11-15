@@ -16,8 +16,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _Params:
-    def __init__(self, seed):
+    def __init__(self, seed, extra_args=None):
         self.seed = seed
+        self.extra_args = extra_args
 
 
 def test_idle_with_seeded_waiting_is_promoted() -> None:
@@ -44,3 +45,11 @@ def test_request_is_seeded() -> None:
     # An explicit seed of 0 is still an explicit seed.
     assert request_is_seeded(_Params(0)) is True
     assert request_is_seeded(object()) is False
+
+
+def test_request_is_seeded_ignores_stage_defaults() -> None:
+    """A seed copied from ``default_sampling_params`` must not opt a request in."""
+    assert request_is_seeded(_Params(42, {"omni_default_seed": True})) is False
+    assert request_is_seeded(_Params(42, {"omni_user_seed": True})) is True
+    assert request_is_seeded(_Params(42)) is True
+    assert request_is_seeded(_Params(None, {"omni_default_seed": True})) is False

@@ -31,8 +31,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _Params:
-    def __init__(self, seed: int | None = None) -> None:
+    def __init__(self, seed: int | None = None, extra_args: dict | None = None) -> None:
         self.seed = seed
+        self.extra_args = extra_args
 
 
 class _StubRequest:
@@ -43,12 +44,13 @@ class _StubRequest:
         request_id: str,
         seed: int | None = None,
         status: RequestStatus = RequestStatus.WAITING,
+        extra_args: dict | None = None,
     ) -> None:
         self.request_id = request_id
         self.status = status
         self.priority = 0
         self.arrival_time = 0.0
-        self.sampling_params = _Params(seed)
+        self.sampling_params = _Params(seed, extra_args)
 
     def __lt__(self, other: _StubRequest) -> bool:
         return (self.priority, self.arrival_time) < (other.priority, other.arrival_time)
@@ -305,3 +307,21 @@ def test_solo_step_hides_the_waiting_queue_when_promoting_kv_holding(monkeypatch
     # The stub only admits from ``waiting``; the point is that the fresh queue
     # is hidden and the KV-holding request stays eligible.
     assert seen["admitted"] is None
+
+
+def test_stage_default_seed_keeps_normal_admission(monkeypatch) -> None:
+    """Review P1: a deploy-level ``default_sampling_params.seed`` is not an opt-in.
+
+    Those seeds are copied into every request by the serving layer, so treating
+    them as seeded would serialize the whole AR engine and drop ``max_num_seqs``
+    to one on the shipped configs that set them.
+    """
+    plain = _StubRequest("plain")
+    default_seeded = _StubRequest("default-seeded", seed=42, extra_args={"omni_default_seed": True})
+    scheduler = _make_scheduler(parked=0, waiting=[plain, default_seeded])
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    # Normal admission: the full active-request budget, no solo step.
+    assert seen["limit"] == 8
+    assert seen["admitted"] is not None

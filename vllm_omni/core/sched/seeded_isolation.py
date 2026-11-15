@@ -15,8 +15,9 @@ waits for the engine to drain, then runs alone, and no other request is admitted
 while it runs. "Waiting" covers both the
 regular wait queue and ``kv_holding_waiting``, so a seeded request that resumes
 from KV retention cannot join a running unseeded request either. Unseeded traffic keeps
-batching as before. Measured cost on the same card: 8 concurrent seeded requests
-take 3.25 s instead of 0.77 s, while 8 unseeded requests stay at 0.83 s.
+batching as before. Measured cost: 8 concurrent seeded requests take seconds instead of
+under one (3.6 s on an RTX 4080 SUPER; 5.9 s on an RTX 6000 Ada in an
+independent run), while 8 unseeded requests stay at 0.8-1.0 s.
 
 The request opts in by carrying an explicit sampling seed - there is no process
 or engine switch. This module only decides *when* to isolate, so it can be
@@ -54,5 +55,19 @@ def isolation_plan(
 
 
 def request_is_seeded(sampling_params: object | None) -> bool:
-    """Whether a request asked for an explicit seed."""
-    return sampling_params is not None and getattr(sampling_params, "seed", None) is not None
+    """Whether the client asked for this request to be reproducible.
+
+    A request whose ``seed`` came from a stage's ``default_sampling_params`` is
+    not an opt-in: those seeds apply to every request on that deployment, so
+    isolating them would serialize the whole engine. The serving layer marks the
+    origin in ``extra_args`` (``omni_user_seed`` / ``omni_default_seed``) before
+    the sampling params reach the scheduler.
+    """
+    if sampling_params is None:
+        return False
+    extra_args = getattr(sampling_params, "extra_args", None)
+    if not isinstance(extra_args, dict):
+        extra_args = {}
+    if extra_args.get("omni_user_seed"):
+        return True
+    return getattr(sampling_params, "seed", None) is not None and not extra_args.get("omni_default_seed")

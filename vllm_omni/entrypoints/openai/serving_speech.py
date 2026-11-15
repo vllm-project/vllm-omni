@@ -97,6 +97,25 @@ SPEECH_AUDIO_TRUNCATED_HEADER = "X-Audio-Truncated"
 _USAGE_TOKENIZER_UNAVAILABLE = object()
 
 
+def _mark_seed_origin(sampling_params_list: list[Any], *, request_seed: int | None) -> None:
+    """Record whether each stage's seed came from the client or the stage defaults.
+
+    Seeded-request isolation keys on a client-supplied seed only. The stage
+    defaults copied from ``default_sampling_params`` also carry a ``seed``, and
+    without this marker every request on those deployments would look like it
+    asked for reproducibility and the AR engine would serialize.
+    """
+    for params in sampling_params_list:
+        if not isinstance(params, SamplingParams) or params.seed is None:
+            continue
+        if params.extra_args is None:
+            params.extra_args = {}
+        if request_seed is not None:
+            params.extra_args["omni_user_seed"] = True
+        else:
+            params.extra_args["omni_default_seed"] = True
+
+
 def _stage_speech_metadata(stage: Any) -> tuple[str | None, str | None, str | None]:
     """Return speech routing metadata from typed or legacy stage configs."""
     topology = getattr(stage, "stage_pipeline_config", None)
@@ -2453,6 +2472,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if stage0_params.extra_args is None:
                 stage0_params.extra_args = {}
             stage0_params.extra_args["tts_local_seed"] = request.seed
+
+        _mark_seed_origin(sampling_params_list, request_seed=request.seed)
 
         # When word_timestamps is requested, also ask for the aligner stage's
         # output so the orchestrator drives the request through the forced-aligner
