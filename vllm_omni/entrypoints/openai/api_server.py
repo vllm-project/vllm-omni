@@ -150,7 +150,7 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _supports_segmentation,
     _update_if_not_none,
 )
-from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _parse_lora_request
+from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _parse_lora_requests
 from vllm_omni.entrypoints.openai.models import serving as openai_models_serving
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
@@ -407,6 +407,8 @@ async def omni_run_server_worker(
     log_config = get_uvicorn_log_config(args)
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
+    if getattr(args, "disable_websocket_compression", False):
+        uvicorn_kwargs["ws_per_message_deflate"] = False
 
     async with build_async_omni(
         args,
@@ -471,6 +473,18 @@ async def omni_run_server_worker(
         _register_omni_exception_handlers(app)
 
         await omni_init_app_state(engine_client, app.state, args)
+
+        # Complete the configured video request before serve_http can expose
+        # /health or admit user traffic. Failure unwinds the engine context.
+        video_warmup_request = getattr(args, "video_output_warmup", None)
+        if video_warmup_request is not None:
+            video_output_handler = getattr(app.state, "openai_streaming_video_output", None)
+            if video_output_handler is None:
+                raise ValueError("--video-output-warmup requires a streaming video output handler")
+            await video_output_handler.warmup(
+                video_warmup_request,
+                timeout=getattr(args, "video_output_warmup_timeout", 180.0),
+            )
 
         # The inherited routes assume a tokenization handler. Pure diffusion
         # has none; omit those capabilities instead of dereferencing None.
@@ -2351,7 +2365,7 @@ async def generate_images(
                 extra_body["generator_device"] = request.generator_device
             if request.lora is not None:
                 # Keep /images validation semantics: invalid LoRA should fail with 400.
-                _parse_lora_request(request.lora)
+                _parse_lora_requests(request.lora)
                 extra_body["lora"] = request.lora
             if request.bot_task is not None:
                 extra_body["bot_task"] = request.bot_task
@@ -2410,9 +2424,9 @@ async def generate_images(
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
-        lora_request, lora_scale = _parse_lora_request(request.lora) if request.lora is not None else (None, None)
-        _update_if_not_none(gen_params, "lora_request", lora_request)
-        _update_if_not_none(gen_params, "lora_scale", lora_scale)
+        lora_requests, lora_scales = _parse_lora_requests(request.lora)
+        _update_if_not_none(gen_params, "lora_request", lora_requests)
+        _update_if_not_none(gen_params, "lora_scale", lora_scales)
 
         # Parse and add size if provided
         if request.size:
@@ -2642,9 +2656,9 @@ async def edit_images(
         _update_if_not_none(gen_params, "num_outputs_per_prompt", n)
         # 3.1 Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_dict = _get_lora_from_json_str(lora)
-        lora_request, lora_scale = _parse_lora_request(lora_dict)
-        _update_if_not_none(gen_params, "lora_request", lora_request)
-        _update_if_not_none(gen_params, "lora_scale", lora_scale)
+        lora_requests, lora_scales = _parse_lora_requests(lora_dict)
+        _update_if_not_none(gen_params, "lora_request", lora_requests)
+        _update_if_not_none(gen_params, "lora_scale", lora_scales)
         # 3.2 Validate resolution if provided
         if resolution is not None and resolution not in SUPPORTED_LAYERED_RESOLUTIONS:
             raise HTTPException(
@@ -2782,7 +2796,7 @@ async def edit_images(
             if lora is not None:
                 # Validate LoRA, then pass through.
                 lora_dict = _get_lora_from_json_str(lora)
-                _parse_lora_request(lora_dict)
+                _parse_lora_requests(lora_dict)
                 extra_body["lora"] = lora_dict
             if bot_task is not None:
                 extra_body["bot_task"] = bot_task

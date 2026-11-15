@@ -14,14 +14,7 @@ from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize(
-    "profile,capacities,kv_gib,runners",
-    [
-        ("minicpmo_4_5_turn_mrv2.yaml", [16, 8, 8], 2, [True, True, True]),
-        ("minicpmo_4_5_turn_mrv2_h200.yaml", [16, 16, 8], 4, [True, True, True]),
-    ],
-)
-def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, runners, monkeypatch):
+def test_cuda_turn_inherits_mrv2_talker_kstep(monkeypatch):
     from pathlib import Path
 
     from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config, merge_pipeline_deploy
@@ -31,17 +24,24 @@ def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, 
     # merge_pipeline_deploy resolves the platform again; test the CUDA profile
     # consistently even when this CPU test runs on a ROCm host.
     monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
-    deploy = Path(__file__).resolve().parents[4] / "vllm_omni/deploy" / profile
+    deploy = Path(__file__).resolve().parents[4] / "vllm_omni/deploy/minicpmo_4_5_turn.yaml"
     config = _apply_platform_overrides(load_deploy_config(deploy), platform="cuda")
     stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == runners
-    assert [s.yaml_engine_args["async_chunk"] for s in stages] == [False, True, True]
-    assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == capacities
-    assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == kv_gib * 1024**3
+    assert config.session_mode == "turn"
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
+    assert [s.yaml_engine_args["async_chunk"] for s in stages] == [True, True, True]
     assert stages[0].yaml_engine_args["enable_prefix_caching"] is True
-    # The base profile's V1 Talker multi-frame block must not reach the MRv2 Talker.
-    assert stages[1].yaml_engine_args.get("speculative_config") is None
-    assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
+    talker = stages[1]
+    assert talker.yaml_engine_args["attention_backend"] == "FLASH_ATTN"
+    assert talker.yaml_engine_args["speculative_config"] == {
+        "method": "ngram",
+        "num_speculative_tokens": 7,
+        "prompt_lookup_min": 1,
+        "prompt_lookup_max": 1,
+    }
+    assert talker.yaml_engine_args["async_scheduling"] is False
+    assert talker.yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
+    assert talker.yaml_runtime["cuda_mps"] is True
 
 
 def _model(mocker, *, v2=True, session="turn", async_chunk=False, speculative_config=None):

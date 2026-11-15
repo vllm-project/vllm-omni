@@ -9,7 +9,7 @@ from .pipeline_kandinsky6 import (
     get_kandinsky6_post_process_func,
     get_kandinsky6_pre_process_func,
 )
-from .scheduling_kandinsky6 import KandinskyFlowMatchScheduler
+from .scheduling_kandinsky6 import KandinskyFlowMatchScheduler, KandinskyPiFlowScheduler
 
 __all__ = [
     "AutoencoderKLHunyuanVideo",
@@ -17,6 +17,7 @@ __all__ = [
     "Kandinsky6TI2VAPipeline",
     "Kandinsky6Transformer3DModel",
     "KandinskyFlowMatchScheduler",
+    "KandinskyPiFlowScheduler",
     "get_kandinsky6_post_process_func",
     "get_kandinsky6_pre_process_func",
 ]

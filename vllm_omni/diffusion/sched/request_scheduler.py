@@ -7,7 +7,10 @@ import json
 from dataclasses import fields, replace
 from typing import TYPE_CHECKING
 
-from vllm_omni.diffusion.attention.schedule import resolve_request_attention_schedule
+from vllm_omni.diffusion.attention.schedule import (
+    resolve_request_attention_schedule,
+    resolve_request_attention_sigma_schedule,
+)
 from vllm_omni.diffusion.data import uses_rank_local_dp_concurrency
 from vllm_omni.diffusion.mixfusion.request import request_batch_key_allowed
 from vllm_omni.diffusion.model_metadata import REQUEST_IDENTITY_EXTRA_ARGS
@@ -21,6 +24,7 @@ from vllm_omni.diffusion.sched.interface import (
     SchedulerRequestState,
     _AdmissionWaitDecision,
 )
+from vllm_omni.lora.utils import build_lora_batch_key
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import AttentionScheduleConfig
@@ -33,9 +37,10 @@ _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
 ) - {
     "attention_schedule",
     "attention_schedule_explicit",
+    "attention_sigma_schedule",
     "condition_key",
     "flow_shift",
-    "lora_int_id",
+    "lora_key",
     "negative_conditioning",
     "rank_local_dp_extra_args_signature",
     "sample_solver",
@@ -99,7 +104,8 @@ def build_request_batch_sampling_params_key(
 
     ``attention_schedule_config`` is the service's ``diffusion_attention_schedule``. The key carries
     the request's resolved schedule and whether the request sent it, so a request that inherits the
-    default and one that sends the same ranges explicitly stay in separate batches.
+    default and one that sends the same ranges explicitly stay in separate batches. Sigma windows are
+    keyed on their resolved value only.
     """
     sampling = request.sampling_params
     # LoRA identity is optional on sampling params (and on test stubs).
@@ -121,9 +127,12 @@ def build_request_batch_sampling_params_key(
             name for name, value in prompt.items() if name.startswith("negative_") and value is not None
         )
     key_kwargs["condition_key"] = getattr(request, "batch_compatibility_key", None)
-    key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
+    key_kwargs["lora_key"] = build_lora_batch_key(lora_request, getattr(sampling, "lora_scale", None))
     key_kwargs["attention_schedule"] = resolve_request_attention_schedule(sampling, attention_schedule_config)
     key_kwargs["attention_schedule_explicit"] = sampling.attention_schedule is not None
+    key_kwargs["attention_sigma_schedule"] = resolve_request_attention_sigma_schedule(
+        sampling, attention_schedule_config
+    )
     return RequestBatchSamplingParamsKey(**key_kwargs)
 
 
