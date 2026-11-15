@@ -20,7 +20,7 @@ from vllm.v1.engine.output_processor import (
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats, RequestStateStats
 
-from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.data_entry_keys import flatten_payload, unflatten_payload
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
@@ -112,6 +112,26 @@ def _native_phase_metrics(stats: RequestStateStats) -> dict[str, float | int]:
         # was observed.
         metrics[defs.VLLM_NUM_PREEMPTIONS] = int(stats.num_preemptions)
     return metrics
+
+
+def _warn_on_dropped_pooling_keys(pooling_output: Any, mm_output: Any) -> None:
+    """Flag pooling-only keys, which the authoritative multimodal field drops.
+
+    Every in-tree producer mirrors one payload on both channels or sets only
+    one, so a difference means a producer broke that contract and the next
+    stage loses data. Only missing keys are flagged: a key on both channels
+    with different values still resolves to ``multimodal_output`` silently,
+    so this is not a full mirror-consistency check. The warning repeats once
+    per distinct set of dropped keys.
+    """
+    if not isinstance(pooling_output, dict) or not isinstance(mm_output, dict):
+        return
+    dropped = flatten_payload(pooling_output).keys() - flatten_payload(mm_output).keys()
+    if dropped:
+        logger.warning_once(
+            "Dropping pooling_output keys not carried by multimodal_output: %s",
+            ", ".join(sorted(dropped)),
+        )
 
 
 class OmniRequestState(RequestState):
@@ -770,6 +790,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                     # is only its compatibility carrier, not a second chunk.
                     if mm_output is None:
                         req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
+                    else:
+                        _warn_on_dropped_pooling_keys(eco.pooling_output, mm_output)
                     eco.pooling_output = None
 
             # Native pooling cache-miss errors carry no tensor. Upstream

@@ -23,7 +23,7 @@ from vllm.v1.engine import FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.core.sched.duplex_stage_work import PERF_CHUNK_KEY, stage_work_rows
+from vllm_omni.core.sched.duplex_stage_work import stage_work_rows
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreRequest
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
@@ -40,6 +40,7 @@ from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, validate_duplex_re
 from vllm_omni.engine.duplex.replica_placement import DuplexReplicaPlacement
 from vllm_omni.engine.duplex.session.engine_session import DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
+from vllm_omni.engine.duplex.session.perf_ledger import with_perf_chunk
 from vllm_omni.engine.messages import EngineQueueMessage, OutputMessage
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
@@ -306,15 +307,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         chunk = req_state.stage_output_chunks.get(src_stage_id)
         if chunk is None:
             return
-        for next_input in next_inputs:
-            buffer = next_input.get("model_intermediate_buffer") if isinstance(next_input, dict) else None
-            duplex = buffer.get("duplex") if isinstance(buffer, dict) else None
-            if isinstance(buffer, dict) and isinstance(duplex, dict):
-                # Copy both levels: the stage-input processor may share them with bridge state.
-                next_input["model_intermediate_buffer"] = {
-                    **buffer,
-                    "duplex": {**duplex, PERF_CHUNK_KEY: list(chunk)},
-                }
+        for index, next_input in enumerate(next_inputs):
+            if isinstance(next_input, dict):
+                next_inputs[index] = with_perf_chunk(next_input, chunk)
 
     async def _report_duplex_session_request_error(
         self,
@@ -322,19 +317,19 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         replica_id: int | None,
         eco: OmniEngineCoreOutput,
         req_state: OrchestratorRequestState,
-    ) -> None:
+    ) -> bool:
         if not req_state.session_owned or getattr(eco, "finish_reason", None) != FinishReason.ERROR:
-            return
+            return False
         # Segment boundaries do not terminate a resumable request. Context
         # overflow emits a separate terminal ERROR with is_segment_finished=False.
         if getattr(eco, "is_segment_finished", False):
-            return
+            return False
         reason = getattr(eco, "stop_reason", None)
         error = reason if isinstance(reason, str) and reason else "duplex session request failed"
         # Duplex sessions receive session events, not the ordinary request queue's
         # ErrorMessage. Close a resident session before another append can recreate
         # its finished stage request without the model's voice/persona prefill.
-        await self._handle_forward_failure(req_state.request_id, stage_id, req_state, RuntimeError(error))
+        return await self._handle_forward_failure(req_state.request_id, stage_id, req_state, RuntimeError(error))
 
     async def _handle_forward_failure(
         self,

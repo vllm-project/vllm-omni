@@ -177,9 +177,18 @@ def test_qwen_image_21_matches_reference(accuracy_artifact_root: Path, run_level
     device_type = "rocm" if current_omni_platform.is_rocm() else current_omni_platform.device_type
     device = device_preflight(device_type)
     device_name = device["device"]
-    profile = resolve_device_profile(device_name, profiles=bounds)
+    device_architecture = device.get("device_arch")
+    profile = resolve_device_profile(
+        device_name,
+        device_architecture=device_architecture,
+        profiles=bounds,
+    )
     xfail_profiles = policy.get("expected_xfail", {}).get(case_name, {})
-    xfail_profile = resolve_device_profile(device_name, profiles=xfail_profiles)
+    xfail_profile = resolve_device_profile(
+        device_name,
+        device_architecture=device_architecture,
+        profiles=xfail_profiles,
+    )
     expected_xfail = xfail_profiles.get(xfail_profile)
     if expected_xfail:
         assert isinstance(expected_xfail, str) and expected_xfail
