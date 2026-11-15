@@ -330,7 +330,6 @@ class _Output:
             raise self.error
         return OmniModelRunnerOutput(
             req_ids=[self.rid],
-            req_id_to_index={self.rid: 0},
             prompt_logprobs_dict={},
             inter_stage_outputs=[self.payload] if self.payload is not None else None,
             sampled_token_ids=[[self.token]],
@@ -683,7 +682,6 @@ def test_native_publication_omits_only_transported_pooler_payload(
     client = [{"audio": torch.tensor([0.25])}]
     output = OmniModelRunnerOutput(
         req_ids=["internal"],
-        req_id_to_index={"internal": 0},
         sampled_token_ids=[[21]],
         prompt_logprobs_dict={},
         pooler_output=pooler,
@@ -767,7 +765,6 @@ def test_native_publication_retains_queued_mixed_batch(plane, monkeypatch, publi
     tokens = [[21], [22], [23]]
     output = OmniModelRunnerOutput(
         req_ids=req_ids,
-        req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
         sampled_token_ids=tokens,
         prompt_logprobs_dict={},
         pooler_output=None if async_chunk else payloads,

@@ -153,9 +153,7 @@ def test_cached_chunk_updates_request_and_model_state_with_or_without_slot(slot_
     )
     cached = OmniCachedRequestData(
         req_ids=["req"],
-        resumed_req_ids=set(),
         new_token_ids=[[]],
-        all_token_ids={"req": [1]},
         new_block_ids=[()],
         num_computed_tokens=[0],
         num_output_tokens=[0],
@@ -353,7 +351,7 @@ def test_generation_aux_output_copies_and_materializes_without_sampling(monkeypa
     monkeypatch.setattr(torch.cuda, "Event", lambda **kw: CopyEvent())
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(module, "_async_copy_mm", lambda *a, **kw: {})
-    output = OmniModelRunnerOutput(["req-0"], {"req-0": 0}, [[]])
+    output = OmniModelRunnerOutput(req_ids=["req-0"], sampled_token_ids=[[]])
     result = module.OmniGenerationAsyncOutput(
         model_runner_output=output,
         multimodal_outputs={},

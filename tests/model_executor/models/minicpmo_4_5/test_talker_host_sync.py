@@ -110,6 +110,7 @@ def _step(talker, infos, hidden, mocker, *, batched: bool, input_ids: torch.Tens
 
 
 def test_batched_decode_matches_scalar_preprocess(mocker) -> None:
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is outside the vLLM 0.34 scope")
     input_ids = torch.tensor([3, _EOS, _EOS, 6], dtype=torch.int32)
     hidden = torch.randn(4, 4, generator=torch.Generator().manual_seed(1))
     penalties = torch.tensor([1.05, 1.2, 1.05, 1.0])

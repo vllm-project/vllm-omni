@@ -427,7 +427,6 @@ def test_async_output_preserves_fixed_token_scores_on_host(monkeypatch) -> None:
     scores = torch.tensor([[-0.5, -1.5], [-0.2, -2.2]])
     mro = omni_ar_model_runner.OmniModelRunnerOutput(
         req_ids=["req-0"],
-        req_id_to_index={"req-0": 0},
         sampled_token_ids=None,
         prompt_logprobs_dict={},
         prompt_token_id_logprobs_dict={"req-0": scores},

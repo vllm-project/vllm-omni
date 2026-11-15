@@ -23,6 +23,9 @@ from vllm_omni.platforms.npu.worker.aux_output import NPUAuxOutputMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+# This mixin is consumed only by the retired OmniNPUModelRunner V1 path.
+pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="NPU V1 aux-output runner is outside the vLLM 0.34 scope")
+
 
 class _Router:
     def _select_experts(self, logical_ids):

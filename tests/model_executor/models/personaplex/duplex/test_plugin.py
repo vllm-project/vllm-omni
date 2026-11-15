@@ -111,15 +111,16 @@ def test_personaplex_deploy_is_duplex_and_propagates_capacity_to_all_model_stage
 def test_the_duplex_mrv2_deploy_carries_valid_stage0_perf_switches() -> None:
     import inspect
 
-    stages = merge_pipeline_deploy(
-        PERSONAPLEX_PIPELINE, load_deploy_config(DEPLOY_PATH.with_name("personaplex_duplex_mrv2.yaml"))
-    )
-    overrides = stages[0].yaml_engine_args["hf_overrides"]
+    deploy = load_deploy_config(DEPLOY_PATH.with_name("personaplex_duplex_mrv2.yaml"))
+    overrides = deploy.stages[0].engine_extras["hf_overrides"]
 
     # PersonaPlexConfig takes **kwargs, so a misspelled switch would be ignored silently.
     assert set(overrides) <= set(inspect.signature(PersonaPlexConfig.__init__).parameters)
     assert overrides["mimi_cuda_graphs"] is True
     assert overrides["depformer_cuda_graphs"] is True
+
+    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+        merge_pipeline_deploy(PERSONAPLEX_PIPELINE, deploy)
 
 
 def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_path: Path) -> None:

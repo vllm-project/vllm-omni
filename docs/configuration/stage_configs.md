@@ -329,6 +329,8 @@ fallbacks, Fish-Omni's DAC stage, PersonaPlex's Talker, VibeVoice, YuE2, and the
 profiles. Selecting `v2` manually does not establish support for those paths.
 YuE2's audio synthesis still depends on V1 model sampling hooks; its two
 offline audio export tests are not applicable to the V2 runtime.
+The complete PersonaPlex workflow is also unavailable: its Talker still
+requires V1, although its Code2Wav stage has V2 components.
 The Merge CI matrix excludes the LFM3 and VibeVoice jobs that require V1;
 their exclusion does not count as a passing V2 model test.
 

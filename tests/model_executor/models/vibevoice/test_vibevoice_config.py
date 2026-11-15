@@ -94,7 +94,7 @@ def test_registration_and_deploy():
     args = stage.yaml_engine_args
     # VibeVoice is eager-only: graph, async scheduling and prefix caching must stay off.
     assert args["enforce_eager"] and not args["async_scheduling"] and not args["enable_prefix_caching"]
-    assert not args["use_v2_model_runner"] and args["max_num_seqs"] == 4
+    assert args["use_v2_model_runner"] and args["max_num_seqs"] == 4
 
 
 def test_prompt():
@@ -158,6 +158,7 @@ def test_reference_resampling_and_rejection(processor):
 
 
 def test_startup_rejects_unsupported_runtime(mocker):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is outside the vLLM 0.34 scope")
     from vllm_omni.model_executor.models.vibevoice.vibevoice import _check_positive_kv_capacity, _check_supported_config
 
     def config(cache_dtype="auto", v2=False, num_gpu_blocks=4097) -> VllmConfig:

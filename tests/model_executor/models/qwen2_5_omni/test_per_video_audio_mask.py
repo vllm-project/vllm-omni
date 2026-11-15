@@ -852,6 +852,5 @@ def test_omni_model_runner_output_can_carry_kv_connector_output_only():
     output = OmniModelRunnerOutput.with_kv_conn_output_only(marker)
 
     assert output.req_ids == []
-    assert output.req_id_to_index == {}
     assert output.sampled_token_ids == []
     assert output.kv_connector_output is marker

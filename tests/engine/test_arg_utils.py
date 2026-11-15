@@ -74,8 +74,11 @@ def test_stage_runner_selects_matching_input_processor_validator(logits_processo
 
 @pytest.mark.parametrize("use_v2", [False, True])
 def test_plain_vllm_config_retains_upstream_runner_preference(monkeypatch, use_v2):
-    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", use_v2)
-    assert VllmConfig().use_v2_model_runner is use_v2
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", str(int(use_v2)))
+    assert not hasattr(VllmConfig(), "use_v2_model_runner")
+    assert OmniEngineArgs().use_v2_model_runner
+    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
+        OmniEngineArgs(use_v2_model_runner=False)
 
 
 def test_sync_config_is_omni():

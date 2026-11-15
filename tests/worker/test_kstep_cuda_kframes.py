@@ -15,6 +15,7 @@ These tests pin the properties the hooks rely on, without a GPU.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
@@ -44,6 +45,10 @@ def _mf_model(stage: str = "tts"):
 
 class _DraftedRunner:
     """Minimal runner surface ``drafts_this_step`` reads."""
+
+    input_batch: SimpleNamespace
+    execute_model_state: tuple[None, ...]
+    _sample: Callable[..., None]
 
     def __init__(self, num_spec_tokens: int, stage: str = "tts"):
         self.num_spec_tokens = num_spec_tokens
@@ -140,6 +145,7 @@ def test_applies_skips_a_stage_without_multi_frame_support():
 
 @pytest.mark.parametrize("short", [False, True])
 def test_gpu_propose_uses_scheduled_width_for_tensor_rows(short):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is outside the vLLM 0.34 scope")
     import torch
 
     from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
@@ -162,6 +168,7 @@ def test_gpu_propose_uses_scheduled_width_for_tensor_rows(short):
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_gpu_sample_tokens_neutralizes_only_kstep_control_head(enabled):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is outside the vLLM 0.34 scope")
     from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
     runner = _DraftedRunner(3)
@@ -210,6 +217,7 @@ def test_kstep_frame_rows_picks_the_row_the_loop_samples():
 
 @pytest.mark.parametrize("fail", [False, True])
 def test_cuda_runner_restores_narrow_context(monkeypatch, fail):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is outside the vLLM 0.34 scope")
     import torch
     import vllm.forward_context
 

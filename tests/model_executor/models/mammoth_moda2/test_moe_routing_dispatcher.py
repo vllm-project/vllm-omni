@@ -121,6 +121,7 @@ def test_routing_ids_ignore_padding_and_stale_cpu_under_async() -> None:
 
 
 def test_select_moe_replay_batch_descriptor_uses_unpadded_ids() -> None:
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is outside the vLLM 0.34 scope")
     from vllm_omni.model_executor.models.mammoth_moda2.moe_cudagraph_bridge import MammothGPUARModelRunner
     from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
