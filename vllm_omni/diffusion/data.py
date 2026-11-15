@@ -7,7 +7,7 @@ import math
 import os
 import random
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -780,6 +780,8 @@ def resolve_model_class_name(
 
     from vllm_omni.diffusion.utils.hf_utils import _looks_like_flux3, _looks_like_hidream_o1
 
+    if model_type == "praxis":
+        return "Praxis1Pipeline"
     if _looks_like_hidream_o1(model, cfg):
         return "HiDreamO1ImagePipeline"
     if _looks_like_flux3(model, cfg):
@@ -800,6 +802,13 @@ def resolve_model_class_name(
         "ming_flash_omni",
         "ming_flash_omni_thinker",
     ):
+        try:
+            transformer_config = get_hf_file_to_dict("transformer/config.json", model, revision=revision)
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not read Ming transformer metadata for %s: %s", model, exc)
+            transformer_config = None
+        if isinstance(transformer_config, Mapping) and transformer_config.get("_class_name") == "DiffusionTransformer":
+            return "MingImageDiffusionPipeline"
         return "MingImagePipeline"
     if model_type == "nextstep":
         return "NextStep11Pipeline"
@@ -1834,6 +1843,11 @@ class OmniDiffusionConfig:
                 model_type = cfg.get("model_type")
                 architectures = cfg.get("architectures") or []
 
+                if model_type == "praxis":
+                    self.model_class_name = "Praxis1Pipeline"
+                    self.update_multimodal_support()
+                    return
+
                 from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
 
                 assert self.model is not None
@@ -1885,11 +1899,19 @@ class OmniDiffusionConfig:
                     "ming_flash_omni",
                     "ming_flash_omni_thinker",
                 ):
-                    # Ming-flash-omni-2.0 — imagegen stage uses the custom
-                    # ``MingImagePipeline`` (ZImage DiT + Qwen2 connector). See
-                    # vllm_omni/diffusion/models/ming_flash_omni/pipeline_ming_imagegen.py.
-                    self.model_class_name = "MingImagePipeline"
-                    self.tf_model_config = TransformerConfig()
+                    # Shared Bailing metadata also appears on Ming-Image checkpoints.
+                    if self.model_class_name is None:
+                        self.model_class_name = resolve_model_class_name(self.model, revision=self.revision)
+                    from vllm_omni.model_executor.models.ming_image.pipeline import MING_IMAGE_PIPELINE
+
+                    if self.model_class_name in (
+                        MING_IMAGE_PIPELINE.diffusers_class_name,
+                        *MING_IMAGE_PIPELINE.diffusers_class_aliases,
+                    ):
+                        if not self._load_component_transformer_config():
+                            self.set_tf_model_config(TransformerConfig())
+                    else:
+                        self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
                 elif model_type == "nextstep":
                     if self.model_class_name is None:
@@ -2041,6 +2063,55 @@ class DiffusionOutput:
 
     # Host-side playback diagnostics; carried through the existing output metadata.
     streaming_metrics: dict[str, float | int] = field(default_factory=dict)
+
+    # In-process ownership only; never part of the pipeline constructor contract.
+    _ready_event: torch.Event | None = field(default=None, init=False, repr=False, compare=False)
+    _ready_tensors: tuple[torch.Tensor, ...] = field(default=(), init=False, repr=False, compare=False)
+
+    def _record_device_ready(self) -> None:
+        """Capture the producer stream before UNI hands output to another thread."""
+
+        def tensors(value: object) -> Iterator[torch.Tensor]:
+            if isinstance(value, torch.Tensor):
+                if value.device.type not in ("cpu", "meta"):
+                    yield value
+            elif isinstance(value, dict):
+                for item in value.values():
+                    yield from tensors(item)
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    yield from tensors(item)
+
+        self._ready_tensors = tuple(
+            tensor
+            for value in (
+                self.output,
+                self.media.video.tensor if self.media is not None else None,
+                self.trajectory_timesteps,
+                self.trajectory_latents,
+                self.trajectory_log_probs,
+                self.custom_output,
+            )
+            for tensor in tensors(value)
+        )
+        if not self._ready_tensors:
+            return
+
+        from vllm_omni.platforms import current_omni_platform
+
+        self._ready_event = current_omni_platform.record_device_event()
+        if self._ready_event is None:
+            # Backends without events must still finish producing the output.
+            current_omni_platform.synchronize()
+
+    def _wait_device_ready(self) -> None:
+        """Order consumer reads and keep storage alive on the consuming stream."""
+        if self._ready_event is not None:
+            self._ready_event.wait()
+        for tensor in self._ready_tensors:
+            tensor.record_stream(torch.accelerator.current_stream(tensor.device))
+        self._ready_event = None
+        self._ready_tensors = ()
 
     def output_nbytes(self) -> int:
         """Payload bytes retained by one decoded output, excluding model workspace."""
