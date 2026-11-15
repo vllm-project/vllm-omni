@@ -264,9 +264,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 getattr(self.talker, "mrv2_decode_preprocess_is_identity", False)
             )
             self.logits_vocab_size = int(self.talker.logits_vocab_size)
-            # CUDA K-step fused graph hooks live on the Talker; the runner sees
-            # this wrapper (after cudagraph unwrapping), so delegate them here.
+            # The runner sees this wrapper. The Talker owns codec state and CUDA K-step hooks.
             for hook_name in (
+                "kstep_rows_ready",
+                "prepare_kstep_inputs",
+                "rewrite_kstep_initial_embeds",
+                "flush_cuda_kstep_feedback",
                 "prepare_cuda_kstep",
                 "cuda_kstep_frame",
                 "commit_cuda_kstep",
@@ -1077,8 +1080,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2_sampling import (
                 MiniCPMO45DuplexSampler,
             )
+            from vllm_omni.worker_v2.ngram_adapter import use_scheduler_ngram
 
-            return MiniCPMO45DuplexSampler(sampler, self), None
+            # Keep the duplex wrapper's output contract. The rejection sampler
+            # verifies ordinary requests using the underlying token sampler.
+            duplex_sampler = MiniCPMO45DuplexSampler(sampler, self)
+            if not use_scheduler_ngram(self.vllm_config):
+                return duplex_sampler, None
+
+            from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+
+            spec = self.vllm_config.speculative_config
+            return duplex_sampler, RejectionSampler(sampler, spec, sampler.req_states.draft_tokens.device)
         # Keep the runner's defaults, including the rejection sampler that
         # verifies draft tokens.
         return None
@@ -1125,6 +1138,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # a step actually runs it is decided per deployment by stage 1's
         # speculative_config (the runner checks its num_spec_tokens for that).
         return self.model_stage == "tts"
+
+    @property
+    def kstep_continue_token_id(self) -> int:
+        return self.talker.kstep_continue_token_id
 
     @property
     def batch_stop_logits(self):

@@ -137,7 +137,11 @@ def ras_verification_logits(
 
     states = sampler.sampling_states
     rows = expanded_idx_mapping.long()
-    top_k, top_p = states.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
+    top_k, top_p, _ = states.get_top_k_top_p(
+        expanded_idx_mapping,
+        idx_mapping_np,
+        logits.shape[-1],
+    )
     if top_k is None:
         top_k = torch.full_like(rows, default_top_k, dtype=torch.int32)
     if top_p is None:

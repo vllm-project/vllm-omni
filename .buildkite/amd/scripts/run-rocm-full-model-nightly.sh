@@ -12,12 +12,19 @@ artifact_name=${4:?artifact directory name required}
 shift 4
 test_targets=("$test_target" "$@")
 level_marker=${ROCM_E2E_LEVEL_MARKER:-full_model}
+run_level=${ROCM_E2E_RUN_LEVEL:-full_model}
 test_timeout_minutes=${ROCM_E2E_TIMEOUT_MINUTES:-105}
 [[ "$expected_tests" =~ ^[1-9][0-9]*$ ]]
 [[ "$model_kind" == omni || "$model_kind" == tts || "$model_kind" == diffusion ]]
 [[ "$artifact_name" =~ ^[a-z0-9-]+$ ]]
-[[ "$level_marker" == full_model || "$level_marker" == slow ]]
+[[ "$level_marker" == full_model || "$level_marker" == advanced_model || "$level_marker" == slow || "$level_marker" == all ]]
+[[ "$run_level" == core_model || "$run_level" == advanced_model || "$run_level" == full_model ]]
 [[ "$test_timeout_minutes" =~ ^[1-9][0-9]*$ ]]
+if [[ "$level_marker" == all ]]; then
+    marker_expression="$model_kind and rocm and MI325 and cards_1 and not nvidia_only"
+else
+    marker_expression="$level_marker and $model_kind and rocm and MI325 and cards_1 and not nvidia_only"
+fi
 artifact_dir="${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/${artifact_name}"
 mkdir -p "$artifact_dir"
 
@@ -64,7 +71,7 @@ trap check_cleanup EXIT
         printf 'checkout_head=%s\n' "$(git rev-parse HEAD)"
     fi
     printf 'target=%s\n' "${test_targets[@]}"
-    echo "expected_tests=$expected_tests marker=$level_marker run_level=full_model timeout=${test_timeout_minutes}m"
+    echo "expected_tests=$expected_tests marker=$level_marker run_level=$run_level timeout=${test_timeout_minutes}m"
     rocminfo
     python3 - <<'PY'
 import torch
@@ -80,8 +87,8 @@ baseline_ready=1
 
 pytest_args=(
     "${test_targets[@]}"
-    -m "$level_marker and $model_kind and rocm and MI325 and cards_1 and not nvidia_only"
-    --run-level full_model --shard-id 0 --num-shards 1
+    -m "$marker_expression"
+    --run-level "$run_level" --shard-id 0 --num-shards 1
 )
 timeout --signal=TERM --kill-after=1m 10m \
     bash .buildkite/amd/scripts/assert-pytest-collection.sh "$expected_tests" "${pytest_args[@]}" \

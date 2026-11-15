@@ -261,6 +261,11 @@ has a single live owner at a time, so concurrent same-shape requests never
 overwrite each other's prefix. Those buffers require additional memory; graph
 entries are bounded by the transformer's cache limit.
 
+Each captured graph owns its private memory pool, so dropping idle entries
+cannot leave later captures reusing a pool whose last graph was destroyed.
+Capture failures restore the caller's CUDA stream before falling back to
+eager decode, preserving output ordering across consecutive requests.
+
 ### Verification
 
 For a direct API smoke test:

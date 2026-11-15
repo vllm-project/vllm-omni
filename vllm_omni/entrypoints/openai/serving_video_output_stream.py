@@ -55,7 +55,7 @@ from vllm_omni.entrypoints.openai.stage_params import (
     get_default_sampling_params_list,
     resolve_diffusion_sampling_params,
 )
-from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
+from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_requests
 from vllm_omni.entrypoints.openai.video_api_utils import (
     FragmentedMP4VideoEncoder,
     StreamingVideoFormat,
@@ -543,6 +543,22 @@ class OmniStreamingVideoOutputHandler:
         track_playback: bool,
     ) -> None:
         """Deliver accepted interactions in ingress order without blocking the reader."""
+
+        async def on_rejected(event_id: str, reason: str) -> None:
+            # A rejection that arrives after the queued ack is reported as a
+            # correlated error; the generation keeps streaming.
+            logger.info("Interaction %s rejected for request %s: %s", event_id, request_id, reason)
+            interaction_event_ids.discard(event_id)
+            await self._send_error(
+                websocket,
+                "Failed to apply interaction",
+                code="interaction_failed",
+                request_id=request_id,
+                event_id=event_id,
+                send_lock=send_lock,
+                response_queue=response_queue,
+            )
+
         try:
             while True:
                 interaction = await interaction_queue.get()
@@ -553,11 +569,13 @@ class OmniStreamingVideoOutputHandler:
                                 request_id,
                                 interaction=interaction,
                                 track_playback=True,
+                                on_error=on_rejected,
                             )
                         else:
                             await self._engine_client.submit_interaction_async(
                                 request_id,
                                 interaction=interaction,
+                                on_error=on_rejected,
                             )
                         progress.touch()
                     except asyncio.CancelledError:
@@ -994,19 +1012,18 @@ class OmniStreamingVideoOutputHandler:
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
         try:
-            lora_request, lora_scale = parse_lora_request(lora_body)
+            lora_requests, lora_scales = parse_lora_requests(lora_body)
         except ValueError as e:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=str(e),
             ) from e
 
-        if lora_request is None:
+        if not lora_requests:
             return
 
-        gen_params.lora_request = lora_request
-        if lora_scale is not None:
-            gen_params.lora_scale = lora_scale
+        gen_params.lora_request = lora_requests
+        gen_params.lora_scale = lora_scales
 
     async def _iter_generation_outputs(
         self,

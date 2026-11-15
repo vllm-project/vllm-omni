@@ -88,6 +88,54 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 > The PyPI package is `quack-kernels` (imported as `quack`); plain `pip install
 > quack` is an unrelated statistics library. Requires CUDA 12.9+ and Python 3.12.
 
+### FlashInfer autotune for diffusion stages
+
+On SM100+ vLLM runs some quantized linears through FlashInfer: MXFP8 linears
+(`FlashInferCutedslMxfp8LinearKernel`, e.g. AutoRound MXFP8 checkpoints) and FP8
+linears with per-tensor activation scales (`FlashInferFP8ScaledMMLinearKernel`).
+FlashInfer picks their GEMM tactic by heuristic unless it is autotuned, and vLLM
+autotunes FlashInfer only in its LLM worker warm-up. Diffusion stages therefore
+autotune FlashInfer themselves, by default on CUDA SM100+ with FlashInfer
+installed (on SM90 FlashInfer's heuristic already matches the tuned tactic).
+Online `--quantization fp8` is not affected: it uses dynamic per-token
+activation scales on CUTLASS, so nothing is tuned.
+
+```bash
+vllm serve <mxfp8-checkpoint> --omni                                  # SM100+: on by default
+vllm serve <mxfp8-checkpoint> --omni --no-diffusion-flashinfer-autotune  # off
+vllm serve <mxfp8-checkpoint> --omni --diffusion-flashinfer-autotune     # force on (e.g. SM90)
+```
+
+On one B200, Wan2.2-T2V-A14B MXFP8 (832x480, 81 frames, 40 steps) went from
+112 s to 95 s per request with identical output.
+
+The first forward of each new batch runs under FlashInfer's autotune context,
+which profiles the GEMM shapes it has not seen; with step execution that covers
+every step of the requests in that batch, since prefill and decode differ. That
+forward is slower, so send a warm-up request at the measured shape and batch
+size before timing. A batch is identified by the scheduler's
+batch-compatibility key of each request it batches -- output size, frame count,
+outputs per prompt, CFG, LoRA and the pipeline's own condition key (for example
+Qwen-Image-2.1's reference-image sizes) -- so two requests of one shape count
+as a new batch after a single one, and a new reference-image geometry is tuned
+again. Rows that depend on the prompt text are not covered: text embeddings are
+padded to the longest prompt in the batch, so no request predicts them at
+admission, and those GEMMs keep FlashInfer's heuristic tactic. A request that
+fails or is cancelled part way through leaves its batch untuned, so a retry
+tunes the steps it never reached. Later requests
+run in FlashInfer's normal mode and use the tuned tactics: tune mode is not kept
+on, because it adds host time to every FlashInfer call even when the tactic is
+cached. Tactics are cached per rank under
+`$VLLM_CACHE_ROOT/flashinfer_autotune/diffusion/<key>/rank<N>.json`, keyed on the
+model, quantization, dtype and parallel layout, and are reused after a restart.
+A tactic is only valid for the GPU and library versions it was tuned on;
+FlashInfer rejects such a file and will not overwrite it, so the worker then
+writes `rank<N>.env-<fingerprint>.json` next to it instead of re-tuning on every
+start.
+Captured CUDA graphs are compatible: their eager warm-up runs before capture, so
+the capture only sees cached tactics. The flag is a no-op off CUDA or without
+FlashInfer.
+
 ## Model Type Support
 
 ### Diffusion Models

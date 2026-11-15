@@ -2410,7 +2410,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # positions per request runs K codec frames here, one replay each, using
         # the same loop the NPU runner uses. Everything else -- prefill, a mixed
         # step, another stage -- falls through to the ordinary single forward.
-        from vllm_omni.platforms.npu.worker import talker_multiframe
+        from vllm_omni.worker import talker_multiframe
 
         frames = talker_multiframe.applies(self.model, model_kwargs_extra)
         if frames <= 1 and talker_multiframe.is_multi_token_decode(self.model, model_kwargs_extra):

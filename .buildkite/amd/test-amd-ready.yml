@@ -366,7 +366,7 @@ steps:
         # JoyImage's nonblocking nightly lane owns its cold AITER builds.
         # H3 VAE ops assume NVIDIA CUDA; ROCm sets torch.version.hip.
         - >-
-          bash .buildkite/amd/scripts/assert-pytest-collection.sh 117
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 120
           tests/diffusion/models/
           --ignore=tests/diffusion/models/auk/test_auk_vae_fastpath.py
           --ignore=tests/diffusion/models/mammoth_moda2/test_dit_attention_cuda.py
