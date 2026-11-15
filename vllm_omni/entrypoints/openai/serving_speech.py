@@ -98,22 +98,24 @@ _USAGE_TOKENIZER_UNAVAILABLE = object()
 
 
 def _mark_seed_origin(sampling_params_list: list[Any], *, request_seed: int | None) -> None:
-    """Record whether each stage's seed came from the client or the stage defaults.
+    """Mark the stage seeds that came from the client instead of the stage defaults.
 
-    Seeded-request isolation keys on a client-supplied seed only. The stage
-    defaults copied from ``default_sampling_params`` also carry a ``seed``, and
-    without this marker every request on those deployments would look like it
-    asked for reproducibility and the AR engine would serialize.
+    Seeded-request isolation only opts in on ``omni_user_seed``; a seed copied
+    from ``default_sampling_params`` stays unmarked and keeps normal batching.
+    The per-request list can share ``SamplingParams`` objects with the
+    process-wide defaults, so mark a clone and write it back rather than mutating
+    the shared instance.
     """
-    for params in sampling_params_list:
-        if not isinstance(params, SamplingParams) or params.seed is None:
+    if request_seed is None:
+        return
+    for index, params in enumerate(sampling_params_list):
+        if not isinstance(params, SamplingParams) or params.seed != request_seed:
             continue
-        if params.extra_args is None:
-            params.extra_args = {}
-        if request_seed is not None:
-            params.extra_args["omni_user_seed"] = True
-        else:
-            params.extra_args["omni_default_seed"] = True
+        marked = params.clone()
+        extra_args = dict(marked.extra_args or {})
+        extra_args["omni_user_seed"] = True
+        marked.extra_args = extra_args
+        sampling_params_list[index] = marked
 
 
 def _stage_speech_metadata(stage: Any) -> tuple[str | None, str | None, str | None]:

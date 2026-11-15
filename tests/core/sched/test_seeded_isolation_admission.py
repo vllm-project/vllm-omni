@@ -37,19 +37,27 @@ class _Params:
 
 
 class _StubRequest:
-    """Request stub carrying the fields the scheduler and the queues read."""
+    """Request stub carrying the fields the scheduler and the queues read.
+
+    ``seed`` defaults to a client-marked seed; pass ``stage_default=True`` for a
+    request whose seed came from ``default_sampling_params`` (unmarked).
+    """
 
     def __init__(
         self,
         request_id: str,
         seed: int | None = None,
         status: RequestStatus = RequestStatus.WAITING,
-        extra_args: dict | None = None,
+        *,
+        stage_default: bool = False,
     ) -> None:
         self.request_id = request_id
         self.status = status
         self.priority = 0
         self.arrival_time = 0.0
+        extra_args = None
+        if seed is not None and not stage_default:
+            extra_args = {"omni_user_seed": True}
         self.sampling_params = _Params(seed, extra_args)
 
     def __lt__(self, other: _StubRequest) -> bool:
@@ -317,7 +325,7 @@ def test_stage_default_seed_keeps_normal_admission(monkeypatch) -> None:
     to one on the shipped configs that set them.
     """
     plain = _StubRequest("plain")
-    default_seeded = _StubRequest("default-seeded", seed=42, extra_args={"omni_default_seed": True})
+    default_seeded = _StubRequest("default-seeded", seed=42, stage_default=True)
     scheduler = _make_scheduler(parked=0, waiting=[plain, default_seeded])
 
     seen = _run_schedule(scheduler, monkeypatch)

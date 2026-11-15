@@ -19,8 +19,10 @@ batching as before. Measured cost: 8 concurrent seeded requests take seconds ins
 under one (3.6 s on an RTX 4080 SUPER; 5.9 s on an RTX 6000 Ada in an
 independent run), while 8 unseeded requests stay at 0.8-1.0 s.
 
-The request opts in by carrying an explicit sampling seed - there is no process
-or engine switch. This module only decides *when* to isolate, so it can be
+The request opts in through the ``omni_user_seed`` marker that the speech
+serving path sets when the client supplies a seed; stages that copy a
+``default_sampling_params`` seed, and the other entrypoints that do the same,
+stay unmarked. There is no process or engine switch. This module only decides *when* to isolate, so it can be
 unit-tested without a GPU or a scheduler instance.
 """
 
@@ -59,15 +61,17 @@ def request_is_seeded(sampling_params: object | None) -> bool:
 
     A request whose ``seed`` came from a stage's ``default_sampling_params`` is
     not an opt-in: those seeds apply to every request on that deployment, so
-    isolating them would serialize the whole engine. The serving layer marks the
-    origin in ``extra_args`` (``omni_user_seed`` / ``omni_default_seed``) before
-    the sampling params reach the scheduler.
+    isolating them would serialize the whole engine. The serving layer marks a
+    client-supplied seed with ``extra_args["omni_user_seed"]``; anything
+    unmarked keeps normal batching.
     """
     if sampling_params is None:
         return False
     extra_args = getattr(sampling_params, "extra_args", None)
     if not isinstance(extra_args, dict):
-        extra_args = {}
-    if extra_args.get("omni_user_seed"):
-        return True
-    return getattr(sampling_params, "seed", None) is not None and not extra_args.get("omni_default_seed")
+        return False
+    # Only an explicit client marker opts in. Every other path - stage defaults,
+    # realtime responses, offline fallbacks - leaves the seed unmarked and keeps
+    # normal batching, so one entrypoint forgetting to mark cannot serialize an
+    # engine.
+    return bool(extra_args.get("omni_user_seed"))
