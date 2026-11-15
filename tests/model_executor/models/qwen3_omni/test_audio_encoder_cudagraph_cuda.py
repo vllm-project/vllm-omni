@@ -191,7 +191,6 @@ def test_replay_metadata_does_not_read_the_device(encoder):
 
 
 def test_captured_graphs_match_eager_and_keep_previous_outputs(encoder):
-    from vllm.compilation.monitor import set_cudagraph_capturing_enabled
     from vllm.distributed.parallel_state import graph_capture
     from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 
@@ -201,11 +200,7 @@ def test_captured_graphs_match_eager_and_keep_previous_outputs(encoder):
     manager = SingleReplayEncoderCudaGraphManager(encoder.vllm_config, torch.device("cuda"), DTYPE, encoder)
     try:
         with torch.inference_mode(), graph_capture(device=torch.device("cuda")):
-            set_cudagraph_capturing_enabled(True)
-            try:
-                manager.capture(graph_pool=torch.cuda.graph_pool_handle())
-            finally:
-                set_cudagraph_capturing_enabled(False)
+            manager.capture(graph_pool=torch.cuda.graph_pool_handle())
         # Explicit budgets set the audio budgets (whole 13-token chunks).
         assert manager.path_token_budgets == {"audio": [13, 52]}
         # One full chunk filling the smallest budget; a tail chunk padded to a

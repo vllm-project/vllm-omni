@@ -437,9 +437,9 @@ class Qwen2_5OmniForConditionalGeneration(
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec] | None = None,
         *,
-        hf_config: PretrainedConfig,
-        image_grid_thw: list[list[int]] | torch.Tensor,
-        video_grid_thw: list[list[int]] | torch.Tensor,
+        hf_config: PretrainedConfig | None = None,
+        image_grid_thw: list[list[int]] | torch.Tensor | None = None,
+        video_grid_thw: list[list[int]] | torch.Tensor | None = None,
         second_per_grid_ts: list[float] | None = None,
         context_len: int = 0,
         seq_len: int | None = None,
@@ -462,6 +462,15 @@ class Qwen2_5OmniForConditionalGeneration(
             |vision chunk 1|audio chunk 1|vision chunk 2|audio chunk 2 |...
         """
 
+        # Native MRoPE callers pass features directly. Keep the extended
+        # config/grid form below for the existing AuK position caller.
+        if hf_config is None:
+            if self.thinker is not None:
+                return self.thinker.get_mrope_input_positions(input_tokens, mm_features or [])
+            length = len(input_tokens)
+            return torch.arange(length, dtype=torch.long).expand(3, -1), 0
+
+        assert image_grid_thw is not None and video_grid_thw is not None
         # TODO(fyabc): refactor and share more code with
         #  _vl_get_input_positions_tensor.
 

@@ -175,7 +175,6 @@ def _make_fast_path_sched(*, defer_block_free: bool) -> tuple[MagicMock, Request
     sched.log_stats = False
     sched.kv_cache_config = MagicMock(kv_cache_groups=[])
     sched.use_v2_model_runner = False
-    sched.prev_step_scheduled_req_ids = set()
     sched.needs_kv_cache_zeroing = False
     sched.connector = None
     sched.ec_connector = None

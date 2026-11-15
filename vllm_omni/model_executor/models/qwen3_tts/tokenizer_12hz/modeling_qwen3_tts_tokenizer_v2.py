@@ -19,7 +19,7 @@
 import copy
 import inspect
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,6 +40,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import ModelOutput, auto_docstring, logging
 from transformers.utils.deprecation import deprecate_kwarg
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 
@@ -1754,14 +1755,21 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
 class Qwen3TTSTokenizerV2Encoder(MimiModel):
     def __init__(self, config: MimiConfig):
+        config = copy.deepcopy(config)
+        config.decoder_config = None
         super().__init__(config)
-        self.config = config
 
-        self.upsample = None
-        self.decoder_transformer = None
-        self.decoder = None
-
-        self.post_init()
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Speech checkpoints retain Mimi's flat names; Transformers 5.22
+        # groups the SEANet, transformer and downsample under the encoder.
+        mapper = WeightsMapper(
+            orig_to_new_prefix={
+                "encoder.layers.": "encoder.encoder_seanet.layers.",
+                "encoder_transformer.": "encoder.encoder_transformer.",
+                "downsample.": "encoder.downsample.",
+            }
+        )
+        return AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
 
 
 @auto_docstring

@@ -185,7 +185,6 @@ def _make_scheduler(
     )
     sched.use_v2_model_runner = native
     sched.async_scheduling = False
-    sched.prev_step_scheduled_req_ids = set()
     sched._last_stats_time = time.monotonic()  # make_stats() short-circuits
     sched.finish_calls = []
     sched.finish_calls_unresolved = []

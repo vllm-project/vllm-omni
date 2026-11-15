@@ -854,3 +854,59 @@ def test_omni_model_runner_output_can_carry_kv_connector_output_only():
     assert output.req_ids == []
     assert output.sampled_token_ids == []
     assert output.kv_connector_output is marker
+
+
+@pytest.mark.parametrize("modality", [None, "image", "audio", "video"])
+def test_qwen2_wrapper_mrope_accepts_native_features(modality):
+    from vllm.multimodal.inputs import (
+        MultiModalFeatureSpec,
+        MultiModalFieldElem,
+        MultiModalKwargsItem,
+        PlaceholderRange,
+    )
+
+    from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni import Qwen2_5OmniForConditionalGeneration
+    from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
+        Qwen2_5OmniThinkerForConditionalGeneration,
+    )
+
+    thinker = Qwen2_5OmniThinkerForConditionalGeneration.__new__(Qwen2_5OmniThinkerForConditionalGeneration)
+    torch.nn.Module.__init__(thinker)
+    thinker.config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2, tokens_per_second=25))
+    model = Qwen2_5OmniForConditionalGeneration.__new__(Qwen2_5OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.thinker = thinker
+    features = []
+    expected = torch.arange(6).expand(3, -1)
+    if modality is not None:
+        data = (
+            {"audio_feature_lengths": torch.tensor(15)}
+            if modality == "audio"
+            else {f"{modality}_grid_thw": torch.tensor([1, 4, 4])}
+        )
+        features = [
+            MultiModalFeatureSpec(
+                data=MultiModalKwargsItem(
+                    {key: MultiModalFieldElem(value, MultiModalBatchedField()) for key, value in data.items()}
+                ),
+                modality=modality,
+                identifier=modality,
+                mm_position=PlaceholderRange(offset=1, length=4),
+            )
+        ]
+        if modality != "audio":
+            expected = torch.tensor([[0, 1, 1, 1, 1, 3], [0, 1, 1, 2, 2, 3], [0, 1, 2, 1, 2, 3]])
+    positions, delta = model.get_mrope_input_positions(list(range(6)), features)
+    torch.testing.assert_close(positions, expected)
+    assert delta == (0 if modality in (None, "audio") else -2)
+
+
+def test_qwen2_wrapper_codec_stage_mrope_is_sequential():
+    from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni import Qwen2_5OmniForConditionalGeneration
+
+    model = Qwen2_5OmniForConditionalGeneration.__new__(Qwen2_5OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.thinker = None
+    positions, delta = model.get_mrope_input_positions([1, 2, 3], [])
+    torch.testing.assert_close(positions, torch.arange(3).expand(3, -1))
+    assert delta == 0

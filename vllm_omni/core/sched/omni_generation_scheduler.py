@@ -759,10 +759,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
 
-        # Record request ids scheduled in this step for the next update.
-        self.prev_step_scheduled_req_ids.clear()
-        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
-
         scheduler_output = self._build_generation_scheduler_output(
             new_reqs_data,
             cached_reqs_data,

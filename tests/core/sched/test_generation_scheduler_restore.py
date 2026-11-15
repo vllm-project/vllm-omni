@@ -107,7 +107,6 @@ def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
     scheduler.connector = None
     scheduler.aux_output_connector = None
     scheduler.ec_connector = None
-    scheduler.prev_step_scheduled_req_ids = set()
     scheduler._pending_finish_reqs = []
     scheduler._consume_pending_connector_output = lambda model_mode: None
     scheduler._process_pending_input_timeouts = lambda: None

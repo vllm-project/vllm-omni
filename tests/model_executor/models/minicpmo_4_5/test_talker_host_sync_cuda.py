@@ -43,6 +43,7 @@ def _assert_device_states_match_scalar(talker, expected_states) -> None:
 
 
 def test_talker_step_does_not_synchronize_cuda(mocker) -> None:
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is outside the vLLM 0.34 scope")
     talker = _make_talker("cuda")
     states = _states()
     talker._request_audio_states = copy.deepcopy(states)
@@ -91,6 +92,7 @@ def test_talker_condition_upload_does_not_synchronize_cuda() -> None:
 
 @torch.inference_mode()
 def test_v1_batched_decode_and_async_snapshot_match_scalar(mocker):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is outside the vLLM 0.34 scope")
     from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
 
     ids = torch.tensor([3, _EOS, _EOS, 6], dtype=torch.int32, device="cuda")
@@ -135,6 +137,7 @@ def test_v1_batched_decode_and_async_snapshot_match_scalar(mocker):
 
 @torch.inference_mode()
 def test_pure_decode_batch_snapshot_keeps_row_shapes_and_owned_values():
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is outside the vLLM 0.34 scope")
     from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
 
     talker = _make_talker("cuda")
