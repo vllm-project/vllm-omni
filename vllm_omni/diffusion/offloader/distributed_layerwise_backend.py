@@ -18,10 +18,12 @@ This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import weakref
 from collections.abc import Sequence
+from contextlib import contextmanager
 from functools import partial
 from itertools import chain
 from typing import Any
@@ -76,6 +78,25 @@ from .tensor_utils import (
 )
 
 logger = init_logger(__name__)
+
+# vLLM workers run torch with one intra-op thread. Packing a streamed block from the
+# checkpoint mmap (layout transforms such as QKV reordering, then the staging copy) runs
+# on the critical path of every layer, so give it more threads for its duration.
+_STAGING_THREADS = max(1, int(os.environ.get("VLLM_OMNI_DLO_STAGING_THREADS", "16")))
+
+
+@contextmanager
+def _staging_threads():
+    previous = torch.get_num_threads()
+    if _STAGING_THREADS <= previous:
+        yield
+        return
+    torch.set_num_threads(_STAGING_THREADS)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
 
 # A backend normally owns both objects below. This process-lifetime safety
 # owner prevents HostWeightLease.__del__ from unmapping storage when cleanup
@@ -562,23 +583,24 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         slot_buffers: dict[torch.dtype, torch.Tensor],
     ) -> dict[torch.dtype, torch.Tensor]:
         staged: dict[torch.dtype, torch.Tensor] = {}
-        for dtype, metas in metadata.items():
-            total_numel = sum(meta["numel"] for meta in metas)
-            destination = slot_buffers[dtype][:total_numel]
-            sources = cpu_sources[dtype]
-            for source_info, meta in zip(sources, metas, strict=True):
-                source = DistributedLayerwiseOffloadHook._resolve_mmap_source(source_info, meta, dtype)
-                start = meta["offset"]
-                physical_storage = destination[start : start + meta["numel"]]
-                if source.is_contiguous():
-                    physical_storage.copy_(source.flatten())
-                else:
-                    torch.as_strided(
-                        physical_storage,
-                        size=source.shape,
-                        stride=source.stride(),
-                    ).copy_(source)
-            staged[dtype] = destination
+        with _staging_threads():
+            for dtype, metas in metadata.items():
+                total_numel = sum(meta["numel"] for meta in metas)
+                destination = slot_buffers[dtype][:total_numel]
+                sources = cpu_sources[dtype]
+                for source_info, meta in zip(sources, metas, strict=True):
+                    source = DistributedLayerwiseOffloadHook._resolve_mmap_source(source_info, meta, dtype)
+                    start = meta["offset"]
+                    physical_storage = destination[start : start + meta["numel"]]
+                    if source.is_contiguous():
+                        physical_storage.copy_(source.flatten())
+                    else:
+                        torch.as_strided(
+                            physical_storage,
+                            size=source.shape,
+                            stride=source.stride(),
+                        ).copy_(source)
+                staged[dtype] = destination
         return staged
 
     def _stage_mmap_sources(self, slot: int) -> dict[torch.dtype, torch.Tensor]:
