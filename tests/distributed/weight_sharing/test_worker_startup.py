@@ -50,7 +50,7 @@ def test_startup_registry_stays_out_of_request_rpc(mocker, sharing):
             mp=ctx,
             cast=cast,
             logger=mocker.Mock(),
-            set_multiprocessing_worker_envs=lambda: None,
+            set_multiprocessing_worker_envs=mocker.Mock(),
             WorkerProc=mocker.Mock(worker_main=_startup_worker),
         ),
     )

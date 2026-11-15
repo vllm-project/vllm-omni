@@ -721,6 +721,8 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
         quality="lossless",
         seed=7,
         num_outputs_per_prompt=1,
+        lora_request=None,
+        lora_scale=1.0,
         attention_schedule=None,
         attention_sigma_schedule=None,
     )

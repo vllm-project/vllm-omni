@@ -194,6 +194,8 @@ def test_encoder_preparation_routes_edit_sources_without_qwen_inputs(
             quality=None,
             seed=17,
             num_outputs_per_prompt=1,
+            lora_request=None,
+            lora_scale=1.0,
             attention_schedule=None,
             attention_sigma_schedule=None,
         ),
