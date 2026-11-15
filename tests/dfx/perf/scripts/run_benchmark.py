@@ -687,6 +687,10 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
 
 def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
+    if params.get("dataset_name") in {"ovo-bench", "videomme-streaming"}:
+        from tests.e2e.accuracy.long_video_qa.validation import assert_accuracy_result
+
+        assert_accuracy_result(result, params, num_prompt)
     _assert_fixed_stage_workloads(result, params, num_prompt)
     assert_duplex_artifact_publication(result, params, num_prompt)
     for metric in params.get("required_duplex_metrics", []):

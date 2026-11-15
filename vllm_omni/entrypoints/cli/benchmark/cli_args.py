@@ -300,6 +300,22 @@ def add_diffusion_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_long_video_cli_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("Continuous visual-session QA")
+    group.add_argument("--long-video-media-root", type=Path, help="Root of local official video files.")
+    group.add_argument("--long-video-annotation-sha256", help="Require an exact annotation-file revision.")
+    group.add_argument("--long-video-ids", nargs="+", help="Original question IDs (not video IDs).")
+    group.add_argument("--long-video-fps", type=_positive_finite_float, default=1.0)
+    group.add_argument("--long-video-max-edge", type=int, default=336)
+    group.add_argument(
+        "--long-video-timeout-s",
+        type=_positive_finite_float,
+        default=180.0,
+        help="Timeout for each observation or question, excluding paced playback.",
+    )
+    group.add_argument("--long-video-output-dir", type=Path, default=Path("long-video-output"))
+
+
 def add_daily_omni_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments specific to the Daily-Omni dataset."""
     group = parser.add_argument_group("Daily-Omni Dataset Options")
@@ -521,6 +537,8 @@ _OMNI_BENCH_DATASET_CHOICES = (
     "daily-omni",
     "omniinteract",
     "omni-duplex-eval",
+    "ovo-bench",
+    "videomme-streaming",
     "seed-tts",
     "seed-tts-text",
     "seed-tts-design",
@@ -605,6 +623,7 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
     """Register all vLLM-Omni serving benchmark arguments."""
     add_daily_omni_cli_args(parser)
     add_videomme_cli_args(parser)
+    add_long_video_cli_args(parser)
     add_omniinteract_cli_args(parser)
     add_duplex_eval_cli_args(parser)
     add_duplex_cli_args(parser)
@@ -615,6 +634,22 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
 
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
+    if getattr(args, "dataset_name", None) in {"ovo-bench", "videomme-streaming"}:
+        if args.backend != "openai-realtime-duplex" or args.endpoint != "/v1/realtime":
+            raise ValueError("Visual-session QA requires --backend openai-realtime-duplex --endpoint /v1/realtime")
+        if not args.dataset_path or not args.long_video_media_root:
+            raise ValueError("Visual-session QA requires local --dataset-path annotations and --long-video-media-root")
+        if not 0 < args.long_video_fps <= 4 or not 32 <= args.long_video_max_edge <= 1024:
+            raise ValueError("Visual-session QA requires 0 < FPS <= 4 and 32 <= max edge <= 1024")
+        if args.num_prompts < 0:
+            raise ValueError("--num-prompts must be non-negative (0 selects all)")
+        if args.max_concurrency is None:
+            args.max_concurrency = 1
+        elif args.max_concurrency <= 0:
+            raise ValueError("--max-concurrency must be positive")
+        for name in ("ignore_eos", "profile", "skip_tokenizer_init", "probe_request_rate"):
+            if getattr(args, name, False):
+                raise ValueError(f"Visual-session QA does not support --{name.replace('_', '-')}")
     if getattr(args, "dataset_name", None) == "omni-duplex-eval":
         if args.backend != "openai-realtime-duplex" or args.endpoint != "/v1/realtime":
             raise ValueError("Omni-DuplexEval requires --backend openai-realtime-duplex --endpoint /v1/realtime")
