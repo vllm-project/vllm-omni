@@ -85,7 +85,8 @@ def test_rejects_unusable_base_request(prompt, error):
             _base(voice_clone_prompt=[{"ref_code": CODE, "ref_spk_embedding": SPK, "ref_text": "Words."}]),
             id="voice-clone-prompt-icl",
         ),
-        pytest.param(_base(speaker=["stored"]), id="stored-speaker"),
+        # Intentionally passed to the Talker: it resolves a stored voice from a cache this check cannot see.
+        pytest.param(_base(speaker=["stored"]), id="stored-speaker-no-ref-left-to-talker"),
         # Shapes the speech API's _build_tts_params sends.
         pytest.param(_base(ref_audio=[[[0.0, 0.1], 24000]], ref_text=TEXT), id="api-inline-audio"),
         pytest.param(

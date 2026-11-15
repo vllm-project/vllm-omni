@@ -1090,7 +1090,8 @@ class OmniRunner(_EngineWorkerOwner):
         if is_tts_model and modalities == ["audio"]:
             tts_kw = mm_processor_kwargs or {}
             task_type = tts_kw.get("task_type", "CustomVoice")
-            speaker = tts_kw.get("speaker", "Vivian")
+            # Only CustomVoice needs a built-in speaker; for Base it names a stored voice.
+            speaker = tts_kw.get("speaker", "Vivian" if task_type == "CustomVoice" else None)
             language = tts_kw.get("language", "Auto")
             max_new_tokens = int(tts_kw.get("max_new_tokens", 2048))
             ref_audio = tts_kw.get("ref_audio", None)
@@ -1103,9 +1104,10 @@ class OmniRunner(_EngineWorkerOwner):
                     "task_type": [task_type],
                     "text": [text_str],
                     "language": [language],
-                    "speaker": [speaker],
                     "max_new_tokens": [max_new_tokens],
                 }
+                if speaker is not None:
+                    additional_information["speaker"] = [speaker]
                 if ref_audio is not None:
                     additional_information["ref_audio"] = [ref_audio]
                 if ref_text is not None:
