@@ -94,6 +94,7 @@ Load a PEFT-format LoRA adapter at initialization. The adapter is pre-loaded int
 
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 
 lora_path = "/path/to/lora_adapter"
@@ -111,15 +112,63 @@ lora_request = LoRARequest(
 )
 
 outputs = omni.generate(
-    prompt="A piece of cheesecake",
-    lora_request=lora_request,
-    lora_scale=2.0, # optional arg, default 1.0
+    "A piece of cheesecake",
+    OmniDiffusionSamplingParams(
+        lora_request=lora_request,
+        lora_scale=2.0,  # optional arg, default 1.0
+    ),
 )
 ```
+
+#### PEFT backend: stacking multiple LoRAs in one request
+
+A single request can activate several LoRA adapters at once, each with its own
+scale. The adapters are composed into a single adapter whose per-layer rank is
+the sum of the individual ranks; the composed adapter is cached and activated
+like any other adapter, and requests with different LoRA combinations (or
+different scales) are scheduled into separate batches.
+
+Constraints:
+
+- The summed rank of the stacked adapters must not exceed **512** per layer.
+  Two or three typical LoRAs (rank 4-64) fit comfortably.
+- Adapters with a scale of approximately 0 are skipped.
+- Packed-projection stacking requires a compatible loader and packed-module mapping; MiniMax-H3 supports its fused QKV and MLP projections.
+- MiniMax-H3 accepts ordinary adapter stacks and at most one compatible Turbo adapter. Native distilled adapters such as FlashGen cannot be composed with other adapters.
+- FastH3 Omni accepts ordinary adapters with independent scales, including under distributed layerwise offload; Turbo and native distilled adapters remain unsupported with this checkpoint.
+
+Offline: pass a list of `LoRARequest` objects together with a matching list of
+scales:
+
+```python
+outputs = omni.generate(
+    prompt="A piece of cheesecake",
+    lora_request=[lora_request_a, lora_request_b],
+    lora_scale=[0.8, 0.6],
+)
+```
+
+Online: the `lora` request field accepts an array of objects instead of a
+single object (a single object remains valid):
+
+```json
+"lora": [
+  {"name": "style", "local_path": "/path/to/style.safetensors", "scale": 0.8, "int_id": 1},
+  {"name": "character", "local_path": "/path/to/character.safetensors", "scale": 0.6, "int_id": 2}
+]
+```
+
+`int_id` is optional; when omitted it is derived from `local_path`.
 
 #### Distill backend: fuse distilled LoRA at init
 
 For distilled few-step LoRAs, pass `lora_backend="distill"` together with one or more concrete `.safetensors` files. The weights are fused into the base model once at init; subsequent `generate()` calls do not need a `LoRARequest`.
+
+With tensor parallelism, the fusion loader selects each rank's portion of the
+adapter delta to match the base linear weights. Packed QKV and merged column
+projections are split per projection before being packed for each rank.
+Replicated weights and row-parallel biases keep the full delta. Unloading an
+adapter uses the same partitioning.
 
 ##### Supported pipelines
 
@@ -144,7 +193,7 @@ omni = Omni(
     lora_backend="distill",
 )
 
-outputs = omni.generate(prompt="A piece of cheesecake")
+outputs = omni.generate("A piece of cheesecake")
 ```
 
 Multi-file example (Wan2.2 MoE, high + low noise):

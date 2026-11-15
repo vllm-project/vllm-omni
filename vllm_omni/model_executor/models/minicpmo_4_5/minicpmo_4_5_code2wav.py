@@ -935,24 +935,38 @@ class MiniCPMO45Code2Wav(nn.Module):
             return (*prompt, cache_signature)
         return (*prompt, cache_signature, item.cache_epoch)
 
+    def _npu_cross_reference_inactive_reason(self) -> str | None:
+        """Share admission conditions with initialization diagnostics."""
+        if not getattr(self, "_npu_cross_reference_batching", False):
+            return "configuration switch is disabled"
+        if self.backend is None:
+            return "backend is unavailable"
+        if getattr(self, "_min_batch_size", 1) != 1:
+            return "code2wav_min_batch_size must be 1"
+        wrapper = self.backend._whole_euler_graph_wrapper
+        if wrapper is None:
+            return "Whole-Euler wrapper is unavailable"
+        if not wrapper.enabled:
+            return "Whole-Euler graph is disabled"
+        if wrapper.ragged_body is None:
+            return "ragged Whole-Euler body is unavailable"
+        if not self.backend._whole_euler_ragged_active():
+            return "Whole-Euler ragged execution is inactive"
+        if wrapper.device.type != "npu":
+            return "wrapper device must be NPU"
+        if getattr(wrapper, "dtype", None) != torch.float32:
+            return "wrapper dtype must be FP32"
+        if getattr(wrapper, "att_slots", 0) != 0:
+            return "attention slot pool must be disabled"
+        if not getattr(self.backend, "_ragged_fused_body", False):
+            return "fused ragged body is required"
+        if getattr(self.backend, "_estimator_att_cache_dtype", None) != torch.float32:
+            return "attention cache dtype must be FP32"
+        return None
+
     def _npu_cross_reference_active(self) -> bool:
         """Admit only the already-supported FP32 fused Whole-Euler arena."""
-        if not getattr(self, "_npu_cross_reference_batching", False) or self.backend is None:
-            return False
-        if getattr(self, "_min_batch_size", 1) != 1:
-            # Post-setup shape splitting can create singleton groups. Preserve
-            # the existing strict minimum-bucket contract for such profiles.
-            return False
-        if not self.backend._whole_euler_ragged_active():
-            return False
-        wrapper = self.backend._whole_euler_graph_wrapper
-        return (
-            wrapper.device.type == "npu"
-            and getattr(wrapper, "dtype", None) == torch.float32
-            and getattr(wrapper, "att_slots", 0) == 0
-            and getattr(self.backend, "_ragged_fused_body", False)
-            and getattr(self.backend, "_estimator_att_cache_dtype", None) == torch.float32
-        )
+        return self._npu_cross_reference_inactive_reason() is None
 
     @staticmethod
     def _npu_same_shape_groups(
@@ -1087,11 +1101,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
             if len(groups) != 1:
                 raise _batch_error("npu_cross_reference_shape_mismatch")
-            if getattr(self, "_npu_cross_reference_batching", False):
-                return self.backend.decode_ragged_batch(tokens, features, states, last_chunks=last_chunks)
-            # Keep uniform padding and fallback policy; conditions and caches
-            # remain per request. Mixed-history NPU guards are unchanged.
-            return self.backend.decode_batch(torch.stack(tokens, dim=0), features, states, last_chunk=last_chunks[0])
+            return self.backend.decode_ragged_batch(tokens, features, states, last_chunks=last_chunks)
         if (
             ragged
             or (isinstance(features, list) and self.backend._whole_euler_ragged_active())
@@ -1564,6 +1574,8 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "meta.duplex_turn_id": [torch.tensor(item.duplex_turn_id, dtype=torch.int32) for item in items],
                 "meta.llm_output_text_utf8": [item.segment_text_utf8 for item in items],
                 "meta.tts_is_last_chunk": [torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items],
+                "meta.duplex_audio_cache_epoch": [torch.tensor(item.cache_epoch, dtype=torch.int64) for item in items],
+                "meta.duplex_audio_chunk_seq": [torch.tensor(item.chunk_seq, dtype=torch.int64) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
                 "meta.turn_end": [torch.tensor(item.turn_end, dtype=torch.bool) for item in items],
             },
@@ -1822,7 +1834,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         # Parsed before the platform branches: a typo in a shared stage config
         # must fail at startup on every platform, not only where the toggle is
         # consumed (CUDA for TensorRT, NPU for the device speaker embedding).
-        device_spk = read_bool_flag(extra, "token2wav_device_spk", True)
+        device_spk = read_bool_flag(
+            extra, "token2wav_device_spk", current_omni_platform.is_cuda() or current_omni_platform.is_npu()
+        )
         use_trt = read_bool_flag(extra, "token2wav_trt", False) or (os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1")
         cpu_reference_spk = read_bool_flag(extra, "token2wav_spk_cpu_reference", False)
         # The flag selects a CUDA speaker-only engine. Keep the previous path
@@ -1883,20 +1897,26 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
             token2wav.enable_trt_spk_embedding(cpu_reference=True)
             logger.info("MiniCPM-o Code2Wav: CPU-reference campplus speaker embedding on TensorRT")
-        elif current_omni_platform.is_cuda() or current_omni_platform.is_npu():
+        elif device_spk:
             # CAM++ speaker embedding on device via torch (weights loaded from
             # the same campplus.onnx) — replaces the per-request CPU
             # onnxruntime run that blocks the host ~120-155ms per request.
             # "token2wav_device_spk": false in the stage extra config falls
             # back to the CPU onnxruntime path (accuracy triage).
-            if device_spk:
+            flow_parameter = next(token2wav.flow.parameters(), None)
+            if flow_parameter is not None and flow_parameter.device.type != "cpu":
                 token2wav.enable_device_spk_embedding(use_trt=False)
                 logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on device (torch)")
             else:
-                logger.info(
-                    "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
-                    "(token2wav_device_spk=false)"
+                logger.warning(
+                    "MiniCPM-o Code2Wav: token2wav_device_spk=true but %s; using CPU onnxruntime",
+                    "flow has no parameters" if flow_parameter is None else "flow is on CPU",
                 )
+        else:
+            logger.info(
+                "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
+                "(token2wav_device_spk=false)"
+            )
         if read_bool_flag(extra, "token2wav_spk_cuda_graph", False):
             token2wav.enable_speaker_cuda_graph(self.vllm_config)
             logger.info("MiniCPM-o Code2Wav: exact-shape Torch speaker CUDA graphs enabled")
@@ -1915,12 +1935,14 @@ class MiniCPMO45Code2Wav(nn.Module):
             watchdog=self._watchdog,
         )
         wrapper = self.backend._whole_euler_graph_wrapper
+        inactive_reason = self._npu_cross_reference_inactive_reason()
         if wrapper is not None:
-            wrapper.npu_mixed_history = self._npu_cross_reference_active()
+            wrapper.npu_mixed_history = inactive_reason is None
         if self._npu_cross_reference_batching and (wrapper is None or not wrapper.npu_mixed_history):
             logger.warning(
                 "NPU cross-reference CFM batching is inactive: requires NPU FP32 fused Whole-Euler, "
-                "FP32 attention caches, no slot pool and code2wav_min_batch_size=1"
+                "FP32 attention caches, no slot pool and code2wav_min_batch_size=1; reason: %s",
+                inactive_reason,
             )
         # Deferred until the worker warmup hook (capture_auxiliary_graphs) or, on
         # runners without that hook, the first chunk that needs a graph. Capturing
