@@ -89,13 +89,13 @@ def test_unmatched_hardware_uses_temporary_fallback_and_empty_baseline_is_not_ga
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     measured = {"throughput_qps": 0.01}
-    baseline = {"H100": {"throughput_qps": 1.0}}
+    baseline = {"H200": {"throughput_qps": 1.0}}
     for hardware in ("B200", None):
-        with pytest.raises(AssertionError, match="on H100"):
+        with pytest.raises(AssertionError, match="on H200"):
             assert_baseline_within_tolerance(measured, baseline, hardware)
-    assert any(record.levelname == "ERROR" and "falling back to H100" in record.message for record in caplog.records)
-    assert_baseline_within_tolerance(measured, {}, "H100")
-    assert_baseline_within_tolerance(measured, None, "H100")
+    assert any(record.levelname == "ERROR" and "falling back to H200" in record.message for record in caplog.records)
+    assert_baseline_within_tolerance(measured, {}, "H200")
+    assert_baseline_within_tolerance(measured, None, "H200")
 
 
 def test_missing_nonfinite_negative_and_unresolved_baselines_fail() -> None:
@@ -145,7 +145,7 @@ def test_diffusion_assert_result_checks_named_hardware_only_when_enabled() -> No
         "completed": 1,
         "throughput_qps": 0.5,
         "latency_mean": 1.0,
-        "baseline": {"H100": {"throughput_qps": 1.0, "latency_mean": 1.0}},
+        "baseline": {"H100": {"throughput_qps": 1.0, "latency_mean": 1.0}, "H200": {"throughput_qps": 1.0}},
     }
     assert_result(result, 1)
     with pytest.raises(AssertionError, match="throughput_qps"):

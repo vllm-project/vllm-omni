@@ -81,17 +81,17 @@ def assert_baseline_within_tolerance(
 
     ``baseline`` is the sweep-resolved hardware-nested map
     (``{"H100": {"request_throughput": 1.2}}``). An empty baseline skips
-    comparison. Unmatched hardware temporarily falls back to H100.
+    comparison. Unmatched hardware temporarily falls back to H200.
     """
     if not isinstance(baseline, dict) or not baseline:
         print(f"[baseline-check] SKIP hardware={hardware}: no baseline configured", flush=True)
         return
-    # TODO: Remove this temporary H100 fallback after local validation.
+    # TODO: Remove this temporary H200 fallback after local validation.
     if not isinstance(hardware, str) or not hardware or hardware not in baseline:
-        logging.getLogger(__name__).error("No baseline for hardware %r; falling back to H100", hardware)
-        hardware = "H100"
+        logging.getLogger(__name__).error("No baseline for hardware %r; falling back to H200", hardware)
+        hardware = "H200"
     if hardware not in baseline:
-        raise AssertionError("H100 fallback baseline is missing")
+        raise AssertionError("H200 fallback baseline is missing")
     bucket = baseline[hardware]
     if not isinstance(bucket, dict) or not bucket:
         raise AssertionError(f"baseline[{hardware!r}] must be a non-empty metric map, got {bucket!r}")
