@@ -131,6 +131,7 @@ def finalize_long_video(samples, outputs) -> dict | None:
             continue
         case = sample.case
         root = sample.output_dir
+        assert case is not None and root is not None
         result = getattr(output, "long_video_result", {})
         prediction = extract_choice(output.generated_text) if output.success else None
         rows.append(
@@ -161,6 +162,7 @@ def finalize_long_video(samples, outputs) -> dict | None:
             artifact_errors.append(str(exc))
     if not rows:
         return None
+    assert root is not None
     summary = {
         "protocol": "continuous-visual-mcq-v1",
         "modalities": ["video", "text"],

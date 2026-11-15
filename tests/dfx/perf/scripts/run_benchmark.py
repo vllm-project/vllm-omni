@@ -608,7 +608,7 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
         },
         branch=str(result.get("branch") or os.environ.get("BUILDKITE_BRANCH", "")),
         num_prompts=pooled.num_prompts,
-        max_concurrency=int(result["max_concurrency"]) if isinstance(result.get("max_concurrency"), int) else None,
+        max_concurrency=int(concurrency) if isinstance(concurrency := result.get("max_concurrency"), int) else None,
         benchmark_exit_code=0 if passed else 1,
         generation={
             "completed": pooled.completed,

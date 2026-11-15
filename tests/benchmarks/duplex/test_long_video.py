@@ -200,7 +200,7 @@ def test_real_websocket_replay_and_cleanup(tmp_path, fail, text_event):
     Image.new("RGB", (16, 16), "red").save(frame)
     prepared = PreparedVideo((frame, frame), 0.12, "test-digest")
     commands = []
-    events = []
+    events: list[dict] = []
 
     async def exercise():
         async def handler(socket):

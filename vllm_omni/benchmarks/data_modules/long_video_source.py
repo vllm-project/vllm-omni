@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 from contextlib import ExitStack
 from pathlib import Path
+from typing import BinaryIO, cast
 
 from filelock import FileLock
 from huggingface_hub import constants as hf_constants
@@ -105,7 +106,7 @@ def _extract_ovo(root: Path) -> Path:
         with tempfile.TemporaryDirectory(prefix=".ovo-", dir=root) as temporary, ExitStack() as stack:
             staging = Path(temporary).resolve()
             stream = _ArchiveParts([stack.enter_context(part.open("rb")) for part in parts])
-            with tarfile.open(fileobj=stream, mode="r|*") as archive:
+            with tarfile.open(fileobj=cast(BinaryIO, stream), mode="r|*") as archive:
                 for member in archive:
                     destination = (staging / member.name).resolve()
                     if not destination.is_relative_to(staging) or not (member.isdir() or member.isfile()):
@@ -114,7 +115,9 @@ def _extract_ovo(root: Path) -> Path:
                         destination.mkdir(parents=True, exist_ok=True)
                     else:
                         destination.parent.mkdir(parents=True, exist_ok=True)
-                        with archive.extractfile(member) as source, destination.open("wb") as out:
+                        source = archive.extractfile(member)
+                        assert source is not None
+                        with source, destination.open("wb") as out:
                             shutil.copyfileobj(source, out)
             _ovo_media(staging)
             staging.rename(target)

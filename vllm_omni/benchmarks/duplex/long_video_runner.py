@@ -12,7 +12,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pybase64 as base64
 
@@ -29,14 +29,14 @@ class PreparedVideo:
 
 
 def prepare_video(case: VideoQuestion, directory: Path, *, fps: float, max_edge: int) -> PreparedVideo:
-    """Decode chronologically to bounded-size PNGs on disk, never past the query time."""
+    """Decode chronologically to bounded-size PNG images on disk, never past the query time."""
     import av
 
     digest = hashlib.sha256()
     with case.video.open("rb") as source:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
-    paths = []
+    paths: list[Path] = []
     with av.open(str(case.video)) as container:
         stream = container.streams.video[0]
         if stream.duration is not None and stream.time_base is not None:
@@ -103,7 +103,7 @@ async def replay_video(
     )
     url = build_realtime_url(url, model, autostart=False)
     async with DuplexClient(url, model=model, config=config, extra_headers=headers, reconnect=None) as client:
-        capabilities = client.session_info.get("capabilities", {})
+        capabilities = cast(dict[str, Any], client.session_info.get("capabilities", {}))
         required = capabilities.get("required_input_modalities", [])
         optional = capabilities.get("optional_input_modalities", [])
         if "audio" in required or "video" not in (*required, *optional):
@@ -115,7 +115,7 @@ async def replay_video(
                 async with condition:
                     collector.add(event)
                     if event.type == "response.done" and event.response_id:
-                        if event.raw["response"]["status"] != "completed":
+                        if cast(dict[str, Any], event.raw["response"])["status"] != "completed":
                             raise RuntimeError(f"Observation failed: {event.raw}")
                         completed.append(event.response_id)
                     if event.type == "error":
@@ -212,7 +212,7 @@ async def replay_video(
                 events.extend(
                     event
                     for event in collector.events
-                    if event.get("type", "").startswith("response.")
+                    if cast(str, event.get("type", "")).startswith("response.")
                     or event.get("type") in {"error", "input_audio_buffer.committed"}
                 )
 
