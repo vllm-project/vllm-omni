@@ -151,30 +151,50 @@ def has_tts_text_conditioning(
     return isinstance(hidden_states, dict) and isinstance(hidden_states.get("trailing_text"), torch.Tensor)
 
 
+_TEXT_ERROR = (
+    "Qwen3-TTS requests need `text` as a list whose first item is non-blank (e.g. ['Hello.']), "
+    "or precomputed text token ids, in `additional_information` or `model_intermediate_buffer`; "
+    "neither may override the other's with a blank value"
+)
+
+
+def _talker_info_views(info: object, buffer: object) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The payloads the Talker can receive for a prompt, one per model runner.
+
+    Model Runner V2 lays ``model_intermediate_buffer`` over
+    ``additional_information`` (``OmniIntermediateBuffer.add_request``); the V1
+    runner applies ``additional_information`` last
+    (``OmniGPUModelRunner._update_additional_information``). Both merge nested
+    sections key by key, which for the top-level text keys checked here is a
+    plain overlay. A non-dict payload counts as empty.
+    """
+    info = info if isinstance(info, dict) else {}
+    buffer = buffer if isinstance(buffer, dict) else {}
+    return {**info, **buffer}, {**buffer, **info}
+
+
 @skip_on_streaming_updates
 def check_text_prompt(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
     """Reject requests without usable text before submission (stage-0 prompt transform).
 
     The speech API validates input in its adapter, but offline callers pass
-    ``additional_information`` straight to the engine. There, blank text is
-    synthesized, and text that :func:`has_tts_text_conditioning` rejects raises
-    inside the Talker's ``preprocess``, which stops the engine. Rejecting here
-    fails only the caller's request.
+    ``additional_information`` and ``model_intermediate_buffer`` straight to the
+    engine. There, blank text is synthesized, and text that
+    :func:`has_tts_text_conditioning` rejects raises inside the Talker's
+    ``preprocess``, which stops the engine. Rejecting here fails only the
+    caller's request. The text must survive either runner's merge of the two
+    payloads; a client ``trailing_text`` hidden state does not count, since the
+    Talker writes its own at first prefill.
 
     Streaming-input updates skip this check: the Talker builds its prompt from
     the first chunk only, and ``AsyncOmni`` closes the stream with a text-less
     ``TokensPrompt([0])`` update.
     """
     for item in prompt if isinstance(prompt, list) else (prompt,):
-        info = item.get("additional_information") if isinstance(item, dict) else None
-        ok = isinstance(info, dict) and has_tts_text_conditioning(
-            info, info.get("hidden_states"), allow_blank_text=False
-        )
-        if not ok:
-            raise ValueError(
-                "Qwen3-TTS requests need `additional_information` with `text` as a list whose "
-                "first item is non-blank (e.g. ['Hello.']), or precomputed text token ids"
-            )
+        fields = item if isinstance(item, dict) else {}
+        views = _talker_info_views(fields.get("additional_information"), fields.get("model_intermediate_buffer"))
+        if not all(has_tts_text_conditioning(view, allow_blank_text=False) for view in views):
+            raise ValueError(_TEXT_ERROR)
     return prompt
 
 
