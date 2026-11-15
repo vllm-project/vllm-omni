@@ -80,9 +80,10 @@ DEFAULT_SPEECH_TIMEOUT_S = 180.0
 _MIN_AUDIO_BYTES = 20_000
 _SINGLE_STREAM_HNR_DB = -2.0 if current_platform.is_rocm() else 0.0
 
-# Per-request seeds for the HNR gate in test_plain_text_pcm_streaming. The
-# values only bound CI variance; the gate is the pass count, not the values.
-_HNR_GATE_SEEDS = (1, 2, 3, 5)
+# Per-request seeds for the HNR gate in test_plain_text_pcm_streaming. The set
+# includes both low- and typical-HNR seeds; the gate is the pass count, not any
+# individual result.
+_HNR_GATE_SEEDS = (42, 1, 2, 3)
 
 # Reuse the shared TTS reference clip (clean ~5 s 24 kHz mono human speech)
 # vendored under tests/assets/qwen3_tts/. Keeps a single WAV across TTS
