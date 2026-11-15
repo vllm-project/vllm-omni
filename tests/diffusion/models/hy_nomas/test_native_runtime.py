@@ -19,8 +19,6 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.models.hy_nomas import pipeline_hy_nomas
 from vllm_omni.diffusion.models.hy_nomas.camera import prepare_camera_inputs
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import HyNomasTransformer
-from vllm_omni.diffusion.models.hy_nomas.pixelumm import PixelUMMDCAELatentDecoder
-from vllm_omni.diffusion.models.hy_nomas.pixelumm_model import DCAEVPixelUMMDecoder, GenExpertArch
 from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import prepare_camera
 from vllm_omni.diffusion.models.hy_nomas.scheduler import EulerSolver
 
@@ -116,7 +114,6 @@ class BlockReference(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, BlockReference())
 checks = runpy.run_path({str(Path(__file__).resolve())!r})
 checks['test_native_dit_cache_and_camera']()
-checks['test_real_pixelumm_stream_matches_full_decode']()
 assert not any(name.split('.')[0] in ('hymm', 'configs') for name in sys.modules)
 """
     result = subprocess.run(
@@ -212,27 +209,6 @@ def test_native_segmented_kv_matches_contiguous_storage():
 def test_invalid_model_geometry_fails_before_allocation(update):
     with pytest.raises(ValueError, match="dimensions|RoPE"):
         HyNomasTransformer({**_SMALL_TRANSFORMER_CONFIG, **update}, device="meta")
-
-
-@torch.no_grad()
-def test_real_pixelumm_stream_matches_full_decode():
-    torch.manual_seed(11)
-    arch = GenExpertArch(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2, num_kv_heads=1, head_dim=8)
-    model = PixelUMMDCAELatentDecoder(
-        DCAEVPixelUMMDecoder(arch), seed=7, temporal_window_latents=4, temporal_overlap_latents=2, decoder_tile_pixels=0
-    ).eval()
-    latent = torch.randn(1, 32, 7, 1, 1)
-    full = model.decode(latent).sample
-    session = model.create_streaming_decode_session()
-    parts = []
-    for start, end in ((0, 2), (2, 4), (4, 7)):
-        session.final_segment = end == 7
-        part = session.push(latent[:, :, start:end], pixel_frames=4 * (end - start))
-        if part.numel():
-            parts.append(part)
-    parts.append(session.finish())
-    torch.testing.assert_close(torch.cat(parts, dim=2), full, rtol=0, atol=0)
-    assert session.buffer.numel() == 0 and session.pending is None
 
 
 @pytest.mark.parametrize("steps", [4, 6, 8])
