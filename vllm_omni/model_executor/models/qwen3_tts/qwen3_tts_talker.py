@@ -196,6 +196,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     # that it never writes again, so the runner stores them without copying.
     preprocess_prefill_updates_owned = True
 
+    def create_mrv2_model_state(self, vllm_config, encoder_cache, device):
+        if device.type == "npu":
+            from vllm_omni.platforms.npu.models.qwen3_tts_model_state import (
+                NPUQwen3TTSTalkerModelState,
+            )
+
+            return NPUQwen3TTSTalkerModelState(vllm_config, self, encoder_cache, device)
+
+        from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+        return OmniModelState(vllm_config, self, encoder_cache, device)
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.vllm_config = vllm_config

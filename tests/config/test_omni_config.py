@@ -1314,12 +1314,16 @@ def test_v1_downstream_stage_keeps_duplex_sessions():
     assert not any(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
 
 
-def test_qwen3_tts_high_concurrency_mrv2_profile_is_explicit_opt_in():
-    assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml").model_runner == "v1"
-    assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml").model_runner == "v2"
+def test_qwen3_tts_high_concurrency_cuda_profiles_keep_runner_split():
+    base = load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml")
+    mrv2 = load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml")
+    assert base.model_runner == "v1"
+    assert mrv2.model_runner == "v2"
+    assert _apply_platform_overrides(base, platform="npu").model_runner == "v2"
+    assert _apply_platform_overrides(mrv2, platform="npu").model_runner == "v2"
 
 
-def test_qwen3_tts_default_profile_is_experimental_mrv2_with_v1_platform_fallback():
+def test_qwen3_tts_default_profile_selects_mrv2_on_npu():
     deploy_path = _DEPLOY_DIR / "qwen3_tts.yaml"
     assert load_deploy_config(deploy_path).model_runner == "v2"
 
@@ -1328,26 +1332,75 @@ def test_qwen3_tts_default_profile_is_experimental_mrv2_with_v1_platform_fallbac
     assert all(stage.yaml_engine_args["use_v2_model_runner"] is True for stage in stages)
 
     assert _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda").model_runner == "v2"
-    for platform in ("npu", "xpu", "rocm", "musa"):
+    assert _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu").model_runner == "v2"
+    for platform in ("xpu", "rocm", "musa"):
         assert _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform).model_runner == "v1"
 
     # The explicit MRV2 profile resolves to the same runner selection.
     assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_mrv2.yaml").model_runner == "v2"
 
 
-def test_qwen3_tts_mrv2_retunes_do_not_change_default_mrv1_profile():
+def test_qwen3_tts_mrv2_profile_enables_npu_for_both_stages():
+    deploy_path = _DEPLOY_DIR / "qwen3_tts_mrv2.yaml"
+    resolved = resolve_deploy_yaml(deploy_path)
+    assert resolved["model_runner"] == "v2"
+
+    deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+    assert deploy.model_runner == "v2"
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    stages = merge_pipeline_deploy(pipeline, deploy)
+    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True]
+    assert [stage.enforce_eager for stage in deploy.stages] == [False, True]
+    assert [stage.compilation_config["cudagraph_mode"] for stage in deploy.stages] == ["PIECEWISE", "NONE"]
+    # The shipped default selects MRv2 for both NPU stages as well.
+    default_npu = _apply_platform_overrides(
+        load_deploy_config(_DEPLOY_DIR / "qwen3_tts.yaml"),
+        platform="npu",
+    )
+    assert default_npu.model_runner == "v2"
+    assert [stage.enforce_eager for stage in default_npu.stages] == [False, True]
+    assert [stage.compilation_config["cudagraph_mode"] for stage in default_npu.stages] == ["PIECEWISE", "NONE"]
+    default_npu_stages = merge_pipeline_deploy(pipeline, default_npu)
+    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in default_npu_stages] == [True, True]
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "qwen3_tts_high_concurrency.yaml",
+        "qwen3_tts_high_concurrency_mrv2.yaml",
+        "qwen3_tts_high_concurrency_mrv2_b4.yaml",
+    ],
+)
+def test_qwen3_tts_high_concurrency_profiles_enable_npu_mrv2(filename):
+    deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / filename), platform="npu")
+    assert deploy.model_runner == "v2"
+    assert [stage.enforce_eager for stage in deploy.stages] == [True, True]
+    assert deploy.stages[1].compilation_config["cudagraph_mode"] == "NONE"
+    stages = merge_pipeline_deploy(_resolve_pipeline_or_skip("qwen3_tts"), deploy)
+    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, True]
+
+
+def test_qwen3_tts_mrv2_retunes_do_not_change_default_cuda_v1_control():
     default = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml")
     mrv2 = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2.yaml")
     default_extra = default["connectors"]["connector_of_shared_memory"]["extra"]
     mrv2_extra = mrv2["connectors"]["connector_of_shared_memory"]["extra"]
 
-    # B2 batch stays consistent with the graph buckets; V1 profile untouched.
+    # B2 batch stays consistent with the graph buckets; the CUDA V1 control is untouched.
     assert default_extra["decode_batch_max_size"] == 1
     assert mrv2_extra["decode_batch_max_size"] == 2
     assert mrv2_extra["decode_cudagraph_batch_sizes"] == [1, 2]
     assert mrv2_extra["code_predictor_prefix_graphs"] is False
     assert mrv2["stages"][1]["enforce_eager"] is False
     assert default["stages"][1]["enforce_eager"] is True
+    assert (
+        _apply_platform_overrides(
+            load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml"),
+            platform="npu",
+        ).model_runner
+        == "v2"
+    )
 
 
 def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():

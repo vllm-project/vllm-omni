@@ -2,9 +2,9 @@
 # Verified on 1x H100.
 #
 # Runner selection:
-#   Model Runner V2 (MRV2) is EXPERIMENTAL and is the default runner on CUDA
-#   for this model. Set `model_runner: v1` to opt out. The `platforms:`
-#   sections at the end of this file keep V1 on NPU, XPU, ROCm and MUSA.
+#   Model Runner V2 (MRV2) is the default runner on CUDA and NPU for this model.
+#   Set `model_runner: v1` to opt out on supported platforms. The `platforms:`
+#   sections at the end of this file keep V1 on XPU, ROCm and MUSA.
 #   See docs/configuration/stage_configs.md ("Qwen3-TTS with Model Runner V2").
 #
 # Fields omitted from a stage fall back to StageDeployConfig defaults (see
@@ -159,15 +159,17 @@ platforms:
         # Stage 1 eager on ROCm so decoder convolutions execute normally.
         enforce_eager: true
   npu:
-    model_runner: v1
+    model_runner: v2
     stages:
       - stage_id: 0
         enforce_eager: false
         compilation_config:
           cudagraph_mode: PIECEWISE
       - stage_id: 1
+        # The NPU MRv2 generation runner uses eager outer dispatch.
+        enforce_eager: true
         compilation_config:
-          cudagraph_mode: PIECEWISE
+          cudagraph_mode: NONE
   xpu:
     model_runner: v1
     stages:
