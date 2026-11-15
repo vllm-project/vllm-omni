@@ -305,6 +305,10 @@ def test_blanked_prompt_leaves_every_codec_logit_unpenalized() -> None:
 
 
 def test_talker_sample_blanks_penalty_prompt_without_touching_runner_state(mocker) -> None:
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     talker = _make_talker()
     metadata = _PenaltyMetadata(prompt_token_ids=torch.tensor([[0, 2, 0]]))
     captured: dict[str, torch.Tensor] = {}
@@ -372,6 +376,10 @@ def _capture_sampler_logits(mocker) -> dict[str, Any]:
 
 
 def test_sample_scores_the_upstream_windowed_codec_penalty(mocker) -> None:
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     talker = _make_talker()
     talker._request_audio_states["req-pen"] = {"finished": False, "step": 0}
     # ``head_code`` is eye(8, 2) here, so only codes 0 and 1 carry a non-zero
@@ -402,6 +410,10 @@ def test_codec_penalty_forgets_codes_older_than_the_upstream_window(mocker) -> N
     # vLLM's sampler penalty spans the whole stream, so every code ever sampled
     # stays taxed and a long tail drifts toward never-sampled codes. Upstream
     # scores only the last ``past_window`` frames.
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     talker = _make_talker()
     talker._request_audio_states["req-window"] = {"finished": False, "step": 0}
     hidden = torch.tensor([[1.0, -2.0]])
@@ -428,6 +440,10 @@ def test_codec_penalty_forgets_codes_older_than_the_upstream_window(mocker) -> N
 
 
 def test_sample_honours_a_request_that_disabled_penalties(mocker) -> None:
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     talker = _make_talker()
     talker._request_audio_states["req-none"] = {"finished": False, "step": 0}
     hidden = torch.tensor([[1.0, -2.0]])
@@ -449,6 +465,10 @@ def test_sample_restores_forced_eos_that_min_tokens_masked_away(mocker) -> None:
     # ``min_tokens`` masks every stage stop_token_id, including the codec EOS
     # compute_logits just forced, so the sampler returns an arbitrary id for a
     # request the model already finished.
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     talker = _make_talker()
     talker._request_audio_states["req-empty"] = {"finished": True}
 
@@ -475,6 +495,10 @@ def test_sample_restores_forced_eos_that_min_tokens_masked_away(mocker) -> None:
 
 
 def test_sample_leaves_unforced_rows_to_the_sampler(mocker) -> None:
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     talker = _make_talker()
     talker._request_audio_states["req-a"] = {"finished": True}
     talker._request_audio_states["req-b"] = {"finished": False, "step": 0}
@@ -712,6 +736,7 @@ def test_make_omni_output_packs_the_previous_codec_id() -> None:
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("default_device", [None, "cpu"])
 def test_make_omni_output_reads_history_from_runner_cpu_buffer(device, default_device) -> None:
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 output/snapshot contract is retired")
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA codec output")
     from types import SimpleNamespace
@@ -917,6 +942,7 @@ def test_cpu_codec_transport_preserves_embedding_and_owns_delta(device, dtype, c
 @pytest.mark.parametrize("use_snapshot", [False, True])
 @pytest.mark.parametrize("include_hidden", [False, True])
 def test_cpu_codec_transport_routes_owned_payloads(monkeypatch, use_snapshot, include_hidden) -> None:
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 output/snapshot contract is retired")
     from types import SimpleNamespace
 
     from tests.worker.test_gpu_ar_model_runner import _make_async_output_runner
@@ -1517,6 +1543,10 @@ def test_turn_end_drain_until_silent_stops_only_after_silence() -> None:
 
 @pytest.mark.parametrize("aux_penalty", [None, "frequency", "presence"])
 def test_sample_skips_only_neutral_upstream_penalties(mocker, aux_penalty):
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     from vllm.sampling_params import SamplingParams
 
     talker = _make_talker()
@@ -1549,6 +1579,10 @@ def test_sample_skips_only_neutral_upstream_penalties(mocker, aux_penalty):
 
 @pytest.mark.parametrize("params", [None, [], [None], [None, None]])
 def test_sample_keeps_general_penalties_when_request_context_is_missing(mocker, params):
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     talker = _make_talker()
     talker._penalty_histories = [torch.tensor([1])]
     captured = _capture_sampler_logits(mocker)
@@ -1558,6 +1592,10 @@ def test_sample_keeps_general_penalties_when_request_context_is_missing(mocker, 
 
 
 def test_sample_keeps_general_penalties_without_codec_history(mocker):
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     from vllm.sampling_params import SamplingParams
 
     talker = _make_talker()

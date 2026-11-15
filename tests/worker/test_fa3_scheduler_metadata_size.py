@@ -15,9 +15,12 @@ a failure is unambiguously an Omni-runner regression. Pure CPU — no model, no
 CUDA, no flashinfer.
 """
 
+import pytest
+
+pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+
 from types import SimpleNamespace
 
-import pytest
 import torch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 

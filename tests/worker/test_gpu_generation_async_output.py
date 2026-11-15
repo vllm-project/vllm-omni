@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import pytest
+
+pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 import torch
 
 from tests.helpers.mark import hardware_marks

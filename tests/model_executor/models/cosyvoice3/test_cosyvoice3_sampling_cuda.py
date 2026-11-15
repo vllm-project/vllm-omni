@@ -5,6 +5,10 @@
 from types import SimpleNamespace
 
 import pytest
+
+pytest.importorskip(
+    "vllm.v1.worker.gpu_input_batch", reason="CosyVoice V1-only sampling contract is retired; V2 sampling tests remain"
+)
 import torch
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput

@@ -8,7 +8,6 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_marks
-from vllm_omni.worker.gpu_generation_model_runner import _HostCopyBatch
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
@@ -16,6 +15,9 @@ pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_ca
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_host_copy_batch_preserves_noncontiguous_outputs_on_current_stream():
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="V1 host-copy helper is retired")
+    from vllm_omni.worker.gpu_generation_model_runner import _HostCopyBatch
+
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         source = torch.arange(24, device="cuda", dtype=torch.float32).reshape(4, 6)

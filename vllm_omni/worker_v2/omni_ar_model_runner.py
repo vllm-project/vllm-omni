@@ -361,7 +361,6 @@ class OmniARModelRunner(OmniGPUModelRunner):
         # --- Build base output ---
         model_runner_output = OmniModelRunnerOutput(
             req_ids=input_batch.req_ids,
-            req_id_to_index={rid: i for i, rid in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore[arg-type]
             prompt_logprobs_dict=prompt_logprobs_dict,
             prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,

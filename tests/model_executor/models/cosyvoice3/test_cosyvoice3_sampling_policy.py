@@ -3,6 +3,10 @@
 """V1 request-owned host routing, independent of model weights or CUDA."""
 
 import pytest
+
+pytest.importorskip(
+    "vllm.v1.worker.gpu_input_batch", reason="CosyVoice V1-only sampling contract is retired; V2 sampling tests remain"
+)
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker import gpu_input_batch

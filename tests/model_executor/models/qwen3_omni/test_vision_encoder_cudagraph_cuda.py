@@ -61,6 +61,7 @@ def _engine_config():
             encoder_cudagraph_token_budgets=BUDGETS,
             encoder_cudagraph_max_vision_items_per_batch=2,
             encoder_cudagraph_max_frames_per_batch=None,
+            encoder_cudagraph_max_token_budget=5120,
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
     )

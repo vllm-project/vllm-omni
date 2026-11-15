@@ -15,20 +15,12 @@ from vllm.config import VllmConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.logits_processor.state import LogitsProcessors
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops.topk_topp_sampler import random_sample
-from vllm.v1.worker.gpu_input_batch import InputBatch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.data_entry_keys import to_struct
 from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3, cosyvoice3_talker
 from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model, _normalize_request_conditioning
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
-from vllm_omni.worker import gpu_ar_model_runner
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -142,7 +134,14 @@ def _make_sampling_metadata(
     *,
     output_token_ids: list[list[int]],
     repetition_penalty: float = 2.0,
-) -> SamplingMetadata:
+):
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="Retired V1 sampler/runner contract; native V2 and model-domain tests remain separate",
+    )
+    from vllm.v1.sample.logits_processor.state import LogitsProcessors
+    from vllm.v1.sample.metadata import SamplingMetadata
+
     batch_size = len(output_token_ids)
     return SamplingMetadata(
         temperature=torch.ones(batch_size, dtype=torch.float32),
@@ -210,6 +209,12 @@ def output_payload_talker(monkeypatch, output_payload_vllm_config):
 def test_talker_skips_unused_hidden_payload_without_async_materialization(
     output_payload_talker, output_payload_vllm_config, async_scheduling
 ):
+    pytest.importorskip(
+        "vllm.v1.worker.gpu_model_runner",
+        reason="Retired V1 sampler/runner contract; native V2 and model-domain tests remain separate",
+    )
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
     runner = object.__new__(GPUARModelRunner)
     runner.use_async_scheduling = async_scheduling
     runner.omni_prefix_cache = None
@@ -231,6 +236,14 @@ def test_talker_inline_output_preserves_conditioning_and_tokens(
     output_payload_talker, output_payload_vllm_config, monkeypatch, mocker, is_prefill
 ):
     """Token-only output retains prefill conditioning and sampled codec IDs."""
+    pytest.importorskip(
+        "vllm.v1.worker.gpu_model_runner",
+        reason="Retired V1 sampler/runner contract; native V2 and model-domain tests remain separate",
+    )
+    from vllm.v1.worker.gpu_input_batch import InputBatch
+
+    from vllm_omni.worker import gpu_ar_model_runner
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
     runner = object.__new__(GPUARModelRunner)
     runner.model = output_payload_talker
@@ -680,6 +693,12 @@ def _reference_param(param, row, default):
 
 def _reference_ras_one(weighted_scores, history, *, top_p, top_k, win_size, tau_r, generator):
     """Serial RAS oracle from the pre-B1 implementation, including RNG draws."""
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="Retired V1 sampler/runner contract; native V2 and model-domain tests remain separate",
+    )
+    from vllm.v1.sample.ops.topk_topp_sampler import random_sample
+
     native_sample = getattr(random_sample, "__wrapped__", random_sample)
     probs, ids = weighted_scores.softmax(dim=0).sort(descending=True, stable=True)
     keep = probs.cumsum(dim=0) - probs < top_p
@@ -859,6 +878,12 @@ def test_mixed_ras_applies_processors_before_greedy_and_random_selection():
 
 
 def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
+    pytest.importorskip(
+        "vllm.v1.worker.gpu_model_runner",
+        reason="Retired V1 sampler/runner contract; native V2 and model-domain tests remain separate",
+    )
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
     metadata = _make_sampling_metadata(output_token_ids=[[1, 2, 3]])
     expected = SamplerOutput(
         sampled_token_ids=torch.tensor([[7]], dtype=torch.int32),
@@ -899,6 +924,12 @@ def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
 
 
 def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
+    pytest.importorskip(
+        "vllm.v1.worker.gpu_model_runner",
+        reason="Retired V1 sampler/runner contract; native V2 and model-domain tests remain separate",
+    )
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
     metadata = _make_sampling_metadata(output_token_ids=[])
     seen_histories: list[list[list[int]]] = []
 
@@ -939,6 +970,12 @@ def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
 
 
 def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
+    pytest.importorskip(
+        "vllm.v1.worker.gpu_model_runner",
+        reason="Retired V1 sampler/runner contract; native V2 and model-domain tests remain separate",
+    )
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
     metadata = _make_sampling_metadata(output_token_ids=[])
     seen_histories: list[list[list[int]]] = []
 
@@ -1128,6 +1165,14 @@ def test_full_response_singleton_uses_the_optimized_batch_path(monkeypatch):
 
 
 def test_full_response_adapter_uses_live_prefill_then_empty_decode(monkeypatch):
+    pytest.importorskip(
+        "vllm.v1.worker.gpu_model_runner",
+        reason="Retired V1 sampler/runner contract; native V2 and model-domain tests remain separate",
+    )
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
     model = _make_talker_model()
     hidden = torch.ones(2, 4)
     runner = object.__new__(OmniGPUModelRunner)
@@ -1328,6 +1373,14 @@ def test_generation_output_ownership_is_exposed_only_for_owned_codec(stage, owne
     [("custom", True), ("decline", True), ("default", True), ("speculative", True), ("default", False)],
 )
 def test_runner_commits_deferred_rng_once_before_sampling(mocker, route, has_commit):
+    pytest.importorskip(
+        "vllm.v1.worker.gpu_model_runner",
+        reason="Retired V1 sampler/runner contract; native V2 and model-domain tests remain separate",
+    )
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
     events = []
     expected = object()
     metadata = SimpleNamespace()

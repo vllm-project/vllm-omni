@@ -3,6 +3,9 @@
 """Runner shutdown releases the encoder CUDA graph manager before upstream teardown."""
 
 import pytest
+
+pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner

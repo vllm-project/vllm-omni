@@ -102,6 +102,8 @@ class OmniGPUWorkerBase(GPUWorker):
     for custom trace naming, background gzip, and trace path collection.
     """
 
+    use_v2_model_runner = True
+
     def _capture_auxiliary_graphs(self) -> None:
         """Let opt-in models warm valid inputs before the worker becomes ready."""
         capture = getattr(self.model_runner.model, "capture_auxiliary_graphs", None)

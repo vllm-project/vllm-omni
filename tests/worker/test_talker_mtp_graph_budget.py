@@ -17,15 +17,11 @@ import pytest
 import torch
 import vllm.config
 import vllm.v1.worker.gpu.model_runner as upstream_v2
-import vllm.v1.worker.gpu_model_runner as upstream_v1
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
 
-import vllm_omni.worker.gpu_ar_model_runner as ar_runner_module
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner as OmniV1Runner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner as OmniV2Runner
 from vllm_omni.worker_v2.staged_writes import StagedWrites
 
@@ -45,6 +41,10 @@ def device_memory(monkeypatch):
 
 
 def _make_v1_runner(monkeypatch, device_memory, *, mtp_size, fail=False):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+    import vllm_omni.worker.gpu_ar_model_runner as ar_runner_module
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
     runner = object.__new__(GPUARModelRunner)
     wrapper = object.__new__(CUDAGraphWrapper)
     wrapper.graph_pool = "global-pool"
@@ -92,6 +92,9 @@ class _NullContext:
 
 
 def test_v1_profile_adds_the_talker_mtp_graphs_and_restores_the_runner(monkeypatch, device_memory):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+    import vllm.v1.worker.gpu_model_runner as upstream_v1
+
     runner, wrapper, events = _make_v1_runner(monkeypatch, device_memory, mtp_size=GIB // 2)
     monkeypatch.setattr(upstream_v1.GPUModelRunner, "profile_cudagraph_memory", lambda self: 3 * GIB)
     captured_before = compilation_counter.num_cudagraph_captured
@@ -108,6 +111,7 @@ def test_v1_profile_adds_the_talker_mtp_graphs_and_restores_the_runner(monkeypat
 
 
 def test_v1_profile_restores_the_runner_when_capture_fails(monkeypatch, device_memory):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
     runner, wrapper, events = _make_v1_runner(monkeypatch, device_memory, mtp_size=GIB, fail=True)
 
     with pytest.raises(RuntimeError, match="capture failed"):
@@ -121,6 +125,7 @@ def test_v1_profile_restores_the_runner_when_capture_fails(monkeypatch, device_m
 
 @pytest.mark.parametrize("has_talker_mtp, graph_wrapped", [(False, True), (True, False)])
 def test_v1_profile_skips_runners_without_talker_mtp_graphs(monkeypatch, device_memory, has_talker_mtp, graph_wrapped):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
     runner, _, events = _make_v1_runner(monkeypatch, device_memory, mtp_size=GIB)
     runner.has_talker_mtp = has_talker_mtp
     if not graph_wrapped:
@@ -133,6 +138,7 @@ def test_v1_profile_skips_runners_without_talker_mtp_graphs(monkeypatch, device_
 def test_v1_profile_leaves_the_full_sizes_to_upstream_for_talker_models(monkeypatch, device_memory):
     """With a talker, _dummy_run runs the MTP inside each FULL decoder capture,
     so upstream's estimate already holds those sizes."""
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
     runner, _, events = _make_v1_runner(monkeypatch, device_memory, mtp_size=GIB // 2)
     runner.model = SimpleNamespace(talker=object())
 
@@ -141,6 +147,9 @@ def test_v1_profile_leaves_the_full_sizes_to_upstream_for_talker_models(monkeypa
 
 
 def test_v1_capture_reports_the_talker_mtp_graphs(monkeypatch, device_memory):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+    import vllm.v1.worker.gpu_model_runner as upstream_v1
+
     runner, _, events = _make_v1_runner(monkeypatch, device_memory, mtp_size=GIB // 4)
     monkeypatch.setattr(upstream_v1.GPUModelRunner, "capture_model", lambda self: 2 * GIB)
 
@@ -149,6 +158,9 @@ def test_v1_capture_reports_the_talker_mtp_graphs(monkeypatch, device_memory):
 
 
 def test_v1_capture_without_talker_mtp_graphs_measures_nothing(monkeypatch, device_memory):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+    import vllm.v1.worker.gpu_model_runner as upstream_v1
+
     runner, _, events = _make_v1_runner(monkeypatch, device_memory, mtp_size=GIB)
     runner.has_talker_mtp = False
     monkeypatch.setattr(upstream_v1.GPUModelRunner, "capture_model", lambda self: 2 * GIB)
@@ -165,8 +177,12 @@ class _RecordingWrapper(CUDAGraphWrapper):
 
 def _make_capture_runner(monkeypatch, *, model=None, entries=()):
     """Sizes 1 and 2 dispatch to FULL graphs here, size 4 does not."""
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
     import vllm.compilation.monitor as monitor
     import vllm.distributed.parallel_state as parallel_state
+
+    import vllm_omni.worker.gpu_ar_model_runner as ar_runner_module
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
     runner = object.__new__(GPUARModelRunner)
     wrapper = object.__new__(_RecordingWrapper)
@@ -195,6 +211,7 @@ def _make_capture_runner(monkeypatch, *, model=None, entries=()):
 
 @pytest.mark.parametrize("skip_full, expected", [(False, [4, 4, 2, 2, 1, 1]), (True, [4, 4])])
 def test_capture_skips_only_the_sizes_that_dispatch_to_full(monkeypatch, skip_full, expected):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
     runner, wrapper = _make_capture_runner(monkeypatch)
 
     runner._capture_talker_mtp_graphs(skip_full=skip_full)
@@ -204,6 +221,9 @@ def test_capture_skips_only_the_sizes_that_dispatch_to_full(monkeypatch, skip_fu
 
 
 def _capture_log(monkeypatch, caplog, **kwargs):
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+    import vllm_omni.worker.gpu_ar_model_runner as ar_runner_module
+
     runner, wrapper = _make_capture_runner(monkeypatch, **kwargs)
     with caplog.at_level("INFO", logger=ar_runner_module.logger.name):
         runner._capture_talker_mtp_graphs()
@@ -213,6 +233,7 @@ def _capture_log(monkeypatch, caplog, **kwargs):
 def test_capture_leaves_the_graphs_captured_with_the_decoder_alone(monkeypatch, caplog):
     """With a talker, _dummy_run captures the MTP inside the FULL decoder
     graphs; the real capture neither runs nor counts those sizes again."""
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
     calls, records = _capture_log(monkeypatch, caplog, model=SimpleNamespace(talker=object()), entries=(1, 2))
 
     assert calls == [4, 4]
@@ -223,6 +244,7 @@ def test_capture_leaves_the_graphs_captured_with_the_decoder_alone(monkeypatch, 
 def test_capture_warns_about_a_full_size_the_decoder_capture_missed(monkeypatch, caplog):
     """Profiling skipped size 2 because it dispatches to FULL, so a new graph
     there is outside the budget."""
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
     calls, records = _capture_log(monkeypatch, caplog, model=SimpleNamespace(talker=object()), entries=(1,))
 
     assert calls == [4, 4, 2, 2]
@@ -234,6 +256,7 @@ def test_capture_warns_about_a_full_size_the_decoder_capture_missed(monkeypatch,
 def test_capture_without_a_talker_expects_no_graphs_from_the_decoder(monkeypatch, caplog):
     """Without a talker, _dummy_run never runs the MTP and profiling measured
     every size, so the FULL sizes are captured here without a warning."""
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
     calls, records = _capture_log(monkeypatch, caplog)
 
     assert calls == [4, 4, 2, 2, 1, 1]
@@ -248,6 +271,10 @@ def test_capture_without_a_talker_expects_no_graphs_from_the_decoder(monkeypatch
 def test_profiling_and_dummy_run_share_one_talker_mtp_predicate(has_talker, has_talker_mtp, expected):
     """skip_full is right only while it matches the condition under which
     _dummy_run runs talker_mtp; both read the base runner's helper."""
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner as OmniV1Runner
+
     assert "_talker_mtp_runs_in_dummy_run" not in GPUARModelRunner.__dict__
     assert "self._talker_mtp_runs_in_dummy_run()" in inspect.getsource(OmniV1Runner._dummy_run)
     runner = object.__new__(GPUARModelRunner)
@@ -305,16 +332,11 @@ def test_v2_an_eager_mtp_runner_is_neither_captured_nor_measured(monkeypatch, de
 
 
 @pytest.mark.parametrize(
-    "enabled_before, restore_capturing, enabled_after",
-    [(True, True, True), (False, True, False), (True, False, False)],
+    "ambient_mode, restore_capturing",
+    [(CUDAGraphMode.NONE, True), (CUDAGraphMode.PIECEWISE, True), (CUDAGraphMode.PIECEWISE, False)],
 )
-def test_v2_mtp_capture_restores_the_capturing_flag_while_profiling(
-    monkeypatch, enabled_before, restore_capturing, enabled_after
-):
-    """MRv2 leaves CUDA graph capturing enabled for its own capture. The MTP
-    capture also runs inside the profiling pass, before that real capture, so
-    there it restores the flag; after the real capture it disables it as before."""
-    import vllm.compilation.monitor as monitor
+def test_v2_mtp_capture_uses_forward_context_modes(monkeypatch, ambient_mode, restore_capturing):
+    """Native V2 warms eagerly, captures FULL, and restores the caller's context."""
     import vllm.distributed.parallel_state as parallel_state
     import vllm.forward_context as forward_context
 
@@ -331,22 +353,30 @@ def test_v2_mtp_capture_restores_the_capturing_flag_while_profiling(
     calls = []
     state._mtp_state._is_mtp_graph_runner = lambda: True
     state.model = SimpleNamespace(mtp_accepts_req_infos=False)
-    state.vllm_config = SimpleNamespace(compilation_config=SimpleNamespace(cudagraph_num_of_warmups=1))
+    state.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            cudagraph_num_of_warmups=1, fast_moe_cold_start=False, static_forward_context={}
+        ),
+        parallel_config=SimpleNamespace(data_parallel_size=1, use_sequence_parallel_moe=False, is_moe_model=False),
+    )
     state.device = "cpu"
     for name in ("_mtp_input_ids", "_mtp_input_embeds", "_mtp_hidden", "_mtp_text_step"):
         setattr(state._mtp_state, name, torch.zeros(4))
     state._mtp_state._mtp_sample_uniforms = None
     state._mtp_state._get_mtp_capture_sizes = lambda: [2]
     state._mtp_state._get_mtp_base_sampling_kwargs = lambda: {}
-    state._mtp_state._call_mtp_runner = lambda *args, **kwargs: calls.append(monitor.cudagraph_capturing_enabled)
-    monkeypatch.setattr(parallel_state, "graph_capture", lambda device: _NullContext())
-    monkeypatch.setattr(forward_context, "set_forward_context", lambda *args, **kwargs: _NullContext())
-    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *args, **kwargs: None)
-    monkeypatch.setattr(monitor, "cudagraph_capturing_enabled", enabled_before)
-
-    state._mtp_state.capture_mtp_graphs(
-        lambda num_reqs: SimpleNamespace(num_tokens=num_reqs), restore_capturing=restore_capturing
+    state._mtp_state._call_mtp_runner = lambda *args, **kwargs: calls.append(
+        forward_context.get_forward_context().cudagraph_runtime_mode
     )
+    monkeypatch.setattr(parallel_state, "graph_capture", lambda device: _NullContext())
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *args, **kwargs: None)
+    ambient = forward_context.ForwardContext(
+        no_compile_layers={}, attn_metadata=None, slot_mapping={}, cudagraph_runtime_mode=ambient_mode
+    )
+    with forward_context.override_forward_context(ambient):
+        state._mtp_state.capture_mtp_graphs(
+            lambda num_reqs: SimpleNamespace(num_tokens=num_reqs), restore_capturing=restore_capturing
+        )
+        assert forward_context.get_forward_context() is ambient
 
-    assert calls == [True, True]
-    assert monitor.cudagraph_capturing_enabled is enabled_after
+    assert calls == [CUDAGraphMode.NONE, CUDAGraphMode.FULL]

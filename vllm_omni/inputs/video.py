@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Temporary capture reuse for vLLM 0.33.0; remove after vllm#66466."""
+"""Temporary capture reuse for reviewed vLLM versions; remove after vllm#66466."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.video_decoders.base import VideoSourceMetadata, VideoTargetMetadata
     from vllm.multimodal.video_decoders.opencv import OpenCVVideoBackendMixin
 
-_AFFECTED_VLLM_VERSION = "0.33.0"
+_AFFECTED_VLLM_VERSIONS = frozenset({"0.33.0", "0.34.0rc3"})
 
 
 def apply_opencv_capture_reuse_patch() -> None:
@@ -29,7 +29,7 @@ def apply_opencv_capture_reuse_patch() -> None:
         version = Version(vllm.__version__)
     except InvalidVersion:
         return
-    if version.public != _AFFECTED_VLLM_VERSION:
+    if version.public not in _AFFECTED_VLLM_VERSIONS:
         return
 
     from vllm.multimodal.video_decoders import opencv

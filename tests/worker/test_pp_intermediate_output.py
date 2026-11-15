@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Non-final pipeline outputs must reach vLLM's existing PP sender unchanged."""
 
+import pytest
+
+pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+
 from types import SimpleNamespace
 
-import pytest
 import torch
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner

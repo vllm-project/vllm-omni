@@ -257,13 +257,11 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         parallel_config = self.vllm_config.parallel_config
         if parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
-                "Omni Model Runner V2 does not support pipeline parallel; "
-                "use model_runner: v1 when pipeline_parallel_size > 1"
+                "Omni Model Runner V2 does not support pipeline parallel; set pipeline_parallel_size=1"
             )
         if getattr(parallel_config, "prefill_context_parallel_size", 1) > 1:
             raise NotImplementedError(
-                "Omni Model Runner V2 does not support prefill context parallelism; "
-                "use model_runner: v1 when prefill_context_parallel_size > 1"
+                "Omni Model Runner V2 does not support prefill context parallelism; set prefill_context_parallel_size=1"
             )
 
     @staged_writes.runner_context
@@ -1104,7 +1102,8 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         else:
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
-                has_lora=self.lora_config is not None,
+                # vLLM 0.34 dropped BatchDescriptor.has_lora; num_active_loras
+                # carries the lora state.
                 num_active_loras=batch_desc.num_active_loras,
             )
             try:

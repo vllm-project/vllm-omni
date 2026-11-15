@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Golden characterization of ``_build_model_sampler_output_token_ids``.
 
 The base runner (``OmniGPUModelRunner``) and the AR runner
@@ -11,9 +11,12 @@ A later change collapses these two copies into one; these goldens pin today's di
 exactly (crop vs keep) so that merge is provably behaviour-preserving. Pure CPU.
 """
 
+import pytest
+
+pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner

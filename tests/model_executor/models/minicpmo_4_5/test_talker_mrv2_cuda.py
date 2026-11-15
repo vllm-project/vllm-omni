@@ -36,6 +36,9 @@ def test_talker_sampler_supports_upstream_dummy_sampler_profiling():
     runner.sampler = wrapped
     runner.model = SimpleNamespace(compute_logits=lambda hidden: hidden)
     runner.input_buffers = InputBuffers(4, 64, device)
+    # Upstream _dummy_sampler_run now delegates to model_state.dummy_sampler_run;
+    # False is the documented ModelState default ("run the default passes").
+    runner.model_state = SimpleNamespace(dummy_sampler_run=lambda sampler, hidden: False)
     # Exercise both real upstream profiling passes, including add_request
     # with for_sampler_warmup() before any RequestState admission.
     runner._dummy_sampler_run(torch.randn(3, vocab, device=device))

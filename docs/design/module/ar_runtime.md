@@ -93,15 +93,15 @@ including SM89 code generation affected by LLVM SLP reduction reordering.
 
 The MRv2 Talker adapter follows the selected vLLM sampler's dispatch contract,
 including its `has_topp_only_rows` predicate. Seeded rows pass that predicate to
-top-k/top-p masking before drawing from their request-local V1 generators.
+top-k/top-p masking before the model's categorical draw with request-local Torch generators.
 Unseeded and greedy rows keep upstream sampling. When mixed rows have already
 been masked, their upstream call disables repeated masking and fused sampling.
 
 Custom samplers register their selected JIT kernels while the runner's startup
-registry is active. The Talker's seeded V1 stream uses native top-k/top-p
+registry is active. The Talker's seeded stream uses native top-k/top-p
 masking even when unseeded sampling selects FlashInfer, so it registers those
 native kernels explicitly. AR workers also warm the existing fused-MoE prefill
-batch sizes on both runner implementations before CUDA graph capture and JIT
+batch sizes on the V2 runner before CUDA graph capture and JIT
 monitoring. These startup passes leave EPLB load recording disabled.
 
 ## Full-payload input scheduling

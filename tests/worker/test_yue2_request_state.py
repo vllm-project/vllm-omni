@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """YuE2's worker-side sampler follows retained engine outputs on recompute."""
 
-import numpy as np
 import pytest
+
+pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+
+import numpy as np
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.utils import CpuGpuBuffer

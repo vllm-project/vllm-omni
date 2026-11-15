@@ -22,12 +22,15 @@ complete only because the Omni sampling path sent.
 
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+
 import os
 from datetime import timedelta
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 import torch
 from vllm.v1.worker import gpu_model_runner as upstream_runner_module
 

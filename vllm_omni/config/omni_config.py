@@ -539,7 +539,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
-    use_v2_model_runner: bool = False
+    use_v2_model_runner: bool = True
     supports_native_mrv2_data_plane: bool = False
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None

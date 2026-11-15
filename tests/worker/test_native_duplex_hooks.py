@@ -329,11 +329,10 @@ def test_minicpmo_model_hook_ignores_serving_new_user_turn_marker():
     assert torch.equal(logits, original_logits)
 
 
-def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
+def test_duplex_helper_builds_typed_sampling_rows():
     from vllm_omni.model_executor.duplex_sampling import DuplexSamplingHelper
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
-    runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner = SimpleNamespace()
     runner.input_batch = SimpleNamespace(req_ids=["req-duplex", "req-plain"])
     runner.model_intermediate_buffer = {
         "req-duplex": {
@@ -365,6 +364,7 @@ def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
 
 
 def test_generic_ar_runner_skips_duplex_rows_without_model_hook():
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="V1 runner sampling contract is retired")
     from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
     runner = GPUARModelRunner.__new__(GPUARModelRunner)
@@ -383,18 +383,19 @@ def test_generic_ar_runner_skips_duplex_rows_without_model_hook():
 
 
 def test_plain_model_hook_resolution_does_not_allocate_duplex_tracking():
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+    from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 
-    runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner = SimpleNamespace()
     runner.model = SimpleNamespace()
     runner._duplex_sampling_hook = None
     runner._duplex_sampling_hook_resolved = False
 
-    assert runner._resolve_duplex_sampling_hook() is None
+    assert DuplexSamplingRunnerMixin._resolve_duplex_sampling_hook(runner) is None
     assert not hasattr(runner, "_duplex_sampling_helper")
 
 
 def test_minicpmo_non_duplex_sample_skips_duplex_row_scan():
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="V1 runner sampling contract is retired")
     from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
     calls = []
@@ -423,6 +424,7 @@ def test_minicpmo_non_duplex_sample_skips_duplex_row_scan():
 
 
 def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="V1 runner sampling contract is retired")
     from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
     calls = []
@@ -451,6 +453,7 @@ def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
 
 
 def test_generic_ar_runner_has_no_minicpmo_sampler_state_or_typeerror_probe():
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="V1 runner class contract is retired")
     from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
     source = inspect.getsource(GPUARModelRunner)
@@ -1149,9 +1152,7 @@ def test_minicpmo_seeded_text_survives_explicit_initial_listen():
 
 @pytest.mark.parametrize("initial_text", [None, "", "Please say hello.", "请说你好。"])
 @pytest.mark.parametrize("speech_envelope", [False, True])
-def test_minicpmo_seeded_context_keeps_assistant_turn_open_until_eos(initial_text, speech_envelope, mocker):
-    from vllm.v1.sample.metadata import SamplingMetadata
-
+def test_minicpmo_seeded_context_keeps_assistant_turn_open_until_eos(initial_text, speech_envelope):
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
 
     runtime = _stage0_vision_runtime()
@@ -1165,7 +1166,7 @@ def test_minicpmo_seeded_context_keeps_assistant_turn_open_until_eos(initial_tex
     logits = torch.zeros((1, 16), dtype=torch.float32)
     logits[0, 10] = 20.0
     original_logits = logits.clone()
-    sampling_metadata = mocker.Mock(spec=SamplingMetadata)
+    sampling_metadata = object()  # This policy hook does not consume sampler metadata.
     model.prepare_duplex_sampling(logits, sampling_metadata, (row,))
     token_ids = model._minicpmo45_native_duplex_token_ids_cache
     sampled = model._finalize_minicpmo45_native_duplex_sample(0, 7, token_ids)

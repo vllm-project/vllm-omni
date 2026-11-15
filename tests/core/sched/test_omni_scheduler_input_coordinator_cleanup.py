@@ -177,6 +177,11 @@ def test_native_oversized_chunk_uses_real_finish_cleanup_and_emits_one_error(
     scheduler.aux_output_connector = None
     scheduler.ec_connector = None
     scheduler.defer_block_free = False
+    # vLLM 0.34 Scheduler state reached via the inherited upstream cleanup /
+    # requeue paths; __new__ bypasses the __init__ that creates them.
+    scheduler.async_kv_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler._parked_reservations = {}
+    scheduler._parked_reserved_blocks = 0
     kv_cache = mocker.Mock(spec=KVCacheManager)
     kv_cache.take_events.return_value = []
     kv_cache.estimate_cached_tokens.return_value = 0

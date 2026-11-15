@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Static coupling check for the ``has_preprocess`` capture/replay buffers.
 
 For models with ``has_preprocess``, CUDA-graph *capture* (``_dummy_run``) and
@@ -19,11 +19,13 @@ Scope: the BASE runner (``OmniGPUModelRunner``) and the generation runner's
 ``_preprocess`` is inherited from the base).
 """
 
+import pytest
+
+pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+
 import ast
 import inspect
 import textwrap
-
-import pytest
 
 from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner

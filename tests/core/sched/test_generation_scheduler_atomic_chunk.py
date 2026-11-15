@@ -315,7 +315,8 @@ def _make_runner_output():
         kv_connector_output=None,
         ec_connector_output=None,
         cudagraph_stats=None,
-        req_id_to_index={},
+        # req_id_to_index was dropped upstream; the pin derives it from req_ids.
+        req_ids=[],
     )
 
 

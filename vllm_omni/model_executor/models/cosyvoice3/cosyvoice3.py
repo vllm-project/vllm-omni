@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from __future__ import annotations
+
 import hashlib
 import os
 from collections import OrderedDict
@@ -10,7 +12,7 @@ from functools import partial
 from math import gcd
 from threading import Lock
 from types import MethodType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import onnxruntime
@@ -38,8 +40,6 @@ from vllm.multimodal.processing import (
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
@@ -74,6 +74,9 @@ from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.transformers_utils.repo_utils import hf_api
 from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache, get_speaker_cache
 
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
+
 logger = init_logger(__name__)
 
 # vLLM stacks these Qwen2 projections; the checkpoint carries one tensor per shard.
@@ -84,8 +87,8 @@ _QWEN2_STACKED_SHARDS = {
 
 
 class _CosyVoice3RejectionSampler(RejectionSampler):
-    def __call__(self, logits, input_batch, draft_logits=None, invalid_drafts=None):
-        output = super().__call__(logits, input_batch, draft_logits, invalid_drafts)
+    def __call__(self, logits, input_batch, draft_logits=None):
+        output = super().__call__(logits, input_batch, draft_logits)
         if input_batch.num_draft_tokens > 0:
             # Startup warmup also verifies drafts; keep request-time evidence visible.
             logger.debug("CosyVoice3 Talker is verifying draft codes")
@@ -451,7 +454,7 @@ class _SpeechTokenBatcher:
                         future.set_exception(exc)
 
 
-_REFERENCE_CONDITIONERS: dict[str, "CosyVoice3MultiModalProcessor"] = {}
+_REFERENCE_CONDITIONERS: dict[str, CosyVoice3MultiModalProcessor] = {}
 _REFERENCE_CACHE_DEBUG = {True: 0, False: 0}
 _REFERENCE_CONDITIONERS_LOCK = Lock()
 
@@ -647,10 +650,10 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
         model = model.to(device).eval()
         return (model, _s3, device)
 
-    _s3_batcher: "_SpeechTokenBatcher | None" = None
+    _s3_batcher: _SpeechTokenBatcher | None = None
 
     @classmethod
-    def _ensure_s3_batcher(cls) -> "_SpeechTokenBatcher":
+    def _ensure_s3_batcher(cls) -> _SpeechTokenBatcher:
         if cls._s3_batcher is None:
             model, s3, device = cls._ensure_s3_model()
             with _REFERENCE_CONDITIONERS_LOCK:
@@ -755,7 +758,7 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
 
     def _get_mm_fields_config(
         self,
-        hf_inputs: "BatchFeature",
+        hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
         return {
@@ -884,7 +887,7 @@ class CosyVoice3Model(
         if self._dspark_config is not None:
             if vllm_config.model_config.model_stage != "cosyvoice3_talker":
                 raise ValueError("CosyVoice3 DSpark must be configured on the Talker stage only")
-            if not vllm_config.use_v2_model_runner:
+            if not getattr(vllm_config.model_config, "use_v2_model_runner", True):
                 raise ValueError("CosyVoice3 DSpark requires model_runner: v2")
             if vllm_config.parallel_config.tensor_parallel_size != 1:
                 raise ValueError("CosyVoice3 DSpark currently supports one GPU (TP=1)")
@@ -946,7 +949,7 @@ class CosyVoice3Model(
         else:
             raise ValueError(f"Model stage not supported {self.model_stage}")
 
-    def get_language_model(self) -> "nn.Module":
+    def get_language_model(self) -> nn.Module:
         """Expose the decoder for upstream MoE detection and draft-layer setup."""
         if getattr(self, "_dspark_config", None) is not None:
             # This Qwen decoder's text embedding is not a speech embedding.
@@ -1151,6 +1154,8 @@ class CosyVoice3Model(
         per_req_sampling_params: list[SamplingParams | None] | None = None,
         defer_rng: bool = False,
     ) -> SamplerOutput | None:
+        from vllm.v1.sample.sampler import Sampler
+
         if logits is None or logits.numel() == 0:
             return None
         if self.model_stage != "cosyvoice3_talker":

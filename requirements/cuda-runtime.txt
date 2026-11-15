@@ -1,0 +1,41 @@
+# Native 9950ce36 CUDA selection for dependencies shared with vLLM-Omni.
+# Exact versions: requirements/test/cuda.txt and its kv_connectors_cuda.txt
+# extension. These locks target Python 3.12 / CUDA; common.txt remains portable.
+# Only LMCache's two metadata upper bounds use cuda-telemetry-overrides.txt.
+accelerate==1.13.0
+av==16.1.0
+einops==0.8.1
+filelock==4.2.6
+huggingface-hub==2.4.0
+imageio==2.37.0
+inflect==5.6.2
+msgpack==1.2.3
+msgspec==0.21.1
+psutil==6.1.0
+pydantic==2.12.0
+pydantic-settings==2.14.2
+pyzmq==27.1.0
+regex==2026.2.28
+requests==2.34.2
+safetensors==0.8.0
+scipy==1.13.1
+soundfile==0.12.1
+soxr==0.5.0.post1
+tokenizers==0.23.3
+tqdm==4.67.3
+transformers==5.22.0
+typing-extensions==4.16.0
+
+lmcache==0.5.6
+opentelemetry-api==1.45.2
+opentelemetry-exporter-http-transport==0.66b2
+opentelemetry-exporter-otlp==1.45.2
+opentelemetry-exporter-otlp-common==0.66b2
+opentelemetry-exporter-otlp-proto-common==1.45.2
+opentelemetry-exporter-otlp-proto-grpc==1.45.2
+opentelemetry-exporter-otlp-proto-http==1.45.2
+opentelemetry-exporter-prometheus==0.66b2
+opentelemetry-proto==1.45.2
+opentelemetry-sdk==1.45.2
+opentelemetry-semantic-conventions==0.66b2
+opentelemetry-semantic-conventions-ai==0.4.13

@@ -1,0 +1,4 @@
+# Native 9950ce36 requirements/test/kv_connectors_cuda.overrides has these two
+# LMCache upper-bound exceptions; tools/kv_connector_lock.py records the same pairs.
+opentelemetry-api==1.45.2
+opentelemetry-exporter-prometheus==0.66b2

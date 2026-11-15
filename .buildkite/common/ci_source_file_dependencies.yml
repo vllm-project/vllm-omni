@@ -724,6 +724,8 @@ source_file_dependencies:
     - docker/Dockerfile.ci.dockerignore
     - requirements/cuda.txt
     - requirements/cuda-bootstrap.txt
+    - requirements/cuda-runtime.txt
+    - requirements/cuda-telemetry-overrides.txt
     - requirements/cudnn-runtime.txt
     - tools/prepare_ci_telemetry.py
     - .buildkite/cuda/scripts/build-ci-image.sh

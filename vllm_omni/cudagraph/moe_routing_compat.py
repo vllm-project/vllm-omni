@@ -32,6 +32,6 @@ def ensure_moe_specialty_runner_compatible(runner: object) -> None:
     raise RuntimeError(
         "cudagraph_specialize_moe_routing is enabled but "
         f"{type(runner).__name__} does not implement MoE specialty "
-        "capture/replay. Use V1 MammothGPUARModelRunner for MammothModa2 "
-        "FULL AR stages, or a cudagraph_mode without FULL."
+        "capture/replay. Mammoth FULL specialty graphs require the unsupported V1 runner; "
+        "use a cudagraph_mode without FULL."
     )

@@ -9,10 +9,13 @@ follows another zero-token step. Both are optional and must never fail the step.
 
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+
 import contextlib
 from types import SimpleNamespace
 
-import pytest
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
 import vllm_omni.worker.gpu_generation_model_runner as gen_runner_module
@@ -209,7 +212,7 @@ def test_hook_exceptions_are_swallowed_and_warned_once_per_hook(mock_logger) -> 
     on every idle step (~1 kHz), so each hook warns on its own first failure,
     then logs at debug, and is still tried on later steps."""
     events: list[tuple] = []
-    errors = {"added": RuntimeError("bad payload"), "idle": RuntimeError("prefetch failed")}
+    errors: dict[str, BaseException] = {"added": RuntimeError("bad payload"), "idle": RuntimeError("prefetch failed")}
     runner = _make_runner(_HookModel(events, errors), events)
 
     for _ in range(2):

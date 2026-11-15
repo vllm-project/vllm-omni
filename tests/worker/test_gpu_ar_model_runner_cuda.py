@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """GPU AR model runner tests that need a CUDA device (CPU tests: test_gpu_ar_model_runner.py)."""
 
+import pytest
+
+pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is unsupported with vLLM 0.34")
+
 from types import SimpleNamespace
 
-import pytest
 import torch
 from vllm.utils.platform_utils import is_pin_memory_available
 

@@ -17,14 +17,14 @@ from vllm.multimodal.video import Qwen2VLVideoBackend, VideoBackend
 from vllm.multimodal.video_decoders import opencv
 
 import vllm_omni  # noqa: F401  # Install the compatibility patch through its real entrypoint.
-from vllm_omni.inputs.video import _AFFECTED_VLLM_VERSION, apply_opencv_capture_reuse_patch
+from vllm_omni.inputs.video import _AFFECTED_VLLM_VERSIONS, apply_opencv_capture_reuse_patch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 requires_capture_reuse_workaround = pytest.mark.skipif(
-    Version(vllm.__version__).public != _AFFECTED_VLLM_VERSION
+    Version(vllm.__version__).public not in _AFFECTED_VLLM_VERSIONS
     or "cap" in signature(opencv.OpenCVVideoBackendMixin.get_video_metadata).parameters,
-    reason="Requires vLLM 0.33.0 without the upstream fix; retirement checks remain unconditional.",
+    reason="Requires a reviewed vLLM version without the upstream fix; retirement checks remain unconditional.",
 )
 
 
@@ -113,7 +113,7 @@ def test_video_decode_reuses_capture_without_changing_frames(
 def test_video_workaround_is_reviewed_when_vllm_pin_changes(dockerfile):
     lines = (Path(__file__).resolve().parents[2] / "docker" / dockerfile).read_text().splitlines()
     pin = next(line.split("=", 1)[1] for line in lines if line.startswith("ARG VLLM_VERSION="))
-    assert pin == _AFFECTED_VLLM_VERSION, (
+    assert pin in _AFFECTED_VLLM_VERSIONS, (
         "vLLM pin changed: review inputs/video.py against vllm#66466; remove the workaround "
         "when the fix is included, or reproduce the regression before extending its version guard."
     )
@@ -134,7 +134,10 @@ def test_video_workaround_is_retired_when_upstream_reuses_capture(video_bytes, n
     assert len(opens) == 2, "Upstream decoder changed: review/remove inputs/video.py (vllm#66466)."
 
 
-@pytest.mark.parametrize("version", ["0.32.0", "0.33.1", "0.34.0", "0.33.0.post1", "0.33.0.dev1", "dev"])
+@pytest.mark.parametrize(
+    "version",
+    ["0.32.0", "0.33.1", "0.34.0rc0", "0.34.0rc2", "0.34.0rc4", "0.34.0", "0.33.0.post1", "0.33.0.dev1", "dev"],
+)
 def test_video_workaround_leaves_other_versions_untouched(version, native_decoder, monkeypatch):
     _restore_native(monkeypatch, native_decoder)
     monkeypatch.setattr(vllm, "__version__", version)
@@ -143,9 +146,10 @@ def test_video_workaround_leaves_other_versions_untouched(version, native_decode
     assert opencv.OpenCVVideoBackendMixin.open_video_capture.__func__ is native_decoder[1]
 
 
-def test_video_workaround_is_idempotent_for_local_builds(native_decoder, monkeypatch):
+@pytest.mark.parametrize("version", sorted(_AFFECTED_VLLM_VERSIONS))
+def test_video_workaround_is_idempotent_for_local_builds(version, native_decoder, monkeypatch):
     _restore_native(monkeypatch, native_decoder)
-    monkeypatch.setattr(vllm, "__version__", "0.33.0+cu130")
+    monkeypatch.setattr(vllm, "__version__", f"{version}+cu130")
     apply_opencv_capture_reuse_patch()
     decoder = opencv.decode_opencv
     opener = opencv.OpenCVVideoBackendMixin.open_video_capture

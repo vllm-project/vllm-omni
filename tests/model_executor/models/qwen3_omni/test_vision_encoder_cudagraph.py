@@ -13,7 +13,6 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen
 from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.encoder_cudagraph import BudgetGraphMetadata, EncoderCudaGraphManager
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 import vllm_omni.model_executor.models.qwen3_omni.qwen3_omni as outer_module
 import vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker as thinker_module
@@ -23,7 +22,6 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
 )
 from vllm_omni.worker.encoder_cudagraph import SingleReplayEncoderCudaGraphManager
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -96,6 +94,7 @@ def _config(stage="thinker", *, embeds=False):
             encoder_cudagraph_token_budgets=[2, 4],
             encoder_cudagraph_max_vision_items_per_batch=2,
             encoder_cudagraph_max_frames_per_batch=None,
+            encoder_cudagraph_max_token_budget=5120,
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
         device_config=SimpleNamespace(device="cpu"),
@@ -134,6 +133,12 @@ def _combined(monkeypatch, stage, *, embeds=False):
 
 
 def _runner_factory(model, cfg, supports_mm_inputs=True):
+    pytest.importorskip(
+        "vllm.v1.worker.gpu_model_runner",
+        reason="Retired V1 sampler/runner contract; native V2 and model-domain tests remain separate",
+    )
+    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
     runner = object.__new__(OmniGPUModelRunner)
     runner.compilation_config = cfg.compilation_config
     runner.supports_mm_inputs = supports_mm_inputs
@@ -336,7 +341,12 @@ def test_graph_entry_preserves_vision_module_hooks():
 
 
 def _run_encoder_step(monkeypatch, model, manager, batches):
+    pytest.importorskip(
+        "vllm.v1.worker.gpu_model_runner",
+        reason="Retired V1 sampler/runner contract; native V2 and model-domain tests remain separate",
+    )
     import vllm.v1.worker.gpu_model_runner as runner_module
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
     monkeypatch.setattr(runner_module, "group_and_batch_mm_kwargs", lambda *args, **kwargs: iter(batches))
     keys = [f"item{index}" for index in range(sum(count for _, count, _ in batches))]

@@ -310,19 +310,33 @@ exclusively.
 
 ### Stage-level runner selection
 
-`model_runner: v1` or `v2` at the deploy level sets the default runner.
-A `model_runner` on an individual stage overrides that default, allowing
-one stage to migrate or roll back independently. This does not change
-`PipelineConfig` topology, input adapters, or the connector payload contract.
-An omitted stage override preserves the deploy-level selection.
+With vLLM 0.34, `model_runner: v2` is the default and the only supported
+model runner. An individual stage can select `v2` explicitly. Configuration
+resolution still applies platform overrides before stage selection; any
+resolved `v1` stage raises an error. There is no V1 fallback. Runner selection
+does not change `PipelineConfig` topology or the connector payload contract.
+
+The default CUDA Qwen3-TTS and Qwen3-Omni profiles, and the CUDA overlays in
+MiniCPM-o 4.5 and Moss-TTS-local, already select V2. The default
+`qwen3_tts.yaml` and `qwen3_omni_moe.yaml` also select the existing Ascend V2
+implementations on NPU; the CUDA-tuned `*_mrv2.yaml` overlays are not NPU
+profiles. A V2 worker implementation alone does not qualify every model or
+deployment on a platform.
+
+Profiles that still resolve to V1 are unavailable with this version. These
+include Qwen3-TTS's XPU/ROCm/MUSA fallbacks, Qwen3-Omni's XPU/ROCm/MUSA
+fallbacks, Fish-Omni's DAC stage, PersonaPlex's Talker, VibeVoice, and the LFM3-Omni
+profiles. Selecting `v2` manually does not establish support for those paths.
+The Merge CI matrix excludes the LFM3 and VibeVoice jobs that require V1;
+their exclusion does not count as a passing V2 model test.
 
 MRv2 native downstream receivers accept turn-based requests. A pipeline that
-sets `supports_duplex_mrv2` also accepts duplex sessions on those stages.
-Qwen3-Omni and MiniCPM-o 4.5 set that flag. Resumable streaming input uses the
-V1 prompt-replacement path unless the pipeline implements the MRv2 equivalent.
-Selecting a runner does not add session capabilities the pipeline lacks.
-Platform fallbacks and stage overrides are validated after configuration
-resolution.
+sets `supports_duplex_mrv2` also accepts duplex sessions on those stages;
+Qwen3-Omni and MiniCPM-o 4.5 set that flag. Resumable streaming input without
+a model-owned V2 implementation is unsupported. Pipeline parallelism and
+prefill context parallelism greater than one remain unsupported by the Omni
+V2 runner. These are source-defined limits, not a claim that model or hardware
+validation has passed.
 
 ### Stage fields
 
@@ -637,51 +651,29 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 ## Qwen3-TTS with Model Runner V2
 
-Qwen3-TTS selects Model Runner V2 by default on CUDA and NPU. MRV2 remains
-experimental for this model; its scheduler and delivery paths are still being
-qualified. Set `model_runner: v1` in a copy of the deploy config
-to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on XPU,
-ROCm and MUSA. On NPU, the V2 Talker uses `FULL_AND_PIECEWISE`; Code2Wav
-retains `PIECEWISE`. If opting out to V1 on NPU, set both `model_runner: v1`
-and stage 0 to `PIECEWISE` in the NPU platform section of the copied
-configuration. The NPU Talker rejects
-V1 with full decode graphs before loading weights; use `PIECEWISE`, `NONE` or
-eager execution for V1. Select one of these
-deployment profiles:
+Qwen3-TTS selects Model Runner V2 by default on CUDA and NPU. With vLLM
+0.34.0rc3, V2 is the only supported model runner; overrides that select V1 on
+XPU, ROCm and MUSA are rejected. MRV2 remains experimental for this model.
+On NPU, the V2 Talker uses `FULL_AND_PIECEWISE`; Code2Wav retains
+`PIECEWISE`. These settings do not establish hardware qualification.
+Select one of these deployment profiles:
 
 | Profile | Runner | Code2Wav graph batches | Intended use |
 | --- | --- | --- | --- |
-| `qwen3_tts.yaml` | V2 on CUDA/NPU; V1 on XPU/ROCm/MUSA | B1 | Shipped default; experimental |
+| `qwen3_tts.yaml` | V2 on CUDA/NPU; V1 overrides unsupported | B1 | Shipped default; experimental |
 | `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
 | `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
 | `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` | V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
-| `qwen3_tts_high_concurrency.yaml` | V1 | Existing defaults | V1 high-concurrency control |
+| `qwen3_tts_high_concurrency.yaml` | V2 (default) | Existing defaults | Original high-concurrency tuning |
 | `qwen3_tts_fused_single_gpu.yaml` | V2 | N/A (in-Talker decoder) | Opt-in single-stage CUDA pipeline on one GPU |
 
 The former `qwen3_tts_mrv2.yaml` profile has been removed. Use
-`qwen3_tts.yaml` instead: their resolved settings were identical on CUDA,
-XPU, ROCm and MUSA. On NPU, the former profile selected V1 with `PIECEWISE`
-Talker graphs, while the default selects V2 with `FULL_AND_PIECEWISE`.
-To retain that NPU V1 behavior, use a custom overlay:
-
-```yaml
-# qwen3_tts_npu_v1.yaml; replace base_config with your installed file's path.
-base_config: /absolute/path/to/vllm_omni/deploy/qwen3_tts.yaml
-platforms:
-  npu:
-    model_runner: v1
-    stages:
-      - stage_id: 0
-        compilation_config:
-          cudagraph_mode: PIECEWISE
-```
-
-Relative `base_config` paths resolve from the overlay's directory.
+`qwen3_tts.yaml` instead; it selects V2 on CUDA and NPU.
 
 ```bash
-# Use the overlay above to retain V1 on NPU.
+# Use the bundled V2 profile.
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
-  --deploy-config /path/to/qwen3_tts_npu_v1.yaml
+  --deploy-config vllm_omni/deploy/qwen3_tts.yaml
 ```
 
 The V2 profiles bound Talker prefill to 512 tokens per step and select the
@@ -689,8 +681,8 @@ Talker AR runner and the Code2Wav generation
 runner together. Native inter-stage delivery carries codec payloads directly;
 request-owned snapshots preserve buffers through asynchronous completion and
 CUDA graph reuse. Terminal completion waits for upstream stage metrics before
-releasing request state. Platform sections retain V1 on XPU, ROCm and MUSA;
-this change does not qualify MRV2 on those backends or enable other model families.
+releasing request state. Platform sections that retain V1 on XPU, ROCm and
+MUSA are unsupported; this change does not qualify V2 on those backends.
 Selecting V2 for a stage without `supports_native_mrv2_data_plane` emits a warning
 when pipeline and deployment settings are merged. That stage retains the legacy
 transport path; the warning does not establish support for that combination.

@@ -27,6 +27,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, cast
 
 import janus
+import numpy as np
 import torch
 from opentelemetry.trace import Tracer
 from vllm.config import ModelConfig
@@ -193,6 +194,13 @@ def build_engine_core_request_from_tokens(
 
     prompt_token_ids = prompt.get("prompt_token_ids")
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
+    # vLLM 0.34 types EngineCoreRequest.prompt_token_ids as a 32-bit int
+    # ``np.ndarray`` at runtime (TokenBuffer asserts itemsize == 4); coerce
+    # list prompts so /v1/run stage inputs round-trip through
+    # ``msgspec.convert`` symmetrically (a decoded plain list fails the
+    # ndarray field check).
+    if isinstance(prompt_token_ids, list):
+        prompt_token_ids = np.asarray(prompt_token_ids, dtype=np.int32)
 
     sampling_params = None
     pooling_params = None
@@ -3230,7 +3238,7 @@ class OrchestratorBase:
                 already_submitted=already_submitted,
                 t_submit_start=_t_submit_start,
                 submit_kwargs=submit_kwargs,
-                params_override=self._diffusion_params_for_samples(
+                params_override=cast(Orchestrator, self)._diffusion_params_for_samples(
                     req_state, src_stage_id, self._maybe_clone_diffusion_params_for_cfg(req_id, params)
                 ),
                 pinned_replica_id=pinned_replica_id,
@@ -4120,7 +4128,7 @@ class Orchestrator(OrchestratorBase):
                     request_id,
                     stage_id,
                     f"streaming (resumable) input is not supported: stage {mrv2_stage_id} runs on "
-                    "model_runner v2, which supports turn-based requests only; use model_runner: v1 "
+                    "model_runner v2, which supports turn-based requests only; select a V2 duplex profile "
                     "for that stage",
                 )
                 return

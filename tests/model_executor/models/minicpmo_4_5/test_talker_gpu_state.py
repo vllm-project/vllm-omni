@@ -293,6 +293,7 @@ def test_fused_gpu_window_penalty_matches_reference(device, batch):
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_v1_gpu_output_uses_async_snapshot_and_reuses_finished_slot():
+    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 output/snapshot contract is retired")
     from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
 
     talker = _make_talker()
@@ -378,6 +379,10 @@ def test_gpu_decode_masks_finished_request_when_new_request_joins(device):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("aux_penalty", ["neutral", "frequency", "presence", "mixed"])
 def test_sampler_fast_path_preserves_seeded_tokens_and_auxiliary_penalties(aux_penalty, mocker):
+    pytest.importorskip(
+        "vllm.v1.sample.sampler",
+        reason="MiniCPM V1 model.sample protocol is retired; native V2 sampler has separate coverage",
+    )
     from dataclasses import replace
     from types import SimpleNamespace
 

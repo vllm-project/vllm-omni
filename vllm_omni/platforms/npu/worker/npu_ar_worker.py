@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from vllm.logger import init_logger
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.platforms.npu.ascend_warmup_patch import apply_ascend_warmup_patch
 from vllm_omni.platforms.npu.worker.base import OmniNPUWorkerBase
-from vllm_omni.platforms.npu.worker.npu_ar_model_runner import NPUARModelRunner
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
 logger = init_logger(__name__)
@@ -22,17 +21,12 @@ apply_ascend_warmup_patch()
 class NPUARWorker(OmniWorkerMixin, OmniNPUWorkerBase):
     """NPU AR worker for thinker/talker stages in Omni model."""
 
-    model_runner_cls = NPUARModelRunner
-
     def init_device(self):
         self.device = self._init_device()
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)
 
-        if self.use_v2_model_runner:
-            from vllm_omni.platforms.npu.worker.npu_omni_v2_model_runner import NPUOmniARModelRunner
+        from vllm_omni.platforms.npu.worker.npu_omni_v2_model_runner import NPUOmniARModelRunner
 
-            logger.info("Using MR v2 NPUOmniARModelRunner on NPU.")
-            self.model_runner = NPUOmniARModelRunner(self.vllm_config, self.device)
-        else:
-            self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
+        logger.info("Using MR v2 NPUOmniARModelRunner.")
+        self.model_runner = NPUOmniARModelRunner(self.vllm_config, self.device)

@@ -42,7 +42,7 @@ import os
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -52,7 +52,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.v1.outputs import SamplerOutput
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex.input import decode_pcm_f32le
@@ -61,6 +60,9 @@ from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import (
     require_request_id,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+
+if TYPE_CHECKING:
+    from vllm.v1.sample.metadata import SamplingMetadata
 
 logger = init_logger(__name__)
 
