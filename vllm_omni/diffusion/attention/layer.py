@@ -912,6 +912,14 @@ class Attention(nn.Module):
             dtype = None
         elif disabled:
             dtype = "float"
+        logger.warning_once(
+            "ATTN_POLICY role=%s spec_precision=%s global_dtype=%s has_spec=%s effective=%s",
+            self.role,
+            self._spec_quant_precision(self.attn_spec),
+            self._kv_cache_dtype,
+            self._has_spec_quantization,
+            dtype,
+        )
         if dtype is None and (attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra):
             return attn_metadata
         extra = dict(attn_metadata.extra) if attn_metadata is not None else {}
