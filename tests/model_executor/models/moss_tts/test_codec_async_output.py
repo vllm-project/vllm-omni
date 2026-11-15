@@ -86,7 +86,8 @@ def make_decoder(*, v2=True, channels=2, device="cpu", model_type="moss_tts_loca
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("codec_version", [1, 2])
-def test_loading_codec_releases_encoder_and_preserves_decode(monkeypatch, codec_version):
+@pytest.mark.parametrize("device_type", ["cpu", "cuda", "npu"])
+def test_loading_codec_releases_encoder_and_preserves_decode(monkeypatch, mocker, codec_version, device_type):
     from tests.model_executor.models.moss_tts.test_audio_tokenizer_v1_streaming import _make_codec
     from tests.model_executor.models.moss_tts.test_codec_ring_headroom import tiny_codec
     from vllm_omni.model_executor.models.moss_tts import modeling_moss_tts_codec as codec_module
@@ -97,13 +98,18 @@ def test_loading_codec_releases_encoder_and_preserves_decode(monkeypatch, codec_
     encoder_ref = weakref.ref(codec.encoder)
     expected_parameters = {f"_codec.{name}" for name, _ in codec.named_parameters() if not name.startswith("encoder.")}
     decoder = make_decoder(streaming=False)
-    decoder.vllm_config.device_config = SimpleNamespace(device=torch.device("cpu"))
+    decoder.vllm_config.device_config = SimpleNamespace(device=mocker.Mock(spec=torch.device, type=device_type))
     decoder.vllm_config.load_config = object()
     decoder.vllm_config.model_config.enforce_eager = True
     monkeypatch.setattr(codec_module, "load_codec", lambda *args, **kwargs: (codec.config, codec))
+    empty_cache = mocker.patch.object(codec_module.current_omni_platform, "empty_cache", create=True)
 
     loaded = decoder.load_weights(iter(()))
 
+    if device_type == "cpu":
+        empty_cache.assert_not_called()
+    else:
+        empty_cache.assert_called_once_with()
     assert encoder_ref() is None
     assert loaded == expected_parameters
     assert codec.encoder is None
