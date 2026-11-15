@@ -46,6 +46,13 @@ ORCHESTRATOR_PORT_OFFSET = 200
 ConnectorPurpose = Literal["request_forwarding", "kv_transfer", "orchestrator"]
 
 
+def _resolve_local_host() -> str:
+    """Return this process's IP for same-host headless connector fallback."""
+    import socket
+
+    return socket.gethostbyname(socket.gethostname())
+
+
 def compute_connector_zmq_port(
     base_port: int,
     *,
@@ -108,7 +115,18 @@ def resolve_connector_spec(
             replica_id=replica_id,
         )
     if role == "receiver":
-        extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
+        sender_host = extra.get("sender_host")
+        if sender_host is None or str(sender_host).lower() in {
+            "auto",
+            "0.0.0.0",
+            "*",
+            "::",
+        }:
+            # `host: auto` is this worker's bind address, not the producer's.
+            # Same-host/headless mode needs the local address; remote
+            # deployments must set sender_host explicitly.
+            sender_host = _resolve_local_host()
+        extra.setdefault("sender_host", sender_host)
         extra.setdefault("sender_zmq_port", resolved_port)
         extra.pop("zmq_port", None)
         outgoing = extra.get("outgoing")

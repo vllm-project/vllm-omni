@@ -88,3 +88,19 @@ def test_load_qwen_yaml_configs(yaml_file):
 
     except Exception as e:
         pytest.fail(f"Failed to load config {yaml_file.name}: {e}")
+
+
+def test_receiver_auto_sender_host_resolves_to_local_address():
+    from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        resolve_connector_spec,
+    )
+
+    spec = ConnectorSpec(
+        name="NixlConnector",
+        extra={"host": "auto", "zmq_port": 50061, "from_stage": 1},
+    )
+    resolved = resolve_connector_spec(spec, stage_id=2, role="receiver")
+
+    assert resolved.extra["sender_host"] not in {"auto", "0.0.0.0", "*", "::"}
+    assert resolved.extra["sender_zmq_port"] == 50062
