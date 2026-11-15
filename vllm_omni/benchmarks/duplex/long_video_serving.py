@@ -101,6 +101,8 @@ async def request_long_video(request, output, *, headers, pbar, total_timeout_s:
         output.output_tokens = result["output_tokens"]
         output.duplex_request_metrics = result["request_metrics"]
         output.duplex_session_metrics = result["session_metrics"]
+        # Serve TTFT covers available responses across the session, including
+        # observations; final-question latency is saved separately as query_ttft_ms.
         output.ttft = (metric_mean(result["session_metrics"].get("ttft_ms")) or 0.0) / 1000
         output.success = True
         output.long_video_result = result

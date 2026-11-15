@@ -1032,6 +1032,11 @@ soundtrack; compare scores only under matching conditions.
 The saved benchmark JSON includes `long_video_qa`, shared duplex metrics and
 per-question results. Shared server timing fields remain unmeasured when the
 server supplies no timing snapshots for text-only observations.
+The standard serve-bench TTFT statistics aggregate each session's mean of
+available response timings, including per-frame observation responses.
+Use the saved `long_video_query_ttft_ms` and `long_video_query_completion_ms`
+distributions for final-question latency; their per-question values are
+`query_ttft_ms` and `query_completion_ms`.
 `query_ttft_ms` and `query_completion_ms` start when the
 question is submitted; session elapsed time includes real-time playback.
 `pacing_max_lag_s` reports accumulated observation delay.
