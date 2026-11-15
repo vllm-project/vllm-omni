@@ -38,10 +38,26 @@ One desktop GPU, 16,311MiB; native Linux, 28GiB container RAM limit.
 
 ## Checkpoints and deployment
 
-The concurrency, memory and quality tables below were measured on `0c6328ed`
-plus the frozen evidence patch. A separate c1 smoke tested `e058eca1` with
-PR #10345 at `c8ed377d` applied (`ad9c3c28` combined): 20/20 requests completed,
-with first-audio p50 1.388 s and EOF RTF p50 1.044. See the
+The baseline concurrency, memory and quality tables later in this recipe were
+measured on `0c6328ed` plus the frozen evidence patch. A separate c1 smoke
+tested `e058eca1` with PR #10345 at `c8ed377d` applied (`ad9c3c28` combined).
+Ten EN and ten ZH requests ran after two warmups per language; the first API
+request was excluded from timing. Memory was measured in a separate
+four-request c1 window.
+
+| Metric | Result |
+| --- | ---: |
+| Timed requests completed | 20/20 |
+| First audio p50 / p95 (s) | 1.388 / 1.407 |
+| EOF RTF p50 / p95 | 1.044 / 1.073 |
+| Talker peak allocated / reserved (GiB) | 5.516 / 5.650 |
+| Codec peak allocated / reserved (GiB) | 3.837 / 3.949 |
+| Sampled device peak (MiB) | 14,655.4 |
+
+Device usage includes the API reference encoder. Reserved includes allocated.
+The smoke peak was sampled independently; its rounded value matches the baseline.
+NVML intervals were median 100.64 ms, max 750.76 ms; brief peaks may be missed.
+See the
 [smoke results and logs](https://github.com/RongHuang14/vllm-omni/releases/download/a7-moss-realtime-16gb-evidence-v1/moss-a7-current-head-c1-smoke-c8ed377.tar.gz).
 
 Run from the repository root in a matching vLLM environment. Pin the Talker
