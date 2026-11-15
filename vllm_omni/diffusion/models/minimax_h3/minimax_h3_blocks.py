@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.offloader.module_residency import BoundedAllocatorCache, PinnedModuleStager
 
 from .adaln_cache import MiniMaxH3RuntimeAdalnCache
+from .head_overlap import run_head_overlap
 from .vdnh3 import VDNConfig, VDNH3HybridAttention
 
 if TYPE_CHECKING:
@@ -80,6 +82,10 @@ def _ring_sequence_parallel_is_active(attention_layer: Attention) -> bool:
     if is_forward_context_available() and not get_forward_context().sp_active:
         return False
     return True
+
+
+_OVERLAP_GROUPS = int(os.environ.get("OMNI_H3_HEAD_OVERLAP_GROUPS", "0"))
+_OVERLAP_DIRECT = os.environ.get("OMNI_H3_HEAD_OVERLAP_DIRECT") == "1"
 
 
 def _attention_isolates_packed_requests(attention_layer: Any, backend: type[AttentionBackend] | None = None) -> bool:
@@ -355,6 +361,7 @@ class MiniMaxH3Attention(nn.Module):
         reference_kv_layer_index: int | None = None,
         reference_kv_compact: bool = False,
         vdn_window: VDNLayout | None = None,
+        overlap_rope_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -468,6 +475,36 @@ class MiniMaxH3Attention(nn.Module):
             extra=extra,
             video_layout=video_layout,
         )
+        if (
+            _OVERLAP_GROUPS > 1
+            and num_requests == 1
+            and not use_ring
+            and backend.get_name() == "FLASH_ATTN"
+            and gate_compress is None
+            and vdn_window is None
+            and reference_kv_state is None
+            and q.is_cuda
+            and q.dtype == torch.bfloat16
+        ):
+            result = run_head_overlap(
+                self.attention,
+                q,
+                k,
+                v,
+                metadata,
+                _OVERLAP_GROUPS,
+                _OVERLAP_DIRECT,
+                rope=overlap_rope_table,
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                eps=self.q_norm.variance_epsilon,
+            )
+            if result is not None:
+                return result
+        if overlap_rope_table is not None:
+            q, k = fused_qk_norm_rope(
+                q, k, self.q_norm.weight, self.k_norm.weight, overlap_rope_table, self.q_norm.variance_epsilon
+            )
         return self.attention(
             q.unsqueeze(0),
             k.unsqueeze(0),
@@ -476,7 +513,12 @@ class MiniMaxH3Attention(nn.Module):
         ).squeeze(0)
 
     def _project_qkv(
-        self, x: torch.Tensor, rope_table: torch.Tensor | None, vdn_window: VDNLayout | None = None
+        self,
+        x: torch.Tensor,
+        rope_table: torch.Tensor | None,
+        vdn_window: VDNLayout | None = None,
+        *,
+        defer_norm: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project/normalize/rotate QKV, retaining raw Q/K for the VDN branch."""
         total = x.shape[0]
@@ -491,6 +533,8 @@ class MiniMaxH3Attention(nn.Module):
             raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
         # The VDN linear branch reads the raw projections; norm/RoPE are out of place.
         q_raw, k_raw = q, k
+        if defer_norm:
+            return q, k, v, q_raw, k_raw
         if rope_table is None:
             q = self.q_norm(q)
             k = self.k_norm(k)
@@ -542,7 +586,17 @@ class MiniMaxH3Attention(nn.Module):
                 reference_kv_state.local_sequence_rows,
                 projected_rows=total,
             )
-        q, k, v, q_raw, k_raw = self._project_qkv(x, rope_table, vdn_window)
+        direct_rope = (
+            _OVERLAP_DIRECT
+            and _OVERLAP_GROUPS > 1
+            and rope_table is not None
+            and x.is_cuda
+            and vdn_window is None
+            and self.vdn is None
+            and num_requests == 1
+            and reference_kv_state is None
+        )
+        q, k, v, q_raw, k_raw = self._project_qkv(x, rope_table, vdn_window, defer_norm=direct_rope)
 
         # The gate is projected from the same local rows as Q. Pure Ulysses
         # reshards it alongside Q/K/V in UlyssesParallelAttention so each VSA
@@ -574,6 +628,7 @@ class MiniMaxH3Attention(nn.Module):
             reference_kv_layer_index=reference_kv_layer_index,
             reference_kv_compact=reference_kv_compact,
             vdn_window=vdn_window,
+            overlap_rope_table=rope_table if direct_rope else None,
         )
         if self.vdn is not None:
             out = self.vdn.gate_softmax(out, x)
