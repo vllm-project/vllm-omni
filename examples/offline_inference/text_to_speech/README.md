@@ -409,7 +409,7 @@ python examples/offline_inference/text_to_speech/moss_tts_nano/end2end.py \
 
 ## Miso TTS
 
-Single-stage 8B Llama3.2 backbone + 300M codebook decoder (talker stage), then Mimi codec decode (stage 1) at 24 kHz with ``async_chunk`` streaming like Qwen3-TTS.
+8B Llama 3.2 backbone + 300M codebook decoder (talker stage), then Mimi codec decode (stage 1) at 24 kHz with ``async_chunk`` streaming like Qwen3-TTS.
 
 ### Prerequisites
 
@@ -428,7 +428,7 @@ python examples/offline_inference/text_to_speech/miso_tts/end2end.py \
 
 ### Notes
 
-- Deploy config: `vllm_omni/deploy/miso_tts.yaml` (sets `hf_overrides` when the HF repo lacks `config.json`).
+- Deploy config: `vllm_omni/deploy/miso_tts.yaml` is loaded by default (sets `hf_overrides` when the HF repo lacks `config.json`); pass `--deploy-config` to override.
 - Default `--max-generation-frames 125` ≈ 10 s of audio (80 ms per frame).
 - Online serving: pass OpenAI `voice` as the speaker id string (`"0"`, `"1"`).
 - Optional multi-turn context can be supplied offline via `additional_information["context"]` (list of `{text, speaker, audio}`).

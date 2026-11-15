@@ -39,6 +39,19 @@ def _pick(info: dict, key: str, default):
     return val if val is not None else default
 
 
+def _request_key(value: Any) -> str:
+    """Normalize a request id so session allocation and release use the same key.
+
+    The engine injects ``global_request_id`` as a single-element list, while
+    ``on_requests_finished`` receives the bare scheduler id string.
+    """
+    if isinstance(value, (list, tuple)):
+        return str(value[0]) if value else ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return "" if value is None else str(value)
+
+
 @dataclass
 class _Segment:
     speaker: int
@@ -144,7 +157,6 @@ class MisoTTSTalkerForConditionalGeneration(nn.Module):
     has_preprocess = False
     has_postprocess = False
     enable_update_additional_information = True
-    inject_omni_request_id_into_runtime_info = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -289,7 +301,14 @@ class MisoTTSTalkerForConditionalGeneration(nn.Module):
                 codes.append(torch.zeros(MISO_NUM_CODEBOOKS, dtype=torch.long))
                 flags.append(True)
                 continue
-            key = str(info.get("global_request_id") or info.get("_omni_req_id") or id(info))
+            key = _request_key(info.get("global_request_id")) or _request_key(info.get("_omni_req_id"))
+            if not key:
+                # Without a stable id a session would be rebuilt (and the shared
+                # KV cache reset) every step, so finish the row instead.
+                logger.warning_once("Miso talker runtime info has no request id; finishing request")
+                codes.append(torch.zeros(MISO_NUM_CODEBOOKS, dtype=torch.long))
+                flags.append(True)
+                continue
             sess = self._session(key, info)
             if sess is None:
                 codes.append(torch.zeros(MISO_NUM_CODEBOOKS, dtype=torch.long))
@@ -298,14 +317,14 @@ class MisoTTSTalkerForConditionalGeneration(nn.Module):
             fr, done = self._step(sess)
             codes.append(fr.cpu())
             flags.append(done)
-            # Don't pop session here - let connector signal when truly finished via runtime info
+            # Sessions are released in on_requests_finished once the scheduler finishes the request.
         self._ar_last_chunk_flags = flags
         # Include done flag in multimodal_output so connector knows when to finish
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs={"codes": {"audio": codes}, "done": flags})
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for rid in finished_req_ids:
-            self._sessions.pop(str(rid), None)
+            self._sessions.pop(_request_key(rid), None)
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None) -> torch.Tensor:
         if isinstance(hidden_states, OmniOutput):

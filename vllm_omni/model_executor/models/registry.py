@@ -438,11 +438,6 @@ _OMNI_MODELS = {
         "miso_tts_talker",
         "MisoTTSTalkerForConditionalGeneration",
     ),
-    "MisoTTSSingleStageForVLLM": (
-        "miso_tts",
-        "miso_tts_vllm_wrapper",
-        "MisoTTSSingleStageForVLLM",
-    ),
     ## MOSS-TTS (full variants: Delay + Realtime)
     # MossTTSDelayModel: MOSS-TTS (8B), MOSS-TTSD (8B), MOSS-SoundEffect (8B), MOSS-VoiceGenerator (1.7B)
     "MossTTSDelayModel": (

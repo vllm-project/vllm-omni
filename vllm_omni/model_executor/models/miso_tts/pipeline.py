@@ -12,6 +12,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.miso_tts"
 
 MISO_TTS_PIPELINE = PipelineConfig(
     model_type="miso_tts",
+    default_deploy_config_name="miso_tts.yaml",
     model_arch="MisoTTSTalkerForConditionalGeneration",
     stages=(
         StagePipelineConfig(
@@ -42,26 +43,6 @@ MISO_TTS_PIPELINE = PipelineConfig(
             custom_process_input_func=f"{_PROC}.talker2mimi_token_only",
             sync_process_input_func=f"{_PROC}.talker2mimi_token_only",
             sampling_constraints={"detokenize": True},
-        ),
-    ),
-)
-
-MISO_TTS_SINGLE_STAGE_PIPELINE = PipelineConfig(
-    model_type="miso_tts",
-    model_arch="MisoTTSSingleStageForVLLM",
-    stages=(
-        StagePipelineConfig(
-            stage_id=0,
-            model_stage="miso_tts",
-            execution_type=StageExecutionType.LLM_AR,
-            input_sources=(),
-            owns_tokenizer=False,
-            final_output=True,
-            final_output_type="audio",
-            engine_output_type="audio",
-            sampling_constraints={
-                "detokenize": False,
-            },
         ),
     ),
 )

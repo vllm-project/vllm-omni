@@ -87,6 +87,7 @@ def main() -> None:
         seed=args.seed if args.seed is not None else 42,
         detokenize=False,
     )
+    mimi_sampling = SamplingParams(temperature=0.0, max_tokens=4096, detokenize=True)
 
     req = build_request(
         text=args.text,
@@ -97,7 +98,8 @@ def main() -> None:
         seed=args.seed,
     )
 
-    outputs = omni.generate([req], sampling_params=sampling)
+    # One SamplingParams per stage: talker, then Mimi decoder.
+    outputs = omni.generate([req], sampling_params_list=[sampling, mimi_sampling])
     out = outputs[0]
     mm = out.outputs[0].multimodal_output
     audio = mm.get("model_outputs")

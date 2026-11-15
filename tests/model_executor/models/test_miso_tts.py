@@ -7,20 +7,21 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.miso_tts import (
-    MisoTTSMimiDecoder,
-    MisoTTSTalkerForConditionalGeneration,
-)
-from vllm_omni.model_executor.models.miso_tts import miso_tts_mimi as mimi_module
-from vllm_omni.model_executor.models.miso_tts import miso_tts_talker as talker_module
-from vllm_omni.model_executor.models.miso_tts.modeling_miso_tts import (
+pytest.importorskip("torchtune")
+
+from vllm_omni.model_executor.models.miso_tts import miso_tts_mimi as mimi_module  # noqa: E402
+from vllm_omni.model_executor.models.miso_tts import miso_tts_talker as talker_module  # noqa: E402
+from vllm_omni.model_executor.models.miso_tts.modeling_miso_tts import (  # noqa: E402
     MISO_NUM_CODEBOOKS,
     MISO_TTS_8B_CONFIG,
     sample_topk,
 )
-from vllm_omni.model_executor.models.miso_tts.pipeline import MISO_TTS_PIPELINE
-from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.transformers_utils.configs.miso_tts import MisoTTSConfig
+from vllm_omni.model_executor.models.miso_tts.pipeline import MISO_TTS_PIPELINE  # noqa: E402
+from vllm_omni.model_executor.models.output_templates import OmniOutput  # noqa: E402
+from vllm_omni.transformers_utils.configs.miso_tts import MisoTTSConfig  # noqa: E402
+
+MisoTTSMimiDecoder = mimi_module.MisoTTSMimiDecoder
+MisoTTSTalkerForConditionalGeneration = talker_module.MisoTTSTalkerForConditionalGeneration
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -284,3 +285,54 @@ def test_miso_pipeline_registered() -> None:
     from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 
     assert OMNI_PIPELINES["miso_tts"] is MISO_TTS_PIPELINE
+    assert MISO_TTS_PIPELINE.default_deploy_config_name == "miso_tts.yaml"
+
+
+def test_talker_session_released_by_bare_scheduler_id() -> None:
+    talker = object.__new__(MisoTTSTalkerForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker._sessions = {}
+    sessions = []
+
+    def _fake_session(key, info):
+        if key not in talker._sessions:
+            sessions.append(key)
+            talker._sessions[key] = object()
+        return talker._sessions[key]
+
+    talker._session = _fake_session
+    talker._step = lambda _s: (torch.zeros(_Q, dtype=torch.long), False)
+    talker._model = object()
+    talker.config = SimpleNamespace(hidden_size=8)
+    talker._device = None
+    talker._ar_last_chunk_flags = []
+
+    info = {"global_request_id": ["req-1"], "text": "hi"}
+    talker.forward(runtime_additional_information=[info])
+    talker.forward(runtime_additional_information=[info])
+    assert sessions == ["req-1"]
+
+    talker.on_requests_finished({"req-1"})
+    assert talker._sessions == {}
+
+
+def test_talker_finishes_row_without_request_id() -> None:
+    talker = object.__new__(MisoTTSTalkerForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker._sessions = {}
+    talker._model = object()
+    talker.config = SimpleNamespace(hidden_size=8)
+    talker._device = None
+    talker._ar_last_chunk_flags = []
+
+    out = talker.forward(runtime_additional_information=[{"text": "hi"}])
+    assert out.multimodal_outputs["done"] == [True]
+    assert talker._sessions == {}
+
+
+def test_miso_tts_serving_adapter_registered() -> None:
+    from vllm_omni.entrypoints.openai.tts_adapters import TTS_ADAPTER_REGISTRY, all_tts_stage_keys
+
+    assert "miso_tts" in TTS_ADAPTER_REGISTRY
+    assert "miso_tts" in all_tts_stage_keys()
+    assert "MisoTTSTalkerForConditionalGeneration" in TTS_ADAPTER_REGISTRY["miso_tts"].model_archs
