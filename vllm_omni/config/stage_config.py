@@ -1066,7 +1066,7 @@ def _merge_platforms(
     base: dict[str, Any] | None,
     overlay: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Deep-merge two ``platforms:`` blocks per-platform, per-stage_id."""
+    """Merge platform blocks by stage ID and named connector definition."""
     if not base and not overlay:
         return None
     base = base or {}
@@ -1077,6 +1077,9 @@ def _merge_platforms(
         op = overlay.get(plat) or {}
         merged_plat = {**bp, **{k: v for k, v in op.items() if k != "stages"}}
         merged_plat["stages"] = _merge_stage_lists(bp.get("stages"), op.get("stages"))
+        connectors = _merge_connectors(bp.get("connectors"), op.get("connectors"))
+        if connectors is not None:
+            merged_plat["connectors"] = connectors
         merged[plat] = merged_plat
     return merged
 

@@ -416,7 +416,9 @@ stages:
 ```
 
 `platforms.<platform>.connectors` deep-merges named connector definitions,
-including `extra`, after `base_config` inheritance. This applies both to deploy
+including `extra`, through each `base_config` inheritance level and then onto
+the shared connectors. A partial platform override retains the other inherited
+platform values. This applies both to deploy
 resolution and to the connector spec passed to workers. Unspecified keys retain
 their shared values; other platforms retain the shared connector. To override a
 platform-specific value in a user overlay, use the same platform block.

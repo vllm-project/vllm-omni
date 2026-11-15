@@ -77,3 +77,39 @@ def test_reference_optimizations_are_cuda_only(monkeypatch, deploy_name, platfor
         # CUDA overrides retain the shared NPU option and chunk geometry.
         assert extra["cfm_npu_cross_reference_batching"] is True
         assert extra["codec_chunk_frames"] == 25
+
+
+@pytest.mark.parametrize("deploy_name", [_DEPLOY, "minicpmo_4_5_turn.yaml"])
+@pytest.mark.parametrize("platform", ["cuda", "npu"])
+@pytest.mark.parametrize("depth", [1, 2])
+def test_platform_connector_overlay_preserves_inherited_options(tmp_path, monkeypatch, deploy_name, platform, depth):
+    from vllm_omni.config.stage_config import resolve_deploy_yaml
+    from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
+    from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
+
+    monkeypatch.setattr(current_omni_platform, "device_name", platform)
+    path = get_deploy_config_path(deploy_name)
+    expected = _apply_platform_overrides(load_deploy_config(path), platform=platform).connectors
+    options = ("token2wav_float16", "token2wav_spk_cuda_graph")
+    for level, option in enumerate(options[:depth]):
+        overlay = tmp_path / f"overlay-{level}.yaml"
+        overlay.write_text(
+            f"base_config: {path}\n"
+            "platforms:\n"
+            "  cuda:\n"
+            "    connectors:\n"
+            "      connector_of_shared_memory:\n"
+            "        extra:\n"
+            f"          {option}: false\n"
+        )
+        path = overlay
+        if platform == "cuda":
+            expected["connector_of_shared_memory"]["extra"][option] = False
+
+    deploy = _apply_platform_overrides(load_deploy_config(path), platform=platform)
+    transfer = load_omni_transfer_config(config_dict=resolve_deploy_yaml(path))
+    stage_extra = get_stage_connector_spec(transfer, stage_id=2, async_chunk=True)["extra"]
+    assert deploy.connectors == expected
+    # Worker resolution also adds transport-owned role/wakeup metadata.
+    for key, value in expected["connector_of_shared_memory"]["extra"].items():
+        assert stage_extra[key] == value

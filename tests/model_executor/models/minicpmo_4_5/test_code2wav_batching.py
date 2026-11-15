@@ -2220,7 +2220,8 @@ def _padded_decode_adapter(bucket_frames: int) -> tuple[BatchedToken2Wav, int, i
 
 
 @pytest.mark.parametrize("disable_during_setup", [False, True], ids=["after-setup", "during-setup"])
-def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disable_during_setup):
+@pytest.mark.parametrize("grouped", [False, True], ids=["single-prompt", "grouped-prompts"])
+def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disable_during_setup, grouped):
     adapter, _, _ = _padded_decode_adapter(bucket_frames=16)
     adapter.flow.decoder.rand_noise = torch.randn(1, 1, 400)
     prompt = batched_token2wav_module.PromptFeatures(
@@ -2241,8 +2242,11 @@ def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disa
 
         monkeypatch.setattr(wrapper, "replay", replay_then_disable)
 
+    def setup():
+        return adapter.setup_prompts([prompt], 4) if grouped else adapter.setup_batch(prompt, 1)
+
     with torch.no_grad():
-        padded = adapter.setup_batch(prompt, 1)
+        padded = setup()
         assert padded[0].flow_cache["estimator_att_cache"].shape[-2] == 304
         padded_keys = list(adapter._setup_cache)
         # has_cached_setup agrees with setup_batch's key, padding included.
@@ -2250,9 +2254,9 @@ def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disa
 
         wrapper.enabled = False
         assert not adapter.has_cached_setup(prompt)
-        unpadded = adapter.setup_batch(prompt, 1)
+        unpadded = setup()
         assert adapter.has_cached_setup(prompt)
-        reused = adapter.setup_batch(prompt, 1)
+        reused = setup()
 
     assert unpadded[0].flow_cache["estimator_att_cache"].shape[-2] == 300
     assert unpadded[0] is not padded[0]
@@ -2260,6 +2264,39 @@ def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disa
     assert adapter.flow.encoder.calls == [1, 1]
     assert padded_keys == [(prompt.cache_key, 16)]
     assert list(adapter._setup_cache) == [(prompt.cache_key, 0)]
+
+
+def test_grouped_setup_snapshots_padding_policy_per_microbatch(monkeypatch):
+    adapter, _, _ = _padded_decode_adapter(bucket_frames=16)
+    adapter.flow.decoder.rand_noise = torch.randn(1, 1, 400)
+    adapter._setup_cache_size = 3
+    prompts = [
+        PromptFeatures(
+            cache_key=(str(row), f"voice-{row}.wav"),
+            speech_tokens=torch.full((1, 298), 5, dtype=torch.long),
+            speaker_embedding=torch.ones(1, 1),
+            mels=torch.ones(1, 300, 1),
+        )
+        for row in range(3)
+    ]
+    wrapper = adapter._cfm_graph_wrapper
+    replay = wrapper.replay
+
+    def replay_then_disable(*args, **kwargs):
+        result = replay(*args, **kwargs)
+        wrapper.enabled = False
+        return result
+
+    monkeypatch.setattr(wrapper, "replay", replay_then_disable)
+    with torch.no_grad():
+        states = adapter.setup_prompts(prompts, 2)
+
+    assert adapter.flow.encoder.calls == [2, 1]
+    assert [state.flow_cache["estimator_att_cache"].shape[-2] for state in states] == [304, 304, 300]
+    assert list(adapter._setup_cache) == [
+        (prompt.cache_key, policy) for prompt, policy in zip(prompts, (16, 16, 0), strict=True)
+    ]
+    assert [adapter.has_cached_setup(prompt) for prompt in prompts] == [False, False, True]
 
 
 def test_padded_chunk_keeps_the_cross_chunk_caches_on_the_valid_boundary():

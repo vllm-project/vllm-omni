@@ -2106,6 +2106,9 @@ class BatchedToken2Wav(nn.Module):
             for start in range(0, len(rows), max_batch):
                 selected = rows[start : start + max_batch]
                 group = [features[row] for row in selected]
+                # Capture may disable padding during this setup. Keep its
+                # original policy in the cache key, then recheck for the next group.
+                cache_keys = [self._setup_cache_key(feature) for feature in group]
                 if len(group) == 1:
                     created = self._create_initial_states(group[0], 1)
                 else:
@@ -2116,10 +2119,10 @@ class BatchedToken2Wav(nn.Module):
                         mels=torch.cat([f.mels for f in group]),
                     )
                     created = self._create_initial_states(combined, len(group))
-                for row, state in zip(selected, created, strict=True):
+                for row, state, cache_key in zip(selected, created, cache_keys, strict=True):
                     states[row] = state
                     if self._setup_cache_size > 0:
-                        self._setup_cache[self._setup_cache_key(features[row])] = state
+                        self._setup_cache[cache_key] = state
                         while len(self._setup_cache) > self._setup_cache_size:
                             self._setup_cache.popitem(last=False)
         assert all(state is not None for state in states)
