@@ -21,6 +21,8 @@ class SchedulingMetadataUpdate:
     prompt_token_ids: tuple[int, ...] | None = None
     resize_prompt_to: int | None = None
     input_terminal: bool = False
+    # Native MRv2 receive: the producing step's duplex chunk id from payload meta.
+    duplex_perf_chunk: tuple[int, int] | None = None
 
 
 @dataclass
