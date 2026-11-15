@@ -9,7 +9,6 @@ from typing import Any
 
 __all__ = [
     "CausalLingBotWorldTransformer3DModel",
-    "LingBotCameraControlReducer",
     "LingBotWorldCausalDMDPipeline",
     "get_lingbot_world_post_process_func",
     "get_lingbot_world_pre_process_func",
@@ -23,10 +22,6 @@ def __getattr__(name: str) -> Any:
         from .transformer import CausalLingBotWorldTransformer3DModel
 
         return CausalLingBotWorldTransformer3DModel
-    if name == "LingBotCameraControlReducer":
-        from .actions import LingBotCameraControlReducer
-
-        return LingBotCameraControlReducer
     if name in (
         "LingBotWorldCausalDMDPipeline",
         "get_lingbot_world_post_process_func",

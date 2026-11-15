@@ -11,8 +11,11 @@ latent block per request while retaining model state across requests. The
 generic runtime owns identity, event ordering, session lifecycle, routing, and
 KV allocation. A model adapter owns model-specific controls and conditioning.
 
-LingBot World v2 is the first single-KV-branch integration. DreamZero uses the
-same runner capability with two logical CFG branches.
+ABot World uses this tick path with a single KV branch. DreamZero uses the
+same runner capability with two logical CFG branches. LingBot World v2 no
+longer uses ticks: it runs on the same runner through step execution, where one
+request covers the whole rollout (see the
+[LingBot World 2.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Robbyant/LingBot-World-2.0.md)).
 
 ## Identities
 
@@ -50,10 +53,9 @@ therefore does not require a private entrypoint override.
    `bind_ar_diffusion_state()` exposes it to the pipeline only for the duration
    of `execute_model()`.
 6. The model pipeline validates the tick and generates exactly one latent
-   block. LingBot interprets camera controls in
-   `LingBotCameraControlReducer` and
-   `LingBotWorldCausalDMDPipeline.forward()`; the generic runtime does not parse
-   camera or action schemas.
+   block. ABot World, for example, interprets camera controls in
+   `ABotCameraControlReducer` and `ABotWorldCausalPipeline`; the generic
+   runtime does not parse camera or action schemas.
 7. The pipeline returns one `DiffusionOutput` with the generated payload and an
    `ARDiffusionChunkMetadata` mapping under `metadata["ar_diffusion"]`.
    `AsyncOmni` exposes it as
@@ -182,13 +184,14 @@ The generic runtime transports controls as opaque
 and reduce those values. This keeps target/velocity, key state, pose,
 intrinsics, and other model-specific conventions out of the session protocol.
 
-For LingBot World v2:
+LingBot World v2 uses the runner through step execution rather than ticks:
 
-- `lingbot_world/actions.py` parses key-state and trajectory controls;
+- `lingbot_world/actions.py` parses request-scoped WASD `camera_action_script`s
+  and integrates them into camera trajectories;
 - `lingbot_world/camera.py` loads or constructs camera trajectories and Plücker embeddings;
 - `lingbot_world/transformer.py` implements checkpoint-compatible causal attention; and
 - `lingbot_world/pipeline.py` constructs conditioning, owns small non-KV session state, and
-  produces one block plus the standard metadata envelope.
+  produces one block per step-execution chunk plus the standard metadata envelope.
 
 ## Ulysses sequence parallelism
 
@@ -235,8 +238,8 @@ CPU contract tests cover:
 - capacity expansion under a tuned fraction;
 - DreamZero model-owned state accounting;
 - runner session reuse, reset, close, LRU eviction, and forward cleanup; and
-- LingBot model registration, imports, camera/action reduction, and one-block
-  output metadata.
+- LingBot model registration, imports, camera action scripts, and stepwise
+  chunk metadata.
 
 GPU validation must additionally exercise real model loading, action input,
 prompt switching, rolling-window replacement, reset, close, finite output

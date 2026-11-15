@@ -378,7 +378,7 @@ class LingBotSelfAttention(nn.Module):
             )
             if (query.is_cuda or query.device.type == "npu") and query.shape[0] == 1:
                 # Package the visible window as a block table and call the
-                # same block-table entry point as the realtime path
+                # same block-table entry point as the stepwise path
                 # (FlashAttention on CUDA, the fused kernel on NPU) so direct
                 # replay is a numerical oracle for paged execution, rather
                 # than a comparison between two different attention kernels.

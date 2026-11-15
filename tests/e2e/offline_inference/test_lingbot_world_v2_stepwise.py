@@ -4,7 +4,7 @@
 
 One ``AsyncOmni.generate()`` must stream one latent chunk per AR block while
 keeping a single request identity, which is what separates this path from the
-tick control plane exercised by ``test_lingbot_world_v2.py``.
+request-mode replay exercised by ``test_lingbot_world_v2.py``.
 """
 
 from __future__ import annotations
