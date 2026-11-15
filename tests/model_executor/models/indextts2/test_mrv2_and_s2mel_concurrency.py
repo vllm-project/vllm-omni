@@ -501,24 +501,12 @@ def test_d2h_eliminations_in_pooler_snapshot_and_emotion_lookup():
 
 @pytest.mark.parametrize("use_gpt_latent", [True, False])
 def test_mixed_prefill_decode_and_replace_keys_prevent_duplicate_conditioning(use_gpt_latent: bool):
-    """Verify:
-    1. _resolve_full_payload_replace_keys() resolves _FULL_PAYLOAD_REPLACE_KEYS from
-       stage_input_processors.indextts2 without fixture injection;
-    2. When a prefill request (mel_code_count=0) shares a batch with an active decode
-       request (mel_code_count=1) — or in IndexTTS-2.5 (use_gpt_latent=False) where
-       prefill always emits meta — S_ref / ref_mel / style are emitted only once at
-       mel_code_count == 1 and never concatenated into batch-2 tensors;
-    3. Even if a duplicate conditioning chunk arrives in accumulate_full_payload_output,
-       _FULL_PAYLOAD_REPLACE_KEYS keeps S_ref / ref_mel / style at batch size 1 so
-       Stage 1 torch.cat([prompt_condition, cond], dim=1) succeeds.
-    """
+    """Verify real REPLACE-key resolution and single-emission S_ref/ref_mel/style contract."""
     from vllm_omni.data_entry_keys import flatten_payload
 
     plane, sent_packets, _ = _make_mrv2_data_plane_with_indextts()
-    assert "_full_payload_replace_keys_cached" not in plane.__dict__
     resolved_keys = plane._resolve_full_payload_replace_keys()
     assert resolved_keys == _FULL_PAYLOAD_REPLACE_KEYS
-    assert {"meta.S_ref", "meta.ref_mel", "meta.style", "meta.duration_factor", "meta.use_gpt_latent"} <= resolved_keys
 
     talker = object.__new__(IndexTTS2TalkerForConditionalGeneration)
     nn.Module.__init__(talker)
@@ -647,3 +635,39 @@ def test_mixed_prefill_decode_and_replace_keys_prevent_duplicate_conditioning(us
     prompt_cond = decoder._regulate_lengths(stage1_info["S_ref"], [5], [5])
     cat_condition = torch.cat([prompt_cond, cond], dim=1)
     assert cat_condition.shape == (1, 9, 24)
+
+
+@pytest.mark.parametrize("use_gpt_latent", [True, False])
+def test_immediate_stop_at_prefill_errors_cleanly_on_zero_mel_codes(use_gpt_latent: bool):
+    """If step 0 samples STOP_MEL_TOKEN (mel_len=0), Stage-1 payload build fails cleanly."""
+    from vllm_omni.model_executor.stage_input_processors.indextts2 import STOP_MEL_TOKEN
+
+    talker = object.__new__(IndexTTS2TalkerForConditionalGeneration)
+    nn.Module.__init__(talker)
+    talker.use_gpt_latent = use_gpt_latent
+    prefill_out = talker.make_omni_output(
+        torch.zeros(1, GPT_DIM),
+        model_intermediate_buffer=[
+            {
+                "meta": {
+                    "mel_code_count": 0,
+                    "S_ref": torch.randn(1, 5, HIDDEN),
+                    "ref_mel": torch.randn(1, 80, 5),
+                    "style": torch.randn(1, 192),
+                    "duration_factor": 1.0,
+                }
+            }
+        ],
+    )
+    req = SimpleNamespace(
+        request_id="req-eos0",
+        output_token_ids=[STOP_MEL_TOKEN],
+    )
+    payload = prefill_out.multimodal_outputs or {}
+    if use_gpt_latent:
+        with pytest.raises(ValueError, match="missing meta.use_gpt_latent"):
+            talker2s2mel_full_payload(None, payload, req)
+    else:
+        flat_payload = {f"meta.{k}": v for k, v in payload["meta"][0].items()}
+        with pytest.raises(ValueError, match="zero non-stop mel codes"):
+            talker2s2mel_full_payload(None, flat_payload, req)

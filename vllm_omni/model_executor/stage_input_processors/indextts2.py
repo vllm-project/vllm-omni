@@ -154,6 +154,8 @@ def _build_s2mel_additional_information(
 ) -> dict[str, Any]:
     """Build the Stage-1 S2Mel tensor contract shared by legacy and connector paths."""
     mel_codes_clean, latent_clean, code_lens = _strip_stop_token(mel_codes, latent)
+    if mel_codes_clean.numel() == 0 or not torch.any(code_lens > 0):
+        raise ValueError(f"{context} produced zero non-stop mel codes")
 
     additional_information = {
         "mel_codes": mel_codes_clean,
