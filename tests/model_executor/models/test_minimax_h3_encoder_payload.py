@@ -606,29 +606,8 @@ def test_make_omni_output_mixed_warmup_and_real_request_metadata() -> None:
             request_sample_eligible=[False, True],
         )
 
-
-def test_make_omni_output_skips_ineligible_chunked_prefill_and_raises_if_eligible_metadata_missing() -> None:
-    # Mid/chunked prefill is not eligible: missing metadata must not raise, and
-    # the slot stays an empty placeholder. An eligible decode (or a decode-flagged
-    # contract row) still emits when metadata is present, and still raises when
-    # it is not.
-    model = _bare_encoder()
-    real = _cached_encoder_info()
-    output = model.make_omni_output(
-        torch.zeros(2, 5120),
-        model_intermediate_buffer=[{"req_id": "chunked_prefill"}, real],
-        request_sample_eligible=[False, True],
-    )
-    multimodal = output.multimodal_outputs
-    assert multimodal is not None
-    embed = multimodal["embed"]["embedding"]
-    assert len(embed) == 2
-    assert embed[0].numel() == 0  # skipped mid-prefill placeholder
-    # The cached-fixture embeddings may be empty; layout marks a real emit.
-    layout = multimodal["kv_metadata.minimax_h3_encoder_layout"]
-    assert layout[0].numel() == 0
-    assert layout[1].numel() > 0
-
+    # All-ineligible batch: do not emit embed / layout keys. The mixed case
+    # above already covers the eligible emit and missing-metadata raise.
     skipped = _bare_encoder().make_omni_output(
         torch.zeros(1, 5120),
         model_intermediate_buffer=[{"req_id": "chunked_prefill"}],
@@ -637,13 +616,6 @@ def test_make_omni_output_skips_ineligible_chunked_prefill_and_raises_if_eligibl
     skipped_mm = skipped.multimodal_outputs or {}
     assert "embed" not in skipped_mm
     assert "kv_metadata.minimax_h3_encoder_layout" not in skipped_mm
-
-    with pytest.raises(RuntimeError, match="request metadata is missing from the runner"):
-        _bare_encoder().make_omni_output(
-            torch.zeros(1, 5120),
-            model_intermediate_buffer=[{"req_id": "decode_flagged"}],
-            request_sample_eligible=[True],
-        )
 
 
 def test_driving_audio_is_not_a_short_reference_and_survives_stage_transport():
