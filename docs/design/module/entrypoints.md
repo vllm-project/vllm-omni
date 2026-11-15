@@ -82,6 +82,12 @@ last_verified_commit: 3d7fc3b9ba3cac88d579d4dc35b78b0b641675fc
 Entrypoints translate offline, CLI, and serving requests into stable engine
 operations and translate engine outputs into public responses.
 
+`AsyncOmni` explicitly rejects the process checkpoint methods exposed by newer
+vLLM `EngineClient` versions (`checkpoint_prepare`, `checkpoint_restore`, and
+`checkpoint_state`). This keeps ordinary serving instantiable without claiming
+checkpoint support. All three raise `NotImplementedError` before accessing or
+changing stage state; sleep and weight-transfer APIs retain their own contracts.
+
 ## Contract status
 
 This document describes current entrypoint responsibilities plus the boundary
@@ -100,6 +106,14 @@ The serving composition removes inherited `/tokenize`, `/detokenize`, and
 optional `/tokenizer_info` routes when no tokenization handler is configured
 (including pure diffusion mode). These endpoints return HTTP 404 and are absent
 from OpenAPI in that mode; configured handlers retain upstream vLLM routing.
+
+An optional `--video-output-warmup` request runs through the streaming video
+handler before HTTP serving starts. The frontend owns request validation,
+draining generation and encoding, and the startup deadline. It does not expose
+`/health` or admit traffic until that request completes successfully. Failure
+aborts the internal request and unwinds engine startup. The request explicitly
+supplies model-specific inputs and a finite frame count; playback pacing is
+rejected because there is no player. Omitting the option skips this warmup.
 
 When `--api-server-count` is greater than one, the serve composition root
 starts the frontend process manager while a parent-owned `StageRuntime`
@@ -198,6 +212,9 @@ ADD or update, not while waiting for the next client chunk. Frontend abort
 keeps `request_states` until `generate()` consumes the terminal output.
 Video output sessions shield final task cleanup and unfinished-request abort
 from ASGI cancellation, including disconnects immediately after `session.done`.
+Video encoding and encoder close run on one worker per stream so encoding does
+not block control handling. Cancellation queues close after any running encode;
+the event loop does not join that worker while it drains cleanup.
 Abort cleanup bounds both its coroutine and the engine acknowledgement wait
 with `ABORT_TIMEOUT_S`; an unresponsive orchestrator must not hold the shield
 indefinitely.
