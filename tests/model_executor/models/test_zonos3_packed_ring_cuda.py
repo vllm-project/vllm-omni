@@ -10,7 +10,6 @@ import torch
 from tests.helpers.mark import hardware_marks
 from tests.model_executor.models.test_zonos3_codec import small_config, spec
 from vllm_omni.model_executor.models.zonos3.codec import (
-    CodecManager,
     ZACCodecChunk,
     ZACConvNeXt,
     ZACDecoderNetwork,
@@ -173,13 +172,13 @@ def test_segmented_conv_preserves_noncontiguous_packed_input():
 
 
 @torch.inference_mode()
-def test_packed_manager_graph_lifecycle_and_owned_pcm():
-    """Manager routing/ownership against identical direct packed graph math."""
-    from tests.model_executor.models.test_zonos3_codec import graph_network
+def test_packed_model_state_graph_lifecycle_and_owned_pcm():
+    """ModelState routing/ownership against identical direct packed graph math."""
+    from tests.model_executor.models.test_zonos3_codec import graph_network, make_codec_state
 
     network = graph_network("cuda")
-    manager = CodecManager(network, 2, max_chunk=4, graph_batch_sizes=(1, 2), graph_frame_sizes=(1, 4))
-    reference = ZACCodecGraphWrapper(network, 2, 4, manager.graph.capture_keys)
+    manager = make_codec_state(network, 2, max_chunk=4, graph_batch_sizes=(1, 2), graph_frame_sizes=(1, 4))
+    reference = ZACCodecGraphWrapper(network, 2, 4, manager.model.graph.capture_keys)
     reference.capture()
     codes = torch.randint(0, 4096, (8, 10))
     retained = []
@@ -217,8 +216,8 @@ def test_packed_manager_graph_lifecycle_and_owned_pcm():
     check([ZACCodecChunk("b", 3, 4, codes[:0], True)], [1])
     manager.release("b")
     manager.release("c")
-    assert not manager._streams and not manager._finished and len(manager._free) == 2
-    assert manager.graph.replay_count == 4 and manager.graph.eager_count == 0
+    assert not manager.states and not manager._finished and len(manager._free) == 2
+    assert manager.model.graph.replay_count == 4 and manager.model.graph.eager_count == 0
     for audio, snapshot in retained:
         torch.testing.assert_close(audio, snapshot, atol=0, rtol=0)
 

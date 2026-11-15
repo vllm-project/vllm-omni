@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_marks
-from tests.model_executor.models.test_zonos3_sampler import add_sampling, codes, make_batch, make_state, run
+from tests.model_executor.models.test_zonos3_sampler import add_sampling, codes, make_state, run
 from vllm_omni.model_executor.models.zonos3.model_state import Zonos3ARModelState
 from vllm_omni.platforms import current_omni_platform
 
@@ -50,13 +50,10 @@ def test_top_k_filters_every_codebook_with_single_and_reordered_requests(order):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
-def test_gpu_warmup_determined_tokens_and_owned_snapshots(dtype):
+def test_gpu_determined_tokens_and_owned_snapshots(dtype):
     from vllm import SamplingParams
 
     state = make_state(4, "cuda", dtype)
-    _, requests = make_batch([0, 1, 2, 3], device="cuda")
-    state.warmup_sampling(torch.randn(4, 16, device="cuda", dtype=dtype), requests)
-    assert state.options == [None] * 4 and not state.sampling_state.position.any()
     singles = [make_state(1, "cuda", dtype) for _ in range(4)]
     for slot, single in enumerate(singles):
         params = SamplingParams(temperature=0.7, top_k=5, top_p=0.85, seed=100 + slot)

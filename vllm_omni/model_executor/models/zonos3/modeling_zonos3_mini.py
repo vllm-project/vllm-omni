@@ -24,6 +24,7 @@ from torch import nn
 from torch.nn import functional as F
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.utils.device_copy import index_to_device
@@ -704,10 +705,11 @@ class Zonos3ForCausalLM(nn.Module):
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # The upstream startup/prompt-logprob plumbing sees the logical control
-        # vocabulary only. Real request logprobs are rejected by ModelState.
-        # MultiOutputHead runs in ModelState.postprocess_model_output().
-        return torch.zeros((hidden_states.shape[0], 3), dtype=hidden_states.dtype, device=hidden_states.device)
+        # Only upstream dummy sampling uses this placeholder head. Its startup
+        # top-logprobs pass needs more columns than our logical control vocabulary.
+        # Real RVQ logits/sampling run in ModelState.postprocess_model_output().
+        width = max(3, SamplingParams.for_sampler_warmup().logprobs or 0)
+        return torch.zeros((hidden_states.shape[0], width), dtype=hidden_states.dtype, device=hidden_states.device)
 
     def forward(
         self,

@@ -218,31 +218,6 @@ def test_tts_local_seed_is_accepted_as_shared_speech_sampling_metadata():
 
 
 @torch.inference_mode()
-def test_model_state_warmup_covers_buckets_and_leaves_seeded_requests_unchanged():
-    state, reference = make_state(4), make_state(4)
-    _, requests = make_batch([0, 1, 2, 3])
-    calls = []
-    hook = state.model.multi_output.register_forward_pre_hook(lambda _module, args: calls.append(len(args[0])))
-    try:
-        state.warmup_sampling(torch.randn(4, 16), requests)
-    finally:
-        hook.remove()
-    assert calls == [1, 2, 4]
-    assert state.options == [None] * 4 and not state._generators
-    assert state._sample_output is None and not state._sampling_pending
-    assert not state.sampling_state.position.any()
-    assert not state.next_embeddings.any() and (state.history == -1).all()
-    params = SamplingParams(temperature=0.7, top_k=5, top_p=0.8, seed=42)
-    for instance in (state, reference):
-        add_sampling(instance, 0, params)
-        instance.apply_staged_writes()
-    hidden = torch.randn(1, 16)
-    _, actual = run(state, [0], hidden)
-    _, expected = run(reference, [0], hidden)
-    assert torch.equal(codes(actual), codes(expected))
-
-
-@torch.inference_mode()
 def test_official_rvq_filter_probabilities_with_repetition_and_delayed_min_frames(monkeypatch):
     root = os.environ.get("ZONOS3_REFERENCE_ROOT")
     if not root:

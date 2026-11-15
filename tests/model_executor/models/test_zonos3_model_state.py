@@ -306,7 +306,7 @@ def test_native_startup_decode_warmup_can_run_before_full_graph_capture(owner, m
     assert upstream.call_count == 1
 
 
-def test_zonos3_warmup_sampling_params_drop_text_logprobs(owner):
+def test_zonos3_startup_requests_drop_text_logprobs(owner):
     from vllm.v1.core.sched.output import NewRequestData
 
     state, _, _ = owner

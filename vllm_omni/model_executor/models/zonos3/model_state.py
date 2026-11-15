@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from typing import Any
 
@@ -19,7 +19,7 @@ from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, apply_top_k_top_p_pytorch
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, get_num_sampled_and_rejected
+from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -34,6 +34,7 @@ from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
 from .ar_config import Zonos3Architecture
+from .codec import ZACCodecChunk, ZACPCMOutput, Zonos3CodecModel
 from .modeling_zonos3_mini import Zonos3BackboneBatch, Zonos3ForCausalLM, Zonos3PrefillSpan
 from .sampling_state import EOS, Zonos3ARSamplingState
 
@@ -613,37 +614,6 @@ class Zonos3ARModelState(OmniModelState):
             raise RuntimeError("Zonos3 determined tokens require the current step's postprocess output")
         return output
 
-    def warmup_sampling(self, hidden_states: torch.Tensor, req_states: RequestState) -> None:
-        """Exercise the serving sampling path before requests, then reset its state."""
-        rows = min(hidden_states.shape[0], self.max_num_reqs)
-        buckets = self.vllm_config.compilation_config.cudagraph_capture_sizes or ()
-        sizes = sorted({1, rows, *(size for size in buckets if 0 < size <= rows)})
-        options = Zonos3SamplingOptions.from_params(
-            SamplingParams(temperature=0.9, top_k=50, top_p=0.9, min_p=0.1, repetition_penalty=1.2, seed=0),
-            self.model.config,
-            self.max_model_len,
-        )
-        slots = index_to_device(list(range(rows)), self.device)
-        buffers = InputBuffers(rows, rows, self.device)
-        try:
-            for slot in range(rows):
-                self._stage_sampling_options(slot, options)
-            self.apply_staged_writes()
-            for size in sizes:
-                self.sampling_state.reset(slots, torch.zeros(rows, dtype=torch.bool, device=self.device))
-                self.history.index_fill_(0, slots, -1)
-                batch = InputBatch.make_dummy(size, size, buffers)
-                self.postprocess_model_output(hidden_states[:size], batch, req_states)
-        finally:
-            self.sampling_state.reset(slots, torch.zeros(rows, dtype=torch.bool, device=self.device))
-            self.history.index_fill_(0, slots, -1)
-            self.next_embeddings.index_fill_(0, slots, 0)
-            for slot in range(rows):
-                self.options[slot] = None
-                self._generators.pop(slot, None)
-                self._sampling_pending.discard(slot)
-            self._sample_output = None
-
     def prepare_attn(
         self,
         input_batch: InputBatch,
@@ -677,7 +647,139 @@ class Zonos3ARModelState(OmniModelState):
         )
 
 
+@dataclass
+class CodecState:
+    slot: int
+    chunk_seq: int = 0
+    frames: int = 0
+    skip_samples: int = 0
+    emitted_samples: int = 0
+
+
 class Zonos3CodecModelState(OmniModelState):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        model: Zonos3CodecModel,
+        encoder_cache: EncoderCache | None,
+        device: torch.device,
+    ) -> None:
+        super().__init__(vllm_config, model, encoder_cache, device)
+        self._initialize_codec_state(vllm_config.scheduler_config.max_num_seqs)
+
+    def _initialize_codec_state(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("Codec request capacity must be positive")
+        self._free = list(range(capacity - 1, -1, -1))
+        self.states: dict[str, CodecState] = {}
+        self._finished: set[str] = set()
+        self._internal_to_external: dict[str, str] = {}
+        self._external_to_internal: dict[str, str] = {}
+
+    def prepare_inputs(self, input_batch: InputBatch, req_states: RequestState) -> dict[str, Any]:
+        return {**super().prepare_inputs(input_batch, req_states), "codec_state": self}
+
+    def _allocate(self, chunk: ZACCodecChunk) -> CodecState:
+        slot = self._free[-1]
+        self.model.graph.codec.reset(index_to_device([slot], self.device))
+        state = CodecState(slot=slot, skip_samples=chunk.skip_samples)
+        self._free.pop()
+        self.states[chunk.request_id] = state
+        return state
+
+    def release(self, request_id: str) -> None:
+        """Cancellation/completion never flushes stale partial audio."""
+        state = self.states.pop(request_id, None)
+        if state is not None:
+            self._free.append(state.slot)
+        self._finished.discard(request_id)
+
+    def on_requests_finished(self, req_ids: set[str]) -> None:
+        for internal_id in req_ids:
+            external_id = self._internal_to_external.pop(internal_id, None)
+            if external_id is not None:
+                self._external_to_internal.pop(external_id, None)
+                self.release(external_id)
+        super().on_requests_finished(req_ids)
+
+    def _validate(self, chunks: Sequence[ZACCodecChunk]) -> None:
+        ids = [chunk.request_id for chunk in chunks]
+        if len(ids) != len(set(ids)):
+            raise ValueError("A codec runner step must contain at most one chunk per request")
+        new = 0
+        for chunk in chunks:
+            if chunk.request_id in self._finished:
+                raise ValueError("Codec request already finished; completion cleanup is required before reuse")
+            state = self.states.get(chunk.request_id)
+            expected_seq, expected_frames = (0, 0) if state is None else (state.chunk_seq, state.frames)
+            if chunk.chunk_seq != expected_seq or chunk.frame_offset != expected_frames:
+                raise ValueError("Out-of-order or missing ZAC codec chunk")
+            if chunk.skip_samples < 0 or (state is not None and chunk.skip_samples):
+                raise ValueError("Codec context skip belongs only on the first chunk")
+            codes = chunk.codes
+            if codes.device.type != "cpu" or codes.dtype not in (torch.int32, torch.int64):
+                raise ValueError("Codec input must be CPU-materialized integer RVQ codes")
+            if codes.ndim != 2 or codes.shape[1] != 10:
+                raise ValueError("Expected ZAC codes [frames, 10]")
+            if bool(((codes < -1) | (codes >= self.model.network.config.codebook_size)).any()) or bool(
+                (codes[:, 0] < 0).any()
+            ):
+                raise ValueError("Invalid ZAC code index (only residual codebooks may be absent)")
+            if codes.shape[0] == 0 and not chunk.finished:
+                raise ValueError("Empty ZAC input must carry the final marker")
+            new += state is None
+        if new > len(self._free):
+            raise RuntimeError("No free ZAC decoder slots for the scheduled cohort")
+
+    @torch.inference_mode()
+    def decode(self, chunks: Sequence[ZACCodecChunk]) -> list[ZACPCMOutput]:
+        self._validate(chunks)
+        if any(len(chunk.codes) > self.model.max_chunk for chunk in chunks):
+            raise ValueError(f"Packed Codec input exceeds configured {self.model.max_chunk} RVQ frames per chunk")
+        if not chunks:
+            return []
+        succeeded = False
+        try:
+            for chunk in chunks:
+                if chunk.request_id not in self.states:
+                    self._allocate(chunk)
+            lengths = [len(chunk.codes) for chunk in chunks]
+            codes = torch.cat([chunk.codes.to(torch.long) for chunk in chunks])
+            if not codes.numel():
+                codes = torch.zeros(1, 10, dtype=torch.long, device="cpu")
+            slots = index_to_device([self.states[c.request_id].slot for c in chunks], self.device)
+            audio = self.model.decode_packed(codes, slots, lengths, [c.finished for c in chunks])
+            counts = [
+                self.model.graph.codec.output_end(self.states[c.request_id].frames + n, c.finished)
+                - self.states[c.request_id].emitted_samples
+                for c, n in zip(chunks, lengths, strict=True)
+            ]
+            # Own the whole cohort before another replay can overwrite graph storage.
+            owned = audio[: sum(counts)].clone()
+            outputs, offset = [], 0
+            for chunk, n, count in zip(chunks, lengths, counts, strict=True):
+                state = self.states[chunk.request_id]
+                skip = min(count, state.skip_samples)
+                outputs.append(
+                    ZACPCMOutput(
+                        chunk.request_id, chunk.chunk_seq, owned[offset + skip : offset + count], chunk.finished
+                    )
+                )
+                offset += count
+                state.skip_samples -= skip
+                state.frames += n
+                state.emitted_samples += count
+                state.chunk_seq += 1
+                if chunk.finished:
+                    self.release(chunk.request_id)
+                    self._finished.add(chunk.request_id)
+            succeeded = True
+            return outputs
+        finally:
+            if not succeeded:
+                for chunk in chunks:
+                    self.release(chunk.request_id)
+
     def on_request_preempted(self, req_id: str, req_index: int) -> None:
         del req_index
         raise RuntimeError(f"Zonos3 Codec does not support preemption/state recomputation: {req_id}")

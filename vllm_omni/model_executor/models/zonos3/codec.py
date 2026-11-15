@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict, cast
@@ -782,7 +782,7 @@ class ZACPackedSynthesis:
 class ZACPackedCodec(nn.Module):
     """Complete pack→pack Codec shared by eager execution and graph capture.
 
-    The manager owns slot initialization and output copies.
+    ModelState owns slot initialization and output copies.
     """
 
     def __init__(self, network: ZACDecoderNetwork, capacity: int, max_chunk: int, token_capacity: int) -> None:
@@ -839,149 +839,6 @@ class ZACPCMOutput:
     finished: bool
 
 
-@dataclass
-class _Stream:
-    slot: int
-    chunk_seq: int = 0
-    frames: int = 0
-    skip_samples: int = 0
-    emitted_samples: int = 0
-
-
-class CodecManager:
-    def __init__(
-        self,
-        network: ZACDecoderNetwork,
-        capacity: int,
-        *,
-        graph_batch_sizes: tuple[int, ...] = (),
-        graph_frame_sizes: tuple[int, ...] = (),
-        max_chunk: int = 31,
-    ) -> None:
-        from .cuda_graph_wrapper import ZACCodecGraphWrapper
-
-        if capacity < 1:
-            raise ValueError("Codec request capacity must be positive")
-        self.network = network
-        self.device = next(network.parameters()).device
-        self.max_chunk = max_chunk
-        self.graph = ZACCodecGraphWrapper(
-            network,
-            capacity,
-            max_chunk,
-            [(b, b * t) for b in graph_batch_sizes for t in graph_frame_sizes],
-        )
-        self.state = self.graph.codec.state
-        if graph_batch_sizes and self.device.type == "cuda":
-            self.graph.capture()
-        self._free = list(range(capacity - 1, -1, -1))
-        self._streams: dict[str, _Stream] = {}
-        self._finished: set[str] = set()
-
-    def _allocate(self, chunk: ZACCodecChunk) -> _Stream:
-        slot = self._free[-1]
-        self.graph.codec.reset(index_to_device([slot], self.device))
-        stream = _Stream(slot=slot, skip_samples=chunk.skip_samples)
-        self._free.pop()
-        self._streams[chunk.request_id] = stream
-        return stream
-
-    def release(self, request_id: str) -> None:
-        """Cancellation/completion hook: no stale partial audio is flushed."""
-        stream = self._streams.pop(request_id, None)
-        if stream is not None:
-            self._free.append(stream.slot)
-        self._finished.discard(request_id)
-
-    def _validate(self, chunks: Sequence[ZACCodecChunk]) -> None:
-        ids = [chunk.request_id for chunk in chunks]
-        if len(ids) != len(set(ids)):
-            raise ValueError("A codec runner step must contain at most one chunk per request")
-        new = 0
-        for chunk in chunks:
-            if chunk.request_id in self._finished:
-                raise ValueError("Codec request already finished; completion cleanup is required before reuse")
-            stream = self._streams.get(chunk.request_id)
-            expected_seq, expected_frames = (0, 0) if stream is None else (stream.chunk_seq, stream.frames)
-            if chunk.chunk_seq != expected_seq or chunk.frame_offset != expected_frames:
-                raise ValueError("Out-of-order or missing ZAC codec chunk")
-            if chunk.skip_samples < 0 or (stream is not None and chunk.skip_samples):
-                raise ValueError("Codec context skip belongs only on the first chunk")
-            codes = chunk.codes
-            if codes.device.type != "cpu" or codes.dtype not in (torch.int32, torch.int64):
-                raise ValueError("Codec input must be CPU-materialized integer RVQ codes")
-            if codes.ndim != 2 or codes.shape[1] != 10:
-                raise ValueError("Expected ZAC codes [frames, 10]")
-            # Only CPU data is inspected. Device execution has no sync to read
-            # code values, EOS, chunk position or valid lengths.
-            if bool(((codes < -1) | (codes >= self.network.config.codebook_size)).any()) or bool(
-                (codes[:, 0] < 0).any()
-            ):
-                raise ValueError("Invalid ZAC code index (only residual codebooks may be absent)")
-            if codes.shape[0] == 0 and not chunk.finished:
-                raise ValueError("Empty ZAC input must carry the final marker")
-            new += stream is None
-        if new > len(self._free):
-            raise RuntimeError("No free ZAC decoder slots for the scheduled cohort")
-
-    @torch.inference_mode()
-    def decode(self, chunks: Sequence[ZACCodecChunk]) -> list[ZACPCMOutput]:
-        self._validate(chunks)
-        if any(len(chunk.codes) > self.max_chunk for chunk in chunks):
-            raise ValueError(f"Packed Codec input exceeds configured {self.max_chunk} RVQ frames per chunk")
-        if not chunks:
-            return []
-        succeeded = False
-        try:
-            for chunk in chunks:
-                if chunk.request_id not in self._streams:
-                    self._allocate(chunk)
-            lengths = [len(chunk.codes) for chunk in chunks]
-            codes = torch.cat([chunk.codes.to(torch.long) for chunk in chunks])
-            if not codes.numel():
-                codes = torch.zeros(1, 10, dtype=torch.long, device="cpu")
-            slots = index_to_device([self._streams[c.request_id].slot for c in chunks], self.device)
-            audio, _, _ = self.graph(
-                to_device_nonblocking(codes, self.device),
-                slots,
-                index_to_device(lengths, self.device),
-                to_device_nonblocking(torch.tensor([c.finished for c in chunks], device="cpu"), self.device),
-            )
-            counts = [
-                self.graph.codec.output_end(self._streams[c.request_id].frames + n, c.finished)
-                - self._streams[c.request_id].emitted_samples
-                for c, n in zip(chunks, lengths, strict=True)
-            ]
-            # Graph outputs alias bucket storage. One owning copy survives later
-            # replays and asynchronous PCM materialization for the whole cohort.
-            owned = audio[: sum(counts)].clone()
-            outputs = []
-            offset = 0
-            for chunk, n, count in zip(chunks, lengths, counts, strict=True):
-                stream = self._streams[chunk.request_id]
-                skip = min(count, stream.skip_samples)
-                outputs.append(
-                    ZACPCMOutput(
-                        chunk.request_id, chunk.chunk_seq, owned[offset + skip : offset + count], chunk.finished
-                    )
-                )
-                offset += count
-                stream.skip_samples -= skip
-                stream.frames += n
-                stream.emitted_samples += count
-                stream.chunk_seq += 1
-                if chunk.finished:
-                    self.release(chunk.request_id)
-                    self._finished.add(chunk.request_id)
-            succeeded = True
-            return outputs
-        finally:
-            if not succeeded:
-                # Reclaim every slot in a partially mutated cohort before retry.
-                for chunk in chunks:
-                    self.release(chunk.request_id)
-
-
 if TYPE_CHECKING:
     from vllm.sequence import IntermediateTensors
     from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -1031,10 +888,8 @@ class Zonos3CodecModel(nn.Module):
         finally:
             torch.set_default_dtype(previous_dtype)
         self.allow_patterns_overrides = [self.files.generator]
-        self._manager: CodecManager | None = None
+        self.graph = None
         self._weights_loaded = False
-        self._internal_to_external: dict[str, str] = {}
-        self._external_to_internal: dict[str, str] = {}
 
     def create_mrv2_model_state(
         self, vllm_config: VllmConfig, encoder_cache: EncoderCache | None, device: torch.device
@@ -1043,8 +898,10 @@ class Zonos3CodecModel(nn.Module):
 
         return Zonos3CodecModelState(vllm_config, self, encoder_cache, device)
 
-    def _codec_manager(self) -> CodecManager:
-        if self._manager is None:
+    def _initialize_runtime(self) -> None:
+        from .cuda_graph_wrapper import ZACCodecGraphWrapper
+
+        if self.graph is None:
             capacity = self.vllm_config.scheduler_config.max_num_seqs
             connector = self.vllm_config.model_config.stage_connector_config
             extra = connector.get("extra", connector) if isinstance(connector, dict) else connector.extra
@@ -1059,14 +916,15 @@ class Zonos3CodecModel(nn.Module):
             batches = tuple(1 << i for i in range((capacity - 1).bit_length())) + (capacity,)
             if self.vllm_config.model_config.enforce_eager:
                 batches, frames = (), ()
-            self._manager = CodecManager(
+            self.graph = ZACCodecGraphWrapper(
                 self.network,
                 capacity,
-                graph_batch_sizes=batches,
-                graph_frame_sizes=frames,
-                max_chunk=max_chunk,
+                max_chunk,
+                [(b, b * t) for b in batches for t in frames],
             )
-        return self._manager
+            self.max_chunk = max_chunk
+            if batches and next(self.network.parameters()).device.type == "cuda":
+                self.graph.capture()
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: object = None) -> None:
         """Declare the native generation task, as other forward-only codecs do.
@@ -1075,6 +933,18 @@ class Zonos3CodecModel(nn.Module):
         logits. The method exists for upstream architecture/task inspection.
         """
         return None
+
+    def decode_packed(
+        self, codes: torch.Tensor, slots: torch.Tensor, lengths: list[int], final: list[bool]
+    ) -> torch.Tensor:
+        device = slots.device
+        audio, _, _ = self.graph(
+            to_device_nonblocking(codes, device),
+            slots,
+            index_to_device(lengths, device),
+            to_device_nonblocking(torch.tensor(final, device="cpu"), device),
+        )
+        return audio
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         # Native task inspection requires the embedding interface even for a
@@ -1098,6 +968,7 @@ class Zonos3CodecModel(nn.Module):
         sampling_metadata: object = None,
         logits_index: torch.Tensor | None = None,
         sampler: object = None,
+        codec_state: Zonos3CodecModelState | None = None,
     ) -> OmniOutput:
         del (
             input_ids,
@@ -1111,6 +982,8 @@ class Zonos3CodecModel(nn.Module):
         )
         if not self._weights_loaded:
             raise RuntimeError("Zonos3 Codec release weights have not been loaded")
+        if codec_state is None:
+            raise ValueError("Zonos3 Codec requires its native ModelState")
         infos = model_intermediate_buffer if model_intermediate_buffer is not None else runtime_additional_information
         if request_ids is None or infos is None or len(request_ids) != len(infos):
             raise ValueError("Zonos3 Codec needs one native request ID and payload per scheduled row")
@@ -1127,8 +1000,8 @@ class Zonos3CodecModel(nn.Module):
                 raise ValueError("Zonos3 Codec payload is missing its external request identity")
             external_id = meta["request_id"]
             if (
-                self._internal_to_external.get(internal_id, external_id) != external_id
-                or self._external_to_internal.get(external_id, internal_id) != internal_id
+                codec_state._internal_to_external.get(internal_id, external_id) != external_id
+                or codec_state._external_to_internal.get(external_id, internal_id) != internal_id
             ):
                 raise ValueError("Zonos3 Codec request identity changed without lifecycle cleanup")
             namespace = info.get("codes")
@@ -1153,29 +1026,21 @@ class Zonos3CodecModel(nn.Module):
         device = next(self.network.parameters()).device
         audio = [torch.empty(0, device=device, dtype=torch.float32) for _ in request_ids]
         if pending:
-            decoded = self._codec_manager().decode(pending)
+            decoded = codec_state.decode(pending)
             for i, output in zip(indices, decoded, strict=True):
                 audio[i] = output.audio
             for internal_id, external_id in bindings:
-                self._internal_to_external[internal_id] = external_id
-                self._external_to_internal[external_id] = internal_id
+                codec_state._internal_to_external[internal_id] = external_id
+                codec_state._external_to_internal[external_id] = internal_id
         payload = cast(
             OmniPayload, {"model_outputs": audio, "sr": [torch.tensor(44100, dtype=torch.int32)] * len(audio)}
         )
         return OmniOutput(text_hidden_states=torch.empty((len(audio), 0), device=device), multimodal_outputs=payload)
 
-    def on_requests_finished(self, finished_req_ids: set[str]) -> None:
-        for internal_id in finished_req_ids:
-            external_id = self._internal_to_external.pop(internal_id, None)
-            if external_id is not None:
-                self._external_to_internal.pop(external_id, None)
-                if self._manager is not None:
-                    self._manager.release(external_id)
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         # Release .pt files contain nested state dictionaries rather than flat
         # HF tensors. Resolve their exact paths and load strictly once; do not
-        # iterate the default loader's unrelated/nested tensor stream.
+        # iterate the default loader's unrelated/nested weight iterator.
         del weights
         if self._weights_loaded:
             raise RuntimeError("Zonos3 Codec release weights are already loaded")
@@ -1191,4 +1056,4 @@ class Zonos3CodecModel(nn.Module):
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
         self._weights_loaded = True
-        self._codec_manager()
+        self._initialize_runtime()

@@ -152,13 +152,6 @@ def _guard_graph_replay_for_pooler_copy(
 class OmniARModelRunner(OmniGPUModelRunner):
     """AR stage runner. Produces per-request hidden states + multimodal outputs."""
 
-    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
-        warmup = getattr(type(self.model_state), "warmup_sampling", None)
-        if warmup is not None:
-            warmup(self.model_state, hidden_states, self.req_states)
-            return
-        super()._dummy_sampler_run(hidden_states)
-
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.kv_transfer_manager: OmniKVTransferManager | None = None
