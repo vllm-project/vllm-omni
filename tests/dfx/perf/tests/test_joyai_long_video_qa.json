@@ -26,7 +26,8 @@
         "--trust-remote-code"
       ],
       "update": {
-        "duplex_session.collect_stats": true
+        "duplex_session.collect_stats": true,
+        "duplex_session.max_sessions": 8
       }
     },
     "benchmark_params": [
@@ -44,8 +45,7 @@
         "percentile-metrics": "ttft,e2el",
         "metric-percentiles": "50,95",
         "dataset_name": "ovo-bench",
-        "dataset_path": "/workspace/datasets/OVO-Bench/ovo_bench_new.json",
-        "long_video_media_root": "/workspace/datasets/OVO-Bench/src_videos",
+        "dataset_path": "JoeLeelyf/OVO-Bench@fec29e3385747b5642d995370143ba92d2819bd2",
         "long_video_ids": [
           "37",
           "316",
@@ -55,7 +55,7 @@
           3
         ],
         "max_concurrency": [
-          1
+          8
         ],
         "long_video_output_dir": "tests/dfx/perf/results/joyai_long_video/ovo-bench",
         "long_video_annotation_sha256": "dc4a90daf26764dc8ab8b228ea4af864ba2ea50c2833ead8c9af6573f78ccf97",
@@ -75,8 +75,7 @@
         "percentile-metrics": "ttft,e2el",
         "metric-percentiles": "50,95",
         "dataset_name": "videomme-streaming",
-        "dataset_path": "/workspace/datasets/Video-MME/videomme/test-00000-of-00001.parquet",
-        "long_video_media_root": "/workspace/datasets/Video-MME/video",
+        "dataset_path": "lmms-lab/Video-MME",
         "long_video_ids": [
           "322-1",
           "322-2",
@@ -89,7 +88,7 @@
           6
         ],
         "max_concurrency": [
-          1
+          8
         ],
         "long_video_output_dir": "tests/dfx/perf/results/joyai_long_video/videomme-streaming",
         "long_video_annotation_sha256": "7fffab8ed38ecc2f9f0eca4c44d8a11636f0ee96116ede83580c8b9ae0faf986",

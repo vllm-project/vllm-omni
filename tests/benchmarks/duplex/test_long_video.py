@@ -68,6 +68,7 @@ def test_cli_routes_real_annotations(tmp_path):
         ]
     )
     preprocess_serve_args(args)
+    assert args.max_concurrency == 1
     samples = get_samples(args, tokenizer=None)
     assert len(samples) == args.num_prompts == 1
     assert isinstance(samples[0], LongVideoSampleRequest)
@@ -95,8 +96,11 @@ def test_missing_or_forward_task_is_not_silently_dropped(tmp_path):
         load_video_questions(annotation, tmp_path, dataset="ovo-bench", ids=["37"])
 
 
-def test_videomme_official_flat_rows(tmp_path):
-    (tmp_path / "abc.mp4").touch()
+@pytest.mark.parametrize("folder", ["", "nested/short"])
+def test_videomme_official_rows(tmp_path, folder):
+    directory = tmp_path / folder
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "abc.mp4").touch()
     path = tmp_path / "mme.json"
     path.write_text(
         json.dumps(
@@ -136,6 +140,9 @@ def test_failed_and_invalid_answers_remain_in_denominator(tmp_path):
     assert report["accuracy"] == 1 / 3
     assert report["completed"] == 2
     assert report["valid_answers"] == 1
+    assert (tmp_path / "ovo-bench/0000-37/.done").is_file()
+    assert (tmp_path / "ovo-bench/0002-37/.failed.json").is_file()
+    assert json.loads((tmp_path / "ovo-bench/0002-37/result.json").read_text())["success"] is False
     assert json.loads((tmp_path / "accuracy.json").read_text())["samples"] == 3
 
 
@@ -193,6 +200,7 @@ def test_real_websocket_replay_and_cleanup(tmp_path, fail, text_event):
     Image.new("RGB", (16, 16), "red").save(frame)
     prepared = PreparedVideo((frame, frame), 0.12, "test-digest")
     commands = []
+    events = []
 
     async def exercise():
         async def handler(socket):
@@ -243,6 +251,7 @@ def test_real_websocket_replay_and_cleanup(tmp_path, fail, text_event):
                 fps=20,
                 timeout_s=1,
                 extra_body={},
+                events=events,
             )
 
     if fail:
@@ -257,6 +266,7 @@ def test_real_websocket_replay_and_cleanup(tmp_path, fail, text_event):
         question_at = next(when for when, event in commands if event["type"] == "conversation.item.create")
         assert question_at - appends[0] >= 0.1
     assert commands[-1][1]["type"] == "session.close"
+    assert any(event["type"] == ("error" if fail else "response.done") for event in events)
 
 
 def test_request_timeout_marks_failure_and_joins_cleanup(tmp_path, monkeypatch):

@@ -997,9 +997,15 @@ when inference takes longer than the input interval.
 Use the official [OVO annotations](https://github.com/JoeLeelyf/OVO-Bench/tree/main/data)
 and source videos, or the official
 [Video-MME parquet and videos](https://huggingface.co/datasets/lmms-lab/Video-MME).
+`--dataset-path` accepts a Hub ID, a local dataset directory, or an annotation
+file with `--long-video-media-root`. Hub sources use the Hugging Face cache;
+Video-MME reuses the existing Video-MME downloader and extraction layout.
+OVO downloads its pinned official annotations and source-video tar parts,
+then extracts them once under a file lock. Set `HF_HOME` to choose the cache
+and `HF_HUB_OFFLINE=1` to reuse a fully populated cache without downloading.
 All media is local during inference. OVO resolves each annotation's `video`
-relative to the media root. Video-MME resolves `<videoID>.mp4` in a flat video
-directory. `--long-video-annotation-sha256` pins the annotation file; each
+relative to the media root. Video-MME resolves `<videoID>.mp4` in flat or
+nested video directories. `--long-video-annotation-sha256` pins the annotation file; each
 result also records the source video's SHA256.
 
 ```bash
@@ -1041,7 +1047,15 @@ pytest tests/dfx/perf/scripts/run_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_joyai_long_video_qa.json -m local_model
 ```
 
-Set the local annotation/media paths in the JSON to match your dataset mirror.
+The JSON uses Hub IDs; local mirrors can be supplied through `dataset_path`.
+CLI default concurrency is 1, matching OmniInteract and Omni-DuplexEval.
+The local regression sets the client concurrency cap and server session capacity
+to 8. Its fixed subsets contain 3 OVO and 6 Video-MME questions, so their
+actual peak concurrency is bounded by those sample counts.
+Each run gets a fresh `run-*` directory containing `accuracy.json` and
+`<dataset>/<index>-<question-id>/result.json`, `events.json`, and a `.done` or
+`.failed.json` marker. Events retain response and commit diagnostics, including
+partial traces for failed sessions. The visual-only protocol produces text.
 Performance records go to `tests/dfx/perf/results/`; the same run writes the
 standard accuracy envelope, including `Hardware`, to
 `tests/e2e/accuracy/long_video_qa/results/`. The fixed questions report scores

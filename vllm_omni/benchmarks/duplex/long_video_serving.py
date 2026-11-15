@@ -31,9 +31,14 @@ class LongVideoSampleRequest(SampleRequest):
 
 
 def get_long_video_samples(args: argparse.Namespace) -> list[SampleRequest]:
+    from vllm_omni.benchmarks.data_modules.long_video_source import resolve_long_video_source
+
+    annotation, media_root = resolve_long_video_source(
+        args.dataset_path, dataset=args.dataset_name, media_root=args.long_video_media_root
+    )
     cases = load_video_questions(
-        Path(args.dataset_path),
-        Path(args.long_video_media_root),
+        annotation,
+        media_root,
         dataset=args.dataset_name,
         ids=args.long_video_ids,
     )
@@ -76,6 +81,7 @@ async def request_long_video(request, output, *, headers, pbar, total_timeout_s:
     sample = request.long_video_sample
     output.start_time = time.perf_counter()
     output.tpot_measured = False
+    output.long_video_events = []
     try:
         result = await asyncio.wait_for(
             run_video_question(
@@ -87,6 +93,7 @@ async def request_long_video(request, output, *, headers, pbar, total_timeout_s:
                 timeout_s=sample.timeout_s,
                 extra_body=dict(request.extra_body or {}),
                 headers=headers,
+                events=output.long_video_events,
             ),
             timeout=total_timeout_s,
         )
@@ -118,7 +125,8 @@ def extract_choice(text: str) -> str | None:
 def finalize_long_video(samples, outputs) -> dict | None:
     rows = []
     root = None
-    for sample, output in zip(samples, outputs, strict=True):
+    artifact_errors = []
+    for index, (sample, output) in enumerate(zip(samples, outputs, strict=True)):
         if not isinstance(sample, LongVideoSampleRequest):
             continue
         case = sample.case
@@ -143,6 +151,14 @@ def finalize_long_video(samples, outputs) -> dict | None:
                 **result,
             }
         )
+        try:
+            directory = root / case.dataset / f"{index:04d}-{case.id}"
+            directory.mkdir(parents=True, exist_ok=True)
+            _write_json(directory / "result.json", rows[-1])
+            _write_json(directory / "events.json", getattr(output, "long_video_events", []))
+            _write_json(directory / (".done" if output.success else ".failed.json"), {"error": output.error})
+        except OSError as exc:
+            artifact_errors.append(str(exc))
     if not rows:
         return None
     summary = {
@@ -157,8 +173,19 @@ def finalize_long_video(samples, outputs) -> dict | None:
         "output_dir": str(root),
         "items": rows,
     }
+    if artifact_errors:
+        summary["artifact_error"] = "; ".join(dict.fromkeys(artifact_errors))
     try:
-        (root / "accuracy.json").write_text(json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8")
+        _write_json(root / "accuracy.json", summary)
     except OSError as exc:
-        summary["artifact_error"] = str(exc)
+        artifact_errors.append(str(exc))
+    if artifact_errors:
+        summary["artifact_error"] = "; ".join(dict.fromkeys(artifact_errors))
     return summary
+
+
+def _write_json(path: Path, value) -> None:
+    with tempfile.TemporaryDirectory(dir=path.parent) as temporary:
+        staged = Path(temporary) / path.name
+        staged.write_text(json.dumps(value, indent=2, allow_nan=False), encoding="utf-8")
+        staged.replace(path)

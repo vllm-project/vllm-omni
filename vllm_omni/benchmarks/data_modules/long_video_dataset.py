@@ -51,6 +51,7 @@ def load_video_questions(
     selected: list[VideoQuestion] = []
     wanted = set(ids) if ids else None
     seen: set[str] = set()
+    video_index: dict[str, list[Path]] | None = None
     for row in rows:
         if dataset == "ovo-bench":
             # Forward responding has a different protocol and scoring rule.
@@ -73,6 +74,8 @@ def load_video_questions(
             identity = str(question["id"] if dataset == "ovo-bench" else question["question_id"])
             if wanted is not None and identity not in wanted:
                 continue
+            if identity in {"", ".", ".."} or "/" in identity or "\\" in identity:
+                raise ValueError(f"Invalid question ID: {identity}")
             if identity in seen:
                 raise ValueError(f"Duplicate question ID: {identity}")
             seen.add(identity)
@@ -91,6 +94,15 @@ def load_video_questions(
                 answer = question["answer"]
                 if answer not in {"A", "B", "C", "D"}:
                     raise ValueError(f"Invalid answer for {identity}")
+            if dataset == "videomme-streaming" and not video.is_file():
+                if video_index is None:
+                    video_index = {}
+                    for candidate in root.rglob("*.mp4"):
+                        video_index.setdefault(candidate.name, []).append(candidate)
+                matches = video_index.get(video.name, [])
+                if len(matches) != 1:
+                    raise ValueError(f"Expected one video matching {video.name}, found {len(matches)}")
+                video = matches[0]
             path = video.resolve()
             if not path.is_relative_to(root) or not path.is_file():
                 raise ValueError(f"Video must exist inside media root: {video}")

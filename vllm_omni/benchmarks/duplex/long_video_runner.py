@@ -79,6 +79,7 @@ async def replay_video(
     timeout_s: float,
     extra_body: dict[str, Any],
     headers: dict[str, str] | None = None,
+    events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """At most one observation response is in flight; record any pacing lag.
 
@@ -207,6 +208,13 @@ async def replay_video(
         finally:
             reader.cancel()
             await asyncio.gather(reader, return_exceptions=True)
+            if events is not None:
+                events.extend(
+                    event
+                    for event in collector.events
+                    if event.get("type", "").startswith("response.")
+                    or event.get("type") in {"error", "input_audio_buffer.committed"}
+                )
 
 
 async def run_video_question(
@@ -219,6 +227,7 @@ async def run_video_question(
     timeout_s: float,
     extra_body: dict[str, Any],
     headers: dict[str, str] | None = None,
+    events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     # This temporary directory lives until the session closes, including on
     # cancellation. Decode/resize and file IO stay off the websocket event loop.
@@ -242,6 +251,7 @@ async def run_video_question(
                 timeout_s=timeout_s,
                 extra_body=extra_body,
                 headers=headers,
+                events=events,
             ),
             timeout=prepared.duration_s + timeout_s,
         )
