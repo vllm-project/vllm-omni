@@ -28,7 +28,8 @@ async def receive_text_with_timeout(websocket: WebSocket, timeout_s: float | Non
         return await websocket.receive_text()
     try:
         return await asyncio.wait_for(websocket.receive_text(), timeout=timeout_s)
-    except TimeoutError:
+    # asyncio.TimeoutError is not the builtin TimeoutError before Python 3.11.
+    except (TimeoutError, asyncio.TimeoutError):
         return None
 
 

@@ -67,7 +67,6 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
             Denoised latents
         """
         self.scheduler.set_begin_index(0)
-        self.transformer.do_true_cfg = do_true_cfg
         additional_transformer_kwargs = additional_transformer_kwargs or {}
 
         with self.progress_bar(total=len(timesteps)) as pbar:

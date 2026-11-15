@@ -106,6 +106,16 @@ vllm serve nvidia/Cosmos3-Nano \
   --init-timeout 1800
 ```
 
+For a two-GPU pipeline-parallel deployment, add --pipeline-parallel-size 2:
+
+    vllm serve nvidia/Cosmos3-Nano \
+      --omni \
+      --host 0.0.0.0 --port 8000 \
+      --init-timeout 1800 \
+      --pipeline-parallel-size 2
+
+Cosmos3 Pipeline-Parallel is validated for T2V/I2V. Cache backends (TeaCache, SeaCache, Cache-DiT) cannot be used with Pipeline-Parallel; the server rejects `--cache-backend` when `--pipeline-parallel-size` is greater than 1. Model-level CPU offload (`--enable-cpu-offload`) is likewise rejected with Pipeline-Parallel.
+
 For Cosmos3, SeaCache is the recommended default choice when opting into
 diffusion caching. Caching remains opt-in; add `--cache-backend sea_cache` to
 the command above. Its default threshold and maximum cached-step streak are
@@ -126,9 +136,16 @@ speed, but can increase quality loss. Setting `sea_max_consecutive_cached` to
 `0` removes the streak cap.
 
 To run **without** guardrails (you are responsible for license compliance),
-add `--no-guardrails` (no token/`cosmos-guardrail` needed). For extra GPUs use
+add `--no-guardrails` (no token/`cosmos-guardrail` needed), or pass
+[`vllm_omni/deploy/cosmos3_omni.yaml`](../../vllm_omni/deploy/cosmos3_omni.yaml)
+via `--deploy-config` (same opt-in overlay as Super; `pipeline: cosmos3_omni_deploy`).
+For extra GPUs use
 `--ulysses-degree N` (context parallel) or `--tensor-parallel-size N`;
 `--enable-layerwise-offload` reduces VRAM on smaller GPUs;
+`--vae-fast-path channels_last` speeds up the Wan VAE video decode by switching the
+decoder convolutions to channels-last kernels (output no longer bit-identical to
+diffusers; the default `lossless` fast path is bit-exact, see
+[Wan VAE Decoder Fast Path](../../docs/user_guide/diffusion/vae_fast_path.md));
 `--quantization fp8` (online, no calibration) cuts peak VRAM for 720p video
 generation from ~50 GB to ~36 GB with BF16-level quality (T2V composition can
 shift at the same seed). The pipeline
@@ -166,6 +183,32 @@ The schedule currently supports one active request per worker. Model-level and
 layer-wise offload are designed to work with this live-weight path but still
 require GPU validation. Distributed layer-wise offload and incompatible native
 weight layouts fail during loading.
+
+#### Low-precision attention
+
+Add the appropriate option to your `vllm serve` command:
+
+- **Blackwell** — FlashInfer attention:
+
+    ```bash
+    --diffusion-attention-config \
+    '{"default": {
+      "backend": "FLASHINFER_ATTN",
+      "quant": {
+        "dtype_qk": "bfloat16",
+        "dtype_vo": "fp8_e4m3",
+        "flashinfer_backend": "auto"
+      }
+    }}'
+    ```
+
+- **Ampere / Ada / Hopper** — first
+  [install SageAttention](../../docs/user_guide/diffusion/attention_backends/sage.md#installation),
+  then use:
+
+    ```bash
+    --diffusion-attention-backend SAGE_ATTN
+    ```
 
 #### Verification
 
@@ -401,11 +444,21 @@ OpenPI route uses the normal API authentication middleware. RoboLab's
 
 #### Notes
 
-- **Measured latency (1x B300, bf16, guardrails off, diffusion cache off):**
-    - T2I 1024² — 10 / 25 / 50 steps → ~0.4 / 0.7 / **1.3 s**
-    - T2V 1280×720 @ 35 steps — 25 / 49 / 93 / **189** frames → ~7 / 15 / 33 / **~93 s**
-    - I2V 1280×720, 189 frames @ 35 steps → ~**99 s**
-    - Action 640×480 @ 30 steps — forward-dynamics 61f ~**4 s**, policy 17f ~**1–3 s**.
+- **Measured latency (1x B300, BF16 weights, guardrails off, diffusion cache off):**
+
+    | Workload | Baseline (BF16 attention) | Low-precision attention (BF16 Q/K + FP8 V) |
+    | --- | --- | --- |
+    | T2I 1024², 10 / 25 / **50** steps | ~0.4 / 1 / **2 s** | ~1 / 2 / **5 s** |
+    | T2V 1280×720, 25 / 49 / 93 / **189** frames, 35 steps | ~7 / 15 / 34 / **94 s** | ~8 / 15 / 32 / **82 s** |
+    | I2V 1280×720, 189 frames, 35 steps | **~94 s** | **~82 s** |
+    | Forward dynamics, AV, 640×480, 61 frames, 30 steps | **~3 s** | **~3 s** |
+    | Policy, Bridge, 640×480, 17 frames, 30 steps | **~1 s** | **~1 s** |
+
+    Measured using `vllm/vllm-omni:nightly-2139e3f158256c0480b5d848a9293980b14ef78d`.
+    Values are means of three end-to-end generations after one warmup
+    per workload and attention setting, using the server commands above with
+    guardrails and diffusion caching disabled.
+
     - Guardrails-on overhead: ~8% on T2I, negligible on video.
 - **Memory:** transformer ~17 GiB (bf16); peak ~46 GiB for 720p video on 1 GPU;
   full repo (transformer + Wan VAE + Qwen3-VL vision encoder + audio tokenizer)
@@ -724,8 +777,10 @@ vllm serve nvidia/Cosmos3-Nano \
 ```
 
 To run **without** guardrails (you are responsible for license compliance),
-add `--no-guardrails` (no token/`cosmos-guardrail` needed). For tensor parallel
-add `--tensor-parallel-size 8`. `--quantization fp8` and
+add `--no-guardrails` (no token/`cosmos-guardrail` needed), or pass
+[`vllm_omni/deploy/cosmos3_omni.yaml`](../../vllm_omni/deploy/cosmos3_omni.yaml)
+via `--deploy-config` (same opt-in overlay as Super; `pipeline: cosmos3_omni_deploy`).
+For tensor parallel add `--tensor-parallel-size 8`. `--quantization fp8` and
 `--enable-layerwise-offload` are not supported on NPU.
 The pipeline auto-resolves from `model_index.json`; pass
 `--model-class-name Cosmos3OmniDiffusersPipeline` to force it explicitly.

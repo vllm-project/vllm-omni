@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Ray-serializable verl-omni HTTP server test double for RLHF E2E tests.
 
@@ -10,31 +10,48 @@ Ray workers can unpickle ``vLLMOmniHttpServerLocal`` via
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import os
-from dataclasses import asdict
 from enum import Enum
 from typing import Any
 
+import psutil
 import torchvision.transforms as T
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
 from vllm.entrypoints.openai.api_server import build_app
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 import vllm_omni.entrypoints.cli.serve
-from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import omni_init_app_state
 from vllm_omni.inputs.data import OmniCustomPrompt, OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 logger = logging.getLogger(__name__)
 
 CUSTOM_PIPELINE_CLASS = "tests.e2e.features.helpers.custom_pipeline.QwenImagePipelineWithLogProbForTest"
 WORKER_EXTENSION_CLASS = "tests.e2e.features.helpers.custom_pipeline.vLLMOmniColocateWorkerExtensionForTest"
+
+
+def _snapshot_diffusion_workers() -> list[tuple[psutil.Process, float]]:
+    """Capture worker identities before shutdown can reparent descendants."""
+    try:
+        descendants = psutil.Process().children(recursive=True)
+    except psutil.Error:
+        return []
+
+    workers: list[tuple[psutil.Process, float]] = []
+    for proc in descendants:
+        try:
+            cmdline = proc.cmdline()
+            title = (cmdline[0] if cmdline and cmdline[0] else proc.name()).lower()
+            if title.startswith("vllm-omni::diffusionworker"):
+                workers.append((proc, proc.create_time()))
+        except psutil.Error:
+            continue
+    return workers
 
 
 class RolloutMode(Enum):
@@ -183,7 +200,6 @@ class vLLMOmniHttpServerLocal:
             "tensor_parallel_size": _cfg_get(self.config, "tensor_model_parallel_size", 1),
             "seed": self.replica_rank + int(_cfg_get(self.config, "seed", 0) or 0),
             "override_generation_config": json.dumps({}),
-            "scheduling_policy": _cfg_get(self.config, "scheduling_policy", "fcfs"),
             "compilation_config": compilation_config,
             **engine_kwargs,
         }
@@ -191,7 +207,7 @@ class vLLMOmniHttpServerLocal:
         model_path = str(_cfg_get(self.model_config, "local_path", None) or _cfg_get(self.model_config, "path"))
         server_args_list = ["serve", model_path] + build_cli_args_from_config(args)
 
-        parser = FlexibleArgumentParser(description="vLLM-Omni CLI")
+        parser = TrackingArgumentParser(description="vLLM-Omni CLI")
         subparsers = parser.add_subparsers(required=False, dest="subparser")
         cmds: dict[str, Any] = {}
         for cmd in vllm_omni.entrypoints.cli.serve.cmd_init():
@@ -204,11 +220,10 @@ class vLLMOmniHttpServerLocal:
 
         await self.run_server(parsed)
 
-    async def run_server(self, args: argparse.Namespace) -> None:
-        engine_args = OmniEngineArgs.from_cli_args(args)
-        engine_args = asdict(engine_args)
-
-        engine_args["enable_dummy_pipeline"] = True
+    async def run_server(self, args: TrackingNamespace) -> None:
+        # Match the production entrypoint: parser defaults are not user overrides.
+        engine_args = args.get_explicit_kwargs_dict()
+        engine_args["model"] = args.model
         engine_args["custom_pipeline_args"] = {"pipeline_class": CUSTOM_PIPELINE_CLASS}
 
         engine_client = AsyncOmni(**engine_args)
@@ -216,6 +231,28 @@ class vLLMOmniHttpServerLocal:
         await omni_init_app_state(engine_client, app.state, args)
 
         self.engine = engine_client
+
+    async def shutdown(self) -> None:
+        """Stop the diffusion engine before Ray destroys this actor."""
+        workers = _snapshot_diffusion_workers()
+        if self.engine is not None:
+            self.engine.shutdown()
+            self.engine = None
+        identities = {proc.pid: created for proc, created in workers}
+        _, alive = psutil.wait_procs([proc for proc, _ in workers], timeout=5)
+        remaining: list[int] = []
+        for proc in alive:
+            try:
+                if (
+                    proc.create_time() == identities[proc.pid]
+                    and proc.is_running()
+                    and proc.status() != psutil.STATUS_ZOMBIE
+                ):
+                    remaining.append(proc.pid)
+            except psutil.Error:
+                continue
+        if remaining:
+            raise RuntimeError(f"engine shutdown left diffusion worker PIDs: {remaining}")
 
     async def generate(
         self,
@@ -251,7 +288,10 @@ class vLLMOmniHttpServerLocal:
         sampling_kwargs["extra_args"] = extra_args
         diffusion_sampling_params = OmniDiffusionSamplingParams(**sampling_kwargs)
 
-        generator = self.engine.generate(
+        engine = self.engine
+        if engine is None:
+            raise RuntimeError("Server must be launched before generating")
+        generator = engine.generate(
             prompt=custom_prompt,
             request_id=request_id,
             sampling_params_list=[diffusion_sampling_params],

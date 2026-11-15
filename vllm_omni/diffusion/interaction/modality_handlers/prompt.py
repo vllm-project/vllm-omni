@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 import torch
@@ -14,6 +14,7 @@ from typing_extensions import override
 
 from vllm_omni.diffusion.interaction.modality_handlers.base import InteractionHandler
 from vllm_omni.diffusion.interaction.types import (
+    MAX_PENDING_INTERACTION_EVENTS,
     InteractionChunkMetadata,
     InteractionEvent,
     InteractionMode,
@@ -69,6 +70,7 @@ class PromptSession(InteractionSession):
     """Request-local prompt-update session under ``state.interaction_sessions['prompt']``."""
 
     pending_event: QueuedPromptEvent | None = None
+    coalesced_event_ids: list[str] = field(default_factory=list)
     active_event: QueuedPromptEvent | None = None
     version: int = 0
 
@@ -90,6 +92,7 @@ class PromptInteractionHandler(InteractionHandler):
     """
 
     modality: ClassVar[str] = "prompt"
+    lazy_initialize_session: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -113,16 +116,14 @@ class PromptInteractionHandler(InteractionHandler):
         )
 
     @override
-    def enqueue(
+    def validate_payload(
         self,
         state: StepRequestState,
         *,
         event_id: str,
-        received_at: float,
         payload: InteractionPayload,
         transition_chunks: int | None,
     ) -> None:
-        """Prompt updates are last-write-win and unbuffered at chunk boundary."""
         prompt = payload.get("prompt")
         if not isinstance(prompt, str) or not prompt:
             raise ValueError("prompt must be non-empty")
@@ -135,6 +136,33 @@ class PromptInteractionHandler(InteractionHandler):
         duration = DEFAULT_TRANSITION_CHUNKS if transition_chunks is None else transition_chunks
         if duration < 0:
             raise ValueError("transition_chunks must be >= 0")
+        session = state.interaction_sessions.get("prompt")
+        if isinstance(session, PromptSession):
+            with session.lock:
+                pending_count = len(session.coalesced_event_ids) + int(session.pending_event is not None)
+                if pending_count >= MAX_PENDING_INTERACTION_EVENTS:
+                    raise ValueError("too many pending prompt interactions; wait for the next chunk boundary")
+
+    @override
+    def enqueue(
+        self,
+        state: StepRequestState,
+        *,
+        event_id: str,
+        received_at: float,
+        payload: InteractionPayload,
+        transition_chunks: int | None,
+    ) -> None:
+        """Prompt updates are last-write-win and unbuffered at chunk boundary."""
+        self.validate_payload(
+            state,
+            event_id=event_id,
+            payload=payload,
+            transition_chunks=transition_chunks,
+        )
+        prompt = payload.get("prompt")
+        assert isinstance(prompt, str)
+        duration = DEFAULT_TRANSITION_CHUNKS if transition_chunks is None else transition_chunks
 
         target_prompt_embeds, _ = self._encode_prompt(
             prompt=prompt,
@@ -149,6 +177,11 @@ class PromptInteractionHandler(InteractionHandler):
         assert isinstance(session, PromptSession)
         with session.lock:
             # Chunk-level LWW: replace any prior pending event.
+            if session.pending_event is not None:
+                if session.pending_event.received_at > received_at:
+                    session.coalesced_event_ids.append(event_id)
+                    return
+                session.coalesced_event_ids.append(session.pending_event.event_id)
             session.pending_event = QueuedPromptEvent(
                 event_id=event_id,
                 received_at=received_at,
@@ -164,12 +197,13 @@ class PromptInteractionHandler(InteractionHandler):
         *,
         boundary_at: float,
         chunk_index: int | None = None,
-        num_frames: int | None = None,
+        num_media_frames: int | None = None,
         fps: float | None = None,
+        num_latent_frames: int | None = None,
     ) -> InteractionChunkMetadata | None:
         """Advance or start prompt interpolation before the next chunk."""
         # Prompt lerp is chunk-LWW; media timeline and caller chunk_index unused.
-        del chunk_index, num_frames, fps
+        del chunk_index, num_media_frames, fps, num_latent_frames
         session = state.interaction_sessions.get("prompt")
         assert isinstance(session, PromptSession)
 
@@ -184,6 +218,8 @@ class PromptInteractionHandler(InteractionHandler):
             session.last_boundary_at = boundary_at
             pending_event = session.pending_event
             session.pending_event = None
+            coalesced_event_ids = session.coalesced_event_ids
+            session.coalesced_event_ids = []
             active_event = session.active_event
 
             # If current transition is not complete, advance it.
@@ -220,6 +256,13 @@ class PromptInteractionHandler(InteractionHandler):
                 # Stage lerp-start embeds at activation (after any same-boundary advance).
                 pending_event.source_prompt_embeds = state.prompt_embeds.detach().clone()
                 pending_event.elapsed_transition_chunks = 0.0
+                if (
+                    active_event is not None
+                    and active_event.transition_chunks > 0
+                    and active_event.elapsed_transition_chunks < active_event.transition_chunks
+                    and active_event.event_id not in completed_event_ids
+                ):
+                    completed_event_ids.append(active_event.event_id)
                 session.active_event = pending_event
                 active_event = pending_event
                 event_id = pending_event.event_id
@@ -263,4 +306,5 @@ class PromptInteractionHandler(InteractionHandler):
             started_event_ids=started_event_ids,
             active_event_ids=active_event_ids,
             completed_event_ids=completed_event_ids,
+            coalesced_event_ids=coalesced_event_ids,
         )

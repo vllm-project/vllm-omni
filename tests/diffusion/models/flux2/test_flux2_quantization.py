@@ -16,17 +16,13 @@ class _RecordingBlock(nn.Module):
 
 
 def test_flux2_propagates_online_quant_config_to_all_transformer_blocks(monkeypatch):
-    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-
     from vllm_omni.diffusion.models.flux2 import flux2_transformer
+    from vllm_omni.quantization import build_quant_config
 
     monkeypatch.setattr(flux2_transformer, "Flux2TransformerBlock", _RecordingBlock)
     monkeypatch.setattr(flux2_transformer, "Flux2SingleTransformerBlock", _RecordingBlock)
 
-    quant_config = Fp8Config(
-        is_checkpoint_fp8_serialized=False,
-        activation_scheme="dynamic",
-    )
+    quant_config = build_quant_config("fp8")
     model = flux2_transformer.Flux2Transformer2DModel(
         in_channels=4,
         out_channels=4,

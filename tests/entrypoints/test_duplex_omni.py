@@ -15,6 +15,7 @@ from tests.entrypoints.test_omni_entrypoints import FakeAsyncOmniEngine
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import (
     AudioDelta,
     DuplexEvent,
@@ -41,9 +42,23 @@ class FakeDuplexEngine(FakeAsyncOmniEngine):
         self.duplex_session_config = DuplexSessionRuntimeConfig(max_sessions=2)
         self.duplex_capabilities = DuplexCapabilities(supports_session_resume=True)
         self.opened: list[tuple[str, DuplexSessionConfig]] = []
+        self.outputs: dict[str, DuplexOutputBuffer] = {}
         self.closed: list[tuple[str, str]] = []
         self.resumed: list[tuple[str, int]] = []
+        #: The control id of every resume RPC, in order (a replay repeats one).
+        self.resume_control_ids: list[str | None] = []
+        #: Per session: the control id that produced the current lease generation, and that generation.
+        self.lease: dict[str, tuple[str | None, int]] = {}
+        #: How many resume RPCs, after applying the resume, answer with a
+        #: timeout: the engine landed it but the waiter never saw the result.
+        self.resume_timeouts_remaining = 0
         self.touched: list[tuple[str, str]] = []
+        #: The lease-generation fence of every detach, in order (``None`` = unfenced).
+        self.detach_generations: list[int | None] = []
+        #: When set, ``resume_session_async`` parks on it after signalling ``resume_started``:
+        #: the engine has applied the resume, its result has not reached the caller.
+        self.resume_gate: asyncio.Event | None = None
+        self.resume_started = asyncio.Event()
         self.commands: list[tuple[str, commands.DuplexCommand]] = []
         self.open_error: DuplexSessionError | None = None
         self.close_error: DuplexSessionError | None = None
@@ -51,10 +66,11 @@ class FakeDuplexEngine(FakeAsyncOmniEngine):
     def _result(self, operation: str, session_id: str, **fields: Any) -> DuplexControlResultMessage:
         return DuplexControlResultMessage(control_id="c", operation=operation, session_id=session_id, ok=True, **fields)
 
-    async def open_session_async(self, session_id, session_config, *, timeout=None):
+    async def open_session_async(self, session_id, session_config, *, output_buffer, timeout=None):
         self.opened.append((session_id, session_config))
         if self.open_error is not None:
             raise self.open_error
+        self.outputs[session_id] = output_buffer
         return self._result(
             "open",
             session_id,
@@ -71,12 +87,33 @@ class FakeDuplexEngine(FakeAsyncOmniEngine):
         self.emit(session_id, SessionClosed(reason=reason))
         return self._result("close", session_id)
 
-    async def resume_session_async(self, session_id, *, expected_lease_generation, timeout=None):
+    async def resume_session_async(self, session_id, *, expected_lease_generation, control_id=None, timeout=None):
         self.resumed.append((session_id, expected_lease_generation))
-        return self._result("resume", session_id, lease_generation=expected_lease_generation + 1)
+        self.resume_control_ids.append(control_id)
+        resumed_by, generation = self.lease.get(session_id, (None, 0))
+        if control_id is not None and control_id == resumed_by:
+            # The engine's replay answer: the generation this resume produced.
+            # Its answer can be lost to a timeout exactly like the first one.
+            if self.resume_timeouts_remaining > 0:
+                self.resume_timeouts_remaining -= 1
+                raise DuplexSessionError("duplex resume timed out", code="timeout", retryable=True)
+            return self._result("resume", session_id, lease_generation=generation)
+        if expected_lease_generation != generation:
+            raise DuplexSessionError("duplex lease generation mismatch", code="session_resume_conflict")
+        generation += 1
+        self.lease[session_id] = (control_id, generation)
+        if self.resume_gate is not None:
+            self.resume_started.set()
+            await self.resume_gate.wait()
+        if self.resume_timeouts_remaining > 0:
+            self.resume_timeouts_remaining -= 1
+            raise DuplexSessionError("duplex resume timed out", code="timeout", retryable=True)
+        return self._result("resume", session_id, lease_generation=generation)
 
-    async def touch_session_async(self, session_id, *, activity, timeout=None):
+    async def touch_session_async(self, session_id, *, activity, expected_lease_generation=None, timeout=None):
         self.touched.append((session_id, activity))
+        if activity == "detach":
+            self.detach_generations.append(expected_lease_generation)
         return self._result("touch", session_id)
 
     async def submit_command_async(self, session_id, command):
@@ -85,7 +122,11 @@ class FakeDuplexEngine(FakeAsyncOmniEngine):
     def emit(self, session_id: str, event: DuplexEvent) -> None:
         # The session manager binds the session identity to every event it emits.
         event = replace(event, session_id=session_id)
-        self.output_q.put(DuplexSessionEventMessage(session_id=session_id, event=event))
+        if isinstance(event, SessionClosed):
+            self.outputs.pop(session_id, None)
+            self.output_q.put(DuplexSessionEventMessage(session_id=session_id, event=event))
+        elif session_id in self.outputs:
+            self.outputs[session_id].put(event)
 
 
 def _make_omni(monkeypatch: pytest.MonkeyPatch) -> tuple[DuplexOmni, FakeDuplexEngine]:
@@ -118,6 +159,7 @@ async def test_open_session_allocates_the_id_and_ignores_client_ids(monkeypatch)
         assert handle.session_id != "mine"
         ((session_id, config),) = engine.opened
         assert session_id == handle.session_id
+        assert engine.outputs[session_id] is handle._outbox
         assert isinstance(config, DuplexSessionConfig)
         assert config.model == "dummy-model" and config.instructions == "hi"
         assert handle.capabilities is engine.duplex_capabilities
@@ -131,6 +173,32 @@ async def test_open_session_allocates_the_id_and_ignores_client_ids(monkeypatch)
         assert engine.opened[1][1].model == "dummy-model"
         assert omni.duplex_session_config.max_sessions == 2
         assert omni.duplex_capabilities.supports_session_resume is True
+    finally:
+        omni.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_events_skips_audio_invalidated_after_dequeue(monkeypatch) -> None:
+    omni, engine = _make_omni(monkeypatch)
+    try:
+        handle = await omni.open_session()
+        output = engine.outputs[handle.session_id]
+        original_get = output.get
+
+        async def get_then_invalidate() -> DuplexEvent | None:
+            event = await original_get()
+            if isinstance(event, AudioDelta) and event.response_id == "cancelled":
+                output.invalidate("cancelled", through_epoch=0)
+            return event
+
+        monkeypatch.setattr(output, "get", get_then_invalidate)
+        engine.emit(handle.session_id, AudioDelta(response_id="cancelled", epoch=0, delta="old"))
+        engine.emit(handle.session_id, AudioDelta(response_id="current", epoch=1, delta="new"))
+
+        events = await _collect(handle, 1)
+
+        assert isinstance(events[0], AudioDelta)
+        assert events[0].response_id == "current" and events[0].delta == "new"
     finally:
         omni.shutdown()
 
@@ -324,3 +392,141 @@ async def test_shutdown_closes_every_handle(monkeypatch) -> None:
     assert first.close_reason == "shutdown"
     assert omni.sessions == {}
     assert engine.shutdown_called
+
+
+@pytest.mark.asyncio
+async def test_detach_session_forwards_the_lease_generation_fence(monkeypatch) -> None:
+    omni, engine = _make_omni(monkeypatch)
+    try:
+        handle = await omni.open_session()
+        await omni.detach_session(handle.session_id, expected_lease_generation=3)
+        await omni.detach_session(handle.session_id)
+        assert engine.detach_generations == [3, None]
+    finally:
+        omni.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_resume_cancelled_mid_rpc_is_adopted_and_detached_once_it_lands(monkeypatch) -> None:
+    """The resume RPC runs in an executor: cancelling its waiter does not stop the engine.
+
+    Without compensation the engine ends up with the lease resumed (no
+    disconnect grace) for a connection that is gone, and the handle keeps the
+    old generation, so a later reconnect resumes against a stale lease. The
+    outcome has to be observed off the cancelled task: adopt the generation
+    the resume produced and detach exactly that lease.
+    """
+    omni, engine = _make_omni(monkeypatch)
+    try:
+        handle = await omni.open_session()
+        engine.resume_gate = asyncio.Event()
+        resume = asyncio.create_task(omni.resume_session(handle.session_id, expected_lease_generation=0))
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+
+        resume.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await resume
+        # Nothing to give back yet: the engine has not answered.
+        assert handle.lease_generation == 0
+        assert engine.detach_generations == []
+
+        engine.resume_gate.set()
+        await asyncio.gather(*list(omni._resume_compensations))
+        assert handle.lease_generation == 1, "the generation the resume produced is adopted"
+        assert engine.touched == [(handle.session_id, "detach")]
+        assert engine.detach_generations == [1], "the detach is fenced on that generation"
+    finally:
+        omni.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_resume_cancelled_then_timed_out_is_settled_by_replaying_it(monkeypatch) -> None:
+    """A timeout after the cancel leaves the outcome unknown: the resume is replayed under its id.
+
+    The engine may have applied the resume after the waiter gave up, and the
+    RPC router drops the late answer. Replaying the same control id makes the
+    engine report the generation that resume produced (or land it now), so
+    the handle adopts the real generation and the lease is detached again.
+    """
+    omni, engine = _make_omni(monkeypatch)
+    try:
+        handle = await omni.open_session()
+        engine.resume_gate = asyncio.Event()
+        engine.resume_timeouts_remaining = 1
+        resume = asyncio.create_task(omni.resume_session(handle.session_id, expected_lease_generation=0))
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+
+        resume.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await resume
+        engine.resume_gate.set()
+        await asyncio.gather(*list(omni._resume_compensations))
+
+        assert len(engine.resume_control_ids) == 2, "the resume was replayed once"
+        assert engine.resume_control_ids[0] == engine.resume_control_ids[1] is not None
+        assert engine.lease[handle.session_id][1] == 1, "the replay did not resume a second time"
+        assert handle.lease_generation == 1
+        assert engine.detach_generations == [1]
+    finally:
+        omni.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_resume_is_settled_through_the_callers_callback(monkeypatch) -> None:
+    """A caller that owns attachments decides what the landed generation means; DuplexOmni does not detach."""
+    omni, engine = _make_omni(monkeypatch)
+    try:
+        handle = await omni.open_session()
+        settled: list[int] = []
+
+        async def on_abandoned(lease_generation: int) -> None:
+            settled.append(lease_generation)
+
+        engine.resume_gate = asyncio.Event()
+        resume = asyncio.create_task(
+            omni.resume_session(handle.session_id, expected_lease_generation=0, on_abandoned=on_abandoned)
+        )
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+        resume.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await resume
+        engine.resume_gate.set()
+        await asyncio.gather(*list(omni._resume_compensations))
+
+        assert settled == [1]
+        assert handle.lease_generation == 1
+        assert engine.detach_generations == [], "the callback owns the decision"
+    finally:
+        omni.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_resume_keeps_replaying_across_repeated_timeouts(monkeypatch) -> None:
+    """A replay can time out too; giving up then would reopen the lost-answer window.
+
+    The engine applied the resume, the abandoned RPC and the first replay both
+    lose their answers to timeouts, the second replay is answered: the handle
+    adopts the generation and the lease is settled, with the lease bumped once.
+    """
+    omni, engine = _make_omni(monkeypatch)
+    try:
+        omni._resume_replay_backoff_s = (0.01, 0.02)
+        handle = await omni.open_session()
+        engine.resume_gate = asyncio.Event()
+        engine.resume_timeouts_remaining = 2
+        resume = asyncio.create_task(omni.resume_session(handle.session_id, expected_lease_generation=0))
+        await asyncio.wait_for(engine.resume_started.wait(), timeout=2.0)
+
+        resume.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await resume
+        engine.resume_gate.set()
+        await asyncio.wait_for(asyncio.gather(*list(omni._resume_compensations)), timeout=5.0)
+
+        assert len(engine.resume_control_ids) == 3, "the abandoned RPC, a replay that timed out, the replay answered"
+        assert len(set(engine.resume_control_ids)) == 1
+        assert engine.lease[handle.session_id][1] == 1, "the lease was bumped once"
+        assert handle.lease_generation == 1
+        assert engine.detach_generations == [1]
+    finally:
+        omni.shutdown()

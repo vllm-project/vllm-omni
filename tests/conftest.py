@@ -23,6 +23,7 @@ bootstrap_vllm_layer_custom_op_modules()
 pytest_plugins = (
     "tests.helpers.fixtures.config",
     "tests.helpers.fixtures.clean",
+    "tests.helpers.fixtures.cpu_threads",
     "tests.helpers.fixtures.log",
     "tests.helpers.fixtures.media",
     "tests.helpers.fixtures.pytest_collection",

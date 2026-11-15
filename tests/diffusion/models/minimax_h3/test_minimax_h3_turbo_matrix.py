@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from vllm_omni.diffusion.models.minimax_h3.lora import (
@@ -77,6 +79,29 @@ def _spec(filename: str) -> TurboSpec:
 def test_sigma_points_follow_the_step_count() -> None:
     assert _spec("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors").sigma_points == 5
     assert _spec("minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors").sigma_points == 9
+
+
+@pytest.mark.parametrize(("filename", "task", "steps", "video_shift"), PUBLISHED)
+def test_turbo_request_counts_evaluations_and_preserves_sigma_grid(filename, task, steps, video_shift):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
+    from vllm_omni.errors import OmniClientError
+
+    spec = _spec(filename)
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    pipeline.default_video_shift = video_shift
+    pipeline.default_audio_shift = spec.audio_shift
+    sampling = SimpleNamespace(num_inference_steps=steps, extra_args={})
+    pipeline._validate_turbo_sampling(sampling, spec)
+    for shift in (video_shift, spec.audio_shift):
+        sigmas = minimax_h3_time_shift_sigmas(num_steps=steps, shift_scale=shift)
+        # The old point-count API requested steps + 1 points on this same grid.
+        base = [1.0 - i / steps for i in range(steps + 1)]
+        expected = [shift * value / (1 + (shift - 1) * value) for value in base]
+        assert sigmas == pytest.approx(expected, abs=1e-7)
+    sampling.num_inference_steps = spec.sigma_points
+    with pytest.raises(OmniClientError, match=f"num_inference_steps={steps}"):
+        pipeline._validate_turbo_sampling(sampling, spec)
 
 
 def test_task_family_decides_supported_tasks() -> None:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 
 import torch
@@ -183,6 +183,10 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
         return free, total
 
     @classmethod
+    def memory_reserved(cls, device: torch.device | int | None = None) -> int:
+        return int(torch.musa.memory_reserved(device))
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return torch.musa.get_device_name(device_id)
 
@@ -190,7 +194,7 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
     def set_device_control_env_var(cls, devices: str | int | None) -> None:
         import os
 
-        os.environ["MUSA_VISIBLE_DEVICES"] = devices
+        os.environ["MUSA_VISIBLE_DEVICES"] = "" if devices is None else str(devices)
 
     @classmethod
     def unset_device_control_env_var(cls) -> None:

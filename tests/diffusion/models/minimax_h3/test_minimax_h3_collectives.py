@@ -11,6 +11,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tests.helpers.mark import hardware_test
+
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
@@ -87,7 +89,8 @@ def _collective_worker(rank, rendezvous, backend):
         sampling = OmniDiffusionSamplingParams(
             height=32, width=32, num_frames=96, extra_args={"task": "t2va", "aspect_ratio": "1:1"}
         )
-        text_conditioning = model._prepare_local_conditioning({"prompt": "test"}, sampling)
+        text_conditioning, window_text = model._prepare_local_conditioning({"prompt": "test"}, sampling)
+        assert window_text is None
         torch.testing.assert_close(text_conditioning.hidden_states, torch.full_like(text_conditioning.hidden_states, 2))
         assert text_conditioning.visual_condition is None
 
@@ -145,7 +148,7 @@ def test_two_rank_conditioning_and_errors_gloo(tmp_path):
     _run_collectives(tmp_path, "gloo")
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=2)
 @pytest.mark.parallel
 @pytest.mark.skipif(
     os.environ.get("VLLM_TEST_MINIMAX_H3_COLLECTIVES") != "1",

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,8 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from transformers.configuration_utils import PretrainedConfig, layer_type_validation
-from transformers.modeling_rope_utils import rope_config_validation
+from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
@@ -20,7 +22,8 @@ logger = logging.get_logger(__name__)
 
 class Qwen3TTSSpeakerEncoderConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`Qwen3TTSSpeakerEncoder`].
+    This is the configuration class to store the configuration of the Qwen3TTS speaker encoder
+    ([`ECAPATimeDelayNet`]).
     It is used to instantiate a Qwen3TTS speaker encoder model according to the specified arguments, defining the model
     architecture. The architecture is based on the ECAPA-TDNN model.
 
@@ -244,7 +247,8 @@ class Qwen3TTSTalkerCodePredictorConfig(PretrainedConfig):
         # BC: if there is a 'type' field, move it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-        rope_config_validation(self)
+        self.standardize_rope_params()
+        self.validate_rope()
 
         self.layer_types = layer_types
         if self.layer_types is None:
@@ -254,7 +258,7 @@ class Qwen3TTSTalkerCodePredictorConfig(PretrainedConfig):
                 else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
-        layer_type_validation(self.layer_types)
+        self.validate_layer_type()
         self.num_code_groups = num_code_groups
 
 
@@ -533,6 +537,10 @@ class Qwen3TTSConfig(PretrainedConfig):
         if any("Code2Wav" in str(a) for a in archs):
             if hasattr(config, "rope_parameters"):
                 delattr(config, "rope_parameters")
+            # Code2Wav doesn't use position embeddings, but vLLM validates
+            # max_model_len <= max_position_embeddings. Set a large value
+            # to allow the pipeline.yaml max_model_len (65536) to pass validation.
+            config.max_position_embeddings = 131072
         return config
 
 

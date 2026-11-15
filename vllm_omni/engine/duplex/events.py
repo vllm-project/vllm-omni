@@ -4,8 +4,8 @@
 """The event vocabulary one duplex session speaks, assembled from two layers.
 
 The classes themselves no longer live here. ``vllm_omni.protocol.duplex.events``
-carries the whole vocabulary --- 22 Tier 1 classes re-exported from
-``vllm_omni.protocol.realtime.events``, 8 Tier 2 ones and 12 Tier 3 ones --- so
+carries the whole vocabulary --- 21 Tier 1 classes re-exported from
+``vllm_omni.protocol.realtime.events``, 9 Tier 2 ones and 13 Tier 3 ones --- so
 a non-duplex Realtime consumer can take the Tier 1 half and its wire rendering
 without the duplex session control plane (RFC #6592 P0a). The engine imports
 the duplex module and never the Tier 1 one directly.
@@ -61,6 +61,7 @@ from vllm_omni.protocol.duplex.events import (
     SessionReplaced,
     SessionResumed,
     SessionResyncRequired,
+    SessionStats,
     SessionUpdated,
     Speak,
     SpeechStarted,
@@ -74,6 +75,7 @@ from vllm_omni.protocol.duplex.events import (
     new_event_id,
 )
 
+#: Internal events that terminate a response/session and must never be dropped as stale.
 DOMAIN_TERMINAL_EVENTS = frozenset(
     {
         "response.done",
@@ -140,6 +142,7 @@ __all__ = [
     "SessionCreated",
     "SessionExpired",
     "SessionHeartbeatAck",
+    "SessionStats",
     "SessionReplaced",
     "SessionResumed",
     "SessionResyncRequired",

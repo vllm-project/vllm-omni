@@ -96,6 +96,19 @@ This document owns offline API semantics, CLI and serve composition,
 supported OpenAI-compatible routes, request validation and normalization,
 response conversion, streaming/session behavior, and engine handoff.
 
+The serving composition removes inherited `/tokenize`, `/detokenize`, and
+optional `/tokenizer_info` routes when no tokenization handler is configured
+(including pure diffusion mode). These endpoints return HTTP 404 and are absent
+from OpenAPI in that mode; configured handlers retain upstream vLLM routing.
+
+An optional `--video-output-warmup` request runs through the streaming video
+handler before HTTP serving starts. The frontend owns request validation,
+draining generation and encoding, and the startup deadline. It does not expose
+`/health` or admit traffic until that request completes successfully. Failure
+aborts the internal request and unwinds engine startup. The request explicitly
+supplies model-specific inputs and a finite frame count; playback pacing is
+rejected because there is no player. Omitting the option skips this warmup.
+
 When `--api-server-count` is greater than one, the serve composition root
 starts the frontend process manager while a parent-owned `StageRuntime`
 launches the shared local stage engines. Each frontend receives only its own
@@ -191,6 +204,14 @@ stage so `wake_up(stage_ids=[0])` does not skip a later `wake_up(stage_ids=[1])`
 Streaming input pumps take an admission slot immediately before each EngineCore
 ADD or update, not while waiting for the next client chunk. Frontend abort
 keeps `request_states` until `generate()` consumes the terminal output.
+Video output sessions shield final task cleanup and unfinished-request abort
+from ASGI cancellation, including disconnects immediately after `session.done`.
+Video encoding and encoder close run on one worker per stream so encoding does
+not block control handling. Cancellation queues close after any running encode;
+the event loop does not join that worker while it drains cleanup.
+Abort cleanup bounds both its coroutine and the engine acknowledgement wait
+with `ABORT_TIMEOUT_S`; an unresponsive orchestrator must not hold the shield
+indefinitely.
 Multi-API serving must preserve one client rank and one channel set per
 frontend, include every frontend in readiness/failure observation, and keep
 stage lifecycle ownership in the parent composition root.

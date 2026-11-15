@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import ctypes
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -14,45 +16,23 @@ from vllm_omni.diffusion.distributed import a2a_permute
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_jit_build_includes_cuda_headers_from_nvidia_wheels(tmp_path, monkeypatch) -> None:
-    cu13_include = tmp_path / "nvidia" / "cu13" / "include"
-    nccl_include = tmp_path / "nvidia" / "nccl" / "include"
-    nccl_lib = tmp_path / "nvidia" / "nccl" / "lib" / "libnccl.so.2"
-    cu13_include.mkdir(parents=True)
-    nccl_include.mkdir(parents=True)
-    nccl_lib.parent.mkdir(parents=True)
-    (cu13_include / "cusparse.h").touch()
-    (nccl_include / "nccl.h").touch()
-    nccl_lib.touch()
-
-    load_kwargs = {}
-    monkeypatch.setattr(a2a_permute.sysconfig, "get_paths", lambda: {"purelib": str(tmp_path)})
-    monkeypatch.setattr(
-        torch.utils.cpp_extension,
-        "load",
-        lambda **kwargs: load_kwargs.update(kwargs),
-    )
-    monkeypatch.setattr(a2a_permute.symm_mem, "set_backend", lambda _backend: None)
-    monkeypatch.setattr(a2a_permute, "_BUILT", False)
-
-    a2a_permute.ensure_a2a_permute_available()
-
-    assert set(load_kwargs["extra_include_paths"]) == {str(cu13_include), str(nccl_include)}
-    assert load_kwargs["extra_ldflags"] == [str(nccl_lib)]
-
-
 @dataclass
 class _FakeAllocation:
-    """Byte workspace stand-in that slices and reinterprets like ``symm_mem.empty()``."""
-
     size: int
     device: torch.device
 
-    def __post_init__(self) -> None:
-        self.buffer = torch.empty(self.size, dtype=torch.uint8)
 
-    def __getitem__(self, item: slice) -> torch.Tensor:
-        return self.buffer[item]
+class _FakeHandle:
+    rank = 0
+
+    def __init__(self, allocation: _FakeAllocation) -> None:
+        self.allocation = allocation
+        self.views: list[tuple[tuple[int, ...], torch.dtype]] = []
+
+    def get_buffer(self, rank, shape, dtype):
+        assert rank == self.rank
+        self.views.append((shape, dtype))
+        return self.allocation, shape, dtype
 
 
 def test_workspace_reuses_peak_capacity_across_shapes(monkeypatch) -> None:
@@ -87,21 +67,26 @@ def test_workspace_reuses_peak_capacity_across_shapes(monkeypatch) -> None:
         allocations.append(allocation)
         return allocation
 
-    monkeypatch.setattr(a2a_permute.symm_mem, "empty", empty)
-    # The handle is only retained to keep the rendezvous registration alive.
-    monkeypatch.setattr(a2a_permute.symm_mem, "rendezvous", lambda _allocation, _group: object())
+    monkeypatch.setattr(
+        a2a_permute.symm_mem,
+        "_SymmetricMemory",
+        SimpleNamespace(
+            empty_strided_p2p=lambda shape, stride, dtype, device: empty(shape[0], dtype=dtype, device=device)
+        ),
+    )
+    monkeypatch.setattr(a2a_permute.symm_mem, "rendezvous", lambda allocation, _group: _FakeHandle(allocation))
 
     device = torch.device("cuda:0")
     first = a2a_permute._get_symm_buffer((2, 3), torch.float16, device, "group")
+    handle = a2a_permute._SYMM_WORKSPACES[(device, "group")].handle
+    assert a2a_permute._get_symm_buffer((2, 3), torch.float16, device, "group") is first
+    assert handle.views == [((2, 3), torch.float16)]
     smaller = a2a_permute._get_symm_buffer((1, 4), torch.float16, device, "group")
     larger = a2a_permute._get_symm_buffer((4, 3), torch.float16, device, "group")
 
-    assert (first.shape, first.dtype) == ((2, 3), torch.float16)
-    assert (smaller.shape, smaller.dtype) == ((1, 4), torch.float16)
-    assert (larger.shape, larger.dtype) == ((4, 3), torch.float16)
-    # A sub-capacity request reuses the workspace; only growth allocates again.
-    assert smaller.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
-    assert larger.untyped_storage().data_ptr() != first.untyped_storage().data_ptr()
+    assert first[0].size == 12
+    assert smaller[0] is first[0]
+    assert larger[0].size == 24
     assert [allocation.size for allocation in allocations] == [12, 24]
     assert len(a2a_permute._SYMM_WORKSPACES) == 1
     assert len(all_reduce_calls) == 1
@@ -114,3 +99,194 @@ def test_workspace_reuses_peak_capacity_across_shapes(monkeypatch) -> None:
     a2a_permute.clear_a2a_permute_workspaces()
     assert not a2a_permute._SYMM_WORKSPACES
     assert synchronize_calls == [device, device, device]
+
+
+def test_ce_reuses_plans_and_graphs_across_qkv_gate_output_cycles(monkeypatch, mocker):
+    """Run the real cache/Graph policy on CPU; only CUDA execution is mocked."""
+    stream = mocker.Mock(cuda_stream=17)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: stream)
+    monkeypatch.setattr(torch.cuda, "Event", mocker.Mock)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    captures = mocker.patch.object(torch.cuda, "CUDAGraph", side_effect=mocker.Mock)
+    mocker.patch.object(torch.cuda, "graph", side_effect=lambda graph, stream: nullcontext())
+    transfers = mocker.patch.object(a2a_permute._CEPlan, "_run_eager")
+    monkeypatch.setattr(a2a_permute, "_ce_runtime", lambda: None)
+
+    x = torch.zeros(1, 8, 4, 4)
+    allocation = torch.empty(3 * x.numel())
+    handle = mocker.Mock(rank=0, buffer_ptrs=[allocation.data_ptr()] * 2)
+    workspace = a2a_permute._SymmWorkspace(allocation, handle, allocation.nbytes, 17, ce_stream=stream)
+    monkeypatch.setattr(a2a_permute, "_SYMM_WORKSPACES", {(x.device, "group"): workspace})
+    monkeypatch.setattr(a2a_permute, "_get_symm_buffer", lambda shape, dtype, device, group: allocation[: shape[0]])
+
+    retained: tuple[tuple[a2a_permute._CEPlan, torch.cuda.CUDAGraph | None], ...] = ()
+    for step in range(3):
+        # New data/pointers with unchanged layouts must replay the same Graphs.
+        incoming = x + step
+        a2a_permute._exchange_ce((incoming, incoming, incoming), "group", 2)
+        a2a_permute._exchange_ce((incoming,), "group", 2)
+        a2a_permute._exchange_ce((incoming.view(1, 16, 2, 4),), "group", 2, reverse=True)
+        plans = tuple(workspace.ce_plans.values())
+        assert len(plans) == 3
+        assert captures.call_count == 3
+        assert transfers.call_count == 6  # One warmup and one capture per plan.
+        if step:
+            assert all(plan is old and plan.graph is graph for plan, (old, graph) in zip(plans, retained))
+        retained = tuple((plan, plan.graph) for plan in plans)
+        assert all(plan.graph.replay.call_count == step + 1 for plan in plans)
+
+    # A new gate layout replaces only its own slot; history remains bounded.
+    a2a_permute._exchange_ce((x[:, :4],), "group", 2)
+    plans = tuple(workspace.ce_plans.values())
+    assert len(plans) == 3 and captures.call_count == 4
+    assert sum(plan is old for plan, (old, _) in zip(plans, retained)) == 2
+
+
+@pytest.mark.parametrize("size,batch", [(2, 1), (3, 2), (4, 2)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_ce_direct_copies_match_independent_4d_exchange(monkeypatch, size, batch, dtype):
+    """Execute peer writes on CPU, including batched, strided and GQA regions."""
+
+    class Stream:
+        cuda_stream = 17
+
+        def wait_event(self, event):
+            pass
+
+    class Event:
+        def record(self, stream):
+            pass
+
+    def copy2d(dst, dpitch, src, spitch, width, height, kind, stream):
+        assert kind == 4 and stream == 17
+        for row in range(height):
+            ctypes.memmove(dst + row * dpitch, src + row * spitch, width)
+        return 0
+
+    def copy3d(pointer, stream):
+        args = pointer._obj
+        for plane in range(args.extent.depth):
+            copy2d(
+                args.dstPtr.ptr + plane * args.dstPtr.pitch * args.dstPtr.ysize,
+                args.dstPtr.pitch,
+                args.srcPtr.ptr + plane * args.srcPtr.pitch * args.srcPtr.ysize,
+                args.srcPtr.pitch,
+                args.extent.width,
+                args.extent.height,
+                args.kind,
+                stream,
+            )
+        return 0
+
+    def check(result):
+        assert result == 0
+
+    monkeypatch.setattr(
+        a2a_permute,
+        "_ce_runtime",
+        lambda: SimpleNamespace(
+            lib=SimpleNamespace(cudaMemcpy2DAsync=copy2d, cudaMemcpy3DAsync=copy3d), CUDART_CHECK=check
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: Stream())
+    monkeypatch.setattr(torch.cuda, "Stream", lambda device: Stream())
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    assert ctypes.sizeof(a2a_permute._Memcpy3DParams) == 160
+    for reverse in (False, True):
+        shapes = [(batch, 7 * size, 2, 3)] if reverse else [(batch, 7, h * size, 3) for h in (2, 1, 1)]
+        shared = [torch.empty(sum(torch.Size(shape).numel() for shape in shapes), dtype=dtype) for _ in range(size)]
+        plans = []
+        # Reuse plans with new source pointers and values on the second exchange.
+        for iteration in range(2):
+            inputs = [
+                tuple(
+                    (
+                        torch.arange(torch.Size(shape).numel() * 3).reshape(*shape[:2], 3, *shape[2:]) % 97
+                        + rank
+                        + index
+                        + iteration * 10
+                    ).to(dtype)[:, :, 1]
+                    for index, shape in enumerate(shapes)
+                )
+                for rank in range(size)
+            ]
+            for rank in range(size):
+                if not iteration:
+                    handle = SimpleNamespace(
+                        rank=rank, buffer_ptrs=[x.data_ptr() for x in shared], barrier=lambda: None
+                    )
+                    plans.append(a2a_permute._CEPlan(inputs[rank], shared[rank], handle, size, reverse, Stream()))
+                # Graph capture records transport only; eager calls own their output.
+                result = plans[rank]._run_eager(inputs[rank], copy_out=bool(iteration))
+                if iteration:
+                    assert result.data_ptr() != shared[rank].data_ptr()
+                else:
+                    assert result is None
+            for rank in range(size):
+                for index, (part, shape) in enumerate(
+                    zip(shared[rank].split([torch.Size(s).numel() for s in shapes]), shapes)
+                ):
+                    b, sequence, heads, dim = shape
+                    axis, gather = (1, 2) if reverse else (2, 1)
+                    expected = torch.cat([x[index].chunk(size, axis)[rank] for x in inputs], dim=gather)
+                    output_shape = (
+                        (b, sequence // size, heads * size, dim)
+                        if reverse
+                        else (b, sequence * size, heads // size, dim)
+                    )
+                    torch.testing.assert_close(part.view(output_shape), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kv_heads", [4, 8])
+def test_ce_fake_ops_preserve_functional_output_metadata(kv_heads):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        x = torch.empty(2, 17, 8, 64, dtype=torch.bfloat16, device="cuda")
+        k = torch.empty(2, 17, kv_heads, 64, dtype=x.dtype, device=x.device)
+        q, k, v = a2a_permute.ulysses_qkv_fwd_group(x, k, k, "fake-only", 2)
+        assert q.shape == (2, 34, 4, 64)
+        assert k.shape == v.shape == (2, 34, kv_heads // 2, 64)
+        gate = a2a_permute.ulysses_qkv_fwd(x, "fake-only", 2)
+        assert gate.shape == q.shape
+        packed = a2a_permute.ulysses_qkv_ce(x, x, x, "fake-only", 2)
+        assert packed.shape == (3 * x.numel(),) and packed.dtype == x.dtype
+        y = packed[: x.numel()].view(2, 34, 4, 64)
+        z = a2a_permute.ulysses_o_rev(y, "fake-only", 2)
+        assert y.shape == (2, 34, 4, 64)
+        assert z.shape == x.shape and z.dtype == x.dtype and z.device == x.device
+
+
+def test_npu_initialization_never_builds_cuda(monkeypatch):
+    import sys
+
+    calls = []
+    module = SimpleNamespace(ensure_a2a_permute_available=lambda: calls.append("npu"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu", module)
+    monkeypatch.setattr(a2a_permute, "current_omni_platform", SimpleNamespace(is_npu=lambda: True))
+
+    def unexpected():
+        pytest.fail("NPU initialization must not compile CUDA")
+
+    monkeypatch.setattr(a2a_permute, "_ce_runtime", unexpected)
+    a2a_permute.ensure_a2a_permute_available()
+    assert calls == ["npu"]
+
+
+def test_grouped_npu_dispatch_preserves_fused_qkv(monkeypatch):
+    import sys
+
+    query, key, value = (SimpleNamespace(device=SimpleNamespace(type="npu")) for _ in range(3))
+    outputs = (object(), object(), object())
+
+    def forward(q, k, v, group_name, world_size):
+        assert (q, k, v) == (query, key, value)
+        assert (group_name, world_size) == ("ulysses", 4)
+        return outputs
+
+    module = SimpleNamespace(ulysses_qkv_fwd_group=forward)
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.distributed.ulysses_symmetric_memory_npu", module)
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.distributed.qkv_a2a", None)
+    assert a2a_permute.ulysses_qkv_fwd_group(query, key, value, "ulysses", 4) is outputs

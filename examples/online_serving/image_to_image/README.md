@@ -2,9 +2,11 @@
 
 This example demonstrates how to deploy image-to-image models for online image editing service using vLLM-Omni.
 
-Supported models include Qwen-Image-Edit, BAGEL, and other image-to-image pipelines.
+Supported models include Qwen-Image-Edit, BAGEL, JoyAI-Image-Edit, and other image-to-image pipelines.
 
 For **multi-image** input editing, use **Qwen-Image-Edit-2509** (QwenImageEditPlusPipeline) and send multiple images in the user message content.
+
+For **JoyAI-Image-Edit**, use `jdopensource/JoyAI-Image-Edit-Diffusers` and send exactly one input image.
 
 ## Start Server
 
@@ -27,6 +29,12 @@ vllm serve Qwen/Qwen-Image-Edit-2509 --omni --port 8092
 
 ```bash
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091
+```
+
+### JoyAI-Image-Edit
+
+```bash
+vllm serve jdopensource/JoyAI-Image-Edit-Diffusers --omni --port 8092
 ```
 
 ### Start with Parameters
@@ -76,6 +84,11 @@ EOF
 
 curl -s http://localhost:8092/v1/chat/completions   -H "Content-Type: application/json"   -d @request.json | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > output.png
 ```
+
+For JoyAI-Image-Edit, set classifier-free guidance with `guidance_scale`
+in `extra_body` (default: `4.0`). `true_cfg_scale` remains supported as an
+alias; if both are provided, their values must match. Values at or below `1.0`
+disable CFG.
 
 ### Method 2: Using OpenAI Python SDK
 

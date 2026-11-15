@@ -47,7 +47,7 @@ def _first_request_images(outputs) -> list:
     return req_out.images
 
 
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": ["L4", "B200"]})
 def test_qwen_image_autoround_w4a16_load():
@@ -56,7 +56,7 @@ def test_qwen_image_autoround_w4a16_load():
     Verifies that quant_config is propagated to all transformer blocks
     and produces a valid, non-blank image.
     """
-    with OmniRunner(QUANTIZED_MODEL, enforce_eager=True) as runner:
+    with OmniRunner(QUANTIZED_MODEL, enforce_eager=True, enable_cpu_offload=True) as runner:
         outputs = runner.omni.generate(
             "a cup of coffee on a table",
             _sampling_params(),
@@ -69,7 +69,7 @@ def test_qwen_image_autoround_w4a16_load():
         assert arr.std() > 1.0, "Generated image appears blank (std ≈ 0)"
 
 
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": ["L4", "B200"]})
 def test_qwen_image_autoround_w4a16_generate():
@@ -85,7 +85,7 @@ def test_qwen_image_autoround_w4a16_generate():
         true_cfg_scale=5.0,
         generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
     )
-    with OmniRunner(QUANTIZED_MODEL, enforce_eager=True) as runner:
+    with OmniRunner(QUANTIZED_MODEL, enforce_eager=True, enable_cpu_offload=True) as runner:
         outputs = runner.omni.generate(
             "a cup of coffee on a wooden table, morning sunlight, photorealistic",
             params,

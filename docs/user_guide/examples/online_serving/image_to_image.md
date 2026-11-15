@@ -2,10 +2,13 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/image_to_image>.
 
+This example demonstrates how to deploy image-to-image models for online image editing service using vLLM-Omni.
 
-This example demonstrates how to deploy Qwen-Image-Edit model for online image editing service using vLLM-Omni.
+Supported models include Qwen-Image-Edit, BAGEL, JoyAI-Image-Edit, and other image-to-image pipelines.
 
 For **multi-image** input editing, use **Qwen-Image-Edit-2509** (QwenImageEditPlusPipeline) and send multiple images in the user message content.
+
+For **JoyAI-Image-Edit**, use `jdopensource/JoyAI-Image-Edit-Diffusers` and send exactly one input image.
 
 ## Start Server
 
@@ -24,8 +27,13 @@ vllm serve Qwen/Qwen-Image-Edit --omni --port 8092
 vllm serve Qwen/Qwen-Image-Edit-2509 --omni --port 8092
 ```
 
-### Start with Parameters
+### JoyAI-Image-Edit
 
+```bash
+vllm serve jdopensource/JoyAI-Image-Edit-Diffusers --omni --port 8092
+```
+
+### Start with Parameters
 
 Or use the startup script:
 
@@ -75,6 +83,11 @@ curl -s http://localhost:8092/v1/chat/completions \
   | jq -r '.choices[0].message.content[0].image_url.url' \
   | cut -d',' -f2 | base64 -d > output.png
 ```
+
+For JoyAI-Image-Edit, set classifier-free guidance with `guidance_scale`
+in `extra_body` (default: `4.0`). `true_cfg_scale` remains supported as an
+alias; if both are provided, their values must match. Values at or below `1.0`
+disable CFG.
 
 ### Method 2: Using OpenAI Python SDK
 
@@ -129,7 +142,10 @@ python openai_chat_client.py --input input1.png input2.png --prompt "Combine the
     pip install 'vllm-omni[demo]'
     ```
 
-    Or, if installing from source: `pip install -e '.[demo]'`
+    For this 0.33 source checkout, follow the
+    [source demo dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+    from the repository root. Build the temporary Gradio wheel and include it
+    with `.[demo]` in the same normal install command.
 
 ```bash
 python gradio_demo.py
@@ -331,7 +347,7 @@ The response contains multiple images in `choices[0].message.content` — one pe
 #### Qwen-Image-Layered Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `layers` | int | 4 | Number of layers to decompose |
 | `resolution` | int | 640 | Resolution for dimension calculation (640 or 1024) |
 | `cfg_scale` | float | 4.0 | Classifier-free guidance scale (alias for `true_cfg_scale`) |
@@ -367,17 +383,17 @@ endpoint, pass the supported generation controls as top-level form fields
 directly. For image dimensions and count, use `size` and `n` rather than
 `height`, `width`, or `num_outputs_per_prompt`.
 
-| Parameter                | Type  | Default | Description                           |
-| ------------------------ | ----- | ------- | ------------------------------------- |
-| `height`                 | int   | None    | Output image height in pixels         |
-| `width`                  | int   | None    | Output image width in pixels          |
-| `size`                   | str   | None    | Output image size (e.g., "1024x1024") |
-| `num_inference_steps`    | int   | 50      | Number of denoising steps             |
-| `guidance_scale`         | float | 1.0     | CFG guidance scale                    |
-| `seed`                   | int   | None    | Random seed (reproducible)            |
-| `negative_prompt`        | str   | None    | Negative prompt                       |
-| `num_outputs_per_prompt` | int   | 1       | Number of images to generate          |
-| `layers`                 | int   | 4       | Number of layers (Qwen-Image-Layered) |
+| Parameter                | Type  | Default | Description                                  |
+| ------------------------ | ----- | ------- | -------------------------------------------- |
+| `height`                 | int   | None    | Output image height in pixels                |
+| `width`                  | int   | None    | Output image width in pixels                 |
+| `size`                   | str   | None    | Output image size (e.g., "1024x1024")        |
+| `num_inference_steps`    | int   | 50      | Number of denoising steps                    |
+| `guidance_scale`         | float | 1.0     | CFG guidance scale                           |
+| `seed`                   | int   | None    | Random seed (reproducible)                   |
+| `negative_prompt`        | str   | None    | Negative prompt                              |
+| `num_outputs_per_prompt` | int   | 1       | Number of images to generate                 |
+| `layers`                 | int   | 4       | Number of layers (Qwen-Image-Layered)        |
 | `resolution`             | int   | 640     | Resolution, 640 or 1024 (Qwen-Image-Layered) |
 
 ## Response Format

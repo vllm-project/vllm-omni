@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 cfg-distilled full denoise loop.
 
-Per step, the positive presentation is forwarded exactly once. Video and audio
-target rows chain through the Euler-eta0 update while visual and audio condition
+The sampler owns model evaluations and numerical integration. Video and audio
+target rows chain through the selected solver while visual and audio condition
 rows stay pinned to their noised step-0 anchors.
 """
 
@@ -16,17 +16,18 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
+from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.forward_context import (
+    set_forward_context_denoise_sigma,
     set_forward_context_denoise_step_idx,
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
 )
+from vllm_omni.diffusion.sampler import SamplingState, sampler_object
 from vllm_omni.platforms import current_omni_platform
 
-from .scheduling_minimax_h3_euler_ancestral import (
-    minimax_h3_euler_eta0_step,
-    minimax_h3_rf_v_to_x0,
-)
+from .latent_mask import MiniMaxH3LatentEdit
+from .sampling import MiniMaxH3Model, MiniMaxH3ModelBatch
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
@@ -42,12 +43,15 @@ def minimax_h3_publish_denoise_progress(
 ) -> None:
     """Publish denoise progress for step-gated attention features.
 
-    Both execution modes must publish the same trio: the step index drives the
+    Both execution modes must publish the same four values: the step index drives the
     dense warmup of RAINFUSION_ATTN, the normalized descending timestep
     drives the TRTLLM_ATTN skip gate (which stays dense while it is unset),
-    and the total step count enables the ``end_step`` tail fallback.
+    the total step count enables the ``end_step`` tail fallback, and the
+    video sigma selects the profile when sigma windows are bound.
     """
     set_forward_context_denoise_step_idx(step)
+    # H3 publishes its shifted rectified-flow video sigma; only bound sigma windows read it.
+    set_forward_context_denoise_sigma(sigma_video)
     set_forward_context_denoise_timestep(sigma_video)
     set_forward_context_denoise_total_steps(total_steps)
 
@@ -86,6 +90,7 @@ class MiniMaxH3DenoiseBranch:
             raise ValueError(f"token_tags length {int(token_tags.view(-1).shape[0])} != seq_len {seq_len}")
         cu = packed["cu_seqlens"].to(torch.int32)
         self.device = device
+        self.locked_audio_rows: torch.Tensor | None = None
         # ``used_len`` is the real (non-padding) document length; step-mode
         # batching concatenates layouts and needs both bounds as Python ints so
         # it can rebuild ``cu_seqlens`` without a device sync per step.
@@ -137,15 +142,15 @@ class MiniMaxH3DenoiseBranch:
                 for span in raw_spans
             )
             target_start = next(span.start for span in reversed(spans) if span.role == "target")
-            prefix_tags = token_tags[:target_start]
-            prefix_segments: list[int] = []
-            if prefix_tags.numel():
-                # Run-lengths preserve modality/reference boundaries without
-                # carrying CUDA tensors into every attention layer.
+            prefix_segments = packed.get("vsa_prefix_segments")
+            if prefix_segments is None:
+                # Native T2VA/FL2VA layouts use modality runs, including any
+                # vision-token overrides. Ref2VA supplies explicit boundaries.
+                prefix_tags = token_tags[:target_start]
                 boundaries = torch.nonzero(prefix_tags[1:] != prefix_tags[:-1]).flatten().tolist()
                 starts = [0, *(index + 1 for index in boundaries)]
                 stops = [*(index + 1 for index in boundaries), target_start]
-                prefix_segments = [stop - start for start, stop in zip(starts, stops, strict=True)]
+                prefix_segments = tuple(stop - start for start, stop in zip(starts, stops, strict=True) if stop > start)
             self.static_kwargs["video_token_layout"] = VideoTokenLayout(
                 used_len=int(cu[1]),
                 video_spans=spans,
@@ -185,25 +190,23 @@ class MiniMaxH3DenoiseBranch:
         t_audio: float,
         imgvid_cond_timestep: float,
         audio_ref_cond_timestep: float,
+        video_target_timesteps: torch.Tensor | None = None,
+        audio_target_timesteps: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         x = self.x_base.clone()
         x[0].index_copy_(0, self.img_pos_dev, video_rows)
         audio_x = self.audio_x_base.clone()
         audio_x[0].index_copy_(0, self.audio_pos_dev, audio_rows)
-        # Packed-sequence timestep semantics: non-media rows (text and
-        # padding) inherit the current video timestep. Later steps must reuse
-        # the previous step's updated rows; re-initializing from zeros is only
-        # valid at step 0.
-        timesteps = torch.full(
-            (self.seq_len,),
-            float(t_video),
-            dtype=torch.float32,
-            device=x.device,
+        timesteps = torch.empty(self.seq_len, dtype=torch.float32, device=self.device)
+        self.fill_timesteps(
+            timesteps,
+            t_video=t_video,
+            t_audio=t_audio,
+            imgvid_cond_timestep=imgvid_cond_timestep,
+            audio_ref_cond_timestep=audio_ref_cond_timestep,
+            video_target_timesteps=video_target_timesteps,
+            audio_target_timesteps=audio_target_timesteps,
         )
-        timesteps[self.img_pos_dev[self.update_mask_dev]] = t_video
-        timesteps[self.img_pos_dev[~self.update_mask_dev]] = imgvid_cond_timestep
-        timesteps[self.audio_pos_dev[self.audio_update_mask_dev]] = t_audio
-        timesteps[self.audio_pos_dev[~self.audio_update_mask_dev]] = audio_ref_cond_timestep
         unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
         return {
             **self.static_kwargs,
@@ -212,6 +215,56 @@ class MiniMaxH3DenoiseBranch:
             "unique_timesteps": unique_timesteps,
             "inverse_indices": inverse_indices,
         }
+
+    def fill_timesteps(
+        self,
+        timesteps: torch.Tensor,
+        *,
+        t_video: float,
+        t_audio: float,
+        imgvid_cond_timestep: float,
+        audio_ref_cond_timestep: float,
+        video_target_timesteps: torch.Tensor | None = None,
+        audio_target_timesteps: torch.Tensor | None = None,
+    ) -> None:
+        """Fill one request's packed row timesteps in an existing tensor."""
+        if timesteps.shape != (self.seq_len,):
+            raise ValueError(f"timesteps must have shape ({self.seq_len},)")
+        # Packed-sequence timestep semantics: non-media rows (text and
+        # padding) inherit the current video timestep. Later steps must reuse
+        # the previous step's updated rows; re-initializing from zeros is only
+        # valid at step 0.
+        timesteps.fill_(float(t_video))
+        timestep_groups = (
+            (
+                "video_target_timesteps",
+                self.img_pos_dev,
+                self.update_mask_dev,
+                video_target_timesteps,
+                t_video,
+                imgvid_cond_timestep,
+            ),
+            (
+                "audio_target_timesteps",
+                self.audio_pos_dev,
+                self.audio_update_mask_dev,
+                audio_target_timesteps,
+                t_audio if self.locked_audio_rows is None else 1.0,
+                audio_ref_cond_timestep,
+            ),
+        )
+        for name, positions, update_mask, target_timesteps, current_timestep, condition_timestep in timestep_groups:
+            target_positions = positions[update_mask]
+            if target_timesteps is None:
+                timesteps[target_positions] = current_timestep
+            else:
+                target_timesteps = target_timesteps.to(device=self.device, dtype=torch.float32).reshape(-1)
+                if target_timesteps.shape[0] != target_positions.shape[0]:
+                    raise ValueError(
+                        f"{name} rows {target_timesteps.shape[0]} != target rows {target_positions.shape[0]}"
+                    )
+                timesteps[target_positions] = target_timesteps
+            timesteps[positions[~update_mask]] = condition_timestep
 
 
 def minimax_h3_prepare_denoise_rows(
@@ -222,12 +275,12 @@ def minimax_h3_prepare_denoise_rows(
     keyframe_cond_rows: torch.Tensor | None,
     audio_ref_rows: torch.Tensor | None,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Validate the initial rows against the layout and pin the condition rows.
 
-    Returns ``(video_rows, audio_rows, cond_anchor, audio_anchor)`` with the
-    anchors already written into their rows, which is the state both the
-    request-mode loop and step-mode ``prepare_encode()`` start from.
+    Returns ``(video_rows, audio_rows)`` with the condition rows already written
+    in, which is the state both the request-mode loop and step-mode
+    ``prepare_encode()`` start from.
     """
     n_cond = int((~positive.update_mask).sum())
     if keyframe_cond_rows is None:
@@ -262,7 +315,7 @@ def minimax_h3_prepare_denoise_rows(
         video_rows[~update] = cond_anchor
     if audio_anchor is not None:
         audio_rows[~audio_update] = audio_anchor
-    return video_rows, audio_rows, cond_anchor, audio_anchor
+    return video_rows, audio_rows
 
 
 def minimax_h3_denoise_loop(
@@ -273,13 +326,16 @@ def minimax_h3_denoise_loop(
     initial_audio_rows: torch.Tensor,
     keyframe_cond_rows: torch.Tensor | None,
     audio_ref_rows: torch.Tensor | None = None,
+    video_edit: MiniMaxH3LatentEdit | None = None,
+    audio_edit: MiniMaxH3LatentEdit | None = None,
     sigmas_video: list[float],
     sigmas_audio: list[float],
     device: torch.device,
     imgvid_cond_noise_aug_for_inference: float = MINIMAX_H3_IMGVID_COND_TIMESTEP,
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
-    on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
+    update_progress: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
+    sampler: str = "euler",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -297,7 +353,7 @@ def minimax_h3_denoise_loop(
     # Ascend-specific performance optimization and must not alter that path.
     if current_omni_platform.is_npu():
         positive.prepare_rope_table(model)
-    video_rows, audio_rows, cond_anchor, audio_anchor = minimax_h3_prepare_denoise_rows(
+    video_rows, audio_rows = minimax_h3_prepare_denoise_rows(
         positive=positive,
         initial_video_rows=initial_video_rows,
         initial_audio_rows=initial_audio_rows,
@@ -307,62 +363,64 @@ def minimax_h3_denoise_loop(
     )
     update = positive.update_mask_dev
     audio_update = positive.audio_update_mask_dev
+    if video_edit is not None:
+        video_edit = video_edit.to(device=device, dtype=torch.float32)
+    if audio_edit is not None:
+        audio_edit = audio_edit.to(device=device, dtype=torch.float32)
 
-    num_steps = len(sigmas_video) - 1
-    for step in range(num_steps):
-        step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
-        with step_cm:
-            s_v, s_v_next = sigmas_video[step], sigmas_video[step + 1]
-            s_a, s_a_next = sigmas_audio[step], sigmas_audio[step + 1]
-            # Publish where we are so step-gated attention features (the dense
-            # warmup of RAINFUSION_ATTN, the timestep gate of TRTLLM_ATTN) can
-            # see it. Gates use the scheduler-style descending timestep, which
-            # for a rectified-flow schedule is the video sigma.
-            minimax_h3_publish_denoise_progress(step, s_v, num_steps)
-            t_v, t_a = 1.0 - s_v, 1.0 - s_a
-            imgvid_cond_t = max(t_v, float(imgvid_cond_noise_aug_for_inference))
-            audio_ref_cond_t = max(t_a, float(audio_cond_noise_aug_for_inference))
+    # Each call denoises one sequence and publishes its steps from 0 with its
+    # own num_steps. forward() runs one call per output seed and per
+    # continuation window, all with the main num_steps, and with latent_refine
+    # one more call per output seed over the tail of the sigma list, which has
+    # its own num_steps. Step ranges select profiles on each call from step 0.
+    # The pipeline checks them against the main num_steps before the first call
+    # and rejects them together with latent_refine, so a request with step
+    # ranges runs only calls with the main num_steps. Sigma windows select from
+    # the sigma each call publishes, including the refine call.
+    reference_kv_state = None
+    create_reference_kv_state = getattr(model, "create_reference_kv_state", None)
+    if callable(create_reference_kv_state):
+        reference_kv_state = create_reference_kv_state(
+            global_reference_rows=int((~positive.update_mask).sum()),
+            device=device,
+        )
+    if reference_kv_state is not None:
+        positive.static_kwargs["reference_kv_state"] = reference_kv_state
 
-            fk = positive.forward_kwargs(
-                video_rows=video_rows,
-                audio_rows=audio_rows,
-                t_video=t_v,
-                t_audio=t_a,
-                imgvid_cond_timestep=imgvid_cond_t,
-                audio_ref_cond_timestep=audio_ref_cond_t,
+    adapter = MiniMaxH3Model(
+        model,
+        positive,
+        (video_rows, audio_rows),
+        (video_edit, audio_edit),
+        (imgvid_cond_noise_aug_for_inference, audio_cond_noise_aug_for_inference),
+    )
+    state = SamplingState((video_rows[update], audio_rows[audio_update]), (sigmas_video, sigmas_audio))
+
+    def write_back_and_update_progress(state):
+        nonlocal video_rows, audio_rows
+        adapter.validate_write_back(state)
+        video_rows, audio_rows = adapter.write_back(state)
+        if update_progress is not None:
+            update_progress(state.step_index - 1, video_rows, audio_rows)
+        check_request_cancellation(synchronize=True)
+
+    def step_context(states):
+        check_request_cancellation()
+        return step_profiler(states[0].step_index) if step_profiler is not None else nullcontext()
+
+    try:
+        with torch.inference_mode():
+            sampler_object(sampler).sample(
+                MiniMaxH3ModelBatch({state: adapter}),
+                [state],
+                callback=write_back_and_update_progress,
+                step_context=step_context,
             )
-            with torch.inference_mode():
-                v_video, v_audio = model(**fk)
-            mv_video_t = v_video.float()[update]
-            mv_audio_t = v_audio.float()[audio_update]
-
-            x0_video = minimax_h3_rf_v_to_x0(
-                video_rows[update],
-                mv_video_t,
-                torch.tensor(t_v, dtype=torch.float32, device=device),
-            )
-            new_target = minimax_h3_euler_eta0_step(video_rows[update], x0_video, sigma_curr=s_v, sigma_next=s_v_next)
-            video_rows = video_rows.clone()
-            video_rows[update] = new_target
-            if cond_anchor is not None:
-                video_rows[~update] = cond_anchor  # per-step imgvid cond reset
-
-            x0_audio = minimax_h3_rf_v_to_x0(
-                audio_rows[audio_update],
-                mv_audio_t,
-                torch.tensor(t_a, dtype=torch.float32, device=device),
-            )
-            new_audio = minimax_h3_euler_eta0_step(
-                audio_rows[audio_update], x0_audio, sigma_curr=s_a, sigma_next=s_a_next
-            )
-            audio_rows = audio_rows.clone()
-            audio_rows[audio_update] = new_audio
-            if audio_anchor is not None:
-                audio_rows[~audio_update] = audio_anchor  # per-step audio ref reset
-            if on_step is not None:
-                on_step(step, video_rows, audio_rows)
-
-    minimax_h3_publish_denoise_progress(None, None, None)
+    finally:
+        minimax_h3_publish_denoise_progress(None, None, None)
+        if reference_kv_state is not None:
+            positive.static_kwargs.pop("reference_kv_state", None)
+            reference_kv_state.close()
     return video_rows, audio_rows
 
 

@@ -14,6 +14,7 @@ import asyncio
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
@@ -111,6 +112,7 @@ class InlineStageDiffusionClient(StageClientBase):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
+        payload_sender_info: dict[str, Any] | None = None,
     ) -> None:
         # Each request mutates its sampling state while it is normalized and
         # executed. Callers commonly reuse one params object for concurrent
@@ -128,7 +130,8 @@ class InlineStageDiffusionClient(StageClientBase):
                 prompt,
                 sampling_params,
                 kv_sender_info,
-                kv_transfer_params,
+                kv_transfer_params=kv_transfer_params,
+                payload_sender_info=payload_sender_info,
             )
         )
         self._tasks[request_id] = task
@@ -140,6 +143,7 @@ class InlineStageDiffusionClient(StageClientBase):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[str, Any] | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
+        payload_sender_info: dict[str, Any] | None = None,
     ) -> None:
         try:
             request = OmniDiffusionRequest(
@@ -148,6 +152,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 request_id=request_id,
                 kv_sender_info=kv_sender_info,
                 kv_transfer_params=kv_transfer_params,
+                payload_sender_info=payload_sender_info,
             )
 
             if self.od_config.streaming_output:
@@ -238,6 +243,11 @@ class InlineStageDiffusionClient(StageClientBase):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
+        # Playback only updates condition-protected host state. A worker RPC
+        # may occupy the single executor thread for a whole GPU chunk.
+        if method in ("update_streaming_playback", "track_streaming_interaction", "release_streaming_output"):
+            return getattr(self._engine, method)(*args, **(kwargs or {}))
+
         loop = asyncio.get_running_loop()
 
         if method == "profile":
@@ -247,9 +257,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 profile_prefix = f"stage_{self.stage_id}_rep_{self.replica_id}_diffusion_{int(time.time())}"
             return await loop.run_in_executor(
                 self._executor,
-                self._engine.profile,
-                is_start,
-                profile_prefix,
+                partial(self._engine.profile, is_start, profile_prefix, **(kwargs or {})),
             )
 
         kwargs = kwargs or {}

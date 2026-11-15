@@ -17,6 +17,7 @@ Cosmos port) reuses unchanged. Three concerns live here:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -115,11 +116,27 @@ def allocate_kv_pool_with_views(
     cache_shape = (num_blocks, block_size, num_kv_heads, head_dim)
     flat_shape = (num_blocks * block_size, num_kv_heads, head_dim)
     for _ in range(num_layers):
-        k = torch.empty(cache_shape, dtype=dtype, device=device)
-        v = torch.empty(cache_shape, dtype=dtype, device=device)
-        kv_pools.append([k, v])
-        k_pools.append(k.reshape(flat_shape))
-        v_pools.append(v.reshape(flat_shape))
+        # The flat slot views are what the paged-write custom op mutates inside the
+        # compiled block graphs, so they must be the *base* allocations: dynamo only
+        # honours mark_static_address on the tensor object it sees as a graph input,
+        # and a view of a static base is still classified as a mutated input, which
+        # makes inductor skip CUDA graphs for every block ("skipping cudagraphs due
+        # to mutated inputs"). The block-table layout is therefore the view here.
+        k = torch.empty(flat_shape, dtype=dtype, device=device)
+        v = torch.empty(flat_shape, dtype=dtype, device=device)
+        for pool in (k, v):
+            # Block 0 is the manager's null block: block tables are tail-padded with
+            # it and it is never written. The contiguous-K/V gather path may read
+            # (masked) rows from it, so it must hold finite values; every other
+            # block is fully written before it is read.
+            pool[:block_size].zero_()
+            # Session-lifetime storage: tell dynamo/inductor the address is static so
+            # CUDA-graph trees (mode="reduce-overhead") mutate it in place instead of
+            # copying ~300 MB per layer per replay (or skipping the graph).
+            torch._dynamo.mark_static_address(pool)
+        kv_pools.append([k.view(cache_shape), v.view(cache_shape)])
+        k_pools.append(k)
+        v_pools.append(v)
     return kv_pools, k_pools, v_pools
 
 
@@ -180,6 +197,19 @@ def chunk_window_skipped_tokens(
     return (skipped // chunk_size) * chunk_size
 
 
+def visible_window_blocks(*, chunk_size: int, block_size: int, sink_tokens: int, window_tokens: int) -> int:
+    """Most blocks a sink plus a recent window can span; see ``max_video_blocks``.
+
+    Each range is converted on its own: the sink ends at a fixed position, and
+    the recent range starts on a chunk boundary, so at most
+    ``block_size - gcd(chunk_size, block_size)`` tokens past a block edge.
+    """
+    worst_start_offset = block_size - math.gcd(chunk_size, block_size)
+    sink_blocks = -(-sink_tokens // block_size)
+    recent_blocks = -(-(window_tokens + worst_start_offset) // block_size)
+    return sink_blocks + recent_blocks
+
+
 class ChunkWindowManager(SlidingWindowManager):
     """``SlidingWindowManager`` that evicts at chunk boundaries.
 
@@ -203,14 +233,26 @@ class ChunkWindowManager(SlidingWindowManager):
         Call only after commit/eviction, then shift the request's storage
         position by the returned amount. Physical pages and model positions
         are unchanged, including any allocated but not yet committed tail.
+
+        The gap starts where :meth:`remove_skipped_blocks` starts freeing: after
+        the sink's blocks, which are ``sink_chunks`` only while a frame is a
+        block. Its removal is also rounded down to a whole number of chunks.
+        Eviction snaps to chunk boundaries and reads its position in storage
+        coordinates, and paged attention reads each block's offset there too;
+        shifting storage by whole chunks *and* whole blocks leaves both exactly
+        as they were in model positions. When a frame is a block, every gap
+        already is one.
         """
         if self.enable_caching:
             raise RuntimeError("AR block-table compaction requires prefix caching to be disabled")
         blocks = self.req_to_blocks.get(request_id, [])
-        start = self.kv_cache_spec.sink_chunks
+        spec = self.kv_cache_spec
+        start = -(-(spec.sink_chunks * spec.chunk_size) // self.block_size)
         end = start
         while end < len(blocks) and blocks[end] == self._null_block:
             end += 1
+        blocks_per_step = spec.chunk_size // math.gcd(spec.chunk_size, self.block_size)
+        end = start + (end - start) // blocks_per_step * blocks_per_step
         if end == start:
             return 0
         del blocks[start:end]
@@ -225,17 +267,32 @@ class ChunkWindowManager(SlidingWindowManager):
         total_computed_tokens: int,
         num_prompt_tokens: int | None = None,
     ) -> None:
-        """Free the middle gap while preserving the leading attention sink."""
+        """Free the middle gap while preserving the leading attention sink.
+
+        ``sink_chunks`` counts frames while the block table is indexed in
+        blocks, so the sink is converted before it is used as an index. The two
+        were interchangeable while a frame was a block; this commit is what
+        separates them.
+
+        Neither boundary is guaranteed to land on a block edge -- 832x480 is
+        1560 tokens per frame against a 16-token block -- so a block can hold
+        the end of one frame and the start of the next. The sink end rounds up
+        so a straddling block stays protected, and the freed range ends on a
+        rounded-down boundary so only wholly-skipped blocks are released. Both
+        are exact when the sizes divide, which is every geometry that paged one
+        frame per block before.
+        """
         del num_prompt_tokens
         num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
         if num_skipped_tokens <= 0:
             return
-        sink_blocks = self.kv_cache_spec.sink_chunks
-        num_skipped_blocks = num_skipped_tokens // self.block_size
+        sink_tokens = self.kv_cache_spec.sink_chunks * self.kv_cache_spec.chunk_size
+        first_live_block = -(-sink_tokens // self.block_size)
+        last_freed_block = (sink_tokens + num_skipped_tokens) // self.block_size
         self._remove_blocks_in_range(
             request_id,
-            sink_blocks,
-            sink_blocks + num_skipped_blocks,
+            first_live_block,
+            last_freed_block,
         )
 
 

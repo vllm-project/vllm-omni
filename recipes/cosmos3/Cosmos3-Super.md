@@ -57,7 +57,17 @@ vllm serve nvidia/Cosmos3-Super \
 
 Guardrails are on by default (gated `nvidia/Cosmos-1.0-Guardrail` — `pip install
 cosmos-guardrail`, accept the license, set `HF_TOKEN`); add `--no-guardrails` to
-disable. `--enable-layerwise-offload` reduces VRAM on smaller GPUs;
+disable, or pass
+[`vllm_omni/deploy/cosmos3_omni.yaml`](../../vllm_omni/deploy/cosmos3_omni.yaml)
+via `--deploy-config` on either multi-GPU command above (opt-in omni deploy
+overlay, `pipeline: cosmos3_omni_deploy`; without that `pipeline:` key
+`--deploy-config` cannot apply for Cosmos3). Same YAML works for Super / Nano
+(T2I and video); topology `final_output_type` matches the CLI default (`video`).
+`--enable-layerwise-offload` reduces VRAM on smaller GPUs;
+`--vae-fast-path channels_last` speeds up the Wan VAE video decode by switching the
+decoder convolutions to channels-last kernels (output no longer bit-identical to
+diffusers; the default `lossless` fast path is bit-exact, see
+[Wan VAE Decoder Fast Path](../../docs/user_guide/diffusion/vae_fast_path.md));
 `--quantization fp8` (online, no calibration) cuts peak VRAM for 720p video
 generation from ~83 GB to ~55 GB per GPU (2-GPU) with BF16-level quality (T2V
 composition can shift at the same seed).
@@ -76,6 +86,11 @@ Lower `sea_threshold` values and smaller `sea_max_consecutive_cached` caps are
 more conservative. Higher values allow more cached steps and may improve
 speed, but can increase quality loss. Setting `sea_max_consecutive_cached` to
 `0` removes the streak cap.
+
+#### Low-precision attention
+
+For low-precision attention settings, see the
+[Cosmos3-Nano recipe](./Cosmos3-Nano.md#low-precision-attention).
 
 #### Verification
 
@@ -124,12 +139,23 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
 
 #### Notes
 
-- **Measured (2x B300, bf16, guardrails off, diffusion cache off, official 2-GPU config above):**
-    - T2I 1024², 50 steps → **~6 s**
-    - T2V 1280×720, 189 frames, 35 steps → **~197 s**
-    - I2V 1280×720, 189 frames, 35 steps → **~200 s**
-    - T2V + sound (189 frames, 35 steps) → **~198 s**, output muxes **AAC 48 kHz stereo**
-    - (NVIDIA's reference: 8×H200 @ 50 steps ≈ 55 s/video; 2×H200 @ 35 steps ≈ 3 min/video.)
+- **Measured latency (2× B300, CFG2/HSDP2, BF16 weights, guardrails off, diffusion cache off):**
+
+    | Workload | Baseline (BF16 attention) | Low-precision attention (BF16 Q/K + FP8 V) |
+    | --- | --- | --- |
+    | T2I 1024², 50 steps | ~7 s | ~10 s |
+    | T2V 1280×720, 189 frames, 35 steps | ~185 s | ~162 s |
+    | I2V 1280×720, 189 frames, 35 steps | ~185 s | ~162 s |
+    | T2V + sound, 1280×720, 189 frames, 35 steps (output muxes AAC 48 kHz stereo) | ~187 s | ~164 s |
+
+    Measured using `vllm/vllm-omni:nightly-2139e3f158256c0480b5d848a9293980b14ef78d`.
+    Values are means of three end-to-end generations after one warmup
+    per workload and attention setting, using the server commands above with
+    guardrails and diffusion caching disabled.
+
+    **Reference:** NVIDIA's reference is 8×H200 @ 50 steps ≈ 55 s/video;
+    2×H200 @ 35 steps ≈ 3 min/video.
+
 - **Memory:** ~61.5 GiB per GPU when sharded across 2 GPUs (HSDP shard 2); repo ~135 GB on disk.
 - Same generation defaults, supported sizes, V2V reference-video controls
   (`condition_frame_indexes_vision`, `condition_video_keep`), and

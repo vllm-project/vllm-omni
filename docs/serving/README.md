@@ -12,6 +12,11 @@ This guide focuses on vLLM-Omni's primary task endpoints. Compatible models
 may also expose standard routes inherited from vLLM, such as
 `POST /v1/completions`; those routes remain model- and task-dependent.
 
+`POST /tokenize`, `POST /detokenize`, and the opt-in `GET /tokenizer_info`
+require a model with a configured tokenization handler. Pure diffusion servers
+do not expose these routes and return HTTP 404; token counting is unavailable
+for those servers.
+
 ## Start and Verify the Server
 
 Start a model with the shared serving command:
@@ -49,6 +54,9 @@ the default wrapper for every generation task.
 | Sound, music, or ambient audio generation | `POST /v1/audio/generate` | JSON | Audio bytes | [Audio Generation](audio_generate_api.md) |
 | Text-to-image | `POST /v1/images/generations` | JSON | Base64 JSON or an image file | [Image Generation](image_generation_api.md) |
 | Image editing | `POST /v1/images/edits` | Multipart form | Base64 JSON or SSE | [Image Edit](image_edit_api.md) |
+| Promptable image segmentation | `POST /v1/images/segmentations` | Multipart form | Instance masks, boxes, scores (JSON) | [Image Segmentation](image_segmentation_api.md) |
+| Video concept segmentation and tracking | `POST /v1/videos/segmentations` | Multipart form | Per-frame tracked instance masks, boxes, scores (JSON); optional mask videos | [Video Segmentation](video_segmentation_api.md) |
+| Video depth estimation | `POST /v1/videos/depth` | Multipart form | Per-frame depth as a rendered MP4; optional raw float16 depth (NPZ) | [Video Depth](video_depth_api.md) |
 | Video generation (recommended) | `POST /v1/videos` | Multipart form | Asynchronous job JSON | [Videos](videos_api.md) |
 | Video generation (blocking) | `POST /v1/videos/sync` | Multipart form | Video bytes | [Videos](videos_api.md#synchronous-response) |
 
@@ -144,23 +152,26 @@ interchangeably.
 | ---------- | ---------- | ------------------- | --------- |
 | Incremental text input for speech synthesis | `WS /v1/audio/speech/stream` | Send text events and receive audio | [Streaming Text to Speech](speech_api.md#streaming-text-input-websocket) |
 | Live video understanding | `WS /v1/video/chat/stream` | Send video frames and receive text/audio | [Streaming Video Input](video_stream_api.md) |
-| Turn-based realtime audio | `WS /v1/realtime` | Stream one audio input and receive transcript/audio events | [Realtime Audio](realtime_api.md) |
+| Turn-based realtime audio | `WS /v1/realtime` | Stream one audio input and receive transcript/audio events | [Realtime Audio](realtime_openai_duplex_api.md) |
 | Continuous speech-to-speech interaction | `WS /v1/realtime?duplex=1` (alias `WS /v1/duplex`) | Listen and speak concurrently with session control | [Full Duplex](full_duplex_api.md) |
 | Generated video chunks | `WS /v1/realtime/video` | Start a diffusion request and receive fragmented MP4 | [Streaming Video Output](streaming_video_output_api.md) |
 | Robot policy inference | `WS /v1/realtime/robot/openpi` | Send MessagePack observations and receive action arrays | [OpenPI Robot Policy](openpi_api.md) |
 
 All six routes are model- or configuration-dependent. In particular,
-`/v1/realtime` is full duplex when the model is a duplex model (its pipeline
-declares a `duplex_plugin` and the deploy configuration sets
-`session_mode: duplex`); a stock Realtime client needs no vendor query
-parameter, and `duplex=0` is the explicit opt-out. Such a server serves the
-websocket route plus `POST /v1/chat/completions`, and no other turn-based
-HTTP route. On a duplex server that chat route is not the turn-based path:
-each request runs on a short-lived duplex session, so it holds one of
-`duplex_session.max_sessions` for its lifetime and answers at the model's
-real-time pace -- see [Full Duplex](full_duplex_api.md). Clients should
-also verify the duplex capability payload because the query-parameter form
-falls back to the ordinary realtime handler when duplex is unavailable.
+`/v1/realtime` is full duplex when the server is a duplex server: the model's
+pipeline declares a `duplex_plugin` and its deploy configuration sets
+`session_mode: duplex` (with `session_mode: turn` the same model boots the
+ordinary turn-based serving stack instead). On a duplex server a stock
+Realtime client needs no vendor query parameter; `duplex=0` opts out of native
+duplex and selects the turn-based Realtime handler. It runs generation on the
+same stages, alongside live websocket sessions, and opens no duplex session
+or consumes a `duplex_session.max_sessions` slot -- see
+[Full Duplex](full_duplex_api.md).
+Such a server serves the websocket route plus `POST /v1/chat/completions`,
+`/v1/models` and `/health`, and no other turn-based HTTP route. On a server
+that is not duplex, an explicit `?duplex=1` is refused rather than answered by
+the turn-based handler, so a client that requested duplex never silently gets
+the other protocol.
 
 ## Related Endpoints
 
@@ -172,6 +183,7 @@ falls back to the ordinary realtime handler when duplex is unavailable.
 | TTS voice management | `GET/POST /v1/audio/voices`, `DELETE /v1/audio/voices/{name}` | [Voices](speech_api.md#voices-endpoint) |
 | Video job lifecycle | `GET /v1/videos`, `GET/DELETE /v1/videos/{video_id}`, `GET /v1/videos/{video_id}/content` | [Video endpoints](videos_api.md#endpoints) |
 | Release and restore stage memory | `POST /v1/omni/sleep`, `POST /v1/omni/wakeup` | [Sleep Mode](../features/sleep_mode.md) |
+| Run one stage per call (experimental) | `POST /v1/run` | [Independent Stage Execution](../features/independent_stage_execution.md) |
 
 ## Standalone Experimental Servers
 

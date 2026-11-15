@@ -14,15 +14,13 @@ Functions, not a component, because there is nothing here to own.
 from __future__ import annotations
 
 import asyncio
-import binascii
 from typing import TYPE_CHECKING
-
-import pybase64 as base64
 
 from vllm_omni.engine.duplex.config import DuplexPlaybackCommitPolicy
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import ErrorEvent, OverlapDecision, error_event
 from vllm_omni.engine.duplex.plugin import payload_turn_id
+from vllm_omni.protocol.duplex import base64_decoded_size
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -81,6 +79,24 @@ def response_in_progress(session: DuplexEngineSession, tasks: DuplexSessionTasks
     return tasks.has_response_bound_append_tasks()
 
 
+def next_commit_allowed(
+    session: DuplexEngineSession,
+    tasks: DuplexSessionTasks,
+    *,
+    concurrent_turn_requests_released: bool,
+) -> bool:
+    """Whether a new commit may flush/submit now.
+
+    Idle sessions always allow it. When ``supports_concurrent_turn_requests`` is on and
+    the plugin has released the commit gate, a commit is allowed even though
+    prior assistant TTS/playback still counts as ``response_in_progress``.
+    Barge-in remains the abort path; this gate does not cancel anything.
+    """
+    if not response_in_progress(session, tasks):
+        return True
+    return session.capabilities.supports_concurrent_turn_requests and concurrent_turn_requests_released
+
+
 def assistant_playback_active(session: DuplexEngineSession) -> bool:
     """Whether the client is still playing audio the session has sent."""
     return (
@@ -93,10 +109,8 @@ def audio_payload_size_bytes(payload: Mapping[str, object]) -> int:
     audio = payload.get("audio") or payload.get("data")
     if not isinstance(audio, str):
         return 0
-    try:
-        return len(base64.b64decode(audio, validate=True))
-    except (ValueError, binascii.Error):
-        return 0
+    # Measured, not decoded: by here the audio is base64 this process encoded.
+    return base64_decoded_size(audio) or 0
 
 
 # --------------------------------------------------------------------------- #
@@ -169,25 +183,6 @@ def overlap_decision_event(session: DuplexEngineSession, decision: dict[str, obj
         reason=reason if isinstance(reason, str) else None,
         details=details,
     )
-
-
-def input_committed_payload(
-    session: DuplexEngineSession,
-    committed: DuplexCommittedInput,
-    *,
-    realtime_item_id: object | None = None,
-) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "type": "input.committed",
-        "session_id": session.session_id,
-        "turn_id": committed.turn_id,
-        "epoch": committed.epoch,
-        "history_len": len(session.history),
-        "message": committed.message,
-    }
-    if isinstance(realtime_item_id, str) and realtime_item_id:
-        payload["realtime_item_id"] = realtime_item_id
-    return payload
 
 
 def audio_committed_payload(

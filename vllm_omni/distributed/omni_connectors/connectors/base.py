@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from typing import Any
@@ -56,9 +56,27 @@ class OmniConnectorBase(ABC):
         pass
 
     @abstractmethod
-    def cleanup(self, request_id: str) -> None:
-        """Clean up resources for a request."""
+    def cleanup(self, request_id: str) -> bool | None:
+        """Clean up resources, optionally reporting whether any were reclaimed."""
         pass
+
+    def get_with_deadline(
+        self,
+        from_stage: str,
+        to_stage: str,
+        get_key: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        deadline: float,
+    ) -> tuple[Any, int] | None:
+        """Receive with a monotonic deadline; blocking backends must override this."""
+        raise NotImplementedError(f"{type(self).__name__} does not support deadline-aware receive")
+
+    def abandon_get(self, get_key: str) -> None:
+        """Retire unresolved discovery attempts; never cancel an active DMA READ."""
+
+    def reap_consumed(self) -> None:
+        """Release producer bookkeeping for payloads consumed by another process."""
 
     @abstractmethod
     def health(self) -> dict[str, Any]:
@@ -90,14 +108,14 @@ class OmniConnectorBase(ABC):
 
     @staticmethod
     def serialize_obj(obj: Any) -> bytes:
-        """Serialize a Python object to bytes using centralized serializer."""
+        """Serialize with the shared serializer; connectors may own their own OmniSerde."""
         from ..utils.serialization import OmniSerializer
 
         return OmniSerializer.serialize(obj)
 
     @staticmethod
     def deserialize_obj(data: bytes) -> Any:
-        """Deserialize bytes to Python object using centralized serializer."""
+        """Deserialize with the shared serializer; connectors may own their own OmniSerde."""
         from ..utils.serialization import OmniSerializer
 
         return OmniSerializer.deserialize(data)

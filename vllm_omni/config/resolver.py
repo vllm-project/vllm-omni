@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
+from pathlib import Path
 from typing import Any
 
 from vllm.logger import init_logger
@@ -14,8 +15,9 @@ from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remot
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.stage_config import PipelineConfig
+from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.diffusion.data import resolve_model_class_name
-from vllm_omni.diffusion.registry import DiffusionModelRegistry
+from vllm_omni.diffusion.registry import DiffusionModelRegistry, resolve_native_single_file
 from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 
 logger = init_logger(__name__)
@@ -29,6 +31,7 @@ class OmniConfigResolution:
     stage_configs: tuple[Any, ...]
     pipeline_config: PipelineConfig | None = None
     omni_lb_policy: str | None = None
+    weight_sharing: WeightSharingConfig | None = None
 
     @property
     def endpoint_restrictions(self) -> tuple[EndpointRestriction, ...]:
@@ -173,6 +176,9 @@ def _build_registered_resolution(
         stage_configs=tuple(structured_config.stage_configs),
         pipeline_config=structured_config.pipeline_config,
         omni_lb_policy=getattr(structured_config, "strategy_omni_lb_policy", None),
+        # Optional: callers may build partial structured views (and older
+        # configs predate the field), exactly like strategy provenance above.
+        weight_sharing=getattr(structured_config, "weight_sharing", None),
     )
 
 
@@ -204,17 +210,24 @@ def resolve_omni_config(
     """Resolve registry/deploy inputs through the single public entrypoint."""
     normalized_overrides = _convert_dataclasses_to_dict(dict(cli_overrides or {}))
     normalized_overrides = with_trust_remote_code_override(normalized_overrides, trust_remote_code)
+    native_single_file_model = resolve_native_single_file(normalized_overrides.get("model_class_name"))
+    is_native_single_file = native_single_file_model is not None and Path(model).is_file()
+    if is_native_single_file:
+        normalized_overrides["model_class_name"] = native_single_file_model
     registry_overrides = dict(normalized_overrides)
     _flatten_stage_overrides(registry_overrides, stage_overrides)
 
     strategy_specs = _load_strategy_specs(strategy_config_path)
-    structured_config = StageConfigFactory.create_from_model(
-        model,
-        trust_remote_code=trust_remote_code,
-        cli_overrides=registry_overrides,
-        deploy_config_path=deploy_config_path,
-        strategy_specs=strategy_specs,
-    )
+    structured_config = None
+    # Native checkpoint files have no HF config or pipeline index to discover.
+    if deploy_config_path is not None or not is_native_single_file:
+        structured_config = StageConfigFactory.create_from_model(
+            model,
+            trust_remote_code=trust_remote_code,
+            cli_overrides=registry_overrides,
+            deploy_config_path=deploy_config_path,
+            strategy_specs=strategy_specs,
+        )
     if structured_config is not None:
         return _build_registered_resolution(structured_config)
 
@@ -226,7 +239,9 @@ def resolve_omni_config(
         )
     if model_class_name is not None:
         normalized_overrides.setdefault("model_class_name", model_class_name)
-    default_config = StageConfigFactory.create_typed_default_diffusion(model, normalized_overrides)
+    default_config = StageConfigFactory.create_typed_default_diffusion(
+        model, normalized_overrides, deploy_config_path=deploy_config_path
+    )
 
     return OmniConfigResolution(
         config_path=deploy_config_path,

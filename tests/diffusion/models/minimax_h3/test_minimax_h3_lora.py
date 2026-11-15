@@ -282,7 +282,7 @@ def test_h3_turbo_allows_distributed_layerwise_offload(monkeypatch):
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
     pipeline._turbo_lora_specs = {}
-    pipeline._native_lora_adapter_ids = set()
+    pipeline._native_distilled_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
     pipeline.od_config = SimpleNamespace(
         enable_cpu_offload=False,
@@ -333,7 +333,7 @@ def test_h3_turbo_offload_compatibility_follows_dit_selection(
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
     pipeline._turbo_lora_specs = {}
-    pipeline._native_lora_adapter_ids = set()
+    pipeline._native_distilled_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
     pipeline.od_config = SimpleNamespace(
         diffusion_offload_config={"mode": mode, "components": components},
@@ -490,9 +490,10 @@ def test_only_an_active_recognized_turbo_adapter_restricts_ref2va(monkeypatch):
     pipeline.partition = "combined"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
     pipeline._turbo_lora_specs = {}
-    pipeline._native_lora_adapter_ids = set()
+    pipeline._native_distilled_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
     request = _request("generic-peft")
+    pipeline.transformer = torch.nn.Module()
 
     def load():
         return pipeline._load_diffusion_lora_adapter(
@@ -545,13 +546,13 @@ def test_h3_turbo_requires_all_loaded_targets_to_bind():
 @pytest.mark.parametrize(
     ("num_inference_steps", "extra_args", "error"),
     [
-        (None, {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=5"),
-        (4, {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=5"),
-        ("5", {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=5"),
-        (5, {"flow_shift": 7.0, "audio_flow_shift": 3.0}, "flow_shift=6"),
-        (5, {"flow_shift": "bad", "audio_flow_shift": 3.0}, "flow_shift=6"),
-        (5, {"flow_shift": 6.0, "audio_flow_shift": 4.0}, "audio_flow_shift=3"),
-        (5, {"flow_shift": 6.0, "audio_flow_shift": []}, "audio_flow_shift=3"),
+        (None, {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=4"),
+        (5, {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=4"),
+        ("5", {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=4"),
+        (4, {"flow_shift": 7.0, "audio_flow_shift": 3.0}, "flow_shift=6"),
+        (4, {"flow_shift": "bad", "audio_flow_shift": 3.0}, "flow_shift=6"),
+        (4, {"flow_shift": 6.0, "audio_flow_shift": 4.0}, "audio_flow_shift=3"),
+        (4, {"flow_shift": 6.0, "audio_flow_shift": []}, "audio_flow_shift=3"),
     ],
 )
 def test_h3_turbo_rejects_unsupported_sampling(num_inference_steps, extra_args, error):
@@ -569,7 +570,7 @@ def test_h3_turbo_rejects_unsupported_sampling(num_inference_steps, extra_args, 
         pipeline._validate_turbo_sampling(sampling, _spec())
 
 
-def test_h3_turbo_accepts_five_sigma_points_for_four_nfe():
+def test_h3_turbo_accepts_four_steps_for_four_nfe():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
@@ -577,8 +578,27 @@ def test_h3_turbo_accepts_five_sigma_points_for_four_nfe():
     pipeline.default_audio_shift = 3.0
     pipeline._validate_turbo_sampling(
         SimpleNamespace(
-            num_inference_steps=5,
+            num_inference_steps=4,
             extra_args={"flow_shift": 6.0, "audio_flow_shift": 3.0},
         ),
         _spec(),
     )
+
+
+@pytest.mark.parametrize("turbo_scale", [0.0, 0.7, 1.0])
+def test_h3_finds_turbo_in_composition(turbo_scale):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    spec = _spec()
+    pipeline._turbo_lora_specs = {2: spec}
+    pipeline._native_distilled_lora_adapter_ids = set()
+    first = _request("swap")
+    first.lora_int_id = 1
+    turbo = _request("turbo")
+    turbo.lora_int_id = 2
+    sampling = SimpleNamespace(lora_request=[first, turbo], lora_scale=[1.0, turbo_scale])
+    assert pipeline._active_turbo_spec(sampling) is (spec if turbo_scale else None)
+    sampling.lora_request.reverse()
+    sampling.lora_scale.reverse()
+    assert pipeline._active_turbo_spec(sampling) is (spec if turbo_scale else None)

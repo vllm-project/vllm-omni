@@ -5,17 +5,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 
 from .temporal_chunks import decode_temporal_chunks
 
+if TYPE_CHECKING:
+    from .vae import MiniMaxH3VideoVAE
+
 MiniMaxH3VideoChunkCallback = Callable[[torch.Tensor], None]
 
 
 def decode_h3_chunks(
-    host,
+    host: MiniMaxH3VideoVAE,
     latent: torch.Tensor,
     callback: MiniMaxH3VideoChunkCallback | None,
     *,
@@ -51,8 +55,7 @@ def decode_h3_chunks(
         if not owner or error is not None:
             return
         try:
-            processor = getattr(host.model, "processor", None)
-            decoded = raw if processor is None else processor.revert_tensor(raw)
+            decoded = host._revert_decoded(raw)
             frames = host._normalize_decoded_frames(decoded).contiguous()
             assert callback is not None
             callback(frames)
@@ -80,6 +83,5 @@ def decode_h3_chunks(
 
     if not result.numel():
         return result
-    processor = getattr(host.model, "processor", None)
-    decoded = result if processor is None else processor.revert_tensor(result)
+    decoded = host._revert_decoded(result)
     return host._normalize_decoded_frames(decoded)

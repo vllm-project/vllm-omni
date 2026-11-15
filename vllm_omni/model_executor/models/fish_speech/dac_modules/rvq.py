@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from the fish-speech 0.1.0 PyPI release (Apache-2.0)
 # https://pypi.org/project/fish-speech/0.1.0/
 # Copyright (c) Fish Audio
@@ -117,24 +117,30 @@ class DownsampleResidualVectorQuantize(nn.Module):
             nn.init.trunc_normal_(m.weight, std=0.02)
             nn.init.constant_(m.bias, 0)
 
+    def _quantize(
+        self, z: torch.Tensor, n_quantizers: int | None = None
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        z = self.downsample(z)
+        z = self.pre_module(z)
+        semantic_result = self.semantic_quantizer(z)
+        residual_z = z - semantic_result[0]
+        residual_result = self.quantizer(residual_z, n_quantizers=n_quantizers)
+        return semantic_result, residual_result
+
     def forward(self, z, n_quantizers: int = None, semantic_len: torch.Tensor = None, **kwargs):
         # z: (B, D, T)
         original_shape = z.shape
         if semantic_len is None:
             semantic_len = torch.LongTensor([z.shape[-1]])
-        z = self.downsample(z)
-        z = self.pre_module(z)  # B, T, D
+        semantic_result, residual_result = self._quantize(z, n_quantizers)
         (
             semantic_z,
             semantic_codes,
             semantic_latents,
             semantic_commitment_loss,
             semantic_codebook_loss,
-        ) = self.semantic_quantizer(z)
-        residual_z = z - semantic_z
-        residual_z, codes, latents, commitment_loss, codebook_loss = self.quantizer(
-            residual_z, n_quantizers=n_quantizers
-        )
+        ) = semantic_result
+        residual_z, codes, latents, commitment_loss, codebook_loss = residual_result
         z = semantic_z + residual_z
         commitment_loss = commitment_loss + semantic_commitment_loss
         codebook_loss = codebook_loss + semantic_codebook_loss
@@ -163,6 +169,13 @@ class DownsampleResidualVectorQuantize(nn.Module):
         )
 
         return results
+
+    def encode(self, z: torch.Tensor, n_quantizers: int | None = None, **kwargs) -> torch.Tensor:
+        """Return codebook indices without reconstructing the quantized features."""
+        semantic_result, residual_result = self._quantize(z, n_quantizers)
+        _, semantic_codes, *_ = semantic_result
+        _, codes, *_ = residual_result
+        return torch.cat([semantic_codes, codes], dim=1)
 
     def decode(self, indices: torch.Tensor):
         new_indices = torch.zeros_like(indices)

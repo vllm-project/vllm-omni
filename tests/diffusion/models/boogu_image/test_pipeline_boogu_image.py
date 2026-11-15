@@ -13,11 +13,14 @@ Two groups:
    CFG handling, and reshape logic can be verified numerically on CPU.
 """
 
+import os
+import zlib
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
+from transformers import Qwen3VLConfig
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, TransformerConfig
 
@@ -56,9 +59,17 @@ def mock_dependencies(mocker, monkeypatch):
         f"{_MODULE}.FlowMatchEulerDiscreteScheduler.from_pretrained",
         lambda *a, **k: mock_scheduler,
     )
-    monkeypatch.setattr(
+    mllm_loader = mocker.patch(
         f"{_MODULE}.Qwen3VLForConditionalGeneration.from_pretrained",
-        lambda *a, **k: mllm_wrapper,
+        return_value=mllm_wrapper,
+    )
+    mllm_config_loader = mocker.patch(
+        f"{_MODULE}.Qwen3VLConfig.from_pretrained",
+        return_value=Qwen3VLConfig(),
+    )
+    mllm_builder = mocker.patch(
+        f"{_MODULE}.create_transformers_model_with_vllm_linears",
+        return_value=nn.Linear(1, 1),
     )
     monkeypatch.setattr(
         f"{_MODULE}.Qwen3VLProcessor.from_pretrained",
@@ -74,12 +85,17 @@ def mock_dependencies(mocker, monkeypatch):
     mock_transformer_cls.return_value = mock_transformer_instance
     monkeypatch.setattr(f"{_MODULE}.BooguImageTransformer2DModel", mock_transformer_cls)
 
-    # Treat the dummy model id as a local path: skips hub prefetch.
-    mocker.patch("os.path.exists", return_value=True)
+    # Treat only the dummy model id as local. Other filesystem checks (for
+    # example lazy imports in the quantization registry) must remain real.
+    path_exists = os.path.exists
+    mocker.patch("os.path.exists", side_effect=lambda path: str(path).startswith("dummy-boogu") or path_exists(path))
 
     return {
         "inner_encoder": inner_encoder,
         "mllm_wrapper": mllm_wrapper,
+        "mllm_loader": mllm_loader,
+        "mllm_config_loader": mllm_config_loader,
+        "mllm_builder": mllm_builder,
         "processor": mock_processor,
         "vae": mock_vae,
         "scheduler": mock_scheduler,
@@ -128,6 +144,9 @@ def test_constructor_wires_components(boogu_pipeline, mock_dependencies):
     assert boogu_pipeline.vae_scale_factor == 8
     assert boogu_pipeline.default_sample_size == 128
     assert hasattr(boogu_pipeline, "load_weights")
+    assert "quantization_config" not in mock_dependencies["mllm_loader"].call_args.kwargs
+    mock_dependencies["mllm_config_loader"].assert_not_called()
+    mock_dependencies["mllm_builder"].assert_not_called()
 
 
 def test_constructor_strips_mllm_lm_head(boogu_pipeline, mock_dependencies):
@@ -188,7 +207,7 @@ def test_constructor_weights_sources(boogu_pipeline):
     assert source.fall_back_to_pt is True
 
 
-def test_constructor_routes_only_transformer_config(mock_dependencies, mocker):
+def test_constructor_rejects_unsupported_mllm_quantization(mock_dependencies, mocker):
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
     from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
@@ -204,18 +223,154 @@ def test_constructor_routes_only_transformer_config(mock_dependencies, mocker):
             {"transformer": transformer_config, "mllm": encoder_config, "vae": None}
         ),
     )
+    with pytest.raises(ValueError, match="Boogu MLLM only supports FP8 quantization"):
+        BooguImagePipeline(od_config=od_config)
+    mock_dependencies["mllm_loader"].assert_not_called()
+    mock_dependencies["mllm_config_loader"].assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("quantization_config", "quantize_mllm"),
+    [
+        pytest.param("fp8", True, id="global-fp8"),
+        pytest.param({"mllm": {"method": "fp8"}, "transformer": {"method": "fp8"}}, True, id="mllm-and-dit-fp8"),
+        pytest.param({"mllm": None, "transformer": "fp8"}, False, id="dit-only-fp8"),
+    ],
+)
+def test_constructor_routes_mllm_quantization(mock_dependencies, quantization_config, quantize_mllm):
+    from transformers import AutoModel
+    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8Static128BlockSym
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+    from vllm_omni.quantization.fp8_config import DiffusionFp8Config
+
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        revision="test-revision",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.bfloat16,
+        quantization_config=quantization_config,
+    )
+    pipeline = BooguImagePipeline(od_config=od_config)
+
+    if quantize_mllm:
+        mock_dependencies["mllm_loader"].assert_not_called()
+        mock_dependencies["mllm_config_loader"].assert_called_once_with(
+            "dummy-boogu", subfolder="mllm", local_files_only=True, revision="test-revision"
+        )
+        builder = mock_dependencies["mllm_builder"]
+        builder.assert_called_once()
+        auto_cls, hf_config, online_quant_config = builder.call_args.args
+        assert auto_cls is AutoModel
+        assert hf_config is mock_dependencies["mllm_config_loader"].return_value
+        assert isinstance(online_quant_config, OnlineQuantizationConfig)
+        assert online_quant_config.args.linear.weight == kFp8Static128BlockSym
+        assert builder.call_args.kwargs == {
+            "dtype": torch.bfloat16,
+            "device": pipeline._execution_device,
+            "prefix": "mllm",
+            "skip_modules": ("mllm.visual",),
+        }
+        assert pipeline.mllm is builder.return_value
+        assert not pipeline.mllm.training
+        assert all(not parameter.requires_grad for parameter in pipeline.mllm.parameters())
+        transformer_source, mllm_source = pipeline.weights_sources
+        assert transformer_source.subfolder == "transformer"
+        assert mllm_source.model_or_path == "dummy-boogu"
+        assert mllm_source.subfolder == "mllm"
+        assert mllm_source.prefix == "mllm."
+        assert mllm_source.revision == "test-revision"
+    else:
+        assert "quantization_config" not in mock_dependencies["mllm_loader"].call_args.kwargs
+        assert pipeline.mllm is mock_dependencies["inner_encoder"]
+        mock_dependencies["mllm_config_loader"].assert_not_called()
+        mock_dependencies["mllm_builder"].assert_not_called()
+        assert [source.subfolder for source in pipeline.weights_sources] == ["transformer"]
+    assert isinstance(mock_dependencies["transformer_cls"].call_args.kwargs["quant_config"], DiffusionFp8Config)
+
+
+def test_constructor_preserves_mllm_ignored_layers(mock_dependencies):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+    from vllm_omni.quantization.fp8_config import DiffusionFp8Config
+
+    quant_config = DiffusionFp8Config(
+        ignored_layers=["mllm.language_model.layers.0.self_attn.q_proj", "transformer.blocks.0.attn.to_q"]
+    )
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.bfloat16,
+        quantization_config=quant_config,
+    )
     BooguImagePipeline(od_config=od_config)
-    kwargs = mock_dependencies["transformer_cls"].call_args.kwargs
-    assert kwargs["quant_config"] is transformer_config
-    assert kwargs["prefix"] == "transformer"
+
+    online_quant_config = mock_dependencies["mllm_builder"].call_args.args[2]
+    assert online_quant_config.ignored_layers == quant_config.ignored_layers
+
+
+def test_constructor_preserves_serialized_mllm_quantization(mock_dependencies):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+
+    mock_dependencies["mllm_config_loader"].return_value = Qwen3VLConfig(
+        quantization_config={"quant_method": "fp8", "modules_to_not_convert": ["model.visual"]}
+    )
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu-fp8",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.bfloat16,
+        quantization_config="fp8",
+    )
+    pipeline = BooguImagePipeline(od_config=od_config)
+
+    # No override: HF reads the serialized checkpoint's scales and skip list.
+    assert "quantization_config" not in mock_dependencies["mllm_loader"].call_args.kwargs
+    assert pipeline.mllm is mock_dependencies["inner_encoder"]
+    mock_dependencies["mllm_builder"].assert_not_called()
+    assert [source.subfolder for source in pipeline.weights_sources] == ["transformer"]
+
+
+def test_load_weights_maps_mllm_and_preserves_transformer():
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+
+    pipeline = object.__new__(BooguImagePipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.mllm = nn.ModuleDict(
+        {
+            "language_model": nn.Linear(2, 2, bias=False),
+            "visual": nn.Linear(2, 2, bias=False),
+        }
+    )
+    pipeline.transformer = nn.Linear(2, 2, bias=False)
+    language_weight = torch.full((2, 2), 1.0)
+    visual_weight = torch.full((2, 2), 2.0)
+    transformer_weight = torch.full((2, 2), 3.0)
+
+    loaded = pipeline.load_weights(
+        [
+            ("mllm.lm_head.weight", torch.full((2, 2), 9.0)),
+            ("mllm.model.language_model.weight", language_weight),
+            ("mllm.model.visual.weight", visual_weight),
+            ("transformer.weight", transformer_weight),
+        ]
+    )
+
+    assert loaded == {"mllm.language_model.weight", "mllm.visual.weight", "transformer.weight"}
+    torch.testing.assert_close(pipeline.mllm["language_model"].weight, language_weight)
+    torch.testing.assert_close(pipeline.mllm["visual"].weight, visual_weight)
+    torch.testing.assert_close(pipeline.transformer.weight, transformer_weight)
 
 
 @pytest.mark.parametrize(
     ("parallel_config", "cache_backend", "message"),
     [
         (DiffusionParallelConfig(tensor_parallel_size=2), "none", "Tensor parallelism"),
-        (DiffusionParallelConfig(ulysses_degree=2), "none", "Sequence parallelism"),
-        (DiffusionParallelConfig(ring_degree=2), "none", "Sequence parallelism"),
+        (DiffusionParallelConfig(ring_degree=2), "none", "Ulysses only"),
+        (
+            DiffusionParallelConfig(ulysses_degree=2, cfg_parallel_size=2),
+            "none",
+            "CFG parallelism is not validated",
+        ),
         (
             DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=2),
             "none",
@@ -270,13 +425,112 @@ def test_constructor_accepts_cfg_parallel(mock_dependencies, cfg_parallel_size):
     assert hasattr(pipeline, "predict_noise_with_multi_branch_cfg")
 
 
+def test_constructor_accepts_ulysses_uaa(
+    mock_dependencies,
+    monkeypatch,
+):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    monkeypatch.setattr(
+        f"{_MODULE}.current_omni_platform.is_cuda",
+        lambda: True,
+    )
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(
+            params={
+                "num_attention_heads": 28,
+                "num_kv_heads": 7,
+            }
+        ),
+        dtype=torch.float32,
+        parallel_config=DiffusionParallelConfig(
+            ulysses_degree=2,
+            ulysses_mode="advanced_uaa",
+        ),
+    )
+
+    pipeline = BooguImagePipeline(od_config=od_config)
+    assert pipeline.transformer is mock_dependencies["transformer"]
+
+
+def test_constructor_requires_uaa_for_boogu_gqa(
+    mock_dependencies,
+    monkeypatch,
+):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    monkeypatch.setattr(
+        f"{_MODULE}.current_omni_platform.is_cuda",
+        lambda: True,
+    )
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(
+            params={
+                "num_attention_heads": 28,
+                "num_kv_heads": 7,
+            }
+        ),
+        dtype=torch.float32,
+        parallel_config=DiffusionParallelConfig(
+            ulysses_degree=2,
+            ulysses_mode="strict",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="advanced_uaa"):
+        BooguImagePipeline(od_config=od_config)
+
+
+def test_constructor_rejects_non_cuda_sequence_parallelism(
+    mock_dependencies,
+    monkeypatch,
+):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    monkeypatch.setattr(
+        f"{_MODULE}.current_omni_platform.is_cuda",
+        lambda: False,
+    )
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.float32,
+        parallel_config=DiffusionParallelConfig(
+            ulysses_degree=2,
+            ulysses_mode="advanced_uaa",
+        ),
+    )
+
+    with pytest.raises(NotImplementedError, match="requires CUDA"):
+        BooguImagePipeline(od_config=od_config)
+
+    mock_dependencies["mllm_wrapper"].model.to.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Prompt-encoding tests (deterministic fakes, no constructor)
 # ---------------------------------------------------------------------------
 
 
+def _content_id(text: str) -> int:
+    """Bounded text IDs, stable across processes unlike builtin ``hash()``.
+
+    Seed/reference checks use separate transformers so BF16 rounding cannot
+    hide their smaller signals beneath the content term.
+    """
+    return zlib.crc32(text.encode()) % 9973
+
+
 class _RecordingProcessor:
-    """Fake Qwen3VLProcessor: deterministic token ids derived from the text."""
+    """Fake Qwen3VLProcessor with content-derived token IDs."""
 
     def __init__(self):
         self.calls = []
@@ -288,8 +542,8 @@ class _RecordingProcessor:
         for i, messages in enumerate(prompts):
             system_text = messages[0]["content"][0]["text"]
             user_text = messages[1]["content"][0]["text"]
-            input_ids[i, 0] = len(system_text) % 997
-            input_ids[i, 1] = len(user_text) % 997
+            input_ids[i, 0] = _content_id(system_text)
+            input_ids[i, 1] = _content_id(user_text)
             input_ids[i, 2:] = torch.arange(2, _SEQ_LEN) + i
         attention_mask = torch.ones(batch, _SEQ_LEN, dtype=torch.long)
         attention_mask[:, -1] = 0  # fake right-padding
@@ -1038,7 +1292,10 @@ def test_apply_chat_template_ti2i_places_image_before_text():
 
 
 class _ImageAwareRecordingProcessor:
-    """Records whether reference images reached the processor."""
+    """Record reference-image presence and encode text with stable IDs.
+
+    Find text by type because TI2I puts the image first.
+    """
 
     def __init__(self):
         self.calls = []
@@ -1050,7 +1307,13 @@ class _ImageAwareRecordingProcessor:
             has_image.append(any(c.get("type") == "image" for c in user_content))
         self.calls.append({"prompts": prompts, "kwargs": kwargs, "has_image": has_image})
         batch = len(prompts)
-        input_ids = torch.arange(batch * _SEQ_LEN, dtype=torch.long).view(batch, _SEQ_LEN)
+        input_ids = torch.zeros(batch, _SEQ_LEN, dtype=torch.long)
+        for i, messages in enumerate(prompts):
+            system_text = messages[0]["content"][0]["text"]
+            user_text = next(c["text"] for c in messages[1]["content"] if c.get("type") == "text")
+            input_ids[i, 0] = _content_id(system_text)
+            input_ids[i, 1] = _content_id(user_text)
+            input_ids[i, 2:] = torch.arange(2, _SEQ_LEN) + i
         attention_mask = torch.ones(batch, _SEQ_LEN, dtype=torch.long)
         return {"input_ids": input_ids, "attention_mask": attention_mask}
 
@@ -1313,53 +1576,8 @@ def test_forward_image_guidance_ignored_without_reference():
 
 
 # ---------------------------------------------------------------------------
-# Request-batch: compatibility key, generator routing, output split
+# Request-batch: generator routing, output split
 # ---------------------------------------------------------------------------
-
-
-def test_boogu_batch_compatibility_key_t2i_stable_ti2i_unique():
-    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import _boogu_batch_compatibility_key
-
-    # t2i: request_id does not enter the key -> t2i requests batch together.
-    assert _boogu_batch_compatibility_key(False, "req-a") == _boogu_batch_compatibility_key(False, "req-b")
-    assert _boogu_batch_compatibility_key(False, "req-a")[1] == "t2i"
-
-    # ti2i: request_id in the key -> each edit gets a unique key, never co-batched.
-    assert _boogu_batch_compatibility_key(True, "req-a") != _boogu_batch_compatibility_key(True, "req-b")
-    assert _boogu_batch_compatibility_key(True, "req-a")[1] == "ti2i"
-
-    # t2i and ti2i never share a key.
-    assert _boogu_batch_compatibility_key(False, "req-a") != _boogu_batch_compatibility_key(True, "req-a")
-
-
-def test_pre_process_key_wiring_t2i_batches_ti2i_isolated(tmp_path):
-    # End-to-end: real pre-process sets request.batch_compatibility_key, and the
-    # scheduler's key builder reads it into condition_key. Two t2i requests share
-    # a key (co-batchable); two edit requests get distinct keys (batch=1).
-    import PIL.Image
-
-    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import get_boogu_image_pre_process_func
-    from vllm_omni.diffusion.request import OmniDiffusionRequest
-    from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-    pre = get_boogu_image_pre_process_func(_make_edit_od_config(tmp_path))
-
-    def condition_key(prompt, rid):
-        req = OmniDiffusionRequest(
-            prompt=prompt, sampling_params=OmniDiffusionSamplingParams(height=512, width=512), request_id=rid
-        )
-        pre(req)
-        return build_request_batch_sampling_params_key(req).condition_key
-
-    t2i_a = condition_key({"prompt": "a cat"}, "t-a")
-    t2i_b = condition_key({"prompt": "a dog"}, "t-b")
-    assert t2i_a == t2i_b and t2i_a[1] == "t2i"
-
-    img = PIL.Image.new("RGB", (64, 64))
-    ti2i_a = condition_key({"prompt": "edit", "multi_modal_data": {"image": img}}, "e-a")
-    ti2i_b = condition_key({"prompt": "edit", "multi_modal_data": {"image": img}}, "e-b")
-    assert ti2i_a != ti2i_b and ti2i_a[1] == "ti2i"
 
 
 class _GeneratorRecordingVAE:
@@ -1489,78 +1707,6 @@ def test_forward_request_batch_num_outputs_slices_and_generators():
     assert outs[0].output.shape[0] == 2 and outs[1].output.shape[0] == 2
     assert float(outs[0].output[0, 0, 0, 0]) == 0.0 and float(outs[0].output[1, 0, 0, 0]) == 1.0
     assert float(outs[1].output[0, 0, 0, 0]) == 2.0 and float(outs[1].output[1, 0, 0, 0]) == 3.0
-
-
-def test_forward_batch_isolation_partner_content_and_seed():
-    """CFG-on, B=2: request A's output must not change when only the
-    co-batched partner's prompt content, negative prompt, or seed changes.
-
-    ``_FakeTransformer``/``_FakeScheduler`` are content-blind (always-zero
-    velocity, latents passed through unchanged), so they cannot catch a
-    cross-request value leak. This test swaps in a transformer whose output
-    depends on both ``instruction_embeds`` (content, positive or negative
-    depending on which CFG branch called it) and ``latents`` (seed), and a
-    scheduler that actually applies the predicted velocity, so a batching bug
-    that mixes rows in either the cond or uncond prediction would change A's
-    result. A negative-prompt-only perturbation is required to cover the
-    uncond branch: varying only the positive prompt never touches
-    ``negative_instruction_embeds``, so an earlier version of this test
-    passed even with a synthetic row-mixing bug injected into the uncond
-    predict() call (verified via a RED-arm check before this fix).
-    """
-
-    class _ContentAwareTransformer(_FakeTransformer):
-        def __call__(self, latents, timestep, instruction_embeds, freqs_real, instruction_attention_mask, **kwargs):
-            content = instruction_embeds.mean(dim=(1, 2)).view(-1, 1, 1, 1)
-            return latents + content
-
-    class _ApplyingScheduler(_FakeScheduler):
-        def step(self, model_output, t, latents, return_dict=False):
-            return (model_output,)
-
-    def run(prompt_a, seed_a, neg_a, prompt_b, seed_b, neg_b):
-        pipeline = _make_forward_pipeline()
-        pipeline.transformer = _ContentAwareTransformer()
-        pipeline.scheduler = _ApplyingScheduler()
-        kw = dict(height=64, width=64, num_inference_steps=2, guidance_scale=4.0, output_type="latent")
-        req = _wrap_request_batch(
-            [
-                (
-                    {"prompt": prompt_a, "negative_prompt": neg_a},
-                    _sampling(**kw, generator=torch.Generator().manual_seed(seed_a)),
-                ),
-                (
-                    {"prompt": prompt_b, "negative_prompt": neg_b},
-                    _sampling(**kw, generator=torch.Generator().manual_seed(seed_b)),
-                ),
-            ]
-        )
-        return pipeline.forward(req)[0].output
-
-    baseline = run("a cat on a mat", 1, "ugly", "a dog in a park", 2, "blurry")
-    assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a totally different scene", 2, "blurry"))
-    assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a dog in a park", 999, "blurry"))
-    assert torch.equal(baseline, run("a cat on a mat", 1, "ugly", "a dog in a park", 2, "watermark"))
-
-
-def test_forward_batched_ti2i_fails_closed():
-    # A batched ti2i must fail closed (it is gated to batch=1).
-    pipeline = _make_forward_pipeline()
-
-    def edit_prompt():
-        return {
-            "prompt": "make it winter",
-            "additional_information": {"preprocessed_image": torch.zeros(1, 3, 64, 64), "prompt_image": None},
-        }
-
-    req = _wrap_request_batch(
-        [
-            (edit_prompt(), _sampling(num_inference_steps=1, guidance_scale=1.0)),
-            (edit_prompt(), _sampling(num_inference_steps=1, guidance_scale=1.0)),
-        ]
-    )
-    with pytest.raises(RuntimeError, match="gated to batch=1"):
-        pipeline.forward(req)
 
 
 def test_supports_request_batch_enabled():

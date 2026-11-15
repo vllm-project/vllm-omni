@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for ``OmniARScheduler._drop_aborted_queued_requests``.
 
 ``schedule()`` sweeps ``FINISHED_ABORTED`` requests out of the queues before
@@ -6,7 +9,7 @@ handing control to upstream, because upstream ``Scheduler.schedule()`` raises
 admits in a finished state -- which kills the stage's engine core, not just
 the request.
 
-Regression for the sweep missing ``skipped_waiting``, the third queue
+Regression for the sweep missing ``kv_holding_waiting``, the third queue
 upstream admits from. An aborted duplex session parked there was re-selected
 by ``_select_waiting_queue_for_scheduling`` on a later tick and crashed the
 stage.
@@ -46,28 +49,31 @@ class _StubRequest:
         return (self.priority, self.arrival_time) < (other.priority, other.arrival_time)
 
 
-def _make_scheduler(policy: SchedulingPolicy, *, waiting=(), skipped_waiting=(), running=()):
+def _make_scheduler(policy: SchedulingPolicy, *, waiting=(), kv_holding_waiting=(), running=()):
     """Bare scheduler with just the surface the sweep reads."""
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler.waiting = create_request_queue(policy)
     for req in waiting:
         scheduler.waiting.add_request(req)
-    scheduler.skipped_waiting = create_request_queue(policy)
-    for req in skipped_waiting:
-        scheduler.skipped_waiting.add_request(req)
+    scheduler.kv_holding_waiting = create_request_queue(policy)
+    scheduler.deferred_waiting = set()
+    for req in kv_holding_waiting:
+        scheduler.kv_holding_waiting.add_request(req)
     scheduler.running = list(running)
     return scheduler
 
 
 @pytest.mark.parametrize("policy", _POLICIES)
-def test_schedule_sweeps_skipped_waiting_before_upstream_selection(
+def test_schedule_sweeps_kv_holding_waiting_before_upstream_selection(
     monkeypatch: pytest.MonkeyPatch,
     policy: SchedulingPolicy,
 ) -> None:
     """The public schedule path must remove aborted skipped requests first."""
     aborted = _StubRequest("req-aborted", RequestStatus.FINISHED_ABORTED)
-    scheduler = _make_scheduler(policy, skipped_waiting=[aborted])
+    scheduler = _make_scheduler(policy, kv_holding_waiting=[aborted])
     scheduler.chunk_transfer_adapter = None
+    scheduler.max_num_active_reqs = 8
+    scheduler.max_num_running_reqs = 8
     scheduler.input_coordinator = None
     scheduler.num_waiting_for_streaming_input = 0
     scheduler._process_pending_omni_inputs = lambda model_mode: None
@@ -81,7 +87,7 @@ def test_schedule_sweeps_skipped_waiting_before_upstream_selection(
     sentinel = object()
 
     def upstream_schedule(_self, _throttle_prefills: bool = False):
-        assert list(scheduler.skipped_waiting) == []
+        assert list(scheduler.kv_holding_waiting) == []
         return sentinel
 
     monkeypatch.setattr(ar_sched_mod.VLLMScheduler, "schedule", upstream_schedule)

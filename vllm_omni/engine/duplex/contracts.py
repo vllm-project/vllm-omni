@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import base64
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
+
+import regex as re
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +80,9 @@ class DuplexStageSubmission:
     context: DuplexStageRequestContext
     prompt: Mapping[str, object]
     already_submitted: bool
+    # True: resume/update an existing stage0 id. False: open a new ephemeral id.
+    # Distinct from DuplexCapabilities.supports_core_resumable_request.
+    resumable: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", MappingProxyType(dict(self.prompt)))
@@ -97,6 +102,9 @@ class DuplexOutputContext:
     segment_finished: bool
     segment_token_ids: tuple[int, ...] = ()
     segment_output_metadata: Mapping[str, object] = field(default_factory=dict)
+    # Session stats (RFC #8325): the (epoch, seq) chunks this output finishes
+    # handling for. Their spans reach the ledger directly (``on_stage_work``).
+    perf_chunks: frozenset[tuple[int, int]] = frozenset()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "segment_token_ids", tuple(self.segment_token_ids))
@@ -105,10 +113,20 @@ class DuplexOutputContext:
             "segment_output_metadata",
             MappingProxyType(dict(self.segment_output_metadata)),
         )
+        object.__setattr__(self, "perf_chunks", frozenset(self.perf_chunks))
 
 
 class DuplexStagePort(ABC):
     """Narrow stage-management surface the session runner/manager use (implemented by DuplexOrchestrator)."""
+
+    def reserve_session(self, session_id: str) -> None:
+        """Atomically reserve capacity, leaving none on error; legacy ports do nothing."""
+
+    def release_session(self, session_id: str) -> None:
+        """Idempotently release a session's replica reservation after cleanup."""
+
+    def reject_session(self, reason: str) -> None:
+        """Observe admission rejection when the stage port enables placement."""
 
     @property
     @abstractmethod
@@ -157,22 +175,85 @@ def duplex_resource_request_id(fence: DuplexFence, role: str) -> str:
     return f"duplex-s.{encoded_session_id}.e.{fence.epoch}.r.{role}"
 
 
-def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
-    """Return whether a current-format resource request belongs to a session."""
+def duplex_ephemeral_stage_request_id(fence: DuplexFence, *, stage_id: int) -> str:
+    """Turn-scoped Stage request id for non-resumable (ephemeral) duplex models."""
+    return duplex_resource_request_id(fence, f"stage{stage_id}-turn{fence.turn_id}")
+
+
+def duplex_is_auxiliary_request(request_id: str | None) -> bool:
+    fields = _duplex_resource_request_fields(request_id)
+    return fields is not None and fields[2].startswith("auxiliary-")
+
+
+_EPHEMERAL_TURN_IN_REQUEST_ID = re.compile(r"\.r\.stage\d+-turn(\d+)$")
+
+
+def duplex_turn_id_from_request_id(request_id: str | None) -> int | None:
+    """Parse ephemeral ``…r.stage{N}-turn{T}`` ids."""
+    if not isinstance(request_id, str):
+        return None
+    match = _EPHEMERAL_TURN_IN_REQUEST_ID.search(request_id)
+    return int(match.group(1)) if match else None
+
+
+def duplex_same_turn_request_ids(request_id: str, candidate_ids: Iterable[str]) -> list[str]:
+    """Other ephemeral stage ids from the same session, epoch, and turn.
+
+    ``request_id`` itself is not included. Non-ephemeral ids are ignored.
+    """
+    turn_id = duplex_turn_id_from_request_id(request_id)
+    if turn_id is None or ".r." not in request_id:
+        return []
+    prefix = request_id.rsplit(".r.", 1)[0] + ".r."
+    return [
+        candidate
+        for candidate in candidate_ids
+        if candidate != request_id
+        and isinstance(candidate, str)
+        and candidate.startswith(prefix)
+        and duplex_turn_id_from_request_id(candidate) == turn_id
+    ]
+
+
+def _duplex_resource_request_fields(request_id: str | None) -> tuple[str, str, str] | None:
+    """Split ``duplex-s.<b64url>.e.<epoch>.r.<role>`` or return None."""
+    if not isinstance(request_id, str):
+        return None
     parts = request_id.split(".")
     if len(parts) != 6 or parts[0] != "duplex-s" or parts[2] != "e" or parts[4] != "r":
-        return False
+        return None
+    return parts[1], parts[3], parts[5]
+
+
+def duplex_session_id_from_request_id(request_id: str | None) -> str | None:
+    """Decode the session id from ``duplex-s.<b64url>.e.<epoch>.r.<role>``."""
+    fields = _duplex_resource_request_fields(request_id)
+    if fields is None:
+        return None
+    encoded, _, _ = fields
+    pad = "=" * (-len(encoded) % 4)
     try:
-        int(parts[3])
+        return base64.urlsafe_b64decode(encoded + pad).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def duplex_resource_request_belongs_to_session(request_id: str, session_id: str) -> bool:
+    """Return whether a current-format resource request belongs to a session."""
+    fields = _duplex_resource_request_fields(request_id)
+    if fields is None:
+        return False
+    encoded, epoch, role = fields
+    try:
+        int(epoch)
     except ValueError:
         return False
-    role = parts[5]
     if not role or any(
         character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in role
     ):
         return False
     encoded_session_id = base64.urlsafe_b64encode(session_id.encode("utf-8")).decode("ascii").rstrip("=")
-    return parts[1] == encoded_session_id
+    return encoded == encoded_session_id
 
 
 __all__ = [
@@ -187,6 +268,10 @@ __all__ = [
     "DuplexStageSubmission",
     "DuplexStageSubmissionResult",
     "duplex_data_plane_request_info",
+    "duplex_ephemeral_stage_request_id",
+    "duplex_turn_id_from_request_id",
     "duplex_resource_request_belongs_to_session",
     "duplex_resource_request_id",
+    "duplex_same_turn_request_ids",
+    "duplex_session_id_from_request_id",
 ]

@@ -1,4 +1,4 @@
-﻿# FP8 Quantization
+# FP8 Quantization
 
 ## Overview
 
@@ -17,11 +17,11 @@ in deep DiT blocks.
 ## Hardware Support
 
 | Device | Support |
-|--------|---------|
+| -------- | --------- |
 | NVIDIA Blackwell GPU (SM 100+) | ✅ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ |
-| AMD ROCm | ⭕ |
+| AMD ROCm | ✅ ([configurable online blocks](rocm_online_fp8.md) are available for quality-sensitive models) |
 | Intel XPU | ⭕ |
 | Ascend NPU | ❌ |
 
@@ -65,7 +65,17 @@ vLLM-Omni points that cache at `~/.cache/vllm_omni/quack` (override with
 `QUACK_CACHE_DIR`) instead of quack's default under `/tmp`, so it survives restarts.
 In containers, set `QUACK_CACHE_DIR` to a mounted/persistent path — or bake it into
 the image — so the first cold start does not recompile. The engine's startup dummy
-run already exercises the kernels, so with a warm cache the first real request is fast.
+run exercises the kernels, but new shapes, layouts, dtypes, or bias settings may
+still need compilation or tuning. The warmup helper uses inference mode and
+transposed weights without bias. Daemon workers compile candidates in-process
+while retaining autotuning and caching.
+
+Scale validation and Quack/FlashInfer dispatch run inside a PyTorch custom op.
+This keeps layer-specific scale addresses and validation-cache updates out of
+Dynamo tracing without introducing a graph break. Unpopulated scales and Quack
+failures still fall back to FlashInfer at runtime. CUDA graph capture additionally
+requires warming the dispatch with populated scales; Python validation and
+dispatch do not rerun during CUDA graph replay.
 
 To pre-warm specific shapes (e.g. at image build time):
 
@@ -78,41 +88,93 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 > The PyPI package is `quack-kernels` (imported as `quack`); plain `pip install
 > quack` is an unrelated statistics library. Requires CUDA 12.9+ and Python 3.12.
 
+### FlashInfer autotune for diffusion stages
+
+On SM100+ vLLM runs some quantized linears through FlashInfer: MXFP8 linears
+(`FlashInferCutedslMxfp8LinearKernel`, e.g. AutoRound MXFP8 checkpoints) and FP8
+linears with per-tensor activation scales (`FlashInferFP8ScaledMMLinearKernel`).
+FlashInfer picks their GEMM tactic by heuristic unless it is autotuned, and vLLM
+autotunes FlashInfer only in its LLM worker warm-up. Diffusion stages therefore
+autotune FlashInfer themselves, by default on CUDA SM100+ with FlashInfer
+installed (on SM90 FlashInfer's heuristic already matches the tuned tactic).
+Online `--quantization fp8` is not affected: it uses dynamic per-token
+activation scales on CUTLASS, so nothing is tuned.
+
+```bash
+vllm serve <mxfp8-checkpoint> --omni                                  # SM100+: on by default
+vllm serve <mxfp8-checkpoint> --omni --no-diffusion-flashinfer-autotune  # off
+vllm serve <mxfp8-checkpoint> --omni --diffusion-flashinfer-autotune     # force on (e.g. SM90)
+```
+
+On one B200, Wan2.2-T2V-A14B MXFP8 (832x480, 81 frames, 40 steps) went from
+112 s to 95 s per request with identical output.
+
+The first forward of each new batch runs under FlashInfer's autotune context,
+which profiles the GEMM shapes it has not seen; with step execution that covers
+every step of the requests in that batch, since prefill and decode differ. That
+forward is slower, so send a warm-up request at the measured shape and batch
+size before timing. A batch is identified by the scheduler's
+batch-compatibility key of each request it batches -- output size, frame count,
+outputs per prompt, CFG, LoRA and the pipeline's own condition key (for example
+Qwen-Image-2.1's reference-image sizes) -- so two requests of one shape count
+as a new batch after a single one, and a new reference-image geometry is tuned
+again. Rows that depend on the prompt text are not covered: text embeddings are
+padded to the longest prompt in the batch, so no request predicts them at
+admission, and those GEMMs keep FlashInfer's heuristic tactic. A request that
+fails or is cancelled part way through leaves its batch untuned, so a retry
+tunes the steps it never reached. Later requests
+run in FlashInfer's normal mode and use the tuned tactics: tune mode is not kept
+on, because it adds host time to every FlashInfer call even when the tactic is
+cached. Tactics are cached per rank under
+`$VLLM_CACHE_ROOT/flashinfer_autotune/diffusion/<key>/rank<N>.json`, keyed on the
+model, quantization, dtype and parallel layout, and are reused after a restart.
+A tactic is only valid for the GPU and library versions it was tuned on;
+FlashInfer rejects such a file and will not overwrite it, so the worker then
+writes `rank<N>.env-<fingerprint>.json` next to it instead of re-tuning on every
+start.
+Captured CUDA graphs are compatible: their eager warm-up runs before capture, so
+the capture only sees cached tactics. The flag is a no-op off CUDA or without
+FlashInfer.
+
 ## Model Type Support
 
 ### Diffusion Models
 
 | Model | HF models | Online | Pre-calibrated | Recommendation | `ignored_layers` | Text-Encoder quantization |
-|-------|-----------|:-------:|:------:|----------------|------------------|------------------|
+| ------- | ----------- | :-------: | :------: | ---------------- | ------------------ | ------------------ |
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes | Yes | Skip sensitive image-stream MLPs when quality regresses | `img_mlp` | |
+| Qwen-Image-2.1 | `Qwen/Qwen-Image-2.1` | Yes | Not validated | Skip image-stream MLPs for best fidelity; all-layer FP8 is loadable. On H200 (1024×1024, teapot prompt) DiT FP8-all is ~30.4 GB / 6.06 s vs BF16 ~36.9 GB / 7.34 s (~33 dB vs BF16). Text encoder FP8 covers the language model only — the vision tower and LM head stay BF16 | `img_mlp` | ✅︎ (language model only) |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Not validated | Validate against BF16 before documenting as supported | TBD | |
-| LTX-2 | `Lightricks/LTX-2`, `rootonchair/LTX-2-19b-distilled` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
+| LTX-2 | `Lightricks/LTX-2` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
 | LTX-2.3 | `diffusers/LTX-2.3-Diffusers`, `diffusers/LTX-2.3-Distilled-Diffusers` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
-| Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Yes | All layers | None | ✅︎ |
-| FLUX.1 | `black-forest-labs/FLUX.1-dev`, `black-forest-labs/FLUX.1-schnell` | Yes | Yes | All layers | None | |
+| Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Yes | Use the checked-in quality-test exclusions; ROCm additionally uses `online_block_size=64` | See the quality configuration | ✅︎ |
+| FLUX.1 | `black-forest-labs/FLUX.1-dev`, `black-forest-labs/FLUX.1-schnell` | Yes | Yes | All layers | None | ✅︎ |
 | FLUX.2-dev | `black-forest-labs/FLUX.2-dev` | Yes | Not validated | All layers | None | ✅︎ |
 | FLUX.2-klein | `black-forest-labs/FLUX.2-klein-4B` | Yes | Yes | All layers | None | |
 | HunyuanImage-3.0 | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | Yes | Yes | All layers; use the Hunyuan deploy config for multi-stage runs | None | |
 | HunyuanVideo-1.5 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v`, `720p_t2v`, `480p_i2v` | Yes | Yes | All layers | None | |
 | Cosmos3 | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | Yes | Not validated | All layers | None | |
 | MiniMax-H3 | `MiniMaxAI/MiniMax-H3` (`FL2VA` / `Ref2VA`) | Yes | Not validated | `quantization="fp8"` quantizes eligible DiT and text-encoder linears; mixed-precision input/output heads stay FP32 | None | ✅︎ |
+| MiniMax-H3-Image | `MiniMaxAI/MiniMax-H3-Image` (`t2i` / `edit`) | Yes | Not validated | DiT linears only; fused PDD heads stay FP32 and the text encoder stays BF16. On 4× RTX PRO 6000 (USP 4) median latency drops 16–20%; edits stay close to BF16 (~32 dB) while t2i layouts can shift (16–19 dB), so validate output quality before enabling | None | |
+| SenseNova-U1.5 | `sensenova/SenseNova-U1.5-8B-MoT` | Yes | Not validated | UND/GEN language-model linears only | None | |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
-| Model | Scope | Format | Status |
-|-------|-------|--------|--------|
+| Model      | Scope                        | Format                                   | Status                              |
+| ---------- | ---------------------------- | ---------------------------------------- | ----------------------------------- |
 | Qwen3-Omni | Thinker language-model stage | [ModelOpt](modelopt.md) `quant_algo=FP8` | Tested for thinker memory reduction |
-| Qwen3-TTS | TTS language-model stage | Checkpoint config | Not validated |
+| Qwen3-TTS  | TTS language-model stage     | Checkpoint config                        | Not validated                       |
 
 Audio encoder, vision encoder, talker, and code2wav stay in BF16 unless a
 model-specific guide says otherwise.
 
-### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
+### Multi-Stage Diffusion Model (BAGEL, GLM-Image, MammothModa2)
 
-| Model | Scope | Status | Notes |
-|-------|-------|--------|-------|
-| BAGEL | Stage-specific transformer or DiT module | Not validated | Route FP8 to the intended stage before enabling |
-| GLM-Image | Stage-specific transformer or DiT module | Not validated | Validate quality against BF16 baseline |
+| Model        | Scope                                    | Status               | Notes                                                                           |
+| ------------ | ---------------------------------------- | -------------------- | ------------------------------------------------------------------------------- |
+| BAGEL        | Stage-specific transformer or DiT module | Not validated        | Route FP8 to the intended stage before enabling                                 |
+| GLM-Image    | Stage-specific transformer or DiT module | Not validated        | Validate quality against BF16 baseline                                          |
+| MammothModa2 | DiT stage (`stage_id: 1`) only           | Validated online FP8 | Use `quantization: fp8` on stage 1; run the AR stage in BF16                    |
 
 ## Configuration
 
@@ -151,7 +213,7 @@ For a pipeline that exposes both a transformer and a quantization-aware text
 encoder, the scope is:
 
 | Configuration | Transformer | Text encoder | Components without supported quantizable layers |
-|---------------|-------------|--------------|-------------------------------------------------|
+| --------------- | ------------- | -------------- | ------------------------------------------------- |
 | `quantization="fp8"` | FP8 | FP8 | checkpoint precision |
 | `{"transformer": {"method": "fp8"}}` | FP8 | checkpoint precision | checkpoint precision |
 | `{"text_encoder": {"method": "fp8"}}` | checkpoint precision | FP8 | checkpoint precision |
@@ -197,14 +259,19 @@ on every rank. Runtime DLO host residency is sharded normally. Use
 `--dlo-no-use-allgather` when the synchronized AllGather request-wave contract
 does not fit the workload.
 
+This DLO path supports per-tensor online FP8 only. Configurable
+`online_block_size` layouts fail closed for DLO AllGather and HSDP until their
+weight and scale sharding contracts are qualified.
+
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `method` | str | - | Quantization method (`"fp8"`) |
 | `ignored_layers` | list[str] | `[]` | Layer name patterns to keep in BF16 |
 | `activation_scheme` | str | `"dynamic"` | `"dynamic"` selects online activation scaling, or `"static"` when scales are available |
 | `weight_block_size` | list[int] \| None | `None` | Block size for block-wise weight quantization |
+| `online_block_size` | int \| None | `None` | ROCm-only online weight/activation group size (`32`, `64`, or `128`); see [Online FP8 Block Scaling](rocm_online_fp8.md) |
 
 The available `ignored_layers` names depend on the model architecture, for
 example `to_qkv`, `to_out`, `img_mlp`, or `txt_mlp`.

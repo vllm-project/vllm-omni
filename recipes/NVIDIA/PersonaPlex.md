@@ -25,10 +25,10 @@ matching the reference implementation frame for frame on the golden replays used
 as the acceptance gate.
 
 PersonaPlex is the first Moshi-class (pure-lockstep) model on the vLLM-Omni
-full-duplex serving stack: it plugs into the generic `/v1/duplex` handler
-through the standard plugin seams (`duplex_serving_adapter` /
-`duplex_runtime_extension` in its `pipeline.py`) with a model-specific
-package at `vllm_omni/model_executor/models/personaplex/duplex/`.
+unified full-duplex framework: its `pipeline.py` declares one
+`duplex_plugin` (`PersonaPlexDuplexPlugin`), and the model-specific package at
+`vllm_omni/model_executor/models/personaplex/duplex/` holds the plugin, the
+worker-side lockstep Stage 0 runtime and the 80 ms input framing.
 
 ## References
 
@@ -84,8 +84,10 @@ duplex (`is_enabled()` is unconditionally true). Turn-based models
 
 ## Hardware Support
 
-Verified on GPU (Hopper-class). The serving path is plain PyTorch eager plus the
-native modules, so other CUDA GPUs with enough memory are expected to work.
+Verified on GPU (Hopper-class). The shipped deploy config runs the Stage 0
+talker with CUDA graphs and replays the streaming Mimi encode (Stage 0) and
+decode (Stage 1) frame steps from model-local CUDA graphs, bitwise equal to
+eager. Other CUDA GPUs with enough memory are expected to work.
 
 ## GPU
 
@@ -114,16 +116,18 @@ HF_TOKEN=... CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main ser
   --deploy-config vllm_omni/deploy/personaplex.yaml
 ```
 
-This exposes `WS /v1/duplex` (native duplex dialect) and
-`WS /v1/realtime?duplex=1` (OpenAI Realtime projection; client API and wire
-protocol in [`docs/serving/realtime_duplex_api.md`](../../docs/serving/realtime_duplex_api.md)).
-Voice and persona are set per session via `extra_body`.
+This exposes `WS /v1/realtime?duplex=1` (alias `WS /v1/duplex`): the OpenAI
+Realtime session protocol, client API and wire vocabulary in
+[`docs/serving/realtime_duplex_api.md`](../../docs/serving/realtime_duplex_api.md).
+Voice (`voice`, a bundled `.pt` basename) and persona (`instructions`) are set
+in `session.update`; the model takes no client commits and serves no
+`/v1/chat/completions` route.
 
 #### Verification
 
 ```bash
-# GPU-free contract tests (stage0 runtime + unified serving adapter)
-pytest tests/model_executor/models/personaplex/duplex/ -q
+# GPU-free contract tests (plugin, stage0 runtime, runner scenario)
+pytest tests/model_executor/models/personaplex/duplex/ tests/engine/duplex/test_session_runner_personaplex.py -q
 
 # GPU e2e: paced 24 kHz PCM over /v1/realtime?duplex=1, two concurrent
 # sessions, overflow admission, slot recycling, non-silent output
@@ -135,9 +139,11 @@ python tests/e2e/online_serving/personaplex_realtime_duplex.py \
 
 #### Notes
 
-- Realtime budget is 80 ms/frame. Verified eager per-tick latency at four
-  concurrent sessions is ~70-74 ms on this hardware class, i.e. all four
-  conversations stay realtime; single-session has comfortable headroom.
+- Realtime budget is 80 ms/frame. The shipped config admits two sessions; on a
+  141 GB card, 64 concurrent 30 s sessions stayed realtime after raising
+  `duplex_session.max_sessions` and both stages' `max_num_seqs` (see the
+  sizing notes in `vllm_omni/deploy/personaplex.yaml`). Longer sessions cost
+  more per step as their context fills.
 - Decoding is greedy only (temperature/top-k knobs are intentionally not
   exposed): greedy is what the parity gates pin against the reference
   implementation, and sampling amplifies sub-bit numeric drift into divergence.

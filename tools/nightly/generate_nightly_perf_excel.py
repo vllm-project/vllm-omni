@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Generate a nightly Excel performance report from JSON results.
 
@@ -137,6 +140,7 @@ def _omni_group_key(record: dict[str, Any]) -> tuple[Any, ...]:
     return (
         record.get("model_id") or "",
         record.get("test_name") or "",
+        record.get("name") or "",
         record.get("dataset_name") or "",
         record.get("max_concurrency") if record.get("max_concurrency") is not None else 0,
         record.get("num_prompts") if record.get("num_prompts") is not None else 0,
@@ -171,6 +175,7 @@ def _load_summary_columns(script_dir: str) -> list[str]:
         "model_id",
         "tokenizer_id",
         "test_name",
+        "name",
         "dataset_name",
         "num_prompts",
         "request_rate",
@@ -218,7 +223,7 @@ def _load_summary_columns(script_dir: str) -> list[str]:
 
 def _ensure_omni_summary_columns(summary_columns: list[str]) -> list[str]:
     """Ensure omni summary contains required columns, even when a custom columns file exists."""
-    required = ("test_name", "dataset_name", "source_file")
+    required = ("test_name", "name", "dataset_name", "source_file")
     existing = set(summary_columns)
     if all(c in existing for c in required):
         return summary_columns
@@ -232,8 +237,18 @@ def _ensure_omni_summary_columns(summary_columns: list[str]) -> list[str]:
         else:
             out.append("test_name")
     existing = set(out)
-    if "dataset_name" not in existing:
+    if "name" not in existing:
         if "test_name" in out:
+            idx = out.index("test_name") + 1
+            out.insert(idx, "name")
+        else:
+            out.append("name")
+    existing = set(out)
+    if "dataset_name" not in existing:
+        if "name" in out:
+            idx = out.index("name") + 1
+            out.insert(idx, "dataset_name")
+        elif "test_name" in out:
             idx = out.index("test_name") + 1
             out.insert(idx, "dataset_name")
         else:
@@ -570,6 +585,7 @@ def _apply_build_metadata_to_latest_only(
     whose date starts with the same YYYYMMDD as the lexicographic max date receive
     build metadata; older calendar days get None.
     When max date is shorter than 8 chars, falls back to exact match.
+    Branch stays in the source JSON and is not written into this workbook.
     """
     if not records:
         return
@@ -586,6 +602,7 @@ def _apply_build_metadata_to_latest_only(
         else:
             in_latest_day = False
 
+        r.pop("branch", None)
         if in_latest_day:
             r["commit_sha"] = commit_sha
             r["build_id"] = build_id
@@ -798,7 +815,7 @@ def generate_excel_report(
 ) -> None:
     """Main logic: load JSON records and generate an Excel report with multiple sheets."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    omni_summary_columns = _ensure_omni_summary_columns(_load_summary_columns(script_dir))
+    omni_summary_columns = [c for c in _ensure_omni_summary_columns(_load_summary_columns(script_dir)) if c != "branch"]
 
     omni_records = _collect_omni_records(input_dir)
     diffusion_records = _collect_diffusion_records(diffusion_input_dir)
