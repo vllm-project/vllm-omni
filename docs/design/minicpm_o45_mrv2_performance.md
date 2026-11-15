@@ -608,6 +608,11 @@ Speaker replay also checks the selected backend, so CPU ONNX Runtime and
 TensorRT overrides remain usable. The development runs used private CUDA MPS
 on one L20X; the CUDA tuning is not qualified for other platforms.
 
+The CUDA deployment sets `cfm_drop_upstream_att_buffer: true` to remove the
+unused upstream CFM/DiT chunk attention buffers before device placement.
+`BatchedToken2Wav` manages its request and graph caches separately. The core
+loader retains its default of `false` for callers using upstream streaming.
+
 The runtime bundle includes:
 
 - Nonblocking transfer of the retained codec history window to the Talker device.

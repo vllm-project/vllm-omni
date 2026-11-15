@@ -72,7 +72,12 @@ def test_reference_optimizations_are_cuda_only(monkeypatch, deploy_name, platfor
     stage_extra = get_stage_connector_spec(transfer, stage_id=2, async_chunk=True)["extra"]
     resolved_extra = deploy.connectors["connector_of_shared_memory"]["extra"]
     for extra in (stage_extra, resolved_extra):
-        for flag in ("token2wav_float16", "token2wav_spk_cuda_graph", "token2wav_s3_cuda_graph"):
+        for flag in (
+            "token2wav_float16",
+            "token2wav_spk_cuda_graph",
+            "token2wav_s3_cuda_graph",
+            "cfm_drop_upstream_att_buffer",
+        ):
             assert extra.get(flag, False) is (platform == "cuda")
         # CUDA overrides retain the shared NPU option and chunk geometry.
         assert extra["cfm_npu_cross_reference_batching"] is True

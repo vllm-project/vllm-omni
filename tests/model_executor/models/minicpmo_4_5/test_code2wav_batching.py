@@ -2299,6 +2299,41 @@ def test_grouped_setup_snapshots_padding_policy_per_microbatch(monkeypatch):
     assert [adapter.has_cached_setup(prompt) for prompt in prompts] == [False, False, True]
 
 
+@pytest.mark.parametrize("with_graph_wrapper", [False, True], ids=["eager", "graph-contract"])
+def test_cfm_stream_does_not_use_upstream_attention_buffers(with_graph_wrapper):
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import drop_upstream_chunk_att_buffers
+
+    adapter, mel_frames, _ = _padded_decode_adapter(bucket_frames=0)
+    if not with_graph_wrapper:
+        adapter._cfm_graph_wrapper = None
+    decoder = adapter.flow.decoder
+    # The real DiT owns one buffer; stand in for the upstream CFM's other one.
+    decoder.register_buffer("att_cache_buffer", torch.ones(8), persistent=False)
+    mu = torch.randn(1, 1, mel_frames)
+    cond = torch.zeros_like(mu)
+    speakers = torch.randn(1, 1)
+
+    def decode_stream():
+        cnn = att = None
+        outputs = []
+        for _ in range(3):
+            result = adapter._decode_cfm(mu, speakers, cond, cnn_cache=cnn, att_cache=att)
+            _, cnn, att = result
+            # Retain snapshots across subsequent cache writes.
+            outputs.append(tuple(value.clone() for value in result))
+        return outputs
+
+    with torch.no_grad():
+        expected = decode_stream()
+        assert drop_upstream_chunk_att_buffers(adapter.flow) > 0
+        assert not hasattr(decoder, "att_cache_buffer")
+        assert not hasattr(decoder.estimator, "att_cache_buffer")
+        actual = decode_stream()
+    for actual_chunk, expected_chunk in zip(actual, expected, strict=True):
+        for actual_tensor, expected_tensor in zip(actual_chunk, expected_chunk, strict=True):
+            torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+
+
 def test_padded_chunk_keeps_the_cross_chunk_caches_on_the_valid_boundary():
     """Caches the next chunk reads must not carry padding.
 

@@ -188,6 +188,9 @@ platforms:
           token2wav_s3_cuda_graph: true
           ref_setup_batch_size: 4
           token2wav_float16: true
+          # BatchedToken2Wav owns its caches; omit unused upstream chunk buffers
+          # before device placement, saving about 1.04 GiB per FP16 replica.
+          cfm_drop_upstream_att_buffer: true
     # Private MPS for colocated CUDA stages. NPU does not read this block.
     # A missing or failing nvidia-cuda-mps-control daemon, parallel stage
     # init, or a stage that is not one numeric GPU disables MPS and continues. Set false

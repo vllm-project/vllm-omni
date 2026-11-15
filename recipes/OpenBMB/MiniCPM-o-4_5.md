@@ -37,6 +37,8 @@ deployment. It places all three stages and two Code2Wav replicas
 on logical GPU 0, enables grouped reference setup and Flow FP16, and disables
 Thinker prefix caching for ngram speculation. Measurements used private CUDA
 MPS and one large-memory L20X; this is not a qualified production preset.
+The CUDA profile also drops unused upstream CFM attention buffers before
+placing Code2Wav on the device; its batched backend owns the active caches.
 
 ```bash
 vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code \
