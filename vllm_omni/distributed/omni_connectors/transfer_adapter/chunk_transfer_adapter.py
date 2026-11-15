@@ -199,6 +199,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if getattr(batch_func, "per_step_batch", False) is True:
                 self.custom_process_next_stage_input_batch_func = batch_func
         self._processor_accepts_step_tokens: dict[Callable[..., Any], bool] = {}
+        self._processor_accepts_typed_kwargs: dict[Callable[..., Any], tuple[bool, bool]] = {}
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)
         self.get_req_chunk: dict[str, int] = defaultdict(int)
@@ -387,6 +388,89 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             )
         self._processor_accepts_step_tokens[processor] = accepts
         return accepts
+
+    def _add_typed_kwargs(
+        self,
+        processor: Callable[..., Any],
+        processor_kwargs: dict[str, Any],
+        *,
+        multimodal_output: Any,
+        external_req_id: str,
+        chunk_id: int,
+        is_finished: bool,
+        src_stage_id: int,
+        target_stage_id: int,
+    ) -> None:
+        """Issue #2336: inject ``chunk_meta`` / ``transfer_payload`` when the processor opts in.
+
+        Builds a :class:`ChunkMeta` from the authoritative ``chunk_id`` counter
+        (``chunk_id == 0`` → PREFILL, ``chunk_id > 0`` → DECODE), and wraps the
+        multimodal payload via :class:`TransferPayload.from_dict`.
+
+        The signature probe result is cached per processor (mirroring
+        :meth:`_accepts_new_token_ids`) so the hot path pays ``inspect`` cost
+        only once.  Only *explicit* parameter names opt in — a processor with
+        ``**kwargs`` but no ``chunk_meta`` / ``transfer_payload`` slot will
+        **not** receive these kwargs, avoiding a downstream ``TypeError`` when
+        that processor forwards ``**kwargs`` to a strict callee.
+
+        The ``is_finished`` parameter here represents the **whole-request**
+        terminal flag (``request.is_finished()``), not a segment boundary.  A
+        data-bearing last decode chunk carries ``phase=DECODE`` with
+        ``is_final=True``; :class:`ChunkPhase.FINAL` is reserved for metadata-
+        only terminators that follow the last data chunk.
+        """
+        try:
+            from vllm_omni.core.transfer_types import ChunkMeta, TransferPayload  # noqa: PLC0415
+        except ImportError:  # pragma: no cover — new module is always present
+            return
+
+        # ── Cached signature probe (Fix: reuse pattern from _accepts_new_token_ids) ──
+        cached = self._processor_accepts_typed_kwargs.get(processor)
+        if cached is None:
+            try:
+                sig_params = inspect.signature(processor).parameters
+            except (TypeError, ValueError):
+                self._processor_accepts_typed_kwargs[processor] = (False, False)
+                return
+            # Only explicit parameter names opt in — VAR_KEYWORD does not.
+            accepts_chunk_meta = "chunk_meta" in sig_params
+            accepts_transfer_payload = "transfer_payload" in sig_params
+            cached = (accepts_chunk_meta, accepts_transfer_payload)
+            self._processor_accepts_typed_kwargs[processor] = cached
+
+        accepts_chunk_meta, accepts_transfer_payload = cached
+        if not (accepts_chunk_meta or accepts_transfer_payload):
+            return
+
+        # ── Build ChunkMeta from the authoritative counter ──
+        #
+        # Fix (amy-why-3459): keep phase=DECODE for data-bearing last chunks;
+        # ChunkPhase.FINAL is reserved for metadata-only terminators that
+        # follow the last data chunk.
+        #
+        # Fix (Bounty-hunter): ``is_finished`` here is the *whole-request*
+        # terminal flag — segment boundaries must NOT cause FINAL/FINAL-is_terminal.
+        if chunk_id == 0:
+            chunk_meta = ChunkMeta.prefill(is_final=is_finished)
+        else:
+            # decode chunk; ``is_final=True`` when this is the last
+            # data-bearing chunk of the sequence.
+            chunk_meta = ChunkMeta.decode(chunk_index=chunk_id, is_final=is_finished)
+
+        if accepts_chunk_meta:
+            processor_kwargs["chunk_meta"] = chunk_meta
+        if accepts_transfer_payload:
+            # Widen OmniPayloadStruct to a plain dict for from_dict.
+            raw = dict(multimodal_output) if isinstance(multimodal_output, Mapping) else {}
+            transfer_payload = TransferPayload.from_dict(
+                raw,
+                source_stage=src_stage_id,
+                target_stage=target_stage_id,
+                chunk=chunk_meta,
+                request_id=external_req_id,
+            )
+            processor_kwargs["transfer_payload"] = transfer_payload
 
     def has_active_sender(self, external_req_id: str) -> bool:
         """Whether this request owns a sender, including work still queued.
@@ -961,6 +1045,28 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 }
                 if self._accepts_new_token_ids(processor):
                     processor_kwargs["new_token_ids"] = task.get("new_token_ids", ())
+                # Issue #2336: wire typed chunk_meta and transfer_payload into
+                # the actual async-chunk processor boundary.  Build from the
+                # authoritative chunk counter + multimodal payload and pass
+                # only when the processor signature opts in — older processors
+                # continue to work via the kwargs above unchanged.
+                #
+                # ``is_finished`` here is the **whole-request** terminal flag,
+                # not a segment boundary — ``is_segment_finished`` ends only
+                # the current realtime segment while a resumable request can
+                # continue.  Segment-local flushing is already handled by the
+                # ``"is_finished": is_segment_finished or is_finished`` entry
+                # above, which is the historic contract the processor expects.
+                self._add_typed_kwargs(
+                    processor,
+                    processor_kwargs,
+                    multimodal_output=multimodal_output,
+                    external_req_id=external_req_id,
+                    chunk_id=chunk_id,
+                    is_finished=is_finished,
+                    src_stage_id=stage_id,
+                    target_stage_id=next_stage_id,
+                )
                 payload_data = processor(**processor_kwargs)
 
             except Exception as e:

@@ -498,16 +498,71 @@ def thinker2talker_async_chunk(
     multimodal_output: OmniPayload | dict[str, Any],
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
+    *,
+    chunk_meta: Any | None = None,
+    transfer_payload: Any | None = None,
 ) -> OmniPayloadStruct | None:
     """
     Process thinker outputs to create talker inputs.
     1. thinker's text generation outputs (token IDs + hidden states)
     2. Split hidden states into: prompt embeddings + generated embeddings
     3. Package for talker with additional information
+
+    New in Issue #2336: ``chunk_meta`` (explicit :class:`ChunkMeta`) and
+    ``transfer_payload`` (:class:`TransferPayload`) are optional kwargs.
+    When provided, phase semantics come from ``chunk_meta.phase`` instead
+    of the historic ``chunk_id == 0`` / ``chunk_id > 0`` inference.
+    Callers that do not supply these keep working unchanged.
     """
+    # Local import to avoid a hard dep on the new module for tests that
+    # import this file in isolation.
+    try:
+        from vllm_omni.core.transfer_types import ChunkMeta as _ChunkMeta
+        from vllm_omni.core.transfer_types import ChunkPhase as _ChunkPhase
+    except ImportError:  # pragma: no cover — new module is always present
+        _ChunkMeta = None  # type: ignore[assignment,misc]
+        _ChunkPhase = None  # type: ignore[assignment,misc]
 
     request_id = request.external_req_id
-    chunk_id = transfer_manager.put_req_chunk[request_id]
+
+    # Resolve phase semantics: prefer the explicit ChunkMeta when available,
+    # otherwise fall back to the legacy chunk_id counter.
+    phase: str | None = None
+    _chunk_index: int | None = None
+    if chunk_meta is not None and _ChunkMeta is not None and isinstance(chunk_meta, _ChunkMeta):
+        phase = chunk_meta.phase.value
+        _chunk_index = chunk_meta.chunk_index
+        # ``is_final`` from ChunkMeta overrides the caller's ``is_finished``
+        # flag when the ChunkMeta carries an explicit terminal marker.
+        if chunk_meta.is_terminal():
+            is_finished = True
+    chunk_id = _chunk_index if _chunk_index is not None else transfer_manager.put_req_chunk[request_id]
+
+    # Prefer tensors from TransferPayload when both arrive — they carry
+    # explicit dotted keys that mirror the historic multimodal_output shape.
+    #
+    # Fix (amy-why-3459): use ``transfer_payload.as_dict()`` which properly
+    # rebuilds a fresh nested structure (including int layer keys) without
+    # mutating the producer's original multimodal_output via shallow-copy
+    # ``setdefault`` writes.
+    if transfer_payload is not None:
+        # Use the TransferPayload's serialised dict — it already has the
+        # correct nested shape and contains the same tensors that the
+        # producer stashed into multimodal_output.  as_dict handles int
+        # layer keys correctly (``"hidden_states.layers.3"`` → {"3": ...}
+        # rebuilt via the isdigit branch, which matches how downstream
+        # layers look them up).
+        rebuilt = transfer_payload.as_dict()
+        # Merge any extra top-level fields that the producer may have
+        # added outside the TransferPayload contract (future-proofing —
+        # today the payload is built from the same multimodal_output so
+        # this is a no-op).
+        if isinstance(multimodal_output, Mapping):
+            for extra_key, extra_val in multimodal_output.items():
+                if extra_key not in rebuilt:
+                    rebuilt[extra_key] = extra_val
+        multimodal_output = rebuilt
+
     if not isinstance(multimodal_output, Mapping):
         logger.debug("thinker2talker_async_chunk: skip non-dict multimodal_output for req=%s", request_id)
         return None
@@ -551,7 +606,15 @@ def thinker2talker_async_chunk(
     def _maybe_cpu(t: Any) -> torch.Tensor | None:
         return t.detach().cpu() if isinstance(t, torch.Tensor) else None
 
-    if chunk_id == 0:
+    # Phase-aware routing (Issue #2336).  When an explicit ChunkMeta was
+    # provided we branch on ``phase``; otherwise fall back to the historic
+    # ``chunk_id == 0`` / ``chunk_id > 0`` split.
+    _is_prefill_chunk = (
+        phase is not None
+        and _ChunkPhase is not None
+        and phase in (_ChunkPhase.PREFILL.value, _ChunkPhase.PREEMPT.value)
+    ) or chunk_id == 0
+    if _is_prefill_chunk:
         all_token_ids = _ensure_list(request.all_token_ids)
         prompt_token_ids = _ensure_list(request.prompt_token_ids)
         payload = OmniPayloadStruct(
