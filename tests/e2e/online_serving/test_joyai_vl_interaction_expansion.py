@@ -193,7 +193,8 @@ def observation_frame(index):
     return buffer.getvalue()
 
 
-async def run_continuous(url, model, output_dir):
+async def run_continuous(url, model, output_dir, *, cycles=1):
+    """Run twelve-minute cycles with cancellation and same-session recovery."""
     output_dir.mkdir(parents=True, exist_ok=True)
     config = SessionConfig(
         auto_response=False,
@@ -224,6 +225,7 @@ async def run_continuous(url, model, output_dir):
 
     async def consume(client):
         nonlocal last_progress
+        output_sample_rate_hz = config.output_audio.sample_rate_hz
         async for event in client:
             stream.write(json.dumps({"elapsed_s": time.monotonic() - started, "event": event.raw}) + "\n")
             rid = event.response_id
@@ -242,6 +244,7 @@ async def run_continuous(url, model, output_dir):
                 if rid in finished:
                     result["errors"].append({"late_delta": event.type, "response_id": rid})
                 if event.type == "response.output_audio.delta":
+                    output_sample_rate_hz = event.sample_rate_hz or output_sample_rate_hz
                     audio[rid] = audio.get(rid, 0) + len(base64.b64decode(event.raw["delta"]))
                 else:
                     texts[rid] = texts.get(rid, "") + event.raw.get("delta", "")
@@ -259,7 +262,7 @@ async def run_continuous(url, model, output_dir):
                 if status == "completed" and audio.get(rid, 0):
                     # The sink consumes spontaneous speech as well as explicit answers.
                     # Otherwise unacknowledged playback keeps vision-follow active.
-                    await client.ack_playback(audio[rid] * 500 / 24000, response_id=rid)
+                    await client.ack_playback(audio[rid] * 500 / output_sample_rate_hz, response_id=rid)
             if event.type == "session.closed":
                 result["closed"] = True
 
@@ -351,11 +354,11 @@ async def run_continuous(url, model, output_dir):
                 await drain(reader)
                 started = time.monotonic()
                 next_frame = started
-                for index in range(720):
-                    if index in (180, 360):
+                for index in range(720 * cycles):
+                    if index % 720 in (180, 360):
                         await drain(reader)
                         action_started = time.monotonic()
-                        if index == 180:
+                        if index % 720 == 180:
                             await question(
                                 client,
                                 "What color is the shape in the latest image? Say its color, then count from one to one hundred aloud without skipping numbers.",
@@ -410,8 +413,8 @@ async def run_continuous(url, model, output_dir):
                 result["input_elapsed_s"] = time.monotonic() - started
                 await drain(reader)
                 assert created == finished
-                assert len(cancelled) == 1
-                assert result.get("resumed") and result["input_elapsed_s"] >= 720
+                assert len(cancelled) == cycles
+                assert result.get("resumed") and result["input_elapsed_s"] >= 720 * cycles
                 await asyncio.sleep(30)
                 check(reader)
             finally:
@@ -423,7 +426,7 @@ async def run_continuous(url, model, output_dir):
         async with DuplexClient(url, model=model, config=config, reconnect=None) as client:
             done = asyncio.create_task(client.wait_for("response.done", timeout_s=180))
             await asyncio.sleep(0)
-            await submit(client, 719, count=False)
+            await submit(client, 720 * cycles - 1, count=False)
             terminal = await done
             assert terminal.raw["response"]["status"] == "completed", terminal.raw
         result["passed"] = True
