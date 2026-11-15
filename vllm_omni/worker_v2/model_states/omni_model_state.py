@@ -1036,46 +1036,40 @@ class OmniModelState(DefaultModelState):
     def _request_sample_eligible(
         self,
         input_batch: InputBatch,
-        req_states: RequestState,
         buffer_list: Sequence[Any],
     ) -> list[bool]:
         """Per-request sample eligibility for models that opt into the runner contract.
 
         Warmup dummy requests are never eligible: they do not pass through
         stage input processors, so request metadata such as the MiniMax H3
-        encoder payload is absent. Real requests follow the V1 rule and
-        become eligible once this step reaches the end of the request's
-        currently known tokens. If those counts are unavailable, keep the
-        historical default (eligible) so a finished real request is not
-        silently skipped.
+        encoder payload is absent.
+
+        Real requests reuse the same batch-ordered finishing rule as
+        ``publish_sampled_embeddings``: a row is eligible when
+        ``num_computed_prefill_tokens_np + num_scheduled_tokens >= prefill_len_np``.
+        Those arrays are already in batch order, and ``prefill_len_np`` includes
+        codec tokens replayed after preemption, so this matches the V1
+        ``num_computed + scheduled >= num_tokens`` rule without a second
+        ``idx_mapping_np`` / ``RequestState`` lookup. Missing arrays or a
+        buffer/batch length mismatch fail loudly rather than defaulting a
+        slot to eligible or silently reading another request's counts.
         """
+        num_reqs = input_batch.num_reqs
+        if len(buffer_list) != num_reqs:
+            raise ValueError(
+                "request sample eligibility requires one gathered buffer per batch "
+                f"row: num_buffers={len(buffer_list)} num_reqs={num_reqs}"
+            )
+        computed = input_batch.num_computed_prefill_tokens_np[:num_reqs]
+        scheduled = np.asarray(input_batch.num_scheduled_tokens[:num_reqs])
+        finishing = computed + scheduled >= input_batch.prefill_len_np[:num_reqs]
         eligible: list[bool] = []
         for batch_idx, info in enumerate(buffer_list):
             req_id = info.get("req_id") if isinstance(info, Mapping) else None
             if isinstance(req_id, str) and is_warmup_request(req_id):
                 eligible.append(False)
                 continue
-            try:
-                req_idx = int(input_batch.idx_mapping_np[batch_idx])
-            except Exception:
-                req_idx = batch_idx
-            try:
-                scheduled = int(input_batch.num_scheduled_tokens[batch_idx])
-            except Exception:
-                eligible.append(True)
-                continue
-            computed = self._get_req_state_value(getattr(req_states, "num_computed_tokens_np", None), req_idx)
-            if computed is None:
-                computed = self._get_req_state_value(getattr(req_states, "num_computed_tokens", None), req_idx)
-            if computed is None:
-                computed = self._get_input_batch_num_computed(input_batch, req_idx, batch_idx)
-            num_tokens = self._get_req_state_value(getattr(req_states, "total_len", None), req_idx)
-            if num_tokens is None:
-                num_tokens = self._get_req_state_value(getattr(req_states, "prefill_len", None), req_idx)
-            if computed is None or num_tokens is None:
-                eligible.append(True)
-                continue
-            eligible.append(computed + scheduled >= num_tokens)
+            eligible.append(bool(finishing[batch_idx]))
         return eligible
 
     # ------------------------------------------------------------------
@@ -1120,7 +1114,7 @@ class OmniModelState(DefaultModelState):
                 }
                 if requires_request_sample_eligibility(self.model):
                     make_output_kwargs["request_sample_eligible"] = self._request_sample_eligible(
-                        input_batch, req_states, buffer_list
+                        input_batch, buffer_list
                     )
                 logits_index = input_batch.logits_indices
                 if getattr(self.model, "postprocess_requires_multimodal_outputs", False):

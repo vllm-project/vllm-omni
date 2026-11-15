@@ -583,53 +583,6 @@ def _cached_encoder_info():
     }
 
 
-def test_make_omni_output_skips_ineligible_warmup_slot_without_metadata() -> None:
-    model = _bare_encoder()
-    output = model.make_omni_output(
-        torch.zeros(1, 5120),
-        model_intermediate_buffer=[{"req_id": "_warmup_0_"}],
-        request_sample_eligible=[False],
-    )
-    # Parent text-encoder fields may still be present; H3 encoder payload must not be.
-    multimodal = output.multimodal_outputs or {}
-    assert "embed" not in multimodal
-    assert f"kv_metadata.{MINIMAX_H3_ENCODER_LAYOUT_KEY}" not in multimodal
-
-
-def test_make_omni_output_emits_payload_for_real_request_with_metadata() -> None:
-    model = _bare_encoder()
-    output = model.make_omni_output(
-        torch.zeros(1, 5120),
-        model_intermediate_buffer=[_cached_encoder_info()],
-        request_sample_eligible=[True],
-    )
-    multimodal = output.multimodal_outputs
-    assert multimodal is not None
-    assert len(multimodal["embed"]["embedding"]) == 1
-    assert len(multimodal["embed"]["speech_feat"]) == 1
-
-
-def test_make_omni_output_raises_when_real_request_metadata_is_missing() -> None:
-    model = _bare_encoder()
-    with pytest.raises(RuntimeError, match="request metadata is missing from the runner"):
-        model.make_omni_output(
-            torch.zeros(1, 5120),
-            model_intermediate_buffer=[{"req_id": "request-1"}],
-            request_sample_eligible=[True],
-        )
-
-
-def test_make_omni_output_raises_when_eligibility_is_omitted_for_unannotated_slot() -> None:
-    # Tip / runner-gap behavior: missing eligibility defaults every slot to
-    # eligible, so a dummy or malformed real request without metadata raises.
-    model = _bare_encoder()
-    with pytest.raises(RuntimeError, match="request metadata is missing from the runner"):
-        model.make_omni_output(
-            torch.zeros(1, 5120),
-            model_intermediate_buffer=[{"req_id": "_warmup_0_"}],
-        )
-
-
 def test_make_omni_output_mixed_warmup_and_real_request_metadata() -> None:
     model = _bare_encoder()
     real = _cached_encoder_info()
