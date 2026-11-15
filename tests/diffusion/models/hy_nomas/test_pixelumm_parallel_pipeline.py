@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,11 +12,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.diffusion.ar_diffusion.test_capability_runner import make_runner
+from tests.diffusion.ar_diffusion.test_capability_runner import make_runner, scheduler_output
 from tests.diffusion.models.hy_nomas.test_ar import PipelineWithCPUComponents
 from tests.diffusion.models.hy_nomas.test_pixelumm_parallel import make_decoder
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -39,6 +43,55 @@ def make_request(index, *, frames=9, session="s", close=False):
     )
 
 
+def make_group(rank, world_size):
+    ranks = list(range(world_size))
+    device_group = dist.new_group(ranks, backend="gloo")
+    ulysses_group = dist.new_group(ranks, backend="gloo")
+
+    def all_reduce(value):
+        dist.all_reduce(value, group=device_group)
+        return value
+
+    def broadcast_object(value, src=0):
+        objects = [value]
+        dist.broadcast_object_list(objects, src=src)
+        return objects[0]
+
+    return SimpleNamespace(
+        ulysses_rank=rank,
+        ulysses_group=ulysses_group,
+        rank_in_group=rank,
+        world_size=world_size,
+        cpu_group=dist.group.WORLD,
+        all_reduce=all_reduce,
+        broadcast_object=broadcast_object,
+    )
+
+
+def make_pipeline(world_size, mode, group):
+    pipeline = PipelineWithCPUComponents()
+    pipeline.sp_size = world_size
+    pipeline.heads_num = 2 * world_size
+    pipeline.hidden_size = 8 * world_size
+    pipeline.in_channels = 32
+    pipeline.transformer.config.out_channels = 32
+    pipeline.decoder_parallel_mode = mode
+    pipeline.vae = make_decoder()
+    if mode == "window":
+        pipeline.vae.configure_distributed_decode(group.ulysses_group)
+    pipeline.initialize_ar(
+        {
+            "ar_height": 128,
+            "ar_width": 128,
+            "ar_chunk_latent_frames": 3,
+            "ar_max_latent_frames": 12,
+            "ar_max_segments": 4,
+            "ar_session_capacity": 1,
+        }
+    )
+    return pipeline
+
+
 def _pipeline_worker(rank, world_size, rendezvous):
     dist.init_process_group(
         "gloo", init_method=rendezvous, rank=rank, world_size=world_size, timeout=timedelta(seconds=120)
@@ -46,17 +99,7 @@ def _pipeline_worker(rank, world_size, rendezvous):
     try:
         torch.set_num_threads(1)
 
-        def all_reduce(value):
-            dist.all_reduce(value)
-            return value
-
-        group = SimpleNamespace(
-            ulysses_rank=rank,
-            ulysses_group=dist.group.WORLD,
-            world_size=world_size,
-            cpu_group=dist.group.WORLD,
-            all_reduce=all_reduce,
-        )
+        group = make_group(rank, world_size)
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr("vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas.get_sp_group", lambda: group)
             patch.setattr("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", lambda: group)
@@ -70,26 +113,7 @@ def _pipeline_worker(rank, world_size, rendezvous):
             )
             outputs, positions, offline_outputs = {}, {}, {}
             for mode in ("none", "window"):
-                pipeline = PipelineWithCPUComponents()
-                pipeline.sp_size = world_size
-                pipeline.heads_num = 2 * world_size
-                pipeline.hidden_size = 8 * world_size
-                pipeline.in_channels = 32
-                pipeline.transformer.config.out_channels = 32
-                pipeline.decoder_parallel_mode = mode
-                pipeline.vae = make_decoder()
-                if mode == "window":
-                    pipeline.vae.configure_distributed_decode(dist.group.WORLD)
-                pipeline.initialize_ar(
-                    {
-                        "ar_height": 128,
-                        "ar_width": 128,
-                        "ar_chunk_latent_frames": 3,
-                        "ar_max_latent_frames": 12,
-                        "ar_max_segments": 4,
-                        "ar_session_capacity": 1,
-                    }
-                )
+                pipeline = make_pipeline(world_size, mode, group)
                 runner = make_runner(pipeline)
                 videos, starts, committed = [], [], []
                 for index in range(3):
@@ -188,3 +212,124 @@ def _pipeline_worker(rank, world_size, rendezvous):
 def test_pipeline_window_parallel_matches_serial_and_recovers(tmp_path, monkeypatch, world_size):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[4]))
     mp.spawn(_pipeline_worker, args=(world_size, (tmp_path / "rendezvous").as_uri()), nprocs=world_size, join=True)
+
+
+def _prepare_failure_worker(rank, world_size, rendezvous):
+    dist.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=world_size, timeout=timedelta(seconds=20)
+    )
+    try:
+        torch.set_num_threads(1)
+
+        group = make_group(rank, world_size)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr("vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas.get_sp_group", lambda: group)
+            patch.setattr("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", lambda: group)
+            patch.setattr("vllm_omni.diffusion.distributed.parallel_state.get_world_group", lambda: group)
+            patch.setattr(
+                "vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas.action_conditioning",
+                lambda *args: (2, None, None),
+            )
+            patch.setattr(
+                "vllm_omni.experimental.ar_diffusion.runner.current_omni_platform",
+                SimpleNamespace(synchronize=lambda: None),
+            )
+            pipeline = make_pipeline(world_size, "window", group)
+            runner = make_runner(pipeline, step_execution=True)
+            runner.od_config.parallel_config = DiffusionParallelConfig(
+                data_parallel_size=1, sequence_parallel_size=world_size, ulysses_degree=world_size
+            )
+            runner.od_config.cache_backend = None
+            runner.od_config.streaming_output = True
+            runner.kv_transfer_manager = OmniKVTransferManager.from_od_config(runner.od_config)
+            runner.cache_backend = None
+            runner._kv_prefetch_enabled = False
+            runner.vllm_config = None
+            runner._interaction_coordinator = InteractionCoordinator({})
+            patch.setattr(
+                "vllm_omni.diffusion.worker.diffusion_model_runner.set_forward_context",
+                lambda *args, **kwargs: nullcontext(),
+            )
+            patch.setattr(
+                "vllm_omni.diffusion.worker.diffusion_model_runner.current_omni_platform",
+                SimpleNamespace(
+                    is_available=lambda: False,
+                    max_memory_reserved=lambda: 0,
+                    max_memory_allocated=lambda: 0,
+                ),
+            )
+            cases = (
+                ("forward-runner", "runner", world_size - 1),
+                ("forward", "noise", 0),
+                ("forward", "decoder", world_size - 1),
+                ("step", "runner", 0),
+                ("step", "noise", world_size - 1),
+                ("step", "decoder", 0),
+            )
+            for mode, point, failure_rank in cases:
+                session_id = f"{mode}-{point}"
+                request = make_request(0, session=session_id, close=True)
+                request.requests[0].request_id = session_id
+                request.requests[0].sampling_params.extra_args = (
+                    {"session_id": session_id, "close_session": True} if mode == "forward-runner" else {}
+                )
+
+                def fail(*args, **kwargs):
+                    raise torch.OutOfMemoryError(f"injected {point} failure")
+
+                with pytest.MonkeyPatch.context() as failure_patch:
+                    if rank == failure_rank:
+                        if point == "runner":
+                            failure_patch.setattr(runner, "_initialize_generator", fail)
+                        elif point == "noise":
+                            failure_patch.setattr(torch, "randn", fail)
+                        else:
+                            failure_patch.setattr(pipeline.vae, "create_streaming_decode_session", fail)
+                    if mode == "forward-runner":
+                        with pytest.raises(RuntimeError, match="injected .* failure|another SP rank"):
+                            runner.execute_model(request.requests[0])
+                    elif mode == "forward":
+                        with pytest.raises(RuntimeError, match="injected .* failure|another SP rank"):
+                            with runner._bound_ar_session(session_id, description="prepare failure"):
+                                pipeline.forward(request)
+                    else:
+                        req = request.requests[0]
+                        scheduled = DiffusionSchedulerOutput(
+                            step_id=0,
+                            scheduled_new_reqs=[NewRequestData(request_id=session_id, req=req)],
+                            scheduled_cached_reqs=CachedRequestData.make_empty(),
+                            finished_req_ids=set(),
+                            num_running_reqs=1,
+                            num_waiting_reqs=0,
+                        )
+                        result = runner.execute_stepwise(scheduled).get_request_output(session_id)
+                        assert result.finished and result.result is not None
+                        assert "injected" in result.result.error or "another SP rank" in result.result.error
+                assert session_id not in runner._sessions and session_id not in pipeline._ar_sessions
+                assert session_id not in runner.state_cache
+                if mode == "step":
+                    for step in range(4):
+                        wave = scheduled if step == 0 else scheduler_output(request_ids=(session_id,))
+                        recovered = runner.execute_stepwise(wave).get_request_output(session_id)
+                        if recovered.finished:
+                            break
+                        assert recovered.result is None, recovered
+                    assert recovered.finished and recovered.result is not None and recovered.result.error is None, (
+                        recovered
+                    )
+                    assert len(recovered.result.output["payload"]["video"]) == (9 if rank == 0 else 0)
+                    assert session_id not in runner._sessions and session_id not in pipeline._ar_sessions
+                    assert session_id not in runner.state_cache
+                else:
+                    with runner._bound_ar_session(session_id, description="prepare recovery"):
+                        recovered = pipeline.forward(request)
+                    assert len(recovered.output["payload"]["video"]) == (9 if rank == 0 else 0)
+                    runner.close_session(session_id)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_prepare_failure_is_synchronized_and_recovers(tmp_path, monkeypatch, world_size):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[4]))
+    mp.spawn(_prepare_failure_worker, args=(world_size, (tmp_path / "prepare-rendezvous").as_uri()), nprocs=world_size)

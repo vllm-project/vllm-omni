@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from itertools import groupby
 from pathlib import Path
@@ -573,7 +573,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 # A staged VAE has no resident budget for the decoder's rolling
                 # buffers; a resident VAE keeps the decode on the device so the
                 # quantize and the transfer stay uint8.
-                self.vae.create_streaming_decode_session(to_cpu=self._streaming_decode_to_cpu())
+                self.vae.create_streaming_decode_session(to_cpu=self._streaming_decode_to_cpu(), _synchronize=False)
                 if bound is not None
                 else None,
                 torch.empty((1, 0), dtype=torch.bool, device=self.device),
@@ -916,6 +916,9 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             error = exc
         self._check_sp_error(error, operation)
 
+    def request_preparation_context(self) -> AbstractContextManager[None]:
+        return self._decoder_guard("request preparation")
+
     def _decoder_is_output_rank(self) -> bool:
         return self.decoder_parallel_mode == "none" or get_sp_group().ulysses_rank == 0
 
@@ -1091,11 +1094,12 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
         if request.num_reqs != 1:
             raise ValueError("Hy-Nomas processes one request at a time.")
-        req = request.requests[0]
-        state = StepRequestState(request_id=req.request_id, sampling=req.sampling_params, prompt=req.prompt)
-        state.extra["hy_nomas_request_mode"] = True
         try:
-            self.prepare_encode(state)
+            with self.request_preparation_context():
+                req = request.requests[0]
+                state = StepRequestState(request_id=req.request_id, sampling=req.sampling_params, prompt=req.prompt)
+                state.extra["hy_nomas_request_mode"] = True
+                self.prepare_encode(state)
             chunks = []
             frame_start = self._session().emitted_frames
             while not state.request_denoise_completed:

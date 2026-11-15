@@ -1043,6 +1043,7 @@ class PixelUMMDecoder(nn.Module):
         retain_history: bool = False,
         generator: torch.Generator | None = None,
         rolling: bool = True,
+        _synchronize: bool = True,
     ) -> "PixelUMMStreamingDecodeSession":
         """
         Create session state for stable append-only decoding.
@@ -1053,7 +1054,7 @@ class PixelUMMDecoder(nn.Module):
         The default rolling mode, which AR sessions use, discards completed prefixes
         and requires retain_history=False.
         """
-        with self._decode_guard("stream session initialization"):
+        with self._decode_guard("stream session initialization") if _synchronize else nullcontext():
             if self.config.num_steps != 1:
                 raise ValueError("Streaming PixelUMM decoding requires num_steps=1")
             seed = self._seed(generator)

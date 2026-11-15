@@ -189,6 +189,12 @@ def _window_worker(rank, world_size, rendezvous):
             # Larger groups already exercised partitioning and non-output rank recovery.
             return
 
+        invalid_stream = make_decoder(num_steps=2 if rank else 1)
+        invalid_stream.configure_distributed_decode(dist.group.WORLD)
+        expect_collective_error(
+            invalid_stream.create_streaming_decode_session, "requires num_steps=1|another decode rank"
+        )
+
         failure_latent = latent
         baseline = make_decoder(spatial_tile=64, spatial_overlap=0, temporal_overlap=0)
         other_owner = make_decoder(spatial_tile=64, spatial_overlap=0, temporal_overlap=0)

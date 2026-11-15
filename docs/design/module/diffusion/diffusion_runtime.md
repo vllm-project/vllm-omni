@@ -261,6 +261,13 @@ computing different requests.
 `step_scheduler()`; completed requests run `post_decode()`. The scheduler keeps
 only lifecycle and progress metadata—it does not hold model tensors.
 
+Pipelines may implement `request_preparation_context()` to synchronize
+rank-local preparation errors. In request mode, the runner enters it around
+local setup before `forward()`; in step mode, it enters it around runner setup
+and `prepare_encode()` for new requests. A pipeline using this context must
+arrange its internal collectives so that every participating rank can reach
+the same error synchronization.
+
 **Step mode is also the path for streaming diffusion output**. Enabling
 `streaming_output` turns on step execution if needed. Chunk-capable pipelines
 can emit intermediate outputs through the same request stream; final-only step
