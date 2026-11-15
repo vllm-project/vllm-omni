@@ -2318,13 +2318,7 @@ class AttentionSpec:
                     f"backend={self.backend!r}. Remove quant or set a supported backend."
                 )
             if self.backend.upper() == "FLASH_ATTN":
-                if (
-                    q.dtype_qk is not None
-                    or q.dtype_vo is not None
-                    or q.flashinfer_backend is not None
-                    or q.q_block_size != 1
-                    or q.k_block_size != 16
-                ):
+                if q.dtype_qk is not None or q.dtype_vo is not None or q.flashinfer_backend is not None:
                     raise ValueError(
                         "FLASH_ATTN quant supports only MindIE precision and execution options; "
                         "use quant.precision to select the quantization precision."

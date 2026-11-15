@@ -142,8 +142,6 @@ class TestAttentionSpec:
             {"dtype_qk": "int8"},
             {"dtype_vo": "fp8_e4m3"},
             {"flashinfer_backend": "fa2"},
-            {"q_block_size": 4},
-            {"k_block_size": 4},
         ],
     )
     def test_flash_attention_rejects_other_backend_quant_options(self, quant):
