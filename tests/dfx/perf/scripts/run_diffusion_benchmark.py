@@ -43,6 +43,7 @@ import pytest
 
 from benchmarks.diffusion.backends import endpoint_filename_token, normalize_endpoint
 from tests.dfx.conftest import (
+    assert_baseline_within_tolerance,
     create_paired_benchmark_pytest_params,
     get_runtime_resource_label,
     hardware_json_value,
@@ -51,7 +52,6 @@ from tests.dfx.conftest import (
     resolve_pytest_marks,
     resource_label_for_filename,
 )
-from tests.dfx.perf.baseline_gate import assert_baseline_within_tolerance
 from tests.helpers.runtime import get_open_port
 
 

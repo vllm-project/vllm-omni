@@ -40,7 +40,7 @@ the same resolved map on the metrics it returns.
 
 `--assert-baseline` (registered in `tests/dfx/conftest.py`, default off) makes
 both runners call `assert_baseline_within_tolerance()` in
-`tests/dfx/perf/baseline_gate.py`:
+`tests/dfx/conftest.py`:
 
 - Compare only the bucket whose key is the runtime `Hardware` value. Another
   device's bucket is recorded and not compared.

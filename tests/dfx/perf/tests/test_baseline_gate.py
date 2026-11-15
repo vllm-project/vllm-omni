@@ -7,7 +7,7 @@ import math
 
 import pytest
 
-from tests.dfx.perf.baseline_gate import (
+from tests.dfx.conftest import (
     BASELINE_REGRESSION_TOLERANCE,
     assert_baseline_within_tolerance,
     metric_lower_is_better,
