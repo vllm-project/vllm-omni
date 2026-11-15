@@ -94,12 +94,14 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`MiniMaxAI/MiniMax-H3-Image-AMD.md`](./MiniMaxAI/MiniMax-H3-Image-AMD.md) | Six-step text-to-image and image editing HTTP serving | 1x–8x AMD Instinct MI325X or MI350X (measured) |
 | [`MiniMaxAI/MiniMax-H3-Spark-GB10.md`](./MiniMaxAI/MiniMax-H3-Spark-GB10.md) | MiniMax H3 T2VA and Ref2VA on DGX Spark | 1x or 2x DGX Spark (GB10) |
 | [`MiniMaxAI/MiniMax-H3-MUSA.md`](./MiniMaxAI/MiniMax-H3-MUSA.md) | MiniMax H3 T2VA, FL2VA, and Ref2VA on MUSA | 4x MTT S5000 (TP4 Ref2VA profile) |
+| [`MiniMaxAI/MiniMax-H3-Image-4090.md`](./MiniMaxAI/MiniMax-H3-Image-4090.md) | MiniMax-H3-Image text-to-image serving with layerwise offload | 1x RTX 4090 24GB (community deployment) |
 | [`MiniMaxAI/MiniMax-H3-Image-H200.md`](./MiniMaxAI/MiniMax-H3-Image-H200.md) | MiniMax-H3-Image text-to-image and reference editing | 1x (offload), 2x or 4x H200 141GB (measured) |
 | [`MiniMaxAI/MiniMax-H3-Image-H100.md`](./MiniMaxAI/MiniMax-H3-Image-H100.md) | MiniMax-H3-Image text-to-image and reference editing | 1x or 2x with DLO, 4x H100 80GB (configuration-only) |
 | [`MiniMaxAI/MiniMax-H3-Image-B200.md`](./MiniMaxAI/MiniMax-H3-Image-B200.md) | MiniMax-H3-Image text-to-image and reference editing | 1x, 2x or 4x B200 180GB (configuration-only) |
 | [`MiniMaxAI/MiniMax-H3-Image-B300.md`](./MiniMaxAI/MiniMax-H3-Image-B300.md) | MiniMax-H3-Image text-to-image and reference editing | 1x, 2x or 4x B300 288GB (configuration-only) |
 | [`MiniMaxAI/MiniMax-H3-Image-RTX-PRO-6000.md`](./MiniMaxAI/MiniMax-H3-Image-RTX-PRO-6000.md) | MiniMax-H3-Image text-to-image and reference editing | 1x (offload), 2x or 4x RTX PRO 6000 Blackwell 96GB (measured) |
 | [`MiniMaxAI/MiniMax-H3-Image-XPU.md`](./MiniMaxAI/MiniMax-H3-Image-XPU.md) | MiniMax-H3-Image text-to-image and reference editing on XPU | 1x or 2x with DLO, 4x Intel Arc Pro B70 32GB (measured) |
+| [`MiniMaxAI/MiniMax-H3-Image-NPU.md`](./MiniMaxAI/MiniMax-H3-Image-NPU.md) | MiniMax-H3-Image text-to-image and reference editing on Ascend | 1x or 8x Atlas 800T A3 / Atlas 800I A2 / Atlas 350 |
 | [`krea/Krea-2.md`](./krea/Krea-2.md) | Text-to-image (Turbo + Raw), offline + online, with LoRA | 1x H100 80GB / 1x Intel Arc Pro B70 32GB |
 | [`Kandinsky/Kandinsky6-TI2VA.md`](./Kandinsky/Kandinsky6-TI2VA.md) | Text/image-to-video-and-audio, offline and `/v1/videos` | 1x H100 80GB with CPU offload; 2x H100 for parallel modes |
 | [`LTX/LTX-2.md`](./LTX/LTX-2.md) | LTX-2/LTX-2.3 text-to-video and image-to-video with synchronized audio | H200 141GB / 96GB-class GPU / 1x Intel Arc Pro B70 32GB |
@@ -112,7 +114,8 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`NVIDIA/SANA-Video-2B.md`](./NVIDIA/SANA-Video-2B.md) | Native and Diffusers-adapter 480p/720p T2V+I2V | 1x RTX 5090 32GB |
 | [`meituan-longcat/LongCat-Video-Avatar-1.5.md`](./meituan-longcat/LongCat-Video-Avatar-1.5.md) | Audio-driven avatar video generation (AT2V / AI2V, single- and multi-speaker, AVC continuation) | 1x H100 80GB |
 | [`mistralai/Voxtral-TTS.md`](./mistralai/Voxtral-TTS.md) | Online serving for TTS | 1x RTX 4090 24GB |
-| [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) |
+| [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) or 1x RTX 5090 32GB with layerwise offload |
+| [`Runway/Praxis-1.md`](./Runway/Praxis-1.md) | Closed-loop video/action robot policy (DROID single arm, YAM two arms): offline, OpenPI and Positronic serving | 1x NVIDIA H100 80GB |
 | [`SandAI/MAGI-2-preview-L20X.md`](./SandAI/MAGI-2-preview-L20X.md) | Native Preview-stage text/image-to-video-and-audio generation | 1x/4x NVIDIA L20X 140 GiB qualified |
 | [`SandAI/MAGI-2-preview-NPU.md`](./SandAI/MAGI-2-preview-NPU.md) | Online Preview-stage T2VA at 272p | 4x NPU, 112 GiB each; TP1/SP4 eager |
 | [`Robbyant/LingBot-World-2.0.md`](./Robbyant/LingBot-World-2.0.md) | Offline and experimental realtime interactive world generation | 1x H200/B200 or 2x B200 for TP=2 |

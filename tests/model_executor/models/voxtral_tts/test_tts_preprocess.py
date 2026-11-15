@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import functools
 
@@ -76,3 +76,31 @@ def test_tts_preprocess_keeps_legacy_top_level_audio_feedback():
     assert len(model.model.embed_multimodal_calls) == 1
     torch.testing.assert_close(model.model.embed_multimodal_calls[0]["audio_tokens"], audio_tokens)
     torch.testing.assert_close(output_embeds, torch.full((1, 4), 7.0))
+
+
+def test_tts_postprocess_uses_explicit_batch_row_without_advancing_v1_counter():
+    model = _make_voxtral_tts_model()
+    model.post_process_idx = 0
+    frames = [torch.tensor([[1, 2]]), torch.tensor([[3, 4]])]
+
+    update = model.tts_postprocess(
+        torch.zeros(1, 4),
+        multimodal_outputs={"codes": {"audio": frames}},
+        _omni_batch_row=1,
+    )
+
+    torch.testing.assert_close(update["codes"]["audio"], frames[1])
+    assert model.post_process_idx == 0
+
+
+def test_tts_postprocess_retains_v1_request_order_fallback():
+    model = _make_voxtral_tts_model()
+    model.post_process_idx = 0
+    frames = [torch.tensor([[1, 2]]), torch.tensor([[3, 4]])]
+
+    first = model.tts_postprocess(torch.zeros(1, 4), multimodal_outputs={"codes": {"audio": frames}})
+    second = model.tts_postprocess(torch.zeros(1, 4), multimodal_outputs={"codes": {"audio": frames}})
+
+    torch.testing.assert_close(first["codes"]["audio"], frames[0])
+    torch.testing.assert_close(second["codes"]["audio"], frames[1])
+    assert model.post_process_idx == 2

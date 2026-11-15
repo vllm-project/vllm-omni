@@ -19,7 +19,7 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
-from vllm.v1.worker.gpu.input_batch import set_dummy_context
+from vllm.v1.worker.gpu.input_batch import InputBatch, set_dummy_context
 from vllm.v1.worker.gpu.lora_utils import get_num_active_loras_for_dispatch
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_runner import (
@@ -38,7 +38,9 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
+from vllm_omni.model_executor.models.interfaces import SupportsMRv2MultiFrameDecode, supports_multi_frame_decode
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import sanitize_sampling_params_min_tokens_stop_ids
 from vllm_omni.worker_v2 import staged_writes
@@ -101,6 +103,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     use_aux_hidden_state_outputs: bool = False
     speculator: Any = None
     num_speculative_steps: int = 0
+    _kstep_frames: int = 0
     _last_aux_output: Any
     _last_multimodal_outputs: dict[str, Any] | None
     _model_returns_tuple: bool
@@ -400,6 +403,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     super().load_model(*args, **kwargs)
             finally:
                 _mr_module.init_model_state = _orig
+        self._kstep_frames = self._resolve_talker_kstep_frames()
         self._last_aux_output = None
         self._last_multimodal_outputs = None
         self._configure_cudagraph_output_contract()
@@ -444,17 +448,16 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     def _publish_shared_backbone_if_configured(self) -> None:
         """Publish finalized AR backbone weights when this rank is a provider.
 
-        The startup layer attaches a ``SharedWeightGroupConfig`` to
-        ``self.vllm_config`` as ``weight_sharing`` before model load.  This hook
-        runs after the model and all post-load transforms are complete and keeps
-        both the backend and the ``ExportSession`` alive for step-3 lifecycle.
-
-        Provider publishing is wired only on the Model Runner V2 path
-        (:class:`OmniGPUModelRunner`); an AR stage must run on MRv2 to publish.
+        Read this TP rank's bootstrap from additional_config after the model
+        and all post-load transforms are complete. Keep the backend and export
+        session alive until sharing-group teardown.
         """
-        group = getattr(self.vllm_config, "weight_sharing", None)
-        if group is None or getattr(group, "role", None) != "provider":
+        from vllm_omni.distributed.weight_sharing.worker_session import resolve_worker_sharing
+
+        sharing = resolve_worker_sharing(self.vllm_config, role="provider")
+        if sharing is None:
             return
+        group, _ = sharing
         if getattr(self, "_weight_share_session", None) is not None:
             return  # Already published; step-3 owns teardown, do not re-export.
         if getattr(self, "_weight_share_backend", None) is not None:
@@ -614,9 +617,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         *,
         max_query_len: int | None,
         is_padding: bool,
-    ) -> Any:
-        from vllm.v1.worker.gpu.input_batch import InputBatch
-
+    ) -> InputBatch:
         return InputBatch.make_dummy(
             num_reqs,
             num_tokens,
@@ -694,6 +695,109 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         if skip_drafts:
             return 0
         return scheduler_output.num_spec_tokens_to_schedule
+
+    def _resolve_talker_kstep_frames(self) -> int:
+        if not current_omni_platform.is_cuda() or not getattr(self.model, "supports_multi_frame_decode", False):
+            return 0
+        from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
+
+        frames = talker_kstep_frames(self.model_config.model_stage, self.vllm_config.speculative_config)
+        supports_multi_frame_decode(self.model, mrv2=frames > 1)
+        return frames
+
+    def _dummy_sampler_run(self, hidden_states: Any) -> Any:
+        """The Talker's two control logits cannot satisfy profiling's top-k request."""
+        if self._kstep_frames > 1:
+            return None
+        return super()._dummy_sampler_run(hidden_states)
+
+    def _build_kstep_model_kwargs_extra(self, model_inputs: dict[str, Any], input_batch: InputBatch) -> dict[str, Any]:
+        """Build per-request spans and codec state for the multi-frame loop."""
+        num_reqs = input_batch.num_reqs
+        spans = OmniModelState._request_token_spans(input_batch)
+        extra: dict[str, Any] = {
+            "model_intermediate_buffer": model_inputs.get("model_intermediate_buffer"),
+            "runtime_additional_information": model_inputs.get("runtime_additional_information"),
+            "request_token_spans": spans,
+        }
+        # Distinguish prefill spans from drafted decode spans.
+        prefilling = getattr(input_batch, "is_prefilling_np", None)
+        buffers = extra.get("model_intermediate_buffer")
+        if prefilling is not None and isinstance(buffers, (list, tuple)):
+            # Keep live decode buffers writable by the frame loop.
+            marked = []
+            for index, info in enumerate(buffers):
+                if isinstance(info, dict) and index < len(prefilling) and bool(prefilling[index]):
+                    prefill_info = dict(info)
+                    prefill_info["_omni_is_prefill"] = True
+                    marked.append(prefill_info)
+                else:
+                    marked.append(info)
+            extra["model_intermediate_buffer"] = marked
+            extra["runtime_additional_information"] = marked
+        cast(SupportsMRv2MultiFrameDecode, self.model).prepare_kstep_inputs(
+            extra,
+            num_reqs=num_reqs,
+            prefilling=prefilling,
+            seed_ids=model_inputs.get("input_ids"),
+            ib_ids=getattr(input_batch, "input_ids", None),
+            logits_idx=getattr(input_batch, "logits_indices", None),
+        )
+        return extra
+
+    def _run_kstep_model_forward(
+        self,
+        model_inputs: dict[str, Any],
+        frames: int,
+        extra: dict[str, Any],
+    ) -> Any:
+        """Execute each codec frame against its own one-query attention view."""
+        from vllm.forward_context import get_forward_context
+
+        from vllm_omni.worker import talker_multiframe
+
+        spans = extra.get("request_token_spans") or []
+        # Replace the first placeholder with the confirmed previous codec.
+        cast(SupportsMRv2MultiFrameDecode, self.model).rewrite_kstep_initial_embeds(
+            model_inputs.get("inputs_embeds"), extra, spans, model_inputs.get("input_ids")
+        )
+        from vllm_omni.worker.talker_cuda_graph import begin_cuda_narrow_step
+
+        # The eager fallback needs the same per-frame positions and KV slots
+        # as graph replay. Reusing the wide context would overwrite KV entries.
+        narrow = begin_cuda_narrow_step(
+            forward_context=get_forward_context(),
+            frames=frames,
+            positions=model_inputs["positions"],
+            inputs_embeds=model_inputs.get("inputs_embeds"),
+            spans=spans,
+            graph_owner=self,
+        )
+        if narrow is None:
+            raise RuntimeError("MiniCPM-o MRv2 K-step requires a one-query CUDA attention view")
+
+        forward_inputs = model_inputs | extra
+        forward_inputs.update(input_ids=None, positions=narrow.positions, inputs_embeds=narrow.inputs_embeds)
+
+        def run_model() -> Any:
+            return self.model(**forward_inputs)
+
+        try:
+            return talker_multiframe.run(
+                model=self.model,
+                run_model=run_model,
+                after_forward=lambda: None,
+                inputs_embeds=model_inputs.get("inputs_embeds"),
+                input_ids=model_inputs.get("input_ids"),
+                frames=frames,
+                # Frame kwargs supply the Omni fields.
+                model_kwargs={k: v for k, v in model_inputs.items() if k not in extra},
+                model_kwargs_extra=extra,
+                narrow=narrow,
+                keep_cuda_narrow_on_decline=True,
+            )
+        finally:
+            narrow.restore()
 
     @torch.inference_mode()
     @staged_writes.runner_context
@@ -913,11 +1017,30 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
 
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
+        # Dummy/profile batches have no real codec history. Real K-step
+        # batches use the frame loop's graph instead of the MRv2 graph manager.
+        kstep_frames = 0
+        kstep_extra: dict[str, Any] = {}
+        if not dummy_run and not is_profile:
+            from vllm_omni.worker import talker_multiframe
+
+            expected_frames = self._kstep_frames
+            if expected_frames and not any(is_warmup_request(req_id) for req_id in input_batch.req_ids):
+                cast(SupportsMRv2MultiFrameDecode, self.model).flush_cuda_kstep_feedback()
+                kstep_extra = self._build_kstep_model_kwargs_extra(model_inputs, input_batch)
+            if kstep_extra and scheduler_output.scheduled_spec_decode_tokens:
+                kstep_frames = talker_multiframe.applies(self.model, kstep_extra)
+                if kstep_frames != expected_frames:
+                    raise RuntimeError(
+                        f"MiniCPM-o scheduled {expected_frames}-frame Talker drafts "
+                        "without an executable multi-frame decode batch"
+                    )
+
         # Target layers a drafter reads (EAGLE-3, DFlash, DSpark). They ride in
         # the forward's tuple output, separate from the Omni auxiliary output.
         draft_aux_hidden_states = None
         # --- Model forward ---
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+        if batch_desc.cg_mode == CUDAGraphMode.FULL and kstep_frames <= 1:
             # FULL graph replay.  Preprocess already wrote to the static
             # inputs_embeds buffer above.
             assert self.cudagraph_manager is not None
@@ -966,7 +1089,9 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     is_padding=input_batch.is_padding,
                 ):
                     self.kv_connector.pre_forward(scheduler_output)
-                    if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                    if kstep_frames > 1:
+                        model_output = self._run_kstep_model_forward(model_inputs, kstep_frames, kstep_extra)
+                    elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
                         assert self.cudagraph_manager is not None
                         model_output = self.cudagraph_manager.run_pw_graph(
                             self.model,
@@ -997,7 +1122,22 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
                     self.model._last_captured_layers = self._last_aux_output
             else:
                 hidden_states = model_output
-        if not dummy_run and isinstance(hidden_states, torch.Tensor):
+        if kstep_extra and kstep_frames == 0 and isinstance(hidden_states, torch.Tensor):
+            kstep_extra["request_sample_eligible"] = [
+                int(input_batch.num_computed_prefill_tokens_np[i]) + int(input_batch.num_scheduled_tokens[i])
+                >= int(input_batch.prefill_len_np[i])
+                for i in range(input_batch.num_reqs)
+            ]
+            output = self.model.make_omni_output(hidden_states, **kstep_extra)
+            hidden_states = output.text_hidden_states
+            self._last_multimodal_outputs = output.multimodal_outputs
+        if (
+            not dummy_run
+            and isinstance(hidden_states, torch.Tensor)
+            # These outputs are materialized by make_omni_output() in the AR
+            # sampling phase, so their state update must wait for that phase.
+            and not getattr(self.model, "postprocess_requires_multimodal_outputs", False)
+        ):
             self.model_state.run_postprocess(hidden_states, input_batch)
 
         self.execute_model_state = ExecuteModelState(

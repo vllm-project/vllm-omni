@@ -8,6 +8,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -16,6 +17,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.config import LoadConfig
 
+from tests.diffusion.models.hy_nomas.test_native_runtime import _small_transformer
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, resolve_model_class_name
 from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
 from vllm_omni.diffusion.media import VideoValueRange
@@ -26,7 +28,6 @@ from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import MODEL_ID,
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import build_transformer, load_transformer_weights
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import (
     HyNomasPipeline,
-    build_decoder,
     build_model_config,
     validate_config,
 )
@@ -218,6 +219,7 @@ def test_pipeline_loads_diffusers_components(checkpoint, monkeypatch, text_encod
         custom_pipeline_args={} if text_encoder_override is None else {"text_encoder": text_encoder_override},
     )
     pipeline = HyNomasPipeline(od_config=config)
+    assert pipeline.od_config is config
     assert pipeline.transformer is transformer and pipeline.text_encoder is text_encoder and pipeline.vae is vae
     assert [(source.subfolder, source.prefix) for source in pipeline.weights_sources] == [
         ("transformer", "transformer."),
@@ -352,6 +354,88 @@ def test_nonempty_negative_prompt_is_rejected(negative_prompt):
 def test_negative_prompt_requires_string(negative_prompt):
     with pytest.raises(OmniClientError, match="negative_prompt must be a string"):
         normalize_request({"prompt": "A forest", "negative_prompt": negative_prompt}, OmniDiffusionSamplingParams())
+
+
+def test_decode_chunk_matches_legacy_quantization():
+    """Decoded latents must reach the encoder as HWC uint8 the legacy formula produced."""
+    from contextlib import nullcontext
+
+    pixels = torch.tensor([-1.4, -0.2, 0.0, 0.6], dtype=torch.float32).reshape(1, 1, 2, 1, 2)
+
+    class Decoder:
+        final_segment = False
+
+        def push(self, latents, *, pixel_frames):
+            del latents, pixel_frames
+            return pixels
+
+        def finish(self):
+            return torch.empty((0,))
+
+    session = SimpleNamespace(decoder=Decoder(), height=1, width=2)
+    pipeline = object.__new__(HyNomasPipeline)
+    pipeline.vae = SimpleNamespace(
+        config=SimpleNamespace(scaling_factor=1.0, shift_factor=None),
+        parameters=lambda: iter([torch.zeros(1, dtype=torch.float32)]),
+    )
+    pipeline._component_context = lambda module: nullcontext()
+    pipeline.sp_size = 1
+    pipeline.device = torch.device("cpu")
+
+    video = pipeline._decode_chunk(session, torch.zeros(1), pixel_frames=2, finish=False)
+
+    # (v * 0.5 + 0.5) -> clamp -> * 255 -> round-half-even -> uint8, laid out as HWC.
+    expected = np.array([[[[0], [102]]], [[[128], [204]]]], dtype=np.uint8)
+    assert video.dtype == np.uint8
+    assert video.shape == (2, 1, 2, 1)
+    assert video.flags["C_CONTIGUOUS"]
+    np.testing.assert_array_equal(video, expected)
+
+
+@pytest.mark.parametrize(("vae_offloaded", "expected"), [(False, False), (True, True)])
+def test_streaming_decode_to_cpu_follows_vae_residency(vae_offloaded, expected):
+    """A resident VAE must keep decoded pixels on the device.
+
+    ``create_streaming_decode_session(to_cpu=True)`` returns CPU tensors, so the
+    ``uint8`` quantization and every subsequent op would run on the host and the
+    pinned staging in ``_to_host`` would degenerate into a plain pageable copy.
+    """
+    pipeline = object.__new__(HyNomasPipeline)
+    pipeline._vae_offloaded = vae_offloaded
+
+    assert pipeline._streaming_decode_to_cpu() is expected
+
+
+@pytest.mark.parametrize(
+    ("offload_components", "vae_offloaded"),
+    [
+        (None, True),  # every component staged, VAE included
+        (frozenset({"dit"}), False),  # only the DiT staged, so the VAE stays resident
+        (frozenset({"text_encoder"}), False),
+    ],
+)
+def test_cpu_offload_profile_tracks_vae_residency(offload_components, vae_offloaded, monkeypatch):
+    """Only the all-components profile stages the VAE; naming components leaves it resident."""
+    from vllm_omni.diffusion.models.hy_nomas import pipeline_hy_nomas as module
+
+    monkeypatch.setattr(module, "apply_sequential_offload", lambda **kwargs: None)
+    monkeypatch.setattr(module, "remove_sequential_offload", lambda modules: None)
+
+    pipeline = object.__new__(HyNomasPipeline)
+    pipeline.transformer = SimpleNamespace()
+    pipeline.text_encoder = SimpleNamespace()
+    pipeline.vae = SimpleNamespace()
+    pipeline._cpu_offload = False
+    pipeline._vae_offloaded = False
+
+    pipeline.enable_omni_model_cpu_offload(device=torch.device("cpu"), offload_components=offload_components)
+
+    assert pipeline._vae_offloaded is vae_offloaded
+    assert pipeline._streaming_decode_to_cpu() is vae_offloaded
+
+    pipeline.disable_omni_model_cpu_offload()
+    assert pipeline._vae_offloaded is False
+    assert pipeline._streaming_decode_to_cpu() is False
 
 
 @pytest.fixture
@@ -512,9 +596,12 @@ def test_module_offload_rejects_unsupported_components(components, mocker):
         ({"quantization_config": "int8"}, "unquantized"),
         ({"lora_path": "adapter"}, "LoRA"),
         ({"custom_pipeline_args": {"arbitrary": True}}, "custom_pipeline_args"),
+        ({"custom_pipeline_args": {"decoder_backend": "reference"}}, "Unsupported Hy-Nomas custom_pipeline_args"),
+        ({"custom_pipeline_args": {"decoder_backend": "native"}}, "Unsupported Hy-Nomas custom_pipeline_args"),
         ({"enable_layerwise_offload": True}, "layer offload"),
         ({"flow_shift": 3.0}, "flow_shift=5"),
         ({"enforce_eager": False, "diffusion_compile_granularity": "full"}, "full transformer compilation"),
+        ({"enforce_eager": False, "diffusion_compile_granularity": "layer"}, "Unsupported"),
     ],
 )
 def test_unsupported_engine_features(overrides, match):
@@ -738,16 +825,6 @@ def test_native_transformer_factory_places_every_parameter(checkpoint):
     assert all(parameter.dtype == torch.bfloat16 for parameter in parameters.values())
 
 
-def test_decoder_factory_places_every_parameter():
-    decoder = build_decoder(DECODER_CONFIG, torch.device("meta"))
-    parameters = dict(decoder.named_parameters())
-    assert len(parameters) == 476
-    assert all(name.startswith("decoder.") for name in parameters)
-    assert all(
-        parameter.device.type == "meta" and parameter.dtype == torch.bfloat16 for parameter in parameters.values()
-    )
-
-
 @pytest.mark.parametrize("sp_size,ulysses_size,world_size", [(1, 1, 1), (2, 2, 2), (2, 4, 2), (2, 2, 4)])
 def test_sequence_parallelism_matches_worker_group(monkeypatch, sp_size, ulysses_size, world_size):
     group = SimpleNamespace(ulysses_world_size=ulysses_size, world_size=world_size)
@@ -757,3 +834,25 @@ def test_sequence_parallelism_matches_worker_group(monkeypatch, sp_size, ulysses
     else:
         with pytest.raises(ValueError, match="match ulysses_degree"):
             pipeline_hy_nomas.validate_sequence_parallelism(sp_size)
+
+
+def test_setup_compile_regional_and_eager_gates(pipeline, mocker):
+    d = os.path.join(os.path.dirname(pipeline_hy_nomas.__file__), "../../../deploy")
+    assert all(OmegaConf.load(f"{d}/{f}.yaml").stages[0].enforce_eager is True for f in ("hy_nomas", "hy_nomas_ar"))
+    spy = mocker.spy(pipeline_hy_nomas, "regionally_compile")
+    opts = {"triton.cudagraphs": False, "triton.cudagraph_trees": False}
+    c0 = OmniDiffusionConfig(distributed_executor_backend="mp", dtype=torch.bfloat16, diffusion_compile_dynamic=False)
+    c1 = OmniDiffusionConfig(distributed_executor_backend="mp", dtype=torch.bfloat16, enforce_eager=True)
+    for od_config, dyn in ((None, True), (c0, False), (None, True), (c1, None)):
+        if od_config is not None or hasattr(pipeline, "od_config"):
+            pipeline.od_config = od_config
+        t = pipeline.transformer = _small_transformer(num_layers=2)
+        spy.reset_mock()
+        pipeline.setup_compile()
+        assert spy.call_args_list == ([] if dyn is None else [((t,), {"dynamic": dyn, "options": opts})])
+        blocks = (*t.double_blocks, *t.action_modules)
+        assert all(hasattr(b.forward, "_torchdynamo_orig_callable") is (dyn is not None) for b in blocks)
+    for g, match in (("full", "full transformer compilation.*'regional'"), ("layer", "Unsupported")):
+        c1.enforce_eager, c1.diffusion_compile_granularity = False, g
+        with pytest.raises(ValueError, match=match):
+            pipeline.setup_compile()
