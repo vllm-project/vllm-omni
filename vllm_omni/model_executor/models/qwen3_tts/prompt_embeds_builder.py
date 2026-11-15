@@ -844,8 +844,8 @@ class Qwen3TTSPromptEmbedsBuilder:
 
     # -------------------- speaker encoder / codec encoder --------------------
 
-    # Some NPUs (310P, Ascend 950) do not support torch.stft; builders on
-    # such devices set this flag to compute the mel spectrogram on CPU.
+    # 310P does not support torch.stft; its builder sets this flag to compute
+    # the mel spectrogram on CPU.
     _mel_spectrogram_on_cpu: bool = False
 
     def extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
@@ -870,7 +870,6 @@ class Qwen3TTSPromptEmbedsBuilder:
         # Follow official implementation: mel_spectrogram expects 24kHz. Move
         # the waveform first so STFT/mel computation stays on the model device
         # instead of materializing a CPU mel tensor and copying it per request.
-        # Devices without torch.stft set _mel_spectrogram_on_cpu instead.
         mel_device = torch.device("cpu") if self._mel_spectrogram_on_cpu else dev
         wav_tensor = torch.from_numpy(wav).to(device=mel_device, dtype=torch.float32).unsqueeze(0)
         mels = mel_spectrogram(
