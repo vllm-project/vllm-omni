@@ -367,6 +367,31 @@ def test_spec_precision_rejects_unsupported_platform(runtime, monkeypatch):
         make_layer(runtime, monkeypatch, method=None, quant={"precision": "mxfp4"})
 
 
+@pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
+@pytest.mark.parametrize("skip_quant", [False, True])
+def test_packed_capability_uses_spec_precision(runtime, monkeypatch, mocker, precision, skip_quant):
+    layer = make_layer(runtime, monkeypatch, method=None, skip_steps=None, quant={"precision": precision})
+    layer._disable_kv_quant = skip_quant
+    # Model a backend that supports packed varlen only for floating-point attention.
+    capability = mocker.patch.object(
+        layer, "supports_multi_doc_packed_varlen", side_effect=lambda kv_cache_dtype: kv_cache_dtype in (None, "float")
+    )
+    query = torch.randn(6, 2, 64, dtype=torch.bfloat16)
+    dense = mocker.patch.object(layer, "_forward_packed_dense_buckets", return_value=query)
+    varlen = mocker.patch.object(layer, "forward", return_value=query.unsqueeze(0))
+    layer.forward_packed(query, query, query, cu_seqlens=torch.tensor([0, 2, 6]), max_seqlen=4)
+
+    expected_dtype = "float" if skip_quant else precision
+    capability.assert_called_once_with(kv_cache_dtype=expected_dtype)
+    assert layer._with_kv_cache_dtype(None).extra["kv_cache_dtype"] == expected_dtype
+    if skip_quant:
+        varlen.assert_called_once()
+        dense.assert_not_called()
+    else:
+        dense.assert_called_once()
+        varlen.assert_not_called()
+
+
 @pytest.mark.parametrize("method", [None, "auto", "float", "fp8", "mxfp8", "mxfp4"])
 @pytest.mark.parametrize("quant", [None, {"fp8_fa_mode": "C8V16_TILING512"}])
 def test_global_quant_method_keeps_original_policy(runtime, monkeypatch, mocker, method, quant):

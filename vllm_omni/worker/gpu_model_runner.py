@@ -210,8 +210,9 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
-        group = getattr(self.vllm_config, "weight_sharing", None)
-        if getattr(group, "role", None) == "provider":
+        from vllm_omni.distributed.weight_sharing.worker_session import resolve_worker_sharing
+
+        if resolve_worker_sharing(self.vllm_config, role="provider") is not None:
             raise ValueError(
                 "weight sharing role='provider' requires the Model Runner V2 path; "
                 "the MRv1 runner cannot publish a shared backbone"
@@ -2409,7 +2410,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # positions per request runs K codec frames here, one replay each, using
         # the same loop the NPU runner uses. Everything else -- prefill, a mixed
         # step, another stage -- falls through to the ordinary single forward.
-        from vllm_omni.platforms.npu.worker import talker_multiframe
+        from vllm_omni.worker import talker_multiframe
 
         frames = talker_multiframe.applies(self.model, model_kwargs_extra)
         if frames <= 1 and talker_multiframe.is_multi_token_decode(self.model, model_kwargs_extra):

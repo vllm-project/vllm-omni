@@ -116,6 +116,19 @@ class TestParallelKnobForwarding:
         assert defaults == {key: None for key in _KNOBS}
 
 
+class TestQuantizationChoice:
+    """``--quantization`` must accept every method the diffusion path can build."""
+
+    def test_mxfp8_is_accepted(self):
+        """mxfp8 is buildable by build_quant_config(), so argparse must not reject it."""
+        args = _parse_real_args(["--quantization", "mxfp8"])
+        assert args.quantization == "mxfp8"
+
+    def test_unknown_method_is_rejected(self):
+        with pytest.raises(SystemExit):
+            _parse_real_args(["--quantization", "not-a-method"])
+
+
 class TestARGridMaxTokens:
     """The AR grid budget formula must stay shared between serving and offline.
 

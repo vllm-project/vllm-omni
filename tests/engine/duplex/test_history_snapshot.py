@@ -35,6 +35,68 @@ def test_snapshot_aligns_unbound_and_registered_sources(session):
     assert snapshot.history_revision == session.history_revision
 
 
+def test_prompt_history_aligns_visible_messages_and_item_ids(session):
+    nested = [{"type": "audio_url", "audio_url": {"url": "native-duplex:audio"}}]
+    first = {"role": "user", "content": nested}
+    session.append_history_message(first)
+    session.reserve_history_item("pending")
+    session.register_history_item("second", {"role": "assistant", "content": "reply"})
+
+    messages, item_ids = session.history_for_prompt()
+
+    assert item_ids == (None, "second")
+    assert messages == (first, {"role": "assistant", "content": "reply"})
+    assert messages[0] is not first
+    assert messages[0]["content"] is nested
+    messages[0]["role"] = "view-only"
+    assert session.history[0]["role"] == "user"
+
+    session.register_history_item("first", first)
+    session.register_history_item("pending", {"role": "assistant", "content": "ready"})
+    rebound, rebound_ids = session.history_for_prompt()
+    assert rebound_ids == ("first", "pending", "second")
+    assert [message["content"] for message in rebound] == [nested, "ready", "reply"]
+    assert session.delete_history_item("first")
+    session.register_history_item("first", {"role": "user", "content": "new"})
+    recreated, recreated_ids = session.history_for_prompt()
+    assert recreated_ids == ("pending", "second", "first")
+    assert [message["content"] for message in recreated] == ["ready", "reply", "new"]
+    assert item_ids == (None, "second")
+
+
+@pytest.mark.parametrize("corruption", ["untracked", "misbound"])
+def test_prompt_history_rejects_broken_source_tracking(session, corruption):
+    first = {"role": "user", "content": "first"}
+    second = {"role": "user", "content": "second"}
+    session.register_history_item("first", first)
+    session.register_history_item("second", second)
+    if corruption == "untracked":
+        session._conversation.messages.append({"role": "user", "content": "untracked"})
+    else:
+        session._conversation.sources[id(second)] = session._conversation.sources[id(first)]
+
+    with pytest.raises(RuntimeError, match="history_source_tracking_invariant"):
+        session.history_for_prompt()
+
+
+def test_snapshot_rejects_misbound_source_identity(session):
+    first = {"role": "user", "content": "first"}
+    second = {"role": "user", "content": "second"}
+    session.register_history_item("first", first)
+    session.register_history_item("second", second)
+    session._conversation.sources[id(second)] = session._conversation.sources[id(first)]
+
+    with pytest.raises(RuntimeError, match="history_source_tracking_invariant"):
+        session.history_snapshot()
+
+
+def test_snapshot_rejects_untracked_visible_message(session):
+    session._conversation.messages.append({"role": "user", "content": "untracked"})
+
+    with pytest.raises(RuntimeError, match="history_source_tracking_invariant"):
+        session.history_snapshot()
+
+
 def test_old_snapshot_keeps_nested_content_after_source_replacement(session):
     session.register_history_item("user", {"role": "user", "content": [{"type": "text", "text": "before"}]})
     before = session.history_snapshot()
