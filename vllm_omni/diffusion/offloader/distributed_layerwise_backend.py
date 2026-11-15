@@ -83,6 +83,22 @@ logger = init_logger(__name__)
 _ACTIVE_HWR_REGISTRATIONS: list[tuple[HostRegistration, HostWeightLease]] = []
 _ACTIVE_HWR_REGISTRATIONS_LOCK = threading.Lock()
 
+# XCCL rejects E8M0 scales as a collective element type.  Their one-byte
+# storage is identical to uint8, so all-gather the underlying bytes instead.
+_BYTE_VIEW_ALLGATHER_DTYPES = {dtype for dtype in (getattr(torch, "float8_e8m0fnu", None),) if dtype is not None}
+
+
+def _all_gather_into_tensor(
+    output: torch.Tensor,
+    input_tensor: torch.Tensor,
+    group: torch.distributed.ProcessGroup | None,
+) -> None:
+    """All-gather a shard, using byte storage for unsupported dtypes."""
+    if input_tensor.dtype in _BYTE_VIEW_ALLGATHER_DTYPES:
+        output = output.view(torch.uint8)
+        input_tensor = input_tensor.view(torch.uint8)
+    torch.distributed.all_gather_into_tensor(output, input_tensor, group=group)
+
 
 def _retain_active_hwr_registration(
     registration: HostRegistration,
@@ -662,10 +678,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 with current_omni_platform.stream(self.comm_stream):
                     for dtype, local_shard in gpu_shards.items():
                         gw = gpu_weights[dtype][: self._ag_output_sizes[dtype]]
-                        torch.distributed.all_gather_into_tensor(
+                        _all_gather_into_tensor(
                             gw,
                             local_shard,
-                            group=self.dp_group,
+                            self.dp_group,
                         )
                     evt.record(self.comm_stream)
             else:
@@ -692,10 +708,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                             full_out = gpu_weights[dtype_manifest.dtype][
                                 chunk.full_offset : chunk.full_offset + chunk.padded_numel
                             ]
-                            torch.distributed.all_gather_into_tensor(
+                            _all_gather_into_tensor(
                                 full_out,
                                 local_input,
-                                group=self.dp_group,
+                                self.dp_group,
                             )
                             self._ag_done_events[input_slot].record(self.comm_stream)
                         self._chunk_reuse_events[input_slot] = self._ag_done_events[input_slot]

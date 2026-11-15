@@ -490,15 +490,26 @@ class TestDistributedLayerwiseOffloadHook:
             {dtype: torch.empty_like(shard) for dtype, shard in rank0_hook.cpu_shards.items()} for _ in range(2)
         ]
 
+        collective_dtypes = []
+
         def fake_allgather(output, local_shard, *, group):
             del group
-            remote_shard = rank1_hook.cpu_shards[local_shard.dtype]
-            shard_size = local_shard.numel()
-            output[:shard_size].copy_(local_shard)
-            output[shard_size : 2 * shard_size].copy_(remote_shard)
+            collective_dtypes.append(local_shard.dtype)
+            local_bytes = local_shard.view(torch.uint8)
+            if local_shard.dtype == torch.uint8:
+                remote_bytes = rank1_hook.cpu_shards[torch.float8_e8m0fnu].view(torch.uint8)
+            else:
+                remote_bytes = rank1_hook.cpu_shards[local_shard.dtype].view(torch.uint8)
+            shard_size = local_bytes.numel()
+            output_bytes = output.view(torch.uint8)
+            output_bytes[:shard_size].copy_(local_bytes)
+            output_bytes[shard_size : 2 * shard_size].copy_(remote_bytes)
 
         monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
         rank0_hook.prefetch_layer(slot=0, non_blocking=False)
+
+        assert torch.uint8 in collective_dtypes
+        assert torch.float8_e8m0fnu not in collective_dtypes
 
         for name, tensor in rank0_block.named_parameters():
             assert tensor.stride() == expected_strides[name]
