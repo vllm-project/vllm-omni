@@ -331,9 +331,10 @@ def get_campplus_torch(onnx_path: str, device: str | torch.device) -> CampplusTo
     # time, so two stages on different cards both passing "npu" would collide
     # on one key and silently share weights pinned to the first card (review).
     d = device if isinstance(device, torch.device) else torch.device(device)
+    # ``torch.cpu.current_device()`` returns the string "cpu", which cannot
+    # index a device — CPU keeps its indexless form on purpose.
     if d.index is None and d.type != "cpu":
-        # Resolve the active device without requiring a CUDA-shaped module API.
-        d = torch.empty(0, device=d).device
+        d = torch.device(d.type, getattr(torch, d.type).current_device())
     key = (os.path.abspath(onnx_path), str(d))
     cached = _CAMPPLUS_TORCH_CACHE.get(key)
     if cached is not None:

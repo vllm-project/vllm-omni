@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
 E2E expansion tests for Voxtral TTS offline inference (nightly CI).
@@ -24,10 +24,7 @@ from vllm import SamplingParams
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
-from tests.helpers.stage_config import (
-    get_deploy_config_path,
-    stage_config_path_for_run_level,
-)
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 MODEL = "mistralai/Voxtral-4B-TTS-2603"
@@ -61,7 +58,7 @@ def _compose_request(model_name: str, text: str, voice: str) -> dict:
 
 
 @pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
-@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 def test_voxtral_tts_offline_basic(omni_runner_function: OmniRunner) -> None:
     """Offline sync path; function-scoped runner so AsyncOmni test does not overlap a live Omni."""
     omni = omni_runner_function.omni
@@ -98,17 +95,14 @@ def test_voxtral_tts_offline_basic(omni_runner_function: OmniRunner) -> None:
     assert np.max(np.abs(audio_array)) > 0.01, "Audio appears to be silence"
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-def test_voxtral_tts_offline_streaming(run_level: str):
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_voxtral_tts_offline_streaming():
     """Test AsyncOmni streaming inference for Voxtral TTS."""
-
-    deploy_config = stage_config_path_for_run_level(STAGE_CONFIG, run_level)
-    assert deploy_config is not None
 
     async def _run():
         async_omni = AsyncOmni(
             model=MODEL,
-            deploy_config=deploy_config,
+            deploy_config=STAGE_CONFIG,
             stage_init_timeout=300,
             enforce_eager=True,
         )

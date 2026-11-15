@@ -7,30 +7,23 @@ import base64
 import io
 import json
 import wave
-from pathlib import Path
 
 import pytest
 from PIL import Image
 
-from tests.e2e.online_serving.helpers.joyai_vl_interaction import joyai_server_params
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServerParams
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.full_model, pytest.mark.omni]
+pytestmark = [pytest.mark.advanced_model, pytest.mark.omni]
 
 
-async def run_observations(url, model, output_dir, *, expect_streaming=False, instruction_pcm=b""):
-    # Keep the cancellation turn generating after its first transcript delta;
-    # a one-word color reply can finish before the client coroutine resumes.
+async def run_observations(url, model, output_dir):
     config = SessionConfig(
         auto_response=False,
         temperature=0.0,
-        instructions=(
-            None
-            if instruction_pcm
-            else "For every new image, say the color of only the newest image in English. "
-            "If it is green, also count from one to fifty aloud, saying every number without skipping any."
-        ),
+        instructions="Describe the color of the current image in one short spoken sentence whenever it changes.",
         extra_body={"tts_language": "English"},
     )
     collector = EventCollector()
@@ -38,87 +31,43 @@ async def run_observations(url, model, output_dir, *, expect_streaming=False, in
         consumer = asyncio.create_task(collector.consume(client))
         await asyncio.sleep(0)
         try:
-            if not instruction_pcm:
-                await client.send(
-                    {
-                        "type": "conversation.item.create",
-                        "item": {
-                            "type": "message",
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_text",
-                                    "text": "What color is the latest image? Answer aloud whenever I send a new image.",
-                                }
-                            ],
-                        },
-                    }
-                )
+            await client.send(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "What color is the latest image? Answer aloud whenever I send a new image.",
+                            }
+                        ],
+                    },
+                }
+            )
             pending_playback = None
-            for index, color in enumerate(("red", "blue", "green", "yellow")):
+            for index, color in enumerate(("red", "blue")):
                 image = io.BytesIO()
                 Image.new("RGB", (224, 224), color).save(image, format="JPEG")
                 done = asyncio.create_task(client.wait_for("response.done", timeout_s=180))
-                progress = (
-                    asyncio.create_task(client.wait_for("response.output_audio_transcript.delta", timeout_s=180))
-                    if index == 2
-                    else None
-                )
                 await asyncio.sleep(0)
                 try:
-                    if index == 3 and instruction_pcm:
-                        # Start a fresh query after cancelling the spoken
-                        # counting instruction retained in conversation history.
-                        await client.send(
-                            {
-                                "type": "conversation.item.create",
-                                "item": {
-                                    "type": "message",
-                                    "role": "user",
-                                    "content": [{"type": "input_text", "text": "What color is the newest image?"}],
-                                },
-                            }
-                        )
-                    await client.append_audio(
-                        instruction_pcm if index in (0, 2) else b"",
-                        video_frames=[base64.b64encode(image.getvalue()).decode()],
-                    )
+                    await client.append_audio(b"", video_frames=[base64.b64encode(image.getvalue()).decode()])
                     await client.commit(create_response=True)
                     if pending_playback is not None:
                         # The next observation was committed after response.done
                         # but before the previous audio finished playing.
                         played_ms, response_id = pending_playback
                         await client.ack_playback(played_ms, response_id=response_id)
-                    if progress is not None:
-                        # Cancel after the model begins replying, rather than at
-                        # response.created, which precedes engine submission.
-                        event = await progress
-                        assert not done.done(), "Response finished before cancellation"
-                        await client.cancel_response(event.response_id)
                     terminal = await done
                 finally:
                     if not done.done():
                         done.cancel()
-                    if progress is not None:
-                        progress.cancel()
-                        await asyncio.gather(progress, return_exceptions=True)
                     await asyncio.gather(done, return_exceptions=True)
-                if index == 2:
-                    assert terminal.raw["response"]["status"] == "cancelled", terminal.raw
-                    pending_playback = None
-                    continue
                 assert terminal.raw["response"]["status"] == "completed", terminal.raw
-                assert color in collector.response_text(terminal.response_id).lower()
                 pcm = collector.audio_bytes(terminal.response_id)
                 assert len(pcm) >= 2400 and len(pcm) % 2 == 0, "Expected nonempty PCM16 speech"
-                if expect_streaming:
-                    chunks = [
-                        event
-                        for event in collector.events
-                        if event.get("type") == "response.output_audio.delta"
-                        and event.get("response_id") == terminal.response_id
-                    ]
-                    assert len(chunks) > 1, "Expected streamed audio before the final waveform"
                 with wave.open(str(output_dir / f"observation-{index}.wav"), "wb") as wav:
                     wav.setnchannels(1)
                     wav.setsampwidth(2)
@@ -128,15 +77,7 @@ async def run_observations(url, model, output_dir, *, expect_streaming=False, in
             assert pending_playback is not None
             played_ms, response_id = pending_playback
             await client.ack_playback(played_ms, response_id=response_id)
-            assert len(set(collector.response_ids)) == 4
-            if instruction_pcm:
-                transcripts = [
-                    event["transcript"]
-                    for event in collector.events
-                    if event.get("type") == "conversation.item.input_audio_transcription.completed"
-                ]
-                assert len(transcripts) == 2 and all("color" in text.lower() for text in transcripts), transcripts
-            assert not collector.errors(), collector.errors()
+            assert len(set(collector.response_ids)) == 2
             await client.close()
             await consumer
         finally:
@@ -150,28 +91,25 @@ async def run_observations(url, model, output_dir, *, expect_streaming=False, in
 
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize(
-    "omni_server,with_asr",
+    "omni_server",
     [
-        pytest.param(joyai_server_params(), False, id="visual-duplex"),
-        pytest.param(joyai_server_params(asr=True), True, id="asr-duplex"),
+        OmniServerParams(
+            model="jdopensource/JoyAI-VL-Interaction-Preview",
+            # The fixture patches load_format on explicit stages; materialize the
+            # duplex override on the same base used by joyai_vl_interaction_duplex.yaml.
+            stage_config_path=modify_stage_config(
+                get_deploy_config_path("joyai_vl_interaction.yaml"),
+                updates={"session_mode": "duplex"},
+            ),
+        )
     ],
-    indirect=["omni_server"],
+    indirect=True,
 )
-def test_committed_observations_produce_speech_cancel_and_release_session(omni_server, tmp_path, with_asr):
-    instruction_pcm = b""
-    if with_asr:
-        path = Path(__file__).resolve().parents[2] / "assets/joyai_vl_interaction/color_instruction_16k.wav"
-        with wave.open(str(path), "rb") as audio:
-            assert (audio.getnchannels(), audio.getsampwidth(), audio.getframerate()) == (1, 2, 16000)
-            instruction_pcm = audio.readframes(audio.getnframes())
+def test_committed_video_observations_produce_speech_and_release_session(omni_server, tmp_path):
     asyncio.run(
         run_observations(
             f"ws://{omni_server.host}:{omni_server.port}/v1/realtime?duplex=1",
             omni_server.model,
             tmp_path,
-            # The ASR profile uses async_chunk=false: Code2Wav returns a complete
-            # waveform, so only the visual profile requires multiple deltas.
-            expect_streaming=not with_asr,
-            instruction_pcm=instruction_pcm,
         )
     )

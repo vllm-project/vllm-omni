@@ -1,0 +1,22 @@
+# Opt-in single-H200 throughput profile for turn-mode MiniCPM-o 4.5.
+# Use NVIDIA MPS when sharing the GPU across stages. Warm representative
+# streaming shapes before admitting traffic: graph capture can delay
+# first audio by seconds. Talker capacity 16 reduces C32 admission-tail
+# latency at similar throughput; C16 P99 varied across independent starts.
+# This reserves 4 GiB of Talker KV (2 GiB more than the generic MRv2 profile).
+# Keep room for lazy graph caches on the 141 GiB H200.
+#
+# FP32 weights/caches are retained, but the opt-in TF32 policy changes
+# rounding. Quality evidence and limits:
+# docs/design/minicpm_o45_mrv2_performance.md
+base_config: minicpmo_4_5_turn_mrv2.yaml
+
+stages:
+  - stage_id: 1
+    max_num_seqs: 16
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        kv_cache_memory_bytes: 4294967296

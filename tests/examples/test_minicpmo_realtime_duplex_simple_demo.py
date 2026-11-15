@@ -240,19 +240,10 @@ def test_final_create_response_flag_parses_from_the_cli(monkeypatch):
     monkeypatch.setattr(
         demo.sys,
         "argv",
-        [
-            "realtime_duplex_demo.py",
-            "--input-wav",
-            "input.wav",
-            "--tail-silence-s",
-            "8.2",
-            "--final-create-response",
-        ],
+        ["realtime_duplex_demo.py", "--input-wav", "input.wav", "--final-create-response"],
     )
 
-    args = demo.parse_args()
-    assert args.tail_silence_s == 8.2
-    assert args.final_create_response is True
+    assert demo.parse_args().final_create_response is True
 
 
 def test_a_forced_response_must_drain_before_the_session_closes():

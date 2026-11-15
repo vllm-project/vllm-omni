@@ -32,7 +32,6 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     load_deploy_config,
 )
-from vllm_omni.config.weight_sharing import WeightSharingConfig
 from vllm_omni.engine.arg_utils import is_frontend_only
 from vllm_omni.engine.async_engine_utils import (
     SHUTDOWN_ENQUEUE_TIMEOUT_S,
@@ -128,7 +127,6 @@ class OmniEngineBase:
     _client_config: OmniClientConfig | None = None
     _output_sink: OutputQueueSink | None = None
     _watermark_config: WatermarkConfig | None = None
-    _weight_sharing_config: WeightSharingConfig | None = None
 
     def __init__(
         self,
@@ -273,13 +271,6 @@ class OmniEngineBase:
             kwargs,
             trust_remote_code=trust_remote_code,
         )
-
-        resolution: OmniConfigResolution | None = getattr(self, "_config_resolution", None)
-        self._weight_sharing_config = resolution.weight_sharing if resolution is not None else None
-        if self._weight_sharing_config is not None and (
-            single_stage_mode or self._omni_master_address is not None or self._parallel_stage_init
-        ):
-            raise ValueError("weight sharing requires local two-stage ownership and sequential initialization")
 
         if self._single_stage_id_filter is not None:
             self._validate_single_stage_choice(self._single_stage_id_filter, self.stage_configs)
@@ -427,11 +418,8 @@ class OmniEngineBase:
             client_config=self._client_config,
             watermark_config=self._watermark_config,
         )
-        if self._weight_sharing_config is None:
-            self._runtime.initialize()
-            self._assign_stage_runtime_fields()
+        self._runtime.initialize()
 
-    def _assign_stage_runtime_fields(self) -> None:
         self.num_stages = len(self.stage_configs)
         self.stage_pools = self._runtime.stage_pools
         self.stage_clients = [
@@ -488,9 +476,6 @@ class OmniEngineBase:
 
         async def _run_orchestrator() -> None:
             self._initialize_stages(stage_init_timeout)
-            if self._weight_sharing_config is not None:
-                await self._runtime.initialize_shared(self._weight_sharing_config)
-                self._assign_stage_runtime_fields()
 
             pd_config = self._detect_pd_config()
 
@@ -513,8 +498,6 @@ class OmniEngineBase:
                 collect_stage_metrics=self._collect_stage_metrics,
                 enable_orch_monitor=self._enable_orch_monitor,
             )
-            if self._weight_sharing_config is not None:
-                orchestrator.weight_sharing = self._runtime.sharing
             await orchestrator.publish_stage_post_warmup_memory()
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -545,10 +528,6 @@ class OmniEngineBase:
                     task.cancel()
                 if pending:
                     loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-                sharing = getattr(getattr(self, "_runtime", None), "sharing", None)
-                if sharing is not None and not sharing.termination_complete:
-                    # Also covers failures between stage readiness and run().
-                    loop.run_until_complete(sharing.close())
                 loop.run_until_complete(loop.shutdown_asyncgens())
                 if hasattr(loop, "shutdown_default_executor"):
                     loop.run_until_complete(loop.shutdown_default_executor())

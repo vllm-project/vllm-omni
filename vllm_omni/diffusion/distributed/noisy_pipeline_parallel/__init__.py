@@ -7,11 +7,6 @@ Mainline depends only on ``SupportsNoisyPPKV``. Concrete NoisyKV stays under
 runner), same pattern as stepwise ``SupportsStepExecution``.
 """
 
-from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.batch import (
-    ComputeBatch,
-    MemberRef,
-    organize_batches,
-)
 from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
     ARDiffusionCellContext,
     CellAdapter,
@@ -32,8 +27,6 @@ from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan impor
 __all__ = [
     "ARDiffusionCellContext",
     "CellAdapter",
-    "ComputeBatch",
-    "MemberRef",
     "CellPlan",
     "CellRunSpec",
     "CellSchedule",
@@ -42,7 +35,6 @@ __all__ = [
     "SupportsNoisyPPKV",
     "build_cell_plan",
     "cfg_step_replicas",
-    "organize_batches",
     "resolve_pp_rank_and_group",
     "run_cell_pipeline",
 ]

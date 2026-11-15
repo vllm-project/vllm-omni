@@ -65,10 +65,9 @@ class _States:
         self.top_k = SimpleNamespace(gpu=top_k, np=top_k.cpu().numpy())
         self.top_p = SimpleNamespace(gpu=top_p, np=top_p.cpu().numpy())
 
-    def get_top_k_top_p(self, expanded_idx_mapping, idx_mapping_np, vocab_size):
-        assert vocab_size == self.vocab_size
+    def get_top_k_top_p(self, expanded_idx_mapping, idx_mapping_np):
         rows = expanded_idx_mapping.long()
-        return self.top_k.gpu[rows], self.top_p.gpu[rows], False
+        return self.top_k.gpu[rows], self.top_p.gpu[rows]
 
 
 def _ras_sampler(tokens, prompt_len, total_len, temperature, top_k, top_p, seeds, vocab):
@@ -97,8 +96,7 @@ def _sample(sampler, logits, pos, fused):
         pos,
         None,
         None,
-        None,
-        return_logprobs=not fused,  # logprobs keep the tensor path
+        not fused,  # logprobs keep the tensor path
         default_top_p=0.8,
         default_top_k=25,
         win_size=10,

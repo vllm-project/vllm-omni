@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU regressions for folding frozen HiFT generator weight normalization."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 from torch import nn
@@ -138,10 +136,9 @@ def test_load_weights_folds_loaded_not_initial_weights(tmp_path, weight_norm_api
 
     # Exercise the real loader with a small vocoder and synthetic checkpoints.
     # __new__ skips CosyVoice3Code2Wav.__init__ (which would build the DiT and
-    # flow decoder); weight-norm tests leave optional DiT compilation disabled.
+    # flow decoder); load_weights only touches .flow_model and .hift.
     model = CosyVoice3Code2Wav.__new__(CosyVoice3Code2Wav)
     nn.Module.__init__(model)
-    model.config = SimpleNamespace(cosyvoice3_compile_dit=False)
     model.flow_model = nn.Linear(2, 2)
     # Start in training mode to check the loader's transition to eval.
     model.hift = _make_hift().train()

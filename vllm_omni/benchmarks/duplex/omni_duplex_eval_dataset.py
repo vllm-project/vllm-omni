@@ -285,19 +285,9 @@ def _read_hf(load_dataset: Callable[..., Any], dataset: str, want: str | None) -
         # passes ``None``) and implied physical split support that does not
         # exist, so it was removed.
         return load_dataset("parquet", data_files=dataset)
-    kwargs = {}
-    if not Path(dataset).exists() and "@" in dataset:
-        if Path(dataset).is_absolute() or dataset.startswith(("./", "../", "~")):
-            raise FileNotFoundError(f"Local dataset path does not exist: {dataset!r}")
-        dataset, revision = dataset.rsplit("@", 1)
-        if not dataset:
-            raise ValueError("Dataset ID must not be empty before '@revision'")
-        if not revision:
-            raise ValueError("Dataset revision must not be empty")
-        kwargs["revision"] = revision
     if want:
-        kwargs["split"] = want
-    return load_dataset(dataset, **kwargs)
+        return load_dataset(dataset, split=want)
+    return load_dataset(dataset)
 
 
 def _rows_from_hf(dataset: str, *, split: str | None) -> list[dict[str, Any]]:
@@ -363,7 +353,7 @@ def load_samples(
     ids: Iterable[str] | None = None,
 ) -> list[DuplexSample]:
     if isinstance(dataset, str | Path):
-        path = Path(str(dataset)).expanduser()
+        path = Path(str(dataset))
         if path.exists():
             # A directory or a ``.parquet`` file is a Hugging Face dataset
             # layout (e.g. a locally mirrored Omni-DuplexEval snapshot); only

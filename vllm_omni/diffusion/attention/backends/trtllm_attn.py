@@ -308,10 +308,7 @@ class TrtllmAttentionBackend(AttentionBackend):
         return True
 
     @classmethod
-    def supports_multi_doc_packed_varlen(cls, kv_cache_dtype: str | None = None) -> bool:
-        # kv_cache_dtype is accepted for signature parity: this backend
-        # declares no supported quantization dtypes, so an effective non-float
-        # policy is rejected at init and never reaches the packed dispatch.
+    def supports_multi_doc_packed_varlen(cls) -> bool:
         return True
 
     @staticmethod

@@ -59,9 +59,10 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
   --port 8091
 ```
 
-This profile selects the turn engine for ordinary HTTP requests and inherits
-the default CUDA MRv2 Talker with K-step. Mode selection happens at startup.
-WebSocket query parameters cannot switch engines.
+This profile inherits the default model and stage settings and overrides only
+`session_mode`. It supports ordinary HTTP requests without creating a duplex
+session handler. Mode selection happens at startup; a WebSocket query parameter
+does not switch engines. The Python `Omni` / `AsyncOmni` APIs are unchanged.
 
 !!! warning
 

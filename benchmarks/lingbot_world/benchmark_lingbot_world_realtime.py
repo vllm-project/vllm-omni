@@ -200,8 +200,7 @@ async def run_session(
     updates = sorted(workload.prompt_updates, key=lambda update: update.after_chunk)
     update_index = 0
 
-    # Avoid recompressing encoded MP4 chunks on the delivery critical path.
-    async with connect(url, max_size=None, ping_interval=None, compression=None) as websocket:
+    async with connect(url, max_size=None, ping_interval=None) as websocket:
         async with send_lock:
             await websocket.send(json.dumps(payload, ensure_ascii=False))
         started = time.perf_counter()

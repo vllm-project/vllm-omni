@@ -9,7 +9,8 @@ projection into ``VllmConfig`` and ``SamplingParams`` is covered by
 ``tests/engine/test_qwen3_omni_deploy_projection.py`` and does not launch
 the 30B model.
 
-Abort / sleep-admission coverage is in ``test_qwen3_omni_colocate_async.py``.
+Abort / sleep-admission lives in ``test_qwen3_omni_colocate_async.py`` so it
+does not overlap this module's OmniRunners.
 """
 
 import os

@@ -7,13 +7,11 @@ from __future__ import annotations
 import math
 import warnings
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import OmniAutoencoderKLWan
 from vllm_omni.diffusion.models.abot_world import abot_world_transformer as abot_transformer
 from vllm_omni.diffusion.models.abot_world.abot_world_transformer import (
     ABotCausalHead,
@@ -25,6 +23,7 @@ from vllm_omni.diffusion.models.abot_world.pipeline_abot_world import (
     ABOT_DMD_TIMESTEPS,
     _build_shifted_flow_schedule,
     _convert_wan_umt5_encoder_state_dict,
+    _fix_wan22_residual_vae_keys,
     _paged_kv_tokens_per_frame,
     _positive_finite_flow_shift,
     _resolve_local_model_path,
@@ -203,7 +202,7 @@ def test_umt5_conversion_maps_gated_gelu_branches() -> None:
     assert converted["encoder.block.0.layer.1.DenseReluDense.wi_1.weight"].item() == suffixes.index("ffn.fc1.weight")
 
 
-def test_wan22_residual_vae_conversion_preserves_grouped_blocks(monkeypatch) -> None:
+def test_wan22_residual_vae_conversion_preserves_grouped_blocks() -> None:
     source = {
         "encoder.downsamples.0.downsamples.0.residual.0.gamma": torch.tensor(0),
         "encoder.downsamples.0.downsamples.2.resample.1.weight": torch.tensor(1),
@@ -211,18 +210,15 @@ def test_wan22_residual_vae_conversion_preserves_grouped_blocks(monkeypatch) -> 
         "decoder.upsamples.0.upsamples.3.time_conv.weight": torch.tensor(3),
         "decoder.upsamples.3.upsamples.0.residual.0.gamma": torch.tensor(4),
     }
-    stale = {
-        "encoder.down_blocks.0.downsamples.0.norm1.gamma": torch.tensor(-1),
-        "decoder.up_blocks.0.resnets.0.norm1.gamma": torch.tensor(-1),
-        "decoder.upsamples.3.upsamples.0.residual.0.gamma": torch.tensor(-1),
-        "quant_conv.weight": torch.tensor(4),
-    }
-    monkeypatch.setattr("diffusers.loaders.single_file_utils.convert_wan_vae_to_diffusers", lambda _: stale)
-    vae = Mock()
-    monkeypatch.setattr(OmniAutoencoderKLWan, "from_config", Mock(return_value=vae))
-    assert OmniAutoencoderKLWan.from_wan22_state_dict(source) is vae
-    converted = vae.load_state_dict.call_args.args[0]
-    assert vae.load_state_dict.call_args.kwargs == {"strict": True, "assign": True}
+    converted = _fix_wan22_residual_vae_keys(
+        source,
+        {
+            "encoder.down_blocks.0.downsamples.0.norm1.gamma": torch.tensor(-1),
+            "decoder.up_blocks.0.resnets.0.norm1.gamma": torch.tensor(-1),
+            "decoder.upsamples.3.upsamples.0.residual.0.gamma": torch.tensor(-1),
+            "quant_conv.weight": torch.tensor(4),
+        },
+    )
 
     assert set(converted) == {
         "encoder.down_blocks.0.resnets.0.norm1.gamma",

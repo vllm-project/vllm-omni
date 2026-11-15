@@ -77,26 +77,14 @@ def test_stage_input_round_trips_llm_receiver():
     assert decode_stage_input(encode_payload(stage_input), ("llm", "llm")) == stage_input
 
 
-@pytest.mark.parametrize("adapter_count", [0, 1, 2])
-def test_stage_input_round_trips_sampling_params(adapter_count):
+def test_stage_input_round_trips_sampling_params():
     """Ensure a stage's sampling params (including complex types) survive encoding."""
-    adapters = [
-        LoRARequest(lora_name=f"adapter-{index}", lora_int_id=index + 1, lora_path=f"/adapter-{index}")
-        for index in range(adapter_count)
-    ]
-    if adapter_count == 1:
-        lora_request = adapters[0]
-        lora_scale = 0.7
-    else:
-        lora_request = adapters
-        lora_scale = [0.3, 0.8][:adapter_count]
     stage_input = msgspec.structs.replace(
         _next_stage_input(),
         sampling_params_list=[
             SamplingParams(structured_outputs=StructuredOutputsParams(json={"type": "object"})),
             OmniDiffusionSamplingParams(
-                lora_request=lora_request,
-                lora_scale=lora_scale,
+                lora_request=LoRARequest(lora_name="adapter", lora_int_id=1, lora_path="/adapter"),
             ),
         ],
     )

@@ -24,7 +24,6 @@ import torch
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
 from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
-from vllm_omni.diffusion.layers import vae_rms_norm as vrn
 
 from . import triton_data_movement as dm
 from . import triton_rms_norm_cl as cl
@@ -151,9 +150,8 @@ def norm_act_cat_time(
     channels_last: bool,
     silu: bool,
     bias: torch.Tensor | None = None,
-    probe_reduction: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Return ``[zeros | history | norm_act(x)]`` and its last (at most two) history/``x`` frames.
+    """Return ``[zeros | history | norm_act(x)]`` and its last two frames.
 
     ``channels_last`` selects the existing approximate normalization, not a
     layout conversion. Lossless supports dense channels-first/frame-major
@@ -210,7 +208,7 @@ def norm_act_cat_time(
         return None
 
     out_t = pad_front + t
-    keep_t = min(2, tc + t)  # never the zero front padding, like dm.cat_time_5d
+    keep_t = min(2, out_t)
     if channels_last:
         block_c = triton.next_power_of_2(c)
         block_p = max(1, cl._TILE_ELEMENTS // block_c)
@@ -249,7 +247,7 @@ def norm_act_cat_time(
                 enable_fp_fusion=False,
             )
         else:
-            denom = vrn.fp32_channel_norm(x, probe=probe_reduction).clamp_min_(1e-12)
+            denom = torch.linalg.vector_norm(x, dim=1, keepdim=True, dtype=torch.float32).clamp_min_(1e-12)
             if not denom.is_contiguous():
                 denom = denom.contiguous()
             _norm_scale_cat_time_kernel[(b * c * out_t, tiles)](

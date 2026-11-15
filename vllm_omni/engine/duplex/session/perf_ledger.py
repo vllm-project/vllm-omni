@@ -354,19 +354,11 @@ def _chunk_document(chunk: ChunkPerfRecord, origin: int, *, final: bool) -> dict
 def with_perf_chunk(prompt: dict[str, object], chunk: tuple[int, int]) -> dict[str, object]:
     """Return ``prompt`` with ``duplex.perf_chunk`` set, so stage schedulers time its steps.
 
-    Qwen-style stateless prompts have no duplex envelope yet. Create the
-    telemetry envelope for them as well, treating None as absent at either
-    level; callers only stamp measured requests.
+    Prompts without a duplex envelope are returned unchanged; their chunks get no spans.
     """
     buffer = prompt.get("model_intermediate_buffer")
-    if buffer is None:
-        buffer = {}
-    if not isinstance(buffer, Mapping):
-        return prompt
-    duplex = buffer.get("duplex")
-    if duplex is None:
-        duplex = {}
-    if not isinstance(duplex, Mapping):
+    duplex = buffer.get("duplex") if isinstance(buffer, Mapping) else None
+    if not isinstance(buffer, Mapping) or not isinstance(duplex, Mapping):
         return prompt
     return {
         **prompt,

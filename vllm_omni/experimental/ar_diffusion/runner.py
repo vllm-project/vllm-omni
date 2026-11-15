@@ -635,11 +635,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
             )
         self._perf_e2e_times.append(time.perf_counter() - started)
-        if getattr(output, "error", None):
-            # The base runner serializes OmniClientError into DiffusionOutput,
-            # so _bound_ar_session cannot observe it as a failed forward.
-            self._release_session(session_id, reset_model=False, reason="forward_error", suppress_errors=True)
-        elif close_session:
+        if close_session:
             self.close_session(session_id)
         return output
 

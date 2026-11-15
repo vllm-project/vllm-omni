@@ -35,7 +35,6 @@ from diffusers.models.autoencoders.vae import DecoderOutput
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.wan_decoder_utils import _persistent_input_buffer
-from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath.families import is_role
 from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
 
 logger = init_logger(__name__)
@@ -768,7 +767,7 @@ def _replace_child(
     group: dist.ProcessGroup,
     split_dim: str,
 ) -> None:
-    if is_role(child, "causal_conv3d"):
+    if child.__class__.__name__ == "WanCausalConv3d":
         setattr(
             parent,
             name,
@@ -830,12 +829,12 @@ def _patch_decoder_modules(
     split_dim: str,
     inside_attention: bool = False,
 ) -> None:
-    if is_role(module, "attention_block"):
+    if module.__class__.__name__ == "WanAttentionBlock":
         _patch_attention_block(module, group, split_dim)
         inside_attention = True
 
     for name, child in list(module.named_children()):
-        if is_role(child, "causal_conv3d"):
+        if child.__class__.__name__ == "WanCausalConv3d":
             _replace_child(module, name, child, group, split_dim)
             continue
         if isinstance(child, nn.Conv2d) and not inside_attention:

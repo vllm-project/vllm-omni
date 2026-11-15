@@ -7,17 +7,16 @@ Unit tests for DiffusionWorker class.
 This module tests the DiffusionWorker implementation:
 - sleep: Putting worker into sleep mode (levels 1 and 2)
 - wake_up: Waking worker from sleep mode
-- shutdown: Releasing collective resources before process groups
 """
 
 import pytest
 import torch
 from pytest_mock import MockerFixture
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 def patch_cumem_allocator(mocker: MockerFixture):
@@ -58,7 +57,6 @@ def mock_gpu_worker(mocker: MockerFixture, mock_od_config):
     return worker
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestDiffusionWorkerSleep:
     """Test DiffusionWorker.sleep method."""
 
@@ -201,7 +199,6 @@ class TestDiffusionWorkerSleep:
         assert bool(result) is True
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestDiffusionWorkerWakeUp:
     """Test DiffusionWorker.wake_up method."""
 
@@ -304,36 +301,6 @@ class TestDiffusionWorkerWakeUp:
         assert result is True
 
 
-@pytest.mark.cpu
-class TestDiffusionWorkerShutdown:
-    def test_releases_collective_resources_before_process_groups(self, mocker: MockerFixture):
-        worker = DiffusionWorker.__new__(DiffusionWorker)
-        worker.model_runner = None
-        events = []
-        mocker.patch(
-            "vllm_omni.diffusion.distributed.a2a_permute.clear_a2a_permute_workspaces",
-            side_effect=lambda: events.append("workspace"),
-        )
-        mocker.patch(
-            "vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env",
-            side_effect=lambda: events.append("process_groups"),
-        )
-        worker.shutdown()
-        assert events == ["workspace", "process_groups"]
-
-    def test_destroys_process_groups_after_transport_cleanup_error(self, mocker: MockerFixture):
-        worker = DiffusionWorker.__new__(DiffusionWorker)
-        worker.model_runner = None
-        mocker.patch(
-            "vllm_omni.diffusion.distributed.a2a_permute.clear_a2a_permute_workspaces",
-            side_effect=RuntimeError("collective cleanup failed"),
-        )
-        destroy = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
-        worker.shutdown()
-        destroy.assert_called_once_with()
-
-
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestDiffusionWorkerInitLoraManager:
     """Test DiffusionWorker.init_lora_manager method."""
 

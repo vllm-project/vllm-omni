@@ -564,9 +564,7 @@ async def stream_video(args: argparse.Namespace) -> None:
     pending_chunk_metadata: dict[str, Any] | None = None
 
     try:
-        # MP4 is already compressed; deflate adds CPU work before output credit
-        # can be returned to the generator, for little reduction in bytes.
-        async with connect(url, max_size=None, compression=None) as websocket:
+        async with connect(url, max_size=None) as websocket:
             ws = websocket
             heartbeat_task = asyncio.create_task(_send_heartbeats(websocket, send_lock))
             async with send_lock:
