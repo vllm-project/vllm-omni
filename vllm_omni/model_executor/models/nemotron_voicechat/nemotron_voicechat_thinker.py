@@ -52,6 +52,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.v1.outputs import SamplerOutput
+from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+from vllm.v1.worker.gpu.sample.output import SamplerOutput as MRv2SamplerOutput
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.nemotron_voicechat.duplex.input import decode_pcm_f32le
@@ -60,6 +62,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import (
     require_request_id,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
 if TYPE_CHECKING:
     from vllm.v1.sample.metadata import SamplingMetadata
@@ -227,6 +230,41 @@ def compute_acoustic_frame_count(nemo_stt_cfg: dict[str, Any], num_samples: int)
         repeat_num=repeat,
     )
     return int(out[0])
+
+
+class _NemotronDuplexSampler(OmniSampler):
+    """Commit the existing frame policy through native MRv2 sampling."""
+
+    def __init__(self, sampler: Any, model: NemotronVoiceChatThinkerForConditionalGeneration):
+        super().__init__(sampler)
+        self.model = model
+
+    def __call__(self, logits: torch.Tensor, input_batch: Any) -> MRv2SamplerOutput:
+        rows = tuple(
+            DuplexSamplingRow(i, request_id, None, None, None, None)
+            for i, request_id in enumerate(input_batch.req_ids)
+            if "sampling_frame_eligible" in self.model._sessions.get(request_id, {})
+        )
+        if rows and input_batch.num_draft_tokens:
+            raise NotImplementedError("Nemotron VoiceChat duplex sampling does not support speculative decoding")
+        self.model.prepare_duplex_sampling(logits, None, rows)
+        output = self.model.sample(logits, None)
+        if output is None:
+            return self.base_sampler(logits, input_batch)
+        counts, rejected = get_num_sampled_and_rejected(
+            input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.req_states.prefill_len.gpu,
+        )
+        return MRv2SamplerOutput(
+            sampled_token_ids=output.sampled_token_ids.long(),
+            logprobs_tensors=output.logprobs_tensors,
+            num_nans=None,
+            num_sampled=counts,
+            num_rejected=rejected,
+        )
 
 
 class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
@@ -447,10 +485,13 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 if prompt_len and computed + (end - start) < prompt_len:
                     tokens.append(None)
                     continue
-            with torch.inference_mode():
-                function_token = self.function_head(model_outputs[end - 1 : end].to(self._dtype)).argmax(dim=-1)
             request_id = info.get("request_id") if isinstance(info, dict) else None
             session = self._sessions.get(request_id) if isinstance(request_id, str) else None
+            if isinstance(session, dict) and not session.get("sampling_frame_eligible", True):
+                tokens.append(None)
+                continue
+            with torch.inference_mode():
+                function_token = self.function_head(model_outputs[end - 1 : end].to(self._dtype)).argmax(dim=-1)
             forced_token = session.get("forced_function_token") if isinstance(session, dict) else None
             if isinstance(forced_token, int):
                 function_token = torch.full_like(function_token, forced_token)
@@ -508,6 +549,12 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             multimodal_outputs=multimodal_outputs,
         )
 
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None] | None:
+        if getattr(self.vllm_config.model_config, "session_mode", "turn") != "duplex":
+            return None
+        self._mrv2_duplex_sampling = True
+        return _NemotronDuplexSampler(sampler, self), None
+
     def prepare_duplex_sampling(
         self,
         logits: torch.Tensor,
@@ -562,6 +609,10 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                     active = True
                 elif function_token == int(session["nvc_function_eotc_id"]):
                     active = False
+            if forced and getattr(self, "_mrv2_duplex_sampling", False):
+                queue = session["forced_function_tokens"]
+                if not queue or queue[0] != session["forced_function_token"]:
+                    raise RuntimeError("Nemotron VoiceChat forced function-token queue lost alignment")
             decisions.append((row_idx, request_id, session, active, forced, pad_id))
         # All rows are validated before committing any request's policy state.
         sampled = logits.argmax(dim=-1).to(dtype=torch.int32)
@@ -571,6 +622,14 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             session["function_call_active"] = active
             # PAD must also reach the next frame's text fusion, not just the wire.
             self._duplex_previous_text_tokens[request_id] = int(sampled[row_idx].item())
+            if getattr(self, "_mrv2_duplex_sampling", False) and function_tokens is not None:
+                # V2 postprocess precedes sampling. Commit both feedback
+                # channels here, after this frame's function/text decision.
+                function_token = function_tokens[row_idx]
+                if forced:
+                    function_token = session.pop("forced_function_token")
+                    session["forced_function_tokens"].pop(0)
+                session["func_token"] = function_token
         return SamplerOutput(
             sampled_token_ids=sampled.unsqueeze(-1),
             logprobs_tensors=None,
@@ -1172,6 +1231,16 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         On multi-chunk prefill, only the final chunk (whose forward covers the
         last prefill position, acoustic frame 0) contributes a token.
         """
+        request_id = kwargs.get("request_id")
+        session = self._sessions.get(request_id) if isinstance(request_id, str) else None
+        if (
+            getattr(self, "_mrv2_duplex_sampling", False)
+            and session is not None
+            and "sampling_frame_eligible" in session
+        ):
+            # The registered sampler owns duplex feedback, including discarded
+            # prefill rows. Offline requests retain the ordinary hook below.
+            return {}
         if hidden_states is None or hidden_states.numel() == 0 or not self._use_function_head:
             return {}
         if kwargs.get("_omni_is_prefill"):
