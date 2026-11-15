@@ -1009,7 +1009,17 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                                 # shutdown() cleared _completed_outputs while
                                 # we were unpacking; drop this delivery.
                                 continue
-                            self._finish_output(batch_id, output_result, exc)
+                            # execute_batch may have registered this batch's
+                            # split map while we unpacked without the lock (it
+                            # found nothing cached yet). Look again under the
+                            # lock that files the output, or the output would
+                            # be cached beside a map nothing ever consumes.
+                            late_map = self._batch_split_map.pop(batch_id, None)
+                            if late_map is None:
+                                self._finish_output(batch_id, output_result, exc)
+                        if late_map is not None:
+                            error = msg.error or (str(exc) if exc is not None else None)
+                            self._deliver_batch_split(late_map, output_result, error)
 
     def _finish_output(
         self,
