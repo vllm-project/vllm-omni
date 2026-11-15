@@ -8,6 +8,8 @@ from transformers import PretrainedConfig, PreTrainedModel, Qwen2Config, Qwen2Mo
 from transformers.utils import is_flash_attn_2_available
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.attention.backends.utils.fa import is_flash_attn_available
+
 from .audio_dsp import ISTFTHead
 
 logger = init_logger(__name__)
@@ -56,7 +58,7 @@ def _qwen2_config(backbone):
         "flash_attention_2",
     ):
         return config
-    if is_flash_attn_2_available():
+    if is_flash_attn_2_available() and is_flash_attn_available():
         config._attn_implementation_autoset = True
         config._attn_implementation = "flash_attention_2"
     else:

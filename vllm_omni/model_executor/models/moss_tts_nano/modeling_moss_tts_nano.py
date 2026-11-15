@@ -33,6 +33,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.attention.backends.utils.fa import is_flash_attn_available
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import (
     reinit_rotary_inv_freq,
@@ -162,14 +163,12 @@ def _pick(info: dict, key: str, default):
 
 def _configure_attention_implementation(lm: nn.Module, device: torch.device) -> None:
     if device.type == "cuda":
-        try:
-            import flash_attn  # noqa: F401
-
+        if is_flash_attn_available():
             lm._set_attention_implementation("flash_attention_2")
             logger.info("MOSS-TTS-Nano using flash_attention_2")
-        except ImportError:
+        else:
             lm._set_attention_implementation("sdpa")
-            logger.info("MOSS-TTS-Nano using sdpa (flash_attn not installed)")
+            logger.info("MOSS-TTS-Nano using sdpa (flash_attn unavailable)")
     else:
         # The checkpoint defaults to flash_attention_2, whose external
         # flash_attn package is CUDA-only. PyTorch SDPA is dispatched to the

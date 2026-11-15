@@ -551,6 +551,23 @@ def is_flash_attn_installed() -> bool:
     return False
 
 
+def is_flash_attn_available() -> bool:
+    """Return whether flash_attn is installed and can run on this GPU.
+
+    On ROCm, follow vLLM's ViT backend rule.
+    """
+    try:
+        import flash_attn  # noqa: F401
+    except ImportError:
+        return False
+    if current_omni_platform.is_rocm():
+        from vllm.platforms.rocm import flash_attn_triton_available, on_cdna
+
+        if not (on_cdna() or flash_attn_triton_available()):
+            return False
+    return True
+
+
 def _index_first_axis(tensor, indices):
     """
     A local implementation of the PyTorch indexing operation `tensor[indices]` on the first axis,
