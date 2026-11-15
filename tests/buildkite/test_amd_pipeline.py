@@ -5787,5 +5787,5 @@ def test_weekly_all_jobs_are_blocking_after_burn_in() -> None:
     weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
-    assert len(steps) == 36
+    assert len(steps) == 35
     assert {step["grade"] for step in steps} == {"Blocking"}
