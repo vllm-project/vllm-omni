@@ -270,6 +270,51 @@ def test_pad_batch_time_pads_batch_and_time() -> None:
 
 
 @pytest.mark.cpu
+def test_fit_loop_inputs_preserves_valid_c_mask_on_padded_rows() -> None:
+    from types import SimpleNamespace
+
+    wrapper = AuKCUDAGraphWrapper(_make_dit("cpu"), enabled=False)
+    fake_entry = SimpleNamespace(
+        static_x_in=torch.zeros(4, 9, 4),
+        static_ctx=SimpleNamespace(c=torch.zeros(4, 8, 8), prompt=torch.zeros(4, 4, 4)),
+    )
+    x = torch.randn(2, 6, 4)
+    x_mask = torch.ones(2, 6, dtype=torch.bool)
+    text = torch.randn(2, 5, 8)
+    c_mask = torch.tensor([[True, True, True, True, True], [True, True, True, False, False]])
+    ref = torch.randn(2, 3, 4)
+    ref_mask = torch.ones(2, 3, dtype=torch.bool)
+
+    _, _, _, fitted_c_mask, _, _ = wrapper._fit_loop_inputs(
+        fake_entry,
+        x,
+        x_mask,
+        text,
+        c_mask,
+        ref,
+        ref_mask,  # type: ignore[arg-type]
+    )
+    assert fitted_c_mask.shape == (4, 8)
+    assert torch.equal(fitted_c_mask[:2, :5], c_mask)
+    assert not fitted_c_mask[:2, 5:].any()
+    assert fitted_c_mask[2:, 0].all()
+    assert not fitted_c_mask[2:, 1:].any()
+
+
+@pytest.mark.cpu
+def test_retire_graph_generation_preserves_uncapturable_loop_keys() -> None:
+    wrapper = AuKCUDAGraphWrapper(_make_dit("cpu"), enabled=False, max_graphs=1)
+    bad_key = (2, 32, 16, 0, False, 4)
+    wrapper._uncapturable_loop_keys.add(bad_key)
+    wrapper._loop_cache[(1, 32, 16, 0, False, 4)] = object()  # type: ignore[assignment]
+
+    wrapper._retire_graph_generation_if_full()
+
+    assert wrapper._loop_cache == {}
+    assert bad_key in wrapper._uncapturable_loop_keys
+
+
+@pytest.mark.cpu
 def test_larger_loop_entry_reuses_near_batch_and_rejects_tiny_batch() -> None:
     wrapper = AuKCUDAGraphWrapper(_make_dit("cpu"), enabled=False)
     fake128 = object()
