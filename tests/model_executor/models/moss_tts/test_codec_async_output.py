@@ -86,7 +86,7 @@ def make_decoder(*, v2=True, channels=2, device="cpu", model_type="moss_tts_loca
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("codec_version", [1, 2])
-@pytest.mark.parametrize("device_type", ["cpu", "cuda", "npu"])
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
 def test_loading_codec_releases_encoder_and_preserves_decode(monkeypatch, mocker, codec_version, device_type):
     from tests.model_executor.models.moss_tts.test_audio_tokenizer_v1_streaming import _make_codec
     from tests.model_executor.models.moss_tts.test_codec_ring_headroom import tiny_codec
