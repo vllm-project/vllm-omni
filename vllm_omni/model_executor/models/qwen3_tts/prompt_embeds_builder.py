@@ -152,25 +152,10 @@ def has_tts_text_conditioning(
 
 
 _TEXT_ERROR = (
-    "Qwen3-TTS requests need `text` as a list whose first item is non-blank (e.g. ['Hello.']), "
-    "or precomputed text token ids, in `additional_information` or `model_intermediate_buffer`; "
-    "neither may override the other's with a blank value"
+    "Qwen3-TTS requests need `additional_information` with `text` as a list whose first item is "
+    "non-blank (e.g. ['Hello.']), or precomputed text token ids, and no `model_intermediate_buffer` "
+    "value that blanks them"
 )
-
-
-def _talker_info_views(info: object, buffer: object) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The payloads the Talker can receive for a prompt, one per model runner.
-
-    Model Runner V2 lays ``model_intermediate_buffer`` over
-    ``additional_information`` (``OmniIntermediateBuffer.add_request``); the V1
-    runner applies ``additional_information`` last
-    (``OmniGPUModelRunner._update_additional_information``). Both merge nested
-    sections key by key, which for the top-level text keys checked here is a
-    plain overlay. A non-dict payload counts as empty.
-    """
-    info = info if isinstance(info, dict) else {}
-    buffer = buffer if isinstance(buffer, dict) else {}
-    return {**info, **buffer}, {**buffer, **info}
 
 
 def check_text_update(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
@@ -178,23 +163,21 @@ def check_text_update(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
 
     A plain stage-0 update keeps the first chunk's ``additional_information``
     but installs its own ``model_intermediate_buffer``, which Model Runner V2
-    lays over it when it re-admits the request. An update that sets
+    lays over it when it re-admits the request. An update whose buffer sets
     ``meta.replace_streaming_prompt`` replaces both payloads, so it gets the
-    first-submission check. ``AsyncOmni`` closes every stream with a text-less
+    first-submission check. The scheduler reads that flag from the buffer only:
+    it receives ``additional_information`` serialized, so a flag there leaves a
+    plain extension. ``AsyncOmni`` closes every stream with a text-less
     ``TokensPrompt([0])`` update, which passes.
     """
     for item in prompt if isinstance(prompt, list) else (prompt,):
-        if not isinstance(item, dict):
+        buffer = item.get("model_intermediate_buffer") if isinstance(item, dict) else None
+        if not isinstance(buffer, dict):
             continue
-        buffer = item.get("model_intermediate_buffer")
-        if any(
-            isinstance(payload, dict)
-            and isinstance(payload.get("meta"), dict)
-            and payload["meta"].get("replace_streaming_prompt") is True
-            for payload in (buffer, item.get("additional_information"))
-        ):
+        meta = buffer.get("meta")
+        if isinstance(meta, dict) and meta.get("replace_streaming_prompt") is True:
             check_text_prompt(item, sampling_params_list)
-        elif isinstance(buffer, dict) and ("text" in buffer or PRECOMPUTED_TEXT_IDS_KEY in buffer):
+        elif "text" in buffer or PRECOMPUTED_TEXT_IDS_KEY in buffer:
             if not has_tts_text_conditioning(buffer, allow_blank_text=False):
                 raise ValueError(_TEXT_ERROR)
     return prompt
@@ -209,17 +192,27 @@ def check_text_prompt(prompt: Any, sampling_params_list: Sequence[Any]) -> Any:
     engine. There, blank text is synthesized, and text that
     :func:`has_tts_text_conditioning` rejects raises inside the Talker's
     ``preprocess``, which stops the engine. Rejecting here fails only the
-    caller's request. The text must survive either runner's merge of the two
-    payloads; a client ``trailing_text`` hidden state does not count, since the
-    Talker writes its own at first prefill.
+    caller's request.
 
-    Streaming-input updates run :func:`check_text_update` instead: the Talker
-    builds its prompt from the first chunk only, and ``AsyncOmni`` closes the
+    ``additional_information`` must carry the text itself: a plain streaming
+    update replaces the first chunk's ``model_intermediate_buffer`` with its
+    own, often none, and Model Runner V2 then re-admits the request from the
+    first chunk's ``additional_information`` and that buffer. Laying the buffer over it, as Model Runner V2 does
+    (``OmniIntermediateBuffer.add_request``), must keep the text too; the V1
+    runner applies ``additional_information`` last. A client ``trailing_text``
+    hidden state does not count, since the Talker writes its own at first
+    prefill.
+
+    Streaming-input updates run :func:`check_text_update` instead: a plain
+    update keeps the first chunk's ``additional_information``, though its own
+    buffer is laid over it on Model Runner V2, and ``AsyncOmni`` closes the
     stream with a text-less ``TokensPrompt([0])`` update.
     """
     for item in prompt if isinstance(prompt, list) else (prompt,):
         fields = item if isinstance(item, dict) else {}
-        views = _talker_info_views(fields.get("additional_information"), fields.get("model_intermediate_buffer"))
+        info, buffer = fields.get("additional_information"), fields.get("model_intermediate_buffer")
+        info = info if isinstance(info, dict) else {}
+        views = (info, {**info, **buffer} if isinstance(buffer, dict) else info)
         if not all(has_tts_text_conditioning(view, allow_blank_text=False) for view in views):
             raise ValueError(_TEXT_ERROR)
     return prompt

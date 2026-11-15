@@ -53,6 +53,9 @@ _REJECTED = {
     # Model Runner V2 lays model_intermediate_buffer over additional_information.
     "buffer-blank-text": _prompt(["Hello."], buffer={"text": [""]}),
     "buffer-only-blank-text": _prompt(buffer={"text": ["  "]}),
+    # A plain streaming update drops the buffer, so the text must be in additional_information.
+    "buffer-only-text": _prompt(buffer={"text": ["Hello."]}),
+    "buffer-only-text-ids": _prompt([""], buffer={PRECOMPUTED_TEXT_IDS_KEY: [[1, 2, 3]]}),
     "buffer-none-text-ids": _prompt([""], buffer={PRECOMPUTED_TEXT_IDS_KEY: None}, **{PRECOMPUTED_TEXT_IDS_KEY: [[1]]}),
     "plain-string": "Hello.",
     "text-prompt-dict": {"prompt": "Hello."},
@@ -68,7 +71,7 @@ _ACCEPTED = {
     # Precomputed text ids carry the text; the raw string is not used.
     "text-ids": _prompt([""], **{PRECOMPUTED_TEXT_IDS_KEY: [[1, 2, 3]]}),
     "tensor-text-ids": _prompt([""], **{PRECOMPUTED_TEXT_IDS_KEY: torch.tensor([[1, 2, 3]])}),
-    "buffer-text": _prompt(buffer={"text": ["Hello."]}),
+    "buffer-text": _prompt(["Hello."], buffer={"text": ["Hi."]}),
     "buffer-text-ids": _prompt(["Hello."], buffer={PRECOMPUTED_TEXT_IDS_KEY: [[1, 2, 3]]}),
 }
 
@@ -100,8 +103,9 @@ _REJECTED_UPDATES = {
     "buffer-blank-text": _update(buffer={"text": [""]}),
     "buffer-none-text-ids": _update(buffer={PRECOMPUTED_TEXT_IDS_KEY: None}),
     # A replacing update installs both payloads, so it needs a first chunk's text.
-    "replace-blank-text": _update({"text": [""], **_REPLACE}),
-    "buffer-replace-blank-text": _update({"text": ["  "]}, buffer=_REPLACE),
+    "replace-blank-text": _update({"text": ["  "]}, buffer=_REPLACE),
+    "replace-buffer-only-text": _update(buffer={"text": ["Hello."], **_REPLACE}),
+    "replace-buffer-blanks-text": _update({"text": ["Hello."]}, buffer={"text": [""], **_REPLACE}),
 }
 _ACCEPTED_UPDATES = {
     # AsyncOmni closes every stream with TokensPrompt([0]); the engine stamps the request id.
@@ -110,7 +114,10 @@ _ACCEPTED_UPDATES = {
     # A plain update keeps the first chunk's additional_information.
     "plain-blank-text": _update({"text": ["  "]}),
     "buffer-text": _update(buffer={"text": ["Hello."]}),
-    "replace-text": _update({"text": ["Hello."], **_REPLACE}),
+    "replace-text": _update({"text": ["Hello."]}, buffer=_REPLACE),
+    # The scheduler receives additional_information serialized and reads the
+    # replace flag from the buffer only, so this update is a plain extension.
+    "info-replace-flag-blank-text": _update({"text": [""], **_REPLACE}),
 }
 
 
