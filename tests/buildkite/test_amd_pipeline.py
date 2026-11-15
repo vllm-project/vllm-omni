@@ -1423,7 +1423,7 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
         command = "\n".join(step["commands"])
         assert "if" not in step
         assert step["agent_pool"] == pool
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == "Blocking"
         assert step["depends_on"] == "amd-build"
         assert marker in command
         assert filename in command
@@ -1689,7 +1689,7 @@ def test_hunyuan_rocm_reliability_disables_expert_parallel() -> None:
     assert "hunyuan_image3_dit_rocm_reliability.yaml" not in startup
     assert '"enable_expert_parallel": True' in accuracy
     assert step["agent_pool"] == "mi300_4"
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["depends_on"] == "amd-build"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 45
@@ -1800,7 +1800,7 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
         command = "\n".join(step["commands"])
         assert "if" not in step
         assert step["agent_pool"] == pool
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == "Blocking"
         assert step["depends_on"] == "amd-build"
         assert step["mirror_hardwares"] == ["amdproduction"]
         assert step["timeout_in_minutes"] == timeout
@@ -1993,7 +1993,7 @@ def test_bagel_weekly_selects_only_the_rocm_img2img_node() -> None:
     node = "tests/e2e/online_serving/test_bagel.py::test_bagel_img2img_online[omni_server0]"
     dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
 
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 90
@@ -2105,7 +2105,7 @@ def test_bagel_weekly_covers_shared_offline_rocm_nodes() -> None:
     command = "\n".join(step["commands"])
     dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
 
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
@@ -2200,7 +2200,7 @@ def test_moss_tts_weekly_selects_three_marked_nodes() -> None:
     command = "\n".join(step["commands"])
     dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
 
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 90
@@ -2550,7 +2550,7 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         assert step["agent_pool"] == "mi300_1"
         assert step["depends_on"] == "amd-build"
         assert step["mirror_hardwares"] == ["amdproduction"]
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == "Blocking"
         assert step["timeout_in_minutes"] == expected["timeout"]
         assert step["source_file_dependencies"] == dependency
         assert step["env"] == expected_env | cast(dict[str, str], expected.get("env", {}))
@@ -5884,3 +5884,11 @@ def test_minicpmo_rocm_v1_duplex_ready_executes_junit_guard_before_exit(
         timeout_status=timeout_status,
         expected_status=expected_status,
     )
+
+
+def test_weekly_all_jobs_are_blocking_after_burn_in() -> None:
+    weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
+    steps = [step for group in weekly["steps"] for step in group["steps"]]
+
+    assert len(steps) == 36
+    assert {step["grade"] for step in steps} == {"Blocking"}
