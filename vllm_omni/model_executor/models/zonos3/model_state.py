@@ -22,7 +22,6 @@ from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.states import RequestState
@@ -148,6 +147,19 @@ class _Prompt:
     has_audio_prefix: bool
 
 
+@dataclass
+class _PromptInput:
+    frames: torch.Tensor
+    condition_start: int = 0
+    conditions: tuple[int, ...] = ()
+    speaker_row: int | None = None
+    speaker: torch.Tensor | None = None
+    waveform: torch.Tensor | None = None
+    sample_rate: int | None = None
+    has_audio_prefix: bool = False
+    warmup: bool = False
+
+
 class Zonos3ARModelState(OmniModelState):
     supports_prompt_embeds = False
     # vLLM attaches an all-valid grammar mask to startup warmup requests and
@@ -201,6 +213,8 @@ class Zonos3ARModelState(OmniModelState):
         self._generators: dict[int, torch.Generator] = {}
         self._sample_output: SamplerOutput | None = None
         self._slots = torch.empty(self.max_num_reqs, dtype=torch.int64, device=device)
+        self._scratch_slots = torch.arange(self.max_num_reqs, 2 * self.max_num_reqs, device=device)
+        self._decode_rows = torch.arange(self.max_num_reqs, device=device)
         self._batches: dict[int, Zonos3BackboneBatch] = {}
         self._prompts: dict[str, _Prompt] = {}
         self._lengths: dict[str, int] = {}
@@ -288,14 +302,13 @@ class Zonos3ARModelState(OmniModelState):
         del req_index
         raise RuntimeError(f"Zonos3 AR does not support preemption/state recomputation: {req_id}")
 
-    def build_prompt(self, req_id: str, info: dict[str, Any]) -> _Prompt:
+    def _prompt_input(self, req_id: str, info: dict[str, Any]) -> _PromptInput:
         length = self._lengths[req_id]
         if is_warmup_request(req_id):
-            return _Prompt(torch.zeros((length, self._embed_dim), dtype=self.dtype, device=self.device), False)
-        payload = info
-        if not payload:
+            return _PromptInput(torch.zeros(length, 11, dtype=torch.int64), warmup=True)
+        if not info:
             raise ValueError("Missing Zonos3 prompt conditioning metadata")
-        ids = payload.get("frame_ids")
+        ids = info.get("frame_ids")
         c = self.model.config
         if (
             not isinstance(ids, torch.Tensor)
@@ -308,20 +321,17 @@ class Zonos3ARModelState(OmniModelState):
             ((ids[:, 10] < 0) | (ids[:, 10] >= c.text_rows)).any()
         ):
             raise ValueError("Zonos3 conditioning contains out-of-vocabulary frame IDs")
-        embeddings = self.model.multi_embedder(to_device_nonblocking(ids, self.device))
-        speaker = payload.get("speaker_embedding")
-        waveform = payload.get("reference_waveform")
+        speaker, waveform = info.get("speaker_embedding"), info.get("reference_waveform")
+        sample_rate = info.get("reference_sample_rate")
         if waveform is not None:
-            encoder = getattr(self.model, "speaker_encoder", None)
             if (
                 speaker is not None
-                or encoder is None
+                or self.model.speaker_encoder is None
                 or not isinstance(waveform, torch.Tensor)
                 or waveform.device.type != "cpu"
             ):
                 raise ValueError("Zonos3 raw reference requires the model's ownmect_s2 encoder and CPU waveform")
-            sample_rate = payload.get("reference_sample_rate")
-            max_samples = int(self.model.config.speaker_reference_max_seconds * int(sample_rate or 0))
+            max_samples = int(c.speaker_reference_max_seconds * int(sample_rate or 0))
             if (
                 not isinstance(sample_rate, int)
                 or sample_rate <= 0
@@ -331,23 +341,24 @@ class Zonos3ARModelState(OmniModelState):
             ):
                 raise ValueError(
                     "Zonos3 raw speaker reference must be non-empty and no longer than "
-                    f"{self.model.config.speaker_reference_max_seconds:g} seconds"
+                    f"{c.speaker_reference_max_seconds:g} seconds"
                 )
-            # build_prompt runs once per request; chunked prefill slices the
-            # cached embeddings and never repeats this expensive extraction.
-            speaker = encoder(waveform, sample_rate).squeeze(0)
-        if speaker is not None:
-            row = payload.get("speaker_row")
+        row = info.get("speaker_row")
+        if speaker is not None or waveform is not None:
             if (
                 not isinstance(row, int)
                 or not 0 <= row < length
-                or not isinstance(speaker, torch.Tensor)
-                or (waveform is None and speaker.device.type != "cpu")
-                or speaker.shape != (c.speaker_embedding_dim,)
+                or (
+                    speaker is not None
+                    and (
+                        not isinstance(speaker, torch.Tensor)
+                        or speaker.device.type != "cpu"
+                        or speaker.shape != (c.speaker_embedding_dim,)
+                    )
+                )
             ):
                 raise ValueError("Invalid Zonos3 speaker embedding row")
-            embeddings[row] = self.model.speaker_projection(to_device_nonblocking(speaker, self.device).to(self.dtype))
-        buckets, start = payload.get("condition_buckets"), payload.get("condition_start")
+        buckets, start = info.get("condition_buckets"), info.get("condition_start")
         if (
             not isinstance(buckets, (list, tuple))
             or len(buckets) != c.condition_count
@@ -355,11 +366,77 @@ class Zonos3ARModelState(OmniModelState):
             or not 0 <= start <= length - c.condition_count
         ):
             raise ValueError("Invalid Zonos3 condition rows")
-        for i, (bucket, count) in enumerate(zip(buckets, c.condition_bucket_counts, strict=True)):
+        for bucket, count in zip(buckets, c.condition_bucket_counts, strict=True):
             if not isinstance(bucket, int) or not 0 <= bucket <= count:
                 raise ValueError("Invalid Zonos3 condition bucket ID")
-            embeddings[start + i] = self.model.condition_embeddings[i].weight[bucket]
-        return _Prompt(embeddings, bool(payload.get("has_audio_prefix", False)))
+        return _PromptInput(
+            ids, start, tuple(buckets), row, speaker, waveform, sample_rate, bool(info.get("has_audio_prefix", False))
+        )
+
+    def preprocess_batch(self, req_infos: Sequence[tuple[str, dict[str, Any]]]) -> list[_Prompt]:
+        """One pinned frame transfer and embedding pass for all new prompts.
+
+        Prompt caches own immutable views of this cohort's embedding allocation.
+        Host staging is fresh per call; the caching pinned allocator retains it
+        until queued copies complete, without a reusable-buffer overwrite race.
+        """
+        if not req_infos:
+            return []
+        plans = [self._prompt_input(req_id, info) for req_id, info in req_infos]
+        frames = torch.cat([plan.frames for plan in plans])
+        embeddings = self.model.multi_embedder(to_device_nonblocking(frames, self.device))
+        offsets = np.cumsum([0, *(len(p.frames) for p in plans)])
+        # Variable-length raw waveforms retain separate encoder calls. Plain
+        # speaker vectors and resulting GPU vectors each share one projection.
+        cpu_speakers, gpu_speakers = [], []
+        for i, plan in enumerate(plans):
+            if plan.warmup:
+                embeddings[offsets[i] : offsets[i + 1]].zero_()
+            row = int(offsets[i]) + (plan.speaker_row or 0)
+            if plan.waveform is not None:
+                feature = self.model.speaker_encoder(plan.waveform, plan.sample_rate).squeeze(0)
+                gpu_speakers.append((row, feature))
+            elif plan.speaker is not None:
+                cpu_speakers.append((row, plan.speaker))
+        for group in (cpu_speakers, gpu_speakers):
+            if group:
+                features = to_device_nonblocking(torch.stack([value for _, value in group]), self.device).to(self.dtype)
+                rows = index_to_device([row for row, _ in group], self.device)
+                embeddings.index_copy_(0, rows, self.model.speaker_projection(features))
+        real = [(i, p) for i, p in enumerate(plans) if not p.warmup]
+        if real:
+            positions = [
+                [int(offsets[i]) + p.condition_start + j for i, p in real]
+                for j in range(self.model.config.condition_count)
+            ]
+            buckets = [[p.conditions[j] for _, p in real] for j in range(self.model.config.condition_count)]
+            indices = to_device_nonblocking(torch.tensor([positions, buckets], dtype=torch.int64), self.device)
+            for j, table in enumerate(self.model.condition_embeddings):
+                embeddings.index_copy_(0, indices[0, j], table(indices[1, j]))
+        return [_Prompt(embeddings[offsets[i] : offsets[i + 1]], p.has_audio_prefix) for i, p in enumerate(plans)]
+
+    def build_prompt(self, req_id: str, info: dict[str, Any]) -> _Prompt:
+        return self.preprocess_batch([(req_id, info)])[0]
+
+    def preprocess_decode_batch(
+        self, input_batch: InputBatch, embeddings: torch.Tensor, rows: np.ndarray
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather next-frame embeddings once; pure decode needs no host staging."""
+        if rows.size == input_batch.num_reqs:
+            slots = input_batch.idx_mapping[: input_batch.num_reqs]
+            destination = self._decode_rows[: input_batch.num_reqs]
+            torch.index_select(self.next_embeddings, 0, slots, out=embeddings[: input_batch.num_reqs])
+        elif rows.size:
+            metadata = np.stack((input_batch.query_start_loc_np[rows], input_batch.idx_mapping_np[rows])).astype(
+                np.int64
+            )
+            staged = to_device_nonblocking(torch.from_numpy(metadata), self.device)
+            destination, slots = staged.unbind(0)
+            embeddings.index_copy_(0, destination, self.next_embeddings.index_select(0, slots))
+        else:
+            slots = destination = self._decode_rows[:0]
+        self._decode_started.update(input_batch.req_ids[i] for i in rows)
+        return slots, destination
 
     def _batch(self, tokens: int, decode: bool) -> Zonos3BackboneBatch:
         batch = self._batches.get(tokens)
@@ -382,11 +459,12 @@ class Zonos3ARModelState(OmniModelState):
             state.reset(slots)
         self._static_inputs_embeds[:num_tokens].zero_()
         batch = self._batch(num_tokens, num_reqs == num_tokens)
+        batch.dummy_slots = tuple(slots)
+        # Both FULL and PIECEWISE graphs keep raw workspace addresses. Retain
+        # every capture bucket and reuse its exact bank during live replay.
+        # Arbitrary uncaptured eager shapes are still transient in _batch().
+        self._batches[num_tokens] = batch
         if batch.decode_only:
-            # Retain the actual capture workspace, even if upstream finalizes
-            # capture sizes after ModelState initialization. Graphs keep raw
-            # pointers to it; eager prefill shapes are deliberately not cached.
-            self._batches[num_tokens] = batch
             self._slots[:num_tokens].copy_(index_to_device(slots, self.device))
             batch.decode_slots = self._slots[:num_tokens]
             batch.prefill_spans = ()
@@ -401,6 +479,9 @@ class Zonos3ARModelState(OmniModelState):
             batch.prefill_spans = tuple(spans)
             batch.decode_slots = torch.empty(0, dtype=torch.int64, device=self.device)
             batch.decode_rows = batch.decode_slots
+        self.model.bind_gdn_batch(batch)
+        if self.model._compiled_gdn:
+            return {"inputs_embeds": self._static_inputs_embeds[:num_tokens], "zonos3_workspace": batch.workspace.bank}
         return {"inputs_embeds": self._static_inputs_embeds[:num_tokens], "zonos3_batch": batch}
 
     def prepare_inputs(self, input_batch: InputBatch, req_states: RequestState) -> dict[str, Any]:
@@ -422,60 +503,77 @@ class Zonos3ARModelState(OmniModelState):
         one_token = bool(np.all(input_batch.num_scheduled_tokens == 1))
         decode_only = one_token and input_batch.decode_graph_eligible
         batch = self._batch(tokens, decode_only)
-        spans, decode_slots, decode_rows = [], [], []
-        for row, req_id in enumerate(input_batch.req_ids):
-            slot = int(input_batch.idx_mapping_np[row])
-            if self._request_slots.get(req_id) != slot:
-                raise RuntimeError("Zonos3 request/slot identity mismatch")
-            start = int(input_batch.query_start_loc_np[row])
+        batch.dummy_slots = ()
+        expected_slots = np.fromiter(
+            (self._request_slots.get(req_id, -1) for req_id in input_batch.req_ids), dtype=np.int64
+        )
+        if not np.array_equal(expected_slots, input_batch.idx_mapping_np):
+            raise RuntimeError("Zonos3 request/slot identity mismatch")
+        prefill_rows = np.flatnonzero(input_batch.is_prefilling_np)
+        decode_rows = np.flatnonzero(~input_batch.is_prefilling_np)
+        if np.any(input_batch.num_scheduled_tokens[decode_rows] != 1) or any(
+            input_batch.req_ids[i] not in self._prompts for i in decode_rows
+        ):
+            raise ValueError("Zonos3 AR decode needs one logical token after conditioning prefill")
+        spans, new = [], []
+        for row in prefill_rows:
+            req_id = input_batch.req_ids[row]
+            if req_id in self._decode_started:
+                raise RuntimeError("Zonos3 cannot resume prefill after AR decode")
             length = int(input_batch.num_scheduled_tokens[row])
-            if input_batch.is_prefilling_np[row]:
-                if req_id in self._decode_started:
-                    raise RuntimeError("Zonos3 cannot resume prefill after AR decode")
-                prompt = self._prompts.get(req_id)
-                if prompt is None:
-                    prompt = self.build_prompt(req_id, self.intermediate_buffer.buffers[slot])
-                    self._prompts[req_id] = prompt
-                    self.sampling_state.has_audio_prefix[slot] = prompt.has_audio_prefix
-                offset = int(input_batch.num_computed_prefill_tokens_np[row])
-                if (
-                    offset + length > prompt.embeddings.shape[0]
-                    or int(input_batch.prefill_len_np[row]) != prompt.embeddings.shape[0]
-                ):
-                    raise ValueError("Zonos3 scheduled prefill differs from its exact logical prompt length")
-                embeddings[start : start + length].copy_(prompt.embeddings[offset : offset + length])
-                if decode_only:
-                    # One-token prefills may use a native decode graph. Update
-                    # the CPU prefill frontier without reading recurrent state.
-                    for state in self.gdn_states.values():
-                        state.prefill_tokens[slot] = offset + 1
-                else:
-                    spans.append(Zonos3PrefillSpan(start, length, slot, offset))
-            else:
-                if length != 1 or req_id not in self._prompts:
-                    raise ValueError("Zonos3 AR decode needs one logical token after conditioning prefill")
-                self._decode_started.add(req_id)
-                decode_slots.append(slot)
-                decode_rows.append(start)
-        if decode_rows:
-            rows = index_to_device(decode_rows, self.device)
-            slots = index_to_device(decode_slots, self.device)
-            embeddings.index_copy_(0, rows, self.next_embeddings.index_select(0, slots))
+            offset = int(input_batch.num_computed_prefill_tokens_np[row])
+            if offset + length > self._lengths[req_id] or int(input_batch.prefill_len_np[row]) != self._lengths[req_id]:
+                raise ValueError("Zonos3 scheduled prefill differs from its exact logical prompt length")
+            if req_id not in self._prompts:
+                new.append((req_id, self.intermediate_buffer.buffers[int(expected_slots[row])]))
+            spans.append(
+                Zonos3PrefillSpan(int(input_batch.query_start_loc_np[row]), length, int(expected_slots[row]), offset)
+            )
+        if new:
+            prompts = self.preprocess_batch(new)
+            self._prompts.update((req_id, prompt) for (req_id, _), prompt in zip(new, prompts, strict=True))
+            prefix_slots = [
+                self._request_slots[req_id]
+                for (req_id, _), prompt in zip(new, prompts, strict=True)
+                if prompt.has_audio_prefix
+            ]
+            if prefix_slots:
+                # A GPU fill replaces per-request Python-bool assignment, which
+                # otherwise performs a blocking pageable scalar transfer.
+                self.sampling_state.has_audio_prefix.index_fill_(0, index_to_device(prefix_slots, self.device), True)
+        pieces = [
+            self._prompts[input_batch.req_ids[i]].embeddings[span.previous_tokens : span.previous_tokens + span.length]
+            for i, span in zip(prefill_rows, spans, strict=True)
+        ]
+        if len(pieces) == 1:
+            span = spans[0]
+            embeddings[span.start : span.start + span.length].copy_(pieces[0])
+        elif pieces:
+            destinations = np.concatenate(
+                [np.arange(span.start, span.start + span.length, dtype=np.int64) for span in spans]
+            )
+            rows = to_device_nonblocking(torch.from_numpy(destinations), self.device)
+            embeddings.index_copy_(0, rows, torch.cat(pieces))
+        live_slots, live_rows = self.preprocess_decode_batch(input_batch, embeddings, decode_rows)
         if decode_only:
             count = input_batch.num_reqs
             if tokens > self.max_num_reqs:
                 raise ValueError("Zonos3 decode graph padding exceeds its configured request capacity")
-            slots = [int(slot) for slot in input_batch.idx_mapping_np] + list(
-                range(self.max_num_reqs, self.max_num_reqs + tokens - count)
-            )
-            self._slots[:tokens].copy_(index_to_device(slots, self.device))
+            self._slots[:count].copy_(input_batch.idx_mapping[:count])
+            self._slots[count:tokens].copy_(self._scratch_slots[: tokens - count])
             batch.decode_slots, batch.prefill_spans = self._slots[:tokens], ()
+            for span in spans:
+                for state in self.gdn_states.values():
+                    state.prefill_tokens[span.slot] = span.previous_tokens + 1
         else:
             batch.prefill_spans = tuple(spans)
-            batch.decode_slots = index_to_device(decode_slots, self.device)
-            batch.decode_rows = index_to_device(decode_rows, self.device)
+            batch.decode_slots, batch.decode_rows = live_slots, live_rows
         model_inputs["inputs_embeds"] = embeddings
-        model_inputs["zonos3_batch"] = batch
+        self.model.bind_gdn_batch(batch)
+        if self.model._compiled_gdn:
+            model_inputs["zonos3_workspace"] = batch.workspace.bank
+        else:
+            model_inputs["zonos3_batch"] = batch
 
     def _setting(self, name: str, slots: torch.Tensor) -> torch.Tensor:
         backed: UvaBackedTensor = getattr(self.settings, name)
@@ -566,25 +664,27 @@ class Zonos3ARModelState(OmniModelState):
             prefill_len = req_states.prefill_len.gpu.to(device=hidden.device)
             sampled = (input_batch.seq_lens >= prefill_len.index_select(0, slots)).to(torch.int32)
             rejected = torch.zeros_like(sampled)
-        active = (sampled > 0) & ~(
-            (self.sampling_state.eoa_frame.index_select(0, slots) >= 0)
-            & (self.sampling_state.drain_remaining.index_select(0, slots) == 0)
-        )
-        position = self.sampling_state.position.index_select(0, slots)
         logits = self.model.multi_output(hidden.index_select(0, input_batch.logits_indices))
-        probs = self.probabilities(logits, slots, max(option.repetition_window for option in options))
+        width = max(option.repetition_window for option in options)
         if hidden.device.type == "cuda":
-            noise_position = (position[:, None] * 10 + self.sampling_state.columns).reshape(-1)
-            codes = gumbel_sample(
-                probs.log().reshape(-1, self.model.config.audio_vocab),
-                slots.repeat_interleave(10),
-                self.settings.temperature.gpu,
-                self.settings.seed.gpu,
-                noise_position,
-                apply_temperature=False,
-                is_drafting=False,
-            ).view(-1, 10)
+            from .sampling_kernels import sample_rvq
+
+            codes = sample_rvq(
+                logits,
+                slots,
+                self.sampling_state,
+                self.settings,
+                self.history,
+                width,
+                self.model.config.codebook_size,
+                self.model.config.eoa_id,
+            )
         elif hidden.device.type == "cpu":
+            probs = self.probabilities(logits, slots, width)
+            active = (sampled > 0) & ~(
+                (self.sampling_state.eoa_frame.index_select(0, slots) >= 0)
+                & (self.sampling_state.drain_remaining.index_select(0, slots) == 0)
+            )
             codes = self._draw_cpu(probs, [int(slot) for slot in input_batch.idx_mapping_np], active)
         else:
             raise ValueError("Zonos3 sampling supports CUDA serving and CPU numerical checks")
@@ -593,17 +693,22 @@ class Zonos3ARModelState(OmniModelState):
         # itself remains active and its raw codes are delivered to the processor.
         # The row is represented by padding because the generic runner still
         # partitions one output row per scheduled request token.
-        codes = torch.where(active[:, None], codes, self.model.config.audio_pad_id)
-        step = self.sampling_state.accept(slots, codes, active)
-        ring = position[:, None] % self.max_model_len
-        old = self.history[slots[:, None], self.sampling_state.columns[None, :], ring]
-        self.history[slots[:, None], self.sampling_state.columns[None, :], ring] = torch.where(
-            step.active[:, None], step.codes, old
-        )
-        frame = torch.cat((step.codes, torch.full_like(step.codes[:, :1], self.model.config.text_vocab)), -1)
-        embeddings = self.model.multi_embedder(frame)
-        previous = self.next_embeddings.index_select(0, slots)
-        self.next_embeddings.index_copy_(0, slots, torch.where(step.active[:, None], embeddings, previous))
+        step = self.sampling_state.accept(slots, codes, sampled > 0)
+        if hidden.device.type == "cuda":
+            from .sampling_kernels import commit_feedback
+
+            commit_feedback(self.model, slots, step, self.sampling_state, self.history, self.next_embeddings)
+        else:
+            position = self.sampling_state.position.index_select(0, slots) - step.active.long()
+            ring = position[:, None] % self.max_model_len
+            old = self.history[slots[:, None], self.sampling_state.columns[None, :], ring]
+            self.history[slots[:, None], self.sampling_state.columns[None, :], ring] = torch.where(
+                step.active[:, None], step.codes, old
+            )
+            frame = torch.cat((step.codes, torch.full_like(step.codes[:, :1], self.model.config.text_vocab)), -1)
+            embeddings = self.model.multi_embedder(frame)
+            previous = self.next_embeddings.index_select(0, slots)
+            self.next_embeddings.index_copy_(0, slots, torch.where(step.active[:, None], embeddings, previous))
         self._sample_output = SamplerOutput(step.logical_token_ids.long(), None, None, sampled, rejected)
         return hidden, Zonos3CodeSnapshot(step.codes)
 
@@ -626,7 +731,10 @@ class Zonos3ARModelState(OmniModelState):
         ubatch_idx: int = 0,
         model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     ) -> dict[str, Any]:
-        warmup_only = bool(input_batch.req_ids) and all(is_warmup_request(req_id) for req_id in input_batch.req_ids)
+        startup_dummy = self._startup and all(req_id not in self._request_slots for req_id in input_batch.req_ids)
+        warmup_only = startup_dummy or (
+            bool(input_batch.req_ids) and all(is_warmup_request(req_id) for req_id in input_batch.req_ids)
+        )
         if (
             not for_capture
             and not warmup_only

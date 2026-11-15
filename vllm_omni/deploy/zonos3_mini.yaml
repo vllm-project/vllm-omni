@@ -10,7 +10,7 @@ connectors:
     extra:
       codec_chunk_frames: 15
       codec_chunk_ramp: [1, 2, 4, 8, 15]
-      first_chunk_codebooks: 10
+      first_chunk_codebooks: 1
       codebook_sizes: [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]
       eoa_id: 4096
       audio_pad_id: 4097
@@ -35,9 +35,10 @@ stages:
     enforce_eager: false
     async_scheduling: true
     compilation_config:
-      mode: 0
-      cudagraph_mode: FULL_DECODE_ONLY
-      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
+      mode: 3
+      cudagraph_mode: FULL_AND_PIECEWISE
+      splitting_ops: [vllm::unified_attention, vllm::unified_attention_with_output, vllm::zonos3_gdn_core]
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
     output_connectors:
       to_stage_1: shm
     default_sampling_params:

@@ -68,6 +68,10 @@ class Zonos3ARSamplingState:
     def accept(
         self, slots: torch.Tensor, sampled_codes: torch.Tensor, active: torch.Tensor | None = None
     ) -> Zonos3SamplingStep:
+        if sampled_codes.is_cuda:
+            from .sampling_kernels import accept_rvq
+
+            return Zonos3SamplingStep(*accept_rvq(self, slots, sampled_codes, active))
         position = self.position.index_select(0, slots)
         previous_eoa = self.eoa_frame.index_select(0, slots)
         remaining = self.drain_remaining.index_select(0, slots)

@@ -270,9 +270,7 @@ def test_native_attention_binding_requires_complete_gdn_cache_semantics():
         validate_zonos3_ar_runtime(config)
 
 
-@pytest.mark.parametrize(
-    "mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL]
-)
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
 def test_unsupported_graph_modes_fail_instead_of_downgrading(mode):
     config = valid_runtime()
     config.compilation_config.cudagraph_mode = mode
@@ -280,8 +278,10 @@ def test_unsupported_graph_modes_fail_instead_of_downgrading(mode):
         validate_zonos3_ar_runtime(config)
 
 
-def test_native_full_decode_mode_is_accepted_before_backend_construction():
+@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.FULL_AND_PIECEWISE])
+def test_native_full_decode_mode_is_accepted_before_backend_construction(mode):
     config = valid_runtime()
+    config.compilation_config.cudagraph_mode = mode
     validate_zonos3_ar_runtime(config)
     config.model_config.enforce_eager = True
     with pytest.raises(ValueError, match="requires FULL_DECODE_ONLY"):
@@ -359,6 +359,7 @@ def official_lm():
     root = os.environ.get("ZONOS3_REFERENCE_ROOT")
     if not root:
         pytest.skip("Set ZONOS3_REFERENCE_ROOT for official AR arithmetic checks")
+    assert root is not None
     path = Path(root) / "model/src/zonos3"
     buckets = {"__name__": "_zonos3_reference_buckets"}
     exec(compile((path / "condition_buckets.py").read_text(), str(path / "condition_buckets.py"), "exec"), buckets)
@@ -370,7 +371,7 @@ def official_lm():
         if not (isinstance(node, ast.ImportFrom) and node.module in ("zonos3.condition_buckets", "zonos3.tts.probe"))
     ]
     module = ModuleType("_zonos3_official_lm_oracle")
-    module.bucket_counts = buckets["bucket_counts"]
+    module.__dict__["bucket_counts"] = buckets["bucket_counts"]
     sys.modules[module.__name__] = module
     try:
         exec(compile(tree, str(filename), "exec"), module.__dict__)
@@ -592,13 +593,13 @@ def test_complete_backbone_hidden_logits_mixed_prefill_decode_and_conditioning(o
 
     def run(ids, spans, decode_slots, decode_rows, decode_only):
         embeddings = native.multi_embedder(torch.cat([row[1] for row in ids]))
-        positions = []
+        positions: list[int] = []
         expected_hidden, expected_logits = [], []
         start = 0
         for slot, frame_ids in ids:
             offset = caches[slot].position
             positions.extend(range(offset, offset + len(frame_ids)))
-            capture = {}
+            capture: dict[str, torch.Tensor] = {}
             output = oracle(
                 frame_ids,
                 caches[slot],

@@ -157,24 +157,31 @@ def test_conditioning_once_chunked_mixed_prefill_feedback_and_static_bucket(owne
     state, sampler, _ = owner
     capture_inputs = state.prepare_dummy_inputs(4, 4)
     slot_pointer = capture_inputs["zonos3_batch"].decode_slots.data_ptr()
+    prefill_capture = state.prepare_dummy_inputs(2, 8)
+    assert state._batch(8, False).workspace.bank is prefill_capture["zonos3_batch"].workspace.bank
     add(owner, "a", 0, 6)
     add(owner, "b", 1, 5)
     compiled = []
-    original = state.build_prompt
+    original = state.preprocess_batch
 
-    def compile_once(req_id, info):
-        compiled.append(req_id)
-        return original(req_id, info)
+    def compile_once(req_infos):
+        compiled.append([req_id for req_id, _ in req_infos])
+        return original(req_infos)
 
-    monkeypatch.setattr(state, "build_prompt", compile_once)
-    first, _ = step(owner, batch(owner, [("a", 0, 2, 0, True), ("b", 1, 5, 0, True)]))
+    monkeypatch.setattr(state, "preprocess_batch", compile_once)
+    embedding_shapes = []
+    hook = state.model.multi_embedder.register_forward_pre_hook(lambda _, args: embedding_shapes.append(args[0].shape))
+    first, first_inputs = step(owner, batch(owner, [("a", 0, 2, 0, True), ("b", 1, 5, 0, True)], padded=8))
+    assert first_inputs["zonos3_batch"].workspace.bank is prefill_capture["zonos3_batch"].workspace.bank
+    hook.remove()
+    assert embedding_shapes == [torch.Size([11, 11]), torch.Size([2, 11])]
     assert first.num_sampled.tolist() == [0, 1]
     feedback = state.next_embeddings[1].clone()
     second_data = batch(owner, [("a", 0, 4, 2, True), ("b", 1, 1, 5, False)])
     second, inputs = step(owner, second_data)
     assert second.num_sampled.tolist() == [1, 1]
     torch.testing.assert_close(inputs["inputs_embeds"][4], feedback)
-    assert compiled == ["a", "b"]
+    assert compiled == [["a", "b"]]
     third_data = batch(owner, [("b", 1, 1, 6, False), ("a", 0, 1, 6, False)], padded=4)
     _, inputs = step(owner, third_data)
     assert inputs["zonos3_batch"] is capture_inputs["zonos3_batch"]
@@ -304,6 +311,12 @@ def test_native_startup_decode_warmup_can_run_before_full_graph_capture(owner, m
     data.req_ids = ["_warmup_0_"]
     assert state.prepare_attn(data, CUDAGraphMode.NONE, (), torch.empty(0), [], None) == {}
     assert upstream.call_count == 1
+    data.req_ids = ["req_0_capture_dummy"]
+    state._startup = True
+    assert state.prepare_attn(data, CUDAGraphMode.NONE, (), torch.empty(0), [], None) == {}
+    state._startup = False
+    with pytest.raises(RuntimeError, match="one native FULL"):
+        state.prepare_attn(data, CUDAGraphMode.NONE, (), torch.empty(0), [], None)
 
 
 def test_zonos3_startup_requests_drop_text_logprobs(owner):

@@ -139,7 +139,7 @@ class Zonos3TTSAdapter(ARTTSAdapter):
                 raise ValueError("silence_prefill_frames must be in 0..30")
             chunk_size = extra.get("chunk_size", 15)
             chunk_ramp = extra.get("chunk_ramp", (1, 2, 4, 8, 15))
-            first_chunk_codebooks = extra.get("first_chunk_codebooks", 10)
+            first_chunk_codebooks = extra.get("first_chunk_codebooks", 1)
             if not isinstance(chunk_size, int) or chunk_size < 1:
                 raise ValueError("chunk_size must be a positive integer")
             if not isinstance(chunk_ramp, (list, tuple)) or any(

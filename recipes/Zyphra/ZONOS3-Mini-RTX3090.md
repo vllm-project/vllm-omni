@@ -16,7 +16,7 @@
 | Output | Mono WAV at 44,100 Hz |
 | Provided profile | `vllm_omni/deploy/zonos3_mini.yaml`, 32 request slots, AR context 2048 tokens |
 | Precision | AR BF16; speaker encoder and Codec weights FP32 |
-| Execution | Eager AR prefill, graph AR decode, model-owned Codec graphs |
+| Execution | Piecewise AR prefill/mixed, FULL AR decode, model-owned Codec graphs |
 | Qualified scope | Single-GPU default-voice serving; 128 requests per concurrency at 1/4/8/16/32, with WER evaluation |
 | Voice cloning / other topologies | Not qualified by this recipe |
 
@@ -155,7 +155,11 @@ The two overrides can be combined in one Stage 1 object:
 ```
 
 Do not apply a global `--enforce-eager` to this profile: Stage 0 currently requires
-`FULL_DECODE_ONLY`. To adjust Codec bucket shapes, edit connector
+FULL decode graphs. The provided `FULL_AND_PIECEWISE` configuration keeps decode
+in one FULL graph and splits mixed/prefill steps at Zonos3 GDN and global
+attention cores. GDN request metadata and recurrent updates execute outside the
+piecewise graphs; surrounding backbone operations compile and replay.
+To adjust Codec bucket shapes, edit connector
 `codec_chunk_frames` / `codec_chunk_ramp` and the Codec stage's `max_num_seqs` in
 a copy of the deploy YAML. The graph keys are derived from those values.
 
@@ -177,6 +181,13 @@ curl --fail-with-body http://localhost:8000/v1/audio/speech \
 
 Expected result: a non-empty, decodable 44.1 kHz mono WAV containing the requested
 sentence. Do not pass `sample_rate` to this model; its native output is 44.1 kHz.
+
+The default `first_chunk_codebooks=1` sends the first Codec chunk as soon as
+CB0 arrives, omitting unavailable residual codebooks. Only the first chunk uses
+this partial policy; subsequent chunks wait for all codebooks. Frames already
+emitted are not replayed with later residuals. Set
+`"extra_params": {"first_chunk_codebooks": 10}` to request a full-codebook first
+chunk. This affects first-audio latency and can affect the initial audio.
 
 The default `silence_prefill_frames=3` adds delayed silence rows to the AR prompt
 and primes the Codec; the corresponding prefill samples are cropped from output.

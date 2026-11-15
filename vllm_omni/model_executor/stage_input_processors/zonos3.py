@@ -25,7 +25,7 @@ class Zonos3ChunkConfig:
     pad_id: int
     chunk_size: int = 15
     chunk_ramp: tuple[int, ...] = (1, 2, 4, 8, 15)
-    first_chunk_codebooks: int = 10
+    first_chunk_codebooks: int = 1
 
     def __post_init__(self) -> None:
         if len(self.codebook_sizes) != 10 or any(size <= 0 for size in self.codebook_sizes):
@@ -203,7 +203,7 @@ def zonos3_rvq_async_chunk(
                 pad_id=int(extra["audio_pad_id"]),
                 chunk_size=int(extra.get("codec_chunk_frames", 15)),
                 chunk_ramp=tuple(extra.get("codec_chunk_ramp", (1, 2, 4, 8, 15))),
-                first_chunk_codebooks=int(extra.get("first_chunk_codebooks", 10)),
+                first_chunk_codebooks=int(extra.get("first_chunk_codebooks", 1)),
             )
         )
         root[_STATE_KEY] = state
@@ -253,6 +253,8 @@ def zonos3_rvq_async_chunk(
                 metadata = unflatten_payload(metadata)
             conditioning = _zonos3_conditioning(metadata)
             overrides = conditioning.get("codec_chunking", {})
+            if not isinstance(overrides, Mapping):
+                raise ValueError("Invalid Zonos3 per-request Codec chunk settings")
             if overrides and (
                 state.config.chunk_size != overrides.get("chunk_size", state.config.chunk_size)
                 or state.config.chunk_ramp != tuple(overrides.get("chunk_ramp", state.config.chunk_ramp))

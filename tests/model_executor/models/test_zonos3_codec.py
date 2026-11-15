@@ -7,6 +7,7 @@ import json
 import math
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -172,7 +173,7 @@ def test_release_config_selects_retained_stages_and_pruned_layer_indices():
                 }
             )
     stages.append({"type": "PatchedPretransform", "direction": "up", "patch_size": 23})
-    release = {
+    release: dict[str, Any] = {
         "model": {
             "sample_rate": 44100,
             "internal_sample_rate": 44160,
@@ -373,7 +374,7 @@ def checkpoint(tmp_path, monkeypatch):
     )
     torch.save({"step": 50000, "trainable": trainable}, tmp_path / files.checkpoint)
     with (tmp_path / files.generator).open("rb") as handle:
-        digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        digest = hashlib.sha256(handle.read()).hexdigest()
     # This fixture tests loading, not release-weight parity: only its generated
     # tiny checkpoint is accepted, and production keeps the registry checksum.
     monkeypatch.setattr(codec_checkpoint, "GENERATOR_SHA256", digest)
@@ -480,6 +481,7 @@ def test_native_finalizer_transport_codec_lifecycle(checkpoint, termination):
                 "codebook_sizes": [4096] * 10,
                 "eoa_id": 4096,
                 "audio_pad_id": 4097,
+                "first_chunk_codebooks": 10,  # Full-codebook waveform oracle in this test.
             }
         },
     )

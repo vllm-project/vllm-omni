@@ -20,6 +20,8 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torchaudio.compliance.kaldi import fbank
 
+from vllm_omni.utils.device_copy import to_device_nonblocking
+
 
 class NewGELUActivation(nn.Module):
     def forward(self, input: Tensor) -> Tensor:
@@ -647,7 +649,7 @@ class Zonos3SpeakerEncoder(nn.Module):
         if waveform.numel() == 0 or not bool(waveform.isfinite().all()):
             raise ValueError("Zonos3 reference audio must contain finite samples")
         device = self.model.linear.weight.device
-        waveform = waveform.to(device=device, dtype=torch.float32).mean(0, keepdim=True)
+        waveform = to_device_nonblocking(waveform.float(), device).mean(0, keepdim=True)
         if sample_rate != 16000:
             waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
         waveform = waveform[:, : 60 * 16000]

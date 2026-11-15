@@ -166,7 +166,8 @@ def test_deployment_resolves_both_native_stages_with_release_parser(tmp_path):
     assert ar.model_config.recompute_preemption == "fail"
     assert ar.model_config.enforce_eager is False
     assert ar.cache_config.kv_cache_memory_bytes == 128 * 1024**2
-    assert "FULL_DECODE_ONLY" in str(ar.compilation_config)
+    assert "FULL_AND_PIECEWISE" in str(ar.compilation_config)
+    assert "vllm::zonos3_gdn_core" in str(ar.compilation_config)
     assert codec.stage_pipeline_config.hf_config_name == "codec_config"
     assert codec.stage_pipeline_config.retains_state_across_chunks
     assert codec.model_config.enforce_eager is False

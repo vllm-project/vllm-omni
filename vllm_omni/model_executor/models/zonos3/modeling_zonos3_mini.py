@@ -22,11 +22,15 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import nn
 from torch.nn import functional as F
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.forward_context import get_forward_context
 from vllm.sampling_params import SamplingParams
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device
 
 from .ar_config import Zonos3Architecture
@@ -220,7 +224,8 @@ class Zonos3GDN(nn.Module):
             is_rms_norm=True,
         )[0]
         result = self.wo(normalized.reshape(batch * length, INNER)).view(batch, length, width)
-        self._pin_fla_tables(tables)
+        if current_omni_platform.is_graph_capturing():
+            self._pin_fla_tables(tables)
         return result, conv_final, final.float()
 
     def _cpu_windows(
@@ -534,6 +539,7 @@ class Zonos3BackboneBatch:
     decode_rows: torch.Tensor
     prefill_spans: tuple[Zonos3PrefillSpan, ...] = ()
     decode_only: bool = True
+    dummy_slots: tuple[int, ...] = ()
 
 
 class Zonos3GlobalAttention(Zonos3AttentionProjection):
@@ -577,16 +583,66 @@ def validate_zonos3_ar_runtime(vllm_config: VllmConfig) -> None:
         raise ValueError(
             "Zonos3 V1 requires prefix caching disabled: KV-only hits cannot restore GDN conv/recurrent state"
         )
-    if (
-        vllm_config.model_config.enforce_eager
-        or vllm_config.compilation_config.cudagraph_mode is not CUDAGraphMode.FULL_DECODE_ONLY
+    if vllm_config.model_config.enforce_eager or vllm_config.compilation_config.cudagraph_mode not in (
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        CUDAGraphMode.FULL_AND_PIECEWISE,
     ):
-        raise ValueError("Zonos3 AR requires FULL_DECODE_ONLY: native FULL decode graphs and eager prefill")
+        raise ValueError("Zonos3 AR requires FULL_DECODE_ONLY or FULL_AND_PIECEWISE with native FULL decode graphs")
     parallel = vllm_config.parallel_config
     if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1 or parallel.enable_expert_parallel:
         raise ValueError("Zonos3 V1 supports one tensor/pipeline rank per stage without expert parallelism")
 
 
+def zonos3_gdn_core(
+    x: torch.Tensor,
+    conv: torch.Tensor,
+    recurrent: torch.Tensor,
+    window: torch.Tensor,
+    window_length: torch.Tensor,
+    total_tokens: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    # State tensors are explicit mutated operands so compilation cannot reorder
+    # this op across another consumer. Python request metadata stays outside FX.
+    layer = get_forward_context().no_compile_layers[layer_name]
+    batch = layer._runtime_batch
+    # Functionalization/piecewise replay can supply different operand storage.
+    # All GPU reads and writes must use the declared operands, not bound pools.
+    state = Zonos3GDNState(conv, recurrent, window, window_length, total_tokens, layer._runtime_state.prefill_tokens)
+    # Piecewise capture calls each eager boundary repeatedly with the same
+    # dummy prompt. Reset only scratch slots, outside stream capture. Recording
+    # resets in a FULL graph would erase live recurrent state on every replay.
+    if batch.dummy_slots and not current_omni_platform.is_graph_capturing():
+        state.reset(batch.dummy_slots)
+    output.copy_(Zonos3ForCausalLM._gdn_forward(layer, x, batch, state))
+
+
+def _zonos3_gdn_fake(
+    x: torch.Tensor,
+    conv: torch.Tensor,
+    recurrent: torch.Tensor,
+    window: torch.Tensor,
+    window_length: torch.Tensor,
+    total_tokens: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="zonos3_gdn_core",
+    op_func=zonos3_gdn_core,
+    mutates_args=["conv", "recurrent", "window", "window_length", "total_tokens", "output"],
+    fake_impl=_zonos3_gdn_fake,
+)
+
+
+@support_torch_compile(
+    dynamic_arg_dims={"positions": 0, "inputs_embeds": 0, "zonos3_workspace": 1},
+    enable_if=lambda c: c.compilation_config.mode == CompilationMode.VLLM_COMPILE,
+)
 class Zonos3ForCausalLM(nn.Module):
     has_preprocess = True
     has_postprocess = False
@@ -616,6 +672,7 @@ class Zonos3ForCausalLM(nn.Module):
         super().__init__()
         config = architecture
         validate_zonos3_ar_runtime(vllm_config)
+        self._compiled_gdn = vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
         self.config = config
         # Keep the release's flat module names, including conditioning modules.
         self.multi_embedder = MultiEmbedding(config)
@@ -637,6 +694,16 @@ class Zonos3ForCausalLM(nn.Module):
         self.allow_patterns_overrides = ["model.pth" if direct else f"{subdir}/model.pth"]
         self._weights_loaded = False
         self.speaker_encoder = None
+
+        if self._compiled_gdn:
+            context = vllm_config.compilation_config.static_forward_context
+            for index, layer in enumerate(self.layers):
+                if isinstance(layer.attention, Zonos3GDN):
+                    name = f"{prefix}.layers.{index}.zonos3_gdn"
+                    if name in context:
+                        raise ValueError(f"Duplicate Zonos3 GDN layer: {name}")
+                    layer.attention._context_name = name
+                    context[name] = layer.attention
 
     def allocate_gdn_states(self, capacity: int) -> dict[int, Zonos3GDNState]:
         return {
@@ -673,6 +740,13 @@ class Zonos3ForCausalLM(nn.Module):
             raise RuntimeError("Zonos3 AR parameter loading was incomplete")
         self.eval().requires_grad_(False)
         return expected
+
+    def bind_gdn_batch(self, batch: Zonos3BackboneBatch) -> None:
+        if self._compiled_gdn:
+            for index, layer in enumerate(self.layers):
+                if isinstance(layer.attention, Zonos3GDN):
+                    layer.attention._runtime_batch = batch
+                    layer.attention._runtime_state = batch.gdn_states[index]
 
     @staticmethod
     def _gdn_forward(
@@ -719,6 +793,7 @@ class Zonos3ForCausalLM(nn.Module):
         *,
         inputs_embeds: torch.Tensor | None = None,
         zonos3_batch: Zonos3BackboneBatch | None = None,
+        zonos3_workspace: torch.Tensor | None = None,
         model_intermediate_buffer: list[dict[str, Any]] | None = None,
         runtime_additional_information: list[dict[str, Any]] | None = None,
         seq_token_counts: list[int] | None = None,
@@ -738,28 +813,44 @@ class Zonos3ForCausalLM(nn.Module):
         )
         if not self._weights_loaded:
             raise RuntimeError("Zonos3 AR release weights have not been loaded")
-        if inputs_embeds is None or positions is None or zonos3_batch is None:
+        if inputs_embeds is None or positions is None or (zonos3_batch is None and zonos3_workspace is None):
             raise ValueError("Zonos3 AR requires native ModelState-prepared embeddings, positions and state")
         batch = zonos3_batch
         config = self.config
         tokens = inputs_embeds.shape[0]
-        workspace = batch.workspace
-        if workspace.bank.shape[1] < tokens or positions.shape[0] != tokens:
+        bank = zonos3_workspace if zonos3_workspace is not None else batch.workspace.bank
+        if bank.shape[1] < tokens or positions.shape[0] != tokens:
             raise ValueError("Zonos3 Backbone workspace/position shape does not match the scheduled rows")
         # Speaker/condition substitution happens in ModelState before this norm.
         x = F.rms_norm(inputs_embeds, (config.dim,), eps=config.norm_eps)
-        workspace.write(0, x)
+        bank[0, :tokens].copy_(x)
         for i, layer in enumerate(self.layers):
-            mixed = workspace.route(2 * i + 1, tokens, self.block_attnres_queries[2 * i], config.norm_eps)
+            mixed = full_attnres_route(bank[: 2 * i + 1, :tokens], self.block_attnres_queries[2 * i], config.norm_eps)
             attention_input = layer.attention_norm(mixed)
             if isinstance(layer.attention, Zonos3GDN):
-                attention_output = self._gdn_forward(layer.attention, attention_input, batch, batch.gdn_states[i])
+                if self._compiled_gdn:
+                    state = layer.attention._runtime_state
+                    attention_output = torch.empty_like(attention_input)
+                    torch.ops.vllm.zonos3_gdn_core(
+                        attention_input,
+                        state.conv,
+                        state.recurrent,
+                        state.window,
+                        state.window_length,
+                        state.total_tokens,
+                        attention_output,
+                        layer.attention._context_name,
+                    )
+                else:
+                    attention_output = self._gdn_forward(layer.attention, attention_input, batch, batch.gdn_states[i])
             else:
                 attention_output = layer.attention(attention_input, positions, batch)
-            workspace.write(2 * i + 1, attention_output)
-            mixed = workspace.route(2 * i + 2, tokens, self.block_attnres_queries[2 * i + 1], config.norm_eps)
-            workspace.write(2 * i + 2, layer.feed_forward(layer.ffn_norm(mixed)))
-        mixed = workspace.route(config.n_sources, tokens, self.block_attnres_queries[-1], config.norm_eps)
+            bank[2 * i + 1, :tokens].copy_(attention_output)
+            mixed = full_attnres_route(
+                bank[: 2 * i + 2, :tokens], self.block_attnres_queries[2 * i + 1], config.norm_eps
+            )
+            bank[2 * i + 2, :tokens].copy_(layer.feed_forward(layer.ffn_norm(mixed)))
+        mixed = full_attnres_route(bank[: config.n_sources, :tokens], self.block_attnres_queries[-1], config.norm_eps)
         return self.out_norm(mixed)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

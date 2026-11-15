@@ -14,7 +14,7 @@ from vllm_omni.model_executor.stage_input_processors.zonos3 import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-CONFIG = Zonos3ChunkConfig(codebook_sizes=(4096,) + (1024,) * 9, eoa_id=4096, pad_id=4097)
+CONFIG = Zonos3ChunkConfig(codebook_sizes=(4096,) + (1024,) * 9, eoa_id=4096, pad_id=4097, first_chunk_codebooks=10)
 
 
 def delayed(frames: torch.Tensor) -> torch.Tensor:
@@ -94,11 +94,19 @@ def test_silence_priming_counts_only_generated_frames_toward_first_chunk(first_c
         assert (combined[silence_frames, 1:] == -1).all()
 
 
-@pytest.mark.parametrize("codebooks", [1, 2, 4, 9])
+@pytest.mark.parametrize("codebooks", [None, 1, 2, 4, 9])
 def test_partial_first_chunk_never_replays_frames(codebooks):
     frames = torch.arange(200).reshape(20, 10)
     rows = delayed(frames)
-    state = Zonos3RVQStageInputProcessor(replace(CONFIG, first_chunk_codebooks=codebooks))
+    config = (
+        Zonos3ChunkConfig(codebook_sizes=CONFIG.codebook_sizes, eoa_id=CONFIG.eoa_id, pad_id=CONFIG.pad_id)
+        if codebooks is None
+        else replace(CONFIG, first_chunk_codebooks=codebooks)
+    )
+    state = Zonos3RVQStageInputProcessor(config)
+    if codebooks is None:
+        assert config.first_chunk_codebooks == 1
+    codebooks = config.first_chunk_codebooks
     first = state.push("r", rows[:codebooks])
     assert torch.equal(first.codes.audio[0, :codebooks], frames[0, :codebooks])
     assert (first.codes.audio[0, codebooks:] == -1).all()
@@ -165,7 +173,7 @@ def test_mixed_request_progress(concurrency):
     frames = [torch.full((i + 3, 10), i, dtype=torch.int64) for i in range(concurrency)]
     rows = [delayed(f) for f in frames]
     states = [Zonos3RVQStageInputProcessor(CONFIG) for _ in frames]
-    result = [[] for _ in frames]
+    result: list[list[torch.Tensor]] = [[] for _ in frames]
     for step in range(max(map(len, rows))):
         # Reverse batch order on alternating steps, removing completed requests.
         order = range(concurrency) if step % 2 else reversed(range(concurrency))
@@ -187,6 +195,7 @@ class Connector:
                 "codebook_sizes": CONFIG.codebook_sizes,
                 "eoa_id": CONFIG.eoa_id,
                 "audio_pad_id": CONFIG.pad_id,
+                "first_chunk_codebooks": 10,
             }
         }
     )
@@ -242,6 +251,7 @@ def test_native_hook_accumulates_raw_rows_until_terminal():
     rows = delayed(frames)
     assert zonos3_rvq_async_chunk(manager, {"codes": {"audio": rows[:5]}}, request) is None
     state = manager.request_payload[request.external_req_id]["_zonos3_rvq_state"]
+    assert isinstance(state, Zonos3RVQStageInputProcessor)
     assert state.received == 5
     zonos3_rvq_async_chunk(manager, {"codes": {"audio": rows[5:]}}, request)
     request.finished = True
