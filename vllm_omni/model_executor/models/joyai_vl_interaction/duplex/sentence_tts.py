@@ -39,6 +39,7 @@ from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import (
     DELEGATION_TAG,
     RESPONSE_TOKEN,
     SILENCE_TOKEN,
+    Action,
     parse_action,
 )
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import USER_QUERY_HEADER
@@ -137,6 +138,26 @@ def spoken_payload(raw: str, *, finished: bool) -> str | None:
         return None
     cleaned = sanitize_spoken_text(parsed.text)
     return cleaned or None
+
+
+def _repeat_policy_holds_tts(observation: object | None, raw: str, *, finished: bool) -> bool:
+    """True while Talker must wait on the data-plane repeat policy.
+
+    Unfinished RESPONSE text that is still a prefix of ``previous_response``
+    may finish as a suppressed repeat; audio already handed to Talker cannot
+    be retracted. An exact repeat at finish is also held so Code2Wav is
+    aborted with no speech. Compare ``parsed.text``, not the sanitized Talker
+    payload, and skip delegation notes: they are not repeats.
+    """
+    previous = getattr(observation, "previous_response", "")
+    if not isinstance(previous, str) or not previous:
+        return False
+    parsed = parse_action(raw)
+    if parsed.action is not Action.RESPONSE or not parsed.text:
+        return False
+    if finished:
+        return parsed.text == previous
+    return previous.startswith(parsed.text)
 
 
 def _pending_units(state: dict[str, object]) -> list[str]:
@@ -560,6 +581,10 @@ def plan_partial_stage_output(
         return None
 
     raw, finished = _raw_action_text(output, observation)
+    if _repeat_policy_holds_tts(observation, raw, finished=finished):
+        # Do not feed the splitter: a later divergence must still speak the
+        # buffered prefix, and ``fed_text`` would drop it.
+        return None
     spoken = spoken_payload(raw, finished=finished)
     request_id = str(getattr(output, "request_id", getattr(req_state, "request_id", "")))
     prior_emits = int(bridge.get("emits", 0))

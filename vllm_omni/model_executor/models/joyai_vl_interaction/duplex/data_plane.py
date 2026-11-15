@@ -410,7 +410,9 @@ class JoyAIDataPlane(DuplexDataPlane):
         so later tokens never reach the solver. Mid-generation only the spoken
         note is shown; the call is published at finish. The shared call handler
         returns before the response lifecycle, so a note-free call still owes
-        the observation an empty terminal.
+        the observation an empty terminal. A note that was already fully
+        streamed owes the same lifecycle event even when the finish delta is
+        empty: otherwise a text-only session never emits ``response.done``.
         """
         spoken = action.text or ""
         emitted = observation.text_emitted
@@ -470,8 +472,8 @@ class JoyAIDataPlane(DuplexDataPlane):
                 )
                 yield note_event
                 return
-            if not delta:
-                return
+            # Streamed notes still need the finish lifecycle when there is no
+            # new delta; ``spoken_note`` keeps audio from aborting Code2Wav.
             yield spoken_note()
             return
         call_event = dict(event)
@@ -482,10 +484,8 @@ class JoyAIDataPlane(DuplexDataPlane):
             "arguments": arguments,
         }
         yield call_event
-        if delta:
-            yield spoken_note()
-            return
         if spoken:
+            yield spoken_note()
             return
         # A note-free call still ends its observation. The call result above is
         # published, but nothing else of this output will produce a terminal.

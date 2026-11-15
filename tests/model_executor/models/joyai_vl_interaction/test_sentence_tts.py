@@ -159,6 +159,11 @@ class _FakeReqState:
 
 
 @dataclass
+class _RepeatObservation:
+    previous_response: str = ""
+
+
+@dataclass
 class _FakeCompletion:
     text: str
     cumulative_text: str | None = None
@@ -181,6 +186,105 @@ def _stage0_output(text: str, *, finished: bool = False) -> _FakeOutput:
         request_id="req-1",
         outputs=[_FakeCompletion(text=text, cumulative_text=text if finished else None)],
     )
+
+
+def test_plan_partial_holds_a_prefix_of_the_previous_response():
+    """Sentence TTS must not speak a reply the repeat policy may still suppress."""
+    orchestrator = _FakeOrchestrator()
+    req_state = _FakeReqState()
+    observation = _RepeatObservation(previous_response="水开了。关火。")
+    held = plan_partial_stage_output(
+        orchestrator,
+        0,
+        0,
+        _stage0_output("</response> 水开了。关"),
+        req_state,
+        joyai_stage_id=0,
+        observation=observation,
+    )
+    assert held is None
+    assert req_state.streaming.bridge_states.get("joyai_sentence_tts", {}).get("fed_text") in (None, "")
+
+
+def test_plan_partial_skips_talker_on_an_exact_repeat():
+    orchestrator = _FakeOrchestrator()
+    req_state = _FakeReqState()
+    observation = _RepeatObservation(previous_response="水开了。关火。")
+    skipped = plan_partial_stage_output(
+        orchestrator,
+        0,
+        0,
+        _stage0_output("</response> 水开了。关火。", finished=True),
+        req_state,
+        joyai_stage_id=0,
+        observation=observation,
+    )
+    assert skipped is None
+
+
+def test_plan_partial_speaks_a_shorter_prefix_that_is_not_a_repeat():
+    """Finish of a proper prefix is a new answer, not ``is_repeat``."""
+    orchestrator = _FakeOrchestrator()
+    req_state = _FakeReqState()
+    observation = _RepeatObservation(previous_response="水开了。关火。")
+    spoken = plan_partial_stage_output(
+        orchestrator,
+        0,
+        0,
+        _stage0_output("</response> 水开了。", finished=True),
+        req_state,
+        joyai_stage_id=0,
+        observation=observation,
+    )
+    assert spoken is not None
+    assert "水开了" in spoken.output.text
+
+
+def test_plan_partial_releases_buffered_text_when_the_reply_diverges():
+    orchestrator = _FakeOrchestrator()
+    req_state = _FakeReqState()
+    observation = _RepeatObservation(previous_response="水开了。关火。")
+    assert (
+        plan_partial_stage_output(
+            orchestrator,
+            0,
+            0,
+            _stage0_output("</response> 水开了。关"),
+            req_state,
+            joyai_stage_id=0,
+            observation=observation,
+        )
+        is None
+    )
+    released = plan_partial_stage_output(
+        orchestrator,
+        0,
+        0,
+        _stage0_output("</response> 水开了。再等等。", finished=True),
+        req_state,
+        joyai_stage_id=0,
+        observation=observation,
+    )
+    assert released is not None
+    assert "水开了" in released.output.text
+    assert "再等等" in released.output.text
+
+
+def test_plan_partial_does_not_hold_a_delegation_note():
+    orchestrator = _FakeOrchestrator()
+    req_state = _FakeReqState()
+    observation = _RepeatObservation(previous_response="Checking the pot.")
+    opened = plan_partial_stage_output(
+        orchestrator,
+        0,
+        0,
+        _stage0_output("</response> Checking the pot. </delegation> Why is it smoking?", finished=True),
+        req_state,
+        joyai_stage_id=0,
+        observation=observation,
+    )
+    assert opened is not None
+    assert "Checking the pot." in opened.output.text
 
 
 def test_plan_partial_hands_the_first_sentence_resumable():
