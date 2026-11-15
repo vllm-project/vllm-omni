@@ -136,7 +136,69 @@ def test_pending_metadata_only_flushes_after_a_real_successful_forward(monkeypat
             runner.execute_model(SimpleNamespace())
     else:
         assert runner.execute_model(SimpleNamespace(), dummy_run=step == "dummy") is output
-    flush.assert_not_called()
+    if step == "no_hook":
+        flush.assert_not_called()
+    else:
+        flush.assert_called_once_with(())
+
+
+@pytest.mark.parametrize("step", ["dummy", "failed", "capture"])
+@pytest.mark.cpu
+def test_bagel_unassigned_metadata_does_not_leak_into_next_forward(monkeypatch, step):
+    from vllm_omni.model_executor.models.bagel.bagel import OmniBagelForConditionalGeneration
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    model = object.__new__(OmniBagelForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    # Encoder profiling and earlier image requests leave this image geometry.
+    model._pending_img2img_info = []
+    model._last_img2img_info = (6, 4, 32, 32)
+    model._ropes_pending = []
+    live_metadata = {"ropes": [7], "image_shape": [32, 32]}
+    model._ropes_metadata = {"live": live_metadata}
+    model._img2img_token_id = 99
+    runner = object.__new__(OmniARModelRunner)
+    runner.model, runner.execute_model_state = model, None
+    monkeypatch.setattr(runner, "_handle_kv_transfer_pre", lambda _: None)
+    fail = step == "failed"
+
+    def attention(_input_ids, positions, *_args, **_kwargs):
+        if fail:
+            raise RuntimeError("attention failed after position metadata")
+        return torch.zeros(len(positions), 2)
+
+    model._mot_forward = attention
+
+    def parent_forward(_runner, scheduler_output, *_args, **_kwargs):
+        n = scheduler_output.tokens
+        # Keep the real Bagel forward, position rewrite and pending producer.
+        model(torch.full((n,), 99), torch.arange(n), inputs_embeds=torch.zeros(n, 2))
+        runner.execute_model_state = SimpleNamespace(input_batch=SimpleNamespace(req_ids=scheduler_output.req_ids))
+        return None
+
+    monkeypatch.setattr(OmniGPUModelRunner, "execute_model", parent_forward)
+    excluded = SimpleNamespace(tokens=12, req_ids=["excluded"])
+    if step == "capture":
+        # Native graph capture invokes the model directly, bypassing the runner.
+        model(torch.full((12,), 99), torch.arange(12), inputs_embeds=torch.zeros(12, 2))
+    elif step == "failed":
+        with pytest.raises(RuntimeError, match="attention failed after position metadata"):
+            runner.execute_model(excluded)
+    else:
+        runner.execute_model(excluded, dummy_run=True)
+    assert model._ropes_pending[0]["ropes"] == [3]
+    assert "excluded" not in model._ropes_metadata
+
+    fail = False
+    runner.execute_model(SimpleNamespace(tokens=14, req_ids=["real"]))
+    assert model.get_kv_transfer_metadata("real") == {
+        "ropes": [5],
+        "image_shape": [32, 32],
+        "prefill_position_count": 14,
+    }
+    assert model._ropes_pending == []
+    assert model._ropes_metadata["live"] is live_metadata
+    assert model._last_img2img_info == (6, 4, 32, 32)
 
 
 class _FakeStream:

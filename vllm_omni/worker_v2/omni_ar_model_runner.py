@@ -192,6 +192,11 @@ class OmniARModelRunner(OmniGPUModelRunner):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> Any:
+        flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
+        if callable(flush_pending_metadata):
+            # Capture and unsuccessful forwards can leave unassigned metadata.
+            # Discard it without clearing metadata already bound to live requests.
+            flush_pending_metadata(())
         if not dummy_run:
             self._handle_kv_transfer_pre(scheduler_output)
         previous_state = self.execute_model_state if not dummy_run else None
@@ -209,7 +214,6 @@ class OmniARModelRunner(OmniGPUModelRunner):
         if not dummy_run and state is not None and state is not previous_state:
             # Preserve model-owned RoPE metadata in the actual forward order
             # before the next step exports the finished requests' KV caches.
-            flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
             if callable(flush_pending_metadata):
                 flush_pending_metadata(state.input_batch.req_ids)
         return output
