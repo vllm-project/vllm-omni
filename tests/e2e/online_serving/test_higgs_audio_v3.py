@@ -21,6 +21,8 @@ os.environ.setdefault("VLLM_MOE_USE_DEEP_GEMM", "0")
 import pytest
 from vllm.platforms import current_platform
 
+from tests.helpers.assertions import SuccessRateGate, collect_at_success_rate
+from tests.helpers.client import OmniResponse
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServerParams
@@ -77,6 +79,10 @@ DEFAULT_SPEECH_TIMEOUT_S = 180.0
 # silence-only outputs without flagging short legitimate clips.
 _MIN_AUDIO_BYTES = 20_000
 _SINGLE_STREAM_HNR_DB = -2.0 if current_platform.is_rocm() else 0.0
+
+# Per-request seeds for the HNR gate in test_plain_text_pcm_streaming. The
+# values only bound CI variance; the gate is the pass count, not the values.
+_HNR_GATE_SEEDS = (1, 2, 3, 5)
 
 # Reuse the shared TTS reference clip (clean ~5 s 24 kHz mono human speech)
 # vendored under tests/assets/qwen3_tts/. Keeps a single WAV across TTS
@@ -158,23 +164,37 @@ class TestHiggsAudioV3OnlineHappyPath:
         windows stitch into a coherent PCM stream. The byte-count gate is the same as
         the sync paths; per-chunk audio content is verified offline against Whisper.
 
-        NOTE: ``min_hnr_db=-2.0`` sits below the typical speech-noise floor so the
-        check still catches catastrophic codec failure (silence, white noise, sample
-        scramble all give HNR << -2) while allowing for the sliding-window codec's
-        slightly-noisier-than-sync output. The default 1.0 dB threshold has too
-        little margin on real-weight runs, and even 0.0 dB is below the measured
-        floor on some valid profiles.
+        NOTE: per-rendition HNR is a sampled metric rather than a per-path
+        constant. With the stage-0 sampling defaults, renditions of this sentence
+        measured anywhere from -2.4 dB to +2.6 dB on both runners and averaged
+        about +1.5 dB, so a single unseeded request at a fixed floor fails
+        whenever it draws a noisy rendition. The gate therefore sends four
+        requests with pinned seeds and requires three of them to clear
+        ``min_hnr_db=0.0``: one noisy rendition no longer flakes CI, while a
+        codec or runner regression that sinks every rendition still fails all
+        four. The pinned seeds only bound CI variance; the pass count is the
+        gate. Requests are sent one at a time because the V1 sampler produces a
+        different rendition for the same seed when requests share a batch,
+        while MRV2 reproduces its renditions either way.
         """
-        online_client.send_audio_speech_request(
-            {
-                "model": omni_server.model,
-                "input": "The quick brown fox jumps over the lazy dog.",
-                "stream": True,
-                "stream_format": "audio",
-                "response_format": "pcm",
-                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
-                "min_hnr_db": -2.0,
-            }
+        seed_iter = iter(_HNR_GATE_SEEDS)
+
+        def sample() -> OmniResponse:
+            return online_client.send_audio_speech_request(
+                {
+                    "model": omni_server.model,
+                    "input": "The quick brown fox jumps over the lazy dog.",
+                    "stream": True,
+                    "stream_format": "audio",
+                    "response_format": "pcm",
+                    "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                    "min_hnr_db": 0.0,
+                    "seed": next(seed_iter),
+                }
+            )[0]
+
+        collect_at_success_rate(
+            sample, SuccessRateGate(min_successes=3, concurrency=1), request_num=len(_HNR_GATE_SEEDS)
         )
 
     @pytest.mark.slow

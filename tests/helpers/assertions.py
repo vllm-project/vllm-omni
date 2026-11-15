@@ -39,14 +39,16 @@ _GENDER_PIPELINE = None
 _GENDER_PIPELINE_LOCK = threading.Lock()
 
 # Assertions that sample a random variable rather than testing whether serving works:
-# whether TTS audio is intelligible enough to transcribe back, and whether a preset voice's
-# timbre estimates as the expected gender. Both are decided by the model and the estimator,
-# so a caller measuring a success rate has to tell them apart from a serving failure. The
+# whether TTS audio is intelligible enough to transcribe back, whether a preset voice's
+# timbre estimates as the expected gender, and whether a sampled rendition's harmonics
+# clear an HNR floor. All are decided by the model and the estimator, so a caller
+# measuring a success rate has to tell them apart from a serving failure. The
 # messages are constants because a caller matching the wording by hand would silently stop
 # matching if it were reworded, reclassifying every quality failure as a hard failure.
 AUDIO_MISMATCH_MESSAGE = "The audio content is not same as the text"
 GENDER_MISMATCH_MESSAGE = "estimated gender is"
-_QUALITY_FAILURE_MESSAGES = (AUDIO_MISMATCH_MESSAGE, GENDER_MISMATCH_MESSAGE)
+HNR_FLOOR_MESSAGE = "is below the configured floor"
+_QUALITY_FAILURE_MESSAGES = (AUDIO_MISMATCH_MESSAGE, GENDER_MISMATCH_MESSAGE, HNR_FLOOR_MESSAGE)
 
 
 @dataclass(frozen=True)
