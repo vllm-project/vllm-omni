@@ -172,6 +172,12 @@ Native duplex batches use ordinary decoding on both runners so the duplex
 sampler receives one logit row per request. Ascend's `ngram_gpu` proposer uses MRv1
 and the same native duplex guard. Use `ngram` for MRv2.
 
+The CUDA profile also enables Thinker Ngram. In a duplex deployment, ordinary
+chat requests retain the stock rejection sampler alongside the duplex sampler;
+verification is required for both CUDA worker drafts and Ascend scheduler
+drafts. On every platform, a batch containing native duplex requests drops
+its drafts before the scheduler accounts for the scheduled tokens.
+
 To disable Thinker Ngram, set `speculative_config: null` for stage 0 under
 `platforms.npu.stages` in a deploy overlay. Use `async_scheduling: true` there
 to restore asynchronous scheduling for ordinary decoding.
