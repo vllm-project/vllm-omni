@@ -2313,9 +2313,7 @@ class BatchedToken2Wav(nn.Module):
         prompt_lengths, projected_speakers = self._batch_conditioning(features, batch_size)
         prompt_len = max(prompt_lengths)
         att_keep = (prompt_len, _CACHE_TRIM_SUFFIX)
-        prompt_att_cache = (
-            self._prompt_att_caches.get(features.cache_key) if not isinstance(features, list) else None
-        )
+        prompt_att_cache = self._prompt_att_caches.get(features.cache_key) if not isinstance(features, list) else None
         prompt_cache_key = features.cache_key if not isinstance(features, list) else None
         with self._autocast(tokens.device):
             self._watchdog.phase(
