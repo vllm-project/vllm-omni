@@ -2144,7 +2144,7 @@ stages:
 
     @pytest.mark.parametrize("runner", ["v1", "v2"])
     @pytest.mark.parametrize("disable_prefix_cache", [False, True])
-    def test_minicpmo_turn_cuda_prefix_cache_can_be_disabled(self, monkeypatch, tmp_path, runner, disable_prefix_cache):
+    def test_minicpmo_turn_cuda_prefix_cache_stays_disabled(self, monkeypatch, tmp_path, runner, disable_prefix_cache):
         """Both runners keep prefix caching off for inherited ngram speculation."""
         from vllm_omni import platforms
 

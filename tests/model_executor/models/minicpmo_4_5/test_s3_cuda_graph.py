@@ -34,6 +34,19 @@ def _reference(tokenizer, mels, lengths):
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("core_device", ["cpu", "cuda"])
+def test_facade_preserves_cpu_tokenizer(core_device, mocker):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import MiniCPMO45Token2wav
+
+    tokenizer = torch.nn.Linear(1, 1, device="cpu")
+    facade = MiniCPMO45Token2wav.__new__(MiniCPMO45Token2wav)
+    facade._core = mocker.Mock(device=torch.device(core_device), audio_tokenizer=tokenizer, _s3_cuda_graph=None)
+    assert facade.enable_s3_cuda_graph(_config()) is False
+    assert facade._core.audio_tokenizer is tokenizer
+    assert facade._core._s3_cuda_graph is None
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("frames", [59, 60, 61, 600])
 @torch.inference_mode()
 def test_cpu_fallback_preserves_tokens_and_lengths(frames):

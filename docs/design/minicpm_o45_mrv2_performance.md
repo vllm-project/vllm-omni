@@ -604,14 +604,17 @@ on one L20X; the CUDA tuning is not qualified for other platforms.
 
 The runtime bundle includes:
 
-- Nonblocking transfer of the initial host codec history to the Talker device.
+- Nonblocking transfer of the retained codec history window to the Talker device.
 - A CUDA single-row FP32 sampler that retains exponential noise generation and
   division, and fuses argmax with probability validation. Invalid probabilities
   still feed an asynchronous device assertion. CPU, unsupported layouts/dtypes
   and widths outside 1–8192 retain native multinomial. Seeded token and generator
-  parity is tested for both eager execution and CUDA graph replay. This CUDA
-  K-step sampling path is active when Triton is available, including with the
-  default deployment; other sampling paths retain their implementation.
+  parity is tested for both eager execution and CUDA graph replay. With Triton
+  available, this helper serves per-row CUDA K-step sampling, including V1 and
+  mixed greedy/stochastic batches. The default all-stochastic CUDA MRv2 K-step
+  path uses upstream batched exponential noise and returns before this helper.
+  Default-deployment throughput measurements therefore do not isolate or
+  establish a benefit from the single-row helper.
 - `ref_setup_batch_size` (backend default 1; deployment default 4): group equal-shaped reference features for
   encoder/CFM setup, preserve voice order, separate output state ownership and
   bounded setup-cache retention.
@@ -625,29 +628,10 @@ The runtime bundle includes:
   Four workers regressed the C16 screen, so the default profile
   leaves this option disabled. Worker threads live for the backend lifetime.
 
-The full development evidence and rejected variants are recorded in
+Historical development evidence and rejected variants are recorded in
 [InferRSI #435](https://github.com/InferMatrixLab/InferRSI/pull/435).
-The unchecked sampler prototype is superseded by the checked implementation;
-unpadded reference processing and batched history commits were rejected and
-are not enabled here. The earlier per-batch CPU thread-pool prototype is
-superseded by the optional bounded prefetch implementation. Initial
-chunk size, idle-prefetch waiter count, capacity and replica-count sweeps use
-existing configuration controls, not additional runtime implementations.
-
-Latest development screen: 64 tuning requests per concurrency, two repetitions,
-with disjoint `2*C` warmup requests. All measured cells completed without request
-failures. Hardware: one L20X (143771 MiB), torch 2.14.0+cu130, vLLM 0.33.0,
-published s3tokenizer 0.3.0. Flow FP16 used the immediately preceding FP32 and
-engine controls from the same allocation; no new paired control was run.
-
-| Mean per-request RTF | C1 | C16 | C32 |
-| --- | ---: | ---: | ---: |
-| Checked sampler + grouped setup, FP32 | 0.06070 | 0.23153 | 0.33311 |
-| Same runtime + Flow FP16 | 0.06069 | 0.23159 | 0.30565 |
-| Independent engine, `b6a6cb1`, `track_s_fast_r16` | 0.06424 | 0.21633 | 0.26031 |
-
-The FP16 C32 result is 8.24% lower than that FP32 control; C16/C32 remain slower
-than the engine. WER, WavLM speaker similarity and UTMOS scores were collected,
-but formal quality non-inferiority and the held-out five-fresh-server-run gate
-remain pending. These tuning results do not establish final service acceptance,
-statistical significance, or an end-to-end gain attributable to every patch.
+The rebased whole-PR comparison and its measured revisions are recorded in
+[PR #10331](https://github.com/vllm-project/vllm-omni/pull/10331).
+Those results include code and deployment changes; they do not attribute gains
+to each component. Formal quality non-inferiority and independent-engine
+acceptance remain unestablished.

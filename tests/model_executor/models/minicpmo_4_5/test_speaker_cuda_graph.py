@@ -50,19 +50,6 @@ def test_facade_preserves_non_torch_speaker():
     assert facade._core._spk_model is speaker
 
 
-@pytest.mark.cpu
-@pytest.mark.parametrize("core_device", ["cpu", "cuda"])
-def test_facade_preserves_cpu_tokenizer(core_device, mocker):
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import MiniCPMO45Token2wav
-
-    tokenizer = torch.nn.Linear(1, 1, device="cpu")
-    facade = MiniCPMO45Token2wav.__new__(MiniCPMO45Token2wav)
-    facade._core = mocker.Mock(device=torch.device(core_device), audio_tokenizer=tokenizer, _s3_cuda_graph=None)
-    assert facade.enable_s3_cuda_graph(_config()) is False
-    assert facade._core.audio_tokenizer is tokenizer
-    assert facade._core._s3_cuda_graph is None
-
-
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()

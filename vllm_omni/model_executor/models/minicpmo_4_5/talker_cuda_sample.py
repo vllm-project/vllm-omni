@@ -20,19 +20,19 @@ def _validate_argmax(probabilities, ratios, output, valid, n: tl.constexpr, bloc
 
 def sample(probabilities: torch.Tensor, generator: torch.Generator | None) -> torch.Tensor:
     if (
-        not probabilities.is_cuda
-        or probabilities.dtype != torch.float32
-        or probabilities.ndim != 2
-        or probabilities.shape[0] != 1
-        or not probabilities.is_contiguous()
-        or not 0 < probabilities.shape[1] <= 8192
+        probabilities.is_cuda
+        and probabilities.dtype == torch.float32
+        and probabilities.ndim == 2
+        and probabilities.shape[0] == 1
+        and probabilities.is_contiguous()
+        and 0 < probabilities.shape[1] <= 8192
     ):
-        return torch.multinomial(probabilities, 1, generator=generator).reshape(1)
-    noise = torch.empty_like(probabilities).exponential_(1, generator=generator)
-    ratios = probabilities / noise
-    output = torch.empty(1, dtype=torch.long, device=probabilities.device)
-    valid = torch.empty(1, dtype=torch.bool, device=probabilities.device)
-    width = probabilities.shape[1]
-    _validate_argmax[(1,)](probabilities, ratios, output, valid, width, triton.next_power_of_2(width))
-    torch._assert_async(valid, "probability tensor contains inf, nan or a negative value, or has zero mass")
-    return output
+        noise = torch.empty_like(probabilities).exponential_(1, generator=generator)
+        ratios = probabilities / noise
+        output = torch.empty(1, dtype=torch.long, device=probabilities.device)
+        valid = torch.empty(1, dtype=torch.bool, device=probabilities.device)
+        width = probabilities.shape[1]
+        _validate_argmax[(1,)](probabilities, ratios, output, valid, width, triton.next_power_of_2(width))
+        torch._assert_async(valid, "probability tensor contains inf, nan or a negative value, or has zero mass")
+        return output
+    return torch.multinomial(probabilities, 1, generator=generator).reshape(1)

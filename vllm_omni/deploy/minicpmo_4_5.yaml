@@ -186,11 +186,8 @@ platforms:
           token2wav_spk_cpu_reference: false
           token2wav_spk_cuda_graph: true
           token2wav_s3_cuda_graph: true
-          initial_codec_chunk_frames: 0
           ref_setup_batch_size: 4
           token2wav_float16: true
-          # Four-worker CPU prefetch regressed C16; keep it disabled.
-          token2wav_ref_cpu_prefetch_workers: 0
     # Private MPS for colocated CUDA stages. NPU does not read this block.
     # A missing or failing nvidia-cuda-mps-control daemon, parallel stage
     # init, or a stage that is not one numeric GPU disables MPS and continues. Set false

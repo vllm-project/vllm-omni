@@ -44,7 +44,7 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code \
 ```
 
 See the [performance contract](../../docs/design/minicpm_o45_mrv2_performance.md#seed-tts-experimental-optimization-bundle)
-for controls, results and outstanding quality/performance gates. CPU background
+for controls and performance-evidence limits. CPU background
 reference extraction remains disabled because it regressed the C16 screen.
 
 ## References
