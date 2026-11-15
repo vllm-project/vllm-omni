@@ -895,6 +895,43 @@ class OmniModelState(DefaultModelState):
         if self._has_mtp:
             self._mtp_state.record_inputs(input_batch, embeds)
 
+    @staticmethod
+    def _sample_keep_mask(input_batch: InputBatch) -> np.ndarray:
+        """Rows whose sample is kept this step: decode or a finishing prefill chunk.
+
+        Official ``InputBatch`` sets ``is_prefilling_np`` to
+        ``num_computed_prefill_tokens_np < prefill_len_np``. Under that invariant
+        and non-negative scheduled counts, this mask equals
+        ``computed + scheduled >= prefill_len_np``. The OR is still the shared
+        rule so eligibility cannot drop a decode-flagged row that
+        ``publish_sampled_embeddings`` would keep, even if a caller sets the
+        phase flag independently of the counts. This is a runner-wide keep mask,
+        not a MiniMax-H3-only prefill contract. Those arrays are already in
+        batch order, and ``prefill_len_np`` includes codec tokens replayed after
+        preemption. Missing arrays raise ``AttributeError``; a short array
+        raises ``ValueError`` rather than defaulting a slot or reading another
+        request's counts.
+        """
+        num_reqs = input_batch.num_reqs
+        computed = np.asarray(input_batch.num_computed_prefill_tokens_np[:num_reqs])
+        scheduled = np.asarray(input_batch.num_scheduled_tokens[:num_reqs])
+        prefill_len = np.asarray(input_batch.prefill_len_np[:num_reqs])
+        is_prefilling = np.asarray(input_batch.is_prefilling_np[:num_reqs], dtype=np.bool_)
+        if not (
+            computed.shape[0] == num_reqs
+            and scheduled.shape[0] == num_reqs
+            and prefill_len.shape[0] == num_reqs
+            and is_prefilling.shape[0] == num_reqs
+        ):
+            raise ValueError(
+                "sample keep mask requires batch-ordered arrays of length "
+                f"num_reqs={num_reqs}: computed={computed.shape[0]} "
+                f"scheduled={scheduled.shape[0]} prefill_len={prefill_len.shape[0]} "
+                f"is_prefilling={is_prefilling.shape[0]}"
+            )
+        finishing = computed + scheduled >= prefill_len
+        return ~is_prefilling | finishing
+
     def publish_sampled_embeddings(
         self, input_batch: InputBatch, sampled_token_ids: torch.Tensor
     ) -> tuple[dict[str, Any], torch.cuda.Event] | None:
@@ -914,10 +951,7 @@ class OmniModelState(DefaultModelState):
             return None
         if sampled_token_ids.reshape(num_reqs, -1).shape[1] != 1:
             return None  # speculative steps sample several tokens per row
-        computed = input_batch.num_computed_prefill_tokens_np[:num_reqs]
-        scheduled = np.asarray(input_batch.num_scheduled_tokens[:num_reqs])
-        finishing = computed + scheduled >= input_batch.prefill_len_np[:num_reqs]
-        kept = ~input_batch.is_prefilling_np[:num_reqs] | finishing
+        kept = self._sample_keep_mask(input_batch)
         rows = np.flatnonzero(kept).tolist()
         device = sampled_token_ids.device
         # Preserve the empty per-row prefill marker even when every request
@@ -1042,13 +1076,14 @@ class OmniModelState(DefaultModelState):
 
         Warmup dummy requests are never eligible: they do not pass through
         stage input processors, so request metadata such as the MiniMax H3
-        encoder payload is absent.
+        encoder payload is absent. That warmup filter is applied only here,
+        after the shared keep mask.
 
-        Real requests reuse the same batch-ordered finishing rule as
-        ``publish_sampled_embeddings``: a row is eligible when
-        ``num_computed_prefill_tokens_np + num_scheduled_tokens >= prefill_len_np``.
+        Real requests reuse ``_sample_keep_mask``: the same
+        ``~is_prefilling_np | finishing`` rule as ``publish_sampled_embeddings``.
         Those arrays are already in batch order, and ``prefill_len_np`` includes
-        codec tokens replayed after preemption, so this matches the V1
+        codec tokens replayed after preemption. On a well-formed official
+        ``InputBatch``, this agrees with the V1
         ``num_computed + scheduled >= num_tokens`` rule without a second
         ``idx_mapping_np`` / ``RequestState`` lookup. Missing arrays or a
         buffer/batch length mismatch fail loudly rather than defaulting a
@@ -1060,16 +1095,14 @@ class OmniModelState(DefaultModelState):
                 "request sample eligibility requires one gathered buffer per batch "
                 f"row: num_buffers={len(buffer_list)} num_reqs={num_reqs}"
             )
-        computed = input_batch.num_computed_prefill_tokens_np[:num_reqs]
-        scheduled = np.asarray(input_batch.num_scheduled_tokens[:num_reqs])
-        finishing = computed + scheduled >= input_batch.prefill_len_np[:num_reqs]
+        kept = self._sample_keep_mask(input_batch)
         eligible: list[bool] = []
         for batch_idx, info in enumerate(buffer_list):
             req_id = info.get("req_id") if isinstance(info, Mapping) else None
             if isinstance(req_id, str) and is_warmup_request(req_id):
                 eligible.append(False)
                 continue
-            eligible.append(bool(finishing[batch_idx]))
+            eligible.append(bool(kept[batch_idx]))
         return eligible
 
     # ------------------------------------------------------------------

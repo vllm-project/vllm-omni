@@ -233,72 +233,117 @@ def test_output_spans_follow_reordered_mixed_batch():
     assert "request_sample_eligible" not in seen
 
 
-@pytest.mark.parametrize("req_id", ["_warmup_0_", "_v2_mixed_warmup_decode_"])
-def test_postprocess_marks_warmup_ineligible_when_model_requires_eligibility(req_id):
-    # A finished dummy sequence would look sample-eligible under the token rule;
-    # warmup IDs must still be skipped so missing stage metadata does not raise.
-    state = _make_state(have_multimodal_outputs=True)
-    state.model.requires_request_sample_eligibility = True
-    batch = _DummyInputBatch([0])
-    batch.req_ids = [req_id]
-    batch.num_scheduled_tokens = [4]
-    batch.query_start_loc_np = [0]
-    # Finished under the shared finishing rule; warmup IDs must still be ineligible.
-    batch.num_computed_prefill_tokens_np = np.array([0], dtype=np.int32)
-    batch.prefill_len_np = np.array([4], dtype=np.int32)
-    state.intermediate_buffer.buffers[0] = {"req_id": req_id}
+def _eligibility_batch(indices, req_ids, scheduled, computed, prefill_len, is_prefilling):
+    batch = _DummyInputBatch(indices)
+    batch.req_ids = list(req_ids)
+    batch.num_scheduled_tokens = list(scheduled)
+    starts = [0]
+    for count in scheduled[:-1]:
+        starts.append(starts[-1] + count)
+    batch.query_start_loc_np = starts
+    batch.num_computed_prefill_tokens_np = np.array(computed, dtype=np.int32)
+    batch.prefill_len_np = np.array(prefill_len, dtype=np.int32)
+    batch.is_prefilling_np = np.array(is_prefilling, dtype=np.bool_)
+    return batch
+
+
+def _capture_eligibility(state, batch, hidden_rows):
     seen = {}
     state.model.make_omni_output = lambda hidden, **kwargs: (
         seen.update(kwargs) or OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
     )
-    req_states = SimpleNamespace(
-        num_computed_tokens_np=np.array([0], dtype=np.int32),
-        prompt_len=np.array([4], dtype=np.int32),
-        prefill_len=np.array([4], dtype=np.int32),
-        total_len=np.array([4], dtype=np.int32),
+    for i, req_id in enumerate(batch.req_ids):
+        state.intermediate_buffer.buffers[int(batch.idx_mapping_np[i])] = {"req_id": req_id}
+    state.postprocess_model_output(torch.zeros(hidden_rows, 2), batch, SimpleNamespace())
+    return seen
+
+
+@pytest.mark.parametrize("req_id", ["_warmup_0_", "_v2_mixed_warmup_decode_"])
+def test_postprocess_marks_warmup_ineligible_when_model_requires_eligibility(req_id):
+    # A finished dummy sequence, even a decode-flagged one, would look
+    # sample-eligible under the keep mask; warmup IDs must still be skipped
+    # so missing stage metadata does not raise.
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.requires_request_sample_eligibility = True
+    batch = _eligibility_batch(
+        [0],
+        [req_id],
+        scheduled=[4],
+        computed=[4],
+        prefill_len=[4],
+        is_prefilling=[False],
     )
-    state.postprocess_model_output(torch.zeros(4, 2), batch, req_states)
+    seen = _capture_eligibility(state, batch, 4)
     assert seen["request_sample_eligible"] == [False]
 
 
-def test_postprocess_eligibility_follows_finished_tokens_for_real_requests():
+def test_postprocess_eligibility_keeps_finishing_prefill_and_skips_chunked_prefill():
     state = _make_state(have_multimodal_outputs=True)
     state.model.requires_request_sample_eligibility = True
-    batch = _DummyInputBatch([2, 0])
-    batch.req_ids = ["prefill", "decode"]
-    batch.num_scheduled_tokens = [3, 1]
-    batch.query_start_loc_np = [0, 3]
-    # Batch-ordered finishing rule, same arrays as publish_sampled_embeddings:
-    # prefill row: 0 + 3 >= 3 -> eligible; decode row: 5 + 1 >= 8 is false.
-    batch.num_computed_prefill_tokens_np = np.array([0, 5], dtype=np.int32)
-    batch.prefill_len_np = np.array([3, 8], dtype=np.int32)
-    state.intermediate_buffer.buffers[2] = {"req_id": "prefill"}
-    state.intermediate_buffer.buffers[0] = {"req_id": "decode"}
-    seen = {}
-    state.model.make_omni_output = lambda hidden, **kwargs: (
-        seen.update(kwargs) or OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+    # Finishing prefill: 0 + 3 >= 3, still marked prefilling this step.
+    # Mid/chunked prefill (renamed from the old "decode" row): 5 + 1 >= 8 is
+    # false and is_prefilling=True, so both the finishing-only rule and the
+    # shared keep mask leave the row ineligible.
+    batch = _eligibility_batch(
+        [2, 0],
+        ["prefill", "chunked_prefill"],
+        scheduled=[3, 1],
+        computed=[0, 5],
+        prefill_len=[3, 8],
+        is_prefilling=[True, True],
     )
-    state.postprocess_model_output(torch.zeros(4, 2), batch, SimpleNamespace())
+    seen = _capture_eligibility(state, batch, 4)
     assert seen["request_sample_eligible"] == [True, False]
-    assert [info["req_id"] for info in seen["model_intermediate_buffer"]] == ["prefill", "decode"]
+    assert [info["req_id"] for info in seen["model_intermediate_buffer"]] == ["prefill", "chunked_prefill"]
+
+
+def test_postprocess_eligibility_keeps_official_decode_rows():
+    # Official InputBatch decode: is_prefilling=False and computed == prefill_len.
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.requires_request_sample_eligibility = True
+    batch = _eligibility_batch(
+        [0],
+        ["decode"],
+        scheduled=[1],
+        computed=[8],
+        prefill_len=[8],
+        is_prefilling=[False],
+    )
+    seen = _capture_eligibility(state, batch, 1)
+    assert seen["request_sample_eligible"] == [True]
+
+
+def test_postprocess_eligibility_or_prefilling_flag_when_counts_diverge():
+    # Contract test, not a claim that this combination occurs on a well-formed
+    # production InputBatch (officially is_prefilling_np == computed < prefill_len).
+    # is_prefilling=False but 5 + 1 < 8: finishing-only eligibility would drop
+    # the row, while publish_sampled_embeddings would still keep it.
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.requires_request_sample_eligibility = True
+    batch = _eligibility_batch(
+        [0],
+        ["decode_flagged"],
+        scheduled=[1],
+        computed=[5],
+        prefill_len=[8],
+        is_prefilling=[False],
+    )
+    seen = _capture_eligibility(state, batch, 1)
+    assert seen["request_sample_eligible"] == [True]
 
 
 def test_postprocess_mixed_warmup_and_real_request_eligibility():
     state = _make_state(have_multimodal_outputs=True)
     state.model.requires_request_sample_eligibility = True
-    batch = _DummyInputBatch([0, 1])
-    batch.req_ids = ["_warmup_0_", "request-1"]
-    batch.num_scheduled_tokens = [4, 4]
-    batch.query_start_loc_np = [0, 4]
-    batch.num_computed_prefill_tokens_np = np.array([0, 0], dtype=np.int32)
-    batch.prefill_len_np = np.array([4, 4], dtype=np.int32)
-    state.intermediate_buffer.buffers[0] = {"req_id": "_warmup_0_"}
-    state.intermediate_buffer.buffers[1] = {"req_id": "request-1"}
-    seen = {}
-    state.model.make_omni_output = lambda hidden, **kwargs: (
-        seen.update(kwargs) or OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+    batch = _eligibility_batch(
+        [0, 1],
+        ["_warmup_0_", "request-1"],
+        scheduled=[4, 4],
+        computed=[0, 0],
+        prefill_len=[4, 4],
+        is_prefilling=[True, True],
     )
-    state.postprocess_model_output(torch.zeros(8, 2), batch, SimpleNamespace())
+    seen = _capture_eligibility(state, batch, 8)
     assert seen["request_sample_eligible"] == [False, True]
 
 
@@ -314,16 +359,44 @@ def test_structured_postprocess_rejects_multiple_logits_rows_per_request():
     state.model.make_omni_output.assert_not_called()
 
 
-def test_postprocess_eligibility_fails_loudly_when_finishing_arrays_are_missing():
+@pytest.mark.parametrize(
+    "missing",
+    ["num_computed_prefill_tokens_np", "prefill_len_np", "is_prefilling_np"],
+)
+def test_postprocess_eligibility_fails_loudly_when_keep_mask_arrays_are_missing(missing):
+    # Use a real DummyInputBatch, not a MagicMock that would invent attributes.
     state = _make_state(have_multimodal_outputs=True)
     state.model.requires_request_sample_eligibility = True
-    batch = _DummyInputBatch([0])
-    batch.req_ids = ["request-1"]
-    batch.num_scheduled_tokens = [4]
-    batch.query_start_loc_np = [0]
+    batch = _eligibility_batch(
+        [0],
+        ["request-1"],
+        scheduled=[4],
+        computed=[0],
+        prefill_len=[4],
+        is_prefilling=[True],
+    )
+    delattr(batch, missing)
     state.intermediate_buffer.buffers[0] = {"req_id": "request-1"}
     state.model.make_omni_output = lambda hidden, **kwargs: OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
     with pytest.raises(AttributeError):
+        state.postprocess_model_output(torch.zeros(4, 2), batch, SimpleNamespace())
+
+
+def test_postprocess_eligibility_fails_loudly_when_keep_mask_arrays_are_short():
+    state = _make_state(have_multimodal_outputs=True)
+    state.model.requires_request_sample_eligibility = True
+    batch = _eligibility_batch(
+        [0],
+        ["request-1"],
+        scheduled=[4],
+        computed=[0],
+        prefill_len=[4],
+        is_prefilling=[True],
+    )
+    batch.num_computed_prefill_tokens_np = np.array([], dtype=np.int32)
+    state.intermediate_buffer.buffers[0] = {"req_id": "request-1"}
+    state.model.make_omni_output = lambda hidden, **kwargs: OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+    with pytest.raises(ValueError, match="sample keep mask requires batch-ordered arrays"):
         state.postprocess_model_output(torch.zeros(4, 2), batch, SimpleNamespace())
 
 
@@ -1050,6 +1123,19 @@ def test_publish_sampled_embeddings_for_rows_whose_sample_is_kept(monkeypatch) -
     # A non-final prefill chunk's sample is discarded, so it publishes nothing.
     assert [tuple(row.shape) for row in sampled] == [(1, 3), (1, 3), (0,), (1, 3)]
     assert [row.tolist() for row in sampled if row.numel()] == [[[v] * 3] for v in (11.0, 12.0, 14.0)]
+
+    # Contract case, not claimed as a well-formed production InputBatch:
+    # decode-flagged with computed + scheduled < prefill_len is still kept.
+    diverge = SimpleNamespace(
+        num_reqs=1,
+        num_scheduled_tokens=[1],
+        num_computed_prefill_tokens_np=np.array([5], dtype=np.int32),
+        prefill_len_np=np.array([8], dtype=np.int32),
+        is_prefilling_np=np.array([False]),
+    )
+    extra, _done = state.publish_sampled_embeddings(diverge, torch.tensor([[15]]))
+    assert extra["embed"]["sampled"][0].shape == (1, 3)
+    assert extra["embed"]["sampled"][0].tolist() == [[15.0, 15.0, 15.0]]
 
     batch.is_prefilling_np[:] = True
     batch.num_computed_prefill_tokens_np[:] = 0
