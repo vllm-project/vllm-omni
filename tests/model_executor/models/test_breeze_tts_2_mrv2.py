@@ -131,29 +131,6 @@ def test_mrv2_real_row_without_breeze_metadata_fails_closed():
         state.postprocess_model_output(torch.zeros(1, model.hidden_size), _batch([0], [1], [0]), None)
 
 
-def test_mrv2_prefill_runs_breeze_batch_preprocess(mocker):
-    model, graph = _text_talker(mocker)
-    state = _state(model)
-    target_ids = [5, 6, 7]
-    state.intermediate_buffer.buffers[1] = _prefill_info("speech-0", target_ids, seed=11)
-    input_ids = torch.zeros(3, dtype=torch.long)
-    inputs = {"input_ids": input_ids, "inputs_embeds": torch.zeros(3, model.hidden_size)}
-    req_states = _ReqStates(prompt_len=np.array([0, 3]))
-
-    state.run_preprocess(_batch([1], [3], [0]), inputs, req_states)
-
-    graph.run_batch.assert_called_once()
-    expected = torch.tensor(target_ids, dtype=torch.float32)[:, None].expand(-1, model.hidden_size)
-    torch.testing.assert_close(inputs["inputs_embeds"], expected, rtol=0, atol=0)
-    assert inputs["input_ids"] is input_ids
-    buffer = state.intermediate_buffer.buffers[1]
-    assert buffer["breeze_prepared"] == {}
-    breeze_state = buffer["breeze_state"]
-    assert breeze_state["history"].shape == (1, 0)
-    assert breeze_state["current"].shape == (1, model.num_codebooks)
-    assert breeze_state["generator"].initial_seed() == 11
-
-
 @pytest.mark.parametrize("leading_prefill", [False, True])
 @torch.inference_mode()
 def test_mrv2_decode_matches_v1_decode_hook(mocker, leading_prefill):
@@ -187,7 +164,7 @@ def test_mrv2_decode_matches_v1_decode_hook(mocker, leading_prefill):
 
 @torch.inference_mode()
 def test_mrv2_cfg_cycle_keeps_breeze_state_in_runner_buffers(mocker):
-    model, _ = _text_talker(mocker)
+    model, graph = _text_talker(mocker)
     model.config = TalkerConfig(vocab_size=8, eos_token_id=7)
     model.codebook_size = 6
     model._first_code_sampler = BreezeFirstCodeSampler()
@@ -206,18 +183,30 @@ def test_mrv2_cfg_cycle_keeps_breeze_state_in_runner_buffers(mocker):
     buffers[cond] = _prefill_info("cfg", [1, 2, 3], 1, guidance_scale=2.0)
     buffers[plain] = _prefill_info("plain", [4, 5], 2)
     buffers[uncond] = _prefill_info(f"cfg{CFG_UNCOND_SUFFIX}", [6], 1, role="uncond", guidance_scale=2.0)
+    seeds = {cond: 1, plain: 2, uncond: 1}
     req_states = _ReqStates(prompt_len=np.array([2, 1, 3, 0]))
     slots, tokens, computed = [uncond, cond, plain], [1, 3, 2], [0, 0, 0]
 
     for step in range(4):
         num_tokens = sum(tokens)
         batch = _batch(slots, tokens, computed)
-        inputs = {
-            "input_ids": torch.zeros(num_tokens, dtype=torch.long),
-            "inputs_embeds": torch.zeros(num_tokens, model.hidden_size),
-        }
+        input_ids = torch.zeros(num_tokens, dtype=torch.long)
+        inputs = {"input_ids": input_ids, "inputs_embeds": torch.zeros(num_tokens, model.hidden_size)}
         state.run_preprocess(batch, inputs, req_states)
-        if step:
+        assert inputs["input_ids"] is input_ids
+        if step == 0:
+            # Prefill encodes every scheduled prompt in one text-encoder batch.
+            graph.run_batch.assert_called_once()
+            target_rows = torch.tensor([6, 1, 2, 3, 4, 5], dtype=torch.float32)
+            expected = target_rows[:, None].expand(-1, model.hidden_size)
+            torch.testing.assert_close(inputs["inputs_embeds"], expected, rtol=0, atol=0)
+            for slot, seed in seeds.items():
+                assert buffers[slot]["breeze_prepared"] == {}
+                breeze_state = buffers[slot]["breeze_state"]
+                assert breeze_state["history"].shape == (1, 0)
+                assert breeze_state["current"].shape == (1, model.num_codebooks)
+                assert breeze_state["generator"].initial_seed() == seed
+        else:
             # Both CFG branches embed the shared frame.
             rows = {slot: row for row, slot in enumerate(slots)}
             assert torch.equal(inputs["inputs_embeds"][rows[cond]], inputs["inputs_embeds"][rows[uncond]])
@@ -238,3 +227,6 @@ def test_mrv2_cfg_cycle_keeps_breeze_state_in_runner_buffers(mocker):
         last_rows = dict(zip(slots, (np.cumsum(tokens) - 1).tolist(), strict=True))
         torch.testing.assert_close(guided.args[0], hidden[[last_rows[cond], last_rows[uncond]]], rtol=0, atol=0)
         slots, tokens, computed = [plain, uncond, cond] if step % 2 == 0 else [cond, plain, uncond], [1, 1, 1], [9] * 3
+
+    # Decode steps never re-encode the text prompts.
+    graph.run_batch.assert_called_once()
