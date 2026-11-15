@@ -104,3 +104,24 @@ def test_receiver_auto_sender_host_resolves_to_local_address():
 
     assert resolved.extra["sender_host"] not in {"auto", "0.0.0.0", "*", "::"}
     assert resolved.extra["sender_zmq_port"] == 50062
+
+
+def test_receiver_explicit_sender_host_is_preserved():
+    from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        resolve_connector_spec,
+    )
+
+    spec = ConnectorSpec(
+        name="NixlConnector",
+        extra={
+            "host": "auto",
+            "sender_host": "10.1.2.3",
+            "zmq_port": 50061,
+            "from_stage": 1,
+        },
+    )
+    resolved = resolve_connector_spec(spec, stage_id=2, role="receiver")
+
+    assert resolved.extra["sender_host"] == "10.1.2.3"
+    assert resolved.extra["sender_zmq_port"] == 50062
