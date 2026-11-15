@@ -576,15 +576,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
                     f"lengths={len(ref_lengths_list)} batch={cfm_batch_size}"
                 )
 
-            estimator = cfm.estimator
-            max_cfm_group_size = min(cfm_batch_size, self.s2mel_cfm_batch_size)
-            required_cache_batch = max(2, max_cfm_group_size * (2 if self.inference_cfg_rate > 0 else 1))
-            if (
-                estimator.transformer.freqs_cis is None
-                or getattr(estimator.transformer, "max_batch_size", -1) < required_cache_batch
-            ):
-                estimator.setup_caches(max_batch_size=required_cache_batch, max_seq_length=16384)
-                logger.info("[S2Mel] DiT caches initialized (freqs_cis + causal_mask)")
+            self._ensure_dit_caches(cfm.estimator, cfm_batch_size)
             cfm_seeds = self._cfm_request_seeds(
                 request_infos,
                 batch_size=int(cat_condition.shape[0]),
@@ -1344,6 +1336,32 @@ class IndexTTS2S2MelDecoder(nn.Module):
 
         self._warmup_external_models()
         return loaded_params
+
+    def _ensure_dit_caches(self, estimator: Any, cfm_batch_size: int) -> None:
+        max_cfm_group_size = max(1, min(cfm_batch_size, self.s2mel_cfm_batch_size))
+        cfg_factor = 2 if self.inference_cfg_rate > 0 else 1
+        required_cache_batch = max(2, max_cfm_group_size * cfg_factor)
+        # Allocate caches up to the configured max CFM group batch size once
+        # so transitioning from c=1 to concurrent batches never reallocates
+        # the 16384x16384 causal_mask at runtime.
+        target_cache_batch = max(required_cache_batch, self.s2mel_cfm_batch_size * cfg_factor)
+        if (
+            estimator.transformer.freqs_cis is None
+            or getattr(estimator.transformer, "max_batch_size", -1) < required_cache_batch
+        ):
+            if estimator.transformer.freqs_cis is not None and not getattr(
+                estimator.transformer, "use_kv_cache", False
+            ):
+                estimator.transformer.max_batch_size = max(
+                    int(getattr(estimator.transformer, "max_batch_size", 0)),
+                    target_cache_batch,
+                )
+            else:
+                estimator.setup_caches(max_batch_size=target_cache_batch, max_seq_length=16384)
+                logger.info(
+                    "[S2Mel] DiT caches initialized (max_batch_size=%d, freqs_cis + causal_mask)",
+                    target_cache_batch,
+                )
 
     def _configure_dit_runtime(self, device: torch.device) -> None:
         if self._dit_runtime_configured:

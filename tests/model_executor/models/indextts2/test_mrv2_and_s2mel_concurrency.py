@@ -671,3 +671,30 @@ def test_immediate_stop_at_prefill_errors_cleanly_on_zero_mel_codes(use_gpt_late
         flat_payload = {f"meta.{k}": v for k, v in payload["meta"][0].items()}
         with pytest.raises(ValueError, match="zero non-stop mel codes"):
             talker2s2mel_full_payload(None, flat_payload, req)
+
+
+def test_ensure_dit_caches_avoids_runtime_reallocation_across_batch_growth():
+    decoder = object.__new__(IndexTTS2S2MelDecoder)
+    decoder.s2mel_cfm_batch_size = 16
+    decoder.inference_cfg_rate = 0.7
+
+    setup_calls: list[tuple[int, int]] = []
+    transformer = SimpleNamespace(freqs_cis=None, max_batch_size=-1, use_kv_cache=False)
+
+    def setup_caches(max_batch_size: int, max_seq_length: int):
+        setup_calls.append((max_batch_size, max_seq_length))
+        transformer.freqs_cis = torch.ones(1)
+        transformer.max_batch_size = max_batch_size
+
+    estimator = SimpleNamespace(transformer=transformer, setup_caches=setup_caches)
+
+    decoder._ensure_dit_caches(estimator, cfm_batch_size=1)
+    decoder._ensure_dit_caches(estimator, cfm_batch_size=8)
+    assert setup_calls == [(32, 16384)]
+
+    # Even if an earlier step initialized a smaller max_batch_size with use_kv_cache=False,
+    # batch growth must not trigger another 16384x16384 causal_mask allocation.
+    transformer.max_batch_size = 2
+    decoder._ensure_dit_caches(estimator, cfm_batch_size=8)
+    assert setup_calls == [(32, 16384)]
+    assert transformer.max_batch_size == 32
