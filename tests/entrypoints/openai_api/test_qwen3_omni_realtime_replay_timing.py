@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 import websockets
 
-from tests.entrypoints.openai_api.test_qwen3_omni_realtime_websocket import (
+from tests.entrypoints.openai_api.helpers import (
     CLIENT_VAD_REPLAY_PATH,
     _run_client_vad_replay,
 )

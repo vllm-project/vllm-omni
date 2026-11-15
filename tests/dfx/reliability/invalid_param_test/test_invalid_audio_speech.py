@@ -830,7 +830,7 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
         pytest.param(
             "wav_pdf_type",
             {"consent": "consent_ok", "name": "v_bad_mime_{uuid}"},
-            ("mime", "unsupported", "audio/mp4"),
+            ("mime", "unsupported", "application/pdf"),
             id="audio_unsupported_mime",
         ),
         pytest.param(

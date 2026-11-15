@@ -100,7 +100,7 @@ Extension methods add specialized capabilities to diffusion models beyond standa
 
 | Method | Description | Best For |
 |--------|-------------|----------|
-| **[LoRA Inference](diffusion/lora.md)** | Enables inference with Low-Rank Adaptation (LoRA) adapters weights | Reinforcement learning extensions |
+| **[LoRA Inference](diffusion/lora.md)** | Enables inference with LoRA adapter weights, including stacking multiple adapters in one request | Reinforcement learning extensions |
 | **[Frame Interpolation](diffusion/frame_interpolation.md)** | Inserts intermediate video frames after generation for smoother motion | Video generation pipelines that need higher temporal smoothness |
 
 ### Execution Modes
@@ -198,6 +198,7 @@ The following tables show which models support each feature:
 |------------------------------|:---------:|:----------:|:---------------------:|:--------------:|:-----------------:|:-----------------:|:------:|:-------------------------:|:--------------------:|:--------------:|:----------------:|
 | **Wan2.2**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ✅         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ❌        |        ❌         |
 | **ABot-World**               |     ❌     |     ❌      |           ❌           |       ❌        |         ✅         |         ❌         |   ❌    |             ❓             |          ❌           |       ❌        |   ✅ (one request) |
+| **Praxis-1**                 |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Wan2.2-S2V**               |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ❌        |        ❌         |
 | **Wan2.1-VACE**              |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LTX-2**                    |     ❌     |     ✅      | ✅ (Ulysses only) |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
@@ -208,6 +209,7 @@ The following tables show which models support each feature:
 | **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **Kandinsky 6 TI2VA**        | ✅* (uncalibrated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ (decode) | ✅ (FP8) | ✅ (1 request) |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |     ✅     |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
+| **LingBot-Video**            |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **MiniMax-H3** ([FastH3 single-card guide](https://github.com/vllm-project/vllm-omni/blob/main/recipes/FastVideo/FastH3%20RefOmni%20Single%20Card.md)) | ✅ (FL2VA) | ✅ | ✅ | ❌ | ✅ (DiT/TE) | ❌ | ✅ | ✅ | ✅ (tile) | ✅ (DiT) | ❌ |
 | **PAN 2 T2V I2V**            |     ❌     |     ✅      | ✅ (Ulysses only)<sup>6</sup> |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❓        |        ❌         |
@@ -280,7 +282,7 @@ The following tables show which models support each feature:
        Multi-device Distributed Layerwise Offload has a separate topology and
        compatibility matrix in the [Distributed Layerwise Offloading guide](diffusion/offloader/distributed_layerwise_offload.md).
     5. The compatibility matrix uses FP8 as the representative quantization method.
-    6. Step Execution is not compatible with any diffusion cache backend. LoRA is supported, but each scheduled batch must use a single adapter (requests with different `lora_request` or `lora_scale` are kept in separate batches).
+    6. Step Execution is not compatible with any diffusion cache backend. LoRA is supported, but each scheduled batch activates a single (possibly composed) adapter: a request may stack multiple LoRAs into one composed adapter, while requests with different `lora_request` combinations or `lora_scale` values are kept in separate batches.
 
 ## Multi-Thread Weight Loading
 

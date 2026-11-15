@@ -9,6 +9,7 @@ A tiny ``WanTransformer3DModel`` runs its real ``forward``: every block gets the
 """
 
 import socket
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -121,7 +122,7 @@ class _CountingInductor:
 
 
 class _Pipeline(DenoiseProgressMixin):
-    pass
+    scheduler = SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000))
 
 
 def _service(schedule_config: AttentionScheduleConfig | None) -> tuple[Any, Any, _CountingInductor]:
