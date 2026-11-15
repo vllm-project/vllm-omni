@@ -407,6 +407,7 @@ def test_voice_request_before_and_after_clone_registration(omni_server, online_c
         "model": omni_server.model,
         "input": get_prompt("text"),
         "voice": _DEFAULT_VOICE_NAME,
+        "seed": _OMNIVOICE_REF_AUDIO_SEED,
         "transcript_escalation_model": "large-v3",
     }
 
@@ -448,6 +449,7 @@ def test_registered_default_voice_overrides_placeholder(omni_server, online_clie
         "model": omni_server.model,
         "input": get_prompt("text"),
         "voice": _DEFAULT_VOICE_NAME,
+        "seed": _OMNIVOICE_REF_AUDIO_SEED,
         "transcript_escalation_model": "large-v3",
     }
 
