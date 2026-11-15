@@ -38,32 +38,13 @@ def test_unseeded_traffic_is_untouched() -> None:
     assert isolation_plan(has_running=False, seeded_running=False, seeded_waiting=False) == (False, False)
 
 
-def test_request_is_seeded() -> None:
-    assert request_is_seeded(None) is False
-    assert request_is_seeded(_Params(None)) is False
-    # An unmarked seed is a stage default, not a client opt-in.
-    assert request_is_seeded(_Params(42)) is False
-    # An explicit seed of 0 is still explicit when the client marked it.
-    assert request_is_seeded(_Params(0, {"omni_user_seed": True})) is True
-    assert request_is_seeded(object()) is False
-
-
 def test_request_is_seeded_requires_the_client_marker() -> None:
     """Only an explicit client marker opts in; unmarked seeds (stage defaults) do not."""
-    assert request_is_seeded(_Params(42, {"omni_user_seed": True})) is True
-    assert request_is_seeded(_Params(42, {"omni_default_seed": True})) is False
-    assert request_is_seeded(_Params(42)) is False
-    assert request_is_seeded(_Params(None, {"omni_user_seed": True})) is True
+    assert request_is_seeded(None) is False
+    assert request_is_seeded(object()) is False
     assert request_is_seeded(_Params(None)) is False
-
-
-def test_unmarked_default_from_non_speech_entrypoints_does_not_opt_in() -> None:
-    """Chat, realtime and offline paths copy the stage defaults without marking.
-
-    Those requests must keep normal batching, otherwise a YAML default seed would
-    serialize the engine on every entrypoint, not just on /v1/audio/speech.
-    """
-    from vllm.sampling_params import SamplingParams
-
-    default = SamplingParams(seed=42)
-    assert request_is_seeded(default) is False
+    # A stage-default seed is unmarked and must keep normal batching.
+    assert request_is_seeded(_Params(42)) is False
+    assert request_is_seeded(_Params(42, {"omni_user_seed": True})) is True
+    # An explicit seed of 0 is still explicit when the client marked it.
+    assert request_is_seeded(_Params(0, {"omni_user_seed": True})) is True

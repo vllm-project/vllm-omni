@@ -97,27 +97,6 @@ SPEECH_AUDIO_TRUNCATED_HEADER = "X-Audio-Truncated"
 _USAGE_TOKENIZER_UNAVAILABLE = object()
 
 
-def _mark_seed_origin(sampling_params_list: list[Any], *, request_seed: int | None) -> None:
-    """Mark the stage seeds that came from the client instead of the stage defaults.
-
-    Seeded-request isolation only opts in on ``omni_user_seed``; a seed copied
-    from ``default_sampling_params`` stays unmarked and keeps normal batching.
-    The per-request list can share ``SamplingParams`` objects with the
-    process-wide defaults, so mark a clone and write it back rather than mutating
-    the shared instance.
-    """
-    if request_seed is None:
-        return
-    for index, params in enumerate(sampling_params_list):
-        if not isinstance(params, SamplingParams) or params.seed != request_seed:
-            continue
-        marked = params.clone()
-        extra_args = dict(marked.extra_args or {})
-        extra_args["omni_user_seed"] = True
-        marked.extra_args = extra_args
-        sampling_params_list[index] = marked
-
-
 def _stage_speech_metadata(stage: Any) -> tuple[str | None, str | None, str | None]:
     """Return speech routing metadata from typed or legacy stage configs."""
     topology = getattr(stage, "stage_pipeline_config", None)
@@ -2474,8 +2453,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if stage0_params.extra_args is None:
                 stage0_params.extra_args = {}
             stage0_params.extra_args["tts_local_seed"] = request.seed
-
-        _mark_seed_origin(sampling_params_list, request_seed=request.seed)
+            # Only this stage received the client seed, so it is the only one
+            # that opts into seeded-request isolation; stage defaults stay
+            # unmarked and keep normal batching.
+            stage0_params.extra_args["omni_user_seed"] = True
 
         # When word_timestamps is requested, also ask for the aligner stage's
         # output so the orchestrator drives the request through the forced-aligner
