@@ -80,13 +80,14 @@ def test_v2_terminal_span_on_the_stop_step_is_not_reported() -> None:
     assert not _flagged(warnings)
 
 
-def test_v1_terminal_span_of_a_finished_request_is_not_reported() -> None:
-    request = _V1Request(finished=True)
+def test_v1_terminal_span_while_generation_continues_is_still_reported() -> None:
+    # V1 requests do not carry the sampled_token_ids field used by V2 snapshots.
+    request = _V1Request(finished=False)
 
     payload, warnings = _forward(request)
 
     assert payload.meta.last_chunk is True
-    assert not _flagged(warnings)
+    assert _flagged(warnings)
 
 
 def test_terminal_span_while_generation_continues_is_still_reported() -> None:
