@@ -22,6 +22,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 def measurements(tmp_path, monkeypatch):
     profile = runner.ROOT / "tests/e2e/accuracy/lingbot_world/configs/cuda.json"
     root = tmp_path / "raw"
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(tmp_path / "accuracy-results"))
     settings = runner.load_settings(profile, tmp_path / "judgments", generation=root)
     monkeypatch.setattr(runner, "git_revision", lambda _: "c" * 40)
     arm = root / "candidate"
@@ -87,7 +88,7 @@ def test_three_scorers_use_shared_frontend_and_keep_independent_verdicts(measure
     assert reports["vbench"]["comparison_status"] == reports["wbench"]["comparison_status"] == "score_floor"
     assert reports["precision"]["measurements"]["replay"]["tensors"]["output/decoded"]["mean"] == 1.0
     assert "no stored reference tensors" in capsys.readouterr().out
-    files = list((settings["output"] / "results").glob("result_acc_*.json"))
+    files = list((tmp_path / "accuracy-results").glob("result_acc_*.json"))
     assert len(files) == 3
     records = [read_json(path) for path in files]
     assert not any("record_only" in str(row) or "pending_baseline" in str(row) for row in records)
@@ -98,6 +99,20 @@ def test_three_scorers_use_shared_frontend_and_keep_independent_verdicts(measure
     assert semantic["boardwalk-42_dynamic_degree"] == 1.0
     assert numerical["measurement_report"]["measurements"]["replay"]["tensors"]["output/decoded"]["shape"] == [2]
     assert all("passed" not in row and "status" not in row and "measurements" not in row for row in records)
+
+
+def test_accuracy_uses_shared_default_result_sink_without_environment_override(measurements, monkeypatch, tmp_path):
+    from tests.e2e.accuracy import helpers
+
+    settings, data = measurements
+    monkeypatch.delenv("ACC_BENCH_RESULT_DIR")
+    default_results = tmp_path / "shared-default-results"
+    monkeypatch.setattr(helpers, "_default_diffusion_accuracy_result_dir", lambda: default_results)
+    monkeypatch.setattr(helpers, "_accuracy_hardware_label", lambda: "H100")
+    report = checks.run_accuracy(settings, data, "precision")
+    record = read_json(next(default_results.glob("result_acc_*.json")))
+    assert report["passed"] and record["measurement_report"] == report
+    assert not list((settings["output"] / "results").glob("result_acc_*.json"))
 
 
 def test_cuda_score_floors_gate_semantic_suites_only(measurements, monkeypatch, tmp_path, capsys):
@@ -117,9 +132,7 @@ def test_cuda_score_floors_gate_semantic_suites_only(measurements, monkeypatch, 
     assert checks.run_accuracy(settings, data, "vbench")["passed"]
     precision = checks.run_accuracy(settings, data, "precision")
     assert precision["passed"] and precision["comparison_status"] == "finite_only"
-    records = {
-        row["dataset"]: row for row in map(read_json, (settings["output"] / "results").glob("result_acc_*.json"))
-    }
+    records = {row["dataset"]: row for row in map(read_json, (tmp_path / "accuracy-results").glob("result_acc_*.json"))}
     assert records["lingbot_world_vbench"]["baseline"] == {"H100": floors}
     assert records["lingbot_world_vbench"]["comparison_status"] == "score_floor"
     assert records["lingbot_world_precision"]["baseline"] == {}
@@ -165,7 +178,7 @@ def test_npu_results_preserve_generation_identity_separate_from_h100_evaluator(m
     write_json(root / "generation.json", manifest)
     stub_semantic_boundary(monkeypatch, tmp_path)
     checks.run_accuracy(settings, (root, manifest), "vbench")
-    result = read_json(next((settings["output"] / "results").glob("result_acc_*.json")))
+    result = read_json(next((tmp_path / "accuracy-results").glob("result_acc_*.json")))
     assert result["Hardware"] == "A2" and result["generation_platform"] == "npu"
     assert result["generation_hardware"]["devices"] == ["Ascend 910B"] * 4
     assert result["evaluator_hardware"] == "H100"

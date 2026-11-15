@@ -108,7 +108,6 @@ def run_accuracy(settings, data, suite):
         dataset=f"lingbot_world_{suite}",
         metrics=metrics,
         baseline={settings["hardware"]: floors} if floors else {},
-        result_dir=settings["output"] / "results",
         extra={
             "Hardware": settings["hardware"],
             "generation_platform": settings["platform"],

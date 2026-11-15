@@ -1577,7 +1577,54 @@ def test_lingbot_nightly_uses_independent_perf_and_accuracy_frameworks(monkeypat
             {"step": "lingbot-npu-nightly-accuracy-data", "allow_failure": True},
             "lingbot-npu-accuracy-ci-image",
         ]
-        assert "--lingbot-generation=lingbot-artifacts/npu-accuracy" in " ".join(accuracy["commands"])
+        assert "--lingbot-generation=tests/e2e/accuracy/results/lingbot_world/npu-capture" in " ".join(
+            accuracy["commands"]
+        )
+
+
+@pytest.mark.parametrize("platform", ["cuda", "npu"])
+def test_lingbot_accuracy_uploads_preserve_original_inputs_and_diagnostics_without_staged_video_copies(
+    tmp_path, platform
+):
+    path = Path(f".buildkite/{platform}/{'test-npu-nightly.yml' if platform == 'npu' else 'test-nightly.yml'}")
+    jobs = {step.get("key"): step for step in _iter_steps(yaml.safe_load(path.read_text()))}
+    accuracy = jobs[f"lingbot-{platform}-nightly-accuracy"]
+    results = Path("tests/e2e/accuracy/results")
+    output = results / "lingbot_world" / platform
+    expected = {
+        results / "result_acc_lingbot_world_precision.json",
+        output / "precision.json",
+        output / "results/bench-precision.json",
+        output / "vbench/vbench/native/inputs.json",
+        output / "vbench/vbench/native/evaluator.log",
+        output / "vbench/vbench/native/raw_0/result_eval_results.json",
+    }
+    capture = output if platform == "cuda" else results / "lingbot_world/npu-capture"
+    captured = {
+        capture / "generation.json",
+        capture / "candidate/precision.npz",
+        capture / "candidate/case/rollout.mp4",
+    }
+    for artifact in expected | captured:
+        destination = tmp_path / artifact
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"preserved diagnostic or original input")
+    staged = output / "vbench/vbench/native/video_0/rollout-0.mp4"
+    (tmp_path / staged).parent.mkdir(parents=True)
+    (tmp_path / staged).symlink_to(tmp_path / capture / "candidate/case/rollout.mp4")
+
+    def uploaded(job):
+        return {file.relative_to(tmp_path) for pattern in job["artifact_paths"] for file in tmp_path.glob(pattern)}
+
+    artifacts = uploaded(accuracy)
+    assert expected <= artifacts
+    assert staged not in artifacts
+    assert all(str(artifact).startswith("tests/e2e/accuracy/") for artifact in artifacts)
+    if platform == "cuda":
+        assert captured <= artifacts
+    else:
+        assert captured.isdisjoint(artifacts)
+        assert captured <= uploaded(jobs["lingbot-npu-nightly-accuracy-data"])
 
 
 @pytest.mark.parametrize("platform,download_exit", [("cuda", 0), ("npu", 0), ("npu", 1)])
@@ -1625,12 +1672,12 @@ def test_lingbot_recording_commands_preserve_independent_checks_and_failure_stat
         assert calls[0]["args"] == [
             "artifact",
             "download",
-            "lingbot-artifacts/npu-accuracy/**",
+            "tests/e2e/accuracy/results/lingbot_world/npu-capture/**",
             ".",
             "--step",
             "lingbot-npu-nightly-accuracy-data",
         ]
-        assert "--lingbot-generation=lingbot-artifacts/npu-accuracy" in pytest_args
+        assert "--lingbot-generation=tests/e2e/accuracy/results/lingbot_world/npu-capture" in pytest_args
         if download_exit:
             assert "each test will validate its required inputs" in result.stdout
     else:

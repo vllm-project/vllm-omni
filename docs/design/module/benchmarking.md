@@ -103,8 +103,11 @@ After generation releases its server, the packaged `vllm bench serve --omni`
 evaluation path measures numerical and native WBench/VBench results.
 Each test validates its own complete input population, prints measured values
 and writes its own accuracy JSON before asserting. It does not read another
-test's verdict. Raw tensors, complete videos and per-dimension/binary scores
-remain CI artifacts. On CUDA and NPU, WBench and VBench scores are checked
+test's verdict. Standard `result_acc_*.json` records use the shared
+`tests/e2e/accuracy/results` sink (or `ACC_BENCH_RESULT_DIR`); capture and
+evaluator diagnostics stay beneath its `lingbot_world` subdirectory. Raw
+tensors, original complete videos and per-dimension/binary scores remain CI
+artifacts; VBench staging symlinks do not produce duplicate video uploads. On CUDA and NPU, WBench and VBench scores are checked
 against per-platform floors derived from recorded CI runs. Numerical precision
 has no stored reference tensors: it checks a complete, finite replay and does
 not compute tensor error, PSNR or SSIM. Generation and evaluator errors always

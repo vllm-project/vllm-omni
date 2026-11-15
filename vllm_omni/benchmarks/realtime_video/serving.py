@@ -281,6 +281,8 @@ def finalize_realtime_video(
         if output.success and output.session_result is not None:
             result = output.session_result
             try:
+                # Validate even short sessions before native metric conversion;
+                # these may have no steady population to validate below.
                 if any(
                     record.byte_length <= 0 or record.num_frames != pixel_frames_in_chunk(record.index)
                     for record in result.records
@@ -378,6 +380,8 @@ def finalize_realtime_video(
         try:
             steady_per_session = max(0, workload.num_chunks - max(1, options.warmup_chunks) - 1)
             if steady_per_session:
+                # Keep the complete measured-population validator; shared
+                # aggregation below owns the reported summary values.
                 performance_metrics(
                     document, num_chunks=workload.num_chunks, min_steady=len(requests) * steady_per_session
                 )

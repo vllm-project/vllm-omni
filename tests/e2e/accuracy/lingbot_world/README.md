@@ -60,7 +60,7 @@ python -m pytest -sv --run-level full_model \
   tests/e2e/accuracy/lingbot_world/test_wbench.py \
   tests/e2e/accuracy/lingbot_world/test_vbench.py \
   --lingbot-profile=tests/e2e/accuracy/lingbot_world/configs/cuda.json \
-  --lingbot-output=lingbot-artifacts/cuda-accuracy
+  --lingbot-output=tests/e2e/accuracy/results/lingbot_world/cuda
 ```
 
 NPU capture requires four A2 devices. Transfer the whole capture directory to
@@ -70,36 +70,43 @@ model runtime on that worker:
 ```bash
 python -m tests.e2e.accuracy.lingbot_world.prepare capture \
   --profile tests/e2e/accuracy/lingbot_world/configs/npu.json \
-  --output lingbot-artifacts/npu-accuracy
+  --output tests/e2e/accuracy/results/lingbot_world/npu-capture
 python -m pytest -sv --run-level full_model \
   tests/e2e/accuracy/lingbot_world/test_precision.py \
   tests/e2e/accuracy/lingbot_world/test_wbench.py \
   tests/e2e/accuracy/lingbot_world/test_vbench.py \
   --lingbot-profile=tests/e2e/accuracy/lingbot_world/configs/npu.json \
-  --lingbot-generation=lingbot-artifacts/npu-accuracy \
-  --lingbot-output=lingbot-artifacts/npu-accuracy-results
+  --lingbot-generation=tests/e2e/accuracy/results/lingbot_world/npu-capture \
+  --lingbot-output=tests/e2e/accuracy/results/lingbot_world/npu
 ```
 
-CI prints measurements with `pytest -sv` and uploads these result files:
+CI prints measurements with `pytest -sv`. Standard accuracy records use the
+shared `write_accuracy_result` destination, `tests/e2e/accuracy/results`,
+respecting `ACC_BENCH_RESULT_DIR` when set. CI uploads these result files:
 
 | Result | Path |
 | --- | --- |
 | Performance JSON | `tests/dfx/perf/results/result_test_lingbot_world_realtime_{cuda,npu}_*.json` |
-| Three standard accuracy results | `<output>/results/result_acc_lingbot-world-v2-14b-causal-fast-diffusers_lingbot_world_{precision,wbench,vbench}_*.json` |
+| Three standard accuracy results | `tests/e2e/accuracy/results/result_acc_lingbot-world-v2-14b-causal-fast-diffusers_lingbot_world_{precision,wbench,vbench}_*.json` |
 | Shared benchmark scoring results | `<output>/results/bench-{precision,wbench,vbench}.json` |
 | Per-suite reports | `<output>/{precision,wbench,vbench}.json` |
 | Raw scoring details | `<output>/precision/precision.json`, `<output>/wbench/` and `<output>/vbench/` |
 
-`<output>` is `lingbot-artifacts/cuda-accuracy` on CUDA and
-`lingbot-artifacts/npu-accuracy-results` on the NPU evaluation worker. Raw
+`<output>` is `tests/e2e/accuracy/results/lingbot_world/cuda` on CUDA and
+`tests/e2e/accuracy/results/lingbot_world/npu` on the NPU evaluation worker. Raw
 semantic directories include evaluator logs, input manifests, worker results
 and native per-video scores. Capture artifacts include `generation.json`,
 `candidate/precision.npz` and each `candidate/<case>/` directory's
 `rollout.mp4`, `benchmark.json` and `serve-result.json`, with model, source,
 workload and allocation provenance. On CUDA, capture and scoring share the
 output directory. NPU capture is uploaded separately under
-`lingbot-artifacts/npu-accuracy` and downloaded by the evaluation step; both
-NPU directories are uploaded recursively.
+`tests/e2e/accuracy/results/lingbot_world/npu-capture` and downloaded by the
+evaluation step. NPU capture files are uploaded recursively. Evaluation uploads include JSON
+reports and logs, with CUDA also retaining the numerical NPZ and original
+`candidate/<case>/rollout.mp4` videos. VBench stages symlinks to those videos
+under `video_*/rollout-0.mp4`; these staging copies are not uploaded again. The
+original videos, evaluator input manifests, logs and native score details
+remain available for baseline work and debugging.
 
 Existing uploads were checked in CUDA [build 19659](https://buildkite.com/vllm/vllm-omni/builds/19659)
 and NPU [build 11510](https://buildkite.com/vllm/vllm-omni-npu-ci/builds/11510),
@@ -107,6 +114,27 @@ both at `b0e2faeb7fa37f90b14764fc8817d93f1f887540`. They contain nonempty
 performance JSON, all three accuracy results, numerical NPZ and video/scoring
 artifacts. This confirms uploads for that historical revision; it does not
 validate later revisions on native hardware.
+
+The historical CUDA accuracy job uploaded 46 files for the three test suites:
+
+| Files | Count | Purpose |
+| --- | --- | --- |
+| Capture and provenance | 14 | NPZ, three original videos, per-case serving/benchmark JSON, generation/model/allocation/cleanup records |
+| Standard accuracy records | 3 | Shared result format, measured metrics, score floors and final verdicts |
+| Serving benchmark results | 3 | `vllm bench` result envelope and unmodified measurements |
+| Suite verdict reports | 3 | Per-suite measurements with the applied accuracy verdict |
+| Native measurements and diagnostics | 20 | Numerical measurement report, semantic reports/raw scores, evaluator inputs/logs/worker output and native per-video details |
+| VBench staging video copies | 3 | Symlinks to original capture videos, now excluded from uploads |
+
+The retained JSON formats serve existing CLI, accuracy and evaluator consumers;
+they are kept together with the original tensors/videos and provenance. For
+that same successful three-case workload the new upload selection would keep
+43 files. This is an audit of the historical manifest, not a fixed artifact
+count: partial captures, evaluator failures or additional native diagnostics
+can change the count. Historical NPU outputs split the same 46-file inventory
+into 14 capture files and 32 evaluator/result files; the updated evaluator
+upload similarly excludes its three staged video copies, and standard records
+move to the shared accuracy results directory.
 
 Normal measurement or score-floor failures retain their reports before the
 pytest assertion, and partial capture retains available inputs and its

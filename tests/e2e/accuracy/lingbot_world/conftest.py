@@ -11,7 +11,7 @@ import pytest
 def pytest_addoption(parser):
     group = parser.getgroup("lingbot-world")
     group.addoption("--lingbot-profile", type=Path, help="Accuracy workload JSON")
-    group.addoption("--lingbot-output", type=Path, default=Path("lingbot-artifacts/accuracy"))
+    group.addoption("--lingbot-output", type=Path, default=Path("tests/e2e/accuracy/results/lingbot_world"))
     group.addoption("--lingbot-generation", type=Path, help="Previously captured accuracy data, e.g. NPU outputs")
 
 
