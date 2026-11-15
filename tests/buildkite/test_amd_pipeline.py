@@ -2578,6 +2578,9 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         assert "vllm_omni/outputs/" in dependency_paths
         if dependency == "tts_audex_weekly":
             assert "tests/assets/" not in dependency_paths
+        if dependency == "tts_breeze_tts2_weekly":
+            # The ROCm Breeze step runs V1; MRv2 paths live in a CUDA-only key.
+            assert not any(path.startswith("vllm_omni/worker_v2/") for path in dependency_paths)
 
         for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
             assert label not in pipeline_path.read_text(encoding="utf-8")

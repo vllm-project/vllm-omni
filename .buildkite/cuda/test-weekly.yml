@@ -269,6 +269,7 @@ steps:
       - label: "TTS · Breeze TTS 2 · L4"
         source_file_dependencies:
           - tts_breeze_tts2_weekly
+          - tts_breeze_tts2_mrv2_weekly
         timeout_in_minutes: 90
         env:
           VLLM_OMNI_CI_MODEL_RUNNER: "v2"
