@@ -100,30 +100,20 @@ unchanged.
 
 ### Connector support at startup
 
-For a diffusion stage declaring `stage_input_payload_keys`, regular startup
-checks the resolved connection graph before building worker startup plans.
-Headless startup uses the same check before launching its local replicas. Every
-configured incoming edge must declare deadline-aware receive support. Errors
-identify the stage, edge (for example, `0→1`), and connector.
+For diffusion stages with `stage_input_payload_keys`, regular and headless
+startup validate every incoming edge before worker launch. Errors name the
+stage, edge (for example, `0→1`), and connector. The runtime uses one connector
+per stage, preferring outgoing edges, so incoming types must match the resolved
+type: `E --NIXL--> G --SHM--> D` and mixed Mooncake/SHM edges are rejected.
 
-On edges attached to a payload-receiving stage, `ConnectorSpec.name` selects the
-backend. `extra.type` may be omitted or repeat that name, but conflicting values
-are rejected before edge resolution. This prevents extras from silently changing
-the backend checked by preflight, and applies to both deploy YAMLs and
-programmatically supplied connector specs.
+On edges attached to a payload receiver, `ConnectorSpec.name` selects the
+backend; `extra.type` may be omitted or repeat it, but cannot override it.
+This applies to deploy YAMLs and programmatic specs before edge resolution.
+Validation does not establish parameter compatibility or peer connectivity.
 
-A middle stage currently resolves one connector, preferring its outgoing edge.
-The preflight therefore also rejects incoming connector types that differ from
-the resolved connector type, even when both types support deadline receive.
-For example, `E --NIXL--> G --SHM--> D` is rejected, as is either mixed
-Mooncake/SHM direction. This does not add mixed-backend or multi-input routing,
-validate all backend parameters, or prove that peers can communicate.
-
-`OmniDiffusionConfig` also validates an explicitly configured connector for
-direct configuration callers. A missing or empty `type` is an error, not an
-implicit SHM selection; unknown names are reported separately from unsupported
-capabilities. An unsupported configured pairing is rejected even if a particular
-request could otherwise supply sufficient inline data.
+Direct `OmniDiffusionConfig` callers also reject unsupported connectors and
+missing or empty `type` values; unknown names receive a separate error.
+An unsupported pairing is rejected even when a request supplies inline data.
 
 | Connector | Synchronous diffusion payload receive | Backend responsibility |
 | --- | --- | --- |
@@ -135,13 +125,10 @@ request could otherwise supply sufficient inline data.
 | `YuanrongConnector` / `YuanrongTransferEngineConnector` | Not supported | Same deadline contract and registration requirement. |
 | Other/custom connectors | Opt-in required | Implement `get_with_deadline` and register with `supports_deadline_receive=True`; implement `abandon_get` when discovery creates ownership. Do not inherit an unbounded blocking call. |
 
-Custom connectors that implement `get_with_deadline()` must register with
-`OmniConnectorFactory.register_connector(..., supports_deadline_receive=True)`.
-Capability inspection does not construct a connector or load its native backend.
-Stages without payload input keys, including existing asynchronous AR `get()`
-users, are unaffected. Inline payload configurations without a connector are
-also unaffected. This support matrix concerns stage payloads, not native KV
-transfer or all uses of the listed connectors.
+Capability inspection uses registration metadata without loading or constructing
+backends. Stages without payload input keys and inline configurations without a
+connector are unaffected. This matrix covers stage payloads, not native KV
+transfer; it does not add mixed-backend or multi-input routing.
 
 The deadline covers retry sleeps, metadata socket waits, and NIXL completion
 polling. It is **not a hard real-time bound** on Python execution, allocation,
