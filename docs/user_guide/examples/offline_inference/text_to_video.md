@@ -82,19 +82,14 @@ python text_to_video.py \
   --output lingbot_t2v.mp4
 ```
 
-Use the same command with `robbyant/lingbot-video-moe-30b-a3b` for the MoE
-checkpoint. Requested frame counts are rounded upward to the causal
-VAE's `4n+1` grid. For a local checkpoint path whose name does not contain
-`lingbot`, pass `--model-class-name LingBotVideoPipeline`.
-
-LingBot-only options such as `batch_cfg` and `output_type` use the shared
-model-extra channel, for example:
-
-```bash
-python text_to_video.py \
-  --model robbyant/lingbot-video-dense-1.3b \
-  --extra-body '{"batch_cfg": true, "output_type": "np"}'
-```
+Use `robbyant/lingbot-video-moe-30b-a3b` for the MoE checkpoint. For local
+paths without `lingbot` in the directory name, add
+`--model-class-name LingBotVideoPipeline`. Model-only options use
+`--extra-body`, for example `'{"batch_cfg": true, "output_type": "np"}'`.
+On a 32 GiB card, run the MoE checkpoint with `--enable-layerwise-offload
+--vae-use-tiling --vae-use-slicing`; see the
+[LingBot-Video recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Robbyant/LingBot-Video.md)
+for measured memory.
 
 ### LTX-2
 
