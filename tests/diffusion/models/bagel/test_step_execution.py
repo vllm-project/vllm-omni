@@ -14,6 +14,7 @@ from PIL import Image
 from safetensors.torch import save_file
 from torch import nn
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.bagel.bagel_transformer import Bagel, NaiveCache
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import (
     BagelGenParams,
@@ -167,7 +168,7 @@ def test_bagel_step_preprocessor_buckets_effective_img2img_sizes(tmp_path):
     assert (second.sampling_params.height, second.sampling_params.width) == (512, 1024)
 
     scheduler = StepScheduler()
-    scheduler.initialize(types.SimpleNamespace(max_num_seqs=2, diffusion_attention_schedule=None))
+    scheduler.initialize(OmniDiffusionConfig(max_num_seqs=2, diffusion_attention_schedule=None))
     scheduler.add_request(first)
     scheduler.add_request(second)
 

@@ -77,7 +77,15 @@ def consumer_load(weight_sharing, contracts, monkeypatch):
         },
     )
     loader = loader_cls()
-    loader.od_config = SimpleNamespace(weight_sharing=group, dtype="float32", diffusion_attention_schedule=None)
+    loader.od_config = SimpleNamespace(
+        lora_application="runtime",
+        enable_prompt_embed_cache=False,
+        prompt_embed_cache_size=32,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        weight_sharing=group,
+        dtype="float32",
+        diffusion_attention_schedule=None,
+    )
     loader.quant_config = None
     loader.parallel_config = SimpleNamespace(use_hsdp=False)
     loader._init_from_load_format = Mock(return_value=model)

@@ -36,6 +36,7 @@ from vllm.outputs import CompletionOutput
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.config.stage_config import StagePipelineConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
@@ -1449,7 +1450,7 @@ class TestSpeechAPI:
             assert response.status_code == 200
 
         scheduler = RequestScheduler()
-        scheduler.initialize(SimpleNamespace(max_num_seqs=2, diffusion_attention_schedule=None))
+        scheduler.initialize(OmniDiffusionConfig(max_num_seqs=2, diffusion_attention_schedule=None))
         for index, sampling_params in enumerate(passed_sampling_params):
             scheduler.add_request(
                 OmniDiffusionRequest(

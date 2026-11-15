@@ -39,6 +39,19 @@ _ItemT = TypeVar("_ItemT")
 _ResultT = TypeVar("_ResultT")
 
 
+def _pipeline_config(**overrides):
+    """Config defaults read by partially constructed H3 pipelines in this module."""
+    fields = dict(
+        additional_config={},
+        step_execution=False,
+        cache_backend="none",
+        controlnet_model_path=None,
+        diffusion_offload_config=None,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
 def _append_and_return(items: list[_ItemT], item: _ItemT, result: _ResultT) -> _ResultT:
     items.append(item)
     return result
@@ -411,7 +424,7 @@ def test_preencode_request_preserves_serving_codec_defaults(codec_extra, expecte
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace(diffusion_attention_schedule=None)
+    pipeline.od_config = _pipeline_config(diffusion_attention_schedule=None)
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
     pipeline.text_encoder = object()
@@ -465,7 +478,7 @@ def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace(diffusion_attention_schedule=None)
+    pipeline.od_config = _pipeline_config(diffusion_attention_schedule=None)
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
     cache_spec = object()
@@ -1093,7 +1106,7 @@ def test_decoder_stage_preserves_preencoded_frame_counts(monkeypatch, num_output
     decoder = object.__new__(MiniMaxH3DecoderPipeline)
     nn.Module.__init__(decoder)
     decoder.device = torch.device("cpu")
-    decoder.od_config = SimpleNamespace()
+    decoder.od_config = _pipeline_config()
     payload = {
         "video_latents": [torch.tensor([index]) for index in range(num_outputs)],
         "audio_latents": [torch.zeros(1) for _ in range(num_outputs)],
@@ -1260,7 +1273,7 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace(diffusion_attention_schedule=None)
+    pipeline.od_config = _pipeline_config(diffusion_attention_schedule=None)
     pipeline._base_schedule_by_partition = schedules
     pipeline.load_text_encoder = False
     pipeline.load_vae_encoder = False
@@ -2346,7 +2359,7 @@ def test_no_offload_keeps_text_encoder_resident():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = _pipeline_config(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
     )
@@ -2367,7 +2380,7 @@ def test_model_offload_uses_hooked_text_encoder_call():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = _pipeline_config(
         enable_cpu_offload=True,
         enable_layerwise_offload=False,
     )
@@ -2393,7 +2406,7 @@ def test_legacy_layer_offload_preserves_minimax_stage_lifecycle(enable_layerwise
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = _pipeline_config(
         diffusion_offload_config=None,
         enable_cpu_offload=False,
         enable_layerwise_offload=enable_layerwise,
@@ -2421,7 +2434,7 @@ def test_layerwise_encoder_selection_releases_text_encoder():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = _pipeline_config(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,
@@ -2446,7 +2459,7 @@ def test_layerwise_dit_only_keeps_text_encoder_resident():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = _pipeline_config(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,
@@ -2468,7 +2481,7 @@ def test_dit_encoder_selection_keeps_vae_resident():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = _pipeline_config(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,
@@ -4175,7 +4188,7 @@ def _peer_rank_preencode_pipeline(monkeypatch):
     pipeline.audio_vae = FakeAudioVAE()
     pipeline.video_vae = PeerRankVideoVAE()
     pipeline.device = torch.device("cpu")
-    pipeline.od_config = SimpleNamespace()
+    pipeline.od_config = _pipeline_config()
     monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_uses_manual_component_offload", lambda self, component: False)
     return pipeline
 

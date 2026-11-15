@@ -102,7 +102,17 @@ def _cached_ids(sched_output) -> list[str]:
 
 def _scheduler_config(**fields) -> SimpleNamespace:
     """A stand-in for OmniDiffusionConfig carrying the fields the scheduler reads directly."""
-    return SimpleNamespace(diffusion_attention_schedule=None, **fields)
+    defaults = dict(
+        diffusion_attention_schedule=None,
+        stage_role=None,
+        model_stage=None,
+        model_class_name=None,
+        max_num_seqs=1,
+        omni_kv_config={},
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+    )
+    defaults.update(fields)
+    return SimpleNamespace(**defaults)
 
 
 def _initialize_paged_scheduler(
@@ -1702,7 +1712,7 @@ class TestDiffusionEngine:
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
     ) -> None:
-        od_config = SimpleNamespace(model_class_name="mock_model", streaming_output=False)
+        od_config = _scheduler_config(model_class_name="mock_model", streaming_output=False)
         fake_executor_cls = mocker.Mock(return_value=mocker.Mock())
 
         monkeypatch.setattr(
@@ -1928,7 +1938,7 @@ class TestDiffusionEngine:
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
     ) -> None:
-        od_config = SimpleNamespace(model_class_name="mock_model", streaming_output=False)
+        od_config = _scheduler_config(model_class_name="mock_model", streaming_output=False)
         od_config.step_execution = True
         fake_executor = mocker.Mock()
         fake_executor_cls = mocker.Mock(return_value=fake_executor)

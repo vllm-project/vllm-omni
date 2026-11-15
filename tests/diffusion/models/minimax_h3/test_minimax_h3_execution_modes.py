@@ -29,7 +29,14 @@ def pipeline(monkeypatch):
     model.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
     model.default_video_shift = 12.0
     model.default_audio_shift = 3.0
-    model.od_config = SimpleNamespace(enable_layerwise_offload=False, diffusion_attention_schedule=None)
+    model.od_config = SimpleNamespace(
+        additional_config={},
+        step_execution=False,
+        cache_backend="none",
+        diffusion_offload_config=None,
+        enable_layerwise_offload=False,
+        diffusion_attention_schedule=None,
+    )
     model._quality_policy = SimpleNamespace(resolve=Mock(return_value=SimpleNamespace(cache_dit=None)))
     model._cache_dit_runtime = SimpleNamespace(prepare=Mock())
     model.encode_prompt = Mock(

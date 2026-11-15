@@ -1251,9 +1251,13 @@ def _graph_od_config(**overrides) -> SimpleNamespace:
         cache_backend="none",
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
-        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1, data_parallel_size=1),
+        diffusion_kv_mode="dense_legacy",
+        diffusion_kv_cache_dtype=None,
         diffusion_kv_cache_skip_step_indices=None,
+        diffusion_attention_config=AttentionConfig(),
         diffusion_attention_schedule=None,
+        diffusion_graph_release_after_denoise=False,
     )
     vars(od_config).update(overrides)
     return od_config

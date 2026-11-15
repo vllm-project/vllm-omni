@@ -552,7 +552,10 @@ class TestSupportedPipelines:
             streaming_output=True,
             step_execution=False,
             model_class_name="NoStepPipeline",
-            parallel_config=SimpleNamespace(use_hsdp=False),
+            enable_prompt_embed_cache=False,
+            prompt_embed_cache_size=32,
+            diffusion_use_graph=False,
+            parallel_config=SimpleNamespace(use_hsdp=False, data_parallel_size=1),
             diffusion_attention_schedule=None,
         )
         runner.device = torch.device("cpu")
