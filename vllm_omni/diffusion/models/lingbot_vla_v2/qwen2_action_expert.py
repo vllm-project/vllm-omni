@@ -150,8 +150,9 @@ class AdaRMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-        self.gamma = nn.Linear(cond_dim, hidden_size)
-        self.beta = nn.Linear(cond_dim, hidden_size)
+        self.gamma: nn.Linear | None = nn.Linear(cond_dim, hidden_size)
+        self.beta: nn.Linear | None = nn.Linear(cond_dim, hidden_size)
+        self.fused_gb: nn.Linear | None = None
 
         # Zero-initialized modulation starts as a plain RMSNorm.
         nn.init.zeros_(self.gamma.weight)
@@ -159,18 +160,58 @@ class AdaRMSNorm(nn.Module):
         nn.init.zeros_(self.beta.weight)
         nn.init.zeros_(self.beta.bias)
 
+    def fuse_weights(self) -> bool:
+        """Merge ``gamma`` and ``beta`` into one linear projection and free the originals."""
+        if self.fused_gb is not None or self.gamma is None or self.beta is None:
+            return False
+        fused = nn.Linear(
+            self.gamma.in_features,
+            self.gamma.out_features * 2,
+            bias=True,
+            device=self.gamma.weight.device,
+            dtype=self.gamma.weight.dtype,
+        )
+        with torch.no_grad():
+            fused.weight.copy_(torch.cat([self.gamma.weight, self.beta.weight], dim=0))
+            fused.bias.copy_(torch.cat([self.gamma.bias, self.beta.bias], dim=0))
+        fused.requires_grad_(self.gamma.weight.requires_grad)
+        self.fused_gb = fused
+        self.gamma = None
+        self.beta = None
+        return True
+
     def forward(self, hidden_states, cond):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight.to(torch.float32) * hidden_states
 
-        hidden_states = self.weight * hidden_states
-        cond = cond.to(torch.float32)
-        gamma = self.gamma(cond).unsqueeze(1)  # [B, 1, H]
-        beta = self.beta(cond).unsqueeze(1)  # [B, 1, H]
-        hidden_states = (1 + gamma.to(torch.float32)) * hidden_states + beta.to(torch.float32)
+        cond_fp32 = cond.to(torch.float32)
+        if self.fused_gb is not None:
+            w = self.fused_gb.weight
+            b = self.fused_gb.bias
+            gb = F.linear(
+                cond_fp32,
+                w if w.dtype == torch.float32 else w.float(),
+                b if (b is None or b.dtype == torch.float32) else b.float(),
+            ).unsqueeze(1)
+            gamma, beta = gb.chunk(2, dim=-1)
+        else:
+            assert self.gamma is not None and self.beta is not None
+            gamma = self.gamma(cond_fp32).unsqueeze(1)  # [B, 1, H]
+            beta = self.beta(cond_fp32).unsqueeze(1)  # [B, 1, H]
+        hidden_states = (1.0 + gamma.to(torch.float32)) * hidden_states + beta.to(torch.float32)
         return hidden_states.to(input_dtype)
+
+
+def fuse_adarms(module: nn.Module) -> list[str]:
+    """Fuse every unfused :class:`AdaRMSNorm` under ``module`` and return their module paths."""
+    fused: list[str] = []
+    for name, child in module.named_modules():
+        if isinstance(child, AdaRMSNorm) and child.fuse_weights():
+            fused.append(name)
+    return fused
 
 
 def replace_lnorm_with_adanorm(module, hidden_size, cond_dim, final_norm_adanorm):

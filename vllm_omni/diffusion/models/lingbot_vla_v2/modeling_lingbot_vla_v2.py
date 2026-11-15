@@ -31,6 +31,7 @@ from transformers import AutoConfig, PretrainedConfig
 from .align_queries import AlignQueries
 from .dual_stream import QwenvlWithExpertV2Config, QwenvlWithExpertV2Model
 from .flow_matching import FlowMatching
+from .qwen2_action_expert import fuse_adarms
 from .utils import make_att_2d_masks
 
 
@@ -257,3 +258,7 @@ class LingBotVLAV2ForActionPrediction(AlignQueries, FlowMatching):
         if missing:
             raise ValueError(f"Missing LingBot inference weights: {sorted(missing)[:20]}")
         return loaded
+
+    def fuse_adarms(self) -> list[str]:
+        """Fuse AdaRMSNorm gamma/beta projections after weights are loaded."""
+        return fuse_adarms(self)

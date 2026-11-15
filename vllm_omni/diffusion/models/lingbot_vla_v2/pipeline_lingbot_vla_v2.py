@@ -4,6 +4,7 @@
 
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -12,6 +13,7 @@ from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.platforms import current_omni_platform
 
 from .config import LingBotVLAV2Config
 from .modeling_lingbot_vla_v2 import LingBotVLAV2ForActionPrediction
@@ -64,8 +66,29 @@ class LingBotVLAV2Pipeline(nn.Module):
                 loaded = self.model.load_weights((key, checkpoint.get_tensor(key)) for key in checkpoint.keys())
             self.loaded_weight_names: set[str] = {f"model.{name}" for name in loaded}
             self.model.to(self.device).eval()
+            fused_adarms = self.model.fuse_adarms()
+            for mod_name in fused_adarms:
+                old_names = {
+                    f"model.{mod_name}.gamma.weight",
+                    f"model.{mod_name}.gamma.bias",
+                    f"model.{mod_name}.beta.weight",
+                    f"model.{mod_name}.beta.bias",
+                }
+                if old_names <= self.loaded_weight_names:
+                    self.loaded_weight_names -= old_names
+                    self.loaded_weight_names.update(
+                        {f"model.{mod_name}.fused_gb.weight", f"model.{mod_name}.fused_gb.bias"}
+                    )
         self.requires_grad_(False)
         self._validate_handshake()
+        self.enable_cuda_graph = (
+            self.device.type == "cuda"
+            and not od_config.enforce_eager
+            and bool(getattr(od_config, "enable_cuda_graph_decode", True))
+        )
+        self.model.configure_action_cuda_graph(self.enable_cuda_graph)
+        if self.enable_cuda_graph:
+            self.warmup_action_cuda_graph()
 
     @staticmethod
     def _resolve_model_dir(model: str, revision: str | None) -> Path:
@@ -108,6 +131,33 @@ class LingBotVLAV2Pipeline(nn.Module):
         if streamed is not None:
             raise ValueError(f"LingBot loads model.safetensors itself; got framework weight {streamed[0]}")
         return self.loaded_weight_names
+
+    def _build_warmup_observation(self) -> dict[str, Any]:
+        h, w = self.config.resize_imgs_with_padding
+        dummy_frame = np.zeros((h, w, 3), dtype=np.uint8)
+        obs: dict[str, Any] = {
+            "state": np.zeros((self.config.state_dim,), dtype=np.float32),
+            "prompt": "pick up the object",
+        }
+        for key in self.config.camera_keys:
+            obs[key] = dummy_frame
+        return obs
+
+    def warmup_action_cuda_graph(self, num_steps: int | None = None) -> None:
+        """Capture the default-shape action denoising CUDA graph from a dummy observation at startup."""
+        if not getattr(self, "enable_cuda_graph", False) or self.device.type != "cuda":
+            return
+        steps = self.config.num_steps if num_steps is None else num_steps
+        with torch.inference_mode(False), torch.no_grad():
+            inputs = self.processor.build_model_inputs(self._build_warmup_observation())
+            self.model.sample_actions(**inputs, num_steps=steps)
+
+    def release_captured_graphs(self) -> None:
+        """Release captured action denoising CUDA graphs (e.g. on sleep level 2)."""
+        model = getattr(self, "model", None)
+        release = getattr(model, "release_captured_graphs", None)
+        if callable(release) and release() > 0:
+            current_omni_platform.empty_cache()
 
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:

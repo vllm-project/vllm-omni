@@ -18,6 +18,8 @@
 
 """Flow-matching action sampling of LingBot-VLA 2.0: suffix embedding, velocity prediction and Euler steps."""
 
+from typing import TYPE_CHECKING
+
 import einops
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -25,8 +27,27 @@ from torch import nn
 
 from .utils import create_sinusoidal_pos_embedding, make_att_2d_masks
 
+if TYPE_CHECKING:
+    from .cudagraph import LingBotActionLoopCUDAGraph
+
 
 class FlowMatching(nn.Module):
+    _action_graph_runner: "LingBotActionLoopCUDAGraph | None" = None
+    _enable_action_cuda_graph: bool = False
+
+    def configure_action_cuda_graph(self, enabled: bool) -> None:
+        """Enable or disable CUDA-graph capture for the action denoising loop."""
+        self._enable_action_cuda_graph = bool(enabled)
+        if not self._enable_action_cuda_graph and self._action_graph_runner is not None:
+            self._action_graph_runner.clear()
+            self._action_graph_runner = None
+
+    def release_captured_graphs(self) -> int:
+        """Release any captured action denoising CUDA graphs and static buffers."""
+        if self._action_graph_runner is None:
+            return 0
+        return self._action_graph_runner.clear()
+
     @staticmethod
     def _fp32_linear(module, x):
         """Compute linear layer in fp32 regardless of module's current parameter dtype."""
@@ -183,6 +204,21 @@ class FlowMatching(nn.Module):
                 raise ValueError(f"Expected noise shape {shape}, got {tuple(noise.shape)}")
             x_t = noise.to(device=state.device, dtype=state.dtype).clone()
         masks, positions, kv = self._embed_and_fill_prefix(images, img_masks, lang_tokens, lang_masks, image_grid_thw)
+        if self._enable_action_cuda_graph and state.is_cuda and state.shape[0] == 1:
+            from .cudagraph import LingBotActionLoopCUDAGraph
+
+            if self._action_graph_runner is None or self._action_graph_runner.device != state.device:
+                self._action_graph_runner = LingBotActionLoopCUDAGraph(self, device=state.device)
+            graph_out = self._action_graph_runner.run(
+                num_steps=steps,
+                state=state,
+                masks=masks,
+                kv=kv,
+                positions=positions,
+                noise=x_t,
+            )
+            if graph_out is not None:
+                return graph_out
         dt = torch.tensor(-1.0 / steps, device=state.device, dtype=state.dtype)
         time = torch.tensor(1.0, device=state.device, dtype=state.dtype)
         cache = {}
