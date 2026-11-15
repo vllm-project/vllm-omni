@@ -5,7 +5,8 @@ opentelemetry-api>=1.28.0
 # MOSS-TTS-Nano's list/set weight-loading compatibility is handled by
 # transformers_keys_to_ignore_compat in model_executor/models/utils.py.
 transformers >= 5.16.1, < 5.20.0
-av>=14.0.0
+# Older PyAV can ignore BT.709 metadata during YUV-to-RGB conversion.
+av>=18.0.0
 # typing_extensions.Concatenate accepts a trailing `...` on 3.10 only from
 # 4.13 (older 4.12.x re-export typing.Concatenate, which rejects it). The
 # Nemotron VoiceChat codec annotates `Concatenate[int, ...]`, so pin the

@@ -58,10 +58,15 @@ The WebSocket control reader uses a bounded response outbox so a blocked media s
 ## Install Client Dependency
 
 ```bash
-pip install av websockets
+pip install "av>=18.0.0" websockets
 # For the Gradio demo:
 pip install 'vllm-omni[demo]' websockets
 ```
+
+PyAV 18.0.0 or newer is required for correct BT.709 YUV-to-RGB conversion.
+Older versions such as 16.1.0 can shift colors when decoding received video
+for saving, even when the input carries the correct color metadata. See
+[the upstream report](https://github.com/PyAV-Org/PyAV/issues/2230).
 
 The command-line client needs only `av` and `websockets`, including when saving
 video; it does not require PyTorch or a local vLLM/vLLM-Omni installation.

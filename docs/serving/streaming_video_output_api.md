@@ -19,7 +19,7 @@ vllm serve BestWishYsh/Helios-Distilled --omni \
 Install the client dependency and run the provided client:
 
 ```bash
-pip install av websockets
+pip install "av>=18.0.0" websockets
 
 python examples/online_serving/streaming_video_generation/streaming_video_client.py \
   --host 127.0.0.1 \
@@ -28,6 +28,9 @@ python examples/online_serving/streaming_video_generation/streaming_video_client
   --prompt "A serene lakeside sunrise with mist over the water" \
   --output output.mp4
 ```
+
+Use PyAV 18.0.0 or newer. Older versions such as 16.1.0 can ignore BT.709
+metadata during YUV-to-RGB conversion and shift colors in saved videos.
 
 ## Client Frame Diagnostics
 
