@@ -51,7 +51,13 @@ After launching the model, users send a request as usual. Refer to other documen
 
 ### `--diffusers-load-kwargs`
 
-Passed as-is to `DiffusionPipeline.from_pretrained()`.
+Passed to `DiffusionPipeline.from_pretrained()`.
+
+For Diffusers 0.42+, `dduf_file` is materialized locally before loading.
+This requires additional temporary disk space of the uncompressed archive size
+for each live pipeline in each worker. The directory is released with the pipeline
+or on load failure; normal process exit also cleans it. A forced kill can leave
+files for operating-system cleanup. Older versions retain native DDUF loading.
 
 This is suitable for model-specific configurations not available through the vLLM-Omni interface.
 For example: `--diffusers-load-kwargs '{"use_safetensors": true}'`.
