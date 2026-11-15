@@ -2,6 +2,44 @@
 
 This section describes how to add TeaCache to a diffusion transformer model. We use the Qwen-Image transformer as the reference implementation.
 
+## Qwen-Image 2.1 experimental decode adapter
+
+Qwen-Image 2.1 uses a single-stream transformer with per-layer prefix KV. Its
+TeaCache boundary differs from the older dual-stream Qwen-Image extractor:
+
+- `QwenImage21DenoisingAdapter` intercepts only the decode block stack.
+  Prefill bypasses the hook, executes every block and resets approximation state.
+- Sequence preparation and output normalization/projection remain in the model's
+  original forward. Each executed block receives its own prefix-KV entry.
+- The decision feature is first-block `img_norm1(target) * (1 + scale)` using
+  the current timestep's target modulation. Explicit `cond`/`uncond` identities
+  select separate positive/negative TeaCache states.
+- Backend refresh targets the adapter even when the original transformer has
+  another hook registry, by locating the TeaCache hook rather than matching the
+  pipeline class name. No parameters are registered on the adapter.
+- Whole-decode CUDA graphs are disabled because their replay bypasses Python
+  skip decisions. Other cache backends remain disabled for this model.
+- A frozen `QwenImage21SkipPolicy` on the adapter chooses the threshold per
+  request (`cfg_rel_l1_thresh` when the pipeline sets `do_true_cfg`) and allows
+  skips only inside `skip_timestep_range`. The extractor passes the threshold
+  through the hook's per-call `rel_l1_thresh` override and forces steps outside
+  the range through `synchronize_cache_decision`, which also resets the
+  accumulated distance. Without these keys the decision is the plain TeaCache rule.
+
+This is an opt-in experiment for single-GPU, batch-1 request-mode inference,
+without quantized weights, LoRA, offload or FP8 prefix storage. Both enablers
+reject those combinations; prefill also rejects dynamically loaded LoRA wrappers
+before writing prefix KV. Five finite coefficients and a finite positive
+threshold must be supplied explicitly; no model-specific defaults are registered.
+Real-checkpoint force-full parity and a bounded eager BF16 numerical-quality/performance
+experiment have been run on one RTX PRO 6000 Blackwell. The author accepted the
+later fixed 32-pair quality set on November 4, 2026, with minor color shifts in
+some samples and no other obvious visual regressions relative to dense reported.
+This bounded acceptance does not establish lossless output; other platforms and
+feature combinations remain unqualified.
+See the [user guide](../../user_guide/diffusion/cache_acceleration/teacache.md#qwen-image-21-experimental)
+for the bounded dense collector and calibration requirements.
+
 ---
 
 ## Table of Contents
@@ -31,7 +69,7 @@ vLLM-omni provides a **hook-based** TeaCache system that requires **zero changes
 The TeaCache system consists of three main components:
 
 | Component | Purpose | Location |
-|-----------|---------|----------|
+| ----------- | --------- | ---------- |
 | [`CacheContext`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/#vllm_omni.diffusion.cache.CacheContext) | Dataclass containing model-specific information for caching | `vllm_omni/diffusion/cache/teacache/context.py` |
 | [`EXTRACTOR_REGISTRY`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/teacache/extractors/#vllm_omni.diffusion.cache.teacache.extractors.EXTRACTOR_REGISTRY) | Maps transformer class names to extractor functions | `vllm_omni/diffusion/cache/teacache/extractors.py` |
 | [`TeaCacheConfig`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/#vllm_omni.diffusion.cache.TeaCacheConfig) | Configuration including thresholds and polynomial coefficients | `vllm_omni/diffusion/cache/teacache/config.py` |
@@ -42,7 +80,6 @@ The hook handles all caching logic automatically, including:
 - CFG-parallel compatibility
 - L1 distance computation with polynomial rescaling
 - Residual caching and reuse
-
 
 ---
 
@@ -57,6 +94,7 @@ To add TeaCache support for a new model, you need to:
 ### Step 1: Model-Specific Preprocessing
 
 Extract and process model inputs. This typically involves:
+
 - Embedding image/latent inputs
 - Processing text encoder outputs (if dual-stream)
 - Creating timestep embeddings
@@ -196,14 +234,14 @@ Package all information into a `CacheContext` object.
 **CacheContext Fields:**
 
 | Field | Type | Purpose |
-|-------|------|---------|
+| ------- | ------ | --------- |
 | `modulated_input` | `torch.Tensor` | Tensor used for cache decision (similarity comparison) |
 | `hidden_states` | `torch.Tensor` | Current hidden states (will be modified by caching) |
-| `encoder_hidden_states` | `torch.Tensor | None` | Encoder states for dual-stream models, `None` for single-stream |
+| `encoder_hidden_states` | `torch.Tensor \| None` | Encoder states for dual-stream models, `None` for single-stream |
 | `temb` | `torch.Tensor` | Timestep embedding tensor |
 | `run_transformer_blocks` | `Callable[[], tuple]` | Executes transformer blocks, returns `(hidden_states, [encoder_hidden_states])` |
 | `postprocess` | `Callable[[torch.Tensor], Any]` | Applies final transformations to produce model output |
-| `extra_states` | `dict | None` | Optional dict for additional model-specific state |
+| `extra_states` | `dict \| None` | Optional dict for additional model-specific state |
 
 ### Step 6: Register the Extractor
 
@@ -239,7 +277,6 @@ _MODEL_COEFFICIENTS = {
 }
 ```
 
-
 **Initial approach:** Start with coefficients from a similar model architecture, then tune empirically following [Customization](#customization) section.
 
 ---
@@ -258,10 +295,10 @@ The polynomial coefficients rescale L1 distances between consecutive modulated i
 - Training data characteristics
 - Noise prediction behavior across timesteps
 
-| Approach | Performance | Effort |
-|----------|-------------|--------|
-| Using defaults from similar model | Unreliable: Z-Image with Qwen-Image's coefficients under-predicted output change ~3x and over-skipped steps (#8270); treat as a placeholder and calibrate | Low |
-| Estimating custom coefficients | Best performance | Medium |
+| Approach                          | Performance                                                                                                                                               | Effort |
+|-----------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|--------|
+| Using defaults from similar model | Unreliable: Z-Image with Qwen-Image's coefficients under-predicted output change ~3x and over-skipped steps (#8270); treat as a placeholder and calibrate | Low    |
+| Estimating custom coefficients    | Best performance                                                                                                                                          | Medium |
 
 #### Implement Data Collection Adapter
 
@@ -330,6 +367,7 @@ print(f"Estimated coefficients: {coeffs}")
 ```
 
 Note: some models may require the vLLM context and config to be initialized to initialize vLLM modules. To this end, you may need a workaround like the following to be able to run coefficient estimation.
+
 ```python
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -360,11 +398,10 @@ if __name__ == "__main__":
         <create the estimator + run estimation here>
 ```
 
-
 **Data Statistics Guide:**
 
 | Metric | Good Range | Warning Signs |
-|--------|------------|---------------|
+| -------- | ------------ | --------------- |
 | **Count** | 2000-5000+ | < 1000: too few prompts |
 | **Input Diffs (x)** | 0.01-0.10 | Very small (<0.001): model may not modulate properly |
 | **Output Diffs (y)** | Should correlate with x | No correlation: check extractor |
@@ -418,6 +455,7 @@ See more detailed examples in [user guide for teacache](../../user_guide/diffusi
 **Problem:** The transformer class name doesn't exist in `EXTRACTOR_REGISTRY`.
 
 **Solution:** Check the class name and add to registry:
+
 ```python
 # Check transformer class name
 print(pipeline.transformer.__class__.__name__)
@@ -439,6 +477,7 @@ EXTRACTOR_REGISTRY["YourTransformer2DModel"] = extract_your_context
 - **Missing coefficients in config:**
 
 **Solution:** Add coefficients to `_MODEL_COEFFICIENTS` in `config.py`, or pass custom coefficients:
+
 ```python
 omni = Omni(
     model="your-model",
@@ -458,6 +497,7 @@ omni = Omni(
 **Problem:** `rel_l1_thresh` is too aggressive, causing cache reuse when outputs differ significantly.
 
 **Solution:** Lower the threshold:
+
 ```python
 cache_config={"rel_l1_thresh": 0.1}  # Try 0.1-0.2
 ```
@@ -473,7 +513,7 @@ cache_config={"rel_l1_thresh": 0.1}  # Try 0.1-0.2
 Complete examples in the codebase:
 
 | Model | Path | Pattern | Notes |
-|-------|------|---------|-------|
+| ------- | ------ | --------- | ------- |
 | **Qwen-Image** | `vllm_omni/diffusion/cache/teacache/extractors.py` | Dual-stream | `extract_qwen_context` |
 | **Bagel** | `vllm_omni/diffusion/cache/teacache/extractors.py` | Omni model | `extract_bagel_context` |
 | **TeaCache Core** | `vllm_omni/diffusion/cache/teacache/` | Base implementation | Hook and config |
