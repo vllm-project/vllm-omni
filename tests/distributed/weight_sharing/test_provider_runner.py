@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Exercise the provider runner hook with the real backend and CPU codec."""
 
+import importlib
 import sys
 from contextlib import nullcontext
+from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
+import msgspec
 import pytest
 import torch
 
@@ -50,6 +53,10 @@ def provider_runner(weight_sharing, contracts, monkeypatch):
             )
         ),
     )
+    runtime = importlib.import_module(f"{weight_sharing.__name__}.runtime")
+    worker = importlib.import_module(f"{weight_sharing.__name__}.worker_session")
+    monkeypatch.setitem(sys.modules, "vllm_omni.distributed.weight_sharing.worker_session", worker)
+    monkeypatch.setitem(sys.modules, "vllm.distributed", SimpleNamespace(get_tensor_model_parallel_rank=lambda: 0))
     context = make_context(contracts)
 
     def publish(backend, model, *, group, device_index):
@@ -59,9 +66,13 @@ def provider_runner(weight_sharing, contracts, monkeypatch):
         return backend.prepare_export(bindings, spec, context)
 
     runner = runner_cls()
-    runner.vllm_config = SimpleNamespace(
-        weight_sharing=SimpleNamespace(role="provider", session_id=context.identity.session_id, group_id="group")
+    plan = runtime.SharingPlan(
+        0, 1, ("GPU-0",), (runtime.DeviceBudget(2048, 64, 64, 64),), "model", "revision", "layout"
     )
+    bootstrap = runtime.SharingRuntime(plan, None).bootstrap("provider")
+    group = replace(bootstrap.groups[0], session_id=context.identity.session_id)
+    bootstrap = msgspec.structs.replace(bootstrap, groups=(group,))
+    runner.vllm_config = SimpleNamespace(additional_config={runtime.CONFIG_KEY: msgspec.to_builtins(bootstrap)})
     runner.device = torch.device("cuda:3")
     runner.jit_warmup_registry = SimpleNamespace(activate=nullcontext)
     runner.adapter = SimpleNamespace(publish_backbone=Mock(side_effect=publish))
@@ -172,7 +183,7 @@ def test_device_mismatch_is_rejected_before_export(provider_runner, device):
 
 def test_ordinary_reload_forwards_arguments(provider_runner):
     runner, _, _, _ = provider_runner
-    runner.vllm_config.weight_sharing = None
+    runner.vllm_config.additional_config.clear()
     upstream_reload = type(runner).__bases__[0].reload_weights
     upstream_reload.side_effect = None
     weights = iter(())

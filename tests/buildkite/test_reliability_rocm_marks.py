@@ -26,6 +26,17 @@ FAULT_FILES = (
     "tests/dfx/reliability/test_hunyuan_image.py",
     "tests/dfx/reliability/test_minicpmo_4_5.py",
 )
+INVALID_PARAMETER_ROCM_MARKS = {
+    "test_invalid_video_generation.py": {'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})': 1},
+    "test_invalid_server_control.py": {'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})': 1},
+    "test_invalid_image_generation.py": {'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})': 1},
+    "test_invalid_image_editing.py": {'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})': 1},
+    "test_invalid_audio_diffusion.py": {'hardware_marks(res={"cuda": "L4", "rocm": "MI325"})': 1},
+    "test_invalid_audio_speech.py": {
+        'hardware_marks(res={"cuda": "L4", "rocm": "MI325"})': 1,
+        'hardware_marks(res={"cuda": "H100", "rocm": "MI325"})': 2,
+    },
+}
 QWEN_HARD_OOM_TESTS = {
     "test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech",
     "test_reliability_fault_gpu_oom_large_request_failure",
@@ -54,6 +65,19 @@ def test_fault_injection_cases_declare_mi325(filename: str, num_cards: int) -> N
     tree = ast.parse(source)
     keywords = ast.literal_eval(_assignment_value(tree, "FAULT_ERROR_KEYWORDS"))
     assert "connection" in keywords
+
+
+def test_minicpmo_fault_injection_declares_mi325() -> None:
+    source = (RELIABILITY_DIR / "test_minicpmo_4_5.py").read_text(encoding="utf-8")
+    assert 'res = {"cuda": "H100", "rocm": "MI325"}' in source
+    assert "num_cards = 1" in source
+
+
+@pytest.mark.parametrize(("filename", "expected_markers"), INVALID_PARAMETER_ROCM_MARKS.items())
+def test_invalid_parameter_scopes_declare_mi325(filename: str, expected_markers: dict[str, int]) -> None:
+    source = (RELIABILITY_DIR / "invalid_param_test" / filename).read_text(encoding="utf-8")
+    for marker, expected_count in expected_markers.items():
+        assert source.count(marker) == expected_count
 
 
 def test_qwen_oom_uses_free_memory_ceiling_and_eager_params() -> None:

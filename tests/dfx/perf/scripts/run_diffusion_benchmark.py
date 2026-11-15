@@ -14,7 +14,7 @@ This runner separates two concepts:
 A config JSON file may be passed via --test-config-file. If omitted, every ``*.json`` under
 ``tests/dfx/perf/tests/`` is loaded and pytest ``-m`` filters by each case's ``mark``:
   pytest run_diffusion_benchmark.py -m "diffusion"
-  pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+  pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_bagel_vllm_omni.json
 
 Optional JSON field ``mark`` is applied as pytest marks on that case via
 ``pytest.param`` (e.g. ``"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}}, "full_model", "diffusion"]``).

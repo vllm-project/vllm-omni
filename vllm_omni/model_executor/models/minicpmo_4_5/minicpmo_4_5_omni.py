@@ -264,9 +264,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 getattr(self.talker, "mrv2_decode_preprocess_is_identity", False)
             )
             self.logits_vocab_size = int(self.talker.logits_vocab_size)
-            # CUDA K-step fused graph hooks live on the Talker; the runner sees
-            # this wrapper (after cudagraph unwrapping), so delegate them here.
+            # The runner sees this wrapper. The Talker owns codec state and CUDA K-step hooks.
             for hook_name in (
+                "kstep_rows_ready",
+                "prepare_kstep_inputs",
+                "rewrite_kstep_initial_embeds",
+                "flush_cuda_kstep_feedback",
                 "prepare_cuda_kstep",
                 "cuda_kstep_frame",
                 "commit_cuda_kstep",
@@ -1127,6 +1130,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         return self.model_stage == "tts"
 
     @property
+    def kstep_continue_token_id(self) -> int:
+        return self.talker.kstep_continue_token_id
+
+    @property
     def batch_stop_logits(self):
         # The runner probes this attribute on the registered architecture
         # (getattr in npu_model_runner); without the forward it reads None and
@@ -1437,7 +1444,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """Sample duplex rows with at most two host reads: the boundary decisions, then the stage-2 tokens.
 
         Per row: chunk_eos at the speak-length cap, else the boundary draw, else
-        the stage-2 draw, the chunk cut and the listen->tts_bos rewrite. Each
+        the stage-2 draw and the listen->tts_bos rewrite. Each
         row's own generator draws as it would one row at a time; rows sharing
         the process-wide generator draw every boundary before any stage-2 token.
         """
@@ -1449,7 +1456,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             boundary = [row_idx for row_idx in row_idxs if row_idx not in resolved]
             if boundary:
                 hits = self._minicpmo45_duplex_boundary_hits(logits, boundary, chunk_eos_id, sampling_metadata)
-                resolved.update((row_idx, chunk_eos_id) for row_idx, hit in zip(boundary, hits.tolist()) if hit)
+                resolved.update(
+                    (row_idx, chunk_eos_id) for row_idx, hit in zip(boundary, hits.tolist(), strict=True) if hit
+                )
         stage2_rows = [row_idx for row_idx in row_idxs if row_idx not in resolved]
         if stage2_rows:
             draws = self._minicpmo45_duplex_stage2_draws(

@@ -71,6 +71,11 @@ def _reliability_server_params() -> dict[str, Any]:
                 0: {"parallel_config.enable_expert_parallel": False},
             }
         }
+        # A cold or contended MI325 restart can still be loading the 32-shard
+        # checkpoint after the 900-second fixture default. Keep the bounded
+        # startup deadline, but leave enough headroom for observed progress.
+        params["stage_init_timeout"] = 1800
+        params["init_timeout"] = 2100
     return params
 
 
