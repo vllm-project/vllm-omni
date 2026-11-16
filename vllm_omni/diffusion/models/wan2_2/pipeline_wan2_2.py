@@ -29,7 +29,10 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
     begin_scheduled_denoise,
+    check_scheduler_sigmas,
     clear_scheduled_denoise_step_on_exit,
+    get_forward_context,
+    is_forward_context_available,
 )
 from vllm_omni.diffusion.graph import build_denoise_graph_runner, release_denoise_graphs_after_denoise
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
@@ -727,10 +730,22 @@ class Wan22Pipeline(
         # Checks a bound attention schedule against the actual sequence (3 steps for DMD) and returns its
         # length; None without a schedule, so unscheduled runs publish no total.
         total_steps = begin_scheduled_denoise(len(timesteps))
+        sigma_scheduled = is_forward_context_available() and bool(get_forward_context().attention_sigma_schedule)
         with self.progress_bar(total=len(timesteps)) as pbar, clear_scheduled_denoise_step_on_exit(total_steps):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                self.record_denoise_step(step_idx, t, total_steps=total_steps)
+                self.record_denoise_step(
+                    step_idx,
+                    t,
+                    total_steps=total_steps,
+                    # DMD bypasses set_timesteps and steps its fixed timesteps with the grid
+                    # sigma nearest to each one, so publish that sigma.
+                    sigma=(
+                        self.scheduler.sigma_for_timestep(t, device="cpu").item()
+                        if self.is_dmd and sigma_scheduled
+                        else None
+                    ),
+                )
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer
@@ -1396,6 +1411,8 @@ class Wan22Pipeline(
             else:
                 self.scheduler.set_timesteps(num_steps, device=device)
             timesteps = self.scheduler.timesteps
+            # Bound sigma windows read these sigmas at every step; reject unusable ones before the first forward.
+            check_scheduler_sigmas(self.scheduler.sigmas)
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
         if boundary_ratio is not None:
