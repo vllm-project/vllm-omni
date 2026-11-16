@@ -23,6 +23,7 @@ which change the computed audio:
 
 from __future__ import annotations
 
+import contextlib
 import math
 from typing import Any
 
@@ -563,6 +564,8 @@ class KokoroNetwork(nn.Module):
             istftnet=dict(config.istftnet),
         )
         self.style_dim = config.style_dim
+        # Run the vocoder with cuDNN/MIOpen disabled (set on ROCm by the model).
+        self.decoder_without_cudnn = False
 
     @staticmethod
     def is_adain_affine_param(name: str) -> bool:
@@ -609,5 +612,9 @@ class KokoroNetwork(nn.Module):
         F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
         t_en = self.text_encoder(input_ids, input_lengths, text_mask)
         asr = t_en @ pred_aln_trg
-        audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, : self.style_dim], generator).squeeze()
+        # flags() also resets benchmark/deterministic/allow_tf32 to their defaults inside the block,
+        # so enter it only when the bypass is requested (ROCm) and leave CUDA's settings untouched.
+        no_cudnn = torch.backends.cudnn.flags(enabled=False) if self.decoder_without_cudnn else contextlib.nullcontext()
+        with no_cudnn:
+            audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, : self.style_dim], generator).squeeze()
         return audio, pred_dur

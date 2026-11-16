@@ -99,6 +99,10 @@ class KokoroForConditionalGeneration(nn.Module):
 
         self.network = KokoroNetwork(self.config)
         self.network.eval()
+        # On ROCm, MIOpen picks a slow solver for the vocoder's dilated Conv1d,
+        # compiles and tunes for every new chunk length, and on MIOpen <= 3.6
+        # miscomputes its long InstanceNorm rows (ROCm/rocm-libraries#14544).
+        self.network.decoder_without_cudnn = current_omni_platform.is_rocm()
         self.frontend = KokoroTextFrontend()
 
         # Every voice pack, loaded on the device in load_weights().
