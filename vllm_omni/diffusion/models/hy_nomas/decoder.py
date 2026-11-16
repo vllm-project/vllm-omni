@@ -15,11 +15,13 @@
 # limitations under the License.
 
 import math
-from collections.abc import Iterable
-from contextlib import nullcontext
+import struct
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 from diffusers.models.autoencoders.vae import DecoderOutput
 from torch import nn
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -617,6 +619,91 @@ class PixelUMMDecoder(nn.Module):
             num_steps,
             seed,
         )
+        self._decode_group: dist.ProcessGroup | None = None
+        self._decode_error_status: torch.Tensor | None = None
+        self._decode_output_rank = 0
+
+    def configure_distributed_decode(self, process_group: dist.ProcessGroup, *, output_rank: int = 0) -> None:
+        """Configure collective decoding on the supplied group."""
+        if not dist.is_initialized():
+            raise RuntimeError("PixelUMM window decoding requires torch.distributed")
+        if process_group is None:
+            raise ValueError("PixelUMM window decoding requires an explicit process group")
+        size = dist.get_world_size(process_group)
+        if size <= 1:
+            raise ValueError("PixelUMM window decoding requires more than one rank")
+        if not 0 <= output_rank < size:
+            raise ValueError(f"PixelUMM output rank {output_rank} is outside group size {size}")
+        # Keep the status on the decode device even when model weights are offloaded.
+        self._decode_error_status = torch.empty(1, dtype=torch.int32, device=self.device)
+        self._decode_group = process_group
+        self._decode_output_rank = output_rank
+
+    def _is_output_rank(self) -> bool:
+        return self._decode_group is None or dist.get_rank(self._decode_group) == self._decode_output_rank
+
+    @contextmanager
+    def _decode_guard(self, operation: str) -> Iterator[None]:
+        if self._decode_group is None:
+            yield
+            return
+        error = None
+        try:
+            yield
+        except Exception as exc:
+            error = exc
+        failed = self._decode_error_status
+        if failed is None:
+            raise RuntimeError("PixelUMM distributed error status is not initialized")
+        failed.fill_(int(error is not None))
+        dist.all_reduce(failed, group=self._decode_group)
+        if error is not None:
+            raise error
+        if failed.item():
+            raise RuntimeError(f"PixelUMM {operation} failed on another decode rank")
+
+    def _validate_decode_metadata(self, values: Sequence[int]) -> None:
+        if self._decode_group is None:
+            return
+        with self._decode_guard("metadata preparation"):
+            length = torch.tensor([len(values)], dtype=torch.int64, device=self.device)
+            lengths = [torch.empty_like(length) for _ in range(dist.get_world_size(self._decode_group))]
+        dist.all_gather(lengths, length, group=self._decode_group)
+        if any(not torch.equal(length, other) for other in lengths):
+            raise ValueError("PixelUMM distributed decode requires identical metadata")
+        with self._decode_guard("metadata allocation"):
+            metadata = torch.tensor(values, dtype=torch.int64, device=self.device)
+            peers = [torch.empty_like(metadata) for _ in lengths]
+        dist.all_gather(peers, metadata, group=self._decode_group)
+        if any(not torch.equal(metadata, other) for other in peers):
+            raise ValueError("PixelUMM distributed decode requires identical metadata")
+
+    def _validate_decode_latent(self, latent: torch.Tensor) -> None:
+        if self._decode_group is None:
+            return
+        with self._decode_guard("latent validation"):
+            dtype = str(latent.dtype).encode("ascii")
+            decoder_dtype = str(self.dtype).encode("ascii")
+            signature = (
+                self._decode_output_rank,
+                *latent.shape,
+                len(dtype),
+                *dtype,
+                len(decoder_dtype),
+                *decoder_dtype,
+            )
+        self._validate_decode_metadata(signature)
+        with self._decode_guard("latent allocation"):
+            local = latent.contiguous().to(device=self.device)
+            # Broadcast uses an in-place buffer, separate from the caller's latent.
+            reference = local.clone() if self._is_output_rank() else torch.empty_like(local)
+        source = dist.get_global_rank(self._decode_group, self._decode_output_rank)
+        dist.broadcast(reference, src=source, group=self._decode_group)
+        with self._decode_guard("latent comparison"):
+            equal = torch.tensor(int(torch.equal(local, reference)), dtype=torch.int32, device=self.device)
+        dist.all_reduce(equal, op=dist.ReduceOp.MIN, group=self._decode_group)
+        if not equal.item():
+            raise ValueError("PixelUMM distributed decode requires identical latent values")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load checkpoint tensors, stacking q/k/v and gate/up projections like vLLM's Qwen3."""
@@ -717,39 +804,134 @@ class PixelUMMDecoder(nn.Module):
 
         return source
 
-    def _predict_x0(self, latent, xt_source, seed, t_starts=None, pad_short=False):
-        frames, height, width = latent.shape[2:]
-        window = self.config.temporal_window_latents
-        stride = window - self.config.temporal_overlap_latents
-        if t_starts is None:
-            t_starts = _window_starts(frames, window, stride)
-        length = min(window, frames)
+    def _tile_grid(self, height: int, width: int) -> tuple[list[int], list[int], int, int]:
         cells = self.config.decoder_tile_pixels // 32
         if cells <= 0 or (height <= cells and width <= cells):
-            rows = [0]
-            columns = [0]
-            tile_h = height
-            tile_w = width
-        else:
-            spatial_stride = cells - self.config.decoder_tile_overlap_pixels // 32
-            tile_h = min(cells, height)
-            tile_w = min(cells, width)
-            rows = _window_starts(height, tile_h, min(spatial_stride, tile_h))
-            columns = _window_starts(width, tile_w, min(spatial_stride, tile_w))
-        pad_noise = None
-        if pad_short and frames >= window and t_starts[-1] + window > frames:
-            variance, mean = torch.var_mean(latent.detach().float(), dim=(2, 3, 4), correction=0, keepdim=True)
-            generator = torch.Generator(device=latent.device).manual_seed(_frame_seed(seed, frames - 1))
-            noise = torch.randn(
-                (latent.shape[0], latent.shape[1], window, height, width),
-                generator=generator,
-                device=latent.device,
-                dtype=torch.float32,
-            )
-            pad_noise = mean + variance.sqrt() * noise
-        row_pixels = [row * 32 for row in rows]
+            return [0], [0], height, width
+        spatial_stride = cells - self.config.decoder_tile_overlap_pixels // 32
+        tile_h, tile_w = min(cells, height), min(cells, width)
+        rows = _window_starts(height, tile_h, min(spatial_stride, tile_h))
+        columns = _window_starts(width, tile_w, min(spatial_stride, tile_w))
+        return rows, columns, tile_h, tile_w
+
+    @staticmethod
+    def _merge_tiles(tiles: list[torch.Tensor], rows: list[int], columns: list[int]) -> torch.Tensor:
+        if len(tiles) == 1:
+            return tiles[0]
         column_pixels = [column * 32 for column in columns]
-        blender = _TemporalBlender((t_starts[-1] + length - t_starts[0]) * 4)
+        row_outputs = [
+            _merge_overlapping(tiles[row * len(columns) : (row + 1) * len(columns)], column_pixels, dim=-1)
+            for row in range(len(rows))
+        ]
+        return _merge_overlapping(row_outputs, [row * 32 for row in rows], dim=-2)
+
+    def _predict_x0(self, latent, xt_source, seed, t_starts=None, pad_short=False, *, all_ranks=False):
+        with self._decode_guard("window preparation"):
+            frames, height, width = latent.shape[2:]
+            window = self.config.temporal_window_latents
+            stride = window - self.config.temporal_overlap_latents
+            if t_starts is None:
+                t_starts = _window_starts(frames, window, stride)
+            t_starts = list(t_starts)
+            length = min(window, frames)
+            rows, columns, tile_h, tile_w = self._tile_grid(height, width)
+            pad_noise = None
+            if pad_short and frames >= window and t_starts[-1] + window > frames:
+                variance, mean = torch.var_mean(latent.detach().float(), dim=(2, 3, 4), correction=0, keepdim=True)
+                generator = torch.Generator(device=latent.device).manual_seed(_frame_seed(seed, frames - 1))
+                noise = torch.randn(
+                    (latent.shape[0], latent.shape[1], window, height, width),
+                    generator=generator,
+                    device=latent.device,
+                    dtype=torch.float32,
+                )
+                pad_noise = mean + variance.sqrt() * noise
+            row_pixels = [row * 32 for row in rows]
+            column_pixels = [column * 32 for column in columns]
+            blender = _TemporalBlender((t_starts[-1] + length - t_starts[0]) * 4)
+        if self._decode_group is not None:
+            signed_seed = (seed + (1 << 63)) % (1 << 64) - (1 << 63)
+            self._validate_decode_metadata(
+                (
+                    int(all_ranks),
+                    int(pad_short),
+                    self._decode_output_rank,
+                    signed_seed,
+                    self.config.num_steps,
+                    frames,
+                    height,
+                    width,
+                    window,
+                    stride,
+                    length,
+                    tile_h,
+                    tile_w,
+                    len(t_starts),
+                    len(rows),
+                    len(columns),
+                    *t_starts,
+                    *rows,
+                    *columns,
+                )
+            )
+            with self._decode_guard("task preparation"):
+                spatial = [(row, column) for row in rows for column in columns]
+                tasks = [(index, row, column) for index in range(len(t_starts)) for row, column in spatial]
+            size = dist.get_world_size(self._decode_group)
+            rank = dist.get_rank(self._decode_group)
+            receives = all_ranks or self._is_output_rank()
+            destination = dist.get_global_rank(self._decode_group, self._decode_output_rank)
+            idle_shape = (latent.shape[0], 3, length * 4, tile_h * 32, tile_w * 32)
+            pending: dict[int, list[torch.Tensor | None]] = {}
+            next_window = 0
+            for first in range(0, len(tasks), size):
+                index = first + rank
+                with self._decode_guard("window computation"):
+                    if index < len(tasks):
+                        temporal, row, column = tasks[index]
+                        start = t_starts[temporal]
+                        real = latent[:, :, start : start + length, row : row + tile_h, column : column + tile_w]
+                        if pad_noise is not None and real.shape[2] < length:
+                            fill = length - real.shape[2]
+                            offset = (start // stride) % (window - fill + 1)
+                            tile = pad_noise[:, :, offset : offset + fill, row : row + tile_h, column : column + tile_w]
+                            real = torch.cat([real, tile.to(real.dtype)], dim=2)
+                        noise = xt_source(start, start + length, row, column, tile_h, tile_w)
+                        local = self.decoder(real.contiguous(), noise.contiguous()).contiguous()
+                    else:
+                        local = torch.empty(idle_shape, device=latent.device, dtype=self.dtype)
+                    if tuple(local.shape) != idle_shape or local.dtype != self.dtype or local.device != latent.device:
+                        raise RuntimeError("PixelUMM window output does not match the distributed tensor contract")
+                    gathered = [torch.empty_like(local) for _ in range(size)] if receives else None
+                if all_ranks:
+                    dist.all_gather(gathered, local, group=self._decode_group)
+                else:
+                    dist.gather(local, gather_list=gathered, dst=destination, group=self._decode_group)
+                with self._decode_guard("window merge"):
+                    if receives:
+                        assert gathered is not None
+                        for source_rank, output in enumerate(gathered):
+                            task_index = first + source_rank
+                            if task_index >= len(tasks):
+                                break
+                            temporal, tile = divmod(task_index, len(spatial))
+                            pending.setdefault(temporal, [None] * len(spatial))[tile] = output
+                        del output
+                        while next_window in pending and all(tile is not None for tile in pending[next_window]):
+                            tiles = pending.pop(next_window)
+                            blender.add(
+                                self._merge_tiles(tiles, rows, columns), (t_starts[next_window] - t_starts[0]) * 4
+                            )
+                            del tiles
+                            next_window += 1
+                del gathered, local
+            result = None
+            with self._decode_guard("window finalization"):
+                if receives:
+                    if pending or next_window != len(t_starts):
+                        raise RuntimeError("PixelUMM window decode left incomplete windows")
+                    result = blender.result()
+            return result
         for first in t_starts:
             row_outputs = []
             for row in rows:
@@ -794,14 +976,25 @@ class PixelUMMDecoder(nn.Module):
             [`~models.autoencoders.vae.DecoderOutput`] or `tuple`:
                 RGB pixels with shape `(batch, 3, pixel_frames, height * 32, width * 32)`.
         """
-        if latents.ndim != 5 or latents.shape[1] != 32 or min(latents.shape[2:]) < 1:
-            raise ValueError("latents must have nonempty shape (batch, 32, frames, height, width)")
-        seed = self._seed(generator)
-        steps = self.config.denoising_step_list[: self.config.num_steps]
+        with self._decode_guard("offline input validation"):
+            if latents.ndim != 5 or latents.shape[1] != 32 or min(latents.shape[2:]) < 1:
+                raise ValueError("latents must have nonempty shape (batch, 32, frames, height, width)")
+            seed = self._seed(generator)
+            steps = self.config.denoising_step_list[: self.config.num_steps]
+            signed_seed = (seed + (1 << 63)) % (1 << 64) - (1 << 63)
+            target_frames = -1 if pixel_frames is None else int(pixel_frames)
+            schedule = (
+                tuple(struct.unpack("!q", struct.pack("!d", float(step)))[0] for step in steps)
+                if self._decode_group is not None
+                else ()
+            )
+        self._validate_decode_metadata((self.config.num_steps, signed_seed, target_frames, *schedule))
+        self._validate_decode_latent(latents)
         if len(steps) == 1:
             video = self._predict_x0(latents, self._noise_tile(latents, seed), seed)
         else:
-            state = self._make_noise(latents, 0, latents.shape[2], seed)
+            with self._decode_guard("multistep state preparation"):
+                state = self._make_noise(latents, 0, latents.shape[2], seed)
 
             def source(first, last, row, column, height, width):
                 return state[
@@ -809,17 +1002,22 @@ class PixelUMMDecoder(nn.Module):
                 ]
 
             for index, current in enumerate(steps):
-                video = self._predict_x0(latents, source, seed)
+                video = self._predict_x0(latents, source, seed, all_ranks=index + 1 < len(steps))
                 if index + 1 < len(steps):
-                    ratio = steps[index + 1] / current
-                    for offset in range(0, state.shape[2], 40):
-                        end = offset + 40
-                        anchor = video[:, :, offset:end].to(device=state.device, dtype=torch.float32)
-                        state[:, :, offset:end] = anchor + ratio * (state[:, :, offset:end] - anchor)
-        if pixel_frames is not None:
-            if not 1 <= pixel_frames <= video.shape[2]:
-                raise ValueError("pixel_frames must be positive and no larger than the decoded frame count")
-            video = video[:, :, :pixel_frames]
+                    with self._decode_guard("multistep state update"):
+                        assert video is not None
+                        ratio = steps[index + 1] / current
+                        for offset in range(0, state.shape[2], 40):
+                            end = offset + 40
+                            anchor = video[:, :, offset:end].to(device=state.device, dtype=torch.float32)
+                            state[:, :, offset:end] = anchor + ratio * (state[:, :, offset:end] - anchor)
+        with self._decode_guard("offline output preparation"):
+            if video is None:
+                video = latents.new_empty((0,))
+            elif pixel_frames is not None:
+                if not 1 <= pixel_frames <= video.shape[2]:
+                    raise ValueError("pixel_frames must be positive and no larger than the decoded frame count")
+                video = video[:, :, :pixel_frames]
         if return_dict:
             return DecoderOutput(sample=video)
         return (video,)
@@ -832,9 +1030,10 @@ class PixelUMMDecoder(nn.Module):
     @torch.no_grad()
     def _decode_windows(
         self, latent: torch.Tensor, starts: list[int], seed: int, pad_short: bool = False, frame_offset: int = 0
-    ) -> torch.Tensor:
-        latent = latent.to(device=self.device, dtype=self.dtype)
-        xt_source = self._noise_tile(latent, seed, frame_offset)
+    ) -> torch.Tensor | None:
+        with self._decode_guard("stream window preparation"):
+            latent = latent.to(device=self.device, dtype=self.dtype)
+            xt_source = self._noise_tile(latent, seed, frame_offset)
         return self._predict_x0(latent, xt_source, seed, t_starts=starts, pad_short=pad_short)
 
     def create_streaming_decode_session(
@@ -844,6 +1043,7 @@ class PixelUMMDecoder(nn.Module):
         retain_history: bool = False,
         generator: torch.Generator | None = None,
         rolling: bool = True,
+        _synchronize: bool = True,
     ) -> "PixelUMMStreamingDecodeSession":
         """
         Create session state for stable append-only decoding.
@@ -854,12 +1054,14 @@ class PixelUMMDecoder(nn.Module):
         The default rolling mode, which AR sessions use, discards completed prefixes
         and requires retain_history=False.
         """
-        if self.config.num_steps != 1:
-            raise ValueError("Streaming PixelUMM decoding requires num_steps=1")
-        seed = self._seed(generator)
-        return PixelUMMStreamingDecodeSession(
-            self, to_cpu=to_cpu, retain_history=retain_history, seed=seed, rolling=rolling
-        )
+        with self._decode_guard("stream session initialization") if _synchronize else nullcontext():
+            if self.config.num_steps != 1:
+                raise ValueError("Streaming PixelUMM decoding requires num_steps=1")
+            seed = self._seed(generator)
+            session = PixelUMMStreamingDecodeSession(
+                self, to_cpu=to_cpu, retain_history=retain_history, seed=seed, rolling=rolling
+            )
+        return session
 
 
 class PixelUMMStreamingDecodeSession:
@@ -894,6 +1096,42 @@ class PixelUMMStreamingDecodeSession:
         self.finished = False
         self.seed = seed
         self.final_segment = True
+
+    def _validate_parallel_state(self, operation: int, pixel_frames: int) -> None:
+        if self.model._decode_group is None:
+            return
+        with self.model._decode_guard("stream state preparation"):
+            shape = () if self.buffer is None else tuple(self.buffer.shape)
+            signed_seed = (self.seed + (1 << 63)) % (1 << 64) - (1 << 63)
+            values = (
+                operation,
+                pixel_frames,
+                int(self.final_segment),
+                int(self.finished),
+                int(self.to_cpu),
+                int(self.retain_history),
+                int(self.rolling),
+                signed_seed,
+                self.model._decode_output_rank,
+                self.window,
+                self.stride,
+                self.temporal_ratio,
+                self.available_latent_frames,
+                self.available_pixel_frames,
+                self.next_window_start,
+                self.committed_raw_pixel_frames,
+                self.committed_pixel_frames,
+                self.buffer_latent_start,
+                self.segment_raw_start,
+                self.segment_visible_start,
+                len(shape),
+                len(self.push_latent_frames),
+                len(self.push_pixel_frames),
+                *shape,
+                *self.push_latent_frames,
+                *self.push_pixel_frames,
+            )
+        self.model._validate_decode_metadata(values)
 
     def _append_decoded_windows(self, video: torch.Tensor, *, first_window_start: int) -> None:
         clip_start = first_window_start * self.temporal_ratio
@@ -990,55 +1228,62 @@ class PixelUMMStreamingDecodeSession:
 
     def _decode_provisional_raw(self) -> torch.Tensor | None:
         """Decode the exact current tail from the raw stable boundary onward."""
-        raw_start = self.committed_raw_pixel_frames
-        raw_end = self.available_raw_pixel_frames
-        if raw_end <= raw_start:
+        with self.model._decode_guard("stream tail planning"):
             assert self.buffer is not None
-            if self.pending is not None:
-                return self.pending[:, :, :0]
-            return self.buffer.new_empty((0,))
-        regular_decoded_latent_end = 0
-        if self.next_window_start > 0:
-            regular_decoded_latent_end = self.next_window_start - self.stride + self.window
-        regular_decoded_raw_end = regular_decoded_latent_end * self.temporal_ratio
-        if raw_end <= regular_decoded_raw_end:
-            if self.pending is not None:
-                pending_end = self.pending_pixel_start + int(self.pending.shape[2])
-                if not (self.pending_pixel_start <= raw_start and pending_end >= raw_end):
-                    raise RuntimeError(
-                        f"PixelUMM pending output does not cover the regular decoded range [{raw_start}, {raw_end}); "
-                        f"pending=[{self.pending_pixel_start}, {pending_end})"
-                    )
-                local_start = raw_start - self.pending_pixel_start
-                local_end = raw_end - self.pending_pixel_start
-                return self.pending[:, :, local_start:local_end].contiguous()
-            raise RuntimeError("PixelUMM session is missing pending regular-window output")
-        assert self.buffer is not None
-        starts = self._provisional_window_starts()
-        committed_latent = raw_start // self.temporal_ratio
-        # Start from the first window that reaches past the committed latents.
-        first_index = len(starts) - 1
-        for index, start in enumerate(starts):
-            if start + self.window > committed_latent:
-                first_index = index
-                break
-        selected_starts = starts[first_index:]
+            raw_start = self.committed_raw_pixel_frames
+            raw_end = self.available_raw_pixel_frames
+            selected_starts = None
+            result = None
+            regular_end = self.next_window_start - self.stride + self.window if self.next_window_start > 0 else 0
+            if raw_end <= raw_start:
+                if self.model._is_output_rank():
+                    result = self.pending[:, :, :0] if self.pending is not None else self.buffer.new_empty((0,))
+            elif raw_end <= regular_end * self.temporal_ratio:
+                if self.model._is_output_rank():
+                    if self.pending is None:
+                        raise RuntimeError("PixelUMM session is missing pending regular-window output")
+                    pending_end = self.pending_pixel_start + int(self.pending.shape[2])
+                    if not self.pending_pixel_start <= raw_start <= raw_end <= pending_end:
+                        raise RuntimeError(
+                            "PixelUMM pending output does not cover the regular decoded range "
+                            f"[{raw_start}, {raw_end}); "
+                            f"pending=[{self.pending_pixel_start}, {pending_end})"
+                        )
+                    result = self.pending[
+                        :, :, raw_start - self.pending_pixel_start : raw_end - self.pending_pixel_start
+                    ].contiguous()
+            else:
+                starts = self._provisional_window_starts()
+                committed_latent = raw_start // self.temporal_ratio
+                first_index = next(
+                    (index for index, start in enumerate(starts) if start + self.window > committed_latent),
+                    len(starts) - 1,
+                )
+                selected_starts = starts[first_index:]
+        if selected_starts is None:
+            return result
         decoded = self._decode_windows(selected_starts)
-        assert decoded is not None
-        decoded_raw_start = selected_starts[0] * self.temporal_ratio
-        local_start = raw_start - decoded_raw_start
-        local_end = raw_end - decoded_raw_start
-        if not 0 <= local_start <= local_end <= decoded.shape[2]:
-            raise RuntimeError(
-                "PixelUMM provisional decode does not cover the requested raw range: "
-                f"decoded_start={decoded_raw_start}, requested=[{raw_start}, {raw_end}), "
-                f"decoded_frames={decoded.shape[2]}"
-            )
-        return decoded[:, :, local_start:local_end].contiguous()
+        with self.model._decode_guard("stream tail slicing"):
+            if self.model._is_output_rank():
+                assert decoded is not None
+                decoded_raw_start = selected_starts[0] * self.temporal_ratio
+                local_start, local_end = raw_start - decoded_raw_start, raw_end - decoded_raw_start
+                if not 0 <= local_start <= local_end <= decoded.shape[2]:
+                    raise RuntimeError(
+                        "PixelUMM provisional decode does not cover the requested raw range: "
+                        f"decoded_start={decoded_raw_start}, requested=[{raw_start}, {raw_end}), "
+                        f"decoded_frames={decoded.shape[2]}"
+                    )
+                result = decoded[:, :, local_start:local_end].contiguous()
+        return result
 
     def _commit_until(self, stable_raw_until: int) -> torch.Tensor | None:
         stable_raw_until = int(stable_raw_until)
         if stable_raw_until <= self.committed_raw_pixel_frames:
+            return None
+        if not self.model._is_output_rank():
+            self.committed_raw_pixel_frames = stable_raw_until
+            self.committed_pixel_frames = self._visible_frames_before_raw(stable_raw_until)
             return None
         if self.pending is None:
             raise RuntimeError("PixelUMM session has no decoded pixels to commit")
@@ -1062,21 +1307,25 @@ class PixelUMMStreamingDecodeSession:
         return stable
 
     def _decode_ready_regular_windows(self) -> torch.Tensor | None:
-        starts = []
-        while self.next_window_start + self.window <= self.available_latent_frames:
-            starts.append(self.next_window_start)
-            self.next_window_start += self.stride
+        with self.model._decode_guard("stream window planning"):
+            starts = []
+            while self.next_window_start + self.window <= self.available_latent_frames:
+                starts.append(self.next_window_start)
+                self.next_window_start += self.stride
         if not starts:
             return None
         decoded = self._decode_windows(starts)
-        assert decoded is not None
-        self._append_decoded_windows(decoded, first_window_start=starts[0])
-        tail_start = self.available_latent_frames - self.window
-        if tail_start >= 0 and tail_start % self.stride == 0:
-            stable_latent_frames = tail_start + 1
-        else:
-            stable_latent_frames = max(0, tail_start)
-        return self._commit_until(stable_latent_frames * self.temporal_ratio)
+        with self.model._decode_guard("stream stable-prefix commit"):
+            if self.model._is_output_rank():
+                assert decoded is not None
+                self._append_decoded_windows(decoded, first_window_start=starts[0])
+            tail_start = self.available_latent_frames - self.window
+            if tail_start >= 0 and tail_start % self.stride == 0:
+                stable_latent_frames = tail_start + 1
+            else:
+                stable_latent_frames = max(0, tail_start)
+            stable = self._commit_until(stable_latent_frames * self.temporal_ratio)
+        return stable
 
     @property
     def stable_pixel_frames(self) -> int:
@@ -1095,6 +1344,9 @@ class PixelUMMStreamingDecodeSession:
                 f"Requested PixelUMM pixels are not stable yet: range=[{start}, {end}), "
                 f"stable={self.committed_pixel_frames}."
             )
+        if not self.model._is_output_rank():
+            assert self.buffer is not None
+            return self.buffer.new_empty((0,))
         selected = []
         cursor = start
         for part_start, part in self.committed:
@@ -1116,77 +1368,85 @@ class PixelUMMStreamingDecodeSession:
     @torch.no_grad()
     def push(self, latent: torch.Tensor, *, pixel_frames: int | None = None) -> torch.Tensor:
         """Append one arbitrary-length segment and return newly stable pixels."""
-        if self.finished:
-            raise RuntimeError("Cannot push PixelUMM latents after finish().")
-        if latent.ndim != 5 or latent.shape[2] <= 0:
-            raise ValueError(f"expected non-empty [B,C,T,H,W], got {tuple(latent.shape)}")
-        latent_frames = int(latent.shape[2])
-        if pixel_frames is None:
-            segment_pixel_frames = latent_frames * self.temporal_ratio
-        else:
-            segment_pixel_frames = int(pixel_frames)
-        if segment_pixel_frames <= 0:
-            raise ValueError("pixel_frames must be positive")
-        min_pixel_frames = (latent_frames - 1) * self.temporal_ratio + 1
-        max_pixel_frames = latent_frames * self.temporal_ratio
-        if not min_pixel_frames <= segment_pixel_frames <= max_pixel_frames:
-            raise ValueError(
-                "PixelUMM streaming segment pixel length is inconsistent with its latent length: "
-                f"latent_frames={latent_frames}, pixel_frames={segment_pixel_frames}, "
-                f"expected_range=[{min_pixel_frames}, {max_pixel_frames}]."
-            )
-        previous_stable = self.committed_pixel_frames
-        if self.buffer is not None:
-            self.buffer = torch.cat([self.buffer, latent], dim=2)
-        elif self.rolling:
-            # Rolling sessions later slice the buffer; own the storage.
-            self.buffer = latent.clone()
-        else:
-            self.buffer = latent.contiguous()
-        self.available_latent_frames += latent_frames
-        self.available_pixel_frames += segment_pixel_frames
-        self.push_latent_frames.append(latent_frames)
-        self.push_pixel_frames.append(segment_pixel_frames)
+        with self.model._decode_guard("stream input validation"):
+            if self.finished:
+                raise RuntimeError("Cannot push PixelUMM latents after finish().")
+            if latent.ndim != 5 or latent.shape[2] <= 0:
+                raise ValueError(f"expected non-empty [B,C,T,H,W], got {tuple(latent.shape)}")
+            latent_frames = int(latent.shape[2])
+            segment_pixel_frames = latent_frames * self.temporal_ratio if pixel_frames is None else int(pixel_frames)
+            if segment_pixel_frames <= 0:
+                raise ValueError("pixel_frames must be positive")
+            min_pixel_frames = (latent_frames - 1) * self.temporal_ratio + 1
+            max_pixel_frames = latent_frames * self.temporal_ratio
+            if not min_pixel_frames <= segment_pixel_frames <= max_pixel_frames:
+                raise ValueError(
+                    "PixelUMM streaming segment pixel length is inconsistent with its latent length: "
+                    f"latent_frames={latent_frames}, pixel_frames={segment_pixel_frames}, "
+                    f"expected_range=[{min_pixel_frames}, {max_pixel_frames}]."
+                )
+        self._validate_parallel_state(0, segment_pixel_frames)
+        self.model._validate_decode_latent(latent)
+        with self.model._decode_guard("stream buffer append"):
+            previous_stable = self.committed_pixel_frames
+            if self.buffer is not None:
+                self.buffer = torch.cat([self.buffer, latent], dim=2)
+            elif self.rolling:
+                # Rolling sessions later slice the buffer; own the storage.
+                self.buffer = latent.clone()
+            else:
+                self.buffer = latent.contiguous()
+            self.available_latent_frames += latent_frames
+            self.available_pixel_frames += segment_pixel_frames
+            self.push_latent_frames.append(latent_frames)
+            self.push_pixel_frames.append(segment_pixel_frames)
         stable = self._decode_ready_regular_windows()
-        self._trim_completed_prefix()
-        if stable is None or self.committed_pixel_frames <= previous_stable:
-            assert self.buffer is not None
-            return self.buffer.new_empty((0,))
+        with self.model._decode_guard("stream push finalization"):
+            self._trim_completed_prefix()
+            if stable is None or self.committed_pixel_frames <= previous_stable:
+                assert self.buffer is not None
+                stable = self.buffer.new_empty((0,))
         return stable
 
     @torch.no_grad()
     def finish(self) -> torch.Tensor:
         """Publish the withheld tail and close the append-only timeline."""
-        if self.rolling and not self.final_segment:
-            raise ValueError("rolling finish requires final_segment=True on the closing segment")
-        if self.finished:
-            raise RuntimeError("PixelUMM streaming decode is already finished.")
-        if self.buffer is None:
-            raise RuntimeError("Cannot finish an empty PixelUMM streaming session.")
+        with self.model._decode_guard("stream finish validation"):
+            if self.rolling and not self.final_segment:
+                raise ValueError("rolling finish requires final_segment=True on the closing segment")
+            if self.finished:
+                raise RuntimeError("PixelUMM streaming decode is already finished.")
+            if self.buffer is None:
+                raise RuntimeError("Cannot finish an empty PixelUMM streaming session.")
+        self._validate_parallel_state(1, -1)
         previous_stable = self.committed_pixel_frames
         provisional_raw = self._decode_provisional_raw()
-        assert provisional_raw is not None
-        stable = self._visible_slice_from_raw(
-            provisional_raw, raw_start=self.committed_raw_pixel_frames, raw_end=self.available_raw_pixel_frames
-        )
-        if self.to_cpu:
-            stable = stable.cpu()
-        if self.retain_history and stable.shape[2] > 0:
-            self.committed.append((previous_stable, stable))
-        if self.pending is not None:
-            self.pending = self.pending[:, :, :0]
-        self.pending_pixel_start = self.available_raw_pixel_frames
-        self.committed_raw_pixel_frames = self.available_raw_pixel_frames
-        self.committed_pixel_frames = self.available_pixel_frames
-        self.finished = True
-        if self.rolling:
-            self.buffer = self.buffer[:, :, :0].clone()
-            self.pending = None
-            self.push_latent_frames.clear()
-            self.push_pixel_frames.clear()
-        if self.committed_pixel_frames <= previous_stable:
-            assert self.buffer is not None
-            return self.buffer.new_empty((0,))
+        with self.model._decode_guard("stream finish commit"):
+            stable = None
+            if self.model._is_output_rank():
+                assert provisional_raw is not None
+                stable = self._visible_slice_from_raw(
+                    provisional_raw, raw_start=self.committed_raw_pixel_frames, raw_end=self.available_raw_pixel_frames
+                )
+                if self.to_cpu:
+                    stable = stable.cpu()
+                if self.retain_history and stable.shape[2] > 0:
+                    self.committed.append((previous_stable, stable))
+            if self.pending is not None:
+                self.pending = self.pending[:, :, :0]
+            self.pending_pixel_start = self.available_raw_pixel_frames
+            self.committed_raw_pixel_frames = self.available_raw_pixel_frames
+            self.committed_pixel_frames = self.available_pixel_frames
+            self.finished = True
+            if self.rolling:
+                assert self.buffer is not None
+                self.buffer = self.buffer[:, :, :0].clone()
+                self.pending = None
+                self.push_latent_frames.clear()
+                self.push_pixel_frames.clear()
+            if stable is None or self.committed_pixel_frames <= previous_stable:
+                assert self.buffer is not None
+                stable = self.buffer.new_empty((0,))
         return stable
 
     def full_video(self) -> torch.Tensor:
@@ -1198,11 +1458,14 @@ class PixelUMMStreamingDecodeSession:
         return self.slice_pixels(0, self.available_pixel_frames)
 
     def _decode_windows(self, starts):
-        local_starts = [start - self.buffer_latent_start for start in starts]
-        pad_short = bool(self.model.tail_hold_latents) and not self.final_segment
+        with self.model._decode_guard("stream window input"):
+            local_starts = [start - self.buffer_latent_start for start in starts]
+            pad_short = bool(self.model.tail_hold_latents) and not self.final_segment
+            assert self.buffer is not None
         video = self.model._decode_windows(
             self.buffer, local_starts, self.seed, pad_short=pad_short, frame_offset=self.buffer_latent_start
         )
-        if self.to_cpu:
-            return video.cpu()
+        with self.model._decode_guard("stream window output"):
+            if video is not None and self.to_cpu:
+                video = video.cpu()
         return video

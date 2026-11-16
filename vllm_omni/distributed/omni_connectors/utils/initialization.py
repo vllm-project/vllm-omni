@@ -316,6 +316,15 @@ def load_omni_transfer_config(
 
     # Parse global connectors (from runtime.connectors)
     global_connectors = runtime_config.get("connectors", {})
+    # Transfer config is also loaded directly from the resolved YAML, without
+    # DeployConfig. Apply the same named-connector overlay on this path.
+    from vllm_omni.config.stage_config import _merge_connectors
+    from vllm_omni.platforms import current_omni_platform
+
+    platform = (current_omni_platform.device_name or "").lower()
+    platform_connectors = (config_dict.get("platforms") or {}).get(platform, {}).get("connectors")
+    if platform_connectors:
+        global_connectors = _merge_connectors(global_connectors, platform_connectors) or {}
 
     # Parse stage-level connectors
     stage_args = config_dict.get("stage_args", [])

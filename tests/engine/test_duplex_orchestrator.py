@@ -13,9 +13,11 @@ from typing import Any
 
 import numpy as np
 import pytest
+from vllm.config import ModelConfig
 from vllm.outputs import CompletionOutput
 from vllm.v1.engine import FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.input_processor import InputProcessor
 
 from tests.engine.test_orchestrator import (
     FakeOutputProcessor,
@@ -29,6 +31,7 @@ from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
+    DuplexInputCapacity,
     DuplexStageRequestContext,
     DuplexStageSubmission,
     duplex_resource_request_id,
@@ -40,6 +43,7 @@ from vllm_omni.engine.duplex.messages import (
     DuplexSessionCommandMessage,
     OpenDuplexSessionMessage,
 )
+from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator, DuplexOrchestratorRequestState
 from vllm_omni.engine.messages import AbortRequestMessage, AddCompanionRequestMessage, ShutdownRequestMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState, build_engine_core_request_from_tokens
@@ -1804,3 +1808,152 @@ async def test_repeated_replica_failure_reports_session_error_and_close_once(
     finally:
         cleanup_gate.set()
         await manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("input_tokens", [15, 16])
+async def test_capacity_validation_reuses_engine_expansion_and_recovers_after_rejection(mocker, input_tokens):
+    from vllm.renderers import BaseRenderer
+    from vllm.renderers.params import TokenizeParams
+    from vllm.sampling_params import SamplingParams
+
+    orchestrator, clients, _, _ = _build()
+    renderer = mocker.Mock(spec=BaseRenderer, mm_processor_cache=None)
+    renderer.default_cmpl_tok_params = TokenizeParams(max_total_tokens=20)
+    processor = mocker.Mock(
+        spec=InputProcessor,
+        model_config=mocker.Mock(spec=ModelConfig, is_encoder_decoder=False),
+        renderer=renderer,
+    )
+    orchestrator._stage_input_processors[0] = processor
+    clear_cache = mocker.spy(orchestrator, "_clear_stage_input_cache")
+    features = object()
+    expanded = {"type": "multimodal", "prompt_token_ids": [1] * input_tokens, "mm_kwargs": features}
+    renderer.render_cmpl.return_value = (expanded,)
+
+    def process_inputs(*, request_id, prompt, params, **kwargs):
+        assert prompt is expanded
+        assert prompt["mm_kwargs"] is features
+        return build_engine_core_request_from_tokens(request_id, prompt, params, resumable=False)
+
+    processor.process_inputs.side_effect = process_inputs
+
+    async def submit(request_id):
+        context = DuplexStageRequestContext(
+            request_id=request_id,
+            session_id=request_id,
+            fence=DuplexFence(request_id),
+            stage_id=0,
+            final_stage_id=0,
+            config_generation=0,
+            sampling_params=(SamplingParams(max_tokens=5),),
+        )
+        orchestrator.ensure_request(context)
+        return await orchestrator.submit(
+            DuplexStageSubmission(
+                context=context,
+                prompt={"prompt": "raw prompt", "multi_modal_data": {"image": [features]}},
+                already_submitted=False,
+                resumable=False,
+                input_capacity=DuplexInputCapacity(20, 5),
+            )
+        )
+
+    rejected = input_tokens > 15
+    if rejected:
+        with pytest.raises(DuplexInputCapacityError, match="reserved output tokens"):
+            await submit("too-large")
+        assert not clients[0].add_request_calls
+        processor.process_inputs.assert_not_called()
+        clear_cache.assert_called_once_with(0)
+        assert not orchestrator._stage_input_submission_locks[0].locked()
+        expanded["prompt_token_ids"] = [1] * 15
+    await submit("fits")
+    assert len(clients[0].add_request_calls) == 1
+    assert clients[0].add_request_calls[0][0].prompt_token_ids == [1] * 15
+    assert renderer.render_cmpl.call_count == 1 + int(rejected)
+    assert processor.process_inputs.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("input_tokens", [15, 16, 21, 30])
+async def test_real_renderer_preserves_exact_recoverable_capacity_rejection(mocker, input_tokens):
+    from vllm.renderers import BaseRenderer
+
+    class TextTokenizer:
+        max_chars_per_token = 10
+        is_fast = False
+
+        def __call__(self, text, **kwargs):
+            tokens = [1] * len(text)
+            if kwargs.get("truncation"):
+                tokens = tokens[: kwargs["max_length"]]
+            return {"input_ids": tokens}
+
+    class CpuRenderer(BaseRenderer):
+        def render_messages(self, messages, params):
+            raise AssertionError("completion rendering does not use chat messages")
+
+    renderer = object.__new__(CpuRenderer)
+    renderer.model_config = mocker.Mock(spec=ModelConfig, max_model_len=20, encoder_config={}, is_encoder_decoder=False)
+    renderer.mm_processor = None
+    renderer.tokenizer = TextTokenizer()
+    processor = mocker.Mock(spec=InputProcessor, model_config=renderer.model_config, renderer=renderer)
+    orchestrator, _, _, _ = _build()
+    orchestrator._stage_input_processors[0] = processor
+    checks = []
+    capacity = DuplexOrchestrator._input_capacity_validator(DuplexInputCapacity(20, 5))
+
+    def validate(count):
+        checks.append(count)
+        capacity(count)
+
+    async def process(size):
+        return await orchestrator._process_stage_inputs(
+            0, validate_input_tokens=validate, prompt={"prompt": "x" * size}, request_id="capacity"
+        )
+
+    if input_tokens > 15:
+        with pytest.raises(DuplexInputCapacityError, match=f"needs {input_tokens} input tokens"):
+            await process(input_tokens)
+        processor.process_inputs.assert_not_called()
+        assert checks == [input_tokens]
+    await process(15)
+    assert checks == ([15] if input_tokens == 15 else [input_tokens, 15])
+    processor.process_inputs.assert_called_once()
+    assert len(processor.process_inputs.call_args.kwargs["prompt"]["prompt_token_ids"]) == 15
+    assert renderer.default_cmpl_tok_params.max_total_tokens == 20
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("input_tokens", [15, 16])
+async def test_resumable_capacity_counts_prompt_embeddings(input_tokens):
+    import torch
+    from vllm.sampling_params import SamplingParams
+
+    orchestrator, clients, _, _ = _build()
+    context = DuplexStageRequestContext(
+        request_id="embedded",
+        session_id="embedded",
+        fence=DuplexFence("embedded"),
+        stage_id=0,
+        final_stage_id=0,
+        config_generation=0,
+        sampling_params=(SamplingParams(max_tokens=5),),
+    )
+    orchestrator.ensure_request(context)
+    embeddings = torch.zeros((input_tokens, 4), device="cpu")
+    submission = DuplexStageSubmission(
+        context=context,
+        prompt={"prompt_token_ids": None, "prompt_embeds": embeddings},
+        already_submitted=False,
+        resumable=True,
+        input_capacity=DuplexInputCapacity(20, 5),
+    )
+    if input_tokens > 15:
+        with pytest.raises(DuplexInputCapacityError, match="needs 16 input tokens"):
+            await orchestrator.submit(submission)
+        assert not clients[0].add_request_calls
+    else:
+        await orchestrator.submit(submission)
+        assert clients[0].add_request_calls[0][0].prompt_embeds is embeddings

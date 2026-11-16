@@ -17,6 +17,11 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, cast
 
+# Preserve the original Session input_image admission limits for plugins that
+# do not override them. These bound stored data URLs, not per-request tokens.
+DEFAULT_IMAGE_HISTORY_MAX_ITEMS = 8
+DEFAULT_IMAGE_HISTORY_MAX_BYTES = 4 * 1024 * 1024
+
 
 def _normalized_voice(value: object) -> str | None:
     """Return the canonical form used to decide whether a voice update is a change.
