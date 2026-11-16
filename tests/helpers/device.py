@@ -25,6 +25,8 @@ can appear in ``pytest.mark.skipif`` conditions and ``parametrize`` lists.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 from vllm_omni.platforms import current_omni_platform
@@ -35,8 +37,10 @@ DEVICE_TYPE: str = current_omni_platform.device_type
 #: The platform's torch submodule (``torch.cuda`` / ``torch.xpu`` / ...).
 DEVICE_MODULE = torch.get_device_module(DEVICE_TYPE)
 
-#: Device graph class, or ``None`` where the platform has none.
-DEVICE_GRAPH = getattr(DEVICE_MODULE, "CUDAGraph", None) or getattr(DEVICE_MODULE, "XPUGraph", None)
+#: Device graph class, or ``None`` where the platform has none. Typed ``Any``
+#: because the tests that use it are gated to platforms that have one, and an
+#: ``Optional`` here would make every ``DEVICE_GRAPH()`` call a type error.
+DEVICE_GRAPH: Any = getattr(DEVICE_MODULE, "CUDAGraph", None) or getattr(DEVICE_MODULE, "XPUGraph", None)
 
 #: Collective backend that matches the device (``nccl`` / ``xccl`` / ``gloo``).
 DIST_BACKEND: str = {"cuda": "nccl", "rocm": "nccl", "xpu": "xccl"}.get(DEVICE_TYPE, "gloo")
