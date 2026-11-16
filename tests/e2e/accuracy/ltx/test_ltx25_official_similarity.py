@@ -155,8 +155,12 @@ def test_ltx_reference_runner_unwraps_audio_only_output() -> None:
     assert sample_rate == 48_000
 
 
-def test_ltx_reference_runner_resolves_gemma4_rope_layer_config() -> None:
-    from .run_ltx25_reference import _gemma4_rope_config_for_layer
+def test_ltx_reference_runner_resolves_gemma4_rope_layer_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    from transformers.models.gemma4_unified.modeling_gemma4_unified import (
+        Gemma4UnifiedTextRotaryEmbedding,
+    )
+
+    from .run_ltx25_reference import _configure_official_gemma4_rope_compatibility
 
     @dataclass(frozen=True)
     class LayerConfig:
@@ -173,14 +177,40 @@ def test_ltx_reference_runner_resolves_gemma4_rope_layer_config() -> None:
         def head_dim(self) -> int:
             raise AssertionError("heterogeneous global head_dim must not be read")
 
-    config = Config()
-    resolved = _gemma4_rope_config_for_layer(
-        cast("Gemma4UnifiedTextConfig", config),
-        "sliding_attention",
+    observed: list[tuple[object, torch.device | None, str | None, dict[str, object]]] = []
+
+    def original_compute_default_rope_parameters(
+        config: object,
+        device: torch.device | None = None,
+        layer_type: str | None = None,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, float]:
+        observed.append((config, device, layer_type, kwargs))
+        return torch.empty(0), 1.0
+
+    monkeypatch.setattr(
+        Gemma4UnifiedTextRotaryEmbedding,
+        "compute_default_rope_parameters",
+        staticmethod(original_compute_default_rope_parameters),
     )
 
-    assert resolved is config.per_layer_config["sliding_attention"]
-    assert resolved.head_dim == 256
+    config = Config()
+    _configure_official_gemma4_rope_compatibility()
+    installed = Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters
+    device = torch.device("cpu")
+    inv_freq, attention_scaling = installed(
+        cast("Gemma4UnifiedTextConfig", config),
+        device=device,
+        layer_type="sliding_attention",
+        sentinel=True,
+    )
+
+    assert inv_freq.numel() == 0
+    assert attention_scaling == 1.0
+    assert observed == [(config.per_layer_config["sliding_attention"], device, "sliding_attention", {"sentinel": True})]
+
+    _configure_official_gemma4_rope_compatibility()
+    assert Gemma4UnifiedTextRotaryEmbedding.compute_default_rope_parameters is installed
 
 
 def test_connector_weight_index_is_authoritative(tmp_path: Path) -> None:
