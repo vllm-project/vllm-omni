@@ -8,7 +8,7 @@ import functools
 import math
 import re
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
@@ -390,9 +390,12 @@ class StagePipelineConfig:
     supports_native_mrv2_data_plane: bool = False
     supports_duplex_mrv2: bool = False
     # Sampling keys this stage's model_runner: v2 implementation does not
-    # support. Checked against ``default_sampling_params`` at deploy merge:
-    # a non-neutral default fails at startup with the v1 opt-out named; a
-    # value equal to the engine default passes.
+    # support. Checked against ``default_sampling_params`` at deploy-merge time
+    # and request sampling at the frontend admission boundary. An unsupported
+    # default fails at startup (with the v1 opt-out named), while an unsupported
+    # request fails before it can enter the engine queue. Keys whose
+    # engine-default value is neutral (e.g. repetition_penalty=1.0) pass; any
+    # non-neutral value fails.
     mrv2_unsupported_sampling_params: tuple[str, ...] = ()
     # Declares the ``model_runner: v2`` + legacy-transport combination
     # validated for this stage, silencing the unvalidated-integration
@@ -1202,6 +1205,34 @@ _MRV2_NEUTRAL_SAMPLING_VALUES: dict[str, Any] = {
     "min_tokens": 0,
     "min_p": 0.0,
 }
+_MRV2_EXPLICIT_SAMPLING_PARAMS = frozenset({"logprobs", "prompt_logprobs"})
+
+
+def get_unsupported_mrv2_sampling_params(
+    params: Mapping[str, Any] | Any,
+    unsupported: Collection[str],
+) -> tuple[str, ...]:
+    """Return unsupported MRV2 sampling keys that are active in *params*.
+
+    The same neutral-value rules apply to deploy defaults and request objects.
+    ``logprobs`` and ``prompt_logprobs`` are presence-sensitive: even zero
+    explicitly requests log-probabilities and therefore cannot be treated as a
+    neutral value.
+    """
+    bad: list[str] = []
+    for key in unsupported:
+        value = params.get(key) if isinstance(params, Mapping) else getattr(params, key, None)
+        if key in _MRV2_EXPLICIT_SAMPLING_PARAMS:
+            invalid = value is not None
+        elif key in _MRV2_NEUTRAL_SAMPLING_VALUES:
+            invalid = value not in (_MRV2_NEUTRAL_SAMPLING_VALUES[key], None, [], {})
+        else:
+            # Collection-valued options (allowed_token_ids, bad_words, and
+            # logit_bias) are neutral when empty; any populated value is active.
+            invalid = bool(value)
+        if invalid:
+            bad.append(key)
+    return tuple(sorted(set(bad)))
 
 
 def _validate_mrv2_default_sampling_params(
@@ -1211,11 +1242,7 @@ def _validate_mrv2_default_sampling_params(
     if stage_runner != "v2" or not ps.mrv2_unsupported_sampling_params:
         return
     params = (ds.default_sampling_params if ds is not None else None) or {}
-    bad = [
-        key
-        for key in sorted(set(params) & set(ps.mrv2_unsupported_sampling_params))
-        if params[key] not in (_MRV2_NEUTRAL_SAMPLING_VALUES.get(key), None, [], {})
-    ]
+    bad = get_unsupported_mrv2_sampling_params(params, ps.mrv2_unsupported_sampling_params)
     if bad:
         raise ValueError(
             f"stage {ps.stage_id}: default_sampling_params {bad} are not supported by this model's "
@@ -1512,6 +1539,8 @@ def _build_extras(
         extras["cfg_kv_collect_func"] = ps.cfg_kv_collect_func
     if ps.async_chunk_prewarm_payload_func:
         extras["async_chunk_prewarm_payload_func"] = ps.async_chunk_prewarm_payload_func
+    if ps.mrv2_unsupported_sampling_params:
+        extras["mrv2_unsupported_sampling_params"] = tuple(ps.mrv2_unsupported_sampling_params)
     if ps.extras:
         extras.update(ps.extras)
     return extras

@@ -1656,6 +1656,7 @@ class TestRegistry:
         # Stage-1 codec CUDA graph windows follow the connector geometry.
         hf_overrides = stage1.engine_extras["hf_overrides"]
         assert hf_overrides["codec_graph_single_max_frames"] == 33
+        assert hf_overrides["codec_graph_frame_sizes"] == [8, 33]
         assert hf_overrides["codec_graph_batch_sizes"] == list(range(1, 17))
 
 

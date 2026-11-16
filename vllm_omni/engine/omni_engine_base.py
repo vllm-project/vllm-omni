@@ -454,6 +454,7 @@ class OmniEngineBase:
                 final_output_type=client.final_output_type,
                 stage_type=client.stage_type,
                 model_stage=getattr(client, "model_stage", None),
+                mrv2_unsupported_sampling_params=tuple(getattr(client, "mrv2_unsupported_sampling_params", ())),
             )
             for client in self.stage_clients
         ]

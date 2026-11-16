@@ -90,6 +90,9 @@ stages:
       # Codec CUDA graph windows follow the connector chunk shape (25 + 8 = 33);
       # batch buckets sized to this profile's max_num_seqs.
       codec_graph_single_max_frames: 33
+      codec_graph_frame_sizes:
+      - 8
+      - 33
       codec_graph_batch_sizes:
       - 1
       - 2

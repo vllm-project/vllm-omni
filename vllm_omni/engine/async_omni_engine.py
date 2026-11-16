@@ -20,6 +20,7 @@ from vllm.multimodal.cache import ShmObjectStoreSenderCache
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.kv_hints import KvHintsEnvelope
 
+from vllm_omni.config.stage_config import get_unsupported_mrv2_sampling_params
 from vllm_omni.data_entry_keys import REQUEST_ARTIFACT_DIRS_KEY, TRANSFORM_OWNED_META_KEYS
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import (
@@ -54,6 +55,27 @@ class AsyncOmniEngine(OmniEngineBase):
     # ---- request helpers ----
 
     _DEFAULT_MM_HASHER_ALGORITHM = "blake3"
+
+    def _validate_stage0_sampling_params(
+        self,
+        request_id: str,
+        params: OmniSamplingParams,
+        *,
+        entry_stage_id: int,
+    ) -> None:
+        """Reject active MRV2-incompatible sampling before queue admission."""
+        if entry_stage_id != 0 or not getattr(self, "stage_metadata", None):
+            return
+        unsupported = tuple(getattr(self.stage_metadata[0], "mrv2_unsupported_sampling_params", ()))
+        if not unsupported:
+            return
+        bad = get_unsupported_mrv2_sampling_params(params, unsupported)
+        if bad:
+            raise ValueError(
+                "model_runner: v2 supports temperature/top-k/top-p/seed sampling only; "
+                f"request {request_id} set unsupported sampling parameter(s): {', '.join(bad)}. "
+                "Remove them or run this stage with model_runner: v1"
+            )
 
     def _resolve_mm_hasher_algorithm(self) -> str:
         """Return the MM hash algorithm configured for stage 0.
@@ -265,6 +287,7 @@ class AsyncOmniEngine(OmniEngineBase):
             effective_sampling_params_list = disable_watermarking(effective_sampling_params_list)
 
         params = effective_sampling_params_list[0]
+        self._validate_stage0_sampling_params(request_id, params, entry_stage_id=entry_stage_id)
 
         # Keep the original prompt for downstream stages (they need the raw
         # dict, e.g. for multi_modal_data).
