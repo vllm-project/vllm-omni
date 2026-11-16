@@ -34,6 +34,8 @@ _TINY_TARGET_DIMS = {
 
 @pytest.fixture(autouse=True)
 def _use_tiny_h3_dimensions(monkeypatch):
+    # CPU weight-layout tests do not need CUDA-backed pinned memory.
+    monkeypatch.setattr("vllm.lora.lora_model.PIN_MEMORY", False)
     monkeypatch.setattr(lora_module, "_TURBO_TARGET_DIMS", _TINY_TARGET_DIMS)
 
 
