@@ -1,41 +1,36 @@
 # .buildkite/intel/pipeline-intel.yml
 #
-# Two mutually exclusive XPU steps. The scope follows the same signals the CUDA
-# weekly/nightly steps use (.buildkite/cuda/test-weekly.yml): a scheduled build
-# that sets NIGHTLY=1, or a PR labelled ``nightly-test``. Every ordinary PR
-# takes the pr scope.
+# Four steps: {pr, broad} x {1-card agents, 2-card agents}. Exactly two run per
+# build, because the pr and broad steps carry mutually exclusive ``if``
+# expressions - the same signals the CUDA weekly/nightly steps use
+# (.buildkite/cuda/test-weekly.yml): a scheduled build that sets NIGHTLY=1, or a
+# PR labelled ``nightly-test``. Every ordinary PR takes the pr pair.
 #
-#   pr     the no-card XPU-dispatch stage, core_model on one and on two cards,
-#          and the omni models: ~37min measured. Needs tiny-random/Qwen-Image
-#          (30MB), riverclouds/qwen_image_random (9.9GB), Qwen2.5-Omni-3B (12GB)
-#          and Qwen2.5-Omni-7B (21GB) in the agent's HF cache.
-#   broad  also advanced_model on one and two cards (Qwen3-TTS, Z-Image, Wan2.1,
-#          Voxtral, and BAGEL-7B-MoT for sleep mode), hence its larger budget.
+# Scope:
+#   pr     the no-card XPU-dispatch stage, core_model and the omni models.
+#          Needs tiny-random/Qwen-Image (30MB), riverclouds/qwen_image_random
+#          (9.9GB), Qwen2.5-Omni-3B (12GB) and Qwen2.5-Omni-7B (21GB) in the
+#          agent's HF cache.
+#   broad  adds advanced_model: Qwen3-TTS, Z-Image, Wan2.1, Voxtral on one card,
+#          and the sleep/wake suite on two, which also needs BAGEL-7B-MoT.
 #
-# Card budget. The script pins the first card of the agent's ZE_AFFINITY_MASK
-# for the cards_1 stages and the first two for the cards_2 ones, and XPU_REQUIRE_CARDS
-# makes it fail rather than quietly drop a stage: a step asking for 2 cards that
-# lands on a single-card agent is an error, not a green build with less coverage.
+# Card classes: the 1-card steps own every cards_1 stage (and the no-card one),
+# the 2-card steps own only the cards_2 stages, so the scarce 2-card agents do
+# not repeat the long lane. XPU_TEST_CARDS selects which group a step runs and
+# XPU_REQUIRE_CARDS checks the mask the agent actually hands over, so a tag that
+# does not match reality fails the step instead of quietly dropping stages.
 #
-# Both steps target agents tagged cards=2, so the agent side needs, per
-# instance:
+# Agent side, 16 cards over two 8-card hosts = ten 1-card and three 2-card
+# instances, with disjoint masks:
 #
-#   buildkite-agent start --tags "queue=intel-gpu-omni,cards=2"
-#   ZE_AFFINITY_MASK=0,1        # two cards, disjoint between instances
+#   buildkite-agent start --tags "queue=intel-gpu-omni,cards=1"  ZE_AFFINITY_MASK=<n>
+#   buildkite-agent start --tags "queue=intel-gpu-omni,cards=2"  ZE_AFFINITY_MASK=<n>,<n+1>
 #
-# The tag is the promise and the mask is the reality; XPU_REQUIRE_CARDS checks
-# the second. An 8-card host therefore carries four such instances.
+#   host A: cards=1 on 0,1,2,3,4,5      cards=2 on 6,7
+#   host B: cards=1 on 0,1,2,3          cards=2 on 4,5 and 6,7
 #
-# NOTE: this targeting only schedules once the agents carry the tag. Tag them
-# before merging, or the Intel steps sit unscheduled.
-#
-# A single-card queue can run the smaller lane with its own step: target
-# cards: "1" and set XPU_REQUIRE_CARDS: "1", which skips the cards_2 stages
-# deliberately and says so in the log.
-#
-# Exactly one step runs per build, so the image is built once either way. To
-# get the broad scope on demand: new build with NIGHTLY=1, or label the PR
-# ``nightly-test``.
+# NOTE: the steps only schedule once the agents carry these tags. Re-cut the
+# agents before merging, or the Intel steps sit unscheduled.
 common_xpu_env: &common_xpu_env
   DOCKER_BUILDKIT: "1"
   # Buildkite will automatically replace this with the actual commit hash
@@ -44,15 +39,36 @@ common_xpu_env: &common_xpu_env
   # The CI image is local-only and the run's trap deletes it, so compressing
   # its ~37GB of layers only costs test time.
   EXPORT_COMPRESSION: "uncompressed"
-  # Container test budget; leaves the rest of timeout_in_minutes for the
-  # image build.
-  XPU_TEST_BUDGET: "60m"
+
+pr_if: &pr_if >-
+  build.env("NIGHTLY") != "1" && !(build.pull_request.labels includes "nightly-test")
+broad_if: &broad_if >-
+  build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
 
 steps:
   - group: "INTEL Tests"
     steps:
-      - label: "Intel: XPU Test"
-        if: build.env("NIGHTLY") != "1" && !(build.pull_request.labels includes "nightly-test")
+      # ~37min measured end to end: dispatch 3m40s, omni 10m05s,
+      # core_model 23m01s, mxfp8 23s. Stage caps sum to 51m.
+      - label: "Intel: XPU Test · 1 card"
+        if: *pr_if
+        command: "bash .buildkite/intel/scripts/run-xpu-test.sh"
+        agents:
+          queue: "intel-gpu-omni"
+          cards: "1"
+        env:
+          <<: *common_xpu_env
+          XPU_TEST_SCOPE: "pr"
+          XPU_TEST_CARDS: "1"
+          XPU_REQUIRE_CARDS: "1"
+          XPU_TEST_BUDGET: "55m"
+        priority: 100
+        timeout_in_minutes: 75
+        soft_fail: false
+
+      # 1m41s measured; the image build dominates this step.
+      - label: "Intel: XPU Test · 2 cards"
+        if: *pr_if
         command: "bash .buildkite/intel/scripts/run-xpu-test.sh"
         agents:
           queue: "intel-gpu-omni"
@@ -60,13 +76,31 @@ steps:
         env:
           <<: *common_xpu_env
           XPU_TEST_SCOPE: "pr"
+          XPU_TEST_CARDS: "2"
           XPU_REQUIRE_CARDS: "2"
+          XPU_TEST_BUDGET: "15m"
         priority: 100
-        timeout_in_minutes: 80
+        timeout_in_minutes: 40
         soft_fail: false
 
-      - label: "Intel: XPU Test (broad)"
-        if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
+      - label: "Intel: XPU Test · 1 card (broad)"
+        if: *broad_if
+        command: "bash .buildkite/intel/scripts/run-xpu-test.sh"
+        agents:
+          queue: "intel-gpu-omni"
+          cards: "1"
+        env:
+          <<: *common_xpu_env
+          XPU_TEST_SCOPE: "broad"
+          XPU_TEST_CARDS: "1"
+          XPU_REQUIRE_CARDS: "1"
+          XPU_TEST_BUDGET: "70m"
+        priority: 100
+        timeout_in_minutes: 95
+        soft_fail: false
+
+      - label: "Intel: XPU Test · 2 cards (broad)"
+        if: *broad_if
         command: "bash .buildkite/intel/scripts/run-xpu-test.sh"
         agents:
           queue: "intel-gpu-omni"
@@ -74,9 +108,9 @@ steps:
         env:
           <<: *common_xpu_env
           XPU_TEST_SCOPE: "broad"
+          XPU_TEST_CARDS: "2"
           XPU_REQUIRE_CARDS: "2"
-          # The extra stages do not fit the pr budget.
-          XPU_TEST_BUDGET: "95m"
+          XPU_TEST_BUDGET: "35m"
         priority: 100
-        timeout_in_minutes: 120
+        timeout_in_minutes: 60
         soft_fail: false

@@ -161,6 +161,13 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     # instead of quietly dropping those stages. Set XPU_REQUIRE_CARDS=1 on a
     # single-card queue to opt out of the 2-card stages on purpose.
     require_cards="${XPU_REQUIRE_CARDS:-2}"
+    # Which card classes this step owns. A dedicated 2-card step sets
+    # XPU_TEST_CARDS=2 so it does not repeat the 1-card lane that the
+    # single-card agents already run; "1,2" (the default) runs everything.
+    test_cards="${XPU_TEST_CARDS:-1,2}"
+    case ",${test_cards}," in *,1,*) run_1card=1 ;; *) run_1card=0 ;; esac
+    case ",${test_cards}," in *,2,*) run_2card=1 ;; *) run_2card=0 ;; esac
+    echo "XPU_TEST_CARDS=${test_cards} -> 1-card stages=${run_1card}, 2-card stages=${run_2card}"
     if [ "${#mask_cards[@]}" -lt "${require_cards}" ]; then
         echo "ERROR: this step wants ${require_cards} cards but the agent gave" \
              "${#mask_cards[@]} (ZE_AFFINITY_MASK=${mask}). Point the step at an" \
@@ -180,6 +187,31 @@ time timeout -k 30 "${XPU_TEST_BUDGET}" docker run \
     # the mounted cache. It carries no XPU marker, so skip the file outright.
     ignore=(--ignore tests/e2e/offline_inference/test_cosyvoice3_expansion.py)
 
+
+    # The GPU stages load these from the mounted cache. Resolving them up front
+    # turns "LocalEntryNotFoundError six minutes into the omni stage" into one
+    # clear message naming what the agent is missing.
+    if [ "${run_1card}" = 1 ]; then
+        python - <<PY || exit 1
+from huggingface_hub import snapshot_download
+
+needed = ["tiny-random/Qwen-Image", "riverclouds/qwen_image_random",
+          "Qwen/Qwen2.5-Omni-3B", "Qwen/Qwen2.5-Omni-7B"]
+missing = []
+for repo in needed:
+    try:
+        snapshot_download(repo, local_files_only=True)
+    except Exception as exc:
+        missing.append(f"{repo}: {type(exc).__name__}")
+if missing:
+    raise SystemExit(
+        "these checkpoints are not in the mounted HF cache:\n  "
+        + "\n  ".join(missing)
+        + "\nSeed them on the agent cache that HF_CACHE points at."
+    )
+print("checkpoint preflight ok:", ", ".join(needed))
+PY
+    fi
 
     rc=0
     # A stage that starts an engine can leave a worker process behind, and its
@@ -225,48 +257,47 @@ PY
     # independent and the CUDA and ROCm lanes already run it. Note --ignore does
     # not apply to files named explicitly, which is why the exclusions live in
     # the list itself. See the header of both files for the measurements.
-    mapfile -t xpu_path < <(grep -v "^#" .buildkite/intel/xpu-path-tests.txt | grep .)
-    stage "xpu dispatch (no card)" 6m "${one_card}" -n "${XPU_CPU_WORKERS:-8}" \
-        "${xpu_path[@]}" \
-        -m "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
+    if [ "${run_1card}" = 1 ]; then
+        mapfile -t xpu_path < <(grep -v "^#" .buildkite/intel/xpu-path-tests.txt | grep .)
+        stage "xpu dispatch (no card)" 6m "${one_card}" -n "${XPU_CPU_WORKERS:-8}" \
+            "${xpu_path[@]}" \
+            -m "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
 
-    # The omni models go first and in their own process. They want the most
-    # device memory of anything here - Qwen2.5-Omni colocates three stages on
-    # one card at utils 0.45/0.25/0.15 - so they run while the card is clean.
-    stage "omni · 1 card" 15m "${one_card}" "${paths[@]}" "${ignore[@]}" \
-        -m "omni and xpu and B60 and cards_1" --run-level core_model
+        # The omni models go first and in their own process. They want the most
+        # device memory of anything here - Qwen2.5-Omni colocates three stages
+        # on one card at utils 0.45/0.25/0.15 - so they run on a clean card.
+        stage "omni · 1 card" 15m "${one_card}" "${paths[@]}" "${ignore[@]}" \
+            -m "omni and xpu and B60 and cards_1" --run-level core_model
 
-    # core_model excludes omni: the async-omni tests carry both markers and
-    # would otherwise run twice.
-    stage "core_model · 1 card" 28m "${one_card}" "${paths[@]}" "${ignore[@]}" \
-        -m "core_model and not omni and xpu and B60 and cards_1" --run-level core_model
-    stage "mxfp8 config" 2m "${one_card}" tests/diffusion/quantization/test_mxfp8_config.py
+        # core_model excludes omni: the async-omni tests carry both markers and
+        # would otherwise run twice.
+        stage "core_model · 1 card" 28m "${one_card}" "${paths[@]}" "${ignore[@]}" \
+            -m "core_model and not omni and xpu and B60 and cards_1" --run-level core_model
+        stage "mxfp8 config" 2m "${one_card}" tests/diffusion/quantization/test_mxfp8_config.py
+
+        # advanced_model loads the larger checkpoints (Qwen3-TTS, Z-Image,
+        # Wan2.1, Voxtral), so it waits for the nightly or a manual build.
+        # full_model stays out of both until the cache is seeded.
+        if [ "${XPU_TEST_SCOPE:-pr}" = "broad" ]; then
+            stage "advanced_model · 1 card" 15m "${one_card}" "${paths[@]}" "${ignore[@]}" \
+                -m "advanced_model and not full_model and xpu and B60 and cards_1" --run-level core_model
+        fi
+    fi
 
     # Two cards: distributed init over XCCL plus the step pipeline in each
     # parallel mode. The SKU set is wider here because the only 2-card XPU
     # suites in-tree are marked B70 (sleep mode), and a B70 agent satisfies the
-    # B60-marked ones too. Skipped when the agent hands this job one card.
-    if [ "${#mask_cards[@]}" -ge 2 ]; then
+    # B60-marked cases too.
+    if [ "${run_2card}" = 1 ]; then
         stage "core_model · 2 cards" 8m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
             -m "core_model and xpu and (B60 or B70) and cards_2" --run-level core_model
-    else
-        echo "--- :pytest: 2-card stages skipped on purpose (XPU_REQUIRE_CARDS=1)"
-    fi
 
-    # advanced_model loads the larger checkpoints (Qwen3-TTS, Z-Image, Wan2.1,
-    # Voxtral), so it waits for the nightly or a manually triggered build.
-    # full_model stays out of both until the cache is seeded: tens of GB a case.
-    if [ "${XPU_TEST_SCOPE:-pr}" = "broad" ]; then
-        stage "advanced_model · 1 card" 15m "${one_card}" "${paths[@]}" "${ignore[@]}" \
-            -m "advanced_model and not full_model and xpu and B60 and cards_1" --run-level core_model
-        # 11 sleep/wake cases on two cards (B70-marked). Not measured yet: they
-        # need BAGEL-7B-MoT, Qwen2.5-Omni-7B and qwen_image_random in the cache.
-        if [ "${#mask_cards[@]}" -ge 2 ]; then
+        # 11 sleep/wake cases. Not measured yet: they additionally need
+        # BAGEL-7B-MoT in the mounted cache.
+        if [ "${XPU_TEST_SCOPE:-pr}" = "broad" ]; then
             stage "advanced_model · 2 cards" 20m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
                 -m "advanced_model and not full_model and xpu and (B60 or B70) and cards_2" --run-level core_model
         fi
-    else
-        echo "--- :pytest: skipping advanced_model (XPU_TEST_SCOPE=pr)"
     fi
 
     exit "${rc}"

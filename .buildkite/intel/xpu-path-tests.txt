@@ -227,7 +227,6 @@ tests/e2e/accuracy/test_videogen_modelopt_quant.py
 tests/e2e/features/custom_pipeline/test_async_omni_collective_rpc.py
 tests/e2e/features/prefill_phase/test_chunked_prefill_tail.py
 tests/e2e/offline_inference/test_audex_tts.py
-tests/e2e/offline_inference/test_cosyvoice3_expansion.py
 tests/e2e/offline_inference/test_flux1_dev_autoround_w4a16_expansion.py
 tests/e2e/offline_inference/test_flux2_klein.py
 tests/e2e/offline_inference/test_glm_image_autoround_w4a16_expansion.py

@@ -59,3 +59,6 @@ tests/model_executor/models/qwen3_tts/test_qwen3_tts_code2wav.py
 tests/model_executor/models/test_omni_processing.py
 tests/platforms/test_record_device_event.py
 tests/worker/test_worker_base.py
+# Resolves a model directory at import time, so it errors in a stage that is
+# meant to need no weights at all (8 errors, 2026-11-16).
+tests/e2e/offline_inference/test_cosyvoice3_expansion.py
