@@ -887,7 +887,7 @@ class CosyVoice3Model(
         self.omni_pooler_payload_include_hidden = not cosyvoice3_packed_inference_enabled()
         self.model_stage = vllm_config.model_config.model_stage
         # The Talker attaches OmniOutput after forward, including on MRv2 replay.
-        self._mrv2_tensor_output = self.model_stage == "cosyvoice3_talker"
+        self.mrv2_forward_returns_tensor = self.model_stage == "cosyvoice3_talker"
         model_dir = vllm_config.model_config.model
         if not os.path.isdir(model_dir):
             model_dir = hf_api().snapshot_download(model_dir)

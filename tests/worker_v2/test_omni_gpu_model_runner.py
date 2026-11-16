@@ -514,13 +514,37 @@ def test_capture_contract_uses_model_declaration(stage, declared):
 
 def test_capture_contract_keeps_drafter_layers_for_postprocessed_multimodal_output():
     runner = _make_runner()
-    runner.model = SimpleNamespace(have_multimodal_outputs=True, _mrv2_tensor_output=True)
+    runner.model = SimpleNamespace(have_multimodal_outputs=True, mrv2_forward_returns_tensor=True)
     runner.use_aux_hidden_state_outputs = True
 
     runner._configure_cudagraph_output_contract()
 
     assert not runner._model_has_structured_output
     assert not runner._exclude_full_graph
+
+
+@pytest.mark.parametrize(
+    ("stage", "use_mrv2", "returns_aux", "exclude_full"),
+    [("llm", True, False, False), ("tts", True, False, False), ("llm", True, True, True), ("llm", False, False, True)],
+)
+def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = stage
+    model._use_v2_model_runner = use_mrv2
+    model._returns_aux_hidden_states = returns_aux
+    model.have_multimodal_outputs = True
+
+    runner = _make_runner()
+    runner.model = model
+    runner._configure_cudagraph_output_contract()
+
+    assert runner._model_has_structured_output is exclude_full
+    assert runner._exclude_full_graph is exclude_full
 
 
 def _aux_output(num_tokens):
