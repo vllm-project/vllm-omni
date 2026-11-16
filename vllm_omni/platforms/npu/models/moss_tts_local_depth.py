@@ -28,7 +28,6 @@ from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 logger = init_logger(__name__)
 
 _PATCHED = False
-_original_setup_compile: Callable | None = None
 _original_generate_frame: Callable | None = None
 _depth_graph_runners: WeakKeyDictionary[object, NPUExactGraphRunner] = WeakKeyDictionary()
 
@@ -210,30 +209,34 @@ def _whole_loop_compute(
     return (bin_tok, torch.stack(toks, dim=1))
 
 
-def _patched_setup_compile(self) -> None:
-    assert _original_setup_compile is not None
-    _original_setup_compile(self)
-    if self in _depth_graph_runners:
-        return
-    from vllm_omni.platforms import current_omni_platform
+def _ensure_runner(model: nn.Module, device: torch.device) -> NPUExactGraphRunner | None:
+    """Lazily create the graph runner on the first NPU ``generate_frame`` call.
 
-    if not current_omni_platform.is_npu():
-        return
+    The model no longer has a ``setup_compile`` lifecycle hook, so runner
+    initialization moved here — it runs after model loading and device setup,
+    on the first frame that would actually use the graph.
+    """
+    runner = _depth_graph_runners.get(model)
+    if runner is not None:
+        return runner
+    if device.type != "npu":
+        return None
     if not NPUExactGraphRunner.is_supported():
         logger.warning_once("MOSS-TTS local depth NPUGraph not supported on this torch_npu; eager fallback")
-        return
+        return None
     runner = NPUExactGraphRunner(
         max_graphs=_MAX_GRAPHS,
         component_name="MOSS-TTS local depth",
         disable_config_hint="set enforce_eager=True",
     )
-    _depth_graph_runners[self] = runner
+    _depth_graph_runners[model] = runner
     logger.info(
         "MOSS-TTS local depth NPU whole-loop graph enabled (max_graphs=%d, max_batch=%d); "
         "lazy capture on first generate_frame",
         _MAX_GRAPHS,
         _MAX_GRAPH_BATCH,
     )
+    return runner
 
 
 @torch.no_grad()
@@ -260,7 +263,7 @@ def _patched_generate_frame(
     # Per-row generators draw independent Gumbel noise per request, which the
     # single-generator graph path cannot reproduce; stay eager for them.
     per_row_generators = generators is not None and any(gen is not None for gen in generators)
-    runner = _depth_graph_runners.get(self)
+    runner = _ensure_runner(self, backbone_last_hidden.device)
     if (
         runner is not None
         and repetition_penalty == 1.0
@@ -363,7 +366,7 @@ def _patched_generate_frame(
 
 def apply_moss_tts_local_depth_patch() -> None:
     """Patch the shared depth transformer with Ascend NPUGraph acceleration."""
-    global _PATCHED, _original_setup_compile, _original_generate_frame
+    global _PATCHED, _original_generate_frame
     if _PATCHED:
         return
 
@@ -371,9 +374,7 @@ def apply_moss_tts_local_depth_patch() -> None:
         MossTTSLocalDepthTransformer,
     )
 
-    _original_setup_compile = MossTTSLocalDepthTransformer.setup_compile
     _original_generate_frame = MossTTSLocalDepthTransformer.generate_frame
-    MossTTSLocalDepthTransformer.setup_compile = _patched_setup_compile  # type: ignore[method-assign]
     MossTTSLocalDepthTransformer.generate_frame = _patched_generate_frame  # type: ignore[method-assign]
     _PATCHED = True
     logger.debug("Applied NPU patch for MOSS-TTS local depth whole-loop graph")

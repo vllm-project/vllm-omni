@@ -129,7 +129,7 @@ export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
 export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
 # CI-like: single JSON file (nightly Perf Test steps)
 pytest -s -v dfx/perf/scripts/run_diffusion_benchmark.py \
-  --test-config-file dfx/perf/tests/test_qwen_image_vllm_omni.json
+  --test-config-file dfx/perf/tests/test_bagel_vllm_omni.json
 # Local bulk load: all *.json under tests/dfx/perf/tests/, filter by JSON mark
 pytest -sv dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"
 pytest -sv dfx/perf/scripts/run_benchmark.py -m "full_model and omni and H100"
@@ -165,7 +165,7 @@ Nightly **L4** for a model is often **multiple jobs** in `test-nightly.yml`, not
 | `server_params` | Yes | `model`, `serve_args`, … |
 | `benchmark_params[]` | Yes | Each row: **`name`** (pytest id suffix), workload fields, **`baseline`** |
 
-Copy structure from `test_qwen_image_vllm_omni.json` or `test_cosmos3_vllm_omni.json` (2-GPU mark example).
+Copy structure from `test_bagel_vllm_omni.json` or `test_cosmos3_vllm_omni.json` (2-GPU mark example).
 
 **Omni perf JSON**: `test_qwen3_omni_*.json` — same `mark` shape with `"marks": ["full_model", "omni"]`; run via `run_benchmark.py`.
 
@@ -200,7 +200,7 @@ Copy structure from `test_qwen_image_vllm_omni.json` or `test_cosmos3_vllm_omni.
 
 | Model type | Perf runner | Config example |
 |------------|-------------|----------------|
-| Diffusion X2I/X2V | `dfx/perf/scripts/run_diffusion_benchmark.py` | `test_qwen_image_vllm_omni.json`, `test_cosmos3_vllm_omni.json` |
+| Diffusion X2I/X2V | `dfx/perf/scripts/run_diffusion_benchmark.py` | `test_bagel_vllm_omni.json`, `test_cosmos3_vllm_omni.json` |
 | TTS | `dfx/perf/scripts/run_benchmark.py` | `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json` |
 | Omni | `dfx/perf/scripts/run_benchmark.py` | `test_qwen3_omni_async_chunk.json`, `test_qwen3_omni_no_async_chunk.json`, … |
 
@@ -263,7 +263,7 @@ Paths are relative to `tests/` after `cd tests`.
 | **Diffusion X2I** L2 online smoke | `pytest -s -v e2e/online_serving/test_qwen_image.py e2e/online_serving/test_bagel.py -m "core_model and diffusion" --run-level=core_model` |
 | **Diffusion X2V** L2 online smoke | `pytest -s -v e2e/online_serving/test_wan22_t2v.py -m "core_model and diffusion" --run-level=core_model` |
 | **Diffusion X2I** L4 online expansion (H100) | `pytest -s -v e2e/online_serving/test_qwen_image_expansion.py -m "full_model and diffusion and H100" --run-level=full_model` |
-| **Diffusion X2I** L4 perf (nightly) | `pytest -s -v dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file dfx/perf/tests/test_qwen_image_vllm_omni.json` |
+| **Diffusion X2I** L4 perf (nightly) | `pytest -s -v dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file dfx/perf/tests/test_bagel_vllm_omni.json` |
 | **Diffusion X2I** L4 online expansion (Edit) | `pytest -s -v e2e/online_serving/test_qwen_image_edit_expansion.py -m "full_model and diffusion and H100" --run-level=full_model` |
 | **Diffusion X2V** L4 nightly | `pytest -s -v e2e/online_serving/test_wan22_expansion.py -m "full_model and cuda" --run-level=full_model` |
 | **Invalid param** weekly H100 | `pytest -s -v dfx/reliability/invalid_param_test/ -m "slow and H100"` |

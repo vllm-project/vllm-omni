@@ -135,6 +135,7 @@ _PLATFORM_EXTERNAL = (
     "MASTER_ADDR",
     "MASTER_PORT",
     "MINDIE_SD_FA_TYPE",
+    "MOONCAKE_CONFIG_PATH",
     "MORI_RDMA_DEVICES",
     "MUSA_VISIBLE_DEVICES",
     "MV2_COMM_WORLD_LOCAL_RANK",
@@ -151,6 +152,7 @@ _PLATFORM_EXTERNAL = (
     "RAY_RAYLET_PID",
     "RDMA_DEVICE_NAME",
     "SAGE_ATTN_TENSOR_LAYOUT",
+    "TASK_QUEUE_ENABLE",
     "TORCHINDUCTOR_CACHE_DIR",
     "VLLM_LOCAL_RANK",
     "WORLD_SIZE",
@@ -230,6 +232,12 @@ _MODEL_PROMOTE = (
     "VLLM_OMNI_WAN_VAE_ENCODE_MARGIN",
     "VLLM_OMNI_WAN_VAE_ENCODE_SPLIT",
     "YUE2_VAE",  # VAE checkpoint selection belongs in typed model configuration.
+    # Intel XPU: MiniMax-H3 video VAE decoder fast paths.
+    "H3_VAE_COMPILE",
+    "H3_VAE_FP16_WEIGHTS",
+    "H3_VAE_XEFMHA",
+    # Wan2.2 S2V: =1 quantizes the audio injector with the DiT's quant config (default off).
+    "VLLM_OMNI_S2V_QUANT_AUDIO_INJECTOR",
 )
 
 _MODEL_REQUEST_SCOPE = (
@@ -254,6 +262,8 @@ _MODEL_INTERNALIZE = (
     "MAGI2_ROUTER_BIAS_SOURCE",
     "NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE",
     "VLLM_OMNI_CODE2WAV_STATS",
+    # CI-only fallback for memory-constrained MOSS Realtime qualification.
+    "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE",
     "VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR",
     "VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS",
     "VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS_LOG_EVERY",

@@ -353,8 +353,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
         position: int,
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        forward_prefix = self._compiled_forward_prefix or self._forward_prefix
-        return forward_prefix(seq_embeds, kv_cache, position, attn_mask)
+        return self._forward_prefix(seq_embeds, kv_cache, position, attn_mask)
 
     @staticmethod
     def _sample_channel(

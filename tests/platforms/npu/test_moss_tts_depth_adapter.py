@@ -615,7 +615,6 @@ class TestPatchedGenerateFrameDispatch:
         # Store the *unbound* class method so _patched_generate_frame can
         # call it with explicit self.
         cls = type(model)
-        adapter._original_setup_compile = cls.setup_compile
         adapter._original_generate_frame = cls.generate_frame
         try:
             with torch.inference_mode():
@@ -830,20 +829,17 @@ class TestArWorkerPatchRegistration:
 
         cls = MossTTSLocalDepthTransformer
         orig_patched = adapter._PATCHED
-        orig_setup = cls.setup_compile
         orig_gen = cls.generate_frame
         try:
             yield cls
         finally:
-            cls.setup_compile = orig_setup
             cls.generate_frame = orig_gen
             adapter._PATCHED = orig_patched
-            adapter._original_setup_compile = None
             adapter._original_generate_frame = None
 
     def test_init_ar_worker_runtime_installs_depth_patch(self, restored_patch):
         """``NPUOmniPlatform.init_ar_worker_runtime`` installs the patched
-        ``setup_compile`` / ``generate_frame`` on the depth transformer class."""
+        ``generate_frame`` on the depth transformer class."""
         pytest.importorskip("vllm_ascend")
         from vllm_omni.platforms.npu.platform import NPUOmniPlatform
 
@@ -853,12 +849,11 @@ class TestArWorkerPatchRegistration:
         NPUOmniPlatform.init_ar_worker_runtime(vllm_config=SimpleNamespace(), device=torch.device("cpu"))
 
         assert adapter._PATCHED is True
-        assert cls.setup_compile is adapter._patched_setup_compile
         assert cls.generate_frame is adapter._patched_generate_frame
 
     def test_init_ar_worker_runtime_is_idempotent(self, restored_patch):
         """A second call must not re-swap (the ``_PATCHED`` guard holds), so
-        the original methods captured on the first call stay consistent."""
+        the original method captured on the first call stays consistent."""
         pytest.importorskip("vllm_ascend")
         from vllm_omni.platforms.npu.platform import NPUOmniPlatform
 
@@ -866,12 +861,10 @@ class TestArWorkerPatchRegistration:
         adapter._PATCHED = False
 
         NPUOmniPlatform.init_ar_worker_runtime(vllm_config=SimpleNamespace(), device=torch.device("cpu"))
-        first_setup = cls.setup_compile
         first_gen = cls.generate_frame
-        assert adapter._original_setup_compile is not None
+        assert adapter._original_generate_frame is not None
 
         NPUOmniPlatform.init_ar_worker_runtime(vllm_config=SimpleNamespace(), device=torch.device("cpu"))
-        assert cls.setup_compile is first_setup
         assert cls.generate_frame is first_gen
 
     def test_ar_worker_init_device_invokes_ar_runtime_hook(self, monkeypatch):
@@ -937,5 +930,5 @@ class TestArWorkerPatchRegistration:
 
         # The patch was installed before the model runner was constructed.
         assert adapter._PATCHED is True
-        assert cls.setup_compile is adapter._patched_setup_compile
+        assert cls.generate_frame is adapter._patched_generate_frame
         assert runner_built == [True]
