@@ -179,6 +179,13 @@ and XPU methods to select different kernels or reject unsupported execution at
 model construction time. The user guide is the source of truth for the current
 hardware support matrix.
 
+Online CUDA MXFP8 reuses vLLM's online linear method for weight loading,
+quantization, scale layout and kernel selection. Omni supplies the diffusion
+activation reshape and checks for SM100, SM103 or SM107 before constructing
+the method. CUDA native serialized MXFP8 checkpoints are rejected explicitly;
+this path does not add CUDA MXFP8 MoE support. See the
+[MXFP8 guide](../../user_guide/quantization/mxfp8.md) for runtime prerequisites.
+
 Quantization methods must also respect the weight layout produced by the
 configured parallelism strategy:
 

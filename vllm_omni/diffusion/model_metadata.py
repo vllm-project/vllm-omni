@@ -59,6 +59,7 @@ FLUX3_MAX_INPUT_IMAGES = 10
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "Praxis1Pipeline": DiffusionModelMetadata(final_output_type="actions"),
     "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
     "HyNomasModularPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
@@ -177,6 +178,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         attention_mask_free=True,
         final_output_type="video",
     ),
+    "CausVidWanPipeline": DiffusionModelMetadata(final_output_type="video"),
     "WanT2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "WanI2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "LTX2Pipeline": DiffusionModelMetadata(final_output_type="video"),
