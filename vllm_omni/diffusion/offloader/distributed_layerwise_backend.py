@@ -347,10 +347,15 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             offset = offsets.get(dtype, 0)
             transform = (tensor_transforms or {}).get(id(target))
             runtime_source = transform(source) if callable(transform) else source
-            if runtime_source.dtype != dtype or runtime_source.shape != source.shape:
+            # Rank-local staging is sized from the recorded ``numel``/``shape``
+            # of the transformed tensor and re-validated at pack time, so a
+            # model-declared runtime layout may legitimately be smaller than the
+            # checkpoint tensor; ``_shard_and_pin`` accepts the same transforms.
+            # Only dtype must hold, because sources are bucketed by dtype.
+            if runtime_source.dtype != dtype:
                 raise ValueError(
-                    "mmap weight transform changed tensor metadata for "
-                    f"{name!r}: expected dtype={dtype}, shape={tuple(source.shape)}, "
+                    "mmap weight transform changed tensor dtype for "
+                    f"{name!r}: expected dtype={dtype}, "
                     f"got dtype={runtime_source.dtype}, shape={tuple(runtime_source.shape)}"
                 )
             stride = runtime_source.stride()

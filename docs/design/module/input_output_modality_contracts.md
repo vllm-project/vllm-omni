@@ -25,9 +25,6 @@ primary_code_paths:
   - vllm_omni/data_entry_keys.py
   - vllm_omni/engine/messages.py
   - vllm_omni/engine/serialization.py
-  - vllm_omni/engine/mm_outputs.py
-  - vllm_omni/engine/output_modality.py
-  - vllm_omni/engine/output_processor.py
 related_code_paths:
   - vllm_omni/model_executor/stage_input_processors/**
   - vllm_omni/core/sched/**
@@ -92,13 +89,31 @@ public rendering of its error fields belong to `error_contracts.md`.
 
 ## Current audio decoding compatibility
 
-Omni retains soundfile-first automatic audio decoding when using vLLM 0.32.
+Omni retains soundfile-first automatic audio decoding when using vLLM 0.33.
 Decoder rounding can affect BF16 model inputs and generated responses.
 Missing soundfile dependencies and unsupported formats fall back to upstream
 decoders; explicit backend selections keep upstream behavior. Encoded-size,
 duration and decoded-memory limits remain enforced by upstream media helpers,
 and recognized-format corruption errors propagate. Tests in
 `tests/inputs/test_audio_decode.py` cover these compatibility boundaries.
+
+## Temporary video decoding compatibility
+
+With vLLM 0.33.0, Omni reuses one OpenCV capture for metadata and frame
+extraction within each synchronous video decode. The upstream decoder still
+owns frame counting, sampling, recovery, and output metadata. The reuse context
+is reset on completion or error and is isolated between concurrent calls.
+Standalone metadata reads open their own capture.
+
+`vllm_omni/inputs/video.py` only installs this workaround for 0.33.0 (including
+local build suffixes), and skips builds exposing the upstream optional `cap`
+argument from [vllm#66466](https://github.com/vllm-project/vllm/pull/66466).
+`tests/inputs/test_video_decode.py` checks frame and metadata parity, and fails
+when either CUDA/CI Docker version pin changes or the native decoder stops
+opening two captures. The dependency update must review and remove this shim
+once the upstream fix is included; extending the version guard requires
+reproducing the regression on the new dependency. Runtime deactivation is
+automatic, but deleting the shim and its retirement checks requires a PR.
 
 ## Runner scheduling metadata
 
