@@ -302,11 +302,15 @@ PY
             -m "(core_model or omni) and not advanced_model and not full_model and xpu and (B60 or B70) and cards_2" \
             --run-level core_model
 
-        # 11 sleep/wake cases. Not measured yet: they additionally need
-        # BAGEL-7B-MoT in the mounted cache.
         if [ "${XPU_TEST_SCOPE:-pr}" = "broad" ]; then
-            stage "advanced_model · 2 cards" 20m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
+            # Z-Image-Turbo on two cards and tensor parallel TP=2.
+            stage "advanced_model · 2 cards" 15m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
+                --ignore tests/entrypoints/test_omni_sleep_mode_xpu.py \
                 -m "advanced_model and not full_model and xpu and (B60 or B70) and cards_2" --run-level core_model
+            # tests/entrypoints/test_omni_sleep_mode_xpu.py stays out: BAGEL-7B-MoT
+            # loads 27.37 GiB of LLM weights, and at the util 0.9 the suite sets on a
+            # 30.3 GiB card that leaves 0.0 GiB of KV cache, so every case fails
+            # engine init (VLLMZ-3554). It needs larger cards, not a CI change.
         fi
     fi
 

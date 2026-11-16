@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.utils.network_utils import get_open_port
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
@@ -1913,7 +1914,7 @@ def test_execute_stepwise_with_ulysses_parallel():
 
     torch.multiprocessing.spawn(
         _distributed_step_worker,
-        args=(world_size, "ulysses", "29540"),
+        args=(world_size, "ulysses", str(get_open_port())),
         nprocs=world_size,
     )
 
@@ -1929,7 +1930,7 @@ def test_execute_stepwise_with_ring_parallel():
 
     torch.multiprocessing.spawn(
         _distributed_step_worker,
-        args=(world_size, "ring", "29541"),
+        args=(world_size, "ring", str(get_open_port())),
         nprocs=world_size,
     )
 
@@ -1945,6 +1946,6 @@ def test_execute_stepwise_with_cfg_parallel():
 
     torch.multiprocessing.spawn(
         _distributed_step_worker,
-        args=(world_size, "cfg", "29542"),
+        args=(world_size, "cfg", str(get_open_port())),
         nprocs=world_size,
     )

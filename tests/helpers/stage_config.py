@@ -363,7 +363,10 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                         "gpu_memory_utilization": 0.3,
                         "max_num_batched_tokens": 4096,
                         "max_model_len": 4096,
-                        "devices": "2",
+                        # Shares the talker's card, as the base XPU deploy and
+                        # the ROCm overlay above do: 0.5 + 0.3 of one card, so
+                        # the whole pipeline fits on two.
+                        "devices": "1",
                     },
                 ],
             },
