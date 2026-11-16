@@ -14,7 +14,6 @@
 #
 # The checkpoint ships no tokenizer: the serving adapter sends a one-token
 # placeholder prompt and the text rides additional_information.
-# `tokenizer: gpt2` is a placeholder too, as in indextts2.yaml.
 async_chunk: false
 dtype: float32
 
@@ -29,7 +28,6 @@ stages:
     devices: "0"
     skip_mm_profiling: true
     skip_tokenizer_init: true
-    tokenizer: gpt2
     default_sampling_params:
       # The stop/continue token is chosen in-model; greedy just reads it back.
       temperature: 0.0
