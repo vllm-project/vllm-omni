@@ -35,7 +35,7 @@ class DiffusionBatchingPolicy(ABC):
 
     def admit_waiting(
         self,
-        scheduler: "BaseScheduler",
+        scheduler: BaseScheduler,
         scheduled_new_reqs: list[Any],
         scheduled_cached_request_ids: list[str],
     ) -> None:
@@ -48,11 +48,7 @@ class DiffusionBatchingPolicy(ABC):
         """
         deferred: list[str] = []
         waiting_budget = len(scheduler._waiting)
-        while (
-            scheduler._waiting
-            and waiting_budget
-            and len(scheduler._running) < scheduler.max_num_running_reqs
-        ):
+        while scheduler._waiting and waiting_budget and len(scheduler._running) < scheduler.max_num_running_reqs:
             waiting_budget -= 1
             state = scheduler._request_states.get(scheduler._waiting[0])
             if state is None:
@@ -99,7 +95,7 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
 
     def admit_waiting(
         self,
-        scheduler: "BaseScheduler",
+        scheduler: BaseScheduler,
         scheduled_new_reqs: list[Any],
         scheduled_cached_request_ids: list[str],
     ) -> None:
@@ -110,7 +106,7 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
 
     def _admit_by_compute_budget(
         self,
-        scheduler: "BaseScheduler",
+        scheduler: BaseScheduler,
         candidates: list[SchedulerRequestState],
         scheduled_new_reqs: list[Any],
         scheduled_cached_request_ids: list[str],
@@ -126,9 +122,10 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
         # single frame) than the ones the server actually serves.
         if not scheduler._running and candidates:
             head = candidates[0]
-            if not scheduler._can_schedule_waiting(head) or scheduler._admit_state(
-                head, scheduled_new_reqs, scheduled_cached_request_ids
-            ) == "stalled":
+            if (
+                not scheduler._can_schedule_waiting(head)
+                or scheduler._admit_state(head, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled"
+            ):
                 return
             running_units += self.request_units(head)
             candidates = candidates[1:]
@@ -177,10 +174,7 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
             # score order for whatever budget is left. Without this, cheaper
             # younger requests in score order would consume the freed slot and
             # the aged request would miss it again.
-            if (
-                scheduler._admit_state(reserve_state, scheduled_new_reqs, scheduled_cached_request_ids)
-                == "stalled"
-            ):
+            if scheduler._admit_state(reserve_state, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled":
                 return
             running_units += reserved_cost
             candidates = [state for state in candidates if state is not reserve_state]
@@ -192,15 +186,12 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
             head = candidates[index]
             head_cost = self.request_units(head)
             if running_units + head_cost <= budget and scheduler._can_schedule_waiting(head):
-                if (
-                    scheduler._admit_state(head, scheduled_new_reqs, scheduled_cached_request_ids)
-                    == "stalled"
-                ):
+                if scheduler._admit_state(head, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled":
                     break
                 running_units += head_cost
             index += 1
 
-    def sorted_waiting_states(self, scheduler: "BaseScheduler") -> list[SchedulerRequestState]:
+    def sorted_waiting_states(self, scheduler: BaseScheduler) -> list[SchedulerRequestState]:
         """Order waiting requests by DRR score, descending.
 
         Ties fall back to enqueue time (FIFO) then request_id for
@@ -221,7 +212,7 @@ class ComputeBudgetDiffusionBatchingPolicy(DiffusionBatchingPolicy):
         scored.sort(key=lambda item: (-item[0], item[1], item[2]))
         return [item[3] for item in scored]
 
-    def running_compute_units(self, scheduler: "BaseScheduler") -> int:
+    def running_compute_units(self, scheduler: BaseScheduler) -> int:
         return sum(
             self.request_units(scheduler._request_states[request_id])
             for request_id in scheduler._running

@@ -971,10 +971,7 @@ class OmniServeCommand(CLISubcommand):
             "--diffusion-batching-config",
             type=json.loads,
             default=None,
-            help=(
-                "JSON config for diffusion continuous-batching policy. "
-                'Example: \'{"compute_unit_budget":10240}\'.'
-            ),
+            help=("JSON config for diffusion continuous-batching policy. Example: '{\"compute_unit_budget\":10240}'."),
         )
         omni_config_group.add_argument(
             "--diffusion-batching-policy",
