@@ -126,6 +126,11 @@ class FastVideoVSABackend(AttentionBackend):
 
     @classmethod
     def validate_available(cls) -> None:
+        if current_omni_platform.is_npu():
+            from vllm_omni.diffusion.attention.ops.npu_tile64_block_sparse import require_npu_tile64_sparse
+
+            require_npu_tile64_sparse()
+            return
         if all(importlib.util.find_spec(name) is None for name in ("fastvideo_kernel", "flashinfer", "cudnn")):
             raise ImportError(
                 "FASTVIDEO_VSA requires the optional fastvideo-kernel package "

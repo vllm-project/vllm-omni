@@ -280,6 +280,161 @@ def test_h3_without_layout_delegates_to_shared_backend(monkeypatch):
     assert all(actual is wanted for actual, wanted in zip(calls[0], (impl, query, query, query, metadata)))
 
 
+def _fake_npu_block_sparse_operator(monkeypatch, calls):
+    """Stand in for torch_npu.npu_block_sparse_attention: 64-row query blocks, 128-row key blocks, no key mask."""
+
+    def npu_block_sparse_attention(query, key, value, block_sparse_mask, block_shape, **kwargs):
+        calls["block_shape"] = list(block_shape)
+        calls["rows"] = (query.shape[2], key.shape[2])
+        calls["mask"] = block_sparse_mask.bool().clone()
+        token_mask = block_sparse_mask.bool().repeat_interleave(block_shape[0], dim=-2)
+        token_mask = token_mask.repeat_interleave(block_shape[1], dim=-1)
+        logits = torch.matmul(query.float(), key.float().transpose(-1, -2)) * kwargs["scale_value"]
+        logits = logits.masked_fill(~token_mask, float("-inf"))
+        lse = torch.logsumexp(logits, dim=-1, keepdim=True)
+        output = torch.matmul(torch.softmax(logits, dim=-1).nan_to_num(0.0), value.float())
+        return output.to(query.dtype), lse
+
+    module = types.ModuleType("torch_npu")
+    setattr(module, "npu_block_sparse_attention", npu_block_sparse_attention)
+    monkeypatch.setitem(sys.modules, "torch_npu", module)
+
+
+def _h3_npu_impl(**backend_kwargs):
+    kwargs = {"topk": 64, "min_seq_len": 1, "disable_when_sp_active": False}
+    kwargs.update(backend_kwargs)
+    return MiniMaxH3VSAImpl(num_heads=2, head_size=128, softmax_scale=128**-0.5, backend_kwargs=kwargs)
+
+
+def _dense_reference(query):
+    return torch.nn.functional.scaled_dot_product_attention(
+        *(x.float().transpose(1, 2) for x in (query, query, query))
+    ).transpose(1, 2)
+
+
+@pytest.mark.parametrize("video_shape", [(2, 4, 4), (8, 4, 4)], ids=["even_tiles", "odd_tiles"])
+def test_h3_npu_tile64_tiles_untiles_and_ignores_zero_padded_keys(monkeypatch, video_shape):
+    calls: dict[str, Any] = {}
+    _fake_npu_block_sparse_operator(monkeypatch, calls)
+    prefix_segments = (5, 70)
+    seq_len = sum(prefix_segments) + math.prod(video_shape)
+    torch.manual_seed(0)
+    query = torch.randn(1, seq_len, 2, 128, dtype=torch.bfloat16)
+
+    output = _h3_npu_impl().forward_npu(query, query, query, _h3_metadata(prefix_segments, video_shape))
+
+    # top-k covers every video tile, so the result must be plain attention over
+    # the real rows: neither the tile padding nor the key pairing may leak in.
+    torch.testing.assert_close(output.float(), _dense_reference(query), atol=2e-2, rtol=2e-2)
+    tiles = 3 + math.ceil(math.prod(video_shape) / 64)
+    assert calls["block_shape"] == [64, 128]
+    assert calls["rows"] == (tiles * 64, (tiles + tiles % 2) * 64)
+
+
+def test_h3_npu_tile64_keeps_prefix_dense_and_pairs_the_selected_video_tiles(monkeypatch):
+    calls: dict[str, Any] = {}
+    _fake_npu_block_sparse_operator(monkeypatch, calls)
+    prefix_segments, video_shape = (5,), (16, 4, 4)
+    query = torch.randn(1, 5 + 16 * 4 * 4, 2, 128, dtype=torch.bfloat16)
+
+    _h3_npu_impl(topk=1).forward_npu(query, query, query, _h3_metadata(prefix_segments, video_shape))
+
+    # 1 prefix tile + 4 video tiles -> key blocks {prefix, v0}, {v1, v2}, {v3, pad}.
+    mask = calls["mask"]
+    assert mask.shape[-2:] == (5, 3)
+    assert mask[..., :1, :].all(), "prefix queries stay dense"
+    assert mask[..., 0].all(), "the key block holding the prefix is always enabled"
+    assert (mask[..., 1:, 1:].sum(dim=-1) <= 1).all(), "one selected video tile enables at most one more key block"
+
+
+def test_h3_npu_tile64_applies_the_learned_compression_gate(monkeypatch):
+    _fake_npu_block_sparse_operator(monkeypatch, {})
+    impl = _h3_npu_impl()
+    prefix_segments, video_shape = (5,), (2, 4, 4)
+    torch.manual_seed(0)
+    query = torch.randn(1, 5 + 2 * 4 * 4, 2, 128, dtype=torch.bfloat16)
+
+    without_gate = impl.forward_npu(query, query, query, _h3_metadata(prefix_segments, video_shape))
+    zero_gate = impl.forward_npu(
+        query, query, query, _h3_metadata(prefix_segments, video_shape, gate=torch.zeros_like(query))
+    )
+    live_gate = impl.forward_npu(
+        query, query, query, _h3_metadata(prefix_segments, video_shape, gate=torch.full_like(query, 0.5))
+    )
+
+    torch.testing.assert_close(zero_gate.float(), without_gate.float())
+    assert not torch.allclose(live_gate.float(), without_gate.float())
+
+
+def test_h3_npu_tile64_drops_the_packed_padding_and_restores_it_as_zeros(monkeypatch):
+    _fake_npu_block_sparse_operator(monkeypatch, {})
+    impl = _h3_npu_impl()
+    prefix_segments, video_shape = (5,), (2, 4, 4)
+    valid = 5 + 2 * 4 * 4
+    torch.manual_seed(0)
+    real = torch.randn(1, valid, 2, 128, dtype=torch.bfloat16)
+    padded = torch.cat([real, torch.randn(1, 27, 2, 128, dtype=torch.bfloat16)], dim=1)
+    metadata = _h3_metadata(prefix_segments, video_shape)
+    metadata.extra["valid_kv_length"] = valid
+
+    output = impl.forward_npu(padded, padded, padded, metadata)
+
+    assert output.shape == padded.shape
+    expected = impl.forward_npu(real, real, real, _h3_metadata(prefix_segments, video_shape))
+    torch.testing.assert_close(output[:, :valid].float(), expected.float(), rtol=0, atol=0)
+    assert output[:, valid:].abs().sum() == 0
+
+
+@pytest.mark.parametrize("case", ["no_layout", "tile128"])
+def test_h3_npu_keeps_the_dense_path_for_layouts_it_does_not_run(monkeypatch, case):
+    impl = _h3_npu_impl()
+    query = torch.randn(1, 37, 2, 128, dtype=torch.bfloat16)
+    metadata = AttentionMetadata() if case == "no_layout" else _h3_metadata((5,), (2, 4, 4))
+    if case == "tile128":
+        metadata.extra["vsa_h3_tile_size"] = 128
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("this layout must not reach the NPU sparse route")
+
+    monkeypatch.setattr(impl, "_forward_h3", unexpected)
+    output = impl.forward_npu(query, query, query, metadata)
+    torch.testing.assert_close(output, impl.sdpa_fallback.forward_npu(query, query, query, metadata), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("pinned_sparsity", [False, True])
+@pytest.mark.parametrize("fallback_on_error", [False, True])
+def test_h3_npu_kernel_failure_preserves_fallback_policy(monkeypatch, pinned_sparsity, fallback_on_error):
+    impl = _h3_npu_impl(fallback_on_error=fallback_on_error)
+    query = torch.randn(1, 37, 2, 128, dtype=torch.bfloat16)
+    metadata = _h3_metadata((5,), (2, 4, 4))
+    if pinned_sparsity:
+        metadata.extra["vsa_h3_sparsity"] = 0.8
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("kernel failure")
+
+    monkeypatch.setattr(impl, "_forward_h3", fail)
+    if fallback_on_error and not pinned_sparsity:
+        output = impl.forward_npu(query, query, query, metadata)
+        expected = impl.sdpa_fallback.forward_npu(query, query, query, metadata)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    else:
+        with pytest.raises(RuntimeError, match="kernel failure"):
+            impl.forward_npu(query, query, query, metadata)
+
+
+def test_h3_npu_accelerator_failure_is_not_swallowed(monkeypatch):
+    impl = _h3_npu_impl(fallback_on_error=True)
+    query = torch.randn(1, 37, 2, 128, dtype=torch.bfloat16)
+
+    def fail(*args, **kwargs):
+        raise torch.AcceleratorError("device failure")
+
+    monkeypatch.setattr(impl, "_forward_h3", fail)
+    with pytest.raises(torch.AcceleratorError, match="device failure"):
+        impl.forward_npu(query, query, query, _h3_metadata((5,), (2, 4, 4)))
+
+
 def test_omni_multiregion_geometry_preserves_interleaved_reference_order():
     prefix = (5, 512, 3, 7, 128, 9)
     regions = ((5, (8, 4, 16)), (527, (4, 4, 8)), (664, (4, 4, 24)))

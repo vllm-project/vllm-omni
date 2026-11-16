@@ -62,6 +62,30 @@ def _get_h3_tile_metadata(
     return partition, sizes, non_pad, untile, len(prefix_sizes), int(video_sizes.numel())
 
 
+@functools.lru_cache(maxsize=32)
+def _get_h3_zero_row_gather(
+    prefix_segments: tuple[int, ...],
+    video_shape: tuple[int, int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Source row of every tiled slot, with padding slots pointing one past the last row.
+
+    Appending a single zero row to the source then lets one ``index_select``
+    produce the tiled, zero-padded tensor. Ascend runs ``index_select`` on the
+    device, while the indexed assignment the other providers use is dispatched
+    to its host-side fallback there.
+    """
+    partition, sizes, non_pad, _, _, _ = _get_h3_tile_metadata(prefix_segments, video_shape, device)
+    gather = torch.full((int(sizes.numel()) * 64,), partition.numel(), device=device, dtype=torch.long)
+    gather[non_pad] = partition
+    return gather
+
+
+def _tile_with_zero_row(rows: torch.Tensor, gather: torch.Tensor) -> torch.Tensor:
+    zero_row = rows.new_zeros((rows.shape[0], 1, *rows.shape[2:]))
+    return torch.cat([rows, zero_row], dim=1).index_select(1, gather)
+
+
 def _get_h3_layout(
     attn_metadata: AttentionMetadata | None,
 ) -> tuple[tuple[int, ...], tuple[int, int, int], int] | None:
@@ -202,13 +226,18 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
         else:
             raise ValueError(f"unsupported VSA-H3 tile size: {block_size}")
         logical_blocks = int(sizes.numel())
-        target_shape = (query.shape[0], logical_blocks * block_size, query.shape[2], query.shape[3])
-        q_tiled = torch.zeros(target_shape, device=query.device, dtype=query.dtype)
-        k_tiled = torch.zeros_like(q_tiled)
-        v_tiled = torch.zeros_like(q_tiled)
-        q_tiled[:, non_pad] = query[:, partition]
-        k_tiled[:, non_pad] = key[:, partition]
-        v_tiled[:, non_pad] = value[:, partition]
+        zero_row_gather = None
+        if provider == "npu":
+            zero_row_gather = _get_h3_zero_row_gather(prefix_segments, video_shape, query.device)
+            q_tiled, k_tiled, v_tiled = (_tile_with_zero_row(t, zero_row_gather) for t in (query, key, value))
+        else:
+            target_shape = (query.shape[0], logical_blocks * block_size, query.shape[2], query.shape[3])
+            q_tiled = torch.zeros(target_shape, device=query.device, dtype=query.dtype)
+            k_tiled = torch.zeros_like(q_tiled)
+            v_tiled = torch.zeros_like(q_tiled)
+            q_tiled[:, non_pad] = query[:, partition]
+            k_tiled[:, non_pad] = key[:, partition]
+            v_tiled[:, non_pad] = value[:, partition]
 
         q_pool = mean_pool_tiles(q_tiled[:, : logical_blocks * block_size], sizes, block_size=block_size)
         k_pool = mean_pool_tiles(k_tiled[:, : logical_blocks * block_size], sizes, block_size=block_size)
@@ -254,8 +283,11 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
         )
 
         if gate is not None:
-            gate_tiled = torch.zeros_like(q_tiled[:, : logical_blocks * block_size])
-            gate_tiled[:, non_pad] = gate[:, partition]
+            if zero_row_gather is not None:
+                gate_tiled = _tile_with_zero_row(gate, zero_row_gather)
+            else:
+                gate_tiled = torch.zeros_like(q_tiled[:, : logical_blocks * block_size])
+                gate_tiled[:, non_pad] = gate[:, partition]
             v_pool = mean_pool_tiles(v_tiled[:, : logical_blocks * block_size], sizes, block_size=block_size)
             compressed = torch.matmul(torch.softmax(scores, dim=-1), v_pool)
             compressed = compressed.permute(0, 2, 1, 3).to(output.dtype)
@@ -266,7 +298,45 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
                     gate_tiled.shape[0], logical_blocks, block_size, gate_tiled.shape[2], gate_tiled.shape[3]
                 )
             ).view_as(output)
+        if zero_row_gather is not None:
+            return output.index_select(1, untile)
         return output[:, untile].contiguous()
+
+    def forward_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        """Run 64-token VSA layouts on the Ascend block-sparse operator.
+
+        Layers without a VSA layout (the token refiner) and 128-token layouts
+        keep the shared dense path.
+        """
+        if _get_h3_layout(attn_metadata) is None or attn_metadata.extra.get("vsa_h3_tile_size", 64) != 64:
+            return super().forward_npu(query, key, value, attn_metadata)
+        # A checkpoint that pins its sparsity must not be served dense.
+        requires_sparse = attn_metadata.extra.get("vsa_h3_sparsity") is not None
+        # The packed document is padded past its valid rows. This platform masks
+        # that tail for the dense path; the sparse path drops it and restores it.
+        valid = min(int(attn_metadata.extra.get("valid_kv_length", query.shape[1])), query.shape[1])
+        try:
+            if self.precision != "bf16":
+                raise ValueError("NPU VSA requires BF16 precision")
+            output = self._forward_h3(query[:, :valid], key[:, :valid], value[:, :valid], attn_metadata, provider="npu")
+        except Exception as exc:
+            # A device fault poisons the process context; a dense retry would
+            # only obscure the original failure.
+            if isinstance(exc, torch.AcceleratorError) or requires_sparse or not self.fallback_on_error:
+                raise
+            logger.warning_once("FASTVIDEO_VSA falling back to SDPA on NPU: VSA-H3 kernel failed: %s", exc)
+            return super().forward_npu(query, key, value, attn_metadata)
+        if valid == query.shape[1]:
+            return output
+        restored = torch.zeros_like(query)
+        restored[:, :valid] = output
+        return restored
 
     def forward_cuda(
         self,

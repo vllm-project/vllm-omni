@@ -178,9 +178,25 @@ For H3, check `FastH3 adapter active` at startup and
 The Wan route requires CUDA tensors in FP16 or BF16, 256-token blocks,
 standard `head_size**-0.5` scaling, equal Q/K/V head counts, no attention mask,
 and no active sequence-parallel context. The MiniMax-H3 route uses 64-token
-`(4, 4, 4)` blocks and supports pure Ulysses. NPU and XPU paths do not execute
-the FastVideo VSA CUDA kernel. FastH3 Omni uses `(4, 4, 8)` logical blocks
+`(4, 4, 4)` blocks and supports pure Ulysses. XPU paths do not execute the
+FastVideo VSA CUDA kernel. FastH3 Omni uses `(4, 4, 8)` logical blocks
 instead; see its recipe for the separate tile128 provider requirements.
+
+### Ascend NPU
+
+On Ascend the 64-token MiniMax-H3 route runs on
+`torch_npu.npu_block_sparse_attention` with `fastvideo_vsa_provider: auto`
+(the named providers are CUDA kernels and are refused there). The operator
+takes query blocks of any size but key blocks only in multiples of 128, so
+queries keep their 64-token tiles and keys are paired: a query tile attends
+every tile it selected plus the neighbour each one shares a 128-token key
+block with. The selection is therefore a superset of the CUDA route's, never
+a subset, and the attention budget per query is up to twice the configured
+one. Tile padding is zero-filled; its contribution to the softmax denominator
+is removed exactly from the log-sum-exp the operator returns.
+
+Layers without a VSA gate (the token refiner) and 128-token layouts keep the
+dense path on this platform.
 
 ## Automatic provider selection
 
