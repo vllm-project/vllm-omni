@@ -140,7 +140,8 @@ def _collect_audio(omni_runner: OmniRunner, request: dict) -> tuple[torch.Tensor
         if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
             continue
         sr = mm.get("sr")
-        return audio.reshape(-1).cpu(), int(sr.item()) if sr is not None else SAMPLE_RATE
+        assert sr is not None, "Output did not provide its sample rate (sr metadata missing)"
+        return audio.reshape(-1).cpu(), int(sr.item())
     raise AssertionError("No stage outputs received")
 
 
