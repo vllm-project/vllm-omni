@@ -61,6 +61,9 @@ logger = init_logger(__name__)
 PRECOMPUTED_REF_CODE_KEY = "precomputed_ref"
 NORMALIZED_REF_AUDIO_KEY = "_qwen3_tts_normalized_ref_audio"
 REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
+# Device copies of cached reference codes and their summed codec embeddings.
+_REF_CODE_DEVICE_CACHE_MAX_ENTRIES = 64
+_REF_CODEC_EMBED_CACHE_MAX_ENTRIES = 16
 PRECOMPUTED_TEXT_IDS_KEY = "_qwen3_tts_text_ids"
 PRECOMPUTED_REF_IDS_KEY = "_qwen3_tts_ref_ids"
 
@@ -379,10 +382,12 @@ class Qwen3TTSPromptEmbedsBuilder:
         # Text-conditioning embeddings projected by ``preprocess_infos_batch``
         # for the current step's new requests, keyed by request id.
         self._batched_text_embeds: dict[str, torch.Tensor] = {}
+        self._ref_codec_embed_cache: OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
 
         self._ref_audio_artifact_cache_max_entries = int(ref_audio_artifact_cache_max_entries)
         self._ref_audio_artifact_cache: OrderedDict[str, dict[str, torch.Tensor | bool]] = OrderedDict()
         self._long_tensor_cache: dict[tuple[str, tuple[int, ...]], torch.Tensor] = {}
+        self._ref_code_device_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
 
         # Bounded LRU; caller-supplied orig_sr can otherwise grow this without limit.
         self._resampler_cache: OrderedDict[tuple[int, int], AudioResampler] = OrderedDict()
@@ -397,6 +402,22 @@ class Qwen3TTSPromptEmbedsBuilder:
     def _pad_embed(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """Return the pad-token embedding on the requested device/dtype, shape ``[1, 1, H]``."""
         return self._tts_pad_embed_buffer.to(device=device, dtype=dtype).reshape(1, 1, -1)
+
+    def _device_ref_code(self, ref_code: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """One device tensor per cached reference, so per-reference caches downstream can key on it."""
+        if ref_code.device.type != "cpu":
+            return ref_code.to(device=device, dtype=torch.long)
+        cpu = ref_code.to(dtype=torch.long).contiguous()
+        key = (str(device), tuple(cpu.shape), hashlib.sha1(cpu.numpy().tobytes()).hexdigest())
+        cached = self._ref_code_device_cache.get(key)
+        if cached is None:
+            cached = cpu.to(device=device)
+            self._ref_code_device_cache[key] = cached
+            while len(self._ref_code_device_cache) > _REF_CODE_DEVICE_CACHE_MAX_ENTRIES:
+                self._ref_code_device_cache.popitem(last=False)
+        else:
+            self._ref_code_device_cache.move_to_end(key)
+        return cached
 
     def _long_tensor(self, values: Sequence[int], device: torch.device) -> torch.Tensor:
         device = torch.device(device)
@@ -1155,20 +1176,20 @@ class Qwen3TTSPromptEmbedsBuilder:
 
     # -------------------- ICL prompt assembly --------------------
 
-    def _generate_icl_prompt(
-        self,
-        *,
-        text_id: torch.Tensor,
-        ref_id: torch.Tensor,
-        ref_code: torch.Tensor,
-        tts_pad_embed: torch.Tensor,
-        tts_eos_embed: torch.Tensor,
-        non_streaming_mode: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Port of the official ``Qwen3TTSForConditionalGeneration.generate_icl_prompt``."""
-        text_embed = self._project_text_ids(torch.cat([ref_id, text_id], dim=-1))
-        text_embed = torch.cat([text_embed, tts_eos_embed], dim=1)
-
+    def _ref_codec_embed_sum(self, ref_code: torch.Tensor) -> torch.Tensor:
+        """Codec BOS + reference code embeddings, summed over code groups; cached per reference tensor."""
+        # Entries keep ref_code alive, so a matching storage address is the same tensor.
+        key = (
+            str(ref_code.device),
+            ref_code.untyped_storage().data_ptr(),
+            ref_code.storage_offset(),
+            tuple(ref_code.shape),
+            ref_code.stride(),
+        )
+        cached = self._ref_codec_embed_cache.get(key)
+        if cached is not None:
+            self._ref_codec_embed_cache.move_to_end(key)
+            return cached[1]
         # codec embed (codec bos + codec) 1 T2 D
         residual_embeds = self._residual_code_embeddings()
         codec_embed: list[torch.Tensor] = []
@@ -1185,6 +1206,26 @@ class Qwen3TTSPromptEmbedsBuilder:
             ],
             dim=1,
         )
+        self._ref_codec_embed_cache[key] = (ref_code, codec_embed_sum)
+        while len(self._ref_codec_embed_cache) > _REF_CODEC_EMBED_CACHE_MAX_ENTRIES:
+            self._ref_codec_embed_cache.popitem(last=False)
+        return codec_embed_sum
+
+    def _generate_icl_prompt(
+        self,
+        *,
+        text_id: torch.Tensor,
+        ref_id: torch.Tensor,
+        ref_code: torch.Tensor,
+        tts_pad_embed: torch.Tensor,
+        tts_eos_embed: torch.Tensor,
+        non_streaming_mode: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Port of the official ``Qwen3TTSForConditionalGeneration.generate_icl_prompt``."""
+        text_embed = self._project_text_ids(torch.cat([ref_id, text_id], dim=-1))
+        text_embed = torch.cat([text_embed, tts_eos_embed], dim=1)
+
+        codec_embed_sum = self._ref_codec_embed_sum(ref_code)
 
         text_lens = int(text_embed.shape[1])
         codec_lens = int(codec_embed_sum.shape[1])
@@ -1447,7 +1488,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                         ref_code_cached = _cached.get("ref_code")
                         ref_spk_embed_cached = _cached.get("ref_spk_embedding")
                         if isinstance(ref_code_cached, torch.Tensor):
-                            ref_code_cached = ref_code_cached.to(device=input_ids.device)
+                            ref_code_cached = self._device_ref_code(ref_code_cached, input_ids.device)
                         if isinstance(ref_spk_embed_cached, torch.Tensor):
                             ref_spk_embed_cached = ref_spk_embed_cached.to(device=input_ids.device)
                         voice_clone_prompt = {
@@ -1477,7 +1518,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             if isinstance(ref_code_t, torch.Tensor):
                 if ref_code_t.ndim == 3:
                     ref_code_t = ref_code_t[0]
-                ref_code_t = ref_code_t.to(device=input_ids.device, dtype=torch.long)
+                ref_code_t = self._device_ref_code(ref_code_t, input_ids.device)
                 ref_code_len = int(ref_code_t.shape[0])
             else:
                 codes = info_dict.get("codes")

@@ -165,6 +165,8 @@ def _make_minimal_builder(
     builder._ref_audio_artifact_cache = OrderedDict()
     builder._resampler_cache = OrderedDict()
     builder._resampler_cache_max = 16
+    builder._ref_code_device_cache = OrderedDict()
+    builder._ref_codec_embed_cache = OrderedDict()
     return builder
 
 

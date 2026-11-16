@@ -744,6 +744,11 @@ the throughput measurements for CustomVoice do not qualify Base voice
 cloning quality. Reference layout, grouping and priming are model hooks;
 the shared worker does not select Qwen's context length or codebook layout.
 
+The single-stage Talker caches the decoder state primed by each voice-clone
+reference (`additional_config.stream_prime_cache_size`, default 8 references;
+`0` disables it). A request that reuses a cached reference restores that state
+with one copy instead of decoding its reference frames again.
+
 ### Qwen3-TTS first-frame delivery and rollback
 
 The standard `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -275,6 +276,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.stream_prime_graphs = None
         # Power-of-two frame counts below the priming chunk: see prime_stream_decoder.
         self.stream_prime_pieces: dict[int, Any] = {}
+        # Primed decoder state per voice-clone reference, restored with one
+        # copy instead of re-decoding the reference frames for every request.
+        # Keyed by the reference-code tensor: entries keep it alive, so the
+        # prompt builder's per-reference device tensor keeps its address.
+        self.stream_prime_cache: OrderedDict[tuple, tuple[torch.Tensor, list[torch.Tensor]]] = OrderedDict()
+        self.stream_prime_cache_size = int(extra.get("stream_prime_cache_size", 8)) if self.stream_decode else 0
         self.stream_sample_rate = 0
         self.stream_chunk_frames = 25
         # The runners bypass only the outer whole-MTP graph when explicit
@@ -1527,13 +1534,53 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             return None
         return ref.reshape(-1, int(self.talker_config.num_code_groups))[-self.stream_ref_context_frames :]
 
+    @staticmethod
+    def _stream_prime_key(ref: torch.Tensor) -> tuple | None:
+        if ref.dtype.is_floating_point:
+            return None
+        if ref.device.type == "cpu":
+            return ("cpu", str(ref.dtype), tuple(ref.shape), ref.contiguous().numpy().tobytes())
+        storage = ref.untyped_storage()
+        return (str(ref.device), storage.data_ptr(), ref.storage_offset(), tuple(ref.shape), ref.stride())
+
     def prime_stream_decoder(self, primes: list[tuple[int, torch.Tensor]]) -> None:
-        """Prime equal-length reference groups without padding or aliasing live slots."""
+        """Prime reference slots, restoring cached states for references seen before."""
         if not primes:
             return
         stream = self.stream_decoder
         if stream is None:
             raise RuntimeError("Reference priming requires the single-stage PCM decoder")
+        cache, cap = self.stream_prime_cache, self.stream_prime_cache_size
+        if cap <= 0:
+            self._prime_stream_groups(stream, primes)
+            return
+        targets: list[torch.Tensor] = []
+        sources: list[torch.Tensor] = []
+        todo: list[tuple[int, torch.Tensor, tuple | None]] = []
+        for req_idx, ref in primes:
+            key = self._stream_prime_key(ref)
+            entry = cache.get(key) if key is not None else None
+            if entry is None:
+                todo.append((req_idx, ref, key))
+                continue
+            cache.move_to_end(key)
+            targets.extend(stream._slot_state(req_idx))
+            sources.extend(entry[1])
+        if targets:
+            logger.info_once("Qwen3-TTS stream decoder: restoring primed reference state from cache")
+            torch._foreach_copy_(targets, sources)
+        if not todo:
+            return
+        self._prime_stream_groups(stream, [(req_idx, ref) for req_idx, ref, _key in todo])
+        for req_idx, ref, key in todo:
+            if key is None or key in cache:
+                continue
+            cache[key] = (ref, [t.clone() for t in stream._slot_state(req_idx)])
+            while len(cache) > cap:
+                cache.popitem(last=False)
+
+    def _prime_stream_groups(self, stream: Any, primes: list[tuple[int, torch.Tensor]]) -> None:
+        """Prime equal-length reference groups without padding or aliasing live slots."""
         groups: dict[int, list[tuple[int, torch.Tensor]]] = {}
         for req_idx, ref in primes:
             groups.setdefault(int(ref.shape[0]), []).append((req_idx, ref))
