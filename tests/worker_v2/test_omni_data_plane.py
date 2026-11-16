@@ -371,6 +371,34 @@ def test_duplex_perf_metadata_does_not_schedule_model_work(plane, finished):
     assert metadata.input_terminal is finished
 
 
+@pytest.mark.parametrize("buffer_chunk", [None, [2, 6]], ids=["attribute_only", "attribute_over_buffer"])
+def test_native_sender_preserves_request_perf_chunk(raw_plane, buffer_chunk):
+    from vllm_omni.core.sched.duplex_stage_work import set_request_perf_chunk
+
+    sent = []
+
+    class Connector:
+        def put(self, *, data, **_kwargs):
+            sent.append(data)
+            return True, 0, None
+
+    request = _new_request()
+    request.model_intermediate_buffer = {"duplex": {"perf_chunk": buffer_chunk}} if buffer_chunk else {}
+    set_request_perf_chunk(request, (2, 7))
+    _start_save_thread(raw_plane, Connector())
+    try:
+        enqueued, completion = raw_plane._enqueue_chunk_payload(
+            request, {"codes": {"audio": torch.tensor([21])}}, wait_for_delivery=True
+        )
+        assert enqueued
+        assert completion is not None
+        completion.wait()
+        (received,) = sent
+        assert received["meta"]["duplex_perf_chunk"] == [2, 7]
+    finally:
+        _stop_save_thread(raw_plane)
+
+
 class _Output:
     copy_event = None
 

@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from vllm.distributed.parallel_state import get_tp_group
 
-from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer
+from vllm_omni.core.sched.duplex_stage_work import request_perf_chunk
 from vllm_omni.data_entry_keys import OmniPayload, OmniPayloadStruct, returns_stage_payload, to_dict
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
@@ -1650,7 +1650,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         # Native MRv2 sends bypass the scheduler's chunk transfer adapter.
         # Carry the measured request's identity so downstream work reaches
         # the same session turn. Copy metadata only; builder tensors stay shared.
-        perf_chunk = perf_chunk_from_buffer(getattr(request, "model_intermediate_buffer", None))
+        perf_chunk = request_perf_chunk(request)
         if perf_chunk is not None:
             if isinstance(payload_data, OmniPayloadStruct):
                 payload_data = to_dict(payload_data)
