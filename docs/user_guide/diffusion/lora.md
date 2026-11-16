@@ -148,80 +148,6 @@ outputs = omni.generate(
 )
 ```
 
-Online: the `lora` request field accepts an array of objects instead of a
-single object (a single object remains valid):
-
-```json
-"lora": [
-  {"name": "style", "local_path": "/path/to/style.safetensors", "scale": 0.8, "int_id": 1},
-  {"name": "character", "local_path": "/path/to/character.safetensors", "scale": 0.6, "int_id": 2}
-]
-```
-
-`int_id` is optional; when omitted it is derived from `local_path`.
-
-#### Deployment-default request adapters
-
-Make generation easier to use by configuring sampling settings, LoRA adapters and adapter strengths once on the server. Clients can then focus on basic inputs: the model, prompt and any required reference media. They can omit sampling and LoRA fields, or override them for individual requests.
-
-For PEFT runtime application, configure these defaults in the diffusion stage's `default_sampling_params`. The CLI equivalent for stage 0 is:
-
-```bash
-vllm serve MODEL --omni --lora-backend peft --max-cpu-loras 2 \
-  --default-sampling-params '{"0":{"num_inference_steps":50,"guidance_scale":4.0,"lora_request":[{"lora_name":"style","lora_int_id":1,"lora_path":"/models/style"},{"lora_name":"character","lora_int_id":2,"lora_path":"/models/character"}],"lora_scale":[0.8,0.6]}}'
-```
-
-The sampling values above are illustrative; choose values and adapters supported by the selected model. For example, a distilled few-step model requires its own sampling settings.
-
-These are internal sampling-parameter names, rather than the HTTP `lora` object's `name`, `local_path` and `scale` fields. A single adapter may use one `lora_request` object and a scalar `lora_scale`; a stack uses parallel lists with one strength per adapter. Paths are local to the server and adapters must be compatible with the selected model.
-
-Image, video and diffusion chat requests use the following override rules:
-
-| Request | Effective adapters |
-| --- | --- |
-| Omit `lora` | Inherit the stage's configured adapters and strengths. |
-| Provide a `lora` object or non-empty list | Replace the entire default adapter group; request strengths default to 1.0. |
-| Provide `lora: []` | Disable deployment-default request adapters for this request. |
-
-Malformed explicit LoRA overrides return HTTP 400 before generation; they do not fall back to deployment defaults.
-
-For multipart endpoints, send the JSON string `[]` in the `lora` form field. For chat, put `lora` in `extra_body`. Each request receives its own copy of the stage defaults, so overrides do not affect later requests. This does not unload adapters fused into the base weights or override a pipeline's fixed adapter policy.
-
-##### Request examples
-
-With server defaults configured, this request inherits sampling settings, both adapters and their strengths. No inference tuning fields are required in the request. This example targets an image-capable deployment:
-
-```bash
-curl http://localhost:8000/v1/images/generations \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"MODEL","prompt":"A person standing in a garden"}'
-```
-
-To replace the default group, add this field to the JSON body:
-
-```json
-{
-  "lora": [
-    {"name": "style", "local_path": "/models/style.safetensors", "scale": 0.4},
-    {"name": "character", "local_path": "/models/character.safetensors", "scale": 0.9}
-  ]
-}
-```
-
-A single object is also accepted. This replaces the entire group; omitted adapters are not retained. Each omitted request `scale` defaults to `1.0`, rather than inheriting its deployment strength. Send `"lora": []` to disable request adapters for that request; the next request that omits `lora` inherits defaults again.
-
-For multipart video requests, encode `lora` as a JSON form value:
-
-```bash
-curl http://localhost:8000/v1/videos \
-  -F 'model=MODEL' -F 'prompt=A person standing in a garden' \
-  -F 'lora=[{"name":"character","local_path":"/models/character.safetensors","scale":0.9}]'
-```
-
-Omit the form field to inherit defaults, or use `-F 'lora=[]'` to disable them. Reference media and other generation fields follow the selected model's existing API. For diffusion chat through the OpenAI Python SDK, pass `extra_body={"lora": [...]}` or `extra_body={"lora": []}`; on the wire, `lora` is a top-level JSON field.
-
-Deployment configuration uses `lora_request` / `lora_scale` and internal adapter fields `lora_name`, `lora_int_id`, `lora_path`. HTTP uses `lora` and `name`, `local_path`, `scale`; request `int_id` is optional and otherwise derived from the path. This change adds default inheritance and explicit clearing, without adding model-specific adapter compatibility.
-
 #### Distill backend: fuse distilled LoRA at init
 
 For distilled few-step LoRAs, pass `lora_backend="distill"` together with one or more concrete `.safetensors` files. The weights are fused into the base model once at init; subsequent `generate()` calls do not need a `LoRARequest`.
@@ -322,6 +248,72 @@ checkpoint second to `--lora-path`.
 
 !!! note "Server-side Path Requirement"
     The LoRA adapter path (`local_path`) must be readable on the **server** machine. If your client and server are on different machines, ensure the LoRA adapter is accessible via a shared mount or copied to the server.
+
+### Online Inference
+
+For PEFT serving, configure sampling settings, adapters and strengths once in the diffusion stage's `default_sampling_params`. Clients can then focus on the model, prompt and required reference media, with per-request overrides when needed. For fused distilled adapters, see [Online serving](#online-serving).
+
+```bash
+vllm serve MODEL --omni --lora-backend peft --max-cpu-loras 2 \
+  --default-sampling-params '{"0":{"num_inference_steps":50,"guidance_scale":4.0,"lora_request":[{"lora_name":"style","lora_int_id":1,"lora_path":"/models/style.safetensors"},{"lora_name":"character","lora_int_id":2,"lora_path":"/models/character.safetensors"}],"lora_scale":[0.8,0.6]}}'
+```
+
+Alternatively, store the same defaults in a deploy YAML, for example `lora-defaults.yaml` for a single diffusion stage:
+
+```yaml
+async_chunk: false
+stages:
+  - stage_id: 0
+    default_sampling_params:
+      num_inference_steps: 50
+      guidance_scale: 4.0
+      lora_request:
+        - lora_name: style
+          lora_int_id: 1
+          lora_path: /models/style.safetensors
+        - lora_name: character
+          lora_int_id: 2
+          lora_path: /models/character.safetensors
+      lora_scale: [0.8, 0.6]
+```
+
+```bash
+vllm serve MODEL --omni --deploy-config lora-defaults.yaml \
+  --lora-backend peft --max-cpu-loras 2
+```
+
+For an existing multi-stage deploy file, add `default_sampling_params` to its diffusion stage using that stage's actual `stage_id`; preserve the other stage settings. YAML places the defaults directly under the stage, while `--default-sampling-params` wraps them in a mapping keyed by stage ID. Explicit request fields override CLI defaults, which override YAML defaults.
+
+Choose sampling values and adapters compatible with the selected model. A single default uses one `lora_request` object and scalar `lora_scale`; a stack uses parallel lists. These internal configuration fields differ from the HTTP fields below. Adapter paths must be readable by the server.
+
+On an image-capable deployment, this request inherits the sampling settings, both adapters and their strengths:
+
+```bash
+curl http://localhost:8000/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"MODEL","prompt":"A person standing in a garden"}'
+```
+
+The HTTP `lora` field accepts one adapter object or an array with independent strengths:
+
+```json
+"lora": [
+  {"name": "style", "local_path": "/path/to/style.safetensors", "scale": 0.8, "int_id": 1},
+  {"name": "character", "local_path": "/path/to/character.safetensors", "scale": 0.6, "int_id": 2}
+]
+```
+
+`int_id` is optional; when omitted it is derived from `local_path`.
+
+| Request | Effective adapters |
+| --- | --- |
+| Omit `lora` | Inherit the stage's adapters and strengths. |
+| Provide an object or non-empty list | Replace the entire group; omitted request strengths default to 1.0. |
+| Provide `lora: []` | Disable deployment-default request adapters for this request. |
+
+Overrides do not change later requests. Malformed explicit overrides return HTTP 400 before generation rather than falling back to defaults. This does not unload fused weights or override a pipeline's fixed adapter policy.
+
+For multipart video requests, encode the same object or array as JSON in the `lora` form field (for example, `-F 'lora=[]'` to disable defaults). With the OpenAI Python SDK's diffusion chat API, pass it through `extra_body={"lora": ...}`; on the wire, `lora` is a top-level JSON field. Required reference media follow the selected model's existing API.
 
 ## Wan2.2 LightX2V Offline Assembly
 

@@ -5,28 +5,7 @@ In vLLM-Omni, a model's `PipelineConfig` defines its fixed stage topology, while
 !!! note
     Default deploy config YAMLs (for example, `vllm_omni/deploy/qwen2_5_omni.yaml`, `vllm_omni/deploy/qwen3_omni_moe.yaml`, and `vllm_omni/deploy/qwen3_tts.yaml`) are bundled and loaded automatically when `--deploy-config` is omitted. The resolved pipeline selects its default through `default_deploy_config_name`.
 
-For diffusion sampling, explicit request fields override `--default-sampling-params`, which overrides deploy YAML defaults. CLI values are merged by stage ID, and `extra_args` is merged by key. Invalid CLI JSON fails startup; model-owned sampling constraints still apply.
-
-## Make requests simpler with deployment defaults
-
-Deployment owners can configure sampling settings and LoRA adapters once, so calling applications only need to supply basic inputs such as the model, prompt and required reference media. Clients may omit inference tuning fields and override them only when needed.
-
-For a single diffusion stage, configure both sampling and adapter defaults with:
-
-```bash
-vllm serve MODEL --omni --lora-backend peft \
-  --default-sampling-params '{"0":{"num_inference_steps":50,"guidance_scale":4.0,"lora_request":{"lora_name":"character","lora_int_id":1,"lora_path":"/models/character.safetensors"},"lora_scale":0.8}}'
-```
-
-Choose sampling values and an adapter compatible with the selected model; the values above are illustrative. On an image-capable deployment, a request can then contain only:
-
-```json
-{"model": "MODEL", "prompt": "A person standing in a garden"}
-```
-
-Reference-based models also require their input media. The stage defaults supply omitted sampling settings, adapters and strengths.
-
-Diffusion PEFT stages may include `lora_request` (one adapter object or a list) and `lora_scale` (one strength or a parallel list) in `default_sampling_params`. An omitted HTTP `lora` inherits this group; an explicit object or non-empty list replaces it, and `lora: []` disables it for that request. Overrides do not mutate the stage defaults. See [deployment-default adapters](../user_guide/diffusion/lora.md#deployment-default-request-adapters) for configuration and request examples.
+For diffusion sampling, explicit request fields override `--default-sampling-params`, which overrides deploy YAML defaults. CLI values are merged by stage ID, and `extra_args` is merged by key. Invalid CLI JSON fails startup; model-owned sampling constraints still apply. Sampling settings, PEFT adapters and their strengths can be configured once so clients only need to send basic inputs. For adapter fields and request overrides, see [LoRA online inference](../user_guide/diffusion/lora.md#online-inference).
 
 ## Pipeline configuration
 

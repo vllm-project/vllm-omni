@@ -92,21 +92,7 @@ the [Diffusion LoRA guide](../../user_guide/diffusion/lora.md) for formats,
 supported pipelines and checkpoint name mapping
 ([#8001](https://github.com/vllm-project/vllm-omni/issues/8001)).
 
-### Deployment-default request adapters
-
-Deployment defaults let clients focus on the model, prompt and required
-input media. Sampling settings, adapter selection and adapter strengths can
-be configured once by the deployment owner and omitted from ordinary
-requests, while explicit per-request overrides remain available.
-
-Diffusion stage `default_sampling_params` may define `lora_request` and
-`lora_scale` as a single adapter/strength or parallel lists. Configured adapter
-dictionaries are normalized into `LoRARequest` objects by
-`OmniDiffusionSamplingParams`. Serving code starts from a request-local copy:
-omitted HTTP `lora` inherits the default group, an explicit adapter object or
-non-empty list replaces the group, and `[]` clears it for that request.
-Overrides do not change later requests. The existing worker and LoRA manager
-own loading and activation; fixed policies and fused weights remain separate.
+Diffusion stage `default_sampling_params` owns the default adapter group and strengths. `OmniDiffusionSamplingParams` normalizes configured dictionaries into `LoRARequest` objects. Serving starts from a request-local copy: omission inherits the group, an explicit object or non-empty list replaces it, and `[]` clears it without changing later requests. The existing worker and manager own adapter loading and activation; fixed and fused adapter policies remain separate. Configuration and request examples are in the [LoRA guide](../../user_guide/diffusion/lora.md#online-inference).
 
 ## Not supported
 

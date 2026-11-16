@@ -138,24 +138,6 @@ codec may not import the engine, the entrypoints or the model code, which
 second consumer lands (#6592 P0b) the package is expected to graduate to its
 own module document with owners drawn from both consumers.
 
-### Diffusion adapter defaults at the HTTP boundary
-
-Serving uses deployment defaults for omitted sampling and adapter settings,
-so clients can submit basic inputs without repeating inference configuration.
-The request still supplies the model, prompt and any media required by its
-modality; explicit tuning fields override the applicable defaults.
-
-Image, video, streaming-video and diffusion-chat handlers preserve the
-presence of the HTTP `lora` field. Omission inherits the diffusion stage's
-default adapter group; an object or non-empty list replaces it, while an
-explicit empty list clears the request-local adapters and strengths. Empty
-lists must not be treated as absent by truthiness checks. Malformed explicit
-overrides fail with HTTP 400 before generation rather than falling back to
-the deployment defaults. Configured adapter
-dictionaries are normalized by `OmniDiffusionSamplingParams`; worker-side
-loading remains owned by the diffusion runtime. See the
-[LoRA contract](../feature/lora.md#deployment-default-request-adapters).
-
 ## Candidate invariants
 
 These identifiers are proposals while the document is `draft`.
@@ -185,6 +167,8 @@ extension point.
 
 **Rule:** Public protocol values MUST be validated and converted to internal
 request contracts before engine submission.
+
+Diffusion LoRA requests preserve omission versus an explicit empty list and reject malformed overrides with HTTP 400 before generation; see [Diffusion LoRA](../feature/lora.md#diffusion-stages).
 
 ### ENTRY-INV-101: Streaming preserves request identity
 
