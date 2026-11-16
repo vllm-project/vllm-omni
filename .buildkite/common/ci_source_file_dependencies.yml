@@ -1178,6 +1178,11 @@ source_file_dependencies:
     - vllm_omni/model_executor/stage_input_processors/breeze_tts_2.py
     - vllm_omni/outputs/
 
+  # MRv2 paths for the CUDA Breeze weekly step only. The ROCm step shares
+  # tts_breeze_tts2_weekly but still runs on V1.
+  tts_breeze_tts2_mrv2_weekly:
+    - vllm_omni/worker_v2/
+
   tts_gepard_weekly:
     - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
     - tests/assets/
