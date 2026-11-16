@@ -1098,17 +1098,17 @@ class Cosmos3OmniDiffusersPipeline(
             self.device.type != "cuda"
             or od_config.parallel_config.world_size != 1
             or od_config.parallel_config.use_hsdp
-            or od_config.enforce_eager
             or resolved_offload.strategy is not OffloadStrategy.NONE
             or od_config.cache_backend not in (None, "none", "sea_cache")
             or od_config.quantization_config is not None
             or od_config.lora_path is not None
             or od_config.enable_sleep_mode
-            or od_config.diffusion_compile_granularity != "regional"
+            or (not od_config.enforce_eager and od_config.diffusion_compile_granularity != "regional")
             or od_config.diffusion_attention_schedule is not None
         ):
             raise ValueError(
-                "Cosmos3 manual CUDA graphs require a single resident CUDA GPU with regional compilation, "
+                "Cosmos3 manual CUDA graphs require a single resident CUDA GPU with eager execution "
+                "or regional compilation, "
                 "with no cache or SeaCache, without offload, quantization, LoRA, sleep or attention schedules."
             )
 

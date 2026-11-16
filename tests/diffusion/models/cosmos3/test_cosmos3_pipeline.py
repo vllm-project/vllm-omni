@@ -938,11 +938,17 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
 
 @pytest.mark.parametrize("use_graphs", [False, True])
 @pytest.mark.parametrize("cache_backend", ["none", "sea_cache"])
+@pytest.mark.parametrize(
+    ("enforce_eager", "compile_granularity"),
+    [(False, "regional"), (True, "regional"), (True, "full")],
+)
 def test_distilled_pipeline_initializes_sde_scheduler(
     stub_real_pipeline_init,
     monkeypatch: pytest.MonkeyPatch,
     use_graphs: bool,
     cache_backend: str,
+    enforce_eager: bool,
+    compile_granularity: str,
     tmp_path,
 ) -> None:
     from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
@@ -971,13 +977,15 @@ def test_distilled_pipeline_initializes_sde_scheduler(
     config = _make_od_config(sound_gen=False)
     if use_graphs:
         monkeypatch.setattr(pipeline_cosmos3, "get_local_device", lambda: torch.device("cuda"))
-        config = OmniDiffusionConfig(
-            model=str(tmp_path),
-            dtype=torch.float32,
-            tf_model_config=TransformerConfig.from_dict(config.tf_model_config),
-            additional_config={"cosmos3_manual_cuda_graphs": True},
-            cache_backend=cache_backend,
-        )
+    config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        dtype=torch.float32,
+        tf_model_config=TransformerConfig.from_dict(config.tf_model_config),
+        additional_config={"cosmos3_manual_cuda_graphs": use_graphs},
+        cache_backend=cache_backend,
+        enforce_eager=enforce_eager,
+        diffusion_compile_granularity=compile_granularity,
+    )
     pipeline = Cosmos3OmniDiffusersPipeline(od_config=config)
     assert pipeline.is_distilled_model is True
     assert isinstance(pipeline.scheduler, FlowMatchEulerDiscreteScheduler)
@@ -3868,7 +3876,6 @@ def test_diffuse_releases_conditioning_after_completion_or_failure(
 @pytest.mark.parametrize(
     "override",
     [
-        {"enforce_eager": True},
         {"diffusion_compile_granularity": "full"},
         {"cache_backend": "cache_dit"},
         {"enable_cpu_offload": True},
