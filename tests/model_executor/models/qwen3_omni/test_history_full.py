@@ -3,6 +3,7 @@
 """Full-history defaults preserve raw sources or reject the complete request."""
 
 import json
+from dataclasses import replace
 from unittest.mock import Mock
 
 import numpy as np
@@ -13,7 +14,7 @@ from vllm.sampling_params import SamplingParams
 
 from tests.engine.duplex.test_session_runner import Harness
 from tests.model_executor.models.qwen3_omni.test_history_multimodal import image_message
-from tests.model_executor.models.qwen3_omni.test_history_policy import Processor, audio_message, text_history
+from tests.model_executor.models.qwen3_omni.test_history_policy import Processor, audio_message, runtime, text_history
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, DuplexStageSubmission
@@ -192,7 +193,8 @@ def test_full_history_keeps_tool_anchors_outside_the_recent_window():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("keep_question", [False, True])
-async def test_full_history_capacity_error_preserves_session_and_can_retry_after_deletion(keep_question):
+@pytest.mark.parametrize("policy", ["full_history", "bounded_recent", "incremental"])
+async def test_history_capacity_error_preserves_session_and_can_retry_after_deletion(keep_question, policy):
     from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
     from vllm_omni.engine.duplex.commands import CreateItem, CreateResponse, DeleteItem
     from vllm_omni.engine.duplex.config import DuplexSessionState
@@ -200,10 +202,8 @@ async def test_full_history_capacity_error_preserves_session_and_can_retry_after
     h = await open_qwen()
     try:
         plugin = h.runner.plugin
-        plugin.processor = Processor()
-        plugin._history_runtime.bind(
-            plugin.processor, Mock(spec=ModelConfig, max_model_len=4096, multimodal_config=None)
-        )
+        plugin._history_runtime = runtime(policy)
+        plugin.processor = plugin._history_runtime.processor
         enable_engine_capacity(h)
         await h.run(
             CreateItem(
@@ -248,13 +248,17 @@ async def test_full_history_capacity_error_preserves_session_and_can_retry_after
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("complete_first", "delete_all"), [(False, False), (True, False), (False, True)])
-async def test_full_history_deleting_one_merged_commit_removes_only_its_pcm(complete_first, delete_all):
+@pytest.mark.parametrize("policy", ["full_history", "recent", "bounded_recent", "incremental"])
+async def test_deleting_one_merged_commit_removes_only_its_pcm(complete_first, delete_all, policy):
     from tests.engine.duplex.test_session_runner import append_audio, tts_output
     from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
     from vllm_omni.engine.duplex.commands import AckPlayback, Commit, CreateItem, CreateResponse, DeleteItem
 
     h = await open_qwen()
     try:
+        plugin = h.runner.plugin
+        plugin._history_runtime = runtime(policy)
+        plugin.processor = plugin._history_runtime.processor
         for value in (0.1, 0.2):
             await h.run(append_audio(value=value))
             await h.run(Commit(final=True, create_response=False))
@@ -290,6 +294,102 @@ async def test_full_history_deleting_one_merged_commit_removes_only_its_pcm(comp
             np.testing.assert_allclose(audio[0][0], np.full(16000, 0.2, dtype="<f4"))
     finally:
         await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["bounded_recent", "incremental"])
+@pytest.mark.parametrize("evict_before_delete", [False, True])
+async def test_deleted_pcm_is_removed_from_pool_after_foreground_cache_eviction(policy, evict_before_delete):
+    from tests.engine.duplex.test_session_runner import append_audio, tts_output
+    from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
+    from vllm_omni.engine.duplex.commands import AckPlayback, Commit, CreateItem, CreateResponse, DeleteItem
+
+    h = await open_qwen()
+    try:
+        plugin = h.runner.plugin
+        plugin._history_runtime = runtime(policy)
+        # Two clips exceed the foreground cache, while the larger pool keeps
+        # both. This exercises the same eviction without allocating 8 MiB.
+        plugin._history_runtime.behavior = replace(plugin._history_runtime.behavior, audio_cache_bytes=100000)
+
+        async def finish_response():
+            submission = h.port.submissions[-1]
+            response_id = h.session.active_response_id
+            await h.deliver_and_settle(
+                tts_output(submission.context.request_id, samples=0, text="heard", finished=True), stage_id=0
+            )
+            await h.deliver_and_settle(tts_output(submission.context.request_id, finished=True), stage_id=2)
+            await h.run(AckPlayback(response_id=response_id, played_ms=1000, committed_ms=1000))
+
+        for value in (0.1, 0.2):
+            await h.run(append_audio(value=value))
+            await h.run(Commit(final=True, create_response=False))
+        first_id = h.session.history_snapshot().item_ids[0]
+        await h.run(CreateResponse())
+        await finish_response()
+        if not evict_before_delete:
+            await h.run(DeleteItem(item_id=first_id))
+        await h.run(append_audio(value=0.3))
+        await h.run(Commit(final=True, create_response=True))
+        assert len(h.runner.model_state.audio_history) == 1
+        if evict_before_delete:
+            await finish_response()
+            await h.run(DeleteItem(item_id=first_id))
+            await h.run(
+                CreateItem(
+                    item={
+                        "id": "recall-after-deletion",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "recall"}],
+                    }
+                )
+            )
+            await h.run(CreateResponse())
+        audios = h.port.submissions[-1].prompt["multi_modal_data"]["audio"]
+        assert len(audios) == 2
+        for (audio, _), value in zip(audios, (0.2, 0.3)):
+            np.testing.assert_allclose(audio, np.full(16000, value, dtype="<f4"))
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.parametrize("same_pcm", [False, True])
+def test_legacy_anonymous_audio_after_tool_result_is_new_input(same_pcm):
+    from tests.model_executor.models.qwen3_omni.test_duplex_tools import _weather_turn
+
+    plugin = plugin_for("recent")
+    state = plugin.create_session_state()
+    message, first = audio_message(0)
+    _, second = audio_message(0 if same_pcm else 1)
+    plan(plugin, [message], state=state, payload=first)
+    prompt = plan(
+        plugin,
+        [message],
+        state=state,
+        payload=second,
+        runtime={"qwen_tool_turns": [_weather_turn("call", "Paris", "18C", 1)]},
+    )
+    audios = prompt["multi_modal_data"]["audio"]
+    assert len(audios) == 2
+    for (audio, _), value in zip(audios, (1, 1 if same_pcm else 2)):
+        np.testing.assert_allclose(audio, np.full(160, value, dtype="<f4"))
+
+
+def test_legacy_merged_commits_do_not_duplicate_first_audio():
+    plugin = plugin_for("recent")
+    state = plugin.create_session_state()
+    first_message, first = audio_message(0)
+    second_message, second = audio_message(1)
+    plan(plugin, [first_message], state=state, payload=first)
+    merged = {
+        **first,
+        "audio": pybase64.b64encode(pybase64.b64decode(first["audio"]) + pybase64.b64decode(second["audio"])).decode(),
+    }
+    prompt = plan(plugin, [first_message, second_message], state=state, payload=merged)
+    audios = prompt["multi_modal_data"]["audio"]
+    assert len(audios) == 1
+    np.testing.assert_allclose(audios[0][0], np.repeat(np.array([1, 2], dtype="<f4"), 160))
 
 
 @pytest.mark.asyncio

@@ -261,14 +261,22 @@ class QwenHistoryRuntime:
         turns = turn_ranges(state.history)
         unanswered = has_unanswered_user_input(state.history)
         current_contents = []
+        unbound_contents = []
         current_start = turns[-1][0] if unanswered else len(state.history)
         for message in state.history[current_start:]:
             if has_audio(message):
-                current_contents.append(message.get("content"))
+                content = message.get("content")
+                current_contents.append(content)
+                if state.audio_for(message) is None and not any(
+                    any(content is old for old in contents) for contents, _ in available_audio
+                ):
+                    unbound_contents.append(content)
         submitted = isinstance(encoded, str) and bool(encoded)
         sources = list(available_audio)
-        if submitted and current_contents:
-            sources.append((tuple(current_contents), payload))
+        if submitted and unbound_contents:
+            # A deleted assistant can join previously distinct audio turns.
+            # Preserve known bindings; this fallback only fills missing sources.
+            sources.append((tuple(unbound_contents), payload))
         valid = set(turns)
         for start, end in self.policy.select(state, self.limits):
             if (start, end) not in valid or start < last:
@@ -399,7 +407,7 @@ class QwenHistoryRuntime:
             visual.pop(0)
             prompt, count = render(groups, summary, visual)
         if count + output_tokens > self.max_model_len:
-            raise DuplexRuntimeConfigError("Current input and reserved output exceed Qwen context capacity")
+            raise DuplexInputCapacityError("Current input and reserved output exceed Qwen context capacity")
         # Grow backwards until full. Re-tokenizing the entire lifetime history
         # once per removed turn would make a long text-only session quadratic.
         for group in reversed(context.groups[:-1]):

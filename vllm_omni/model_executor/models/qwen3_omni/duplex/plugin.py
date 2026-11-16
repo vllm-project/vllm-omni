@@ -40,6 +40,8 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
     RECENT_MESSAGE_WINDOW,
     RECENT_PROMPT_IMAGES,
     Message,
+    live_audio_bindings,
+    select_committed_audio_sources,
 )
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_runtime import HISTORY_PROMPT, QwenHistoryRuntime
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
@@ -975,67 +977,20 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             return self._prepare_original_prompt_config(config, state=state, payload=payload)
         self._history_runtime.validate_history(config.get("conversation", ()))
         previous_audio = list(state.audio_history)
-        self._bind_audio_history(config, state=state, payload=payload)
+        current_is_in_history = self._bind_audio_history(config, state=state, payload=payload)
         memory = state.history_policy_state
         memory.reconcile(config.get("conversation", ()))
         memory.retain([*previous_audio, *state.audio_history], self._history_runtime.limits)
-        prompt = self._history_runtime.foreground(memory, payload, state.audio_history)
+        # The cache holds the source-filtered submission, including partial
+        # deletion. Only genuinely unbound input needs an anonymous fallback.
+        current = {} if current_is_in_history else payload
+        prompt = self._history_runtime.foreground(memory, current, state.audio_history)
         logger.debug("Qwen history memory counts=%s retained_audio_bytes=%d", dict(memory.counts), memory.audio_bytes)
         return {**config, HISTORY_PROMPT: prompt}
 
-    @staticmethod
-    def _select_original_audio_sources(
-        payload: dict[str, object], item_ids: set[str]
-    ) -> tuple[dict[str, object], tuple[str, ...]] | None:
-        """Select committed PCM segments by engine-owned item provenance.
-
-        None means provenance is absent. A known but deleted input returns no
-        sources, so it must never be appended again as anonymous current audio.
-        """
-        segments = payload.get("committed_audio_segments")
-        if segments is None:
-            item_id = payload.get("realtime_item_id")
-            if not isinstance(item_id, str):
-                return None
-            return (payload, (item_id,)) if item_id in item_ids else ({}, ())
-        if (
-            not isinstance(segments, list)
-            or not segments
-            or any(
-                not isinstance(segment, dict)
-                or not isinstance(segment.get("item_id"), str)
-                or type(segment.get("byte_count")) is not int
-                or segment["byte_count"] <= 0
-                or segment["byte_count"] % 4
-                for segment in segments
-            )
-        ):
-            raise DuplexInputCapacityError("Full history audio has invalid committed-source boundaries")
-        kept = [segment for segment in segments if segment["item_id"] in item_ids]
-        if not kept:
-            return {}, ()
-        source_ids = tuple(dict.fromkeys(segment["item_id"] for segment in kept))
-        if len(kept) == len(segments):
-            return payload, source_ids
-        raw = base64.b64decode(payload["audio"], validate=True)
-        if sum(segment["byte_count"] for segment in segments) != len(raw):
-            raise DuplexInputCapacityError("Full history audio does not match its committed-source boundaries")
-        chunks, offset = [], 0
-        for segment in segments:
-            end = offset + segment["byte_count"]
-            if segment["item_id"] in item_ids:
-                chunks.append(raw[offset:end])
-            offset = end
-        return {
-            **payload,
-            "audio": base64.b64encode(b"".join(chunks)).decode("ascii"),
-            "committed_audio_segments": kept,
-            "realtime_item_id": source_ids[-1],
-        }, source_ids
-
     def on_history_item_deleted(self, *, state: QwenDuplexSessionState, item_id: str) -> int:
         """Remove deleted idle commits before a reused item ID can merge with them."""
-        if self._history_runtime.behavior.audio_retention != "original" or state.committed_audio_consume_started:
+        if state.committed_audio_consume_started:
             return 0
         payload = state.committed_audio_payload
         if payload is None:
@@ -1052,7 +1007,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         )
         if item_id not in source_ids:
             return 0
-        selected = self._select_original_audio_sources(
+        selected = select_committed_audio_sources(
             payload, {value for value in source_ids if isinstance(value, str) and value != item_id}
         )
         if selected is None:
@@ -1069,13 +1024,12 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         state.committed_audio_reserved_bytes = min(old_bytes, kept_bytes)
         return old_bytes - state.committed_audio_reserved_bytes
 
-    def _bind_original_audio_history(
+    def _bind_committed_audio_history(
         self, config: dict[str, object], *, state: QwenDuplexSessionState, payload: dict[str, object]
     ) -> bool:
         """Retain live originals and bind only the commits in this payload."""
         history = config.get("conversation", [])
         source_ids = config.get("conversation_item_ids", ())
-        live = {id(message.get("content")) for message in history}
         by_item = {
             item_id: message["content"]
             for message, item_id in zip(history, source_ids)
@@ -1084,35 +1038,35 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             and isinstance(message.get("content"), list)
             and any(part.get("type") == "audio_url" for part in message["content"])
         }
-        retained = []
-        for keys, value in state.audio_history:
-            surviving = tuple(key for key in keys if id(key) in live)
-            if not surviving:
-                continue
-            if len(surviving) != len(keys):
-                allowed = {item_id for item_id, content in by_item.items() if any(content is key for key in surviving)}
-                selected = self._select_original_audio_sources(value, allowed)
-                if selected is None or not selected[1]:
-                    raise DuplexInputCapacityError("Cannot separate a deleted audio source without commit provenance")
-                value, ids = selected
-                surviving = tuple(by_item[item_id] for item_id in ids)
-            retained.append((surviving, value))
+        retained = live_audio_bindings(state.audio_history, history, source_ids)
         state.audio_history = retained
         if not payload.get("audio"):
             return False
         has_source_ids = isinstance(config.get("conversation_item_ids"), (list, tuple)) and len(source_ids) == len(
             history
         )
-        selected = self._select_original_audio_sources(payload, set(by_item)) if has_source_ids else None
+        selected = select_committed_audio_sources(payload, set(by_item)) if has_source_ids else None
         if selected is not None:
             value, ids = selected
             keys = tuple(by_item[item_id] for item_id in ids)
             if not keys:
                 return True  # All known current sources were explicitly deleted.
         else:
+            # Legacy submissions concatenate commits since the last tool or
+            # assistant boundary when they carry no explicit source metadata.
+            lengths = []
+            for key in ("qwen_tool_turns", "qwen_tool_turns_inflight"):
+                turns = config.get(key)
+                if isinstance(turns, list):
+                    lengths.extend(
+                        turn["history_len"]
+                        for turn in turns
+                        if isinstance(turn, dict) and isinstance(turn.get("history_len"), int)
+                    )
+            start = unanswered_turn_start(history, lower_bound=max(lengths, default=0))
             pending = [
                 message["content"]
-                for message in history[unanswered_turn_start(history) :]
+                for message in history[start:]
                 if message.get("role") == "user"
                 and isinstance(message.get("content"), list)
                 and any(part.get("type") == "audio_url" for part in message["content"])
@@ -1120,15 +1074,14 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             keys = tuple(
                 content
                 for content in pending
-                if not any(content is old for old_keys, _ in retained for old in old_keys)
+                if self._history_runtime.behavior.audio_retention != "original"
+                or not any(content is old for old_keys, _ in retained for old in old_keys)
             )
             if not keys:
-                if any(value.get("audio") == payload["audio"] for _, value in retained):
-                    return True
                 if pending:
-                    raise DuplexInputCapacityError(
-                        "Full history cannot rebind retained audio without commit provenance"
-                    )
+                    if any(value.get("audio") == payload["audio"] for _, value in retained):
+                        return True
+                    raise DuplexInputCapacityError("Cannot rebind retained audio without commit provenance")
                 return False
             value = payload
         state.audio_history = [
@@ -1147,51 +1100,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         Return whether the submitted audio has source items in Session history.
         Prompt selection is performed separately by each history policy.
         """
+        current_is_in_history = self._bind_committed_audio_history(config, state=state, payload=payload)
         if self._history_runtime.behavior.audio_retention == "original":
-            return self._bind_original_audio_history(config, state=state, payload=payload)
-        history = config.get("conversation", [])
-        bind_from = 0
-        lengths = []
-        for key in ("qwen_tool_turns", "qwen_tool_turns_inflight"):
-            raw_turns = config.get(key)
-            if not isinstance(raw_turns, list):
-                continue
-            lengths.extend(
-                turn.get("history_len")
-                for turn in raw_turns
-                if isinstance(turn, dict) and isinstance(turn.get("history_len"), int)
-            )
-        if lengths:
-            # Audio committed after a tool result belongs to the new
-            # question, not to every earlier user item still in history.
-            bind_from = max(lengths)
-        # The history accessor copies message dicts but preserves content identity.
-        # Keep payloads privately, never put PCM into public conversation events.
+            return current_is_in_history
         has_audio = bool(payload.get("audio"))
-        # A committed audio item need not be last: camera/text items can arrive
-        # before response.create. Search only the unanswered user turn so a new
-        # payload can never overwrite an earlier, already answered utterance.
-        current_contents = []
-        if has_audio:
-            # System updates do not answer pending user input. Keep the same
-            # unanswered-turn boundary as foreground selection and compression.
-            start = unanswered_turn_start(history, lower_bound=bind_from)
-            for message in history[start:]:
-                if message.get("role") != "user":
-                    continue
-                content = message.get("content")
-                if isinstance(content, list) and any(part.get("type") == "audio_url" for part in content):
-                    current_contents.append(content)
-        current_is_in_history = bool(current_contents)
-        if current_is_in_history:
-            # The runner concatenates multiple commits made before a response.
-            # Associate that single payload with all of its source audio items.
-            state.audio_history = [
-                (keys, value)
-                for keys, value in state.audio_history
-                if not any(key is content for key in keys for content in current_contents)
-            ]
-            state.audio_history.append((tuple(current_contents), payload))
         # Reserve one of the four audio slots for the actual submitted input,
         # including when deferred input has no trailing user history entry.
         history_limit = self._history_runtime.behavior.audio_cache_items

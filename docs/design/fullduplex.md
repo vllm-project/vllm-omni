@@ -206,12 +206,16 @@ compression work still validates its original message labels and is retried
 when those positions move.
 
 Unanswered user items and intervening system messages form one protected turn.
-Multiple audio commits within that turn share one merged payload in the prompt,
-including on the explicit `recent` path. Distinct audio source bindings remain
-separate even when their payload objects or PCM values are identical.
+Merged audio submissions retain their committed source IDs. Only the source
+items whose PCM is present share that payload in the prompt, including on the
+explicit `recent` path. Deleting an assistant reply can join older turns without
+merging their existing audio bindings. Distinct bindings remain separate even
+when their payload objects or PCM values are identical.
 Foreground fitting preserves that complete turn, including original media, or
-returns an explicit capacity error. Background dialogue and visual compression
-wait until the turn has an assistant reply. `chunk_messages` is a batch target:
+returns a recoverable capacity error. After removing oversized source items,
+clients can retry the remaining input without submitting a new user item.
+Background dialogue and visual compression wait until the turn has an assistant
+reply. `chunk_messages` is a batch target:
 an indivisible audio turn can exceed it when its actual audio count, retained
 bytes and processor-expanded input plus reserved output fit the hard limits.
 

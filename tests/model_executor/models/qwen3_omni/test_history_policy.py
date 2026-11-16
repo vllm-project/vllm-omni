@@ -14,7 +14,7 @@ from vllm.outputs import CompletionOutput, RequestOutput
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
-from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError, DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
     HistoryLimits,
@@ -431,7 +431,7 @@ async def test_expanded_audio_context_limit_and_oversize_batch_progress():
     assert request is not None and request.model_source.start == 2
     sync_history(state, [message])
     context = owner.foreground(state, payload)
-    with pytest.raises(DuplexRuntimeConfigError, match="capacity"):
+    with pytest.raises(DuplexInputCapacityError, match="capacity"):
         owner.build_foreground(context, {}, 64)
 
 
@@ -559,6 +559,36 @@ def test_rebinding_audio_counts_source_still_held_by_preparation():
     assert state.audio_for(message).encoded is replacement["audio"]
 
 
+def test_partial_audio_deletion_preserves_preparing_pool_limit():
+    first, payload = audio_message(0)
+    second, other = audio_message(1)
+    merged = pybase64.b64encode(pybase64.b64decode(payload["audio"]) + pybase64.b64decode(other["audio"])).decode()
+    payload = {
+        **payload,
+        "audio": merged,
+        "committed_audio_segments": [
+            {"item_id": "source-0", "byte_count": 640},
+            {"item_id": "source-1", "byte_count": 640},
+        ],
+    }
+    limits = HistoryLimits(max_audio_items=1, max_audio_bytes=len(merged))
+    state = QwenHistoryState(limits=limits)
+    sync_history(state, [first, second])
+    state.retain([((first["content"], second["content"]), payload)], limits)
+    original = state.audio[0]
+    state.preparing = {id(original): original}
+    session = state._test_session
+    session.delete_history_item("source-0")
+    sync_history(state, session.history, session=session)
+    # The worker still owns merged PCM. Its smaller replacement cannot use
+    # another pool slot while the worker is running, or revive deleted audio.
+    assert state.held_audio == (original,)
+    assert state.audio_bytes <= limits.max_audio_bytes
+    assert state.audio_for(second) is None
+    state.preparing.clear()
+    assert not state.held_audio
+
+
 @pytest.mark.asyncio
 async def test_audio_trigger_uses_bound_model_limit():
     owner = runtime(recent_messages=100)
@@ -667,6 +697,49 @@ async def test_consecutive_commits_share_one_source_in_foreground_and_summary(co
         assert owner.apply(memory, request, completion("heard every committed source"))
         assert memory.processed == completed_length
         assert len(memory.ledger.get(memory.summary_node_id).sources) == completed_length
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["recent", "bounded_recent", "incremental", "full_history"])
+@pytest.mark.parametrize("system_update", [False, True])
+async def test_deleted_reply_does_not_rebind_old_audio_to_new_commit(policy, system_update):
+    from tests.engine.duplex.test_session_runner import append_audio, tts_output
+    from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
+    from vllm_omni.engine.duplex.commands import AckPlayback, Commit, CreateItem, DeleteItem
+
+    h = await open_qwen()
+    try:
+        h.runner.plugin._history_runtime = runtime(policy)
+        await h.run(append_audio(value=0.1))
+        await h.run(Commit(final=True, create_response=True))
+        submission = h.port.submissions[-1]
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            tts_output(submission.context.request_id, samples=0, text="heard A", finished=True), stage_id=0
+        )
+        await h.deliver_and_settle(tts_output(submission.context.request_id, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000, committed_ms=1000))
+        assert h.runner.model_state.committed_audio_payload is None
+        await h.run(DeleteItem(item_id=f"item_{response_id}"))
+        if system_update:
+            await h.run(
+                CreateItem(
+                    item={
+                        "id": "system-after-deletion",
+                        "type": "message",
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": "answer briefly"}],
+                    }
+                )
+            )
+        await h.run(append_audio(value=0.2))
+        await h.run(Commit(final=True, create_response=True))
+        audios = h.port.submissions[-1].prompt["multi_modal_data"]["audio"]
+        assert len(audios) == 2
+        np.testing.assert_allclose(audios[0][0], np.full(16000, 0.1, dtype="<f4"))
+        np.testing.assert_allclose(audios[1][0], np.full(16000, 0.2, dtype="<f4"))
     finally:
         await h.manager.shutdown()
 

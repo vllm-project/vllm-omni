@@ -218,7 +218,7 @@ async def test_current_input_survives_system_item_before_response(keep, policy, 
         if not fits:
             assert not h.port.submissions
             assert any(
-                event.type == "error" and event.code == "invalid_duplex_runtime_config" and "capacity" in event.message
+                event.type == "error" and event.code == "input_capacity_exceeded" and "capacity" in event.message
                 for event in events
             )
             return

@@ -14,12 +14,14 @@ import math
 from abc import ABC, abstractmethod
 from collections import Counter, deque
 from collections.abc import Hashable, Mapping, Sequence
-from dataclasses import InitVar, dataclass, field
+from dataclasses import dataclass, field
 from typing import Literal
 
+import pybase64 as base64
 import regex as re
 
 from vllm_omni.engine.duplex.history import unanswered_turn_start
+from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger, DuplexSourceRef, source_refs
 from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
 from vllm_omni.engine.duplex.session.source_costs import SourceTokenCache
@@ -35,6 +37,83 @@ RECENT_PROMPT_IMAGES = 8
 
 Message = Mapping[str, object]
 AudioEntry = tuple[tuple[object, ...], Mapping[str, object]]
+
+
+def select_committed_audio_sources(
+    payload: Mapping[str, object], item_ids: set[str]
+) -> tuple[Mapping[str, object], tuple[str, ...]] | None:
+    """Select committed PCM segments by engine-owned item provenance.
+
+    None means provenance is absent. A known but deleted input returns no
+    sources, so it must never be appended again as anonymous current audio.
+    """
+    segments = payload.get("committed_audio_segments")
+    if segments is None:
+        item_id = payload.get("realtime_item_id")
+        if not isinstance(item_id, str):
+            return None
+        return (payload, (item_id,)) if item_id in item_ids else ({}, ())
+    if (
+        not isinstance(segments, list)
+        or not segments
+        or any(
+            not isinstance(segment, dict)
+            or not isinstance(segment.get("item_id"), str)
+            or type(segment.get("byte_count")) is not int
+            or segment["byte_count"] <= 0
+            or segment["byte_count"] % 4
+            for segment in segments
+        )
+    ):
+        raise DuplexInputCapacityError("Submitted audio has invalid committed-source boundaries")
+    kept = [segment for segment in segments if segment["item_id"] in item_ids]
+    if not kept:
+        return {}, ()
+    source_ids = tuple(dict.fromkeys(segment["item_id"] for segment in kept))
+    if len(kept) == len(segments):
+        return payload, source_ids
+    raw = base64.b64decode(payload["audio"], validate=True)
+    if sum(segment["byte_count"] for segment in segments) != len(raw):
+        raise DuplexInputCapacityError("Submitted audio does not match its committed-source boundaries")
+    chunks, offset = [], 0
+    for segment in segments:
+        end = offset + segment["byte_count"]
+        if segment["item_id"] in item_ids:
+            chunks.append(raw[offset:end])
+        offset = end
+    return {
+        **payload,
+        "audio": base64.b64encode(b"".join(chunks)).decode("ascii"),
+        "committed_audio_segments": kept,
+        "realtime_item_id": source_ids[-1],
+    }, source_ids
+
+
+def live_audio_bindings(
+    entries: Sequence[AudioEntry], history: Sequence[Message], item_ids: Sequence[str | None]
+) -> list[AudioEntry]:
+    """Keep only live source PCM, including inside a partially deleted merge."""
+    live = {id(message.get("content")) for message in history}
+    by_item = {
+        item_id: message["content"]
+        for message, item_id in zip(history, item_ids)
+        if isinstance(item_id, str) and has_audio(message)
+    }
+    retained = []
+    for keys, value in entries:
+        surviving = tuple(key for key in keys if id(key) in live)
+        if not surviving:
+            continue
+        if len(surviving) != len(keys):
+            allowed = {item_id for item_id, content in by_item.items() if any(content is key for key in surviving)}
+            selected = select_committed_audio_sources(value, allowed)
+            if selected is None or not selected[1]:
+                raise DuplexInputCapacityError("Cannot separate a deleted audio source without commit provenance")
+            value, ids = selected
+            surviving = tuple(by_item[item_id] for item_id in ids)
+        retained.append((surviving, value))
+    return retained
+
 
 _PREVIOUS_MEMORY = "PREVIOUS_MEMORY"
 _END_PREVIOUS_MEMORY = "END_PREVIOUS_MEMORY"
@@ -179,6 +258,15 @@ class RetainedAudio:
     contents: tuple[object, ...]
     encoded: str
     key: str
+    payload: Mapping[str, object] = field(default_factory=dict, compare=False, repr=False)
+
+    @classmethod
+    def from_payload(cls, contents: tuple[object, ...], payload: Mapping[str, object]) -> RetainedAudio:
+        encoded = payload["audio"]
+        assert isinstance(encoded, str)
+        key = hashlib.sha256(encoded.encode("ascii")).hexdigest() + ":" + ",".join(str(id(c)) for c in contents)
+        # The runner can mutate queued payload dictionaries after an idle delete.
+        return cls(contents, encoded, key, dict(payload))
 
     def belongs_to(self, message: Message) -> bool:
         """Match identity, never PCM equality between distinct user turns."""
@@ -241,10 +329,11 @@ class QwenHistoryState:
     token_plan: tuple[Hashable, HistoryWork | VisualWork] | None = None
     partial: HistoryFold | None = None
     source_costs: SourceTokenCache = field(default_factory=SourceTokenCache)
-    limits: InitVar[HistoryLimits] = field(kw_only=True)
+    limits: HistoryLimits = field(kw_only=True)
     visual: SessionVisualHistory = field(init=False)
 
-    def __post_init__(self, limits: HistoryLimits) -> None:
+    def __post_init__(self) -> None:
+        limits = self.limits
         self.visual = SessionVisualHistory(
             memory=VisualMemory(
                 chunk_frames=limits.visual_chunk_images,
@@ -305,8 +394,12 @@ class QwenHistoryState:
         self.history = tuple(history)
         self.visual.reconcile(history, self.snapshot, self.ledger)
         self.prune_source_costs()
-        live = {id(m.get("content")) for m in history if has_audio(m)}
-        self.audio = [a for a in self.audio if id(a) in self.preparing or any(id(c) in live for c in a.contents)]
+        previous = {id(audio.payload): audio for audio in self.audio}
+        entries = live_audio_bindings([(a.contents, a.payload) for a in self.audio], history, self.snapshot.item_ids)
+        self.audio = [
+            previous.get(id(payload)) or RetainedAudio.from_payload(contents, payload) for contents, payload in entries
+        ]
+        self.trim_audio(self.limits)
 
     def prune_source_costs(self) -> None:
         """Drop costs for processed, revised or regrouped turns."""
@@ -324,6 +417,8 @@ class QwenHistoryState:
         Rebinding replaces the association, but in-flight references stay charged.
         """
         self.media_revision += 1
+        if self.snapshot is not None:
+            entries = live_audio_bindings(entries, self.history, self.snapshot.item_ids)
         for contents, payload in entries:
             encoded = payload.get("audio")
             if not isinstance(encoded, str) or not encoded:
@@ -339,13 +434,12 @@ class QwenHistoryState:
                 for a in self.audio
             ):
                 continue
-            key = hashlib.sha256(encoded.encode("ascii")).hexdigest() + ":" + ",".join(str(id(c)) for c in contents)
             # A merged commit replaces its previous binding, never other turns.
             self.audio = [a for a in self.audio if not any(c is old for c in contents for old in a.contents)]
             if len(encoded) > limits.max_audio_bytes:
                 self.counts["oversize_audio"] += 1
                 continue
-            self.audio.append(RetainedAudio(contents, encoded, key))
+            self.audio.append(RetainedAudio.from_payload(contents, payload))
         positions = {id(m.get("content")): i for i, m in enumerate(self.history)}
         self.audio.sort(
             key=lambda a: min((positions.get(id(c), len(self.history)) for c in a.contents), default=len(self.history))

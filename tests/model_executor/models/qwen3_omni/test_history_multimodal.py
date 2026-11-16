@@ -18,7 +18,7 @@ from tests.model_executor.models.qwen3_omni.test_history_policy import (
     sync_history,
     text_history,
 )
-from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError
 from vllm_omni.engine.duplex.session.visual_history import VisualWork
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -193,7 +193,7 @@ def test_current_mixed_audio_image_input_and_image_capacity():
     prompt = owner.build_foreground(owner.foreground(state, payload), {}, 128)
     assert set(prompt["multi_modal_data"]) == {"image", "audio"}
     owner.processor.image_tokens = 10000
-    with pytest.raises(DuplexRuntimeConfigError, match="capacity"):
+    with pytest.raises(DuplexInputCapacityError, match="capacity"):
         owner.build_foreground(owner.foreground(state, payload), {}, 128)
 
 
