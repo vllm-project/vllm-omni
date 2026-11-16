@@ -617,7 +617,6 @@ source_file_dependencies:
     - vllm_omni/model_executor/duplex_sampling.py
     - vllm_omni/outputs/duplex.py
     - vllm_omni/deploy/qwen3_omni_duplex.yaml
-    - vllm_omni/deploy/qwen3_omni_duplex_mrv2.yaml
     - vllm_omni/entrypoints/cli/benchmark/
     - vllm_omni/benchmarks/
     - tests/dfx/conftest.py

@@ -131,6 +131,8 @@ block tail is recomputed. A missing or stale resident fails only that request.
 Changed/pruned history, playback-truncated text, or an unsupported completion
 boundary falls back to full-snapshot processing. Tool turns, changed prompt
 settings and the existing message/audio window limits also use that fallback.
+Removing tool definitions or settling private tool results requires one full
+snapshot before delta continuation can resume, so the old tool inputs leave KV.
 Nonempty `initial_user_text` uses full snapshots because it belongs only to the
 current audio turn; appending would retain previous turns' injected text.
 Fallback snapshots are tokenized in full without a rendered-text prefix cache.

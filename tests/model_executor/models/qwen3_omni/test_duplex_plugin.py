@@ -2498,6 +2498,73 @@ async def test_conversation_none_completion_keeps_the_tool_pair():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_state", ["schemas", "settled_result"])
+async def test_resident_turn_rebuilds_once_after_tool_state_is_removed(mocker, tool_state):
+    """Prompt-only tools must disappear before the resident can accept deltas."""
+    from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
+
+    tools = [{"type": "function", "name": "get_weather", "parameters": {"type": "object", "properties": {}}}]
+    h = await open_qwen(
+        history_policy="recent", extra_body={"realtime_tools": tools} if tool_state == "schemas" else {}
+    )
+    # Isolate history eligibility from the separately tested token-ledger check:
+    # the previous reply has completed at an append-compatible token boundary.
+    can_append = mocker.AsyncMock(return_value=True)
+    h.port.can_append_turn = can_append
+    h.manager.plugin.processor.apply_chat_template = lambda messages, **kw: (
+        repr(kw.get("tools", []))
+        + "".join("<|im_start|>" + m["role"] + "\n" + repr(m) + "<|im_end|>\n" for m in messages)
+        + "<|im_start|>assistant\n"
+    )
+    try:
+        if tool_state == "schemas":
+            await h.run(append_audio())
+            await h.run(Commit(final=True, create_response=True))
+        else:
+            h.session.append_history_message({"role": "user", "content": "Paris"})
+            await _publish_call(h, "call_weather")
+            await h.run(
+                CreateItem(
+                    item=normalize_conversation_item(
+                        {"type": "function_call_output", "call_id": "call_weather", "output": "18C"}
+                    )
+                )
+            )
+            await h.run(CreateResponse())
+        first = h.port.submissions[-1]
+        assert "get_weather" in first.prompt["prompt"]
+        request_id = first.context.request_id
+        for turn in range(2):
+            response_id = h.session.active_response_id
+            await h.deliver_and_settle(tts_output(request_id, samples=0, text="hello", finished=True), stage_id=0)
+            await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+            await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+            assert h.session.active_response_id is None
+            if turn == 0 and tool_state == "schemas":
+                await h.run(translate_realtime_command({"type": "session.update", "session": {"tools": []}}))
+            assert not any(
+                h.session.runtime_config.get(key)
+                for key in ("qwen_tools", "qwen_tool_turns", "qwen_tool_turns_inflight")
+            )
+            await h.run(append_audio())
+            await h.run(Commit(final=True, create_response=True))
+            assert len(h.port.submissions) == turn + 2, [event.to_realtime() for event in h.events]
+            submission = h.port.submissions[-1]
+            assert submission.context.request_id == request_id
+            assert submission.already_submitted and submission.resume_from_full_prompt
+            assert "get_weather" not in submission.prompt["prompt"]
+            assert "18C" not in submission.prompt["prompt"]
+            if turn == 0:
+                assert "_duplex_turn_delta" not in submission.prompt
+                can_append.assert_not_awaited()
+            else:
+                assert submission.prompt["_duplex_turn_delta"] is True
+                can_append.assert_awaited_once_with(request_id, "hello")
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["ephemeral", "snapshot", "delta", "context_view", "initial_text", "full_history"])
 async def test_committed_turns_preserve_lifecycle_and_process_only_required_history(mocker, mode):
     resumable = mode != "ephemeral"
@@ -2508,7 +2575,7 @@ async def test_committed_turns_preserve_lifecycle_and_process_only_required_hist
         history_policy="full_history" if mode == "full_history" else "recent",
     )
     if mode == "context_view":
-        h.manager.runtime_config = replace(h.manager.runtime_config, context_keep_media_turns=10)
+        h.manager.runtime_config = replace(h.manager.runtime_config, context_keep_media_turns=4)
 
     async def can_append(request_id, text):
         return mode in {"delta", "context_view", "initial_text", "full_history"} and text == "hello"
@@ -2525,7 +2592,7 @@ async def test_committed_turns_preserve_lifecycle_and_process_only_required_hist
     bind_request = mocker.spy(h.session, "bind_request")
     try:
         ids = []
-        for i in range(5 if mode in {"delta", "full_history"} else 2):
+        for i in range(5 if mode in {"delta", "context_view", "full_history"} else 2):
             bind_request.reset_mock()
             snapshot.reset_mock()
             decode.reset_mock()

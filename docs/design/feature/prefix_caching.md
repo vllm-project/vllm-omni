@@ -59,7 +59,9 @@ sequence. A session cursor selects only new user messages; edits to submitted
 history invalidate it. The token ledger checks the latest heard reply against
 completed output before rendering a delta, without rebuilding old history or
 decoding old media. Window eviction, tool turns and nonempty `initial_user_text`
-use a full snapshot. The latter is injected into the current audio turn only,
+use a full snapshot. Removing tool definitions or settling private tool results
+also requires a snapshot to remove those prompt-only inputs from resident KV.
+`initial_user_text` is injected into the current audio turn only,
 so keeping earlier injections would change the conversation.
 The default `full_history` policy and other history policies use full snapshots
 on the same resident request. This preserves their source selection, compression

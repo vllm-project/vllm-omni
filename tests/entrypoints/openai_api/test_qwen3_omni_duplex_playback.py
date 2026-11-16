@@ -56,7 +56,7 @@ class _DuplexTestRuntime(NamedTuple):
 
 
 @pytest.fixture(scope="class")
-def qwen_duplex_server(tmp_path_factory, cached_silero_vad_artifact, cached_smart_turn_artifact, run_level):
+def qwen_duplex_server(request, tmp_path_factory, cached_silero_vad_artifact, cached_smart_turn_artifact, run_level):
     """Load real weights once for all interruption repetitions and history checks."""
     from transformers import AutoProcessor
 
@@ -75,6 +75,7 @@ def qwen_duplex_server(tmp_path_factory, cached_silero_vad_artifact, cached_smar
                     # Deploy overlays replace this section atomically. Keep
                     # the selected profile's continuation and session policy.
                     **asdict(base_session),
+                    **getattr(request, "param", {}),
                     "model_custom_options": {**base_session.model_custom_options, "history_policy": "recent"},
                     "server_vad_model_path": cached_silero_vad_artifact,
                     "semantic_vad_model_path": cached_smart_turn_artifact,
@@ -615,7 +616,10 @@ class TestQwen3OmniDuplexPlayback:
         )
 
     @pytest.mark.advanced_model
+    @pytest.mark.parametrize("qwen_duplex_server", [{"context_keep_media_turns": 4}], indirect=True, ids=["snapshot"])
     def test_mixed_image_audio_history_pruning(self, qwen_duplex_server, tmp_path: Path):
+        # A history view forces full snapshots while retaining the recent
+        # policy's four audio turns. APC stays enabled for the reuse check.
         stats = asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, tmp_path / "events.json"))
         # Six turns preserve multimodal history, then prune its oldest turn.
         # The helper checks audio, transcript and the exact submitted history;

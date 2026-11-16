@@ -1001,11 +1001,18 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             runtime_config.get(key) != previous_runtime_config.get(key) for key in ("instructions", "initial_user_text")
         ):
             return False
-        # Window eviction changes resident context and still requires a snapshot.
-        if any(runtime_config.get(key) for key in ("qwen_tools", "qwen_tool_turns", "qwen_tool_turns_inflight")):
+        # Tool schemas and private tool turns are prompt-only inputs. When
+        # they disappear from runtime, rebuild once to remove them from KV;
+        # the conversation cursor cannot detect that change.
+        if any(
+            config.get(key)
+            for config in (runtime_config, previous_runtime_config)
+            for key in ("qwen_tools", "qwen_tool_turns", "qwen_tool_turns_inflight")
+        ):
             return False
         if extra_body.get("realtime_tools"):
             return False
+        # Window eviction changes resident context and still requires a snapshot.
         return history_length <= behavior.message_window and (
             not payload.get("audio")
             or (
