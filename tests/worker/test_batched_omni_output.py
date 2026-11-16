@@ -3,18 +3,23 @@
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
 from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [
+    pytest.mark.core_model,
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
+]
 
 
-def test_async_packed_snapshot_survives_source_reuse():
+@pytest.mark.parametrize("num_tensors", [1, 3])
+def test_async_packed_snapshot_survives_source_reuse(num_tensors):
     values = [
         torch.arange(12, device="cuda").view(1, 12),
         torch.empty((0, 12), device="cuda", dtype=torch.long),
         torch.arange(24, device="cuda").view(2, 12),
-    ]
+    ][:num_tensors]
     expected = [v.cpu() for v in values]
     snapshot = _snapshot_tensor_payload_to_cpu_async(
         {"list": values, "tuple": tuple(values)}, copy_stream=torch.cuda.Stream(), pin_memory=True
@@ -74,3 +79,16 @@ def test_mixed_stop_flags_do_not_synchronize_cuda():
     assert all("current" not in info.get("audio_codes", {}) for info in infos)
     prefill = model.make_omni_output(hidden[:1], runtime_additional_information=[{}])
     assert model._batch_should_continue is None and prefill.multimodal_outputs == {}
+
+
+@pytest.mark.parametrize("shape", [(), (1, 1), (0, 1)])
+def test_equal_shape_async_snapshot_survives_source_reuse(shape):
+    values = [torch.full(shape, i, dtype=torch.long, device="cuda") for i in range(16)]
+    expected = [value.cpu() for value in values]
+    snapshot = _snapshot_tensor_payload_to_cpu_async(
+        {"list": values, "tuple": tuple(values)}, copy_stream=torch.cuda.Stream(), pin_memory=True
+    )
+    for value in values:
+        value.fill_(-99)
+    snapshot.wait()
+    torch.testing.assert_close(snapshot.payload, {"list": expected, "tuple": tuple(expected)}, rtol=0, atol=0)

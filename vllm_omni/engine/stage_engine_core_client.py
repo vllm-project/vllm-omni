@@ -113,6 +113,22 @@ class StageEngineCoreClientBase(StageClientBase):
 
         return StageEngineCoreClient(**client_args)
 
+    def shutdown(self, timeout: float | None = None) -> None:
+        # The orchestrator calls shutdown() without arguments. Forward an
+        # explicitly configured grace period instead of falling back to the
+        # upstream process manager's five-second best-effort timeout.
+        if timeout is None:
+            configured = getattr(self, "_stage_shutdown_timeout", None)
+            if configured is not None:
+                timeout = configured
+            else:
+                configured = getattr(getattr(self, "vllm_config", None), "shutdown_timeout", None)
+                if configured is not None and configured > 0:
+                    timeout = configured
+        # Both concrete clients place an upstream MPClient after this mixin
+        # in their MRO; StageClientBase itself has no process manager.
+        super().shutdown(timeout=timeout)  # type: ignore[misc]
+
     def __init__(
         self,
         vllm_config: Any,
@@ -139,6 +155,7 @@ class StageEngineCoreClientBase(StageClientBase):
         """
         # -------- Stage metadata (public fields used at runtime) --------
         self.replica_id = 0
+        self._stage_shutdown_timeout = getattr(getattr(metadata, "runtime_cfg", None), "shutdown_timeout", None)
         if metadata is not None:
             self.stage_id = metadata.stage_id
             self.replica_id = getattr(metadata, "replica_id", 0)
@@ -153,6 +170,7 @@ class StageEngineCoreClientBase(StageClientBase):
             self.prompt_transform_func = metadata.prompt_transform_func
             self.prompt_expand_func = metadata.prompt_expand_func
             self.custom_process_input_func = metadata.custom_process_input_func
+            self.async_chunk_prewarm_payload_func = getattr(metadata, "async_chunk_prewarm_payload_func", None)
 
         self.engine_outputs: Any = None
         self.client_addresses = dict(client_addresses or {})

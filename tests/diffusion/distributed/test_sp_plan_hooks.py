@@ -45,12 +45,7 @@ requires_distributed = pytest.mark.skipif(
 )
 
 # Module-level markers: these tests are diffusion + parallel related
-pytestmark = [
-    pytest.mark.diffusion,
-    pytest.mark.parallel,
-    pytest.mark.core_model,
-    pytest.mark.cpu,
-]
+pytestmark = [pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.core_model]
 
 # =============================================================================
 # Tests for sp_plan.py
@@ -735,6 +730,48 @@ class TestSequenceParallelSplitHookInit:
         assert result is module
         assert hook.module_forward_metadata is not None
         assert hook.module_forward_metadata._cls is DummyModule
+
+    @pytest.mark.parametrize("as_list", [False, True])
+    @pytest.mark.parametrize("keyword", [False, True])
+    @pytest.mark.parametrize("auto_pad", [False, True])
+    @pytest.mark.parametrize("actually_split", [False, True])
+    def test_input_split_activates_attention_until_gather(
+        self, monkeypatch, as_list, keyword, auto_pad, actually_split
+    ):
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
+        from vllm_omni.diffusion.hooks import sequence_parallel as hooks
+
+        class Module(nn.Module):
+            def forward(self, hidden_states, rope):
+                assert get_forward_context().sp_active == actually_split
+                return hidden_states[0] if as_list else hidden_states
+
+        spec = SequenceParallelInput(split_dim=1, auto_pad=auto_pad)
+        config = SequenceParallelConfig(ulysses_degree=2)
+        split = hooks.SequenceParallelSplitHook(
+            {"hidden_states": [spec, spec] if as_list else spec, "rope": spec}, config
+        )
+        module = Module()
+        split.initialize_hook(module)
+        monkeypatch.setattr(split, "_prepare_sp_input", lambda x, *_args: x[:, :2] if actually_split else x)
+        monkeypatch.setattr(hooks, "sp_gather", lambda x, dim, **_kwargs: torch.cat((x, x), dim=dim))
+        gather = hooks.SequenceParallelGatherHook(SequenceParallelOutput(gather_dim=1), config)
+        tensor = torch.randn(1, 4, 8)
+        hidden = [tensor, tensor] if as_list else tensor
+        args, kwargs = ((), {"hidden_states": hidden, "rope": tensor}) if keyword else ((hidden, tensor), {})
+        with set_forward_context():
+            ctx = get_forward_context()
+            ctx.sp_plan_hooks_applied = True
+            args, kwargs = split.pre_forward(module, *args, **kwargs)
+            result = split.post_forward(module, module(*args, **kwargs))
+            # Multiple tensors belong to one split boundary, not nested scopes.
+            assert ctx._sp_shard_depth == int(actually_split)
+            assert ctx._sp_equal_pad_stack == ([auto_pad] if actually_split else [])
+            if actually_split:
+                gather.post_forward(module, result)
+            assert not ctx.sp_active
+            assert ctx._sp_equal_pad_stack == []
 
 
 @pytest.mark.cpu

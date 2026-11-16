@@ -122,19 +122,45 @@ def parse_lora_request(lora_body: Any) -> tuple[LoRARequest | None, float | None
     return LoRARequest(str(lora_name), int(lora_int_id), str(lora_path)), scale
 
 
-def get_supported_speakers_from_hf_config(hf_config: Any) -> set[str]:
-    """Extract supported speaker names from a model hf_config."""
-    config = (
-        hf_config.get("talker_config") if isinstance(hf_config, dict) else getattr(hf_config, "talker_config", None)
-    )
-    if config is None:
-        return set()
+def parse_lora_requests(
+    lora_body: Any,
+) -> tuple[LoRARequest | list[LoRARequest] | None, float | list[float] | None]:
+    """Parse a request-level LoRA object or array of objects.
 
-    for spk_attr in ("speaker_id", "spk_id"):
-        speakers_dict = config.get(spk_attr) if isinstance(config, dict) else getattr(config, spk_attr, None)
-        if speakers_dict and isinstance(speakers_dict, dict):
-            return {speaker.lower() for speaker in speakers_dict}
-    return set()
+    Accepts the legacy single-object shape (see ``parse_lora_request``) or a
+    non-empty list of such objects to stack multiple adapters on one request.
+    A single object (or a one-element array) keeps the legacy scalar
+    ``(LoRARequest, float)`` shape; only a genuine stack of 2+ adapters
+    produces lists. Per-adapter scales default to 1.0 when omitted.
+
+    Raises:
+        ValueError: If any object shape is invalid, required fields are missing,
+            or the same adapter appears more than once in a stack.
+    """
+    if lora_body is None:
+        return None, None
+
+    items = lora_body if isinstance(lora_body, list) else [lora_body]
+    if not items:
+        raise ValueError("Invalid lora field: expected a non-empty array of objects.")
+
+    lora_requests: list[LoRARequest] = []
+    lora_scales: list[float] = []
+    seen: set[int] = set()
+    for item in items:
+        lora_request, lora_scale = parse_lora_request(item)
+        if lora_request is None:
+            raise ValueError("Invalid lora field: array items must be objects.")
+        if lora_request.lora_int_id in seen:
+            raise ValueError(
+                f"Duplicate LoRA adapter in stack: id={lora_request.lora_int_id}, name={lora_request.lora_name}"
+            )
+        seen.add(lora_request.lora_int_id)
+        lora_requests.append(lora_request)
+        lora_scales.append(lora_scale if lora_scale is not None else 1.0)
+    if len(lora_requests) == 1:
+        return lora_requests[0], lora_scales[0]
+    return lora_requests, lora_scales
 
 
 def resolve_diffusion_od_config(engine_client: Any, diffusion_engine: Any = None) -> Any:
@@ -156,18 +182,3 @@ def is_single_stage_diffusion(engine_client: Any) -> bool:
     if len(stage_configs) != 1:
         return False
     return getattr(stage_configs[0], "stage_type", None) in ("diffusion", "DIFFUSION")
-
-
-def validate_requested_speaker(speaker: str | None, supported_speakers: set[str]) -> str | None:
-    """Normalize and validate an optional speaker value.
-
-    Returns the normalized speaker string when provided, otherwise ``None``.
-    Raises ``ValueError`` when the speaker is not in the supported list.
-    """
-    if not isinstance(speaker, str) or not speaker.strip():
-        return None
-
-    normalized = speaker.lower().strip()
-    if supported_speakers and normalized not in supported_speakers:
-        raise ValueError(f"Invalid speaker '{speaker}'. Supported: {', '.join(sorted(supported_speakers))}")
-    return normalized

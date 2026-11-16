@@ -55,7 +55,9 @@ def dit_modulation(estimator: nn.Module, time_embedding: torch.Tensor) -> torch.
     """adaLN table ``(depth + 1, 9, C)`` for one timestep; scales stored as ``1 + scale``."""
     embedding = time_embedding.reshape(1, 1, -1)
     table = torch.stack([block.adaLN_modulation(embedding).reshape(9, -1) for block in estimator.blocks], dim=0)
-    table[:, (_SCALE_MSA, _SCALE_MLP, _SCALE_CONV)] += 1.0
+    # Basic slicing avoids uploading an advanced-index tensor inside NPUGraph.
+    # Each shift/scale/gate triple stores its scale at indices 1, 4 and 7.
+    table[:, _SCALE_MSA::3].add_(1.0)
     final_shift, final_scale = estimator.final_layer.adaLN_modulation(embedding).reshape(2, -1)
     final = table.new_zeros((1, 9, int(table.shape[2])))
     # Where a block keeps its MSA shift/scale, so the last block's closing LayerNorm reads it like a next block.
@@ -152,9 +154,10 @@ def _attention(
     if slots is None:
         # ``att_cache`` behind the current frames: left where it is when it
         # already sits there (the Whole-Euler arena's aliasing), else copied once.
-        cached = 0 if att_cache is None else int(att_cache.shape[2])
-        kv = kv[:, :, : frames + cached]
-        behind = kv[:, :, frames:]
+        # Both caches are split K/V ``(2, N, H, T, D)`` rows.
+        cached = 0 if att_cache is None else int(att_cache.shape[-2])
+        kv = kv[:, :, :, : frames + cached]
+        behind = kv[:, :, :, frames:]
         if cached and (att_cache.data_ptr() != behind.data_ptr() or att_cache.stride() != behind.stride()):
             behind.copy_(att_cache)
     q = qkv_head_layer_norm(
@@ -167,8 +170,7 @@ def _attention(
         rows=rows,
         positions=positions,
     )
-    head_dim = int(q.shape[-1])
-    keys, values = kv[..., :head_dim], kv[..., head_dim:]
+    keys, values = kv[0], kv[1]
     if rows is not None or (
         kv.is_cuda and kv.dtype == q.dtype == torch.float32 and tiled_attention_supported(kv.get_device())
     ):

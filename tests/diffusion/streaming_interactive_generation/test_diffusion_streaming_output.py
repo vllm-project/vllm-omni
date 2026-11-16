@@ -296,10 +296,13 @@ class TestPipelineStreamingOutputToEntrypoint:
 
         encoded = [b"pipeline-fmp4-0", b"pipeline-fmp4-1"]
 
+        audio_calls = []
+
         class FakeStreamingVideoEncoder:
             encode_calls: list[int] = []
 
-            def encode(self, video):
+            def encode(self, video, audio=None, *, audio_sample_rate=None):
+                audio_calls.append((audio, audio_sample_rate))
                 del video
                 idx = len(self.encode_calls)
                 self.encode_calls.append(idx)
@@ -351,6 +354,7 @@ class TestPipelineStreamingOutputToEntrypoint:
                     assert done["type"] == "session.done"
                     assert done["chunks"] == 2
 
+            assert audio_calls == [(None, None), (None, None)]
             await _wait_for(lambda: len(pipeline.requests) == 1)
             assert pipeline.requests[0].request_id
         finally:
@@ -399,11 +403,16 @@ class TestPipelineStreamingOutputToEntrypoint:
                 )
             )
 
-        async def try_get_output_async(self) -> Any | None:
-            try:
-                return self._fixture.output_sync_q.get_nowait()
-            except queue.Empty:
-                return None
+        async def get_outputs_async(self, timeout: float = 1.0, max_messages: int = 256) -> list[Any]:
+            msgs: list[Any] = []
+            while len(msgs) < max_messages:
+                try:
+                    msgs.append(self._fixture.output_sync_q.get_nowait())
+                except queue.Empty:
+                    break
+            if not msgs:
+                await asyncio.sleep(0.001)
+            return msgs
 
         def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
             return self.stage_metadata[stage_id]
@@ -411,8 +420,8 @@ class TestPipelineStreamingOutputToEntrypoint:
         def is_alive(self) -> bool:
             return self._fixture.thread.is_alive()
 
-        async def abort_async(self, request_ids: list[str]) -> None:
-            del request_ids
+        async def abort_async(self, request_ids: list[str], timeout: float = 1.0) -> None:
+            del request_ids, timeout
 
     @classmethod
     def _make_inline_pipeline_client(cls, pipeline: _StepStreamingPipeline) -> InlineStageDiffusionClient:
@@ -450,6 +459,7 @@ class TestPipelineStreamingOutputToEntrypoint:
         omni = object.__new__(AsyncOmni)
         omni.engine = engine
         omni.log_stats = False
+        omni.collect_stage_metrics = True
         omni._pause_cond = asyncio.Condition()
         omni._paused = False
         omni.request_states = {}

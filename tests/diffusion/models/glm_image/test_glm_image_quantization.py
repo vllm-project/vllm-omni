@@ -6,8 +6,6 @@ These tests verify that the GLM-Image DiT transformer correctly accepts and uses
 quantization configs for W4A16/AutoRound quantization support.
 """
 
-import os
-
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -43,8 +41,9 @@ def _init_distributed():
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29502")
+    from tests.helpers.runtime import assign_ephemeral_master_port
+
+    assign_ephemeral_master_port()
     init_distributed_environment(
         world_size=1,
         rank=0,

@@ -72,6 +72,10 @@ def _replace_streaming_session(session: Request) -> None:
     sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
+    # Upstream Scheduler.__init__ resolves hash_block_size = block_size (16 by
+    # default); the super()._update_request_as_session call at the pinned
+    # target truncates session.block_hashes with it.
+    sched.hash_block_size = 16
     sched.chunk_transfer_adapter = None
     sched.kv_holding_waiting = set()
     sched.deferred_waiting = set()
@@ -89,6 +93,7 @@ def _replace_streaming_session(session: Request) -> None:
 
 def _make_drain_sched(session: Request) -> MagicMock:
     sched = MagicMock()
+    sched.grammar_compile_error_reqs = {}
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True

@@ -10,7 +10,14 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    AttentionSpec,
+    DiffusionParallelConfig,
+    OmniDiffusionConfig,
+)
+from vllm_omni.diffusion.models.minimax_h3 import fasth3_checkpoint
 from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import (
     FASTH3_BASE_MODEL,
     FASTH3_V2_BASE_SCHEDULE,
@@ -34,6 +41,13 @@ from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _cpu_worker_with_fastvideo_kernel(monkeypatch):
+    """Resolve VSA providers as a CPU worker with fastvideo-kernel would, whatever machine runs the tests."""
+    monkeypatch.setattr(fasth3_checkpoint, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(fasth3_checkpoint, "require_fastvideo_sparse", lambda: None)
 
 
 def _fastvideo_metadata() -> dict[str, object]:
@@ -220,6 +234,36 @@ def test_v2_serving_contract_rejects_incompatible_runtime(kwargs, partition, mat
         spec.check_serving_contract(partition=partition, od_config=_od_config(**kwargs))
 
 
+def test_v2_serving_contract_rejects_a_base_precision_the_device_cannot_run():
+    # H3 skips warm-up, so the base provider has to resolve at startup rather than on the first request.
+    spec = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
+    config = _od_config(per_role={"self": AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_precision="sage")})
+    with pytest.raises(ValueError, match="FastH3 V2 cannot run its base attention: FlashInfer tile64 requires CUDA"):
+        spec.check_serving_contract(partition="fl2va", od_config=config)
+
+
+def test_v2_serving_contract_rejects_a_base_fastvideo_provider_without_its_kernel(monkeypatch):
+    def missing_kernel():
+        raise ImportError("FastVideo tile64 requires fastvideo-kernel; install vllm-omni[vsa]")
+
+    monkeypatch.setattr(fasth3_checkpoint, "require_fastvideo_sparse", missing_kernel)
+    spec = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
+    with pytest.raises(ValueError, match="FastH3 V2 cannot run its base attention: .*fastvideo-kernel"):
+        spec.check_serving_contract(partition="fl2va", od_config=_od_config())
+
+
+def test_v2_serving_contract_resolves_providers_with_bf16_whatever_the_dtype(mocker):
+    resolve = mocker.patch.object(fasth3_checkpoint, "resolve_block_sparse_provider", return_value="flashinfer")
+    config = _scheduled(AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA")))
+    config.dtype = torch.float16
+    FastH3CheckpointSpec.from_metadata(_fastvideo_metadata()).check_serving_contract(
+        partition="fl2va", od_config=config
+    )
+    # The base, then the profile; H3's attention operands are BF16 whatever --dtype is.
+    assert [call.args[3] for call in resolve.call_args_list] == [torch.bfloat16, torch.bfloat16]
+    assert {call.kwargs["block_size"] for call in resolve.call_args_list} == {64}
+
+
 def test_v2_serving_contract_reads_a_per_role_fixed_topk_override():
     spec = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
     config = _od_config(
@@ -227,6 +271,39 @@ def test_v2_serving_contract_reads_a_per_role_fixed_topk_override():
     )
     with pytest.raises(ValueError, match="fixed fastvideo_vsa_topk"):
         spec.check_serving_contract(partition="fl2va", od_config=config)
+
+
+def _scheduled(profile: AttentionConfig) -> OmniDiffusionConfig:
+    """A valid V2 baseline with one schedule profile, ``sparse``."""
+    return OmniDiffusionConfig(
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA")),
+        diffusion_attention_schedule=AttentionScheduleConfig(profiles={"sparse": profile}, default=[]),
+    )
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=1)),
+        AttentionConfig(per_role={"self": AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=1)}),
+    ],
+    ids=["default", "per_role_self"],
+)
+def test_v2_serving_contract_rejects_a_scheduled_fixed_topk_on_the_dit_role(profile):
+    spec = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
+    with pytest.raises(ValueError, match="fixed fastvideo_vsa_topk override from attention schedule profile 'sparse'"):
+        spec.check_serving_contract(partition="fl2va", od_config=_scheduled(profile))
+
+
+def test_v2_serving_contract_ignores_a_scheduled_topk_on_the_token_refiner():
+    """The pin is on the gated DiT layers (role "self"). The token refiner has no VSA gate, so FASTVIDEO_VSA
+    runs its dense fallback there and a fixed top-k on that role selects nothing."""
+    profile = AttentionConfig(
+        per_role={"minimax_h3.token_refiner": AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=1)}
+    )
+    FastH3CheckpointSpec.from_metadata(_fastvideo_metadata()).check_serving_contract(
+        partition="fl2va", od_config=_scheduled(profile)
+    )
 
 
 def test_v2_request_contract_accepts_omitted_steps_and_default_shifts():
@@ -310,6 +387,25 @@ def test_resolve_native_vaes_uses_pinned_revision_and_only_vae_patterns(tmp_path
     assert sorted(path.name for path in model_root.iterdir()) == ["provenance.json"]
     assert not (model_root / "model_index.json").exists()
     assert not (model_root / "conversion.json").exists()
+
+
+def test_public_v2_without_provenance_uses_the_native_vae_compatibility_pin(tmp_path, monkeypatch):
+    """Public V2 revision 3da2ddfe has no provenance.json."""
+    (tmp_path / "fastvideo_inference.json").write_text(json.dumps(_fastvideo_metadata()))
+    calls = {}
+
+    def download(**kwargs):
+        calls.update(kwargs)
+        return "/base/snapshot"
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint.download_weights_from_hf_specific", download
+    )
+    result = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata()).resolve_native_vaes(tmp_path)
+    assert str(result) == "/base/snapshot/FL2VA"
+    assert calls["revision"] == "9bfb6693f2cf6de171db46d1aa586f67d773a1da"
+    assert calls["model_name_or_path"] == FASTH3_BASE_MODEL
+    assert calls["allow_patterns"] == ["FL2VA/video_vae/**", "FL2VA/audio_vae/**"]
 
 
 @pytest.mark.parametrize(
@@ -399,6 +495,35 @@ def test_native_local_model_root_keeps_partition_layout(tmp_path):
 
     assert is_minimax_h3_modular(str(root)) is False
     assert resolve_minimax_h3_model_root(str(root), None, "fl2va") == str(root / "FL2VA" / "text_encoder")
+
+
+def test_native_local_model_root_with_modular_index_keeps_partition_layout(tmp_path):
+    # The official MiniMaxAI/MiniMax-H3 repository ships modular_model_index.json at its root.
+    root = tmp_path / "MiniMax-H3"
+    (root / "FL2VA" / "text_encoder").mkdir(parents=True)
+    (root / "FL2VA" / "text_encoder" / "config.json").write_text("{}", encoding="utf-8")
+    (root / "FL2VA" / "model_index.json").write_text("{}", encoding="utf-8")
+    (root / "Ref2VA").mkdir()
+    (root / "modular_model_index.json").write_text(
+        json.dumps({"_class_name": "MiniMaxH3ModularPipeline"}),
+        encoding="utf-8",
+    )
+
+    assert is_minimax_h3_modular(str(root)) is False
+    assert resolve_minimax_h3_model_root(str(root), None, "fl2va") == str(root / "FL2VA" / "text_encoder")
+    assert resolve_minimax_h3_diffusion_model_path(str(root), None, "fl2va") == str(root / "FL2VA")
+
+
+def test_empty_partition_dirs_do_not_override_modular_marker(tmp_path):
+    root = tmp_path / "FastH3"
+    (root / "FL2VA").mkdir(parents=True)
+    (root / "Ref2VA").mkdir()
+    (root / "modular_model_index.json").write_text(
+        json.dumps({"_class_name": "MiniMaxH3ModularPipeline"}),
+        encoding="utf-8",
+    )
+
+    assert is_minimax_h3_modular(str(root)) is True
 
 
 def test_diffusion_resolver_returns_local_modular_root_without_partition_files(tmp_path):
@@ -527,6 +652,7 @@ def _load_fixture(
         rope_inv_freq_len=2,
     )
     model._diffusers_weights = diffusers_weights
+    model._serialized_weight_map = {}
     model._rope_theta = 10000.0
     qkv_calls: list[tuple[str | None, torch.Tensor]] = []
     fc1_calls: list[tuple[int, torch.Tensor]] = []
@@ -591,6 +717,36 @@ def test_diffusers_load_weights_uses_shape_aware_qkv_and_mlp_slices():
     )
 
 
+def test_diffusers_fp8_scales_follow_qkv_and_gate_up_weights():
+    model, _, _ = _load_fixture(diffusers_weights=True)
+    qkv = model.blocks[0].attn.qkv_proj
+    fc1 = model.blocks[0].mlp.fc1
+    qkv.weight_scale = nn.Parameter(torch.zeros(12), requires_grad=False)
+    fc1.weight_scale = nn.Parameter(torch.zeros(6), requires_grad=False)
+
+    def load_qkv(param, value, shard):
+        assert value.shape == (4,)
+        offset = {"q": 0, "k": 4, "v": 8}[shard]
+        param.data[offset : offset + 4].copy_(value)
+
+    def load_fc1(param, value, shard):
+        assert value.shape == (3,)
+        param.data[shard * 3 : (shard + 1) * 3].copy_(value)
+
+    qkv.weight_scale.weight_loader = load_qkv
+    fc1.weight_scale.weight_loader = load_fc1
+    scales = torch.arange(1, 13, dtype=torch.float32).reshape(12, 1)
+    model.load_weights(
+        [
+            (f"transformer_blocks.0.attn.to_{part}.weight_scale", value)
+            for part, value in zip(("q", "k", "v"), scales.chunk(3), strict=True)
+        ]
+        + [("transformer_blocks.0.ff.net.0.proj.weight_scale", scales[:6])]
+    )
+    torch.testing.assert_close(qkv.weight_scale, scales.flatten())
+    torch.testing.assert_close(fc1.weight_scale, torch.tensor([4.0, 5.0, 6.0, 1.0, 2.0, 3.0]))
+
+
 def test_native_load_weights_keeps_grouped_qkv_and_gate_first_layouts():
     model, qkv_calls, fc1_calls = _load_fixture(diffusers_weights=False)
     grouped_qkv = torch.arange(36, dtype=torch.float32).reshape(12, 3)
@@ -619,6 +775,73 @@ def test_native_load_weights_keeps_grouped_qkv_and_gate_first_layouts():
     torch.testing.assert_close(model.blocks[0].attn.qkv_proj.weight, expected_qkv)
     torch.testing.assert_close(model.blocks[0].mlp.fc1.weight, fc1)
     assert torch.equal(model.rope.inv_freq, torch.zeros(2))
+
+
+def test_native_load_weights_reorders_grouped_qkv_scales():
+    model, _, _ = _load_fixture(diffusers_weights=False)
+    qkv = model.blocks[0].attn.qkv_proj
+    qkv.weight_scale = nn.Parameter(torch.zeros(12, 2), requires_grad=False)
+
+    def scale_loader(param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: str | None = None) -> None:
+        assert shard_id is None
+        param.data.copy_(loaded_weight)
+
+    qkv.weight_scale.weight_loader = scale_loader
+    grouped_scale = torch.arange(24, dtype=torch.float32).reshape(12, 2)
+    loaded = model.load_weights([("blocks.0.attn.qkv_proj.weight_scale", grouped_scale)])
+
+    expected = torch.cat(
+        (
+            grouped_scale[:2],
+            grouped_scale[6:8],
+            grouped_scale[2:4],
+            grouped_scale[8:10],
+            grouped_scale[4:6],
+            grouped_scale[10:],
+        )
+    )
+    assert loaded == {"blocks.0.attn.qkv_proj.weight_scale"}
+    torch.testing.assert_close(qkv.weight_scale, expected)
+
+
+def test_native_load_weights_passes_through_per_tensor_qkv_scale():
+    model, _, _ = _load_fixture(diffusers_weights=False)
+    qkv = model.blocks[0].attn.qkv_proj
+    qkv.weight_scale = nn.Parameter(torch.zeros(1), requires_grad=False)
+    calls = []
+
+    def scale_loader(param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: str | None = None) -> None:
+        assert shard_id is None
+        calls.append(loaded_weight.clone())
+        param.data.copy_(loaded_weight.reshape_as(param))
+
+    qkv.weight_scale.weight_loader = scale_loader
+    scale = torch.tensor(0.5)
+    loaded = model.load_weights([("blocks.0.attn.qkv_proj.weight_scale", scale)])
+
+    assert loaded == {"blocks.0.attn.qkv_proj.weight_scale"}
+    assert len(calls) == 1
+    torch.testing.assert_close(qkv.weight_scale, torch.tensor([0.5]))
+
+
+def test_native_load_weights_passes_through_per_tensor_fc1_scale():
+    model, _, _ = _load_fixture(diffusers_weights=False)
+    fc1 = model.blocks[0].mlp.fc1
+    fc1.weight_scale = nn.Parameter(torch.zeros(1), requires_grad=False)
+    calls = []
+
+    def scale_loader(param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: int | None = None) -> None:
+        assert shard_id is None
+        calls.append(loaded_weight.clone())
+        param.data.copy_(loaded_weight.reshape_as(param))
+
+    fc1.weight_scale.weight_loader = scale_loader
+    scale = torch.tensor(0.25)
+    loaded = model.load_weights([("blocks.0.mlp.fc1.weight_scale", scale)])
+
+    assert loaded == {"blocks.0.mlp.fc1.weight_scale"}
+    assert len(calls) == 1
+    torch.testing.assert_close(fc1.weight_scale, torch.tensor([0.25]))
 
 
 def test_diffusers_load_weights_rejects_unknown_name():

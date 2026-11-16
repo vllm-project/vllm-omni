@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import random
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
@@ -92,6 +93,31 @@ def test_tp_seed_same_across_ranks_and_varies_across_requests():
 
     # Seeds must vary across requests (non-determinism preserved).
     assert len(set(seeds)) == n_requests, f"Expected {n_requests} unique seeds but got {len(set(seeds))}: {seeds}"
+
+
+@pytest.mark.parametrize("seed", [-(2**63), -1, 0, 17, 2**63 - 1, "17", np.int64(17)])
+def test_extra_args_seed_remains_model_owned(seed, monkeypatch):
+    monkeypatch.setattr("vllm_omni.diffusion.request.random.randint", lambda *_: 123)
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "test"},
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"seed": seed}),
+        request_id="request-test",
+    )
+
+    assert request.sampling_params.seed == 123
+    assert request.sampling_params.extra_args["seed"] is seed
+
+
+@pytest.mark.parametrize("seed", [-(2**63), -1, 0, 42, 2**63 - 1, np.int64(42)])
+def test_canonical_seed_does_not_remove_model_owned_extra_seed(seed):
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "test"},
+        sampling_params=OmniDiffusionSamplingParams(seed=seed, extra_args={"seed": 17}),
+        request_id="request-test",
+    )
+
+    assert request.sampling_params.seed == seed
+    assert request.sampling_params.extra_args["seed"] == 17
 
 
 def _request_with_guidance(**sampling_kwargs) -> OmniDiffusionRequest:

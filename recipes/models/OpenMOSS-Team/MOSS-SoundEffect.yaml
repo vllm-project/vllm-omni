@@ -1,0 +1,120 @@
+meta:
+  title: "MOSS-SoundEffect"
+  slug: "moss-soundeffect"
+  provider: "OpenMOSS"
+  description: "OpenMOSS's 8B sound-effect generation model — environmental, urban, biological, human-action and musical sounds with controllable duration, no reference audio — served via vLLM-Omni through the OpenAI /v1/audio/speech API (24 kHz mono)."
+  date_added: 2026-06-17
+  date_updated: 2026-06-15
+  tasks:
+    - omni
+  related_recipes:
+    - OpenMOSS-Team/MOSS-TTS
+    - stabilityai/stable-audio-open-1.0
+    - OpenMOSS-Team/MOSS-VoiceGenerator
+
+model:
+  model_id: "OpenMOSS-Team/MOSS-SoundEffect"
+  min_vllm_version: "0.22.0"
+  architecture: dense
+  parameter_count: "8B"
+  active_parameters: "8B"
+  context_length: 0
+  base_args:
+    - "--omni"
+    - "--deploy-config"
+    - "vllm_omni/deploy/moss_sound_effect.yaml"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: t2a
+      label: "Text → Sound"
+      endpoint: "/v1/audio/speech"
+      description: "MOSS-SoundEffect sound-effect synthesis from a text description (no ref audio)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "OpenMOSS-Team/MOSS-SoundEffect",
+            "input": "Thunder rumbling, rain pattering on a tin roof.",
+            "response_format": "wav"
+          }' --output thunder.wav
+
+dependencies:
+  - note: "vLLM-Omni provides the audio serving backend and the `--omni` serve path. See the installation guide for pre-built wheels or building from source."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 32
+    description: "MOSS-SoundEffect 8B (MossTTSDelay, n_vq=16) — text-to-sound-effect"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [MOSS-SoundEffect](https://huggingface.co/OpenMOSS-Team/MOSS-SoundEffect) is the
+  **sound-effect generation** member of OpenMOSS's MOSS-TTS Family, served through
+  **vLLM-Omni** with the OpenAI-compatible `/v1/audio/speech` API. It generates
+  audio for natural environments, urban scenes, biological sounds, human actions,
+  and musical fragments — suitable for film, games, and interactive experiences.
+  Output is **24 kHz mono**.
+
+  Unlike the speech members of the family, MOSS-SoundEffect takes **no reference
+  audio**: the `input` field is a text description of the sound (mapped to the
+  upstream `ambient_sound` parameter). Generation runs at ~12.5 tokens/second;
+  longer descriptions (or a higher token budget) produce longer audio.
+
+  ## Prerequisites
+
+  - **Hardware**: a single CUDA GPU comparable to the 8B MOSS-TTS profile
+    (~18 GB talker + ~8 GB codec).
+  - **vLLM-Omni** targeting vLLM >= 0.22.
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  ```
+
+  ## Launch the server
+
+  MOSS-SoundEffect shares `model_type=moss_tts_delay`, so pass its deploy config
+  explicitly:
+
+  ```bash
+  vllm serve OpenMOSS-Team/MOSS-SoundEffect --omni \
+    --deploy-config vllm_omni/deploy/moss_sound_effect.yaml --port 8000
+  ```
+
+  ## Client usage
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "OpenMOSS-Team/MOSS-SoundEffect",
+      "input": "Thunder rumbling, rain pattering on a tin roof.",
+      "response_format": "wav"
+    }' --output thunder.wav
+  ```
+
+  ## Known limitations
+
+  - Output is **24 kHz mono**.
+  - No `ref_audio` is accepted; `input` is a text description of the sound.
+
+  ## References
+
+  - [Model card](https://huggingface.co/OpenMOSS-Team/MOSS-SoundEffect)
+  - [MOSS-TTS Family](https://huggingface.co/OpenMOSS-Team/MOSS-TTS) · [GitHub](https://github.com/OpenMOSS/MOSS-TTS)

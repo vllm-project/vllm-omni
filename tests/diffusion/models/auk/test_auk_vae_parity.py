@@ -38,9 +38,10 @@ import soundfile as sf
 import torch
 import torchaudio.functional as AF
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE
 
-pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, pytest.mark.gpu, pytest.mark.cuda]
+pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 # The released model.vae.model_init_kwargs, shared by both models under test.
 VAE_CONFIG = {

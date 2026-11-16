@@ -671,9 +671,12 @@ async def _paced_load_frames(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> None:
-    next_send = epoch
+    # Frames follow the capture clock: frame k is due at epoch + k periods, so
+    # sleep overshoot inside a slot does not accumulate into slower-than-realtime
+    # input. Only a send that overruns its slot pushes later frames back.
+    lag = 0.0
     for seq in range(math.ceil(pcm.size / FRAME_SAMPLES)):
-        await sleep(max(0.0, next_send - clock()))
+        await sleep(max(0.0, epoch + lag + seq * FRAME_PERIOD_S - clock()))
         _check_load_connection(client)
         event = _frame_event(pcm[seq * FRAME_SAMPLES : (seq + 1) * FRAME_SAMPLES], seq)
         started = clock()
@@ -681,7 +684,9 @@ async def _paced_load_frames(
         completed = clock()
         sends.append((epoch + seq * FRAME_PERIOD_S, started, completed))
         # Do not burst to catch up after a stalled send; report accumulated lag.
-        next_send = max(epoch + (seq + 1) * FRAME_PERIOD_S, completed + FRAME_PERIOD_S)
+        next_slot = epoch + lag + (seq + 1) * FRAME_PERIOD_S
+        if completed > next_slot:
+            lag += completed + FRAME_PERIOD_S - next_slot
 
 
 async def _request_load_close(client: RawRealtimeProbe, timeout_s: float) -> None:
