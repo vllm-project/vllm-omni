@@ -59,6 +59,24 @@ def _labels(doc: dict) -> set[str]:
     return {step["label"] for step in _leaf_steps(doc)}
 
 
+def test_live_weekly_suite_is_preserved_when_filtering_combined_nightly() -> None:
+    """The AMD bootstrap filters NIGHTLY_TESTS and retains the full weekly group."""
+    doc = COMBINER.combine_test_suites(
+        [f"NIGHTLY_TESTS:{AMD_NIGHTLY_PIPELINE}", "WEEKLY_TESTS:.buildkite/amd/test-amd-weekly.yml"]
+    )
+    weekly = next(step for step in doc["steps"] if step.get("group") == "WEEKLY_TESTS")
+    filtered = FILTER.filter_amd_nightly_suite(
+        doc,
+        [
+            "vllm_omni/worker_v2/omni_model_runner.py",
+            "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py",
+        ],
+        pipeline_path=AMD_NIGHTLY_PIPELINE,
+        group_name="NIGHTLY_TESTS",
+    )
+    assert next(step for step in filtered["steps"] if step.get("group") == "WEEKLY_TESTS") == weekly
+
+
 def _small_nightly_pipeline() -> dict:
     return {
         "env": {"SHARED": "value"},

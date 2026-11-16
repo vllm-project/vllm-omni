@@ -8,15 +8,16 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from tests.buildkite.source_dependency_helpers import (
     PIPELINES,
+    ROOT,
     evaluation_families,
     load_pipeline,
 )
 from tests.buildkite.source_dependency_helpers import dependency_keys as _keys
 from tests.buildkite.source_dependency_helpers import leaf_steps as _leaves
-from tests.buildkite.source_dependency_helpers import nightly_pipeline_fixture as nightly_pipeline_fixture
 from tests.buildkite.source_dependency_helpers import selected_labels as _selected
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -215,23 +216,35 @@ def test_duplex_directories_match_real_files(nightly, changed_file):
     assert expected <= _selected(path, doc, [changed_file, QWEN])
 
 
-def test_v2_runtime_follows_deployment_profiles(nightly):
+@pytest.mark.parametrize(
+    "changed_file",
+    ["vllm_omni/worker_v2/omni_model_runner.py", "vllm_omni/worker_v2/mooncake_capture.py"],
+)
+def test_v2_runtime_follows_deployment_profiles(nightly, changed_file):
     platform, path, doc, families = nightly
     speech = _labels(families, lambda key: not key.startswith("diffusion_"))
     expected = set()
     if platform == "cuda":
         expected = speech
     elif platform == "npu":
-        expected = _labels(families, lambda key: key.startswith("omni_minicpmo_4_5_"))
-    selected = _selected(path, doc, ["vllm_omni/worker_v2/omni_model_runner.py", WAN])
+        expected = _labels(families, lambda key: key.startswith(("omni_minicpmo_4_5_", "tts_qwen3_tts_")))
+    selected = _selected(path, doc, [changed_file, WAN])
     assert selected & speech == expected
 
 
-def test_npu_v2_adapter_selects_only_its_consumers(nightly):
+@pytest.mark.parametrize(
+    "changed_file",
+    ["vllm_omni/platforms/npu/worker/npu_omni_v2_model_runner.py", "vllm_omni/worker_v2/ngram_adapter.py"],
+)
+def test_npu_v2_adapter_selects_only_its_consumers(nightly, changed_file):
     platform, path, doc, families = nightly
     speech = _labels(families, lambda key: not key.startswith("diffusion_"))
-    expected = _labels(families, lambda key: key.startswith("omni_minicpmo_4_5_")) if platform == "npu" else set()
-    selected = _selected(path, doc, ["vllm_omni/platforms/npu/worker/npu_omni_v2_model_runner.py", WAN])
+    expected = (
+        _labels(families, lambda key: key.startswith(("omni_minicpmo_4_5_", "tts_qwen3_tts_")))
+        if platform == "npu"
+        else set()
+    )
+    selected = _selected(path, doc, [changed_file, WAN])
     assert selected & speech == expected
     qwen = {
         step["label"]
@@ -239,6 +252,70 @@ def test_npu_v2_adapter_selects_only_its_consumers(nightly):
         if any(key.startswith("omni_qwen3_omni_") and key.endswith(("_accuracy", "_perf")) for key in _keys(step))
     }
     assert not selected & qwen
+
+
+@pytest.mark.parametrize(
+    "changed_file",
+    [
+        "vllm_omni/platforms/npu/worker/base.py",
+        "vllm_omni/platforms/npu/worker/npu_ar_model_runner.py",
+        "vllm_omni/platforms/npu/worker/npu_ar_worker.py",
+        "vllm_omni/platforms/npu/worker/npu_generation_model_runner.py",
+        "vllm_omni/platforms/npu/worker/npu_generation_worker.py",
+        "vllm_omni/platforms/npu/worker/npu_model_runner.py",
+        "vllm_omni/platforms/npu/worker/talker_narrow_replay.py",
+        "vllm_omni/worker/talker_multiframe.py",
+    ],
+)
+def test_npu_speech_worker_changes_keep_consumers(nightly_pipeline, changed_file):
+    """Keep every NPU speech consumer, including new jobs and moved worker files."""
+    platform, path, doc = nightly_pipeline
+    assert (ROOT / changed_file).is_file()
+    families = evaluation_families(doc)
+    labels = _labels(families)
+    expected = _labels(families, lambda key: not key.startswith("diffusion_")) if platform == "npu" else set()
+    # The Wan edit disables fallback without selecting any speech job.
+    selected = _selected(path, doc, [changed_file, WAN]) & labels
+    wan = _labels(families, lambda key: key.startswith("diffusion_wan22_"))
+    assert selected - wan == expected
+
+
+@pytest.mark.parametrize("platform", ["cuda", "amd"])
+@pytest.mark.parametrize(
+    "changed_file",
+    [
+        "vllm_omni/worker_v2/omni_model_runner.py",
+        "vllm_omni/worker_v2/mooncake_capture.py",
+        "vllm_omni/core/prefix_cache/manager.py",
+    ],
+)
+def test_weekly_qwen3_tts_dependencies_follow_runner_profile(platform, changed_file):
+    """Keep MRv2 consumers and isolate jobs retaining the default V1 deployment."""
+    filename = "test-weekly.yml" if platform == "cuda" else "test-amd-weekly.yml"
+    path = Path(".buildkite") / platform / filename
+    doc = load_pipeline(path)
+    consumers = [step for step in _leaves(doc) if "tts_qwen3_tts_function" in _keys(step)]
+    assert consumers
+    deploy = yaml.safe_load((ROOT / "vllm_omni/deploy/qwen3_tts.yaml").read_text(encoding="utf-8"))
+    deploy_platform = "rocm" if platform == "amd" else platform
+    runner = deploy.get("platforms", {}).get(deploy_platform, {}).get("model_runner", deploy["model_runner"])
+    expected = {
+        step["label"] for step in consumers if step.get("env", {}).get("VLLM_OMNI_CI_MODEL_RUNNER", runner) == "v2"
+    }
+    # AMD bootstrap preserves weekly groups instead of source-filtering them.
+    # Check these jobs' declarations without interpreting unrelated weekly metadata.
+    probe = {"steps": consumers} if platform == "amd" else doc
+    assert _selected(path, probe, [changed_file, WAN]) & {step["label"] for step in consumers} == expected
+
+
+@pytest.mark.parametrize("level", ["ready", "merge"])
+def test_lingbot_offload_test_keeps_its_model_consumers(level):
+    """Retain main's offload test path when composing shared diffusion dependencies."""
+    path = Path(f".buildkite/cuda/test-{level}.yml")
+    doc = load_pipeline(path)
+    expected = {step["label"] for step in _leaves(doc) if "diffusion_lingbot_function" in _keys(step)}
+    assert expected
+    assert expected <= _selected(path, doc, ["tests/e2e/online_serving/test_lingbot_video_offload.py", QWEN])
 
 
 def test_gpu_v1_workers_do_not_select_diffusion_or_npu_jobs(nightly):
@@ -298,12 +375,17 @@ def tts_consumers(request):
     consumers = []
     paths = [
         *PIPELINES.values(),
+        Path(".buildkite/amd/test-amd-weekly.yml"),
         *(Path(f".buildkite/cuda/test-{level}.yml") for level in ("ready", "merge", "weekly")),
     ]
     for path in paths:
         doc = load_pipeline(path)
         labels = {step["label"] for step in _leaves(doc) if request.param in _keys(step)}
         if labels:
+            if path.name == "test-amd-weekly.yml":
+                # Weekly declarations are metadata probes; the AMD bootstrap
+                # uploads this group intact, as checked by the combined-suite test.
+                doc = {"steps": [step for step in _leaves(doc) if step["label"] in labels]}
             consumers.append((path, doc, labels))
     assert consumers, request.param
     return consumers

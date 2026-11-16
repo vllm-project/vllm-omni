@@ -7,7 +7,6 @@ from __future__ import annotations
 import pytest
 
 from tests.buildkite.source_dependency_helpers import evaluation_families
-from tests.buildkite.source_dependency_helpers import nightly_pipeline_fixture as nightly_pipeline_fixture
 from tests.buildkite.source_dependency_helpers import selected_labels as _selected
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

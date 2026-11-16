@@ -8,7 +8,6 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -66,11 +65,3 @@ def selected_labels(path, doc, changes):
     steps = list(leaf_steps(filtered))
     assert all("source_file_dependencies" not in step for step in steps)
     return {step["label"] for step in steps}
-
-
-@pytest.fixture(name="nightly_pipeline", scope="module", params=PIPELINES)
-def nightly_pipeline_fixture(request):
-    """Provide the same live platform inventory to all routing test modules."""
-    platform = request.param
-    path = PIPELINES[platform]
-    return platform, path, load_pipeline(path)
