@@ -4,10 +4,9 @@
 
 The root hook packs and restores a forward call through an object
 implementing :class:`MixFusionAdapter`. Models with a declarative
-``_mixfusion_plan`` get the framework's
-:class:`~vllm_omni.diffusion.mixfusion.chunked.ChunkedJointAdapter`; an
-explicit ``mixfusion_adapter`` is the escape hatch for a layout family the
-declarative plan cannot express.
+``_mixfusion_plan`` select the framework's chunked joint or prefix-KV adapter
+through the root's request declaration. An explicit ``mixfusion_adapter`` is
+the escape hatch for a layout family the declarative plan cannot express.
 
 The hooks never interpret the payloads in :class:`PackedInputs`
 (``boundary_outputs`` and ``adapter_state``); they only move them between the
@@ -17,11 +16,14 @@ boundaries the plan declares.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from torch import nn
 
 from vllm_omni.diffusion.mixfusion.execution_plan import PackedExecutionPlan
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.mixfusion.sequence import PackedSequencePlan
 
 #: How a stream's tokens are laid out across the packed rows. ``"chunked"``
 #: streams arrive as one row per (request, chunk) and carry one chunk per
@@ -70,7 +72,7 @@ class PackedInputs:
 
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
-    plan: PackedExecutionPlan
+    plan: PackedExecutionPlan | PackedSequencePlan
     boundary_outputs: dict[str, Any] = field(default_factory=dict)
     adapter_state: Any = None
 
@@ -97,6 +99,8 @@ class MixFusionAdapter(Protocol):
         """
         ...
 
-    def restore_output(self, module: nn.Module, output: Any, plan: PackedExecutionPlan) -> list[Any]:
+    def restore_output(
+        self, module: nn.Module, output: Any, plan: PackedExecutionPlan | PackedSequencePlan
+    ) -> list[Any]:
         """Turn the packed forward output back into one output per request."""
         ...

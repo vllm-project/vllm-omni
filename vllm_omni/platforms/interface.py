@@ -98,11 +98,14 @@ class OmniPlatform(Platform):
 
     @classmethod
     def register_additional_diffusion_fused_moe_hooks(cls, moe_runner: Any) -> None:
+        from vllm_omni.diffusion.mixfusion.plan import mixfusion_compatible_hook
+
         # One-shot lazy kernel initialisation on the first forward (no-op unless
         # the runner exposes an uninitialised quant_method). Mirrors the prior
         # wrapper behaviour exactly, just bound to the runner module.
         init_handle: Any = None
 
+        @mixfusion_compatible_hook
         def _kernel_init_pre_hook(module: Any, args: Any, kwargs: Any) -> None:
             nonlocal init_handle
             quant_method = getattr(module, "quant_method", None)

@@ -1005,6 +1005,10 @@ class Attention(nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        cu_seqlens_k: torch.Tensor | None = None,
+        max_seqlen_k: int | None = None,
+        causal: bool = False,
+        sequence_lengths: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
     ) -> torch.Tensor:
         """Run attention over a flat ``[total_tokens, heads, head_dim]`` packing.
 
@@ -1014,6 +1018,25 @@ class Attention(nn.Module):
         policy receive one varlen forward; every other backend is served by
         mask-free equal-length dense buckets with the same isolation.
         """
+        if cu_seqlens_k is not None:
+            from vllm_omni.diffusion.mixfusion.sequence_attention import sequence_attention
+
+            if max_seqlen_k is None:
+                raise ValueError("Packed prefix attention requires max_seqlen_k")
+            return sequence_attention(
+                self,
+                query,
+                key,
+                value,
+                cu_query=cu_seqlens,
+                cu_key=cu_seqlens_k,
+                max_query=max_seqlen,
+                max_key=max_seqlen_k,
+                causal=causal,
+                lengths=sequence_lengths,
+            )
+        if causal or max_seqlen_k is not None or sequence_lengths is not None:
+            raise ValueError("Packed prefix attention requires independent Q/K boundaries")
         if self.supports_multi_doc_packed_varlen(kv_cache_dtype=self._effective_kv_cache_dtype()):
             metadata = AttentionMetadata(
                 extra={

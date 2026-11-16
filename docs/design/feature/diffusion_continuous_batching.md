@@ -171,11 +171,12 @@ path does not currently support sequence parallelism or a diffusion cache
 backend. When a finished stepwise request is followed by an explicit text
 fallback wave, the runner retires its step state and paged diffusion-KV rows
 before the full forward dispatch.
-HunyuanImage3 accepts batched step states only when its resolved self-attention
-backend is `TORCH_SDPA`; otherwise it rejects groups larger than one request.
+HunyuanImage3 ordinary homogeneous step batching requires its resolved
+self-attention backend to be `TORCH_SDPA`. Its MixFusion path also supports
+FlashAttention varlen and attention-local dense buckets, as described below.
 Configure `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or
 `diffusion_attention_config.default.backend=TORCH_SDPA` when
-`max_num_seqs>1`. See the
+using ordinary homogeneous batching with `max_num_seqs>1`. See the
 [HunyuanImage-3.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md)
 for its validated configuration. Helios supports only a single active step
 request and must use `max_num_seqs=1`.
@@ -213,7 +214,7 @@ cost of a pipeline contract the scheduler must not assume generically:
 
 - A pipeline opts in with `supports_mixfusion: ClassVar[bool] = True`
   (read via `getattr`, not part of the runtime protocol check). Currently
-  only `QwenImagePipeline` sets it.
+  `QwenImagePipeline` and `HunyuanImage3Pipeline` set it.
 - The engine resolves the capability through the registry at startup and
   `mixfusion.setup.validate_mixfusion_config` rejects server-level
   `enable_mixfusion` on pipelines without it, or together with
@@ -235,9 +236,11 @@ declares the request layout and its configuration sources. The framework
 resolves those sources on the loaded pipeline and sends the
 serializable values to the engine. Its common host preparation resolves
 image counts, image token lengths and request-specific constraints before admission,
-without text encoding, device tensors or per-model preparation callbacks.
+without embedding or device tensors. A grid layout uses common image geometry
+preparation; a prefix-KV layout reads a validated summary from the model's
+existing CPU tokenizer/layout preprocessor.
 
-Only requests with prepared `MixFusionRequestInfo` relax the resolution key.
+Only requests with prepared grid or sequence metadata relax the resolution key.
 Dense and packed requests have distinct keys. Static unsupported combinations
 (no packing plan, SP, CFG parallel or conflicting hooks) retain dense
 scheduling. Requests unsupported by the model's host preparation, or unable
@@ -245,9 +248,12 @@ to meet the chunk policy even alone, also keep dense scheduling. Existing
 per-prompt input isolation remains in effect.
 
 `StepScheduler` passes the entire running batch plus each candidate to the
-common `fits_chunk_budget` predicate. Its GCD cost estimate must meet the
-strictest `mixfusion_min_chunk_tokens` and total chunks, including multiple
-images, must fit the strictest `mixfusion_max_chunks`. A candidate that fails
+common `fits_mixfusion_budget` predicate. For chunked joint attention, its
+GCD cost estimate must meet the strictest `mixfusion_min_chunk_tokens` and
+total chunks, including multiple images, must fit the strictest
+`mixfusion_max_chunks`. Flat prefix-KV layouts validate their sequence
+geometry and use the existing `max_num_seqs` capacity; chunk limits do not
+apply because these layouts do not split requests into chunks. A candidate that fails
 stays waiting under the normal FIFO policy. The scheduler publishes selected
 requests and a `use_mixfusion` execution flag in `DiffusionSchedulerOutput`.
 It does not publish a chunk size, tensor shape map or packing plan.
@@ -255,10 +261,13 @@ It does not publish a chunk size, tensor shape map or packing plan.
 The runner builds tensor latents for dense output and list latents for an
 approved MixFusion output. Request flags no longer choose the worker layout.
 The runner retains each new request's admission metadata in `StepRequestState`.
-`MixFusionDriver` validates actual image/token counts and runtime compatibility,
+`MixFusionDriver` validates request identity, dtype/device and runtime
+compatibility; each adapter validates its latent shape and token contract. It
 arms an empty `MixFusionStep`, and calls the ordinary `pipeline.denoise_step`.
 It does not admit, split, regroup or silently fall back. The root adapter
-computes the GCD from actual prepared latents and builds `PackedExecutionPlan`.
+for chunked joint attention computes the GCD from actual prepared latents
+and builds `PackedExecutionPlan`. Prefix-KV packing builds a
+`PackedSequencePlan` from the current request/CFG documents instead.
 Request arrivals, departures, reordering and text-length changes invalidate
 the layout cache. Failed preparation may remove a request before packing;
 the remaining requests use their own GCD immediately. Removing requests cannot
@@ -295,10 +304,12 @@ implements *how*.
 
 | Layer | Location | Owns |
 | --- | --- | --- |
-| Scheduler policy | `mixfusion/scheduling.py`, `StepScheduler` | Compatibility and whole-batch chunk-budget admission |
+| Scheduler policy | `mixfusion/scheduling.py`, `StepScheduler` | Compatibility and whole-batch admission by layout |
 | Driver | `mixfusion/driver.py` (`MixFusionDriver`) | Execution validation and arming/restoring `MixFusionStep` |
 | Hooks + plan types | `hooks/mixfusion.py`, `mixfusion/plan.py` | Applying `_mixfusion_plan` at module boundaries |
 | Chunked packing | `mixfusion/chunked.py` (`ChunkedJointAdapter`), `mixfusion/execution_plan.py` | Actual-input GCD and `PackedExecutionPlan`, per-request RoPE through the model's own boundary module, chunk split/reassembly |
+| Prefix-KV packing | `mixfusion/sequence.py` (`PrefixKVAdapter`) | Independent request/CFG documents, causal/full segments, prefix capture and output restoration |
+| Prefix attention | `mixfusion/sequence_attention.py` | Independent Q/K boundaries, varlen or dense buckets with bottom-right causal alignment |
 | Joint attention | `Attention.forward` (plan-key dispatch), `mixfusion/packed_attention.py` | Per-request text + image reassembly, one packed varlen forward (or the dense fallbacks), scatter back per stream |
 | Startup wiring | `mixfusion/setup.py`, `mixfusion/request.py` | Config validation, mounting, request opt-in and batch-key relaxation |
 
@@ -350,8 +361,8 @@ _mixfusion_plan = {
   (the chunk-stacked layout has one table row per chunk).
 - The pipeline declares `supports_mixfusion: ClassVar[bool] = True` and its
   keyword builder accepts a per-request latent list. Request preparation is
-  owned by `mixfusion/request.py`; models do not add a request module or
-  implement configuration/preparation callbacks.
+  owned by common grid preparation or the model's existing layout
+  preprocessor; models do not need a separate MixFusion request module.
 
 The hooks stay inert unless the driver arms a `MixFusionStep`; without one
 the model runs its ordinary dense forward. Model-specific eligibility is
@@ -372,11 +383,55 @@ call `forward` again with fresh metadata that has no plan key. A nested
 plan-keyed call while a packed call is running raises instead of recursing.
 
 A layout the declarative plan cannot express (a different stream structure,
-e.g. single-stream blocks that concatenate text and image, or an LLM-style
-unified sequence with prefix KV) sets an explicit `mixfusion_adapter`
+e.g. a new single-stream structure) sets an explicit `mixfusion_adapter`
 implementing the `MixFusionAdapter` protocol; `MixFusionReplaceOutput` hands
 its root-computed values to declared boundaries. That is a per-layout-family
 framework extension, not a per-model requirement.
+
+### HunyuanImage3 prefix-KV layout
+
+HunyuanImage3 declares `MixFusionRoot(request=MixFusionSequenceRequest())` on
+its decoder. Its existing CPU preprocessor computes the actual output size,
+image token count, CFG branches, and prefix/first-step lengths; the scheduler
+reads only that immutable summary. It does not hold latent or embedding tensors.
+
+The pipeline retains per-request 2D patch projection, timestep conditioning,
+output projection, CFG and diffusion scheduler state. The root adapter packs
+`(request, CFG branch)` documents into `[1, total_query_tokens, hidden_size]`.
+Decoder normalization, QKV and MoE run on that flat sequence, without GCD
+chunks or request padding. Each document keeps its own positions and prefix KV.
+
+First steps use the tokenizer's causal/full image spans. Subsequent steps query
+only timestep/special and image tokens, reusing the invariant prefix captured
+on the first step. A new request's first step can share the decoder call with
+an existing request's later step. Legacy AR KV stays request-owned and is
+validated before its reused prefix is removed from queries. This is the
+`dense_legacy` path, separate from scheduler-paged KV.
+
+Attention gathers causal and full segments into independent Q/K document
+boundaries. FlashAttention runs varlen calls with the segment's causal mode;
+TORCH_SDPA groups exact Q/K lengths and uses an explicit causal mask. A dense
+backend without mask support splits causal queries by their legal KV prefix.
+Only attention is bucketed; there is no per-bucket decoder fallback. Layout
+caches retain geometry and indices, never a completed request's embeddings or KV.
+
+Packed execution can produce numerical differences from serial execution
+that exceed image similarity thresholds for some prompts and seeds. Validate
+accuracy and throughput together on the intended workload and hardware.
+
+The sequence root checks native hooks throughout the decoder subtree. A hook
+may opt in with `mixfusion_compatible_hook` only if it is independent of request
+layout or derives its geometry from the actual packed input. The MoE token-count
+and one-time kernel initialization hooks satisfy this contract; unknown hooks
+continue to block packed admission.
+
+The initial scope is standard t2i with one output per request, CFG on or off,
+variable resolution/aspect ratio and prompt length. Distilled/MeanFlow, edits,
+custom latents and custom timestep/sigma sequences do not use packed admission.
+Requests with dynamic attention step/sigma schedules retain dense admission.
+Existing step restrictions on SP, CFG parallel, diffusion caches and KV step
+skipping remain. `max_num_seqs` bounds request count, not the total number of
+tokens or peak memory; size the batch limit for the actual workload.
 
 ## Model Author Guidelines
 
@@ -414,7 +469,7 @@ mapping, seeded concurrency, LoRA compatibility, and tensor IPC.
 - Step continuous batching remains experimental; use `max_num_seqs=1` for the
   conservative step path.
 - MixFusion shape relaxation requires the pipeline `supports_mixfusion`
-  capability (Qwen-Image only); edit/zero_cond_t requests, SP>1, CFG
+  capability (Qwen-Image or HunyuanImage3); edit/zero_cond_t requests, SP>1, CFG
   parallel and conflicting forward hooks retain ordinary dense admission.
 
 ## Related Implementation

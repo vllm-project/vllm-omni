@@ -116,10 +116,25 @@ def test_resolve_prefers_an_explicit_adapter():
 
 
 def test_validation_uses_declared_input_requirements():
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionRequestInfo
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    state = StepRequestState(
+        request_id="a",
+        sampling=OmniDiffusionSamplingParams(),
+        latents=torch.zeros(1, 2, DIM),
+        timesteps=torch.tensor([1.0]),
+        mixfusion_info=MixFusionRequestInfo(1, 2, 1, 128),
+    )
+    batch = InputBatch.make_batch([state], use_mixfusion=True)
+    batch.grids = [(1, 1)]
     adapter = ChunkedJointAdapter(_FakeDiT._mixfusion_plan[""])
-    adapter.validate_inputs(_FakeDiT(), SimpleNamespace(grids=[(1, 1)]))
+    adapter.validate_inputs(_FakeDiT(), batch)
+    batch.grids = None
     with pytest.raises(ValueError, match="missing grids"):
-        adapter.validate_inputs(_FakeDiT(), SimpleNamespace(grids=None))
+        adapter.validate_inputs(_FakeDiT(), batch)
 
 
 def test_packed_forward_matches_each_request_alone():

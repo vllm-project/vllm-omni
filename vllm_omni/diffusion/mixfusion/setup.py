@@ -18,7 +18,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion, plan_foreign_hooks
 from vllm_omni.diffusion.mixfusion.chunked import resolve_mixfusion_adapter
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
-from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot
+from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot, MixFusionSequenceRequest
 from vllm_omni.diffusion.mixfusion.request import prepare_image_request, resolve_image_request_config
 from vllm_omni.diffusion.mixfusion.scheduling import MixFusionCapability
 from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
@@ -141,8 +141,9 @@ def inspect_mixfusion_capability(pipeline: nn.Module) -> MixFusionCapability:
     root = transformer._mixfusion_plan.get("")
     if not isinstance(root, MixFusionRoot) or root.request is None:
         return MixFusionCapability(reason="MixFusion root declares no request layout")
-    config = resolve_image_request_config(root.request, pipeline)
-    return MixFusionCapability(request_config=config, reason="")
+    if isinstance(root.request, MixFusionSequenceRequest):
+        return MixFusionCapability(request_config=root.request, reason="")
+    return MixFusionCapability(request_config=resolve_image_request_config(root.request, pipeline), reason="")
 
 
 def initialize_mixfusion_admission(engine: DiffusionEngine) -> None:
@@ -170,13 +171,31 @@ def prepare_mixfusion_admission(engine: DiffusionEngine, request: OmniDiffusionR
         DEFAULT_MIN_CHUNK_TOKENS,
         mixfusion_requested,
     )
-    from vllm_omni.diffusion.mixfusion.scheduling import fits_chunk_budget
+    from vllm_omni.diffusion.mixfusion.scheduling import MixFusionSequenceInfo, fits_mixfusion_budget
 
     request.mixfusion_info = None
     capability = getattr(engine, "mixfusion_capability", None)
     if capability is None or capability.request_config is None or not request.use_step_execution:
         return
     if not mixfusion_requested(request.sampling_params, engine.od_config, supported=True):
+        return
+    if isinstance(capability.request_config, MixFusionSequenceRequest):
+        from vllm_omni.diffusion.attention.schedule import (
+            resolve_request_attention_schedule,
+            resolve_request_attention_sigma_schedule,
+        )
+
+        schedule = getattr(engine.od_config, "diffusion_attention_schedule", None)
+        if resolve_request_attention_schedule(
+            request.sampling_params, schedule
+        ) or resolve_request_attention_sigma_schedule(request.sampling_params, schedule):
+            return
+        try:
+            info = attrgetter(capability.request_config.metadata_attr)(request)
+        except AttributeError:
+            return
+        if isinstance(info, MixFusionSequenceInfo) and fits_mixfusion_budget([info]):
+            request.mixfusion_info = info
         return
     extras = request.sampling_params.extra_args or {}
     info = prepare_image_request(
@@ -190,5 +209,5 @@ def prepare_mixfusion_admission(engine: DiffusionEngine, request: OmniDiffusionR
         ),
         int(extras.get("mixfusion_max_chunks", getattr(engine.od_config, "mixfusion_max_chunks", DEFAULT_MAX_CHUNKS))),
     )
-    if info is not None and fits_chunk_budget([info]):
+    if info is not None and fits_mixfusion_budget([info]):
         request.mixfusion_info = info

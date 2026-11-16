@@ -12,6 +12,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 
 from vllm_omni.diffusion.diffusion_kv.kv_cache_utils import get_cache_namespace, hash_prefix_cache_value
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionSequenceInfo
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .hunyuan_image3_tokenizer import TokenizerEncodeOutput
@@ -311,7 +312,9 @@ def prepare_hunyuan_layout(
         batch_system_prompt=[system_prompt],
         batch_cot_text=cot_text,
         batch_ar_token_ids=extract_hunyuan_ar_token_ids([request.prompt]),
-        validate_ar_kv_prefix=request.kv_transfer_params is not None,
+        validate_ar_kv_prefix=(
+            request.kv_transfer_params is not None or getattr(sampling, "past_key_values", None) is not None
+        ),
         max_length=None,
         bot_task=tokenizer_bot_task,
         image_base_size=image_base_size,
@@ -334,6 +337,9 @@ class HunyuanPreparedLayout:
     tokenizer_output: TokenizerEncodeOutput
     rope_image_info: list[list[tuple[slice, tuple[int, int]]]]
     generated_image_info: ImageInfo
+    # Optional trusted summary. Only the existing model preprocessor fills it
+    # after checking the request against the supported MixFusion input scope.
+    mixfusion_sequence: MixFusionSequenceInfo | None = None
 
     def __post_init__(self) -> None:
         tokens = self.tokenizer_output.tokens

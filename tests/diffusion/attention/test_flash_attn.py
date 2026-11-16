@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import PACKED_CAUSAL_KEY, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.backends.utils import fa  # noqa: E402
@@ -854,6 +854,38 @@ def test_packed_varlen_metadata_must_be_complete(monkeypatch):
 
     with pytest.raises(ValueError, match="Incomplete packed FlashAttention metadata"):
         impl.forward_cuda(query, query, query, metadata)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("forward", ["forward_cuda", "forward_xpu"])
+def test_prefix_varlen_keeps_independent_lengths_and_per_call_causality(monkeypatch, forward):
+    calls = []
+
+    def kernel(q, k, v, **kwargs):
+        calls.append(kwargs)
+        assert (q.shape[0], k.shape[0], v.shape[0]) == (5, 12, 12)
+        return q
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", kernel)
+    impl = FlashAttentionImpl(num_heads=4, num_kv_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    q, k, v = torch.randn(1, 5, 4, 8), torch.randn(1, 12, 2, 8), torch.randn(1, 12, 2, 8)
+    cq, ck = torch.tensor([0, 2, 5], dtype=torch.int32), torch.tensor([0, 5, 12], dtype=torch.int32)
+    for causal in (True, False):
+        metadata = AttentionMetadata(
+            extra={
+                "cu_seqlens_q": cq,
+                "cu_seqlens_k": ck,
+                "max_seqlen_q": 3,
+                "max_seqlen_k": 7,
+                PACKED_CAUSAL_KEY: causal,
+            }
+        )
+        assert torch.equal(getattr(impl, forward)(q, k, v, metadata), q)
+        assert calls[-1]["causal"] is causal
+        assert calls[-1]["cu_seqlens_q"] is cq and calls[-1]["cu_seqlens_k"] is ck
+        assert calls[-1]["max_seqlen_q"] == 3 and calls[-1]["max_seqlen_k"] == 7
+        assert impl.causal is False
 
 
 # ---------------------------------------------------------------------------

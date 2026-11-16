@@ -5,6 +5,7 @@ import copy
 import logging
 from collections.abc import Iterable
 from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -16,6 +17,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 from PIL import Image as PILImage
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.generation.utils import ALL_CACHE_NAMES, GenerationMixin
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.utils.generic import ModelOutput
 from vllm.config.vllm import get_current_vllm_config
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
@@ -37,6 +39,9 @@ from vllm_omni.diffusion.forward_context import (
     request_denoise_progress,
     set_forward_context_denoise_step_idx,
 )
+from vllm_omni.diffusion.mixfusion.request import mixfusion_requested
+from vllm_omni.diffusion.mixfusion.scheduling import MixFusionSequenceInfo
+from vllm_omni.diffusion.mixfusion.sequence import SequenceDocument, SequenceGeometry
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import _is_rank_zero
@@ -119,6 +124,21 @@ def _log_step0_profile_reuse(od_config: OmniDiffusionConfig) -> None:
             "default attention schedule selects at step 0, also affects the steps it does not cover.",
             profile,
         )
+
+
+@dataclass
+class _PreparedModelForward:
+    model_inputs: dict[str, Any]
+    inputs_embeds: torch.Tensor
+    image_mask: torch.Tensor | None
+    timestep: torch.Tensor | None
+    token_h: int | None
+    token_w: int | None
+    first_step: bool
+    num_special_tokens: int | None
+    mode: str
+    uncond_cfg_prefill: bool
+    return_dict: bool
 
 
 class HunyuanImage3FlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
@@ -295,6 +315,7 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
         )
 
     def pre_process_func(request: OmniDiffusionRequest):
+        nonlocal tokenizer_wrapper, generation_config
         prompt = request.prompt
         if isinstance(prompt, str):
             prompt = OmniTextPrompt(prompt=prompt)
@@ -321,8 +342,24 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
                 request.sampling_params.height = int(bridge_h or first_image_h)
 
         request.prompt = prompt
-        if prepare_diffusion_kv_layout:
-            assert tokenizer_wrapper is not None and generation_config is not None
+        sampling = request.sampling_params
+        use_mixfusion = (
+            mixfusion_requested(sampling, od_config, supported=True)
+            and not prepare_diffusion_kv_layout
+            and not has_images
+            and not prompt["additional_information"].get("batch_cond_image_info")
+            and sampling.latents is None
+            and sampling.timesteps is None
+            and sampling.sigmas is None
+            and sampling.num_outputs_per_prompt in (None, 0, 1)
+            and not _config_flag(hf_config, "cfg_distilled")
+            and not _config_flag(hf_config, "use_meanflow")
+        )
+        if prepare_diffusion_kv_layout or use_mixfusion:
+            if tokenizer_wrapper is None:
+                tokenizer_wrapper = TokenizerWrapper(od_config.model, revision=od_config.revision)
+            if generation_config is None:
+                generation_config = GenerationConfig.from_pretrained(od_config.model, revision=od_config.revision)
             prepared_layout = request_layout_utils.prepare_hunyuan_layout(
                 request,
                 tokenizer_wrapper=tokenizer_wrapper,
@@ -332,11 +369,30 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
                 cfg_distilled=_config_flag(hf_config, "cfg_distilled"),
                 use_meanflow=_config_flag(hf_config, "use_meanflow"),
             )
+            if use_mixfusion:
+                info = prepared_layout.generated_image_info
+                output = prepared_layout.tokenizer_output
+                prepared_layout = replace(
+                    prepared_layout,
+                    mixfusion_sequence=MixFusionSequenceInfo(
+                        latent_shape=(
+                            1,
+                            hf_config.vae["latent_channels"],
+                            int(info.image_height) // hf_config.vae_downsample_factor[0],
+                            int(info.image_width) // hf_config.vae_downsample_factor[1],
+                        ),
+                        image_tokens=int(info.image_token_length),
+                        prefix_lengths=tuple(int(row[-1]) for row in output.gen_timestep_scatter_index),
+                        query_lengths=tuple(int(row[-1]) for row in output.real_pos),
+                        special_tokens=request_layout_utils.hunyuan_num_special_tokens(info),
+                    ),
+                )
             request.prepared_layout = prepared_layout
-            request.diffusion_kv_requests = request_layout_utils.build_hunyuan_diffusion_kv_requests(
-                request,
-                prepared_layout,
-            )
+            if prepare_diffusion_kv_layout:
+                request.diffusion_kv_requests = request_layout_utils.build_hunyuan_diffusion_kv_requests(
+                    request,
+                    prepared_layout,
+                )
 
         return request
 
@@ -387,6 +443,7 @@ class HunyuanImage3Pipeline(
     DenoiseProgressMixin,
 ):
     supports_step_execution: ClassVar[bool] = True
+    supports_mixfusion: ClassVar[bool] = True
     supports_weight_reload: ClassVar[bool] = True
     supports_request_batch = False
     support_image_input = True
@@ -1804,7 +1861,7 @@ class HunyuanImage3Pipeline(
             for name, item in check_list:
                 assert item is not None, f"`{name}` should be provided when `{target}`."
 
-    def forward_call(
+    def _prepare_model_forward(
         self,
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -1843,7 +1900,7 @@ class HunyuanImage3Pipeline(
         # for MeanFlow distilled models
         timesteps_r: torch.Tensor | None = None,
         timesteps_r_scatter_index: torch.Tensor | None = None,
-    ) -> tuple | CausalMMOutputWithPast:
+    ) -> _PreparedModelForward:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # Sanity Check of Inputs
         self._check_inputs(
@@ -1970,11 +2027,8 @@ class HunyuanImage3Pipeline(
                 seq_len,
             )
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        from vllm.forward_context import set_forward_context
-
-        with set_forward_context(None, self.vllm_config):
-            outputs = self.model(
+        return _PreparedModelForward(
+            model_inputs=dict(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -1995,7 +2049,110 @@ class HunyuanImage3Pipeline(
                 ar_kv_reuse_len=ar_kv_reuse_len,
                 paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
                 full_attn_spans=full_attn_spans,
-            )
+            ),
+            inputs_embeds=inputs_embeds,
+            image_mask=image_mask,
+            timestep=timestep,
+            token_h=token_h,
+            token_w=token_w,
+            first_step=bool(first_step),
+            num_special_tokens=num_special_tokens,
+            mode=mode,
+            uncond_cfg_prefill=uncond_cfg_prefill,
+            return_dict=return_dict,
+        )
+
+    def forward_call(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: list[torch.FloatTensor] | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        custom_pos_emb: tuple[torch.FloatTensor] | None = None,
+        mode: str = "gen_text",
+        first_step: bool | None = None,
+        # for gen image
+        images: BatchRaggedImages | None = None,
+        image_mask: torch.Tensor | None = None,
+        timestep: BatchRaggedTensor | None = None,
+        gen_timestep_scatter_index: torch.Tensor | None = None,
+        # for cond image
+        cond_vae_images: BatchRaggedImages | None = None,
+        cond_timestep: BatchRaggedTensor | None = None,
+        cond_vae_image_mask: torch.Tensor | None = None,
+        cond_vit_images: BatchRaggedImages | None = None,
+        cond_vit_image_mask: torch.Tensor | None = None,
+        vit_kwargs: dict[str, Any] | None = None,
+        cond_timestep_scatter_index: torch.Tensor | None = None,
+        query_lens: list[int] | None = None,
+        seq_lens: list[int] | None = None,
+        num_image_tokens: int | None = None,
+        num_special_tokens: int | None = None,
+        uncond_cfg_prefill: bool = False,
+        ar_kv_reuse_len: int = 0,
+        full_attn_spans: list[list[tuple[int, int]]] | None = None,
+        # for CFG distilled models
+        guidance: torch.Tensor | None = None,
+        guidance_scatter_index: torch.Tensor | None = None,
+        # for MeanFlow distilled models
+        timesteps_r: torch.Tensor | None = None,
+        timesteps_r_scatter_index: torch.Tensor | None = None,
+    ) -> tuple | CausalMMOutputWithPast:
+        prepared = self._prepare_model_forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            custom_pos_emb=custom_pos_emb,
+            mode=mode,
+            first_step=first_step,
+            images=images,
+            image_mask=image_mask,
+            timestep=timestep,
+            gen_timestep_scatter_index=gen_timestep_scatter_index,
+            cond_vae_images=cond_vae_images,
+            cond_timestep=cond_timestep,
+            cond_vae_image_mask=cond_vae_image_mask,
+            cond_vit_images=cond_vit_images,
+            cond_vit_image_mask=cond_vit_image_mask,
+            vit_kwargs=vit_kwargs,
+            cond_timestep_scatter_index=cond_timestep_scatter_index,
+            query_lens=query_lens,
+            seq_lens=seq_lens,
+            num_image_tokens=num_image_tokens,
+            num_special_tokens=num_special_tokens,
+            uncond_cfg_prefill=uncond_cfg_prefill,
+            ar_kv_reuse_len=ar_kv_reuse_len,
+            full_attn_spans=full_attn_spans,
+            guidance=guidance,
+            guidance_scatter_index=guidance_scatter_index,
+            timesteps_r=timesteps_r,
+            timesteps_r_scatter_index=timesteps_r_scatter_index,
+        )
+        from vllm.forward_context import set_forward_context
+
+        with set_forward_context(None, self.vllm_config):
+            outputs = self.model(**prepared.model_inputs)
+        return self._finish_model_forward(prepared, outputs)
+
+    def _finish_model_forward(
+        self, prepared: _PreparedModelForward, outputs: tuple | BaseModelOutputWithPast
+    ) -> tuple | CausalMMOutputWithPast:
+        inputs_embeds = prepared.inputs_embeds
+        bsz, seq_len, n_embd = inputs_embeds.shape
+        mode, uncond_cfg_prefill = prepared.mode, prepared.uncond_cfg_prefill
+        image_mask, timestep = prepared.image_mask, prepared.timestep
+        token_h, token_w = prepared.token_h, prepared.token_w
+        first_step, num_special_tokens = prepared.first_step, prepared.num_special_tokens
+        return_dict = prepared.return_dict
         hidden_states = outputs[0]
 
         if mode == "gen_text":
@@ -2450,7 +2607,7 @@ class HunyuanImage3Pipeline(
         self,
         input_batch: "InputBatch",
         **kwargs: Any,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor | list[torch.Tensor] | None:
         del kwargs
         if getattr(self, "interrupt", False):
             return None
@@ -2462,6 +2619,8 @@ class HunyuanImage3Pipeline(
                 "HunyuanImage3 paged_scheduler currently supports request-level execution only; "
                 "disable step execution or use dense_legacy."
             )
+        if input_batch.use_mixfusion:
+            return self._denoise_step_mixfusion(states)
         # Bound step ranges or sigma windows select attention from each request's own progress (step and
         # total, or sigma), so requests run one at a time and the batch-wide backend check, which reads the
         # baseline config, is skipped.
@@ -2479,6 +2638,140 @@ class HunyuanImage3Pipeline(
             for state, state_pred in zip(group, pred):
                 outputs[state.request_id] = state_pred.unsqueeze(0)
         return torch.cat([outputs[state.request_id] for state in states], dim=0)
+
+    def _denoise_step_mixfusion(self, states: list["StepRequestState"]) -> list[torch.Tensor]:
+        """Prepare requests independently, then execute one packed decoder call."""
+        from vllm.forward_context import set_forward_context
+
+        documents: list[SequenceDocument] = []
+        prepared_requests: list[_PreparedModelForward] = []
+        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
+            for state in states:
+                first_step, cfg_factor = self._validate_step_group_states([state])
+                model_kwargs = state.extra[_STEP_MODEL_KWARGS]
+                timestep = state.current_timestep.reshape(1).expand(cfg_factor)
+                model_inputs = self.prepare_inputs_for_generation(
+                    state.extra[_STEP_INPUT_IDS],
+                    images=torch.cat([state.latents] * cfg_factor, dim=0),
+                    timestep=timestep,
+                    **model_kwargs,
+                )
+                prepared = self._prepare_model_forward(**model_inputs, first_step=first_step)
+                prepared_requests.append(prepared)
+                documents.extend(self._mixfusion_documents(state, prepared))
+
+            with set_forward_context(None, self.vllm_config):
+                hidden_rows = self.model(
+                    mode="gen_image",
+                    use_cache=False,
+                    return_dict=True,
+                    mixfusion_documents=documents,
+                )
+            predictions = []
+            offset = 0
+            for state, prepared in zip(states, prepared_requests, strict=True):
+                count = int(state.extra[_STEP_CFG_FACTOR])
+                rows = documents[offset : offset + count]
+                output = self._finish_model_forward(
+                    prepared,
+                    BaseModelOutputWithPast(last_hidden_state=torch.cat(hidden_rows[offset : offset + count])),
+                )
+                pred = output.diffusion_prediction.float()
+                if prepared.first_step:
+                    self._save_mixfusion_prefix(state, rows)
+                if count == 2:
+                    pred = self.pipeline.cfg_operator(
+                        pred[:1],
+                        pred[1:],
+                        state.extra[_STEP_GUIDANCE_SCALE],
+                        step=state.step_index,
+                    )
+                predictions.append(pred)
+                model_kwargs = self._update_model_kwargs_for_generation(output, state.extra[_STEP_MODEL_KWARGS])
+                bsz, _, query_len, seq_len = model_kwargs["attention_mask"].shape
+                model_kwargs["query_lens"] = [query_len] * bsz
+                model_kwargs["seq_lens"] = [seq_len] * bsz
+                state.extra[_STEP_MODEL_KWARGS] = model_kwargs
+                state.extra[_STEP_INPUT_IDS] = None
+                if prepared.first_step:
+                    state.extra[_STEP_AR_KV] = None
+                offset += count
+        return predictions
+
+    def _mixfusion_documents(
+        self,
+        state: "StepRequestState",
+        prepared: _PreparedModelForward,
+    ) -> list[SequenceDocument]:
+        info = state.mixfusion_info
+        if not isinstance(info, MixFusionSequenceInfo):
+            raise ValueError("Hunyuan packed execution requires sequence admission metadata")
+        values = prepared.model_inputs
+        if prepared.inputs_embeds.shape[0] != len(info.prefix_lengths):
+            raise ValueError("Hunyuan CFG branches disagree with MixFusion admission")
+        if int(values["num_image_tokens"]) != info.image_tokens + info.special_tokens:
+            raise ValueError("Hunyuan image token count disagrees with MixFusion admission")
+        docs = []
+        for branch, prefix_length in enumerate(info.prefix_lengths):
+            prefix_kv = ()
+            if prepared.first_step:
+                reused = int(values["ar_kv_reuse_len"])
+                query_length = info.query_lengths[branch] - reused
+                spans = tuple(tuple(span) for span in values["full_attn_spans"][branch])
+                if reused:
+                    snapshot = state.extra[_STEP_AR_KV]
+                    prefix_kv = tuple(layer[branch] for layer in snapshot)
+                geometry = SequenceGeometry(
+                    state.request_id,
+                    branch,
+                    query_length,
+                    prepared.inputs_embeds.shape[1],
+                    reused,
+                    spans,
+                    capture_length=prefix_length,
+                )
+            else:
+                query_length = info.special_tokens + info.image_tokens
+                prefix_kv = tuple(
+                    (layer["key"][branch, :prefix_length], layer["value"][branch, :prefix_length])
+                    for layer in state.extra[_STEP_PROMPT_KV]
+                )
+                # The later-step state selects only special + image positions;
+                # boi/eoi and tokenizer padding are absent from its compact KV.
+                spans = ((prefix_length + info.special_tokens, prefix_length + query_length),)
+                geometry = SequenceGeometry(
+                    state.request_id,
+                    branch,
+                    query_length,
+                    prepared.inputs_embeds.shape[1],
+                    prefix_length,
+                    spans,
+                )
+            docs.append(
+                SequenceDocument(
+                    geometry,
+                    prepared.inputs_embeds[branch : branch + 1],
+                    values["position_ids"][branch : branch + 1],
+                    values["custom_pos_emb"][0][branch : branch + 1],
+                    values["custom_pos_emb"][1][branch : branch + 1],
+                    prefix_kv=prefix_kv,
+                )
+            )
+        return docs
+
+    def _save_mixfusion_prefix(self, state: "StepRequestState", documents: list[SequenceDocument]) -> None:
+        """Keep the existing per-request cache format, including branch lengths."""
+        cache = []
+        for layer_index in range(len(self.model.layers)):
+            rows = [doc.captured_kv[layer_index] for doc in documents]
+            cache.append(
+                {
+                    "key": self._pad_tensor_rows([k.unsqueeze(0) for k, _ in rows]),
+                    "value": self._pad_tensor_rows([v.unsqueeze(0) for _, v in rows]),
+                    "lens": torch.tensor([k.shape[0] for k, _ in rows], device=rows[0][0].device, dtype=torch.long),
+                }
+            )
+        state.extra[_STEP_PROMPT_KV] = cache
 
     @staticmethod
     def _scheduled_request_progress(state: "StepRequestState"):

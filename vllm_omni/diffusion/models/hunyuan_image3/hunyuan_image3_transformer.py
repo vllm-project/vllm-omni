@@ -88,6 +88,13 @@ from vllm_omni.diffusion.forward_context import (
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.mixfusion.plan import MixFusionRoot, MixFusionSequenceRequest
+from vllm_omni.diffusion.mixfusion.sequence import (
+    SEQUENCE_DOCUMENTS_KEY,
+    PackedSequencePlan,
+    SequenceDocument,
+    run_prefix_attention,
+)
 
 # ResBlock is platform-dispatched in the layers package __init__: CUDA gets
 # fused GroupNorm+SiLU and AdaGN kernels, every other backend gets the plain
@@ -870,7 +877,11 @@ class HunYuanRotary2DEmbedder:
         first_step = kwargs.get("first_step", False)
         device = q.device
         # 1. Prepare cos/sin
-        cos, sin = self._prepare_cos_sin(custom_pos_emb, first_step, device)
+        step = get_forward_context().mixfusion_step if is_forward_context_available() else None
+        if step is not None and isinstance(step.plan, PackedSequencePlan):
+            cos, sin = custom_pos_emb
+        else:
+            cos, sin = self._prepare_cos_sin(custom_pos_emb, first_step, device)
 
         # 2. Shape validation
         query_lens: list[int] = kwargs.get("query_lens")
@@ -1280,6 +1291,17 @@ class ImageKVCacheManager(nn.Module):
         attention_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        step = get_forward_context().mixfusion_step if is_forward_context_available() else None
+        if step is not None and isinstance(step.plan, PackedSequencePlan):
+            return run_prefix_attention(
+                self.attn,
+                query.reshape(-1, self.num_heads, self.head_dim),
+                key.reshape(-1, self.num_kv_heads, self.head_dim),
+                value.reshape(-1, self.num_kv_heads, self.head_dim),
+                step.plan,
+                step.packed.boundary_outputs[SEQUENCE_DOCUMENTS_KEY],
+                self.mixfusion_layer_index,
+            )
         self.image_token_len = kwargs.get("num_image_tokens")
         if self.attn.is_paged_kv_active():
             # A native connector fills the same Scheduler-owned pages as
@@ -1892,6 +1914,7 @@ class HunYuanAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
         )
+        self.image_attn.mixfusion_layer_index = layer_id
 
         if self.use_qk_norm:
             self.query_layernorm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -2168,6 +2191,7 @@ class HunyuanImagePostprocessor(nn.Module):
 
 
 class HunyuanImage3Model(nn.Module):
+    _mixfusion_plan = {"": MixFusionRoot(request=MixFusionSequenceRequest())}
     _cache_dit_adapter_config = CacheDiTAdapterConfig(
         block_forward_patterns={
             "layers": ForwardPattern.Pattern_4,
@@ -2549,6 +2573,7 @@ class HunyuanImage3Model(nn.Module):
         ar_kv_reuse_len: int = 0,
         paged_kv_cached_prefix_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
+        mixfusion_documents: list[SequenceDocument] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         current_omni_platform.reset_diffusion_fused_moe_forward_context()
 
