@@ -67,6 +67,8 @@ def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientH
                 "size": "320x192",
                 "n": 1,
                 "response_format": "b64_json",
+                # Override server DEFAULT_SAMPLING_PARAMS num_frames=81; T2I requires 1.
+                "num_frames": 1,
                 "num_inference_steps": 2,
                 "guidance_scale": 3.0,
                 "flow_shift": 3.0,

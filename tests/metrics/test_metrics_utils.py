@@ -15,6 +15,8 @@ from vllm_omni.metrics.utils import (
     count_tokens_from_outputs,
     count_video_frames,
     extract_diffusion_vae_decode_ms,
+    iter_mm_outputs,
+    iter_request_output_items,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -75,6 +77,23 @@ def test_count_audio_frames_supports_model_outputs() -> None:
 @pytest.mark.parametrize("mm_out", [{}, {"audio": None}, {"model_outputs": None}])
 def test_count_audio_frames_returns_zero_without_audio(mm_out: dict[str, object]) -> None:
     assert count_audio_frames(mm_out) == 0
+
+
+def test_request_output_items_normalize_scalar_pooling_output() -> None:
+    pooling_output = SimpleNamespace(data=SimpleNamespace(shape=(2, 2)))
+    request_output = SimpleNamespace(outputs=pooling_output)
+
+    assert iter_request_output_items(request_output) == (pooling_output,)
+    assert iter_mm_outputs(request_output) == []
+
+
+def test_iter_mm_outputs_preserves_scalar_multimodal_output() -> None:
+    payload = {"audio": [1, 2, 3]}
+    request_output = SimpleNamespace(
+        outputs=SimpleNamespace(multimodal_output=payload),
+    )
+
+    assert iter_mm_outputs(request_output) == [payload]
 
 
 @pytest.mark.parametrize(

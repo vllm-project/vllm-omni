@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU regression tests for MOSS-TTS per-row talker generators."""
 
+from dataclasses import dataclass
+
 import pytest
 import torch
 
@@ -118,3 +120,53 @@ def test_sample_token_single_seeded_row_is_reproducible() -> None:
         return _sample(logits, generators)
 
     torch.testing.assert_close(run()[1], run()[1])
+
+
+def test_generate_frame_forwards_request_generators() -> None:
+    """The frame loop must not drop request-owned RNGs before RVQ sampling."""
+    rvq, width, vocab = 4, 3, 16
+
+    class Decoder(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.codec_embedding = torch.nn.ModuleList([torch.nn.Embedding(vocab, width) for _ in range(rvq - 1)])
+
+        def forward(self, embeds: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+            return embeds
+
+    @dataclass(frozen=True)
+    class LocalConfig:
+        rvq: int
+        hidden_size: int
+
+    class LocalHarness:
+        def __init__(self) -> None:
+            self.config = LocalConfig(rvq=rvq, hidden_size=width)
+            self.model = Decoder()
+
+    local = LocalHarness()
+    heads = torch.nn.ModuleList([torch.nn.Linear(width, vocab, bias=False) for _ in range(rvq)])
+    for head in heads:
+        head.weight.data.zero_()
+    hidden = torch.zeros(2, width)
+
+    def generate(rows: torch.Tensor, generators: list[torch.Generator]) -> torch.Tensor:
+        return modeling_moss_tts_local.MossTTSRealtimeLocalTransformer.generate_frame(
+            local,
+            rows,
+            heads,
+            top_k=0,
+            top_p=1.0,
+            generators=generators,
+        )
+
+    batched_generators = [torch.Generator().manual_seed(seed) for seed in (17, 29)]
+    independent_generators = [torch.Generator().manual_seed(seed) for seed in (17, 29)]
+    actual = generate(hidden, batched_generators)
+    expected = torch.cat(
+        [generate(hidden[row : row + 1], [independent_generators[row]]) for row in range(hidden.shape[0])]
+    )
+
+    torch.testing.assert_close(actual, expected)
+    for batched, independent in zip(batched_generators, independent_generators, strict=True):
+        torch.testing.assert_close(batched.get_state(), independent.get_state())
