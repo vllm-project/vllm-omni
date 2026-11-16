@@ -69,6 +69,11 @@ NIGHTLY_CROSS_PIPELINE_PARITY_OWNER_LABELS = (
     "Wan2.2 Diffusers Backend Similarity",
     "Qwen-Image Diffusers Accuracy",
 )
+NIGHTLY_BLOCKING_COLLECTIVE_JOBS = (
+    ("Diffusion Exchange, Ring and CFG Parity · 2 GPUs", "mi300_2"),
+    ("Diffusion Exchange and Ring Parity · 4 GPUs", "mi300_4"),
+    ("Diffusion CFG Parity · 3 Ranks on 4 GPUs", "mi300_4"),
+)
 TINY_DIFFUSION_PATH = "tests/model_tests/diffusion/test_common_offline.py"
 TINY_DIFFUSION_JOBS = (
     (
@@ -180,6 +185,22 @@ def test_cross_pipeline_parity_nightly_owner_is_blocking(label: str) -> None:
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["grade"] == "Blocking"
+    assert "retry" not in step
+
+
+@pytest.mark.parametrize(("label", "agent_pool"), NIGHTLY_BLOCKING_COLLECTIVE_JOBS)
+def test_nightly_collective_owner_is_blocking(label: str, agent_pool: str) -> None:
+    pipeline = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    matches = [step for step in _walk_steps(pipeline["steps"]) if step.get("label") == label]
+
+    assert len(matches) == 1
+    step = matches[0]
+    assert step["agent_pool"] == agent_pool
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert step["timeout_in_minutes"] == 60
+    assert step["source_file_dependencies"] == "diffusion_collective_parity"
     assert "retry" not in step
 
 
@@ -2781,15 +2802,16 @@ def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
         assert "full_model and rocm and MI325 and cards_1" not in text
 
 
-def test_stable_audio_layerwise_offload_is_one_nonblocking_nightly_job() -> None:
+def test_stable_audio_layerwise_offload_is_one_blocking_nightly_job() -> None:
     step = _find_step("Stable Audio Layerwise Offload", AMD_NIGHTLY_PIPELINE)
     command = "\n".join(step["commands"])
     nightly = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
     nightly_labels = [item.get("label") for item in _walk_steps(nightly["steps"])]
 
     assert nightly_labels.count("Stable Audio Layerwise Offload") == 1
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
+    assert step["depends_on"] == "amd-build"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 60
     assert step["source_file_dependencies"] == [
@@ -2797,6 +2819,7 @@ def test_stable_audio_layerwise_offload_is_one_nonblocking_nightly_job() -> None
         "diffusion_stable_audio_function",
     ]
     assert step["artifact_paths"] == ["artifacts/rocm-stable-audio-layerwise-offload/**/*"]
+    assert "retry" not in step
     assert "full_model and diffusion and rocm and MI325 and cards_1" in command
     assert "--run-level full_model" in command
     assert "timeout --signal=TERM --kill-after=2m 45m" in command
