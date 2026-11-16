@@ -39,6 +39,7 @@ class StageClient(Protocol):
     final_output: bool
     final_output_type: FinalOutputModalityType | None
     default_sampling_params: OmniSamplingParams
+    mrv2_unsupported_sampling_params: tuple[str, ...]
     prompt_transform_func: Any | None
     prompt_expand_func: Any | None
     requires_multimodal_data: bool
