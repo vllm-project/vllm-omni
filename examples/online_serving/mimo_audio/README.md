@@ -52,6 +52,11 @@ The Python client supports the following command-line arguments:
   - Example: `--prompt "What are the main activities shown in this video?"`
 
 
+With `--stream`, the client appends audio chunks to one WAV file per request
+and choice under `--output-audio-path`. Only the first non-empty chunk contains
+a WAV header; subsequent chunks contain PCM for the same file. Concurrent
+requests and different choices are saved separately.
+
 For example, to use multi rounds audios with local files:
 
 ```bash

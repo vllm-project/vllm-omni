@@ -7,6 +7,7 @@ import queue
 import sys
 import threading
 import time
+from contextlib import ExitStack
 from typing import Any
 
 import requests
@@ -350,7 +351,10 @@ def run_multimodal_generation(args) -> None:
             stream=args.stream,
         )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
+    with (
+        concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor,
+        ExitStack() as audio_stack,
+    ):
         futures = [executor.submit(run_one_request, req_id) for req_id in range(num_concurrent_requests)]
 
         if not args.stream:
@@ -383,7 +387,7 @@ def run_multimodal_generation(args) -> None:
             # Stream mode: process chunks from all requests in real-time,
             # displaying them in the order they arrive.
             chunk_queue = queue.Queue()
-            audio_counters = {}
+            audio_files = {}
             chat_completion_id_by_req = {}
             chat_completion_id_lock = threading.Lock()
             last_text_req_id = None
@@ -403,7 +407,6 @@ def run_multimodal_generation(args) -> None:
             for req_id, future in enumerate(futures):
                 req_id_from_future, stream = future.result()
                 assert req_id == req_id_from_future, f"Request ID mismatch: {req_id} != {req_id_from_future}"
-                audio_counters[req_id] = 0
                 t = threading.Thread(target=_stream_reader, args=(req_id, stream), daemon=True)
                 t.start()
                 reader_threads.append(t)
@@ -444,19 +447,21 @@ def run_multimodal_generation(args) -> None:
 
                     if modality == "audio" and content:
                         audio_data = base64.b64decode(content)
-                        audio_dir = (
-                            f"{output_audio_path}/{args.query_type}/{num_concurrent_requests}/{chat_completion_id}"
-                        )
-                        os.makedirs(audio_dir, exist_ok=True)
-                        audio_file_path = f"{audio_dir}/audio_{audio_counters[request_id]}.wav"
-                        with open(audio_file_path, "wb") as f:
-                            f.write(audio_data)
-                        print(
-                            f"\n[{elapsed:7.2f}s][req {request_id}_{chat_completion_id}] Audio saved to {audio_file_path}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        audio_counters[request_id] += 1
+                        # Concurrent requests and choices each own one WAV stream.
+                        audio_key = (request_id, choice.index)
+                        if audio_key not in audio_files:
+                            audio_dir = (
+                                f"{output_audio_path}/{args.query_type}/{num_concurrent_requests}/{chat_completion_id}"
+                            )
+                            os.makedirs(audio_dir, exist_ok=True)
+                            audio_file_path = f"{audio_dir}/audio_{request_id}_{choice.index}.wav"
+                            audio_files[audio_key] = audio_stack.enter_context(open(audio_file_path, "wb"))
+                            print(
+                                f"\n[{elapsed:7.2f}s][req {request_id}_{chat_completion_id}] Audio saved to {audio_file_path}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        audio_files[audio_key].write(audio_data)
 
                     elif modality == "text" and content:
                         if last_text_req_id != request_id:
