@@ -1174,14 +1174,17 @@ unsupported configurations log a reason and use per-turn requests with ordinary
 prefix caching where available. No separate deployment or session switch is
 required. Qwen also advertises `supports_turn_commit_only: true`, so only
 the entry request stays resident; commit, playback and VAD policy remain turn-based. A request-owned
-Qwen input ledger records accepted output tokens. A session-owned append cursor
+Qwen input ledger records accepted output tokens. For the built-in `recent`
+history policy, a session-owned append cursor
 is invalidated by edits to previously submitted history. After checking the
 last heard reply against completed output, the normal path renders only new
 user messages and sends their processed tokens and media to
 EngineCore; resident feature data is reused there, never replayed from frontend
 cache handles. The engine validates the expected prefix length, a digest of
 its token content and the salt without comparing history hashes. APC and hidden-state prefix replay remain enabled.
-History edits, incompatible boundaries and nonempty `initial_user_text` use the
+The default `full_history` policy and other history strategies use full snapshots
+on the resident request, preserving source selection and full-input capacity
+validation. History edits, incompatible boundaries and nonempty `initial_user_text` use the
 full-snapshot fallback. When runnable waiting work makes no progress, the
 scheduler can reclaim a drained idle turn's KV while retaining its logical token
 history and media. A later continuation recovers through APC or recomputation;

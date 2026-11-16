@@ -2290,12 +2290,14 @@ async def test_repeated_replica_failure_reports_session_error_and_close_once(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("input_tokens", [15, 16])
-async def test_capacity_validation_reuses_engine_expansion_and_recovers_after_rejection(mocker, input_tokens):
+@pytest.mark.parametrize("resident", [False, True])
+async def test_capacity_validation_reuses_engine_expansion_and_recovers_after_rejection(mocker, input_tokens, resident):
     from vllm.renderers import BaseRenderer
     from vllm.renderers.params import TokenizeParams
     from vllm.sampling_params import SamplingParams
 
-    orchestrator, clients, _, _ = _build()
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio) if resident else None
+    orchestrator, clients, _, _ = _build(plugin=plugin, async_chunk=resident)
     renderer = mocker.Mock(spec=BaseRenderer, mm_processor_cache=None)
     renderer.default_cmpl_tok_params = TokenizeParams(max_total_tokens=20)
     processor = mocker.Mock(
@@ -2332,7 +2334,8 @@ async def test_capacity_validation_reuses_engine_expansion_and_recovers_after_re
                 context=context,
                 prompt={"prompt": "raw prompt", "multi_modal_data": {"image": [features]}},
                 already_submitted=False,
-                resumable=False,
+                resumable=resident,
+                resume_from_full_prompt=resident,
                 input_capacity=DuplexInputCapacity(20, 5),
             )
         )

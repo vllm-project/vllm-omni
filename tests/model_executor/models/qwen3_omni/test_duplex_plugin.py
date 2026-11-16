@@ -1641,7 +1641,7 @@ async def test_resident_image_replacement_rebuilds_after_admission_limit(mocker)
     """A full image context cannot grow via deltas; deletion invalidates it."""
     from vllm_omni.engine.duplex.commands import DeleteItem
 
-    h = await open_qwen()
+    h = await open_qwen(history_policy="recent")
     can_append = mocker.AsyncMock(return_value=True)
     h.port.can_append_turn = can_append
     snapshot = mocker.spy(h.session, "history_for_prompt")
@@ -2498,16 +2498,20 @@ async def test_conversation_none_completion_keeps_the_tool_pair():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["ephemeral", "snapshot", "delta", "context_view", "initial_text"])
+@pytest.mark.parametrize("mode", ["ephemeral", "snapshot", "delta", "context_view", "initial_text", "full_history"])
 async def test_committed_turns_preserve_lifecycle_and_process_only_required_history(mocker, mode):
     resumable = mode != "ephemeral"
     initial_text = "Read this once" if mode == "initial_text" else None
-    h = await open_qwen(resumable=resumable, initial_user_text=initial_text)
+    h = await open_qwen(
+        resumable=resumable,
+        initial_user_text=initial_text,
+        history_policy="full_history" if mode == "full_history" else "recent",
+    )
     if mode == "context_view":
         h.manager.runtime_config = replace(h.manager.runtime_config, context_keep_media_turns=10)
 
     async def can_append(request_id, text):
-        return mode in {"delta", "context_view", "initial_text"} and text == "hello"
+        return mode in {"delta", "context_view", "initial_text", "full_history"} and text == "hello"
 
     h.port.can_append_turn = can_append
     h.manager.plugin.processor.apply_chat_template = (
@@ -2521,7 +2525,7 @@ async def test_committed_turns_preserve_lifecycle_and_process_only_required_hist
     bind_request = mocker.spy(h.session, "bind_request")
     try:
         ids = []
-        for i in range(5 if mode == "delta" else 2):
+        for i in range(5 if mode in {"delta", "full_history"} else 2):
             bind_request.reset_mock()
             snapshot.reset_mock()
             decode.reset_mock()
@@ -2538,9 +2542,10 @@ async def test_committed_turns_preserve_lifecycle_and_process_only_required_hist
             if initial_text:
                 assert h.port.submissions[-1].prompt["prompt"].count(initial_text) == 1
             use_delta = mode == "delta" and 0 < i < 4
-            expected_audio = 1 if use_delta else min(i + 1, 4)
+            expected_audio = i + 1 if mode == "full_history" else 1 if use_delta else min(i + 1, 4)
             assert len(h.port.submissions[-1].prompt["multi_modal_data"]["audio"]) == expected_audio
             assert decode.call_count == expected_audio
+            assert len(h.runner.model_state.audio_history) == (i + 1 if mode == "full_history" else min(i + 1, 4))
             if use_delta:
                 assert snapshot.call_count == 0
                 assert h.port.submissions[-1].prompt["_duplex_turn_delta"] is True

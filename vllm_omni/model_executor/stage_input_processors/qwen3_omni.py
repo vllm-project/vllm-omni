@@ -668,6 +668,8 @@ def thinker2talker_async_chunk(
             language=language,
         )
 
+    # Only committed decode spans may omit hidden states; they returned above.
+    assert thinker_hid is not None
     if chunk_id == 0:
         all_token_ids = _ensure_list(request.all_token_ids)
         prompt_token_ids = _ensure_list(request.prompt_token_ids)

@@ -44,9 +44,9 @@ def test_turn_history_cursor_uses_only_tail_and_invalidates_old_edits():
     session.reserve_history_item("reply")
     session.checkpoint_append_history(session.history_storage_length)
     session._store_history_item_message("reply", {"role": "assistant", "content": "answer"})
-    session.append_history_message({"role": "user", "content": "new"})
+    session._store_history_item_message("new-input", {"role": "user", "content": "new"})
     session.reserve_history_item("next-reply")
-    assert session.append_history_tail() == ("answer", ({"role": "user", "content": "new"},))
+    assert session.append_history_tail() == ("answer", ({"role": "user", "content": "new"},), ("new-input",))
     # Calibration of the newest reply is checked against generated tokens by
     # the stage port; mutation of already submitted context invalidates KV.
     session._store_history_item_message("reply", {"role": "assistant", "content": "heard"})

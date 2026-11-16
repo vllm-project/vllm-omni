@@ -100,12 +100,19 @@ work. Budget host RAM for the
 [stage-output cache](../design/feature/prefix_caching.md) as well as GPU memory
 for resident KV.
 
-The Thinker request and its KV allocation survive a completed turn. Each new
-commit uses the session's append cursor to select only the new user messages.
+The Thinker request and its KV allocation survive a completed turn. With the
+built-in `recent` history policy, each eligible new commit uses the session's
+append cursor to select only the new user messages.
 Mutations of already submitted history invalidate that cursor. The stage port
 checks the latest heard assistant text against the actual completed output
 before the plugin constructs a suffix-only prompt. Normal turns do not build a
 full history snapshot, render old messages, or decode old media.
+
+The default `full_history` policy uses full snapshots on that same resident
+request, preserving original-source validation and complete input/output capacity
+checks. `bounded_recent`, `incremental` and custom policies also use snapshots so
+their selection and compression rules see the full history. These paths release
+the resident allocation and recover matching blocks through ordinary APC.
 
 The request-owned input ledger retains actual accepted token IDs, not old
 message snapshots. The wire request contains only new tokens and multimodal

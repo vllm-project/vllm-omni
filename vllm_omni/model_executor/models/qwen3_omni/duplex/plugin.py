@@ -45,6 +45,7 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
     RECENT_MESSAGE_WINDOW,
     RECENT_PROMPT_IMAGES,
     Message,
+    RecentHistoryPolicy,
     live_audio_bindings,
     select_committed_audio_sources,
 )
@@ -982,6 +983,15 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     def can_prepare_turn_delta(
         self, *, state, payload, history_length: int, runtime_config, previous_runtime_config, extra_body
     ) -> bool:
+        # Only the built-in recent policy has the bounded append contract.
+        # Full history must validate all sources and their combined capacity;
+        # custom and compression policies must select from the full history.
+        if type(self._history_runtime.policy) is not RecentHistoryPolicy:
+            return False
+        behavior = self._history_runtime.behavior
+        assert behavior.message_window is not None
+        assert behavior.audio_cache_items is not None
+        assert behavior.audio_cache_bytes is not None
         # This text is injected only into the current audio turn, not stored in
         # conversation history. A snapshot removes the previous injection;
         # appending would retain it and add another copy on every turn.
@@ -996,12 +1006,12 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             return False
         if extra_body.get("realtime_tools"):
             return False
-        return history_length <= _HISTORY_MESSAGE_WINDOW and (
+        return history_length <= behavior.message_window and (
             not payload.get("audio")
             or (
-                len(state.audio_history) < _MAX_PROMPT_AUDIOS
+                len(state.audio_history) < behavior.audio_cache_items
                 and sum(len(value.get("audio", "")) for _, value in state.audio_history) + len(payload.get("audio", ""))
-                <= _MAX_PROMPT_AUDIO_BYTES
+                <= behavior.audio_cache_bytes
             )
         )
 
@@ -1074,7 +1084,13 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             and isinstance(message.get("content"), list)
             and any(part.get("type") == "audio_url" for part in message["content"])
         }
-        retained = live_audio_bindings(state.audio_history, history, source_ids)
+        # A validated delta contains only new sources. The append cursor and
+        # revision fence already prove the older sources remain unchanged.
+        retained = (
+            state.audio_history
+            if config.get(DUPLEX_TURN_DELTA_KEY)
+            else live_audio_bindings(state.audio_history, history, source_ids)
+        )
         state.audio_history = retained
         if not payload.get("audio"):
             return False

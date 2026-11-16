@@ -530,7 +530,7 @@ class DuplexEngineSession:
             end -= 1
         return end
 
-    def append_history_tail(self) -> tuple[str, tuple[dict[str, object], ...]] | None:
+    def append_history_tail(self) -> tuple[str, tuple[dict[str, object], ...], tuple[str | None, ...]] | None:
         """Return only the completed reply and new user items after the checkpoint."""
         history = self._conversation
         if not history.append_cursor:
@@ -541,7 +541,11 @@ class DuplexEngineSession:
         text = tail[0].get("content")
         if not isinstance(text, str) or any(item.get("role") != "user" for item in tail[1:]):
             return None
-        return text, tuple(dict(item) for item in tail[1:])
+        return (
+            text,
+            tuple(dict(item) for item in tail[1:]),
+            tuple(self._history_source(item).item_id for item in tail[1:]),
+        )
 
     def _invalidate_appended_history(self, message: dict[str, object]) -> None:
         history = self._conversation

@@ -666,6 +666,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             and isinstance(prompt.get("prompt"), str)
             and "prompt_token_ids" not in prompt
             and not kwargs.get("tokenization_kwargs")
+            # Capacity-checked snapshots must reach the renderer unchanged so
+            # it counts the full expanded input before backend truncation.
+            and kwargs.get("validate_input_tokens") is None
         ):
             processor = self._get_stage_input_processor(stage_id)
             tokenizer = getattr(processor, "tokenizer", None)

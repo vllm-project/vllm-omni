@@ -413,7 +413,6 @@ async def _duplex_thinker_cache_stats(runtime) -> dict[str, float]:
     return stats
 
 
-
 async def _run_duplex_history_pruning(
     runtime, log_path: Path, *, direct_append: bool = False
 ) -> list[dict[str, float]]:
@@ -614,7 +613,6 @@ class TestQwen3OmniDuplexPlayback:
         assert "Resident turn delta" in (qwen_duplex_server.artifacts / "server.log").read_text(), (
             "The multi-turn test must exercise direct append, not only full-snapshot fallback"
         )
-
 
     @pytest.mark.advanced_model
     def test_mixed_image_audio_history_pruning(self, qwen_duplex_server, tmp_path: Path):

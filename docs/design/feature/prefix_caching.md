@@ -54,13 +54,16 @@ use fresh per-turn requests. APC can still reuse
 matching prefixes in that path. Non-CUDA profile overrides disable caching.
 Talker and Code2Wav remain per-turn, with caching disabled.
 
-The normal resident path appends new tokens and media to the actual generated
+With the built-in `recent` history policy, the resident path appends new tokens and media to the actual generated
 sequence. A session cursor selects only new user messages; edits to submitted
 history invalidate it. The token ledger checks the latest heard reply against
 completed output before rendering a delta, without rebuilding old history or
 decoding old media. Window eviction, tool turns and nonempty `initial_user_text`
 use a full snapshot. The latter is injected into the current audio turn only,
 so keeping earlier injections would change the conversation.
+The default `full_history` policy and other history policies use full snapshots
+on the same resident request. This preserves their source selection, compression
+and full-input capacity checks; ordinary APC re-matches unchanged blocks.
 EngineCore validates the resident prefix
 length, token-content digest and salt, without comparing history block hashes. Old materialized media
 remain in the resident request; only new media touch the sender/receiver caches.

@@ -457,7 +457,7 @@ class ModelChannel:
             item_ids: tuple[str | None, ...]
             if use_delta:
                 assert tail is not None
-                history, item_ids = tail[1], ()
+                history, item_ids = tail[1], tail[2]
             else:
                 if view_policy is None and not self._ctx.plugin.uses_history_context:
                     history, item_ids = session.history_for_prompt()
