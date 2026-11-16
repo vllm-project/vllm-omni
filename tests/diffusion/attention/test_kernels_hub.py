@@ -198,6 +198,16 @@ def test_explicit_sage_attention_unsupported_arch_does_not_reach_kernel(monkeypa
 
     with pytest.raises(ValueError, match="does not provide a kernel for sm_103"):
         CudaOmniPlatform.get_diffusion_attn_backend_cls("SAGE_ATTN", head_size=64)
+    with pytest.raises(ValueError, match="does not provide a kernel for sm_103"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("SAGE_ATTN_3", head_size=64)
+
+    monkeypatch.setattr(
+        CudaOmniPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(10, 0)),
+    )
+    with pytest.raises(ValueError, match="does not provide a kernel for sm_100"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("SAGE_ATTN_3", head_size=64)
 
 
 @pytest.mark.core_model

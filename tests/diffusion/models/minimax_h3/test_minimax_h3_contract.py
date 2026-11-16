@@ -1965,6 +1965,61 @@ def test_sage_packed_padding_publishes_valid_kv_length_instead_of_a_mask():
     assert metadata.extra["valid_kv_length"] == 5
 
 
+def test_sage3_packed_padding_publishes_valid_kv_length_instead_of_a_mask(monkeypatch):
+    """SAGE_ATTN_3 rejects attn_mask, so unaligned H3 packed tail padding must use valid_kv_length."""
+    import importlib
+    import types
+
+    from vllm_omni.diffusion.attention.layer import ScheduleCandidate
+    from vllm_omni.diffusion.data import AttentionSpec
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import _candidate_excludes_packed_padding
+
+    monkeypatch.setitem(sys.modules, "sageattn3", types.SimpleNamespace(sageattn3_blackwell=lambda *a, **kw: None))
+    sys.modules.pop("vllm_omni.diffusion.attention.backends.sage_attn3", None)
+    try:
+        backend_cls = importlib.import_module("vllm_omni.diffusion.attention.backends.sage_attn3").SageAttention3Backend
+        candidate = ScheduleCandidate(
+            backend_cls=backend_cls,
+            spec=AttentionSpec(backend="SAGE_ATTN_3"),
+            impl=Mock(),
+            backend_explicit=True,
+        )
+        assert _candidate_excludes_packed_padding(candidate) is None
+
+        class FakeAttention(torch.nn.Module):
+            attn_backend = backend_cls
+
+            def __init__(self):
+                super().__init__()
+                self.metadata = None
+
+            def effective_attention(self):
+                return self, self.attn_backend, None
+
+            def forward(self, query, key, value, metadata):
+                self.metadata = metadata
+                return query
+
+        attention = object.__new__(MiniMaxH3Attention)
+        torch.nn.Module.__init__(attention)
+        attention.attention = FakeAttention()
+        q = torch.randn(8, 2, 4)
+        attention._run_packed_attention(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+            max_seqlen=5,
+            packed_total=8,
+        )
+        metadata = attention.attention.metadata
+        assert metadata is not None
+        assert metadata.attn_mask is None
+        assert metadata.extra["valid_kv_length"] == 5
+    finally:
+        sys.modules.pop("vllm_omni.diffusion.attention.backends.sage_attn3", None)
+
+
 def _packed_backend(name: str, *, mask_free=False, prefix_kv_slicing=False, multi_doc=False):
     class FakeBackend:
         supports_prefix_kv_slicing = prefix_kv_slicing
