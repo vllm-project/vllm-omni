@@ -512,6 +512,17 @@ def test_capture_contract_uses_model_declaration(stage, declared):
     assert runner._full_graph_aux_outputs is False
 
 
+def test_capture_contract_keeps_drafter_layers_for_postprocessed_multimodal_output():
+    runner = _make_runner()
+    runner.model = SimpleNamespace(have_multimodal_outputs=True, _mrv2_tensor_output=True)
+    runner.use_aux_hidden_state_outputs = True
+
+    runner._configure_cudagraph_output_contract()
+
+    assert not runner._model_has_structured_output
+    assert not runner._exclude_full_graph
+
+
 def _aux_output(num_tokens):
     hidden = torch.arange(num_tokens * 2, dtype=torch.float32).reshape(num_tokens, 2)
     return hidden, {"hidden_states": {"layers": {0: hidden + 1, 24: hidden + 2}}}

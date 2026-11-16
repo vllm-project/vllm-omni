@@ -79,7 +79,12 @@ def _runner_assisted_batch_descriptor(
 
 
 def _needs_capture_tensor_unwrap(model: Any) -> bool:
-    return bool(getattr(model, "_returns_tuple", False) or getattr(model, "have_multimodal_outputs", False))
+    # Some models attach multimodal data after replay. Their forward may
+    # return a separate tuple of hidden layers for the drafter.
+    return bool(
+        getattr(model, "_returns_tuple", False)
+        or (getattr(model, "have_multimodal_outputs", False) and not getattr(model, "_mrv2_tensor_output", False))
+    )
 
 
 def _supports_full_graph_aux_outputs(model: Any) -> bool:
