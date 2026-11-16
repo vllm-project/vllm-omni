@@ -10,6 +10,7 @@ and also outputs sampled tokens.
 from __future__ import annotations
 
 import gc
+import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from contextlib import nullcontext
@@ -130,6 +131,11 @@ def _clone_cuda_tensor_payload(value: Any, sources: list[torch.Tensor]) -> Any:
 def _copy_tensor_payload_to_cpu(value: Any, pin_memory: bool) -> Any:
     if isinstance(value, _PackedTensorPayload):
         flat = _copy_tensor_payload_to_cpu(value.tensor, pin_memory)
+        if value.shapes and all(shape == value.shapes[0] for shape in value.shapes):
+            # Decode rows commonly have identical codec/state shapes. One
+            # batch view avoids a slice and view dispatch for every request.
+            rows = flat.view(len(value.shapes), *value.shapes[0]).unbind(0)
+            return rows if value.is_tuple else list(rows)
         items = []
         offset = 0
         for shape in value.shapes:
@@ -433,6 +439,75 @@ class GPUARModelRunner(
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
 
+    def _kstep_constant_draft_tensor(self, rows: int, drafts: int) -> torch.Tensor:
+        """One cached device tensor per (rows, drafts) shape of CONTINUE drafts.
+
+        The K-step draft's value never varies -- only its shape does (batch
+        size, booked span, folded steps). Cache the live shape's tensor so a
+        propose pays no host-list build and no new device allocation; the
+        shape key changes only when the batch or the span changes. The tensor
+        is read-only downstream (`_prepare_input_ids` scatters from it,
+        `update_async_spec_token_ids` reads the CPU copy), so sharing it is
+        safe.
+        """
+        from vllm_omni.worker import talker_multiframe
+
+        key = (rows, drafts)
+        cached = getattr(self, "_kstep_constant_draft_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        device = getattr(self, "device", None) or "cpu"
+        tensor = torch.full(
+            (rows, drafts),
+            talker_multiframe.CONTINUE_TOKEN_ID,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._kstep_constant_draft_cache = (key, tensor)
+        return tensor
+
+    def propose_draft_token_ids(self, scheduler_output, sampled_token_ids, *args, **kwargs):
+        """Carry the Talker's frame count to the scheduler, not a prediction.
+
+        Stage 1 declares a speculative_config so vLLM reserves K query
+        positions per request -- that is what grows the block table and the KV
+        slots the multi-frame loop writes into. The drafter itself has nothing
+        to say: the Talker's vLLM-level vocabulary is `continue`/`stop`, the
+        frames are generated sequentially inside one execute_model, and the
+        model's own stop row ends the request. So the draft is `continue`
+        repeated, and the rejection sampler accepts it exactly up to the frame
+        the codec sequence ended on. The helpers live in the NPU module but are
+        plain Python -- the loop they feed (``talker_multiframe.run``) is the
+        same one the CUDA runner calls.
+        """
+        from vllm_omni.worker import talker_multiframe
+
+        frames = talker_multiframe.drafts_this_step(self)
+        if frames > 1:
+            if isinstance(sampled_token_ids, torch.Tensor):
+                sampled_token_ids = sampled_token_ids.cpu().tolist()
+                sampled_token_ids = [[token for token in row if token >= 0] for row in sampled_token_ids]
+            scheduled = getattr(scheduler_output, "scheduled_spec_decode_tokens", {})
+            drafts = talker_multiframe.constant_drafts(
+                sampled_token_ids,
+                frames,
+                self.input_batch.num_reqs,
+                scheduled_draft_counts=[len(scheduled.get(req_id, [])) for req_id in self.input_batch.req_ids],
+                fold_short_rows=True,
+            )
+            # The draft must be a device tensor: `_prepare_input_ids` scatters
+            # it directly. The value is a constant, so one cached tensor per
+            # live shape is enough.
+            draft_tensor = self._kstep_constant_draft_tensor(
+                int(self.input_batch.num_reqs),
+                len(drafts[0]) if drafts and drafts[0] else 0,
+            )
+            return draft_tensor
+        # Plain steps keep the n-gram drafter: mixed batches (concurrent
+        # arrivals, stops) are single-frame steps that the uniform-span K-step
+        # declines, and the per-request drafter still covers them.
+        return super().propose_draft_token_ids(scheduler_output, sampled_token_ids, *args, **kwargs)
+
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
         from vllm_omni.distributed.ray_utils.utils import (
@@ -562,6 +637,7 @@ class GPUARModelRunner(
 
     def capture_model(self) -> int:
         result = super().capture_model()
+        self._warmup_kstep_sampler_kernels()
         if not self._has_talker_mtp_graphs():
             return result
         torch.accelerator.synchronize()
@@ -571,6 +647,82 @@ class GPUARModelRunner(
         # Report the MTP pool with the rest so the worker compares it against
         # profile_cudagraph_memory(), which includes it.
         return result + max(free_before - torch.accelerator.get_memory_info()[0], 0)
+
+    def _warmup_kstep_sampler_kernels(self) -> None:
+        """Pre-compile the sampler kernels the first K-step request would hit.
+
+        Three JIT compiles otherwise land on the first request of a serve, each
+        worth 0.3-1.0 s of first-audio latency on L20X:
+
+        * the split-row top-p pipeline, specialized on the batch width (its
+          split count is a function of it) and on the vocabulary. K-step batches
+          change width as requests join or leave, and the control rows it
+          filters are the two-wide continue/stop logits, so the codec vocabulary
+          alone is not enough;
+        * the workspace-bound codec prelude and the seeded exponential fill,
+          which the model compiles on first use inside ``prepare_cuda_kstep``.
+        """
+        try:
+            from vllm.v1.sample.ops.topk_topp_triton import (
+                _SPLIT_MAX_BATCH,
+                apply_top_k_top_p_triton,
+            )
+        except Exception:  # pragma: no cover - upstream layout change
+            logger.warning("K-step sampler warmup skipped: import failed")
+            return
+        start = time.perf_counter()
+        try:
+            device = self.device
+            # The split count is derived from the batch width, so the widths that
+            # reach it are what matters: 1..16 for folded steps and the frame
+            # multiples of the loop. The codec vocabulary is already warmed by
+            # vLLM's own pass; the two-wide control rows are not.
+            widths = sorted(set(range(1, 17)) | set(range(8, _SPLIT_MAX_BATCH + 1, 8)))
+            for width in widths:
+                logits = torch.zeros((width, 2), device=device, dtype=torch.float32)
+                probs = torch.full((width,), 0.99, device=device, dtype=torch.float32)
+                apply_top_k_top_p_triton(logits, None, probs)
+            split_ms = (time.perf_counter() - start) * 1000.0
+            warm = getattr(self._kstep_sampling_owner(), "warmup_kstep_sampling_kernels", None)
+            if warm is not None:
+                warm(
+                    device,
+                    dtype=self.model_config.dtype,
+                    frames=self.num_spec_tokens + 1,
+                    max_rows=int(self.scheduler_config.max_num_seqs),
+                    vocab_size=int(self.model_config.get_vocab_size()),
+                )
+            torch.accelerator.synchronize()
+            logger.info(
+                "[kstep-warmup] top-p split %.0f ms, sample kernels %.0f ms (model side: %s)",
+                split_ms,
+                (time.perf_counter() - start) * 1000.0 - split_ms,
+                "warmed" if warm is not None else "no hook",
+            )
+        except Exception:  # pragma: no cover - never fail startup
+            logger.warning("K-step sampler warmup failed", exc_info=True)
+
+    def _kstep_sampling_owner(self) -> Any:
+        """Module that owns the K-step sampling hooks.
+
+        ``FULL`` cudagraph mode hands the runner a wrapper whose ``unwrap()``
+        returns the omni model, and that model re-exports the Talker's bound
+        methods -- so the bound method's ``__self__`` holds the real state.
+        """
+        model = self.model
+        unwrap = getattr(model, "unwrap", None)
+        if callable(unwrap):
+            model = unwrap()
+        for candidate in (model, getattr(model, "model", None)):
+            if candidate is None:
+                continue
+            prepare = getattr(candidate, "prepare_cuda_kstep", None)
+            owner = getattr(prepare, "__self__", None)
+            if owner is not None:
+                return owner
+            if prepare is not None:
+                return candidate
+        return model
 
     def _has_talker_mtp_graphs(self) -> bool:
         from vllm.compilation.cuda_graph import CUDAGraphWrapper
@@ -1085,7 +1237,10 @@ class GPUARModelRunner(
                 flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
-                    self.flush_full_payload_outputs(flush_ids)
+                    self.flush_full_payload_outputs(
+                        flush_ids,
+                        finished_req_output_token_ids=getattr(scheduler_output, "finished_req_output_token_ids", None),
+                    )
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -1188,6 +1343,13 @@ class GPUARModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=False,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+            )
+            # #9865: thin hook — MammothGPUARModelRunner retargets specialty
+            # graphs; default Omni/AR implementation is a no-op.
+            batch_desc = self._select_moe_replay_batch_descriptor(
+                cudagraph_mode,
+                batch_desc,
+                num_tokens_unpadded,
             )
             num_tokens_padded = batch_desc.num_tokens
             num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
@@ -1360,14 +1522,18 @@ class GPUARModelRunner(
                     set_batch_req_ids = getattr(self.model, "set_batch_req_ids", None)
                     if callable(set_batch_req_ids):
                         set_batch_req_ids(req_ids[:num_reqs])
+
         finally:
             if runner_assisted_context_enabled:
                 self._set_runner_assisted_full_attention_metadata_context(enabled=False)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
+                extract_aux = getattr(self.model, "extract_aux_hidden_states", None)
+                if callable(extract_aux):
+                    hidden_states, aux_hidden_states = extract_aux(model_output)
+                else:
+                    hidden_states, aux_hidden_states = model_output
             else:
                 # Common case.
                 hidden_states = model_output
@@ -1809,11 +1975,32 @@ class GPUARModelRunner(
         )
         return inter_stage_outputs, multimodal_outputs
 
+    def _supports_speculative_payload(self) -> bool:
+        """Check both the speculative method and the model payload contract.
+
+        Preparation is method-neutral, but only DFlash's committed-token
+        semantics have been integrated so far. Other methods must opt in
+        here after their token and embedding contracts are validated.
+        """
+        spec_config = self.speculative_config
+        return (
+            spec_config is not None
+            and spec_config.use_dflash()
+            and self._runner_model_omni_flag("supports_speculative_payload")
+        )
+
     def _should_use_async_omni_output(self) -> bool:
         if not self.use_async_scheduling:
             return False
         if self.speculative_config is not None:
-            return False
+            if not (
+                self._supports_speculative_payload()
+                and self._async_chunk
+                and self.omni_prefix_cache is None
+                and not self._runner_model_omni_flag("has_postprocess")
+                and not self._should_accumulate_full_payload_output()
+            ):
+                return False
 
         model_config = getattr(self, "model_config", None)
         if model_config is None:
@@ -1959,11 +2146,16 @@ class GPUARModelRunner(
         postprocess_already_applied: bool = False,
         prefix_cache_step_id: int | None = None,
         restored_mm: dict[str, dict[str, torch.Tensor]] | None = None,
+        payload_routing: tuple[str, list[str]] | None = None,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
 
-        engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        engine_output_type, downstream_req_ids = (
+            payload_routing
+            if payload_routing is not None
+            else self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        )
         downstream_req_ids, sparse_mm_index, audio_sparse_output = resolve_sparse_mm_routing(
             engine_output_type=engine_output_type,
             req_ids_output_copy=req_ids_output_copy,
@@ -2092,6 +2284,9 @@ class GPUARModelRunner(
                         scheduled_seq_len=scheduled_seq_len,
                         restored_mm=restored_mm,
                     )
+                    finalize_payload = getattr(self.model, "finalize_pooler_payload", None)
+                    if callable(finalize_payload):
+                        payload = finalize_payload(payload, multimodal_outputs=multimodal_outputs, idx=idx)
                     pooler_output.append(flatten_payload(payload))
 
         pooler_inter: Sequence[dict[str, object] | None] | None
@@ -2151,7 +2346,7 @@ class GPUARModelRunner(
         self.kv_extracted_req_ids = None
 
         if self.execute_model_state is None:
-            kv_connector_output = self.kv_connector_output
+            kv_connector_output = getattr(self, "kv_connector_output", None)
             self.kv_connector_output = None
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and not get_pp_group().is_last_rank:
@@ -2201,8 +2396,31 @@ class GPUARModelRunner(
                 logits.shape[-1],
             )
 
+        from vllm_omni.worker import talker_multiframe
+
+        if talker_multiframe.drafts_this_step(self) > 0:
+            talker_multiframe.neutralize_kstep_min_tokens(self.input_batch.sampling_metadata.logitsprocs)
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        # Model-owned preparation runs before drafting can reuse target input
+        # buffers. Its tensors travel through the ordinary Omni snapshot.
+        if self._supports_speculative_payload():
+            multimodal_outputs = self.model.prepare_speculative_multimodal_outputs(
+                multimodal_outputs=multimodal_outputs,
+                req_ids=self.input_batch.req_ids,
+                speculative_request_ids={
+                    rid for rid, tokens in scheduler_output.scheduled_spec_decode_tokens.items() if tokens
+                },
+                invalid_req_indices=np.flatnonzero(self.discard_request_mask.np[: self.input_batch.num_reqs]).tolist(),
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                input_token_ids=self.input_ids.gpu[: scheduler_output.total_num_scheduled_tokens],
+                input_positions=self.positions[: scheduler_output.total_num_scheduled_tokens],
+                query_start_loc=self._get_query_start_loc_cpu(snapshot=False),
+                prompt_lens=[len(self.requests[rid].prompt_token_ids or []) for rid in self.input_batch.req_ids],
+                vocab_size=self.input_batch.vocab_size,
+                consumed_input_span=self._should_use_async_omni_output(),
+            )
 
         # Commit conditional RNG before bookkeeping can roll back discarded draws.
         finalize_sampling = getattr(self.model, "finalize_deferred_sampling", None)
@@ -2408,6 +2626,11 @@ class GPUARModelRunner(
         # after a later step has already restored this request again, and it
         # would then consume the wrong step's prefix.
         restored_mm_snapshot = self._take_restored_mm(req_ids_output_snapshot)
+        # Invalid samples include unfinished chunked prefills; their prompt
+        # rows must still travel downstream. Freeze routing without filtering.
+        payload_routing_snapshot = (
+            self._resolve_pooler_payload_req_ids(req_ids_output_snapshot) if use_async_omni_output else None
+        )
 
         def output_builder() -> OmniModelRunnerOutput:
             if output_tensor_snapshot.async_payload is not None:
@@ -2440,6 +2663,7 @@ class GPUARModelRunner(
                     postprocess_already_applied=omni_postprocess_already_applied,
                     prefix_cache_step_id=prefix_cache_step_id,
                     restored_mm=restored_mm_snapshot,
+                    payload_routing=payload_routing_snapshot,
                 )
             output.omni_connector_output = omni_connector_output
             if sampling_feedback is not None:

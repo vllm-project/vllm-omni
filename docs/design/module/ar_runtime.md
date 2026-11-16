@@ -32,6 +32,30 @@ last_reviewed: 2026-07-16
 The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
 
+The experimental Mooncake KV/HS backend uses the existing MRv2 external-load
+state transitions for Qwen3-Omni turn requests. Its connector must withhold
+successful receive completion until both GPU KV and request-local CPU captures
+are ready. For a cancelled or failed load, it reports completion once the
+native KV copy drains, so a CPU-only HS read never holds destination GPU
+blocks. Its prefix lookup is asynchronous: a slow Store delays only requests
+waiting for that lookup, and a lookup past its deadline is a miss.
+A failed receive uses the explicitly configured `recompute` policy;
+the upstream `fail` default still terminates requests for other configurations.
+Restored captures are merged before output publication and consumed once per
+request attempt. External loads do not populate the worker's local prefix-cache
+slots, so local prefix caching remains disabled with this backend. See
+[KV offload configuration](../../configuration/kv_offload.md#mooncake-kv-and-hidden-state-caching-experimental)
+for configuration, scope, and validation limits, and the
+[Mooncake KV/HS cache design](../feature/mooncake_kv_hs_cache.md) for its
+lifecycle and the deferred two-level mode.
+
+MRv2 preserves the auxiliary output tree when capturing PIECEWISE CUDA graphs,
+because their replay returns that tree directly to model postprocessing.
+FULL captures and their NONE-mode warmup flatten auxiliary tensors into the
+native graph buffers; FULL replay restores the tree before postprocessing.
+Both paths therefore publish the same named hidden-state fields to prefix
+caching and downstream stages.
+
 After applying sampled output, the AR scheduler publishes only completed KV
 blocks to upstream prefix caching, including on its plain-decode path. Async
 placeholders and speculative steps use `num_computed_tokens - num_in_flight_tokens`

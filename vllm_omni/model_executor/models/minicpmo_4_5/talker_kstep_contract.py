@@ -14,6 +14,24 @@ This module is now the only interpreter; both consumers call
 
 from typing import Any
 
+# The Talker's vLLM-level vocabulary is two tokens wide: `compute_logits`
+# returns one-hot stop rows ([0, -inf] / [-inf, 0]) and `sample` takes their
+# argmax, so 0 means "keep going" and 1 is the stop token the deploy config
+# names in `stop_token_ids`.
+CONTINUE_TOKEN_ID = 0
+
+# The id that same row emits to mean stop: the stop column wins the argmax,
+# `parse_output` keeps ids below the two-wide vocab, and vLLM's `check_stop`
+# only fires if this id is in the request's `stop_token_ids` -- which stage 1's
+# pipeline constraints derive from this constant.
+STOP_TOKEN_ID = 1
+
+# Width of the Talker vLLM-level head: the two-wide continue/stop row.
+# input_batch.vocab_size must report the same, because InputBatch stores
+# top_k = vocab_size as its no-top-k sentinel and that holds only for 0 or 2.
+STOP_ROW_WIDTH = 2
+
+
 # Hard ceiling on K codec frames per Talker decode step. Same TND ceiling as
 # stage 0: at most 16 query positions per sequence.
 MINICPMO_TALKER_FRAMES_MAX = 16
@@ -37,7 +55,7 @@ def talker_kstep_frames(model_stage: Any, speculative_config: Any) -> int:
     else:
         method = getattr(speculative_config, "method", None)
         num_spec = getattr(speculative_config, "num_speculative_tokens", 0) or 0
-    if method != "ngram":
+    if method not in ("ngram", "ngram_gpu"):
         return 0
     frames = int(num_spec) + 1
     if frames < 2:

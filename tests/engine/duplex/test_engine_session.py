@@ -531,17 +531,17 @@ def test_history_snapshot_aligns_item_identity_across_late_playback_materializat
     session.append_history_message(second)
     session.register_history_item("q2", second)
     session.append_history_message({"role": "user", "content": "anonymous"})
-    messages, item_ids = session.history_snapshot()
-    assert messages == session.history
-    assert item_ids == ("q1", "q2", None)
+    snapshot = session.history_snapshot()
+    assert snapshot.messages == session.history
+    assert snapshot.item_ids == ("q1", "q2", None)
 
     apply_playback_ack(session, {"response_id": response_id, "played_ms": 1_000})
-    messages, item_ids = session.history_snapshot()
-    assert messages == session.history
-    assert item_ids == ("q1", item_id, "q2", None)
-    assert messages[1]["content"] == "played answer"
+    snapshot = session.history_snapshot()
+    assert snapshot.messages == session.history
+    assert snapshot.item_ids == ("q1", item_id, "q2", None)
+    assert snapshot.messages[1]["content"] == "played answer"
     assert session.delete_history_item(item_id)
-    assert session.history_snapshot()[1] == ("q1", "q2", None)
+    assert session.history_snapshot().item_ids == ("q1", "q2", None)
 
 
 @pytest.mark.parametrize("response_ended", [False, True])
@@ -1610,3 +1610,32 @@ def test_deleting_a_live_item_preserves_its_output_playback_cursor(draining):
         )
         assert any(isinstance(event, ErrorEvent) and event.code == "playback_item_not_found" for event in events)
         assert response_id not in session._playback.by_response
+
+
+def test_rejected_user_sources_preserve_new_input_and_ignore_deleted_or_recreated_items():
+    session = _session()
+    session.register_history_item("answered", {"role": "user", "content": "old question"})
+    session.register_history_item("old-answer", {"role": "assistant", "content": "answered"})
+    rejected = session.commit_audio_input().message
+    session.register_history_item("rejected", rejected)
+    session.notify_new_user_item(rejected)
+    sources = session.pending_user_source_ids()
+    assert len(sources) == 1
+    session.reset_unanswered_user_items()
+    new = {"role": "user", "content": "new question"}
+    session.register_history_item("new", new)
+    session.notify_new_user_item(new)
+    session.restore_unanswered_user_sources(sources)
+    session.restore_unanswered_user_sources(sources)
+    assert session.unanswered_user_items() == 2
+    assert session.update_input_transcript(
+        "rejected", "corrected question", audio_part=session.input_audio_part("rejected")
+    )
+    assert session.unanswered_user_items() == 2
+    session.delete_history_item("rejected")
+    assert session.unanswered_user_items() == 1
+    session.register_history_item("rejected", {"role": "user", "content": "recreated"})
+    session.restore_unanswered_user_sources(sources)
+    assert session.unanswered_user_items() == 1
+    session.reset_unanswered_user_items()
+    assert session.unanswered_user_items() == 0
