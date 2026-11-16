@@ -153,13 +153,7 @@ def hunyuan_sequence_template(
     generation_config: Any,
     ar_token_ids: list[tuple[list[int], list[int]] | None] | None,
 ) -> str:
-    """Template whose prefix matches the AR tokens being reused.
-
-    The AR stage frames its prefill with Instruct role markers
-    (``prompt_utils.build_prompt_tokens``). HunyuanImage-3.0 does not set
-    ``sequence_template``, so the DiT fallback of ``pretrain`` drops those
-    markers and the reused prefix no longer matches.
-    """
+    # AR prefill includes instruct role markers. pretrain drops them.
     if ar_token_ids is not None and any(item is not None for item in ar_token_ids):
         return "instruct"
     return getattr(generation_config, "sequence_template", "pretrain")

@@ -1364,9 +1364,6 @@ class HunyuanImage3Pipeline(
             cfg_factor["gen_image"] = 1
         bot_task = kwargs.pop("bot_task", "auto")
         if prepared_layout is None:
-            # Local tokenization still takes drop_think from generation_config.
-            # The sequence template is chosen with the planner so an AR prefix
-            # is not rebuilt with a different role framing.
             drop_think = kwargs.get("drop_think", self.generation_config.drop_think)
             sequence_template = request_layout_utils.hunyuan_sequence_template(
                 self.generation_config, batch_ar_token_ids
