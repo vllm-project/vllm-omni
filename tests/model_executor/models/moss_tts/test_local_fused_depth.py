@@ -126,7 +126,7 @@ def _talker_stub(fused_depth, n_vq, vocab, hidden, codes, should_continue, dtype
 
 
 @cuda_only
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("batch", [1, 128])
 @torch.inference_mode()
 def test_mtp_epilogue_matches_talker_reference(batch):

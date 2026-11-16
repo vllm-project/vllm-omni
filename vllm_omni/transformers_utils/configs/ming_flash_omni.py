@@ -29,6 +29,8 @@ from transformers import (
 )
 from transformers.utils import logging
 
+from .ming_talker import MingFlashOmniTalkerConfig
+
 logger = logging.get_logger(__name__)
 
 
@@ -334,52 +336,6 @@ class MingImageGenConfig(PretrainedConfig):
         return sum(s * s for s in self.img_gen_scales)
 
 
-class MingFlashOmniTalkerConfig(PretrainedConfig):
-    """Configuration class for Ming-flash-omni-2.0 talker (TTS) stage.
-
-    The talker uses a Qwen2 LLM backbone with CFM (Conditional Flow Matching)
-    via a DiT diffusion transformer, plus an Aggregator that maps generated
-    audio latents back to the LLM embedding space for autoregressive generation.
-    """
-
-    model_type = "ming_flash_omni_talker"
-
-    def __init__(
-        self,
-        llm_config: dict[str, Any] | None = None,
-        flowmodel: dict[str, Any] | None = None,
-        aggregator: dict[str, Any] | None = None,
-        steps: int = 10,
-        patch_size: int = 4,
-        history_patch_size: int = 32,
-        latent_dim: int = 64,
-        cfg_strength: float = 2.0,
-        audio_vae_path: str | None = None,
-        campplus_model: str | None = None,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.llm_config = llm_config
-        self.flowmodel = flowmodel or {}
-        self.aggregator = aggregator or {}
-        self.steps = steps
-        self.patch_size = patch_size
-        self.history_patch_size = history_patch_size
-        self.latent_dim = latent_dim
-        self.cfg_strength = cfg_strength
-        self.audio_vae_path = audio_vae_path
-        self.campplus_model = campplus_model
-
-    def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
-        # NOTE: transformers v5 runs validators (e.g. validate_token_ids -> get_text_config)
-        # during PretrainedConfig.__init__, before llm_config is assigned
-        llm_config = getattr(self, "llm_config", None)
-        if isinstance(llm_config, dict):
-            return PretrainedConfig.from_dict(llm_config)
-
-        return llm_config
-
-
 class MingFlashOmniConfig(PretrainedConfig):
     """Configuration class for unified Ming-flash-omni-2.0 model"""
 
@@ -427,11 +383,9 @@ class MingFlashOmniConfig(PretrainedConfig):
 AutoConfig.register(BailingMoeV2Config.model_type, BailingMoeV2Config)
 AutoConfig.register(BailingMM2Config.model_type, BailingMM2Config)
 AutoConfig.register(MingImageGenConfig.model_type, MingImageGenConfig)
-AutoConfig.register(MingFlashOmniTalkerConfig.model_type, MingFlashOmniTalkerConfig)
 AutoConfig.register(MingFlashOmniConfig.model_type, MingFlashOmniConfig)
 
 # Register tokenizer mapping for composition configs so that
 # AutoTokenizer.from_pretrained can resolve the tokenizer class
 AutoTokenizer.register(BailingMM2Config, fast_tokenizer_class=PreTrainedTokenizerFast)
-AutoTokenizer.register(MingFlashOmniTalkerConfig, fast_tokenizer_class=PreTrainedTokenizerFast)
 AutoTokenizer.register(MingFlashOmniConfig, fast_tokenizer_class=PreTrainedTokenizerFast)

@@ -7,26 +7,34 @@ This directory contains examples for running offline inference with Step-Audio2 
 Step-Audio2 is a two-stage audio model:
 
 - **Stage 0 (Thinker)**: Audio understanding → Text + Audio tokens
-  - Input: Audio (16kHz)
-  - Output: Text transcription + Audio tokens for synthesis
+    - Input: Audio (16kHz)
+    - Output: Text transcription + Audio tokens for synthesis
 
 - **Stage 1 (Token2Wav)**: Audio synthesis
-  - Input: Audio tokens + Speaker prompt wav
-  - Output: Synthesized audio waveform (24kHz)
+    - Input: Audio tokens + Speaker prompt wav
+    - Output: Synthesized audio waveform (24kHz)
+
+Long audio inputs are automatically split into chunks of up to 25 seconds before encoding,
+following the [official implementation](https://github.com/stepfun-ai/Step-Audio2/issues/65#issuecomment-3349733269).
+Pass the full audio as a single input item; no caller-side splitting is needed.
+Each audio item is limited to 60 seconds, based on the upstream guidance about quality
+beyond one minute. Longer inputs raise `ValueError` instead of being truncated.
 
 ## Hardware Requirements
 
 | Mode | GPU Configuration | VRAM Required |
-|------|-------------------|---------------|
+| ------ | ------------------- | --------------- |
 | ASR (S2T) | 1x GPU | ~20-25GB |
 | TTS/S2ST (single GPU) | 1x GPU | ~40-50GB |
 | TTS/S2ST (multi GPU) | 2x GPU | GPU0: ~28GB, GPU1: ~22GB |
 
 **Tested on:**
+
 - 1x NVIDIA H100 80GB (single-card S2ST)
 - 2x NVIDIA A10 40GB (multi-card S2ST)
 
 **Notes:**
+
 - Single GPU mode requires high VRAM due to both stages sharing memory
 - Multi GPU mode separates Stage 0 (Thinker) and Stage 1 (Token2Wav) across GPUs
 - VRAM usage can be adjusted via `gpu_memory_utilization` in the deploy config
@@ -38,18 +46,20 @@ Step-Audio2 is a two-stage audio model:
 Single request latency comparison between vLLM-Omni and official Step-Audio2 implementation.
 
 | Task | Tokens | vllm-omni | Step-Audio2 | Speedup |
-|------|--------|-----------|-------------|---------|
+| ------ | -------- | ----------- | ------------- | --------- |
 | S2ST | ~85 | 5.45s | 7.36s | **1.35x** |
 | S2ST | ~160 | 6.67s | 13.92s | **2.09x** |
 | S2ST | ~315 | 9.42s | 31.50s | **3.34x** |
 | TTS | ~1024 | 16.65s | ~87s | **~5.2x** |
 
 **Key observations:**
+
 - Speedup increases with sequence length due to vLLM's efficient KV cache management
 - TTS (pure generation) shows the largest speedup (~5x)
 - S2ST benefits from optimized multi-stage pipeline
 
 **Benchmark environment:**
+
 - GPU: NVIDIA H100 80GB (single card)
 - Model: Step-Audio-2-mini
 - Warmup: 1 run, Measured: 3 runs (averaged)
@@ -59,12 +69,13 @@ Single request latency comparison between vLLM-Omni and official Step-Audio2 imp
 Comparison between sequential (non-async) and async chunk modes via `/v1/audio/speech` TTS endpoint.
 
 | Mode | Mean TTFP | Mean E2E | Mean RTF | Audio Throughput |
-|------|-----------|----------|----------|-----------------|
+| ------ | ----------- | ---------- | ---------- | ----------------- |
 | Sequential | 4316ms | 4316ms | 0.938 | 1.07x realtime |
 | **Async Chunk** | **1437ms** | 4362ms | 0.949 | 1.06x realtime |
 | **Improvement** | **-67% (3x faster)** | ~same | ~same | ~same |
 
 **Key observations:**
+
 - Async chunk reduces **time-to-first-audio (TTFP) by 67%** (4.3s → 1.4s)
 - E2E latency remains comparable — async chunk overlaps Thinker decode with Token2Wav synthesis
 - RTF < 1 in both modes (real-time capable)
@@ -72,6 +83,7 @@ Comparison between sequential (non-async) and async chunk modes via `/v1/audio/s
 - Async chunk mode: Token2Wav starts after first 28 tokens (chunk_size=25 + lookahead=3)
 
 **Benchmark environment:**
+
 - GPU: 4x NVIDIA RTX 3090 24GB (TP=2 for Thinker, 1 GPU for Token2Wav)
 - Model: Step-Audio-2-mini
 - Endpoint: `/v1/audio/speech` (10 prompts, concurrency=1)
@@ -106,6 +118,7 @@ python end2end.py --query-type audio_to_text --model stepfun-ai/Step-Audio-2-min
 Models will be cached in `~/.cache/huggingface/hub/` for future use.
 
 **Supported model**:
+
 - `stepfun-ai/Step-Audio-2-mini`
 
 ### Option 2: Manual Download (for offline use)
@@ -121,7 +134,8 @@ python end2end.py --query-type audio_to_text --model ./models/Step-Audio-2-mini
 ```
 
 Ensure the model directory contains:
-```
+
+```text
 Step-Audio-2-mini/
 ├── config.json
 ├── model.safetensors (or pytorch_model.bin)
@@ -174,6 +188,7 @@ python end2end.py --query-type text_to_audio \
 **Note**: Speaker voice is controlled by the `STEP_AUDIO2_DEFAULT_PROMPT_WAV` environment variable or the default prompt wav bundled with the model.
 
 **Output**:
+
 - Text: `output_step_audio2/00000_text.txt`
 - Audio: `output_step_audio2/00000_output.wav` (24kHz)
 
@@ -189,6 +204,7 @@ python end2end.py --query-type audio_to_audio \
 ```
 
 This mode:
+
 1. Understands the content in `--audio-path` (source)
 2. Generates audio output with the default voice
 
@@ -248,19 +264,20 @@ For **single GPU** setup, edit a deploy config copy to use `devices: "0"` for bo
 ### Sampling Parameters
 
 - **Thinker (Stage 0)**:
-  - Temperature: 0.7 (balanced creativity)
-  - Top-p: 0.9
-  - Max tokens: 1024 (configurable)
+    - Temperature: 0.7 (balanced creativity)
+    - Top-p: 0.9
+    - Max tokens: 1024 (configurable)
 
 - **Token2Wav (Stage 1)**:
-  - Temperature: 0.0 (deterministic)
-  - Operates in generation mode (not sampling)
+    - Temperature: 0.0 (deterministic)
+    - Operates in generation mode (not sampling)
 
 ## Common Issues
 
 ### 1. ImportError: No module named 's3tokenizer'
 
 **Solution**: Install Step-Audio2 package:
+
 ```bash
 pip install step-audio2
 ```
@@ -268,10 +285,12 @@ pip install step-audio2
 ### 2. FileNotFoundError: prompt_wav file not found
 
 **Solution**: Set the `STEP_AUDIO2_DEFAULT_PROMPT_WAV` environment variable to a valid audio file:
+
 ```bash
 export STEP_AUDIO2_DEFAULT_PROMPT_WAV=/path/to/speaker.wav
 python end2end.py --query-type text_to_audio --text "Hello"
 ```
+
 Or ensure the default prompt wav (`default_female.wav`) exists in your model directory.
 
 ### 3. FileNotFoundError: token2wav models not found
@@ -281,6 +300,7 @@ Or ensure the default prompt wav (`default_female.wav`) exists in your model dir
 ### 4. CUDA Out of Memory
 
 **Solutions**:
+
 - Use single GPU mode (set both stages to `devices: "0"`)
 - Reduce `gpu_memory_utilization` in config
 - Reduce `max_num_batched_tokens`
@@ -289,6 +309,7 @@ Or ensure the default prompt wav (`default_female.wav`) exists in your model dir
 ### 5. Model not found in registry
 
 **Solution**: Ensure you're using vLLM-Omni's entry point with `--omni` flag or install vllm-omni properly:
+
 ```bash
 pip install vllm-omni
 ```
@@ -297,7 +318,7 @@ pip install vllm-omni
 
 The script generates files in the output directory (default: `output_step_audio2/`):
 
-```
+```text
 output_step_audio2/
 ├── 00000_text.txt        # Text output from Thinker stage
 ├── 00000_output.wav      # Audio output from Token2Wav stage (24kHz)
@@ -322,6 +343,7 @@ The Token2Wav stage requires a speaker prompt wav for voice conditioning. It is 
 3. `{model_dir}/default_female.wav`
 
 If none are found, set the environment variable explicitly:
+
 ```bash
 export STEP_AUDIO2_DEFAULT_PROMPT_WAV=/path/to/speaker.wav
 ```

@@ -86,13 +86,15 @@ def generate(request: dict, output: Path, repeats: int) -> None:
     pipe = None
     adapters = ExitStack()
     is_cuda = request["device_type"] == "cuda"
+    is_rocm = request["device_type"] == "rocm"
+    torch_device = "cuda" if is_cuda or is_rocm else request["device_type"]
     cudnn_sdp_enabled = torch.backends.cuda.cudnn_sdp_enabled() if is_cuda else None
     try:
         if is_cuda:
             # vLLM's CUDA platform disables cuDNN SDPA globally. Match that policy
             # in this isolated reference worker; the DiT override below is separate.
             torch.backends.cuda.enable_cudnn_sdp(False)
-        else:
+        elif not is_rocm:
             # NPUOmniPlatform.set_device enables internal formats.
             # torch_npu exposes a write-only setter. This worker exits after
             # generation, so the setting cannot leak into another comparison.
@@ -105,7 +107,7 @@ def generate(request: dict, output: Path, repeats: int) -> None:
             request["model"],
             torch_dtype=torch.bfloat16,
             local_files_only=True,
-        ).to(request["device_type"])
+        ).to(torch_device)
         # Native constructs the encoder under the loader's accelerator context.
         # Recreate only non-checkpoint RoPE buffers using the reference's own
         # constructors on that device, without copying any native tensors.
@@ -125,7 +127,7 @@ def generate(request: dict, output: Path, repeats: int) -> None:
                 buffer.copy_(value)
         pipe.transformer.set_attn_processor(QwenImage21AttnProcessor())
         pipe.transformer.set_attention_backend("native")
-        if not is_cuda:
+        if not is_cuda and not is_rocm:
             from npu_reference import real_rope_on_npu
 
             adapters.enter_context(real_rope_on_npu(pipe.transformer))
@@ -160,12 +162,22 @@ def generate(request: dict, output: Path, repeats: int) -> None:
             "text_attention": pipe.text_encoder.config._attn_implementation,
             "encoder_rope_initialization": str(device),
             "transformer_attention": type(pipe.transformer.transformer_blocks[0].attn.processor).__name__,
-            "transformer_sdpa": "CUDNN_ATTENTION (prefill and decode)" if is_cuda else "PyTorch NPU SDPA dispatcher",
+            "transformer_sdpa": (
+                "CUDNN_ATTENTION (prefill and decode)"
+                if is_cuda
+                else "PyTorch SDPA"
+                if is_rocm
+                else "PyTorch NPU SDPA dispatcher"
+            ),
             "scheduler": dict(pipe.scheduler.config),
             "use_kv_cache": True,
             "request": request,
         }
-        if is_cuda:
+        if is_rocm:
+            metadata["controlled_adaptations"]["transformer_sdpa"] = (
+                "Keep upstream native SDPA. ROCm has no cuDNN attention backend."
+            )
+        elif is_cuda:
             metadata["controlled_adaptations"].update(
                 {
                     "sdpa_outside_transformer": (
@@ -235,7 +247,7 @@ def generate(request: dict, output: Path, repeats: int) -> None:
         for image in images:
             image.close()
         gc.collect()
-        getattr(torch, request["device_type"]).empty_cache()
+        getattr(torch, torch_device).empty_cache()
 
 
 def main() -> None:

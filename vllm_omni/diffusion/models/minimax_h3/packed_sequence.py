@@ -391,7 +391,10 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         audio_channel=audio_channel,
     )
     for key in dimensions:
-        _positive_int(dimensions, key, "target", allow_zero=key in ("text_len", "latent_t"))
+        # audio_t=0 is an audio-free (image) document; latent_t=0 is audio-only.
+        _positive_int(dimensions, key, "target", allow_zero=key in ("text_len", "latent_t", "audio_t"))
+    if latent_t == 0 and audio_t == 0:
+        raise ValueError("target must pack visual or audio rows")
     if latent_h % _PATCH_H or latent_w % _PATCH_W:
         raise ValueError("target latent_h and latent_w must be divisible by the spatial patch size (2)")
     if seq_len is not None:
@@ -690,7 +693,9 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         g[audio_mask, 0] += temporal_offset
         g[video_sl, 0] += temporal_offset
         for item in block_slices:
-            if item["kind"] in ("video", "video_audio", "latent_guide"):
+            # Image timeline guides sit at a frame of the window; only static
+            # image references keep their fixed position.
+            if item["kind"] in ("video", "video_audio", "latent_guide") or "frame_index" in item:
                 g[item["visual_sl"], 0] += temporal_offset
 
     target_img_pos = _range_for_slice(video_sl)

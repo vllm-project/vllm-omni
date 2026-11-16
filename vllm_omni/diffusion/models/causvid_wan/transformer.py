@@ -8,7 +8,7 @@ Layer split uses stage group ``G`` via ``layer_pp_rank`` / ``layer_pp_world``.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Hashable, Iterable, Sequence
 from typing import Any
 
 import torch
@@ -68,15 +68,20 @@ def _wan_self_attn_with_kv(
         key = attn.rotary_embedding(key, freqs_cos, freqs_sin)
     scale = 1.0 / (attn.head_dim**0.5)
     if kv_ctx is not None:
-        inputs = kv_ctx.to_layer_inputs() if hasattr(kv_ctx, "to_layer_inputs") else kv_ctx
-        if query.shape[0] == 1:
-            out = paged_write_attn(inputs, query[0], key[0], value[0], None, None, scale)
-            hidden_states = out.unsqueeze(0).flatten(2, 3).type_as(query)
+        # Batched DiT QKV may share one forward while each request keeps its own
+        # paged-KV view; accept a per-batch context list for that case.
+        if isinstance(kv_ctx, (list, tuple)):
+            contexts = list(kv_ctx)
+            if len(contexts) != query.shape[0]:
+                raise ValueError(f"batched self-attn expects {query.shape[0]} kv contexts, got {len(contexts)}")
         else:
-            outs = [
-                paged_write_attn(inputs, query[i], key[i], value[i], None, None, scale) for i in range(query.shape[0])
-            ]
-            hidden_states = torch.stack(outs, dim=0).flatten(2, 3).type_as(query)
+            contexts = [kv_ctx] * query.shape[0]
+        outs = []
+        for i in range(query.shape[0]):
+            ctx_i = contexts[i]
+            inputs = ctx_i.to_layer_inputs() if hasattr(ctx_i, "to_layer_inputs") else ctx_i
+            outs.append(paged_write_attn(inputs, query[i], key[i], value[i], None, None, scale))
+        hidden_states = torch.stack(outs, dim=0).flatten(2, 3).type_as(query)
     else:
         hidden_states = attn.attn(query, key, value, None)
         hidden_states = hidden_states.flatten(2, 3).type_as(query)
@@ -103,15 +108,15 @@ class StageWanTransformer(nn.Module):
         self.layer_groups = max(1, int(layer_groups))
         self.pp_rank = int(pp_rank)
         self.group = 0 if self.layer_groups == 1 else self.pp_rank % self.layer_groups
-        self.is_stage_first = self.group == 0
-        self.is_stage_last = self.group == self.layer_groups - 1
+        self.is_layer_group_first = self.group == 0
+        self.is_layer_group_last = self.group == self.layer_groups - 1
         self.patch_size = tuple(patch_size)
         self.in_features = in_channels * math.prod(self.patch_size)
         self._wan: nn.Module | None = None
         self._cell_kv_ctx: Any | None = None
         self._text: torch.Tensor | None = None
-        self._embeddings: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-        self._rotary: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._embeddings: dict[Hashable, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._rotary: dict[Hashable, tuple[torch.Tensor, torch.Tensor]] = {}
         self._init_wan(
             transformer_config=transformer_config,
             fallback_geo={
@@ -229,8 +234,26 @@ class StageWanTransformer(nn.Module):
             raise ValueError(f"latent {latent_shape} not aligned to patch {self.patch_size}")
         return (t // pt) * (h // ph) * (w // pw)
 
-    def prepare_cell(self, encoder_hidden_states: torch.Tensor, **_kwargs) -> None:
-        """Bind text; clear per-step embedding / per-chunk RoPE caches."""
+    def prepare_cell(self, encoder_hidden_states: torch.Tensor | Sequence[torch.Tensor], **_kwargs) -> None:
+        """Reuse conditioning for the same ordered, immutable prompt tensors.
+
+        Keep only the current pack: identity changes invalidate embeddings and
+        RoPE, so another request composition cannot reuse its text projection.
+        Tensor callers explicitly start a new invocation (the Physis path).
+        """
+        if not isinstance(encoder_hidden_states, torch.Tensor):
+            texts = tuple(encoder_hidden_states)
+            if not texts or any(t.ndim != 3 or t.shape[0] != 1 for t in texts):
+                raise ValueError("Cell conditioning requires one text row per member")
+            if any(t.shape[1:] != texts[0].shape[1:] for t in texts):
+                raise ValueError("Cell conditioning requires equal text shapes")
+            previous = getattr(self, "_prepared_texts", ())
+            if len(texts) == len(previous) and all(a is b for a, b in zip(texts, previous, strict=True)):
+                return
+            encoder_hidden_states = torch.cat(texts, dim=0)
+            self._prepared_texts = texts
+        else:
+            self._prepared_texts = ()
         self._text = encoder_hidden_states
         self._embeddings = {}
         self._rotary = {}
@@ -241,19 +264,33 @@ class StageWanTransformer(nn.Module):
         return hidden.flatten(2).transpose(1, 2)
 
     def _embedding(
-        self, step: int, timestep: torch.Tensor, *, batch_size: int, device: torch.device, dtype: torch.dtype
+        self,
+        step: Hashable,
+        timestep: torch.Tensor,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self._wan is not None and self._text is not None
-        hit = self._embeddings.get(step)
-        if hit is not None:
-            return hit
+        # WanCell and Physis supply CPU noise levels. Build the key before
+        # any H2D copy, and do not read CUDA tensors back just to cache them.
+        cache_key = None
+        if timestep.device.type == "cpu":
+            levels = tuple(float(x) for x in timestep.detach().reshape(-1).tolist())
+            cache_key = (step, levels, device, dtype)
+            hit = self._embeddings.get(cache_key)
+            if hit is not None:
+                return hit
         ts = timestep.to(device=device, dtype=torch.float32)
         if ts.ndim == 0 or (ts.ndim == 1 and ts.shape[0] == 1 and batch_size > 1):
             ts = ts.expand(batch_size)
         temb, timestep_proj, enc, _ = self._wan.condition_embedder(ts, self._text, None, timestep_seq_len=None)
         timestep_proj = self._wan.timestep_proj_prepare(timestep_proj, None)
         out = (temb.to(dtype=dtype), timestep_proj.to(dtype=dtype), enc.to(dtype=dtype))
-        self._embeddings[step] = out
+        # A single current noise-level pack is enough to reuse all local blocks
+        # and unembed; do not retain duplicate full text projections per step.
+        self._embeddings = {cache_key: out} if cache_key is not None else {}
         return out
 
     def _rope_with_temporal_offset(
@@ -291,36 +328,85 @@ class StageWanTransformer(nn.Module):
         return freqs_cos_out.to(latent.device), freqs_sin_out.to(latent.device)
 
     def _rotary_emb(self, chunk: int, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """RoPE for one latent row (batch dim may be 1)."""
         assert self._wan is not None
-        hit = self._rotary.get(chunk)
+        frames = int(latent.shape[2])
+        cache_key = (int(chunk), tuple(latent.shape[2:]), latent.dtype, latent.device)
+        hit = self._rotary.pop(cache_key, None)
         if hit is not None:
+            self._rotary[cache_key] = hit  # refresh LRU order
             return hit
         # Absolute temporal offset so history KV and the current chunk do not share
         # the same frame indices (official CausVid ``current_start``).
-        start_frame = int(chunk) * int(latent.shape[2])
+        start_frame = int(chunk) * frames
         freqs_cos, freqs_sin = self._rope_with_temporal_offset(latent, start_frame=start_frame)
         rotary = (freqs_cos[..., 0::2].to(latent.dtype), freqs_sin[..., 1::2].to(latent.dtype))
-        self._rotary = {chunk: rotary}
+        self._rotary[cache_key] = rotary
+        # Retain only one position per member, not an entire long video timeline.
+        text = getattr(self, "_text", None)
+        capacity = max(1, int(text.shape[0])) if text is not None else 1
+        while len(self._rotary) > capacity:
+            self._rotary.pop(next(iter(self._rotary)))
         return rotary
+
+    def _rotary_emb_for_batch(self, chunks: Sequence[int], latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-member chunk RoPE, concatenated on the batch axis."""
+        if len(chunks) != int(latent.shape[0]):
+            raise ValueError(f"chunks length {len(chunks)} != latent batch {latent.shape[0]}")
+        if len(chunks) == 1:
+            return self._rotary_emb(int(chunks[0]), latent)
+        cos_rows: list[torch.Tensor] = []
+        sin_rows: list[torch.Tensor] = []
+        for i, chunk in enumerate(chunks):
+            cos, sin = self._rotary_emb(int(chunk), latent[i : i + 1])
+            cos_rows.append(cos)
+            sin_rows.append(sin)
+        return torch.cat(cos_rows, dim=0), torch.cat(sin_rows, dim=0)
+
+    @staticmethod
+    def _as_member_list(value: int | Sequence[int], *, batch_size: int, name: str) -> list[int]:
+        if isinstance(value, int):
+            return [int(value)] * batch_size
+        out = [int(v) for v in value]
+        if len(out) != batch_size:
+            raise ValueError(f"{name} length {len(out)} != batch_size {batch_size}")
+        return out
 
     def block(
         self,
         index: int,
         hidden: torch.Tensor,
         *,
-        chunk: int,
-        step: int,
         latent: torch.Tensor,
         timestep: torch.Tensor,
         kv_ctx: Any | None = None,
+        chunks: int | Sequence[int] | None = None,
+        steps: int | Sequence[int] | None = None,
+        chunk: int | None = None,
+        step: int | None = None,
     ) -> torch.Tensor:
         assert self._wan is not None
         if not self.start_layer <= index < self.end_layer:
             raise ValueError(f"block {index} not in [{self.start_layer}, {self.end_layer})")
+        batch_size = int(latent.shape[0])
+        if chunks is None:
+            if chunk is None:
+                raise TypeError("block() requires chunks= or chunk=")
+            chunks = chunk
+        if steps is None:
+            if step is None:
+                raise TypeError("block() requires steps= or step=")
+            steps = step
+        chunk_list = self._as_member_list(chunks, batch_size=batch_size, name="chunks")
+        step_list = self._as_member_list(steps, batch_size=batch_size, name="steps")
         _temb, timestep_proj, enc = self._embedding(
-            step, timestep, batch_size=latent.shape[0], device=latent.device, dtype=latent.dtype
+            tuple(step_list),
+            timestep,
+            batch_size=batch_size,
+            device=latent.device,
+            dtype=latent.dtype,
         )
-        rotary_emb = self._rotary_emb(chunk, latent)
+        rotary_emb = self._rotary_emb_for_batch(chunk_list, latent)
         self._cell_kv_ctx = kv_ctx
         try:
             return self._wan.blocks[index](hidden, enc, timestep_proj, rotary_emb, None, None, False)
@@ -331,18 +417,31 @@ class StageWanTransformer(nn.Module):
         self,
         hidden: torch.Tensor,
         *,
-        chunk: int,
-        step: int,
         latent: torch.Tensor,
         timestep: torch.Tensor,
+        chunks: int | Sequence[int] | None = None,
+        steps: int | Sequence[int] | None = None,
+        chunk: int | None = None,
+        step: int | None = None,
     ) -> torch.Tensor:
-        del chunk
+        del chunks, chunk  # RoPE is block-only; keep kwargs for call-site symmetry.
         assert self._wan is not None
         wan = self._wan
         batch_size, _c, num_frames, height, width = latent.shape
         p_t, p_h, p_w = self.patch_size
         post_t, post_h, post_w = num_frames // p_t, height // p_h, width // p_w
-        temb, _, _ = self._embedding(step, timestep, batch_size=batch_size, device=latent.device, dtype=latent.dtype)
+        if steps is None:
+            if step is None:
+                raise TypeError("unembed() requires steps= or step=")
+            steps = step
+        step_list = self._as_member_list(steps, batch_size=batch_size, name="steps")
+        temb, _, _ = self._embedding(
+            tuple(step_list),
+            timestep,
+            batch_size=batch_size,
+            device=latent.device,
+            dtype=latent.dtype,
+        )
         shift, scale = wan.output_scale_shift_prepare(temb)
         shift, scale = shift.to(hidden.device), scale.to(hidden.device)
         if shift.ndim == 2:
@@ -370,7 +469,7 @@ class StageWanTransformer(nn.Module):
         layer_ids = [only_block] if only_block is not None else list(range(self.start_layer, self.end_layer))
         first_local = layer_ids[0] == self.start_layer
         last_local = layer_ids[-1] == self.end_layer - 1
-        if first_local and self.is_stage_first:
+        if first_local and self.is_layer_group_first:
             hidden = self.embed(latent)
         else:
             if intermediate_tensors is None:
@@ -381,7 +480,7 @@ class StageWanTransformer(nn.Module):
             if kv_contexts is not None:
                 ctx = kv_contexts[0] if len(kv_contexts) == 1 else kv_contexts[idx - self.start_layer]
             hidden = self.block(idx, hidden, chunk=chunk, step=step, latent=latent, timestep=timestep, kv_ctx=ctx)
-        if not (last_local and self.is_stage_last):
+        if not (last_local and self.is_layer_group_last):
             return IntermediateTensors({"hidden_states": hidden})
         return self.unembed(hidden, chunk=chunk, step=step, latent=latent, timestep=timestep)
 

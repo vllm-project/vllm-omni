@@ -182,10 +182,11 @@ class ImageGenerationRequest(BaseModel):
 
     # vllm-omni extension for per-request LoRA.
     # This mirrors the `extra_body.lora` convention in /v1/chat/completions.
-    lora: dict[str, Any] | None = Field(
+    lora: dict[str, Any] | list[dict[str, Any]] | None = Field(
         default=None,
         description=(
-            "Optional LoRA adapter for this request. Expected shape: "
+            "Optional LoRA adapter(s) for this request: a single object or a "
+            "list of objects to stack multiple adapters. Expected shape: "
             "{name/path/scale/int_id}. Field names are flexible "
             "(e.g. name|lora_name|adapter, path|lora_path|local_path, "
             "scale|lora_scale, int_id|lora_int_id)."
@@ -338,3 +339,32 @@ class ImageEditStreamError(BaseModel):
 
 
 ImageEditStreamResponse = ImageEditARDeltaChunk | ImageEditImageChunk | ImageEditStreamError
+
+
+class SegmentationMaskFormat(str, Enum):
+    """Encoding of each instance mask in an image segmentation response."""
+
+    PNG = "png"  # base64 single-channel PNG, 255 inside the instance
+    RLE = "rle"  # COCO uncompressed RLE: column-major run lengths starting with background
+
+
+class SegmentationRLE(BaseModel):
+    size: list[int] = Field(..., description="[height, width] of the mask")
+    counts: list[int] = Field(..., description="Alternating background/foreground run lengths, column-major")
+
+
+class ImageSegmentationInstance(BaseModel):
+    score: float = Field(..., description="Instance confidence in [0, 1]")
+    box: list[float] = Field(..., description="[x0, y0, x1, y1] in input-image pixels")
+    mask: str | SegmentationRLE = Field(..., description="Base64 PNG or COCO RLE, per mask_format")
+
+
+class ImageSegmentationResponse(BaseModel):
+    """Instances of the prompted concept in one image, ordered by descending score."""
+
+    created: int = Field(..., description="Unix timestamp of when segmentation completed")
+    model: str | None = Field(None, description="Served model name")
+    width: int = Field(..., description="Input image width in pixels")
+    height: int = Field(..., description="Input image height in pixels")
+    mask_format: SegmentationMaskFormat
+    data: list[ImageSegmentationInstance]

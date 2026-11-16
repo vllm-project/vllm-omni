@@ -19,7 +19,7 @@ from vllm_omni.model_executor.models.moss_tts.reference_encoder_graphs import (
     install_windowed_attention,
 )
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)]
 
 FRAME, N_VQ = 8, 3
 

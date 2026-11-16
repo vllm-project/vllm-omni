@@ -41,6 +41,11 @@ Input replay uses the real-time clock and 1 FPS. Warmups and request-based
 readiness probes are disabled; the server fixture waits for startup.
 MiniCPM uses its bundled `assets/HT_ref_audio.wav`. The benchmark parameters
 and accuracy reference must select the same 66 IDs: 30 RTD and 36 PR samples.
+Sessions use the `soundtrack` mix (`duplex_eval_mix`): the instruction audio is
+overlaid on the clip's own audio track. The accuracy config records the mix its
+thresholds were measured with. The guard rejects a benchmark with another mix,
+and any score file whose response metadata records a different mix. Metadata
+without a mix counts as `question`.
 
 ## Results
 
@@ -118,27 +123,31 @@ RTD means **Real-Time Description**: content and temporal scores each use
 a 0–3 scale. PR means **Proactive Reminder**: `mean_all_success` is the
 fraction of samples for which every required event succeeded, on a 0–1 scale.
 
-| Metric | Minimum passing score | H800/C8 reference, 2026-10-20 |
-| --- | ---: | ---: |
-| RTD mean content score | 1.8 | 2.0167 |
-| RTD mean temporal score | 1.4 | 1.6667 |
-| PR mean all-success rate | 0.28 | 11/36 = 0.3056 |
+| Metric | Minimum passing score | `soundtrack`, L20X/C8, 2026-10-21 | `question`, H800/C8, 2026-10-20 |
+| --- | ---: | ---: | ---: |
+| RTD mean content score | 1.8 | 1.96 | 2.0167 |
+| RTD mean temporal score | 1.4 | 1.9361 | 1.6667 |
+| PR mean all-success rate | 0.28 | 11/36 = 0.3056 | 11/36 = 0.3056 |
 
-These fixed thresholds use the H800/C8 run at commit `2308562c` as the
-reference, with the same judge, protocol and 66 IDs. The RTD thresholds allow
-approximately 10.7% and 16% below that run's content and temporal scores.
-For the 36 PR samples, a threshold of 0.28 requires at least 11 successes:
-10/36 is approximately 0.2778, so one fewer success than this reference fails.
+The thresholds were set from the `question` run at commit `2308562c`, with
+the same judge, protocol and 66 IDs. The RTD thresholds allow approximately
+10.7% and 16% below that run's content and temporal scores. For the 36 PR
+samples, a threshold of 0.28 requires at least 11 successes: 10/36 is
+approximately 0.2778, so one fewer success than the reference fails. The
+`soundtrack` reference, which completed and judged all 66 sessions, meets the
+same thresholds with the same one-sample PR margin, so they are unchanged.
 Later runs compare against these checked-in
 values; changing the thresholds requires an explicit configuration update.
 The CUDA and NPU jobs share these thresholds. H100/B200 and NPU validation,
 repeated-run stability checks, and hardware-specific performance baseline
 calibration remain pending.
 
-Keep per-task results when interpreting the aggregate. The reference's PR
-correction score was 11/13; event reminder and post-event reminder each scored
-zero. Passing the aggregate establishes the stated aggregate threshold. Separate
-measured task baselines can track improvements in those two tasks.
+Keep per-task results when interpreting the aggregate. In the `soundtrack`
+reference, PR correction scored 8/13, event reminder 3/13 and post-event
+reminder 0/10. The model stayed silent for the whole clip in two correction
+sessions, which therefore score 0. The `question` reference scored 11/13, 0/13 and 0/10.
+Passing the aggregate establishes the stated aggregate threshold. Separate
+measured task baselines can track improvements in individual tasks.
 
 The guard checks complete generation, publication and evaluation; exact
 score-file count and split/ID membership; matching protocol pins in the

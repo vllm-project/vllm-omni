@@ -53,10 +53,18 @@ from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     seed_tts_bench_argv,
     videomme_bench_argv,
 )
-from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import (
+from tests.e2e.accuracy.helpers import (
     _acc_result_filename,
+    _validate_seed_tts,
     _write_accuracy_result_metadata,
+    _DUPLEX_EVAL_DEFAULT_ACC_DIR,
+    dfx_accuracy_result_dir,
+    flatten_omniinteract_accuracy_metrics,
+    omniinteract_accuracy_result_dir,
+    parse_acc_benchmark_args,
+    seed_tts_eval_env,
     sync_dataset_env_from_ns,
+    write_dfx_accuracy_result,
 )
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import resolve_seed_tts_root
 
@@ -104,10 +112,87 @@ def test_acc_result_filename(model: str, expected: str) -> None:
     assert _acc_result_filename(model, "daily_omni", when=when) == expected
 
 
+def test_flatten_omniinteract_accuracy_metrics_lifts_summary_scores() -> None:
+    payload = flatten_omniinteract_accuracy_metrics(
+        {
+            "status": "ok",
+            "summary": {"IA_QTF1": 0.25, "Global_TP": 1.0, "Global_FP": 2, "Global_FN": 3},
+        }
+    )
+    assert payload["status"] == "ok"
+    assert payload["IA_QTF1"] == 0.25
+    assert payload["Global_TP"] == 1.0
+    assert payload["Global_FP"] == 2
+    assert payload["Global_FN"] == 3
+
+
+def test_flatten_omniinteract_accuracy_metrics_keeps_existing_top_level() -> None:
+    payload = flatten_omniinteract_accuracy_metrics(
+        {
+            "status": "ok",
+            "IA_QTF1": 0.9,
+            "summary": {"IA_QTF1": 0.1, "Precision": 0.5},
+        }
+    )
+    assert payload["IA_QTF1"] == 0.9
+    assert payload["Precision"] == 0.5
+
+
+def test_omniinteract_accuracy_result_dir_prefers_acc_then_benchmark(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    monkeypatch.delenv("BENCHMARK_DIR", raising=False)
+    assert omniinteract_accuracy_result_dir() == Path("tests/e2e/accuracy/omniinteract/results")
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path / "perf"))
+    assert omniinteract_accuracy_result_dir() == tmp_path / "perf"
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(tmp_path / "acc"))
+    assert omniinteract_accuracy_result_dir() == tmp_path / "acc"
+
+
+def test_duplex_eval_accuracy_result_dir_ignores_benchmark_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path / "perf"))
+    assert dfx_accuracy_result_dir(_DUPLEX_EVAL_DEFAULT_ACC_DIR) == _DUPLEX_EVAL_DEFAULT_ACC_DIR
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(tmp_path / "acc"))
+    assert dfx_accuracy_result_dir(_DUPLEX_EVAL_DEFAULT_ACC_DIR) == tmp_path / "acc"
+
+
+def test_write_dfx_accuracy_result_envelope(tmp_path: Path) -> None:
+    path = tmp_path / "result_acc_MiniCPM-o-4_5_omniinteract_20261027_120000.json"
+    write_dfx_accuracy_result(
+        path,
+        test_name="test_minicpmo_4_5_omniinteract",
+        name="1q1a",
+        model_id="openbmb/MiniCPM-o-4_5",
+        dataset="omniinteract",
+        dataset_path="lucky-lance/OmniInteract",
+        date="20261027-120000",
+        hardware="H100",
+        baseline={"omniinteract_aggregate_min_ia_qtf1": 0.2, "unused": None},
+        branch="main",
+        num_prompts=4,
+        max_concurrency=8,
+        benchmark_exit_code=0,
+        generation={"completed": 4, "failed": 0},
+        accuracy={"status": "ok", "IA_QTF1": 0.25},
+    )
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["dataset"] == "omniinteract"
+    assert saved["name"] == "1q1a"
+    assert saved["model_id"] == "openbmb/MiniCPM-o-4_5"
+    assert saved["accuracy"]["IA_QTF1"] == 0.25
+    assert saved["max_concurrency"] == 8
+    assert saved["baseline"] == {"omniinteract_aggregate_min_ia_qtf1": 0.2}
+    assert saved["num_prompts"] == 4
+    assert saved["benchmark_exit_code"] == 0
+
+
 def test_write_accuracy_result_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import tests.helpers.hardware as hardware
 
     monkeypatch.setattr(hardware, "get_runtime_resource_label", lambda: "H100")
+    monkeypatch.setenv("BUILDKITE_BRANCH", "main")
     path = tmp_path / "result_acc_MiniCPM-o-4_5_daily_omni_20261014_164800.json"
     path.write_text(
         json.dumps({"model_id": "openbmb/MiniCPM-o-4_5", "daily_omni_accuracy": 0.8}),
@@ -126,8 +211,9 @@ def test_write_accuracy_result_metadata(tmp_path: Path, monkeypatch: pytest.Monk
     assert saved["daily_omni_accuracy"] == 0.8
     assert saved["dataset"] == "daily_omni"
     assert saved["model_id"] == "openbmb/MiniCPM-o-4_5"
-    assert saved["baseline"] == {"min_daily_omni_accuracy": 0.77}
+    assert saved["baseline"] == {"H100": {"min_daily_omni_accuracy": 0.77}}
     assert saved["Hardware"] == "H100"
+    assert saved["branch"] == "main"
 
 
 def test_write_accuracy_result_metadata_hardware_failure_keeps_baseline(
@@ -139,6 +225,7 @@ def test_write_accuracy_result_metadata_hardware_failure_keeps_baseline(
         raise RuntimeError("device_count unavailable")
 
     monkeypatch.setattr(hardware, "get_runtime_resource_label", _boom)
+    monkeypatch.delenv("BUILDKITE_BRANCH", raising=False)
     path = tmp_path / "result_acc_Qwen3-Omni-30B-A3B-Instruct_daily_omni_20261015_110000.json"
     path.write_text(
         json.dumps({"model_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct", "daily_omni_accuracy": 0.8}),
@@ -158,8 +245,9 @@ def test_write_accuracy_result_metadata_hardware_failure_keeps_baseline(
     assert saved["daily_omni_accuracy"] == 0.8
     assert saved["dataset"] == "daily_omni"
     assert saved["model_id"] == "Qwen/Qwen3-Omni-30B-A3B-Instruct"
-    assert saved["baseline"] == {"min_daily_omni_accuracy": 0.69}
+    assert saved["baseline"] == {"default": {"min_daily_omni_accuracy": 0.69}}
     assert saved["Hardware"] == ""
+    assert saved["branch"] == ""
     assert "Hardware" in caplog.text
 
 
@@ -178,6 +266,166 @@ def test_sync_dataset_env_preserves_videomme_hf_repo_id(monkeypatch):
     sync_dataset_env_from_ns(ns)
 
     assert os.environ["VLLM_VIDEOMME_DATASET_PATH"] == "lmms-eval/Video-MME"
+
+
+def test_validate_seed_tts_floor_fails_closed_when_score_is_missing():
+    base = {
+        "seed_tts_content_evaluated": 4,
+        "seed_tts_content_error_mean": 0.02,
+        "seed_tts_sim_mean": None,
+        "seed_tts_sim_evaluated": 0,
+        "seed_tts_utmos_mean": None,
+        "seed_tts_utmos_evaluated": 0,
+    }
+
+    missing = _validate_seed_tts(base, max_mean_wer=0.05, min_mean_sim=0.80, min_mean_utmos=3.5)
+    assert any("seed_tts_sim_mean is missing" in err for err in missing)
+    assert any("seed_tts_utmos_mean is missing" in err for err in missing)
+
+    low = _validate_seed_tts(
+        {
+            **base,
+            "seed_tts_sim_mean": 0.70,
+            "seed_tts_sim_evaluated": 4,
+            "seed_tts_utmos_mean": 3.1,
+            "seed_tts_utmos_evaluated": 4,
+        },
+        max_mean_wer=0.05,
+        min_mean_sim=0.80,
+        min_mean_utmos=3.5,
+    )
+    assert any("seed_tts_sim_mean=0.700000" in err for err in low)
+    assert any("seed_tts_utmos_mean=3.100000" in err for err in low)
+
+    ok = _validate_seed_tts(
+        {
+            **base,
+            "seed_tts_sim_mean": 0.86,
+            "seed_tts_sim_evaluated": 4,
+            "seed_tts_utmos_mean": 4.1,
+            "seed_tts_utmos_evaluated": 4,
+        },
+        max_mean_wer=0.05,
+        min_mean_sim=0.80,
+        min_mean_utmos=3.5,
+    )
+    assert ok == []
+
+
+def test_seed_tts_floor_rejects_incomplete_sim_and_utmos_coverage():
+    """A mean above the floor must not pass when most utterances were not scored."""
+    partial = {
+        "seed_tts_content_evaluated": 1088,
+        "seed_tts_content_error_mean": 0.02,
+        "seed_tts_turn_count": 1088,
+        "seed_tts_request_failed": 0,
+        "seed_tts_no_pcm": 0,
+        "seed_tts_sim_mean": 0.90,
+        "seed_tts_sim_evaluated": 10,
+        "seed_tts_sim_failed": 1078,
+        "seed_tts_utmos_mean": 3.35,
+        "seed_tts_utmos_evaluated": 10,
+        "seed_tts_utmos_failed": 1078,
+    }
+    errs = _validate_seed_tts(partial, max_mean_wer=0.05, min_mean_sim=0.80, min_mean_utmos=3.10)
+    assert any("seed_tts_sim_evaluated=10" in err and "failed=1078" in err for err in errs)
+    assert any("seed_tts_utmos_evaluated=10" in err and "failed=1078" in err for err in errs)
+    assert not any("seed_tts_sim_mean=0.900000" in err for err in errs)
+    assert not any("seed_tts_utmos_mean=3.350000" in err for err in errs)
+
+
+@pytest.mark.parametrize(
+    ("timed_out_requests", "cancelled_after_timeout_requests"),
+    [(1, 0), (0, 3)],
+)
+def test_validate_seed_tts_rejects_high_scoring_partial_timeout_result(
+    timed_out_requests: int,
+    cancelled_after_timeout_requests: int,
+) -> None:
+    partial = {
+        "seed_tts_content_evaluated": 1,
+        "seed_tts_content_error_mean": 0.01,
+        "seed_tts_turn_count": 1,
+        "seed_tts_request_failed": 0,
+        "seed_tts_no_pcm": 0,
+        "seed_tts_sim_mean": 0.95,
+        "seed_tts_sim_evaluated": 1,
+        "seed_tts_sim_failed": 0,
+        "seed_tts_utmos_mean": 4.5,
+        "seed_tts_utmos_evaluated": 1,
+        "seed_tts_utmos_failed": 0,
+        "timed_out_requests": timed_out_requests,
+        "cancelled_after_timeout_requests": cancelled_after_timeout_requests,
+    }
+
+    errs = _validate_seed_tts(partial, max_mean_wer=0.05, min_mean_sim=0.80, min_mean_utmos=3.10)
+
+    assert any(
+        f"timed_out_requests={timed_out_requests}" in err
+        and f"cancelled_after_timeout_requests={cancelled_after_timeout_requests}" in err
+        for err in errs
+    )
+
+
+def test_seed_tts_floor_coverage_excludes_rows_the_scorer_never_sees():
+    """ASR failures skip SIM, empty audio skips UTMOS; neither is a coverage gap."""
+    result = {
+        "seed_tts_turn_count": 1088,
+        "seed_tts_request_failed": 0,
+        "seed_tts_no_pcm": 0,
+        "seed_tts_asr_failed": 2,
+        "seed_tts_empty_audio": 1,
+        "seed_tts_content_evaluated": 1086,
+        "seed_tts_content_error_mean": 0.02,
+        "seed_tts_sim_skipped_no_ref": 3,
+        "seed_tts_sim_mean": 0.86,
+        "seed_tts_sim_evaluated": 1083,
+        "seed_tts_sim_failed": 0,
+        "seed_tts_utmos_mean": 3.35,
+        "seed_tts_utmos_evaluated": 1087,
+        "seed_tts_utmos_failed": 0,
+    }
+    assert _validate_seed_tts(result, max_mean_wer=0.05, min_mean_sim=0.80, min_mean_utmos=3.10) == []
+
+    short = _validate_seed_tts(
+        {**result, "seed_tts_sim_evaluated": 1082, "seed_tts_utmos_evaluated": 1086},
+        max_mean_wer=0.05,
+        min_mean_sim=0.80,
+        min_mean_utmos=3.10,
+    )
+    assert any("seed_tts_sim_evaluated=1082" in err and "expected=1083" in err for err in short)
+    assert any("seed_tts_utmos_evaluated=1086" in err and "expected=1087" in err for err in short)
+
+
+def test_seed_tts_eval_env_enables_only_configured_floors(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("SEED_TTS_SIM_EVAL", raising=False)
+    monkeypatch.delenv("SEED_TTS_UTMOS_EVAL", raising=False)
+    ns = parse_acc_benchmark_args(
+        [
+            "--skip-daily-omni",
+            "--skip-videomme",
+            "--min-seed-tts-mean-sim",
+            "0.80",
+            "--seed-tts-eval-device",
+            "cuda:1",
+        ]
+    )
+
+    env = seed_tts_eval_env(ns)
+
+    assert env["SEED_TTS_WER_EVAL"] == "1"
+    assert env["SEED_TTS_SIM_EVAL"] == "1"
+    assert env["SEED_TTS_EVAL_DEVICE"] == "cuda:1"
+    assert "SEED_TTS_UTMOS_EVAL" not in env
+
+
+def test_seed_tts_eval_env_keeps_explicit_disable(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SEED_TTS_SIM_EVAL", "0")
+    ns = parse_acc_benchmark_args(["--skip-daily-omni", "--skip-videomme", "--min-seed-tts-mean-sim", "0.80"])
+
+    env = seed_tts_eval_env(ns)
+
+    assert "SEED_TTS_SIM_EVAL" not in env
 
 
 def test_seed_tts_bench_argv_preserves_hf_repo_id_from_env(monkeypatch):

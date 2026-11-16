@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.models.magi2.attention import torch_varlen_attention_with_sink
+from vllm_omni.diffusion.models.magi2.layers.native.attention_ops import torch_varlen_attention_with_sink
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 

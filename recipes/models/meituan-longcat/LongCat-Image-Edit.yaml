@@ -24,12 +24,8 @@ omni:
     - i2i
 
 dependencies:
-  - note: "vLLM-Omni must be installed from source with vllm==0.12.0 for LongCat-Image-Edit"
-    command: "git clone https://github.com/vllm-project/vllm-omni.git && cd vllm-omni && uv pip install -e . vllm==0.12.0"
-  - note: "xformers CUDA 12.8 build required for the diffusion attention kernels"
-    command: "uv pip install -U xformers --index-url https://download.pytorch.org/whl/cu128"
-  - note: "diffusers from source (needed by the image-edit pipeline)"
-    command: "git clone https://github.com/huggingface/diffusers.git && cd diffusers && uv pip install -e ."
+  - note: "vLLM-Omni must be installed from source with vllm==0.33.0 for LongCat-Image-Edit"
+    command: "git clone https://github.com/vllm-project/vllm-omni.git && cd vllm-omni && uv pip install --torch-backend=cu130 -e . vllm==0.33.0"
 
 features: {}
 
@@ -56,9 +52,8 @@ guide: |
   ## Prerequisites
 
   - Hardware: 1x GPU with >=40 GB VRAM
-  - vLLM-Omni (runs on top of vLLM 0.12.0)
-  - diffusers (latest from source)
-  - xformers (latest)
+  - vLLM-Omni with final vLLM 0.33.0 and its CUDA 13 / PyTorch 2.14 runtime
+  - diffusers 0.40.0 (installed by the source checkout)
 
   ## Installation
 
@@ -68,15 +63,8 @@ guide: |
   cd vllm-omni
   uv venv
   source .venv/bin/activate
-  uv pip install -e . vllm==0.12.0
-
-  # Update xformers to the latest version
-  uv pip install -U xformers --index-url https://download.pytorch.org/whl/cu128
-
-  # Update diffusers to the latest version
-  git clone https://github.com/huggingface/diffusers.git
-  cd diffusers
-  uv pip install -e .
+  uv pip install --torch-backend=cu130 -e . vllm==0.33.0
+  uv pip check
   ```
 
   ## Usage

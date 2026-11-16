@@ -87,7 +87,7 @@ Supported fields:
 | `warmup_iterations` | Torch-profiler warmup iterations. |
 | `active_iterations` | Torch-profiler active iterations. |
 
-For detailed explanations of the fields, please refer to upstream vLLM implementation [vllm/config/profiler.py](https://github.com/vllm-project/vllm/blob/v0.20.1/vllm/config/profiler.py)
+For detailed explanations of the fields, please refer to upstream vLLM implementation [vllm/config/profiler.py](https://github.com/vllm-project/vllm/blob/v0.33.0/vllm/config/profiler.py)
 
 ### Minimal configurations by output
 
@@ -250,6 +250,8 @@ When `profiler_config.profiler` is set for a diffusion model, the server exposes
 
 - `POST /start_profile`
 - `POST /stop_profile`
+
+> **Note:** `VLLM_TORCH_PROFILER_DIR` was removed in vLLM v0.16.0 when profiling moved to `ProfilerConfig`. A stale value does not enable these endpoints. The server reads it only as a migration diagnostic: if it is set and no stage declares `profiler_config`, it logs a warning at startup and leaves `/start_profile` unregistered. Use `--profiler-config` as shown below, or a `profiler_config` block in the stage YAML. `--profiler-config` is a nested config flag, so it is listed under `vllm serve --help=all` or `vllm serve --help=VllmConfig` rather than in the default `--help` output.
 
 ### Start the server
 

@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.linear import ColumnParallelLinear, LinearBase, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
@@ -31,7 +32,7 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
     is_pipeline_first_stage,
@@ -353,6 +354,17 @@ class OutputScaleShiftPrepare(nn.Module):
         return shift, scale
 
 
+def _reject_vsa_candidate_without_gate(record: ScheduleCandidate) -> str | None:
+    """Schedule candidate check for a WanSelfAttention built without to_gate_compress."""
+    if record.backend_cls.get_name() != "FASTVIDEO_VSA":
+        return None
+    return (
+        "Wan builds the learned to_gate_compress projection only when the baseline backend is FASTVIDEO_VSA, "
+        "so this profile would run without it; set FASTVIDEO_VSA as the baseline backend or select another "
+        "backend for the profile"
+    )
+
+
 class WanSelfAttention(nn.Module):
     """
     Optimized self-attention module using vLLM layers.
@@ -439,6 +451,11 @@ class WanSelfAttention(nn.Module):
             nn.init.zeros_(self.to_gate_compress.weight)
             if self.to_gate_compress.bias is not None:
                 nn.init.zeros_(self.to_gate_compress.bias)
+        else:
+            # The gate exists only under a FASTVIDEO_VSA baseline. A FASTVIDEO_VSA schedule candidate
+            # would run without it, so startup validation rejects that candidate. A dense candidate
+            # under a VSA baseline ignores the gate in its metadata and needs no check.
+            self.attn.add_schedule_candidate_check(_reject_vsa_candidate_without_gate)
 
     def forward(
         self,
@@ -931,7 +948,7 @@ class WanTransformer3DModel(nn.Module):
         inner_dim = num_attention_heads * attention_head_dim
         out_channels = out_channels or in_channels
 
-        # Optional Cell / Noisy KV layer split by (rank, world) without mocking
+        # Optional Cell / Noisy PP layer split by (rank, world) without mocking
         # Omni's S·G process group. When unset, use the live pipeline-parallel group.
         if layer_pp_world is not None:
             if layer_pp_world < 1:
@@ -978,6 +995,12 @@ class WanTransformer3DModel(nn.Module):
         # DMD/FastVideo checkpoints retain VSA semantics when top-k selects every block.
         self.preserve_vsa_all_blocks = False
 
+        # The registry binds packed_modules_mapping to the pipeline class, not to this
+        # transformer, and the config may have been rebuilt from checkpoint metadata.
+        # Bind it here so ignored_layers on to_q/to_k/to_v also cover the fused to_qkv.
+        if quant_config is not None:
+            configure_quant_config(quant_config, type(self))
+
         # 3. Transformer blocks — partitioned across PP stages.
         def _make_block(prefix: str) -> WanTransformerBlock:
             return WanTransformerBlock(
@@ -992,7 +1015,7 @@ class WanTransformer3DModel(nn.Module):
             )
 
         if pp_world is not None:
-            # Explicit (rank, world) slice — used by Cell / Noisy KV layer groups.
+            # Explicit (rank, world) slice — used by Cell / Noisy PP layer groups.
             start_layer, end_layer = get_pp_indices(num_layers, pp_rank, pp_world)
             blocks: list[nn.Module] = []
             for idx in range(num_layers):
