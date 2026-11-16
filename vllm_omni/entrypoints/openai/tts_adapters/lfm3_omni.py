@@ -23,7 +23,7 @@ class Lfm3OmniTTSAdapter(ARTTSAdapter):
     )
     name = "lfm3_omni"
     stage_keys = frozenset({"lfm3_temporal"})
-    model_archs = frozenset({"Lfm3OmniForConditionalGeneration"})
+    model_archs = frozenset({"Lfm3OmniForConditionalGeneration", "Lfm3AudioForConditionalGeneration"})
 
     def __init__(self, ctx):
         super().__init__(ctx)

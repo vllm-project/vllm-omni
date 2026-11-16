@@ -43,6 +43,9 @@ GLM_IMAGE_PIPELINE = PipelineConfig(
             engine_output_type="token_ids",
             model_subdir="vision_language_encoder",
             tokenizer_subdir="processor",
+            # Stamps the target size into mm_processor_kwargs, then calls
+            # prompt.propagate_target_size to mirror it into the AR extra_args.
+            prompt_transform_func="vllm_omni.model_executor.stage_input_processors.glm_image.prepare_ar_prompt",
         ),
         StagePipelineConfig(
             stage_id=1,

@@ -2,14 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from Tencent-Hunyuan/Hy-Nomas@911cea6458 (Copyright 2026 Tencent).
 
+import hashlib
+from collections import OrderedDict
 from collections.abc import Iterable
 from functools import partial
 from types import SimpleNamespace
+from typing import ClassVar
 
 import regex as re
 import torch
 from omegaconf import DictConfig
 from torch import nn
+from torch.nn.attention.flex_attention import BlockMask
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import WeightsMapper
 
@@ -117,11 +121,14 @@ class MMDoubleStreamBlock(nn.Module):
         offsets,
         windows,
         tokens_per_frame,
+        *,
+        block_masks: tuple[BlockMask | None, ...] | None = None,
     ):
-        streams = []
-        for name, x in (("img", img), ("txt", txt)):
-            mods = getattr(self, name + "_mod")(vec).chunk(6, dim=-1)
-            normalized = modulate(getattr(self, name + "_norm1")(x), mods[0], mods[1])
+        img_mod, txt_mod = self.img_mod(vec), self.txt_mod(vec)
+        qkv = []
+        for name, x, mod in (("img", img, img_mod), ("txt", txt, txt_mod)):
+            shift, scale = mod.chunk(6, dim=-1)[:2]
+            normalized = modulate(getattr(self, name + "_norm1")(x), shift, scale)
             q, k, v = [
                 getattr(self, f"{name}_attn_{projection}")(normalized).view(x.shape[0], x.shape[1], self.heads_num, -1)
                 for projection in ("q", "k", "v")
@@ -130,23 +137,43 @@ class MMDoubleStreamBlock(nn.Module):
             k = getattr(self, name + "_attn_k_norm")(k).to(v)
             if name == "img":
                 q, k = apply_rotary(q, tables), apply_rotary(k, tables)
-            streams.append((q, k, v, mods))
-        iq, ik, iv, im = streams[0]
-        tq, tk, tv, tm = streams[1]
-        dtype = iq.dtype
+            qkv.extend((q, k, v))
+        dtype = qkv[0].dtype
+        image_attention, text_attention = self._attend_double_stream(
+            tuple(qkv),
+            (text_mask, cache, history, update, cache_txt, cache_mask, layer_idx, attention, sp_size),
+            (offsets, windows, tokens_per_frame, block_masks),
+        )
+        results = []
+        for name, x, attn, mod in (("img", img, image_attention, img_mod), ("txt", txt, text_attention, txt_mod)):
+            gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)[2:]
+            attn = attn.to(dtype).reshape(x.shape)
+            x = x + getattr(self, name + "_attn_proj")(attn) * gate_msa.unsqueeze(1)
+            x = x + getattr(self, name + "_mlp")(
+                modulate(getattr(self, name + "_norm2")(x), shift_mlp, scale_mlp)
+            ) * gate_mlp.unsqueeze(1)
+            results.append(x)
+        return tuple(results)
+
+    @torch._dynamo.disable
+    def _attend_double_stream(self, qkv, ctx, mask_args) -> tuple[torch.Tensor, torch.Tensor]:
+        text_mask, cache, history, update, cache_txt, cache_mask, layer_idx, attention, sp_size = ctx
+        offsets, windows, tokens_per_frame, block_masks = mask_args
         cache_dtype = cache.cache.dtype if isinstance(cache, ARDiffusionSegmentedKVState) else cache["k"].dtype
-        iq, ik, iv, tq, tk, tv = [value.to(cache_dtype) for value in (iq, ik, iv, tq, tk, tv)]
-        image_tokens = img.shape[1] * sp_size
-        image_mask = torch.ones((img.shape[0], image_tokens), dtype=torch.bool, device=ik.device)
-        current_mask = torch.cat((image_mask, text_mask.bool()), 1)
-        history_mask = cache_mask[:, :history]
-        if update:
-            count = image_tokens + (text_mask.shape[1] if cache_txt else 0)
-            cache_mask[:, history : history + count] = current_mask if cache_txt else image_mask
-        key_mask = torch.cat((history_mask, current_mask if cache_txt or update else image_mask), 1)
-        ranges = None
-        if cache_txt and offsets is not None and windows:
-            ranges = action_ranges(history_mask, text_mask.bool(), image_tokens, offsets, windows, tokens_per_frame)
+        iq, ik, iv, tq, tk, tv = [value.to(cache_dtype) for value in qkv]
+        batch, img_len = iq.shape[:2]
+        image_tokens = img_len * sp_size
+        current_mask = key_mask = ranges = None
+        if block_masks is None:
+            image_mask = torch.ones((batch, image_tokens), dtype=torch.bool, device=ik.device)
+            current_mask = torch.cat((image_mask, text_mask.bool()), 1)
+            history_mask = cache_mask[:, :history]
+            if update:
+                count = image_tokens + (text_mask.shape[1] if cache_txt else 0)
+                cache_mask[:, history : history + count] = current_mask if cache_txt else image_mask
+            key_mask = torch.cat((history_mask, current_mask if cache_txt or update else image_mask), 1)
+            if cache_txt and offsets is not None and windows:
+                ranges = action_ranges(history_mask, text_mask.bool(), image_tokens, offsets, windows, tokens_per_frame)
         metadata = AttentionMetadata(
             joint_query=tq if sp_size > 1 else None,
             joint_key=tk if sp_size > 1 else None,
@@ -165,19 +192,14 @@ class MMDoubleStreamBlock(nn.Module):
         k, v = assemble_kv(
             cache, layer_idx, k, v, history=history, media_tokens=image_tokens, cache_text=cache_txt, update=update
         )
-        hidden = strategy.post_attention(
-            attention(q, k, v, ranges=ranges, query_mask=current_mask, key_mask=key_mask), context
+        attn_out = (
+            attention(q, k, v, block_masks=block_masks)
+            if block_masks is not None
+            else attention(q, k, v, ranges=ranges, query_mask=current_mask, key_mask=key_mask)
         )
-        image_attention, text_attention = hidden[:, : img.shape[1]], hidden[:, img.shape[1] :]
-        results = []
-        for name, x, attn, mods in (("img", img, image_attention, im), ("txt", txt, text_attention, tm)):
-            attn = attn.to(dtype).reshape(x.shape)
-            x = x + getattr(self, name + "_attn_proj")(attn) * mods[2].unsqueeze(1)
-            x = x + getattr(self, name + "_mlp")(modulate(getattr(self, name + "_norm2")(x), mods[3], mods[4])) * mods[
-                5
-            ].unsqueeze(1)
-            results.append(x)
-        return tuple(results)
+        hidden = strategy.post_attention(attn_out, context)
+        fmt = torch.contiguous_format  # Fresh storage prevents cross-break stride/offset guards.
+        return hidden[:, :img_len].clone(memory_format=fmt), hidden[:, img_len:].clone(memory_format=fmt)
 
 
 class ActionModule(nn.Module):
@@ -194,35 +216,71 @@ class ActionModule(nn.Module):
         self.proj_keyboard = nn.Linear(intermediate, hidden, bias=False, **kwargs)
         self.key_attn_q_norm = RMSNorm(self.head_dim, **kwargs)
         self.key_attn_k_norm = RMSNorm(self.head_dim, **kwargs)
-        cos, sin = rotary_tables((7500, 1, 1), config["camera_rope_axes_dim"], config["rope_theta"])
+        axes, theta, dev = config["camera_rope_axes_dim"], config["rope_theta"], self.img_attn_q.weight.device
+        cos, sin = (t.to(device=dev) for t in rotary_tables((7500, 1, 1), axes, theta))
         self.register_buffer("freqs_cos", cos, persistent=False)
         self.register_buffer("freqs_sin", sin, persistent=False)
 
-    def forward(self, x, frames, height, width, camera, attention, sp_size, camera_mask):
+    def forward(
+        self,
+        x,
+        frames,
+        height,
+        width,
+        camera,
+        attention,
+        sp_size,
+        camera_mask,
+        *,
+        q_rotary=None,
+        k_rotary=None,
+        block_masks=None,
+    ):
         batch, length, _ = x.shape
         q = self.img_attn_q(x).view(batch, length, self.heads_num, -1)
         k, v = self.keyboard_attn_kv(self.keyboard_embed(camera)).view(batch, frames, 2, self.heads_num, -1).unbind(2)
         q, k = self.key_attn_q_norm(q).to(v), self.key_attn_k_norm(k).to(v)
-        first = 0 if sp_size == 1 else get_sp_group().rank_in_group * length
-        frame_ids = (torch.arange(length, device=q.device) + first) // (height * width)
-        q = apply_rotary(q, (self.freqs_cos[frame_ids], self.freqs_sin[frame_ids]))
-        k = apply_rotary(k, (self.freqs_cos[:frames], self.freqs_sin[:frames]))
-        rectangles = [
-            (max(0, f * height * width - first), min(length, (f + 1) * height * width - first), f, f + 1)
-            for f in range(frames)
-            if f * height * width < first + length and (f + 1) * height * width > first
-        ]
+        if q_rotary is None or k_rotary is None or block_masks is None:
+            q_rotary, k_rotary, block_masks = self._fallback_camera_plan(
+                batch, length, frames, height, width, sp_size, attention, x.device, q_rotary, k_rotary, block_masks
+            )
+        q = apply_rotary(q, q_rotary)
+        k = apply_rotary(k, k_rotary)
         # Preserve the reference D=128 padding and the original camera scale.
         if self.head_dim == 64:
             q, k, v = [nn.functional.pad(value, (0, 64)) for value in (q, k, v)]
-        out = attention(q, k, v, ranges=[rectangles] * batch)[..., : self.head_dim]
+        out = attention(q, k, v, block_masks=block_masks)[..., : self.head_dim]
         out = self.proj_keyboard(out.reshape(batch, length, -1))
         if camera_mask is not None:
             out = out * camera_mask.float()[:, None, None]
         return x + out
 
+    @torch._dynamo.disable
+    def _fallback_camera_plan(
+        self, batch, length, frames, height, width, sp_size, attention, device, q_rotary, k_rotary, block_masks
+    ):
+        first = 0 if sp_size == 1 else get_sp_group().rank_in_group * length
+        if q_rotary is None:
+            frame_ids = (torch.arange(length, device=self.freqs_cos.device) + first) // (height * width)
+            q_rotary = (self.freqs_cos[frame_ids].to(device=device), self.freqs_sin[frame_ids].to(device=device))
+        if k_rotary is None:
+            k_rotary = (
+                self.freqs_cos[:frames].to(device=device).clone(),
+                self.freqs_sin[:frames].to(device=device).clone(),
+            )
+        if block_masks is None:
+            rectangles = [
+                (max(0, f * height * width - first), min(length, (f + 1) * height * width - first), f, f + 1)
+                for f in range(frames)
+                if f * height * width < first + length and (f + 1) * height * width > first
+            ]
+            block_masks = attention.resolve_masks(length, frames, device, batch_size=batch, ranges=[rectangles] * batch)
+        return q_rotary, k_rotary, block_masks
+
 
 class HyNomasTransformer(nn.Module):
+    _repeated_blocks: ClassVar[list[str]] = ["MMDoubleStreamBlock", "ActionModule"]
+
     def __init__(self, model_config, *, sp_size=1, device=None, dtype=torch.bfloat16):
         super().__init__()
         self.config = SimpleNamespace(**model_config)
@@ -280,6 +338,170 @@ class HyNomasTransformer(nn.Module):
         self.extrinsics_embedding_camctrl = nn.Linear(64, 64, **kwargs)
         self.c2ws_hidden_states_layer1 = nn.Linear(64, 64, **kwargs)
         self.c2ws_hidden_states_layer2 = nn.Linear(64, 64, **kwargs)
+        self._step_rope_cache: OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+        self._step_attention_plan_cache: OrderedDict[tuple, tuple] = OrderedDict()
+        self._step_camera_plan_cache: OrderedDict[tuple, tuple] = OrderedDict()
+
+    @staticmethod
+    def _tensor_meta(t: torch.Tensor, *, slice_end: int | None = None) -> tuple:
+        if not t.is_inference():
+            return (id(t), t.data_ptr(), t._version, tuple(t.shape), t.device, t.dtype)
+        if t.device.type == "cpu":
+            view = t if slice_end is None else t[:, :slice_end]
+            digest = hashlib.blake2b(view.detach().contiguous().view(torch.uint8).numpy(), digest_size=16).digest()
+            return (id(t), t.data_ptr(), "cpu_inference", digest, tuple(t.shape), t.device, t.dtype)
+        end = -1 if slice_end is None else int(slice_end)
+        return (id(t), t.data_ptr(), "device_inference", end, tuple(t.shape), t.device, t.dtype)
+
+    @staticmethod
+    def _inference_snapshots(targets: tuple[tuple[torch.Tensor, int | None], ...]) -> tuple:
+        return tuple(
+            (t, end, (t if end is None else t[:, :end]).detach().clone())
+            for t, end in targets
+            if t.is_inference() and t.device.type != "cpu"
+        )
+
+    @staticmethod
+    def _snapshots_match(snapshots: tuple) -> bool:
+        return not snapshots or all(torch.equal(t if end is None else t[:, :end], snap) for t, end, snap in snapshots)
+
+    @staticmethod
+    def _lru_put(cache: OrderedDict, key: tuple, value: tuple) -> None:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > 8:
+            cache.popitem(last=False)
+
+    def _resolve_step_rope_tables(
+        self, frames: int, height: int, width: int, gfc: int, rank: int, src_device, target_device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        compute_device = src_device if gfc == 0 else None
+        rope_key = (frames, height, width, int(gfc), self.sp_size, rank, compute_device, target_device)
+        if rope_key in self._step_rope_cache:
+            self._step_rope_cache.move_to_end(rope_key)
+            return self._step_rope_cache[rope_key]
+        axes, theta = self.config.rope_axes_dim, self.config.rope_theta
+        tables = rotary_tables((frames, height, width), axes, theta, time_offset=gfc, device=compute_device)
+        if self.sp_size > 1:
+            tables = tuple(torch.chunk(value, self.sp_size, 0)[rank].clone() for value in tables)
+        tables = (tables[0].to(device=target_device), tables[1].to(device=target_device))
+        self._lru_put(self._step_rope_cache, rope_key, tables)
+        return tables
+
+    @staticmethod
+    def _normalize_nested(value):
+        if value is None:
+            return None
+        return tuple(
+            None if row is None else (tuple(int(item) for item in row) if isinstance(row, Iterable) else int(row))
+            for row in value
+        )
+
+    def _make_step_attention_key(self, kw: tuple, update_cache: bool) -> tuple:
+        shape, text_mask, unique_masks, valid_len, cache_txt, offsets, windows, device = kw
+        has_act = bool(cache_txt and offsets is not None and windows)
+        cache_meta = (
+            (int(valid_len), tuple(self._tensor_meta(m, slice_end=valid_len) for m in unique_masks))
+            if valid_len > 0
+            else (0,)
+        )
+        act_meta = (self._normalize_nested(offsets), self._normalize_nested(windows)) if has_act else (None, None)
+        flags = (bool(cache_txt), bool(update_cache), bool(cache_txt or update_cache))
+        return (shape, self.sp_size, device, *flags, self._tensor_meta(text_mask), cache_meta, *act_meta)
+
+    def _cache_attention_plan_variants(self, entry: tuple, kw: tuple, update_cache: bool) -> None:
+        cache_txt = kw[4]
+        for cand in (False, True):
+            if bool(cache_txt or cand) == bool(cache_txt or update_cache):
+                self._lru_put(self._step_attention_plan_cache, self._make_step_attention_key(kw, cand), entry)
+
+    def _resolve_step_attention_plan(self, shape, img, text_mask, cache_masks, valid_len, update, cache_txt, act_args):
+        batch, _, height, width = shape
+        img_local, device = img.shape[1], img.device
+        offsets, windows = act_args
+        unique_masks = tuple({id(mask): mask for mask in cache_masks}.values())
+        kw = (shape, text_mask, unique_masks, valid_len, cache_txt, offsets, windows, device)
+        plan_key = self._make_step_attention_key(kw, update)
+        entry = self._step_attention_plan_cache.get(plan_key)
+        if entry is not None and self._snapshots_match(entry[2]):
+            self._step_attention_plan_cache.move_to_end(plan_key)
+            current_mask, resolved, snapshots, _ = entry
+        else:
+            image_tokens = img_local * self.sp_size
+            image_mask = torch.ones((batch, image_tokens), dtype=torch.bool, device=device)
+            text_mask_bool = text_mask.bool()
+            current_mask = torch.cat((image_mask, text_mask_bool), 1)
+            first_hist = unique_masks[0][:, :valid_len]
+            hetero = (
+                len(unique_masks) > 1
+                and valid_len > 0
+                and any(not torch.equal(m[:, :valid_len], first_hist) for m in unique_masks[1:])
+            )
+            histories = [m[:, :valid_len] for m in unique_masks] if hetero else [first_hist]
+            resolved_list = []
+            for history_mask in histories:
+                key_mask = torch.cat((history_mask, current_mask if cache_txt or update else image_mask), 1)
+                ranges = (
+                    action_ranges(history_mask, text_mask_bool, image_tokens, offsets, windows, height * width)
+                    if cache_txt and offsets is not None and windows
+                    else None
+                )
+                q_len, k_len = current_mask.shape[1], key_mask.shape[1]
+                bm = self.attention.resolve_masks(
+                    q_len, k_len, device, batch_size=batch, ranges=ranges, query_mask=current_mask, key_mask=key_mask
+                )
+                resolved_list.append(bm)
+            resolved = tuple(resolved_list)
+            targets = (
+                ((text_mask, None), *((m, valid_len) for m in unique_masks)) if valid_len > 0 else ((text_mask, None),)
+            )
+            snapshots = self._inference_snapshots(targets)
+            entry = (current_mask, resolved, snapshots, (text_mask, unique_masks))
+            self._cache_attention_plan_variants(entry, kw, update)
+        if update:
+            count = img_local * self.sp_size + (text_mask.shape[1] if cache_txt else 0)
+            written_slice = current_mask[:, :count]
+            for mask in unique_masks:
+                mask[:, valid_len : valid_len + count] = written_slice
+            self._cache_attention_plan_variants(entry, kw, update)
+        by_id = {id(m): bm for m, bm in zip(unique_masks, resolved)}
+        return resolved * len(cache_masks) if len(resolved) == 1 else tuple(by_id[id(m)] for m in cache_masks)
+
+    def _resolve_step_camera_plan(
+        self, *, batch: int, length: int, frames: int, height: int, width: int, device: torch.device
+    ):
+        first = 0 if self.sp_size == 1 else get_sp_group().rank_in_group * length
+        freqs_cos, freqs_sin = self.action_modules[0].freqs_cos, self.action_modules[0].freqs_sin
+        meta = (self._tensor_meta(freqs_cos), self._tensor_meta(freqs_sin))
+        cam_key = (batch, length, first, frames, height, width, device, *meta)
+        entry = self._step_camera_plan_cache.get(cam_key)
+        if entry is not None and self._snapshots_match(entry[3]):
+            self._step_camera_plan_cache.move_to_end(cam_key)
+            q_rotary, k_rotary, cam_block_masks, _, _ = entry
+            return q_rotary, k_rotary, cam_block_masks
+        frame_ids = (torch.arange(length, device=freqs_cos.device) + first) // (height * width)
+        q_rotary = (freqs_cos[frame_ids].to(device=device), freqs_sin[frame_ids].to(device=device))
+        k_rotary = (freqs_cos[:frames].to(device=device).clone(), freqs_sin[:frames].to(device=device).clone())
+        rectangles = [
+            (max(0, f * height * width - first), min(length, (f + 1) * height * width - first), f, f + 1)
+            for f in range(frames)
+            if f * height * width < first + length and (f + 1) * height * width > first
+        ]
+        cam_block_masks = self.camera_attention.resolve_masks(
+            length, frames, device, batch_size=batch, ranges=[rectangles] * batch
+        )
+        self._lru_put(
+            self._step_camera_plan_cache,
+            cam_key,
+            (
+                q_rotary,
+                k_rotary,
+                cam_block_masks,
+                self._inference_snapshots(((freqs_cos, None), (freqs_sin, None))),
+                (freqs_cos, freqs_sin),
+            ),
+        )
+        return q_rotary, k_rotary, cam_block_masks
 
     def _preprocess_camera(self, *, norm_extrinsics, norm_intrinsics, action_onehot, oh, ow, img_dtype, device):
         values = norm_extrinsics.to(img_dtype)
@@ -315,20 +537,26 @@ class HyNomasTransformer(nn.Module):
         if kv_cache_state is None and kv_cache_list is None:
             raise ValueError("Hy-Nomas forward requires KV storage.")
         batch, _, frames, height, width = hidden_states.shape
-        tables = rotary_tables(
-            (frames, height, width),
-            self.config.rope_axes_dim,
-            self.config.rope_theta,
-            time_offset=global_frame_counter,
-            device=hidden_states.device if global_frame_counter == 0 else None,
-        )
         img = self.img_in(hidden_states)
+        rank = get_sp_group().rank_in_group if self.sp_size > 1 else 0
         if self.sp_size > 1:
-            rank = get_sp_group().rank_in_group
             img = torch.chunk(img, self.sp_size, 1)[rank]
-            tables = tuple(torch.chunk(value, self.sp_size, 0)[rank] for value in tables)
+        img = img.clone(memory_format=torch.contiguous_format)  # Normalize PatchEmbed/chunk view stride.
+        tables = self._resolve_step_rope_tables(
+            frames, height, width, global_frame_counter, rank, hidden_states.device, img.device
+        )
         vec = self.time_in(timestep)
         txt = self.txt_in(text_states, timestep, text_mask)
+        shape, act_args = (batch, frames, height, width), (intra_seg_txt_offsets, intra_seg_vid_windows)
+        layer_block_masks = self._resolve_step_attention_plan(
+            shape, img, text_mask, cache_mask_list, cache_valid_len, update_cache, cache_txt, act_args
+        )
+        cam_q = cam_k = cam_masks = None
+        if camera_embedding is not None and len(self.action_modules) > 0:
+            cam_q, cam_k, cam_masks = self._resolve_step_camera_plan(
+                batch=batch, length=img.shape[1], frames=frames, height=height, width=width, device=img.device
+            )
+        cam_args = (frames, height, width, camera_embedding, self.camera_attention, self.sp_size, camera_has_mask)
         for index, block in enumerate(self.double_blocks):
             img, txt = block(
                 img,
@@ -344,14 +572,13 @@ class HyNomasTransformer(nn.Module):
                 index,
                 self.attention,
                 self.sp_size,
-                intra_seg_txt_offsets,
-                intra_seg_vid_windows,
+                None,
+                None,
                 height * width,
+                block_masks=layer_block_masks[index],
             )
             if camera_embedding is not None:
-                img = self.action_modules[index](
-                    img, frames, height, width, camera_embedding, self.camera_attention, self.sp_size, camera_has_mask
-                )
+                img = self.action_modules[index](img, *cam_args, q_rotary=cam_q, k_rotary=cam_k, block_masks=cam_masks)
         if self.sp_size > 1:
             group = get_sp_group()
             img = group.all_gather(img, dim=1, group=group.ulysses_group)
@@ -363,3 +590,6 @@ class HyNomasTransformer(nn.Module):
     def clear_attention_cache(self):
         for attention in (self.attention, self.camera_attention):
             attention.clear()
+        self._step_rope_cache.clear()
+        self._step_attention_plan_cache.clear()
+        self._step_camera_plan_cache.clear()

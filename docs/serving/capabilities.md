@@ -309,6 +309,14 @@ Older plugins omit it and retain their existing behavior.
 | Lance image / video checkpoint | The existing checkpoint resolver selects the matching declaration. I2V is unsupported for the video checkpoint: the HTTP adapter fills the internal `multi_modal_data["image"]` key, while Lance reads `multi_modal_data["first_frame"]`. These are model-internal keys, not HTTP field names; discovery does not add the missing adapter mapping. Its image-generation and editing contracts remain unknown. See `config/config_factory.py` and the Lance pipeline. |
 | Thinker followed by a separate TTS model | A downstream talker does not establish the standalone speech input contract. Aura, JoyAI, and complete Ming Omni topologies retain chat audio; their standalone TTS deployments declare speech separately. |
 
+MiniMax-H3-Image also keeps its image-response, text-to-image and image-edit
+profiles unknown with `worker_checkpoint_tasks_unavailable`: the worker reads
+the release's `t2i`/`edit` task subset. Its existing 16-reference input limit
+is unchanged. Haru's realtime conversation and Praxis1's robot-action payload
+are outside the six standard operation contracts; neither is inferred to
+support ordinary speech or video generation from its internal modalities.
+LFM3-Audio inherits the corresponding full or text-only LFM3-Omni declaration.
+
 These are source-derived contracts, not per-checkpoint inference benchmarks.
 
 `declare_capabilities` declares a complete set: omitted standard profiles are

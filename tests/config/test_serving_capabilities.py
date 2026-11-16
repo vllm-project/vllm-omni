@@ -85,6 +85,11 @@ def test_all_diffusion_registry_aliases_reach_a_declaration(architecture):
         ("StableAudioPipeline", "audio_generation", "text_to_audio", "supported"),
         ("GlmImagePipeline", "image_generation", "text_to_image", "unsupported"),
         ("Sam3Pipeline", "image_edit", "image_to_image", "unsupported"),
+        ("Praxis1Pipeline", "video_generation", "text_to_video", "unsupported"),
+        ("MiniMaxH3ImagePipeline", "chat", "image_response", "unknown"),
+        ("MiniMaxH3ImagePipeline", "chat", "text_response", "unsupported"),
+        ("MiniMaxH3ImagePipeline", "image_generation", "text_to_image", "unknown"),
+        ("MiniMaxH3ImagePipeline", "image_edit", "image_to_image", "unknown"),
         ("DiffusersAdapterPipeline", "image_generation", "text_to_image", "unknown"),
     ],
 )
@@ -111,6 +116,9 @@ def test_declarations_preserve_existing_metadata_overrides_and_defaults():
     assert get_diffusion_model_metadata("BooguImageTurboPipeline").max_multimodal_image_inputs == 1
     assert get_diffusion_model_metadata("LingBotWorldCausalDMDPipeline").final_output_type == "video"
     assert get_diffusion_model_metadata("Wan22VACEPipeline").final_output_type is None
+    assert get_diffusion_model_metadata("CausVidWanPipeline").final_output_type == "video"
+    assert get_diffusion_model_metadata("MiniMaxH3ImagePipeline").max_multimodal_image_inputs == 16
+    assert get_diffusion_model_metadata("Praxis1Pipeline").final_output_type == "actions"
     assert (
         get_diffusion_model_metadata("Wan22VACEPipeline").serving_capabilities.get("video_generation").support
         == "supported"
@@ -134,14 +142,24 @@ def test_selected_pipeline_variant_controls_speech_support():
         assert declaration.get("speech").support == "unsupported"
 
 
-def test_lfm3_text_deployment_does_not_advertise_the_omitted_codec():
-    full = resolve_pipeline_config("lfm3_omni").serving_capabilities
-    text = resolve_pipeline_config("lfm3_omni_text").serving_capabilities
+@pytest.mark.parametrize("model_type", ["lfm3_omni", "lfm3_audio"])
+def test_lfm3_text_deployment_does_not_advertise_the_omitted_codec(model_type):
+    full = resolve_pipeline_config(model_type).serving_capabilities
+    text = resolve_pipeline_config(f"{model_type}_text").serving_capabilities
     assert full.get("speech").support == "supported"
     assert _profile(full, "chat", "audio_response").support == "unknown"
     assert text.get("speech").support == "unsupported"
     assert _profile(text, "chat", "audio_response").support == "unsupported"
     assert _profile(text, "chat", "text_response").support == "supported"
+
+
+def test_haru_realtime_audio_does_not_imply_standard_generation():
+    pipeline = resolve_pipeline_config("haru")
+    assert pipeline.duplex_plugin
+    assert pipeline.stages[0].final_output_type == "audio"
+    for operation in pipeline.serving_capabilities.operations:
+        assert operation.support == "unsupported"
+        assert operation.reason_code == "realtime_session_contract_only"
 
 
 def test_missing_plugin_declaration_is_unknown_and_partial_stays_partial():

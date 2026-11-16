@@ -191,6 +191,13 @@ def _flux3_profile(profile: CapabilityProfile) -> CapabilityProfile:
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "Praxis1Pipeline": DiffusionModelMetadata(
+        final_output_type="actions",
+        serving_capabilities=declare_capabilities(
+            unsupported_reason="outside_standard_operations",
+            sources=("vllm_omni/diffusion/models/praxis1/pipeline_praxis1.py",),
+        ),
+    ),
     "HyNomasPipeline": DiffusionModelMetadata(
         final_output_type="video",
         serving_capabilities=declare_capabilities(
@@ -325,6 +332,25 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         attention_mask_free=True,
         serving_capabilities=MINIMAX_H3_CAPABILITIES,
         serving_capabilities_resolver=MINIMAX_H3_CAPABILITIES_RESOLVER,
+    ),
+    # MiniMax-H3-Image: t2i without references, edit with ordered references
+    # ("Picture i"); it shares H3's packed layout and padding document.
+    "MiniMaxH3ImagePipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        # MINIMAX_H3_IMAGE_MAX_REFERENCES in pipeline_minimax_h3_image.py.
+        max_multimodal_image_inputs=16,
+        final_output_type="image",
+        attention_mask_free=True,
+        serving_capabilities=declare_capabilities(
+            # The worker reads the release's t2i/edit task subset. The frontend
+            # cannot infer it from the pipeline class or final image output.
+            *(
+                replace(profile, support="unknown", reason_code="worker_checkpoint_tasks_unavailable")
+                for profile in (IMAGE_RESPONSE, TEXT_TO_IMAGE, IMAGE_TO_IMAGE)
+            ),
+            unknown_reason="worker_checkpoint_tasks_unavailable",
+            sources=("vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3_image.py",),
+        ),
     ),
     # TaoMate-H3 is a text-prompted streaming model on the MiniMax-H3 packed
     # layout; alignment padding is a second packed document, as for H3.
@@ -619,6 +645,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         ),
     ),
     "CausVidWanPipeline": DiffusionModelMetadata(
+        final_output_type="video",
         serving_capabilities=declare_capabilities(
             TEXT_TO_VIDEO,
             sources=("vllm_omni/diffusion/models/causvid_wan/pipeline_causvid_wan.py",),
