@@ -360,6 +360,17 @@ def test_native_chunks_preserve_duplex_perf_identity(raw_plane, structured, meas
         _stop_save_thread(raw_plane)
 
 
+@pytest.mark.parametrize("finished", [False, True])
+def test_duplex_perf_metadata_does_not_schedule_model_work(plane, finished):
+    plane._model_mode = "generation"
+    payload = {"meta": {"duplex_perf_chunk": [2, 7], "finished": finished}}
+    assert not plane._payload_is_consumable(payload)
+    metadata = plane._extract_scheduling_metadata_update(payload)
+    assert metadata is not None
+    assert metadata.duplex_perf_chunk == (2, 7)
+    assert metadata.input_terminal is finished
+
+
 class _Output:
     copy_event = None
 

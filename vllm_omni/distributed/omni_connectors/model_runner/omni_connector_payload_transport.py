@@ -111,6 +111,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
     _NON_CONSUMABLE_PAYLOAD_KEYS: set[tuple[str, str]] = {
         ("meta", "finished"),
+        ("meta", "duplex_perf_chunk"),
         ("meta", "override_keys"),
         ("meta", "next_stage_prompt_len"),
         ("meta", "left_context_size"),
