@@ -17,7 +17,8 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from vllm.distributed.parallel_state import get_tp_group
 
-from vllm_omni.data_entry_keys import OmniPayload, returns_stage_payload
+from vllm_omni.core.sched.duplex_stage_work import request_perf_chunk
+from vllm_omni.data_entry_keys import MetaStruct, OmniPayload, OmniPayloadStruct, returns_stage_payload
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
@@ -56,6 +57,8 @@ _RECV_POLL_S = _recv_poll_seconds()
 _RECV_DRAIN_REPOLL_PASSES = 8
 
 if TYPE_CHECKING:
+    from vllm.v1.request import Request
+
     from vllm_omni.distributed.omni_connectors.connectors.base import (
         OmniConnectorBase,
     )
@@ -1624,6 +1627,32 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         self._stage_recv_req_ids.clear()
         return output
 
+    @staticmethod
+    def _stamp_duplex_perf_chunk(payload: object, request: object) -> None:
+        """Copy RFC #8325 chunk id onto the payload the next stage receives.
+
+        V1 ``save_async`` writes ``meta.duplex_perf_chunk`` before ``connector.put``.
+        Native MRv2 send used to omit it, so Code2Wav never recorded stage work.
+        """
+        chunk = request_perf_chunk(cast("Request", request))
+        if chunk is None:
+            return
+        stamped = list(chunk)
+        if isinstance(payload, dict):
+            meta = payload.get("meta")
+            if isinstance(meta, MetaStruct):
+                meta.duplex_perf_chunk = stamped
+                return
+            if not isinstance(meta, dict):
+                meta = {}
+                payload["meta"] = meta
+            meta["duplex_perf_chunk"] = stamped
+            return
+        if isinstance(payload, OmniPayloadStruct):
+            if payload.meta is None:
+                payload.meta = MetaStruct()
+            payload.meta.duplex_perf_chunk = stamped
+
     def _enqueue_chunk_payload(
         self,
         request: Any,
@@ -1632,6 +1661,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         wait_for_delivery: bool = False,
     ) -> tuple[bool, Any | None]:
         """Enqueue an already-built payload under its per-request chunk key."""
+        self._stamp_duplex_perf_chunk(payload_data, request)
         raw_req_id = getattr(request, "request_id", None) or getattr(request, "req_id", None)
         request_id = self._resolve_external_req_id(request, raw_req_id)
         if raw_req_id and raw_req_id != request_id:

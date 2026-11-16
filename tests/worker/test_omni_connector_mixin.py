@@ -19,8 +19,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm_omni.core.sched.duplex_stage_work import set_request_perf_chunk
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
-from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.data_entry_keys import CodesStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
@@ -396,6 +397,74 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
         self.assertEqual(seen["calls"], 1)
 
         sender.shutdown_omni_connectors()
+
+    def test_send_chunk_stamps_duplex_perf_chunk_on_dict_payload(self):
+        connector = MockConnector(stage_id=1)
+        sender = MixinHost()
+        sender.init_omni_connectors(
+            model_config=_make_model_config(stage_id=1, async_chunk=True),
+        )
+        sender._omni_connector = connector
+        sender._stage_id = 1
+        sender._async_chunk = True
+
+        def mock_process(transfer_manager, pooling_output, request, is_finished=False):
+            return {"codes": {"audio": [1, 2]}}
+
+        sender._custom_process_func = mock_process
+        request = _make_request("req-1", "ext-req-1")
+        set_request_perf_chunk(request, (0, 2))
+        try:
+            self.assertTrue(sender.send_chunk(request, pooling_output={"value": 42}))
+            task = sender._pending_save_reqs["ext-req-1"].popleft()
+            self.assertEqual(task["data"]["meta"]["duplex_perf_chunk"], [0, 2])
+        finally:
+            sender.shutdown_omni_connectors()
+
+    def test_send_chunk_stamps_duplex_perf_chunk_on_payload_struct(self):
+        connector = MockConnector(stage_id=1)
+        sender = MixinHost()
+        sender.init_omni_connectors(
+            model_config=_make_model_config(stage_id=1, async_chunk=True),
+        )
+        sender._omni_connector = connector
+        sender._stage_id = 1
+        sender._async_chunk = True
+
+        def mock_process(transfer_manager, pooling_output, request, is_finished=False):
+            return OmniPayloadStruct(codes=CodesStruct(audio=torch.tensor([1, 2], dtype=torch.long)))
+
+        sender._custom_process_func = mock_process
+        request = _make_request("req-1", "ext-req-1")
+        set_request_perf_chunk(request, (1, 3))
+        try:
+            self.assertTrue(sender.send_chunk(request, pooling_output={"value": 42}))
+            task = sender._pending_save_reqs["ext-req-1"].popleft()
+            self.assertEqual(task["data"].meta.duplex_perf_chunk, [1, 3])
+        finally:
+            sender.shutdown_omni_connectors()
+
+    def test_send_chunk_omits_duplex_perf_chunk_when_request_has_none(self):
+        connector = MockConnector(stage_id=1)
+        sender = MixinHost()
+        sender.init_omni_connectors(
+            model_config=_make_model_config(stage_id=1, async_chunk=True),
+        )
+        sender._omni_connector = connector
+        sender._stage_id = 1
+        sender._async_chunk = True
+
+        def mock_process(transfer_manager, pooling_output, request, is_finished=False):
+            return {"codes": {"audio": [1, 2]}}
+
+        sender._custom_process_func = mock_process
+        request = _make_request("req-1", "ext-req-1")
+        try:
+            self.assertTrue(sender.send_chunk(request, pooling_output={"value": 42}))
+            task = sender._pending_save_reqs["ext-req-1"].popleft()
+            self.assertNotIn("meta", task["data"])
+        finally:
+            sender.shutdown_omni_connectors()
 
 
 class TestMixinKVCacheTransfer(unittest.TestCase):
