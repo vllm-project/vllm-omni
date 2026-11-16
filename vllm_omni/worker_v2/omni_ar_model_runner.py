@@ -89,8 +89,6 @@ def _resolve_sparse_pooler_routing(
     return sparse_mm_index, audio_sparse_output
 
 
-
-
 def _copy_mm_to_snapshot_slot(value: Any, slot: dict[tuple[Any, ...], torch.Tensor], path: tuple[Any, ...] = ()) -> Any:
     if not path and isinstance(value, dict):
         packed = pack_output_snapshot(value, slot, max_buckets=_ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT)

@@ -70,43 +70,22 @@ class HybridMoE(nn.Module):
 
 
 class LayerNorm(nn.Module):
-    """LayerNorm that supports two data formats: channels_last (default) or channels_first.
-    The ordering of the dimensions in the inputs. channels_last corresponds to inputs with
-    shape (batch_size, T, channels) while channels_first corresponds to inputs
-    with shape (batch_size, channels, T).
-    """
+    """Channel-first normalization used by the offline ownmect_s2 encoder."""
 
-    def __init__(self, channels, eps=1e-06, data_format="channels_last"):
+    def __init__(self, channels, eps=1e-06):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(channels))
         self.bias = nn.Parameter(torch.zeros(channels))
         self.eps = eps
-        self.data_format = data_format
-        if self.data_format not in ["channels_last", "channels_first"]:
-            raise NotImplementedError
-        self.C = (channels,)
 
     def forward(self, x):
-        if self.data_format == "channels_last":
-            return F.layer_norm(x, self.C, self.weight, self.bias, self.eps)
-        elif self.data_format == "channels_first":
-            u = x.mean(1, keepdim=True)
-            s = (x - u).pow(2).mean(1, keepdim=True)
-            x = (x - u) / torch.sqrt(s + self.eps)
-            w = self.weight
-            b = self.bias
-            for _ in range(x.ndim - 2):
-                w = w.unsqueeze(-1)
-                b = b.unsqueeze(-1)
-            x = w * x + b
-            return x
-        else:
-            raise NotImplementedError
-
-    def extra_repr(self) -> str:
-        return ", ".join(
-            [f"{k}={v}" for k, v in {"C": self.C, "data_format": self.data_format, "eps": self.eps}.items()]
-        )
+        mean = x.mean(1, keepdim=True)
+        variance = (x - mean).pow(2).mean(1, keepdim=True)
+        x = (x - mean) / torch.sqrt(variance + self.eps)
+        weight, bias = self.weight, self.bias
+        for _ in range(x.ndim - 2):
+            weight, bias = weight.unsqueeze(-1), bias.unsqueeze(-1)
+        return weight * x + bias
 
 
 class MultiHeadAttention(nn.Module):
@@ -129,33 +108,17 @@ class MultiHeadAttention(nn.Module):
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
-    def forward(self, hidden_states: torch.Tensor, use_cache=False, kv_cache=None, causal=False):
+    def forward(self, hidden_states: torch.Tensor):
         """Input shape: Batch x Time x Channel"""
         bsz, tgt_len, _ = hidden_states.size()
         query_states = self.q_proj(hidden_states) * self.scaling
         key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
         value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
-        if use_cache and kv_cache is not None:
-            k_cache, v_cache = kv_cache
-            key_states = torch.cat([k_cache, key_states], dim=2)
-            value_states = torch.cat([v_cache, value_states], dim=2)
-        new_kv_cache = None
-        if use_cache:
-            new_kv_cache = (key_states.detach(), value_states.detach())
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
         query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
         key_states = key_states.view(*proj_shape)
         value_states = value_states.view(*proj_shape)
-        src_len = key_states.size(1)
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
-        if causal:
-            mask = torch.triu(torch.ones(tgt_len, tgt_len, device=attn_weights.device, dtype=torch.bool), diagonal=1)
-            if src_len > tgt_len:
-                prefix = torch.zeros(tgt_len, src_len - tgt_len, device=attn_weights.device, dtype=torch.bool)
-                mask = torch.cat([prefix, mask], dim=1)
-            attn_weights = attn_weights.masked_fill(
-                mask.unsqueeze(0).expand(bsz * self.num_heads, -1, -1), float("-inf")
-            )
         attn_weights = F.softmax(attn_weights, dim=-1)
         attn_probs = F.dropout(attn_weights, p=self.dropout, training=self.training)
         attn_output = torch.bmm(attn_probs, value_states)
@@ -163,7 +126,7 @@ class MultiHeadAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
         attn_output = self.out_proj(attn_output)
-        return (attn_output, new_kv_cache)
+        return attn_output
 
 
 class FeedForward(nn.Module):
@@ -257,13 +220,11 @@ class TransformerEncoderLayer(nn.Module):
         )
         self.final_layer_norm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
 
-    def forward(self, hidden_states, use_cache=False, kv_cache=None, causal=False):
+    def forward(self, hidden_states):
         if not self.channel_last:
             hidden_states = hidden_states.permute(0, 2, 1)
         attn_residual = hidden_states
-        hidden_states, new_kv_cache = self.attention(
-            hidden_states, use_cache=use_cache, kv_cache=kv_cache, causal=causal
-        )
+        hidden_states = self.attention(hidden_states)
         hidden_states = attn_residual + hidden_states
         hidden_states = self.layer_norm(hidden_states)
         hidden_states = hidden_states + self.feed_forward(hidden_states)
@@ -271,11 +232,11 @@ class TransformerEncoderLayer(nn.Module):
         outputs = hidden_states
         if not self.channel_last:
             outputs = outputs.permute(0, 2, 1)
-        return (outputs, new_kv_cache)
+        return outputs
 
 
 class BasicResBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, group_divisor=None, stride=1, pw=True, causal=False):
+    def __init__(self, in_channels, out_channels, group_divisor=None, stride=1, pw=True):
         super().__init__()
         conv_groups = 1 if group_divisor is None else in_channels // group_divisor
         self.conv1 = nn.Conv2d(
@@ -301,21 +262,14 @@ class BasicResBlock(nn.Module):
                 ),
                 nn.BatchNorm2d(out_channels, affine=True),
             )
-        self.causal = causal
 
     def forward(self, x):
-        if self.causal:
-            x_padded = F.pad(x, (2, 0, 1, 1))
-        else:
-            x_padded = F.pad(x, (1, 1, 1, 1))
+        x_padded = F.pad(x, (1, 1, 1, 1))
         out = self.conv1(x_padded)
         out = self.conv_pw1(out)
         out = self.bn1(out)
         out = self.act1(out)
-        if self.causal:
-            out = F.pad(out, (2, 0, 1, 1))
-        else:
-            out = F.pad(out, (1, 1, 1, 1))
+        out = F.pad(out, (1, 1, 1, 1))
         out = self.conv2(out)
         out = self.conv_pw2(out)
         out = self.bn2(out)
@@ -325,9 +279,8 @@ class BasicResBlock(nn.Module):
 
 
 class PosConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, causal=False):
+    def __init__(self, in_channels, out_channels, kernel_size):
         super().__init__()
-        self.causal = causal
         self.kernel_size = kernel_size
         self.pos_conv = nn.Sequential(
             nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=0, groups=out_channels),
@@ -337,10 +290,7 @@ class PosConv(nn.Module):
         )
 
     def forward(self, x):
-        if not self.causal:
-            x_pad = F.pad(x, (self.kernel_size // 2, self.kernel_size // 2))
-        else:
-            x_pad = F.pad(x, (self.kernel_size // 2 * 2, 0))
+        x_pad = F.pad(x, (self.kernel_size // 2, self.kernel_size // 2))
         out = self.pos_conv(x_pad)
         return out
 
@@ -363,13 +313,11 @@ class MECT_block(nn.Module):
         top_k_token=None,
         shard_scale=1.0,
         expansion=1,
-        causal=False,
     ):
         super().__init__()
         self.scale_f = stride[0] if isinstance(stride, tuple) else stride
         self.scale_t = stride[-1] if isinstance(stride, tuple) else stride
         self.in_channels = in_channels
-        self.causal = causal
         self.expansion = expansion
         self.cnn_block = self._make_layer(
             BasicResBlock, int(out_channels * expansion), cnn_num, group_divisor, stride=stride
@@ -382,10 +330,8 @@ class MECT_block(nn.Module):
         else:
             self.reduce_conv = nn.Identity()
         self.fcdims = in_fdims * out_channels // self.scale_f
-        self.reduce_project = nn.Sequential(
-            nn.Conv1d(self.fcdims, hidden_dims, 1), LayerNorm(hidden_dims, eps=1e-06, data_format="channels_first")
-        )
-        self.pos_conv = PosConv(hidden_dims, hidden_dims, kernel_size=113, causal=causal)
+        self.reduce_project = nn.Sequential(nn.Conv1d(self.fcdims, hidden_dims, 1), LayerNorm(hidden_dims, eps=1e-06))
+        self.pos_conv = PosConv(hidden_dims, hidden_dims, kernel_size=113)
         self.transformer = TransformerEncoderLayer(
             n_state=hidden_dims,
             n_mlp=hidden_dims,
@@ -405,7 +351,7 @@ class MECT_block(nn.Module):
         strides = [stride] + [1] * (num_blocks - 1)
         layers = []
         for stride in strides:
-            layers.append(block(self.in_channels, out_channels, group_divisor, stride, causal=self.causal))
+            layers.append(block(self.in_channels, out_channels, group_divisor, stride))
             self.in_channels = out_channels
         return nn.Sequential(*layers)
 
@@ -417,7 +363,7 @@ class MECT_block(nn.Module):
         x2 = out.permute((0, 2, 1, 3)).reshape((b, c * f, -1))
         out = self.reduce_project(x2)
         out = out + self.pos_conv(out)
-        out, _ = self.transformer(out, causal=self.causal)
+        out = self.transformer(out)
         out = self.expansion_project(out)
         out = out + x2
         out = self.up_sample(out)[..., :t] + x.permute((0, 2, 1, 3)).reshape((b, c * f, -1))
@@ -451,26 +397,17 @@ class MECT(nn.Module):
         top_k_shard=None,
         top_k_token=None,
         shard_scale=1.0,
-        causal=False,
     ):
         super().__init__()
-        if not causal:
-            self.head = nn.Sequential(
-                nn.Conv2d(1, in_channels, kernel_size=3, stride=1, padding=1), nn.BatchNorm2d(in_channels, affine=True)
-            )
-        else:
-            self.head = nn.Sequential(
-                nn.ConstantPad2d((2, 0, 1, 1), 0),
-                nn.Conv2d(1, in_channels, kernel_size=3, stride=1, padding=0),
-                nn.BatchNorm2d(in_channels, affine=True),
-            )
+        self.head = nn.Sequential(
+            nn.Conv2d(1, in_channels, kernel_size=3, stride=1, padding=1), nn.BatchNorm2d(in_channels, affine=True)
+        )
         self.moe_type = moe_type
         self.num_experts_shard = num_experts_shard
         self.num_experts_token = num_experts_token
         self.top_k_shard = top_k_shard
         self.top_k_token = top_k_token
         self.shard_scale = shard_scale
-        self.causal = causal
         self.in_channels = in_channels
         self.feat_dim = feat_dim
         self.channels = in_channels * feat_dim
@@ -500,7 +437,6 @@ class MECT(nn.Module):
                     top_k_token=self.top_k_token,
                     shard_scale=self.shard_scale,
                     expansion=expansion,
-                    causal=self.causal,
                 )
             )
             scale_f = stride[0] if isinstance(stride, tuple) else stride
@@ -529,7 +465,7 @@ class MECT(nn.Module):
 
 
 class MECT_B2(MECT):
-    def __init__(self, config={}):
+    def __init__(self):
         in_channels = 32
         feat_dim = 80
         hidden_dim = 64
@@ -544,13 +480,9 @@ class MECT_B2(MECT):
             + [(3, 128, hidden_dim, conv_group, (1, 2), True, 2)] * 4,
             block4=[(3, 256, hidden_dim, conv_group, (2, 1), True, 1)]
             + [(2, 256, hidden_dim, conv_group, (1, 2), True, 1)] * 2,
-            moe_type=config.get("moe_type", "token"),
-            num_experts_shard=config.get("num_experts_shard", 2),
-            num_experts_token=config.get("num_experts_token", 4),
-            top_k_shard=config.get("top_k_shard", None),
-            top_k_token=config.get("top_k_token", None),
-            shard_scale=config.get("shard_scale", 1.0),
-            causal=config.get("causal", False),
+            moe_type="token",
+            num_experts_shard=2,
+            num_experts_token=4,
         )
 
 
@@ -560,15 +492,11 @@ SPEAKER_CHECKPOINT_SHA256 = "3cef65631f3161cbd8eacc6ea40e59a237c79656d85c7232dcb
 class ASTP(nn.Module):
     """Attentive statistics pooling: Channel - and context-dependent statistics pooling, first used in ECAPA_TDNN."""
 
-    def __init__(self, input_dim, config={}):
+    def __init__(self, input_dim):
         super().__init__()
         self.input_dim = input_dim
-        self.bottleneck_dim = config.get("bottleneck_dim", 128)
-        self.global_context_att = config.get("global_context_att", False)
-        if self.global_context_att:
-            self.linear1 = nn.Conv1d(input_dim * 3, self.bottleneck_dim, kernel_size=1)
-        else:
-            self.linear1 = nn.Conv1d(input_dim, self.bottleneck_dim, kernel_size=1)
+        self.bottleneck_dim = 128
+        self.linear1 = nn.Conv1d(input_dim, self.bottleneck_dim, kernel_size=1)
         self.linear2 = nn.Conv1d(self.bottleneck_dim, input_dim, kernel_size=1)
         self.out_dim = 2 * self.input_dim
 
@@ -581,13 +509,7 @@ class ASTP(nn.Module):
         if len(x.shape) == 4:
             x = x.reshape(x.shape[0], x.shape[1] * x.shape[2], x.shape[3])
         assert len(x.shape) == 3
-        if self.global_context_att:
-            context_mean = torch.mean(x, dim=-1, keepdim=True).expand_as(x)
-            context_std = torch.sqrt(torch.var(x, dim=-1, keepdim=True) + 1e-07).expand_as(x)
-            x_in = torch.cat((x, context_mean, context_std), dim=1)
-        else:
-            x_in = x
-        alpha = torch.tanh(self.linear1(x_in))
+        alpha = torch.tanh(self.linear1(x))
         alpha = torch.softmax(self.linear2(alpha), dim=2)
         mean = torch.sum(alpha * x, dim=2)
         var = torch.sum(alpha * x**2, dim=2) - mean**2
@@ -595,7 +517,6 @@ class ASTP(nn.Module):
         return torch.cat([mean, std], dim=1)
 
     def get_out_dim(self):
-        self.out_dim = 2 * self.input_dim
         return self.out_dim
 
 
@@ -604,11 +525,7 @@ class MECTSpeakerNetwork(nn.Module):
 
     def __init__(self, backbone: nn.Module | None = None) -> None:
         super().__init__()
-        self.feature_extractor = (
-            backbone
-            if backbone is not None
-            else MECT_B2({"moe_type": "token", "num_experts_shard": 2, "num_experts_token": 4})
-        )
+        self.feature_extractor = backbone if backbone is not None else MECT_B2()
         self.encoding_layers = ASTP(self.feature_extractor.get_out_dim())
         self.bn = nn.BatchNorm1d(self.encoding_layers.get_out_dim())
         self.linear = nn.Linear(self.encoding_layers.get_out_dim(), 192, bias=False)

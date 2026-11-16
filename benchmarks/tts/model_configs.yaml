@@ -7,7 +7,8 @@
 # is tracked here.
 
 models:
-  # Experimental integration: server/GPU acceptance and quality are pending.
+  # Native single-stage integration; default-voice serving is validated.
+  # Voice-clone support is not qualified by the default-voice benchmark.
   # PCM is 44.1 kHz; set VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=44100.
   Zyphra/ZONOS3-Mini:
     supported_tasks: [default_voice, voice_clone]

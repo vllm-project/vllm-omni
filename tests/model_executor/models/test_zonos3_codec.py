@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Packed Codec loading and native transport lifecycle against stateless oracles."""
+"""Packed Codec checkpoint loading and independent stateless numerical oracles."""
 
 import math
 from typing import Any
@@ -18,8 +18,6 @@ from vllm_omni.model_executor.models.zonos3.codec import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-# ---------------------------------------------------------------- codec_layers
 
 
 def spec(context=7) -> ZACTransformerSpec:
@@ -54,9 +52,6 @@ def whole_sequence(layer: ZACMossLayer, x: torch.Tensor) -> torch.Tensor:
     output = F.scaled_dot_product_attention(q, k, v.transpose(1, 2), attn_mask=(delta >= 0) & (delta < layer.context))
     x = x + layer.attention_scale * layer.attention_out(output.transpose(1, 2).reshape(b, t, d))
     return x + layer.ffn_scale * layer.ffn(layer.norm2(x))
-
-
-# ---------------------------------------------------------------- codec_network
 
 
 def small_config() -> ZACDecoderConfig:
@@ -192,15 +187,6 @@ def test_release_config_selects_retained_stages_and_pruned_layer_indices():
     release["head"]["stage_layers"]["0"] = [31, 0]
     with pytest.raises(ValueError, match="retained transformer layers"):
         ZACDecoderConfig.from_release(release)
-
-
-# ---------------------------------------------------------------- codec_synthesis
-
-
-# ---------------------------------------------------------------- codec_reference
-
-
-# ---------------------------------------------------------------- codec_lifecycle
 
 
 def whole_audio(model, codes):

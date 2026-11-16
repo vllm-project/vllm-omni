@@ -19,7 +19,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, apply_top_k_top_p_pytorch
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -135,7 +135,6 @@ class Zonos3RVQBuffer:
         self.rows = torch.full((2 * capacity, self.ring, 10), -1, dtype=torch.long, device=device)
         self.received = torch.zeros(2 * capacity, dtype=torch.long, device=device)
         self.consumed_frames = torch.zeros_like(self.received)
-        self.ready_frames = torch.zeros_like(self.received)
         self.primer = torch.zeros_like(self.received)
         self.skip_samples = torch.zeros_like(self.received)
         self.eoa = torch.full_like(self.received, -1)
@@ -160,7 +159,7 @@ class Zonos3RVQBuffer:
             raise ValueError("Silence primer plus initial Codec chunk exceeds static capacity")
         self.rows[slot].fill_(-1)
         self.rows[slot, :n].copy_(primer)
-        for tensor in (self.consumed_frames, self.ready_frames, self.chunk_index):
+        for tensor in (self.consumed_frames, self.chunk_index):
             tensor[slot : slot + 1].zero_()
         self.received[slot : slot + 1].fill_(n)
         self.primer[slot : slot + 1].fill_(n)
@@ -189,7 +188,6 @@ class Zonos3RVQBuffer:
         partial = (index == 0) & ~final
         ready = torch.where(partial, (received - self.first_codebooks[slots] + 1).clamp_min(0), complete)
         ready = torch.where(eoa >= 0, torch.minimum(ready, eoa), ready)
-        self.ready_frames.index_copy_(0, slots, ready)
         consumed = self.consumed_frames[slots]
         threshold = self.thresholds[slots, index.clamp_max(31)]
         run = ((ready - torch.maximum(consumed, self.primer[slots]) >= threshold) | final) & ~self.flushed[slots]
@@ -763,21 +761,18 @@ class Zonos3MiniModelState(OmniModelState):
         else:
             model_inputs["zonos3_batch"] = batch
 
-    def _setting(self, name: str, slots: torch.Tensor) -> torch.Tensor:
+    def _cpu_setting(self, name: str, slots: torch.Tensor) -> torch.Tensor:
         backed: UvaBackedTensor = getattr(self.settings, name)
-        if backed.gpu.device != slots.device:
-            values = backed.np[slots.detach().cpu().numpy()]
-            return torch.from_numpy(values.copy()).to(slots.device)
-        return backed.gpu.index_select(0, slots)
+        return torch.from_numpy(backed.np[slots.numpy()].copy())
 
-    def probabilities(self, logits: torch.Tensor, slots: torch.Tensor, width: int) -> torch.Tensor:
-        """Per-codebook filters, using the same upstream kernels as before."""
+    def _cpu_probabilities(self, logits: torch.Tensor, slots: torch.Tensor, width: int) -> torch.Tensor:
+        """CPU numerical oracle for the fused CUDA RVQ sampler."""
         c = self.model.config
         logits = logits.float()
         positions = self.sampling_state.position.index_select(0, slots)
         ids = torch.arange(c.audio_vocab, device=logits.device)
         invalid = (ids >= c.codebook_size) & (ids != c.eoa_id)
-        minimum = self._setting("min_frames", slots)
+        minimum = self._cpu_setting("min_frames", slots)
         stop_blocked = (minimum[:, None] > 0) & (positions[:, None] < minimum[:, None] + self.sampling_state.columns)
         logits = logits.masked_fill(
             invalid[None, None, :] | (stop_blocked[:, :, None] & (ids == c.eoa_id)), float("-inf")
@@ -788,29 +783,24 @@ class Zonos3MiniModelState(OmniModelState):
             history = self.history[
                 slots[:, None, None], self.sampling_state.columns[None, :, None], indices[:, None, :]
             ]
-            window = self._setting("repetition_window", slots)
-            books = self._setting("repetition_codebooks", slots)
+            window = self._cpu_setting("repetition_window", slots)
+            books = self._cpu_setting("repetition_codebooks", slots)
             valid = (history >= 0) & (history < c.codebook_size)
             valid = valid & (offsets[None, None, :] < torch.minimum(positions, window)[:, None, None])
             valid = valid & (self.sampling_state.columns[None, :, None] < books[:, None, None])
             repeated = torch.zeros_like(logits, dtype=torch.int32)
             repeated.scatter_add_(-1, history.clamp(min=0, max=c.audio_vocab - 1), valid.to(torch.int32))
-            penalty = self._setting("repetition_penalty", slots)[:, None, None]
+            penalty = self._cpu_setting("repetition_penalty", slots)[:, None, None]
             adjusted = torch.where(logits > 0, logits / penalty, logits * penalty)
             logits = torch.where(repeated > 0, adjusted, logits)
-        temperature = self._setting("temperature", slots)[:, None, None]
+        temperature = self._cpu_setting("temperature", slots)[:, None, None]
         logits = logits / torch.where(temperature > 0, temperature, 1.0)
-        # Triton expects contiguous per-codebook settings, including B=1.
-        k = self._setting("top_k", slots).repeat_interleave(10)
-        p = self._setting("top_p", slots).repeat_interleave(10)
-        flat = logits.reshape(-1, c.audio_vocab)
-        if flat.is_cuda:
-            logits = apply_top_k_top_p(flat, k, p, has_topp_only_rows=True)
-        else:
-            logits = apply_top_k_top_p_pytorch(flat, k.to(flat.device), p.to(flat.device))
+        k = self._cpu_setting("top_k", slots).repeat_interleave(10)
+        p = self._cpu_setting("top_p", slots).repeat_interleave(10)
+        logits = apply_top_k_top_p_pytorch(logits.reshape(-1, c.audio_vocab), k, p)
         logits = logits.view(-1, 10, c.audio_vocab)
         probs = logits.softmax(-1)
-        min_p = self._setting("min_p", slots)[:, None, None]
+        min_p = self._cpu_setting("min_p", slots)[:, None, None]
         probs = probs.masked_fill(probs < min_p * probs.amax(-1, keepdim=True), 0)
         total = probs.sum(-1, keepdim=True)
         fallback = torch.zeros_like(probs).scatter_(-1, logits.argmax(-1, keepdim=True), 1.0)
@@ -868,7 +858,7 @@ class Zonos3MiniModelState(OmniModelState):
                 self.model.config.eoa_id,
             )
         elif hidden.device.type == "cpu":
-            probs = self.probabilities(logits, slots, width)
+            probs = self._cpu_probabilities(logits, slots, width)
             active = (sampled > 0) & ~(
                 (self.sampling_state.eoa_frame.index_select(0, slots) >= 0)
                 & (self.sampling_state.drain_remaining.index_select(0, slots) == 0)

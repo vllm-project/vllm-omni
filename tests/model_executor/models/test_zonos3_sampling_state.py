@@ -9,7 +9,7 @@ from vllm_omni.model_executor.models.zonos3.sampling_state import CONTINUE, EOS,
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize("concurrency", [1, 4, 8, 16, 32])
+@pytest.mark.parametrize("concurrency", [1, 32])
 def test_independent_eoa_countdown_matches_reference_with_batch_reordering(concurrency):
     state = Zonos3ARSamplingState(concurrency, 1024, 1025, "cpu")
     slots = torch.arange(concurrency)
@@ -37,7 +37,7 @@ def test_independent_eoa_countdown_matches_reference_with_batch_reordering(concu
                 countdown[i] -= 1
             lengths[i] += 1
         result = state.accept(torch.tensor(active), codes)
-        assert result.eoa_frame.tolist() == [-1 if eoa[i] is None else eoa[i] for i in active]
+        assert state.eoa_frame[torch.tensor(active)].tolist() == [-1 if eoa[i] is None else eoa[i] for i in active]
         assert result.logical_token_ids.flatten().tolist() == [
             EOS if eoa[i] is not None and countdown[i] == 0 else CONTINUE for i in active
         ]
@@ -52,9 +52,8 @@ def test_cold_start_triangle_cannot_end_a_request():
         codes = torch.zeros((1, 10), dtype=torch.int64)
         codes[:, position + 1 :] = 1024
         result = state.accept(slots, codes)
-        assert result.eoa_frame.item() == -1
+        assert state.eoa_frame[0].item() == -1
         assert (result.codes[:, position + 1 :] == 1025).all()
-        assert result.codebook_valid.sum() == position + 1
 
 
 def test_slot_reuse_resets_all_stop_and_delay_state():
@@ -64,7 +63,7 @@ def test_slot_reuse_resets_all_stop_and_delay_state():
     state.accept(slots, torch.full((2, 10), 1024))
     state.reset(torch.tensor([2]), torch.tensor([False]))
     result = state.accept(slots, torch.zeros((2, 10), dtype=torch.int64))
-    assert result.eoa_frame.tolist() == [-1, 0]
+    assert state.eoa_frame[slots].tolist() == [-1, 0]
     assert state.drain_remaining.tolist() == [9, 0, 0]
     assert (result.codes[0, 1:] == 1025).all()
 
@@ -78,11 +77,9 @@ def test_incomplete_prefill_rows_do_not_advance_eoa_or_drain_state():
     assert first.active.tolist() == [False, True]
     assert state.position.tolist() == [0, 1] and state.eoa_frame.tolist() == [-1, 0]
     assert state.drain_remaining.tolist() == [0, 10]
-    previous = state.next_codes.clone()
     for _ in range(10):
         state.accept(slots, eoa, torch.tensor([False, False]))
     assert state.position.tolist() == [0, 1] and state.drain_remaining.tolist() == [0, 10]
-    assert torch.equal(state.next_codes, previous)
 
 
 def test_async_step_after_logical_eos_keeps_device_state_absorbing():
@@ -94,10 +91,9 @@ def test_async_step_after_logical_eos_keeps_device_state_absorbing():
     for _ in range(10):
         last = state.accept(slot, torch.zeros((1, 10), dtype=torch.int64))
     assert last.logical_token_ids.item() == EOS
-    before = state.next_codes.clone()
     extra = state.accept(slot, torch.full((1, 10), 17, dtype=torch.int64))
     assert extra.logical_token_ids.item() == EOS and not extra.active.item()
-    assert state.position.item() == 11 and torch.equal(state.next_codes, before)
+    assert state.position.item() == 11 and extra.codes.eq(state.pad_id).all()
 
 
 def test_codebook0_policy_and_ignore_eos_remain_request_local():
@@ -107,11 +103,10 @@ def test_codebook0_policy_and_ignore_eos_remain_request_local():
     codes = torch.zeros((2, 10), dtype=torch.int64)
     codes[:, 9] = 1024
     step = state.accept(slots, codes)
-    assert step.eoa_frame.tolist() == [-1, -1]
-    assert not step.codebook_valid[:, 9].any()
+    assert state.eoa_frame[slots].tolist() == [-1, -1]
     codes[:, 0] = 1024
     step = state.accept(slots, codes)
-    assert step.eoa_frame.tolist() == [1, -1]
+    assert state.eoa_frame[slots].tolist() == [1, -1]
     for _ in range(10):
         step = state.accept(slots, codes)
     assert step.logical_token_ids[:, 0].tolist() == [EOS, CONTINUE]

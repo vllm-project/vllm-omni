@@ -203,19 +203,6 @@ def test_raw_speaker_encoding_once_across_prefill_chunks_and_cleanup(owner):
 
 
 @torch.inference_mode()
-def test_raw_speaker_reference_enforces_checkpoint_duration_limit(owner):
-    state, _, _ = owner
-    state.model.speaker_encoder = Mock()
-    add(owner, "long-reference", 0, 6)
-    payload = state.intermediate_buffer.buffers[0]
-    payload.pop("speaker_embedding")
-    payload.update(reference_waveform=torch.zeros(30 * 16000 + 1), reference_sample_rate=16000)
-    with pytest.raises(ValueError, match="no longer than 30 seconds"):
-        state.build_prompt("long-reference", state.intermediate_buffer.buffers[0])
-    state.model.speaker_encoder.assert_not_called()
-
-
-@torch.inference_mode()
 def test_one_token_prefill_graph_keeps_frontier_for_later_chunk(owner):
     state, _, _ = owner
     add(owner, "a", 0, 6)

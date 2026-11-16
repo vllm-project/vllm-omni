@@ -617,8 +617,8 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 (
                     state.snapshot(
                         include_token_history=include_token_history,
-                        perf_chunk=(perf_chunks or {}).get(req_id),
                         sampled_token_ids=sampled_by_req.get(req_id) if not state.finished else None,
+                        perf_chunk=(perf_chunks or {}).get(req_id),
                     ),
                     payload,
                 )

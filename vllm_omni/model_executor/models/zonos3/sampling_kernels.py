@@ -156,12 +156,8 @@ def _accept(
     PREFIX,
     IGNORE,
     BOOK0,
-    NEXT,
-    VALID,
     CODES,
     LOGICAL,
-    FRAMES,
-    CODE_VALID,
     LIVE,
     FINISHED,
     EOA: tl.constexpr,
@@ -188,16 +184,11 @@ def _accept(
     remaining = tl.where(first, 11, remaining)
     remaining = tl.where(active & (frame >= 0), tl.maximum(remaining - 1, 0), remaining)
     finished = (frame >= 0) & (remaining == 0)
-    valid = active & started & (codes < EOA) & ((frame < 0) | (position - columns < frame))
     tl.store(POSITION + slot, position + active.to(tl.int64))
     tl.store(EOA_FRAME + slot, frame)
     tl.store(REMAINING + slot, remaining)
-    tl.store(NEXT + slot * 10 + columns, codes, (columns < 10) & active)
-    tl.store(VALID + slot * 10 + columns, valid, (columns < 10) & active)
     tl.store(CODES + row * 10 + columns, codes, columns < 10)
-    tl.store(CODE_VALID + row * 10 + columns, valid, columns < 10)
     tl.store(LOGICAL + row, tl.where(finished, 2, 1))
-    tl.store(FRAMES + row, frame)
     tl.store(LIVE + row, active)
     tl.store(FINISHED + row, finished)
 
@@ -206,8 +197,6 @@ def accept_rvq(state, slots, sampled_codes, active):
     batch = slots.numel()
     codes = torch.empty((batch, 10), dtype=torch.int64, device=slots.device)
     logical = torch.empty((batch, 1), dtype=torch.int32, device=slots.device)
-    frames = torch.empty(batch, dtype=torch.int64, device=slots.device)
-    valid = torch.empty((batch, 10), dtype=torch.bool, device=slots.device)
     live = torch.empty(batch, dtype=torch.bool, device=slots.device)
     finished = torch.empty_like(live)
     _accept[(batch,)](
@@ -220,19 +209,15 @@ def accept_rvq(state, slots, sampled_codes, active):
         state.has_audio_prefix,
         state.ignore_eos,
         state.eoa_codebook0,
-        state.next_codes,
-        state.codebook_valid,
         codes,
         logical,
-        frames,
-        valid,
         live,
         finished,
         state.eoa_id,
         state.pad_id,
         active is not None,
     )
-    return codes, logical, frames, valid, live, finished
+    return codes, logical, live, finished
 
 
 @triton.jit

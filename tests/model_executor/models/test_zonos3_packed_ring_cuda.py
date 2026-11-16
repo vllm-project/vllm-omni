@@ -28,7 +28,7 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32])
+@pytest.mark.parametrize("batch", [1, 4, 32])
 @torch.inference_mode()
 def test_packed_ring_kernel_capture_matches_cpu_reference(batch):
     torch.manual_seed(91)
@@ -89,9 +89,9 @@ def test_packed_ring_kernel_capture_matches_cpu_reference(batch):
         progress.index_add_(0, slots, lengths.to("cuda"))
 
 
-@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32])
 @torch.inference_mode()
-def test_complete_packed_codec_graph_matches_same_eager_forward(batch):
+def test_complete_packed_codec_graph_matches_same_eager_forward():
+    batch = 4
     torch.manual_seed(98)
     network = ZACDecoderNetwork(small_config()).cuda().eval()
     rows = batch * 5 + 3

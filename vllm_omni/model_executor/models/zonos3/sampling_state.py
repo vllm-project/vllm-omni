@@ -3,7 +3,7 @@
 """Device-only delayed RVQ stop state, following reference TTSReq.check_eos.
 
 The default ``any`` EOA policy starts an eleven-step drain, counting that
-same sampling step. CPU stage processing never controls this state machine.
+same sampling step. Codec chunk readiness never controls this state machine.
 """
 
 from dataclasses import dataclass
@@ -19,8 +19,6 @@ NUM_CODEBOOKS = 10
 class Zonos3SamplingStep:
     codes: torch.Tensor
     logical_token_ids: torch.Tensor
-    eoa_frame: torch.Tensor
-    codebook_valid: torch.Tensor
     active: torch.Tensor
     finished: torch.Tensor
 
@@ -42,8 +40,6 @@ class Zonos3ARSamplingState:
         self.has_audio_prefix = torch.zeros(capacity, dtype=torch.bool, device=device)
         self.ignore_eos = torch.zeros(capacity, dtype=torch.bool, device=device)
         self.eoa_codebook0 = torch.zeros(capacity, dtype=torch.bool, device=device)
-        self.next_codes = torch.full((capacity, NUM_CODEBOOKS), pad_id, dtype=torch.int64, device=device)
-        self.codebook_valid = torch.zeros((capacity, NUM_CODEBOOKS), dtype=torch.bool, device=device)
         self.columns = torch.arange(NUM_CODEBOOKS, dtype=torch.int64, device=device)
 
     def reset(
@@ -56,8 +52,6 @@ class Zonos3ARSamplingState:
         self.position.index_fill_(0, slots, 0)
         self.eoa_frame.index_fill_(0, slots, -1)
         self.drain_remaining.index_fill_(0, slots, 0)
-        self.next_codes.index_fill_(0, slots, self.pad_id)
-        self.codebook_valid.index_fill_(0, slots, False)
         self.has_audio_prefix.index_copy_(0, slots, has_audio_prefix)
         for target, value in ((self.ignore_eos, ignore_eos), (self.eoa_codebook0, eoa_codebook0)):
             if value is None:
@@ -96,19 +90,8 @@ class Zonos3ARSamplingState:
         # Reference _check_eos decrements on the first detection step too.
         remaining = torch.where(active & (eoa_frame >= 0), (remaining - 1).clamp(min=0), remaining)
         finished = (eoa_frame >= 0) & (remaining == 0)
-        aligned_frames = position[:, None] - self.columns
-        valid = (
-            active[:, None]
-            & started
-            & (codes < self.eoa_id)
-            & ((eoa_frame[:, None] < 0) | (aligned_frames < eoa_frame[:, None]))
-        )
         self.position.index_copy_(0, slots, position + active.long())
         self.eoa_frame.index_copy_(0, slots, eoa_frame)
         self.drain_remaining.index_copy_(0, slots, remaining)
-        previous_codes = self.next_codes.index_select(0, slots)
-        self.next_codes.index_copy_(0, slots, torch.where(active[:, None], codes, previous_codes))
-        previous_valid = self.codebook_valid.index_select(0, slots)
-        self.codebook_valid.index_copy_(0, slots, torch.where(active[:, None], valid, previous_valid))
         logical = torch.where(finished, EOS, CONTINUE).to(torch.int32).unsqueeze(-1)
-        return Zonos3SamplingStep(codes, logical, eoa_frame, valid, active, finished)
+        return Zonos3SamplingStep(codes, logical, active, finished)

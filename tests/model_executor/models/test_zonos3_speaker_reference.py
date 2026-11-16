@@ -21,6 +21,7 @@ def official_classes():
     root = os.environ.get("ZONOS3_REFERENCE_ROOT")
     if not root:
         pytest.skip("Set ZONOS3_REFERENCE_ROOT for official MECT arithmetic checks")
+    assert root is not None
     directory = Path(root) / "model/src/zonos3/models/third_party/antspeaker/models"
     namespace = {"torch": torch, "nn": nn, "F": F, "math": math, "Tensor": torch.Tensor}
     for path in (directory / "backbones/moe.py", directory / "backbones/mect.py", directory / "poolings.py"):
@@ -28,7 +29,8 @@ def official_classes():
         # Keep original method bodies; remove only package registry/imports.
         tree.body = [node for node in tree.body if isinstance(node, ast.ClassDef)]
         for node in tree.body:
-            node.decorator_list = []
+            if isinstance(node, ast.ClassDef):
+                node.decorator_list = []
         exec(compile(tree, str(path), "exec"), namespace)
     return namespace
 

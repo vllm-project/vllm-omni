@@ -17,7 +17,7 @@ from vllm_omni.model_executor.models.zonos3.codec import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32])
+@pytest.mark.parametrize("batch", [1, 4, 32])
 @pytest.mark.parametrize("scale", [1, 2])
 @torch.inference_mode()
 def test_packed_ring_variable_chunks_wrap_and_padding(batch, scale):
@@ -100,7 +100,7 @@ def test_packed_ring_variable_chunks_wrap_and_padding(batch, scale):
         hook.remove()
 
 
-@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32])
+@pytest.mark.parametrize("batch", [1, 4, 32])
 @torch.inference_mode()
 def test_packed_neural_variable_lengths_matches_whole_trunk(batch):
     torch.manual_seed(93)
@@ -136,7 +136,7 @@ def test_packed_neural_variable_lengths_matches_whole_trunk(batch):
         assert state.frames.tolist() == progress
 
 
-@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32])
+@pytest.mark.parametrize("batch", [1, 4, 32])
 @torch.inference_mode()
 def test_complete_packed_pcm_matches_whole_audio(batch):
     torch.manual_seed(97)

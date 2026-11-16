@@ -365,14 +365,6 @@ class FullAttnResWorkspace:
     ) -> None:
         self.bank = torch.empty((sources, tokens, width), dtype=dtype, device=device)
 
-    def write(self, index: int, value: torch.Tensor) -> None:
-        # Intentional in-place writes keep workspace addresses stable during
-        # native FULL capture/replay. Every source is overwritten each forward.
-        self.bank[index, : value.shape[0]].copy_(value)
-
-    def route(self, sources: int, tokens: int, query: torch.Tensor, eps: float) -> torch.Tensor:
-        return full_attnres_route(self.bank[:sources, :tokens], query, eps)
-
 
 class MultiOutputHead(nn.Module):
     def __init__(self, config: Zonos3Architecture) -> None:

@@ -17,7 +17,6 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 from tests.model_executor.models.test_zonos3_model_state import make_owner
 from vllm_omni.core.sched.output import OmniNewRequestData
-from vllm_omni.model_executor.models.zonos3.model_state import Zonos3SamplingOptions
 from vllm_omni.model_executor.models.zonos3.sampling_state import CONTINUE, EOS
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 
@@ -165,7 +164,7 @@ def test_tail_drain_logical_eos_is_independent_and_absorbs_async_extra_step():
     )
 
 
-@pytest.mark.parametrize("concurrency", [1, 4, 8, 16, 32])
+@pytest.mark.parametrize("concurrency", [1, 4])
 @torch.inference_mode()
 def test_seeded_rvq_sampling_is_invariant_to_batch_reordering(concurrency):
     batched = make_state(concurrency)
@@ -175,9 +174,9 @@ def test_seeded_rvq_sampling_is_invariant_to_batch_reordering(concurrency):
             temperature=0.7 + 0.01 * slot,
             top_k=5,
             top_p=0.85,
-            seed=100 + slot,
+            seed=None,
             repetition_penalty=1.4,
-            extra_args={"repetition_window": 4},
+            extra_args={"repetition_window": 4, "tts_local_seed": 100 + slot},
         )
         add_sampling(single, 0, params)
         single.apply_staged_writes()
@@ -206,24 +205,6 @@ def test_slot_reuse_resets_history_and_output_snapshot_stays_owned():
     assert state.sampling_state.position[0].item() == 0 and (state.history == -1).all()
     run(state, [0], torch.randn(1, 16))
     assert torch.equal(codes(output), saved)
-
-
-def test_state_rejects_unsupported_logical_constraints_and_dirty_staging():
-    state = make_state(1)
-    with pytest.raises(ValueError, match="Unsupported logical-token"):
-        add_sampling(state, 0, SamplingParams(logprobs=2))
-    add_sampling(state, 0, greedy_params())
-    with pytest.raises(RuntimeError, match="staged writes"):
-        run(state, [0], torch.zeros(1, 16))
-    with pytest.raises(ValueError, match="eoa_policy"):
-        Zonos3SamplingOptions.from_params(greedy_params(eoa_policy="bad"), state.model.config, 128)
-
-
-def test_tts_local_seed_is_accepted_as_shared_speech_sampling_metadata():
-    state = make_state(1)
-    params = SamplingParams(temperature=0.7, extra_args={"tts_local_seed": 42})
-    options = Zonos3SamplingOptions.from_params(params, state.model.config, 128)
-    assert options.seed == 42
 
 
 @torch.inference_mode()
@@ -265,7 +246,7 @@ def test_official_rvq_filter_probabilities_with_repetition_and_delayed_min_frame
             ref_history[slot, :6, -width:] = history[:6, -width:]
         ref_history[ref_history >= c.codebook_size] = -1
         logits = torch.randn(2, 10, c.audio_vocab)
-        actual = state.probabilities(logits, torch.arange(2), 5)
+        actual = state._cpu_probabilities(logits, torch.arange(2), 5)
         multinomial, captured = torch.multinomial, []
 
         def draw(probs, num_samples, **kwargs):

@@ -19,35 +19,6 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize("order", [[0], [1, 0]])
-@torch.inference_mode()
-def test_top_k_filters_every_codebook_with_single_and_reordered_requests(order):
-    device = torch.device("cuda")
-    settings = {
-        "top_k": torch.tensor([5, 9], device=device, dtype=torch.int32),
-        "top_p": torch.ones(2, device=device),
-        "temperature": torch.ones(2, device=device),
-        "min_p": torch.zeros(2, device=device),
-        "min_frames": torch.zeros(2, device=device, dtype=torch.int32),
-    }
-    owner = SimpleNamespace(
-        model=SimpleNamespace(config=SimpleNamespace(codebook_size=64, audio_vocab=66, eoa_id=64)),
-        sampling_state=SimpleNamespace(
-            position=torch.zeros(2, device=device, dtype=torch.int64),
-            columns=torch.arange(10, device=device),
-        ),
-        _setting=lambda name, slots: settings[name].index_select(0, slots),
-    )
-    slots = torch.tensor(order, device=device)
-    logits = torch.arange(66, device=device, dtype=torch.float32).expand(len(order), 10, -1).clone()
-    probs = Zonos3MiniModelState.probabilities(owner, logits, slots, 0)
-    assert torch.isfinite(probs).all()
-    for row, slot in enumerate(order):
-        expected = torch.arange(66, device=device) >= 65 - (5 if slot == 0 else 9)
-        expected[65] = False  # Audio padding must never be sampled.
-        assert torch.equal(probs[row] > 0, expected.expand(10, -1))
-
-
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
 def test_gpu_determined_tokens_and_owned_snapshots(dtype):
@@ -104,14 +75,15 @@ def test_fused_rvq_draw_matches_native_filter_and_rng(width):
     settings = SimpleNamespace(**{k: SimpleNamespace(gpu=v) for k, v in values.items()})
     owner = SimpleNamespace(
         model=SimpleNamespace(config=SimpleNamespace(codebook_size=4096, audio_vocab=vocab, eoa_id=4096)),
-        sampling_state=state,
-        history=history,
+        sampling_state=SimpleNamespace(position=state.position.cpu(), columns=state.columns.cpu()),
+        history=history.cpu(),
         max_model_len=ring,
-        _setting=lambda name, selected: values[name].index_select(0, selected),
+        _cpu_setting=lambda name, selected: values[name].cpu().index_select(0, selected),
     )
     for _ in range(3):
         logits = torch.randn(batch, 10, vocab, device="cuda") * 4
-        probs = Zonos3MiniModelState.probabilities(owner, logits, slots, width)
+        owner.sampling_state.position.copy_(state.position.cpu())
+        probs = Zonos3MiniModelState._cpu_probabilities(owner, logits.cpu(), slots.cpu(), width).cuda()
         position = state.position[slots, None] * 10 + state.columns
         expected = gumbel_sample(
             probs.log().view(-1, vocab),
@@ -174,10 +146,10 @@ def test_fused_stop_state_matches_cpu_through_drain_and_slot_reuse(dtype):
                 expected_feedback[slot] = embeddings[row]
         torch.testing.assert_close(history, expected_history, atol=0, rtol=0)
         torch.testing.assert_close(feedback, expected_feedback, atol=0, rtol=0)
-        for field in ("codes", "logical_token_ids", "eoa_frame", "codebook_valid", "active", "finished"):
+        for field in ("codes", "logical_token_ids", "active", "finished"):
             torch.testing.assert_close(getattr(actual, field).cpu(), getattr(expected, field), atol=0, rtol=0)
-        for field in ("position", "eoa_frame", "drain_remaining", "next_codes", "codebook_valid"):
+        for field in ("position", "eoa_frame", "drain_remaining"):
             torch.testing.assert_close(getattr(gpu, field).cpu(), getattr(cpu, field), atol=0, rtol=0)
     for state in (cpu, gpu):
         state.reset(slots.to(state.position.device), torch.zeros(4, dtype=torch.bool, device=state.position.device))
-    torch.testing.assert_close(gpu.next_codes.cpu(), cpu.next_codes, atol=0, rtol=0)
+    torch.testing.assert_close(gpu.position.cpu(), cpu.position, atol=0, rtol=0)

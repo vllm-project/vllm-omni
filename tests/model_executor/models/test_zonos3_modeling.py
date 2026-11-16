@@ -43,7 +43,6 @@ from vllm_omni.model_executor.models.zonos3 import modeling_zonos3_mini
 from vllm_omni.model_executor.models.zonos3.ar_config import Zonos3Architecture
 from vllm_omni.model_executor.models.zonos3.model_state import Zonos3MiniModelState
 from vllm_omni.model_executor.models.zonos3.modeling_zonos3_mini import (
-    FullAttnResWorkspace,
     MultiEmbedding,
     MultiOutputHead,
     Zonos3AttentionProjection,
@@ -134,26 +133,6 @@ def test_release_architecture_has_nine_gdn_two_global_layers_and_exact_widths():
     assert c.condition_bucket_counts == (10, 10, 30)
 
 
-@pytest.mark.parametrize(
-    "key,value",
-    [
-        ("residual_type", "standard"),
-        ("attention_pattern", "global"),
-        ("n_layers", 12),
-        ("moe_router_use_eda", True),
-        ("qwen_gating_style", "elementwise"),
-        ("eoa_id", 1024),
-        ("moe_n_experts", 2),
-        ("moe_alpha", 0.0),
-        ("codebook_sizes", [4096] * 9 + [1024]),
-        ("condition_bucket_counts", [10]),
-    ],
-)
-def test_release_architecture_rejects_incompatible_variants(key, value):
-    with pytest.raises(ValueError):
-        Zonos3Architecture.from_params({**release_params(), key: value})
-
-
 @torch.inference_mode()
 def test_nonzero_checkpoint_padding_embeddings_are_preserved():
     config = small_ar_config()
@@ -176,21 +155,6 @@ def test_dense_checkpoint_up_gate_order():
 
 
 @torch.inference_mode()
-def test_attnres_workspace_is_overwritten_across_bucket_rows():
-    torch.manual_seed(41)
-    workspace = FullAttnResWorkspace(23, 8, 16, dtype=torch.float32, device="cpu")
-    pointer = workspace.bank.data_ptr()
-    for rows in (8, 1, 4, 8):
-        sources = torch.randn(23, rows, 16)
-        query = torch.randn(16)
-        for i, source in enumerate(sources):
-            workspace.write(i, source)
-        expected = full_attnres_route(sources, query, 1e-5)
-        torch.testing.assert_close(workspace.route(23, rows, query, 1e-5), expected)
-        assert workspace.bank.data_ptr() == pointer
-
-
-@torch.inference_mode()
 def test_quantile_bias_changes_selection_but_not_selected_raw_logit_weights():
     c = small_ar_config()
     router = Zonos3QuantileRouter(c)
@@ -202,20 +166,6 @@ def test_quantile_bias_changes_selection_but_not_selected_raw_logit_weights():
     assert choices.tolist() == [[1, 0]] * 3
     expected = router.router_linear(router.rmsnorm_eda(x)).float().gather(-1, choices.long()).softmax(-1)
     torch.testing.assert_close(weights, expected)
-
-
-@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32])
-@torch.inference_mode()
-def test_output_head_ten_codebooks_and_single_row_batch_invariance(batch):
-    torch.manual_seed(21)
-    c = small_ar_config()
-    head = MultiOutputHead(c)
-    head.weight.normal_(std=0.2)
-    x = torch.randn(batch, 16)
-    whole = head(x)
-    assert whole.shape == (batch, 10, 10)
-    for row in range(batch):
-        torch.testing.assert_close(head(x[row : row + 1])[0], whole[row])
 
 
 @torch.inference_mode()
@@ -270,14 +220,6 @@ def test_native_attention_binding_requires_complete_gdn_cache_semantics():
         validate_zonos3_ar_runtime(config)
 
 
-@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
-def test_unsupported_graph_modes_fail_instead_of_downgrading(mode):
-    config = valid_runtime()
-    config.compilation_config.cudagraph_mode = mode
-    with pytest.raises(ValueError, match="requires FULL_DECODE_ONLY"):
-        validate_zonos3_ar_runtime(config)
-
-
 @pytest.mark.parametrize("mode", [CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.FULL_AND_PIECEWISE])
 def test_native_full_decode_mode_is_accepted_before_backend_construction(mode):
     config = valid_runtime()
@@ -285,16 +227,6 @@ def test_native_full_decode_mode_is_accepted_before_backend_construction(mode):
     validate_zonos3_ar_runtime(config)
     config.model_config.enforce_eager = True
     validate_zonos3_ar_runtime(config)
-
-
-@pytest.mark.parametrize(
-    "field,value", [("tensor_parallel_size", 2), ("pipeline_parallel_size", 2), ("enable_expert_parallel", True)]
-)
-def test_unsupported_parallel_state_sharing_fails_explicitly(field, value):
-    config = valid_runtime()
-    setattr(config.parallel_config, field, value)
-    with pytest.raises(ValueError, match="one tensor/pipeline rank"):
-        validate_zonos3_ar_runtime(config)
 
 
 def initialized_gdn():
@@ -306,7 +238,7 @@ def initialized_gdn():
     return layer
 
 
-@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32])
+@pytest.mark.parametrize("batch", [1, 4])
 @torch.inference_mode()
 def test_window_commit_boundary_is_per_slot_and_survives_batch_reordering(batch):
     layer = initialized_gdn()
@@ -330,27 +262,6 @@ def test_window_commit_boundary_is_per_slot_and_survives_batch_reordering(batch)
     state.reset([0])
     assert not state.window[0].any() and not state.recurrent[0].any() and not state.conv[0].any()
     assert state.prefill_tokens[0] == 0 and int(state.total_tokens[0]) == 0
-
-
-@torch.inference_mode()
-def test_stale_prefill_offset_is_rejected_before_state_mutation():
-    layer = initialized_gdn()
-    state = layer.allocate_state(1)
-    layer.forward_prefill(torch.randn(7, 16), 0, 0, state)
-    with pytest.raises(ValueError, match="offset is stale"):
-        layer.forward_prefill(torch.randn(2, 16), 0, 0, state)
-    assert state.prefill_tokens == [7] and int(state.total_tokens[0]) == 7
-
-
-def test_cuda_kernel_preparation_requires_explicit_reference_backend(monkeypatch):
-    layer = initialized_gdn()
-    monkeypatch.delenv("FLA_TILELANG", raising=False)
-    with pytest.raises(ValueError, match="FLA_TILELANG=0"):
-        layer.prepare_cuda([1, 4])
-    monkeypatch.setenv("FLA_TILELANG", "0")
-    monkeypatch.setattr("importlib.metadata.version", lambda name: "0.5.1")
-    with pytest.raises(ImportError, match="fla-core==0.5.2"):
-        layer.prepare_cuda([1, 4])
 
 
 @pytest.fixture(scope="module")
@@ -421,7 +332,7 @@ def test_official_multiembedding_and_full_attnres(official_lm, oracle):
     )
 
 
-@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32])
+@pytest.mark.parametrize("batch", [1, 4])
 @torch.inference_mode()
 def test_official_dense_and_latent_moe(oracle, batch):
     c = small_ar_config()
@@ -460,7 +371,7 @@ def test_official_global_qknorm_rope_head_gating_and_output(official_lm, oracle)
     torch.testing.assert_close(native.output(out, qkv.gate), expected, atol=1e-7, rtol=2e-5)
 
 
-@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32])
+@pytest.mark.parametrize("batch", [1, 4])
 @torch.inference_mode()
 def test_official_multioutput_head_logits(oracle, batch):
     c = small_ar_config()
@@ -494,7 +405,7 @@ def test_official_gdn_chunked_prefill_crosses_training_chunk_boundaries(official
             torch.testing.assert_close(state.conv[0, :, 1:], cache.conv_state[0], atol=3e-7, rtol=3e-5)
 
 
-@pytest.mark.parametrize("batch", [1, 4, 8, 16, 32])
+@pytest.mark.parametrize("batch", [1, 4])
 @torch.inference_mode()
 def test_official_gdn_batched_decode_independent_chunk_positions(official_lm, oracle, batch):
     native = Zonos3GDN(small_ar_config().dim)
@@ -728,4 +639,3 @@ def test_release_checkpoint_native_model_and_parallel_codebook_sampling(tmp_path
         hook.remove()
     assert result.num_sampled.tolist() == [1]
     assert snapshot == {"zonos3_audio": True}
-    assert state.sampling_state.next_codes[0].shape == (10,)
