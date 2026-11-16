@@ -744,6 +744,12 @@ the throughput measurements for CustomVoice do not qualify Base voice
 cloning quality. Reference layout, grouping and priming are model hooks;
 the shared worker does not select Qwen's context length or codebook layout.
 
+On sm_89 GPUs (for example L4 and RTX 4000 Ada), which do not run the PDL
+predictor chain, `additional_config.code_predictor_fp8: true` runs the fused
+code predictor's 15 residual-codebook steps with FP8 (e4m3) weights and
+per-row scales. It is off by default because it changes the predictor's
+numerics.
+
 ### Qwen3-TTS first-frame delivery and rollback
 
 The standard `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`

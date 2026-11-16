@@ -23,7 +23,10 @@ batch sizes each of the 15 dependent steps is launch- and latency-bound:
 from __future__ import annotations
 
 import torch
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, tldevice, triton
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -218,6 +221,7 @@ def _cp_sample_kernel(
     HAS_NEXT: tl.constexpr,
     ss_ptr=None,  # [B] fp32: sum of squares of the next-step input row (PDL chain only)
     PDL: tl.constexpr = False,
+    SS: tl.constexpr = False,
 ):
     row = tl.program_id(0).to(tl.int64)
     idx = tl.arange(0, V)
@@ -252,7 +256,7 @@ def _cp_sample_kernel(
         c = tl.arange(0, HID)
         e = tl.load(table_ptr + code.to(tl.int64) * HID + c)
         tl.store(next_ptr + row * HID + c, e)
-        if PDL:
+        if PDL or SS:
             ef = e.to(tl.float32)
             tl.store(ss_ptr + row, tl.sum(ef * ef, axis=0))
 
@@ -447,6 +451,65 @@ def _cp_gemm_stream_kernel(
         )  # fmt: skip
 
 
+@triton.jit
+def _cp_gemm_w8_kernel(
+    a_ptr, a_rs, a_ro, w_ptr, s_ptr, ws_ptr, cnt_ptr, out_ptr, ss_in_ptr, ss_out_ptr, M, eps,
+    K: tl.constexpr, N: tl.constexpr, HID: tl.constexpr, RMAX: tl.constexpr,
+    BN: tl.constexpr, BK: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
+    EPI: tl.constexpr, NT_IN: tl.constexpr, STAGES: tl.constexpr,
+):  # fmt: skip
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    pid_m = tl.program_id(2)
+    KS: tl.constexpr = K // SK
+    n = pid_n * BN + tl.arange(0, BN)
+    kb = pid_k * KS
+    m = pid_m * BM + tl.arange(0, BM)
+    rmask = m < M
+    arow = m * a_rs + a_ro
+    kk = tl.arange(0, BK)
+    acc = tl.zeros([BN, BM], dtype=tl.float32)
+    for k0 in tl.range(kb, kb + KS, BK, num_stages=STAGES):
+        w = tl.load(w_ptr + n[:, None] * K + (k0 + kk)[None, :]).to(tl.bfloat16)
+        a = tl.load(a_ptr + arow[:, None] * K + (k0 + kk)[None, :], mask=rmask[:, None], other=0.0)
+        acc = tl.dot(w, tl.trans(a), acc)
+    acc = acc * tl.load(s_ptr + n)[:, None]
+    if SK == 1:
+        _cp_gemm_epilogue(
+            acc, m, rmask, arow, n, pid_n, out_ptr, ss_in_ptr, ss_out_ptr, eps, N, HID, RMAX, BN, EPI, NT_IN
+        )
+    else:
+        tl.store(ws_ptr + pid_k * RMAX * N + m[None, :] * N + n[:, None], acc, mask=rmask[None, :])
+        _cp_gemm_reduce(
+            ws_ptr, cnt_ptr, pid_n, pid_m, tl.num_programs(2), M, a_rs, a_ro, n, out_ptr, ss_in_ptr, ss_out_ptr,
+            eps, N, HID, RMAX, BN, BM, SK, EPI, NT_IN,
+        )  # fmt: skip
+
+
+_W8_CANDIDATES = (
+    (64, 256, 2), (64, 128, 4), (64, 128, 1), (64, 128, 2), (64, 128, 8), (64, 256, 1), (32, 256, 1), (32, 128, 4),
+    (128, 128, 1),
+)  # fmt: skip
+_W8_BUCKETS = (16, 32, 64, 128, 256)
+
+
+def _w8_supported(device: torch.device) -> bool:
+    """FP8 (e4m3) weight loads with BF16 MMA: Ada (sm_89). Hopper and newer use the PDL chain."""
+    from vllm_omni.platforms import current_omni_platform
+
+    if not current_omni_platform.is_cuda() or device.type != "cuda":
+        return False
+    capability = current_omni_platform.get_device_capability(device.index or 0)
+    return capability is not None and (capability.major, capability.minor) >= (8, 9)
+
+
+def _w8_quant(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-output-row FP8 e4m3 weights and their FP32 scales."""
+    wf = w.float()
+    s = wf.abs().amax(1).clamp(min=1e-12) / 448.0
+    return (wf / s[:, None]).to(torch.float8_e4m3fn).contiguous(), s.contiguous()
+
+
 # Chain GEMM launch configs by the largest batch they serve (tuned on H200 over the
 # whole predictor graph). Register-panel kernel: (BN, BK, NCH, BM, warps, MT, MSTAGES);
 # streaming kernel: ("s", BN, BK, SK, BM, warps, STAGES). Batches above the
@@ -498,7 +561,7 @@ def _pdl_fits(cfg: tuple, n: int, k: int) -> bool:
 class FusedCodePredictor:
     """Execution object built from a loaded ``Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM``."""
 
-    def __init__(self, predictor, max_batch: int) -> None:
+    def __init__(self, predictor, max_batch: int, fp8_weights: bool = False) -> None:
         model = predictor.model
         weight = next(model.parameters())
         dev, dt = weight.device, weight.dtype
@@ -559,9 +622,15 @@ class FusedCodePredictor:
         kv = (len(self.layers), 2, max_batch, self.kv_heads, self.max_pos, self.head_dim)
         self.cache = torch.zeros(kv, device=dev, dtype=dt)
         self._dummy = torch.zeros(1, device=dev, dtype=dt)
+        # FP8 weight chain for GPUs without the PDL chain (code_predictor_fp8).
+        self._w8 = fp8_weights and not _pdl_supported(dev) and _w8_supported(dev)
+        if fp8_weights and not self._w8:
+            logger.warning("code_predictor_fp8 needs an sm_89 CUDA GPU without the PDL chain; using BF16 weights")
         self._pdl_configs = _PDL_CONFIGS if _pdl_supported(dev) and self._pdl_shapes_fit() else ()
         if self._pdl_configs:
             self._init_pdl(max_batch)
+        elif self._w8:
+            self._init_w8(max_batch)
         if self.layers[0]["qkv"] is not None:
             # The cuBLAS path reads the residual stream directly: fold the
             # RMSNorm weights into the projections (as the PDL chain does) and
@@ -635,6 +704,152 @@ class FusedCodePredictor:
                     L[key] = None
             self.lm_heads = None
 
+    def _init_w8(self, max_batch: int) -> None:
+        dev, hid = self.norm_w.device, self.hidden
+
+        def fold(wt: torch.Tensor, ln: torch.Tensor) -> torch.Tensor:
+            return wt.float().t() * ln.float()[None, :]
+
+        half = _PDL_GU_BN // 2
+        self.w8 = []
+        for L in self.layers:
+            gu = fold(L["gu"], L["ln2"])
+            inter = gu.shape[0] // 2
+            gu = torch.stack((gu[:inter].reshape(-1, half, hid), gu[inter:].reshape(-1, half, hid)), 1)
+            self.w8.append(
+                dict(
+                    qkv=_w8_quant(fold(L["qkv"], L["ln1"])),
+                    o=_w8_quant(L["o"].t()),
+                    gu=_w8_quant(gu.reshape(-1, hid)),
+                    down=_w8_quant(L["down"].t()),
+                )
+            )
+        self.w8_lm = [_w8_quant(fold(h, self.norm_w)) for h in self.lm_heads]
+        inter = self.w8[0]["gu"][0].shape[0] // 2
+        rows = 2 * max_batch
+        self._rows = rows
+        bf = torch.bfloat16
+        self.pdl_x = torch.empty(rows, hid, device=dev, dtype=bf)
+        self.pdl_qkv = torch.empty(rows, (self.heads + 2 * self.kv_heads) * self.head_dim, device=dev, dtype=bf)
+        self.pdl_att = torch.empty(rows, self.heads * self.head_dim, device=dev, dtype=bf)
+        self.pdl_act = torch.empty(rows, inter, device=dev, dtype=bf)
+        self.pdl_logits = torch.empty(max_batch, self.vocab, device=dev, dtype=bf)
+        widest = max(self.pdl_qkv.shape[1], 2 * inter, self.vocab, hid)
+        splits = max(c[2] for c in _W8_CANDIDATES)
+        self.pdl_ws = torch.empty(splits * rows * widest, device=dev, dtype=torch.float32)
+        self.pdl_cnt = torch.zeros(16384, device=dev, dtype=torch.int32)
+        self.pdl_ss = [torch.zeros(hid // 16, rows, device=dev, dtype=torch.float32) for _ in range(2)]
+        for L in self.layers:
+            for key in ("qkv", "o", "gu", "down"):
+                L[key] = None
+        self.lm_heads = None
+        self._w8_cfg = self._tune_w8()
+
+    def _w8_specs(self) -> dict[str, tuple]:
+        W = self.w8[0]
+        return {
+            "qkv": (W["qkv"], self.pdl_x, self.pdl_qkv, 0),
+            "o": (W["o"], self.pdl_att, self.pdl_x, 2),
+            "gu": (W["gu"], self.pdl_x, self.pdl_act, 1),
+            "down": (W["down"], self.pdl_act, self.pdl_x, 2),
+            "lm": (self.w8_lm[0], self.pdl_x, self.pdl_logits, 0),
+        }
+
+    def _w8_launch(self, cfg, a, a_rs, a_ro, w, out, ss_in, nt_in, ss_out, M, epi, eps=0.0) -> int:
+        q, s = w
+        N, K = q.shape
+        BN, BK, SK, BM = cfg
+        _cp_gemm_w8_kernel[(N // BN, SK, triton.cdiv(M, BM))](
+            a, a_rs, a_ro, q, s, self.pdl_ws, self.pdl_cnt, out, ss_in, ss_out, M, eps,
+            K=K, N=N, HID=self.hidden, RMAX=self._rows, BN=BN, BK=BK, SK=SK, BM=BM, EPI=epi,
+            NT_IN=nt_in, STAGES=3, num_warps=4,
+        )  # fmt: skip
+        return self.hidden // BN if epi == 2 else 0
+
+    def _tune_w8(self) -> dict[tuple[str, int], tuple]:
+        from triton.testing import do_bench
+
+        from vllm_omni.platforms import current_omni_platform
+
+        if current_omni_platform.is_graph_capturing():
+            names = self._w8_specs()
+            return {(n, b): (64, 128, 1, 16 if b <= 16 else 32) for n in names for b in _W8_BUCKETS}
+        x_saved = self.pdl_x.clone()
+        ss_in = self.pdl_ss[0]
+        ss_in.fill_(float(self.hidden))
+        best: dict[tuple[str, int], tuple] = {}
+        for name, (w, a, out, epi) in self._w8_specs().items():
+            N, K = w[0].shape
+            for bucket in _W8_BUCKETS:
+                M = min(bucket, self._rows if name != "lm" else self.max_batch)
+                bm = 16 if M <= 16 else 32
+                results = []
+                for bn, bk, sk in _W8_CANDIDATES:
+                    if N % bn or K % (bk * sk) or (epi == 1 and bn != _PDL_GU_BN):
+                        continue
+                    cfg = (bn, bk, sk, bm)
+
+                    def run(cfg=cfg):
+                        self._w8_launch(cfg, a, 1, 0, w, out, ss_in, 1, self.pdl_ss[1], M, epi, 1e-6)
+
+                    run()
+                    results.append((do_bench(run, warmup=5, rep=20), cfg))
+                best[(name, bucket)] = min(results)[1]
+        self.pdl_x.copy_(x_saved)
+        self.pdl_ss[0].zero_()
+        self.pdl_ss[1].zero_()
+        return best
+
+    def _w8_pick(self, name: str, M: int) -> tuple:
+        bucket = next((b for b in _W8_BUCKETS if M <= b), _W8_BUCKETS[-1])
+        return self._w8_cfg[(name, bucket)]
+
+    def _call_w8(self, B, layer0_code, inp, inv_temperature, top_k, sample_uniforms) -> torch.Tensor:
+        x = self.pdl_x
+        if self.proj_wt is not None:
+            torch.addmm(self.proj_b, inp, self.proj_wt, out=x[: 2 * B])
+        else:
+            x[: 2 * B].copy_(inp)
+        ss_cur, ss_nxt = self.pdl_ss
+        torch.sum(x[: 2 * B].float().square(), dim=1, out=ss_cur[0, : 2 * B])
+        nt = 1
+        codes = torch.empty(B, self.groups, device=x.device, dtype=torch.int64)
+        codes[:, 0] = layer0_code.reshape(B)
+        nq, first = 2, 0
+        pick = self._w8_pick
+        for step in range(1, self.groups):
+            rows = B * nq
+            for L, W in zip(self.layers, self.w8):
+                qkv = W["qkv"]
+                self._w8_launch(pick("qkv", rows), x, 1, 0, qkv, self.pdl_qkv, ss_cur, nt, None, rows, 0, L["eps1"])
+                _cp_attention_kernel[(B, self.heads, nq)](
+                    self.pdl_qkv, self.cache[L["index"], 0], self.cache[L["index"], 1], L["qn"], L["kn"],
+                    self.cos, self.sin, self.pdl_att, first, L["head_eps"], self.scale,
+                    NQ=nq, H=self.heads, KVH=self.kv_heads, HD=self.head_dim, MAXP=self.max_pos,
+                    BK=self._attn_keys, num_warps=1,
+                )  # fmt: skip
+                nt = self._w8_launch(pick("o", rows), self.pdl_att, 1, 0, W["o"], x, None, 0, ss_nxt, rows, 2)
+                ss_cur, ss_nxt = ss_nxt, ss_cur
+                self._w8_launch(pick("gu", rows), x, 1, 0, W["gu"], self.pdl_act, ss_cur, nt, None, rows, 1, L["eps2"])
+                nt = self._w8_launch(pick("down", rows), self.pdl_act, 1, 0, W["down"], x, None, 0, ss_nxt, rows, 2)
+                ss_cur, ss_nxt = ss_nxt, ss_cur
+            self._w8_launch(
+                pick("lm", B), x, nq, nq - 1, self.w8_lm[step - 1], self.pdl_logits, ss_cur, nt, None, B, 0, self.eps
+            )
+            has_next = step < self.groups - 1
+            us = sample_uniforms[:, step - 1]
+            _cp_sample_kernel[(B,)](
+                self.pdl_logits, us, us.stride(0), codes, step, self.groups,
+                self.tables[step - 1] if has_next else self._dummy, x, inv_temperature,
+                V=self.vocab, TOPK=top_k, HID=self.hidden, HAS_NEXT=has_next, ss_ptr=ss_nxt, SS=True,
+                num_warps=4,
+            )  # fmt: skip
+            ss_cur, ss_nxt = ss_nxt, ss_cur
+            nt = 1
+            first = step + 1
+            nq = 1
+        return codes
+
     def warmup_batches(self) -> list[int]:
         """Batch sizes that between them compile every kernel variant ``__call__`` can launch."""
         # Triton specializes integer arguments on == 1 and on divisibility by 16: per config bucket run
@@ -643,6 +858,10 @@ class FusedCodePredictor:
         for limit, _ in self._pdl_configs:
             limit = min(limit, self.max_batch)
             batches.update((limit, max(1, limit - 1)))
+        if self._w8:
+            for bucket in _W8_BUCKETS:
+                limit = min(bucket, self.max_batch)
+                batches.update((limit, max(1, limit - 1), max(1, limit // 2)))
         return sorted(batches)
 
     def _pdl_config(self, batch: int) -> dict | None:
@@ -752,6 +971,8 @@ class FusedCodePredictor:
         dev, dt = layer0_embed.device, self.norm_w.dtype
         inp = torch.stack([last_talker_hidden.reshape(B, -1), layer0_embed.reshape(B, -1)], 1).to(dt)
         inp = inp.reshape(2 * B, -1)
+        if self._w8:
+            return self._call_w8(B, layer0_code, inp, inv_temperature, top_k, sample_uniforms)
         cfg = self._pdl_config(B)
         if cfg is not None:
             return self._call_pdl(cfg, B, layer0_code, inp, inv_temperature, top_k, sample_uniforms)
