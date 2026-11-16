@@ -1500,6 +1500,8 @@ def test_parameter_validation():
     # Prompts must contain something other than whitespace, except that an empty
     # negative prompt enables guidance with no negative text for Qwen-Image.
     with pytest.raises(ValueError, match="non-empty"):
+        ImageGenerationRequest(prompt="")
+    with pytest.raises(ValueError, match="non-empty"):
         ImageGenerationRequest(prompt="   ")
     with pytest.raises(ValueError, match="non-empty"):
         ImageGenerationRequest(prompt="test", system_prompt="   ")
@@ -2999,7 +3001,7 @@ def test_image_routes_inherit_engine_defaults(test_client: TestClient, route: st
     )
     test_client.app.state.engine_client.default_sampling_params_list = [defaults]
     for override in (explicit, False):
-        payload = {"prompt": "a cat"}
+        payload: dict[str, str | float | int] = {"prompt": "a cat"}
         if override:
             payload.update(guidance_scale=0.0, seed=0, n=1)
         if route == "generations":
