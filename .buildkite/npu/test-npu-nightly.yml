@@ -19,6 +19,8 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
+            # Keep this benchmark ungated while the known performance issue is evaluated:
+            # https://github.com/vllm-project/vllm-omni/issues/10055
             pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m npu --test-config-file tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
@@ -36,6 +38,8 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - |
             set +e
+            # Keep this benchmark ungated while the known performance issue is evaluated:
+            # https://github.com/vllm-project/vllm-omni/issues/10055
             pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m npu --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
@@ -152,7 +156,7 @@ steps:
             set -euo pipefail
             export BENCHMARK_DIR=tests/dfx/perf/results/minicpmo-4-5-a3-2card
             mkdir -p "$$BENCHMARK_DIR"
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --assert-baseline \
               --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_a3_2card.json \
               -m "full_model and omni and npu and A3 and cards_2" \
               --run-level full_model 2>&1 | tee "$$BENCHMARK_DIR/pytest.log"

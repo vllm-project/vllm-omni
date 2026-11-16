@@ -64,7 +64,7 @@ def _worse_ratio(measured: float, baseline: float, *, lower_is_better: bool) -> 
 
 
 def _regressed(worse_ratio: float, tolerance: float) -> bool:
-    # ``超过 10%`` is strict. Float noise around an exact 10% boundary still passes.
+    # Only regressions strictly beyond tolerance fail; allow float noise at the boundary.
     if worse_ratio <= tolerance:
         return False
     return not math.isclose(worse_ratio, tolerance, rel_tol=1e-9, abs_tol=1e-12)
@@ -112,6 +112,9 @@ def assert_baseline_within_tolerance(
         actual = measured.get(name)
         if not _is_finite_number(actual):
             failures.append(f"{name}: measured value {actual!r} is not a finite number")
+            continue
+        if actual < 0:
+            failures.append(f"{name}: negative measured value {actual} is not supported")
             continue
         try:
             lower_is_better = metric_lower_is_better(str(name))

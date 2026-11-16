@@ -215,10 +215,17 @@ You can add any benchmark running parameters you need here. For all optional par
 
 1. Change the --xxx-xx-xx running parameters to xxx_xx_xx format and fill them as keys in the JSON file.
 2. For boolean variables in the running parameters, modify them to forms such as ignore_eos: true/false and fill them into the JSON file.
-3. Optionally add a `baseline` object. If you omit `baseline` or leave it empty, the performance test still runs but does not assert metric thresholds. With `--assert-baseline`, each metric in the bucket for the machine that ran the case must stay within 10% of that baseline in the worse direction: throughput and QPS fail when they drop below 90% of the baseline, and latency, memory, and real-time factor fail when they rise above 110%. Missing or unmatched hardware logs a warning and skips baseline validation without failing the case. CUDA and NPU perf jobs pass this flag; AMD jobs do not until that hardware has its own baseline.
+3. Optionally add a `baseline` object. If you omit `baseline` or leave it empty, the performance test still runs but does not assert metric thresholds. With `--assert-baseline`, each metric in the bucket for the machine that ran the case must stay within 10% of that baseline in the worse direction: throughput and QPS fail when they drop below 90% of the baseline, and latency, memory, and real-time factor fail when they rise above 110%. Missing or unmatched hardware logs a warning and skips baseline validation without failing the case. CUDA and NPU perf jobs pass this flag except for the Qwen3-Omni NPU exception described below; AMD jobs do not until that hardware has its own baseline.
 4. Set `"name"` on each `benchmark_params` entry for stable pytest ids and readable result keys.
 5. Image/video generation cases (`/v1/images/generations`, `/v1/images/edits`, `/v1/videos`) use this same schema: set `endpoint` to the API path, put width/height/steps/frames in `extra_body`, use `dataset_name: random` for text-only inputs or `random-mm` when the request needs a synthetic image/video. Do not set `server_type` or `task`, and do not use `random-request-config` or kebab-case diffusion client fields.
 6. The qps and concurrency modes are recommended to be mutually exclusive. For detailed explanations, see the table below:
+
+CUDA/NPU ready performance jobs and the MiniCPM-o 4.5 A3 two-card nightly
+job currently have no configured baseline, so the flag only enables the check
+entry point and those cases skip threshold validation until baselines are added.
+The two Qwen3-Omni NPU nightly performance jobs intentionally omit
+`--assert-baseline` while the known performance issue
+[#10055](https://github.com/vllm-project/vllm-omni/issues/10055) is evaluated.
 
 | Parameter       | Type          | Required | Example/Values       | Description                                                         |
 | --------------- | ------------- | -------- | -------------------- | ------------------------------------------------------------------- |

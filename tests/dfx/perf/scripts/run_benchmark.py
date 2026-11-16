@@ -590,7 +590,6 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
     subsets = params.get(_OMNIINTERACT_AGGREGATE_SUBSETS)
     max_concurrency = result.get("max_concurrency")
     min_ia_qtf1 = params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
-    max_concurrency = result.get("max_concurrency")
     passed = not _is_finite_number(min_ia_qtf1) or pooled.ia_qtf1 >= float(min_ia_qtf1)
     write_dfx_accuracy_result(
         accuracy_path,

@@ -55,10 +55,18 @@ both runners call `assert_baseline_within_tolerance()` in
   threshold assertion. The existing TPOT finiteness check still runs whenever
   `mean_tpot_ms` is configured, even without the flag.
 
-CUDA and NPU perf jobs pass `--assert-baseline`. AMD jobs do not, until that
+CUDA and NPU perf jobs pass `--assert-baseline`, except for the Qwen3-Omni NPU
+jobs described below. AMD jobs do not, until that
 hardware has its own bucket. A run without the flag records the baseline and
 does not apply this gate. Do not call a row gated unless the command includes
 the flag and the result hardware matches a bucket.
+
+CUDA/NPU ready performance jobs and the MiniCPM-o 4.5 A3 two-card nightly
+job currently have no configured baseline, so the flag only enables the check
+entry point and those cases skip threshold validation until baselines are added.
+The two Qwen3-Omni NPU nightly performance jobs intentionally omit
+`--assert-baseline` while the known performance issue
+[#10055](https://github.com/vllm-project/vllm-omni/issues/10055) is evaluated.
 
 ## Nightly report chain
 
