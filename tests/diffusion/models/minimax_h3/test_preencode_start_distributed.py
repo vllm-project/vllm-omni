@@ -16,6 +16,31 @@ import torch.distributed as dist
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+def _wait_for_peers() -> None:
+    """Wait until every rank reaches teardown before the group is destroyed.
+
+    ``dist.new_group`` does not synchronise non-member ranks: the barrier it
+    runs after creating a group is gated behind ``_is_barrier_after_init()``,
+    i.e. ``TORCH_DIST_INIT_BARRIER``, which defaults to ``0``. A worker outside
+    ``ranks`` therefore returns immediately, and its
+    ``finally: dist.destroy_process_group()`` can close the group's sockets
+    while a member is still connecting inside ``init_process_group``. That
+    member then fails with ``connectFullMesh ... Connection closed by peer``,
+    which is a teardown race rather than the behaviour under test.
+
+    Every rank reaches teardown, so a barrier over the default group restores
+    the ordering.
+    """
+    if not dist.is_initialized():
+        # Nothing to synchronise: this rank never established a default group.
+        return
+    try:
+        dist.barrier()
+    except RuntimeError:
+        # A peer may already be gone; the worker's own error must stay visible.
+        pass
+
+
 def _prestart_worker(rank, ranks, init_method, result_dir, fail_start):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
@@ -93,6 +118,7 @@ def _prestart_worker(rank, ranks, init_method, result_dir, fail_start):
                 result.update(error_type=type(exc).__name__, error=str(exc))
             (Path(result_dir) / f"rank-{rank}.json").write_text(json.dumps(result))
     finally:
+        _wait_for_peers()
         dist.destroy_process_group()
 
 
@@ -113,7 +139,10 @@ def test_preencode_start_keeps_vae_ranks_consistent(tmp_path, ranks, fail_start)
         for worker in workers:
             worker.join(timeout=max(0, deadline - time.monotonic()))
         assert not any(worker.is_alive() for worker in workers), "MP4 prestart left a VAE rank hanging"
-        assert all(worker.exitcode == 0 for worker in workers)
+        exitcodes = {rank: worker.exitcode for rank, worker in enumerate(workers)}
+        assert all(code == 0 for code in exitcodes.values()), (
+            f"workers exited non-zero: {exitcodes} (ranks={tuple(ranks)}, fail_start={fail_start})"
+        )
         for rank in ranks:
             result = json.loads((tmp_path / f"rank-{rank}.json").read_text())
             owner = rank == ranks[0]

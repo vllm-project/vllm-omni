@@ -74,6 +74,66 @@ def test_vllm_varlen_version_kwargs_targets_only_vllm_dispatcher(monkeypatch):
     assert fa.vllm_varlen_version_kwargs(None) == {}
 
 
+@pytest.fixture
+def clear_vllm_varlen_cache():
+    fa._vllm_flash_attn_varlen.cache_clear()
+    yield
+    fa._vllm_flash_attn_varlen.cache_clear()
+
+
+def _count_vllm_flash_attn_imports(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+    calls = []
+
+    def counting_import(name, *args, **kwargs):
+        if name == "vllm.vllm_flash_attn":
+            calls.append(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", counting_import)
+    return calls
+
+
+@pytest.mark.cpu
+def test_vllm_varlen_lookup_caches_failed_import(monkeypatch, clear_vllm_varlen_cache):
+    # A ``None`` entry in sys.modules makes the import raise ImportError.
+    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", None)
+    calls = _count_vllm_flash_attn_imports(monkeypatch)
+
+    def some_func(**_kwargs):
+        return None
+
+    for _ in range(3):
+        assert fa._is_vllm_flash_attn_varlen(some_func) is False
+        assert fa.vllm_varlen_version_kwargs(some_func) == {}
+    assert fa._vllm_flash_attn_varlen() is None
+    assert len(calls) == 1
+
+
+@pytest.mark.cpu
+def test_vllm_varlen_lookup_matches_dispatcher_by_identity(monkeypatch, clear_vllm_varlen_cache):
+    def vllm_func(**_kwargs):
+        return None
+
+    def other_func(**_kwargs):
+        return None
+
+    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", SimpleNamespace(flash_attn_varlen_func=vllm_func))
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", lambda requested=None: 3)
+    calls = _count_vllm_flash_attn_imports(monkeypatch)
+
+    for _ in range(3):
+        assert fa._is_vllm_flash_attn_varlen(vllm_func) is True
+        assert fa.vllm_varlen_version_kwargs(vllm_func) == {"fa_version": 3}
+        assert fa._is_vllm_flash_attn_varlen(other_func) is False
+        assert fa.vllm_varlen_version_kwargs(other_func) == {}
+    assert fa.vllm_varlen_version_kwargs(None) == {}
+    assert fa._vllm_flash_attn_varlen() is vllm_func
+    assert len(calls) == 1
+
+
 @pytest.mark.cpu
 @pytest.mark.parametrize(
     ("major", "expect_hopper"),
@@ -248,7 +308,7 @@ def test_vllm_dense_adapter_builds_varlen_metadata_and_restores_lse(monkeypatch)
     assert captured["softmax_scale"] == 0.25
 
 
-@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "H100", "B200"]}, num_cards=1)
 @pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="vLLM FlashAttention requires CUDA")
 def test_vllm_dense_adapter_cuda_matches_sdpa_and_lse():
     """Exercise the real versioned vLLM dispatcher and its LSE contract."""
@@ -263,8 +323,7 @@ def test_vllm_dense_adapter_cuda_matches_sdpa_and_lse():
     value = torch.randn_like(key)
 
     capability = torch.cuda.get_device_capability(device)
-    expected_version = 3 if capability[0] == 9 else 2
-    assert capability[0] in (8, 9), f"test expects an Ampere/Ada or Hopper GPU, got SM{capability[0]}{capability[1]}"
+    expected_version = 4 if capability[0] >= 10 else 3 if capability[0] == 9 else 2
     assert fa.resolve_vllm_flash_attn_version() == expected_version
 
     output, lse = fa.vllm_flash_attn_dense_with_lse(

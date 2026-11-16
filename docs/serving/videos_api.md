@@ -233,6 +233,13 @@ upstream vLLM's media URL allowlist protection. Deployments should therefore
 treat remote media URLs as untrusted and choose this setting as part of their
 URL access policy.
 
+### MiniMax H3 Samplers
+
+Set `"sampler"` in `extra_params` to select the sampler. Supported values are
+`euler` (default) and `res_multistep`. Both request and step execution support
+them, and compatible requests share packed model evaluations. Fixed distilled
+schedules remain Euler-only.
+
 ### MiniMax H3 control and inpainting
 
 MiniMax H3 FL2VA accepts preprocessed control videos when the server is

@@ -9,6 +9,12 @@ import torch
 from transformers import AutoTokenizer, UMT5EncoderModel
 
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.cell_timing import CellTiming
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_executor import (
+    resolve_pp_rank_and_group,
+    run_cell_pipeline,
+)
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import cfg_step_replicas
 from vllm_omni.diffusion.models.causvid_wan.pipeline_causvid_wan import CausVidWanPipeline, _as_request_list
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
 from vllm_omni.diffusion.models.physis.common import (
@@ -21,9 +27,6 @@ from vllm_omni.diffusion.models.physis.common import (
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     get_wan22_post_process_func as get_wan22_post_process_func,
 )
-from vllm_omni.experimental.ar_diffusion.cell_executor import resolve_pp_rank_and_group, run_cell_pipeline
-from vllm_omni.experimental.ar_diffusion.cell_schedule import cfg_step_replicas
-from vllm_omni.experimental.ar_diffusion.cell_timing import CellTiming
 
 from .sampler import WAN21_1_3B, WAN21_14B, WAN22_5B, WanFourStepSampler
 
@@ -251,7 +254,7 @@ class PhysisWanPipeline(CausVidWanPipeline):
         return result
 
     def forward(self, req):
-        assert self._chunk_ctx is not None
+        ctx = self._execution_context()
         _, pp = resolve_pp_rank_and_group()
         param = next(self.transformer.parameters())
         device, dtype = param.device, torch.bfloat16
@@ -278,7 +281,7 @@ class PhysisWanPipeline(CausVidWanPipeline):
             tf.capture_sink = True
             self._sink_forward(latent, torch.zeros((), dtype=torch.float32), step=4, pp=pp)
             tf.capture_sink = False
-            self._chunk_ctx.enqueue(request_id, plan, chunk_tokens=self.block_size)
+            ctx.enqueue(request_id, plan, chunk_tokens=self.block_size)
             adapter = PhysisWanCell(
                 tf,
                 sampler=sampler,
@@ -289,7 +292,7 @@ class PhysisWanPipeline(CausVidWanPipeline):
                 dtype=dtype,
                 on_finished=timing.mark,
             )
-            run_cell_pipeline(ctx=self._chunk_ctx, adapter=adapter)
+            run_cell_pipeline(ctx=ctx, members={request_id: adapter})
             finished = self._gather_finished(adapter.finished, pp)
             durations = timing.durations(pp)
             if self.pp_rank == 0:

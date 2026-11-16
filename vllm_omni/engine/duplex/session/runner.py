@@ -861,12 +861,17 @@ class DuplexSessionRunner:
             if session.unanswered_user_items() > previous_user_items:
                 self.memory.note_user_item(command.payload(), str(command.item["id"]))
         elif isinstance(command, DeleteItem):
+            deleted_user_source = bool(session.user_source_ids_for_items((command.item_id,)))
             control = resolve_delete_item(projector, command)
             self._emit_events(control.events)
             for payload in control.payloads:
                 await self.control.on_turn_signal(payload)
             if control.payloads:
                 self.memory.forget_user_item(command.item_id)
+                if deleted_user_source and not session.user_source_ids_for_items((command.item_id,)):
+                    session.release_input_bytes(
+                        self.plugin.on_history_item_deleted(state=self.model_state, item_id=command.item_id)
+                    )
         elif isinstance(command, TruncateItem):
             control = resolve_truncate_item(
                 projector, command, has_audio=self.session.history_item_has_audio(command.item_id)
@@ -1614,6 +1619,7 @@ class DuplexSessionRunner:
         on_append_accepted: Callable[[float], None] | None = None,
         before_append: Callable[[], bool] | None = None,
         input_audio_parts: dict[str, dict[str, object] | None] | None = None,
+        unanswered_source_ids: tuple[int, ...] = (),
     ) -> asyncio.Task[bool]:
         session = self.session
         model_state = self.model_state
@@ -1673,6 +1679,20 @@ class DuplexSessionRunner:
                 for segment in segments
                 if isinstance(segment, dict) and isinstance(segment.get("item_id"), str)
             }
+        if final:
+            # Automatic speech commits need the same retry eligibility as an
+            # explicit response.create, even without a new text-item counter.
+            item_ids = {input_item_id} if isinstance(input_item_id, str) else set()
+            if isinstance(segments, list):
+                item_ids.update(
+                    segment["item_id"]
+                    for segment in segments
+                    if isinstance(segment, dict) and isinstance(segment.get("item_id"), str)
+                )
+            if item_ids:
+                unanswered_source_ids = tuple(
+                    dict.fromkeys((*unanswered_source_ids, *session.user_source_ids_for_items(item_ids)))
+                )
         attempt = AppendAttempt(
             ctx=self.ctx,
             out=self.out,
@@ -1689,6 +1709,7 @@ class DuplexSessionRunner:
             owns_request=final or precreate_response,
             input_audio_part=session.input_audio_part(input_item_id) if isinstance(input_item_id, str) else None,
             input_audio_parts=input_audio_parts,
+            unanswered_source_ids=unanswered_source_ids,
             on_append_accepted=on_append_accepted,
             on_append_prepared=self.memory.preempt_for_submission if interactive else None,
             before_append=before_append,
@@ -2376,9 +2397,9 @@ class DuplexSessionRunner:
         commit has its own prefixes, or when that retained payload is a VISION
         unit the model replays separately. Merging either of those into the
         terminal would reorder or collapse separate units. A single-terminal
-        model leaves a retained camera observation in place, so the newer
-        commit replaces it and a promotion queued for the old payload no
-        longer matches. A vision-only terminal still merges into retained
+        model coalesces retained camera frames into the newer terminal, so a
+        promotion queued for the old payload no longer matches. A vision-only
+        terminal still merges into retained
         speech, which keeps that speech's transcript owner and accumulates
         the frames. Returns False if the model state cannot hold prefixes;
         the caller then rolls the commit back.
@@ -2544,18 +2565,25 @@ class DuplexSessionRunner:
         """
         session = self.session
         model_state = self.model_state
-        if (
-            helpers.response_in_progress(self.session, self.tasks)
-            or self.tasks.append_tasks
-            # Listen-only commit prefixes can still own the data-plane stream.
-            # The retained terminal append follows them in the same wire order.
-            or (self.run.stream_request_id is not None and model_state.committed_audio_payload is None)
-        ):
+        # A listen stream can still hold the data-plane claim with nothing
+        # committed -- in a native session that claim survives its input on
+        # purpose (model_channel deliberately keeps the stream bound for the
+        # next turn). Neither guard here looks at it: ``response_in_progress``
+        # only reports an active response, unplayed assistant audio, a live
+        # response task or a response-bound append, and ``append_tasks`` only
+        # tracks appends. Counting the surviving claim as pending work would
+        # strand the create forever -- no later append releases it once the
+        # input has stopped, and the client only finds out when its drain
+        # times out -- so a create that finds nothing else in flight falls
+        # through to the nothing-to-answer refusals below, which answer it
+        # immediately. Only a turn that still owns the model reaches the
+        # response_already_active branch.
+        if helpers.response_in_progress(self.session, self.tasks) or self.tasks.append_tasks:
             if session.active_response_id is None and (
-                session.active_request_id is not None
-                or self.tasks.append_tasks
-                or self.run.stream_request_id is not None
+                session.active_request_id is not None or self.tasks.append_tasks
             ):
+                # An append is in flight: its terminal append follows in the
+                # same wire order and carries the turn this create asks for.
                 return
             self._emit_error(
                 "response_already_active", "response.create cannot start while another response is active."
@@ -2570,6 +2598,7 @@ class DuplexSessionRunner:
             if operation_id is None:
                 operation_id = uuid.uuid4().hex
                 model_state.committed_audio_operation_id = operation_id
+            unanswered_source_ids = session.pending_user_source_ids()
             session.reset_unanswered_user_items()
             await self._start_append(
                 committed_payload,
@@ -2577,11 +2606,18 @@ class DuplexSessionRunner:
                 precreate_response=True,
                 operation_id=operation_id,
                 retained_committed_payload=committed_payload,
+                unanswered_source_ids=unanswered_source_ids,
             )
             return
         if session.unanswered_user_items() and session.capabilities.supports_text_only_turn:
+            unanswered_source_ids = session.pending_user_source_ids()
             session.reset_unanswered_user_items()
-            await self._start_append({"type": "conversation"}, final=True, precreate_response=True)
+            await self._start_append(
+                {"type": "conversation"},
+                final=True,
+                precreate_response=True,
+                unanswered_source_ids=unanswered_source_ids,
+            )
             return
         if session.capabilities.supports_text_only_turn and self.plugin.has_pending_tool_followup(
             session.runtime_config
@@ -2720,8 +2756,23 @@ class DuplexSessionRunner:
         self.emit(committed_payload)
         return True
 
-    async def _commit_and_start_auto_response(self, event: dict[str, object], *, realtime_item_id: object) -> None:
-        """Commit the buffered turn and submit it, letting the model answer it."""
+    async def _commit_and_start_auto_response(
+        self, event: dict[str, object], *, realtime_item_id: object, precreate_response: bool = False
+    ) -> None:
+        """Commit the buffered turn and submit it, letting the model answer it.
+
+        ``precreate_response`` honors an explicit ``response_create`` on the
+        commit -- but only for a model-native session whose model can decide
+        per unit to keep listening and thereby strand the final user turn;
+        then the forced answer opens its response immediately instead of
+        waiting for the model's own speak decision (or for the client's
+        ``response.create`` re-ask). A session without model-native turn policy
+        (e.g. AURA) keeps opening its responses on model output, and while
+        another response is still running the flag is dropped as well:
+        binding this turn onto the active response would misattribute the
+        in-flight answer. In both skipped cases the retained committed input
+        keeps the client's re-ask armed.
+        """
         session = self.session
         model_state = self.model_state
         prefix_reservations = self._reserve_commit_prefixes()
@@ -2776,7 +2827,11 @@ class DuplexSessionRunner:
             await self._start_append(
                 {**final_payload, "duplex_turn_id": data_plane_turn_id},
                 final=True,
-                precreate_response=False,
+                precreate_response=(
+                    precreate_response
+                    and session.capabilities.supports_model_native_turn_policy
+                    and session.active_response_id is None
+                ),
                 operation_id=commit_reservation.operation_id,
                 retained_committed_payload=final_payload,
             )
@@ -2911,7 +2966,11 @@ class DuplexSessionRunner:
                     ):
                         return
             if commit_action is CommitAction.START_AUTO_RESPONSE:
-                await self._commit_and_start_auto_response(event, realtime_item_id=realtime_item_id)
+                await self._commit_and_start_auto_response(
+                    event,
+                    realtime_item_id=realtime_item_id,
+                    precreate_response=precreate_response_requested,
+                )
                 return
         if event_type == "response.create":
             if session.unanswered_user_items() or model_state.committed_audio_payload is not None:
