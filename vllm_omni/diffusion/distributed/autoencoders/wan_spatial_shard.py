@@ -520,7 +520,9 @@ class WanDistConv2d(nn.Conv2d):
     def forward(
         self, x: torch.Tensor, *, return_bias: bool = False
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
-        if not torch.is_grad_enabled():
+        from .wan_vae_fastpath.forwards import CFG_ATTR
+
+        if getattr(self, CFG_ATTR, None) is not None and not torch.is_grad_enabled():
             x_padded, local_extent = self._assemble_input(x)
         else:
             x = F.pad(x, self._non_split_padding)
@@ -663,6 +665,8 @@ class WanDistCausalConv3d(nn.Conv3d):
         into the same slots with PyTorch. Conv3d uses transient storage
         to avoid retaining one large activation per layer.
         """
+        from .wan_vae_fastpath.forwards import CFG_ATTR
+
         pad_w0, pad_w1, pad_h0, pad_h1, pad_t0, pad_t1 = self._padding
         cache_frames = 0
         if cache_x is not None and pad_t0 > 0:
@@ -683,7 +687,12 @@ class WanDistCausalConv3d(nn.Conv3d):
         shape = (batch, channels, total_frames, total_height, total_width)
         buf = torch.empty(shape, dtype=x.dtype, device=x.device, memory_format=self.input_memory_format)
         fused = False
-        if x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling():
+        if (
+            getattr(self, CFG_ATTR, None) is not None
+            and x.is_cuda
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
             from .wan_vae_fastpath.triton_data_movement import cat_pad_5d
 
             # The kernel writes every element, including zero padding.
@@ -1159,6 +1168,9 @@ def spatial_shard_decode(
                     out = unpatchify(out, patch_size=vae.config.patch_size)
                 out = torch.clamp(out, min=-1.0, max=1.0)
     finally:
+        for module in vae.decoder.modules():
+            if isinstance(module, WanDistConv2d):
+                module._input_buf = None
         vae.clear_cache()
 
     if callback_error is not None:

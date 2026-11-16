@@ -57,6 +57,43 @@ ALL_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
 # that the fast path is bit-exact on XPU, including the XPU-specific divide and conv-bias
 # rules. Every test still runs on XPU when invoked directly.
 _XPU_CI = hardware_test(res={"xpu": "B60"}, num_cards=1)
+
+
+@pytest.mark.skipif(DEVICE != "cuda", reason="Spatial assembly fusion requires CUDA")
+@torch.no_grad()
+@pytest.mark.parametrize("axis", ["height", "width"])
+def test_spatial_cat_pad_requires_installed_fastpath(monkeypatch, axis):
+    from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard as spatial
+
+    monkeypatch.setattr(spatial, "_rank_world", lambda group: (0, 1))
+    conv = spatial.WanDistCausalConv3d(
+        WanCausalConv3d(2, 2, 3, padding=1).to(device=DEVICE), group=None, split_dim=axis
+    )
+    x = torch.randn(1, 2, 2, 4, 5, device="cuda")
+    history = torch.randn_like(x)
+    calls = []
+    cat_pad = dm.cat_pad_5d
+
+    def tracked(*args, **kwargs):
+        result = cat_pad(*args, **kwargs)
+        assert result is not None
+        calls.append(True)
+        return result
+
+    monkeypatch.setattr(dm, "cat_pad_5d", tracked)
+    expected, extent = conv._assemble_input(x, history)
+    assert not calls
+    setattr(conv, fp.CFG_ATTR, fp.FastPathConfig())
+    actual, actual_extent = conv._assemble_input(x, history)
+    assert calls == [True]
+    assert actual_extent == extent
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    delattr(conv, fp.CFG_ATTR)
+    actual, _ = conv._assemble_input(x, history)
+    assert calls == [True]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 # Cosmos3 720p decoder stages, spatially scaled down so the suite stays fast.
 NORM_SHAPES = [
     (1, 1024, 1, 45, 80),

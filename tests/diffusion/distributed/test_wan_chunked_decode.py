@@ -163,11 +163,13 @@ def test_spatial_callback_ownership_and_bounded_retention(monkeypatch, rank, fai
         references.append(weakref.ref(chunk))
         return chunk
 
+    decoder = torch.nn.Module()
+    decoder.forward = decode
     vae = SimpleNamespace(
         config=SimpleNamespace(patch_size=None),
         clear_cache=Mock(),
         post_quant_conv=lambda z: z,
-        decoder=decode,
+        decoder=decoder,
         _feat_map=[],
     )
     callback = Mock(side_effect=RuntimeError("consumer failed") if fail_callback else None)
@@ -224,11 +226,13 @@ def test_spatial_automatic_chunk_size(monkeypatch, level, world_size, override, 
     monkeypatch.setattr(wan_spatial_shard, "install_wan_spatial_shard_decode", install)
     monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, world_size))
     chunks = []
+    decoder = torch.nn.Module()
+    decoder.forward = lambda x, **kwargs: x
     vae = SimpleNamespace(
         config=SimpleNamespace(patch_size=None),
         clear_cache=Mock(),
         post_quant_conv=lambda z: z,
-        decoder=lambda x, **kwargs: x,
+        decoder=decoder,
         _feat_map=[],
     )
     wan_spatial_shard.spatial_shard_decode(
