@@ -69,6 +69,7 @@ _UNSUPPORTED_SAMPLING_PARAMS = ("temperature", "top_p", "top_k", "repetition_pen
 # Speech-request fields other TTS models read and YuE2 does not. The request
 # model accepts them, so without this check they would succeed and do nothing.
 _UNSUPPORTED_OPTIONAL_FIELDS = (
+    "token_count",
     "ref_audio_2",
     "speaker_embedding",
     "x_vector_only_mode",

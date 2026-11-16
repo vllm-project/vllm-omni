@@ -1637,6 +1637,7 @@ def _yue2_request(**overrides: Any) -> OpenAICreateSpeechRequest:
     "overrides, err_substr",
     [
         pytest.param({"duration_seconds": 30.0}, "max_new_tokens", id="duration_seconds"),
+        pytest.param({"token_count": 250}, "token_count", id="token_count"),
         pytest.param({"speaker_embedding": [0.1] * 16}, "speaker_embedding", id="speaker_embedding"),
         pytest.param({"x_vector_only_mode": True}, "x_vector_only_mode", id="x_vector_only_mode"),
         pytest.param({"ambient_sound": "rain"}, "ambient_sound", id="ambient_sound"),
