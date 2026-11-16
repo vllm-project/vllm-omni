@@ -54,6 +54,9 @@ QWEN3_OMNI_COLD_INIT_TIMEOUT_S = 1200
 # Diffusion workers alone may need 15s + 5s + 5s for cooperative cleanup
 # and signal escalation. Keep their tracker alive while the API owns teardown.
 SERVER_SHUTDOWN_TIMEOUT_S = 60
+# Auto-port OmniServer launches can lose the reserved TCP port between the
+# parent's probe close and the child bind under xdist; retry a few times.
+SERVER_PORT_IN_USE_RETRIES = 3
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
@@ -254,7 +257,68 @@ class OmniServer:
             # A child can exit between enumeration and inspecting its sockets.
             return False
 
+    @staticmethod
+    def _is_address_in_use_failure(message: str) -> bool:
+        """Return True when *message* looks like a TCP bind collision."""
+        text = message.lower()
+        return any(
+            needle in text
+            for needle in (
+                "address already in use",
+                "errno 98",
+                "eaddrinuse",
+                "only one usage of each socket address",
+                "error 10048",
+            )
+        )
+
+    def _abandon_launch_attempt(self) -> None:
+        """Kill a failed child and drop the port lock so a retry can rebind."""
+        if self.proc is not None:
+            try:
+                if self.proc.poll() is None:
+                    self._kill_process_tree(self.proc.pid)
+            except Exception:
+                pass
+            self._stop_stderr_reader()
+            self.proc = None
+        if self._port_lock is not None:
+            self._port_lock.release()
+            self._port_lock = None
+        self._server_error_lines = deque(maxlen=100)
+
     def _start_server(self) -> None:
+        attempts = SERVER_PORT_IN_USE_RETRIES if self._auto_port else 1
+        last_error: BaseException | None = None
+        for attempt in range(attempts):
+            try:
+                self._start_server_once()
+                return
+            except RuntimeError as exc:
+                last_error = exc
+                failure_text = f"{exc}{''.join(self._server_error_lines)}"
+                # Only early bind exits may retry. A still-running child that
+                # merely logged an unrelated EADDRINUSE (then hit the startup
+                # timeout) must not consume additional full startup budgets.
+                child_exited = self.proc is not None and self.proc.poll() is not None
+                can_retry = (
+                    self._auto_port
+                    and attempt + 1 < attempts
+                    and child_exited
+                    and self._is_address_in_use_failure(failure_text)
+                )
+                self._abandon_launch_attempt()
+                if not can_retry:
+                    raise
+                print(
+                    f"OmniServer port bind failed (attempt {attempt + 1}/{attempts}); "
+                    "retrying with a new auto-selected port",
+                    flush=True,
+                )
+        assert last_error is not None
+        raise last_error
+
+    def _start_server_once(self) -> None:
         self._reserve_port()
         env = os.environ.copy()
         if self.env_dict is not None:
