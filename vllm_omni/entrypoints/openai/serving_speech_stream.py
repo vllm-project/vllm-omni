@@ -25,6 +25,7 @@ splitter or the commitment policy.
 Protocol:
     Client -> Server:
         {"type": "session.config", ...}   # Session config (first message; repeatable)
+        {"type": "session.ping"}          # Send optional keep alive ping message
         {"type": "input.text", "text": "..."} # Text chunks
         {"type": "input.done"}            # End of utterance, flush and keep connection open
         {"type": "session.close"}         # End of connection
@@ -39,6 +40,7 @@ Protocol:
         ...
         {"type": "audio.done", "utterance_index": 0, "sentence_index": 0}
         {"type": "session.done", "utterance_index": 0, "total_sentences": N}
+        {"type": "session.pong"} # Response to ping message
         {"type": "error", "message": "..."}
         # session.done ends the flushed utterance, not the connection.
         # utterance_index counts input.done flushes. sentence_index counts
@@ -333,6 +335,8 @@ class OmniStreamingSpeechHandler:
                     sentence_index = 0
                     utterance_open = False
 
+                elif msg_type == "session.ping":
+                    await websocket.send_json({"type": "session.pong"})
                 elif msg_type == "session.close":
                     await self._cleanup_commitment_utterance(commitment)
                     commitment = None
