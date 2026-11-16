@@ -290,7 +290,7 @@ def test_duplex_kv_reanchor_runs_after_block_table_writes():
 
 @pytest.mark.parametrize("output_form", ["tuple", "omni"])
 @pytest.mark.parametrize("profile_only", [False, True])
-def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile_only, monkeypatch):
+def test_capture_model_unwraps_multimodal_output_and_excludes_full(output_form, profile_only, monkeypatch, mocker):
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *args, **kwargs: (0, 0))
     runner = object.__new__(OmniGPUModelRunner)
@@ -302,9 +302,10 @@ def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile
             return hidden, {"layers": {}}
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
 
-    runner.model = SimpleNamespace(forward=original_forward)
-    runner._model_returns_tuple = True
-    runner._exclude_full_graph = True
+    runner.model = SimpleNamespace(forward=original_forward, have_multimodal_outputs=True)
+    runner._configure_cudagraph_output_contract()
+    assert runner._model_has_structured_output is True
+    assert runner._exclude_full_graph is True
     runner.use_aux_hidden_state_outputs = False
     piecewise = SimpleNamespace(cg_mode=CUDAGraphMode.PIECEWISE)
     full = SimpleNamespace(cg_mode=CUDAGraphMode.FULL)
@@ -312,8 +313,8 @@ def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile
         _capture_descs={CUDAGraphMode.PIECEWISE: [piecewise], CUDAGraphMode.FULL: [full]},
         _candidates={(1, 0): [piecewise, full]},
     )
-    runner.model_state = SimpleNamespace(capture_mtp_graphs=MagicMock(), _is_mtp_graph_runner=lambda: True)
-    runner._dispatch_mtp_batch_descriptor = MagicMock(return_value="desc")
+    runner.model_state = SimpleNamespace(capture_mtp_graphs=mocker.Mock(), _is_mtp_graph_runner=lambda: True)
+    runner._dispatch_mtp_batch_descriptor = mocker.Mock(return_value="desc")
 
     def assert_unwrapped(_self, *, profile_only: bool = False):
         assert torch.equal(runner.model.forward(), hidden)  # forward unwrapped during capture
@@ -321,8 +322,8 @@ def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile
         return 3
 
     expected_profile_only = profile_only
-    with patch.object(GPUModelRunner, "capture_model", assert_unwrapped):
-        assert runner.capture_model(profile_only=profile_only) == 3
+    monkeypatch.setattr(GPUModelRunner, "capture_model", assert_unwrapped)
+    assert runner.capture_model(profile_only=profile_only) == 3
 
     assert runner.model.forward is original_forward  # restored after capture
     assert runner.cudagraph_manager._capture_descs == {CUDAGraphMode.PIECEWISE: [piecewise]}
@@ -506,7 +507,7 @@ def test_capture_contract_uses_model_declaration(stage, declared):
     runner = _make_runner()
     runner.model = SimpleNamespace(model_stage=stage, _returns_tuple=declared)
     runner._configure_cudagraph_output_contract()
-    assert runner._model_returns_tuple is declared
+    assert runner._model_has_structured_output is declared
     assert runner._exclude_full_graph is declared
     assert runner._full_graph_aux_outputs is False
 

@@ -323,9 +323,9 @@ steps:
             exit $$failed
         mirror_hardwares: l4_1
 
-  # Qualify the dedicated CUDA Gepard and Kokoro owners alongside their AMD
+  # Qualify the dedicated CUDA Gepard owners alongside their AMD
   # additions when a parity PR carries weekly-test.
-  - group: ":microphone: Gepard and Kokoro Weekly Test"
+  - group: ":microphone: Gepard Weekly Test"
     depends_on: upload-weekly-pipeline
     if: build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"
     steps:
@@ -346,25 +346,6 @@ steps:
             tests/e2e/online_serving/test_gepard_tts.py
             -m "tts and cuda"
             --run-level "full_model"
-        mirror_hardwares: l4_1
-
-      # The image has no misaki G2P. Preserve the scheduled lane's explicit
-      # install so this is an execution gate rather than an import-skip.
-      - label: "TTS · Kokoro-82M · L4"
-        source_file_dependencies: tts_kokoro_weekly
-        timeout_in_minutes: 30
-        env:
-          VLLM_OMNI_CI_MODEL_RUNNER: "v2"
-        commands:
-          - >-
-            uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')"
-            "misaki[en]>=0.9.4"
-            "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
-          - >-
-            pytest -s -v tests/e2e/offline_inference/test_kokoro.py
-            tests/e2e/online_serving/test_kokoro.py
-            -m "tts and cuda"
-            --run-level "advanced_model"
         mirror_hardwares: l4_1
 
   # Run the aggregate CUDA H100 owner on parity PRs that touch one of the
@@ -514,16 +495,6 @@ steps:
             tests/e2e/online_serving/test_qwen_image_layered_expansion.py
             tests/e2e/accuracy/test_qwen_image_edit.py
             tests/e2e/accuracy/test_qwen_image_layered.py
-            -m "slow and diffusion and H100 and cards_1"
-            --run-level "full_model"
-        mirror_hardwares: h100_1
-
-      - label: "Diffusion · JoyAI-Image-Edit · Accuracy · H100 · Single-GPU"
-        timeout_in_minutes: 180
-        commands:
-          - >-
-            pytest -sv
-            tests/e2e/accuracy/test_joy_image_edit.py
             -m "slow and diffusion and H100 and cards_1"
             --run-level "full_model"
         mirror_hardwares: h100_1

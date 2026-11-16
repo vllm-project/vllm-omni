@@ -33,7 +33,7 @@ from vllm_omni.core.sched.utils import (
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import CONTINUE_TOKEN_ID
-from vllm_omni.worker_v2.ngram_adapter import is_npu_thinker_ngram, use_scheduler_ngram
+from vllm_omni.worker_v2.ngram_adapter import is_thinker_ngram, use_scheduler_ngram
 
 logger = init_logger(__name__)
 
@@ -169,7 +169,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._npu_thinker_ngram = is_npu_thinker_ngram(self.vllm_config)
+        self._thinker_ngram = is_thinker_ngram(self.vllm_config)
         self._scheduler_ngram: Callable[..., np.ndarray] | None = None
         if use_scheduler_ngram(self.vllm_config):
             from vllm.v1.spec_decode.ngram_proposer import _find_longest_matched_ngram_and_propose_tokens
@@ -219,6 +219,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._init_omni_io_scheduling_state()
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        self._finished_req_output_token_ids: dict[str, list[int]] = {}
         # Streaming sessions finished because their next prompt extension
         # would exceed max_model_len: request_id -> (client_index, reason).
         # Drained into an explicit FinishReason.ERROR output on the next
@@ -777,7 +778,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         call site in ``schedule()`` below stays as a backstop for a step built
         without booking, where there is no accounting to settle.
         """
-        if getattr(self, "_npu_thinker_ngram", False):
+        if getattr(self, "_thinker_ngram", False):
             self._limit_thinker_drafts(scheduler_output)
         self._enforce_kstep_span_uniformity(scheduler_output)
         super()._update_after_schedule(scheduler_output)
@@ -2160,6 +2161,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+        if (
+            getattr(self, "num_spec_tokens", 0) > 0
+            and not self.use_v2_model_runner
+            and not self.vllm_config.model_config.async_chunk
+        ):
+            # Worker histories can contain post-stop verifier samples or async
+            # placeholders. Preserve the scheduler's final history before free.
+            self._finished_req_output_token_ids[request_id] = list(request.output_token_ids)
         self._new_prompt_len_snapshot.pop(request_id, None)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
