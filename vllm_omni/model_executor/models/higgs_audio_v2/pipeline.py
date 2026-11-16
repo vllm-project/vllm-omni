@@ -38,6 +38,9 @@ HIGGS_AUDIO_V2_PIPELINE = PipelineConfig(
                 #     upstream HiggsAudioModel._sample_audio_tokens override).
                 "stop_token_ids": [128009, 128012],
             },
+            # Audio codebooks are folded into the decode embeddings, so a
+            # preemption replay cannot reconstruct the same KV-cache state.
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

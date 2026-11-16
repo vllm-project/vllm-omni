@@ -8,7 +8,7 @@ different KV than the one that produced the audio already delivered
 (vllm-project/vllm-omni#6179):
 
 - a sampled RVQ codebook folded into `inputs_embeds` (Qwen3-Omni talker,
-  VoxCPM2, audio8_tts, fish_speech, qwen3_tts, moss_tts),
+  Higgs Audio v2, VoxCPM2, audio8_tts, fish_speech, qwen3_tts, moss_tts),
 - a per-frame temporal hidden plus codebook (personaplex),
 - 31 side-channel FSQ codes per frame (Gepard).
 
@@ -29,6 +29,7 @@ from vllm_omni.model_executor.models.audio8_tts.pipeline import AUDIO8_TTS_PIPEL
 from vllm_omni.model_executor.models.fish_omni.pipeline import FISH_OMNI_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.pipeline import FISH_SPEECH_PIPELINE
 from vllm_omni.model_executor.models.gepard.pipeline import GEPARD_PIPELINE
+from vllm_omni.model_executor.models.higgs_audio_v2.pipeline import HIGGS_AUDIO_V2_PIPELINE
 from vllm_omni.model_executor.models.moss_tts.pipeline import (
     MOSS_TTS_LOCAL_PIPELINE,
     MOSS_TTS_PIPELINE,
@@ -48,6 +49,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # (pipeline, stage that cannot replay)
 _FAIL = [
     (QWEN3_OMNI_PIPELINE, "talker"),
+    (HIGGS_AUDIO_V2_PIPELINE, "higgs_audio_v2"),
     (VOXCPM2_PIPELINE, "latent_generator"),
     (GEPARD_PIPELINE, "gepard"),
     (AUDIO8_TTS_PIPELINE, "audio8_tts_slow_ar"),
