@@ -257,7 +257,7 @@ def _pack_h3_native_qkv(lora_model: LoRAModel) -> None:
         )
 
 
-def load_minimax_h3_native_lora(
+def load_minimax_h3_native_distilled_lora(
     *,
     partition: str,
     lora_request: LoRARequest,
