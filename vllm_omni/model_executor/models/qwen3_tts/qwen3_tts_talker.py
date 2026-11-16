@@ -44,7 +44,7 @@ from .prompt_embeds_builder import (
     resolve_x_vector_only,
 )
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
-from .stream_decode import stream_ref_context_frames, talker_stream_decode_enabled
+from .stream_decode import stream_chunk_ramp, stream_ref_context_frames, talker_stream_decode_enabled
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Encoder
 
@@ -277,6 +277,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.stream_prime_pieces: dict[int, Any] = {}
         self.stream_sample_rate = 0
         self.stream_chunk_frames = 25
+        self.stream_chunk_ramp = stream_chunk_ramp(vllm_config, self.stream_chunk_frames) if self.stream_decode else ()
         # The runners bypass only the outer whole-MTP graph when explicit
         # generators are present, so seeded requests can still share one raw
         # batched MTP call with independent per-row streams.

@@ -728,7 +728,12 @@ stages:
       code_predictor_fused: true
 ```
 
-This queue uses PCM from the single-stage decoder. The two-stage
+This queue uses PCM from the single-stage decoder.
+
+The single-stage profile streams PCM chunks of `codec_chunk_ramp` frames
+(`[1, 2, 4, 8, 16, 25]`), then 25 frames per chunk. Without a ramp the first
+chunk carries one frame and the next one 25, so a client that starts playback
+on the first chunk waits for audio after 80 ms. The two-stage
 `talker_first_audio` option below uses its own first-frame decoder and does
 not require single-stage execution. The two options cannot be enabled
 together. Single-stage prefix-cache reset with

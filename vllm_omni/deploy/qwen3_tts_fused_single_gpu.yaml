@@ -26,6 +26,10 @@ stages:
       # Opt in to first-frame delivery on its own queue for lower first-audio
       # latency; leave disabled when prioritizing peak throughput.
       talker_stream_first_audio: false
+      # Frames per streamed PCM chunk, by chunk index; codec_chunk_frames (25)
+      # after the last entry. Without a ramp, the second chunk waits for 25
+      # frames (2 s of audio) while the client has played one frame (80 ms).
+      codec_chunk_ramp: [1, 2, 4, 8, 16, 25]
       # Match the standard two-stage profile's voice-clone context boundary.
       # A shorter context (e.g. 25) can change timbre continuity.
       ref_code_context_frames: 72
