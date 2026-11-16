@@ -292,9 +292,35 @@ the same request succeeded: API inference 48.7 seconds, sampling about
 
 The dancer still deviates from the source pose around one second and the
 server audio remains very quiet (RMS about `6.03e-5`). Motion/face/audio quality
-acceptance and a matched author-native Turbo comparison remain open. The
-ordinary no-Control and minimum Inpaint regressions after the November rebase
-also remain pending.
+acceptance and a matched author-native Turbo comparison remain open.
+
+### Integration regressions (2026-11-16)
+
+Tested revision `857dcf4ff` integrates main `86df89849` and CTRL-02 `6bcb998b`.
+Canny and ordinary H3 each completed one real UI Run, including save/close/reopen
+before and after generation. All 124 frames, timestamps and generated stereo
+audio survived saving. These results use the H3 FL2VA/Turbo configuration and
+software versions listed above; the ordinary H3 service loads no Union checkpoint
+and its actual `task=t2va` request contains no control/source/mask/reference media.
+
+| Case | UI execution | API inference | Sampled GPU peak |
+| --- | --- | --- | --- |
+| Canny, uncached preprocessing | 290.62 s | 54.52 s | 134.05 GiB |
+| Ordinary H3, no ControlNet | 38.20 s | 33.99 s | 124.79 GiB |
+
+Both runs used the same physical GPU. Timings exclude model startup; Canny
+includes 231.93 seconds of CPU preprocessing/input preparation before the POST.
+The ordinary case has no input media and uses a revised prompt, so these timings
+do not establish a controlled speedup. All 124 decoded Canny server-output frames
+match the November 8 result. Both server outputs remain quiet: approximately
+-84.39 dBFS RMS for Canny and -61.25 dBFS for ordinary H3.
+
+The ordinary no-Control integration regression is complete. A minimum Inpaint
+regression on this runtime revision remains pending. Depth, Pose, HED, MLSD and
+earlier Inpaint results retain their historical tested revisions; they do not
+establish six-mode coverage on `857dcf4ff`. Human motion/face/audio acceptance,
+the matched native Turbo comparison and known Inpaint editing limitations remain
+open. Turbo results do not establish validation of the template's Base40 recipe.
 
 ## References
 
