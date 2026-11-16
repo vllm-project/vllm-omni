@@ -135,6 +135,7 @@ if HAS_TRITON:
         rotary_half: tl.constexpr,
         eps: tl.constexpr,
         heads_per_program: tl.constexpr,
+        part_heads: tl.constexpr = 0,
     ):
         # Long-video Q/K views can span more than 2**31 elements of fused QKV storage.
         token = tl.program_id(0).to(tl.int64)
@@ -177,6 +178,12 @@ if HAS_TRITON:
         )
 
         out_offsets = token * out_stride_t + heads[:, None] * out_stride_h + dims[None, :] * out_stride_d
+        if part_heads:
+            block = heads // part_heads
+            part_head = heads % part_heads
+            out_offsets = (
+                block[:, None] * out_stride_h + token * out_stride_t + part_head[:, None] * head_dim + dims[None, :]
+            )
         tl.store(out_ptr + out_offsets, output, mask=mask)
 
     @triton.jit
@@ -700,6 +707,31 @@ def _launch_fused_rms_norm_rope(
         num_warps=8,
     )
     return out
+
+
+def stage_head_group_norm_rope(x, weight, rope_table, eps, out):
+    """Write per-head results to contiguous destination/head-group blocks."""
+    tokens, heads, head_dim = x.shape
+    part_heads = out.shape[-2]
+    assert heads == out.shape[0] * part_heads and tokens == out.shape[1]
+    _rms_norm_rope_kernel[(tokens, triton.cdiv(heads, _HEADS_PER_PROGRAM))](
+        x,
+        weight.contiguous(),
+        rope_table.contiguous(),
+        out,
+        *x.stride(),
+        rope_table.stride(0),
+        out.stride(1),
+        out.stride(0),
+        out.stride(3),
+        num_heads=heads,
+        head_dim=head_dim,
+        rotary_half=rope_table.shape[-1] // 2,
+        eps=eps,
+        heads_per_program=_HEADS_PER_PROGRAM,
+        part_heads=part_heads,
+        num_warps=8,
+    )
 
 
 def _launch_fused_qk_norm_rope(

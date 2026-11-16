@@ -1252,7 +1252,17 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # records the same value and the gather never has to choose a
         # collective from rank-local tile shapes.
         with self._tile_gather_protocol(latent), self._decode_tiling_context(latent):
-            decoded = self.model.decode_base(self._denormalize_latent(latent))
+            if os.environ.get("VLLM_OMNI_H3_VAE_STACK_TILES") == "1":
+                if not hasattr(self.model, "stack_tiling"):
+                    raise RuntimeError("MiniMax H3 checkpoint VAE lacks native stacked tiling")
+                previous = self.model.stack_tiling
+                self.model.stack_tiling = self._decoder_tile_grid_uniform(latent)
+                try:
+                    decoded = self.model.decode_base(self._denormalize_latent(latent))
+                finally:
+                    self.model.stack_tiling = previous
+            else:
+                decoded = self.model.decode_base(self._denormalize_latent(latent))
         if decoded.dtype == torch.uint8:
             # The streaming uint8 write-back already ran the revert and the
             # output quantizer inside write_part; nothing remains but the
@@ -1491,7 +1501,12 @@ class MiniMaxH3AudioVAE(nn.Module):
         ).view(1, channels, 1)
         # The remote decoder's TorchScript activations round differently on
         # their first (unfused) call; keep every request on the same path.
-        with torch.jit.optimized_execution(False):
+        decode_context = (
+            _AudioVAEDeterminismContext()
+            if os.environ.get("VLLM_OMNI_H3_AUDIO_DETERMINISTIC") == "1"
+            else torch.jit.optimized_execution(False)
+        )
+        with decode_context:
             waveform = self.remote.decode(latent * std + mean)
         if waveform.ndim != 3 or waveform.shape[1] != 1:
             raise ValueError(f"unexpected decoded audio shape {tuple(waveform.shape)}")
