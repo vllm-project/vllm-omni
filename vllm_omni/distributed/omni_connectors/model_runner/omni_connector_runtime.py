@@ -147,6 +147,7 @@ class _OmniConnectorRuntimeMixin:
     _run_stage_payloads: dict[str, bytes]
     _chunk_stream_completed: set[str]
     _pending_full_payload_send: dict[str, tuple[Any, ...]]
+    _full_payload_ready_req_ids: set[str]
     _kv_sent_req_ids: list[str]
     _kv_pending_transfers: dict[str, dict[str, Any]]
     _kv_active_transfers: set[str]
@@ -311,6 +312,7 @@ class _OmniConnectorRuntimeMixin:
         # -- full_payload_mode: accumulate latest pooler_output per request,
         #    send only when the request finishes (next-cycle flush) --
         self._pending_full_payload_send: dict[str, tuple[Any, ...]] = {}
+        self._full_payload_ready_req_ids: set[str] = set()
 
         # -- KV sent accumulator --
         self._kv_sent_req_ids: list[str] = []
@@ -420,7 +422,9 @@ class _OmniConnectorRuntimeMixin:
             keys_to_clean.append(ext_id)
 
         with self._lock:
-            keys_pending = [k for k in keys_to_clean if self._pending_save_counts.get(k, 0)]
+            keys_pending = [
+                k for k in keys_to_clean if self._pending_save_counts.get(k, 0) or k in self._pending_full_payload_send
+            ]
             for k in keys_pending:
                 self._deferred_send_cleanup.add(k)
             for k in keys_to_clean:

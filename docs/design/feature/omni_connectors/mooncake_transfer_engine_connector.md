@@ -151,8 +151,13 @@ current stream and records a device event. The background sender waits for that
 event before copying to the registered pool. Call preparation on the stream that
 produced the tensors, or establish a stream dependency first. Inputs may then be
 reused on that same producer stream. Queued snapshot bytes are bounded separately
-by `memory_pool_size`; exceeding the budget raises `MemoryError` before reserving
-chunk IDs or delivery tickets. Other connectors retain identity preparation.
+by `memory_pool_size`. Temporary budget exhaustion raises `PayloadCapacityError`
+(a `MemoryError`) before reserving chunk IDs or delivery tickets. Full-payload
+flushes retain the completed result and retry on later scheduler cycles, even
+when its ID is no longer in `finished_req_ids`, without waiting for capacity.
+The retained inputs must remain unchanged until preparation succeeds. A single
+frame larger than the budget raises `MemoryError` and is not retried as temporary
+pressure. Other connectors retain identity preparation.
 
 Direct calls to `put()` with an unprepared container conservatively synchronize
 the device before packing; the caller must keep inputs immutable until it

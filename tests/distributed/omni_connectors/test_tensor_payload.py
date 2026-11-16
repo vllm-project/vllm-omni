@@ -10,6 +10,7 @@ import msgspec
 import pytest
 import torch
 
+from vllm_omni.distributed.omni_connectors.connectors.base import PayloadCapacityError
 from vllm_omni.distributed.omni_connectors.utils.tensor_payload import (
     UnsupportedTensorPayloadError,
     decode_tensor_payload,
@@ -83,7 +84,7 @@ def test_queued_snapshot_budget_and_cancellation(connector):
     payload = {"x": torch.ones(512)}
     prepared = connector.prepare_payload(payload)
     assert 0 < connector._snapshot_bytes <= connector.pool_size
-    with pytest.raises(MemoryError, match="queued tensor snapshots"):
+    with pytest.raises(PayloadCapacityError, match="queued tensor snapshots"):
         connector.prepare_payload(payload)
     del prepared
     gc.collect()
@@ -195,6 +196,129 @@ def connector(monkeypatch):
         )
     yield instance
     instance.close()
+
+
+@pytest.fixture
+def payload_transport(connector):
+    from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+
+    transport = OmniConnectorModelRunnerMixin()
+    transport.init_omni_connectors(SimpleNamespace(), SimpleNamespace(connector=connector), synchronous=True)
+    transport._omni_connector = connector
+    transport.requests = {}
+    yield transport
+    transport._pending_save_reqs.clear()
+    transport.shutdown_omni_connectors()
+
+
+@pytest.mark.parametrize("repeat_finished_ids", [False, True])
+def test_full_payload_flush_retries_snapshot_pressure(payload_transport, connector, repeat_finished_ids):
+    transport = payload_transport
+    payloads = {
+        name: {"x": torch.full((size,), float(i))}
+        for i, (name, size) in enumerate((("first", 512), ("second", 512), ("small", 16), ("unfinished", 16)))
+    }
+    for req_id, payload in payloads.items():
+        transport.accumulate_full_payload_output(req_id, payload, None)
+
+    finished = {"first", "second", "small"}
+    transport.flush_full_payload_outputs(finished)
+    assert set(transport._pending_save_reqs) == {"first", "small"}
+    assert set(transport._pending_full_payload_send) == {"second", "unfinished"}
+    assert transport._save_work_available.is_set()
+    assert dict(transport._put_req_chunk) == {"first": 1, "small": 1}
+
+    retry_ids = finished if repeat_finished_ids else set()
+    transport._save_work_available.clear()
+    transport.flush_full_payload_outputs(retry_ids)
+    assert not transport._save_work_available.is_set()
+    assert set(transport._pending_save_reqs) == {"first", "small"}
+
+    # Consuming the queued tasks releases their snapshots, as the sender does.
+    for req_id in ("first", "small"):
+        task = transport._pending_save_reqs.pop(req_id).popleft()
+        assert transport._send_single_request(task)
+        connector.cleanup(task["put_key"], "0", "1")
+        del task
+    gc.collect()
+    assert connector._snapshot_bytes == 0
+
+    transport.flush_full_payload_outputs(retry_ids)
+    assert set(transport._pending_save_reqs) == {"second"}
+    assert set(transport._pending_full_payload_send) == {"unfinished"}
+    assert dict(transport._put_req_chunk) == {"first": 1, "small": 1, "second": 1}
+    assert transport._save_work_available.is_set()
+    task = transport._pending_save_reqs["second"][0]
+    assert transport._send_single_request(task)
+    stored = connector._local_buffers[task["put_key"] + "@0_1"][2]
+    assert torch.equal(decode_tensor_payload(stored.tensor)["x"], payloads["second"]["x"])
+
+    transport.flush_full_payload_outputs(retry_ids)
+    assert len(transport._pending_save_reqs["second"]) == 1
+    assert not transport._full_payload_ready_req_ids
+
+
+def test_full_payload_retry_survives_request_cleanup(payload_transport, connector):
+    transport = payload_transport
+    held = connector.prepare_payload({"x": torch.ones(512)})
+    transport.accumulate_full_payload_output("req", {"x": torch.ones(512)}, None)
+    transport._put_req_chunk["req"] = 3
+    transport._ramp_chunk_count["req"] = 3
+
+    transport.cleanup_finished_request("req")
+    assert "req" in transport._pending_full_payload_send
+    assert "req" in transport._deferred_send_cleanup
+    assert transport._put_req_chunk["req"] == 3
+    assert not transport._pending_save_reqs
+
+    del held
+    gc.collect()
+    transport.flush_full_payload_outputs(set())
+    task = transport._pending_save_reqs.pop("req").popleft()
+    assert task["put_key"] == "req_0_3"
+    assert transport._send_single_request(task)
+    assert not transport._pending_full_payload_send
+    assert not transport._full_payload_ready_req_ids
+    assert not transport._pending_save_counts
+    assert not transport._deferred_send_cleanup
+    assert not transport._put_req_chunk
+    assert not transport._ramp_chunk_count
+
+
+def test_full_payload_oversized_frame_is_not_retryable(payload_transport):
+    transport = payload_transport
+    transport.accumulate_full_payload_output("large", {"x": torch.ones(4096)}, None)
+    with pytest.raises(MemoryError, match="tensor payload exceeds") as error:
+        transport.flush_full_payload_outputs({"large"})
+    assert not isinstance(error.value, PayloadCapacityError)
+    assert "large" in transport._pending_full_payload_send
+    assert not transport._pending_save_reqs
+    assert not transport._put_req_chunk
+
+
+@pytest.mark.parametrize("error_type", [MemoryError, RuntimeError])
+def test_full_payload_snapshot_failure_is_not_retryable(payload_transport, connector, monkeypatch, error_type):
+    from vllm_omni.distributed.omni_connectors.utils.tensor_payload import TensorPayloadPlan
+
+    def fail_snapshot(*args, **kwargs):
+        raise error_type("snapshot failed")
+
+    monkeypatch.setattr(TensorPayloadPlan, "snapshot", fail_snapshot)
+    payload_transport.accumulate_full_payload_output("req", {"x": torch.ones(4)}, None)
+    with pytest.raises(error_type, match="snapshot failed"):
+        payload_transport.flush_full_payload_outputs({"req"})
+    assert "req" in payload_transport._pending_full_payload_send
+    assert not payload_transport._pending_save_reqs
+    assert not payload_transport._put_req_chunk
+    assert connector._snapshot_bytes == 0
+
+
+def test_full_payload_flush_consumes_no_output(payload_transport):
+    payload_transport._pending_full_payload_send["empty"] = (None, None)
+    payload_transport.flush_full_payload_outputs({"empty"})
+    assert not payload_transport._pending_full_payload_send
+    assert not payload_transport._full_payload_ready_req_ids
+    assert not payload_transport._pending_save_reqs
 
 
 def decode_buffer(connector, buffer, size):

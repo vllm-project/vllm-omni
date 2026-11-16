@@ -18,6 +18,7 @@ import torch
 from vllm.distributed.parallel_state import get_tp_group
 
 from vllm_omni.data_entry_keys import OmniPayload, returns_stage_payload
+from vllm_omni.distributed.omni_connectors.connectors.base import PayloadCapacityError
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
@@ -758,25 +759,21 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
 
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
-        """Send accumulated full_payload outputs for requests that just finished."""
-        pending_req_ids = set(self._pending_full_payload_send.keys())
-        if not (finished_req_ids & pending_req_ids):
-            return
-
-        logger.debug(
-            "[Stage-%s] flush_full_payload_outputs: finished_req_ids=%s, pending=%s",
-            self._stage_id,
-            finished_req_ids,
-            list(self._pending_full_payload_send.keys()),
-        )
-        to_send: dict[str, tuple[Any, Any]] = {}
-        for req_id in finished_req_ids:
-            entry = self._pending_full_payload_send.pop(req_id, None)
-            if entry is not None:
-                to_send[req_id] = self._materialize_full_payload_entry(entry)
-        logger.debug("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
-        if to_send:
-            self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
+        """Queue finished results, retaining those under temporary snapshot pressure."""
+        # Finished IDs may only appear in one scheduler cycle. Remember them
+        # until their result is queued, without sending unfinished accumulators.
+        self._full_payload_ready_req_ids.update(finished_req_ids & self._pending_full_payload_send.keys())
+        for req_id in list(self._pending_full_payload_send):
+            if req_id not in self._full_payload_ready_req_ids:
+                continue
+            output = self._materialize_full_payload_entry(self._pending_full_payload_send[req_id])
+            try:
+                self.send_full_payload_outputs(scheduler_output=None, outputs={req_id: output})
+            except PayloadCapacityError:
+                continue
+            # Also consume intentional no-output / return-stage-payload cases.
+            self._pending_full_payload_send.pop(req_id)
+            self._full_payload_ready_req_ids.discard(req_id)
 
     def send_full_payload_outputs(
         self,

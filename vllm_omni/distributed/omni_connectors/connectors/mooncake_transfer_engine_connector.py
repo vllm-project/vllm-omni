@@ -28,7 +28,7 @@ from ..utils.tensor_payload import (
     synchronize_device,
     synchronize_stream,
 )
-from .base import OmniConnectorBase
+from .base import OmniConnectorBase, PayloadCapacityError
 
 logger = get_connector_logger(__name__)
 
@@ -407,8 +407,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         with self._snapshot_lock:
             if self._closed:
                 raise RuntimeError("Cannot prepare payload: connector is closed")
+            if plan.size > self.pool_size:
+                raise MemoryError("Mooncake tensor payload exceeds memory_pool_size")
             if self._snapshot_bytes + plan.size > self.pool_size:
-                raise MemoryError("Mooncake queued tensor snapshots exceed memory_pool_size")
+                raise PayloadCapacityError("Mooncake queued tensor snapshots exceed memory_pool_size")
             self._snapshot_bytes += plan.size
         try:
             prepared = plan.snapshot(device)
