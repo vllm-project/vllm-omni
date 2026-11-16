@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU tests of Ray placement, rank assignment, RPC output, and cleanup."""
 
 import threading
@@ -163,7 +163,12 @@ def test_shutdown_drains_workers_before_killing_them(monkeypatch, stuck_rank):
     for rank, actor in enumerate(actors):
         ref = f"shutdown-{rank}"
         refs.append(ref)
-        actor.shutdown.remote.side_effect = lambda ref=ref: events.append(ref) or ref
+
+        def shutdown_ref(ref=ref):
+            events.append(ref)
+            return ref
+
+        actor.shutdown.remote.side_effect = shutdown_ref
     fake_ray = Mock()
 
     def wait(pending, num_returns, timeout):
@@ -325,11 +330,12 @@ def test_worker_monitor_does_not_keep_executor_alive(monkeypatch):
     fake_ray = Mock()
     monkeypatch.setattr(ray_module, "ray", fake_ray)
     started = []
-    monkeypatch.setattr(
-        ray_module.threading,
-        "Thread",
-        lambda target, **kwargs: started.append(target) or SimpleNamespace(start=lambda: None),
-    )
+
+    def capture_thread(target, **kwargs):
+        started.append(target)
+        return SimpleNamespace(start=lambda: None)
+
+    monkeypatch.setattr(ray_module.threading, "Thread", capture_thread)
     executor = _make_executor(fake_ray, [Mock()])
     executor._start_worker_monitor()
     (monitor,) = started
@@ -814,7 +820,7 @@ def test_collective_rpc_waits_for_chunk_barrier_before_returning(monkeypatch):
         waiter.join(timeout=2.0)
 
 
-def test_ray_cancellation_flags_update_without_shm():
+def test_ray_cancellation_flags_update_without_shm(monkeypatch):
     from vllm_omni.diffusion.cancellation import (
         RayRequestCancellationRegistry,
         bind_ray_cancel_table,
@@ -823,7 +829,9 @@ def test_ray_cancellation_flags_update_without_shm():
         reset_ray_cancel_table,
     )
     from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+    from vllm_omni.platforms import current_omni_platform
 
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
     actor = ray_module.RayDiffusionWorkerWrapper(0)
     registry = RayRequestCancellationRegistry(
         lambda ids, cancelled=False, finish=False: actor.update_cancellation_flags(
@@ -841,3 +849,45 @@ def test_ray_cancellation_flags_update_without_shm():
     finally:
         reset_ray_cancel_table(token)
         registry.finish("req-a")
+
+
+def test_ray_fatal_worker_cleanup_kills_actor_instead_of_returning_rpc_error(monkeypatch):
+    fake_ray = Mock()
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    handle = fake_ray.get_runtime_context.return_value.current_actor
+    actor = ray_module.RayDiffusionWorkerWrapper(0)
+    actor.worker = Mock()
+    actor.worker.od_config = SimpleNamespace(streaming_output=False, step_execution=False)
+    fatal = SystemExit("decoder did not stop")
+    actor.worker.execute_method.side_effect = fatal
+    with pytest.raises(SystemExit) as raised:
+        actor.execute_rpc("execute_model")
+    assert raised.value is fatal
+    assert not actor.check_alive()
+    fake_ray.kill.assert_called_once_with(handle, no_restart=True)
+
+
+@pytest.mark.parametrize("delivery", ["result", "error", "shutdown"])
+def test_ray_drop_preserves_live_waiter_ownership(delivery):
+    executor = _make_executor(Mock(), [])
+    waiter = executor.wait_output_ready("chunk")
+    executor.drop_output("chunk")
+    assert executor.wait_output_ready("chunk") is waiter
+    assert not waiter.done()
+    value = DiffusionOutput(output=torch.ones(1))
+    error = RuntimeError("pack failed")
+    if delivery == "shutdown":
+        executor.shutdown()
+        with pytest.raises(RuntimeError, match="shut down"):
+            waiter.result(timeout=1.0)
+    else:
+        with executor._futures_lock:
+            executor._finish_output(
+                "chunk", value if delivery == "result" else None, error if delivery == "error" else None
+            )
+        if delivery == "result":
+            assert waiter.result(timeout=1.0) is value
+        else:
+            with pytest.raises(RuntimeError, match="pack failed"):
+                waiter.result(timeout=1.0)
+        executor.shutdown()

@@ -385,7 +385,12 @@ another request's receives. Single-request execution uses tag 0. The Pipeline
 joins all decode jobs before returning and cancels them on admission, compute,
 or output failure. Cancellation drains posted latent transfers before the next
 wave reuses tags; a failed drain stops the Worker rather than reusing an unsafe
-communication group. This does not change Engine dispatch or Request completion.
+communication group. Cancellation skips pending local decode work and waits for
+the active decoder to stop before releasing its VAE state. If a sender, decoder,
+or posted transfer cannot retire within its cancellation deadline, cleanup raises
+a fatal Worker exit (with the original failure preserved in its exception chain).
+The Ray wrapper kills the affected actor so its executor failure monitor tears
+down peer workers; this is not returned as a recoverable request abort. This does not change Engine dispatch or Request completion.
 
 ## Related
 

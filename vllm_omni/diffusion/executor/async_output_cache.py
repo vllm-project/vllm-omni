@@ -116,7 +116,11 @@ class AsyncOutputFutureMixin:
         return fut
 
     def drop_output(self, async_output_id: str) -> None:
-        """Discard an async output that will never be waited on."""
+        """Discard an unclaimed output; an existing genuine waiter keeps ownership.
+
+        Both transports deliver to that waiter normally (or fail it when the
+        executor closes). An abort must not replace another consumer's Future.
+        """
         with self._futures_lock:
             if self._closed:
                 return

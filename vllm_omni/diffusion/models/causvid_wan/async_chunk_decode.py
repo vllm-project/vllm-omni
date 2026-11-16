@@ -13,18 +13,38 @@ import queue
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 import torch
 import torch.distributed as dist
-from vllm.logger import init_logger
 
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 
-logger = init_logger(__name__)
-
 # Bound for cancel() waiting on the latent sender after posting the stop sentinel.
 _SENDER_CANCEL_JOIN_TIMEOUT_S = 5.0
+_CANCEL_DRAIN_TIMEOUT_S = 30.0
+
+
+def _join_on_cancel(thread: threading.Thread, *, timeout: float, session_id: str) -> None:
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        # SystemExit bypasses recoverable request/RPC error handlers. Keep the
+        # original forward/abort exception as context when called during cleanup.
+        raise SystemExit(
+            f"async_chunk_decode cancel: {thread.name} did not stop within {timeout:.1f}s; "
+            f"retiring Worker (session_id={session_id!r})"
+        )
+
+
+def _drain_on_cancel(work: Any, *, session_id: str) -> None:
+    try:
+        if work.wait(timeout=timedelta(seconds=_CANCEL_DRAIN_TIMEOUT_S)) is False:
+            raise TimeoutError("latent transfer did not complete")
+    except Exception as exc:
+        raise SystemExit(
+            f"async_chunk_decode cancel: latent transfer did not drain; retiring Worker (session_id={session_id!r})"
+        ) from exc
 
 
 def _rescale_latents(vae: Any, latent: torch.Tensor) -> torch.Tensor:
@@ -164,13 +184,19 @@ def start_async_chunk_decode(
             """Complete the owner's posted irecvs after a mid-request cancel."""
             with send_lock:
                 already = sent_count[0]
-            for _ in range(max(0, n_chunks - already)):
-                filler = torch.zeros(latent_shape, device="cpu", dtype=dtype)
-                work = dist.isend(filler, dst=owner, group=stream_group, tag=decode_tag)
+            remaining = max(0, n_chunks - already)
+            if not remaining:
+                return
+            filler = torch.zeros(latent_shape, device="cpu", dtype=dtype)
+            for _ in range(remaining):
+                try:
+                    work = dist.isend(filler, dst=owner, group=stream_group, tag=decode_tag)
+                except Exception as exc:
+                    raise SystemExit("Cancelled latent send failed; retiring Worker") from exc
                 with send_lock:
                     send_works.append((filler, work))
                     sent_count[0] += 1
-                work.wait()
+                _drain_on_cancel(work, session_id=session_id)
 
         def join() -> torch.Tensor | None:
             send_q.put(stop)
@@ -182,17 +208,9 @@ def start_async_chunk_decode(
         def cancel() -> None:
             sender_cancelled.set()
             send_q.put(stop)
-            sender_thread.join(timeout=_SENDER_CANCEL_JOIN_TIMEOUT_S)
-            if sender_thread.is_alive():
-                # Do not fill: a stuck sender that later wakes could isend a
-                # real latent after fillers and re-pollute the stream group.
-                # Caller must stop/rebuild workers and the stream process group.
-                raise RuntimeError(
-                    "async_chunk_decode cancel: latent sender did not stop within "
-                    f"{_SENDER_CANCEL_JOIN_TIMEOUT_S:.1f}s; stream group may be "
-                    "unusable until workers are rebuilt "
-                    f"(session_id={session_id!r})"
-                )
+            _join_on_cancel(sender_thread, timeout=_SENDER_CANCEL_JOIN_TIMEOUT_S, session_id=session_id)
+            for _host, work in send_works:
+                _drain_on_cancel(work, session_id=session_id)
             # Owner posted ``n_chunks`` irecvs up front; fill any gap so the
             # next request cannot match a leftover receive on this stream group.
             _fill_remaining_sends()
@@ -223,6 +241,8 @@ def start_async_chunk_decode(
                         break
                     scaled = _rescale_latents(vae, buf)
                     pixels = decoder.decode_chunk(scaled, state).clamp(-1, 1)
+                    if cancelled.is_set():
+                        continue
                     _record_decoded_chunk(
                         pixels=pixels,
                         chunk_index=chunk_index,
@@ -252,13 +272,11 @@ def start_async_chunk_decode(
             cancelled.set()
             # Producer cancel fills remaining isends; wait for the consumer to
             # drain every posted irecv so the stream group is reusable.
-            thread.join(timeout=30.0)
-            if thread.is_alive():
-                logger.warning(
-                    "async_chunk_decode cancel: consumer still alive after 30s drain "
-                    "(posted irecv may be stuck); session_id=%s",
-                    session_id,
-                )
+            _join_on_cancel(thread, timeout=_CANCEL_DRAIN_TIMEOUT_S, session_id=session_id)
+            if error:
+                raise SystemExit(
+                    f"async_chunk_decode cancel: remote decoder failed; retiring Worker ({session_id!r})"
+                ) from error[0]
 
         return AsyncStreamDecodeJob(
             on_finished=None,
@@ -312,6 +330,7 @@ def _start_local(
     pixels_out: list[torch.Tensor] = []
     error: list[BaseException] = []
     emitted = [0]
+    cancelled = threading.Event()
 
     def _consumer() -> None:
         assert decoder is not None and vae is not None
@@ -321,6 +340,8 @@ def _start_local(
                 item = latent_q.get()
                 if item is stop:
                     break
+                if cancelled.is_set():
+                    continue
                 # WanCell passes session-absolute chunk ids; client streaming
                 # and the engine expect request-local 0..n-1 indices (same as
                 # the remote decode path's enumerate).
@@ -328,8 +349,12 @@ def _start_local(
                 del _session_chunk
                 if event is not None:
                     event.synchronize()
+                if cancelled.is_set():
+                    continue
                 scaled = _rescale_latents(vae, host)
                 pixels = decoder.decode_chunk(scaled, state).clamp(-1, 1)
+                if cancelled.is_set():
+                    continue
                 _record_decoded_chunk(
                     pixels=pixels,
                     chunk_index=emitted[0],
@@ -361,8 +386,9 @@ def _start_local(
         return torch.cat(pixels_out, dim=2)
 
     def cancel() -> None:
+        cancelled.set()
         latent_q.put(stop)
-        thread.join(timeout=_SENDER_CANCEL_JOIN_TIMEOUT_S)
+        _join_on_cancel(thread, timeout=_SENDER_CANCEL_JOIN_TIMEOUT_S, session_id=session_id)
 
     return AsyncStreamDecodeJob(
         on_finished=on_finished,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Ray-based distributed executor for diffusion models.
 
@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from ray.util.queue import Queue as RayQueue
 
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+    from vllm_omni.diffusion.worker.diffusion_worker import WorkerWrapperBase
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
@@ -286,7 +287,7 @@ class RayDiffusionWorkerWrapper:
 
     def __init__(self, provisional_rank: int) -> None:
         self.rank = provisional_rank
-        self.worker = None
+        self.worker: WorkerWrapperBase | None = None
         self._chunk_queue = None
         # Local cancel flags updated via the ``cancel`` concurrency group so a
         # mid-forward abort does not wait behind ``execute_rpc``.
@@ -432,6 +433,15 @@ class RayDiffusionWorkerWrapper:
                             result = self.worker.execute_method(method, *(args or ()), **(kwargs or {}))
                     else:
                         result = self.worker.execute_method(method, *(args or ()), **(kwargs or {}))
+        except SystemExit:
+            # A fatal Worker cleanup must not become a recoverable Ray task
+            # error. Graceful exit_actor can wait forever on wait_for_exit in
+            # the concurrent monitor group; kill this actor instead.
+            self.worker = None
+            logger.exception("Ray diffusion Worker %s cannot be reused; terminating actor", self.rank)
+            if ray is not None:
+                ray.kill(ray.get_runtime_context().current_actor, no_restart=True)
+            raise
         finally:
             reset_ray_cancel_table(cancel_token)
         if should_reply:
@@ -995,9 +1005,9 @@ class RayDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
             raise EngineDeadError() from exc
         dead_ranks = [item.rank for item, is_alive in zip(self.workers, alive) if not is_alive]
         if dead_ranks:
-            exc = RuntimeError(f"Ray diffusion worker ranks are not healthy: {dead_ranks}")
-            self._fail(exc)
-            raise EngineDeadError() from exc
+            health_error = RuntimeError(f"Ray diffusion worker ranks are not healthy: {dead_ranks}")
+            self._fail(health_error)
+            raise EngineDeadError() from health_error
 
     def shutdown(self) -> None:
         self._shutdown(graceful=True)

@@ -115,8 +115,8 @@ class _Transport:
             stream_group=self.cv,
             decode_tag=tag,
         )
-        owner = asd_mod.start_async_stream_decode(vae=_FakeVae(), decoder=_FakeDecoder(), pp_rank=0, **kwargs)
-        source = asd_mod.start_async_stream_decode(vae=None, decoder=None, pp_rank=1, **kwargs)
+        owner = asd_mod.start_async_chunk_decode(vae=_FakeVae(), decoder=_FakeDecoder(), pp_rank=0, **kwargs)
+        source = asd_mod.start_async_chunk_decode(vae=None, decoder=None, pp_rank=1, **kwargs)
         return owner, source
 
     def emit(self, source, tag: int, chunk: int, value: float, shape: tuple[int, ...]) -> None:
@@ -236,11 +236,14 @@ def test_pipeline_forward_cancels_stream_job_when_cell_compute_fails(monkeypatch
     pipeline._chunk_ctx = SimpleNamespace()
     cancelled: list[bool] = []
     job = SimpleNamespace(cancel=lambda: cancelled.append(True))
+    from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
+
+    adapter = WanCell.__new__(WanCell)
 
     monkeypatch.setattr(
         pipeline,
         "admit_cell_request",
-        lambda _req: (SimpleNamespace(), "kv-1", False, job),
+        lambda _req, **_kwargs: (adapter, "kv-1", False, job),
     )
 
     def _boom_cell(**_kwargs):
@@ -393,28 +396,31 @@ def test_remote_cancel_drains_posted_irecvs(monkeypatch):
     """Mid-request cancel must finish every posted irecv (FIFO mock)."""
     from vllm_omni.diffusion.models.causvid_wan.async_chunk_decode import start_async_chunk_decode
 
-    pending: list[object] = []
-    completed: list[object] = []
+    monkeypatch.setattr(asd_mod.torch, "empty", _unpinned_empty)
 
-    class _Work:
+    class _ReceiveWork:
         def __init__(self, payload):
             self.payload = payload
             self._done = threading.Event()
 
-        def wait(self):
-            assert self._done.wait(timeout=5.0)
+        def wait(self, timeout=None):
+            seconds = timeout.total_seconds() if timeout is not None else 5.0
+            assert self._done.wait(timeout=seconds)
 
         def complete(self):
             self._done.set()
 
-    def fake_irecv(buf, src, group):
-        del src, group
-        work = _Work(buf)
+    pending: list[_ReceiveWork] = []
+    completed: list[_ReceiveWork] = []
+
+    def fake_irecv(buf, src, group, tag=0):
+        del src, group, tag
+        work = _ReceiveWork(buf)
         pending.append(work)
         return work
 
-    def fake_isend(host, dst, group):
-        del dst, group
+    def fake_isend(host, dst, group, tag=0):
+        del dst, group, tag
         if not pending:
             raise AssertionError("isend with no matching irecv")
         work = pending.pop(0)
@@ -485,17 +491,19 @@ def test_remote_cancel_refuses_fill_while_sender_stuck_on_copy(monkeypatch):
         def wait(self):
             return None
 
-    def fake_isend(host, dst, group):
-        del dst, group
+    def fake_isend(host, dst, group, tag=0):
+        del dst, group, tag
         sends.append(host.detach().clone())
         return _Work()
 
     monkeypatch.setattr(asd_mod.dist, "isend", fake_isend)
 
     hold = threading.Event()
+    copy_entered = threading.Event()
 
     class _DelayedEvent:
         def synchronize(self):
+            copy_entered.set()
             assert hold.wait(timeout=5.0)
 
     monkeypatch.setattr(
@@ -519,8 +527,8 @@ def test_remote_cancel_refuses_fill_while_sender_stuck_on_copy(monkeypatch):
     )
     assert source.on_finished is not None
     source.on_finished(0, torch.ones(shape))
-    time.sleep(0.05)  # let sender dequeue and block on synchronize
-    with pytest.raises(RuntimeError, match="latent sender did not stop"):
+    assert copy_entered.wait(timeout=2.0)
+    with pytest.raises(SystemExit, match="latent-send did not stop"):
         source.cancel()
     assert sends == []
     hold.set()
@@ -529,3 +537,96 @@ def test_remote_cancel_refuses_fill_while_sender_stuck_on_copy(monkeypatch):
         time.sleep(0.01)
     # Cancelled sender must skip the late real isend; no fillers either.
     assert sends == []
+
+
+@pytest.mark.parametrize("stalled", [False, True])
+def test_local_cancel_quiesces_decode_or_retires_worker(monkeypatch, stalled):
+    entered, release, joined, cache_released, done = (threading.Event() for _ in range(5))
+    seen, failures = [], []
+    original = RuntimeError("original forward failure")
+    real_join = asd_mod._join_on_cancel
+
+    class Decoder(_FakeDecoder):
+        def decode_chunk(self, latent, state):
+            entered.set()
+            assert release.wait(timeout=3.0)
+            return super().decode_chunk(latent, state)
+
+        def release(self, state):
+            super().release(state)
+            cache_released.set()
+
+    def join_thread(thread, **kwargs):
+        joined.set()
+        real_join(thread, **kwargs)
+
+    monkeypatch.setattr(asd_mod, "_join_on_cancel", join_thread)
+    monkeypatch.setattr(asd_mod, "_SENDER_CANCEL_JOIN_TIMEOUT_S", 0.02 if stalled else 1.0)
+    decoder = Decoder()
+    job = _start_local(vae=_FakeVae(), decoder=decoder, session_id="cancel", on_chunk=lambda *args: seen.append(args))
+    assert job.on_finished is not None
+    job.on_finished(0, torch.ones(1, 4, 1, 2, 2))
+    assert entered.wait(timeout=2.0)
+    job.on_finished(1, torch.ones(1, 4, 1, 2, 2))
+
+    def cancel():
+        try:
+            raise original
+        except RuntimeError:
+            try:
+                job.cancel()
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                done.set()
+
+    thread = threading.Thread(target=cancel)
+    thread.start()
+    try:
+        assert joined.wait(timeout=2.0)
+        if stalled:
+            assert done.wait(timeout=1.0)
+            assert len(failures) == 1 and isinstance(failures[0], SystemExit)
+            assert failures[0].__context__ is original
+            assert not cache_released.is_set()
+        else:
+            assert not done.is_set(), "cancel returned while decoder still owns the VAE"
+            release.set()
+            assert done.wait(timeout=2.0)
+            assert failures == []
+            assert cache_released.is_set()
+    finally:
+        release.set()
+        thread.join(timeout=2.0)
+        assert cache_released.wait(timeout=2.0)
+    assert decoder.chunks == 1, "queued work was decoded after cancellation"
+    assert seen == [], "cancelled decode emitted a late chunk"
+
+
+def test_remote_owner_cancel_retires_worker_if_receive_cannot_drain(monkeypatch):
+    monkeypatch.setattr(asd_mod.torch, "empty", _unpinned_empty)
+    monkeypatch.setattr(asd_mod, "_CANCEL_DRAIN_TIMEOUT_S", 0.02)
+    transport = _Transport()
+    monkeypatch.setattr(asd_mod.dist, "irecv", transport.irecv)
+    released = threading.Event()
+    decoder = _FakeDecoder()
+    monkeypatch.setattr(decoder, "release", lambda state: released.set())
+    owner = asd_mod.start_async_chunk_decode(
+        vae=_FakeVae(),
+        decoder=decoder,
+        session_id="missing-source",
+        n_chunks=1,
+        latent_shape=(1, 4, 1, 2, 2),
+        dtype=torch.float32,
+        pp_rank=0,
+        source_rank=1,
+        pp_group=SimpleNamespace(ranks=[0, 1]),
+        stream_group=object(),
+    )
+    try:
+        with pytest.raises(SystemExit, match="retiring Worker"):
+            owner.cancel()
+    finally:
+        for work in transport.pending[0]:
+            work.done.set()
+        assert released.wait(timeout=2.0)
