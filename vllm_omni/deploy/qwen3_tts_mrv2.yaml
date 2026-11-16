@@ -7,6 +7,11 @@ model_runner: v2
 platforms:
   npu:
     model_runner: v1
+    stages:
+      - stage_id: 0
+        compilation_config:
+          # V1 cannot inherit the base profile's V2 full decode graphs.
+          cudagraph_mode: PIECEWISE
   xpu:
     model_runner: v1
   rocm:

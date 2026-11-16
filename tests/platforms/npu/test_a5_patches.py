@@ -269,14 +269,23 @@ def test_qwen3_tts_code2wav_patch_skips_fractal_z_conv_cast_on_a5(
 @pytest.mark.parametrize(
     "additional,connector,eager,enabled",
     [
-        ({}, {}, False, False),
-        ({"npu_incremental_codec": True}, {}, False, True),
+        ({}, {}, False, True),
+        ({"npu_incremental_codec": False}, {}, False, False),
         ({"npu_incremental_codec": False}, {"npu_incremental_codec": True}, False, True),
         ({"npu_incremental_codec": True}, {"npu_incremental_codec": False}, False, False),
+        ({}, {}, True, False),
         ({"npu_incremental_codec": True}, {}, True, False),
         ({}, {"npu_incremental_codec": True}, True, False),
     ],
-    ids=["default", "stage-opt-in", "connector-opt-in", "connector-opt-out", "eager-stage", "eager-connector"],
+    ids=[
+        "default",
+        "stage-opt-out",
+        "connector-opt-in",
+        "connector-opt-out",
+        "eager-default",
+        "eager-stage",
+        "eager-connector",
+    ],
 )
 def test_qwen3_tts_incremental_loader_gates(monkeypatch, additional, connector, eager, enabled):
     module, _, _ = _load_qwen3_tts_code2wav_patch(monkeypatch, a5=False)

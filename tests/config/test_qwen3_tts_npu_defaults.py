@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Keep NPU optimizations opt-in and preserve explicit option precedence."""
+"""Resolve NPU optimization defaults and preserve explicit option precedence."""
 
 from types import SimpleNamespace
 
@@ -15,31 +15,36 @@ from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-PREDICTOR_OPTIONS = (
-    "code_predictor_fused_sampling",
-    "code_predictor_frame_graph",
-    "code_predictor_kv_cache",
-    "code_predictor_npu_native_gqa",
-    "code_predictor_npu_fused_swiglu",
-)
+PREDICTOR_DEFAULTS = {
+    "code_predictor_fused_sampling": False,
+    "code_predictor_frame_graph": True,
+    "code_predictor_kv_cache": True,
+    "code_predictor_npu_native_gqa": False,
+    "code_predictor_npu_fused_swiglu": True,
+}
+PREDICTOR_OPTIONS = tuple(PREDICTOR_DEFAULTS)
 
 
 @pytest.mark.parametrize("platform", ["npu", "cuda", "rocm", "xpu", "musa"])
-def test_resolved_defaults_keep_optimizations_opt_in(monkeypatch, platform):
+def test_resolved_optimization_defaults_are_npu_only(monkeypatch, platform):
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: platform == "npu")
     deploy = _apply_platform_overrides(load_deploy_config(get_deploy_config_path("qwen3_tts.yaml")), platform=platform)
-    assert deploy.model_runner == ("v2" if platform == "cuda" else "v1")
+    assert deploy.model_runner == ("v2" if platform in ("cuda", "npu") else "v1")
     if platform == "npu":
         for stage in deploy.stages:
             assert stage.compilation_config is not None
-            assert stage.compilation_config["cudagraph_mode"] == "PIECEWISE"
+            assert stage.compilation_config["cudagraph_mode"] == (
+                "FULL_AND_PIECEWISE" if stage.stage_id == 0 else "PIECEWISE"
+            )
     connector = deploy.connectors["connector_of_shared_memory"]
     config = SimpleNamespace(
         model_config=SimpleNamespace(stage_connector_config=connector),
         additional_config=deploy.stages[0].engine_extras.get("additional_config", {}),
     )
     options = Predictor._stage_connector_extra_config(config)
-    assert all(options.get(key, False) is False for key in PREDICTOR_OPTIONS)
+    assert all(
+        options.get(key, False) is (enabled and platform == "npu") for key, enabled in PREDICTOR_DEFAULTS.items()
+    )
     # Defaults belong to the model/loader. A YAML copy could mask a change
     # to those defaults and give custom deployments different behavior.
     npu_options = {
@@ -65,7 +70,10 @@ def test_npu_predictor_defaults_preserve_explicit_overrides(monkeypatch, source)
         config.additional_config = dict.fromkeys(PREDICTOR_OPTIONS, False)
         config.model_config.stage_connector_config["extra"] = dict.fromkeys(PREDICTOR_OPTIONS, True)
     options = Predictor._stage_connector_extra_config(config)
-    assert all(options[key] is (source in ("additional", "connector_opt_in")) for key in PREDICTOR_OPTIONS)
+    assert all(
+        options[key] is (enabled if source == "implicit" else source in ("additional", "connector_opt_in"))
+        for key, enabled in PREDICTOR_DEFAULTS.items()
+    )
 
 
 @pytest.mark.parametrize("frame_graph", [False, True])
@@ -77,3 +85,14 @@ def test_frame_graph_opt_in_controls_implicit_npu_kv(monkeypatch, frame_graph):
     )
     options = Predictor._stage_connector_extra_config(config)
     assert options["code_predictor_kv_cache"] is frame_graph
+
+
+def test_explicit_mrv2_profile_keeps_valid_npu_v1_fallback():
+    deploy = _apply_platform_overrides(
+        load_deploy_config(get_deploy_config_path("qwen3_tts_mrv2.yaml")), platform="npu"
+    )
+    assert deploy.model_runner == "v1"
+    talker = next(stage for stage in deploy.stages if stage.stage_id == 0)
+    assert talker.enforce_eager is False
+    assert talker.compilation_config is not None
+    assert talker.compilation_config["cudagraph_mode"] == "PIECEWISE"

@@ -626,42 +626,20 @@ throughput gain without matched model-level measurements and audio validation.
 
 ### NPU optimization defaults and overrides
 
-The shipped NPU profile keeps Model Runner V1 and `PIECEWISE` graphs for both
-stages. Model Runner V2 with sampling uniforms, Talker full decode graphs,
-Predictor frame graphs with frame-local KV and fused RoPE/KV writes,
-incremental Codec, and fused SwiGLU require explicit opt-in. The measured
-seven-path profile lowered Mandarin speaker similarity and increased some
-high-concurrency ASR errors; those differences have not been shown to be within
-same-configuration rerun variation. Its historical throughput numbers describe
-that enabled configuration, not the shipped defaults or a quality-neutral gain.
-Fused sampling and native GQA also remain opt-in. Codebook lookup uses reference
+The default NPU profile enables seven paths: Model Runner V2 with sampling
+uniforms, Talker full decode graphs, Predictor frame graphs, frame-local KV,
+fused RoPE/KV writes, incremental Codec, and fused SwiGLU. Fused sampling and
+native GQA require explicit opt-in. Codebook lookup uses reference
 normalization, incremental graphs use separate scratch pools, and Codec decode
 uses one stream. Existing non-NPU defaults are unchanged.
 
-To opt in to the seven-path profile, save the following deployment config beside
-`qwen3_tts.yaml` (or use its absolute path in `base_config`) and pass the new file
-with `--deploy-config`. The NPU platform override is intentional: a
-top-level runner setting alone does not override the inherited NPU selection.
-Validate audio quality for your workload before using this profile.
-
-```yaml
-base_config: qwen3_tts.yaml
-platforms:
-  npu:
-    model_runner: v2
-    stages:
-      - stage_id: 0
-        compilation_config:
-          cudagraph_mode: FULL_AND_PIECEWISE
-        additional_config:
-          code_predictor_frame_graph: true
-          code_predictor_kv_cache: true
-          code_predictor_npu_fused_swiglu: true
-      - stage_id: 1
-        enforce_eager: false
-        additional_config:
-          npu_incremental_codec: true
-```
+This default profile is a performance/quality tradeoff. The measured campaign
+reported lower Mandarin speaker similarity and some higher-concurrency ASR
+regressions; it did not establish that these differences are within
+same-configuration rerun variation. Those aggregate results do not identify
+which individual path causes the quality differences. Keeping the seven
+defaults does not establish quality equivalence or resolve that evidence gap.
+Use the overrides below to evaluate individual paths for the target workload.
 
 On NPU BF16, `code_predictor_kv_cache: true` reuses per-layer K/V buffers
 inside the predictor frame graph. It prefills the first two positions, then
@@ -685,7 +663,7 @@ Unsupported input shapes/dtypes use the reference.
 
 `code_predictor_frame_graph: true` captures all residual codebook
 steps together and disables the outer MTP graph only on NPU. Other platforms
-retain their outer graph when this option is set. It defaults to false on NPU
+retain their outer graph when this option is set. It defaults to true on NPU
 and requires matching temperature/top-k, top-p of 1, and supplied uniforms.
 Unsupported calls retain the re-prefill fallback. Frame graphs also use the NPU fused sampler when enabled and supported, retaining
 the same uniforms, ATen logarithms and top-k Gumbel semantics. Explicit false
@@ -698,11 +676,11 @@ retain the eager path. Only the current frame's selected cache positions are
 written; future positions remain masked by attention.
 
 `npu_incremental_codec: true` retains convolution tails and
-sliding-window KV in per-request slots. It is disabled by default on NPU.
-Stage 1 `enforce_eager: true` skips the incremental arena even when explicitly
-requested and uses the existing stateless decoder without graph capture.
-With incremental Codec enabled and eager mode off, startup captures full chunks
-and single frames. Final partial chunks execute
+sliding-window KV in per-request slots. It is enabled by default on NPU.
+Stage 1 `enforce_eager: true` skips the incremental arena, including the default
+and explicit incremental settings, and uses the existing stateless decoder
+without graph capture. With eager mode off, startup captures full chunks and
+single frames. Final partial chunks execute
 without live graph capture. Each captured graph owns its scratch pool, and
 outputs are copied before the next replay. Per-request state is updated with
 `index_copy_` on the worker's stream.
@@ -719,7 +697,7 @@ The Qwen3-TTS predictor and NPU codec loader own their respective defaults;
 its code default. Override it via stage `additional_config` or connector `extra`.
 Explicit connector values override stage values, and explicit false/empty values
 remain authoritative. `code_predictor_npu_native_gqa` defaults to false and
-`code_predictor_npu_fused_swiglu` defaults to false on NPU. Codec decode runs
+`code_predictor_npu_fused_swiglu` defaults to true on NPU. Codec decode runs
 serially; `npu_incremental_codec: false` selects the existing stateless decoder.
 Predictor frame-local KV is enabled with NPU frame graphs; explicit false retains re-prefill.
 
@@ -741,13 +719,13 @@ these existing Omni owners:
 | Model-fixed prompt embeddings | Existing prompt builder caches projected special tokens and CustomVoice speaker/language prefixes |
 | Cached codec codebooks and fused Snake | Not integrated; reference normalization and eager NPU Snake |
 | Prefill/decode graphs and continuous batching | Existing vLLM scheduler, paged KV and Talker graph runner |
-| Incremental codec | Opt-in `npu_incremental_codec` |
+| Incremental codec | NPU-default `npu_incremental_codec` |
 | Native grouped-query predictor attention | Opt-in `code_predictor_npu_native_gqa` |
-| Fused predictor SwiGLU | Opt-in `code_predictor_npu_fused_swiglu` |
+| Fused predictor SwiGLU | NPU-default `code_predictor_npu_fused_swiglu` |
 | Overlapping disjoint codec groups (U005) | Not integrated; Codec groups run serially |
 
 Override these defaults in stage `additional_config` or connector `extra`.
-On NPU fused SwiGLU and native GQA both default to `false`, and
+On NPU fused SwiGLU defaults to `true`, native GQA defaults to `false`, and
 codec decoding uses one stream. Native predictor attention
 passes the original grouped K/V heads to Ascend inference attention instead of
 materializing repeated heads, with an explicit causal mask. The supported path
@@ -768,7 +746,7 @@ would require a separate semantic and service comparison.
 
 ### NPU Talker decode graph mode
 
-The opt-in NPU optimization profile uses Model Runner V2 and `FULL_AND_PIECEWISE` for the
+The standard NPU Model Runner V2 profile uses `FULL_AND_PIECEWISE` for the
 Talker: prefill retains piecewise graphs and decode replays a complete backbone
 graph. Ascend's V2 graph manager owns attention metadata updates. Code2Wav
 retains its `PIECEWISE` setting and its incremental decoder graphs.
@@ -796,7 +774,7 @@ configuration check does not qualify V1 performance or audio quality.
 
 ### NPU Model Runner V2 sampling inputs
 
-When Qwen3-TTS explicitly selects Model Runner V2 on NPU, sampling uniforms
+The standard Qwen3-TTS NPU profile selects Model Runner V2. Sampling uniforms
 are prepared from request-local generators independently of the outer MTP graph
 wrapper on NPU. Other backends keep request-local per-step generators when
 the outer MTP wrapper is absent; their graph paths still prepare uniform
