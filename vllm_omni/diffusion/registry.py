@@ -54,11 +54,6 @@ _DIFFUSION_MODELS = {
         "pipeline_qwen_image_edit_plus",
         "QwenImageEditPlusPipeline",
     ),
-    "JoyImageEditPipeline": (
-        "joy_image",
-        "pipeline_joy_image_edit",
-        "JoyImageEditPipeline",
-    ),
     "QwenImageLayeredPipeline": (
         "qwen_image",
         "pipeline_qwen_image_layered",
@@ -459,6 +454,11 @@ _DIFFUSION_MODELS = {
         "pipeline_anima",
         "AnimaPipeline",
     ),
+    "Praxis1Pipeline": (
+        "praxis1",
+        "pipeline_praxis1",
+        "Praxis1Pipeline",
+    ),
     "PhysisH3Pipeline": ("physis.h3", "pipeline_physis_h3", "PhysisH3Pipeline"),
     "PhysisLTXPipeline": ("physis.ltx", "pipeline_physis_ltx", "PhysisLTXPipeline"),
     "PhysisWanPipeline": ("physis.wan", "pipeline_physis_wan", "PhysisWanPipeline"),
@@ -542,6 +542,8 @@ def supports_mixfusion(od_config: OmniDiffusionConfig) -> bool:
 
 
 _NO_CACHE_ACCELERATION = {
+    # Praxis-1 jointly denoises video and actions in its own Euler window loop.
+    "Praxis1Pipeline",
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AnimaPipeline",
@@ -657,10 +659,10 @@ def initialize_model(
         # the MixFusionDriver arms a MixFusionStep on the forward context.
         _apply_mixfusion_if_enabled(model, od_config)
 
-        # Install the Wan VAE decoder fast path once the VAE parallel mode is
-        # known. This runs inside the weight-loading memory pool, so any weight
-        # re-layout it performs stays offloadable by sleep mode.
-        _apply_wan_vae_fastpath_if_enabled(model, od_config)
+        # Install the VAE fast paths once the VAE parallel mode is known. This
+        # runs inside the weight-loading memory pool, so any weight re-layout
+        # it performs stays offloadable by sleep mode.
+        _apply_vae_fast_paths_if_enabled(model, od_config)
 
         current_omni_platform.apply_diffusion_model_patches(model, od_config)
 
@@ -669,60 +671,16 @@ def initialize_model(
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
 
 
-def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
-    """Install independent Wan VAE encoder/decoder fast paths on pipeline VAEs.
+def _apply_vae_fast_paths_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
+    """Install the registered VAE encoder/decoder fast paths on the pipeline's VAEs.
 
-    Controlled by ``vae_fast_path`` and ``vae_encode_fast_path`` (``off`` /
-    ``lossless`` / ``channels_last``). Only CUDA and XPU are supported; other
-    platforms keep the reference implementation. Failures never abort model loading.
+    Controlled by ``vae_fast_path`` and ``vae_encode_fast_path`` (``off`` / ``lossless`` / ``channels_last``).
+    Each VAE gets the fast path registered for it in :mod:`vllm_omni.diffusion.vae_fast_path` (built in: every
+    Wan-family VAE, on CUDA and XPU). Failures never abort model loading.
     """
-    level = getattr(od_config, "vae_fast_path", "lossless")
-    encode_level = getattr(od_config, "vae_encode_fast_path", "lossless")
-    if level == "off" and encode_level == "off":
-        return
-    if not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()):
-        logger.debug("Wan VAE fast path is only supported on CUDA and XPU; skipping")
-        return
+    from vllm_omni.diffusion.vae_fast_path import apply_vae_fast_paths
 
-    from diffusers.models.autoencoders import AutoencoderKLWan
-
-    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
-        install_wan_vae_encoder_fastpath,
-        install_wan_vae_fastpath,
-    )
-    from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
-
-    candidates: list[tuple[str, nn.Module]] = []
-    try:
-        discovered = ModuleDiscovery.discover(model)
-        candidates = list(zip(discovered.vae_names, discovered.vaes, strict=True))
-    except Exception:
-        logger.debug("Wan VAE fast path: component discovery failed; falling back to `vae`", exc_info=True)
-    if not candidates and isinstance(getattr(model, "vae", None), nn.Module):
-        candidates = [("vae", model.vae)]
-
-    for name, vae in candidates:
-        if not isinstance(vae, AutoencoderKLWan):
-            continue
-        for component, component_level, install in (
-            ("decoder", level, install_wan_vae_fastpath),
-            ("encoder", encode_level, install_wan_vae_encoder_fastpath),
-        ):
-            if component_level == "off":
-                continue
-            try:
-                report = install(vae, level=component_level)
-            except Exception:
-                logger.warning(
-                    "Failed to install the Wan VAE %s fast path on %s; using the reference %s",
-                    component,
-                    name,
-                    component,
-                    exc_info=True,
-                )
-                continue
-            if report.installed:
-                logger.info("Wan VAE %s fast path (%s) active on %s", component, component_level, name)
+    apply_vae_fast_paths(model, od_config, platform=current_omni_platform)
 
 
 def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
@@ -820,7 +778,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "AnimaPipeline": "get_anima_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
-    "JoyImageEditPipeline": "get_joy_image_edit_post_process_func",
     "QwenImage21Pipeline": "get_qwen_image_21_post_process_func",
     "GlmImagePipeline": "get_glm_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
@@ -920,7 +877,6 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "BooguImageTurboPipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
-    "JoyImageEditPipeline": "get_joy_image_edit_pre_process_func",
     "QwenImage21Pipeline": "get_qwen_image_21_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_pre_process_func",

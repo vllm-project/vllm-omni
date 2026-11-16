@@ -82,6 +82,7 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
     {
         "async_chunk",
         "disable_log_stats",
+        "disable_websocket_compression",
         "command",
         "headless",
         "model",
@@ -93,6 +94,8 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "stage_id",
         "subparser",
         "tokenizer",
+        "video_output_warmup",
+        "video_output_warmup_timeout",
     }
 )
 
@@ -957,6 +960,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     moe_backend: str = "auto"
     linear_backend: str = "auto"
     force_cutlass_fp8: bool = False
+    diffusion_flashinfer_autotune: bool | None = None
     enable_diffusion_pipeline_profiler: bool = False
     enable_mixfusion: bool = False
     mixfusion_min_chunk_tokens: int = 256

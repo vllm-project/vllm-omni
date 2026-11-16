@@ -19,6 +19,7 @@ from vllm import SamplingParams
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 
 import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
+from vllm_omni.core.sched.duplex_stage_work import request_perf_chunk
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_native_mrv2_data_plane,
@@ -279,6 +280,25 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertEqual(req.num_prompt_tokens, 4)
         self.assertEqual(req._all_token_ids, [1, 2, 3, 4])
         self.assertEqual(req._output_token_ids, [])
+
+    def test_native_receive_stamps_duplex_perf_chunk(self):
+        coord = OmniSchedulingCoordinator(stage_id=2, async_chunk=True)
+        req = _make_request("r1")
+        requests = {"r1": req}
+
+        coord.update_request_metadata(
+            requests,
+            {"r1": SchedulingMetadataUpdate(prompt_token_ids=(1, 2), duplex_perf_chunk=(0, 2))},
+        )
+
+        self.assertEqual(request_perf_chunk(req), (0, 2))
+
+        coord.update_request_metadata(
+            requests,
+            {"r1": SchedulingMetadataUpdate(input_terminal=True)},
+        )
+
+        self.assertEqual(request_perf_chunk(req), (0, 2))
 
 
 class TestWaitingForInputTransition(unittest.TestCase):
