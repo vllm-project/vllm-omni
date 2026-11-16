@@ -14,6 +14,7 @@ _REPEAT_MAX_MEAN_ABSOLUTE_ERROR = 0.015
 
 
 @pytest.mark.slow
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 1, "rocm": 1, "xpu": 2})
 @pytest.mark.parametrize("omni_runner", [(MODEL, None)], indirect=True)
@@ -36,6 +37,7 @@ def test_zimage(offline_client: OfflineOmniClient):
 
 
 @pytest.mark.slow
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards={"cuda": 1, "xpu": 2})
 @pytest.mark.parametrize("omni_runner", [(MODEL, None, {"diffusion_use_graph": True})], indirect=True)

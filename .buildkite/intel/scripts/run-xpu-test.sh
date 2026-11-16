@@ -295,8 +295,12 @@ PY
     # suites in-tree are marked B70 (sleep mode), and a B70 agent satisfies the
     # B60-marked cases too.
     if [ "${run_2card}" = 1 ]; then
-        stage "core_model · 2 cards" 8m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
-            -m "core_model and xpu and (B60 or B70) and cards_2" --run-level core_model
+        # "or omni" picks up the Qwen2.5-Omni expansion, which carries the omni
+        # marker and no level; "not advanced_model" keeps the sleep/wake cases
+        # (omni + advanced_model, and BAGEL-7B-MoT) in the broad stage below.
+        stage "core_model · 2 cards" 20m "${two_cards}" "${paths[@]}" "${ignore[@]}" \
+            -m "(core_model or omni) and not advanced_model and not full_model and xpu and (B60 or B70) and cards_2" \
+            --run-level core_model
 
         # 11 sleep/wake cases. Not measured yet: they additionally need
         # BAGEL-7B-MoT in the mounted cache.

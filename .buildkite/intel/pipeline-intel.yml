@@ -66,7 +66,8 @@ steps:
         timeout_in_minutes: 75
         soft_fail: false
 
-      # 1m41s measured; the image build dominates this step.
+      # Real models on two cards: Qwen2.5-Omni-7B split across the pair, plus
+      # sequence parallel and the step pipeline. Stage cap 20m.
       - label: "Intel: XPU Test · 2 cards"
         if: *pr_if
         command: "bash .buildkite/intel/scripts/run-xpu-test.sh"
@@ -78,9 +79,9 @@ steps:
           XPU_TEST_SCOPE: "pr"
           XPU_TEST_CARDS: "2"
           XPU_REQUIRE_CARDS: "2"
-          XPU_TEST_BUDGET: "15m"
+          XPU_TEST_BUDGET: "30m"
         priority: 100
-        timeout_in_minutes: 40
+        timeout_in_minutes: 55
         soft_fail: false
 
       - label: "Intel: XPU Test · 1 card (broad)"
@@ -110,7 +111,7 @@ steps:
           XPU_TEST_SCOPE: "broad"
           XPU_TEST_CARDS: "2"
           XPU_REQUIRE_CARDS: "2"
-          XPU_TEST_BUDGET: "35m"
+          XPU_TEST_BUDGET: "50m"
         priority: 100
-        timeout_in_minutes: 60
+        timeout_in_minutes: 75
         soft_fail: false
