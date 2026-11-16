@@ -2104,6 +2104,98 @@ def test_bagel_offline_weekly_executes_junit_guard_before_exit(
     )
 
 
+_DRAMA3_WEEKLY_CORE_NODE = "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
+_DRAMA3_WEEKLY_ADVANCED_NODES = (
+    _DRAMA3_WEEKLY_CORE_NODE,
+    "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed0-drama_3-rocm]",
+    "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_streaming_002[seed42-drama_3-rocm]",
+    "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_concurrent_003[drama_3-rocm]",
+    "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_requires_ref_text_004[drama_3-rocm]",
+)
+_DRAMA3_WEEKLY_BURNIN_LABELS = {
+    "Drama 3 text-to-audio · Core · 1-GPU",
+    "Drama 3 full advanced · 1-GPU",
+}
+
+
+def test_drama3_weekly_adds_exact_nonblocking_core_and_advanced_owners() -> None:
+    group = _find_group("TTS E2E Weekly", AMD_WEEKLY_PIPELINE)
+    labels = {step["label"] for step in group["steps"]}
+    assert _DRAMA3_WEEKLY_BURNIN_LABELS <= labels
+
+    expected_dependencies = [
+        "tts_drama_3_function",
+        ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh",
+        "tests/helpers/",
+        "tests/assets/qwen3_tts/clone_2.wav",
+    ]
+    expected_env = {
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+    }
+
+    core = _find_step("Drama 3 text-to-audio · Core · 1-GPU", AMD_WEEKLY_PIPELINE)
+    core_command = "\n".join(core["commands"])
+    assert core["agent_pool"] == "mi300_1"
+    assert core["depends_on"] == "amd-build"
+    assert core["mirror_hardwares"] == ["amdproduction"]
+    assert core["grade"] == "NonBlocking"
+    assert core["timeout_in_minutes"] == 60
+    assert core["source_file_dependencies"] == expected_dependencies
+    assert core["env"] == expected_env
+    assert core["artifact_paths"] == ["artifacts/rocm-drama3-core-weekly/**/*"]
+    assert "retry" not in core
+    assert "ROCM_E2E_LEVEL_MARKER=slow" in core_command
+    assert "ROCM_E2E_RUN_LEVEL=core_model" in core_command
+    assert "ROCM_E2E_TIMEOUT_MINUTES=45" in core_command
+    assert ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh" in core_command
+    core_tokens = split(next(command for command in core["commands"] if "run-rocm-full-model-nightly.sh" in command))
+    core_runner = core_tokens.index(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
+    assert core_tokens[core_runner + 1 :] == [
+        _DRAMA3_WEEKLY_CORE_NODE,
+        "1",
+        "tts",
+        "rocm-drama3-core-weekly",
+    ]
+    for node in _DRAMA3_WEEKLY_ADVANCED_NODES[1:]:
+        assert node not in core_command
+
+    advanced = _find_step("Drama 3 full advanced · 1-GPU", AMD_WEEKLY_PIPELINE)
+    advanced_command = "\n".join(advanced["commands"])
+    assert advanced["agent_pool"] == "mi300_1"
+    assert advanced["depends_on"] == "amd-build"
+    assert advanced["mirror_hardwares"] == ["amdproduction"]
+    assert advanced["grade"] == "NonBlocking"
+    assert advanced["timeout_in_minutes"] == 150
+    assert advanced["source_file_dependencies"] == expected_dependencies
+    assert advanced["env"] == expected_env
+    assert advanced["artifact_paths"] == ["artifacts/rocm-drama3-advanced-weekly/**/*"]
+    assert "retry" not in advanced
+    assert "ROCM_E2E_LEVEL_MARKER=slow" in advanced_command
+    assert "ROCM_E2E_RUN_LEVEL=advanced_model" in advanced_command
+    assert "ROCM_E2E_TIMEOUT_MINUTES=120" in advanced_command
+    assert ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh" in advanced_command
+    advanced_tokens = split(
+        next(command for command in advanced["commands"] if "run-rocm-full-model-nightly.sh" in command)
+    )
+    advanced_runner = advanced_tokens.index(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
+    assert advanced_tokens[advanced_runner + 1 :] == [
+        _DRAMA3_WEEKLY_CORE_NODE,
+        "5",
+        "tts",
+        "rocm-drama3-advanced-weekly",
+        *_DRAMA3_WEEKLY_ADVANCED_NODES[1:],
+    ]
+    for node in _DRAMA3_WEEKLY_ADVANCED_NODES:
+        assert advanced_command.count(node) == 1
+
+    source = Path("tests/e2e/online_serving/test_drama_3.py").read_text(encoding="utf-8")
+    assert source.count('"rocm": "MI325"') == 4
+    assert '@pytest.mark.parametrize("seed", [0, 42]' in source
+
+
 _MOSS_WEEKLY_NODES = (
     "tests/e2e/offline_inference/test_moss_tts_expansion.py::test_moss_tts_delay_english[omni_runner0]",
     "tests/e2e/offline_inference/test_moss_tts_expansion.py::test_moss_tts_delay_chinese[omni_runner0]",
@@ -5783,9 +5875,10 @@ def test_minicpmo_rocm_v1_duplex_ready_executes_junit_guard_before_exit(
     )
 
 
-def test_weekly_all_jobs_are_blocking_after_burn_in() -> None:
+def test_weekly_existing_jobs_stay_blocking_while_drama3_burns_in() -> None:
     weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
-    assert len(steps) == 35
-    assert {step["grade"] for step in steps} == {"Blocking"}
+    assert len(steps) == 37
+    assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == (_DRAMA3_WEEKLY_BURNIN_LABELS)
+    assert all(step["grade"] == "Blocking" for step in steps if step["label"] not in _DRAMA3_WEEKLY_BURNIN_LABELS)
