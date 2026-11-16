@@ -132,12 +132,15 @@ def test_session_can_start_before_frames_without_changing_output():
     """Eager initialization must preserve encoded media and timestamps."""
     time = np.arange(8000, dtype=np.float32) / 16000
     audio = [0.1 * np.sin(2 * np.pi * 440 * time)]
+    # mbtree lookahead is not bit-stable across the pauses before eager and
+    # lazy sessions receive their first frames.
+    video_codec_options = {"threads": "1", "mbtree": "0"}
     kwargs = dict(
         value_range=(0.0, 1.0),
         fps=24,
         audio_waveforms=audio,
         audio_sample_rate=16000,
-        video_codec_options={"threads": "1"},
+        video_codec_options=video_codec_options,
         transfer_slots=0,
     )
     lazy = ChunkedVideoMP4Session(**kwargs)

@@ -3,15 +3,17 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class RunRequest(BaseModel):
     """Run one stage: stage 0 takes a prompt dict, later stages the stage_input returned by the previous call."""
 
     stage_id: int = 0
+    # Stage-local replica to run this call on. None keeps automatic routing.
+    replica_id: Annotated[int, Field(strict=True, ge=0)] | None = None
     stage_input: dict[str, Any] | str
     # Per-stage params (stage 0 only). Later calls carry the sampling params in stage_input.
     sampling_params: list[dict[str, Any]] | None = None

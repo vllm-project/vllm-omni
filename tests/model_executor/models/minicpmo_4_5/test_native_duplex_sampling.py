@@ -10,6 +10,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -17,6 +18,20 @@ Model = minicpmo_4_5_omni.MiniCPMO45OmniForConditionalGeneration
 CHUNK_EOS, LISTEN, TTS_PAD, VOCAB = 5, 6, 10, 40
 _NAMES = ("unit", "chunk_eos", "listen", "tts_bos", "turn_eos", "chunk_tts_eos", "tts_pad")
 TOKEN_IDS = {f"{name}_token_id": token for name, token in zip(_NAMES, (1, CHUNK_EOS, LISTEN, 7, 8, 9, TTS_PAD))}
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_chunk_boundary_probability_preserves_softmax_shift_invariance(dtype):
+    # A shared logit offset must not change the decision to stop a speech chunk.
+    # Materializing logsumexp in BF16 loses precision before subtracting it.
+    logits = torch.zeros(5, 3, dtype=dtype)
+    logits += torch.tensor([0, 16, 32, 64, 128], dtype=dtype)[:, None]
+    probabilities = Model._duplex_boundary_chunk_eos_probs(logits, 1)
+    expected = torch.full((5,), 1 / 3, dtype=dtype)
+    torch.testing.assert_close(probabilities, expected, rtol=0, atol=0)
+    # A draw between the correct probability and the rounded logsumexp result
+    # must keep generating for every row, irrespective of the common offset.
+    assert not (torch.full((5,), 0.35) < probabilities).any()
 
 
 class _CharTokenizer:
@@ -185,3 +200,192 @@ def test_candidate_sampling_reads_nothing_back_to_the_host(device):
         for top_k, top_p in [(2, 0.5), (4, 1.0), (0, 0.8)]:
             candidates = Model._duplex_top_k_top_p_candidates(logits, top_k=top_k, top_p=top_p)
             Model._duplex_draw_candidates(logits, candidates, torch.rand(logits.shape[0], device=device))
+
+
+def _character_cap_case(monkeypatch, *, deferred, all_greedy=True):
+    model, states, md, _ = _setup(0, all_greedy=all_greedy, max_chars=28, turns_open=False)
+    model.max_new_speak_tokens_per_chunk = 64
+    md.top_k[0], md.top_p[0] = 1, 1.0
+    if not deferred:
+        monkeypatch.setattr(model, "_sample_minicpmo45_native_duplex_rows_deferred", lambda *a, **k: None)
+
+    def sample(token, alternative=None):
+        logits = torch.full((1, VOCAB), -100.0)
+        logits[0, token] = 100.0
+        if alternative is not None:
+            logits[0, alternative] = 99.0
+        output = model._sample_minicpmo45_native_duplex_stage0(logits, md, duplex_rows=[0])
+        model._commit_minicpmo45_duplex_pending_samples()
+        return output.sampled_token_ids.item()
+
+    return model, states[0], md, sample
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("all_greedy", [False, True])
+@pytest.mark.parametrize("prefix", [[20] * 9, [20] * 8 + [19]])
+def test_character_target_keeps_crossing_token_then_caps_without_sampling(monkeypatch, deferred, all_greedy, prefix):
+    model, state, md, sample = _character_cap_case(monkeypatch, deferred=deferred, all_greedy=all_greedy)
+    # Token 20 has 3 characters, token 19 has 2: 27 + 2 crosses; 26 + 2 reaches 28.
+    md.output_token_ids[0] = prefix.copy()
+    assert sample(19) == 19
+    assert state.generated_tokens == [19]
+    md.output_token_ids[0].append(19)
+    before = md.generators[0].get_state().clone()
+
+    def must_not_sample(*args, **kwargs):
+        pytest.fail("An exhausted character budget must end before any sampler draw")
+
+    monkeypatch.setattr(model, "_minicpmo45_duplex_boundary_hits", must_not_sample)
+    monkeypatch.setattr(model, "_minicpmo45_duplex_stage2_draws", must_not_sample)
+    assert sample(19) == CHUNK_EOS
+    assert state.generated_tokens == [19]
+    assert torch.equal(md.generators[0].get_state(), before)
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_character_target_waits_for_complete_utf8_prefix(monkeypatch, deferred):
+    model, _, md, sample = _character_cap_case(monkeypatch, deferred=deferred)
+
+    class PartialTokenizer(_CharTokenizer):
+        def decode(self, ids, skip_special_tokens=False):
+            return "甲" * 27 + "\ufffd" if list(ids) == [20] else "甲" * 28
+
+    model._minicpmo45_tokenizer_cache = PartialTokenizer()
+    md.output_token_ids[0] = [20]
+    assert sample(19) == 19  # Complete the bytes rather than drop their token.
+    md.output_token_ids[0].append(19)
+    assert sample(19) == CHUNK_EOS
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_character_budget_precedes_future_special_draw_only_when_exhausted(monkeypatch, deferred, exhausted):
+    _, _, md, sample = _character_cap_case(monkeypatch, deferred=deferred)
+    md.output_token_ids[0] = [20] * (10 if exhausted else 9)
+    assert sample(TOKEN_IDS["turn_eos_token_id"]) == (CHUNK_EOS if exhausted else TOKEN_IDS["turn_eos_token_id"])
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("hard_cap", [False, True])
+def test_explicit_force_listen_bypasses_only_soft_character_target(monkeypatch, deferred, hard_cap):
+    model, state, md, sample = _character_cap_case(monkeypatch, deferred=deferred)
+    model._minicpmo45_duplex_payload_for_row = lambda row: {"force_listen": True}
+    model.max_new_speak_tokens_per_chunk = 5 if hard_cap else 64
+    md.output_token_ids[0] = [20] * 10
+    assert sample(LISTEN) == (CHUNK_EOS if hard_cap else LISTEN)
+    assert state.generated_tokens == []
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("all_greedy", [False, True])
+def test_sampled_eos_is_preserved_without_punctuation(monkeypatch, deferred, all_greedy):
+    """Neither an unpunctuated answer nor an unfinished word authorizes resampling EOS."""
+    model, state, md, _ = _character_cap_case(monkeypatch, deferred=deferred, all_greedy=all_greedy)
+    model.max_speak_chars_per_chunk = 0
+    state.current_turn_ended = False
+    prefix, candidate = [27], 26
+    for token in prefix:
+        model._record_minicpmo45_duplex_generation_token(0, token)
+    md.output_token_ids[0] = list(prefix)
+    eos = TOKEN_IDS["turn_eos_token_id"]
+    logits = torch.full((1, VOCAB), -100.0)
+    logits[0, eos], logits[0, candidate] = 27.5, 25.0
+    if deferred:
+        with _NoHostReads():
+            output = model._sample_minicpmo45_native_duplex_stage0(logits, md, duplex_rows=[0])
+    else:
+        output = model._sample_minicpmo45_native_duplex_stage0(logits, md, duplex_rows=[0])
+    model._commit_minicpmo45_duplex_pending_samples()
+    assert output.sampled_token_ids.item() == eos
+    assert state.generated_tokens == [*prefix, eos]
+    assert state.current_turn_ended
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("previous,candidate", [(23, 23), (27, 26)], ids=["repetition", "continuation"])
+def test_model_selected_repetition_and_continuation_are_preserved(monkeypatch, deferred, previous, candidate):
+    model, state, md, sample = _character_cap_case(monkeypatch, deferred=deferred)
+    model.max_speak_chars_per_chunk = 0
+    state.current_turn_ended = False
+    model._record_minicpmo45_duplex_generation_token(0, previous)
+    md.output_token_ids[0] = []
+    assert sample(candidate) == candidate
+    assert state.generated_tokens == [previous, candidate]
+    assert not state.current_turn_ended
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("all_greedy", [False, True])
+def test_only_finite_eos_is_preserved(monkeypatch, deferred, all_greedy):
+    model, state, md, _ = _character_cap_case(monkeypatch, deferred=deferred, all_greedy=all_greedy)
+    model.max_speak_chars_per_chunk = 0
+    state.current_turn_ended = False
+    model._record_minicpmo45_duplex_generation_token(0, 23)
+    md.output_token_ids[0] = []
+    eos = TOKEN_IDS["turn_eos_token_id"]
+    logits = torch.full((1, VOCAB), -torch.inf)
+    logits[0, eos] = 1.0
+    output = model._sample_minicpmo45_native_duplex_stage0(logits, md, duplex_rows=[0])
+    model._commit_minicpmo45_duplex_pending_samples()
+    assert output.sampled_token_ids.item() == eos
+    assert state.generated_tokens == [23, eos]
+    assert state.current_turn_ended
+
+
+def test_deferred_text_is_committed_before_the_next_turn_eos(monkeypatch):
+    """Consecutive deferred samples retain text then EOS without an explicit commit in between."""
+    model, state, md, _ = _character_cap_case(monkeypatch, deferred=True, all_greedy=True)
+    model.max_speak_chars_per_chunk = 0
+    state.current_turn_ended = False
+    eos = TOKEN_IDS["turn_eos_token_id"]
+
+    def draw(token):
+        logits = torch.full((1, VOCAB), -100.0)
+        logits[0, token] = 100.0
+        output = model._sample_minicpmo45_native_duplex_stage0(logits, md, duplex_rows=[0])
+        return output.sampled_token_ids.item()
+
+    md.output_token_ids[0] = []
+    assert draw(21) == 21
+    assert state.generated_tokens == []
+    md.output_token_ids[0] = [21]
+    assert draw(eos) == eos
+    assert state.generated_tokens == [21]
+    model._commit_minicpmo45_duplex_pending_samples()
+    assert state.generated_tokens == [21, eos]
+    assert state.current_turn_ended is True
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("window_enabled", [False, True])
+def test_discarded_async_text_cannot_suppress_next_unit_eos(monkeypatch, deferred, window_enabled):
+    from tests.model_executor.models.minicpmo_4_5.helpers import stage0_vision_runtime
+
+    runtime = stage0_vision_runtime()
+    for name, value in TOKEN_IDS.items():
+        setattr(runtime, name, value)
+    state = _MiniCPMO45Stage0SessionState(session_id="accepted-span", window_enabled=window_enabled)
+    first = runtime._stage_prefill_embeddings_only(state, None, video_frames=[object()], seq=1)
+    assert first["success"]
+    model, _, md, sample = _character_cap_case(monkeypatch, deferred=deferred)
+    model._minicpmo45_duplex_state_for_row = lambda row: state
+    model.max_speak_chars_per_chunk = 0
+    md.output_token_ids[0] = []
+    assert sample(23) == 23  # Accepted text.
+    md.output_token_ids[0] = [23]
+    assert sample(CHUNK_EOS) == CHUNK_EOS
+    assert sample(23) == 23  # Late lookahead text; scheduler stopped at the boundary.
+    second = runtime._stage_prefill_embeddings_only(
+        state,
+        None,
+        video_frames=[object()],
+        seq=2,
+        stage0_window={"completed_token_ids": [23], "completed_terminator_token_id": CHUNK_EOS},
+    )
+    assert second["success"]
+    assert second["input_token_ids"][:3] == [CHUNK_EOS, runtime.unit_end_token_id, runtime.unit_token_id]
+    md.output_token_ids[0] = []
+    eos = TOKEN_IDS["turn_eos_token_id"]
+    assert sample(eos, 29) == eos
+    assert state.current_turn_ended

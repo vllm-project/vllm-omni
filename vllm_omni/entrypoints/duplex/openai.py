@@ -90,8 +90,6 @@ class OpenAIRealtimeHandler:
             engine=state.engine_client,
             model_name=model_name,
             chat_handler=state.openai_serving_chat,
-            tool_call_parser=getattr(state.args, "tool_call_parser", None),
-            enable_auto_tool_choice=getattr(state.args, "enable_auto_tool_choice", False),
             vad_backend_provider=self._vad_backend_provider,
             semantic_vad_backend_provider=self._semantic_vad_backend_provider,
         )

@@ -44,6 +44,7 @@ from vllm_omni.config.omni_config import (
     _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS,
     _DIFFUSION_SCHEDULER_STAGE_ENGINE_FIELD_MAP,
     _LOAD_STAGE_ENGINE_FIELD_MAP,
+    _LORA_CONFIG_ENGINE_FIELD_MAP,
     _PARALLEL_CONFIG_ENGINE_FIELD_MAP,
     _SCHEDULER_STAGE_ENGINE_FIELD_MAP,
     BaseVllmOmniStageConfig,
@@ -1193,14 +1194,17 @@ def _project_omni_stage_engine_args(
         ):
             engine_args.update(_project_upstream_config_fields(config, field_map))
 
-    # Same category as the two above: vLLM config objects copied verbatim from
-    # the stage config into the engine args. Only compilation_config and
-    # profiler_config used to be copied, so a speculative_config in the deploy
-    # config (stage-0 n-gram, or the stage-1 one injected by stage_config.py)
-    # silently disappeared here (no error) and showed up engine-side as
-    # speculative_config=None. getattr(..., None) guards stage config types
-    # that lack the field.
-    for name in ("compilation_config", "profiler_config", "speculative_config"):
+    # Copy typed vLLM config objects verbatim from stage config to engine args.
+    # Keeping this list in sync prevents settings such as speculative_config
+    # from disappearing before engine startup. getattr(..., None) keeps
+    # compatibility with stage config types that omit a field.
+    for name in (
+        "compilation_config",
+        "kernel_config",
+        "profiler_config",
+        "speculative_config",
+        "weight_transfer_config",
+    ):
         value = getattr(stage_config, name, None)
         if value is not None:
             engine_args[name] = copy.deepcopy(value)
@@ -1250,6 +1254,9 @@ def _project_omni_stage_engine_args(
                 _PARALLEL_CONFIG_ENGINE_FIELD_MAP,
             )
         )
+        if stage_config.lora_config is not None:
+            engine_args["enable_lora"] = True
+            engine_args.update(_project_upstream_config_fields(stage_config.lora_config, _LORA_CONFIG_ENGINE_FIELD_MAP))
 
     quantization_config = stage_config.quantization_config
     if quantization_config is not None:
@@ -2118,6 +2125,9 @@ def initialize_diffusion_stage(
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
+    # Startup-only carrier: the manager retains ownership and the executor
+    # removes this registry before od_config is serialized in request RPCs.
+    setattr(od_config, "_sharing_worker_registry", getattr(stage_cfg, "_sharing_worker_registry", None))
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, use_inline)
 
 

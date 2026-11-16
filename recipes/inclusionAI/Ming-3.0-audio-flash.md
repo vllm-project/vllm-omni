@@ -25,7 +25,7 @@ ASR and Speech QA share the Ming3 audio thinker; requests for audio output addit
 
 ### Environment
 
-- Linux, Python 3.11–3.13, and vLLM-Omni matching vLLM 0.32.0.
+- Linux, Python 3.11–3.13, and vLLM-Omni matching final vLLM 0.33.0.
 - Client examples use Bash, `curl`, `jq`, and GNU `base64`.
 - Run commands from the repository root. Speech output also requires the [text normalization resources](#text-normalization-resources).
 

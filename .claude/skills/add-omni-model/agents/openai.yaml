@@ -1,0 +1,4 @@
+interface:
+  display_name: "vLLM-Omni Add Omni Model"
+  short_description: "Integrate a multi-stage thinker/talker/code2wav omni model."
+  default_prompt: "Use $add-omni-model to integrate this omni model into vLLM-Omni: split stages, define the pipeline and hand-off processors, write the deploy YAML, and climb the parity ladder before adding tests and a recipe."

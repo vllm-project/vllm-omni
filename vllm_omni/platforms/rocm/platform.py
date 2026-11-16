@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from typing import TYPE_CHECKING
+
 import torch
+import torch.nn as nn
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.kernel import IrOpPriorityConfig
@@ -11,6 +14,9 @@ from vllm.platforms.rocm import RocmPlatform
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 from vllm_omni.platforms.rocm.patch import apply_patches
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
 
@@ -69,6 +75,12 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         from vllm_omni.diffusion.attention.backends.utils.fa import is_flash_attn_installed
 
         return is_flash_attn_installed()
+
+    @classmethod
+    def apply_diffusion_model_patches(cls, model: nn.Module, od_config: "OmniDiffusionConfig") -> None:
+        from vllm_omni.platforms.rocm.patch.worker.patch_groupnorm import apply_aiter_groupnorm
+
+        apply_aiter_groupnorm(model, od_config.model_class_name)
 
     @classmethod
     def get_diffusion_attn_backend_cls(
@@ -208,6 +220,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         Preserves omni-specific is_custom_op_enabled('rms_norm') check.
         """
         from vllm.config.compilation import CompilationMode
+        from vllm.platforms.rocm import on_gfx90a
 
         # TODO(luka/TJ) use aiter, vllm_c, native by default on ROCm
         cc = vllm_config.compilation_config
@@ -218,7 +231,14 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         # Necessary on ROCm because it's common that users
         # enable rms_norm to use the aiter kernel.
         # TODO(luka/TJ) remove env vars completely
-        if cc.is_custom_op_enabled("rms_norm") and envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_RMSNORM:
+        # AITER rmsnorm is not built for gfx90a and segfaults (upstream 2622ee21aa).
+        # Keep the Omni custom-op gate; do not switch to cudagraph_mode / on_rdna4.
+        if (
+            cc.is_custom_op_enabled("rms_norm")
+            and envs.VLLM_ROCM_USE_AITER
+            and envs.VLLM_ROCM_USE_AITER_RMSNORM
+            and not on_gfx90a()
+        ):
             rms_norm = ["aiter"] + default
         else:
             rms_norm = default
