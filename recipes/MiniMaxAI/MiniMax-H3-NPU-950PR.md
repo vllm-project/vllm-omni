@@ -126,12 +126,17 @@ bf16, and `vllm serve` with `--usp 4` and no quantization raises
 parallel 4 in bf16 uses about 15.5 GB per card. USP4 plus MXFP8 uses about
 31 GB per card and fits.
 
-For Ref2VA on that device, start from the lossy flags, switch `--task-type`
-to `ref2va`, and narrow the dense window. `skip_layers` keeps those DiT
-blocks dense on every step. Measured at 1344x768, 24 fps, 50 steps,
-vLLM-Omni 0.32.0, MindIE-SD 3.2.0. The dense baseline is TP4 bf16
-`FLASH_ATTN` (722.2 s diffuse for 5 s of video). Sharpness is the ratio of
-Laplacian variance against the USP4+MXFP8 dense run of the same prompt.
+For Ref2VA on that device, keep the environment variables and server flags
+of the recommended lossy configuration, switch `--task-type` to `ref2va`,
+and narrow the dense window with the flags below. `skip_layers` keeps those
+DiT blocks dense on every step. The first request is a warmup; exclude it
+from steady-state measurements. Measured at 1344x768, 24 fps, 50 steps,
+vLLM-Omni 0.32.0, MindIE-SD 3.2.0.
+
+| Point | `start_step` | `end_step` | `skip_layers` | 5 s diffuse |
+| --- | ---: | ---: | --- | ---: |
+| Speed | 4 | 4 | `0-1,48-49` | 312.5 s |
+| Sharper | 6 | 6 | `0-2,47-49` | 354.2 s |
 
 ```bash
   --task-type ref2va \
@@ -139,25 +144,20 @@ Laplacian variance against the USP4+MXFP8 dense run of the same prompt.
   --diffusion-quantization-config '{"transformer":{"method":"mxfp8"}}'
 ```
 
-| Point | `start_step` | `end_step` | `skip_layers` | 5 s diffuse | vs 722.2 s | sharpness |
-| --- | ---: | ---: | --- | ---: | ---: | ---: |
-| Speed | 4 | 4 | `0-1,48-49` | 312.5 s | 2.31× | 0.81 |
-| Sharper | 6 | 6 | `0-2,47-49` | 354.2 s | 2.04× | 0.91 |
+A 15 s run of the speed point took 1836 s; that run has no quality comparison.
 
-One 15 s run of the speed point, against the same TP4 bf16 dense baseline,
-went from 4768 s to 1836 s (2.60×). That pair has no quality comparison.
-When frames look soft, move toward the sharper row before lowering
+Quality against the dense USP4+MXFP8 run of the same prompt
+(Laplacian-variance ratio): 0.81 for the speed point, 0.91 for the sharper
+point. When frames look soft, move toward the sharper row before lowering
 `sparsity`.
 
-#### 4×: RainFusion plus Cache-DiT
+#### RainFusion plus Cache-DiT
 
-Same USP4 + MXFP8 stack, with a shorter dense tail and Cache-DiT. Five
-interleaved repeats on vLLM-Omni 0.32.0: in-run dense median 701.95 s,
-candidate median 166.17 s, 4.22× (76.3% lower). Against the frozen TP4 bf16
-baseline of 722.2 s that is 4.35×. Wall-clock medians were 717.4 s and
-181.5 s (3.95×). 31 of 50 denoise steps were cached. Sharpness / flicker /
-luma versus the USP4+MXFP8 dense run were 0.924 / 0.950 / 0.984. The same
-command passed that check at seeds 2202 (165.1 s) and 2303 (165.9 s).
+Same USP4 + MXFP8 stack, with a shorter dense tail and Cache-DiT. Across
+five repeats on vLLM-Omni 0.32.0, the 5 s diffuse median is 166.17 s
+(wall-clock median 181.5 s), with 31 of 50 denoise steps cached. The same
+configuration passed at seeds 2202 (165.1 s) and 2303 (165.9 s). Quality
+versus the dense run: 0.924 sharpness / 0.950 flicker / 0.984 luma.
 
 ```bash
   --task-type ref2va \
