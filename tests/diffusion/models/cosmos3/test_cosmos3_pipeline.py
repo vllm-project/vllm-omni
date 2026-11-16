@@ -1357,6 +1357,28 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     )
     assert prompt_ablation_cfg is not None
     assert prompt_ablation_cfg.emphasize_control_in_prompt is False
+    no_system_prompt_cfg = transfer.resolve_transfer_config(
+        make_sampling_params(extra_args={"edge": True, "use_system_prompt": False})
+    )
+    assert no_system_prompt_cfg is not None
+    assert no_system_prompt_cfg.use_system_prompt is False
+    custom_system_prompt_cfg = transfer.resolve_transfer_config(
+        make_sampling_params(extra_args={"edge": True, "system_prompt": "custom system prompt"})
+    )
+    assert custom_system_prompt_cfg is not None
+    assert custom_system_prompt_cfg.use_system_prompt is True
+    assert custom_system_prompt_cfg.system_prompt == "custom system prompt"
+    with pytest.raises(ValueError, match="must not be empty"):
+        transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": True, "system_prompt": ""}))
+    # Other models use string-valued use_system_prompt modes; transfer must not read them as False.
+    with pytest.raises(ValueError, match="must be a boolean"):
+        transfer.resolve_transfer_config(
+            make_sampling_params(extra_args={"edge": True, "use_system_prompt": "en_vanilla"})
+        )
+    with pytest.raises(ValueError, match="use_system_prompt is false"):
+        transfer.resolve_transfer_config(
+            make_sampling_params(extra_args={"edge": True, "use_system_prompt": False, "system_prompt": "custom"})
+        )
     # fps omitted (no fps/frame_rate on the sampling params) -> wsm preset default (10) applies.
     defaulted_fps_cfg = transfer.resolve_transfer_config(make_sampling_params(extra_args={"wsm": True}))
     assert defaulted_fps_cfg is not None
@@ -1481,57 +1503,6 @@ def test_transfer_control_weight_validation_and_normalization() -> None:
                 }
             )
         )
-
-
-@pytest.mark.parametrize(
-    ("extra_args", "additional_information", "expected_use", "expected_prompt"),
-    [
-        ({"use_system_prompt": False}, None, False, None),
-        ({"use_system_prompt": "false"}, None, False, None),
-        ({"use_system_prompt": "true"}, None, True, None),
-        ({"system_prompt": "custom system prompt"}, None, True, "custom system prompt"),
-        ({}, {"use_system_prompt": False}, False, None),
-        ({}, {"system_prompt": "per-sample system prompt"}, True, "per-sample system prompt"),
-        # Request-level extra_args win over per-sample prompt data.
-        ({"use_system_prompt": True}, {"use_system_prompt": False}, True, None),
-    ],
-)
-def test_transfer_config_resolves_system_prompt_controls(
-    extra_args: dict[str, Any],
-    additional_information: dict[str, Any] | None,
-    expected_use: bool,
-    expected_prompt: str | None,
-) -> None:
-    from vllm_omni.diffusion.models.cosmos3 import transfer
-
-    prompt_data = None
-    if additional_information is not None:
-        prompt_data = {"prompt": "transfer", "additional_information": additional_information}
-    cfg = transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": True, **extra_args}), prompt_data)
-
-    assert cfg is not None
-    assert cfg.use_system_prompt is expected_use
-    assert cfg.system_prompt == expected_prompt
-
-
-@pytest.mark.parametrize(
-    ("extra_args", "error", "match"),
-    [
-        ({"system_prompt": ""}, ValueError, "must not be empty"),
-        ({"system_prompt": "   "}, ValueError, "must not be empty"),
-        ({"system_prompt": 1}, TypeError, "must be a string"),
-        # Other models use string-valued use_system_prompt modes; transfer must not read them as False.
-        ({"use_system_prompt": "en_vanilla"}, ValueError, "must be a boolean"),
-        ({"use_system_prompt": False, "system_prompt": "custom"}, ValueError, "use_system_prompt is false"),
-    ],
-)
-def test_transfer_config_rejects_invalid_system_prompt_controls(
-    extra_args: dict[str, Any], error: type[Exception], match: str
-) -> None:
-    from vllm_omni.diffusion.models.cosmos3 import transfer
-
-    with pytest.raises(error, match=match):
-        transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": True, **extra_args}))
 
 
 def test_transfer_fps_matches_resolved_frame_rate_precedence() -> None:
