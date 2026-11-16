@@ -5,6 +5,8 @@ In vLLM-Omni, a model's `PipelineConfig` defines its fixed stage topology, while
 !!! note
     Default deploy config YAMLs (for example, `vllm_omni/deploy/qwen2_5_omni.yaml`, `vllm_omni/deploy/qwen3_omni_moe.yaml`, and `vllm_omni/deploy/qwen3_tts.yaml`) are bundled and loaded automatically when `--deploy-config` is omitted. The resolved pipeline selects its default through `default_deploy_config_name`.
 
+For diffusion sampling, explicit request fields override `--default-sampling-params`, which overrides deploy YAML defaults. CLI values are merged by stage ID, and `extra_args` is merged by key. Invalid CLI JSON fails startup; model-owned sampling constraints still apply.
+
 ## Pipeline configuration
 
 `PipelineConfig` and its `StagePipelineConfig` entries are Python definitions
@@ -103,7 +105,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | `connectors` | dict | optional | `null` | Named connector specs (`{name, extra}`). Referenced by each stage's `input_connectors` / `output_connectors`. See [Connector schema](#connector-schema). |
 | `edges` | list | optional | `null` | Explicit edge list for the KV transfer graph. Auto-derived from stage inputs if omitted. |
 | `stages` | list | optional | `[]` | Per-stage runtime overrides matched by `stage_id`. Pipeline stages are still created from `PipelineConfig` when this list is empty. |
-| `platforms` | dict | optional | `null` | Keyed by `npu` / `rocm` / `xpu` / `musa`, each contains a `stages:` list with per-platform overrides applied on top of the CUDA defaults, an optional `model_runner` fallback, and optional `connectors:` overrides deep-merged into the matching top-level connectors by name. |
+| `platforms` | dict | optional | `null` | Keyed by platform (`cuda`, `npu`, `rocm`, `xpu`, etc.). Each platform may provide `stages:` overrides, an optional `model_runner` fallback, and named `connectors:` overrides deep-merged into the shared defaults. |
 | `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only` / `qwen3_omni_moe_thinker_only`). |
 | `trust_remote_code` | bool \| null | optional | `null` | **Pipeline-wide.** Trust HF remote code on model load; applies to every stage when specified. |
 | `distributed_executor_backend` | str \| null | optional | `null` | **Pipeline-wide.** Distributed executor backend forwarded to vLLM (`"mp"`, `"ray"`, `"external_launcher"`). If omitted, vLLM auto-selects backend from runtime topology. |
@@ -413,6 +415,14 @@ stages:
     input_connectors:  {from_stage_0: shm}
 ```
 
+`platforms.<platform>.connectors` deep-merges named connector definitions,
+including `extra`, through each `base_config` inheritance level and then onto
+the shared connectors. A partial platform override retains the other inherited
+platform values. This applies both to deploy
+resolution and to the connector spec passed to workers. Unspecified keys retain
+their shared values; other platforms retain the shared connector. To override a
+platform-specific value in a user overlay, use the same platform block.
+
 ### CLI flags
 
 | Flag | Description |
@@ -482,6 +492,37 @@ From highest to lowest:
 3. Platform section (`platforms.npu.stages`, etc.) on top of the base `stages:`
 4. Overlay YAML (via `base_config:`) on top of the base YAML
 5. Parser defaults
+
+### vLLM LoRA on LLM stages
+
+AR and generation stage entries accept vLLM's LoRA engine options, such as
+`enable_lora`, `max_lora_rank`, `max_loras`, `max_cpu_loras`,
+`lora_target_modules`, and `fully_sharded_loras`. As in vLLM, the other options
+take effect only on a stage that also sets `enable_lora: true`.
+
+```yaml
+stages:
+  - stage_id: 0
+    enable_lora: true
+    max_lora_rank: 64
+```
+
+The equivalent CLI and Python forms are
+`--stage-overrides '{"0": {"enable_lora": true, "max_lora_rank": 64}}'` and
+`Omni(model, stage_overrides={"0": {"enable_lora": True, "max_lora_rank": 64}})`.
+
+- Top-level `--enable-lora` (or `enable_lora=True`) works only on single-stage
+  pipelines. Multi-stage pipelines reject global vLLM LoRA options and must use
+  stage-scoped keys, including in the stage-based / `--headless` CLI, where each
+  process resolves the whole pipeline.
+- `AsyncOmni.generate(..., lora_request=...)` applies the adapter on stage 0.
+- Diffusion stages reject `enable_lora` and configure LoRA through `lora_path`,
+  `lora_scale`, and `lora_backend` instead; see [Diffusion LoRA](../user_guide/diffusion/lora.md).
+- `max_cpu_loras` sizes the CPU LoRA cache of whichever stage type receives it.
+  A global value on a pipeline with a diffusion stage sizes only the diffusion
+  cache; set an LLM stage's value with a stage-scoped key.
+
+The design is described in [LoRA](../design/feature/lora.md).
 
 ### Worked override example
 
@@ -864,6 +905,18 @@ capacities, capture sizes, KV budget and `platforms.cuda.cuda_mps`. The
 pipeline no longer changes configuration based on a GPU-memory or MPS probe.
 
 Other platforms use V1 in the same file; NPU keeps its codec graph override.
+On Ascend NPU, `moss_tts_local_npu_mrv2.yaml` is an opt-in profile that runs the
+Talker (Stage0) and codec (Stage1) on MRV2. The Talker builds Ascend attention
+metadata, and the codec inherits the NPU streaming graph settings from
+`moss_tts_local.yaml`. The Stage0
+first-frame direct decode is off on NPU because it needs CUDA-only kernels, so
+Stage1 delivers every chunk:
+
+```bash
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
+  --deploy-config vllm_omni/deploy/moss_tts_local_npu_mrv2.yaml
+```
+
 The 2/3-NPU files retain their distinct multi-device topology. These changes
 do not enable MRV2 for MOSS Delay, Realtime or Nano. Local 1.5 emits 48 kHz
 stereo; benchmark raw PCM with `VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000` and

@@ -54,3 +54,14 @@ stages:
       temperature: 0.0
       max_tokens: 8192
       seed: 0
+
+platforms:
+  rocm:
+    stages:
+      - stage_id: 1
+        # AudexXCodec1 is attention-free, but vLLM still validates the root
+        # XCodec config for KV-cache layout discovery. Supply the nested HuBERT
+        # encoder's head size as ROCm-only metadata; the codec loads its own
+        # unmodified config inside AudexXCodec1.
+        hf_overrides:
+          head_dim: 64
