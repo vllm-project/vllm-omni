@@ -914,13 +914,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _has_runnable_kv_holders(self) -> bool:
         return any(self._request_is_runnable(request) for request in self.kv_holding_waiting)
 
-    def _isolation_group_size(self, request: object) -> int | None:
-        """How many requests must be admitted together in an isolated step.
+    def _isolation_unit(self, request: object) -> list[object] | None:
+        """Requests that must be admitted together with the isolated request.
 
         ``None`` means the request cannot be isolated safely this step (e.g. an
         incomplete CFG pair); the caller then defers admission instead.
         """
-        return 1
+        return [request]
+
+    def _isolation_group_size(self, request: object) -> int | None:
+        unit = self._isolation_unit(request)
+        return None if unit is None else len(unit)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
@@ -957,13 +961,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 promoted = self._promote_seeded_request(queues=("waiting",))
             if promoted is not None:
                 solo_queue, solo_request = promoted
-                group = self._isolation_group_size(solo_request)
-                if group is None:
-                    # Cannot isolate this request safely; admit nothing instead
-                    # of splitting the unit across a solo step.
-                    seeded_defer, solo_queue = True, None
+                unit = self._isolation_unit(solo_request)
+                queue_requests = self.waiting if solo_queue == "waiting" else self.kv_holding_waiting
+                present = {request.request_id for request in queue_requests}
+                if unit is None or any(request.request_id not in present for request in unit):
+                    # Cannot isolate this unit safely; admit nothing instead of
+                    # splitting it across a solo step.
+                    seeded_defer, solo_queue, unit = True, None, None
                 else:
-                    solo_group = group
+                    solo_group = len(unit)
 
         # A solo step admits only the promoted unit (a CFG pair counts as one):
         # empty the *other* queue for this step so it cannot be admitted
@@ -976,10 +982,25 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if deferred:
                 self.waiting = create_request_queue(self.policy)
                 self.kv_holding_waiting = create_request_queue(self.policy)
-            elif solo_queue == "waiting":
-                self.kv_holding_waiting = create_request_queue(self.policy)
-            else:
+            elif drain_kv:
+                # Keep the holders and let them drain at the normal limit.
                 self.waiting = create_request_queue(self.policy)
+            else:
+                # Restrict the promoted queue to the isolation unit, not just
+                # the cap: the queue is pre-built by `OmniCFGARScheduler` and a
+                # cap wide enough for a pair would otherwise admit an unrelated
+                # request that sits between its branches (#9937).
+                promoted_queue = self.waiting if solo_queue == "waiting" else self.kv_holding_waiting
+                promoted_queue.remove_requests(unit)
+                restricted = create_request_queue(self.policy)
+                for request in unit:
+                    restricted.add_request(request)
+                if solo_queue == "waiting":
+                    self.waiting = restricted
+                    self.kv_holding_waiting = create_request_queue(self.policy)
+                else:
+                    self.kv_holding_waiting = restricted
+                    self.waiting = create_request_queue(self.policy)
 
         original_max_num_active_reqs = self.max_num_active_reqs
         # One limit, computed once: the solo cap must survive the async-chunk

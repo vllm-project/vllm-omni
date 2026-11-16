@@ -65,10 +65,10 @@ class _StubRequest:
 
 
 def _make_scheduler(
-    *, parked: int, waiting, kv_holding=(), reserved_slots: int = 0, adapter_parked_running=()
+    *, parked: int, waiting, kv_holding=(), reserved_slots: int = 0, adapter_parked_running=(), cls=OmniARScheduler
 ) -> OmniARScheduler:
     """Real scheduler wrapper with the surface ``schedule()`` reads."""
-    scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler = cls.__new__(cls)
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
     for request in waiting:
@@ -355,14 +355,58 @@ def test_cfg_pair_is_one_isolation_unit() -> None:
 
     scheduler = OmniCFGARScheduler.__new__(OmniCFGARScheduler)
     scheduler._request_pairs = {"a": "pair", "b": "pair"}
-    scheduler._pairs = {"pair": {"cond": "a", "uncond": "b"}}
 
     class _Req:
         def __init__(self, request_id):
             self.request_id = request_id
 
-    assert scheduler._isolation_group_size(_Req("a")) == 2
-    assert scheduler._isolation_group_size(_Req("c")) == 1
+    cond, uncond, single = _Req("a"), _Req("b"), _Req("c")
+    scheduler.requests = {"a": cond, "b": uncond, "c": single}
+    scheduler._pairs = {"pair": {"cond": "a", "uncond": "b"}}
+
+    assert scheduler._isolation_unit(cond) == [cond, uncond]
+    assert scheduler._isolation_group_size(cond) == 2
+    assert scheduler._isolation_group_size(single) == 1
 
     scheduler._pairs["pair"] = {"cond": "a"}
-    assert scheduler._isolation_group_size(_Req("a")) is None
+    assert scheduler._isolation_unit(cond) is None
+    assert scheduler._isolation_group_size(cond) is None
+
+
+class _PairScheduler(OmniARScheduler):
+    """Isolation unit of two branches for a request that names its partner."""
+
+    def _isolation_unit(self, request):
+        if getattr(request, "request_id", None) == "cond":
+            return [request, self._partner]
+        return [request]
+
+
+def test_solo_step_restricts_the_queue_to_the_pair(monkeypatch) -> None:
+    """A cap wide enough for a pair must not admit a request between its branches."""
+    other = _StubRequest("other")
+    cond = _StubRequest("cond", seed=7)
+    uncond = _StubRequest("uncond", seed=7)
+    scheduler = _make_scheduler(cls=_PairScheduler, parked=0, waiting=[other, cond, uncond])
+    scheduler._partner = uncond
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    assert seen["limit"] == 2
+    assert seen["waiting_len"] == 2
+    assert seen["admitted"] == "cond"
+
+
+def test_incomplete_pair_defers_instead_of_splitting(monkeypatch) -> None:
+    class _IncompletePairScheduler(OmniARScheduler):
+        def _isolation_unit(self, request):
+            return None if getattr(request, "request_id", None) == "cond" else [request]
+
+    cond = _StubRequest("cond", seed=7)
+    scheduler = _make_scheduler(cls=_IncompletePairScheduler, parked=0, waiting=[cond])
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    assert seen["waiting_len"] == 0
+    assert seen["kv_len"] == 0
+    assert seen["admitted"] is None
