@@ -973,6 +973,7 @@ class OmniDiffusionConfig:
     # the internal typed resolution used at runtime.
     diffusion_offload_config: dict[str, Any] | None = None
     kv_offload_config: dict[str, Any] | None = None
+    enable_file_backed_offload: bool = False
     # Compatibility aliases. Some model-specific legacy stage lifecycles are
     # intentionally broader than the compact dit/text_encoder selector.
     # When enabled, DiT and encoders swap GPU access (mutual exclusion):
@@ -1451,6 +1452,7 @@ class OmniDiffusionConfig:
                         OffloadStrategy.MODEL_LEVEL: "CPU offload",
                         OffloadStrategy.LAYER_WISE: "layerwise offload",
                         OffloadStrategy.DISTRIBUTED_LAYER_WISE: "distributed layerwise offload",
+                        OffloadStrategy.FILE_BACKED: "file-backed offload",
                     }[offload_strategy]
                 )
             if self.diffusion_attention_schedule is not None:

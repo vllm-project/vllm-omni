@@ -54,6 +54,7 @@ class OffloadStrategy(str, Enum):
     MODEL_LEVEL = "model_level"
     LAYER_WISE = "layer_wise"
     DISTRIBUTED_LAYER_WISE = "distributed_layer_wise"
+    FILE_BACKED = "file_backed"
 
 
 class DLOTransfer(str, Enum):
@@ -118,11 +119,13 @@ _LEGACY_STRATEGY_FIELDS = {
     "enable_cpu_offload": OffloadStrategy.MODEL_LEVEL,
     "enable_layerwise_offload": OffloadStrategy.LAYER_WISE,
     "enable_distributed_layerwise_offload": OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+    "enable_file_backed_offload": OffloadStrategy.FILE_BACKED,
 }
 _LEGACY_STRATEGY_PRIORITY = (
     OffloadStrategy.DISTRIBUTED_LAYER_WISE,
     OffloadStrategy.LAYER_WISE,
     OffloadStrategy.MODEL_LEVEL,
+    OffloadStrategy.FILE_BACKED,
 )
 
 
@@ -366,6 +369,7 @@ def offload_streams_blocks(config: Any) -> bool:
     return resolve_offload(config).strategy in (
         OffloadStrategy.LAYER_WISE,
         OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+        OffloadStrategy.FILE_BACKED,
     )
 
 
@@ -432,6 +436,7 @@ def should_offload_component(config: Any, component: str) -> bool:
     if resolved.strategy not in {
         OffloadStrategy.LAYER_WISE,
         OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+        OffloadStrategy.FILE_BACKED,
     }:
         return False
     return resolved.offloads(component)

@@ -916,6 +916,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     output_type: str = "pil"
     diffusion_offload_config: dict[str, Any] | None = None
     kv_offload_config: dict[str, Any] | None = None
+    enable_file_backed_offload: bool = False
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool = False

@@ -388,6 +388,7 @@ class OmniEngineArgs(EngineArgs):
     enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
     diffusion_offload_config: dict[str, Any] | None = None
+    enable_file_backed_offload: bool | None = None
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
     enable_distributed_layerwise_offload: bool | None = None
@@ -819,6 +820,7 @@ class OrchestratorArgs:
     enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
     diffusion_offload_config: dict[str, Any] | None = None
+    enable_file_backed_offload: bool = False
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool = False
@@ -902,6 +904,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "enable_broadcast_weight_load",
         "num_weight_load_threads",
         "diffusion_offload_config",
+        "enable_file_backed_offload",
         "enable_cpu_offload",
         "enable_layerwise_offload",
         "enable_distributed_layerwise_offload",
