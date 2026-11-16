@@ -38,6 +38,13 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 MiniMax-H3 decode latency. It preserves the video encoder and audio VAE but
 can change generated pixels. Enable it with `additional_config.lightvae_decoder_path`.
 
+#### MiniMax-H3 Tiny Decoder (TAEH3)
+
+[TAEH3](diffusion/tae_decoder.md) replaces the MiniMax-H3 video decoder with a
+tiny convolutional autoencoder for previews and low-memory hosts. It is an
+approximation with visibly softer detail. Enable it with
+`additional_config.tae_decoder_path`.
+
 #### Diffusion KV Prefix Caching
 
 [KV prefix caching](../design/feature/prefix_caching.md#diffusion-kv-prefix-caching)

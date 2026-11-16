@@ -203,6 +203,7 @@ from .regenerate import (
     resolve_regenerate_adapter,
 )
 from .sampling import MiniMaxH3Model, MiniMaxH3ModelBatch
+from .taeh3 import resolve_h3_tae_decoder_path
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_time_shift_sigmas,
@@ -1320,6 +1321,7 @@ class MiniMaxH3Pipeline(
         self.audio_vae = None
         if self.load_vae_decoder:
             lightvae_decoder_path = resolve_h3_lightvae_decoder_path(od_config.additional_config or {})
+            tae_decoder_path = resolve_h3_tae_decoder_path(od_config.additional_config)
             self.video_vae = MiniMaxH3VideoVAE(
                 os.path.join(vae_model_path, "video_vae"),
                 device=self.device,
@@ -1330,10 +1332,12 @@ class MiniMaxH3Pipeline(
                     "video_vae_decoder",
                     str(model_path / "vae_decoder_nvfp4/decoder-nvfp4.safetensors")
                     if lightvae_decoder_path is None
+                    and tae_decoder_path is None
                     and (model_path / "vae_decoder_nvfp4/decoder-nvfp4.safetensors").is_file()
                     else None,
                 ),
                 lightvae_decoder_path=lightvae_decoder_path,
+                tae_decoder_path=tae_decoder_path,
                 allow_decoder_compile=vae_compile_allowed(
                     bool(od_config.enforce_eager),
                     current_omni_platform,
