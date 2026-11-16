@@ -1501,7 +1501,12 @@ class MiniMaxH3AudioVAE(nn.Module):
         ).view(1, channels, 1)
         # The remote decoder's TorchScript activations round differently on
         # their first (unfused) call; keep every request on the same path.
-        with torch.jit.optimized_execution(False):
+        decode_context = (
+            _AudioVAEDeterminismContext()
+            if os.environ.get("OMNI_H3_AUDIO_DETERMINISTIC") == "1"
+            else torch.jit.optimized_execution(False)
+        )
+        with decode_context:
             waveform = self.remote.decode(latent * std + mean)
         if waveform.ndim != 3 or waveform.shape[1] != 1:
             raise ValueError(f"unexpected decoded audio shape {tuple(waveform.shape)}")

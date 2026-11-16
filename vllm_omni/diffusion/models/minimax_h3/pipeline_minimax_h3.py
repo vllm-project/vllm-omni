@@ -1294,6 +1294,10 @@ class MiniMaxH3Pipeline(
                 encoder_group=self.text_encoder_group,
                 quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
             )
+            cudnn_sdp = (od_config.additional_config or {}).get("text_encoder_cudnn_sdp", True)
+            if not isinstance(cudnn_sdp, bool):
+                raise ValueError(f"text_encoder_cudnn_sdp must be a bool, got {cudnn_sdp!r}")
+            self.text_encoder.cudnn_sdp = cudnn_sdp
             if rank < text_encoder_tp_size:
                 self.weights_sources.append(
                     DiffusersPipelineLoader.ComponentSource(
