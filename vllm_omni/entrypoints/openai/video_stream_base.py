@@ -54,6 +54,7 @@ from vllm_omni.entrypoints.openai.video_stream_context import (
 )
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.sample_rate import MissingSampleRateError, get_sampling_rate_or_none
 
 logger = init_logger(__name__)
 
@@ -997,6 +998,9 @@ class OmniStreamingVideoHandler:
             async_chunk_mode = video_stream_envs.VLLM_VIDEO_ASYNC_CHUNK
             streaming = async_chunk_mode == "on"
             audio_tail_tensors: list[Any] = []
+            # First rate advertised on an audio payload; labels the coalesced
+            # tail WAV. Stays None for the (legal) zero-audio drain.
+            audio_tail_sample_rate: int | None = None
 
             try:
                 assert engine_client is not None
@@ -1073,6 +1077,10 @@ class OmniStreamingVideoHandler:
                         else:
                             audio_data = self._get_audio_data(output)
                             if audio_data is not None:
+                                if audio_tail_sample_rate is None:
+                                    audio_tail_sample_rate = get_sampling_rate_or_none(
+                                        self._get_multimodal_output(output)
+                                    )
                                 if isinstance(audio_data, list):
                                     audio_tail_tensors.extend(audio_data)
                                 else:
@@ -1105,6 +1113,7 @@ class OmniStreamingVideoHandler:
                             0,
                             new_drained=len(audio_tail_tensors),
                             is_first=True,
+                            sample_rate=audio_tail_sample_rate,
                         )
                         if b64:
                             await websocket.send_json(
@@ -1188,13 +1197,17 @@ class OmniStreamingVideoHandler:
         if audio_data is None:
             return None, chunks_drained
 
+        # The payload's advertised rate labels the encoded WAV; read it
+        # leniently here because empty (zero-audio) deltas are legal without
+        # one — _encode_tail fails loudly when samples actually ship.
+        sample_rate = get_sampling_rate_or_none(cls._get_multimodal_output(result))
         if video_stream_envs.VLLM_VIDEO_AUDIO_DELTA_MODE == "slow":
-            return cls._delta_slow(audio_data, chunks_drained)
-        return cls._delta_fast(audio_data, chunks_drained)
+            return cls._delta_slow(audio_data, chunks_drained, sample_rate)
+        return cls._delta_fast(audio_data, chunks_drained, sample_rate)
 
     @staticmethod
-    def _get_audio_data(result: OmniRequestOutput):
-        """Navigate OmniRequestOutput → multimodal_output['audio']. None on miss."""
+    def _get_multimodal_output(result: OmniRequestOutput) -> Mapping | None:
+        """Navigate OmniRequestOutput → outputs[0].multimodal_output. None on miss."""
         request_output = result
         if request_output is None:
             return None
@@ -1202,15 +1215,20 @@ class OmniStreamingVideoHandler:
         if not isinstance(outputs, list) or not outputs:
             return None
         mm_output = getattr(outputs[0], "multimodal_output", None)
-        if not isinstance(mm_output, Mapping):
-            return None
-        return mm_output.get("audio")
+        return mm_output if isinstance(mm_output, Mapping) else None
+
+    @staticmethod
+    def _get_audio_data(result: OmniRequestOutput):
+        """Navigate OmniRequestOutput → multimodal_output['audio']. None on miss."""
+        mm_output = OmniStreamingVideoHandler._get_multimodal_output(result)
+        return mm_output.get("audio") if mm_output is not None else None
 
     @classmethod
     def _delta_fast(
         cls,
         audio_data,
         chunks_drained: int,
+        sample_rate: int | None,
     ) -> tuple[str | None, int]:
         """Encode every fresh tensor in this DELTA payload."""
         new_chunks = audio_data if isinstance(audio_data, list) else [audio_data]
@@ -1225,6 +1243,7 @@ class OmniStreamingVideoHandler:
             chunks_drained,
             new_drained=chunks_drained + len(new_chunks),
             is_first=(chunks_drained == 0),
+            sample_rate=sample_rate,
         )
 
     @classmethod
@@ -1232,9 +1251,10 @@ class OmniStreamingVideoHandler:
         cls,
         audio_data,
         chunks_drained: int,
+        sample_rate: int | None,
     ) -> tuple[str | None, int]:
         """Compatibility alias for the DELTA payload contract."""
-        return cls._delta_fast(audio_data, chunks_drained)
+        return cls._delta_fast(audio_data, chunks_drained, sample_rate)
 
     @classmethod
     def _encode_tail(
@@ -1244,6 +1264,7 @@ class OmniStreamingVideoHandler:
         *,
         new_drained: int,
         is_first: bool,
+        sample_rate: int | None,
     ) -> tuple[str | None, int]:
         """Strip the CausalConv leading artifact on first emit, then b64-encode."""
         if tail_np is None or len(tail_np) == 0:
@@ -1252,8 +1273,15 @@ class OmniStreamingVideoHandler:
             tail_np = tail_np[_CODEC_FRAME_SAMPLES:]
         if len(tail_np) == 0:
             return None, new_drained
+        if sample_rate is None:
+            # Every audio-emitting model advertises its rate; WAV-encoding
+            # samples without one would fabricate a header (the old code
+            # hardcoded 24000 regardless of the model's actual rate).
+            raise MissingSampleRateError(
+                "streaming video audio carried no sample rate; the model must emit 'sr' on its multimodal output"
+            )
         try:
-            return cls._encode_audio_wav_b64(tail_np), new_drained
+            return cls._encode_audio_wav_b64(tail_np, sample_rate), new_drained
         except Exception:
             logger.exception("Failed to encode audio delta WAV")
             return None, old_drained
@@ -1269,14 +1297,14 @@ class OmniStreamingVideoHandler:
         return arr
 
     @staticmethod
-    def _encode_audio_wav_b64(audio_np) -> str:
-        """Encode numpy float32 audio to base64 WAV (24kHz)."""
+    def _encode_audio_wav_b64(audio_np, sample_rate: int) -> str:
+        """Encode numpy float32 audio to base64 WAV at the model's rate."""
         from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
         from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio
 
         audio_obj = CreateAudio(
             audio_tensor=audio_np,
-            sample_rate=24000,
+            sample_rate=sample_rate,
             response_format="wav",
             speed=1.0,
             base64_encode=True,

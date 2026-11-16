@@ -20,6 +20,7 @@ from vllm_omni.model_executor.common.request_outputs import (
     text_value,
     unwrap_request_output,
 )
+from vllm_omni.sample_rate import InvalidSampleRateError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -127,13 +128,25 @@ def test_slice_audio_delta_keeps_tensors_as_contiguous_tensors() -> None:
     ("multimodal", "expected"),
     [
         ({"sr": 16000}, 16000),
+        # The duplex wire spelling is a distinct protocol namespace, accepted
+        # here only. Value shapes are the shared reader's contract.
         ({"sample_rate_hz": 22050}, 22050),
-        ({"sr": [48000]}, 48000),
-        ({"sr": np.array([8000])}, 8000),
-        ({"sr": "bad"}, 24000),
-        ({"sr": 0}, 24000),
-        ({}, 24000),
     ],
 )
-def test_sample_rate_hz_falls_back_to_the_default(multimodal: dict, expected: int) -> None:
-    assert sample_rate_hz(multimodal, default=24000) == expected
+def test_sample_rate_hz_reads_the_advertised_rate(multimodal: dict, expected: int) -> None:
+    assert sample_rate_hz(multimodal) == expected
+
+
+def test_sample_rate_hz_is_none_when_the_output_carries_no_rate() -> None:
+    # Zero-audio sparse steps legally carry no rate; callers require one only
+    # once they know samples ship.
+    assert sample_rate_hz({}) is None
+    assert sample_rate_hz({"sr": None}) is None
+    # Empty carriers are sparse-step spellings of "no rate".
+    assert sample_rate_hz({"sr": []}) is None
+
+
+@pytest.mark.parametrize("multimodal", [{"sr": "bad"}, {"sr": 0}])
+def test_sample_rate_hz_raises_on_an_invalid_rate(multimodal: dict) -> None:
+    with pytest.raises(InvalidSampleRateError):
+        sample_rate_hz(multimodal)

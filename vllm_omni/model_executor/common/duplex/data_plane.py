@@ -10,7 +10,7 @@ A subclass whose final stage runs with ``RequestOutputKind.DELTA`` sets
 ``audio_output_is_delta``: each output then carries only the audio produced
 since the previous one, possibly as a list of chunks, which is joined and
 passed through unsliced. Model-specific constants (stage role, runtime
-metadata, default rate) are class attributes for a subclass to set.
+metadata) are class attributes for a subclass to set.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from vllm_omni.model_executor.common.request_outputs import (
     text_value,
     unwrap_request_output,
 )
+from vllm_omni.sample_rate import MissingSampleRateError
 
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
 
@@ -52,7 +53,6 @@ class CumulativeAudioTextDataPlane(DuplexDataPlane):
     uses_model_runner_scheduler: bool = True
     runner_kv_backed: bool = True
     owned_runtime: bool = False
-    default_sample_rate_hz: int = 24000
     # True when the final stage runs with ``RequestOutputKind.DELTA``: each
     # output then carries only its new samples, so they pass through unsliced.
     audio_output_is_delta: bool = False
@@ -123,8 +123,18 @@ class CumulativeAudioTextDataPlane(DuplexDataPlane):
         if text:
             state.text = text
 
-        rate = sample_rate_hz(multimodal, default=self.default_sample_rate_hz)
-        encoded = self._encode_audio(audio_delta, rate, context.response_format, context.speed)
+        rate = sample_rate_hz(multimodal)
+        if audio_delta is not None and rate is None:
+            # Zero-audio sparse steps legally carry no rate; samples without
+            # one are a producer bug and must not fall back to a default.
+            raise MissingSampleRateError(
+                "duplex audio output carried no sample rate; the model must emit 'sr' on its multimodal output"
+            )
+        encoded = (
+            self._encode_audio(audio_delta, rate, context.response_format, context.speed)
+            if audio_delta is not None
+            else None
+        )
         if not encoded and not delta_text:
             return None
         delta_samples = audio_sample_count(audio_delta) or 0
@@ -137,7 +147,7 @@ class CumulativeAudioTextDataPlane(DuplexDataPlane):
             "audio_data": encoded or "",
             "audio_format": context.response_format,
             "sample_rate_hz": rate,
-            "audio_duration_ms": round(delta_samples * 1000 / max(1, rate)),
+            "audio_duration_ms": round(delta_samples * 1000 / rate) if rate else 0,
             "end_of_turn": False,
             "uses_model_runner_scheduler": self.uses_model_runner_scheduler,
             "runner_kv_backed": self.runner_kv_backed,

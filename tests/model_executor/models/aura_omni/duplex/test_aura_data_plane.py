@@ -8,8 +8,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from vllm_omni.model_executor.models.aura_omni.duplex.data_plane import AuraDataPlaneSession
+from vllm_omni.sample_rate import MissingSampleRateError
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _encode_audio(audio: object, sample_rate: int, fmt: str, speed: float | None) -> str | None:
@@ -43,6 +47,22 @@ def test_project_unwraps_data_plane_outputs_and_emits_audio_then_done() -> None:
     assert any(event.get("audio") == "encoded-audio" for event in events)
     assert events[-1].get("end_of_turn") is True
     assert events[0].get("data_plane_request_id") == request_id
+
+
+def test_project_requires_a_rate_when_audio_ships() -> None:
+    plane = AuraDataPlaneSession(_encode_audio)
+    request_id = "duplex-s.abc.e.0.r.stage0-turn1"
+    plane.begin_request(request_id)
+    output = SimpleNamespace(
+        request_id=request_id,
+        finished=True,
+        stage_id=3,
+        outputs=[SimpleNamespace(text="", cumulative_text="", finished=True, multimodal_output={})],
+        multimodal_output={"audio": np.zeros(16, dtype=np.float32)},
+    )
+
+    with pytest.raises(MissingSampleRateError, match="must emit 'sr'"):
+        list(plane.project({"data_plane_outputs": [output]}))
 
 
 def test_project_sends_only_the_new_tail_of_a_growing_waveform() -> None:

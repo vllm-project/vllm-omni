@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Audex code2wav: streaming speech-codec-token → waveform stage.
 
 Wraps the vendored Audex causal speech decoder (see ``speech_decoder/``).
@@ -25,6 +25,7 @@ from vllm_omni.model_executor.models.audex.speech_decoder import (
     AudexCausalSpeechDecoderSession,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 
 logger = init_logger(__name__)
 
@@ -203,7 +204,6 @@ class AudexCode2Wav(nn.Module):
             num_reqs = len(runtime_infos)
 
         audios: list[torch.Tensor] = []
-        sr_tensor = torch.tensor(self._sample_rate, dtype=torch.int32)
         for i in range(num_reqs):
             info = runtime_infos[i] if i < len(runtime_infos) else {}
             info = info if isinstance(info, dict) else {}
@@ -223,5 +223,8 @@ class AudexCode2Wav(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": [sr_tensor] * num_reqs},
+            multimodal_outputs={
+                "model_outputs": audios,
+                SAMPLE_RATE_KEY: make_sample_rate_tensors(self._sample_rate, num_reqs),
+            },
         )
