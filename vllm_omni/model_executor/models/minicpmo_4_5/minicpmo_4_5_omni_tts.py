@@ -2412,34 +2412,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             logger.info("MiniCPM-o Talker: MRv2 device-side codec output active (no host read of sampled ids)")
 
         meta_outputs: dict[str, Any] = {"codec_frame_valid": frame_valid}
-        if native_duplex_batch:
-            native_duplex_flags: list[torch.Tensor] = []
-            duplex_epochs: list[torch.Tensor] = []
-            duplex_turn_ids: list[torch.Tensor] = []
-            condition_seqs: list[torch.Tensor] = []
-            segment_texts_utf8: list[torch.Tensor] = []
-            turn_end_flags: list[torch.Tensor] = []
-            for info in model_intermediate_buffer:
-                info_dict = info if isinstance(info, dict) else {}
-                native_duplex, epoch, turn_id, segment_text, turn_end = _native_duplex_row_meta(info_dict)
-                meta_info = info_dict.get("meta") if isinstance(info_dict.get("meta"), dict) else {}
-                condition_seq = meta_info.get("streaming_condition_seq", -1)
-                condition_seqs.append(
-                    torch.tensor(condition_seq if isinstance(condition_seq, int) else -1, dtype=torch.long)
-                )
-                native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
-                duplex_epochs.append(torch.tensor(epoch, dtype=torch.long))
-                duplex_turn_ids.append(torch.tensor(turn_id, dtype=torch.long))
-                segment_texts_utf8.append(torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8))
-                turn_end_flags.append(torch.tensor(turn_end, dtype=torch.bool))
-            meta_outputs["native_duplex"] = native_duplex_flags
-            meta_outputs["duplex_epoch"] = duplex_epochs
-            meta_outputs["duplex_turn_id"] = duplex_turn_ids
-            meta_outputs["streaming_condition_seq"] = condition_seqs
+        duplex_meta = _native_duplex_meta_outputs(model_intermediate_buffer) if native_duplex_batch else None
+        if duplex_meta is not None:
+            meta_outputs.update(duplex_meta)
             # Key matching Stage 2 and tts2code2wav_async_chunk expectations:
-            meta_outputs["llm_output_text_utf8"] = segment_texts_utf8
-            meta_outputs["native_duplex_segment_text"] = segment_texts_utf8
-            meta_outputs["turn_end"] = turn_end_flags
+            meta_outputs["native_duplex_segment_text"] = duplex_meta["llm_output_text_utf8"]
 
         return OmniOutput(
             text_hidden_states=hidden,

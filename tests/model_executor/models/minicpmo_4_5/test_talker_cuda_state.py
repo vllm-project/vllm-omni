@@ -546,6 +546,48 @@ def test_model_binding_fuses_native_duplex_rows_with_step_metadata():
     assert [d.flatten().tolist() for d in output.multimodal_outputs["codes"]["audio"]] == [[3, 5], [4, 6]]
 
 
+def test_model_binding_rebinds_a_new_duplex_condition_for_the_same_request():
+    """A duplex request moves to its next condition between fused steps.
+
+    The condition setup installs a fresh state dict under the same request id;
+    the bank rebinds it from the host state (step 0, not finished, confirmed
+    codec history) and the next commit reports the new condition sequence.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        MiniCPMO45OmniTTSForConditionalGeneration,
+    )
+
+    model = _binding_model()
+    hidden = torch.zeros(1, 4)
+    first = [_duplex_info("a", epoch=0, turn_id=1, condition_seq=3, text="one")]
+    state = MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(
+        model, hidden, 2, model_intermediate_buffer=first, request_token_spans=[(0, 1)]
+    )
+    state.sample(logits([3]), 0, VOCAB_SIZE - 1)
+    state.sample(logits([VOCAB_SIZE - 1]), 1, VOCAB_SIZE - 1)
+    MiniCPMO45OmniTTSForConditionalGeneration.commit_cuda_kstep(model, hidden)
+    assert model._request_audio_states["a"]["finished"]
+    model._request_codec_history["a"] = [3]
+
+    model._request_audio_states["a"] = {"step": 0, "finished": False, "max_tokens": 10}
+    second = [_duplex_info("a", epoch=0, turn_id=1, condition_seq=4, text="two")]
+    rebound = MiniCPMO45OmniTTSForConditionalGeneration.prepare_cuda_kstep(
+        model, hidden, 2, model_intermediate_buffer=second, request_token_spans=[(0, 1)]
+    )
+    assert rebound is state
+    assert rebound.steps.tolist() == [0]
+    assert not rebound.finished.any()
+    assert rebound.history[0, -1].item() == 3
+    rebound.sample(logits([5]), 0, VOCAB_SIZE - 1)
+    rebound.sample(logits([6]), 1, VOCAB_SIZE - 1)
+    output = MiniCPMO45OmniTTSForConditionalGeneration.commit_cuda_kstep(model, hidden)
+    meta = output.multimodal_outputs["meta"]
+    assert [v.item() for v in meta["streaming_condition_seq"]] == [4]
+    assert bytes(meta["llm_output_text_utf8"][0].tolist()).decode("utf-8") == "two"
+    assert output.multimodal_outputs["codes"]["audio"][0].flatten().tolist() == [5, 6]
+    assert model._request_audio_states["a"]["step"] == 2
+
+
 def test_model_binding_turn_mode_commit_carries_no_duplex_metadata():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         MiniCPMO45OmniTTSForConditionalGeneration,
