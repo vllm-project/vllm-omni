@@ -1569,10 +1569,10 @@ class TestExecutorShutdownCleaner:
             )
 
         assert events == [
+            ("death_signal", signal.SIGKILL),
             ("logging", None),
             ("handler", signal.SIGTERM),
             ("handler", signal.SIGINT),
-            ("death_signal", signal.SIGKILL),
             ("plugins", None),
             ("worker", None),
             ("destroy", None),

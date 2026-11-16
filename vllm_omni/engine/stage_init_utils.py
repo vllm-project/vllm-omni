@@ -352,16 +352,50 @@ def terminate_alive_proc(proc, timeout=5):
 
 
 def set_death_signal(sig: int) -> None:
-    """Best-effort parent-death signal for Linux subprocesses."""
+    """Arm Linux ``PR_SET_PDEATHSIG`` so this process dies if its parent exits.
+
+    ``prctl`` only delivers *future* parent deaths. If the parent already
+    exited (or exits in the window between the liveness check and ``prctl``),
+    registration cannot retroactively deliver that death, so this process
+    would otherwise become an orphan under ``init``. Detect that race and
+    self-signal with ``sig`` instead of silently continuing unprotected.
+
+    Non-Linux platforms are a no-op. ``prctl`` failures are logged; if the
+    parent is already gone when arming fails, this process still self-signals.
+    """
     try:
         import ctypes
         import platform
 
         if platform.system() != "Linux":
             return
-        ctypes.CDLL("libc.so.6").prctl(1, sig)
+
+        # PR_SET_PDEATHSIG == 1. Capture the spawn parent before arming so a
+        # mid-call death still looks like a parent change afterward.
+        parent = os.getppid()
+        if parent <= 1:
+            # Already reparented (typically to init): arming cannot recover.
+            os.kill(os.getpid(), sig)
+            return
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        rc = libc.prctl(1, sig)
+        if rc != 0:
+            logger.warning(
+                "prctl(PR_SET_PDEATHSIG, %s) failed: rc=%s errno=%s",
+                sig,
+                rc,
+                ctypes.get_errno(),
+            )
+            if os.getppid() != parent:
+                os.kill(os.getpid(), sig)
+            return
+
+        # Parent may have died between the initial check and prctl return.
+        if os.getppid() != parent:
+            os.kill(os.getpid(), sig)
     except Exception:
-        pass
+        logger.exception("Failed to set parent death signal")
 
 
 def patch_generation_config_if_needed(model_config: Any) -> None:

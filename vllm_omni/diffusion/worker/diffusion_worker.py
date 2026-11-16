@@ -2347,6 +2347,13 @@ class WorkerProc:
         """Worker initialization and execution loops."""
         if sharing_registry is not None and not sharing_registry.register(rank):
             return  # Parent sealed the sharing group before this worker started.
+
+        # Arm parent-death protection before logging/plugins/WorkerProc init.
+        # A later registration leaves a window where serve-root can die while
+        # this worker is still unprotected and then continue as an orphan
+        # (see #10398). Hard SIGKILL: no manager remains to escalate cleanup.
+        set_death_signal(signal.SIGKILL)
+
         from vllm_omni.plugins import load_omni_general_plugins
 
         # Spawned workers do not inherit the API server's logging setup.
@@ -2365,13 +2372,6 @@ class WorkerProc:
 
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
-
-        # Normal executor shutdown still reaches the handlers above and cleans
-        # up gracefully. If the API-server parent is already gone, however, no
-        # manager remains to escalate a worker that stalls during cleanup. Use
-        # a hard parent-death signal so an abrupt parent exit cannot orphan a
-        # GPU-owning diffusion worker.
-        set_death_signal(signal.SIGKILL)
 
         _setup_diffusion_worker_proc_title_and_log_prefix(
             enable_ep=od_config.parallel_config.enable_expert_parallel,
