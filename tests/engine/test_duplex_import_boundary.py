@@ -110,7 +110,7 @@ forbidden_prefixes = (
     "vllm_omni.model_executor.models.nemotron_voicechat.duplex",
     "vllm_omni.model_executor.models.personaplex.duplex",
     "vllm_omni.model_executor.models.response_judge",
-    "vllm_omni.model_executor.stage_input_processors.response_judge",
+    "vllm_omni.engine.duplex.response_judge",
 )
 loaded = sorted(
     name
@@ -176,6 +176,28 @@ if added:
     raise SystemExit("the client package pulled in server modules: " + ", ".join(added))
 """)
 
+
+def test_response_judge_module_loads_no_model_code() -> None:
+    # The response judge's logic and configuration live in engine/duplex;
+    # its model classes stay under model_executor and are loaded lazily by
+    # the registry. Importing the judge module must not pull them in.
+    _assert_isolated_import_succeeds("""
+import sys
+
+import vllm_omni  # the package __init__ loads its own baseline graph
+
+baseline = set(sys.modules)
+
+import vllm_omni.engine.duplex.response_judge
+
+added = sorted(
+    name
+    for name in set(sys.modules) - baseline
+    if name.startswith(("vllm_omni.model_executor", "vllm.model_executor"))
+)
+if added:
+    raise SystemExit("the response judge module pulled in model code: " + ", ".join(added))
+""")
 
 def test_stable_engine_does_not_expose_duplex_contract_modules() -> None:
     _assert_isolated_import_succeeds("""

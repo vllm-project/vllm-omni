@@ -11,6 +11,12 @@ decision in duplex sessions). The judge is configured on its own stage as
 ``hf_overrides.response_judge`` (docs/features/response_judge.md).
 
 Anything other than a clear "no reply" lets the turn through unchanged.
+
+Lives next to turn detection: ``server_vad`` / ``semantic_vad``
+(turn_detection.py, smart_turn.py) decide when a turn is committed; this
+module decides, after the committed turn has been transcribed, whether it
+needs a reply. It does not hook into the detectors and adds no transcription
+of its own.
 """
 
 from __future__ import annotations

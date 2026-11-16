@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.model_executor.stage_input_processors import response_judge as rj
+from vllm_omni.engine.duplex import response_judge as rj
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

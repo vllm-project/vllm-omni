@@ -349,7 +349,7 @@ class OmniModelConfig(ModelConfig):
         if self.model_stage != "response_judge":
             return
         # Reject a bad judge configuration at startup, not on the first turn.
-        from vllm_omni.model_executor.stage_input_processors.response_judge import JudgeSpec
+        from vllm_omni.engine.duplex.response_judge import JudgeSpec
 
         JudgeSpec.for_model_config(self)
 

@@ -29,7 +29,7 @@ from vllm.model_executor.models.modernbert import ModernBertModel
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
 
-from vllm_omni.model_executor.stage_input_processors.response_judge import LAYA_QTYPES, laya_question_type
+from vllm_omni.engine.duplex.response_judge import LAYA_QTYPES, laya_question_type
 
 
 class LayaDecisionPooler(Pooler):

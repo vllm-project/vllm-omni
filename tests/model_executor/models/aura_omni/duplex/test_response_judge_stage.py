@@ -47,7 +47,7 @@ from vllm_omni.model_executor.models.aura_omni.duplex.stages import (
 )
 from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_JUDGED_PIPELINE, AURA_OMNI_PIPELINE
 from vllm_omni.model_executor.models.registry import OmniModelRegistry
-from vllm_omni.model_executor.stage_input_processors import response_judge as rj
+from vllm_omni.engine.duplex import response_judge as rj
 from vllm_omni.model_executor.stage_input_processors.aura_omni import asr2aura, asr2judge, judge2aura
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
