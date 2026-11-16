@@ -514,22 +514,23 @@ def test_pack_value_preserves_dtype_shape_and_values_for_bfloat16() -> None:
 
 
 @pytest.mark.parametrize("enable_registered_shm", [False, True])
-def test_only_opted_in_host_tensors_borrow_shm_on_unpack(enable_registered_shm: bool) -> None:
+def test_plain_path_host_tensors_never_borrow_shm_on_unpack(enable_registered_shm: bool) -> None:
+    # The opt-in only borrows on the CUDA-registered path. A tensor that falls
+    # back to the plain path (here: a host tensor) keeps copy-and-unlink, so
+    # /dev/shm is not held by live outputs on ROCm / NPU / XPU or host tensors.
     tensor = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
     packed = diffusion_ipc._tensor_to_shm(tensor, enable_registered_shm=enable_registered_shm)
 
     try:
-        assert packed["borrow_on_unpack"] is enable_registered_shm
+        assert not packed.get("borrow_on_unpack")
         segment = shared_memory.SharedMemory(name=packed["name"])
         try:
             unpacked = _unpack_if_shm_handle(packed)
-            # Either way the receiver unlinks the name, even while a borrowed
-            # tensor still maps the segment.
             with pytest.raises(FileNotFoundError):
                 shared_memory.SharedMemory(name=packed["name"])
-            # Write through the unlinked segment: only a borrowed tensor sees it.
+            # Write through the unlinked segment: a copied-out tensor must not see it.
             np.ndarray(tensor.shape, dtype=np.float32, buffer=segment.buf)[0] = -1.0
-            assert (unpacked[0].item() == -1.0) is enable_registered_shm
+            assert unpacked[0].item() == 0.0
         finally:
             segment.close()
         # A view, like a per-request batch split, keeps the data valid alone.
