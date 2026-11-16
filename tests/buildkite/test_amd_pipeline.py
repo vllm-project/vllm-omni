@@ -74,6 +74,11 @@ NIGHTLY_BLOCKING_COLLECTIVE_JOBS = (
     ("Diffusion Exchange and Ring Parity · 4 GPUs", "mi300_4"),
     ("Diffusion CFG Parity · 3 Ranks on 4 GPUs", "mi300_4"),
 )
+NIGHTLY_BLOCKING_FULL_MODEL_LABELS = (
+    "Qwen3-TTS Base Full-Model Expansion",
+    "MiniCPM-o Offline Full-Model Modalities",
+    "MiniCPM-o Online Full-Model Modalities",
+)
 TINY_DIFFUSION_PATH = "tests/model_tests/diffusion/test_common_offline.py"
 TINY_DIFFUSION_JOBS = (
     (
@@ -201,6 +206,21 @@ def test_nightly_collective_owner_is_blocking(label: str, agent_pool: str) -> No
     assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 60
     assert step["source_file_dependencies"] == "diffusion_collective_parity"
+    assert "retry" not in step
+
+
+@pytest.mark.parametrize("label", NIGHTLY_BLOCKING_FULL_MODEL_LABELS)
+def test_nightly_full_model_owner_is_blocking(label: str) -> None:
+    pipeline = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    matches = [step for step in _walk_steps(pipeline["steps"]) if step.get("label") == label]
+
+    assert len(matches) == 1
+    step = matches[0]
+    assert step["agent_pool"] == "mi300_1"
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert step["timeout_in_minutes"] == 120
     assert "retry" not in step
 
 
