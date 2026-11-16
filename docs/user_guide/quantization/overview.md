@@ -20,7 +20,7 @@ For the internal architecture and backend extension points, see the
 
 | Device | FP8 W8A8 | Int8 W8A8 | BitsAndBytes W4 | ModelOpt | MXFP8 W8A8 | MXFP4 W4A4 | AutoRound | msModelSlim | TorchAO FP8 weight-only |
 | -------- | ---------- | ----------- | ------------------ | ---------- | ------------ | ------------ | ----------- | ------------- | --------- |
-| NVIDIA Blackwell GPU (SM 100+) | ✅ | ✅ | ✅ | ✅ | ✅ (online SM100/103/107) | ⭕ | ✅ | ❌ | ⭕ |
+| NVIDIA Blackwell GPU (SM 100+) | ✅ | ✅ (❌ on SM 120) | ✅ | ✅ | ✅ (online SM100/103/107) | ⭕ | ✅ | ❌ | ⭕ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ | ✅ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ | ✅ | ✅ | ⭕ | ⭕ | ⭕ | ✅ | ❌ | ⭕ |
 | AMD ROCm | ✅ ([online block options](rocm_online_fp8.md)) | ⭕ | ❌ | ⭕ | ⭕ | ✅ | ⭕ | ❌ | ⭕ |
@@ -29,6 +29,9 @@ For the internal architecture and backend extension points, see the
 
 Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this
 guide. FP8 on Ampere may use a weight-only path where available.
+
+Int8 W8A8 does not run on `sm_120` GPUs such as the RTX 50 series; see the
+[Int8 guide](int8.md#hardware-support).
 
 ## Model Type Support
 

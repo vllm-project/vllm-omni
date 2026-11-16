@@ -11,8 +11,8 @@ Only online activation scaling is currently supported.
 ## Hardware Support
 
 | Device | Support |
-|--------|---------|
-| NVIDIA Blackwell GPU (SM 100+) | ✅ |
+| -------- | --------- |
+| NVIDIA Blackwell GPU (SM 100+) | ✅ (❌ on SM 120) |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ |
 | AMD ROCm | ⭕ |
@@ -22,12 +22,21 @@ Only online activation scaling is currently supported.
 Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this
 guide.
 
+Int8 W8A8 does not run on workstation/consumer Blackwell (`sm_120`, for
+example RTX 50-series GPUs) with vLLM 0.33.0. vLLM's CUTLASS W8A8 kernel
+raises `Int8 not supported on SM120` when an Int8 linear runs. This was
+reproduced with
+`tests/diffusion/quantization/test_int8_config.py::TestCudaInt8Smoke` on an
+RTX 5090 D v2; see
+[vllm-project/vllm#54316](https://github.com/vllm-project/vllm/pull/54316).
+Use FP8 on these GPUs.
+
 ## Model Type Support
 
 ### Diffusion Model (Qwen-Image, Wan2.2)
 
 | Model | HF models | CUDA | Ascend NPU | Mode | Recommendation |
-|-------|-----------|:----:|:----------:|------|----------------|
+| ------- | ----------- | :----: | :----------: | ------ | ---------------- |
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes | Yes | Online W8A8 | All layers |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Not validated | Online W8A8 | Validate before enabling in docs |
 | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Yes | Online W8A8 | All layers |
@@ -38,14 +47,14 @@ layers, but they are not validated in this guide.
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
 | Model | Scope | Status | Notes |
-|-------|-------|--------|-------|
+| --- | --- | --- | --- |
 | Qwen3-Omni | Thinker language-model stage | Not validated | Prefer checkpoint-supported ModelOpt FP8 or AutoRound paths |
 | Qwen3-TTS | TTS language-model stage | Not validated | No Int8 TTS stage support is documented |
 
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
 
 | Model | Scope | Status | Notes |
-|-------|-------|--------|-------|
+| --- | --- | --- | --- |
 | BAGEL | Stage-specific transformer or DiT module | Not validated | Requires explicit stage routing |
 | GLM-Image | Stage-specific transformer or DiT module | Not validated | Requires quality comparison with BF16 |
 
@@ -84,7 +93,7 @@ vllm serve <your-model> --omni --quantization int8
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `method` | str | - | Quantization method (`"int8"`) |
 | `activation_scheme` | str | `"dynamic"` | `"dynamic"` selects online activation scaling; static is not supported |
 | `ignored_layers` | list[str] | `[]` | Layer name patterns to keep in BF16/FP16 |

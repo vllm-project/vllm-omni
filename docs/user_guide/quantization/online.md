@@ -17,7 +17,7 @@ offline checkpoints produced by msModelSlim and the merge tools.
 
 | Device | FP8 W8A8 | Int8 W8A8 | MXFP8 W8A8 | MXFP4 W4A4 |
 | -------- | ---------- | ----------- | ------------ | ------------ |
-| NVIDIA Blackwell GPU (SM 100+) | ✅ | ✅ | ⭕ | ⭕ |
+| NVIDIA Blackwell GPU (SM 100+) | ✅ | ✅ (❌ on SM 120) | ⭕ | ⭕ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ | ✅ | ⭕ | ⭕ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ | ✅ | ⭕ | ⭕ |
 | AMD ROCm | ⭕ | ⭕ | ⭕ | ⭕ |
@@ -27,6 +27,9 @@ offline checkpoints produced by msModelSlim and the merge tools.
 Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this
 guide. FP8 on Ampere may use a weight-only path where available. MXFP8 and
 MXFP4 are documented for the Ascend NPU path.
+
+Int8 W8A8 does not run on `sm_120` GPUs such as the RTX 50 series; see the
+[Int8 guide](int8.md#hardware-support).
 
 ## Model Type Support
 
