@@ -1130,23 +1130,68 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
         )
 
 
-def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
-    """Kandinsky 6 publishes Pro-geometry defaults (480x864, 125 frames, 50
-    steps) but is not a fixed-duration model: an explicit ``num_frames``
-    must be honoured rather than rejected."""
+@pytest.mark.parametrize(
+    "fields,frames",
+    [
+        ({"num_frames": 97}, 97),
+        ({"seconds": "4", "num_frames": 97}, 97),
+        ({"extra_params": {"duration": 4}}, 97),
+        ({"extra_params": {"duration": 1}, "generate_sound": False}, 25),
+        ({"generate_sound": False}, 121),
+    ],
+)
+def test_hy_nomas_model_parameters_reach_model_validation(fields, frames):
+    from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import normalize_request
+
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "HyNomasModularPipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="tencent/Hy-Nomas-Diffusers")
+    asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A forest", **fields), "hy-standard"))
+    assert engine.captured_sampling_params_list is not None
+    sampling = engine.captured_sampling_params_list[0]
+    assert sampling.num_frames == frames
+    assert normalize_request(engine.captured_prompt, sampling).num_frames == frames
+
+
+def test_hy_nomas_rejects_conflicting_frame_count_and_model_duration():
+    from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import normalize_request
+    from vllm_omni.errors import OmniClientError
+
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "HyNomasModularPipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="tencent/Hy-Nomas-Diffusers")
+    request = VideoGenerationRequest(prompt="A forest", num_frames=121, extra_params={"duration": 4})
+    asyncio.run(handler._run_and_extract(request, "hy-conflicting-duration"))
+    assert engine.captured_sampling_params_list is not None
+    with pytest.raises(OmniClientError, match="conflicts with duration"):
+        normalize_request(engine.captured_prompt, engine.captured_sampling_params_list[0])
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers",
+        "kandinskylab/Kandinsky-6.0-Lite-distill-5s-Diffusers",
+        "kandinskylab/Kandinsky-6.0-Pro-distill-5s-Diffusers",
+    ],
+)
+def test_kandinsky6_serving_defers_checkpoint_defaults_and_preserves_explicit_values(model_name):
+    """The model resolves omitted settings from its checkpoint; explicit values survive serving."""
     engine = FakeAsyncOmni()
     engine.model_class_name = "Kandinsky6TI2VAPipeline"
     handler = OmniOpenAIServingVideo.for_diffusion(
         diffusion_engine=engine,
-        model_name="kandinsky6-bundle",
+        model_name=model_name,
     )
 
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A dog runs on a beach"), "defaults"))
     assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
-    assert (sampling.width, sampling.height) == (864, 480)
-    assert sampling.num_frames == 125
-    assert sampling.num_inference_steps == 50
+    assert (sampling.width, sampling.height) == (None, None)
+    # The generic image-model sentinel is resolved to the checkpoint's video
+    # length by Kandinsky6TI2VAPipeline._resolve_generation_settings().
+    assert sampling.num_frames == 1
+    assert sampling.num_inference_steps is None
     assert sampling.fps == 24.0
 
     asyncio.run(
@@ -1157,6 +1202,7 @@ def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
             "explicit",
         )
     )
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[-1]
     assert (sampling.width, sampling.height) == (512, 320)
     assert sampling.num_frames == 25
@@ -1516,6 +1562,28 @@ def test_h3_latent_edit_uploads_reach_generation_and_are_cleaned(endpoint, test_
     )
     assert not Path(multi_modal_data["source_video"]).exists()
     assert not Path(multi_modal_data["source_audio"]).exists()
+
+
+def test_h3_regenerate_forwards_a_maskless_draft(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "A red fox in fresh snow.", "extra_params": json.dumps({"regenerate": True})},
+        files=[("source_video", ("draft.mp4", b"draft-video", "video/mp4"))],
+    )
+
+    assert response.status_code == 200
+    multi_modal_data = engine.captured_prompt["multi_modal_data"]
+    assert engine.captured_latent_edit_source_bytes == {"source_video": b"draft-video"}
+    assert "video_noise_mask" not in multi_modal_data and "audio_noise_mask" not in multi_modal_data
+    # A 2K regenerate is never continued, so its job is not tagged for the latent cache.
+    assert "latent_cache_key" not in engine.captured_sampling_params_list[0].extra_args
 
 
 def test_latent_edit_fields_are_rejected_for_models_without_capability(test_client):
@@ -3936,7 +4004,7 @@ def test_h3_control_upload_contract(endpoint, mode, test_client, mocker):
     engine = test_client.app.state.openai_serving_video._engine_client
     engine.model_class_name = "MiniMaxH3Pipeline"
     engine.controlnet_model_path = "/configured/control.safetensors"
-    captured = {}
+    captured: dict[str, float | str] = {}
     original = engine.generate
 
     async def generate(prompt, request_id, sampling_params_list):
@@ -3976,7 +4044,9 @@ def test_h3_control_upload_contract(endpoint, mode, test_client, mocker):
     assert not engine.captured_prompt.get("multi_modal_data", {}).get("video")
     for key in ("control_path", "source_path", "mask_path"):
         if key in captured:
-            assert not Path(captured[key]).exists()
+            path = captured[key]
+            assert isinstance(path, str)
+            assert not Path(path).exists()
 
 
 @pytest.mark.parametrize(("endpoint", "with_hint"), [("/v1/videos/sync", False), ("/v1/videos", True)])
@@ -4378,3 +4448,32 @@ def test_h3_control_does_not_borrow_another_stage_checkpoint():
         assert not handler.controlnet_configured
     finally:
         handler.shutdown()
+
+
+@pytest.mark.parametrize("route", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("explicit", [False, True], ids=["inherit", "override-zero"])
+def test_video_routes_inherit_engine_defaults(test_client, mocker: MockerFixture, route: str, explicit: bool) -> None:
+    _mock_encode_video_bytes(mocker)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    defaults = OmniDiffusionSamplingParams(
+        num_inference_steps=4,
+        guidance_scale=3.0,
+        seed=42,
+        extra_args={"stage_default": "keep"},
+    )
+    engine.default_sampling_params_list = [defaults]
+    for override in (explicit, False):
+        payload = {"prompt": "a cat", "fps": "8"}
+        if override:
+            payload.update(guidance_scale="0", seed="0")
+        response = test_client.post(route, data=payload)
+        assert response.status_code == 200, response.text
+        if route == "/v1/videos":
+            _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+        params = engine.captured_sampling_params_list[0]
+        assert params.num_inference_steps == 4
+        assert params.guidance_scale == (0.0 if override else 3.0)
+        assert params.seed == (0 if override else 42)
+        assert params.extra_args["stage_default"] == "keep"
+        params.extra_args["stage_default"] = "mutated"
+    assert defaults.extra_args == {"stage_default": "keep"}

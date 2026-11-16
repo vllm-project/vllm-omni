@@ -9,7 +9,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, InvalidStateError
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.v1.metrics.stats import PrefillStats
@@ -177,6 +177,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "race to evict it).",
                 self._active_window,
             )
+        # The chunk adapter always creates a concrete connector before the
+        # base class starts its worker threads. Connector implementations are
+        # heterogeneous and expose transport-specific methods such as
+        # ``cleanup_prefix``, so retain the existing dynamic interface here.
         self.connector: Any = self.create_connector(model_config)
         self.receives_chunks = stage_receives_chunks(model_config)
         super().__init__(model_config)
@@ -208,7 +212,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._adaptive_states: dict[str, Any] = {}
         self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
-        self.request_payload: dict[str, dict[str, Any]] = {}
+        self.request_payload: dict[str, Any] = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
         # Save-thread only: running count of segments reclaimed after finish.
@@ -306,6 +310,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     @staticmethod
     def _refresh_generation_chunk_prefill_state(request: Request) -> None:
+        # A received generation chunk replaces the prewarm placeholder and is
+        # scheduled as a fresh prefill. Keep the canonical request token
+        # mirrors synchronized at the replacement point so every downstream
+        # consumer observes the current prompt, regardless of its length.
+        request._all_token_ids.clear()
+        request._all_token_ids.extend(request.prompt_token_ids)
+        request._output_token_ids.clear()
         request.num_prompt_tokens = len(request.prompt_token_ids)
         if getattr(request, "prefill_stats", None) is None:
             request.prefill_stats = PrefillStats()
@@ -482,7 +493,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     ) -> dict[str, Any] | None:
         """Per-request admission of a chunk; returns the task to queue, or None."""
         if request is None:
-            raise ValueError("A request is required to enqueue a codec chunk")
+            raise ValueError("save_async requires a request")
         is_finished = force_request_finished or (request.is_finished() and not request.resumable)
         if not hasattr(self, "_segment_generation"):
             self._segment_generation = defaultdict(int)
@@ -941,12 +952,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         try:
             if live and processor is not None:
                 try:
-                    outputs = [
-                        unflatten_payload(dict(t["multimodal_output"]))
-                        if isinstance(t["multimodal_output"], Mapping)
-                        else t["multimodal_output"]
-                        for t in live
-                    ]
+                    outputs = []
+                    for task in live:
+                        raw_output = task["multimodal_output"]
+                        outputs.append(
+                            unflatten_payload(cast(dict[str, Any], raw_output))
+                            if isinstance(raw_output, Mapping)
+                            else raw_output
+                        )
                     payloads = list(
                         processor(
                             self,
@@ -1022,7 +1035,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         sender_token: _SenderGeneration | None = None,
     ):
         raw_mm = task["multimodal_output"]
-        multimodal_output = unflatten_payload(dict(raw_mm)) if isinstance(raw_mm, Mapping) else raw_mm
+        multimodal_output = unflatten_payload(cast(dict[str, Any], raw_mm)) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
@@ -1905,7 +1918,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         elif request_ids is not None:
             request_ids = set(request_ids)
         else:
-            request_ids = requests.keys() if requests is not None else ()
+            assert requests is not None
+            request_ids = requests.keys()
 
         connector_owned_ids = {
             request.request_id

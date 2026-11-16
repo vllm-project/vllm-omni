@@ -14,12 +14,12 @@ import asyncio
 import pytest
 
 from tests.distributed.omni_connectors.test_chunk_transfer_adapter import build_adapter as _build_adapter_fixture
-from tests.engine.duplex.test_audio_drain import _generated, _until
+from tests.engine.duplex.test_audio_drain import _generated
 from tests.engine.duplex.test_session_runner import Harness, close_harness
 from tests.engine.duplex.test_session_runner_personaplex import code2wav_output, frame, open_personaplex_harness
 from tests.engine.test_codec_prefix_flush import _CodecScheduler, _request, _row, _send_queue
 from tests.engine.test_orchestrator import FakeStageClient, _build_stage_pools
-from tests.entrypoints.duplex.test_audio_send_completion import _next_audio
+from tests.helpers.duplex import next_audio, wait_until
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
@@ -138,7 +138,7 @@ class _Composition:
             self.adapter.save_async({"codes": {"audio": _row(sequence - 1)}}, request, is_segment_finished=True)
             _generated(h, sequence)
         _send_queue(self.adapter)
-        await _until(lambda: h.session.audio_delivery.generated_seq == h.session.audio_delivery.accepted_seq)
+        await wait_until(lambda: h.session.audio_delivery.generated_seq == h.session.audio_delivery.accepted_seq)
 
     def submitted_samples(self, h):
         total = 0
@@ -157,9 +157,9 @@ class _Composition:
         before = h.session.audio_delivery.projected_samples
         h.deliver(code2wav_output(h.stage0_request_id(), samples=samples, text=text))
         if samples:
-            await _until(lambda: h.session.audio_delivery.projected_samples == before + samples)
-            return await _next_audio(h.output_buffer)
-        await _until(lambda: h.runner._mailbox.empty())
+            await wait_until(lambda: h.session.audio_delivery.projected_samples == before + samples)
+            return await next_audio(h.output_buffer)
+        await wait_until(lambda: h.runner._mailbox.empty())
         assert h.session.audio_delivery.projected_samples == before
         assert not [pending.event for pending in h.output_buffer._pending if isinstance(pending.event, AudioDelta)]
         return None
@@ -167,7 +167,7 @@ class _Composition:
     async def send(self, h, event):
         before = h.session.audio_delivery.completed_samples
         await h.handler._send_event(h.session.session_id, event, handle=h.handle)
-        await _until(lambda: h.session.audio_delivery.completed_samples > before)
+        await wait_until(lambda: h.session.audio_delivery.completed_samples > before)
 
 
 async def _open_composition(build_adapter, mocker, *, attach=True):
@@ -198,7 +198,7 @@ async def test_delta_totals_are_distinct_from_delivered_watermark(sizes, session
         drains = [h.runner.begin_audio_drain(timeout=5) for h in c.harnesses]
         for h in c.harnesses:
             await c.generate(h)
-        await _until(lambda: len(c.flushes) == sessions)
+        await wait_until(lambda: len(c.flushes) == sessions)
         for h in c.harnesses:
             assert c.submitted_samples(h) == sum(sizes)
             assert len(c.adapter.request_payload[h.stage0_request_id()]["personaplex_frames"]) == 1
@@ -242,7 +242,7 @@ async def test_failed_encode_cannot_advance_delivery_or_transcript(failure, buil
             await h.run(frame())
         drain = h.runner.begin_audio_drain(timeout=5)
         await c.generate(h)
-        await _until(lambda: len(c.flushes) == 1)
+        await wait_until(lambda: len(c.flushes) == 1)
         assert c.submitted_samples(h) == 3840
         await c.send(h, await c.project(h, 1920, "first"))
         fail = True
@@ -261,7 +261,7 @@ async def test_failed_encode_cannot_advance_delivery_or_transcript(failure, buil
         assert not drain.done()
         fail = False
         h.deliver(pending)
-        retried = await _next_audio(h.output_buffer)
+        retried = await next_audio(h.output_buffer)
         assert state.projected_samples == 3840 and state.completed_samples == 1920
         await c.send(h, retried)
         assert (await drain).expected_samples == 3840
@@ -289,7 +289,7 @@ async def test_close_resets_totals_without_touching_another_stream(build_adapter
                 await h.run(frame())
             drain = h.runner.begin_audio_drain(timeout=5)
             await c.generate(h)
-            await _until(lambda: (h.stage0_request_id(), 2) in c.flushes)
+            await wait_until(lambda: (h.stage0_request_id(), 2) in c.flushes)
             event = await c.project(h, 1920, "hello")
             if h is first:
                 old_receipt = h.output_buffer.send_receipt(event)
@@ -300,7 +300,7 @@ async def test_close_resets_totals_without_touching_another_stream(build_adapter
         sibling = second.session.audio_delivery
         old_request = first.stage0_request_id()
         first.submit(commands.CancelResponse())
-        await _until(lambda: first.session.epoch == 1)
+        await wait_until(lambda: first.session.epoch == 1)
         c.adapter.cleanup_sender(old_request)
         await first.run(frame())
         fresh = first.session.audio_delivery
@@ -343,7 +343,7 @@ async def test_close_resets_totals_without_touching_another_stream(build_adapter
         assert fresh.generated_seq == fresh.projected_samples == fresh.completed_samples == 0
         drain = replacement.runner.begin_audio_drain(timeout=5)
         await c.generate(replacement)
-        await _until(lambda: (replacement.stage0_request_id(), 2) in c.flushes)
+        await wait_until(lambda: (replacement.stage0_request_id(), 2) in c.flushes)
         assert c.submitted_samples(replacement) == 1920
         event = await c.project(replacement, 1920, "fresh")
         assert fresh.projected_samples == 1920 and fresh.completed_samples == 0
@@ -355,7 +355,7 @@ async def test_close_resets_totals_without_touching_another_stream(build_adapter
         assert old_receipt.watermark.request_id != fresh.request_id
         complete = mocker.spy(replacement.session, "complete_audio_send")
         replacement.submit(commands.AudioSendCompleted(receipt=old_receipt))
-        await _until(lambda: complete.call_count == 1)
+        await wait_until(lambda: complete.call_count == 1)
         assert fresh.completed_samples == 0 and not drain.done()
         await c.send(replacement, event)
         assert (await drain).expected_samples == 1920

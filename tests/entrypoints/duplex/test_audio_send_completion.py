@@ -15,8 +15,8 @@ import pytest
 from tests.engine.duplex.test_audio_drain import _generated
 from tests.engine.duplex.test_session_runner import close_harness
 from tests.engine.duplex.test_session_runner_personaplex import code2wav_output, frame, open_personaplex_harness
+from tests.helpers.duplex import next_audio, wait_until
 from vllm_omni.engine.duplex import commands
-from vllm_omni.engine.duplex.events import AudioDelta
 from vllm_omni.engine.duplex.messages import DuplexSessionCommandMessage
 from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
@@ -29,24 +29,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def test_transport_completion_cannot_be_forged_as_a_client_realtime_command():
     with pytest.raises(commands.DuplexCommandError):
         commands.command_from_realtime({"type": "transport.audio_send_completed", "samples": 100000})
-
-
-async def _until(predicate):
-    async def wait():
-        while not predicate():
-            await asyncio.sleep(0)
-
-    await asyncio.wait_for(wait(), 3)
-
-
-async def _next_audio(buffer):
-    async def read():
-        while True:
-            event = await buffer.get()
-            if isinstance(event, AudioDelta):
-                return event
-
-    return await asyncio.wait_for(read(), 3)
 
 
 @pytest.mark.asyncio
@@ -84,9 +66,9 @@ async def test_older_send_credits_its_samples_not_newer_projected_audio(monkeypa
         assert h.session.audio_delivery.accepted_seq == 3
         request_id = h.stage0_request_id()
         h.deliver(code2wav_output(request_id, samples=1920, text="he"))
-        first = await _next_audio(h.output_buffer)
+        first = await next_audio(h.output_buffer)
         h.deliver(code2wav_output(request_id, samples=1920, text="hello"))
-        await _until(lambda: h.session.audio_delivery.projected_samples == 3840)
+        await wait_until(lambda: h.session.audio_delivery.projected_samples == 3840, timeout=3)
         assert h.session.playback.sent_ms == 160
         assert h.session.audio_delivery.completed_samples == 0
 
@@ -98,7 +80,7 @@ async def test_older_send_credits_its_samples_not_newer_projected_audio(monkeypa
         assert h.session.audio_delivery.completed_samples == 0
         release.set()
         await task
-        await _until(lambda: h.session.audio_delivery.completed_samples == 1920)
+        await wait_until(lambda: h.session.audio_delivery.completed_samples == 1920, timeout=3)
         # Duplicate receipt for this event cannot credit the newer queued PCM.
         await handle.confirm_output_sent(first)
         await handle.confirm_output_sent(first)
@@ -109,9 +91,9 @@ async def test_older_send_credits_its_samples_not_newer_projected_audio(monkeypa
         assert h.session.playback.sent_ms == 160
         receipt = h.output_buffer.send_receipt(first)
 
-        second = await _next_audio(h.output_buffer)
+        second = await next_audio(h.output_buffer)
         await handler._send_event(h.session.session_id, second, handle=handle)
-        await _until(lambda: h.session.audio_delivery.completed_samples == 3840)
+        await wait_until(lambda: h.session.audio_delivery.completed_samples == 3840, timeout=3)
         assert len(sent) == 2
         assert "_audio_send_watermark" not in str(sent)
         assert "watermark" not in second.to_realtime()
@@ -186,7 +168,7 @@ async def test_receipt_submission_failure_is_not_a_socket_failure(monkeypatch, m
         _generated(h, 2)
         flush = mocker.patch.object(h.port, "flush_audio_prefix", new=mocker.AsyncMock(return_value=2))
         h.deliver(code2wav_output(h.stage0_request_id(), samples=1920, text="hello"))
-        audio = await _next_audio(h.output_buffer)
+        audio = await next_audio(h.output_buffer)
         await handler._attachment_registry.create(h.session.session_id, send=send, close=mocker.AsyncMock())
         cancelled = isinstance(failure, asyncio.CancelledError)
         if cancelled:

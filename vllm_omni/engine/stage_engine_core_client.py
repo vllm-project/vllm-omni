@@ -114,6 +114,22 @@ class StageEngineCoreClientBase(StageClientBase, AsyncMPClient):
 
         return StageEngineCoreClient(**client_args)
 
+    def shutdown(self, timeout: float | None = None) -> None:
+        # The orchestrator calls shutdown() without arguments. Forward an
+        # explicitly configured grace period instead of falling back to the
+        # upstream process manager's five-second best-effort timeout.
+        if timeout is None:
+            configured = getattr(self, "_stage_shutdown_timeout", None)
+            if configured is not None:
+                timeout = configured
+            else:
+                configured = getattr(getattr(self, "vllm_config", None), "shutdown_timeout", None)
+                if configured is not None and configured > 0:
+                    timeout = configured
+        # Both concrete clients place an upstream MPClient after this mixin
+        # in their MRO; StageClientBase itself has no process manager.
+        super().shutdown(timeout=timeout)  # type: ignore[misc]
+
     def __init__(
         self,
         vllm_config: Any,
@@ -140,6 +156,7 @@ class StageEngineCoreClientBase(StageClientBase, AsyncMPClient):
         """
         # -------- Stage metadata (public fields used at runtime) --------
         self.replica_id = 0
+        self._stage_shutdown_timeout = getattr(getattr(metadata, "runtime_cfg", None), "shutdown_timeout", None)
         if metadata is not None:
             self.stage_id = metadata.stage_id
             self.replica_id = getattr(metadata, "replica_id", 0)

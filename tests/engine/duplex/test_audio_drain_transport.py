@@ -20,10 +20,10 @@ import pytest
 import pytest_asyncio
 from pytest_mock import MockerFixture
 
-from tests.engine.duplex.test_audio_drain import _generated, _until
+from tests.engine.duplex.test_audio_drain import _generated
 from tests.engine.duplex.test_session_runner import close_harness
 from tests.engine.duplex.test_session_runner_personaplex import code2wav_output, frame, open_personaplex_harness
-from tests.entrypoints.duplex.test_audio_send_completion import _next_audio
+from tests.helpers.duplex import next_audio, wait_until
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
@@ -103,7 +103,7 @@ class _ControlTransport:
 
     async def pending(self) -> None:
         async def check() -> None:
-            await _until(lambda: self.h.runner._audio_drain_result is not None)
+            await wait_until(lambda: self.h.runner._audio_drain_result is not None)
 
         await self.backend(check())
 
@@ -178,7 +178,7 @@ async def test_native_control_requires_successful_send_and_returns_exact_frozen_
             native.h.deliver(code2wav_output(native.h.stage0_request_id(), samples=3840, text="hello"))
 
         await native.backend(generate())
-        event = await _next_audio(native.h.output_buffer)
+        event = await next_audio(native.h.output_buffer)
         await native.handler._attachment_registry.create(native.handle.session_id, send=send, close=mocker.AsyncMock())
         sending = asyncio.create_task(native.handler._send_event(native.handle.session_id, event, handle=native.handle))
         await asyncio.wait_for(started.wait(), 3)
@@ -235,7 +235,7 @@ async def test_native_timeout_retires_its_rpc_and_allows_a_new_prefix_wait(trans
     assert error.value.code == "timeout" and error.value.retryable
 
     async def settled() -> None:
-        await _until(lambda: native.h.runner._audio_drain_result is None and not native.h.runner._background_tasks)
+        await wait_until(lambda: native.h.runner._audio_drain_result is None and not native.h.runner._background_tasks)
         _generated(native.h, 1)
 
     await native.backend(settled())
@@ -258,7 +258,7 @@ async def test_full_native_request_queue_cannot_block_drain_past_its_timeout(tra
     native.requests.sync_q.put_nowait(heartbeat)
 
     async def held() -> None:
-        await _until(lambda: native.held is heartbeat)
+        await wait_until(lambda: native.held is heartbeat)
 
     await native.backend(held())
     native.requests.sync_q.put_nowait(heartbeat)
@@ -343,7 +343,7 @@ async def test_cancelled_frontend_wait_never_claims_completion_and_close_release
         # Cancelling the frontend wait cannot retract an admitted queue message.
         # Exercise the actual lifecycle control, not direct Future.cancel().
         assert (await native.engine.close_session_async(native.handle.session_id, timeout=1)).ok
-        await _until(lambda: not native.engine.rpc_client._router._pending)
+        await wait_until(lambda: not native.engine.rpc_client._router._pending)
     finally:
         drain.cancel()
         await asyncio.gather(drain, return_exceptions=True)

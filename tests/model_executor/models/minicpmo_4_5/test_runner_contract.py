@@ -107,6 +107,20 @@ def test_required_members_covers_the_protocol():
     assert declared - {"supports_multi_frame_decode"} == set(_REQUIRED_MULTI_FRAME_MEMBERS)
 
 
+def test_required_mrv2_members_cover_the_protocol():
+    from vllm_omni.model_executor.models.interfaces import (
+        _REQUIRED_MRV2_MULTI_FRAME_MEMBERS,
+        SupportsMRv2MultiFrameDecode,
+    )
+
+    declared = {
+        name
+        for name in (*vars(SupportsMRv2MultiFrameDecode), *SupportsMRv2MultiFrameDecode.__annotations__)
+        if not name.startswith("_")
+    }
+    assert declared == set(_REQUIRED_MRV2_MULTI_FRAME_MEMBERS)
+
+
 def test_flag_on_without_members_raises_and_names_them():
     model = SimpleNamespace(supports_multi_frame_decode=True)
     with pytest.raises(TypeError) as excinfo:

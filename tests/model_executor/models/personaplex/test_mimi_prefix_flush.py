@@ -29,11 +29,11 @@ import torch
 from transformers import PretrainedConfig
 from vllm.config import DeviceConfig, VllmConfig
 
-from tests.engine.duplex.test_audio_drain import _generated, _until
+from tests.engine.duplex.test_audio_drain import _generated
 from tests.engine.duplex.test_audio_drain_transport import transport as _transport_fixture
 from tests.engine.duplex.test_session_runner_personaplex import code2wav_output, frame
 from tests.engine.test_codec_prefix_flush import _CodecTransferState, _manager, _request
-from tests.entrypoints.duplex.test_audio_send_completion import _next_audio
+from tests.helpers.duplex import next_audio, wait_until
 from tests.helpers.mark import hardware_marks
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.data_entry_keys import OmniPayloadStruct
@@ -377,7 +377,7 @@ async def weighted_transport(transport, decoder, mocker, monkeypatch):
 async def _weighted_generation(native) -> None:
     for sequence in range(1, 5):
         _generated(native.h, sequence)
-    await _until(lambda: native.h.session.audio_delivery.projected_samples == 3 * FRAME_SIZE)
+    await wait_until(lambda: native.h.session.audio_delivery.projected_samples == 3 * FRAME_SIZE)
 
 
 @pytest.mark.asyncio
@@ -398,7 +398,7 @@ async def test_weighted_native_drain_requires_every_successful_encoded_send(weig
         await native.pending()
         await native.backend(_weighted_generation(native))
         await native.handler._attachment_registry.create(native.handle.session_id, send=send, close=mocker.AsyncMock())
-        first = await _next_audio(native.h.output_buffer)
+        first = await next_audio(native.h.output_buffer)
         assert [pcm.numel() for pcm in decoded] == [FRAME_SIZE, 2 * FRAME_SIZE]
         audio_bytes = first.audio
         assert isinstance(audio_bytes, bytes)
@@ -408,13 +408,13 @@ async def test_weighted_native_drain_requires_every_successful_encoded_send(weig
         await native.handler._send_event(native.handle.session_id, first, handle=native.handle)
 
         async def first_sent() -> None:
-            await _until(lambda: native.h.session.audio_delivery.completed_samples == FRAME_SIZE)
+            await wait_until(lambda: native.h.session.audio_delivery.completed_samples == FRAME_SIZE)
 
         await native.backend(first_sent())
         assert not drain.done()
         # The shared buffer owns one consumer-held event; do not dequeue the
         # next event until the previous event's send receipt has been reported.
-        second = await _next_audio(native.h.output_buffer)
+        second = await next_audio(native.h.output_buffer)
         audio_bytes = second.audio
         assert isinstance(audio_bytes, bytes)
         pcm, rate = soundfile.read(io.BytesIO(audio_bytes), dtype="float32")
@@ -456,7 +456,7 @@ async def test_weighted_native_invalidated_send_cannot_complete_drain(weighted_t
         await native.backend(_weighted_generation(native))
         assert sum(pcm.numel() for pcm in decoded) == 3 * FRAME_SIZE
         old_state = native.h.session.audio_delivery
-        event = await _next_audio(native.h.output_buffer)
+        event = await next_audio(native.h.output_buffer)
         await native.handler._attachment_registry.create(native.handle.session_id, send=send, close=mocker.AsyncMock())
         sending = asyncio.create_task(native.handler._send_event(native.handle.session_id, event, handle=native.handle))
         await asyncio.wait_for(started.wait(), 3)

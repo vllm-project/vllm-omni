@@ -13,6 +13,7 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, UtilityResult
 from tests.engine.duplex.test_session_runner import close_harness
 from tests.engine.duplex.test_session_runner_personaplex import code2wav_output, frame, open_personaplex_harness
 from tests.engine.test_orchestrator import FakeStageClient, _build_stage_pools
+from tests.helpers.duplex import wait_until
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.contracts import AudioDrainTarget
 from vllm_omni.engine.duplex.messages import DrainDuplexAudioMessage, DuplexControlResultMessage
@@ -39,14 +40,6 @@ def test_declared_transport_keeps_cooperative_dp_mro():
 @pytest.fixture(autouse=True)
 def _prefill(monkeypatch):
     monkeypatch.setattr(stage0, "personaplex_prefill_slots", lambda *_: 4)
-
-
-async def _until(predicate):
-    async def wait():
-        while not predicate():
-            await asyncio.sleep(0)
-
-    await asyncio.wait_for(wait(), 2)
 
 
 def _generated(h, sequence):
@@ -76,15 +69,15 @@ async def test_drain_waits_for_generation_flush_and_event_specific_send(mocker):
         for _ in range(3):
             await h.run(frame())
         drain = h.runner.begin_audio_drain(timeout=2)
-        await _until(lambda: not h.runner._mailbox.qsize() and not h.runner.tasks.append_tasks)
+        await wait_until(lambda: not h.runner._mailbox.qsize() and not h.runner.tasks.append_tasks)
         assert not drain.done()
         flush.assert_not_awaited()
         for sequence in (1, 2, 3):
             _generated(h, sequence)
-        await _until(lambda: flush.await_count == 1)
+        await wait_until(lambda: flush.await_count == 1)
         flush.assert_awaited_once_with(h.stage0_request_id(), epoch=0, sequence=3)
         h.deliver(code2wav_output(h.stage0_request_id(), samples=3840, text="hello"))
-        await _until(lambda: h.session.audio_delivery.projected_samples == 3840)
+        await wait_until(lambda: h.session.audio_delivery.projected_samples == 3840)
         assert not drain.done()
         event = None
         while h.output_buffer.pending_events:
@@ -113,10 +106,10 @@ async def test_drain_freezes_before_later_append_while_prior_submit_is_blocked(m
         drain = h.runner.begin_audio_drain(timeout=2)
         h.submit(frame())
         h.submit(commands.Heartbeat())
-        await _until(lambda: h.runner._mailbox.empty())
+        await wait_until(lambda: h.runner._mailbox.empty())
         assert not drain.done() and h.session.audio_delivery is None
         h.port.submit_gate.set()
-        await _until(lambda: h.session.audio_delivery is not None and h.session.audio_delivery.accepted_seq == 2)
+        await wait_until(lambda: h.session.audio_delivery is not None and h.session.audio_delivery.accepted_seq == 2)
         _generated(h, 1)
         target = await drain
         assert (target.accepted_seq, target.expected_samples) == (1, 0)
@@ -135,7 +128,7 @@ async def test_close_or_epoch_cancel_rejects_pending_drain(action, mocker):
         await h.run(frame())
         await h.run(frame())
         drain = h.runner.begin_audio_drain(timeout=2)
-        await _until(lambda: h.runner._mailbox.empty() and not h.runner.tasks.append_tasks)
+        await wait_until(lambda: h.runner._mailbox.empty() and not h.runner.tasks.append_tasks)
         h.submit(action())
         with pytest.raises(RuntimeError, match="invalidated|closed"):
             await asyncio.wait_for(drain, 1)
@@ -154,7 +147,7 @@ async def test_timeout_bounds_work_and_allows_an_explicit_retry(mocker):
             h.runner.begin_audio_drain(timeout=2)
         with pytest.raises(TimeoutError):
             await drain
-        await _until(lambda: not h.runner._background_tasks)
+        await wait_until(lambda: not h.runner._background_tasks)
         retry = h.runner.begin_audio_drain(timeout=1)
         _generated(h, 1)
         assert (await retry).expected_samples == 0
@@ -222,7 +215,7 @@ async def test_control_dispatch_freezes_in_command_order_and_does_not_block_clos
         h.submit(frame())
         h.manager.dispatch(DrainDuplexAudioMessage(control_id="drain", session_id=h.session.session_id, timeout_s=2))
         h.submit(commands.Heartbeat())
-        await _until(lambda: h.runner._mailbox.empty() and not h.runner.tasks.append_tasks)
+        await wait_until(lambda: h.runner._mailbox.empty() and not h.runner.tasks.append_tasks)
         assert h.results.empty()
         h.submit(commands.CloseSession())
         result = await asyncio.wait_for(h.results.get(), 1)
@@ -293,11 +286,11 @@ async def test_cancelled_caller_releases_waiter_without_poisoning_append_tail(mo
         h.submit(frame())
         await h.port.submit_started.wait()
         drain = h.runner.begin_audio_drain(timeout=2)
-        await _until(lambda: h.runner._mailbox.empty())
+        await wait_until(lambda: h.runner._mailbox.empty())
         drain.cancel()
-        await _until(lambda: not h.runner._background_tasks)
+        await wait_until(lambda: not h.runner._background_tasks)
         h.port.submit_gate.set()
-        await _until(lambda: not h.runner.tasks.append_tasks)
+        await wait_until(lambda: not h.runner.tasks.append_tasks)
         await h.run(frame())
         assert h.session.audio_delivery.accepted_seq == 2
     finally:
@@ -436,7 +429,7 @@ async def test_unrelated_cancel_or_unsupported_barge_in_does_not_cancel_drain(co
         await h.run(frame())
         drain = h.runner.begin_audio_drain(timeout=2)
         h.submit(command)
-        await _until(lambda: h.runner._mailbox.empty() and not h.runner.tasks.append_tasks)
+        await wait_until(lambda: h.runner._mailbox.empty() and not h.runner.tasks.append_tasks)
         assert not drain.done()
         _generated(h, 1)
         assert (await drain).expected_samples == 0
@@ -459,7 +452,7 @@ async def test_expired_prefix_barrier_is_bounded_while_submit_remains_blocked(mo
                 h.runner.begin_audio_drain(timeout=1)
         assert len(h.runner.tasks.append_tasks) == 2  # submit and one barrier
         h.port.submit_gate.set()
-        await _until(lambda: not h.runner.tasks.append_tasks)
+        await wait_until(lambda: not h.runner.tasks.append_tasks)
         assert h.session.audio_delivery.accepted_seq == 1
     finally:
         h.port.submit_gate.set()

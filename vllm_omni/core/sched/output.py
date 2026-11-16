@@ -93,8 +93,8 @@ class OmniCachedRequestData(CachedRequestData):
         prompt_token_ids: Mapping from request ID to list of prompt token IDs
     """
 
-    prompt_token_ids: dict[str, list[int]]
-    additional_information: dict[str, dict | None]
+    prompt_token_ids: dict[str, list[int]] = field(default_factory=dict)
+    additional_information: dict[str, dict | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -135,6 +135,8 @@ class OmniSchedulerOutput(SchedulerOutput):
     """Scheduler output with omni-specific transfer metadata."""
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
+    # Scheduler-confirmed history for terminal speculative full-payload sends.
+    finished_req_output_token_ids: dict[str, list[int]] = field(default_factory=dict)
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
     input_terminal_req_ids: set[str] = field(default_factory=set)

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from cache_dit import ForwardPattern
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -89,8 +90,10 @@ def _supports_reference_kv_compaction(blocks: nn.ModuleList) -> bool:
         # AllGather variants would gather target K/V without the cached rows.
         if attention_layer._get_active_parallel_strategy().name not in {"none", "ulysses"}:
             return False
-        backend = getattr(attention_layer, "attn_backend", None)
-        if backend is None or backend.get_name() == "FASTVIDEO_VSA":
+        backends = [getattr(attention_layer, "attn_backend", None)]
+        # A scheduled step runs its profile's backend on the same compacted Q and cached K/V.
+        backends += [record.backend_cls for record in getattr(attention_layer, "_schedule_candidates", {}).values()]
+        if any(backend is None or backend.get_name() == "FASTVIDEO_VSA" for backend in backends):
             return False
     return True
 
@@ -346,7 +349,10 @@ class MiniMaxH3Rope(nn.Module):
         if img_position_ids.dim() != 3 or img_position_ids.shape[0] != 1:
             raise ValueError(f"img_position_ids must be [1, S, 3], got {list(img_position_ids.shape)}")
         pos = img_position_ids[0].to(_FP32_DTYPE)  # [S, 3]
-        per_axis = pos.unsqueeze(-1) * self.inv_freq.view(1, 1, -1)  # [S, 3, 16]
+        # Model CPU offload keeps the DiT (and this buffer) on the host until
+        # its forward hook runs; the rope table is built before that forward.
+        inv_freq = self.inv_freq.to(pos.device)
+        per_axis = pos.unsqueeze(-1) * inv_freq.view(1, 1, -1)  # [S, 3, 16]
         t_f, h_f, w_f = per_axis.unbind(dim=1)  # each [S, 16]
         half = torch.cat((t_f, h_f, w_f), dim=-1)  # [S, 48]
         return torch.cat((half, half), dim=-1)  # [S, 96]
@@ -559,15 +565,66 @@ class MiniMaxH3FinalLayer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.video_out",
             )
-            self.audio_out = ColumnParallelLinear(
-                arch.hidden_size,
-                arch.audio_latents_dim,
-                bias=True,
-                gather_output=True,
-                params_dtype=_FP32_DTYPE,
-                quant_config=None,
-                prefix=f"{prefix}.audio_out",
+            # An audio-free checkpoint has no audio head; forward returns
+            # zero-width audio rows.
+            self.audio_out = (
+                ColumnParallelLinear(
+                    arch.hidden_size,
+                    arch.audio_latents_dim,
+                    bias=True,
+                    gather_output=True,
+                    params_dtype=_FP32_DTYPE,
+                    quant_config=None,
+                    prefix=f"{prefix}.audio_out",
+                )
+                if arch.audio_enabled
+                else None
             )
+        # Fused per-step output heads of a PDD release (load_fused_pdd_heads);
+        # None on every ordinary run.
+        self.fused_pdd_heads: dict[str, torch.Tensor] | None = None
+
+    def load_fused_pdd_heads(self, path: str) -> int:
+        """Swap the output heads for a per-step stack (Parallel Decoding Distillation).
+
+        PDD replicates the final linear layer once per time interval; because
+        H3's Euler step is linear in the predicted velocity, the heads of one
+        denoise step fuse offline into a single head. The file holds
+        ``video_out.{weight,bias}`` (plus ``audio_out.*`` for audio models),
+        one row per step. Returns the step count.
+        """
+        from safetensors import safe_open
+
+        if self.pdd_steps is not None:
+            raise ValueError("fused PDD heads cannot replace the FastH3 pdd_steps heads")
+        with safe_open(path, "pt", device="cpu") as handle:
+            heads = {key: handle.get_tensor(key) for key in handle.keys()}
+        names = ("video_out",) if self.audio_out is None else ("video_out", "audio_out")
+        expected = {f"{name}.{suffix}" for name in names for suffix in ("weight", "bias")}
+        if set(heads) != expected:
+            raise ValueError(f"MiniMax-H3 PDD heads must hold exactly {sorted(expected)}, got {sorted(heads)}")
+        steps = int(heads["video_out.weight"].shape[0])
+        for name in names:
+            projection = getattr(self, name)
+            for suffix, shape in (
+                ("weight", (steps, projection.output_size, projection.input_size)),
+                ("bias", (steps, projection.output_size)),
+            ):
+                key = f"{name}.{suffix}"
+                if steps == 0 or tuple(heads[key].shape) != shape:
+                    raise ValueError(f"MiniMax-H3 PDD {key} must have shape {shape}, got {tuple(heads[key].shape)}")
+                heads[key] = heads[key].to(device=projection.weight.device, dtype=_FP32_DTYPE)
+        self.fused_pdd_heads = heads
+        return steps
+
+    def _fused_pdd_project(self, h: torch.Tensor, name: str, step: int | None) -> torch.Tensor:
+        heads = self.fused_pdd_heads
+        stack = heads[f"{name}.weight"]
+        if step is None or not 0 <= step < stack.shape[0]:
+            raise ValueError(f"MiniMax-H3 PDD has {stack.shape[0]} fused heads; got pdd_step={step!r}")
+        weight = stack[step].to(device=h.device, dtype=h.dtype)
+        bias = heads[f"{name}.bias"][step].to(device=h.device, dtype=h.dtype)
+        return F.linear(h, weight, bias)
 
     def forward(
         self,
@@ -589,7 +646,14 @@ class MiniMaxH3FinalLayer(nn.Module):
         h = h.to(_FP32_DTYPE)
         if self.pdd_steps is not None:
             return self.video_out(h, pdd_step), self.audio_out(h, pdd_step)
-        video, _ = self.video_out(h)
+        if self.fused_pdd_heads is not None:
+            video = self._fused_pdd_project(h, "video_out", pdd_step)
+        else:
+            video, _ = self.video_out(h)
+        if self.audio_out is None:
+            return video, h.new_empty((h.shape[0], 0))
+        if self.fused_pdd_heads is not None:
+            return video, self._fused_pdd_project(h, "audio_out", pdd_step)
         audio, _ = self.audio_out(h)
         return video, audio
 
@@ -812,14 +876,18 @@ class MiniMaxH3DiTModel(nn.Module):
             quant_config=None,
             prefix="video_patch_proj",
         )
-        self.audio_patch_proj = ColumnParallelLinear(
-            arch.audio_latents_dim,
-            arch.hidden_size,
-            bias=True,
-            gather_output=True,
-            params_dtype=_FP32_DTYPE,
-            quant_config=None,
-            prefix="audio_patch_proj",
+        self.audio_patch_proj = (
+            ColumnParallelLinear(
+                arch.audio_latents_dim,
+                arch.hidden_size,
+                bias=True,
+                gather_output=True,
+                params_dtype=_FP32_DTYPE,
+                quant_config=None,
+                prefix="audio_patch_proj",
+            )
+            if arch.audio_enabled
+            else None
         )
         self.condition_proj = ColumnParallelLinear(
             arch.text_dim,
@@ -1048,6 +1116,33 @@ class MiniMaxH3DiTModel(nn.Module):
                         head_dim=self.arch.attention_head_dim,
                     )
                     weight_loader(param, loaded_weight)
+            elif name.endswith(
+                (
+                    ".attn.qkv_proj.qweight",
+                    ".attn.qkv_proj.proj_up",
+                    ".attn.qkv_proj.wcscales",
+                )
+            ):
+                # Serialized quantization checkpoints keep the same grouped
+                # Q/K/V row order as the BF16 checkpoint. Reorder every tensor
+                # with an output dimension before the QKV loader shards it.
+                loaded_weight = _reorder_grouped_qkv_to_qkv(
+                    loaded_weight,
+                    num_query_groups=self.arch.num_attention_heads,
+                    heads_per_group=1,
+                    head_dim=self.arch.attention_head_dim,
+                )
+                weight_loader(param, loaded_weight)
+            elif name.endswith(".attn.qkv_proj.wscales"):
+                # E8M0 scales are stored [K // block, N], so reorder their N
+                # axis through the same grouped-QKV permutation.
+                loaded_weight = _reorder_grouped_qkv_to_qkv(
+                    loaded_weight.T,
+                    num_query_groups=self.arch.num_attention_heads,
+                    heads_per_group=1,
+                    head_dim=self.arch.attention_head_dim,
+                ).T.contiguous()
+                weight_loader(param, loaded_weight)
             elif name.endswith((".mlp.fc1.weight", ".mlp.fc1.weight_scale")):
                 if name.endswith(".weight_scale") and loaded_weight.numel() == 1:
                     weight_loader(param, loaded_weight)
@@ -1195,7 +1290,15 @@ class MiniMaxH3DiTModel(nn.Module):
         video_embed, _ = self.video_patch_proj(x_rows)
         audio_rows = audio_x.view(-1, audio_x.shape[-1])
         audio_rows = audio_rows.index_select(0, audio_global_pos).to(_FP32_DTYPE)
-        audio_embed, _ = self.audio_patch_proj(audio_rows)
+        if self.audio_patch_proj is None:
+            if audio_rows.shape[0]:
+                raise ValueError(
+                    "this MiniMax H3 checkpoint is audio-free (audio_enabled: false) "
+                    f"but the request packs {audio_rows.shape[0]} audio rows"
+                )
+            audio_embed = audio_rows.new_empty((0, self.hidden_size))
+        else:
+            audio_embed, _ = self.audio_patch_proj(audio_rows)
 
         text_rows = text_embeddings_selected.to(device=device, dtype=_BF16_DTYPE)
         text_embed, _ = self.condition_proj(text_rows)
@@ -1246,7 +1349,10 @@ class MiniMaxH3DiTModel(nn.Module):
         if getattr(self, "vdn_config", None) is not None:
             raise ValueError("MiniMax H3 reference-KV offload does not support VDN-H3 hybrid attention")
         if global_reference_rows > 0 and not _supports_reference_kv_compaction(self.blocks):
-            raise ValueError("MiniMax H3 reference-KV reuse requires no SP or pure Ulysses attention")
+            raise ValueError(
+                "MiniMax H3 reference-KV reuse requires no SP or pure Ulysses attention, and FASTVIDEO_VSA "
+                "in neither the base attention nor any attention schedule profile"
+            )
         from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import MiniMaxH3ReferenceKVTier2State
         from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache_dit import iter_minimax_h3_blocks
 

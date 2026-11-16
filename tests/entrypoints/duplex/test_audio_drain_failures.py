@@ -11,7 +11,6 @@ import asyncio
 
 import pytest
 
-from tests.engine.duplex.test_audio_drain import _until
 from tests.engine.duplex.test_session_runner import close_harness
 from tests.engine.duplex.test_session_runner_personaplex import frame
 from tests.entrypoints.duplex.test_audio_drain_accounting import (
@@ -20,6 +19,7 @@ from tests.entrypoints.duplex.test_audio_drain_accounting import (
 from tests.entrypoints.duplex.test_audio_drain_accounting import (
     build_adapter as _build_adapter_fixture,
 )
+from tests.helpers.duplex import wait_until
 from vllm_omni.engine.duplex import commands
 from vllm_omni.model_executor.models.personaplex.duplex import stage0
 
@@ -65,7 +65,7 @@ async def test_acoustic_drain_requires_current_successful_send(build_adapter, mo
             await h.run(frame())
         drain = h.runner.begin_audio_drain(timeout=5)
         await c.generate(h)
-        await _until(lambda: c.flushes)
+        await wait_until(lambda: c.flushes)
         assert c.submitted_samples(h) == 1920
         event = await c.project(h, 1920)
         state = h.session.audio_delivery

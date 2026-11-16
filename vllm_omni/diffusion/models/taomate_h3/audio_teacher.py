@@ -26,10 +26,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+from vllm_omni.diffusion.cuda_graph import GraphedForward
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
 
-from .cuda_graph import GraphedForward
 from .geometry import REQUEST_AUDIO_LATENTS, REQUEST_VIDEO_LATENTS, CanvasGeometry, StreamPlan, request_plan
 from .packed import taomate_audio_only_frozen_prefix_packed_layout, taomate_audio_only_packed_layout
 from .schedule import TEACHER_STATE_NUMBERS, euler_eta0_update_, teacher_sigmas

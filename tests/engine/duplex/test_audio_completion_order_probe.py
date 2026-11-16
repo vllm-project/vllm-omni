@@ -13,6 +13,7 @@ import torch
 
 from tests.engine.duplex.test_session_runner import close_harness
 from tests.engine.duplex.test_session_runner_personaplex import code2wav_output, frame, open_personaplex_harness
+from tests.helpers.duplex import wait_until
 from vllm_omni.engine.duplex.events import AudioDelta
 from vllm_omni.engine.duplex.messages import DuplexSessionCommandMessage
 from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
@@ -22,14 +23,6 @@ from vllm_omni.model_executor.models.personaplex.duplex import stage0
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-async def _until(predicate):
-    async def wait():
-        while not predicate():
-            await asyncio.sleep(0)
-
-    await asyncio.wait_for(wait(), 3)
 
 
 def _generated(h, sequence):
@@ -72,7 +65,10 @@ async def test_fast_second_generation_does_not_overtake_deferred_first_receipt(
         h.submit(frame())
         h.submit(frame())
         await asyncio.wait_for(started.wait(), 3)
-        await _until(lambda: any(task.get_name() == "duplex-generation-receipt" for task in h.runner._background_tasks))
+        await wait_until(
+            lambda: any(task.get_name() == "duplex-generation-receipt" for task in h.runner._background_tasks),
+            timeout=3,
+        )
         release.set()
         await h.settle()
         state = h.session.audio_delivery
@@ -111,12 +107,15 @@ async def test_earlier_committed_generation_does_not_wait_for_later_pending_appe
         h.submit(frame())
         h.submit(frame())
         await asyncio.wait_for(first_started.wait(), 3)
-        await _until(lambda: any(task.get_name() == "duplex-generation-receipt" for task in h.runner._background_tasks))
+        await wait_until(
+            lambda: any(task.get_name() == "duplex-generation-receipt" for task in h.runner._background_tasks),
+            timeout=3,
+        )
         release_first.set()
         await asyncio.wait_for(later_started.wait(), 3)
         assert h.session.audio_delivery.accepted_seq == 1
         try:
-            await asyncio.wait_for(_until(lambda: h.session.audio_delivery.generated_seq == 1), 0.5)
+            await asyncio.wait_for(wait_until(lambda: h.session.audio_delivery.generated_seq == 1, timeout=3), 0.5)
         except TimeoutError:
             pass
         state = h.session.audio_delivery
@@ -165,13 +164,13 @@ async def test_dequeued_unsent_first_delta_cannot_be_credited_by_later_send(monk
             await h.run(frame())
         for sequence in (1, 2, 3):
             _generated(h, sequence)
-        await _until(lambda: h.session.audio_delivery.generated_seq == 3)
+        await wait_until(lambda: h.session.audio_delivery.generated_seq == 3, timeout=3)
         await handler._attachment_registry.create(h.session.session_id, send=send, close=mocker.AsyncMock())
         drain = h.runner.begin_audio_drain(timeout=2)
         request_id = h.stage0_request_id()
         h.deliver(code2wav_output(request_id, samples=1920, text="one"))
         h.deliver(code2wav_output(request_id, samples=1920, text="one two"))
-        await _until(lambda: h.session.audio_delivery.projected_samples == 3840)
+        await wait_until(lambda: h.session.audio_delivery.projected_samples == 3840, timeout=3)
 
         async def next_audio():
             while True:
@@ -187,7 +186,7 @@ async def test_dequeued_unsent_first_delta_cannot_be_credited_by_later_send(monk
         assert h.output_buffer.send_receipt(first) is None
         assert h.output_buffer.send_receipt(second).watermark.samples == 3840
         await handler._send_event(h.session.session_id, second, handle=handle)
-        await _until(lambda: h.runner._mailbox.empty())
+        await wait_until(lambda: h.runner._mailbox.empty(), timeout=3)
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         state = h.session.audio_delivery
