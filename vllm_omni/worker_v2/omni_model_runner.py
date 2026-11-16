@@ -537,10 +537,12 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     # ------------------------------------------------------------------
 
     def _exclude_unsupported_full_graphs(self) -> None:
-        # vLLM 0.29 keys dispatch candidates by (uniform token count, LoRA count).
+        # Keep both native token- and request-keyed dispatch tables aligned
+        # with the capture plan. Uniform decode tables contain FULL graphs.
         manager = self.cudagraph_manager
         assert manager is not None
         manager._capture_descs.pop(CUDAGraphMode.FULL, None)
+        manager._decode_descs.clear()
         manager._candidates = {
             key: [desc for desc in candidates if desc.cg_mode != CUDAGraphMode.FULL]
             for key, candidates in manager._candidates.items()

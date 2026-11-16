@@ -374,6 +374,7 @@ def test_capture_model_unwraps_multimodal_output_and_excludes_full(output_form, 
     runner.cudagraph_manager = SimpleNamespace(
         _capture_descs={CUDAGraphMode.PIECEWISE: [piecewise], CUDAGraphMode.FULL: [full]},
         _candidates={(1, 0): [piecewise, full]},
+        _decode_descs={},
     )
     runner.model_state = SimpleNamespace(capture_mtp_graphs=mocker.Mock(), _is_mtp_graph_runner=lambda: True)
     runner._dispatch_mtp_batch_descriptor = mocker.Mock(return_value="desc")
@@ -393,6 +394,73 @@ def test_capture_model_unwraps_multimodal_output_and_excludes_full(output_form, 
     runner.model_state.capture_mtp_graphs.assert_called_once_with(
         runner._dispatch_mtp_batch_descriptor, restore_capturing=profile_only
     )
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL_AND_PIECEWISE, CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.FULL])
+@pytest.mark.parametrize("supports_full", [False, True])
+def test_capture_exclusion_keeps_native_decode_dispatch_consistent(mode, supports_full, monkeypatch):
+    from vllm.v1.worker.gpu import cudagraph_utils
+
+    monkeypatch.setattr(cudagraph_utils, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True))
+    monkeypatch.setattr(cudagraph_utils.current_platform, "get_global_graph_pool", lambda: None)
+    monkeypatch.setattr(cudagraph_utils, "get_offloader", lambda: SimpleNamespace(sync_prev_onload=lambda: None))
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=64),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        cache_config=SimpleNamespace(use_kda_recoverssm=False),
+        uniform_decode_query_len=1,
+        compilation_config=SimpleNamespace(
+            prefill_cudagraph_capture_token_sizes=[1, 8, 16, 64, 512, 1024],
+            decode_cudagraph_capture_request_sizes=[1, 2, 8, 32, 64],
+            max_cudagraph_capture_size=1024,
+            max_decode_cudagraph_capture_tokens=1024,
+            use_breakable_cudagraph=False,
+        ),
+    )
+    manager = cudagraph_utils.CudaGraphManager(config, torch.device("cpu"), mode, {1: 64, 8: 64, 16: 64}, [0, 2])
+    runner = _make_runner()
+    runner.model = SimpleNamespace(
+        _returns_tuple=True, supports_mrv2_full_graph_aux_outputs=supports_full, forward=lambda: ()
+    )
+    runner._configure_cudagraph_output_contract()
+    runner.use_aux_hidden_state_outputs = False
+    runner.cudagraph_manager = manager
+    runner.model_state = SimpleNamespace()
+
+    def capture(_self, *, profile_only=False):
+        # Replace CUDA recording only; native candidate construction and
+        # dispatch remain real, including the request-indexed decode tables.
+        manager.graphs.update(
+            {desc: SimpleNamespace(replay=lambda: None) for desc in manager._capture_descs.get(CUDAGraphMode.FULL, [])}
+        )
+        manager._graphs_captured = True
+        return 0
+
+    monkeypatch.setattr(GPUModelRunner, "capture_model", capture)
+    runner.capture_model()
+    expected = CUDAGraphMode.FULL if supports_full else mode.mixed_mode()
+    if not supports_full and expected == CUDAGraphMode.FULL:
+        expected = CUDAGraphMode.NONE
+    # Plain decode and the MiniCPM K7/K15 ngram verification widths.
+    for query_len in (1, 8, 16):
+        for num_reqs in (1, 2, 5, 32, 64):
+            for num_loras in (0, 1, 2):
+                desc = manager.dispatch(num_reqs, num_reqs * query_len, query_len, num_loras)
+                if desc.cg_mode == CUDAGraphMode.FULL:
+                    # The startup sampler dummy run must never replay an
+                    # excluded graph, even when decode lookup precedes tokens.
+                    manager.run_fullgraph(desc)
+                assert desc.cg_mode == expected
+                assert desc.num_active_loras == (2 if num_loras else 0)
+                if desc.cg_mode != CUDAGraphMode.NONE:
+                    assert desc in manager._capture_descs[desc.cg_mode]
+    mixed = manager.dispatch(2, 8, None, 0)
+    expected_mixed = mode.mixed_mode()
+    if not supports_full and expected_mixed == CUDAGraphMode.FULL:
+        expected_mixed = CUDAGraphMode.NONE
+    assert mixed.cg_mode == expected_mixed
+    if not supports_full:
+        assert manager._decode_descs == {}
 
 
 @pytest.mark.parametrize(

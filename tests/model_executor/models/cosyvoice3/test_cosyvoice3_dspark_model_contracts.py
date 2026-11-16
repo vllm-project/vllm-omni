@@ -10,6 +10,7 @@ import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.models.interfaces import EagleModelMixin
+from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
@@ -166,9 +167,20 @@ def test_talker_draft_tuple_is_unwrapped_before_logits_and_omni_output(cg_mode, 
     model = CosyVoice3Model.__new__(CosyVoice3Model)
     torch.nn.Module.__init__(model)
     model.model_stage = "cosyvoice3_talker"
-    model._dspark_config = object()
+    model._dspark_config = SimpleNamespace(
+        num_speculative_tokens=7,
+        enable_adaptive_verification=False,
+        rejection_sample_method="standard",
+        fly_entropy_threshold=None,
+        fly_entropy_top_k=None,
+    )
     model.config = SimpleNamespace(llm={"speech_token_size": 3, "eos_token_id": 3}, cosyvoice3_sampling_mode="standard")
     model.model = SimpleNamespace(llm=MagicMock(return_value=(hidden, aux)), llm_decoder=torch.nn.Linear(2, 203))
+    # Match the real constructor plus sampler hook: conditioning is attached
+    # after forward, while the native Eagle tuple belongs to the drafter.
+    model.have_multimodal_outputs = True
+    model.mrv2_custom_sampler(SimpleNamespace(req_states=SimpleNamespace(device=torch.device("cpu"))))
+    assert model.mrv2_forward_returns_tensor is True
 
     runner = object.__new__(OmniGPUModelRunner)
     runner._staged_writes = staged_writes.StagedWrites()
@@ -224,6 +236,23 @@ def test_talker_draft_tuple_is_unwrapped_before_logits_and_omni_output(cg_mode, 
     runner.cudagraph_manager = MagicMock()
     runner.cudagraph_manager.run_fullgraph.return_value = (hidden, aux)
     runner.cudagraph_manager.run_pw_graph.side_effect = lambda target, inputs: target(**inputs)
+    runner.jit_warmup_registry = JitWarmupRegistry(SimpleNamespace())
+    monkeypatch.setattr(GPUModelRunner, "load_model", lambda _self: None)
+    monkeypatch.setattr(runner, "_resolve_talker_kstep_frames", lambda: 0)
+    monkeypatch.setattr(runner, "_publish_shared_backbone_if_configured", lambda: None)
+    runner.load_model()
+    assert not runner._model_has_structured_output
+    assert not runner._exclude_full_graph
+    # Tensor-mode conditioning must not exempt an actual Omni-owned aux slot.
+    model._returns_tuple = True
+    with pytest.raises(NotImplementedError, match="returns its own auxiliary output"):
+        runner.load_model()
+    del model._returns_tuple
+    model._last_captured_layers = {}
+    with pytest.raises(NotImplementedError, match="returns its own auxiliary output"):
+        runner.load_model()
+    del model._last_captured_layers
+    runner.load_model()
     scheduled = SchedulerOutput.make_empty()
     scheduled.num_scheduled_tokens = {"_dummy_req_0": 1}
     scheduled.total_num_scheduled_tokens = 1
@@ -251,3 +280,15 @@ def test_talker_draft_tuple_is_unwrapped_before_logits_and_omni_output(cg_mode, 
     assert torch.isfinite(logits).all()
     assert output.text_hidden_states is hidden
     assert output.multimodal_outputs == {}
+
+    captured = []
+
+    def capture(parent, **_kwargs):
+        captured.append(parent.model(input_batch.input_ids, input_batch.positions, inputs_embeds=embeds))
+        return 0
+
+    monkeypatch.setattr(GPUModelRunner, "capture_model", capture)
+    runner.model_state._is_mtp_graph_runner.return_value = False
+    assert runner.capture_model() == 0
+    assert captured[0][0] is hidden and captured[0][1] is aux
+    assert runner.use_aux_hidden_state_outputs is True
