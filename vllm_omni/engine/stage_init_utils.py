@@ -676,7 +676,11 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         async_chunk_prewarm_payload_func = getattr(importlib.import_module(_mod), _fn)
 
     model_stage = engine_args.get("model_stage")
-    mrv2_unsupported_sampling_params = tuple(_get_attr_or_item(stage_config, "mrv2_unsupported_sampling_params", ()))
+    mrv2_unsupported_sampling_params = (
+        tuple(_get_attr_or_item(stage_config, "mrv2_unsupported_sampling_params", ()))
+        if _get_attr_or_item(engine_args, "use_v2_model_runner", False)
+        else ()
+    )
 
     if stage_type == "diffusion":
         return StageMetadata(
@@ -764,7 +768,11 @@ def extract_stage_metadata_from_omni_stage_config(
             runtime_cfg=stage_config.runtime_config,
             prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
             cfg_kv_collect_func=_resolve_omni_metadata_hook(stage_config.cfg_kv_collect_func),
-            mrv2_unsupported_sampling_params=tuple(stage_config.stage_pipeline_config.mrv2_unsupported_sampling_params),
+            mrv2_unsupported_sampling_params=(
+                tuple(stage_config.stage_pipeline_config.mrv2_unsupported_sampling_params)
+                if stage_config.model_config.use_v2_model_runner
+                else ()
+            ),
         )
 
     return StageMetadata(
@@ -783,7 +791,11 @@ def extract_stage_metadata_from_omni_stage_config(
         prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
         prompt_expand_func=_resolve_omni_metadata_hook(stage_config.prompt_expand_func),
         async_chunk_prewarm_payload_func=_resolve_omni_metadata_hook(stage_config.async_chunk_prewarm_payload_func),
-        mrv2_unsupported_sampling_params=tuple(stage_config.stage_pipeline_config.mrv2_unsupported_sampling_params),
+        mrv2_unsupported_sampling_params=(
+            tuple(stage_config.stage_pipeline_config.mrv2_unsupported_sampling_params)
+            if stage_config.model_config.use_v2_model_runner
+            else ()
+        ),
     )
 
 
