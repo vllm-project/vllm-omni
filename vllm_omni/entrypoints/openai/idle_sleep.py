@@ -334,6 +334,8 @@ class IdleSleepController:
             self.sleeping_stages.difference_update(self.stage_ids)
             if self.state is not IdleSleepState.CLOSED:
                 self.state = IdleSleepState.AWAKE
+                if self.active_transports == 0:
+                    self._arm_timer_locked()
             if self._transition_task is asyncio.current_task():
                 self._transition_task = None
         logger.info(

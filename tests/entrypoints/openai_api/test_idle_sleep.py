@@ -596,6 +596,40 @@ async def test_cancelled_waiter_does_not_cancel_shared_wake():
 
 
 @pytest.mark.asyncio
+async def test_cancelled_only_waiter_rearms_idle_deadline_after_wake():
+    engine = FakeEngine()
+    sleeper = ManualSleeper()
+    controller = make_controller(engine, sleeper)
+    await sleep_once(controller, sleeper)
+    engine.release_wake.clear()
+
+    cancelled = asyncio.create_task(controller.begin_activity())
+    await engine.wake_started.wait()
+
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+
+    assert controller.active_transports == 0
+    assert controller.state is IdleSleepState.WAKING
+
+    engine.release_wake.set()
+    await sleeper.wait_for_calls(2)
+    sleeper.fire()
+
+    async def wait_for_second_sleep() -> None:
+        while len(engine.sleep_calls) < 2:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_second_sleep(), timeout=1)
+
+    assert engine.wake_calls == [[0]]
+    assert engine.resume_calls == [[0]]
+    assert controller.state is IdleSleepState.ASLEEP
+    await controller.close()
+
+
+@pytest.mark.asyncio
 async def test_asgi_releases_activity_on_handler_error():
     engine = FakeEngine()
     sleeper = ManualSleeper()
