@@ -222,6 +222,13 @@ uses each shard's global token offset, including shards that split a frame. Only
 `ulysses_mode="strict"` is supported; `advanced_uaa`, Ring, and AllGather-KV modes
 remain unsupported for this model.
 
+## NPU host lengths
+
+On NPU, LingBot passes the singleton forward's valid query and KV lengths
+from the CPU-owned forward context into paged attention after preparation.
+Direct replay uses the visible tensor shapes. The NPU custom op declares
+the KV pools as mutable inputs.
+
 ## Non-goals
 
 This contract does not currently provide:

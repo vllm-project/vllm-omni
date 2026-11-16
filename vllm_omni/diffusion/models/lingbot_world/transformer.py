@@ -420,6 +420,7 @@ class LingBotSelfAttention(nn.Module):
                     max_query_len=query.shape[1],
                     max_seq_len=visible_key.shape[1],
                     softmax_scale=self.head_dim**-0.5,
+                    npu_lengths=(query.shape[1], visible_key.shape[1]) if query.device.type == "npu" else None,
                 )
             else:
                 output = self.attn(query, visible_key, visible_value)
@@ -834,10 +835,11 @@ class CameraModulationCache:
     block, ``generate_block`` one per loop, and nothing here checks the camera tensor for change.
     """
 
-    __slots__ = ("entries",)
+    __slots__ = ("entries", "prepared")
 
     def __init__(self) -> None:
         self.entries: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.prepared: tuple[tuple, tuple[torch.Tensor, torch.Tensor], torch.Tensor] | None = None
 
 
 class CausalLingBotWorldTransformer3DModel(nn.Module):
@@ -1337,24 +1339,41 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         patched_start_frame = start_frame // patch_frames
         current_start = patched_start_frame * tokens_per_frame
         sink_tokens = self.config.sink_size * tokens_per_frame
-        # Phase 1: create absolute 3D positions for this causal block. The
-        # spatial coordinates restart for every frame; temporal coordinates
-        # begin at ``start_frame`` so cached blocks retain their true ordering.
-        rotary_emb = self._rotary_embedding(
-            frames=patched_frames,
-            height=patched_height,
-            width=patched_width,
-            start_frame=patched_start_frame,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+        # The caller owns an immutable camera condition for the lifetime of
+        # CameraModulationCache (one AR block). Cache before SP sharding, so
+        # every forward still passes through the same SP hooks and layouts.
+        prepared = None
+        if camera_modulation_cache is not None and not torch.is_grad_enabled():
+            prepared = camera_modulation_cache.prepared
+        signature = (
+            id(self),
+            patched_frames,
+            patched_height,
+            patched_width,
+            patched_start_frame,
+            hidden_states.dtype,
+            hidden_states.device,
         )
-        # Phase 2: independently patchify video and camera grids to identical
-        # token layouts, then project timestep and text conditions.
+        if prepared is not None and prepared[0] != signature:
+            raise ValueError("CameraModulationCache must be recreated for each AR block and model")
+        if prepared is None:
+            rotary_emb = self._rotary_embedding(
+                frames=patched_frames,
+                height=patched_height,
+                width=patched_width,
+                start_frame=patched_start_frame,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            camera_hidden_states = self.patch_embedding_wancamctrl(camera_hidden_states)
+            camera_hidden_states = camera_hidden_states + self.c2ws_hidden_states_layer2(
+                F.silu(self.c2ws_hidden_states_layer1(camera_hidden_states))
+            )
+            if camera_modulation_cache is not None and not torch.is_grad_enabled():
+                camera_modulation_cache.prepared = (signature, rotary_emb, camera_hidden_states)
+        else:
+            _, rotary_emb, camera_hidden_states = prepared
         hidden_states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
-        camera_hidden_states = self.patch_embedding_wancamctrl(camera_hidden_states)
-        camera_hidden_states = camera_hidden_states + self.c2ws_hidden_states_layer2(
-            F.silu(self.c2ws_hidden_states_layer1(camera_hidden_states))
-        )
         if hidden_states.shape != camera_hidden_states.shape:
             raise ValueError("Patched video and camera token shapes must match.")
 
@@ -1386,6 +1405,11 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 query_len=hidden_states.shape[1],
             )
             cache.self_attention = [layer_context.to_layer_inputs() for layer_context in cache.self_attention]
+            if hidden_states.device.type == "npu":
+                # prepare() already owns these exact valid lengths on the CPU.
+                # Keep them forward-local: max_seq_len includes padded capacity.
+                lengths = (int(forward_context.query_len), int(forward_context.kv_len))
+                cache.self_attention = [entry._replace(npu_lengths=lengths) for entry in cache.self_attention]
         sp_size = self.blocks[0].self_attn.ulysses_world_size
         global_tokens = patched_frames * tokens_per_frame
         hidden_dim = hidden_states.shape[-1]
