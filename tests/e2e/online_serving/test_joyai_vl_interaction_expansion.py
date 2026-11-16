@@ -1,6 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""JoyAI long-session lifecycle acceptance on real model stages."""
+"""JoyAI long-session lifecycle acceptance on real model stages.
+
+The continuous test runs one twelve-minute cycle by default. For an optional
+one-hour soak through the same server fixture, save this plugin as
+``/tmp/joyai_soak.py``::
+
+    from functools import partial
+
+    def pytest_runtest_setup(item):
+        if item.originalname == "test_twelve_minute_observation_cancel_resume_and_readmission":
+            item.module.run_continuous = partial(item.module.run_continuous, cycles=5)
+
+Then run from the repository root with the model assets available::
+
+    PYTHONPATH=/tmp:. python -m pytest -p joyai_soak -o addopts='' \
+        --run-level=advanced_model -m local_model -k twelve_minute \
+        tests/e2e/online_serving/test_joyai_vl_interaction_expansion.py
+
+Each cycle includes cancellation and same-session recovery. All five cycles
+share one session; close and fresh-session admission are checked at the end.
+"""
 
 import asyncio
 import io
