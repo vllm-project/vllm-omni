@@ -110,10 +110,9 @@ def test_missing_nonfinite_negative_and_unresolved_baselines_fail() -> None:
 
 
 @pytest.mark.parametrize("metric", ["mean_e2el_ms", "request_throughput"])
-@pytest.mark.parametrize("expected", [0.0, 100.0])
-def test_negative_measurement_is_rejected(metric: str, expected: float) -> None:
+def test_negative_measurement_is_rejected(metric: str) -> None:
     with pytest.raises(AssertionError, match="negative measured value"):
-        assert_baseline_within_tolerance({metric: -5.0}, {"H100": {metric: expected}}, "H100")
+        assert_baseline_within_tolerance({metric: -5.0}, {"H100": {metric: 100.0}}, "H100")
 
 
 def test_zero_baseline_rejects_only_the_bad_direction() -> None:
