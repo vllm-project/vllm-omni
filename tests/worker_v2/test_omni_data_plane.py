@@ -879,6 +879,59 @@ def test_ar_receiver_accumulates_rows_and_replaces_chunk_metadata():
     assert merged["meta"]["is_segment_finished"].ndim == 0
 
 
+@pytest.mark.parametrize("structured", [False, True])
+def test_native_publication_preserves_the_scheduled_duplex_chunk(raw_plane, monkeypatch, structured):
+    from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct, to_dict
+    from vllm_omni.worker.scheduling_metadata_adapter import DefaultSchedulingMetadataAdapter
+
+    audio = torch.tensor([10, 11])
+    payload = (
+        OmniPayloadStruct(codes=CodesStruct(audio=audio), meta=MetaStruct(chunk_seq=7))
+        if structured
+        else {"codes": {"audio": audio}, "meta": {"chunk_seq": 7}}
+    )
+    raw_plane._omni_connector = object()
+    raw_plane._request_ids_mapping = {}
+    raw_plane._custom_process_func = lambda transfer_manager, multimodal_output, request: payload
+    raw_plane._custom_process_batch_func = None
+    monkeypatch.setattr(raw_plane, "is_data_transfer_rank", lambda: True)
+
+    updates = []
+
+    def enqueue(request, wire_payload, **_kwargs):
+        if structured:
+            assert type(wire_payload) is type(payload)
+            wire_payload = to_dict(wire_payload)
+        assert wire_payload["meta"]["chunk_seq"] == 7
+        updates.append(DefaultSchedulingMetadataAdapter().extract(wire_payload, model_mode="generation"))
+        return True, None
+
+    monkeypatch.setattr(raw_plane, "_enqueue_chunk_payload", enqueue)
+    request = _new_request()
+    request.model_intermediate_buffer = {"duplex": {"perf_chunk": [0, 99]}}
+    raw_plane.register_request(request)
+    raw_plane._start_output_worker(max_pending_batches=3)
+    for chunk in ((0, 1), (1, 2), None):
+        output = OmniModelRunnerOutput(
+            req_ids=["internal"],
+            req_id_to_index={"internal": 0},
+            prompt_logprobs_dict={},
+            sampled_token_ids=[[21]],
+            inter_stage_outputs=[{"codes.audio": audio}],
+        )
+        if chunk is not None:
+            output.duplex_perf_chunks = {"internal": chunk}
+        raw_plane.reserve_outputs(["internal"])
+        raw_plane.publish_output(output)
+    raw_plane.drain_outputs()
+
+    assert [update.duplex_perf_chunk for update in updates] == [(0, 1), (1, 2), None]
+    if structured:
+        assert payload.meta.duplex_perf_chunk is None
+    else:
+        assert "duplex_perf_chunk" not in payload["meta"]
+
+
 def test_terminal_without_processor_payload_still_sends_finish_marker(raw_plane, monkeypatch):
     # Qwen3-Omni's Talker processor returns None on the terminal call when the
     # last frames ended exactly on a chunk boundary; Code2Wav must still learn

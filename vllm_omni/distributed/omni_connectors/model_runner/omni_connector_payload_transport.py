@@ -16,9 +16,10 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
+from msgspec.structs import replace as replace_struct
 from vllm.distributed.parallel_state import get_tp_group
 
-from vllm_omni.data_entry_keys import OmniPayload, returns_stage_payload
+from vllm_omni.data_entry_keys import MetaStruct, OmniPayload, OmniPayloadStruct, returns_stage_payload
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
@@ -1728,17 +1729,20 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             for request, payload in entries
             if payload is not None or self._request_is_finished(request)
         ]
-        # MRv2 request snapshots carry the serialized tags.
-        entries = [
-            (request, payload)
-            for request, payload in entries
-            if not self._return_stage_payload(request.req_id, request.additional_information, payload)
-        ]
-        if not entries:
-            return 0
         emitted = 0
         completions: list[Any] = []
         for request, payload in entries:
+            chunk = getattr(request, "duplex_perf_chunk", None)
+            if chunk is not None:
+                # Reuse the wire key read by the downstream scheduler. The
+                # model's payload may still be shared with another consumer.
+                if isinstance(payload, OmniPayloadStruct):
+                    meta = replace_struct(payload.meta or MetaStruct(), duplex_perf_chunk=list(chunk))
+                    payload = replace_struct(payload, meta=meta)
+                else:
+                    payload = {**payload, "meta": {**(payload.get("meta") or {}), "duplex_perf_chunk": list(chunk)}}
+            if self._return_stage_payload(request.req_id, request.additional_information, payload):
+                continue
             enqueued, completion = self._enqueue_chunk_payload(request, payload, wait_for_delivery=wait_for_delivery)
             if enqueued:
                 emitted += 1

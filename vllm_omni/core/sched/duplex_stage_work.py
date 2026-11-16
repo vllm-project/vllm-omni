@@ -130,6 +130,13 @@ class DuplexStageWorkRecorder:
         entry = record[1].get(req_id) if record is not None else None
         return entry[1] if entry is not None else None
 
+    def step_chunks(self, scheduler_output: SchedulerOutput) -> dict[str, tuple[int, int]] | None:
+        """Snapshot the measured chunks for a runner that publishes its own output."""
+        record = self._in_flight.get(id(scheduler_output))
+        if record is None:
+            return None
+        return {req_id: chunk for req_id, (_, chunk) in record[1].items()}
+
 
 def _add_span(request: Request, chunk: tuple[int, int], begin_ns: int, end_ns: int) -> None:
     """Append one step span; touching or overlapping spans of the same chunk coalesce."""

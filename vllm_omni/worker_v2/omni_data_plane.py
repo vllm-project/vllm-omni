@@ -72,7 +72,13 @@ class _NativeRequestState:
                 self.output_stopped = True
                 break
 
-    def snapshot(self, *, include_token_history: bool, sampled_token_ids: list[int] | None = None) -> SimpleNamespace:
+    def snapshot(
+        self,
+        *,
+        include_token_history: bool,
+        sampled_token_ids: list[int] | None = None,
+        duplex_perf_chunk: tuple[int, int] | None = None,
+    ) -> SimpleNamespace:
         prompt = list(self.prompt_token_ids) if include_token_history else []
         output = list(self.output_token_ids) if include_token_history else []
         finished = self.finished
@@ -88,6 +94,7 @@ class _NativeRequestState:
             # A ledger tail can belong to an earlier segment. Only these ids
             # were accepted with the payload being published now.
             sampled_token_ids=list(sampled_token_ids or ()),
+            duplex_perf_chunk=duplex_perf_chunk,
             additional_information=self.additional_information,
             model_intermediate_buffer=self.model_intermediate_buffer,
             sampling_params=self.sampling_params,
@@ -104,6 +111,7 @@ class _NativeOutputBatch:
     req_ids: list[str]
     inter_stage_outputs: list[Any | None] | None
     sampled_token_ids: list[list[int]] | None
+    duplex_perf_chunks: dict[str, tuple[int, int]] | None
 
 
 _NATIVE_OUTPUT_STOP = object()
@@ -205,6 +213,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                     req_ids=batch.req_ids,
                     inter_stage_outputs=batch.inter_stage_outputs,
                     sampled_token_ids=batch.sampled_token_ids,
+                    duplex_perf_chunks=batch.duplex_perf_chunks,
                 )
             except BaseException as error:
                 self._record_output_error(error)
@@ -218,12 +227,14 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             req_ids=list(output.req_ids),
             inter_stage_outputs=inter_stage_outputs,
             sampled_token_ids=getattr(output, "sampled_token_ids", None),
+            duplex_perf_chunks=getattr(output, "duplex_perf_chunks", None),
         )
         # Clear only after enqueueing succeeds: the queue retains the payload.
         # Keep independent pooling results and inline output without a send path.
         if inter_stage_outputs is not None and output.pooler_output is inter_stage_outputs and self._can_send:
             output.pooler_output = None
         output.inter_stage_outputs = None
+        output.duplex_perf_chunks = None
 
     def enqueue_outputs(
         self,
@@ -231,6 +242,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         req_ids: list[str],
         inter_stage_outputs: list[Any | None] | None,
         sampled_token_ids: list[list[int]] | None,
+        duplex_perf_chunks: dict[str, tuple[int, int]] | None = None,
     ) -> None:
         """Transfer one completed model batch to the ordered output worker."""
         self._raise_output_error()
@@ -240,6 +252,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             req_ids=req_ids,
             inter_stage_outputs=inter_stage_outputs,
             sampled_token_ids=sampled_token_ids,
+            duplex_perf_chunks=duplex_perf_chunks,
         )
         while True:
             try:
@@ -376,6 +389,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         req_ids: list[str],
         inter_stage_outputs: list[Any | None] | None,
         sampled_token_ids: list[list[int]] | None,
+        duplex_perf_chunks: dict[str, tuple[int, int]] | None = None,
     ) -> int:
         """Commit one deferred output batch, then release its lifecycle holds."""
         send_lock_held = False
@@ -385,6 +399,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 inter_stage_outputs=inter_stage_outputs,
                 sampled_token_ids=sampled_token_ids,
                 terminal_req_ids=set(),
+                duplex_perf_chunks=duplex_perf_chunks,
             )
             # Claim connector ordering before publishing the updated request
             # state. request_terminal() can still register a pending terminal
@@ -542,6 +557,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         inter_stage_outputs: list[Any | None] | None,
         sampled_token_ids: list[list[int]] | None,
         terminal_req_ids: set[str],
+        duplex_perf_chunks: dict[str, tuple[int, int]] | None = None,
     ) -> tuple[list[tuple[Any, Any | None]], list[str]]:
         if not getattr(self, "_can_send", True):
             receive_finished_ids = [req_id for req_id in sorted(terminal_req_ids) if req_id in self._native_requests]
@@ -599,6 +615,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                     state.snapshot(
                         include_token_history=include_token_history,
                         sampled_token_ids=sampled_by_req.get(req_id) if not state.finished else None,
+                        duplex_perf_chunk=duplex_perf_chunks.get(req_id) if duplex_perf_chunks else None,
                     ),
                     payload,
                 )

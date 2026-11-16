@@ -933,7 +933,10 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             input_terminal_req_ids=input_terminal_req_ids or set(),
             pending_request_prewarms=request_prewarms,
         )
-        OmniSchedulerMixin._duplex_stage_work_recorder(self).step_begin(scheduler_output, getattr(self, "requests", {}))
+        recorder = OmniSchedulerMixin._duplex_stage_work_recorder(self)
+        recorder.step_begin(scheduler_output, getattr(self, "requests", {}))
+        if getattr(self, "_native_data_plane", False):
+            scheduler_output.duplex_perf_chunks = recorder.step_chunks(scheduler_output)
         return scheduler_output
 
     def _duplex_stage_work_recorder(self) -> DuplexStageWorkRecorder:

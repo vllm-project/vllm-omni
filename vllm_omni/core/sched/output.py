@@ -141,3 +141,4 @@ class OmniSchedulerOutput(SchedulerOutput):
     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
     input_terminal_req_ids: set[str] = field(default_factory=set)
     pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)
+    duplex_perf_chunks: dict[str, tuple[int, int]] | None = None

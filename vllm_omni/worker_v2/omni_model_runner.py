@@ -299,6 +299,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         plane = getattr(self, "_omni_data_plane", None)
         if plane is None:
             return
+        self._duplex_perf_chunks = getattr(scheduler_output, "duplex_perf_chunks", None)
         for request_data in getattr(scheduler_output, "scheduled_new_reqs", []):
             if is_warmup_request(request_data.req_id):
                 continue

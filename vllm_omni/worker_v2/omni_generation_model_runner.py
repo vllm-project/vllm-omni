@@ -583,6 +583,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             kv_connector_output=kv_connector_output,
             ec_connector_output=execute_model_state.ec_connector_output,
             sampled_token_ids_materialized=True,
+            duplex_perf_chunks=getattr(self, "_duplex_perf_chunks", None),
         )
         output.pending_generation_req_ids = pending
 

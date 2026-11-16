@@ -173,6 +173,8 @@ def test_step_chunk_is_the_chunk_scheduled_even_after_a_queued_update_lands() ->
     assert recorder.step_chunk(scheduler_output, "talker") == (0, 1)
     assert recorder.step_chunk(scheduler_output, "unknown") is None
     assert recorder.step_chunk(_scheduled(), "talker") is None
+    assert recorder.step_chunks(scheduler_output) == {"talker": (0, 1)}
+    assert recorder.step_chunks(_scheduled()) is None
 
 
 def test_stage_work_rows_drop_malformed_rows() -> None:

@@ -366,6 +366,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             prompt_logprobs_dict=prompt_logprobs_dict,
             prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,
             kv_connector_output=None,
+            duplex_perf_chunks=getattr(self, "_duplex_perf_chunks", None),
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted
         model_runner_output._async_chunk = bool(getattr(self.model_config, "async_chunk", False))
