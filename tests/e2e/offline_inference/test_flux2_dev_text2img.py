@@ -165,7 +165,6 @@ def test_flux2_dev_text_to_image_with_cfg(omni_runner_handler: OmniRunnerHandler
 
 
 @hardware_test(res={"cuda": "H100"})
-@pytest.mark.xfail(reason="FLUX.2-dev empty-prompt validation: #9576", strict=True)
 def test_flux2_dev_rejects_empty_prompt(omni_runner_handler: OmniRunnerHandler):
     with pytest.raises((ValueError, RuntimeError)):
         omni_runner_handler.send_diffusion_request(
@@ -183,7 +182,6 @@ def test_flux2_dev_rejects_empty_prompt(omni_runner_handler: OmniRunnerHandler):
 
 
 @hardware_test(res={"cuda": "H100"})
-@pytest.mark.xfail(reason="FLUX.2-dev inference-step validation: #9575", strict=True)
 def test_flux2_dev_rejects_zero_inference_steps(omni_runner_handler: OmniRunnerHandler):
     with pytest.raises((ValueError, RuntimeError)):
         omni_runner_handler.send_diffusion_request(
