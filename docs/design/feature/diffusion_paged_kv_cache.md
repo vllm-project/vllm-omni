@@ -199,8 +199,20 @@ Before real requests are admitted, the engine and Workers:
 
 `kv_cache_memory_bytes` is a physical KV-pool budget per Worker rank, not a
 request token count. When omitted, the normal utilization path sizes the pool
-after subtracting profiled non-KV memory. Reserved pool memory can exceed the
-live payload because it also reflects capacity and fragmentation.
+after subtracting profiled non-KV memory and a fixed **512 MiB of headroom per
+Worker rank** for attention temporaries omitted by the empty-KV profile:
+
+```text
+KV pool budget = requested memory - profiled non-KV memory - 512 MiB
+```
+
+The headroom is deducted once during automatic sizing; it does not allocate
+a scratch tensor or change the raw profile measurement. Startup fails if no
+positive KV budget remains after this deduction. An explicit nonzero
+`kv_cache_memory_bytes` bypasses automatic profiling and the headroom deduction;
+the caller must leave adequate non-KV headroom when choosing that budget.
+Reserved pool memory can exceed the live payload because it also reflects
+capacity and fragmentation.
 
 The empty-KV profile is an estimate, not an upper bound on request memory.
 It omits paged-path temporaries such as contiguous Q/K/V copies, piecewise

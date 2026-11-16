@@ -33,7 +33,7 @@ from vllm.distributed.parallel_state import get_ep_group, get_tp_group
 from vllm.logger import configure_logging, init_logger
 from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
 from vllm.utils.import_utils import resolve_obj_by_qualname
-from vllm.utils.mem_utils import GiB_bytes, MemorySnapshot, format_gib, memory_profiling
+from vllm.utils.mem_utils import GiB_bytes, MemorySnapshot, MiB_bytes, format_gib, memory_profiling
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.worker.utils import request_memory
@@ -102,6 +102,10 @@ if TYPE_CHECKING:
     from vllm_omni.distributed.weight_sharing.worker_registry import ConsumerWorkerRegistry
 
 logger = init_logger(__name__)
+
+# Empty-KV profiling omits native attention temporaries and workspaces.
+# Leave a fixed allowance per rank within the requested memory budget.
+_DIFFUSION_KV_PROFILE_HEADROOM_BYTES = 512 * MiB_bytes
 
 _ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_S = 10.0
 # Maximum time (in seconds) to wait for pending background D2H / SHM packing
@@ -875,7 +879,11 @@ class DiffusionWorker:
         )
 
     def determine_available_kv_memory(self, profile_requests: list[OmniDiffusionRequest]) -> list[int]:
-        """Profile and return each rank's safe Diffusion KV memory budget."""
+        """Return each rank's KV budget with fixed automatic-profiling headroom.
+
+        Automatic sizing leaves 512 MiB beyond the measured non-KV memory.
+        An explicit byte budget bypasses profiling and this deduction.
+        """
 
         def determine_local_memory() -> int:
             assert self.vllm_config is not None
@@ -905,12 +913,15 @@ class DiffusionWorker:
 
             current_omni_platform.empty_cache()
 
-            available_memory = self.requested_memory - profile_result.non_kv_cache_memory
+            available_memory = (
+                self.requested_memory - profile_result.non_kv_cache_memory - _DIFFUSION_KV_PROFILE_HEADROOM_BYTES
+            )
             if available_memory <= 0:
                 raise RuntimeError(
                     "No memory remains for Diffusion KV cache after profiling: "
                     f"requested_memory={self.requested_memory} bytes, "
-                    f"non_kv_cache_memory={profile_result.non_kv_cache_memory} bytes. "
+                    f"non_kv_cache_memory={profile_result.non_kv_cache_memory} bytes, "
+                    f"profiling_headroom={_DIFFUSION_KV_PROFILE_HEADROOM_BYTES} bytes. "
                     "Increase gpu_memory_utilization or reduce the maximum profile request shape."
                 )
             free_gpu_memory = profile_result.after_profile.free_memory
@@ -930,9 +941,10 @@ class DiffusionWorker:
             )
             logger.debug("Worker %d: %r", self.rank, profile_result)
             logger.info(
-                "Worker %d: Available Diffusion KV cache memory: %s GiB",
+                "Worker %d: Available Diffusion KV cache memory: %s GiB (after reserving %s GiB profiling headroom)",
                 self.rank,
                 format_gib(available_memory),
+                format_gib(_DIFFUSION_KV_PROFILE_HEADROOM_BYTES),
             )
             return int(available_memory)
 
