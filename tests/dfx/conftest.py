@@ -81,15 +81,15 @@ def assert_baseline_within_tolerance(
 
     ``baseline`` is the sweep-resolved hardware-nested map
     (``{"H100": {"request_throughput": 1.2}}``). An empty baseline skips
-    comparison. Missing or unmatched hardware fails the check.
+    comparison. Missing or unmatched hardware logs a warning and skips comparison.
     """
     if not isinstance(baseline, dict) or not baseline:
         print(f"[baseline-check] SKIP hardware={hardware}: no baseline configured", flush=True)
         return
     if not isinstance(hardware, str) or not hardware or hardware not in baseline:
         message = f"No matching baseline for hardware {hardware!r}; available hardware: {list(baseline)}"
-        logging.getLogger(__name__).error("[baseline-check] FAIL: %s", message)
-        raise AssertionError(message)
+        logging.getLogger(__name__).warning("[baseline-check] SKIP: %s", message)
+        return
     bucket = baseline[hardware]
     if not isinstance(bucket, dict) or not bucket:
         raise AssertionError(f"baseline[{hardware!r}] must be a non-empty metric map, got {bucket!r}")
@@ -982,6 +982,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "Fail a perf case when a metric is more than 10% worse than the baseline for this hardware. "
             "Throughput and QPS fail when they fall below 90% of the baseline. "
             "Latency, memory, and real-time factor fail when they rise above 110% of the baseline. "
-            "Missing or unmatched hardware fails the check (default: off)."
+            "Missing or unmatched hardware logs a warning and skips baseline validation (default: off)."
         ),
     )

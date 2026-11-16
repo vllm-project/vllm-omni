@@ -30,7 +30,7 @@ finite metric in the matching hardware bucket is compared (see below).
 
 The runtime `Hardware` value selects the bucket. If it is not one of the keys
 (for example a machine whose device name normalizes to an unlisted token), the
-baseline check fails with an error.
+baseline check logs a warning and skips comparison.
 
 ## What a baseline does
 
@@ -43,7 +43,7 @@ both runners call `assert_baseline_within_tolerance()` in
 `tests/dfx/conftest.py`:
 
 - Compare the bucket whose key is the runtime `Hardware` value. Missing or
-  unmatched hardware fails the check.
+  unmatched hardware logs a warning and skips comparison.
 - Throughput and QPS (`throughput`, `qps` in the metric name) fail when the
   measured value is **more than 10% below** the baseline (`measured < baseline * 0.9`).
 - Latency, memory, and real-time factor (`latency`, `ttft`, `tpot`, `itl`,

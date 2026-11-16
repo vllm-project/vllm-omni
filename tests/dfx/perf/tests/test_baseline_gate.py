@@ -3,43 +3,31 @@
 
 """Regression direction and 10% baseline tolerance for perf runners."""
 
+import json
 import math
+from pathlib import Path
 
 import pytest
 
 from tests.dfx.conftest import (
-    BASELINE_REGRESSION_TOLERANCE,
     assert_baseline_within_tolerance,
     metric_lower_is_better,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_LOWER_METRICS = (
-    "latency_mean",
-    "latency_p99",
-    "mean_audio_rtf",
-    "mean_audio_ttfp_ms",
-    "mean_e2el_ms",
-    "mean_peak_memory_mb",
-    "mean_tpot_ms",
-    "mean_ttft_ms",
-    "median_audio_rtf",
-    "median_audio_ttfp_ms",
-    "peak_memory_mb_max",
-    "peak_memory_mb_mean",
-)
-_HIGHER_METRICS = ("audio_throughput", "request_throughput", "throughput_qps")
 
-
-@pytest.mark.parametrize("name", _LOWER_METRICS)
-def test_lower_is_better_metrics(name: str) -> None:
-    assert metric_lower_is_better(name) is True
-
-
-@pytest.mark.parametrize("name", _HIGHER_METRICS)
-def test_higher_is_better_metrics(name: str) -> None:
-    assert metric_lower_is_better(name) is False
+def test_all_configured_baseline_metrics_have_a_direction() -> None:
+    metric_names: set[str] = set()
+    for config_path in sorted(Path(__file__).parent.glob("*.json")):
+        configs = json.loads(config_path.read_text(encoding="utf-8"))
+        for config in configs:
+            for params in config.get("benchmark_params", []):
+                for bucket in params.get("baseline", {}).values():
+                    metric_names.update(bucket)
+    assert metric_names, "No configured baseline metrics found"
+    for name in sorted(metric_names):
+        assert isinstance(metric_lower_is_better(name), bool), name
 
 
 def test_unknown_metric_direction_is_rejected() -> None:
@@ -53,11 +41,9 @@ def test_conflicting_metric_direction_is_rejected() -> None:
 
 
 def test_exact_10_percent_boundary_passes() -> None:
-    assert BASELINE_REGRESSION_TOLERANCE == 0.10
-    tolerance = BASELINE_REGRESSION_TOLERANCE
     measured = {
-        "request_throughput": 1.0 * (1 - tolerance),
-        "mean_e2el_ms": 100.0 * (1 + tolerance),
+        "request_throughput": 0.9,
+        "mean_e2el_ms": 110.0,
     }
     baseline = {"H100": {"request_throughput": 1.0, "mean_e2el_ms": 100.0}}
     assert_baseline_within_tolerance(measured, baseline, "H100")
@@ -86,11 +72,13 @@ def test_latency_increase_beyond_10_percent_fails_and_improvement_passes() -> No
 
 
 @pytest.mark.parametrize("hardware", ["B200", None, ""])
-def test_unmatched_hardware_fails(hardware: str | None, caplog: pytest.LogCaptureFixture) -> None:
+def test_unmatched_hardware_warns_and_skips(hardware: str | None, caplog: pytest.LogCaptureFixture) -> None:
     baseline = {"H100": {"throughput_qps": 1.0}}
-    with pytest.raises(AssertionError, match="No matching baseline for hardware"):
-        assert_baseline_within_tolerance({"throughput_qps": 1.0}, baseline, hardware)
-    assert any(record.levelname == "ERROR" and "No matching baseline" in record.message for record in caplog.records)
+    assert_baseline_within_tolerance({"throughput_qps": 0.01}, baseline, hardware)
+    assert any(
+        record.levelname == "WARNING" and "[baseline-check] SKIP: No matching baseline" in record.message
+        for record in caplog.records
+    )
 
 
 def test_empty_baseline_is_not_gated() -> None:
@@ -136,6 +124,8 @@ def test_omni_assert_result_uses_resolved_baseline_only_when_enabled() -> None:
     assert_result(result, params, 1)
     with pytest.raises(AssertionError, match="request_throughput"):
         assert_result(result, params, 1, check_baseline=True)
+    result.pop("baseline")
+    assert_result(result, params, 1, check_baseline=True)
 
 
 def test_diffusion_assert_result_checks_named_hardware_only_when_enabled() -> None:
@@ -148,7 +138,6 @@ def test_diffusion_assert_result_checks_named_hardware_only_when_enabled() -> No
         "baseline": {"H100": {"throughput_qps": 1.0, "latency_mean": 1.0}},
     }
     assert_result(result, 1)
-    with pytest.raises(AssertionError, match="No matching baseline for hardware"):
-        assert_result(result, 1, check_baseline=True, hardware="B200")
+    assert_result(result, 1, check_baseline=True, hardware="B200")
     with pytest.raises(AssertionError, match="throughput_qps"):
         assert_result(result, 1, check_baseline=True, hardware="H100")

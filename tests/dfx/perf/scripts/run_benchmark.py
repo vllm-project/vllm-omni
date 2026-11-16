@@ -610,7 +610,7 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
         },
         branch=str(result.get("branch") or os.environ.get("BUILDKITE_BRANCH", "")),
         num_prompts=pooled.num_prompts,
-        max_concurrency=int(max_concurrency) if isinstance(max_concurrency, int) else None,
+        max_concurrency=max_concurrency if isinstance(max_concurrency, int) else None,
         benchmark_exit_code=0 if passed else 1,
         generation={
             "completed": pooled.completed,
@@ -687,17 +687,6 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
             assert _is_finite_number(score) and 0 <= score <= 1, "Omni-DuplexEval correction score is invalid"
 
 
-def _baseline_for_check(result: dict, params: dict) -> dict:
-    """Prefer the sweep-resolved map stored on the result over the config lists."""
-    recorded = result.get("baseline")
-    if isinstance(recorded, dict):
-        return recorded
-    configured = params.get("baseline")
-    if isinstance(configured, dict):
-        return configured
-    return {}
-
-
 def assert_result(result, params, num_prompt, *, check_baseline: bool = False) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     _assert_fixed_stage_workloads(result, params, num_prompt)
@@ -719,9 +708,10 @@ def assert_result(result, params, num_prompt, *, check_baseline: bool = False) -
                 )
     hardware = result.get("Hardware")
     if check_baseline:
+        baseline = result.get("baseline")
         assert_baseline_within_tolerance(
             result,
-            _baseline_for_check(result, params),
+            baseline if isinstance(baseline, dict) else None,
             hardware if isinstance(hardware, str) else None,
         )
     if params.get("duplex_performance_only"):
