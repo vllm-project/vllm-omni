@@ -1225,11 +1225,11 @@ full and windowed latents.
 
 ## Request-scoped sampler
 
-H3 supports `euler` (the default), `res_multistep`, and `dpmpp_2m`. Select the sampler per
-request; it applies to both video and audio, using their separate sigma schedules.
-For the HTTP examples above, set `num_inference_steps=20` and add
-`"sampler":"res_multistep"` to the existing `extra_params` object. For example,
-the T2VA fields become:
+H3 supports `euler` (the default), `res_multistep`, and `dpmpp_2m`. Select the
+sampler per request; it applies to both video and audio, using their separate
+sigma schedules. For the HTTP examples above, set `num_inference_steps=20` and
+add `"sampler":"res_multistep"` to the existing `extra_params` object. For
+example, the T2VA fields become:
 
 ```bash
 -F 'num_inference_steps=20' \
@@ -1249,11 +1249,11 @@ sampling_params = OmniDiffusionSamplingParams(
 ```
 
 All three samplers use one DiT evaluation per step in request mode and step
-execution. `res_multistep` and `dpmpp_2m` retain the previous denoised prediction
-independently for each request and each stream; their first and final updates use
-Euler. `dpmpp_2m` follows ComfyUI's `sample_dpmpp_2m`, which extrapolates the
-prediction linearly in `-log(sigma)`. Omitting `sampler`
-or selecting `euler` preserves the existing Euler update. Reducing the step count
+execution. `res_multistep` and `dpmpp_2m` retain the previous denoised
+prediction independently for each request and each stream; their first and final
+updates use Euler. `dpmpp_2m` follows ComfyUI's `sample_dpmpp_2m`, which
+extrapolates the prediction linearly in `-log(sigma)`. Omitting `sampler` or
+selecting `euler` preserves the existing Euler update. Reducing the step count
 reduces model evaluations, but quality depends on the prompt and configuration;
 20 RES steps are a candidate to compare against an Euler-50 reference.
 
