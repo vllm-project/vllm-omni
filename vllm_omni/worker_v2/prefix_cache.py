@@ -140,6 +140,15 @@ class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
         )
         if cfg is None:
             return
+        transfer = getattr(self.vllm_config, "kv_transfer_config", None)
+        mooncake = transfer is not None and transfer.kv_connector == "OmniMooncakeStoreConnector"
+        if mooncake:
+            # Mooncake stores exactly the two captures consumed by the
+            # Qwen3 Thinker-to-Talker processor. The final text hidden tensor
+            # is used for sampling, not for this downstream handoff, and is
+            # not part of the external format. Keep it on the fresh-step path.
+            self._omni_cache_policy = replace(self._omni_cache_policy, needs_full_hidden_states=False)
+            self._prefix_cache_coalesce_mm_only = True
         check_mrv2_prefix_cache_layout(
             block_sizes=list(self.block_tables.block_sizes),
             block_size=cfg.block_size,
@@ -155,6 +164,10 @@ class MRv2PrefixCacheMixin(PrefixCacheRunnerMixin, _RunnerBase):
         # Built now, not on the first step: the adapter's block ledger must
         # observe every request from its first scheduled step.
         self._ensure_omni_prefix_cache()
+        if mooncake:
+            from vllm_omni.worker_v2.mooncake_capture import bind_mooncake_prefix_cache
+
+            bind_mooncake_prefix_cache(self)
 
     def _prefix_cache_save_mrv2(
         self, input_batch: Any, hidden_states: torch.Tensor, multimodal_outputs: dict[str, Any] | None

@@ -187,6 +187,13 @@ class RequestHS:
         self._restored = dict(tensors)
         self._save_cursor = rows
 
+    def skip_prefix(self, start: int) -> None:
+        """Let the local pool own the skipped rows, staging fresh blocks only."""
+        if start < 0 or self._next_token is not None or self._restored is not None:
+            raise ValueError("HS prefix already installed or consumed")
+        self._next_token = start
+        self._save_cursor = (start + self.block_size - 1) // self.block_size * self.block_size
+
     def append(self, start: int, tensors: Mapping[str, torch.Tensor]) -> CaptureTensors:
         rows = self._check_layout(tensors)
         if start < 0 or rows == 0:

@@ -47,6 +47,7 @@ from vllm_omni.core.prefix_cache.controller import StagingBufferHolder, WriteTas
 from vllm_omni.core.prefix_cache.group_view import (
     FullAttentionGroupView,
     check_prefix_cache_kv_groups,
+    check_prefix_cache_kv_transfer,
     stage_prefix_cache_config,
 )
 from vllm_omni.core.prefix_cache.interface import (
@@ -1029,6 +1030,38 @@ def test_slot_reuse_pushes_skip_to_old_task():
     reused = view.slots_for("b", 0, 1)
     assert bool(torch.isin(reused, old_task.reassigned["k"]).all())
     mgr.materialize(s2, ["b"])
+
+
+def test_external_promotion_supersedes_pending_deferred_write():
+    mgr, view = make_manager()
+    try:
+        mgr.register_policy(ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"capture"})))
+        step = run_step(mgr, view, {"old": ([2], 0, 4)}, mm={"capture": torch.full((4, 2), 7.0)})
+        mgr.discard_step(step)
+        slots = view.slots_for("old", 0, 4)
+        with mgr._state_lock:
+            ref = mgr._slot_ref(slots, "capture", "old")
+        old_tids = list(mgr._request_tasks.tasks["old"])
+        mgr.promote_blocks([2], {"capture": torch.full((4, 2), 9.0)})
+        assert torch.equal(mgr._fetch_source(ref), torch.full((4, 2), 7.0))
+        mgr._controller.escalate(old_tids)
+        mgr._controller.join(old_tids)
+        assert torch.equal(mgr._pool.rows("capture", slots), torch.full((4, 2), 9.0))
+    finally:
+        mgr.shutdown()
+
+
+def test_only_omni_mooncake_can_promote_consumer_rows():
+    config = pytest.importorskip("vllm.config")
+    connector = config.KVTransferConfig(
+        kv_role="kv_both",
+        kv_connector="OmniMooncakeStoreConnector",
+        kv_connector_module_path="vllm_omni.distributed.kv_transfer.mooncake.connector",
+    )
+    check_prefix_cache_kv_transfer(connector)
+    connector.kv_connector_module_path = "custom.connector"
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="KV connector"):
+        check_prefix_cache_kv_transfer(connector)
 
 
 def test_step_slots_cpu_matches_block_table_math():

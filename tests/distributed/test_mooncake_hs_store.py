@@ -223,3 +223,25 @@ def test_native_batched_read_spans_batches_and_rejects_a_gap(native_store, nativ
     assert store.remove(hs_key(namespace, attempt.hashes[1]), force=True) == 0
     with pytest.raises(ValueError, match="missing HS"):
         connector._read_hs(attempt, 12)
+
+
+def test_native_mixed_read_skips_locally_resident_prefix(native_store, native_connector):
+    store, namespace, cleanup = native_store
+    connector, attempt, local_hs, local_kv = native_connector
+    attempt.hashes.append(b"prefix-1")
+    attempt.prompt_len = 9
+    attempt.local_tokens = 4
+    key = hs_key(namespace, attempt.hashes[1])
+    kv_key = connector.connector_worker.token_dbs[0].key_for(attempt.hashes[1])
+    cleanup.extend([key, key + ":ready", kv_key])
+    assert store.put(kv_key, b"test-kv-commit") == 0
+    expected = tensors(10)
+    connector._save_hs(PendingSave(attempt, [(4, 8, expected)], 0))
+    # Neither local object exists in the Store. The suffix must still restore
+    # using its absolute token range in the safetensors header.
+    assert store.batch_is_exist([local_hs, local_kv]) == [0, 0]
+    actual = connector._read_hs(attempt, 8)
+    assert all(torch.equal(actual[name], expected[name]) for name in expected)
+    assert store.remove(key, force=True) == 0
+    with pytest.raises(ValueError, match="missing HS"):
+        connector._read_hs(attempt, 8)

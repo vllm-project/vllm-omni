@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -14,9 +16,37 @@ from vllm.config import DeviceConfig, KVTransferConfig, VllmConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker_v2.mooncake_capture import CaptureRequestContext, MooncakeOutputRewrite, snapshot_mooncake_output
+from vllm_omni.worker_v2.mooncake_capture import (
+    CaptureRequestContext,
+    MooncakeOutputRewrite,
+    bind_mooncake_prefix_cache,
+    snapshot_mooncake_output,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_promotion_binding_flushes_decode_before_installing_capture_rows(monkeypatch):
+    calls: list[str | tuple[list[int], dict[str, torch.Tensor]]] = []
+    promoters: list[Callable[[list[int], dict[str, torch.Tensor]], None]] = []
+    connector = CaptureConnector()
+    monkeypatch.setattr(connector, "set_prefix_cache_promoter", promoters.append, raising=False)
+    runner = SimpleNamespace(
+        kv_connector=SnapshotConnector(connector),
+        omni_prefix_cache=SimpleNamespace(promote_blocks=lambda blocks, rows: calls.append((blocks, rows))),
+        _prefix_cache_flush_decode=lambda: calls.append("flush"),
+    )
+    bind_mooncake_prefix_cache(runner)
+    promote = promoters.pop()
+    embedding, hidden = torch.ones((4, 2)), torch.full((4, 2), 2.0)
+    promote([3], {"embedding": embedding, "hidden": hidden})
+    assert calls[0] == "flush"
+    captured = calls[1]
+    assert isinstance(captured, tuple)
+    blocks, rows = captured
+    assert blocks == [3]
+    assert rows["hidden_states.layer_0"] is embedding
+    assert rows["hidden_states.layer_24"] is hidden
 
 
 class CaptureConnector:
