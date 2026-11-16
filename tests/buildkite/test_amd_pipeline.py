@@ -2129,19 +2129,31 @@ def test_cosmos3_weekly_is_blocking_and_replaces_narrow_nightly_owner() -> None:
     assert step["agent_pool"] == "mi300_1"
     assert step["depends_on"] == "amd-build"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 240
+    assert step["timeout_in_minutes"] == 300
     assert step["source_file_dependencies"] == [
         "diffusion_cosmos3_function",
+        ".buildkite/amd/scripts/prewarm_cosmos3_aiter.py",
         ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh",
         "tests/helpers/",
     ]
     assert step["artifact_paths"] == ["artifacts/rocm-cosmos3-weekly/**/*"]
     assert "retry" not in step
+    assert Path(".buildkite/amd/scripts/prewarm_cosmos3_aiter.py").is_file()
+    assert "export VLLM_ROCM_USE_AITER=1" in step["commands"]
+    assert 'export AITER_JIT_DIR="/tmp/vllm-omni-cosmos3-aiter-$$BUILDKITE_JOB_ID"' in step["commands"]
+    assert (
+        'export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-cosmos3-torch-extensions-$$BUILDKITE_JOB_ID"' in step["commands"]
+    )
+    assert 'mkdir -p "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR"' in step["commands"]
+    prewarm_command = next(item for item in step["commands"] if "prewarm_cosmos3_aiter.py" in item)
+    assert "timeout --signal=TERM --kill-after=2m 55m" in prewarm_command
+    runner_command = next(item for item in step["commands"] if "run-rocm-full-model-nightly.sh" in item)
+    assert step["commands"].index(prewarm_command) < step["commands"].index(runner_command)
     assert "ROCM_E2E_LEVEL_MARKER=slow" in command
     assert "ROCM_E2E_RUN_LEVEL=full_model" in command
     assert "ROCM_E2E_TIMEOUT_MINUTES=210" in command
 
-    tokens = split(next(item for item in step["commands"] if "run-rocm-full-model-nightly.sh" in item))
+    tokens = split(runner_command)
     runner_index = tokens.index(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
     assert tokens[runner_index + 1 :] == [
         "tests/e2e/online_serving/test_cosmos3.py",
