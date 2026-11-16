@@ -161,10 +161,27 @@ class NixlConnector(OmniConnectorBase):
             os.environ.get("VLLM_OMNI_NIXL_XFER_TIMEOUT_S") or self.config.get("transfer_timeout_s", 300.0)
         )
         self._poll_interval_s = float(self.config.get("poll_interval_s", 0.001))
-        self._closed = False
-        self._init_handshake()
+        # close() must also be safe when listener startup fails.
+        self._zmq_ctx: zmq.Context | None = None
+        self._req_local = threading.local()
+        self._listener_thread: threading.Thread | None = None
+        self._listener_ready = threading.Event()
+        self._stop_event = threading.Event()
+        self._bind_error: BaseException | None = None
+        self.host: str | None = None
+        self._serving_handshake = False
         self._lease_wakeup = threading.Event()
         self._lease_thread: threading.Thread | None = None
+        self._transfer_wakeup = threading.Event()
+        self._deferred_transfers: list[_DeferredTransfer] = []
+        self._abandoned_queries: list[tuple[str, str, str | None, str]] = []
+        self._transfer_thread: threading.Thread | None = None
+        self._closed = False
+        try:
+            self._init_handshake()
+        except Exception:
+            self.close()
+            raise
         if self._serving_handshake:
             self._lease_thread = threading.Thread(
                 target=self._lease_reaper_loop,
@@ -172,10 +189,6 @@ class NixlConnector(OmniConnectorBase):
                 daemon=True,
             )
             self._lease_thread.start()
-        self._transfer_wakeup = threading.Event()
-        self._deferred_transfers: list[_DeferredTransfer] = []
-        self._abandoned_queries: list[tuple[str, str, str | None, str]] = []
-        self._transfer_thread: threading.Thread | None = None
         if self._role != "sender":
             self._transfer_thread = threading.Thread(
                 target=self._transfer_reaper_loop,
@@ -205,15 +218,6 @@ class NixlConnector(OmniConnectorBase):
         )
         self._handshake_max_wait_s = float(self.config.get("handshake_max_wait_s", 60.0))
         self._handshake_retry_s = float(self.config.get("handshake_retry_s", 0.05))
-        self._zmq_ctx: zmq.Context | None = None
-        self._req_local = threading.local()
-        self._listener_thread: threading.Thread | None = None
-        self._listener_ready = threading.Event()
-        self._stop_event = threading.Event()
-        self._bind_error: BaseException | None = None
-        self.host: str | None = None
-        self._serving_handshake = False
-
         self._handshake_enabled = self._zmq_port is not None or self._sender_host is not None
         if not self._handshake_enabled:
             return
@@ -637,10 +641,12 @@ class NixlConnector(OmniConnectorBase):
         requires a handshake claim at the supplied or configured producer endpoint.
         Only legacy externally owned metadata without a generation bypasses it.
         """
-        direct = isinstance(metadata, dict) and metadata.get("schema_version") == _SCHEMA_VERSION
-        if direct and "generation" not in metadata:
+        direct_metadata = (
+            metadata if isinstance(metadata, dict) and metadata.get("schema_version") == _SCHEMA_VERSION else None
+        )
+        if direct_metadata is not None and "generation" not in direct_metadata:
             # Legacy externally owned metadata has no connector-managed lease.
-            return metadata
+            return direct_metadata
 
         endpoint = self._metadata_endpoint(metadata)
         if endpoint is None and self._sender_host and self._sender_zmq_port:
@@ -659,8 +665,8 @@ class NixlConnector(OmniConnectorBase):
                 if self._zmq_ctx is None:
                     self._zmq_ctx = zmq.Context()
 
-        if direct:
-            return self._query_metadata_at(get_key, *endpoint, generation=metadata["generation"])
+        if direct_metadata is not None:
+            return self._query_metadata_at(get_key, *endpoint, generation=direct_metadata["generation"])
         return self._query_metadata_at(get_key, *endpoint)
 
     def _query_metadata_at(
@@ -724,6 +730,7 @@ class NixlConnector(OmniConnectorBase):
             return False
 
     def _handshake_listener_loop(self) -> None:
+        assert self._zmq_ctx is not None
         router = self._zmq_ctx.socket(zmq.ROUTER)
         try:
             if self._zmq_port == 0:
@@ -801,6 +808,7 @@ class NixlConnector(OmniConnectorBase):
             self._req_local.cache = cache
         sock = cache.get(zmq_addr)
         if sock is None:
+            assert self._zmq_ctx is not None
             sock = self._zmq_ctx.socket(zmq.REQ)
             sock.connect(zmq_addr)
             cache[zmq_addr] = sock
@@ -941,6 +949,7 @@ class NixlConnector(OmniConnectorBase):
             ):
                 transfer.tensors.clear()
                 if transfer.source_metadata is not None:
+                    assert transfer.source_key is not None
                     if not self._notify_transfer_done(transfer.source_key, transfer.source_metadata):
                         continue
                     transfer.source_metadata = None
@@ -1132,7 +1141,7 @@ class NixlConnector(OmniConnectorBase):
         # The producer's device index is meaningless in this process, so keep
         # only its type and land the buffer on this stage's own card.
         backend = getattr(torch, device.type, None)
-        index = backend.current_device() if hasattr(backend, "current_device") else 0
+        index = backend.current_device() if backend is not None and hasattr(backend, "current_device") else 0
         return torch.device(device.type, index)
 
     @staticmethod
