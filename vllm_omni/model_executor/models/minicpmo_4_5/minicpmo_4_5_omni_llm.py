@@ -140,7 +140,6 @@ def _encode_tokens(tokenizer: Any, prompt: str) -> list[int]:
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from vllm_omni.model_executor.models.minicpmo_4_5 import streaming_audio_encoder as streaming_audio
-from vllm_omni.model_executor.models.minicpmo_4_5 import streaming_audio_encoder_graph as streaming_audio_graph
 from vllm_omni.model_executor.models.minicpmo_4_5.vision_fused import (
     VisionGraphEncoder,
     encode_packed_fused,
@@ -2674,9 +2673,6 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
         # the per-model multi-modal data parser.
         return MiniCPMOMultiModalDataParser(target_sr=self.get_default_audio_sampling_rate())
 
-    def get_chunk_length(self) -> int:
-        return self.get_hf_config().audio_chunk_length
-
     def get_max_audio_tokens_per_chunk(self) -> int:
         pool_step = self.get_default_audio_pool_step()
         fbank_feat_in_chunk = 100
@@ -2738,17 +2734,6 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
                 setattr(image_processor, attr, val.tolist())
 
         return hf_processor
-
-    def get_hf_image_processor(self) -> MiniCPMVImageProcessor:
-        """Get the MiniCPM-o image processor."""
-        config = self.get_hf_config()
-        return MiniCPMVImageProcessor(
-            max_slice_nums=config.slice_config.max_slice_nums,
-            scale_resolution=config.image_size,
-            patch_size=config.vision_config.patch_size,
-            use_image_id=config.use_image_id,
-            image_feature_size=config.query_num,
-        )
 
     def get_model_version(self):
         return get_version_by_config(self.get_hf_config())
@@ -2834,15 +2819,6 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
             frame_size,
             max_slice_nums=self.get_video_max_slice_num(),
         )
-
-    def get_max_video_tokens(
-        self,
-        seq_len: int,
-        mm_counts: Mapping[str, int],
-    ) -> int:
-        num_frames = self.get_num_frames_with_most_features(seq_len, mm_counts)
-        num_video_tokens_total = self.get_max_video_frame_tokens() * num_frames
-        return num_video_tokens_total
 
     def get_video_max_slice_num(self) -> int:
         return 1
@@ -4148,10 +4124,10 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         batch_sizes = getattr(config, "duplex_audio_encoder_cuda_graph_batch_sizes", None)
         if getattr(config, "duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions", False) is True:
             # Overrides the explicit list: the grid follows duplex max_sessions.
-            batch_sizes = streaming_audio_graph.batch_sizes_for_sessions(getattr(self, "_duplex_max_sessions", 1))
+            batch_sizes = streaming_audio.batch_sizes_for_sessions(getattr(self, "_duplex_max_sessions", 1))
         allocated = torch.accelerator.memory_allocated(self.apm.conv1.weight.device)
         try:
-            wrapper = streaming_audio_graph.StreamingAudioGraphEncoder(
+            wrapper = streaming_audio.StreamingAudioGraphEncoder(
                 self.apm,
                 self.audio_projection_layer,
                 self.audio_avg_pooler,

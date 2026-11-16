@@ -210,14 +210,6 @@ class HiFTGraphWrapper:
         if self._eager_fallback_total % _EAGER_FALLBACK_SUMMARY_EVERY == 0:
             logger.info("Eager HiFT fallback census (%d total): %s", self._eager_fallback_total, self._eager_fallbacks)
 
-    def eager_fallback_counts(self) -> dict[tuple[int, int, int], int]:
-        """Cumulative eager fallbacks keyed by the request shape they came from.
-
-        The key width is the request's mel width before any width padding:
-        one merged census per request width, whatever replay shape served it.
-        """
-        return dict(self._eager_fallbacks)
-
     def _chunk_mel_frames(self, codec_frames: int) -> int:
         return (int(codec_frames) + self.codec_left_context_frames - self.pre_lookahead_len) * self.flow_upsample_rate
 
