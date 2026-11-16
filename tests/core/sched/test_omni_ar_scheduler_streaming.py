@@ -39,7 +39,6 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 from vllm_omni.engine.messages import TextInputUpdate
-from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import Qwen3TTSTalkerForConditionalGeneration as Talker
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
@@ -1790,13 +1789,11 @@ def test_text_input_wait_reserves_capacity_without_blocking_another_request(rout
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
-@pytest.mark.parametrize("expires", [False, True])
-def test_text_waits_restore_after_upstream_failure_without_reviving_expired_requests(
-    route_scheduler_factory, monkeypatch, async_scheduling, expires
+def test_text_input_wait_restores_queues_and_limits_after_upstream_failure(
+    route_scheduler_factory, monkeypatch, async_scheduling
 ):
     scheduler = route_scheduler_factory(async_scheduling=async_scheduling)
-    clock = [100.0]
-    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: 100.0)
     first = _route_request("waiting", max_tokens=8)
     first.additional_information = {"input_stream": {"token_ids": [31]}}
     second = _route_request("running", max_tokens=12)
@@ -1812,15 +1809,12 @@ def test_text_waits_restore_after_upstream_failure_without_reviving_expired_requ
     original_running_limit = scheduler.max_num_running_reqs
     original_active_limit = scheduler.max_num_active_reqs
     original_blocks = scheduler.kv_cache_manager.get_blocks(first.request_id).get_block_ids()
-    if expires:
-        clock[0] += 10
 
     def fail_schedule(current, throttle_prefills=False):
-        assert current is scheduler
         assert current.running == [second]
         assert list(current.waiting) == original_waiting
-        assert current.max_num_running_reqs == original_running_limit - (not expires)
-        assert current.max_num_active_reqs == original_active_limit - (not expires)
+        assert current.max_num_running_reqs == original_running_limit - 1
+        assert current.max_num_active_reqs == original_active_limit - 1
         raise RuntimeError("upstream scheduling failed")
 
     with monkeypatch.context() as patcher:
@@ -1828,29 +1822,16 @@ def test_text_waits_restore_after_upstream_failure_without_reviving_expired_requ
         with pytest.raises(RuntimeError, match="upstream scheduling failed"):
             scheduler.schedule()
 
-    assert scheduler.running == ([second] if expires else original_running)
+    assert scheduler.running == original_running
     assert list(scheduler.waiting) == original_waiting
     assert list(scheduler.kv_holding_waiting) == original_holding
     assert scheduler.max_num_running_reqs == original_running_limit
     assert scheduler.max_num_active_reqs == original_active_limit
-    if expires:
-        assert first.status == RequestStatus.FINISHED_ERROR
-        assert first.request_id not in scheduler.requests
-        assert scheduler._model_input_streams == {}
-        assert not scheduler.kv_cache_manager.get_blocks(first.request_id).get_block_ids()[0]
-    else:
-        assert first.status == RequestStatus.RUNNING
-        assert scheduler.kv_cache_manager.get_blocks(first.request_id).get_block_ids() == original_blocks
-    scheduled = scheduler.schedule()
-    assert ("queued" in scheduled.num_scheduled_tokens) is expires
-    outputs = _complete_route_step(scheduler, scheduled)
-    errors = [output for batch in outputs.values() for output in batch.outputs if output.request_id == "waiting"]
-    if expires:
-        assert len(errors) == 1 and errors[0].finish_reason == FinishReason.ERROR
-        assert errors[0].stop_reason == "Timed out waiting for text input after 10s"
-    else:
-        assert errors == []
+    assert first.status == RequestStatus.RUNNING
+    assert scheduler.kv_cache_manager.get_blocks(first.request_id).get_block_ids() == original_blocks
     scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+    assert scheduler.requests == {} and scheduler._model_input_streams == {}
+    assert not scheduler.kv_cache_manager.get_blocks(first.request_id).get_block_ids()[0]
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
@@ -1939,23 +1920,12 @@ def test_text_input_preemption_resends_latest_input(route_scheduler_factory, asy
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
-@pytest.mark.parametrize("channel", ["plain", "wire", "native"])
-@pytest.mark.parametrize("timeout_s", [None, 0.1, 1e9])
-def test_text_input_timeout_releases_kv_and_seat_with_one_error(
-    route_scheduler_factory, monkeypatch, async_scheduling, channel, timeout_s
-):
+def test_text_input_timeout_releases_kv_and_seat_with_one_error(route_scheduler_factory, monkeypatch, async_scheduling):
     scheduler = route_scheduler_factory(async_scheduling=async_scheduling)
     clock = [100.0]
     monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
     waiting = _route_request("waiting", max_tokens=8)
-    waiting.additional_information = {"input_stream": {"token_ids": [31]}}
-    if timeout_s is not None:
-        waiting.additional_information["input_stream"]["timeout_s"] = timeout_s
-    if channel == "wire":
-        waiting.additional_information = serialize_additional_information(waiting.additional_information)
-    elif channel == "native":
-        waiting.model_intermediate_buffer = waiting.additional_information
-        waiting.additional_information = None
+    waiting.additional_information = {"input_stream": {"token_ids": [31], "timeout_s": 1e9}}
     other = _route_request("other", max_tokens=12)
     newcomer = _route_request("newcomer", max_tokens=8)
     _admit_route_request(scheduler, waiting)

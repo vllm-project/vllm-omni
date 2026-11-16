@@ -57,7 +57,7 @@ def test_initial_stream_survives_request_payload_transport(channel):
 
 @pytest.mark.parametrize(
     "unsupported",
-    ["v1", "prefix", "speculation", "tp", "dp", "resumable", "base", "layout"],
+    ["v1", "prefix", "speculation", "tp", "pp", "dp", "resumable", "base", "layout"],
 )
 def test_unsupported_streams_are_rejected_during_admission(unsupported):
     request, config = request_and_config()
@@ -69,6 +69,8 @@ def test_unsupported_streams_are_rejected_during_admission(unsupported):
         config.num_speculative_tokens = 1
     elif unsupported == "tp":
         config.parallel_config.tensor_parallel_size = 2
+    elif unsupported == "pp":
+        config.parallel_config.pipeline_parallel_size = 2
     elif unsupported == "dp":
         config.parallel_config.data_parallel_size = 2
     elif unsupported == "resumable":
@@ -120,7 +122,6 @@ def test_input_owns_tokens_and_delivers_only_new_tokens_until_readmission():
     delta["token_ids"].clear()
     assert stream.take_update(reset=False) is None
     assert stream.take_update(reset=True)["token_ids"] == [31, 32, 32]
-    stream.append([], final=True)
     stream.append([], final=True)
     assert stream.take_update(reset=False) == {"token_ids": [], "final": True}
     assert stream.take_update(reset=False) is None

@@ -721,17 +721,21 @@ def test_incremental_word_delivery_matches_the_complete_model_encoding(streaming
     with TestClient(app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
         ws.send_json(_NATIVE_CONFIG)
         ws.send_json({"type": "input.text", "text": words[0]})
-        for word in words[1:]:
+        assert ws.receive_json()["type"] == "audio.start"
+        assert ws.receive_bytes()
+        ws.send_json({"type": "input.text", "text": words[1]})
+        assert ws.receive_bytes()
+        for word in words[2:]:
             ws.send_json({"type": "input.text", "text": word})
         ws.send_json({"type": "input.done"})
-        events, audio = _finish_utterance(ws)
-        assert audio
+        events, _ = _finish_utterance(ws)
         assert not any(event["type"] == "error" or event.get("error") for event in events)
     assert len(app.engine.submissions) == 1
     initial = app.engine.submissions[0]["prompt"]["additional_information"]["input_stream"]
     delivered = initial["token_ids"] + [token for _, tokens, _ in app.engine.appends for token in tokens]
     expected = app.server._tts_tokenizer.encode(build_assistant_text("".join(words)), add_special_tokens=False)[3:-5]
     assert delivered == expected
+    assert any(tokens and not final for _, tokens, final in app.engine.appends)
     assert int(initial["final"]) + sum(final for _, _, final in app.engine.appends) == 1
 
 
@@ -800,21 +804,6 @@ def test_incremental_tokenizer_wait_does_not_start_the_generation_deadline(strea
         assert not any(event["type"] == "error" or event.get("error") for event in events)
     assert len(app.engine.submissions) == 1
     assert not app.engine.cancelled
-
-
-def test_incremental_commitment_starts_before_a_sentence_boundary(native_app, text_tokenizer):
-    with TestClient(native_app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
-        ws.send_json(_NATIVE_CONFIG)
-        ws.send_json({"type": "input.text", "text": "你"})
-        assert native_app.engine.submitting.wait(3)
-        assert ws.receive_json()["type"] == "audio.start"
-        assert ws.receive_bytes()
-        ws.send_json({"type": "input.done"})
-        events, _ = _finish_utterance(ws)
-        assert not events[-2]["error"]
-    params = native_app.engine.submissions[0]["prompt"]["additional_information"]
-    assert params["input_stream"]["token_ids"] == text_tokenizer.encode("你", add_special_tokens=False)
-    assert native_app.engine.appends[-1][1:] == ([], True)
 
 
 @pytest.mark.parametrize("text_policy", [{}, {"text_input_mode": "buffered"}])

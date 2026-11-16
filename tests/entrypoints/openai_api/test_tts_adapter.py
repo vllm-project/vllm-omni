@@ -844,61 +844,6 @@ def test_qwen3_tts_build_constructs_prepared_request():
     assert prepared.model_type == "CustomVoice"
 
 
-def test_qwen3_tts_incremental_input_reuses_tokenizer_and_keeps_the_whole_request_budget(mocker):
-    tokenizer = mocker.Mock()
-    spec = mocker.Mock(footer_ids=[4, 5, 6, 7, 8])
-    encoder = spec.create_stream.return_value
-    encoder.spec = spec
-    preview = encoder.copy.return_value
-    preview.spec = spec
-    preview.feed.side_effect = [[1, 2, 3, 31, 32], [33], []]
-    compile_spec = mocker.patch(
-        "vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts.Qwen3TTSStreamingTokenizerSpec",
-        return_value=spec,
-    )
-    server = SimpleNamespace(
-        _tts_executor=None,
-        _tts_tokenizer=tokenizer,
-        _tts_stage=None,
-        uploaded_speakers={},
-        _voice_created_at=mocker.Mock(return_value=0),
-    )
-    engine_client = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(talker_config=SimpleNamespace(codec_eos_token_id=2150))),
-        append_text=mocker.AsyncMock(),
-    )
-    adapter = Qwen3TTSAdapter(SpeechServingContext(server=server, engine_client=engine_client))
-    adapter.capabilities = TTSCapabilities(
-        supported_speakers=frozenset({"vivian"}),
-        default_speaker="vivian",
-    )
-    mocker.patch.object(adapter, "_estimate_prompt_len_async", new=mocker.AsyncMock(return_value=3))
-    request = OpenAICreateSpeechRequest(input="Hello", voice="vivian", language="English")
-
-    async def prepare():
-        model_input = await adapter.create_incremental_input(request)
-        prepared = await model_input.build("Hello", final=False)
-        await model_input.append("request", " world", final=False)
-        await model_input.append("request", "", final=True)
-        return prepared
-
-    prepared = asyncio.run(prepare())
-
-    compile_spec.assert_called_once_with(tokenizer.backend_tokenizer)
-    assert prepared.prompt["prompt_token_ids"] == [1, 1, 1]
-    assert prepared.tts_params["input_stream"] == {"token_ids": [31, 32], "final": False}
-    assert prepared.tts_params["non_streaming_mode"] == [False]
-    assert engine_client.append_text.await_args_list == [
-        mocker.call("request", [33], final=False),
-        mocker.call("request", [], final=True),
-    ]
-    params = adapter.apply_sampling_overrides([SamplingParams(max_tokens=1024)], request, prepared.prompt)
-    assert params[0].max_tokens == 1024
-    assert QWEN3_TTS_AUTO_BUDGET_KEY not in prepared.tts_params
-    with pytest.raises(Qwen3TTSCodecLimitError, match="incomplete"):
-        adapter.validate_generation(prepared.tts_params, stage0_finish_reason="length", output_tokens=1024)
-
-
 class TestQwen3TTSIncrementalInput:
     """Adapter lifecycle and token delivery, using a small in-memory tokenizer."""
 
@@ -934,6 +879,7 @@ class TestQwen3TTSIncrementalInput:
             _tts_stage=None,
             uploaded_speakers={},
             _voice_created_at=mocker.Mock(return_value=0),
+            _count_usage_text_tokens=lambda text: len(tokenizer.encode(text, add_special_tokens=False)),
         )
         engine = SimpleNamespace(append_text=mocker.AsyncMock())
         adapter = Qwen3TTSAdapter(SpeechServingContext(server=server, engine_client=engine))
@@ -959,7 +905,7 @@ class TestQwen3TTSIncrementalInput:
         expected = adapter_context.tokenizer.encode(build_assistant_text("自动驾驶系统"), add_special_tokens=False)
         assert prepared.tts_params["input_stream"] == {"token_ids": expected[3:-5], "final": True}
 
-    async def test_interleaved_prompt_length_matches_prefill_with_unreleased_text(self, adapter_context):
+    async def test_initial_build_preserves_prefill_length_and_generation_budget(self, adapter_context):
         adapter = adapter_context.adapter
         adapter_context.engine.model_config = SimpleNamespace(
             hf_config=SimpleNamespace(
@@ -975,6 +921,13 @@ class TestQwen3TTSIncrementalInput:
         released = prepared.tts_params["input_stream"]["token_ids"]
         assert 0 < len(released) < len(complete_body)
         assert len(prepared.prompt["prompt_token_ids"]) == 3 + 6 + 1
+        params = adapter.apply_sampling_overrides(
+            [SamplingParams(max_tokens=1024)], adapter_context.request, prepared.prompt
+        )
+        assert params[0].max_tokens == 1024
+        assert QWEN3_TTS_AUTO_BUDGET_KEY not in prepared.tts_params
+        with pytest.raises(Qwen3TTSCodecLimitError, match="incomplete"):
+            adapter.validate_generation(prepared.tts_params, stage0_finish_reason="length", output_tokens=1024)
 
     async def test_append_buffers_without_an_engine_update_and_flushes_at_eof(self, adapter_context):
         model_input = await adapter_context.adapter.create_incremental_input(adapter_context.request)
