@@ -36,10 +36,8 @@ stages:
     devices: "0"
     # The checkpoint ships no HF tokenizer files (only qwen.tiktoken, which
     # the offline driver reads itself); every prompt arrives as token ids,
-    # so the engine builds no tokenizer. Placeholder tokenizer dir follows
-    # the indextts2 precedent.
+    # so the engine builds no tokenizer.
     skip_tokenizer_init: true
-    tokenizer: gpt2
     hf_overrides:
       architectures: ["Yue2ForCausalLM"]
     default_sampling_params:

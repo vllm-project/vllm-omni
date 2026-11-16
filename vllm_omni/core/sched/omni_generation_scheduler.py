@@ -355,6 +355,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return scheduler_output
 
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        self._enforce_kstep_span_uniformity(scheduler_output)
+        super()._update_after_schedule(scheduler_output)
+
     def _is_done_receiving_chunks(self, request_id: str) -> bool:
         if self.chunk_transfer_adapter is not None:
             return self.chunk_transfer_adapter.is_done_receiving_chunks(request_id)
@@ -405,7 +409,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             request.status = RequestStatus.WAITING
             self._enqueue_waiting_request(request)
             return False
-        return super()._handle_stopped_request(request)
+        finished = super()._handle_stopped_request(request)
+        if not finished:
+            # The pin no longer enqueues inside the base stop handler.
+            self._enqueue_waiting_request(request)
+        return finished
 
     def _requeue_completed_native_chunks(self) -> None:
         """Return completed native generation chunks to the admission queue.
@@ -877,6 +885,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         ):
             self.processed_step_seq += 1
             self._drain_deferred_frees()
+            # HiSparse async loads must wait for the same completed-step fence.
+            if getattr(self, "defer_async_loads", False):
+                self._drain_deferred_loads()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():

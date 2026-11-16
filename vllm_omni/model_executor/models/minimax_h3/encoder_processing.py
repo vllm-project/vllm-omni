@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
+from vllm.logger import init_logger
 
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
@@ -52,6 +53,8 @@ from vllm_omni.model_executor.models.minimax_h3.timeline_guides import (
     MINIMAX_H3_TIMELINE_GUIDES_KEY,
     prepare_timeline_guides,
 )
+
+logger = init_logger(__name__)
 
 MINIMAX_H3_FPS = 24
 MINIMAX_H3_MIN_OUTPUT_SECONDS = 4.0
@@ -634,6 +637,21 @@ def prepare_encoder_inputs(
     source_audio = multi_modal_data.get("source_audio")
     raw_video_edit_mask = multi_modal_data.get("video_noise_mask")
     raw_audio_edit_mask = multi_modal_data.get("audio_noise_mask")
+    regenerate = extra_args.get("regenerate", False)
+    if not isinstance(regenerate, bool):
+        raise OmniClientError("MiniMax H3 regenerate must be a boolean")
+    if regenerate:
+        if task != "t2va" or source_video is None or source_audio is not None:
+            raise OmniClientError("MiniMax H3 regenerate takes a prompt and one source_video draft")
+        if raw_video_edit_mask is not None or raw_audio_edit_mask is not None:
+            raise OmniClientError("MiniMax H3 regenerate does not take noise masks")
+        if resolve_continuation_request(extra_args) is not None:
+            # A 2K regenerate leaves the base canvas a continuation must share.
+            raise OmniClientError("MiniMax H3 regenerate does not support continue_from")
+        # The draft travels as a latent-edit source with nothing to regenerate:
+        # both the local and the staged encoder layouts already carry clean
+        # source rows with their mask, and the DiT reads them as the draft.
+        raw_video_edit_mask = 0.0
     if (source_video is not None or source_audio is not None) and (
         raw_video_edit_mask is None and raw_audio_edit_mask is None
     ):
@@ -815,6 +833,7 @@ def prepare_encoder_inputs(
                     target_height=height,
                     target_frame_count=output_frames,
                     workdir=workdir,
+                    cover=regenerate,
                 )
                 edit_video_frames = load_video_frames(edit_video_metadata["prepared_path"])
             except subprocess.CalledProcessError as exc:
@@ -823,6 +842,12 @@ def prepare_encoder_inputs(
             if overlap:
                 # The hidden overlap is regenerated (mask 1); its source frames are placeholders.
                 video_edit = torch.cat((video_edit[:1].expand(overlap, *video_edit.shape[1:]), video_edit))
+    if regenerate and edit_video_metadata is not None:
+        if edit_video_metadata["input_has_audio"]:
+            # Keep the draft's soundtrack for the output; the refiner never sees it.
+            audio_edit_mask = torch.zeros(2, audio_t)
+        else:
+            logger.warning("Open-H3-Regenerate draft has no audio track; the regenerated video will be silent")
 
     audio_edit: tuple[torch.Tensor, int] | None = None
     if audio_edit_mask is not None:

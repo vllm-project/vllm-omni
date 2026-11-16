@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import copy
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -32,14 +31,19 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
+    resolve_diffusion_sampling_params,
 )
-from vllm_omni.entrypoints.openai.utils import get_stage_type, is_video_generation_pipeline, parse_lora_request
+from vllm_omni.entrypoints.openai.utils import get_stage_type, is_video_generation_pipeline, parse_lora_requests
 from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
     _PlanarFrameConverter,
     encode_video_base64,
 )
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.inputs.data import (
+    OmniDiffusionSamplingParams,
+    OmniTextPrompt,
+    absorb_attention_schedule_extra_args,
+)
 from vllm_omni.metrics import count_video_frames
 from vllm_omni.model_extras import get_video_generation_defaults, should_preserve_reference_image_size
 from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
@@ -383,7 +387,7 @@ class OmniOpenAIServingVideo:
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 
-        gen_params = self._resolve_default_sampling_params()
+        gen_params = resolve_diffusion_sampling_params(get_default_sampling_params_list(self._engine_client))
 
         input_image = None if reference_image is None else reference_image.data
         input_video = None if reference_video is None else reference_video.data
@@ -553,6 +557,11 @@ class OmniOpenAIServingVideo:
                     raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
             # Merge extra_params into extra_args
             gen_params.extra_args.update(request.extra_params)
+            try:
+                # The request value replaces a schedule the stage default sampling params carried.
+                absorb_attention_schedule_extra_args(gen_params, override=True)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
 
             # Redact inline arrays when logging so RoboLab policy requests do
             # not flood the server log with image/state payloads.
@@ -571,8 +580,9 @@ class OmniOpenAIServingVideo:
                 loggable = {**loggable, **redacted}
             logger.info("Applied extra_params: %s", loggable)
 
-        if self.supports_latent_continuation:
+        if self.supports_latent_continuation and (request.extra_params or {}).get("regenerate") is not True:
             # Server-owned: the job id is the only key a later continue_from can name.
+            # A regenerate job is refined at 2K, off the base canvas, and is never cached.
             gen_params.extra_args["latent_cache_key"] = reference_id
 
         self._apply_lora(request.lora, gen_params)
@@ -771,33 +781,21 @@ class OmniOpenAIServingVideo:
             return False
         return "num_frames" in video_params.model_fields_set and video_params.num_frames is not None
 
-    def _resolve_default_sampling_params(self) -> OmniDiffusionSamplingParams:
-        default_sampling_params_list = getattr(self._engine_client, "default_sampling_params_list", None)
-        if default_sampling_params_list:
-            for params in default_sampling_params_list:
-                if isinstance(params, OmniDiffusionSamplingParams):
-                    # Requests mutate sampling params in-place, including
-                    # nested dict fields like extra_args. Deep-copy the stage
-                    # defaults so one request cannot leak state into another.
-                    return copy.deepcopy(params)
-        return OmniDiffusionSamplingParams()
-
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
         try:
-            lora_request, lora_scale = parse_lora_request(lora_body)
+            lora_requests, lora_scales = parse_lora_requests(lora_body)
         except ValueError as e:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=str(e),
             ) from e
 
-        if lora_request is None:
+        if not lora_requests:
             return
 
-        gen_params.lora_request = lora_request
-        if lora_scale is not None:
-            gen_params.lora_scale = lora_scale
+        gen_params.lora_request = lora_requests
+        gen_params.lora_scale = lora_scales
 
     async def _run_generation(
         self,

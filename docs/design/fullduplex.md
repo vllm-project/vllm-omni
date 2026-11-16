@@ -245,7 +245,7 @@ vllm_omni/
 │   │   ├── session_attachment.py    DuplexSessionAttachmentRegistry (resume tokens, replay journal)
 │   │   ├── audio_encoding.py        encode_audio, injected into DuplexOmniEngine for the plugin's data plane
 │   │   ├── openai.py                dispatch_realtime_websocket (turn-based /v1/realtime, when duplex mode is not selected)
-│   │   ├── warmup.py                startup warmup probe; wait_for_duplex_warmup holds clients until it finishes
+│   │   ├── warmup.py                startup warmup probe; holds native session admission after WebSocket acceptance
 │   │   └── websocket.py             websocket send/close/receive helpers
 │   └── openai/api_server.py         builds DuplexOmni for duplex models; session-backed app state
 ├── protocol/                        SHARED WIRE CODEC (no engine / no model / no transport)
@@ -341,6 +341,109 @@ vllm_omni/
 - **Resume identity** is `(session_id, resume_token, expected_lease_generation)`:
   the token belongs to the attachment registry, the lease generation is the
   engine-side compare-and-swap.
+
+### Authoritative history snapshots
+
+`DuplexEngineSession.history_snapshot()` synchronously captures a
+`DuplexHistorySnapshot` on the session owner's loop, without an `await`.
+Its aligned tuple columns are `messages`, public `item_ids` (possibly `None`),
+internal `source_ids`, and `source_revisions`, together with one
+`history_revision`. Unresolved history placeholders are omitted from every
+column. The record is frozen; nested protocol dictionaries and lists are
+detached, mutable copies for plugin compatibility. Text, bytes and opaque
+media payloads are shared, rather than cloned. Consumers must treat opaque
+payloads as read-only. Session mutation methods own authoritative writes.
+
+Every non-placeholder history insertion must call `_track_history_message`,
+and removal must call `_forget_history_message`, keeping the source map complete
+for snapshot capture and hard-cutoff updates. Hidden placeholders are untracked.
+
+The default prompt path uses `session.history_for_prompt()` to capture aligned
+history and item IDs while preserving Qwen retained-PCM identity. Like
+`session.history` and unlike `snapshot.messages`, it copies only top-level
+message dictionaries; nested
+protocol/media containers and payloads remain shared with authoritative history
+and must be treated as read-only by prompt consumers.
+
+A source ID is allocated monotonically when a message becomes visible and
+is never reused within that session. Replacing a public item's contents
+preserves its source ID. Deleting it retires the source; recreating the same
+public item ID allocates a new source ID. A late item-ID binding preserves
+the source ID and advances its revision. New sources start at revision zero.
+
+Content edits, accepted changes to heard-prefix evidence, and tighter
+permanent audio cutoffs advance the affected source revision and the global
+history revision. A cutoff change can advance revisions even when the text
+stays equal. Appending or deleting a source advances the global revision.
+Equal-value replacements, rejected operations, hidden reservations, and
+internal playback/cache cleanup alone do not. Revisions are monotonic change
+tokens, not operation counts; one operation can perform multiple writes.
+
+Epoch changes fence in-flight work independently of source validity.
+Re-leasing the same live session on resume preserves IDs and revisions;
+dropping the session drops this state. Snapshots do not imply persistence
+across process restarts. Existing prompt construction remains unchanged;
+memory or stage-view consumers can adopt the snapshot in their own changes.
+
+### Derived context and per-stage views
+
+`DuplexEngineSession.context_ledger` holds derived nodes. A node records the
+`(source_id, revision)` pairs it was built from and the IDs of its parent
+nodes; parents always have smaller IDs. Nodes never write to history or
+advance a revision, and node IDs are never reused.
+
+A node is valid only while every recorded source has the recorded revision in
+the current snapshot and every parent is valid. `refresh(snapshot)` walks the
+nodes in ID order and prunes the invalid ones, so a content edit, a transcript
+update, a deleted source, an accepted heard prefix or a tighter hard cutoff
+removes the affected nodes and all of their descendants. An epoch change alone
+removes nothing. `add_node` admits a node only if its sources and parents are
+valid against the snapshot it is given, so a result computed from older
+sources is rejected when checked against a current snapshot. Admission with
+a historical snapshot does not displace a newer L1 source lookup; duplicate
+L1 nodes for the same source revision are rejected through either admission
+API. Callers refresh against a current authoritative snapshot before reading
+valid nodes.
+
+Admission detaches message dictionaries, lists and tuples from the caller while
+sharing opaque payloads. Batch admission prepares every message before writing
+nodes, so a preparation failure leaves the graph and next node ID unchanged.
+The ledger owns admitted message containers; node readers must treat them and
+opaque payloads as read-only. Rendered views are detached from ledger messages.
+
+A plugin opts a stage in by returning a `DuplexContextViewPolicy` from
+`context_view_policy(stage_id=..., runtime_config=...)`. The default is `None`:
+the prompt config is built exactly as before and no L1 view is rendered. With a
+policy, `conversation` stays the authoritative history and the stage also
+receives `conversation_view`, a list aligned one-to-one with `conversation`:
+
+- User messages before the `keep_media_user_turns` most recent user runs
+  (consecutive user messages) drop their `audio_url` and `image_url` parts and
+  keep their text. The transcript is added as a text part when no text part
+  already carries it.
+- A user run is never emptied. If every message in a run would be empty, the
+  whole run is passed through unchanged.
+- Assistant, system and tool messages are never rewritten. Assistant text
+  already reflects the accepted heard prefix.
+
+This is a candidate context view, not a complete prompt: with a zero-keep
+policy, unanswered input is eligible too. Plugins must preserve current
+request media from `conversation`, and keep binding audio and validating
+sources against it. ModelChannel reuses the snapshot captured for item IDs
+when rendering the view, so both come from the same capture. Policy config
+is deployment-owned; plugin request runtime state is a separate input.
+
+Qwen3-Omni opts in its Thinker stage when
+`duplex_session.context_keep_media_turns` is set (default `null`). It then
+formats older user items from the view, including mixed text/media items.
+Dropped images are never decoded, and a text-only view replaces old audio
+even while its payload remains in the retained audio slots. A turn whose
+audio left those slots keeps its available transcript instead of being
+dropped. The current unanswered user input remains verbatim, including during
+tool continuations, after intervening system instructions, and for audio and
+image items when the knob is `0`.
+The 16-message window, the
+audio-slot limits and the no-empty-run fallback are unchanged.
 
 ## Session lifecycle
 
@@ -717,6 +820,46 @@ through stride-5 pooling. Reference audio must not be cropped to a 100 ms
 boundary to simplify budgeting: the remaining samples can change the
 embeddings even when they do not add a pooled token.
 
+MiniCPM-o native duplex does not apply a character cap unless
+`max_speak_chars_per_chunk` is set to a positive value. The default is 0,
+so the default length limit is the official 20-token budget; sampled chunk
+terminators can still close a chunk earlier. A decoded prefix
+ending in U+FFFD may continue to complete its UTF-8 bytes when a positive
+cap is set. That cap keeps the token that crosses the target, then closes
+the chunk before another draw. Hard token and request caps retain priority;
+explicit `force_listen` bypasses only the soft character target.
+
+MiniCPM-o preserves the stage-2 sampled `<|turn_eos|>`, including after text
+without sentence-ending punctuation. The sampler does not infer whether an
+answer is complete from its decoded tail or replace EOS with another candidate.
+This matches the released `streaming_generate` turn-ending behavior and avoids
+adding text to short answers such as `11` or `北京`. There is no worker-local
+punctuation/continuation state for asynchronous lookahead to advance beyond the
+scheduler's accepted span. The scheduler still supplies the canonical unit
+content and terminator for the next append, including with sliding windows off.
+Sentence-ending punctuation remains a Talker drain hint; it does not decide
+whether the Thinker may end a turn.
+
+`<|turn_eos|>` does not terminate the input unit. The Thinker continues until
+a chunk terminator, and the Talker receives all forwarded tokens and their
+hidden states before that boundary, including any text after an intermediate
+EOS. Such text or a later speak decision reopens the turn. The bridge and
+Talker therefore report `turn_end` only when the final condition token is
+`<|turn_eos|>`, not merely when EOS occurs somewhere in the unit. For example,
+`<|speak|><|turn_eos|><|speak|>green<|chunk_eos|>` delivers `green` and keeps the
+response open. Async lookahead after the actual chunk terminator is excluded.
+
+If a speech unit has no text, its chunk boundary still
+travels through Talker's empty-condition path. That path emits no audio but
+preserves the TTS segment-end notification needed to schedule the next silence
+unit; an empty speech chunk must not be dropped as if it were a listen unit.
+
+Code2Wav attaches queued transcript text once per output payload. The data
+plane deduplicates it by `(duplex_audio_cache_epoch, duplex_audio_chunk_seq)`
+within a model turn, not by text equality or a shared prefix. Adjacent chunks
+containing `1` and `1` must deliver `11`. Legacy outputs without a chunk
+identity retain the cumulative-text snapshot handling.
+
 The MiniCPM-o SigLIP vision tower defaults to reference attention for CUDA BF16 duplex
 sessions. SDPA and eager produce different BF16 embeddings, which can change
 scene descriptions during long video sessions. Turn-mode and non-CUDA vision
@@ -742,6 +885,13 @@ standalone 2-GPU, 3-GPU and 8x4090 layouts and inherited replica and turn-mode
 profiles. Talker and NPU attention settings are unchanged. This aligns the
 Thinker backend selection; it does not establish accuracy or performance parity
 across GPU types and layouts.
+
+The inherited CUDA duplex profile uses upstream `vllm_c` RMSNorm and fused
+add-RMSNorm, `silu_and_mul`, and QK-normalization/RoPE fusion for Thinker stage 0.
+The checkpoint's model and head dtypes are retained. The turn profile resets
+`kernel_config` and `compilation_config` to upstream defaults, including its
+MRv2 derivatives. Other platforms and Talker keep their existing settings;
+explicit engine overrides retain precedence.
 
 Tool result conversion is preparation until the session's final deadline/epoch
 check and admission. `runtime_config_for_function_output` receives an isolated

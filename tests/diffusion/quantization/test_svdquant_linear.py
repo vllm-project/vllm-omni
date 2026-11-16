@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.model_executor.layers.linear import RowParallelLinear
 
 from vllm_omni.quantization import svdquant_config as svdquant
 
@@ -34,6 +35,15 @@ class _FakeNvfp4Kernel:
         return torch.mm(x, self.base_weight)
 
 
+class _FakeMarlinBiasKernel(_FakeNvfp4Kernel):
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        bias = getattr(layer, "bias", None)
+        if bias is not None:
+            padded = torch.nn.functional.pad(bias.detach(), (0, 1))
+            layer.bias = torch.nn.Parameter(padded.flip(0).contiguous(), requires_grad=False)
+
+
 def _register_parameter(
     layer: torch.nn.Module,
     name: str,
@@ -45,12 +55,61 @@ def _register_parameter(
     )
 
 
+def _make_mxfp4_row_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    tp_rank: int,
+    skip_bias_add: bool = False,
+) -> RowParallelLinear:
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda precision: None)
+    method = svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig(precision="mxfp4"))
+
+    layer = object.__new__(RowParallelLinear)
+    torch.nn.Module.__init__(layer)
+    layer.tp_rank = tp_rank
+    layer.tp_size = 2
+    layer.input_is_parallel = True
+    layer.reduce_results = True
+    layer.skip_bias_add = skip_bias_add
+    layer.return_bias = True
+    layer.output_size_per_partition = 3
+    layer.quant_method = method
+
+    _register_parameter(layer, "qweight", torch.zeros((3, 1), dtype=torch.int8))
+    _register_parameter(layer, "wscales", torch.zeros((2, 3), dtype=torch.uint8))
+    _register_parameter(layer, "bias", torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16))
+    layer.smooth_factor = torch.ones(2, dtype=torch.bfloat16)
+    layer.proj_down = torch.zeros((2, 1), dtype=torch.bfloat16)
+    layer.proj_up = torch.zeros((3, 1), dtype=torch.bfloat16)
+
+    method.process_weights_after_loading(layer)
+    return layer
+
+
 def test_supports_only_validated_datacenter_blackwell() -> None:
-    assert not svdquant._supports_capability(SimpleNamespace(major=10, minor=0))
-    assert svdquant._supports_capability(SimpleNamespace(major=10, minor=3))
-    assert not svdquant._supports_capability(SimpleNamespace(major=11, minor=0))
-    assert not svdquant._supports_capability(SimpleNamespace(major=12, minor=0))
-    assert not svdquant._supports_capability(None)
+    assert not svdquant._supports_capability(SimpleNamespace(major=10, minor=0), svdquant._NVFP4_CAPABILITIES)
+    assert svdquant._supports_capability(SimpleNamespace(major=10, minor=3), svdquant._NVFP4_CAPABILITIES)
+    assert not svdquant._supports_capability(SimpleNamespace(major=11, minor=0), svdquant._NVFP4_CAPABILITIES)
+    assert not svdquant._supports_capability(SimpleNamespace(major=12, minor=0), svdquant._NVFP4_CAPABILITIES)
+    assert not svdquant._supports_capability(None, svdquant._NVFP4_CAPABILITIES)
+
+
+def test_mxfp4_supports_blackwell_sm100_and_sm103() -> None:
+    assert svdquant._supports_capability(SimpleNamespace(major=10, minor=0), svdquant._MXFP4_CAPABILITIES)
+    assert svdquant._supports_capability(SimpleNamespace(major=10, minor=3), svdquant._MXFP4_CAPABILITIES)
+    assert not svdquant._supports_capability(SimpleNamespace(major=9, minor=0), svdquant._MXFP4_CAPABILITIES)
+    assert not svdquant._supports_capability(None, svdquant._MXFP4_CAPABILITIES)
+
+
+def test_mxfp4_accepts_xpu_while_nvfp4_remains_cuda_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    platform = SimpleNamespace(is_xpu=lambda: True, is_cuda=lambda: False)
+    monkeypatch.setattr(svdquant, "current_platform", platform)
+
+    svdquant._assert_supported("mxfp4")
+    with pytest.raises(RuntimeError, match="requires a CUDA device"):
+        svdquant._assert_supported("nvfp4")
 
 
 def test_rejects_nvfp4_backend_with_incompatible_layer_contract(
@@ -73,7 +132,7 @@ def test_prepare_weights_uses_existing_nvfp4_layout_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     kernel = _FakeNvfp4Kernel()
-    monkeypatch.setattr(svdquant, "_assert_supported", lambda: None)
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda precision: None)
     monkeypatch.setattr(svdquant, "_nvfp4_kernel", lambda: kernel)
     method = svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig())
     layer = torch.nn.Module()
@@ -105,7 +164,7 @@ def test_prepare_weights_drops_identity_output_scale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     kernel = _FakeNvfp4Kernel()
-    monkeypatch.setattr(svdquant, "_assert_supported", lambda: None)
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda precision: None)
     monkeypatch.setattr(svdquant, "_nvfp4_kernel", lambda: kernel)
     method = svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig())
     layer = torch.nn.Module()
@@ -123,6 +182,172 @@ def test_prepare_weights_drops_identity_output_scale(
     assert layer.output_channel_scale is None
 
 
+def test_prepare_weights_uses_mxfp4_block32_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel = _FakeNvfp4Kernel()
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda precision: None)
+    monkeypatch.setattr(svdquant, "_mxfp4_kernel", lambda: kernel)
+    method = svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig(precision="mxfp4"))
+    layer = torch.nn.Module()
+    qweight = torch.arange(16, dtype=torch.uint8).reshape(4, 4)
+    wscales = torch.tensor([[130, 131, 132, 133], [134, 135, 136, 137]], dtype=torch.uint8)
+    _register_parameter(layer, "qweight", qweight.view(torch.int8))
+    _register_parameter(layer, "wscales", wscales)
+
+    method.process_weights_after_loading(layer)
+
+    assert kernel.processed
+    assert not hasattr(layer, "qweight")
+    assert not hasattr(layer, "wscales")
+    assert layer.weight.dtype == torch.uint8
+    assert torch.equal(layer.weight, qweight)
+    assert layer.weight_scale.dtype == torch.uint8
+    assert torch.equal(layer.weight_scale, wscales.transpose(0, 1))
+    assert not hasattr(layer, "alpha")
+    assert not hasattr(layer, "input_global_scale_inv")
+    assert not hasattr(layer, "output_channel_scale")
+
+
+def test_mxfp4_compatibility_path_applies_rank_correction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_weight = torch.tensor(
+        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+        dtype=torch.bfloat16,
+    )
+    kernel = _FakeNvfp4Kernel(base_weight)
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda precision: None)
+    monkeypatch.setattr(svdquant, "_mxfp4_kernel", lambda: kernel)
+    method = svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig(precision="mxfp4"))
+
+    layer = torch.nn.Module()
+    layer.smooth_factor = torch.tensor([2.0, 4.0], dtype=torch.bfloat16)
+    layer.proj_down = torch.tensor([[1.0], [2.0]], dtype=torch.bfloat16)
+    layer.proj_up = torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.bfloat16)
+    layer.output_size_per_partition = 3
+    x = torch.tensor([[2.0, 4.0], [4.0, 8.0]], dtype=torch.bfloat16)
+    bias = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
+
+    actual = method.apply(layer, x, bias)
+
+    smoothed = x / layer.smooth_factor
+    expected = torch.mm(smoothed, base_weight)
+    expected = expected + torch.mm(torch.mm(x, layer.proj_down), layer.proj_up.T)
+    expected = expected + bias
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(kernel.last_input, smoothed)
+
+
+def test_mxfp4_restores_logical_bias_when_kernel_repacks_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_weight = torch.tensor(
+        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+        dtype=torch.bfloat16,
+    )
+    kernel = _FakeMarlinBiasKernel(base_weight)
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda precision: None)
+    monkeypatch.setattr(svdquant, "_mxfp4_kernel", lambda: kernel)
+    method = svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig(precision="mxfp4"))
+
+    layer = torch.nn.Module()
+    _register_parameter(layer, "qweight", torch.zeros((3, 1), dtype=torch.int8))
+    _register_parameter(layer, "wscales", torch.zeros((2, 3), dtype=torch.uint8))
+    _register_parameter(layer, "bias", torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16))
+    layer.smooth_factor = torch.ones(2, dtype=torch.bfloat16)
+    layer.proj_down = torch.zeros((2, 1), dtype=torch.bfloat16)
+    layer.proj_up = torch.zeros((3, 1), dtype=torch.bfloat16)
+    layer.output_size_per_partition = 3
+
+    method.process_weights_after_loading(layer)
+    logical_bias = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
+    assert layer.bias.shape == logical_bias.shape
+    assert not hasattr(layer, "_svdquant_bias")
+    torch.testing.assert_close(layer.bias, logical_bias)
+
+    x = torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16)
+    actual_without_bias = method.apply(layer, x, None)
+    torch.testing.assert_close(actual_without_bias, torch.mm(x, base_weight))
+
+    actual = method.apply(layer, x, layer.bias)
+    expected = torch.mm(x, base_weight) + logical_bias
+    torch.testing.assert_close(actual, expected)
+
+    layer.to(dtype=torch.float32)
+    assert layer.bias.dtype == torch.float32
+
+
+def test_mxfp4_row_parallel_tp2_adds_bias_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_weight = torch.zeros((2, 3), dtype=torch.bfloat16)
+    kernel = _FakeMarlinBiasKernel(base_weight)
+    monkeypatch.setattr(svdquant, "_mxfp4_kernel", lambda: kernel)
+    monkeypatch.setattr("vllm.model_executor.layers.linear.tensor_model_parallel_all_reduce", lambda value: value)
+
+    rank0 = _make_mxfp4_row_parallel(monkeypatch, tp_rank=0)
+    rank1 = _make_mxfp4_row_parallel(monkeypatch, tp_rank=1)
+    x = torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16)
+
+    output_rank0, _ = rank0(x)
+    output_rank1, _ = rank1(x)
+    combined = output_rank0 + output_rank1
+    expected = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.bfloat16)
+
+    torch.testing.assert_close(combined, expected)
+
+
+def test_mxfp4_row_parallel_skip_bias_add_returns_logical_bias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_weight = torch.zeros((2, 3), dtype=torch.bfloat16)
+    kernel = _FakeMarlinBiasKernel(base_weight)
+    monkeypatch.setattr(svdquant, "_mxfp4_kernel", lambda: kernel)
+    monkeypatch.setattr("vllm.model_executor.layers.linear.tensor_model_parallel_all_reduce", lambda value: value)
+
+    layer = _make_mxfp4_row_parallel(monkeypatch, tp_rank=0, skip_bias_add=True)
+    x = torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16)
+    output, output_bias = layer(x)
+
+    torch.testing.assert_close(output, torch.zeros_like(output))
+    assert output_bias is not None
+    torch.testing.assert_close(output_bias, torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16))
+
+
+def test_mxfp4_does_not_duplicate_bias_when_kernel_leaves_it_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_weight = torch.tensor(
+        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+        dtype=torch.bfloat16,
+    )
+    kernel = _FakeNvfp4Kernel(base_weight)
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda precision: None)
+    monkeypatch.setattr(svdquant, "_mxfp4_kernel", lambda: kernel)
+    method = svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig(precision="mxfp4"))
+
+    layer = torch.nn.Module()
+    _register_parameter(layer, "qweight", torch.zeros((3, 1), dtype=torch.int8))
+    _register_parameter(layer, "wscales", torch.zeros((2, 3), dtype=torch.uint8))
+    _register_parameter(layer, "bias", torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16))
+    original_bias = layer.bias
+    layer.smooth_factor = torch.ones(2, dtype=torch.bfloat16)
+    layer.proj_down = torch.zeros((2, 1), dtype=torch.bfloat16)
+    layer.proj_up = torch.zeros((3, 1), dtype=torch.bfloat16)
+    layer.output_size_per_partition = 3
+
+    method.process_weights_after_loading(layer)
+    assert layer.bias is original_bias
+    assert not hasattr(layer, "_svdquant_bias")
+
+    x = torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16)
+    actual = method.apply(layer, x, layer.bias)
+    expected = torch.mm(x, base_weight) + original_bias
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_compatibility_path_applies_qkv_scale_and_rank_correction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -131,7 +356,7 @@ def test_compatibility_path_applies_qkv_scale_and_rank_correction(
         dtype=torch.bfloat16,
     )
     kernel = _FakeNvfp4Kernel(base_weight)
-    monkeypatch.setattr(svdquant, "_assert_supported", lambda: None)
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda precision: None)
     monkeypatch.setattr(svdquant, "_nvfp4_kernel", lambda: kernel)
     method = svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig())
 
@@ -158,7 +383,7 @@ def test_compatibility_path_applies_qkv_scale_and_rank_correction(
 def test_compatibility_path_rejects_fp16_activations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(svdquant, "_assert_supported", lambda: None)
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda precision: None)
     method = svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig())
     layer = torch.nn.Module()
     with pytest.raises(ValueError, match="requires BF16 activations"):

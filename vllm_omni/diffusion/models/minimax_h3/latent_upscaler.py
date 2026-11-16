@@ -532,12 +532,15 @@ def resolve_minimax_h3_latent_upscaler(
     *,
     device: torch.device,
     latent_stats: Callable[[], tuple[Sequence[float], Sequence[float]]],
+    default_path: str | Path | None = None,
 ) -> MiniMaxH3LatentUpscaler | None:
     """Build the upscaler declared by ``--additional-config``, if any.
 
     ``latent_stats`` yields the VAE's per-channel ``latents_mean`` /
     ``latents_std`` and is called only once a checkpoint is configured, so a
-    deployment without this stage never reaches for them.
+    deployment without this stage never reaches for them. ``default_path`` is
+    the checkpoint a deployment's adapter ships with, used when the config
+    names none.
 
     Recognized keys: ``latent_upscaler_path`` (required to enable the stage),
     ``latent_upscaler_dtype``, ``latent_upscaler_chunk_frames`` (0 disables
@@ -545,7 +548,7 @@ def resolve_minimax_h3_latent_upscaler(
     the device between requests instead of parking them in host memory).
     """
     additional = getattr(od_config, "additional_config", None) or {}
-    path = additional.get("latent_upscaler_path")
+    path = additional.get("latent_upscaler_path") or default_path
     if not path:
         return None
     raw_dtype = additional.get("latent_upscaler_dtype")

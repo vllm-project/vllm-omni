@@ -27,7 +27,14 @@ def test_server_does_not_accept_another_process_listener(monkeypatch):
         def launch(*args, **kwargs):
             foreign_listener.bind((server.host, server.port))
             foreign_listener.listen()
-            return popen([sys.executable, "-c", "import time; time.sleep(0.2); raise SystemExit(7)"])
+            # Forward OmniServer's stderr pipe kwargs so capture stays valid.
+            pipe_kwargs = {
+                key: kwargs[key] for key in ("stderr", "encoding", "errors", "text", "bufsize") if key in kwargs
+            }
+            return popen(
+                [sys.executable, "-c", "import time; time.sleep(0.2); raise SystemExit(7)"],
+                **pipe_kwargs,
+            )
 
         monkeypatch.setattr(runtime.subprocess, "Popen", launch)
         with pytest.raises(RuntimeError, match="exited with code 7"):
@@ -99,7 +106,8 @@ def test_server_accepts_its_own_listener(monkeypatch, in_child):
         )
         if in_child:
             code = f"import subprocess,sys; child=subprocess.Popen([sys.executable,'-c',{code!r}]); child.wait()"
-        return popen([sys.executable, "-c", code])
+        pipe_kwargs = {key: kwargs[key] for key in ("stderr", "encoding", "errors", "text", "bufsize") if key in kwargs}
+        return popen([sys.executable, "-c", code], **pipe_kwargs)
 
     monkeypatch.setattr(runtime.subprocess, "Popen", launch)
     with server:

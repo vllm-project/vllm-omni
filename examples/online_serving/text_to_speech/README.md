@@ -1034,6 +1034,11 @@ reports the last-spoken word, useful for the voice-agent barge-in case.
 
 Single-stage native AR TTS at 48 kHz.
 
+Install the real `voxcpm==2.0.3` runtime and its temporary Gradio backport
+using the [offline VoxCPM2 prerequisites](../../offline_inference/text_to_speech/README.md#voxcpm2)
+before launching the server. Those dependency checks do not establish native
+model or browser acceptance.
+
 ### Launch
 
 ```bash
