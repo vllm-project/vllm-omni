@@ -23,10 +23,12 @@ from vllm_omni.quantization.convrot_config import (
     unpack_int4,
 )
 from vllm_omni.quantization.factory import SUPPORTED_QUANTIZATION_METHODS
+from vllm_omni.quantization.int8_config import NPUInt8OnlineLinearMethod
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 cuda_available = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="GPU platform not available.")
+npu_available = pytest.mark.skipif(not current_omni_platform.is_npu(), reason="NPU platform not available.")
 
 
 @pytest.mark.parametrize("size", [4, 16, 64, 256, 1024])
@@ -146,6 +148,59 @@ def test_int8_routes_to_the_npu_kernel_method_on_ascend(mocker: MockerFixture, m
     # convrot_int4 has no NPU kernel and stays CUDA-only.
     with pytest.raises(NotImplementedError, match="INT4"):
         build_quant_config("convrot_int4").get_quant_method(layer, "blocks.0.ff.net.2")
+
+
+def test_npu_convrot_int8_constructs_without_a_device():
+    """Construction is device free; only weight processing needs an Ascend device."""
+    config = build_quant_config("convrot_int8")
+    method = NPUConvRotInt8OnlineLinearMethod(config)
+    assert isinstance(method, NPUInt8OnlineLinearMethod)
+    assert method.rotation_group_size == config.rotation_group_size
+
+
+@npu_available
+class TestNpuConvRot:
+    """Real NPU kernels: the rotated method quantizes weights and tracks BF16."""
+
+    @staticmethod
+    def _layer(weight):
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
+        layer.logical_widths = [weight.shape[0]]
+        layer.input_size_per_partition = weight.shape[1]
+        layer.output_size_per_partition = weight.shape[0]
+        layer.orig_dtype = weight.dtype
+        return layer
+
+    @staticmethod
+    def _inputs(device):
+        torch.manual_seed(0)
+        x = torch.randn(4, 64, 1024, dtype=torch.bfloat16, device=device)
+        x[..., [3, 500, 777]] *= 80.0  # massive activation channels
+        weight = torch.randn(768, 1024, dtype=torch.bfloat16, device=device) / 32
+        weight[:, 11] *= 30.0  # an outlier input column in the weight
+        bias = torch.randn(768, dtype=torch.bfloat16, device=device)
+        return x, weight, bias
+
+    def _quantized_error(self, method, weight, x, bias):
+        layer = self._layer(weight)
+        method.process_weights_after_loading(layer)
+        out = method.apply(layer, x, bias)
+        assert out.shape == (*x.shape[:-1], weight.shape[0]) and out.dtype == torch.bfloat16
+        ref = torch.nn.functional.linear(x, weight, bias)
+        return layer, ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+
+    def test_int8_rotation_removes_the_outlier_error_of_plain_int8(self):
+        from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+        device = torch.device("npu")
+        x, weight, bias = self._inputs(device)
+        _, plain = self._quantized_error(NPUInt8OnlineLinearMethod(DiffusionInt8Config()), weight, x, bias)
+        layer, rotated = self._quantized_error(
+            NPUConvRotInt8OnlineLinearMethod(build_quant_config("convrot_int8")), weight, x, bias
+        )
+        assert layer.weight.dtype == torch.int8 and layer.convrot_hadamard.shape == (256, 256)
+        assert rotated < 0.02 and rotated < plain / 4
 
 
 @cuda_available
