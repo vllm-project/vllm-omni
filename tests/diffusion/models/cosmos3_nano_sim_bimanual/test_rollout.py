@@ -122,12 +122,10 @@ def pipeline_methods() -> type:
 @pytest.fixture(autouse=True)
 def guardrail_gate(monkeypatch):
     # Execute the real gate without importing GPU guardrail implementations.
-    path = SOURCE.parent / "cosmos3/guardrails.py"
-    tree = ast.parse(path.read_text())
-    body = [node for node in tree.body if isinstance(node, ast.ImportFrom) and node.module == "__future__"]
-    body += [node for node in tree.body if getattr(node, "name", None) == "is_guardrails_enabled"]
+    from vllm_omni.diffusion.utils.guardrail_utils import is_guardrails_enabled
+
     module = ModuleType("vllm_omni.diffusion.models.cosmos3.guardrails")
-    exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])), str(path), "exec"), module.__dict__)
+    monkeypatch.setattr(module, "is_guardrails_enabled", is_guardrails_enabled, raising=False)
     monkeypatch.setitem(sys.modules, module.__name__, module)
 
 
