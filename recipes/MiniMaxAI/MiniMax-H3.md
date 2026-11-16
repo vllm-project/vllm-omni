@@ -1758,6 +1758,24 @@ Select a specific file when a directory contains multiple adapters. General Diff
 | `start_time_seconds` | `0` | Reference-video segment start; use a list in `extra_params` for multiple videos |
 | `width`, `height` | Multiples of 32 | Output aspect ratio must be between 1:4 and 4:1 |
 
+### Experimental CUDA T2VA evaluation
+
+The following model-specific switches are intended for reproducibility and
+performance experiments. Leave them unset for the recommended deployment.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `VLLM_OMNI_H3_HEAD_OVERLAP_GROUPS` | `0` | A value greater than 1 groups attention heads to overlap FA3 with the CUDA Copy Engine. Use `--ulysses-a2a-permute` and pure Ulysses with a compatible head count. |
+| `VLLM_OMNI_H3_HEAD_OVERLAP_DIRECT` | `0` | Set to `1` with head grouping to stage Q/K Norm+RoPE output and scatter the return directly into its final layout. |
+| `VLLM_OMNI_H3_VAE_STACK_TILES` | `0` | Set to `1` to batch same-shaped native decoder tiles. Kernel rounding can differ by decoder, device, or tile shape. Check decoded output equivalence for the intended workload. |
+| `VLLM_OMNI_H3_AUDIO_DETERMINISTIC` | `0` | Set to `1` to use the deterministic audio decoder context. Apply to both arms when comparing outputs. |
+| `text_encoder_cudnn_sdp` in `--additional-config` | `true` | Set to `false` on both arms to avoid process-dependent cuDNN SDPA plan selection during Qwen text encoding. |
+
+Use `VLLM_OMNI_H3_OVERLAP_CHECK=1` for debugging to compare a grouped
+attention shape against the full-head result. Disable the check when timing
+requests. For whole-clip comparison, pair each generated clip by prompt and seed
+and hash the decoded video frames and audio samples.
+
 ## ComfyUI Frontend
 
 Users can also use a ComfyUI frontend to interact with a hosted MiniMax-H3 service. The ComfyUI frontend can run in a separate environment or machine. Refer to [vLLM-Omni ComfyUI Integration](../../docs/features/comfyui.md) for details.

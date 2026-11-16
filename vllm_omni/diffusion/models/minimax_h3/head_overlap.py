@@ -164,7 +164,7 @@ def run_head_overlap(attention, q, k, v, metadata, groups, direct, *, rope, q_we
         output = output.view(rows, heads, dim).clone()
     else:
         output = output.view(groups, world, rows, part_heads, dim).permute(2, 1, 0, 3, 4).reshape(rows, heads, dim)
-    if os.environ.get("OMNI_H3_OVERLAP_CHECK") == "1":
+    if os.environ.get("VLLM_OMNI_H3_OVERLAP_CHECK") == "1":
         signature = (rows, heads, dim, metadata.extra["valid_kv_length"])
         if signature not in state.checked:
             reference_q, reference_k = (

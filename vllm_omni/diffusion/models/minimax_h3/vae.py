@@ -1252,7 +1252,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # records the same value and the gather never has to choose a
         # collective from rank-local tile shapes.
         with self._tile_gather_protocol(latent), self._decode_tiling_context(latent):
-            if os.environ.get("OMNI_H3_VAE_STACK_TILES") == "1":
+            if os.environ.get("VLLM_OMNI_H3_VAE_STACK_TILES") == "1":
                 if not hasattr(self.model, "stack_tiling"):
                     raise RuntimeError("MiniMax H3 checkpoint VAE lacks native stacked tiling")
                 previous = self.model.stack_tiling
@@ -1503,7 +1503,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         # their first (unfused) call; keep every request on the same path.
         decode_context = (
             _AudioVAEDeterminismContext()
-            if os.environ.get("OMNI_H3_AUDIO_DETERMINISTIC") == "1"
+            if os.environ.get("VLLM_OMNI_H3_AUDIO_DETERMINISTIC") == "1"
             else torch.jit.optimized_execution(False)
         )
         with decode_context:

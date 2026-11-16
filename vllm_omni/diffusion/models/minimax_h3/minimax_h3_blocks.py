@@ -84,8 +84,8 @@ def _ring_sequence_parallel_is_active(attention_layer: Attention) -> bool:
     return True
 
 
-_OVERLAP_GROUPS = int(os.environ.get("OMNI_H3_HEAD_OVERLAP_GROUPS", "0"))
-_OVERLAP_DIRECT = os.environ.get("OMNI_H3_HEAD_OVERLAP_DIRECT") == "1"
+_OVERLAP_GROUPS = int(os.environ.get("VLLM_OMNI_H3_HEAD_OVERLAP_GROUPS", "0"))
+_OVERLAP_DIRECT = os.environ.get("VLLM_OMNI_H3_HEAD_OVERLAP_DIRECT") == "1"
 
 
 def _attention_isolates_packed_requests(attention_layer: Any, backend: type[AttentionBackend] | None = None) -> bool:
