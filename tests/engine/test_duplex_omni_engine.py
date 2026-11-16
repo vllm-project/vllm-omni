@@ -25,7 +25,7 @@ from vllm_omni.engine.duplex.messages import (
     ResumeDuplexSessionMessage,
     TouchDuplexSessionMessage,
 )
-from vllm_omni.engine.duplex.plugin import validate_duplex_replica_policy
+from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, validate_duplex_replica_policy
 from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -286,6 +286,7 @@ def test_duplex_runtime_uses_tokenizer_owner_model_config(monkeypatch):
 )
 def test_validate_deployment_checks_replica_policy_before_starting_workers(
     monkeypatch,
+    mocker,
     replica_policy: str,
     replica_cap: int | None,
     single_stage_mode: bool,
@@ -313,7 +314,7 @@ def test_validate_deployment_checks_replica_policy_before_starting_workers(
         capability_calls.append(max_sessions)
         return DuplexCapabilities(supports_multi_session_same_replica=supports_sharing)
 
-    plugin = SimpleNamespace(capabilities=capabilities, configure_pipeline=configure_pipeline)
+    plugin = mocker.Mock(spec=DuplexModelPlugin, capabilities=capabilities, configure_pipeline=configure_pipeline)
 
     def load_plugin(path: str, audio_encoder):
         assert path == "fake.Plugin"
@@ -328,6 +329,7 @@ def test_validate_deployment_checks_replica_policy_before_starting_workers(
         assert candidate_config is runtime_config
         assert len(configure_pipeline_calls) == 1
         assert configure_pipeline_calls[0] is engine.pipeline_config
+        plugin.configure_server.assert_called_once_with(runtime_config)
         validation_calls.append(distributed)
         validate_duplex_replica_policy(candidate_plugin, candidate_config, distributed=distributed)
 
