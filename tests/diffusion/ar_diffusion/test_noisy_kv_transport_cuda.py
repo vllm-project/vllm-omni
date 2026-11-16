@@ -1,14 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Four-rank NCCL coverage for the fixed-shape Same-Step activation path."""
+"""NCCL coverage for KV lifecycle and fixed-shape Same-Step activations."""
 
 import pytest
 import torch
 
-from tests.diffusion.ar_diffusion.test_noisy_kv_transport import _sink_pipeline_worker, get_open_port
+from tests.diffusion.ar_diffusion.test_noisy_kv_transport import (
+    _sink_pipeline_worker,
+    _transfer_worker,
+    get_open_port,
+)
 from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+
+@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=2)
+def test_noisy_kv_nccl_retains_history_after_completion():
+    torch.multiprocessing.spawn(
+        _transfer_worker,
+        args=(4, f"tcp://127.0.0.1:{get_open_port()}", "cuda", "retain"),
+        nprocs=2,
+        join=True,
+    )
 
 
 @hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=4)
