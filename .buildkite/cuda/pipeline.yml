@@ -25,7 +25,7 @@ steps:
         set -euo pipefail
         if [[ -n "$${BACKEND_COMPARISON_ONLY:-}" || "$${BUILDKITE_BRANCH}" == "refs/pull/1994/head" ]]; then
           case "$${BACKEND_COMPARISON_ONLY:-}/$${BUILDKITE_SOURCE}" in
-            1/schedule|smoke/api) ;;
+            1/schedule|smoke/api|refresh/api) ;;
             *) echo "Invalid backend comparison mode or build source." >&2; exit 1 ;;
           esac
           if [[ "$${BUILDKITE_BRANCH}" != "refs/pull/1994/head" ||
@@ -48,6 +48,11 @@ steps:
           if [[ "$${BACKEND_COMPARISON_ONLY}" == "smoke" ]]; then
             smoke_steps="$$(python3 .buildkite/cuda/scripts/comparison_smoke_pipeline.py "$${BACKEND_COMPARISON_CASES:?Select at least one model}")"
             printf '%s\n' "$${smoke_steps}" | buildkite-agent pipeline upload
+            exit 0
+          fi
+          if [[ "$${BACKEND_COMPARISON_ONLY}" == "refresh" ]]; then
+            refresh_steps="$$(python3 .buildkite/cuda/scripts/comparison_smoke_pipeline.py --weekly --only-models "$${BACKEND_COMPARISON_CASES:?Select at least one model}")"
+            printf '%s\n' "$${refresh_steps}" | buildkite-agent pipeline upload
             exit 0
           fi
           weekly_steps="$$(python3 .buildkite/cuda/scripts/comparison_smoke_pipeline.py --weekly)"

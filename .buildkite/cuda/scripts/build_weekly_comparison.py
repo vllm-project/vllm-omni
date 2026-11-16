@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -226,7 +227,7 @@ print(json.dumps({'direct_url': json.loads(raw) if raw else None, 'source_commit
     }
 
 
-def main() -> None:
+def main(only_models: str | None = None) -> None:
     build_id = os.environ["BUILDKITE_BUILD_ID"]
     runner_commit = os.environ["BACKEND_COMPARISON_COMMIT"]
     if output("git", "rev-parse", "HEAD") != runner_commit:
@@ -257,15 +258,20 @@ def main() -> None:
     if any(environment[key] != value for key, value in source.items()):
         raise ValueError("Environment lock does not match the frozen source")
     write_artifact(LOCK_PATH, environment)
-    pipeline = output(
+    command = [
         "python3",
         ".buildkite/cuda/scripts/comparison_smoke_pipeline.py",
         "--weekly",
         "--environment-lock",
         str(LOCK_PATH),
-    )
+    ]
+    if only_models is not None:
+        command.extend(["--only-models", only_models])
+    pipeline = output(*command)
     subprocess.run(["buildkite-agent", "pipeline", "upload"], input=pipeline, text=True, check=True)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--only-models", help="Validated weekly model subset from the upload step")
+    main(parser.parse_args().only_models)

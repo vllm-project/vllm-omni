@@ -21,6 +21,7 @@
         "num-gpus": 1,
         "revision": "286be7ce72277246578a3e3cc2487e95ddae5bcf",
         "dit-precision": "bf16",
+        "component-precisions.text_encoder_2": "bf16",
         "dit-cpu-offload": true,
         "warmup-mode": "off",
         "output-path": "tests/dfx/perf/results/hunyuanvideo-videos"

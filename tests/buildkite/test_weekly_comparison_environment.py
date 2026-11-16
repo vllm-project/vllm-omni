@@ -85,7 +85,8 @@ def test_missing_metadata_is_distinct_from_agent_failure(producer, monkeypatch):
         producer.metadata("key")
 
 
-def test_retry_reuses_source_and_completed_image_before_uploading_jobs(producer, monkeypatch, tmp_path):
+@pytest.mark.parametrize("only_models", [None, "hunyuanvideo15"])
+def test_retry_reuses_source_and_completed_image_before_uploading_jobs(producer, monkeypatch, tmp_path, only_models):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("BUILDKITE_BUILD_ID", "build-id")
     monkeypatch.setenv("BACKEND_COMPARISON_COMMIT", RUNNER)
@@ -110,13 +111,31 @@ def test_retry_reuses_source_and_completed_image_before_uploading_jobs(producer,
 
     monkeypatch.setattr(producer, "build_environment", build_environment)
     monkeypatch.setattr(producer, "run", lambda *args: events.append(args))
-    monkeypatch.setattr(producer, "output", lambda *args: RUNNER if args[0] == "git" else '{"steps": []}')
+    render_calls = []
+
+    def output(*args):
+        if args[0] == "git":
+            return RUNNER
+        render_calls.append(args)
+        return '{"steps": []}'
+
+    monkeypatch.setattr(producer, "output", output)
     monkeypatch.setattr(producer.subprocess, "run", lambda *args, **kwargs: events.append("upload"))
-    producer.main()
-    producer.main()
+    producer.main(only_models)
+    producer.main(only_models)
     assert events.count("resolve") == events.count("build") == 1
     assert json.loads(producer.LOCK_PATH.read_text()) == environment
     assert events.index("build") < events.index("upload")
+    expected: tuple[str, ...] = (
+        "python3",
+        ".buildkite/cuda/scripts/comparison_smoke_pipeline.py",
+        "--weekly",
+        "--environment-lock",
+        str(producer.LOCK_PATH),
+    )
+    if only_models is not None:
+        expected += ("--only-models", only_models)
+    assert render_calls == [expected, expected]
 
 
 def test_build_records_packages_and_digest_and_checks_installed_commit(producer, monkeypatch):

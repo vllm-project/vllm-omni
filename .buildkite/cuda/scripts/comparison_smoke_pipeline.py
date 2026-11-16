@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 from copy import deepcopy
 from pathlib import Path
@@ -21,6 +22,16 @@ GPU_COUNTS = {
     "minimax-h3": 2,
     "cosmos3-nano": 1,
     "hunyuanvideo15": 1,
+}
+WEEKLY_MODEL_KEYS = {
+    "qwen3-omni": "nightly-sglang-omni-qwen3-omni",
+    "qwen3-tts": "nightly-sglang-omni-qwen3-tts",
+    "qwen-image-21": "perf-sglang-qwen-image-21",
+    "minicpm-o": "perf-sglang-minicpm-o",
+    "cosmos3-t2i": "perf-sglang-cosmos3-t2i",
+    "hunyuanvideo15": "perf-sglang-hunyuanvideo15",
+    "minimax-h3": "perf-sglang-minimax-h3",
+    "wan22-i2v": "perf-sglang-wan22-i2v",
 }
 
 
@@ -264,7 +275,16 @@ def weekly_job(job: dict, environment: dict) -> None:
     )
 
 
-def smoke_pipeline(cases: list[str], *, weekly: bool = False, environment: dict | None = None) -> dict:
+def smoke_pipeline(
+    cases: list[str], *, weekly: bool = False, environment: dict | None = None, only_models: list[str] | None = None
+) -> dict:
+    if only_models is not None and (
+        not weekly
+        or not only_models
+        or len(only_models) != len(set(only_models))
+        or set(only_models) - WEEKLY_MODEL_KEYS.keys()
+    ):
+        raise ValueError(f"Select distinct weekly model keys from: {', '.join(WEEKLY_MODEL_KEYS)}")
     qwen_performance = cases == ["qwen-image-21-perf"]
     video_cases = {"wan22-i2v-perf", "hunyuanvideo15-perf", "minimax-h3-perf"}
     video_performance = len(cases) == 1 and cases[0] in video_cases
@@ -292,6 +312,8 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False, environment: dict 
             "|| python3 -m pip install tomli==2.4.1",
             "python3 .buildkite/cuda/scripts/build_weekly_comparison.py",
         ]
+        if only_models is not None:
+            image["commands"][-1] += " --only-models " + shlex.quote(",".join(only_models))
         pipeline["steps"] = [image]
         return pipeline
     if environment is not None and not weekly:
@@ -398,6 +420,9 @@ def smoke_pipeline(cases: list[str], *, weekly: bool = False, environment: dict 
         job["command"] = "\n".join(commands)
         pipeline["steps"].append(job)
     if weekly:
+        if only_models is not None:
+            selected_keys = {WEEKLY_MODEL_KEYS[model] for model in only_models}
+            pipeline["steps"] = [job for job in pipeline["steps"] if job["key"] in selected_keys]
         for job in pipeline["steps"]:
             weekly_job(job, environment)
     return pipeline
@@ -409,10 +434,12 @@ if __name__ == "__main__":
     selection.add_argument("cases", nargs="?", help="Comma-separated model keys")
     selection.add_argument("--weekly", action="store_true", help="Run the validated comparison workloads")
     parser.add_argument("--environment-lock", type=Path, help="Built weekly image and exact package versions")
+    parser.add_argument("--only-models", help="Comma-separated weekly model keys to rerun with a freshly locked image")
     args = parser.parse_args()
     try:
         cases = ["minicpm-o-perf"] if args.weekly else args.cases.split(",")
         environment = json.loads(args.environment_lock.read_text()) if args.environment_lock else None
-        print(json.dumps(smoke_pipeline(cases, weekly=args.weekly, environment=environment)))
+        only_models = args.only_models.split(",") if args.only_models is not None else None
+        print(json.dumps(smoke_pipeline(cases, weekly=args.weekly, environment=environment, only_models=only_models)))
     except ValueError as exc:
         parser.error(str(exc))

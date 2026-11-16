@@ -64,14 +64,16 @@ def comparison_runner(tmp_path: Path):
         "BUILDKITE_COMMIT": COMMIT,
     }
 
-    def run(overrides: dict[str, str], environment: dict | None = None):
+    def run(overrides: dict[str, str], environment: dict | None = None, only_models: str | None = None):
         selected_command = command
         if environment is not None:
             lock = tmp_path / "environment.json"
             lock.write_text(json.dumps(environment))
             selected_command = (
                 "set -euo pipefail; python3 .buildkite/cuda/scripts/comparison_smoke_pipeline.py --weekly "
-                f"--environment-lock {lock} | buildkite-agent pipeline upload"
+                f"--environment-lock {lock} "
+                + (f"--only-models {only_models} " if only_models is not None else "")
+                + "| buildkite-agent pipeline upload"
             )
         result = subprocess.run(
             ["/bin/bash", "-c", selected_command],
@@ -83,6 +85,55 @@ def comparison_runner(tmp_path: Path):
         return result, calls.read_text().splitlines() if calls.exists() else []
 
     return run
+
+
+@pytest.mark.parametrize(
+    ("source", "models", "success"),
+    [
+        ("api", "hunyuanvideo15", True),
+        ("schedule", "hunyuanvideo15", False),
+        ("webhook", "hunyuanvideo15", False),
+        ("api", "", False),
+        ("api", "npu", False),
+        ("api", "hunyuanvideo15,npu", False),
+        ("api", "hunyuanvideo15,hunyuanvideo15", False),
+    ],
+)
+def test_targeted_refresh_builds_image_only_for_explicit_valid_selection(
+    comparison_runner, tmp_path, source, models, success
+):
+    result, calls = comparison_runner(
+        {"BACKEND_COMPARISON_ONLY": "refresh", "BUILDKITE_SOURCE": source, "BACKEND_COMPARISON_CASES": models}
+    )
+    assert (result.returncode == 0) == success, result.stderr
+    assert calls == (["buildkite-agent pipeline upload"] if success else [])
+    if success:
+        (job,) = json.loads((tmp_path / "calls.json").read_text())["steps"]
+        assert job["key"] == "image-build-sglang-omni"
+        assert job["agents"] == {"queue": "medium_cpu_queue_premerge"}
+        assert job["commands"][-1].endswith("build_weekly_comparison.py --only-models hunyuanvideo15")
+
+
+def test_targeted_refresh_uploads_only_hunyuan_with_built_image(comparison_runner, tmp_path):
+    digest = "sha256:" + "c" * 64
+    environment = {
+        "image_digest": digest,
+        "sglang_omni_revision": "b" * 40,
+        "installed_packages": {"sglang": {"sglang": "0.5.23"}},
+    }
+    result, calls = comparison_runner({}, environment, only_models="hunyuanvideo15")
+    assert result.returncode == 0, result.stderr
+    assert calls == ["buildkite-agent pipeline upload"]
+    (job,) = json.loads((tmp_path / "calls.json").read_text())["steps"]
+    assert job["key"] == "perf-sglang-hunyuanvideo15"
+    assert job["depends_on"] == "image-build-sglang-omni"
+    container = next(iter(job["plugins"][0].values()))["podSpec"]["containers"][0]
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == 1
+    assert container["image"].endswith("@" + digest)
+    assert "artifact download" in job["command"]
+    assert '.server_revision == "0.5.23"' in job["command"]
+    assert "git -C /tmp apply" not in job["command"]
+    assert ".completed == 10" in job["command"]
 
 
 def test_schedule_first_uploads_only_cpu_image_builder(comparison_runner, tmp_path):
