@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import weakref
 from contextlib import contextmanager
 
 import pytest
@@ -191,6 +192,60 @@ def test_failed_load_restores_master_and_forces_cache_release(monkeypatch, patch
     assert module.weight.untyped_storage().data_ptr() == master_ptr
     assert torch.equal(module.weight, expected)
     retention.release_if_needed.assert_called_once_with(force=True)
+
+
+@pytest.mark.parametrize("failure", ["synchronize", "second_rebind"])
+def test_reactor_offload_preserves_buffer_owners_until_retry(monkeypatch, patched_runtime, failure):
+    _, synchronize = patched_runtime
+    nz = residency_module.weight_nz
+    layers = [nn.Module(), nn.Module()]
+    for index, layer in enumerate(layers):
+        layer.weight = nn.Parameter(torch.full((2, 2), index, dtype=torch.int8), requires_grad=False)
+
+    owners = []
+
+    def nz_view(buffer, offset, shape):
+        owners.append(weakref.ref(buffer))
+        # Like a borrowed NZ descriptor, the stand-in must not keep the buffer owner alive.
+        return nz.unpack_nz_weight(buffer[offset:], shape).clone()
+
+    monkeypatch.setattr(nz, "get_weight_nz_mode", lambda: "reactor")
+    monkeypatch.setattr(nz, "int8_weight_names", lambda _: {"weight"})
+    monkeypatch.setattr(nz, "check_reactor_support", lambda: None)
+    monkeypatch.setattr(nz, "nz_view", nz_view)
+    # The indexed CPU device makes Tensor.to allocate a distinct staging buffer.
+    stager = PinnedModuleStager(layers, torch.device("cpu:0"), pin_memory=False)
+    masters = [layer.weight.data_ptr() for layer in layers]
+    stager.load()
+    staged = [layer.weight.data_ptr() for layer in layers]
+
+    with monkeypatch.context() as fault:
+        if failure == "synchronize":
+            fault.setattr(synchronize, "side_effect", RuntimeError(failure))
+        else:
+            set_storage = residency_module.set_tensor_storage
+
+            def fail_second_rebind(target, value):
+                if target is layers[1].weight:
+                    raise RuntimeError(failure)
+                set_storage(target, value)
+
+            fault.setattr(residency_module, "set_tensor_storage", fail_second_rebind)
+        with pytest.raises(RuntimeError, match=failure):
+            stager.offload()
+
+    expected = staged if failure == "synchronize" else [masters[0], staged[1]]
+    assert [layer.weight.data_ptr() for layer in layers] == expected
+    assert len(owners) == 2 and all(owner() is not None for owner in owners)
+    with pytest.raises(RuntimeError, match="offload"):
+        stager.load()
+
+    stager.offload()
+    assert [layer.weight.data_ptr() for layer in layers] == masters
+    assert all(owner() is None for owner in owners)
+    stager.load()
+    assert stager.loaded and len(owners) == 4
+    stager.offload()
 
 
 def test_out_of_memory_releases_cache_and_retries_once(monkeypatch, patched_runtime, mocker):

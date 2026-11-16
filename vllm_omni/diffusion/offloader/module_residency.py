@@ -466,6 +466,7 @@ class PinnedModuleStager:
         self.cache_retention = cache_retention
         self.retain_device_storage = retain_device_storage
         self.loaded = False
+        self._offload_pending = False
         self._nz_mode = weight_nz.get_weight_nz_mode()
         self._nz_masters: dict[torch.Tensor, torch.Tensor] = {}
         self._nz_host_weights: dict[torch.Tensor, torch.Tensor] = {}
@@ -593,6 +594,8 @@ class PinnedModuleStager:
         self._release_cache(force=True)
 
     def load(self) -> None:
+        if self._offload_pending:
+            raise RuntimeError("Cannot load partially offloaded weights; retry offload() first")
         if self.loaded:
             return
         if self._device_storages or self._nz_device_weights:
@@ -618,26 +621,20 @@ class PinnedModuleStager:
             raise
 
     def offload(self) -> None:
-        if not self.loaded:
+        if not self.loaded and not self._offload_pending:
             return
 
-        # The module has completed on the compute stream. Synchronize once at
-        # the stage boundary, then discard device storage without any D2H copy.
-        try:
-            current_omni_platform.synchronize()
-            self._restore_masters()
-        except BaseException:
-            self._device_storages.clear()
-            self._nz_device_weights.clear()
-            self._nz_device_buffers.clear()
-            self.loaded = False
-            self._release_cache(force=True)
-            raise
+        # A failed rebind can leave some parameters borrowing device storage.
+        # Keep its owners until every parameter has returned to its CPU master.
+        self._offload_pending = True
+        self.loaded = False
+        current_omni_platform.synchronize()
+        self._restore_masters()
         if not self.retain_device_storage:
             self._device_storages.clear()
             self._nz_device_weights.clear()
             self._nz_device_buffers.clear()
-        self.loaded = False
+        self._offload_pending = False
         self._release_cache()
 
 
