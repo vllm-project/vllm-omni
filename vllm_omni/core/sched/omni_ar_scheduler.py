@@ -887,19 +887,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             ),
         )
 
-    def _promote_seeded_request(self) -> str | None:
-        """Move the oldest seeded request to the front of its queue.
+    def _promote_seeded_request(self, queues: tuple[str, ...] = ("kv_holding", "waiting")) -> tuple[str, object] | None:
+        """Move the oldest seeded request of the given queues to the front.
 
-        Returns the queue that was promoted (``"waiting"`` or
-        ``"kv_holding"``), or ``None`` when no seeded request is waiting.
+        Returns ``(queue_name, request)`` for the promoted request, or ``None``
+        when none of the requested queues holds a runnable seeded request.
         """
-        # Upstream drains KV-holding requests first: their blocks are already
-        # allocated, so they can finish and release memory for the requests that
-        # still need a prefill allocation. Promoting a fresh ``waiting`` request
-        # ahead of them hides that queue for the solo step, and a fresh request
-        # that cannot allocate would livelock the engine while a runnable
-        # KV-holding request waits behind it (review P2 on #9937).
-        for name, queue in (("kv_holding", self.kv_holding_waiting), ("waiting", self.waiting)):
+        for name in queues:
+            queue = self.kv_holding_waiting if name == "kv_holding" else self.waiting
             target = next(
                 (
                     r
@@ -913,8 +908,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if queue.peek_request() is not target:
                 queue.remove_request(target)
                 queue.prepend_request(target)
-            return name
+            return name, target
         return None
+
+    def _has_runnable_kv_holders(self) -> bool:
+        return any(self._request_is_runnable(request) for request in self.kv_holding_waiting)
+
+    def _isolation_group_size(self, request: object) -> int | None:
+        """How many requests must be admitted together in an isolated step.
+
+        ``None`` means the request cannot be isolated safely this step (e.g. an
+        incomplete CFG pair); the caller then defers admission instead.
+        """
+        return 1
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
@@ -933,13 +939,39 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._drop_talker_drafts_if_prefill_pending()
 
         seeded_defer, seeded_solo = self._seeded_isolation_plan()
-        solo_queue = self._promote_seeded_request() if seeded_solo else None
+        solo_queue = None
+        solo_group = 1
+        drain_kv = False
+        if seeded_solo:
+            # Upstream drains KV-holding requests first: their blocks are already
+            # allocated, so they can finish and release memory for the requests
+            # that still need a prefill allocation. A fresh seeded request must
+            # not hide that queue. If only unseeded holders are waiting, drain
+            # them this step (normal limit, ``waiting`` hidden) instead of
+            # solo-admitting a fresh request that may not be able to allocate -
+            # that would repeat the same failing plan and livelock (#9937).
+            promoted = self._promote_seeded_request(queues=("kv_holding",))
+            if promoted is None and self._has_runnable_kv_holders():
+                drain_kv = True
+            elif promoted is None:
+                promoted = self._promote_seeded_request(queues=("waiting",))
+            if promoted is not None:
+                solo_queue, solo_request = promoted
+                group = self._isolation_group_size(solo_request)
+                if group is None:
+                    # Cannot isolate this request safely; admit nothing instead
+                    # of splitting the unit across a solo step.
+                    seeded_defer, solo_queue = True, None
+                else:
+                    solo_group = group
 
-        # A solo step admits exactly one request: the promoted seeded one. Empty
-        # the *other* queue for this step so it cannot be admitted alongside.
+        # A solo step admits only the promoted unit (a CFG pair counts as one):
+        # empty the *other* queue for this step so it cannot be admitted
+        # alongside. A drain step keeps ``kv_holding_waiting`` and hides only
+        # the fresh ``waiting`` queue.
         original_wait_queues = None
         deferred = seeded_defer or self._should_defer_waiting_admission()
-        if deferred or solo_queue is not None:
+        if deferred or solo_queue is not None or drain_kv:
             original_wait_queues = self.waiting, self.kv_holding_waiting
             if deferred:
                 self.waiting = create_request_queue(self.policy)
@@ -958,8 +990,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # seeded request would never be admitted (review P2 on #9937).
         parked_streaming_sessions = int(getattr(self, "num_waiting_for_streaming_input", 0) or 0)
         limit = (
-            min(original_max_num_active_reqs, 1 + parked_streaming_sessions)
-            if seeded_solo
+            min(original_max_num_active_reqs, solo_group + parked_streaming_sessions)
+            if seeded_solo and not drain_kv and not seeded_defer
             else original_max_num_active_reqs
         )
         async_chunk_transport = self._async_chunk_transport_enabled()

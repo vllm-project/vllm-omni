@@ -292,7 +292,8 @@ def test_kv_holding_seeded_request_is_promoted_before_a_fresh_one() -> None:
     resumed = _StubRequest("seeded-kv", seed=9)
     scheduler = _make_scheduler(parked=0, waiting=[fresh], kv_holding=[resumed])
 
-    assert scheduler._promote_seeded_request() == "kv_holding"
+    promoted = scheduler._promote_seeded_request()
+    assert promoted is not None and promoted[0] == "kv_holding"
     assert scheduler.kv_holding_waiting.peek_request() is resumed
     assert scheduler.waiting.peek_request() is fresh
 
@@ -333,3 +334,35 @@ def test_stage_default_seed_keeps_normal_admission(monkeypatch) -> None:
     # Normal admission: the full active-request budget, no solo step.
     assert seen["limit"] == 8
     assert seen["admitted"] is not None
+
+
+def test_unseeded_kv_holder_drains_before_a_fresh_seeded_request(monkeypatch) -> None:
+    """A fresh seeded request must not hide an unseeded KV holder that can free blocks."""
+    seeded = _StubRequest("seeded-fresh", seed=7)
+    holder = _StubRequest("holder")
+    scheduler = _make_scheduler(parked=0, waiting=[seeded], kv_holding=[holder])
+
+    seen = _run_schedule(scheduler, monkeypatch)
+
+    # Drain step: the holder keeps its queue and the fresh seeded request waits.
+    assert seen["waiting_len"] == 0
+    assert seen["kv_len"] == 1
+    assert seen["limit"] == 8
+
+
+def test_cfg_pair_is_one_isolation_unit() -> None:
+    from vllm_omni.core.sched.omni_cfg_ar_scheduler import OmniCFGARScheduler
+
+    scheduler = OmniCFGARScheduler.__new__(OmniCFGARScheduler)
+    scheduler._request_pairs = {"a": "pair", "b": "pair"}
+    scheduler._pairs = {"pair": {"cond": "a", "uncond": "b"}}
+
+    class _Req:
+        def __init__(self, request_id):
+            self.request_id = request_id
+
+    assert scheduler._isolation_group_size(_Req("a")) == 2
+    assert scheduler._isolation_group_size(_Req("c")) == 1
+
+    scheduler._pairs["pair"] = {"cond": "a"}
+    assert scheduler._isolation_group_size(_Req("a")) is None

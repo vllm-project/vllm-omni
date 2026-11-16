@@ -12,12 +12,15 @@ neither the graph path, the connector, nor the sampler RNG is responsible.
 
 The scheduler keeps seeded requests out of every co-batch: a seeded request
 waits for the engine to drain, then runs alone, and no other request is admitted
-while it runs. "Waiting" covers both the
-regular wait queue and ``kv_holding_waiting``, so a seeded request that resumes
-from KV retention cannot join a running unseeded request either. Unseeded traffic keeps
-batching as before. Measured cost: 8 concurrent seeded requests take seconds instead of
-under one (3.6 s on an RTX 4080 SUPER; 5.9 s on an RTX 6000 Ada in an
-independent run), while 8 unseeded requests stay at 0.8-1.0 s.
+while it runs. "Waiting" covers both the regular wait queue and
+``kv_holding_waiting``, so a seeded request that resumes from KV retention cannot
+join a running unseeded request either.
+
+Unseeded traffic batches as before when no seeded request is in flight; while a
+seeded request waits for the engine to drain, unseeded requests that arrive
+alongside it wait too. Measured cost: 8 concurrent seeded requests take seconds
+instead of under one (3.6 s on an RTX 4080 SUPER; 5.9 s on an RTX 6000 Ada in an
+independent run), while 8 unseeded requests alone stay at 0.8-1.0 s.
 
 The request opts in through the ``omni_user_seed`` marker that the speech
 serving path sets when the client supplies a seed; stages that copy a
