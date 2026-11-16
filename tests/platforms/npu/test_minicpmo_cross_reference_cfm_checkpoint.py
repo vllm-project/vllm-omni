@@ -77,6 +77,7 @@ def test_trained_cfm_long_stream_matches_independent_graphs(
     backend = BatchedToken2Wav(
         token2wav,
         cfm_graph_config={
+            "npu_fused_qkv_norm": True,
             "enabled": True,
             "fused_body": True,
             "capture_frames": 50,

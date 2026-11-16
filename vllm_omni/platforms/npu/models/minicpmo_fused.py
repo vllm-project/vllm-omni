@@ -52,7 +52,7 @@ def _same_view(a: torch.Tensor, b: torch.Tensor) -> bool:
     )
 
 
-def prepare_estimator(estimator: nn.Module, *, pack_convs: bool = False, fused_qkv_norm: bool = True) -> None:
+def prepare_estimator(estimator: nn.Module, *, pack_convs: bool = False, fused_qkv_norm: bool) -> None:
     """Establish weight storage before either eager-body or fused-body capture."""
     pack_convs = pack_convs and supports_fused_body(estimator)
     for block in getattr(estimator, "blocks", ()):
@@ -284,7 +284,7 @@ def attention_npu(attn, hidden, att_cache, attn_mask, kv, slots=None):
     if logical_cache > cached:
         behind_keys[:, :, cached:].zero_()
         behind_values[:, :, cached:].zero_()
-    if getattr(attn, "_npu_fused_qkv_norm", True):
+    if attn._npu_fused_qkv_norm:
         query = qkv_head_layer_norm(
             qkv,
             kv,

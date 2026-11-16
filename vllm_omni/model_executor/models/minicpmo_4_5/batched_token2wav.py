@@ -407,7 +407,7 @@ class BatchedToken2Wav(nn.Module):
             prepare_estimator(
                 getattr(getattr(self.flow, "decoder", None), "estimator", None),
                 pack_convs=bool(cfm_graph_cfg.get("enabled", False) and cfm_graph_cfg.get("fused_body", False)),
-                fused_qkv_norm=cfm_graph_cfg.get("npu_fused_qkv_norm", True),
+                fused_qkv_norm=cfm_graph_cfg["npu_fused_qkv_norm"],
             )
         encoder_cfg = dict(chunk_encoder_graph_config or {})
         connector = connector_config or {}

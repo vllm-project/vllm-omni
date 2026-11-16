@@ -151,7 +151,7 @@ def test_original_and_packed_graphs_share_stable_weights():
     decoder = pytest.importorskip("cosyvoice2.flow.decoder_dit")
     prepare_code2wav_graph_runtime()
     attn = decoder.Attention(32, 2, 16, qkv_bias=True, qk_norm=True).npu().eval()
-    prepare_estimator(SimpleNamespace(blocks=[SimpleNamespace(attn=attn)]))
+    prepare_estimator(SimpleNamespace(blocks=[SimpleNamespace(attn=attn)]), fused_qkv_norm=True)
     pointers = [p.weight.data_ptr() for p in (attn.to_q, attn.to_k, attn.to_v)]
     x = torch.randn(2, 6, 32, device="npu")
     kv = torch.empty(2, 2, 2, 6, 16, device="npu")
@@ -225,9 +225,9 @@ def test_convolution_graph_storage_survives_fused_body_warmup():
     )
     conv = estimator.blocks[0].conv.block[1]
     original_pointer = conv.weight.data_ptr()
-    prepare_estimator(estimator)
+    prepare_estimator(estimator, fused_qkv_norm=True)
     assert conv.weight.data_ptr() == original_pointer
-    prepare_estimator(estimator, pack_convs=True)
+    prepare_estimator(estimator, pack_convs=True, fused_qkv_norm=True)
     pointer = conv.weight.data_ptr()
     x = torch.randn(2, conv.in_channels, 12, device="npu")
     for _ in range(3):

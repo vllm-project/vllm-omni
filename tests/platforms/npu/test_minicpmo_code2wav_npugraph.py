@@ -81,7 +81,10 @@ def test_npu_whole_euler_precomputes_modulation_without_fused_body():
         .npu()
         .eval()
     )
-    adapter = BatchedToken2Wav(_Token2Wav(estimator), cfm_graph_config={"enabled": True, "fused_body": False})
+    adapter = BatchedToken2Wav(
+        _Token2Wav(estimator),
+        cfm_graph_config={"npu_fused_qkv_norm": True, "enabled": True, "fused_body": False},
+    )
     assert not adapter._ragged_fused_body
     assert adapter._whole_euler_graph_wrapper.modulation_fn is not None
 
@@ -104,7 +107,7 @@ def test_minicpmo_cfm_estimator_npugraph_matches_eager():
         .eval()
     )
     graph_runner = NPUExactGraphRunner(max_graphs=4)
-    adapter = BatchedToken2Wav(_Token2Wav(estimator))
+    adapter = BatchedToken2Wav(_Token2Wav(estimator), cfm_graph_config={"npu_fused_qkv_norm": True})
 
     def inputs(seed: int):
         def make(shape: tuple[int, ...], offset: float):
@@ -208,7 +211,7 @@ def test_whole_euler_npugraph_matches_eager_and_owns_outputs(bucket_frames, prec
     # block and make modulation/output parity meaningful.
     for parameter in estimator.parameters():
         parameter.normal_(0.0, 0.08)
-    adapter = BatchedToken2Wav(_Token2Wav(estimator))
+    adapter = BatchedToken2Wav(_Token2Wav(estimator), cfm_graph_config={"npu_fused_qkv_norm": True})
     adapter.flow.decoder.rand_noise = torch.randn(1, 2, 128, device="npu")
     adapter.flow.decoder.inference_cfg_rate = 0.7
     wrapper = WholeEulerCFMGraphWrapper(
@@ -486,7 +489,7 @@ def test_fused_body_npugraph_matches_its_eager_path_with_inference_weights():
     )
     for parameter in estimator.parameters():
         parameter.normal_(0.0, 0.08)
-    prepare_estimator(estimator)
+    prepare_estimator(estimator, fused_qkv_norm=True)
     x = torch.randn(2, 7, 6, device="npu")
     embedding = torch.randn(2, 1, 16, device="npu")
     embedding[1].copy_(embedding[0])
