@@ -8,21 +8,15 @@ from vllm.utils.network_utils import get_file_store_init_method
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-@pytest.fixture(autouse=True)
-def _init_distributed(monkeypatch):
-    """The native transformer uses vLLM parallel linear layers, which require a
-    tensor-parallel group; initialize a single-process group for CPU tests."""
+@pytest.fixture(scope="module")
+def _distributed_group():
+    """Share one TP=1 group across tests that instantiate parallel layers."""
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
         initialize_model_parallel,
     )
-    from vllm.model_executor.layers.utils import default_unquantized_gemm
 
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
-        lambda *_args, **_kwargs: default_unquantized_gemm,
-    )
     init_distributed_environment(
         world_size=1,
         rank=0,
@@ -34,6 +28,17 @@ def _init_distributed(monkeypatch):
         yield
     finally:
         cleanup_dist_env_and_memory()
+
+
+@pytest.fixture
+def _cpu_parallel_layers(monkeypatch, _distributed_group):
+    """Keep the CPU kernel override isolated to each model test."""
+    from vllm.model_executor.layers.utils import default_unquantized_gemm
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
+        lambda *_args, **_kwargs: default_unquantized_gemm,
+    )
 
 
 _TINY_CONFIG = {
@@ -345,6 +350,7 @@ def test_native_rope_matches_diffusers(dim, max_seq_len, theta, freqs_dtype):
     torch.testing.assert_close(actual_sin, expected_sin, rtol=0, atol=0)
 
 
+@pytest.mark.usefixtures("_cpu_parallel_layers")
 def test_tiny_transformer_matches_diffusers_and_frozen_output():
     from diffusers import SanaVideoTransformer3DModel as DiffusersTransformer
     from diffusers.configuration_utils import ConfigMixin
@@ -405,6 +411,7 @@ def test_tiny_transformer_matches_diffusers_and_frozen_output():
     torch.testing.assert_close(actual.flatten()[: len(_GOLDEN_PREFIX)], _GOLDEN_PREFIX, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.usefixtures("_cpu_parallel_layers")
 def test_encoder_attention_mask_uses_bool_sdpa_contract(monkeypatch):
     from vllm_omni.diffusion.models.sana_video import SanaVideoTransformer3DModel
 
@@ -452,6 +459,7 @@ def test_encoder_attention_mask_uses_bool_sdpa_contract(monkeypatch):
     assert torch.equal(captured["mask"], input_mask.bool())
 
 
+@pytest.mark.usefixtures("_cpu_parallel_layers")
 def test_encoder_attention_mask_rejects_additive_bias():
     from vllm_omni.diffusion.models.sana_video import SanaVideoTransformer3DModel
 
@@ -467,6 +475,7 @@ def test_encoder_attention_mask_rejects_additive_bias():
         )
 
 
+@pytest.mark.usefixtures("_cpu_parallel_layers")
 def test_linear_attention_requires_rotary_embeddings():
     from vllm_omni.diffusion.models.sana_video.transformer_sana_video import SanaLinearAttention
 
@@ -483,6 +492,7 @@ def test_linear_attention_requires_rotary_embeddings():
         attention(torch.randn(1, 4, 24))
 
 
+@pytest.mark.usefixtures("_cpu_parallel_layers")
 def test_linear_attention_bfloat16_matches_diffusers_mixed_precision():
     from diffusers.models.attention_processor import Attention as DiffusersAttention
     from diffusers.models.transformers.transformer_sana_video import SanaLinearAttnProcessor3_0
@@ -524,6 +534,7 @@ def test_linear_attention_bfloat16_matches_diffusers_mixed_precision():
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.usefixtures("_cpu_parallel_layers")
 def test_transformer_block_without_cross_attention_keeps_feed_forward_norm():
     from vllm_omni.diffusion.models.sana_video.transformer_sana_video import SanaVideoTransformerBlock
 
@@ -541,6 +552,7 @@ def test_transformer_block_without_cross_attention_keeps_feed_forward_norm():
     assert isinstance(block.norm2, torch.nn.LayerNorm)
 
 
+@pytest.mark.usefixtures("_cpu_parallel_layers")
 def test_guidance_transformer_matches_diffusers_and_tuple_output():
     from diffusers import SanaVideoTransformer3DModel as DiffusersTransformer
 
