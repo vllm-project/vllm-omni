@@ -169,6 +169,8 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     pipeline.load_vae_encoder = False
     pipeline.transformer = model
     pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace(cache_backend="none")
+    pipeline._cache_dit_runtime = SimpleNamespace(is_enabled=False)
     pipeline._transformer_for_task = lambda task: model
     pipeline._packed_batch_supported = lambda transformer: packed_batch_supported
     return pipeline

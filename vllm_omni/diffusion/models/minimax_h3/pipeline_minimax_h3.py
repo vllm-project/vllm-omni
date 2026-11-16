@@ -4283,10 +4283,9 @@ class MiniMaxH3Pipeline(
     def _validate_sampler_cache(self, sampler: str) -> None:
         # Heun's correction evaluates a proposal the cache never saw, so a cached
         # residual from the previous prediction would corrupt it.
-        if sampler == "heun" and (
-            getattr(getattr(self, "od_config", None), "cache_backend", None) not in (None, "none")
-            or getattr(getattr(self, "_cache_dit_runtime", None), "is_enabled", False)
-        ):
+        if sampler != "heun":
+            return
+        if self.od_config.cache_backend not in (None, "none") or self.is_cache_dit_enabled():
             raise OmniClientError("Heun requires uncached model runs")
 
     def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
