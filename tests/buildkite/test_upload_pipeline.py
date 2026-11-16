@@ -774,6 +774,21 @@ def test_source_file_dependencies_key_expands_from_registry() -> None:
     assert "Diffusion · Qwen Image Test" not in _surviving_labels(doc, ["vllm_omni/unrelated.py"])
 
 
+def test_cosyvoice3_dspark_ready_tracks_mrv2_runtime() -> None:
+    pipeline_path = Path(".buildkite/cuda/test-ready.yml")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    label = "TTS · CosyVoice3 DSpark Test"
+    matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
+    assert len(matching_steps) == 1
+    assert matching_steps[0]["source_file_dependencies"] == ["tts_cosyvoice3_function", "omni_v2_runtime"]
+    assert label in _surviving_labels(
+        doc,
+        ["vllm_omni/worker_v2/omni_model_runner.py"],
+        pipeline_path=pipeline_path,
+    )
+    assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
+
+
 def test_npu_platform_change_does_not_select_shared_minimax_h3_jobs() -> None:
     doc = {
         "steps": [
