@@ -74,6 +74,7 @@ def _make_wave_config(mode):
     config = SimpleNamespace(
         max_num_seqs=2,
         step_execution=False,
+        diffusion_attention_schedule=None,
         parallel_config=SimpleNamespace(data_parallel_size=2, hsdp_data_parallel=mode == "hsdp"),
     )
     if mode != "hsdp":
@@ -191,7 +192,6 @@ def test_negative_pooled_embeds_change_admission_key():
     [
         ({"use_resolution_template": True}, {"use_resolution_template": False}),
         ({"custom": {"enabled": True}}, {"custom": {"enabled": False}}),
-        (None, {}),
     ],
 )
 def test_dp_extra_args_mismatch_runs_in_separate_waves(executor, wave_config, first_extra_args, second_extra_args):
@@ -237,6 +237,7 @@ def test_dp_extra_args_mismatch_runs_in_separate_waves(executor, wave_config, fi
             {"custom": {"b": 2, "a": 1}, "use_resolution_template": True},
         ),
         (None, None),
+        (None, {}),
         ({}, {}),
     ],
 )

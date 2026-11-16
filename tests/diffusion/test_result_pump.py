@@ -1015,8 +1015,8 @@ def test_dp_wave_key_resolves_attention_schedules_against_the_service(monkeypatc
     executor = _make_executor()
     service = object()
     executor.od_config.diffusion_attention_schedule = service
-    monkeypatch.setattr(executor_module, "any_selected_component_uses_allgather", lambda config: True)
-    monkeypatch.setattr(executor_module, "_uses_text_encoder_allgather", lambda config: False)
+    monkeypatch.setattr(executor_module, "uses_rank_local_dp_concurrency", lambda config: True)
+    monkeypatch.setattr(executor_module, "uses_text_encoder_allgather", lambda config: False)
     received: list[object] = []
 
     def _recording_key(req, attention_schedule_config=None):
