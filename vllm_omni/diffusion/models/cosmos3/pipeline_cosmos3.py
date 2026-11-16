@@ -3860,13 +3860,9 @@ class Cosmos3OmniDiffusersPipeline(
         if generator is None:
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
-        for ignored_key in ("system_prompt", "use_system_prompt"):
-            if self._get_sp_param(sp, ignored_key, None) is not None:
-                logger.warning_once(
-                    "Cosmos3 transfer ignores the '%s' request parameter and always "
-                    "tokenizes both CFG branches with the transfer-specific system prompt.",
-                    ignored_key,
-                )
+        # Both CFG branches share one system prompt, matching training (caption
+        # dropout keeps the system prompt). ``use_system_prompt=False`` drops it
+        # from both; ``system_prompt`` replaces the transfer-specific default.
         cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
             prompt,
             negative_prompt,
@@ -3876,9 +3872,9 @@ class Cosmos3OmniDiffusersPipeline(
             width,
             max_sequence_length,
             sp,
-            use_system_prompt=True,
+            use_system_prompt=transfer_config.use_system_prompt,
             is_t2i=False,
-            system_prompt=COSMOS3_TRANSFER_SYSTEM_PROMPT,
+            system_prompt=transfer_config.system_prompt or COSMOS3_TRANSFER_SYSTEM_PROMPT,
             prompt_suffix=transfer_prompt_suffix,
             use_duration_template=bool(self._get_sp_param(sp, "use_duration_template", True)),
             use_resolution_template=bool(self._get_sp_param(sp, "use_resolution_template", True)),

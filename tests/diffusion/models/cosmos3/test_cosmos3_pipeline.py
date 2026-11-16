@@ -1350,6 +1350,8 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     assert cfg.num_video_frames_per_chunk == 93
     assert cfg.share_vision_temporal_positions is True
     assert cfg.emphasize_control_in_prompt is True
+    assert cfg.use_system_prompt is True
+    assert cfg.system_prompt is None
     prompt_ablation_cfg = transfer.resolve_transfer_config(
         make_sampling_params(extra_args={"edge": True, "emphasize_control_in_prompt": False})
     )
@@ -1479,6 +1481,57 @@ def test_transfer_control_weight_validation_and_normalization() -> None:
                 }
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "additional_information", "expected_use", "expected_prompt"),
+    [
+        ({"use_system_prompt": False}, None, False, None),
+        ({"use_system_prompt": "false"}, None, False, None),
+        ({"use_system_prompt": "true"}, None, True, None),
+        ({"system_prompt": "custom system prompt"}, None, True, "custom system prompt"),
+        ({}, {"use_system_prompt": False}, False, None),
+        ({}, {"system_prompt": "per-sample system prompt"}, True, "per-sample system prompt"),
+        # Request-level extra_args win over per-sample prompt data.
+        ({"use_system_prompt": True}, {"use_system_prompt": False}, True, None),
+    ],
+)
+def test_transfer_config_resolves_system_prompt_controls(
+    extra_args: dict[str, Any],
+    additional_information: dict[str, Any] | None,
+    expected_use: bool,
+    expected_prompt: str | None,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    prompt_data = None
+    if additional_information is not None:
+        prompt_data = {"prompt": "transfer", "additional_information": additional_information}
+    cfg = transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": True, **extra_args}), prompt_data)
+
+    assert cfg is not None
+    assert cfg.use_system_prompt is expected_use
+    assert cfg.system_prompt == expected_prompt
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "error", "match"),
+    [
+        ({"system_prompt": ""}, ValueError, "must not be empty"),
+        ({"system_prompt": "   "}, ValueError, "must not be empty"),
+        ({"system_prompt": 1}, TypeError, "must be a string"),
+        # Other models use string-valued use_system_prompt modes; transfer must not read them as False.
+        ({"use_system_prompt": "en_vanilla"}, ValueError, "must be a boolean"),
+        ({"use_system_prompt": False, "system_prompt": "custom"}, ValueError, "use_system_prompt is false"),
+    ],
+)
+def test_transfer_config_rejects_invalid_system_prompt_controls(
+    extra_args: dict[str, Any], error: type[Exception], match: str
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    with pytest.raises(error, match=match):
+        transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": True, **extra_args}))
 
 
 def test_transfer_fps_matches_resolved_frame_rate_precedence() -> None:
@@ -2761,11 +2814,13 @@ def test_diffuse_transfer_interval_switches_branch_counts(make_cosmos3_pipeline,
 
 
 @pytest.mark.parametrize(
-    ("hint_key", "emphasize_control", "expected_fps", "negative_prompt"),
+    ("hint_key", "emphasize_control", "expected_fps", "negative_prompt", "system_prompt_args"),
     [
-        ("edge", None, 8.0, None),
-        ("wsm", None, 10.0, ""),
-        ("edge", False, 8.0, "custom negative"),
+        ("edge", None, 8.0, None, {}),
+        ("wsm", None, 10.0, "", {}),
+        ("edge", False, 8.0, "custom negative", {}),
+        ("edge", None, 8.0, None, {"use_system_prompt": False}),
+        ("edge", None, 8.0, None, {"system_prompt": "custom system prompt"}),
     ],
 )
 def test_forward_transfer_uses_transfer_prompt_contract_and_source_fps_except_wsm(
@@ -2774,6 +2829,7 @@ def test_forward_transfer_uses_transfer_prompt_contract_and_source_fps_except_ws
     emphasize_control: bool | None,
     expected_fps: float,
     negative_prompt: str | None,
+    system_prompt_args: dict[str, Any],
 ) -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
         COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE,
@@ -2834,6 +2890,7 @@ def test_forward_transfer_uses_transfer_prompt_contract_and_source_fps_except_ws
     }
     if emphasize_control is not None:
         extra_args["emphasize_control_in_prompt"] = emphasize_control
+    extra_args.update(system_prompt_args)
     prompt_data = {
         "prompt": "transfer",
         "modalities": ["video"],
@@ -2860,8 +2917,11 @@ def test_forward_transfer_uses_transfer_prompt_contract_and_source_fps_except_ws
     assert captured["format_aspect_ratio"] == "1,1"
     expected_negative_prompt = "" if negative_prompt is None else negative_prompt
     assert captured["negative_prompt"] == expected_negative_prompt
-    assert captured["format_kwargs"]["use_system_prompt"] is True
-    assert captured["format_kwargs"]["system_prompt"] == COSMOS3_TRANSFER_SYSTEM_PROMPT
+    # Transfer defaults to its training system prompt; requests may replace it or opt out.
+    assert captured["format_kwargs"]["use_system_prompt"] is system_prompt_args.get("use_system_prompt", True)
+    assert captured["format_kwargs"]["system_prompt"] == system_prompt_args.get(
+        "system_prompt", COSMOS3_TRANSFER_SYSTEM_PROMPT
+    )
     assert captured["format_kwargs"]["use_duration_template"] is True
     assert captured["format_kwargs"]["use_resolution_template"] is True
     assert captured["format_kwargs"]["negative_metadata_mode"] == "same"

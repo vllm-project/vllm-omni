@@ -45,6 +45,7 @@ TRANSFER_SAMPLE_DEFAULTS: dict[str, Any] = {
     "num_first_chunk_conditional_frames": 0,
     "share_vision_temporal_positions": True,
     "emphasize_control_in_prompt": True,
+    "use_system_prompt": True,
 }
 TRANSFER_DEFAULTS: dict[str, dict[str, Any]] = {
     "edge": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
@@ -117,6 +118,9 @@ class Cosmos3TransferConfig:
     num_first_chunk_conditional_frames: int = 0
     share_vision_temporal_positions: bool = True
     emphasize_control_in_prompt: bool = True
+    # ``system_prompt=None`` selects the pipeline's transfer-specific default.
+    use_system_prompt: bool = True
+    system_prompt: str | None = None
     num_frames: int | None = None
     fps: float | None = None
 
@@ -201,6 +205,46 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+_TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
+_FALSE_STRINGS = frozenset({"0", "false", "no", "off"})
+
+
+def _as_strict_bool(value: Any, default: bool, *, name: str) -> bool:
+    """Parse a boolean request control, rejecting values that are not clearly boolean.
+
+    Unlike ``_as_bool``, an unrecognized string raises instead of silently
+    resolving to ``False``. ``use_system_prompt`` shares its name with a
+    string-valued control of other models, so a stray value must not disable
+    the transfer system prompt.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_STRINGS:
+            return True
+        if normalized in _FALSE_STRINGS:
+            return False
+    elif isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise ValueError(f"Cosmos3 transfer {name} must be a boolean, got {value!r}.")
+
+
+def _as_system_prompt(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"Cosmos3 transfer system_prompt must be a string, got {type(value)!r}.")
+    if not value.strip():
+        raise ValueError(
+            "Cosmos3 transfer system_prompt must not be empty; set use_system_prompt=false to "
+            "generate without a system prompt."
+        )
+    return value
 
 
 def _as_interval(value: Any) -> tuple[float, float] | None:
@@ -339,6 +383,12 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             _param(extra, sp, prompt_data, "emphasize_control_in_prompt", None),
             bool(TRANSFER_SAMPLE_DEFAULTS["emphasize_control_in_prompt"]),
         ),
+        use_system_prompt=_as_strict_bool(
+            _param(extra, sp, prompt_data, "use_system_prompt", None),
+            bool(TRANSFER_SAMPLE_DEFAULTS["use_system_prompt"]),
+            name="use_system_prompt",
+        ),
+        system_prompt=_as_system_prompt(_param(extra, sp, prompt_data, "system_prompt", None)),
         num_frames=(
             int(_param(extra, sp, prompt_data, "num_frames"))
             if _param(extra, sp, prompt_data, "num_frames", None) is not None
@@ -361,6 +411,8 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             if not user_set:
                 setattr(config, field_name, default_value)
 
+    if config.system_prompt is not None and not config.use_system_prompt:
+        raise ValueError("Cosmos3 transfer system_prompt was provided, but use_system_prompt is false.")
     if config.num_video_frames_per_chunk <= 0:
         raise ValueError("Cosmos3 transfer num_video_frames_per_chunk must be positive.")
     if config.num_conditional_frames < 0:

@@ -175,8 +175,9 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
   strength of a single control. With two or more active controls, the
   per-control attention passes run replicated on every sequence-parallel
   (Ulysses) rank, so Ulysses does not reduce per-rank memory or latency for
-  multi-control transfer requests. Transfer always uses Cosmos3's
-  transfer-specific system prompt, appends a control-adherence directive by
+  multi-control transfer requests. Transfer uses Cosmos3's transfer-specific
+  system prompt by default (`use_system_prompt: false` disables it;
+  `system_prompt` replaces it), appends a control-adherence directive by
   default (`emphasize_control_in_prompt: false` disables it), and enables
   duration/FPS and resolution metadata on both CFG branches
   (`use_duration_template` / `use_resolution_template` to disable;

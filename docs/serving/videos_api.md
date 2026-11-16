@@ -197,8 +197,11 @@ may specify its own `control_path` and `control_weight`. Request-level transfer
 options include
 `control_guidance`, `control_guidance_interval`,
 `emphasize_control_in_prompt`, `num_video_frames_per_chunk`,
-`num_conditional_frames`, `show_control_condition`, and `show_input`. Transfer
-uses its transfer-specific system prompt and, by default, appends a
+`num_conditional_frames`, `show_control_condition`, and `show_input`. By
+default, transfer tokenizes both CFG branches with its transfer-specific system
+prompt, matching training. Set `use_system_prompt` to `false` to generate
+without a system prompt, or pass `system_prompt` to replace the default text;
+an empty `system_prompt` is rejected. Transfer also appends, by default, a
 control-adherence directive to the positive prompt. It adds duration/FPS and
 resolution metadata to both CFG branches but does not add a negative prompt
 automatically. The Cosmos3 recipe includes an optional reference negative

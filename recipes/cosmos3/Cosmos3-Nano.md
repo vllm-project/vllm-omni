@@ -489,10 +489,13 @@ OpenPI route uses the normal API authentication middleware. RoboLab's
   per-control attention passes run replicated on every sequence-parallel
   (Ulysses) rank, so Ulysses does not reduce per-rank memory or latency for
   multi-control transfer requests.
-  Transfer always uses Cosmos3's transfer-specific system prompt. By default it
-  also appends a directive naming every active hint and asking the model to
-  follow its shape, position, and motion precisely; set the request-level
-  `emphasize_control_in_prompt` option to `false` for prompt ablations. Transfer
+  Transfer uses Cosmos3's transfer-specific system prompt on both CFG branches
+  by default. Set the request-level `use_system_prompt` option to `false` to
+  generate without a system prompt, or pass `system_prompt` to replace it. By
+  default it also appends a directive naming every active hint and asking the
+  model to follow its shape, position, and motion precisely; set the
+  request-level `emphasize_control_in_prompt` option to `false` for prompt
+  ablations. Transfer
   does not add a negative prompt automatically. An optional reference prompt is
   provided in [`negative_prompt.json`](negative_prompt.json); compact the JSON
   with `jq -c` and pass it through `negative_prompt` as shown in the transfer
