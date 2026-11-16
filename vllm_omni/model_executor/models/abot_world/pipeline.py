@@ -18,8 +18,10 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
 ABOT_WORLD_PIPELINE = PipelineConfig(
+    serving_capabilities=get_diffusion_model_metadata("ABotWorldCausalPipeline").serving_capabilities,
     model_type="abot_world",
     model_arch="ABotWorldCausalPipeline",
     stages=(
