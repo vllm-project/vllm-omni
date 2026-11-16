@@ -50,11 +50,13 @@ def components(monkeypatch):
                 return x * self.weight
             return (x + residual) * self.weight, x + residual
 
-    for module in (model, upstream):
-        for name, value in dict(
-            HunYuanAttention=Attention, HunYuanCrossAttention=CrossAttention, HunYuanMLP=MLP, RMSNorm=Norm
-        ).items():
-            monkeypatch.setattr(module, name, value)
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    for name, value in dict(
+        HunYuanAttention=Attention, HunYuanCrossAttention=CrossAttention, HunYuanMLP=MLP, RMSNorm=Norm
+    ).items():
+        monkeypatch.setattr(upstream, name, value)
     monkeypatch.setattr(model, "HunyuanImage3SparseMoeBlock", ImageMoE)
     monkeypatch.setattr(upstream, "HunYuanSparseMoeBlock", MLP)
     return SimpleNamespace(registrations=registrations, moe=ImageMoE, norm=Norm)
@@ -111,6 +113,20 @@ def test_decoder_matches_upstream_structure_and_forward(components, moe, layer_i
         torch.testing.assert_close(a, b, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("layer_id", [0, 1])
+def test_npu_decoder_selects_backend_during_construction(components, monkeypatch, layer_id):
+    from vllm.platforms import current_platform
+
+    from vllm_omni.platforms.npu.models import hunyuan_image3 as npu_model
+
+    backend = object()
+    monkeypatch.setattr(current_platform, "device_type", "npu")
+    monkeypatch.setattr(npu_model, "get_image_prefix_backend", lambda: backend)
+    layer = model.HunyuanImage3DecoderLayer(config=config(), layer_id=layer_id)
+    assert layer.self_attn.kwargs["attn_backend"] is backend
+    assert len(components.registrations) == 1
+
+
 @pytest.mark.parametrize(
     "first,last,tied", [(True, True, False), (False, True, False), (False, True, True), (False, False, False)]
 )
@@ -123,8 +139,8 @@ def test_final_moe_exists_before_offload_and_pp_layout(components, monkeypatch, 
         quant_config=object(),
         parallel_config=SimpleNamespace(enable_eplb=False, eplb_config=SimpleNamespace(num_redundant_experts=0)),
     )
-    monkeypatch.setattr(model, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first, is_last_rank=last))
-    monkeypatch.setattr(model, "VocabParallelEmbedding", lambda *a, **kw: nn.Embedding(8, 2))
+    monkeypatch.setattr(upstream, "get_pp_group", lambda: SimpleNamespace(is_first_rank=first, is_last_rank=last))
+    monkeypatch.setattr(upstream, "VocabParallelEmbedding", lambda *a, **kw: nn.Embedding(8, 2))
 
     def make_layers(count, factory, prefix):
         layers = []
@@ -136,7 +152,7 @@ def test_final_moe_exists_before_offload_and_pp_layout(components, monkeypatch, 
             layers.append(layer)
         return 0, count, nn.ModuleList(layers)
 
-    monkeypatch.setattr(model, "make_layers", make_layers)
+    monkeypatch.setattr(upstream, "make_layers", make_layers)
     actual = model.HunyuanModel(vllm_config=vc, prefix="model")
     assert components.registrations == [layer.mlp for layer in actual.layers]
     assert isinstance(actual.embed_tokens, nn.Embedding) == (first or (last and tied))

@@ -48,7 +48,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backend import AttentionBackend, AttentionType
 
 
 def _is_moe(config: PretrainedConfig) -> bool:
@@ -121,6 +121,7 @@ class HunYuanAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         prefix: str = "",
         layer_id: int = -1,
+        attn_backend: type[AttentionBackend] | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -184,6 +185,7 @@ class HunYuanAttention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            attn_backend=attn_backend,
         )
 
         if self.use_qk_norm:
@@ -228,6 +230,7 @@ class HunYuanCrossAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         prefix: str = "",
         layer_id: int = -1,
+        attn_backend: type[AttentionBackend] | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -290,6 +293,7 @@ class HunYuanCrossAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
             attn_type=AttentionType.ENCODER_DECODER,
+            attn_backend=attn_backend,
         )
 
         if self.use_qk_norm:
@@ -433,6 +437,9 @@ class HunYuanDecoderLayer(nn.Module):
         prefix: str = "",
         layer_id: int = -1,
         enable_eplb: bool = False,
+        *,
+        moe_block_cls: type[nn.Module] | None = None,
+        attn_backend: type[AttentionBackend] | None = None,
     ) -> None:
         super().__init__()
         assert layer_id >= 0
@@ -461,6 +468,7 @@ class HunYuanDecoderLayer(nn.Module):
                 cache_config=cache_config,
                 prefix=f"{prefix}.self_attn",
                 layer_id=layer_id,
+                attn_backend=attn_backend,
             )
         elif attention_type == AttentionType.ENCODER_DECODER:
             self.self_attn = HunYuanCrossAttention(
@@ -474,12 +482,13 @@ class HunYuanDecoderLayer(nn.Module):
                 cache_config=cache_config,
                 prefix=f"{prefix}.self_attn",
                 layer_id=layer_id,
+                attn_backend=attn_backend,
             )
         else:
             raise RuntimeError(f"Unsupported attention type: {attention_type}")
 
         if _is_moe(config):
-            self.mlp = HunYuanSparseMoeBlock(
+            self.mlp = (moe_block_cls or HunYuanSparseMoeBlock)(
                 config=config,
                 quant_config=quant_config,
                 layer_id=layer_id,
@@ -535,7 +544,7 @@ class HunYuanDecoderLayer(nn.Module):
     }
 )
 class HunYuanModel(nn.Module, EagleModelMixin):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "", layer_cls: type[nn.Module] | None = None):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
@@ -561,7 +570,7 @@ class HunYuanModel(nn.Module, EagleModelMixin):
             self.embed_tokens = PPMissingLayer()
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: HunYuanDecoderLayer(
+            lambda prefix: (layer_cls or HunYuanDecoderLayer)(
                 config=config,
                 layer_id=int(prefix.split(".")[-1]),
                 cache_config=cache_config,

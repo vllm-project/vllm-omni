@@ -503,7 +503,7 @@ class StageDiffusionClient(StageClientBase):
             )
 
     def shutdown(self) -> None:
-        from vllm_omni.engine.shutdown import stage_shutdown_grace_s
+        from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 
         self._shutting_down = True
         try:
@@ -512,7 +512,7 @@ class StageDiffusionClient(StageClientBase):
             pass
 
         if self._proc_manager is not None and self._proc_manager.proc.is_alive():
-            self._proc_manager.shutdown(timeout=stage_shutdown_grace_s())
+            self._proc_manager.shutdown(timeout=MultiprocDiffusionExecutor.get_shutdown_timeout())
 
         self._request_socket.close(linger=0)
         self._response_socket.close(linger=0)

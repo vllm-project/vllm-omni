@@ -3,8 +3,10 @@
 """Compare the Ascend image-prefix adapter with an explicit joint-full mask."""
 
 import importlib.util
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -87,3 +89,66 @@ def test_incomplete_bidirectional_image_is_rejected():
     metadata = SimpleNamespace(actual_seq_lengths_q=[7], seq_lens_list=[7], mm_prefix_range={0: [(1, 8)]})
     with pytest.raises(ValueError, match="incomplete bidirectional image"):
         list(_MODULE.image_segments(metadata))
+
+
+@pytest.fixture
+def native_backend(monkeypatch):
+    # Check the backend contract on CPU; loading Ascend ops can query a device.
+    class Impl:
+        def __init__(self, *, pcp=1, dcp=1):
+            self.vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp, decode_context_parallel_size=dcp)
+            )
+
+    class Backend:
+        @staticmethod
+        def get_impl_cls():
+            return Impl
+
+    native = SimpleNamespace(
+        AscendAttentionBackend=Backend,
+        AscendAttentionBackendImpl=Impl,
+        AscendAttentionState=SimpleNamespace(DecodeOnly=object(), PrefillCacheHit=object()),
+    )
+    monkeypatch.setitem(sys.modules, "vllm_ascend.attention.attention_v1", native)
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_fused_infer_attention_score=Mock()))
+    _MODULE.get_image_prefix_backend.cache_clear()
+    yield native
+    _MODULE.get_image_prefix_backend.cache_clear()
+
+
+@pytest.mark.parametrize("decode,spans", [(True, True), (False, False), (False, True)])
+def test_explicit_backend_preserves_native_forward_and_corrects_only_image_prefill(
+    monkeypatch, native_backend, decode, spans
+):
+    native = native_backend
+    backend = _MODULE.get_image_prefix_backend()
+    assert backend is _MODULE.get_image_prefix_backend()
+    assert issubclass(backend, native.AscendAttentionBackend)
+    assert native.AscendAttentionBackend.get_impl_cls() is native.AscendAttentionBackendImpl
+    impl = object.__new__(backend.get_impl_cls())
+    impl.key_cache = impl.value_cache = torch.empty(1)
+    impl.num_heads = impl.num_kv_heads = 1
+    impl.scale = 1.0
+    original = Mock(return_value=torch.empty(1))
+    correct = Mock(return_value=original.return_value)
+    monkeypatch.setattr(native.AscendAttentionBackendImpl, "forward_fused_infer_attention", original, raising=False)
+    monkeypatch.setattr(_MODULE, "correct_image_queries", correct)
+    metadata = SimpleNamespace(
+        attn_state=native.AscendAttentionState.DecodeOnly if decode else native.AscendAttentionState.PrefillCacheHit,
+        mm_prefix_range={0: [(0, 0)]} if spans else {},
+    )
+    args = (torch.empty(1), torch.empty(1), torch.empty(1), metadata, torch.empty(1))
+    assert impl.forward_fused_infer_attention(*args) is original.return_value
+    original.assert_called_once_with(*args, None)
+    assert correct.call_count == int(spans and not decode)
+
+
+@pytest.mark.parametrize("pcp,dcp", [(1, 1), (2, 1), (1, 2)])
+def test_explicit_backend_rejects_unsupported_context_parallelism(native_backend, pcp, dcp):
+    impl = _MODULE.get_image_prefix_backend().get_impl_cls()
+    if pcp == dcp == 1:
+        impl(pcp=pcp, dcp=dcp)
+    else:
+        with pytest.raises(ValueError, match="PCP=1 and DCP=1"):
+            impl(pcp=pcp, dcp=dcp)

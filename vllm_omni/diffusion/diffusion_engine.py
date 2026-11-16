@@ -1246,7 +1246,7 @@ class DiffusionEngine:
             num_image_inputs=get_dummy_run_num_image_inputs(model_class_name),
             # Hunyuan skips generic warmup, but paged KV still requires an
             # activation profile. Its image request has exactly one frame.
-            num_frames=1,
+            num_frames=1 if model_class_name.startswith("HunyuanImage3") else None,
         )
         if request is None:
             raise RuntimeError("paged_scheduler requires a runnable Diffusion KV memory profile request")

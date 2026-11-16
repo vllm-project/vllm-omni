@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Respect HY3 image-prefix attention spans with the native Ascend cache."""
 
-from functools import wraps
-from types import MethodType
+from functools import cache
 
 
 def image_segments(metadata):
@@ -47,41 +46,47 @@ def correct_image_queries(query, key_cache, value_cache, metadata, output, *, nu
     return output
 
 
-def enable_image_prefix_lm(attention):
-    """Adapt this AR layer instance; preserve upstream cache writes and decode."""
+@cache
+def get_image_prefix_backend() -> type:
+    """Select HY3 attention through the native backend construction interface."""
     import torch_npu
-    from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl, AscendAttentionState
+    from vllm_ascend.attention.attention_v1 import (
+        AscendAttentionBackend,
+        AscendAttentionBackendImpl,
+        AscendAttentionState,
+    )
 
-    impl = attention.impl
-    if not isinstance(impl, AscendAttentionBackendImpl):
-        raise TypeError(f"Unsupported HY3 image-prefix attention backend: {type(impl)}")
-    parallel = impl.vllm_config.parallel_config
-    if any(
-        getattr(parallel, name, 1) != 1 for name in ("prefill_context_parallel_size", "decode_context_parallel_size")
-    ):
-        raise ValueError("HY3 Ascend image prefixes currently require PCP=1 and DCP=1")
-    if getattr(impl, "_hy3_image_prefix_enabled", False):
-        return
-    original = impl.forward_fused_infer_attention
+    class HunyuanImage3AttentionImpl(AscendAttentionBackendImpl):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            parallel = self.vllm_config.parallel_config
+            if any(
+                getattr(parallel, name, 1) != 1
+                for name in ("prefill_context_parallel_size", "decode_context_parallel_size")
+            ):
+                raise ValueError("HY3 Ascend image prefixes currently require PCP=1 and DCP=1")
 
-    @wraps(original)
-    def forward(self, query, key, value, attn_metadata, output, kv_cache=None):
-        result = original(query, key, value, attn_metadata, output, kv_cache)
-        if attn_metadata.attn_state == AscendAttentionState.DecodeOnly or not getattr(
-            attn_metadata, "mm_prefix_range", None
-        ):
-            return result
-        return correct_image_queries(
-            query,
-            self.key_cache,
-            self.value_cache,
-            attn_metadata,
-            result,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            scale=self.scale,
-            fia=torch_npu.npu_fused_infer_attention_score,
-        )
+        def forward_fused_infer_attention(self, query, key, value, attn_metadata, output, kv_cache=None):
+            result = super().forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache)
+            if attn_metadata.attn_state == AscendAttentionState.DecodeOnly or not getattr(
+                attn_metadata, "mm_prefix_range", None
+            ):
+                return result
+            return correct_image_queries(
+                query,
+                self.key_cache,
+                self.value_cache,
+                attn_metadata,
+                result,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                scale=self.scale,
+                fia=torch_npu.npu_fused_infer_attention_score,
+            )
 
-    impl.forward_fused_infer_attention = MethodType(forward, impl)
-    impl._hy3_image_prefix_enabled = True
+    class HunyuanImage3AttentionBackend(AscendAttentionBackend):
+        @staticmethod
+        def get_impl_cls() -> type:
+            return HunyuanImage3AttentionImpl
+
+    return HunyuanImage3AttentionBackend

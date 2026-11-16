@@ -244,14 +244,10 @@ def test_shutdown_releases_runtime_after_orchestrator_stops(mocker: MockerFixtur
     engine.orchestrator_thread = mocker.MagicMock()
     engine.orchestrator_thread.is_alive.side_effect = [True, False]
     engine._runtime = mocker.MagicMock()
-    engine.stage_pools = [SimpleNamespace(live_num_replicas=2), SimpleNamespace(live_num_replicas=1)]
 
     engine.shutdown()
 
     engine.orchestrator_thread.join.assert_called_once()
-    from vllm_omni.engine.shutdown import stage_shutdown_grace_s
-
-    assert engine.orchestrator_thread.join.call_args.kwargs["timeout"] > 3 * stage_shutdown_grace_s()
     engine._runtime.shutdown.assert_called_once_with()
 
 

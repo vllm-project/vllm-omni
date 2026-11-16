@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from multiprocessing.synchronize import Event
 from typing import TYPE_CHECKING, Any, cast
 
+import vllm.envs as vllm_envs
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.logger import init_logger
@@ -35,7 +36,6 @@ from vllm_omni.diffusion.offloader.config import (
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
-from vllm_omni.engine.shutdown import worker_shutdown_grace_s
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, NewRequestData
@@ -45,7 +45,7 @@ logger = init_logger(__name__)
 
 _DEQUEUE_TIMEOUT_S = 5.0
 _DLO_DP_WAVE_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", 600.0))
-_WORKER_SHUTDOWN_GRACE_S = worker_shutdown_grace_s()
+_WORKER_SHUTDOWN_GRACE_S = max(15.0, float(vllm_envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS))
 _WORKER_TERMINATE_GRACE_S = 5.0
 _WORKER_KILL_GRACE_S = 5.0
 _RESULT_PUMP_JOIN_TIMEOUT_S = 2.0
@@ -1077,6 +1077,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if not p.is_alive():
                 self._is_failed = True
                 raise EngineDeadError(f"Worker process {p.name} is dead")
+
+    @staticmethod
+    def get_shutdown_timeout() -> float:
+        """Allow worker termination phases and device finalizers before parent exit."""
+        return _WORKER_SHUTDOWN_GRACE_S + 30.0
 
     def shutdown(self) -> None:
         self._closed = True

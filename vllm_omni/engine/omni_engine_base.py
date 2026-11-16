@@ -1134,8 +1134,6 @@ class OmniEngineBase:
 
     def shutdown(self) -> None:
         """Send shutdown message and wait for the Orchestrator thread to exit."""
-        from vllm_omni.engine.shutdown import stage_shutdown_grace_s
-
         if getattr(self, "_shutdown_called", False):
             return
         self._shutdown_called = True
@@ -1144,9 +1142,6 @@ class OmniEngineBase:
             finalizer.detach()
 
         logger.info("[OmniEngine] Shutting down Orchestrator")
-        # Preserve the sequential per-replica worker cleanup budgets.
-        replica_count = sum(pool.live_num_replicas for pool in getattr(self, "stage_pools", ()))
-        shutdown_timeout = SHUTDOWN_JOIN_TIMEOUT_S + replica_count * stage_shutdown_grace_s()
         request_queue_closed = False
         shutdown_enqueued = enqueue_orchestrator_shutdown(
             self.request_queue,
@@ -1172,12 +1167,12 @@ class OmniEngineBase:
         orchestrator_stopped = False
         try:
             if self.is_alive():
-                self.orchestrator_thread.join(timeout=shutdown_timeout)
+                self.orchestrator_thread.join(timeout=SHUTDOWN_JOIN_TIMEOUT_S)
             orchestrator_stopped = not self.is_alive()
             if not orchestrator_stopped:
                 logger.error(
                     "[OmniEngine] Orchestrator did not stop within %.1f seconds; continuing cleanup",
-                    shutdown_timeout,
+                    SHUTDOWN_JOIN_TIMEOUT_S,
                 )
         except Exception:
             logger.exception("[OmniEngine] Failed to join Orchestrator thread")

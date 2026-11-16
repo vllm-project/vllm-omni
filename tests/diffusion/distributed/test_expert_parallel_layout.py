@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -421,3 +422,56 @@ def test_init_vllm_group_forwards_use_all2all_only_when_supported(monkeypatch):
     monkeypatch.setattr(parallel_state.vllm_parallel_state, "init_model_parallel_group", legacy)
     parallel_state.init_vllm_model_parallel_group([[0]], 0, "gloo", "ep", use_all2all=True)
     assert received["legacy"] is True
+
+
+@pytest.mark.cpu
+@pytest.mark.core_model
+@pytest.mark.parametrize("fail_second", [False, True])
+def test_native_context_groups_without_ep(monkeypatch, fail_second):
+    import vllm.distributed.parallel_state as native_state
+
+    import vllm_omni.diffusion.distributed.parallel_state as diffusion_state
+
+    monkeypatch.setattr(native_state, "_PCP", None)
+    monkeypatch.setattr(native_state, "_DCP", None)
+    monkeypatch.setattr(diffusion_state, "get_world_group", lambda: SimpleNamespace(world_size=4, local_rank=2))
+    monkeypatch.setattr(native_state, "_WORLD", None)
+    created = []
+
+    def create(**kwargs):
+        assert kwargs["group_ranks"] == [[0], [1], [2], [3]]
+        assert kwargs["local_rank"] == 2
+        assert kwargs["backend"] == "hccl"
+        if fail_second and kwargs["group_name"] == "dcp":
+            raise RuntimeError("group creation failed")
+        group = SimpleNamespace(world_size=1, destroy=Mock())
+        created.append(group)
+        return group
+
+    monkeypatch.setattr(diffusion_state, "init_vllm_model_parallel_group", create)
+    config = SimpleNamespace(
+        kv_transfer_config=object(),
+        parallel_config=SimpleNamespace(enable_expert_parallel=False),
+    )
+    if fail_second:
+        with pytest.raises(RuntimeError, match="group creation failed"):
+            diffusion_state.ensure_native_kv_context_groups(config, backend="hccl")
+        assert native_state._PCP is None and native_state._DCP is None
+        created[0].destroy.assert_called_once()
+    else:
+        diffusion_state.ensure_native_kv_context_groups(config, backend="hccl")
+        diffusion_state.ensure_native_kv_context_groups(config, backend="hccl")
+        assert len(created) == 2
+        assert native_state._PCP is created[0]
+        assert native_state._DCP is created[1]
+
+
+@pytest.mark.cpu
+@pytest.mark.core_model
+def test_native_context_groups_do_not_touch_legacy(monkeypatch):
+    import vllm_omni.diffusion.distributed.parallel_state as diffusion_state
+
+    unexpected = Mock(side_effect=AssertionError("legacy must not create groups"))
+    monkeypatch.setattr(diffusion_state, "get_world_group", unexpected)
+    diffusion_state.ensure_native_kv_context_groups(SimpleNamespace(kv_transfer_config=None), backend="hccl")
+    unexpected.assert_not_called()

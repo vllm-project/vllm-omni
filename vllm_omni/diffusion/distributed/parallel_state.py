@@ -31,6 +31,7 @@ If you only need to use the distributed environment without model parallelism,
 
 import inspect
 from math import prod
+from typing import Any
 
 import torch
 import torch.distributed
@@ -1024,6 +1025,41 @@ def initialize_model_parallel(
         )
     except BaseException:
         destroy_model_parallel()
+        raise
+
+
+def ensure_native_kv_context_groups(vllm_config: Any, *, backend: str) -> None:
+    """Create TP-only native KV context groups, owned by destroy_model_parallel."""
+    if vllm_config.kv_transfer_config is None:
+        return
+
+    parallel_config = vllm_config.parallel_config
+    for field in ("prefill_context_parallel_size", "decode_context_parallel_size"):
+        if getattr(parallel_config, field, 1) != 1:
+            raise ValueError("Native diffusion KV on NPU currently requires PCP=1 and DCP=1")
+    for attr in ("_PCP", "_DCP"):
+        group = getattr(vllm_parallel_state, attr)
+        if group is not None and group.world_size != 1:
+            raise ValueError(f"Native diffusion KV on NPU requires singleton {attr} groups")
+
+    world = get_world_group()
+    ranks = [[rank] for rank in range(world.world_size)]
+    created = []
+    try:
+        for attr, name in (("_PCP", "pcp"), ("_DCP", "dcp")):
+            if getattr(vllm_parallel_state, attr) is None:
+                group = init_vllm_model_parallel_group(
+                    group_ranks=ranks,
+                    local_rank=world.local_rank,
+                    backend=backend,
+                    group_name=name,
+                )
+                setattr(vllm_parallel_state, attr, group)
+                created.append((attr, group))
+    except BaseException:
+        for attr, group in reversed(created):
+            setattr(vllm_parallel_state, attr, None)
+            group.destroy()
         raise
 
 

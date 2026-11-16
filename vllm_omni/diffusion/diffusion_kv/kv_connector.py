@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -172,6 +172,99 @@ def init_worker_kv_connector(vllm_config: VllmConfig, kv_cache_config: KVCacheCo
         vllm_config.kv_transfer_config.kv_connector,
         vllm_config.kv_transfer_config.engine_id,
     )
+
+
+def create_worker_kv_connector(vllm_config: VllmConfig, kv_caches: Any) -> ActiveKVConnector:
+    """Register device pages and reuse the native active connector lifecycle."""
+    from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
+
+    from vllm_omni.platforms import current_omni_platform
+
+    if not current_omni_platform.is_npu():
+        return ActiveKVConnector(vllm_config, kv_caches)
+
+    from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+    mooncake_worker_cls = None
+    kv_config = vllm_config.kv_transfer_config
+    if kv_config is not None and kv_config.kv_connector in {"MooncakeConnector", "MooncakeConnectorV1"}:
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import MooncakeConnectorWorker
+
+        mooncake_worker_cls = MooncakeConnectorWorker
+
+    class AscendActiveKVConnector(ActiveKVConnector):
+        def __init__(self) -> None:
+            # Ascend registers device pages directly, without CUDA host-copy ops.
+            self.vllm_config = vllm_config
+            self.kv_connector = get_kv_transfer_group()
+            self.kv_connector.register_kv_caches(kv_caches)
+            self._pending_load_start = False
+            self._disabled = False
+
+        def pre_forward(self, scheduler_output: Any) -> None:
+            worker = getattr(self.kv_connector, "connector_worker", None)
+            if mooncake_worker_cls is None or not isinstance(worker, mooncake_worker_cls):
+                return super().pre_forward(scheduler_output)
+            receiver = worker.kv_recv_thread
+            metadata = scheduler_output.kv_connector_metadata
+            if receiver is None or metadata is None:
+                return super().pre_forward(scheduler_output)
+            worker.kv_recv_thread = _MooncakeReceiveFanout(worker, metadata, receiver)
+            try:
+                return super().pre_forward(scheduler_output)
+            finally:
+                # Native submission is synchronous; queued tasks own their counts.
+                worker.kv_recv_thread = receiver
+
+    return AscendActiveKVConnector()
+
+
+class _MooncakeReceiveFanout:
+    """Retain Ascend source pages until every local CFG consumer has read them."""
+
+    def __init__(self, worker: Any, metadata: Any, receiver: Any) -> None:
+        self._receiver = receiver
+        self._counts: dict[str, dict[int, dict[str, Any]]] = {}
+        sources = defaultdict(list)
+        for request_id, meta in metadata.requests.items():
+            if not meta.do_virtual:
+                sources[(meta.remote_engine_id, meta.remote_request_id)].append((request_id, meta))
+        for requests in sources.values():
+            if len(requests) < 2:
+                continue
+            if worker._is_hma_required or worker.pcp_size != 1 or worker.dcp_size != 1:
+                raise ValueError("NPU diffusion KV fanout requires TP-only non-hybrid attention")
+            counts: Counter[int] = Counter()
+            ports: dict[int, dict[str, Any]] = {}
+            for _, meta in requests:
+                if meta.remote_pcp_size != 1 or meta.remote_dcp_size != 1:
+                    raise ValueError("NPU diffusion KV fanout requires source PCP=1 and DCP=1")
+                tp_size = meta.remote_ptp_size or worker._prefill_tp_size
+                for ranks in worker._get_remote_ranks_for_req(meta.remote_request_id, tp_size):
+                    for rank in ranks:
+                        port = meta.remote_port + rank
+                        counts[port] += 1
+                        host, _ = worker._get_remote_host_info_by_port(
+                            meta.remote_port,
+                            port,
+                            meta.remote_host,
+                            meta.remote_engine_id,
+                            meta.remote_multi_nodes_meta_mapping,
+                        )
+                        ports[port] = {"host": host}
+            for port, count in counts.items():
+                ports[port]["num"] = count
+            for request_id, _ in requests:
+                self._counts[request_id] = ports
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._receiver, name)
+
+    def add_request(self, **kwargs: Any) -> None:
+        counts = self._counts.get(kwargs["request_id"])
+        if counts is not None:
+            kwargs["remote_port_send_num"] = counts
+        self._receiver.add_request(**kwargs)
 
 
 def shutdown_kv_connector(*, scheduler_connector: KVConnectorBase_V1 | None = None) -> None:

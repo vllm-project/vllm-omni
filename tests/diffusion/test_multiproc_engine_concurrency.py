@@ -1333,6 +1333,28 @@ class TestStageDiffusionClientErrorPropagation:
 
 
 class TestExecutorShutdownCleaner:
+    @pytest.mark.parametrize("worker_timeout", [15.0, 30.0])
+    def test_stage_waits_for_worker_cleanup_before_closing_sockets(self, monkeypatch, worker_timeout):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+        from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+
+        monkeypatch.setattr(executor_module, "_WORKER_SHUTDOWN_GRACE_S", worker_timeout)
+        events = []
+        client = object.__new__(StageDiffusionClient)
+        for name in ("_request_socket", "_response_socket", "_zmq_ctx", "_encoder"):
+            setattr(client, name, Mock())
+
+        def shutdown_process(*, timeout):
+            assert timeout > worker_timeout + 10  # terminate/kill phases plus finalizers
+            events.append("workers-exited")
+
+        client._proc_manager = SimpleNamespace(proc=Mock(), shutdown=shutdown_process)
+        client._proc_manager.proc.is_alive.return_value = True
+        client._request_socket.close.side_effect = lambda **_: events.append("sockets-closed")
+        client.shutdown()
+        assert events == ["workers-exited", "sockets-closed"]
+        client._zmq_ctx.term.assert_called_once_with()
+
     def test_worker_joins_share_one_global_deadline(self, monkeypatch):
         from vllm_omni.diffusion.executor import multiproc_executor as executor_module
 

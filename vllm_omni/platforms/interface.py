@@ -39,19 +39,6 @@ class OmniPlatform(Platform):
 
     _omni_enum: OmniPlatformEnum
 
-    @classmethod
-    def create_diffusion_kv_connector(
-        cls, vllm_config: Any, kv_caches_by_layer: Any, kv_cache_config: Any = None
-    ) -> Any:
-        """Create the device-specific active diffusion KV connector.
-
-        The scheduler and diffusion runner share the connector lifecycle, while
-        cache registration and stream/device handling remain platform-owned.
-        """
-        from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
-
-        return ActiveKVConnector(vllm_config, kv_caches_by_layer)
-
     def is_npu(self) -> bool:
         return self._omni_enum == OmniPlatformEnum.NPU
 

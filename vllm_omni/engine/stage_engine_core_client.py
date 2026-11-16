@@ -30,7 +30,6 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
 )
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
-from vllm_omni.engine.shutdown import stage_shutdown_grace_s
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
@@ -79,10 +78,6 @@ class StageEngineCoreClientBase(StageClientBase):
     """
 
     replica_id: int = 0
-
-    def shutdown(self, timeout: float | None = None) -> None:
-        # The parent must outlive the worker cleanup deadline and finalizers.
-        super().shutdown(timeout=stage_shutdown_grace_s() if timeout is None else timeout)
 
     @staticmethod
     def make_async_mp_client(
