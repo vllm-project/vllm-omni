@@ -65,6 +65,10 @@ OMNI_PROCESSOR_TEST = "tests/model_executor/models/test_omni_processing.py"
 OMNI_PROCESSOR_TIMING_ENV = "VLLM_OMNI_AMD_PROCESSOR_TIMING"
 QWEN_IMAGE_SMOKE_LABEL = "Qwen-Image Official-Weight Smoke"
 QWEN_IMAGE_SMOKE_NODE = "tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]"
+NIGHTLY_CROSS_PIPELINE_PARITY_OWNER_LABELS = (
+    "Wan2.2 Diffusers Backend Similarity",
+    "Qwen-Image Diffusers Accuracy",
+)
 TINY_DIFFUSION_PATH = "tests/model_tests/diffusion/test_common_offline.py"
 TINY_DIFFUSION_JOBS = (
     (
@@ -164,6 +168,19 @@ def _steps_selecting_node(pipeline_path: Path, node: str) -> list[dict]:
         for step in _walk_steps(pipeline["steps"])
         if any(node in split(command) for command in step.get("commands", []))
     ]
+
+
+@pytest.mark.parametrize("label", NIGHTLY_CROSS_PIPELINE_PARITY_OWNER_LABELS)
+def test_cross_pipeline_parity_nightly_owner_is_blocking(label: str) -> None:
+    pipeline = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    matches = [step for step in _walk_steps(pipeline["steps"]) if step.get("label") == label]
+
+    assert len(matches) == 1
+    step = matches[0]
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert "retry" not in step
 
 
 def test_qwen_image_has_one_amd_official_weight_nightly_owner() -> None:
@@ -2108,9 +2125,10 @@ _COSMOS3_WEEKLY_NODES = (
     "test_text_to_image_001",
     "test_video_generation_modes_001",
 )
+_COSMOS3_T2I_NODE = "tests/e2e/online_serving/test_cosmos3.py::test_text_to_image_001"
 
 
-def test_cosmos3_weekly_covers_all_rocm_generation_modes() -> None:
+def test_cosmos3_weekly_is_blocking_and_replaces_narrow_nightly_owner() -> None:
     def flatten_paths(items: list) -> set[str]:
         paths: set[str] = set()
         for item in items:
@@ -2124,23 +2142,35 @@ def test_cosmos3_weekly_covers_all_rocm_generation_modes() -> None:
     command = "\n".join(step["commands"])
     dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
 
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["depends_on"] == "amd-build"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 240
+    assert step["timeout_in_minutes"] == 300
     assert step["source_file_dependencies"] == [
         "diffusion_cosmos3_function",
+        ".buildkite/amd/scripts/prewarm_cosmos3_aiter.py",
         ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh",
         "tests/helpers/",
     ]
     assert step["artifact_paths"] == ["artifacts/rocm-cosmos3-weekly/**/*"]
     assert "retry" not in step
+    assert Path(".buildkite/amd/scripts/prewarm_cosmos3_aiter.py").is_file()
+    assert "export VLLM_ROCM_USE_AITER=1" in step["commands"]
+    assert 'export AITER_JIT_DIR="/tmp/vllm-omni-cosmos3-aiter-$$BUILDKITE_JOB_ID"' in step["commands"]
+    assert (
+        'export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-cosmos3-torch-extensions-$$BUILDKITE_JOB_ID"' in step["commands"]
+    )
+    assert 'mkdir -p "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR"' in step["commands"]
+    prewarm_command = next(item for item in step["commands"] if "prewarm_cosmos3_aiter.py" in item)
+    assert "timeout --signal=TERM --kill-after=2m 55m" in prewarm_command
+    runner_command = next(item for item in step["commands"] if "run-rocm-full-model-nightly.sh" in item)
+    assert step["commands"].index(prewarm_command) < step["commands"].index(runner_command)
     assert "ROCM_E2E_LEVEL_MARKER=slow" in command
     assert "ROCM_E2E_RUN_LEVEL=full_model" in command
     assert "ROCM_E2E_TIMEOUT_MINUTES=210" in command
 
-    tokens = split(next(item for item in step["commands"] if "run-rocm-full-model-nightly.sh" in item))
+    tokens = split(runner_command)
     runner_index = tokens.index(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
     assert tokens[runner_index + 1 :] == [
         "tests/e2e/online_serving/test_cosmos3.py",
@@ -2162,6 +2192,11 @@ def test_cosmos3_weekly_covers_all_rocm_generation_modes() -> None:
     for node in _COSMOS3_WEEKLY_NODES:
         assert f"def {node}" in source
 
+    nightly_source = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
+    assert "Cosmos3 T2I Function" not in nightly_source
+    assert ":full_moon: Cosmos3 MI300 Nightly" not in nightly_source
+    assert _steps_selecting_node(AMD_NIGHTLY_PIPELINE, _COSMOS3_T2I_NODE) == []
+
 
 _DRAMA3_WEEKLY_CORE_NODE = "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
 _DRAMA3_WEEKLY_ADVANCED_NODES = (
@@ -2171,16 +2206,16 @@ _DRAMA3_WEEKLY_ADVANCED_NODES = (
     "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_concurrent_003[drama_3-rocm]",
     "tests/e2e/online_serving/test_drama_3.py::test_voice_clone_requires_ref_text_004[drama_3-rocm]",
 )
-_DRAMA3_WEEKLY_BURNIN_LABELS = {
+_DRAMA3_WEEKLY_LABELS = {
     "Drama 3 text-to-audio · Core · 1-GPU",
     "Drama 3 full advanced · 1-GPU",
 }
 
 
-def test_drama3_weekly_adds_exact_nonblocking_core_and_advanced_owners() -> None:
+def test_drama3_weekly_has_exact_blocking_core_and_advanced_owners() -> None:
     group = _find_group("TTS E2E Weekly", AMD_WEEKLY_PIPELINE)
     labels = {step["label"] for step in group["steps"]}
-    assert _DRAMA3_WEEKLY_BURNIN_LABELS <= labels
+    assert _DRAMA3_WEEKLY_LABELS <= labels
 
     expected_dependencies = [
         "tts_drama_3_function",
@@ -2200,7 +2235,7 @@ def test_drama3_weekly_adds_exact_nonblocking_core_and_advanced_owners() -> None
     assert core["agent_pool"] == "mi300_1"
     assert core["depends_on"] == "amd-build"
     assert core["mirror_hardwares"] == ["amdproduction"]
-    assert core["grade"] == "NonBlocking"
+    assert core["grade"] == "Blocking"
     assert core["timeout_in_minutes"] == 60
     assert core["source_file_dependencies"] == expected_dependencies
     assert core["env"] == expected_env
@@ -2226,7 +2261,7 @@ def test_drama3_weekly_adds_exact_nonblocking_core_and_advanced_owners() -> None
     assert advanced["agent_pool"] == "mi300_1"
     assert advanced["depends_on"] == "amd-build"
     assert advanced["mirror_hardwares"] == ["amdproduction"]
-    assert advanced["grade"] == "NonBlocking"
+    assert advanced["grade"] == "Blocking"
     assert advanced["timeout_in_minutes"] == 150
     assert advanced["source_file_dependencies"] == expected_dependencies
     assert advanced["env"] == expected_env
@@ -2830,9 +2865,9 @@ def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
     assert template.count("soft_fail: true") == 2
 
 
-def test_qwen_image_diffusers_accuracy_is_one_nonblocking_nightly_job() -> None:
+def test_qwen_image_diffusers_accuracy_is_one_blocking_nightly_job() -> None:
     step = _find_step("Qwen-Image Diffusers Accuracy", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["timeout_in_minutes"] == 180
@@ -5934,12 +5969,9 @@ def test_minicpmo_rocm_v1_duplex_ready_executes_junit_guard_before_exit(
     )
 
 
-def test_weekly_existing_jobs_stay_blocking_while_new_coverage_burns_in() -> None:
+def test_weekly_all_jobs_are_blocking() -> None:
     weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
-    burnin_labels = _DRAMA3_WEEKLY_BURNIN_LABELS | {"Cosmos3 generation modes · 1-GPU"}
-
     assert len(steps) == 38
-    assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == burnin_labels
-    assert all(step["grade"] == "Blocking" for step in steps if step["label"] not in burnin_labels)
+    assert all(step["grade"] == "Blocking" for step in steps)
