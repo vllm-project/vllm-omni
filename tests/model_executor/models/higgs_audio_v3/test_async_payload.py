@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -38,21 +37,6 @@ def test_two_inflight_steps_keep_owned_codes_and_masks():
     assert ra[0].tolist() == [[10, 11]]
     assert t._fast_audio_direct_rows == 0
     assert t.finalize_multimodal_outputs_from_cpu_snapshot(None) is None
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-def test_whole_output_explicit_opt_in(enabled):
-    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="ModelRunnerV1 async output is unsupported")
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
-    r = object.__new__(GPUARModelRunner)
-    r.use_async_scheduling = True
-    r.speculative_config = None
-    r.model_config = SimpleNamespace(async_chunk=False, enable_return_routed_experts=False)
-    r.model = SimpleNamespace(use_async_omni_output=True, supports_async_whole_payload=enabled, has_postprocess=False)
-    assert r._should_use_async_omni_output() == enabled
-    r.use_async_scheduling = False
-    assert not r._should_use_async_omni_output()
 
 
 @pytest.mark.parametrize("async_output", [False, True])

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Model-agnostic MoE specialty CUDA-graph runner checks (#9865 / #9911).
 
-Shared V1/V2 runners call these helpers so they do not import a specific
+Shared V2 runners call these helpers so they do not import a specific
 model package. Specialty capture/replay itself still lives under Mammoth.
 """
 
@@ -23,7 +23,7 @@ def ensure_moe_specialty_runner_compatible(runner: object) -> None:
 
     ``cudagraph_specialize_moe_routing`` is normally set during Mammoth model
     ``__init__`` (inside ``load_model``) when the stage uses a FULL cudagraph
-    mode. Checking here — after that load — covers both V1 and V2 runners.
+    mode. Checking here — after that load — checks the active V2 runner.
     """
     if not moe_routing_specialize_enabled(runner):
         return
@@ -32,6 +32,6 @@ def ensure_moe_specialty_runner_compatible(runner: object) -> None:
     raise RuntimeError(
         "cudagraph_specialize_moe_routing is enabled but "
         f"{type(runner).__name__} does not implement MoE specialty "
-        "capture/replay. Mammoth FULL specialty graphs require the unsupported V1 runner; "
+        "capture/replay. Mammoth FULL specialty graphs are unsupported by this runner; "
         "use a cudagraph_mode without FULL."
     )

@@ -13,7 +13,7 @@ from transformers import AutoConfig, PreTrainedTokenizerFast
 from transformers.models.vibevoice_acoustic_tokenizer.feature_extraction_vibevoice_acoustic_tokenizer import (
     VibeVoiceAcousticTokenizerFeatureExtractor,
 )
-from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import ModelConfig
 from vllm.config.multimodal import MultiModalConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.multimodal.cache import MultiModalProcessorOnlyCache
@@ -21,7 +21,6 @@ from vllm.multimodal.processing import InputProcessingContext
 from vllm.multimodal.processing.context import TimingContext
 from vllm.multimodal.processing.inputs import ProcessorInputs
 
-from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.config.stage_config import _DEPLOY_DIR, load_deploy_config, merge_pipeline_deploy
 from vllm_omni.model_executor.models.registry import OmniModelRegistry
 from vllm_omni.model_executor.models.vibevoice.pipeline import VIBEVOICE_PIPELINE
@@ -155,30 +154,3 @@ def test_reference_resampling_and_rejection(processor):
     for array in (np.empty(0), np.array([np.nan]), np.zeros(60 * 24000 + 1)):
         with pytest.raises(ValueError):
             _apply(processor, ids, (array, 24000))
-
-
-def test_startup_rejects_unsupported_runtime(mocker):
-    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is outside the vLLM 0.34 scope")
-    from vllm_omni.model_executor.models.vibevoice.vibevoice import _check_positive_kv_capacity, _check_supported_config
-
-    def config(cache_dtype="auto", v2=False, num_gpu_blocks=4097) -> VllmConfig:
-        runtime = VllmConfig()
-        # Only checkpoint loading is replaced; use the real runtime configs and MRv2 property.
-        runtime.model_config = mocker.Mock(
-            spec=OmniModelConfig, enforce_eager=True, max_model_len=16384, use_v2_model_runner=v2
-        )
-        runtime.scheduler_config = SchedulerConfig(
-            max_model_len=16384, is_encoder_decoder=False, async_scheduling=False, max_num_seqs=4
-        )
-        runtime.cache_config = CacheConfig(enable_prefix_caching=False, cache_dtype=cache_dtype, block_size=16)
-        runtime.cache_config.num_gpu_blocks = num_gpu_blocks
-        return runtime
-
-    _check_supported_config(config())
-    for bad, match in ((config(cache_dtype="fp8"), "quantized KV"), (config(v2=True), "runner V2")):
-        with pytest.raises(ValueError, match=match):
-            _check_supported_config(bad)
-    # 4 requests x 1024 blocks, plus the null block.
-    _check_positive_kv_capacity(config())
-    with pytest.raises(ValueError, match="cannot be preempted"):
-        _check_positive_kv_capacity(config(num_gpu_blocks=4096))

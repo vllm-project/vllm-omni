@@ -13,7 +13,6 @@
 x-qwen3-tts: &qwen3_tts
   - vllm_omni/engine/async_omni_engine.py
   - vllm_omni/entrypoints/omni_base.py
-  - vllm_omni/worker/gpu_model_runner.py
   - vllm_omni/model_executor/models/qwen3_tts/
   - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
   - vllm_omni/model_executor/models/common/fused_sampling.py
@@ -199,7 +198,6 @@ x-qwen3-omni-evaluation: &qwen3_omni_evaluation
   - vllm_omni/distributed/omni_connectors/transfer_adapter/
   - vllm_omni/distributed/omni_connectors/utils/
   # Shared runner/data contracts also consumed by NPU workers.
-  - vllm_omni/worker/gpu_model_runner.py
   - vllm_omni/worker/mixins.py
   - vllm_omni/worker/sampling_utils.py
   - vllm_omni/worker/output/
@@ -302,9 +300,7 @@ x-qwen3-omni-evaluation: &qwen3_omni_evaluation
 x-gpu-v1-workers: &gpu_v1_workers
   - vllm_omni/worker/base.py
   - vllm_omni/worker/encoder_cudagraph.py
-  - vllm_omni/worker/gpu_ar_model_runner.py
   - vllm_omni/worker/gpu_ar_worker.py
-  - vllm_omni/worker/gpu_generation_model_runner.py
   - vllm_omni/worker/gpu_generation_worker.py
   - vllm_omni/worker/gpu_memory_utils.py
   - vllm_omni/worker/memory_utils.py
@@ -738,11 +734,8 @@ source_file_dependencies:
     - vllm_omni/platforms/npu/attention/
     - vllm_omni/platforms/npu/native_rejection_sampler.py
     - vllm_omni/platforms/npu/worker/base.py
-    - vllm_omni/platforms/npu/worker/npu_ar_model_runner.py
     - vllm_omni/platforms/npu/worker/npu_ar_worker.py
-    - vllm_omni/platforms/npu/worker/npu_generation_model_runner.py
     - vllm_omni/platforms/npu/worker/npu_generation_worker.py
-    - vllm_omni/platforms/npu/worker/npu_model_runner.py
     - vllm_omni/platforms/npu/worker/talker_narrow_replay.py
     - vllm_omni/worker/talker_multiframe.py
     - docker/Dockerfile.npu.ci
@@ -1423,7 +1416,6 @@ source_file_dependencies:
     - vllm_omni/model_executor/stage_input_processors/voxtral_tts.py
     - vllm_omni/transformers_utils/configs/voxtral_tts.py
     - vllm_omni/transformers_utils/parsers/voxtral_tts.py
-    - vllm_omni/worker/gpu_model_runner.py
     - vllm_omni/worker_v2/
 
   tts_qwen3_tts_cov:
@@ -1440,8 +1432,6 @@ source_file_dependencies:
     - vllm_omni/model_executor/models/registry.py
     - vllm_omni/model_executor/models/model_local_kv.py
     - vllm_omni/transformers_utils/configs/
-    - vllm_omni/worker/gpu_ar_model_runner.py
-    - vllm_omni/worker/gpu_model_runner.py
     - vllm_omni/worker/sparse_audio.py
     - vllm_omni/outputs/output_processor.py
     - vllm_omni/deploy/vibevoice.yaml
@@ -1565,7 +1555,6 @@ source_file_dependencies:
     - vllm_omni/config/
     - vllm_omni/engine/
     - vllm_omni/worker/gpu_ar_worker.py
-    - vllm_omni/worker/gpu_ar_model_runner.py
     - vllm_omni/worker_v2/
     - vllm_omni/diffusion/worker/
     - vllm_omni/diffusion/stage_diffusion_proc.py

@@ -109,33 +109,6 @@ def _step(talker, infos, hidden, mocker, *, batched: bool, input_ids: torch.Tens
     return embeds, output, logits, captured["logits"], sampled.sampled_token_ids
 
 
-def test_batched_decode_matches_scalar_preprocess(mocker) -> None:
-    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is outside the vLLM 0.34 scope")
-    input_ids = torch.tensor([3, _EOS, _EOS, 6], dtype=torch.int32)
-    hidden = torch.randn(4, 4, generator=torch.Generator().manual_seed(1))
-    penalties = torch.tensor([1.05, 1.2, 1.05, 1.0])
-    results = {}
-    talkers = {}
-    for batched in (False, True):
-        talker = _make_talker()
-        states = _states()
-        talker._request_audio_states = copy.deepcopy(states)
-        results[batched] = _step(
-            talker, _infos(states), hidden, mocker, batched=batched, input_ids=input_ids, penalties=penalties
-        )
-        talkers[batched] = talker
-
-    # Embeddings, masked logits, penalized logits and sampled ids.
-    for index in (0, 2, 3, 4):
-        assert torch.equal(results[False][index], results[True][index])
-    for result in results.values():
-        output = result[1].multimodal_outputs
-        assert [t.tolist() for t in output["codes"]["audio"]] == [[[3]], [], [], [[6]]]
-        assert [t.item() for t in output["meta"]["finished"]] == [False, True, True, True]
-    assert talkers[True]._request_audio_states == talkers[False]._request_audio_states
-    assert talkers[True]._decode_codec_ids == {}
-
-
 def _decode_wrapper():
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
 

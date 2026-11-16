@@ -290,60 +290,6 @@ def test_fused_gpu_window_penalty_matches_reference(device, batch):
     torch.testing.assert_close(actual.cpu(), expected, rtol=1e-6, atol=1e-6)
 
 
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_v1_gpu_output_uses_async_snapshot_and_reuses_finished_slot():
-    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 output/snapshot contract is retired")
-    from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
-
-    talker = _make_talker()
-    talker.emb_code = torch.nn.ModuleList([torch.nn.Embedding(8, 2, device="cuda")])
-    talker._request_audio_states["a"] = {"finished": False, "step": 0}
-    ids = torch.tensor([2], device="cuda")
-    _, _, updates = talker.preprocess_decode_batch(
-        input_ids=ids, req_infos=[dict(request_id="a", audio_state=talker._request_audio_states["a"])]
-    )
-    output = talker.make_omni_output(
-        torch.ones(1, 2, device="cuda"),
-        model_intermediate_buffer=[dict(request_id="a", **updates[0])],
-        request_token_spans=[(0, 1)],
-    )
-    slot = talker._request_audio_states["a"]["_gpu_slot"]
-    snapshot = _snapshot_tensor_payload_to_cpu_async(
-        output.multimodal_outputs, copy_stream=torch.cuda.Stream(), pin_memory=True
-    )
-    # Scalar fallback after GPU batching must still emit the device codec ID.
-    with NoHostRead():
-        _, _, update = talker.preprocess(
-            torch.tensor([3], device="cuda"), None, request_id="a", audio_state=talker._request_audio_states["a"]
-        )
-        second = talker.make_omni_output(
-            torch.ones(1, 2, device="cuda"),
-            model_intermediate_buffer=[dict(request_id="a", **update)],
-            request_token_spans=[(0, 1)],
-        )
-    ids.zero_()
-    talker.on_requests_finished({"a"})
-    talker._flush_deferred_cleanup()
-    assert not talker._device_codec_state.slots
-    talker._request_audio_states["b"] = {"finished": False, "step": 0}
-    _, _, updates = talker.preprocess_decode_batch(
-        input_ids=torch.tensor([4], device="cuda"),
-        req_infos=[dict(request_id="b", audio_state=talker._request_audio_states["b"])],
-    )
-    talker.make_omni_output(
-        torch.ones(1, 2, device="cuda"),
-        model_intermediate_buffer=[dict(request_id="b", **updates[0])],
-        request_token_spans=[(0, 1)],
-    )
-    assert talker._request_audio_states["b"]["_gpu_slot"] == slot
-    snapshot.wait()
-    assert _extract_codec_delta(to_payload_element(snapshot.payload, 0, 0, 1, seq_len=1), "a") == [2]
-    assert _extract_codec_delta(
-        to_payload_element(build_mm_cpu(second.multimodal_outputs), 0, 0, 1, seq_len=1), "a"
-    ) == [3]
-
-
 def test_gpu_decode_masks_finished_request_when_new_request_joins(device):
     talker = _make_talker()
     talker.emb_code = torch.nn.ModuleList([torch.nn.Embedding(8, 2, device=device)])

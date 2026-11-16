@@ -1,16 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CUDA entry points into the Talker's vertical K-frame loop.
+"""Shared vertical K-frame loop contracts without a GPU.
 
-The loop itself is ``talker_multiframe.run`` (the shared worker module, pure
-Python + torch). CUDA only adds two hooks:
-
-* ``gpu_model_runner.OmniGPUModelRunner._model_forward`` calls the loop when a
-  step schedules K positions per request;
-* ``gpu_ar_model_runner.GPUARModelRunner.propose_draft_token_ids`` books those
-  K positions with the scheduler by emitting ``continue`` drafts.
-
-These tests pin the properties the hooks rely on, without a GPU.
+The worker-owned talker_multiframe loop preserves request rows, per-frame
+conditioning and compact K-step outputs. Retired V1 runner entry points are
+outside this suite.
 """
 
 from __future__ import annotations
@@ -143,60 +137,6 @@ def test_applies_skips_a_stage_without_multi_frame_support():
     assert talker_multiframe.applies(model, {}) == 0
 
 
-@pytest.mark.parametrize("short", [False, True])
-def test_gpu_propose_uses_scheduled_width_for_tensor_rows(short):
-    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is outside the vLLM 0.34 scope")
-    import torch
-
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
-    runner = _DraftedRunner(3)
-    runner.input_batch = SimpleNamespace(num_reqs=2, req_ids=["a", "b"])
-    scheduler = SimpleNamespace(scheduled_spec_decode_tokens={"a": [0] * 3, "b": [0] * 3})
-    samples = torch.tensor([[0, 0, 0, 0], [0, 0, -1, -1] if short else [0, 0, 0, 0]])
-    drafts = GPUARModelRunner.propose_draft_token_ids(runner, scheduler, samples, None, None, None)
-    # The draft must be a device tensor (torch.int32): `_prepare_input_ids`
-    # asserts isinstance(..., torch.Tensor) and scatters it directly.
-    assert isinstance(drafts, torch.Tensor)
-    assert drafts.dtype == torch.int32
-    if short:
-        assert drafts.shape == (2, 0)
-    else:
-        assert drafts.shape == (2, 3)
-        assert drafts.tolist() == [[0] * 3, [0] * 3]
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-def test_gpu_sample_tokens_neutralizes_only_kstep_control_head(enabled):
-    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is outside the vLLM 0.34 scope")
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
-    runner = _DraftedRunner(3)
-    if not enabled:
-        runner.model = object()
-
-    class FakeMinTokensLogitsProcessor:
-        def __init__(self):
-            self.min_toks = {"r1": 8}
-
-    processor = FakeMinTokensLogitsProcessor()
-    runner.input_batch = SimpleNamespace(
-        sampling_metadata=SimpleNamespace(logitsprocs=SimpleNamespace(non_argmax_invariant=[processor]))
-    )
-    runner.execute_model_state = (None,) * 13
-
-    class SampleReachedError(Exception):
-        pass
-
-    def sample(*args):
-        raise SampleReachedError
-
-    runner._sample = sample
-    with pytest.raises(SampleReachedError):
-        GPUARModelRunner.sample_tokens(runner, None)
-    assert processor.min_toks == ({} if enabled else {"r1": 8})
-
-
 def test_kstep_frame_rows_picks_the_row_the_loop_samples():
     """The per-frame projection must gather ``end - 1`` of each span.
 
@@ -213,51 +153,3 @@ def test_kstep_frame_rows_picks_the_row_the_loop_samples():
     assert kstep_frame_rows([(0, 1), (1, 2), (2, 3)], torch.device("cpu")).tolist() == [0, 1, 2]
     # Wider spans (a step that scheduled several positions per request).
     assert kstep_frame_rows([(0, 8), (8, 16)], torch.device("cpu")).tolist() == [7, 15]
-
-
-@pytest.mark.parametrize("fail", [False, True])
-def test_cuda_runner_restores_narrow_context(monkeypatch, fail):
-    pytest.importorskip("vllm.v1.worker.gpu_model_runner", reason="Model Runner V1 is outside the vLLM 0.34 scope")
-    import torch
-    import vllm.forward_context
-
-    from vllm_omni.worker import talker_cuda_graph
-    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-
-    owner = SimpleNamespace(
-        model=_mf_model(),
-        input_batch=SimpleNamespace(num_reqs=1),
-    )
-    extra = {
-        "request_token_spans": [(0, 2)],
-        "model_intermediate_buffer": [{"audio_state": {"step": 1}}],
-    }
-    owner._build_model_kwargs_extra = lambda: extra
-    restored = []
-    narrow = SimpleNamespace(restore=lambda: restored.append(True))
-    context = object()
-    monkeypatch.setattr(vllm.forward_context, "get_forward_context", lambda: context)
-
-    def begin(**kwargs):
-        assert kwargs["graph_owner"] is owner
-        assert kwargs["forward_context"] is context
-        return narrow
-
-    monkeypatch.setattr(talker_cuda_graph, "begin_cuda_narrow_step", begin)
-    output = SimpleNamespace(text_hidden_states=torch.zeros(2, 2))
-
-    def run(**kwargs):
-        assert kwargs["narrow"] is narrow
-        if fail:
-            raise RuntimeError("forward failed")
-        return output
-
-    monkeypatch.setattr(talker_multiframe, "run", run)
-    monkeypatch.setattr(talker_multiframe, "ensure_stop_token_vocab", lambda *args: None)
-    if fail:
-        with pytest.raises(RuntimeError, match="forward failed"):
-            OmniGPUModelRunner._model_forward(owner)
-    else:
-        assert OmniGPUModelRunner._model_forward(owner) is output
-        assert owner._omni_last_model_output is output
-    assert restored == [True]

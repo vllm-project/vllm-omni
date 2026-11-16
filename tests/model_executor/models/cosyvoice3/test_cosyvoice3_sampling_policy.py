@@ -9,15 +9,12 @@ pytest.importorskip(
 )
 import torch
 from vllm.sampling_params import SamplingParams
-from vllm.v1.worker import gpu_input_batch
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from tests.model_executor.models.cosyvoice3.test_cosyvoice3_model_helpers import (
     _make_sampling_metadata,
     _make_talker_model,
 )
 from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -142,67 +139,3 @@ def test_host_policy_does_not_read_unused_penalty_buffers(monkeypatch):
     monkeypatch.setattr(torch, "any", lambda *a, **k: pytest.fail("unused penalty buffer"))
     out = model.sample(torch.tensor([[float("-inf"), 2.0]]), metadata, per_req_sampling_params=[_host_params()])
     assert out.sampled_token_ids.tolist() == [[1]]
-
-
-@pytest.mark.parametrize("repetition_penalty", [1.0, 1.0001])
-def test_host_policy_real_input_batch_and_runner(monkeypatch, repetition_penalty):
-    """Validate the host/GPU metadata contract through the actual V1 entry point."""
-    monkeypatch.setattr(gpu_input_batch, "PIN_MEMORY", False)
-    batch = InputBatch(
-        max_num_reqs=2,
-        max_model_len=16,
-        max_num_batched_tokens=16,
-        device=torch.device("cpu"),
-        vocab_size=4,
-        block_sizes=[1],
-        max_num_blocks_per_req=[16],
-        logitsprocs_need_output_token_ids=False,
-    )
-    runner = object.__new__(GPUARModelRunner)
-    runner.model = _make_talker_model()
-    runner.input_batch = batch
-    runner.requests = {}
-    runner.sampler = lambda **kwargs: pytest.fail("unexpected runner fallback")
-    runner._apply_duplex_sampling = lambda *args: None
-
-    def add(req_id, temperature, seed):
-        request = CachedRequestState(
-            req_id=req_id,
-            prompt_token_ids=[0],
-            mm_features=[],
-            sampling_params=SamplingParams(
-                temperature=temperature, seed=seed, top_k=1, top_p=0.8, repetition_penalty=repetition_penalty
-            ),
-            generator=torch.Generator().manual_seed(seed),
-            block_ids=([],),
-            num_computed_tokens=0,
-            output_token_ids=[1],
-        )
-        runner.requests[req_id] = request
-        batch.add_request(request)
-        return request
-
-    greedy = add("greedy", 0.0, 31)
-    random = add("random", 1.0, 32)
-    greedy_state = greedy.generator.get_state().clone()
-    random_state = random.generator.get_state().clone()
-
-    def run():
-        batch.sampling_metadata = batch._make_sampling_metadata()
-        # Metadata construction can use torch.any; only forbid parameter probes
-        # during the actual sampler call, after InputBatch has normalized it.
-        with monkeypatch.context() as patch:
-            patch.setattr(torch, "any", lambda *a, **k: pytest.fail("device penalty probe"))
-            out = runner._sample(torch.tensor([[float("-inf"), 2.0]] * batch.num_reqs), spec_decode_metadata=None)
-        assert out.sampled_token_ids.tolist() == [[1]] * batch.num_reqs
-
-    run()
-    batch.swap_states(0, 1)
-    run()
-    assert torch.equal(greedy.generator.get_state(), greedy_state)
-    assert not torch.equal(random.generator.get_state(), random_state)
-    batch.remove_request("greedy")
-    del runner.requests["greedy"]
-    batch.condense()
-    add("replacement", 0.7, 33)
-    run()
