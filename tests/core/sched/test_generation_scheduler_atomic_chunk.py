@@ -178,6 +178,7 @@ def _make_scheduler(
     sched._pending_finish_reqs = []
     sched._pending_chunk_error_outputs = []
     sched._latest_omni_connector_output = None
+    sched._outputs_awaiting_stage_payload = {}
     sched._native_data_plane = native
     sched.input_coordinator = (
         OmniSchedulingCoordinator(stage_id=1, scheduler_max_num_seqs=max_num_seqs, async_chunk=True) if native else None

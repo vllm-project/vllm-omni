@@ -24,6 +24,13 @@ def _make_pool(*, stage_type: str = "llm", **client_methods: AsyncMock) -> tuple
     return pool, client
 
 
+def _coerce_stage_bool(result):
+    """Reduce a stage result exactly like ``AsyncOmni`` does before returning it."""
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+    return AsyncOmni._coerce_stage_bool(result)
+
+
 @pytest.mark.cpu
 def test_collective_rpc_normalizes_none_args_on_control_helper():
     async def run() -> None:
@@ -213,5 +220,102 @@ def test_cache_reset_failure_is_serialized_and_pool_remains_usable(method, failu
         client.collective_rpc_async.assert_not_awaited()
         # A subsequent control request still completes on the same pool.
         assert await pool.collective_rpc(0, "is_sleeping") == {"via": "collective"}
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_add_lora_uses_the_typed_client_helper():
+    async def run() -> None:
+        add_lora = AsyncMock(return_value=True)
+        pool, client = _make_pool(add_lora_async=add_lora)
+        request = object()
+
+        result = await pool.collective_rpc(0, "add_lora", args=(request,))
+
+        assert result is True
+        add_lora.assert_awaited_once_with(request)
+        client.collective_rpc_async.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_add_lora_without_typed_helper_does_not_fall_back():
+    async def run() -> None:
+        pool, client = _make_pool()
+
+        result = await pool.collective_rpc(0, "add_lora", args=(object(),))
+
+        # A failure must be a plain False, not an error dict: AsyncOmni reduces
+        # a non-empty dict to True and would report a load that never happened.
+        assert result is False
+        assert _coerce_stage_bool(result) is False
+        client.collective_rpc_async.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_add_lora_helper_failure_is_reported_as_false():
+    async def run() -> None:
+        pool, _client = _make_pool(
+            add_lora_async=AsyncMock(side_effect=AttributeError("'list' object has no attribute 'lora_int_id'"))
+        )
+
+        result = await pool.collective_rpc(0, "add_lora", args=(object(),))
+
+        assert result is False
+        assert _coerce_stage_bool(result) is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_add_lora_helper_honors_timeout():
+    async def run() -> None:
+        async def never_returns(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        pool, _client = _make_pool(add_lora_async=AsyncMock(side_effect=never_returns))
+
+        result = await pool.collective_rpc(0, "add_lora", timeout=0.01, args=(object(),))
+
+        assert result is False
+        assert _coerce_stage_bool(result) is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("method,args", [("remove_lora", (7,)), ("pin_lora", (7,)), ("list_loras", ())])
+def test_other_lora_methods_keep_the_generic_path(method, args):
+    async def run() -> None:
+        pool, client = _make_pool(add_lora_async=AsyncMock(return_value=True))
+
+        result = await pool.collective_rpc(0, method, args=args)
+
+        assert result == {"via": "collective"}
+        client.collective_rpc_async.assert_awaited_once_with(
+            method=method,
+            timeout=None,
+            args=args,
+            kwargs={},
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_diffusion_stage_keeps_add_lora_on_the_generic_path():
+    async def run() -> None:
+        add_lora = AsyncMock(return_value=True)
+        pool, client = _make_pool(stage_type="diffusion", add_lora_async=add_lora)
+
+        result = await pool.collective_rpc(0, "add_lora", args=(object(),))
+
+        assert result == {"via": "collective"}
+        add_lora.assert_not_awaited()
+        client.collective_rpc_async.assert_awaited_once()
 
     asyncio.run(run())

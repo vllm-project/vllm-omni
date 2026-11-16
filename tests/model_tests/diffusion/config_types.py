@@ -86,6 +86,10 @@ class DiffusionModelTestOpts(NamedTuple):
     # Keep this False for models whose runtime path is not yet qualified on ROCm.
     rocm_multigpu: bool = True
 
+    # Whether one-card groups should receive native ROCm hardware marks.
+    # Keep this False when the one-card path is unqualified on MI325.
+    rocm_base: bool = True
+
     # When True (default), online tests only run the base case (no accelerations).
     # When False, online tests run all test_groups, same as offline. This should be
     # True unless there is a good reason for it not to be, because the execution of
@@ -104,6 +108,10 @@ class DiffusionModelTestOpts(NamedTuple):
 
     # Native single-file models: builders/resolvers return the containing directory.
     checkpoint_filename: str | None = None
+
+    # Optional engine startup deadline for offline tests whose cold initialization
+    # is known to exceed the default on supported hardware.
+    offline_init_timeout_s: int | None = None
 
 
 ### Mappings & utils for building offline Omni() instances given a list of enabled accelerations

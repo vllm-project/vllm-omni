@@ -120,13 +120,16 @@ class SessionControl:
         if detector is None:
             return [(event, None)]
         audio = event.get("audio")
-        if not isinstance(audio, str) or not audio:
+        if not isinstance(audio, str | bytes) or not audio:
             return [(event, None)]
-        fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm_f32le"
+        fmt_raw = event.get("format")
+        fmt = fmt_raw if isinstance(fmt_raw, str) else "pcm_f32le"
         sample_rate_hz = event.get("sample_rate_hz")
         try:
-            segments = await self._ctx.services.offload(
-                detector.process_segments,
+            # The manager's batcher scores this session's Silero frames together
+            # with every other session's, instead of one pool task per append.
+            segments = await self._ctx.manager.turn_detection_batcher.process_segments(
+                detector,
                 audio,
                 fmt=fmt,
                 sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int) else None,
@@ -510,8 +513,12 @@ class SessionControl:
                     nested_url = image_url.get("url") if isinstance(image_url, dict) else None
                     if isinstance(nested_url, str):
                         existing.append(nested_url)
-            if len(existing) + len(urls) > 8 or sum(map(len, existing + urls)) > 4 * 1024 * 1024:
-                self._out.emit_error("input_backpressure", "Image context exceeds 8 images or 4 MiB; delete old items")
+            max_images, max_image_bytes = self._ctx.plugin.image_history_limits()
+            if len(existing) + len(urls) > max_images or sum(map(len, existing + urls)) > max_image_bytes:
+                self._out.emit_error(
+                    "input_backpressure",
+                    f"Image context exceeds {max_images} images or {max_image_bytes} encoded bytes; delete old items",
+                )
                 return
         message = realtime_item_to_history_message(item)
         item_id = item.get("id") if isinstance(item, dict) else None
@@ -520,7 +527,7 @@ class SessionControl:
             session.register_history_item(item_id if isinstance(item_id, str) else None, message)
             if message.get("role") == "user":
                 # A later response.create may answer this without any audio.
-                session.notify_new_user_item()
+                session.notify_new_user_item(message)
         self._out.emit(
             {
                 "type": "conversation.item.created",

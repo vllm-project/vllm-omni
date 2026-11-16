@@ -147,6 +147,8 @@ class Sam3DetectorConfig:
 class Sam3VisionOutput:
     fpn_hidden_states: tuple[torch.Tensor, ...]
     fpn_position_encoding: tuple[torch.Tensor, ...]
+    # ViT output [batch, hidden, height, width]; the video tracker builds its own FPN from it.
+    last_hidden_state: torch.Tensor | None = None
 
 
 @dataclass
@@ -533,7 +535,9 @@ class Sam3VisionModel(nn.Module):
 
     def forward(self, pixel_values: torch.Tensor) -> Sam3VisionOutput:
         spatial = self.backbone(pixel_values).permute(0, 3, 1, 2)
-        return self.neck(spatial)
+        output = self.neck(spatial)
+        output.last_hidden_state = spatial
+        return output
 
 
 # ---------------------------------------------------------------------------
@@ -879,11 +883,25 @@ class Sam3Detector(nn.Module):
         input_boxes: torch.Tensor | None = None,
         input_boxes_labels: torch.Tensor | None = None,
     ) -> Sam3DetectorOutput:
-        vision = self.vision_encoder(pixel_values)
+        return self.detect(
+            self.vision_encoder(pixel_values),
+            self.encode_text(input_ids, attention_mask),
+            attention_mask.bool(),
+            input_boxes,
+            input_boxes_labels,
+        )
+
+    def detect(
+        self,
+        vision: Sam3VisionOutput,
+        prompt_features: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        input_boxes: torch.Tensor | None = None,
+        input_boxes_labels: torch.Tensor | None = None,
+    ) -> Sam3DetectorOutput:
+        """Detect on precomputed image features, so video frames share one vision pass with the tracker."""
         fpn_features = vision.fpn_hidden_states
         fpn_encodings = vision.fpn_position_encoding
-        prompt_features = self.encode_text(input_ids, attention_mask)
-        prompt_mask = attention_mask.bool()
         if input_boxes is not None and input_boxes.numel() > 0:
             labels = input_boxes_labels
             if labels is None:

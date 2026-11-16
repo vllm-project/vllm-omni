@@ -38,7 +38,7 @@ _SPEECH_BATCH_NO_CLONE_FIELDS = "__speech_batch_no_clone_fields__"
 
 pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
-_L4_SPEECH_HW = hardware_marks(res={"cuda": "L4"})
+_L4_SPEECH_HW = hardware_marks(res={"cuda": "L4", "rocm": "MI325"})
 _SPEECH_SERVER_ARGS = ["--trust-remote-code", "--disable-log-stats"]
 
 _QWEN3_TTS_SPEECH = [
@@ -804,7 +804,7 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
         pytest.param(
             "wav_pdf_type",
             {"consent": "consent_ok", "name": "v_bad_mime_{uuid}"},
-            ("mime", "unsupported", "audio/mp4"),
+            ("mime", "unsupported", "application/pdf"),
             id="audio_unsupported_mime",
         ),
         pytest.param(
@@ -973,7 +973,7 @@ _MINIMAX_MUSIC3_SPEECH = [
             server_args=_SPEECH_SERVER_ARGS,
         ),
         id="minimax_music3",
-        marks=hardware_marks(res={"cuda": "H100"}),
+        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}),
     ),
 ]
 
@@ -1037,7 +1037,7 @@ _YUE2_SPEECH = [
             server_args=_SPEECH_SERVER_ARGS,
         ),
         id="yue2",
-        marks=hardware_marks(res={"cuda": "H100"}),
+        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}),
     ),
 ]
 
