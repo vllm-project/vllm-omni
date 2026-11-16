@@ -559,7 +559,9 @@ def test_fish_capture_contract_preserves_full_graph(model_name):
     from vllm_omni.model_executor.models.fish_omni.fish_omni_model import FishOmniForConditionalGeneration
     from vllm_omni.model_executor.models.fish_speech.fish_speech_slow_ar import FishSpeechSlowARForConditionalGeneration
 
-    model_cls = {"slow_ar": FishSpeechSlowARForConditionalGeneration, "omni": FishOmniForConditionalGeneration}[model_name]
+    model_cls = {"slow_ar": FishSpeechSlowARForConditionalGeneration, "omni": FishOmniForConditionalGeneration}[
+        model_name
+    ]
     model = model_cls.__new__(model_cls)
     torch.nn.Module.__init__(model)
     # Slow AR sets this in its weight-loading constructor.
