@@ -340,7 +340,8 @@ On supported GPU hosts, wrap a test or soak with the repository monitor:
 
 ```bash
 bash tests/dfx/stability/scripts/resource_monitor.sh run --backend gpu -- \
-  pytest -s -v tests/dfx/stability/scripts/run_stability_<model>.py -m slow
+  pytest -s -v tests/dfx/stability/scripts/run_stability_benchmark.py \
+    --test-config-file tests/dfx/stability/tests/test_<model>.json -m slow
 ```
 
 Check the target revision's monitor backends. Do not claim CPU/NPU monitoring

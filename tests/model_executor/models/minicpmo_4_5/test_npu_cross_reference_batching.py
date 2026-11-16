@@ -517,7 +517,8 @@ def test_ragged_npu_inputs_match_independent_streams(batch):
 def test_ragged_npu_groups_allow_lengths_but_keep_hift_boundary():
     items, states, features = _prepared_rows()
     states[1].flow_cache["conformer_att_cache"] = torch.cat([states[1].flow_cache["conformer_att_cache"]] * 2, dim=3)
-    states[1].flow_cache["estimator_att_cache"] = torch.cat([states[1].flow_cache["estimator_att_cache"]] * 2, dim=4)
+    # Split K/V estimator cache: (n_t, depth, 2, rows, heads, frames, head_dim).
+    states[1].flow_cache["estimator_att_cache"] = torch.cat([states[1].flow_cache["estimator_att_cache"]] * 2, dim=5)
     features[1] = replace(
         features[1],
         speech_tokens=torch.cat([features[1].speech_tokens] * 2, dim=1),
@@ -633,7 +634,24 @@ def test_backend_initialization_gates_actual_wrapper_flag(policy, expected, monk
     assert model.backend is backend
     if policy != "no_wrapper":
         assert wrapper.npu_mixed_history is expected
+    else:
+        assert wrapper.npu_mixed_history is True
     inactive_warnings = [
         call for call in warning.call_args_list if "NPU cross-reference CFM batching is inactive" in str(call)
     ]
     assert bool(inactive_warnings) is (policy not in ("eligible", "disabled"))
+
+    reasons = {
+        "fp16": "wrapper dtype must be FP32",
+        "slots": "attention slot pool must be disabled",
+        "bf16_cache": "attention cache dtype must be FP32",
+        "unfused": "fused ragged body is required",
+        "no_ragged": "ragged Whole-Euler body is unavailable",
+        "disabled_graph": "Whole-Euler graph is disabled",
+        "minimum": "code2wav_min_batch_size must be 1",
+        "cpu": "wrapper device must be NPU",
+        "no_wrapper": "Whole-Euler wrapper is unavailable",
+    }
+    if policy in reasons:
+        assert len(inactive_warnings) == 1
+        assert inactive_warnings[0].args[1] == reasons[policy]
