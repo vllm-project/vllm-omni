@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Comprehensive e2e tests of diffusion features for Wan2.1-VACE in online serving mode.
@@ -24,9 +24,9 @@ Coverage:
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = "Wan-AI/Wan2.1-VACE-1.3B-diffusers"
 PROMPT = "A cat walking slowly across a sunlit garden path"
@@ -150,9 +150,9 @@ def _get_vace_feature_cases():
     _get_vace_feature_cases(),
     indirect=True,
 )
-def test_wan_2_1_vace(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_wan_2_1_vace(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Test VACE T2V generation with all supported diffusion acceleration features."""
-    openai_client.send_video_diffusion_request(
+    online_client.send_video_diffusion_request(
         {
             "model": MODEL,
             "form_data": {

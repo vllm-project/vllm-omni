@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """OmniVoice configuration for vLLM-Omni two-stage pipeline."""
 
 import os
@@ -75,6 +75,8 @@ class OmniVoiceConfig(PretrainedConfig):
         self.layer_penalty_factor = getattr(self, "layer_penalty_factor", 5.0)
         self.position_temperature = getattr(self, "position_temperature", 5.0)
         self.class_temperature = getattr(self, "class_temperature", 0.0)
+        self.audio_chunk_duration = getattr(self, "audio_chunk_duration", 15.0)
+        self.audio_chunk_threshold = getattr(self, "audio_chunk_threshold", 30.0)
 
         # Audio output
         self.sample_rate = getattr(self, "sample_rate", 24000)
@@ -90,6 +92,8 @@ class OmniVoiceConfig(PretrainedConfig):
             "cuda_graph_capture_sizes",
             [128, 192, 256, 320, 384, 448, 512, 640, 768, 1024],
         )
+        # TF32 matmuls: not bit-identical; opt-in (matches vLLM default-off), set OMNIVOICE_TF32=1 to enable.
+        self.enable_tf32 = getattr(self, "enable_tf32", os.environ.get("OMNIVOICE_TF32", "0") != "0")
 
 
 AutoConfig.register("omnivoice", OmniVoiceConfig)

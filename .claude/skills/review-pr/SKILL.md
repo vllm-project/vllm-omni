@@ -21,7 +21,10 @@ Make every finding:
 - **Calibrated:** match severity to user and maintainer impact.
 
 Do not report unrelated backlog, style already enforced by pre-commit, or a
-missing test that would not protect changed behavior.
+missing test that would not protect changed behavior. Do report new allowlist
+or budget entries in `check_forbidden_imports.py` / `check_torch_cuda.py` /
+`check_tts_adapter.py` / `check_buildkite.py` unless the PR justifies them:
+those are policy changes, not lint noise.
 
 ## Select the input and depth
 
@@ -38,6 +41,11 @@ Default to maintainer brevity. A detailed or audit request expands coverage and
 lists `path:line` findings, but keeps the same confidence and severity bar.
 
 ## Reference guide
+
+Before reviewing, read the relevant entries in
+[Review and issue lessons](../../../docs/contributing/ci/lessons.md). Verify their
+linked evidence against the current diff and revision; historical examples are
+not proof of a new defect.
 
 Load references in review order: process, one primary module contract, matching
 feature designs, evidence checks, then delivery. Every file is linked directly
@@ -92,11 +100,13 @@ If docs and live code disagree, verify the code/tests and report the drift.
 
 | Reference | Read when |
 | --- | --- |
-| [model-addition-checklist.md](references/checks/model-addition-checklist.md) | A model, architecture, loader, processor, registry, or stage config is added. |
+| [model-addition-checklist.md](references/checks/model-addition-checklist.md) | A model, architecture, loader, processor, registry, pipeline config, or deploy config is added. |
 | [perf-verification.md](references/checks/perf-verification.md) | The PR makes a latency, throughput, memory, or quality claim. |
 | [test-quality-evaluation.md](references/checks/test-quality-evaluation.md) | Tests change, are absent for risky code, or may not exercise production behavior. |
 | [tests-docs-checklist.md](references/checks/tests-docs-checklist.md) | Coverage, CI markers, examples, user docs, or PR evidence need review. |
 | [verification.md](references/checks/verification.md) | Hardware, a server, or a runnable affected path is available for active verification. |
+| [examples-policy.md](../precheck-pr/references/examples-policy.md) | The PR adds, copies, or renames Python under `examples/`; apply the canonical policy shared with `precheck-pr`. |
+| [find-simplifications](../find-simplifications/SKILL.md) | Every review; run a diff-scoped subtraction and simplification pass after correctness blockers. |
 
 ### Delivery and reviewer coordination
 
@@ -118,10 +128,11 @@ it changes again, report the churn and wait for a stable target.
 
 For a trusted PR head, materialize the pinned head in an isolated detached
 worktree. A worktree freezes identity but is not a security sandbox. Treat fork
-heads as untrusted unless the user and environment policy explicitly establish
-otherwise: execute them only in a disposable, secret-free sandbox with restricted
-filesystem, network, and resources; without one, use static SHA-addressed reads
-and CI evidence only. For a local review, freeze the committed, index, worktree,
+heads as untrusted until the user and environment policy explicitly establish
+trust: execute their code only after that trust is recorded for this host,
+with the trusted SHA noted in the review state and secrets kept out of the
+execution scope; without recorded trust, use static SHA-addressed reads and CI
+evidence only. For a local review, freeze the committed, index, worktree,
 and NUL-safe in-scope untracked contents. Follow
 [review-execution.md](references/process/review-execution.md) for trust gates,
 state fingerprints, and byte-for-byte staleness checks.
@@ -152,6 +163,13 @@ contract they protect or use only the applicable evidence checks.
 Apply every category in [general-checks.md](references/process/general-checks.md) before
 lower-priority comments.
 
+If the diff census contains an added, copied, or renamed Python path under
+`examples/`, read and apply the canonical
+[examples policy](../precheck-pr/references/examples-policy.md). Treat a new
+model-specific Python example as blocking. Do not flag model-specific example
+debt that the PR only modifies or removes, and do not run the rest of the
+author-oriented `precheck-pr` workflow.
+
 For each changed value or behavior, trace:
 
 ```text
@@ -172,15 +190,19 @@ promotion gate. Candidate or draft rules are questions, not blockers, unless
 current code, tests, or policy enforce them. Inspect both sides of any config,
 registry, serialization, connector, cache, or stage boundary.
 
-When a diff adds or expands a helper, class, fallback, compatibility branch, or
-public behavior, run a subtraction pass: remove out-of-scope behavior and check
-whether each new abstraction can be deleted, merged, moved, or inlined.
+Read and apply [find-simplifications](../find-simplifications/SKILL.md) on every
+review. Constrain it to the diff and the adjacent ownership, callers, or
+consumers needed to prove a candidate. Check whether added or expanded helpers,
+classes, state, fallback and compatibility branches, data movement, or public
+behavior can be deleted, merged, moved, or inlined. Zero candidates is a valid
+result. Do not widen the review into repository backlog or report speculative
+style preferences as simplification findings.
 
 ### 6. Verify the changed path
 
 Before each validation group, verify the frozen SHA plus the tracked, index,
 untracked, and ignored-file fingerprint, or recreate a pristine snapshot. On a
-trusted head or inside the required sandbox, run an import/version preflight,
+head the user explicitly trusted for this host, run an import/version preflight,
 then the narrowest relevant tests and low-cost static checks. Bind every result
 to the head SHA, snapshot fingerprint, and environment fingerprint. Never run
 imports, tests, builds, hooks, or repo-configurable tooling from an untrusted
@@ -208,9 +230,11 @@ and restart from the new snapshot.
 
 Return findings first. Use
 [maintainer-style-study.md](references/delivery/maintainer-style-study.md) to keep them
-direct and brief. Each finding must include an exact `path:line`, trigger or
-call path, current behavior, impact, and smallest fix direction. If there are
-no findings, say so briefly and name material validation gaps.
+direct and brief. For consolidated replies with multiple actions, use its short
+contributor-owned checklist; omit routine process and maintainer CI narration.
+Each finding must include an exact `path:line`, trigger or call path, current
+behavior, impact, and smallest fix direction. If there are no findings, say so
+briefly and name material validation gaps.
 
 Keep the review read-only unless the user explicitly authorizes posting. Do not
 submit `APPROVE`, `COMMENT`, or `REQUEST_CHANGES`, add labels, edit code, or push

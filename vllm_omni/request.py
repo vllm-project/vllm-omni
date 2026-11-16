@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -11,7 +14,12 @@ from vllm.v1.request import Request
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
-from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.engine import (
+    AdditionalInformationPayload,
+    OmniEngineCoreRequest,
+    PayloadSenderInfo,
+    PromptEmbedsPayload,
+)
 
 
 class OmniRequest(Request):
@@ -36,11 +44,16 @@ class OmniRequest(Request):
         external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict | None = None,
+        payload_sender_info: PayloadSenderInfo | None = None,
         **kwargs,
     ):
         if prompt_embeds is not None:
             kwargs["prompt_embeds"] = self._maybe_decode_prompt_embeds(prompt_embeds)
         super().__init__(*args, **kwargs)
+        # vLLM 0.27 owns this counter; accelerator images still based on 0.26
+        # do not. Keep the Omni scheduler's stale-output drain compatible with
+        # both request layouts until those images move to 0.27.
+        self.num_stale_output_tokens = int(getattr(self, "num_stale_output_tokens", 0) or 0)
         # Preserve serialized prompt embeddings payload (optional)
         self.prompt_embeds_payload: PromptEmbedsPayload | None = (
             prompt_embeds if isinstance(prompt_embeds, PromptEmbedsPayload) else None
@@ -51,6 +64,8 @@ class OmniRequest(Request):
         self.additional_information: AdditionalInformationPayload | None = additional_information
         # Runner-owned runtime payload.
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
+        # Sender's connector address, or the payload itself for run requests.
+        self.payload_sender_info: PayloadSenderInfo | None = payload_sender_info
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -98,7 +113,10 @@ class OmniRequest(Request):
             block_hasher=block_hasher,
             additional_information=request.additional_information,
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            payload_sender_info=request.payload_sender_info,
             resumable=request.resumable,
+            session_id=request.session_id,
+            kv_hints=request.kv_hints,
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Config/message construction helpers used by tests."""
 
 import atexit
@@ -8,11 +11,13 @@ from typing import Any
 
 import yaml
 
+from vllm_omni.config.stage_config import load_deploy_config, resolve_deploy_yaml
+
 
 def modify_stage_config(
     yaml_path: str,
-    updates: dict[str, Any] = None,
-    deletes: dict[str, Any] = None,
+    updates: dict[str, Any] | None = None,
+    deletes: dict[str, Any] | None = None,
 ) -> str:
     """
     Modify configurations in a YAML file, supporting both top-level and stage-specific modifications,
@@ -23,17 +28,17 @@ def modify_stage_config(
         updates: Dictionary containing both top-level and stage-specific modifications to add or update.
                 Format: {
                     'async_chunk': True,
-                    'stage_args': {
-                        0: {'engine_args.max_model_len': 5800},
-                        1: {'engine_args.max_num_seqs': 2}
+                    'stages': {
+                        0: {'max_model_len': 5800},
+                        1: {'max_num_seqs': 2}
                     }
                 }
         deletes: Dictionary containing configurations to delete.
                 Format: {
                     'old_config': None,  # Delete entire key
-                    'stage_args': {
-                        0: ['engine_args.old_param'],
-                        1: ['runtime.unused_setting']
+                    'stages': {
+                        0: ['old_param'],
+                        1: ['unused_setting']
                     }
                 }
 
@@ -45,8 +50,7 @@ def modify_stage_config(
         raise FileNotFoundError(f"yaml does not exist: {path}")
 
     try:
-        with open(yaml_path, encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
+        config = resolve_deploy_yaml(path)
     except Exception as e:
         raise ValueError(f"Cannot parse YAML file: {e}")
 
@@ -164,24 +168,20 @@ def modify_stage_config(
         else:
             print(f"Path {path} does not exist")
 
-    _stage_key = "stages" if "stages" in config else "stage_args"
+    stages = get_stage_entries(config)
 
     # Apply deletions first
     if deletes:
         for key, value in deletes.items():
-            if key in ("stage_args", "stages"):
+            if key == "stages":
                 if value and isinstance(value, dict):
-                    stage_args = config.get(_stage_key, [])
-                    if not stage_args:
-                        raise ValueError("stage_args does not exist in config")
-
                     for stage_id, delete_paths in value.items():
                         if not delete_paths:
                             continue
 
                         # Find stage by ID
                         target_stage = None
-                        for stage in stage_args:
+                        for stage in stages:
                             if stage.get("stage_id") == int(stage_id):
                                 target_stage = stage
                                 break
@@ -204,28 +204,24 @@ def modify_stage_config(
     # Apply updates
     if updates:
         for key, value in updates.items():
-            if key in ("stage_args", "stages"):
+            if key == "stages":
                 if value and isinstance(value, dict):
-                    stage_args = config.get(_stage_key, [])
-                    if not stage_args:
-                        raise ValueError("stage_args does not exist in config")
-
                     for stage_id, stage_updates in value.items():
                         # Find stage by ID
                         target_stage = None
-                        for stage in stage_args:
+                        for stage in stages:
                             if stage.get("stage_id") == int(stage_id):
                                 target_stage = stage
                                 break
 
                         if target_stage is None:
-                            available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
+                            available_ids = [s.get("stage_id") for s in stages if "stage_id" in s]
                             raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
 
                         # Apply updates to this stage
                         for update_path, val in stage_updates.items():
                             # Check if this is a simple key (not dot-separated)
-                            # Example: 'engine_input_source' vs 'engine_args.max_model_len'
+                            # Example: 'engine_input_source' vs nested 'default_sampling_params.max_tokens'
                             if "." not in update_path:
                                 # Direct key assignment (e.g., updating a list value)
                                 target_stage[update_path] = val
@@ -238,6 +234,11 @@ def modify_stage_config(
             else:
                 # Direct top-level key
                 config[key] = value
+
+    # The copy lives in a temporary directory; keep inheritance anchored to
+    # the source deploy rather than resolving its relative base under /tmp.
+    if base_config := config.get("base_config"):
+        config["base_config"] = str((path.parent / base_config).resolve())
 
     # Unique suffix: multiple modify_stage_config calls in one process often run
     # within the same second (e.g. test_qwen3_omni_expansion imports both
@@ -262,6 +263,42 @@ _CI_GENERATED_DIR = _REPO_ROOT / "tests" / ".ci_generated"
 # CI overlays as Python dicts (LSP-friendly). Materialized on demand to
 # tests/.ci_generated/<model>.yaml via get_deploy_config_path("ci/<name>.yaml").
 _CI_OVERLAYS: dict[str, dict[str, Any]] = {
+    "voxcpm2": {
+        "base_config": "voxcpm2.yaml",
+        # Run-level test modifiers inspect the raw overlay before resolving its
+        # base config. Keep a stage-id anchor so those modifiers can preserve
+        # the inherited stage while applying CI-only runner selection.
+        "stages": [{"stage_id": 0}],
+        "platforms": {
+            "rocm": {
+                "stages": [
+                    {
+                        "stage_id": 0,
+                        # Qualify vLLM's native ROCm attention path for transcript
+                        # quality without changing the production deploy profile.
+                        "attention_backend": "ROCM_ATTN",
+                        # MI325 qualification currently produces corrupted speech
+                        # when VoxCPM2's internal Inductor path and LocDiT rewrites
+                        # are active. Keep this correctness-first compatibility
+                        # profile CI-only while preserving production and CUDA
+                        # defaults. Re-enable each optimization independently after
+                        # it passes transcript-quality qualification on ROCm.
+                        "engine_extras": {
+                            "hf_overrides": {
+                                "voxcpm2_runtime_config": {
+                                    "enable_torch_compile": False,
+                                    "enable_loc_dit_fused_qkv": False,
+                                    "enable_loc_dit_fused_mlp": False,
+                                    "enable_loc_dit_zero_dt_cache": False,
+                                    "enable_loc_dit_skip_qkv_contig": False,
+                                },
+                            },
+                        },
+                    },
+                ],
+            },
+        },
+    },
     "qwen2_5_omni": {
         "base_config": "qwen2_5_omni.yaml",
         "async_chunk": False,
@@ -271,7 +308,11 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "max_model_len": 16384,
                 "max_num_batched_tokens": 16384,
                 "max_num_seqs": 1,
-                "gpu_memory_utilization": 0.9,
+                # Thinker owns its card. On a 22 GiB L4 (build 18653, vLLM 0.32.0),
+                # util 0.9 left 0.8 GiB of KV after the 16.78 GiB weights, runner
+                # buffers and the 16384-token prefill peak; one 16384-token request
+                # needs 0.88 GiB.
+                "gpu_memory_utilization": 0.95,
                 "skip_mm_profiling": True,
                 "default_sampling_params": {"max_tokens": 128},
             },
@@ -295,6 +336,15 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
         "platforms": {
+            "rocm": {
+                # ROCm documentation examples request two cards. Share the
+                # Talker's card with Code2Wav and reserve its DiT workspace.
+                "stages": [
+                    {"stage_id": 0, "gpu_memory_utilization": 0.9},
+                    {"stage_id": 1, "gpu_memory_utilization": 0.3},
+                    {"stage_id": 2, "devices": "1"},
+                ],
+            },
             "xpu": {
                 "stages": [
                     {
@@ -379,6 +429,40 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                         "skip_mm_profiling": True,
                         "devices": "5",
                         "default_sampling_params": {"max_tokens": 2000},
+                    },
+                ],
+            },
+        },
+    },
+    "qwen3_omni_moe_colocate_async": {
+        "base_config": "qwen3_omni_moe_thinking.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "enable_sleep_mode": True,
+                "enforce_eager": True,
+                "trust_remote_code": True,
+                "tensor_parallel_size": 1,
+                "devices": "0",
+                "max_num_seqs": 1,
+                "max_model_len": 8192,
+                "max_num_batched_tokens": 8192,
+                "enable_prefix_caching": False,
+                "skip_mm_profiling": True,
+            },
+        ],
+        "platforms": {
+            "rocm": {
+                "stages": [
+                    {
+                        "stage_id": 0,
+                        # This control-plane test needs only 8K tokens. On MI300,
+                        # percentage sizing attempted a ~125 GiB KV allocation
+                        # after the 64.5 GiB model load and then failed while
+                        # allocating the cache. Keep CUDA's existing sizing and
+                        # give only ROCm a bounded cache with ample headroom.
+                        "gpu_memory_utilization": None,
+                        "kv_cache_memory_bytes": 2 * 1024**3,
                     },
                 ],
             },
@@ -619,9 +703,45 @@ def _materialize_ci_overlay(model_type: str) -> Path:
     if base:
         overlay["base_config"] = str(_DEPLOY_DIR / base)
 
-    with open(out, "w", encoding="utf-8") as f:
-        yaml.safe_dump(overlay, f, sort_keys=False)
+    # Other pytest workers may read this path while regenerating the overlay.
+    fd, tmp_path = tempfile.mkstemp(dir=_CI_GENERATED_DIR, suffix=".yaml")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.safe_dump(overlay, f, sort_keys=False)
+        os.replace(tmp_path, out)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
     return out
+
+
+def get_stage_entries(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the ``stages`` list from a new-schema deploy config dict.
+
+    Raises ``ValueError`` when the top-level ``stages`` key is missing.
+    """
+    stages = cfg.get("stages")
+    if stages is None:
+        raise ValueError("Deploy config missing top-level 'stages'")
+    return list(stages)
+
+
+def load_stage_ids(resolved_config: dict[str, Any]) -> list[int]:
+    """Return ``stage_id`` values from a resolved deploy config dict."""
+    stage_ids = [stage["stage_id"] for stage in get_stage_entries(resolved_config) if "stage_id" in stage]
+    if not stage_ids:
+        raise ValueError("No stage IDs found in resolved config")
+    return stage_ids
+
+
+def load_stage_replica_counts(resolved_config: dict[str, Any]) -> dict[int, int]:
+    """Return ``{stage_id: num_replicas}`` from flat stage entries (default 1)."""
+    replica_counts: dict[int, int] = {}
+    for stage in get_stage_entries(resolved_config):
+        stage_id = stage.get("stage_id")
+        if stage_id is None:
+            continue
+        replica_counts[int(stage_id)] = max(1, int(stage.get("num_replicas", 1)))
+    return replica_counts
 
 
 def get_deploy_config_path(rel_path: str) -> str:
@@ -638,33 +758,29 @@ def get_deploy_config_stage(rel_path: str, stage_id: int) -> dict[str, Any]:
     with open(get_deploy_config_path(rel_path), encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
-    stage_key = "stages" if "stages" in cfg else "stage_args"
-    for stage in cfg.get(stage_key, []):
+    for stage in get_stage_entries(cfg):
         if stage.get("stage_id") == stage_id:
             return stage
     raise KeyError(f"No stage_id={stage_id} in deploy config {rel_path!r}")
 
 
-def _get_config_value_by_path(config_dict: dict, path: str) -> Any:
-    """Read a dot-separated path from a nested dict (e.g. ``engine_args.load_format``)."""
-    current: Any = config_dict
-    for key in path.split("."):
-        if not isinstance(current, dict) or key not in current:
-            return None
-        current = current[key]
-    return current
+def get_deploy_duplex_max_sessions(rel_path: str) -> int:
+    """Return the duplex session capacity a deploy yaml admits.
+
+    Loads through ``load_deploy_config`` so ``base_config`` merging and
+    ``DuplexSessionRuntimeConfig`` defaults stay in lockstep with the server
+    instead of being re-implemented here.
+    """
+    return load_deploy_config(get_deploy_config_path(rel_path)).duplex_session.max_sessions
 
 
-def _stage_load_format_paths(stage_config_path: str) -> tuple[str, str, list[int]]:
-    """Return ``(stage_key, load_format_field_path, stage_ids)`` for a deploy YAML."""
-    with open(stage_config_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    new_schema_stages = cfg.get("stages")
-    stage_key = "stages" if new_schema_stages is not None else "stage_args"
-    load_format_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
-    stage_entries = cfg.get(stage_key, [])
-    stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
-    return stage_key, load_format_path, stage_ids
+def _stage_ids_from_deploy_yaml(stage_config_path: str) -> list[int]:
+    """Return all stage IDs, including stages inherited through ``base_config``."""
+    cfg = resolve_deploy_yaml(stage_config_path)
+    try:
+        return load_stage_ids(cfg)
+    except ValueError as exc:
+        raise ValueError(f"Deploy YAML missing top-level 'stages': {stage_config_path}") from exc
 
 
 def _add_dummy_load_format(
@@ -674,10 +790,10 @@ def _add_dummy_load_format(
     """For ``core_model`` runs, patch every stage in the deploy YAML to ``load_format: dummy``."""
     if run_level != "core_model" or stage_config_path is None:
         return stage_config_path
-    stage_key, load_format_path, stage_ids = _stage_load_format_paths(stage_config_path)
+    stage_ids = _stage_ids_from_deploy_yaml(stage_config_path)
     return modify_stage_config(
         stage_config_path,
-        updates={stage_key: {stage_id: {load_format_path: "dummy"} for stage_id in stage_ids}},
+        updates={"stages": {stage_id: {"load_format": "dummy"} for stage_id in stage_ids}},
     )
 
 
@@ -688,38 +804,109 @@ def _delete_dummy_load_format(
     """For ``advanced_model`` / ``full_model``, strip ``load_format: dummy`` so real weights load."""
     if run_level not in {"advanced_model", "full_model"} or stage_config_path is None:
         return stage_config_path
-    stage_key, load_format_path, _stage_ids = _stage_load_format_paths(stage_config_path)
-    with open(stage_config_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    stage_entries = cfg.get(stage_key, [])
+    cfg = resolve_deploy_yaml(stage_config_path)
+    try:
+        stages = get_stage_entries(cfg)
+    except ValueError as exc:
+        raise ValueError(f"Deploy YAML missing top-level 'stages': {stage_config_path}") from exc
 
     deletes: dict[int, list[str]] = {}
-    for stage in stage_entries:
+    for stage in stages:
         stage_id = stage.get("stage_id")
         if stage_id is None:
             continue
-        if _get_config_value_by_path(stage, load_format_path) == "dummy":
-            deletes[stage_id] = [load_format_path]
+        if stage.get("load_format") == "dummy":
+            deletes[stage_id] = ["load_format"]
 
     if not deletes:
         return stage_config_path
 
     return modify_stage_config(
         stage_config_path,
-        deletes={stage_key: deletes},
+        deletes={"stages": deletes},
     )
+
+
+# Weekly CI sets this so the launched deploy YAML selects the runner. Upstream
+# VLLM_USE_V2_MODEL_RUNNER does not: Omni stages read deploy ``model_runner``.
+_CI_MODEL_RUNNER_ENV = "VLLM_OMNI_CI_MODEL_RUNNER"
+
+
+def _ci_model_runner_override() -> str | None:
+    raw = os.environ.get(_CI_MODEL_RUNNER_ENV, "").strip().lower()
+    if not raw:
+        return None
+    if raw not in {"v1", "v2"}:
+        raise ValueError(f"{_CI_MODEL_RUNNER_ENV} must be 'v1' or 'v2', got {raw!r}")
+    return raw
+
+
+def _apply_ci_model_runner(stage_config_path: str | None) -> str | None:
+    """Write deploy-level ``model_runner`` into a copy of the launch YAML.
+
+    A stage that already sets ``model_runner`` keeps that pin. A CUDA platform
+    block that already sets it is updated too, because that platform value
+    replaces the deploy-level choice when the server loads the file.
+    """
+    runner = _ci_model_runner_override()
+    if runner is None:
+        return stage_config_path
+    if stage_config_path is None:
+        raise ValueError(
+            f"{_CI_MODEL_RUNNER_ENV} is set but this test did not provide a deploy config. "
+            "Weekly CI cannot select model_runner without a deploy YAML."
+        )
+
+    path = Path(stage_config_path)
+    with open(path, encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"Deploy YAML must be a mapping: {stage_config_path}")
+    config["model_runner"] = runner
+    base_config = config.get("base_config")
+    if isinstance(base_config, str) and not Path(base_config).is_absolute():
+        # The copy lives in the temp directory, so a relative base would no
+        # longer resolve next to the original file.
+        config["base_config"] = str((path.parent / base_config).resolve())
+    # Platform model_runner replaces the deploy-level value at load time, including
+    # a value inherited through base_config. Put the override on this file so the
+    # overlay wins without dropping the base platform's other fields.
+    resolved = resolve_deploy_yaml(path)
+    resolved_cuda = (resolved.get("platforms") or {}).get("cuda") if isinstance(resolved, dict) else None
+    local_platforms = config.get("platforms")
+    local_cuda = local_platforms.get("cuda") if isinstance(local_platforms, dict) else None
+    if (isinstance(resolved_cuda, dict) and "model_runner" in resolved_cuda) or (
+        isinstance(local_cuda, dict) and "model_runner" in local_cuda
+    ):
+        platforms = config.setdefault("platforms", {})
+        if isinstance(platforms, dict):
+            cuda = platforms.setdefault("cuda", {})
+            if isinstance(cuda, dict):
+                cuda["model_runner"] = runner
+
+    output_fd, output_path = tempfile.mkstemp(prefix=f"{path.stem}_", suffix=".yaml")
+    atexit.register(Path(output_path).unlink, missing_ok=True)
+    with os.fdopen(output_fd, "w", encoding="utf-8") as f:
+        yaml.dump(config, f, default_flow_style=None, sort_keys=False, allow_unicode=True, indent=2)
+    return output_path
 
 
 def stage_config_path_for_run_level(stage_config_path: str | None, run_level: str) -> str | None:
     """Apply run-level deploy YAML tweaks for weight loading (dummy vs real)."""
     if run_level in {"advanced_model", "full_model"}:
-        return _delete_dummy_load_format(stage_config_path, run_level)
-    return _add_dummy_load_format(stage_config_path, run_level)
+        resolved = _delete_dummy_load_format(stage_config_path, run_level)
+    else:
+        resolved = _add_dummy_load_format(stage_config_path, run_level)
+    return _apply_ci_model_runner(resolved)
 
 
 __all__ = [
     "get_deploy_config_path",
     "get_deploy_config_stage",
+    "get_deploy_duplex_max_sessions",
+    "get_stage_entries",
+    "load_stage_ids",
+    "load_stage_replica_counts",
     "modify_stage_config",
     "stage_config_path_for_run_level",
 ]

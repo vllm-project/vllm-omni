@@ -46,7 +46,7 @@ class Omni:
 
     Args:
         model: Model name or path
-        stage_configs: Optional stage configurations
+        deploy_config: Optional path to a deploy configuration
         **kwargs: Additional arguments passed to the engine
 
     Example:

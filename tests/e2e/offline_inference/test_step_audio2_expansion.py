@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E expansion tests for Step-Audio2 offline inference (nightly CI).
 
@@ -19,7 +19,7 @@ from vllm_omni.outputs import OmniRequestOutput
 
 MODEL = "stepfun-ai/Step-Audio-2-mini"
 DEPLOY_CONFIG = get_deploy_config_path("step_audio2_ci.yaml")
-TEST_PARAMS = [(MODEL, None, {"deploy_config": DEPLOY_CONFIG, "trust_remote_code": True})]
+TEST_PARAMS = [(MODEL, DEPLOY_CONFIG, {"trust_remote_code": True})]
 
 pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
@@ -63,13 +63,13 @@ def _assert_non_empty_text_output(outputs: list[OmniRequestOutput]) -> None:
 
     text_output = next((o for o in outputs if o.final_output_type == "text"), None)
     assert text_output is not None
-    assert text_output.request_output is not None
-    text_content = text_output.request_output.outputs[0].text
+    assert text_output is not None
+    text_content = text_output.outputs[0].text
     assert text_content is not None
     assert len(text_content.strip()) > 0
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", TEST_PARAMS, indirect=True)
 def test_audio_to_text_and_audio(omni_runner: OmniRunner) -> None:
     """Test processing audio input and generating text + audio output."""
@@ -81,13 +81,13 @@ def test_audio_to_text_and_audio(omni_runner: OmniRunner) -> None:
 
     audio_output = next((o for o in outputs if o.final_output_type == "audio"), None)
     if audio_output is not None:
-        assert audio_output.request_output is not None
-        audio_tensor = audio_output.request_output.outputs[0].multimodal_output.get("audio")
+        assert audio_output is not None
+        audio_tensor = audio_output.outputs[0].multimodal_output.get("audio")
         if audio_tensor is not None:
             assert audio_tensor.numel() > 0
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", TEST_PARAMS, indirect=True)
 def test_text_only_input(omni_runner: OmniRunner) -> None:
     """Test processing text-only input (no audio)."""

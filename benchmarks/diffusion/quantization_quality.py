@@ -158,7 +158,6 @@ def _build_omni_kwargs(args, quantization=None):
 def _generate_image(omni, args, prompt, seed):
     """Generate a single image and return (PIL.Image, time_seconds, memory_gib)."""
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-    from vllm_omni.outputs import OmniRequestOutput
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
@@ -176,7 +175,7 @@ def _generate_image(omni, args, prompt, seed):
     elapsed = time.perf_counter() - start
     peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
-    req_out = OmniRequestOutput.unwrap_result(outputs)
+    req_out = outputs[0] if isinstance(outputs, list) else outputs
     if not req_out.images:
         raise ValueError("Could not extract image output from result.")
     img = req_out.images[0]
@@ -206,15 +205,15 @@ def _generate_video(omni, args, prompt, seed):
     elapsed = time.perf_counter() - start
     peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
-    first = outputs[0]
-    if hasattr(first, "request_output") and isinstance(first.request_output, list):
-        inner = first.request_output[0]
-        if isinstance(inner, OmniRequestOutput) and hasattr(inner, "images"):
-            frames = inner.images[0] if inner.images else None
-        else:
-            frames = inner
-    elif hasattr(first, "images") and first.images:
-        frames = first.images[0]
+    if isinstance(outputs, list) and isinstance(outputs[0], OmniRequestOutput):
+        first = outputs[0]
+    elif isinstance(outputs, OmniRequestOutput):
+        first = outputs
+    else:
+        raise ValueError("Could not extract video frames from output.")
+
+    if hasattr(first, "images"):
+        frames = first.images[0] if first.images else None
     else:
         raise ValueError("Could not extract video frames from output.")
 

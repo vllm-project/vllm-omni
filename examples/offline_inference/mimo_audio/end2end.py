@@ -297,7 +297,7 @@ def main(args):
     os.makedirs(output_dir, exist_ok=True)
 
     for stage_outputs in omni_outputs:
-        output = stage_outputs.request_output
+        output = stage_outputs
         if stage_outputs.final_output_type == "text":
             request_id = output.request_id
             text_output = output.outputs[0].text
@@ -399,12 +399,6 @@ def parse_args():
         type=int,
         default=5000,
         help="Timeout for initializing stages in seconds (default: 5000)",
-    )
-    parser.add_argument(
-        "--shm-threshold-bytes",
-        type=int,
-        default=65536,
-        help="Threshold for using shared memory in bytes (default: 65536)",
     )
     parser.add_argument(
         "--output-dir",

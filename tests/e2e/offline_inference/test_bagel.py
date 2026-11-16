@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 End-to-end tests for Bagel text2text and img2text (understanding) tasks.
@@ -43,10 +43,17 @@ REFERENCE_TEXT_IMG2TEXT = (
 
 
 # (model, stage_config_path, extra_omni_kwargs) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
-_OMNI_RUNNER_PARAM = (MODEL_NAME, STAGE_CONFIG)
+# Cold ROCm AITER MHA builds can consume most of the default 600-second stage
+# deadline. Match the online BAGEL coverage so the compiled kernel can finish
+# and leave bounded headroom for the stage-ready handshake.
+_OMNI_RUNNER_PARAM = (
+    MODEL_NAME,
+    STAGE_CONFIG,
+    {"stage_init_timeout": 1800, "init_timeout": 2100},
+)
 
 pytestmark = [
-    pytest.mark.advanced_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]
@@ -55,7 +62,7 @@ pytestmark = [
 def _extract_text(omni_outputs: list) -> str:
     """Extract generated text from OmniRequestOutput list."""
     for req_output in omni_outputs:
-        ro = getattr(req_output, "request_output", None)
+        ro = req_output
         if ro and getattr(ro, "outputs", None):
             return "".join(getattr(o, "text", "") or "" for o in ro.outputs)
     return ""

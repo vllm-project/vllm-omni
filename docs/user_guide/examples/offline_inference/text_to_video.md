@@ -12,9 +12,13 @@ For backend selection and SageAttention usage, see the [Diffusion Attention Back
 | Model | Default Resolution | Default Frames | Default Steps | Guidance | VRAM (BF16) |
 |---|---|---|---|---|---|
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
+| `robbyant/lingbot-video-dense-1.3b` / `robbyant/lingbot-video-moe-30b-a3b` | 192x320 | 9 | 2 | 3.0 | ~68 GiB (MoE smoke) |
+| `IFM/PAN2` | 704x1248 | 313 | 50 | 2.5 | ~100 GiB (1 GPU); 32 GB GPUs with offload |
 | `Lightricks/LTX-2` | 512x768 | 121 | 40 | video 3.0 / audio 7.0 | Model-dependent |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
+| `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | 480x832 | 81 | 50 | 6.0 | BF16 DiT + FP32 Wan VAE |
+| `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | 704x1280 | 81 | 50 | 6.0 | ~23.6 GiB |
 
 ## Local CLI Usage
 
@@ -35,6 +39,29 @@ python text_to_video.py \
   --output t2v_out.mp4
 ```
 
+### LingBot-Video
+
+The shared runner recognizes both official LingBot checkpoint IDs and selects
+the native `LingBotVideoPipeline` automatically:
+
+```bash
+python text_to_video.py \
+  --model robbyant/lingbot-video-dense-1.3b \
+  --prompt "a robotic arm picks up a red block" \
+  --height 192 --width 320 --num-frames 9 --num-inference-steps 2 \
+  --guidance-scale 3.0 --flow-shift 3.0 --fps 24 \
+  --output lingbot_t2v.mp4
+```
+
+Use `robbyant/lingbot-video-moe-30b-a3b` for the MoE checkpoint. For local
+paths without `lingbot` in the directory name, add
+`--model-class-name LingBotVideoPipeline`. Model-only options use
+`--extra-body`, for example `'{"batch_cfg": true, "output_type": "np"}'`.
+On a 32 GiB card, run the MoE checkpoint with `--enable-layerwise-offload
+--vae-use-tiling --vae-use-slicing`; see the
+[LingBot-Video recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Robbyant/LingBot-Video.md)
+for measured memory.
+
 ### LTX-2
 
 ```bash
@@ -46,6 +73,21 @@ python text_to_video.py \
 
 See the [LTX-2 recipe](../../../../recipes/LTX/LTX-2.md) for all checkpoints,
 pipeline selection, I2V, defaults, and advanced options.
+
+### PAN 2
+
+```bash
+python text_to_video.py \
+  --model IFM/PAN2 \
+  --prompt "A red fox trots through fresh snow in a quiet pine forest at dawn, steam rising from its breath." \
+  --output pan2_output.mp4
+```
+
+PAN 2 needs a structured prompt; the plain prompt above only shows the command.
+See the [PAN 2 recipe](../../../../recipes/IFM/PAN2.md) for details.
+
+PAN 2 runs guardrails by default, which need the `pan2-guardrail` package:
+`pip install git+https://github.com/ifm-ai/pan2-guardrail`.
 
 ### HunyuanVideo-1.5 (480p)
 
@@ -102,6 +144,31 @@ python text_to_video.py \
   --output quick_test.mp4
 ```
 
+### SANA-Video-2B
+
+```bash
+python text_to_video.py \
+  --model Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+  --model-class-name SanaVideoPipeline \
+  --prompt "A cinematic tracking shot of a sailboat crossing the ocean at sunset." \
+  --height 480 \
+  --width 832 \
+  --num-frames 81 \
+  --num-inference-steps 50 \
+  --guidance-scale 6.0 \
+  --extra-body '{"motion_score": 30}' \
+  --fps 16 \
+  --output sana_video_480p.mp4
+```
+
+For the 720p checkpoint, switch the model to
+`Efficient-Large-Model/SANA-Video_2B_720p_diffusers`, use
+`--height 704 --width 1280`, and write to a different output path. SANA-Video
+accepts `motion_score`, `clean_caption`, and `use_resolution_binning` through
+`--extra-body`. For image-to-video, use the shared
+`examples/offline_inference/image_to_video/image_to_video.py` example with
+`--model-class-name SanaImageToVideoPipeline` and `--image <path>`.
+
 ## Key Arguments
 
 ### Common
@@ -125,6 +192,9 @@ python text_to_video.py \
 - `--audio-sample-rate`: fallback audio sample rate when the pipeline returns audio.
 - `--quantization`: quantization method (`fp8` for FP8, `gguf` for GGUF).
 - `--flow-shift`: scheduler flow_shift parameter.
+- `--lora-path`: path to PEFT LoRA adapter folder or checkpoint file.
+- `--lora-scale`: scale factor for LoRA weights.
+- `--lora-backend`: backend for loading LoRA adapters. Default: peft. Available options: peft, distill.
 
 ### Wan2.2-specific
 

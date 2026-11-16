@@ -81,35 +81,9 @@ class _Qwen3TTSTalker310P(qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneratio
 
 
 class _Qwen3TTSPromptEmbedsBuilder310P(prompt_embeds_builder.Qwen3TTSPromptEmbedsBuilder):
-    def extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
-        dev = self._device()
-        dtype = self._embedding_dtype
-        try:
-            spk_param = next(self._speaker_encoder.parameters())
-            if spk_param.device != dev or spk_param.dtype != dtype:
-                self._speaker_encoder.to(device=dev, dtype=dtype)
-        except StopIteration:
-            pass
+    """Qwen3-TTS prompt-embeds builder specialized for the 310P NPU path."""
 
-        target_sr = int(getattr(self._config.speaker_encoder_config, "sample_rate", 24000))
-        if sr != target_sr:
-            resampler = self._get_resampler(int(sr), target_sr)
-            wav = resampler.resample(wav.astype(np.float32), orig_sr=int(sr))
-
-        # 310P does not support torch.stft on NPU.
-        wav_tensor = torch.from_numpy(wav).to(device=_CPU_DEVICE, dtype=torch.float32).unsqueeze(0)
-        mels = prompt_embeds_builder.mel_spectrogram(
-            wav_tensor,
-            n_fft=1024,
-            num_mels=128,
-            sampling_rate=24000,
-            hop_size=256,
-            win_size=1024,
-            fmin=0,
-            fmax=12000,
-        ).transpose(1, 2)
-        spk = self._speaker_encoder(mels.to(device=dev, dtype=dtype))[0]
-        return spk.to(dtype=dtype)
+    _mel_spectrogram_on_cpu = True
 
 
 # ===================================================================
@@ -148,6 +122,15 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        config = args[0] if args else kwargs.get("config")
+        if config is not None:
+            self.num_heads = getattr(self, "num_heads", config.num_attention_heads)
+            self.num_kv_heads = getattr(self, "num_kv_heads", config.num_key_value_heads)
+            self.head_dim = getattr(
+                self,
+                "head_dim",
+                getattr(config, "head_dim", config.hidden_size // config.num_attention_heads),
+            )
         self._buffers.pop("_fusion_causal_mask", None)
         self._q_size = self.num_heads * self.head_dim
         self._kv_size = self.num_kv_heads * self.head_dim
@@ -157,11 +140,9 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
     def prepare_qkv_weights(self) -> None:
         # Pack QKV once so each graph replay uses one matmul and consumes the
         # weight directly in the 310P matmul layout.
-        self._fused_qkv_weight = maybe_trans_nz(
-            torch.cat((self.q_proj.weight, self.k_proj.weight, self.v_proj.weight), dim=0).contiguous()
-        )
-        if self.q_proj.bias is not None:
-            self._fused_qkv_bias = torch.cat((self.q_proj.bias, self.k_proj.bias, self.v_proj.bias), dim=0)
+        self._fused_qkv_weight = maybe_trans_nz(self.qkv_proj.weight.contiguous())
+        if self.qkv_proj.bias is not None:
+            self._fused_qkv_bias = self.qkv_proj.bias
 
     def forward(
         self,
@@ -170,19 +151,30 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
+        hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
+        hidden_shape_kv = (bsz, seq_len, self.num_kv_heads, self.head_dim)
+
+        # ``prepare_qkv_weights`` packs qkv_proj into the 310P matmul layout;
+        # split it back out the same way before re-applying the 310P
+        # flash-attention path.
         qkv = F.linear(hidden_states, self._fused_qkv_weight, self._fused_qkv_bias)
-        q, k, v = qkv.split((self._q_size, self._kv_size, self._kv_size), dim=-1)
-        q = self.q_norm(q.view(bsz, seq_len, self.num_heads, self.head_dim)).transpose(1, 2)
-        k = self.k_norm(k.view(bsz, seq_len, self.num_kv_heads, self.head_dim)).transpose(1, 2)
-        v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q_raw, k_raw, v_raw = self._split_qkv(qkv)
+        q = self.q_norm(q_raw.view(hidden_shape_q)).transpose(1, 2)
+        k = self.k_norm(k_raw.view(hidden_shape_kv)).transpose(1, 2)
+        v = v_raw.view(hidden_shape_kv).transpose(1, 2)
 
         cos, sin = position_embeddings
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
-        # Use the fused Ascend RoPE op instead of expanding RoPE into
-        # elementwise mul/add/rotate-half kernels.
-        q = torch_npu.npu_rotary_mul(q, cos, sin)
-        k = torch_npu.npu_rotary_mul(k, cos, sin)
+        # Use the fused aclnn rope op, which is NPUGraph-capturable; it
+        # requires the 4D BSND layout with head_dim 128 or 64.
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        cos = cos.transpose(1, 2).contiguous()
+        sin = sin.transpose(1, 2).contiguous()
+        q, k = torch_npu.npu_apply_rotary_pos_emb(q, k, cos, sin, rotary_mode="half")
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
 
         real_tokens = int(bsz) * int(seq_len)
         output_dtype = q.dtype
@@ -304,7 +296,7 @@ class _Qwen3TTSTalkerCodePredictor310P(
             for layer in self.model.layers:
                 attention = layer.self_attn
                 attention.prepare_qkv_weights()
-                qkv_projections.update((attention.q_proj, attention.k_proj, attention.v_proj))
+                qkv_projections.add(attention.qkv_proj)
 
             for module in self.modules():
                 if isinstance(module, nn.Linear) and module not in qkv_projections:

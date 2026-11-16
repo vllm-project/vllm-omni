@@ -304,7 +304,7 @@ def parse_args() -> Namespace:
         "--cfg-alpha",
         type=float,
         default=None,
-        help="CFG alpha for flow-matching guidance (default: use value from stage config, typically 1.2).",
+        help="CFG alpha for flow-matching guidance (default: use the deploy config value, typically 1.2).",
     )
     parser.add_argument(
         "--quantization",

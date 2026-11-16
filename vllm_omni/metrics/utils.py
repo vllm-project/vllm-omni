@@ -1,8 +1,223 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from __future__ import annotations
+
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import fields
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from prettytable import PrettyTable
+
+from vllm_omni.metrics import definitions as metric_defs
+
+if TYPE_CHECKING:
+    from vllm_omni.metrics.modality import OmniModalityMetrics
+    from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
+    from vllm_omni.metrics.stats import StageRequestStats
+
+FAILURE_REASONS = frozenset({"client_abort", "client_disconnect", "stage_error", "unknown"})
+DIFFUSION_METRICS_ONLY_REQUEST_ID = "__vllm_omni_diffusion_metrics__"
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return default
+
+
+def _as_optional_int(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return None
+
+
+def _as_float(value: object, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int | float):
+        return float(value)
+    return default
+
+
+def _as_float_list(value: object) -> list[float]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, int | float) and not isinstance(item, bool)]
+
+
+def extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float | None:
+    if pipeline_timings is None or "queue_wait_ms" not in pipeline_timings:
+        return None
+    return float(pipeline_timings["queue_wait_ms"] or 0.0) / 1000.0
+
+
+def observe_stage_workload_metrics(
+    prom_metrics: OmniPrometheusMetrics,
+    *,
+    stage_type: str,
+    stage_metrics: StageRequestStats,
+) -> None:
+    if stage_type == "diffusion":
+        prom_metrics.observe_num_inference_steps(stage_metrics.num_inference_steps)
+
+    if stage_metrics.output_unit_type == "image":
+        prom_metrics.observe_image_pixels(stage_metrics.image_pixels)
+        prom_metrics.inc_image_count(stage_metrics.output_unit_count)
+
+
+def observe_audio_finalize(
+    mod_metrics: OmniModalityMetrics,
+    *,
+    stage_id: int,
+    replica_id: int,
+    stage_metrics: Any,
+    engine_outputs: Any,
+) -> None:
+    stage_label = str(stage_id)
+    replica_label = str(replica_id)
+    gen_time_s = float(getattr(stage_metrics, "stage_gen_time_ms", 0.0)) / 1000.0
+    mm_out = extract_mm_output(engine_outputs)
+
+    sample_rate = metric_defs.resolve_audio_sample_rate(mm_out)
+    n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
+    if n_frames == 0:
+        n_frames = count_audio_frames(mm_out)
+    mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
+    duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
+    if duration_s > 0:
+        mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
+        mod_metrics.observe_audio_rtf(
+            stage_label,
+            replica_label,
+            metric_defs.compute_audio_rtf(gen_time_s, duration_s),
+        )
+    else:
+        mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
+
+
+def observe_diffusion_finalize(
+    mod_metrics: OmniModalityMetrics,
+    *,
+    stage_id: int,
+    replica_id: int,
+    stage_metrics: Any,
+) -> None:
+    diff_metrics = getattr(stage_metrics, "diffusion_metrics", None)
+    if not diff_metrics:
+        return
+
+    stage_label = str(stage_id)
+    replica_label = str(replica_id)
+
+    exec_s = diff_metrics.get("diffusion_engine_exec_time_s")
+    if exec_s is not None:
+        mod_metrics.observe_diffusion_exec(stage_label, replica_label, float(exec_s))
+        num_steps = int(
+            getattr(stage_metrics, "num_inference_steps", 0) or diff_metrics.get("num_inference_steps") or 0
+        )
+        if num_steps > 0:
+            mod_metrics.observe_diffusion_exec_per_step(stage_label, replica_label, float(exec_s) / num_steps)
+
+    pre_s = diff_metrics.get("preprocess_time_s")
+    if pre_s is not None:
+        mod_metrics.observe_diffusion_preprocess(stage_label, replica_label, float(pre_s))
+
+    post_s = diff_metrics.get("postprocess_time_s")
+    if post_s is not None:
+        mod_metrics.observe_diffusion_postprocess(stage_label, replica_label, float(post_s))
+
+    vae_s = diff_metrics.get("vae_decode_time_s")
+    if vae_s is not None:
+        mod_metrics.observe_vae_decode(stage_label, replica_label, float(vae_s))
+
+    forward_s = diff_metrics.get("forward_time_s")
+    if forward_s is not None:
+        mod_metrics.observe_diffusion_forward(stage_label, replica_label, float(forward_s))
+        num_steps = int(
+            getattr(stage_metrics, "num_inference_steps", 0) or diff_metrics.get("num_inference_steps") or 0
+        )
+        if num_steps > 0 and getattr(stage_metrics, "output_unit_type", None) == "image":
+            mod_metrics.observe_denoise_step_latency(stage_label, replica_label, float(forward_s) / num_steps)
+
+    kv_load_s = diff_metrics.get("kv_recv_time_s")
+    if kv_load_s is not None:
+        mod_metrics.observe_diffusion_kv_load(stage_label, replica_label, float(kv_load_s))
+
+
+def normalize_failure_reason(reason: str | None) -> str:
+    """Map request failure details to the bounded metrics taxonomy."""
+    return reason if reason in FAILURE_REASONS else "unknown"
+
+
+def diffusion_scheduler_waiting_metrics(n_waiting: int) -> dict[str, int]:
+    """Build the diffusion scheduler snapshot consumed by the orchestrator."""
+    return {metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY: max(int(n_waiting), 0)}
+
+
+def diffusion_exception_metrics(exc: BaseException) -> dict[str, Any]:
+    """Return metrics attached to a terminal diffusion error."""
+    metrics = getattr(exc, "diffusion_metrics", None)
+    return dict(metrics) if isinstance(metrics, dict) else {}
+
+
+def sum_diffusion_stage_durations_ms(output: Any, suffix: str | tuple[str, ...]) -> float | None:
+    """Sum matching diffusion stage durations in milliseconds."""
+    durations = getattr(output, "stage_durations", None)
+    if not isinstance(durations, dict):
+        return None
+
+    total = 0.0
+    found = False
+    for key, value in durations.items():
+        if not key.endswith(suffix):
+            continue
+        try:
+            total += float(value)
+            found = True
+        except (TypeError, ValueError):
+            continue
+    return total * 1000.0 if found else None
+
+
+def extract_diffusion_vae_decode_ms(output: Any) -> float | None:
+    # Profiler keys are "<Class>.<target path>". Count decode and decode_latent
+    # on a module named "vae" or ending in "_vae": the default "vae.decode",
+    # MammothModa2 "gen_vae.decode" and MiniMax-H3 "video_vae.decode_latent".
+    return sum_diffusion_stage_durations_ms(
+        output, (".vae.decode", "_vae.decode", ".vae.decode_latent", "_vae.decode_latent")
+    )
+
+
+def extract_diffusion_denoise_ms(output: Any) -> float | None:
+    """Extract denoise-loop time (transformer and per-step scheduler)."""
+    return sum_diffusion_stage_durations_ms(output, ".diffuse")
+
+
+def coerce_bool(value: object, *, default: bool = False) -> bool:
+    """Coerce JSON / form / env-like values to bool.
+
+    Accepts ``bool``, numeric 0/1, and common truthy strings
+    (``\"1\"`` / ``\"true\"`` / ``\"yes\"`` / ``\"on\"``, case-insensitive).
+    ``None`` and unrecognized types return ``default``.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
 
 
 def coerce_positive_int_scalar(value: object) -> int | None:
@@ -35,7 +250,35 @@ def coerce_positive_int_scalar(value: object) -> int | None:
         except Exception:
             return None
     try:
-        value = int(value)
+        value = int(cast(Any, value))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def coerce_positive_float_scalar(value: object) -> float | None:
+    """Coerce a scalar-like value to a positive float.
+
+    Handles plain numeric values, one-element tensor/numpy-like values via
+    ``.item()``, and list/tuple wrappers. Returns ``None`` when no positive
+    float can be extracted.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            coerced = coerce_positive_float_scalar(item)
+            if coerced is not None:
+                return coerced
+        return None
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            value = item()
+        except Exception:
+            return None
+    try:
+        value = float(cast(Any, value))
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
@@ -90,13 +333,29 @@ def extract_mm_output(mm_source: object) -> Mapping[str, Any]:
     return {}
 
 
+def iter_request_output_items(output_source: object) -> tuple[object, ...]:
+    """Normalize vLLM generation and pooling request outputs.
+
+    ``RequestOutput.outputs`` is a list of completion outputs, while
+    ``PoolingRequestOutput.outputs`` is one scalar ``PoolingOutput``. Runtime
+    metrics inspect both shapes, so normalize them before iterating.
+    """
+    outputs = getattr(output_source, "outputs", None)
+    if outputs is None:
+        return ()
+    if isinstance(outputs, (list, tuple)):
+        return tuple(outputs)
+    return (outputs,)
+
+
 def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
     """Collect all non-empty multimodal_output Mappings from ``mm_source``.
 
     Lookup order:
       1. ``mm_source.multimodal_output`` — top-level attribute / property
-      2. each ``mm_source.outputs[i].multimodal_output`` — every CompletionOutput
-         entry that carries a non-empty multimodal Mapping
+      2. each normalized output item's ``multimodal_output`` — every
+         CompletionOutput entry that carries a non-empty multimodal Mapping.
+         A scalar PoolingOutput is accepted and normally contributes nothing.
 
     Accepts both plain ``dict`` and ``MultimodalPayload`` (a ``Mapping``).
     Used by stage-pool metrics aggregation that needs to visit every mm payload.
@@ -113,7 +372,7 @@ def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
     outer_mm = getattr(mm_source, "multimodal_output", None)
     if isinstance(outer_mm, Mapping) and outer_mm:
         multimodal_outputs.append(outer_mm)
-    for output in getattr(mm_source, "outputs", None) or []:
+    for output in iter_request_output_items(mm_source):
         inner_mm = getattr(output, "multimodal_output", None)
         if isinstance(inner_mm, Mapping) and inner_mm:
             multimodal_outputs.append(inner_mm)
@@ -212,10 +471,47 @@ def count_image_pixels(value: object) -> int:
     return dims[-2] * dims[-1]
 
 
+def count_video_frames(video: object) -> int | None:
+    """Return the frame count for common nested and tensor video layouts."""
+    if isinstance(video, Mapping):
+        for key in ("video", "frames", "images"):
+            if key in video:
+                return count_video_frames(video[key])
+        return None
+
+    if isinstance(video, (list, tuple)):
+        return len(video)
+
+    shape = getattr(video, "shape", None)
+    if shape is None:
+        return None
+    try:
+        dims = tuple(int(dim) for dim in shape)
+    except (TypeError, ValueError):
+        return None
+
+    if len(dims) == 5:
+        # Common layouts: [B, C, F, H, W] and [B, F, H, W, C].
+        if dims[-1] in (1, 3, 4):
+            return dims[1]
+        if dims[1] in (1, 3, 4):
+            return dims[2]
+        return dims[1]
+    if len(dims) == 4:
+        # Common layouts: [F, H, W, C] and [C, F, H, W].
+        if dims[-1] in (1, 3, 4):
+            return dims[0]
+        if dims[0] in (1, 3, 4):
+            return dims[1]
+        return dims[0]
+
+    return None
+
+
 def _build_field_defs(
     cls: type,
     exclude: set[str],
-    transforms: dict[str, tuple[str, Callable]] | None = None,
+    transforms: dict[str, tuple[str, Callable[[Any], Any]]] | None = None,
 ) -> list[tuple[str, Callable[[Any], Any]]]:
     """Auto-generate field definitions from a dataclass.
 
@@ -229,16 +525,29 @@ def _build_field_defs(
         List of (display_name, getter_fn) tuples for table generation.
     """
     transforms = transforms or {}
-    result = []
+    result: list[tuple[str, Callable[[Any], Any]]] = []
     for f in fields(cls):
         if f.name in exclude:
             continue
         if f.name in transforms:
             display_name, transform_fn = transforms[f.name]
+
             # Capture variables in closure to avoid late binding issues
-            result.append((display_name, lambda e, fn=transform_fn, n=f.name: fn(getattr(e, n))))
+            def transformed_getter(
+                event: Any,
+                *,
+                transform: Callable[[Any], Any] = transform_fn,
+                name: str = f.name,
+            ) -> Any:
+                return transform(getattr(event, name))
+
+            result.append((display_name, transformed_getter))
         else:
-            result.append((f.name, lambda e, n=f.name: getattr(e, n)))
+
+            def getter(event: Any, *, name: str = f.name) -> Any:
+                return getattr(event, name)
+
+            result.append((f.name, getter))
     return result
 
 

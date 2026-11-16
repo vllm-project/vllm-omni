@@ -47,6 +47,19 @@ Diff-scoped sweep for five fragility patterns that are pervasive in the existing
 
 Roll the ⚠/✗ counts into the report as a single **Code quality** dimension row.
 
+---
+
+## All PRs: Examples Policy (run on every PR, quick & full)
+
+Inspect Python files introduced under `examples/` using
+[examples-policy.md](examples-policy.md). This is a diff-scoped ratchet: existing
+model-specific examples may be edited or removed without triggering the check.
+
+- [ ] **No new model-specific Python examples:** the diff adds, copies, or renames no Python file whose path or behavior is specific to one model, checkpoint, vendor, or model family. ✗ for any violation. Route inference through a shared task/protocol entrypoint, model request behavior through `vllm_omni/model_extras`, and commands through task docs or `recipes/`.
+- [ ] **New generic example code is justified:** any new task-neutral Python file under `examples/` is an actual user-facing entrypoint rather than reusable production logic, a benchmark, an app, a setup tool, or a reproducer. ⚠ when the placement is questionable.
+
+Roll the result into the report as a separate **Examples policy** dimension.
+
 ### Conventions (eyeball — no grep)
 
 Judgment calls that don't grep cleanly — apply them while reading the diff, not as a mechanical check:
@@ -151,6 +164,7 @@ Diffusion models live under `vllm_omni/diffusion/`. In addition to the New Model
 - [ ] **PR body matches diff:** description doesn't claim changes not in the diff
 - [ ] **Branch is rebased:** `git merge-base HEAD origin/main` is recent, no merge conflicts
 - [ ] **CI gates passing:** DCO, pre-commit, build — check `gh pr view --json statusCheckRollup` if a PR already exists
+- [ ] **Local pre-commit gates:** full list in [Linting](../../../../docs/contributing/README.md#linting). Blocking when the diff introduces: stale `vLLM project` SPDX; stdlib `re`/`base64` or pickle in library code; new `torch.cuda` call sites; `tests/**/test_*.py` without level+hardware marks; new `_tts_model_type` branches in `serving_speech.py`; invalid `.buildkite` YAML. macOS/Windows need a native `shellcheck`. ✗ for growing `CHECK_IMPORTS[*].allowed_files`, `ALLOWED_FILES`, or `MAX_MODEL_TYPE_BRANCHES` without review.
 
 ### Full (adds)
 

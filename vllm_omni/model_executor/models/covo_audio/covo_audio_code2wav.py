@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 Tencent.
 import os
 from collections.abc import Iterable
@@ -6,7 +9,6 @@ import numpy as np
 import torch
 from torch import nn
 from vllm.config import VllmConfig
-from vllm.model_executor.models import SupportsPP
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -15,7 +17,7 @@ from .config_covo_audio import CovoAudioCode2WavConfig
 from .token2wav import JsonHParams, Token2WavDecoder
 
 
-class CovoAudioCode2WavForConditionalGeneration(nn.Module, SupportsPP):
+class CovoAudioCode2WavForConditionalGeneration(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -25,9 +27,9 @@ class CovoAudioCode2WavForConditionalGeneration(nn.Module, SupportsPP):
         if os.path.isdir(model_name):
             model_path = model_name
         else:
-            from huggingface_hub import snapshot_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            model_path = snapshot_download(model_name)
+            model_path = hf_api().snapshot_download(model_name)
         token2wav_path = os.path.join(model_path, "token2wav")
 
         code2wav_config = CovoAudioCode2WavConfig()
@@ -46,7 +48,7 @@ class CovoAudioCode2WavForConditionalGeneration(nn.Module, SupportsPP):
             map_location="cpu",
             weights_only=True,
         )
-        self.decoder.load_state_dict(ckpt)
+        self.decoder.load_state_dict(ckpt, strict=False)
         self.decoder.eval()
         self.infer_config = code2wav_config.inference
         self._decoder_moved = False

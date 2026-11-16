@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# Compatibility name: batching is enabled in the default Ming3 TTS profile.
+base_config: ming3_audio_tts.yaml

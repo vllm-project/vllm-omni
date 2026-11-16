@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import base64
@@ -7,18 +10,30 @@ import logging
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 import requests
 import yaml
 from PIL import Image
 
-from tests.e2e.accuracy.helpers import assert_images_pixel_close, assert_similarity, model_output_dir
+from tests.e2e.accuracy.helpers import (
+    SimilarityThresholds,
+    assert_images_pixel_close,
+    assert_similarity,
+    baseline_from_similarity_thresholds,
+    measure_image_similarity,
+    measure_images_pixel_close,
+    model_output_dir,
+    resolve_device_profile,
+    resolve_similarity_thresholds,
+    write_accuracy_result,
+)
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServer
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.diffusion]
 
 logger = logging.getLogger(__name__)
 
@@ -31,15 +46,26 @@ WIDTH = 1024
 PROMPT = "A brown and white dog is running on the grass."
 MEAN_THRESHOLD = 3e-2
 P99_THRESHOLD = 3e-1
-SSIM_THRESHOLD = 0.97
-PSNR_THRESHOLD_CUDA = 30.0
+PSNR_THRESHOLD_ROCM = 29.0
 PSNR_THRESHOLD_NPU = 26.0
 
+# Per-device SSIM/PSNR for online/offline vs baseline. Unlisted devices use ``default``.
+SIMILARITY_THRESHOLDS_BY_DEVICE: dict[str, SimilarityThresholds] = {
+    "B200": SimilarityThresholds(ssim=0.96, psnr=28.0),
+    "default": SimilarityThresholds(ssim=0.97, psnr=30.0),
+}
 
-def _psnr_threshold() -> float:
+
+def _psnr_threshold(thresholds: SimilarityThresholds | None = None) -> float:
     from vllm_omni.platforms import current_omni_platform
 
-    return PSNR_THRESHOLD_NPU if current_omni_platform.is_npu() else PSNR_THRESHOLD_CUDA
+    if current_omni_platform.is_npu():
+        return PSNR_THRESHOLD_NPU
+    if current_omni_platform.is_rocm():
+        return PSNR_THRESHOLD_ROCM
+    if thresholds is None:
+        thresholds = resolve_similarity_thresholds(SIMILARITY_THRESHOLDS_BY_DEVICE)
+    return thresholds.psnr
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -54,10 +80,10 @@ def _baseline_path() -> Path:
     return path
 
 
-_OFFLINE_SCRIPT = _REPO_ROOT / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
+_OFFLINE_SCRIPT = _REPO_ROOT / "examples" / "offline_inference" / "text_to_image" / "text_to_image.py"
 
 # DiT-only deploy config with trust_remote_code (based on hunyuan_image3_dit.yaml).
-_DEPLOY_CONFIG = {
+_DEPLOY_CONFIG: dict[str, Any] = {
     "pipeline": "hunyuan_image3_dit",
     "async_chunk": False,
     "trust_remote_code": True,
@@ -70,7 +96,6 @@ _DEPLOY_CONFIG = {
             "trust_remote_code": True,
             "devices": "0,1,2,3",  # set dynamically by _write_deploy_config
             "vae_use_slicing": False,
-            "moe_backend": "flashinfer_cutlass",
             "vae_use_tiling": False,
             "parallel_config": {
                 "pipeline_parallel_size": 1,
@@ -93,6 +118,14 @@ _DEPLOY_CONFIG = {
         },
     ],
     "platforms": {
+        "rocm": {
+            "stages": [
+                {
+                    "stage_id": 0,
+                    "moe_backend": "auto",
+                },
+            ],
+        },
         "npu": {
             "stages": [
                 {
@@ -121,7 +154,7 @@ def _devices() -> str:
 
 
 def _write_deploy_config(path: Path) -> None:
-    config = copy.deepcopy(_DEPLOY_CONFIG)
+    config: dict[str, Any] = copy.deepcopy(_DEPLOY_CONFIG)
     devices = _devices()
     num_devices = len(devices.split(","))
     config["stages"][0]["devices"] = devices
@@ -209,20 +242,17 @@ def _run_vllm_omni_hunyuan_image3_offline(*, model: str, deploy_config: str, out
     import subprocess
     import sys
 
-    output_dir = str(output_path.parent)
     subprocess.run(
         [
             sys.executable,
             str(_OFFLINE_SCRIPT),
-            "--modality",
-            "text2img",
             "--deploy-config",
             deploy_config,
-            "--prompts",
+            "--prompt",
             PROMPT,
             "--output",
-            output_dir,
-            "--steps",
+            str(output_path),
+            "--num-inference-steps",
             str(NUM_INFERENCE_STEPS),
             "--guidance-scale",
             str(GUIDANCE_SCALE),
@@ -232,45 +262,91 @@ def _run_vllm_omni_hunyuan_image3_offline(*, model: str, deploy_config: str, out
             str(HEIGHT),
             "--width",
             str(WIDTH),
-            "--bot-task",
-            "none",
-            "--sys-type",
+            "--use-system-prompt",
             "en_unified",
+            "--extra-body",
+            '{"bot_task": "none"}',
+            "--trust-remote-code",
             "--model",
             model,
             "--enforce-eager",
+            "--enable-expert-parallel",
+            # Cold MI300 expert-parallel weight loading has crossed the 600s
+            # script defaults. Keep the per-stage bound finite and leave enough
+            # overall headroom for orchestrator startup without changing the
+            # nightly job deadline.
+            "--stage-init-timeout",
+            "900",
+            "--init-timeout",
+            "1800",
         ],
         check=True,
     )
-    images = sorted(Path(output_dir).glob("output_*.png"))
-    assert images, f"No output image found in {output_dir}"
-    image = Image.open(images[0]).convert("RGB")
+    assert output_path.exists(), f"No output image at {output_path}"
+    image = Image.open(output_path).convert("RGB")
     image.load()
-    image.save(output_path)
     return image
 
 
 def _assert_against_baseline(image: Image.Image, label: str) -> None:
     baseline_path = _baseline_path()
     baseline_image = Image.open(baseline_path).convert("RGB")
+    device_profile = resolve_device_profile(profiles=SIMILARITY_THRESHOLDS_BY_DEVICE)
+    thresholds = resolve_similarity_thresholds(SIMILARITY_THRESHOLDS_BY_DEVICE, device_profile)
+    psnr_threshold = _psnr_threshold(thresholds)
+    logger.info(
+        "HunyuanImage3 pixel accuracy thresholds: profile=%s ssim>=%s psnr>=%s",
+        device_profile,
+        thresholds.ssim,
+        psnr_threshold,
+    )
 
+    model_label = f"{MODEL_NAME} ({label} vs baseline)"
+    pixel_metrics = measure_images_pixel_close(
+        model_name=model_label,
+        vllm_image=image,
+        diffusers_image=baseline_image,
+    )
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="image_pixel",
+        metrics=pixel_metrics,
+        baseline={"mean_abs_diff": MEAN_THRESHOLD, "p99_abs_diff": P99_THRESHOLD},
+        extra={"label": label},
+    )
     assert_images_pixel_close(
-        model_name=f"{MODEL_NAME} ({label} vs baseline)",
+        model_name=model_label,
         vllm_image=image,
         diffusers_image=baseline_image,
         mean_threshold=MEAN_THRESHOLD,
         p99_threshold=P99_THRESHOLD,
+        metrics=pixel_metrics,
     )
-    assert_similarity(
-        model_name=f"{MODEL_NAME} ({label} vs baseline)",
+    ssim, psnr = measure_image_similarity(
+        model_name=model_label,
         vllm_image=image,
         diffusers_image=baseline_image,
-        ssim_threshold=SSIM_THRESHOLD,
-        psnr_threshold=_psnr_threshold(),
+    )
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="image_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline=baseline_from_similarity_thresholds(SIMILARITY_THRESHOLDS_BY_DEVICE),
+        extra={"label": label, "device_profile": device_profile},
+    )
+    assert_similarity(
+        model_name=model_label,
+        vllm_image=image,
+        diffusers_image=baseline_image,
+        ssim_threshold=thresholds.ssim,
+        psnr_threshold=psnr_threshold,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=4)
+@pytest.mark.full_model
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=4)
 def test_hunyuan_image3_pixel_accuracy_online(accuracy_artifact_root: Path) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME)
@@ -284,7 +360,8 @@ def test_hunyuan_image3_pixel_accuracy_online(accuracy_artifact_root: Path) -> N
     _assert_against_baseline(image, "online")
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=4)
+@pytest.mark.full_model
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325", "npu": "A3"}, num_cards=4)
 def test_hunyuan_image3_pixel_accuracy_offline(accuracy_artifact_root: Path) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME)

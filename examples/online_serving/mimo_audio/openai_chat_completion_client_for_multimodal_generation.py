@@ -328,7 +328,7 @@ def run_multimodal_generation(args) -> None:
 
     extra_body = {
         "sampling_params_list": sampling_params_list
-        # Optional, it has a default setting in stage_configs of the corresponding model.
+        # Optional; defaults come from the resolved pipeline and deploy config.
     }
 
     # Build messages list (filter None so concurrent tasks get valid structure)

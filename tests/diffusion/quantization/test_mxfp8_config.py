@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for MXFP8 quantization config and linear method dispatch.
 
 Coverage:
@@ -9,11 +9,13 @@ Coverage:
 - Weight / scale shape-transform arithmetic from process_weights_after_loading (CPU)
 - build_quant_config integration
 - MXFP8_QUANT_CONFIG structure as the auto-detection contract
+- Offload-after-quant capability of the shared online-method mixin (CPU)
 """
 
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from torch.nn import Module
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
 from vllm_omni.platforms import current_omni_platform
@@ -165,8 +167,19 @@ def test_get_quant_method_online(mocker: MockerFixture):
         assert type(method).__name__ == "VllmMxfp8OnlineLinearMethod"
 
 
+def test_xpu_online_method_keeps_vllm_weight_lifecycle():
+    """XPU online MXFP8 must not replace vLLM's create_weights: that is where vLLM
+    builds the meta-device weight and selects the shape-dependent MXFP8 kernel."""
+    from vllm.model_executor.layers.quantization.online.mxfp8 import Mxfp8OnlineLinearMethod
+
+    from vllm_omni.quantization.mxfp8_config import VllmMxfp8OnlineLinearMethod
+
+    for name in ("create_weights", "process_weights_after_loading"):
+        assert getattr(VllmMxfp8OnlineLinearMethod, name) is getattr(Mxfp8OnlineLinearMethod, name)
+
+
 def test_get_quant_method_unsupported_platform_raises(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
-    """Unsupported platform (CUDA, ROCm) must raise NotImplementedError."""
+    """Platforms without an MXFP8 implementation must fail explicitly."""
     from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
 
     config = DiffusionMXFP8Config()
@@ -177,6 +190,33 @@ def test_get_quant_method_unsupported_platform_raises(mocker: MockerFixture, mon
 
     with pytest.raises(NotImplementedError):
         config.get_quant_method(layer, "blocks.0.attn1.to_q")
+
+
+def test_cuda_mxfp8_rejects_native_offline(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    layer = mocker.Mock(spec=LinearBase)
+    with pytest.raises(NotImplementedError, match="offline mode is not supported on CUDA"):
+        DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True).get_quant_method(layer, "linear")
+
+
+@pytest.mark.parametrize("capability", [None, (9, 0), (12, 0)])
+def test_cuda_mxfp8_rejects_unsupported_device(monkeypatch: pytest.MonkeyPatch, capability):
+    from vllm.platforms.interface import DeviceCapability
+
+    from vllm_omni.quantization import mxfp8_cuda
+
+    monkeypatch.setattr(mxfp8_cuda.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        mxfp8_cuda.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(*capability) if capability else None,
+    )
+    with pytest.raises(NotImplementedError, match="SM100, SM103 or SM107"):
+        mxfp8_cuda.CUDAMxfp8OnlineLinearMethod()
 
 
 def test_get_quant_method_ignored_layer(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
@@ -191,6 +231,51 @@ def test_get_quant_method_ignored_layer(mocker: MockerFixture, monkeypatch: pyte
 
     method = config.get_quant_method(layer, "proj_out")
     assert isinstance(method, UnquantizedLinearMethod)
+
+
+def test_ignored_layers_default_match_mode_is_exact():
+    """Subtrees are only excluded when a pipeline opts into substring matching."""
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    config = DiffusionMXFP8Config(ignored_layers=["model.visual"])
+    assert config.ignored_layers_match_mode == "exact"
+
+
+def test_get_quant_method_ignored_subtree_with_substring_mode(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
+    """Qwen-Image-2.1 excludes whole subtrees (``model.visual``, ``lm_head``) from
+    MXFP8 by switching ignored_layers_match_mode to "substring"."""
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    config = DiffusionMXFP8Config(ignored_layers=["model.visual", "lm_head"])
+    config.ignored_layers_match_mode = "substring"
+    layer = mocker.Mock(spec=LinearBase)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+
+    method = config.get_quant_method(layer, "model.visual.blocks.0.mlp.linear_fc1")
+    assert isinstance(method, UnquantizedLinearMethod)
+
+
+def test_get_quant_method_ignored_subtree_requires_substring_mode(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+):
+    """Under the default exact mode the same prefix is quantized, not skipped."""
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, VllmMxfp8OnlineLinearMethod
+
+    # The method reads the model dtype from the active vLLM config, which no test has.
+    mocker.patch(
+        "vllm_omni.quantization.mxfp8_config.VllmMxfp8OnlineLinearMethod.__init__",
+        lambda self: None,
+    )
+    config = DiffusionMXFP8Config(ignored_layers=["model.visual"])
+    layer = mocker.Mock(spec=LinearBase)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_xpu", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+
+    method = config.get_quant_method(layer, "model.visual.blocks.0.mlp.linear_fc1")
+    assert isinstance(method, VllmMxfp8OnlineLinearMethod)
 
 
 def test_get_quant_method_non_linear_returns_none(monkeypatch: pytest.MonkeyPatch):
@@ -335,3 +420,99 @@ def test_supported_methods_include_mxfp8():
     from vllm_omni.quantization import SUPPORTED_QUANTIZATION_METHODS
 
     assert "mxfp8" in SUPPORTED_QUANTIZATION_METHODS
+
+
+# ---------------------------------------------------------------------------
+# Offload-after-quant capability (CPU, no NPU ops)
+# ---------------------------------------------------------------------------
+
+
+class TestOffloadAfterQuant:
+    """Online MXFP methods advertise ``supports_offload_after_quant`` so the
+    diffusion loader can stream each layer back to host memory right after it
+    is quantized, instead of accumulating the whole model on the accelerator
+    until the final ``model.to("cpu")``.
+
+    The capability lives on ``_LazyWeightMixin``, which is shared by all
+    online MXFP8/MXFP4 methods, so pinning it here covers mxfp4 too.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _mock_tp(self, mocker: MockerFixture):
+        # create_weights resolves the TP group while computing per-partition
+        # shapes; these tests never initialize torch.distributed.
+        mock_group = mocker.Mock()
+        mock_group.rank_in_group = 0
+        mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=1)
+        mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_rank", return_value=0)
+        mocker.patch("vllm.distributed.parallel_state.get_tp_group", return_value=mock_group)
+
+    def _make_method(self):
+        from vllm_omni.quantization.mxfp8_config import (
+            DiffusionMXFP8Config,
+            NPUMxfp8OnlineLinearMethod,
+        )
+
+        return NPUMxfp8OnlineLinearMethod(DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=False))
+
+    def test_only_methods_advertising_the_capability_are_asked(self):
+        from vllm_omni.diffusion.model_loader.diffusers_loader import (
+            DiffusersPipelineLoader,
+        )
+
+        class MetaDeviceOnlyMethod:
+            """Stands in for upstream online FP8: lazy, but no offload hook."""
+
+            uses_meta_device = True
+
+        model = torch.nn.Sequential(Module(), Module())
+        lazy_mxfp8 = self._make_method()
+        model[0].quant_method = lazy_mxfp8
+        model[1].quant_method = MetaDeviceOnlyMethod()
+
+        marked = DiffusersPipelineLoader._request_offload_after_quant(model)
+
+        assert marked == 1
+        assert lazy_mxfp8._offload_after_quant
+
+    def _load_layer_in_one_chunk(self, method, layer):
+        method.create_weights(
+            layer,
+            input_size_per_partition=8,
+            output_partition_sizes=[4],
+            input_size=8,
+            output_size=4,
+            params_dtype=torch.bfloat16,
+            weight_loader=lambda param, loaded_weight, *args, **kwargs: param.copy_(loaded_weight),
+        )
+        full_weight = torch.randn(4, 8, dtype=torch.bfloat16)
+        layer.weight.weight_loader(layer.weight, full_weight)
+
+    def test_finished_layer_returns_to_cpu_when_enabled(self, mocker: MockerFixture):
+        method = self._make_method()
+        method.enable_offload_after_quant()
+        mocker.patch.object(method, "process_weights_after_loading")
+
+        layer = Module()
+        moved_to = []
+        layer.to = lambda device, *args, **kwargs: moved_to.append(device)  # type: ignore[method-assign]
+
+        self._load_layer_in_one_chunk(method, layer)
+
+        method.process_weights_after_loading.assert_called_once_with(layer)
+        assert layer._already_called_process_weights_after_loading
+        assert moved_to == ["cpu"]
+
+    def test_finished_layer_stays_put_by_default(self, mocker: MockerFixture):
+        method = self._make_method()
+        mocker.patch.object(method, "process_weights_after_loading")
+
+        layer = Module()
+        moved_to = []
+        layer.to = lambda device, *args, **kwargs: moved_to.append(device)  # type: ignore[method-assign]
+
+        self._load_layer_in_one_chunk(method, layer)
+
+        method.process_weights_after_loading.assert_called_once_with(layer)
+        assert layer._already_called_process_weights_after_loading
+        assert moved_to == []

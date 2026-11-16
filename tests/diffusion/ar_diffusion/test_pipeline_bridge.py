@@ -174,6 +174,19 @@ def test_window_reset_can_keep_named_cross_attention_cache():
     assert not st.is_cross_attention_populated(POS, "text")
 
 
+def test_clear_cross_attention_preserves_self_attention_history():
+    kv, st = make_state(num_layers=1, cross_attn_length=8)
+    _prepare_and_commit(st, POS, 2)
+    k = torch.randn(1, 8, N_HEADS, HEAD_DIM)
+    st.populate_cross_attention(POS, "text", [(k, k)])
+    resident_before = kv.window_block_ids(st.adapter(POS))
+
+    st.clear_cross_attention()
+
+    assert kv.window_block_ids(st.adapter(POS)) == resident_before
+    assert not st.is_cross_attention_populated(POS, "text")
+
+
 def test_cross_attention_uses_logical_branch_when_local_slot_is_shared():
     _, st = make_state(num_layers=2, cross_attn_length=8, shared_local_index=True)
     assert st.kv_cache.num_local_kv_branches == 1

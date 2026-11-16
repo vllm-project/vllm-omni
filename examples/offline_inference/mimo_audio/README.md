@@ -19,7 +19,7 @@ MiMo-Audio provides multiple task variants for audio understanding and generatio
 
 ## Setup
 
-Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
+See the [pipeline and deploy configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation for your hardware.
 
 ### Environment Variables
 
@@ -189,7 +189,7 @@ Note: This task uses hardcoded message lists in the script.
 
 ### Other
 
-- If the model or stage config fails to load, check [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) for memory and GPU settings.
+- If the model or deploy config fails to load, check the [pipeline and deploy configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) for memory and GPU settings.
 - For errors when reading/writing WAV (e.g. unsupported format), ensure input files are standard WAV/MP3 and that `soundfile` is linked to a working libsndfile (see above).
 
 ## Notes

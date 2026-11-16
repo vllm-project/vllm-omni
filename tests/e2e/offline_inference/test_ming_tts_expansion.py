@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """E2E expansion tests for Ming-omni-tts offline inference (nightly CI)."""
 
@@ -35,7 +35,6 @@ MIN_AUDIO_SAMPLES = 1000
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.tts,
-    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4704"),
 ]
 
 
@@ -137,14 +136,11 @@ def _extract_final_audio_outputs(outputs):
         if getattr(item, "final_output_type", None) == "audio":
             final_outputs.append(item)
             continue
-        request_output = getattr(item, "request_output", None)
-        if request_output is None:
-            continue
-        multimodal_output = getattr(request_output, "multimodal_output", None)
+        multimodal_output = getattr(item, "multimodal_output", None)
         if isinstance(multimodal_output, Mapping):
             final_outputs.append(item)
             continue
-        completions = getattr(request_output, "outputs", None) or []
+        completions = getattr(item, "outputs", None) or []
         if any(isinstance(getattr(completion, "multimodal_output", None), Mapping) for completion in completions):
             final_outputs.append(item)
     return final_outputs
@@ -155,21 +151,16 @@ def _extract_multimodal_output(output) -> Mapping[str, Any]:
     if isinstance(multimodal_output, Mapping):
         return multimodal_output
 
-    request_output = getattr(output, "request_output", None)
-    if request_output is not None:
-        multimodal_output = getattr(request_output, "multimodal_output", None)
+    completions = getattr(output, "outputs", None) or []
+    for completion in completions:
+        multimodal_output = getattr(completion, "multimodal_output", None)
         if isinstance(multimodal_output, Mapping):
             return multimodal_output
-        completions = getattr(request_output, "outputs", None) or []
-        for completion in completions:
-            multimodal_output = getattr(completion, "multimodal_output", None)
-            if isinstance(multimodal_output, Mapping):
-                return multimodal_output
 
     raise AssertionError("No multimodal audio output found in Ming generate results")
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_ming_tts_offline_basic(ming_engine, ming_tokenizer) -> None:
     """Test blocking Ming generation through Omni."""
     outputs = ming_engine.generate(
@@ -189,7 +180,7 @@ def test_ming_tts_offline_basic(ming_engine, ming_tokenizer) -> None:
     assert sample_rate == SAMPLE_RATE, f"Expected Ming output sample rate {SAMPLE_RATE}, got {sample_rate}"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_ming_tts_speaker_conditioning_differs(ming_engine, ming_tokenizer) -> None:
     """Test that different Ming speaker controls produce different waveform outputs."""
     style_outputs = ming_engine.generate(
@@ -222,7 +213,7 @@ def test_ming_tts_speaker_conditioning_differs(ming_engine, ming_tokenizer) -> N
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_ming_tts_multiple_prompts_queued(ming_engine, ming_tokenizer) -> None:
     """Regression: supported max_num_seqs=1 config must still drain queued prompts."""
     prompts = [
@@ -251,7 +242,7 @@ def test_ming_tts_multiple_prompts_queued(ming_engine, ming_tokenizer) -> None:
         assert np.max(np.abs(waveform.numpy())) > 0.01, f"Request {i} audio appears silent"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_ming_tts_offline_streaming(async_omni_engine, ming_tokenizer) -> None:
     """Test async_chunk streaming Ming generation through AsyncOmni."""
 

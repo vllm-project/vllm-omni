@@ -77,6 +77,22 @@ readiness, one pool per logical stage, replica identity and membership,
 selection and affinity, stage-client/process lifecycle, liveness, draining,
 and shutdown.
 
+Local EngineCore initialization and multi-API serving use
+`StageRuntime.launch_stage_engines(num_api_servers=1)` as their common launch
+entry. It resolves plans when not supplied by the runtime's device-group
+scheduler, coordinates device locks and environment overlays, starts engines,
+and rolls back resources on startup or attachment failure. Single-API clients
+attach locally after readiness and take ownership of the engine resources;
+there is no additional API subprocess. Diffusion and remote attachment retain
+their backend-specific initialization.
+
+For local multi-API serving, the parent runtime owns and launches each stage
+engine once. It supplies a distinct input/output channel for every API
+frontend and stage replica; frontend workers attach clients to those engines
+without acquiring stage-process ownership. Readiness observation and shutdown
+remain parent-owned. This topology currently excludes diffusion and
+remote/headless stages, intra-stage data parallelism, and Ray backends.
+
 It does not own cross-stage request policy, model scheduler policy, connector
 transfer semantics, configuration precedence, or public error rendering.
 
@@ -100,6 +116,13 @@ declared lost.
 **Rule:** Repeated shutdown or cleanup signals MUST NOT leak stage clients,
 process managers, or membership registrations.
 
+AR stage deployments may set `engine_extras.shutdown_timeout` to a nonnegative
+grace period in seconds. The stage client uses it when shutdown has no explicit
+timeout; an explicit caller timeout takes precedence, including zero. With no
+stage override, a positive upstream shutdown timeout is honored, otherwise the
+upstream process manager retains its default grace period. The timeout bounds
+process cleanup; it does not change request draining or admission policy.
+
 ## Invariant namespace
 
 `STAGE-INV` reserves `001-099` for placement and ownership, `100-199` for
@@ -114,6 +137,10 @@ affinity, membership changes, abort routing, process failure, draining, and
 repeated shutdown. Cross-stage policy changes belong in
 `engine_orchestration.md`.
 
+For multi-API changes, additionally exercise per-frontend channel assignment,
+shared-engine startup handshakes, frontend failure observation, and parent
+cleanup without duplicate stage shutdown.
+
 ## Promotion gate
 
 - Reconcile terminology and ownership after #5441 reaches a final state.
@@ -124,3 +151,11 @@ repeated shutdown. Cross-stage policy changes belong in
   processes.
 - Obtain approval from a technical owner and an independent validation
   reviewer.
+
+## Platform preparation before stage construction
+
+`StageEngineCoreProc` calls `current_omni_platform.prepare_stage_engine()`
+before the upstream engine constructor creates its scheduler and cache
+managers. The default hook is a no-op. The NPU implementation installs its
+Mamba allocator signature compatibility here, so Ascend imports and patches
+remain in the NPU platform and are not applied to other platforms.

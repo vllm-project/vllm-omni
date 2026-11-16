@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import logging
 import traceback
@@ -142,7 +142,11 @@ def resolve_current_omni_platform_cls_qualname() -> str:
             if platform_cls_qualname is not None:
                 activated_plugins.append(name)
         except Exception:
-            pass
+            logger.debug(
+                "OmniPlatform plugin %s failed during detection.",
+                name,
+                exc_info=True,
+            )
 
     activated_builtin_plugins = list(set(activated_plugins) & set(builtin_omni_platform_plugins.keys()))
     activated_oot_plugins = list(set(activated_plugins) & set(platform_plugins.keys()))

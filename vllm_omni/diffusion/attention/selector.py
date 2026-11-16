@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Diffusion attention backend selector.
 
@@ -24,6 +24,10 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 
 logger = init_logger(__name__)
+
+# SequenceParallel auto-pad probes mask support before Attention layers exist,
+# so it has no real head_dim. Callers must not treat this sentinel as geometry.
+HEAD_SIZE_UNKNOWN = -1
 
 
 def _load_backend_cls(cls_path: str) -> type[AttentionBackend]:
@@ -151,3 +155,29 @@ def get_attn_backend_for_role(
         source="platform default",
     )
     return backend_cls, None
+
+
+def get_attn_backend_for_capability(
+    role: str,
+    attention_config: AttentionConfig | None = None,
+    role_category: str | None = None,
+) -> type[AttentionBackend]:
+    """Resolve the backend class for capability queries such as mask support.
+
+    SequenceParallel auto-pad does not know ``head_size``. Explicit
+    ``AttentionConfig`` selections are loaded from the registry without
+    geometry validation, so CUDNN_ATTN is not rejected for the unknown
+    sentinel. Platform defaults still consult the platform with
+    ``HEAD_SIZE_UNKNOWN``.
+    """
+    spec = None
+    if attention_config is not None:
+        spec, _ = attention_config.resolve_with_source(
+            role=role,
+            role_category=role_category,
+        )
+    if spec is not None:
+        from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+
+        return DiffusionAttentionBackendEnum[spec.backend.upper()].get_class()
+    return _cached_get_backend_cls(None, HEAD_SIZE_UNKNOWN)

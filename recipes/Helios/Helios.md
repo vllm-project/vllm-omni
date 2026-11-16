@@ -79,7 +79,7 @@ Total generation time: <seconds> seconds (<milliseconds> ms)
 Saved generated video to helios_t2v_base.mp4
 ```
 
-#### Important flags and stage configs
+#### Important flags and deploy config
 
 - `--model BestWishYsh/Helios-Base` selects the base Helios checkpoint used by
   this recipe.
@@ -88,7 +88,7 @@ Saved generated video to helios_t2v_base.mp4
 - `--cache-backend cache_dit` enables the cache-dit acceleration path.
 - `--enable-cache-dit-summary` prints cache-dit summary information after
   diffusion forward passes.
-- No separate stage config is required for this offline recipe; the shared
+- No separate deploy config is required for this offline recipe; the shared
   `text_to_video.py` example configures the pipeline through its arguments.
 - Helios-specific knobs (declared in `vllm_omni/model_extras/helios.py`) are
   passed via the generic `--extra-body` JSON flag:

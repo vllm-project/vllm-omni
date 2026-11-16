@@ -1,0 +1,64 @@
+async_chunk: false
+trust_remote_code: true
+pipeline: indextts2_5
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: false
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 5000
+      connector_get_max_wait: 500
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    # Triton matches the native GPT-2 logits for this non-RoPE model.
+    # FlashInfer produces materially different semantic-token logits.
+    attention_backend: TRITON_ATTN
+    gpu_memory_utilization: 0.4
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    skip_tokenizer_init: true
+    async_scheduling: true
+    max_num_batched_tokens: 2560
+    max_model_len: 2560
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    hf_overrides:
+      use_gpt_latent: false
+    # Stage 0 uses plain vLLM sampling, not the upstream default
+    # num_beams=3 beam search. Use upstream num_beams=1 for parity comparisons.
+    default_sampling_params:
+      temperature: 0.8
+      top_p: 0.8
+      top_k: 30
+      max_tokens: 1500
+      repetition_penalty: 10.0
+      stop_token_ids: [8193]
+      detokenize: false
+  - stage_id: 1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.4
+    enable_prefix_caching: false
+    skip_tokenizer_init: true
+    enforce_eager: true
+    async_scheduling: true
+    max_num_batched_tokens: 8192
+    max_model_len: 32768
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    hf_overrides:
+      use_gpt_latent: false
+      diffusion_steps: 25
+      s2mel_dit_bf16: true
+      s2mel_cfm_batch_size: 4
+      inference_cfg_rate: 0.7
+      s2mel_dit_cuda_graph: false
+      s2mel_dit_torch_compile: true
+      s2mel_dit_torch_compile_mode: default
+      s2mel_vocoder_torch_compile: false
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 32767

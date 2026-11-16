@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """E2E test that follows the EXACT same flow as
 ``verl-omni/tests/workers/rollout/rollout_vllm/test_vllm_omni_generate.py``
@@ -29,13 +29,14 @@ Usage:
 from __future__ import annotations
 
 import os
-from functools import lru_cache
+import shutil
+import tempfile
+from functools import lru_cache, partial
 from uuid import uuid4
 
 import pytest
 import ray
 import torch
-from huggingface_hub import snapshot_download
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 
@@ -46,6 +47,7 @@ from tests.e2e.features.helpers.verl_omni_server import (
     vLLMOmniHttpServerLocal,
 )
 from tests.helpers.mark import hardware_test
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 MODEL = "tiny-random/Qwen-Image"
 TOKENIZER_MODEL = "Qwen/Qwen2-1.5B-Instruct"
@@ -55,7 +57,7 @@ _MIN_PROMPT_TOKENS = 35
 def _resolve_model_path(repo_id: str) -> str:
     if os.path.isdir(repo_id):
         return repo_id
-    return snapshot_download(repo_id=repo_id)
+    return hf_api().snapshot_download(repo_id=repo_id)
 
 
 @lru_cache(maxsize=1)
@@ -76,11 +78,18 @@ def _tokenize_prompt(text: str) -> list[int]:
 
 
 @pytest.fixture
-def init_server():
+def init_server(request: pytest.FixtureRequest):
     """Create and launch a vLLMOmniHttpServerLocal Ray actor with Qwen-Image."""
     model_path = _resolve_model_path(MODEL)
+    # The native AMD runner nests TMPDIR under a Buildkite job UUID. Ray adds
+    # its session and socket suffixes, which can exceed Linux's 107-byte
+    # AF_UNIX path limit before the test reaches the GPU. Keep Ray's root
+    # short, unique, and scoped to this fixture.
+    ray_temp_dir = tempfile.mkdtemp(prefix="ray-", dir="/tmp")
+    request.addfinalizer(partial(shutil.rmtree, ray_temp_dir, ignore_errors=True))
 
     ray.init(
+        _temp_dir=ray_temp_dir,
         runtime_env={
             "env_vars": {
                 "TOKENIZERS_PARALLELISM": "true",
@@ -157,16 +166,24 @@ def init_server():
         cuda_visible_devices="0",
     )
 
-    ray.get(server.launch_server.remote())
-
-    yield server
-
-    ray.shutdown()
+    try:
+        ray.get(server.launch_server.remote())
+        yield server
+    finally:
+        # Close the actor engine first. Ray shutdown alone can leave
+        # DiffusionWorker processes running.
+        try:
+            ray.get(server.shutdown.remote(), timeout=60)
+        finally:
+            try:
+                ray.kill(server, no_restart=True)
+            finally:
+                ray.shutdown()
 
 
 @pytest.mark.core_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_generate(init_server):
     """Concurrent generate() calls covering basic output, logprobs, and multi-request correctness."""
     server = init_server

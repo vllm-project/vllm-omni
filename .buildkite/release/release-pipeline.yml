@@ -18,8 +18,26 @@ steps:
       - "python3 -m build"
       - "bash .buildkite/release/scripts/upload-nightly-wheels.sh"
 
+  - label: "Build and upload wheel - XPU"
+    depends_on: ~
+    key: "build-wheel-xpu"
+    agents:
+      queue: cpu_queue_release
+    commands:
+      - "curl -LsSf https://astral.sh/uv/install.sh | sh"
+      - 'export PATH="$HOME/.local/bin:$PATH"'
+      - "uv venv --python=3.12 && source .venv/bin/activate"
+      - "uv pip install --upgrade build"
+      - "python3 -m build --wheel"
+      - "bash .buildkite/release/scripts/upload-nightly-wheels.sh"
+    env:
+      # setup.py appends +xpu to the version and uses requirements/xpu.txt.
+      VLLM_OMNI_TARGET_DEVICE: "xpu"
+
   - label: "Generate and upload wheel indices"
-    depends_on: "build-wheel"
+    depends_on:
+      - "build-wheel"
+      - "build-wheel-xpu"
     allow_dependency_failure: true
     agents:
       queue: small_cpu_queue_release
@@ -40,9 +58,11 @@ steps:
     commands:
       - "bash .buildkite/release/scripts/publish-release-wheels-pypi.sh"
 
+  # Auto-skip when NIGHTLY=1 (scheduled); otherwise require manual unblock.
   - block: "Unblock to build release Docker images"
     depends_on: ~
     key: block-build-release-images
+    if: build.env("NIGHTLY") != "1"
 
   - group: "Build release Docker images"
     key: "build-release-images"
@@ -63,7 +83,7 @@ steps:
               --progress plain \
               -f docker/Dockerfile.cuda .
           - "docker push public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-$(uname -m)"
-          # re-tag to default image tag and push, just in case arm64 build fails
+          # Fallback default tag (no arch suffix) if arm64 build fails.
           - "docker tag public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-$(uname -m) public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT"
           - "docker push public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT"
         env:
@@ -86,6 +106,66 @@ steps:
         env:
           DOCKER_BUILDKIT: "1"
 
+      # x86_64 only: the vllm/vllm-openai-xpu base image has no arm64 build.
+      - label: "Build release image - XPU"
+        key: build-release-image-xpu
+        depends_on: ~
+        agents:
+          queue: cpu_queue_release
+        commands:
+          - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
+          - |
+            DOCKER_BUILDKIT=1 docker build \
+              --tag public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-xpu \
+              --progress plain \
+              -f docker/Dockerfile.xpu .
+          - "docker push public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-xpu"
+        env:
+          DOCKER_BUILDKIT: "1"
+
+  # NIGHTLY=1 only: promote ECR images to DockerHub nightly tags, then prune.
+  - label: "Publish nightly multi-arch image to DockerHub"
+    depends_on:
+      - build-release-image-x86
+      - build-release-image-arm64
+    if: build.env("NIGHTLY") == "1"
+    key: publish-nightly-images-dockerhub
+    agents:
+      queue: small_cpu_queue_release
+    commands:
+      - "bash .buildkite/release/scripts/publish-release-images.sh nightly"
+      - "bash .buildkite/release/scripts/cleanup-nightly-builds.sh"
+    secrets:
+      RELEASE_DOCKERHUB_TOKEN: OMNI_DOCKERHUB_TOKEN
+    plugins:
+      - docker-login#v3.0.0:
+          username: "vllm"
+          password-env: RELEASE_DOCKERHUB_TOKEN
+    env:
+      DOCKER_BUILDKIT: "1"
+      DOCKERHUB_USERNAME: "vllm"
+
+  # Separate from the CUDA publish so an XPU failure never blocks it.
+  - label: "Publish nightly XPU image to DockerHub"
+    depends_on:
+      - build-release-image-xpu
+    if: build.env("NIGHTLY") == "1"
+    key: publish-nightly-images-dockerhub-xpu
+    agents:
+      queue: small_cpu_queue_release
+    commands:
+      - "bash .buildkite/release/scripts/publish-release-images.sh nightly xpu"
+      - "bash .buildkite/release/scripts/cleanup-nightly-builds.sh vllm/vllm-omni-xpu"
+    secrets:
+      RELEASE_DOCKERHUB_TOKEN: OMNI_DOCKERHUB_TOKEN
+    plugins:
+      - docker-login#v3.0.0:
+          username: "vllm"
+          password-env: RELEASE_DOCKERHUB_TOKEN
+    env:
+      DOCKER_BUILDKIT: "1"
+      DOCKERHUB_USERNAME: "vllm"
+
   - block: "Publish release images to DockerHub"
     key: block-publish-release-images
     depends_on:
@@ -101,10 +181,37 @@ steps:
       queue: small_cpu_queue_release
     commands:
       - "bash .buildkite/release/scripts/publish-release-images.sh"
+    secrets:
+      RELEASE_DOCKERHUB_TOKEN: OMNI_DOCKERHUB_TOKEN
     plugins:
       - docker-login#v3.0.0:
-          username: vllmbot
-          password-env: DOCKERHUB_TOKEN
+          username: "vllm"
+          password-env: RELEASE_DOCKERHUB_TOKEN
     env:
       DOCKER_BUILDKIT: "1"
-      DOCKERHUB_USERNAME: "vllmbot"
+      DOCKERHUB_USERNAME: "vllm"
+
+  # Own block: an XPU release does not wait on the CUDA image builds.
+  - block: "Publish release XPU image to DockerHub"
+    key: block-publish-release-images-xpu
+    depends_on:
+      - build-release-image-xpu
+      - input-release-version
+
+  - label: "Publish release XPU image to DockerHub"
+    depends_on:
+      - block-publish-release-images-xpu
+    key: publish-release-images-dockerhub-xpu
+    agents:
+      queue: small_cpu_queue_release
+    commands:
+      - "bash .buildkite/release/scripts/publish-release-images.sh release xpu"
+    secrets:
+      RELEASE_DOCKERHUB_TOKEN: OMNI_DOCKERHUB_TOKEN
+    plugins:
+      - docker-login#v3.0.0:
+          username: "vllm"
+          password-env: RELEASE_DOCKERHUB_TOKEN
+    env:
+      DOCKER_BUILDKIT: "1"
+      DOCKERHUB_USERNAME: "vllm"

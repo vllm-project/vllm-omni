@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 End-to-end test for Flux2 Klein inpainting.
 
-Inpainting uses ``omni_runner_handler.send_diffusion_request`` with
+Inpainting uses ``offline_client.send_diffusion_request`` with
 ``multi_modal_data`` containing ``image`` and ``mask_image``; see
-:meth:`OmniRunnerHandler.send_diffusion_request` in ``tests.helpers.runtime``.
+:meth:`OfflineOmniClient.send_diffusion_request` in ``tests.helpers.runtime``.
 """
 
 import pytest
@@ -14,7 +14,7 @@ import torch
 from PIL import Image, ImageDraw
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import DiffusionResponse, OmniRunnerHandler
+from tests.helpers.runtime import DiffusionResponse, OfflineOmniClient
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -47,15 +47,17 @@ def _create_test_inputs(color: tuple = (100, 150, 200)):
 
 
 def _images_from_response(response: DiffusionResponse) -> list[Image.Image]:
-    if isinstance(response.images[0], list):
-        return [f for fr in response.images for f in fr]
-    return list(response.images)
+    images = response.images
+    assert images is not None
+    if images and isinstance(images[0], list):
+        return [frame for frames in images for frame in frames]
+    return list(images)
 
 
 def _send_inpaint_with_generator(
-    omni_runner_handler: OmniRunnerHandler, prompt: str, input_image, mask_image, generator: torch.Generator
+    offline_client: OfflineOmniClient, prompt: str, input_image, mask_image, generator: torch.Generator
 ) -> DiffusionResponse:
-    return omni_runner_handler.send_diffusion_request(
+    return offline_client.send_diffusion_request(
         {
             "model": MODEL,
             "prompt": prompt,
@@ -72,18 +74,19 @@ def _send_inpaint_with_generator(
     )
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
+@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_flux2_klein_inpaint_deterministic(omni_runner_handler: OmniRunnerHandler):
+def test_flux2_klein_inpaint_deterministic(offline_client: OfflineOmniClient):
     input_image, mask_image = _create_test_inputs()
     seed = 12345
 
     gen1 = torch.Generator(current_omni_platform.device_type).manual_seed(seed)
     gen2 = torch.Generator(current_omni_platform.device_type).manual_seed(seed)
 
-    r1 = _send_inpaint_with_generator(omni_runner_handler, "A red flower in a field", input_image, mask_image, gen1)
-    r2 = _send_inpaint_with_generator(omni_runner_handler, "A red flower in a field", input_image, mask_image, gen2)
+    r1 = _send_inpaint_with_generator(offline_client, "A red flower in a field", input_image, mask_image, gen1)
+    r2 = _send_inpaint_with_generator(offline_client, "A red flower in a field", input_image, mask_image, gen2)
 
     images1 = _images_from_response(r1)
     images2 = _images_from_response(r2)
@@ -93,17 +96,18 @@ def test_flux2_klein_inpaint_deterministic(omni_runner_handler: OmniRunnerHandle
     )
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
+@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_flux2_klein_inpaint_different_seeds_different_output(omni_runner_handler: OmniRunnerHandler):
+def test_flux2_klein_inpaint_different_seeds_different_output(offline_client: OfflineOmniClient):
     input_image, mask_image = _create_test_inputs()
 
     gen1 = torch.Generator(current_omni_platform.device_type).manual_seed(42)
     gen2 = torch.Generator(current_omni_platform.device_type).manual_seed(99999)
 
-    r1 = _send_inpaint_with_generator(omni_runner_handler, "A beautiful landscape", input_image, mask_image, gen1)
-    r2 = _send_inpaint_with_generator(omni_runner_handler, "A beautiful landscape", input_image, mask_image, gen2)
+    r1 = _send_inpaint_with_generator(offline_client, "A beautiful landscape", input_image, mask_image, gen1)
+    r2 = _send_inpaint_with_generator(offline_client, "A beautiful landscape", input_image, mask_image, gen2)
 
     images1 = _images_from_response(r1)
     images2 = _images_from_response(r2)

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import os
@@ -6,17 +9,20 @@ import sys
 from pathlib import Path
 
 import pytest
-import torch
 
 from tests.e2e.accuracy.helpers import (
     assert_video_metadata,
     assert_video_similarity_metrics,
+    measure_video_similarity_metrics,
+    model_output_dir,
     probe_binary,
     probe_video,
     send_video_request_with_timeout,
+    write_accuracy_result,
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
@@ -37,8 +43,12 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 WORKSPACE_ROOT = REPO_ROOT.parent
 RUNNER_PATH = REPO_ROOT / "examples" / "offline_inference" / "text_to_video" / "text_to_video.py"
 RESULT_ROOT = Path(__file__).parent / "result"
-ARTIFACT_DIR = RESULT_ROOT / "cat_grass"
 VIDEO_TIMEOUT_SECONDS = 60 * 60
+# A cold MI325 load can spend more than ten minutes reading the seven DiT
+# shards (AMD Buildkite #14270). Bound real hangs without failing that path.
+ENGINE_INIT_TIMEOUT_SECONDS = 30 * 60
+# Tile VAE decoding on NPU to reduce peak memory usage.
+VAE_TILING_ARGS = ["--vae-use-tiling"] if current_omni_platform.is_npu() else []
 SERVER_CASES = [
     pytest.param(
         OmniServerParams(
@@ -46,11 +56,14 @@ SERVER_CASES = [
             server_args=[
                 "--flow-shift",
                 str(FLOW_SHIFT),
+                *VAE_TILING_ARGS,
             ],
             env_dict={"VLLM_OMNI_STORAGE_PATH": str(RESULT_ROOT / "storage")},
             use_omni=True,
+            init_timeout=ENGINE_INIT_TIMEOUT_SECONDS,
+            stage_init_timeout=ENGINE_INIT_TIMEOUT_SECONDS,
         ),
-        id="hunyuanvideo15_t2v_default",
+        id="hunyuanvideo15_t2v_vae_tiling" if VAE_TILING_ARGS else "hunyuanvideo15_t2v_default",
     )
 ]
 
@@ -70,8 +83,8 @@ def _runner_env() -> dict[str, str]:
 
 
 def _artifact_paths() -> tuple[Path, Path]:
-    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    return ARTIFACT_DIR / "online.mp4", ARTIFACT_DIR / "offline.mp4"
+    artifact_dir = model_output_dir(RESULT_ROOT, "cat_grass")
+    return artifact_dir / "online.mp4", artifact_dir / "offline.mp4"
 
 
 def _build_offline_command(*, output_path: Path) -> list[str]:
@@ -94,10 +107,15 @@ def _build_offline_command(*, output_path: Path) -> list[str]:
         str(GUIDANCE_SCALE),
         "--flow-shift",
         str(FLOW_SHIFT),
+        "--init-timeout",
+        str(ENGINE_INIT_TIMEOUT_SECONDS),
+        "--stage-init-timeout",
+        str(ENGINE_INIT_TIMEOUT_SECONDS),
         "--fps",
         str(FPS),
         "--seed",
         str(SEED),
+        *VAE_TILING_ARGS,
         "--output",
         str(output_path),
     ]
@@ -115,7 +133,7 @@ def _generate_offline_video() -> Path:
     return offline_path
 
 
-def _generate_online_video(*, omni_server, openai_client, timeout_seconds: int) -> Path:
+def _generate_online_video(*, omni_server, online_client, timeout_seconds: int) -> Path:
     online_path, _ = _artifact_paths()
     request_config = {
         "model": omni_server.model,
@@ -132,7 +150,7 @@ def _generate_online_video(*, omni_server, openai_client, timeout_seconds: int) 
         },
     }
     online_video_bytes = send_video_request_with_timeout(
-        openai_client,
+        online_client,
         request_config,
         timeout_seconds=timeout_seconds,
     )
@@ -141,11 +159,8 @@ def _generate_online_video(*, omni_server, openai_client, timeout_seconds: int) 
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325", "npu": "A3"}, num_cards=1)
 def test_hunyuanvideo15_t2v_diffusers_offline_generates_video() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("HunyuanVideo-1.5 T2V offline accuracy test requires CUDA.")
-
     probe_binary("ffprobe")
     if not RUNNER_PATH.exists():
         raise AssertionError(f"Offline runner does not exist: {RUNNER_PATH}")
@@ -157,20 +172,17 @@ def test_hunyuanvideo15_t2v_diffusers_offline_generates_video() -> None:
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_CASES, indirect=True)
 def test_hunyuanvideo15_t2v_online_serving_generates_video(
     omni_server,
-    openai_client,
+    online_client,
     hunyuanvideo15_online_timeout_seconds: int,
 ) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("HunyuanVideo-1.5 T2V online accuracy test requires CUDA.")
-
     probe_binary("ffprobe")
     online_path = _generate_online_video(
         omni_server=omni_server,
-        openai_client=openai_client,
+        online_client=online_client,
         timeout_seconds=hunyuanvideo15_online_timeout_seconds,
     )
     assert online_path.exists(), f"Expected online video artifact at {online_path}"
@@ -179,11 +191,8 @@ def test_hunyuanvideo15_t2v_online_serving_generates_video(
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325", "npu": "A3"}, num_cards=1)
 def test_hunyuanvideo15_t2v_serving_matches_offline_video_similarity() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("HunyuanVideo-1.5 T2V video similarity test requires CUDA.")
-
     probe_binary("ffmpeg")
     probe_binary("ffprobe")
     online_path, offline_path = _artifact_paths()
@@ -202,10 +211,28 @@ def test_hunyuanvideo15_t2v_serving_matches_offline_video_similarity() -> None:
         f"offline_path={offline_path}"
     )
     assert_video_metadata(online_metadata, width=WIDTH, height=HEIGHT, fps=FPS, frame_count=NUM_FRAMES)
+    ssim, psnr = measure_video_similarity_metrics(
+        label="hunyuanvideo15_t2v",
+        online_path=online_path,
+        offline_path=offline_path,
+    )
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="video_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": SSIM_THRESHOLD, "psnr": PSNR_THRESHOLD},
+        extra={
+            "label": "hunyuanvideo15_t2v",
+            "online_video": str(online_path),
+            "offline_video": str(offline_path),
+        },
+    )
     assert_video_similarity_metrics(
         label="hunyuanvideo15_t2v",
         online_path=online_path,
         offline_path=offline_path,
         ssim_threshold=SSIM_THRESHOLD,
         psnr_threshold=PSNR_THRESHOLD,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )

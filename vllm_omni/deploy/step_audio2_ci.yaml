@@ -15,7 +15,7 @@ stages:
     max_model_len: 1024
     max_num_batched_tokens: 1024
     max_num_seqs: 1
-    gpu_memory_utilization: 0.7
+    gpu_memory_utilization: 0.8
     skip_mm_profiling: true
     enforce_eager: true
     async_scheduling: false

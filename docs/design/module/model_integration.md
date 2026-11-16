@@ -9,6 +9,14 @@ primary_code_paths:
   - vllm_omni/model_executor/**
   - vllm_omni/model_extras/**
   - vllm_omni/plugins/**
+primary_code_path_owners:
+  # Additional owners scoped to a sub-path of model_executor/**
+  - paths:
+      - vllm_omni/model_executor/models/**
+    owners:
+      - "@Sy0307"
+      - "@amy-why-3459"
+      - "@linyueqian"
 related_code_paths:
   - vllm_omni/transformers_utils/**
   - vllm_omni/tokenizers/**
@@ -34,7 +42,7 @@ and execution behavior to stable runtime contracts.
 ### MODEL-INV-001: Registration is explicit
 
 **Rule:** A model integration MUST declare how its model class, loader, input
-processor, and stage configuration are selected.
+processor, and pipeline configuration are selected.
 
 ### MODEL-INV-002: Model code does not route stages
 
@@ -49,3 +57,11 @@ sufficient; an override MUST document the behavioral difference.
 
 Test registration, checkpoint loading, input conversion, and representative
 model execution. Test shared utilities against more than one integration.
+
+## Platform-specific model adapters
+
+Drama 3's Ascend attention compatibility, hybrid model state, and FP8 expert
+adapter live under `platforms/npu/models/` and `platforms/npu/quant/`. Shared
+model code selects these adapters lazily on NPU; CUDA keeps the upstream
+implementations. Generic eager kernels and request-history snapshots remain
+in the shared model implementation.

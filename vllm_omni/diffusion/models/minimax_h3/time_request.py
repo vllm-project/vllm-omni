@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
+
+from collections.abc import Sequence
+
+from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 
 
 def _align_frame_count(frame_count: int) -> int:
@@ -35,30 +40,39 @@ def _time_shift_sigmas(
     *,
     num_steps: int = 50,
     shift_scale: float = 6.0,
+    base_schedule: Sequence[float] | None = None,
 ) -> list[float]:
+    """Build N + 1 sigma boundaries for N denoiser evaluations.
+
+    ``base_schedule`` supplies the rectified-flow positions explicitly and takes
+    precedence over ``num_steps``. Distilled checkpoints need it because their
+    few-step schedule is not the uniform one ``num_steps`` produces; validation
+    and the shift itself live in the shared :class:`DMD2SigmaSchedule`.
+    """
     if shift_scale <= 0:
         raise ValueError("MiniMax H3 shift_scale must be > 0")
-    if num_steps <= 0:
-        raise ValueError("MiniMax H3 num_steps must be > 0")
+
+    if base_schedule is not None:
+        return DMD2SigmaSchedule.from_positions(base_schedule).shifted_sigmas(shift_scale)
 
     import torch
 
-    # The rectified-flow sigma range is fixed at [1.0, 0.0].
+    if num_steps <= 0:
+        raise ValueError("MiniMax H3 num_steps must be > 0")
+
+    # Requests count denoiser evaluations, not sigma points. Include both
+    # endpoints so even a one-step request traverses the full [1.0, 0.0] range.
     base = torch.linspace(
         1.0,
         0.0,
-        int(num_steps),
+        int(num_steps) + 1,
         device="cpu",
         dtype=torch.float32,
     )
     shifted = float(shift_scale) * base / (1 + (float(shift_scale) - 1) * base)
-    shifted, _ = torch.unique_consecutive(shifted, return_counts=True)
-    # A one-point request is still exactly one point.  Normal serving uses
-    # multiple points, but preserving the requested cardinality keeps
-    # ``num_inference_steps`` the sole schedule-size control.
-    if num_steps > 1 and shifted[-1].item() > 0.0:
-        shifted = torch.cat([shifted, torch.tensor([0.0], dtype=shifted.dtype)])
-    return [float(value) for value in shifted.tolist()]
+    # In float32 the first sigma can round one ulp above 1 (flow_shift 2.14, for example), which the
+    # sampler rejects. The last sigma is exactly 0 and the others are positive, so only 1 needs a clamp.
+    return shifted.clamp(max=1.0).tolist()
 
 
 class MiniMaxH3ShapePlanner:
@@ -81,10 +95,12 @@ class MiniMaxH3ShapePlanner:
         *,
         num_steps: int = 50,
         shift_scale: float = 6.0,
+        base_schedule: Sequence[float] | None = None,
     ) -> list[float]:
         return _time_shift_sigmas(
             num_steps=num_steps,
             shift_scale=shift_scale,
+            base_schedule=base_schedule,
         )
 
 
@@ -103,8 +119,10 @@ def minimax_h3_time_shift_sigmas(
     *,
     num_steps: int = 50,
     shift_scale: float = 6.0,
+    base_schedule: Sequence[float] | None = None,
 ) -> list[float]:
     return MINIMAX_H3_SHAPE_PLANNER.time_shift_sigmas(
         num_steps=num_steps,
         shift_scale=shift_scale,
+        base_schedule=base_schedule,
     )

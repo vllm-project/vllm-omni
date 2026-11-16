@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Offline expansion tests for higgs-audio v2.
 
 Mirrors examples/offline_inference/text_to_speech/higgs_audio_v2/end2end.py:
 build Stage-0 prompt_token_ids with the model's own processor + plain-text
 chat template, drive the engine via ``Omni.generate``, and inspect the
-Stage-1 PCM payload directly. The OmniRunnerHandler.send_audio_speech_request
+Stage-1 PCM payload directly. The OfflineOmniClient.send_audio_speech_request
 helper applies a Qwen-style ChatML wrap that is not valid for higgs, so this
 test bypasses it (same approach as test_voxtral_tts.py).
 
@@ -91,7 +91,7 @@ def _extract_pcm(outputs) -> torch.Tensor:
     raise AssertionError(f"no audio payload in any stage output (got {len(outputs)} stages)")
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
 def test_higgs_audio_v2_offline_plain_text(omni_runner_function: OmniRunner) -> None:
     """
@@ -131,7 +131,7 @@ def test_higgs_audio_v2_offline_plain_text(omni_runner_function: OmniRunner) -> 
     assert np.isfinite(arr).all(), "audio contains non-finite samples (nan/inf)"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
 def test_higgs_audio_v2_offline_batch_two_prompts(omni_runner_function: OmniRunner) -> None:
     """
@@ -197,7 +197,7 @@ def _compose_voice_clone_request(model_name: str, text: str, ref_text: str, ref_
     }
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
 def test_higgs_audio_v2_offline_voice_clone(omni_runner_function: OmniRunner) -> None:
     """

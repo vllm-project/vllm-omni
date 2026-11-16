@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Online serving smoke test for streaming video output similarity.
 """
@@ -7,11 +10,16 @@ from pathlib import Path
 
 import pytest
 
-from tests.e2e.accuracy.helpers import assert_video_similarity_metrics, probe_video
+from tests.e2e.accuracy.helpers import (
+    assert_video_similarity_metrics,
+    measure_video_similarity_metrics,
+    probe_video,
+    write_accuracy_result,
+)
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import DiffusionResponse, OmniServer, OpenAIClientHandler
+from tests.helpers.runtime import DiffusionResponse, OmniServer, OnlineOmniClient, get_model_prefix
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = "BestWishYsh/Helios-Distilled"
 PROMPT = "A serene lakeside sunrise with mist over the water."
@@ -67,8 +75,8 @@ def _request_config(model: str, *, serialize_extra_params: bool) -> dict:
     }
 
 
-def _client_for(server: OmniServer, *, run_level: str) -> OpenAIClientHandler:
-    return OpenAIClientHandler(
+def _client_for(server: OmniServer, *, run_level: str) -> OnlineOmniClient:
+    return OnlineOmniClient(
         host=server.host,
         port=server.port,
         api_key="EMPTY",
@@ -95,12 +103,11 @@ def _write_video_artifact(response: DiffusionResponse, output_path: Path) -> Pat
 )
 def test_helios_streaming_output_matches_non_streaming(
     model: str,
-    model_prefix: str,
     run_level: str,
     tmp_path: Path,
     record_property,
 ):
-    model = model_prefix + model
+    model = get_model_prefix() + model
 
     with OmniServer(model, _server_args(streaming_output=True), use_omni=True) as server:
         client = _client_for(server, run_level=run_level)
@@ -132,12 +139,30 @@ def test_helios_streaming_output_matches_non_streaming(
         f"non_streaming_path={non_streaming_path}"
     )
 
-    ssim, psnr = assert_video_similarity_metrics(
+    ssim, psnr = measure_video_similarity_metrics(
+        label="helios_streaming_output",
+        online_path=streaming_path,
+        offline_path=non_streaming_path,
+    )
+    write_accuracy_result(
+        model_id="helios_streaming_output",
+        dataset="video_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": MIN_SSIM, "psnr": MIN_PSNR_DB},
+        extra={
+            "label": "helios_streaming_output",
+            "online_video": str(streaming_path),
+            "offline_video": str(non_streaming_path),
+        },
+    )
+    assert_video_similarity_metrics(
         label="helios_streaming_output",
         online_path=streaming_path,
         offline_path=non_streaming_path,
         ssim_threshold=MIN_SSIM,
         psnr_threshold=MIN_PSNR_DB,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )
     record_property("helios_streaming_vs_non_streaming_psnr_db", psnr)
     record_property("helios_streaming_vs_non_streaming_ssim_percent", ssim * 100.0)

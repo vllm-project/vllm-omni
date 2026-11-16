@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Audex checkpoint layout preparation.
 
 The nvidia/Nemotron-Labs-Audex-2B repo deduplicates weights: the
@@ -50,6 +50,13 @@ XCODEC1_DEFAULT_REPO = "hf-audio/xcodec-hubert-general-balanced"
 _AUDIOGEN_INDEX_FILE = "checkpoint_folder_audiogen/model.safetensors.index.json"
 
 
+def load_audex_tokenizer(model_dir: str):
+    """Load Audex's declared fast tokenizer without probing remote model code."""
+    from transformers import PreTrainedTokenizerFast
+
+    return PreTrainedTokenizerFast.from_pretrained(model_dir)
+
+
 def _download_audiogen_index(model: str) -> str:
     """Resolve the audiogen dedup index to a local path (tiny, cache-first).
 
@@ -57,12 +64,12 @@ def _download_audiogen_index(model: str) -> str:
     metadata round trip per stage-engine boot; a cache miss falls back to
     the network.
     """
-    from huggingface_hub import hf_hub_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     try:
-        return hf_hub_download(model, _AUDIOGEN_INDEX_FILE, local_files_only=True)
+        return hf_api().hf_hub_download(model, _AUDIOGEN_INDEX_FILE, local_files_only=True)
     except Exception:
-        return hf_hub_download(model, _AUDIOGEN_INDEX_FILE)
+        return hf_api().hf_hub_download(model, _AUDIOGEN_INDEX_FILE)
 
 
 def _dedup_shard_patterns(model: str) -> list[str]:
@@ -111,13 +118,13 @@ def ensure_audex_snapshot(model: str, profile: str = "tts") -> str:
     if profile in ("tts", "tta"):
         patterns += _dedup_shard_patterns(model)
 
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     try:
-        return snapshot_download(model, allow_patterns=patterns)
+        return hf_api().snapshot_download(model, allow_patterns=patterns)
     except Exception as download_exc:
         try:
-            return snapshot_download(model, allow_patterns=patterns, local_files_only=True)
+            return hf_api().snapshot_download(model, allow_patterns=patterns, local_files_only=True)
         except Exception:
             raise RuntimeError(
                 f"Could not resolve the Audex repo {model!r} (profile {profile!r}): the download "
@@ -135,13 +142,13 @@ def ensure_xcodec1_snapshot(model: str | None) -> str:
     if os.path.isdir(model):
         return model
 
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     try:
-        return snapshot_download(model)
+        return hf_api().snapshot_download(model)
     except Exception as download_exc:
         try:
-            return snapshot_download(model, local_files_only=True)
+            return hf_api().snapshot_download(model, local_files_only=True)
         except Exception:
             raise RuntimeError(
                 f"Could not resolve the XCodec1 checkpoint {model!r}: the download failed and "

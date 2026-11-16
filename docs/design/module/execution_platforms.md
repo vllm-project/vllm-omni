@@ -8,8 +8,25 @@ owners:
   - "@xuechendi"
 primary_code_paths:
   - vllm_omni/platforms/**
-related_code_paths:
   - vllm_omni/attention/**
+primary_code_path_owners:
+  # Additional owners scoped to attention kernels (quantized/custom attention)
+  - paths:
+      - vllm_omni/attention/**
+    owners:
+      - "@david6666666"
+      - "@lishunyang12"
+  # Additional owner for the Ascend NPU platform tree
+  - paths:
+      - vllm_omni/platforms/npu/**
+    owners:
+      - "@FayeSpica"
+  # Additional owner for the ROCm platform tree
+  - paths:
+      - vllm_omni/platforms/rocm/**
+    owners:
+      - "@haic0"
+related_code_paths: []
 depends_on:
   - ar_runtime.md
   - diffusion/index.md
@@ -24,6 +41,13 @@ last_reviewed: 2026-07-16
 
 Execution platforms isolate hardware-specific capability detection, worker
 selection, patches, kernels, and configuration adjustments.
+
+External platforms use `Operator.register_oot(Implementation)` before model
+construction and implement `forward_oot`. Overrides preserve the operator's
+constructor, parameters, and outputs; `forward_native` is the default fallback.
+Diffusion attention implementations dispatch external platforms to
+`forward_oot` the same way. Only `SDPAImpl` provides it so far; resolution
+rejects an explicitly selected backend whose implementation does not.
 
 ## Candidate invariants
 

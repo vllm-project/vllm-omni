@@ -218,6 +218,20 @@ def test_resolve_stage_physical_devices_uses_visible_baseline(monkeypatch: pytes
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_resolve_stage_physical_devices_captured_unset_ignores_live_env(monkeypatch: pytest.MonkeyPatch):
+    """Parallel init captures an unset CUDA_VISIBLE_DEVICES as None.
+
+    A sibling thread may then narrow the live env for spawn. The captured
+    None must not fall back to that live value, or logical device 0 would
+    map onto the other stage's GPU.
+    """
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6,7")
+    assert resolve_stage_physical_devices(0, "0", visible_baseline=None) == "0"
+    assert resolve_stage_physical_devices(1, "1", visible_baseline=None) == "1"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_map_device_list_raises_on_non_numeric():
     """Non-numeric device IDs raise ValueError."""
     with pytest.raises(ValueError, match="must be non-negative integers"):

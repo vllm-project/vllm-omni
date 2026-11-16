@@ -1,7 +1,7 @@
 # Model Addition Checklist
 
 Read this reference when a PR adds or expands a model architecture, pipeline,
-loader, processor, registry entry, or stage configuration.
+loader, processor, registry entry, pipeline config, or deploy config.
 
 Official docs: [model contribution guides](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/model/),
 [adding an omni model](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/model/adding_omni_model/),

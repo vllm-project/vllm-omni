@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Inline Stage Diffusion Client for vLLM-Omni multi-stage runtime.
 
 Runs DiffusionEngine in a ThreadPoolExecutor inside the Orchestrator process
@@ -11,18 +14,23 @@ import asyncio
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+from vllm_omni.diffusion.data import (
+    DiffusionRequestAbortedError,
+    is_diffusion_request_started_output,
+)
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
+from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID, diffusion_exception_metrics
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -44,7 +52,6 @@ class InlineStageDiffusionClient(StageClientBase):
         model: str,
         od_config: OmniDiffusionConfig,
         metadata: StageMetadata,
-        batch_size: int = 1,
     ) -> None:
         self.model = model
         self.od_config = od_config
@@ -56,8 +63,9 @@ class InlineStageDiffusionClient(StageClientBase):
         self.default_sampling_params = metadata.default_sampling_params
         self.requires_multimodal_data = metadata.requires_multimodal_data
         self.custom_process_input_func = metadata.custom_process_input_func
+        self.prompt_transform_func = None
+        self.prompt_expand_func = None
         self.engine_input_source = metadata.engine_input_source
-        self.batch_size = batch_size
 
         self._enrich_config()
         self._engine = DiffusionEngine.make_engine(self.od_config)
@@ -73,10 +81,10 @@ class InlineStageDiffusionClient(StageClientBase):
         self._engine.executor.register_failure_callback(self._mark_engine_dead)
 
         logger.info(
-            "[InlineStageDiffusionClient] stage-%s [rep-%s] initialized inline (batch_size=%d)",
+            "[InlineStageDiffusionClient] stage-%s [rep-%s] initialized inline (max_num_seqs=%d)",
             self.stage_id,
             self.replica_id,
-            self.batch_size,
+            self.od_config.max_num_seqs,
         )
 
     def _enrich_config(self) -> None:
@@ -103,6 +111,8 @@ class InlineStageDiffusionClient(StageClientBase):
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
+        payload_sender_info: dict[str, Any] | None = None,
     ) -> None:
         # Each request mutates its sampling state while it is normalized and
         # executed. Callers commonly reuse one params object for concurrent
@@ -120,6 +130,8 @@ class InlineStageDiffusionClient(StageClientBase):
                 prompt,
                 sampling_params,
                 kv_sender_info,
+                kv_transfer_params=kv_transfer_params,
+                payload_sender_info=payload_sender_info,
             )
         )
         self._tasks[request_id] = task
@@ -130,6 +142,8 @@ class InlineStageDiffusionClient(StageClientBase):
         prompt: Any,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[str, Any] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
+        payload_sender_info: dict[str, Any] | None = None,
     ) -> None:
         try:
             request = OmniDiffusionRequest(
@@ -137,6 +151,8 @@ class InlineStageDiffusionClient(StageClientBase):
                 sampling_params=sampling_params,
                 request_id=request_id,
                 kv_sender_info=kv_sender_info,
+                kv_transfer_params=kv_transfer_params,
+                payload_sender_info=payload_sender_info,
             )
 
             if self.od_config.streaming_output:
@@ -150,7 +166,13 @@ class InlineStageDiffusionClient(StageClientBase):
                 # only publish the final output.
                 result = None
                 async for results in self._engine.step_streaming(request):
-                    result = results[0]
+                    output = results[0]
+                    if is_diffusion_request_started_output(output):
+                        if not output.request_id:
+                            output.request_id = request_id
+                        self._output_queue.put_nowait(output)
+                        continue
+                    result = output
                 if result is None:
                     raise RuntimeError("Diffusion execution finished without output.")
                 if not result.request_id:
@@ -158,6 +180,15 @@ class InlineStageDiffusionClient(StageClientBase):
                 self._output_queue.put_nowait(result)
         except DiffusionRequestAbortedError as e:
             logger.info("request_id: %s aborted: %s", request_id, str(e))
+            metrics = diffusion_exception_metrics(e)
+            if metrics:
+                self._output_queue.put_nowait(
+                    OmniRequestOutput(
+                        request_id=DIFFUSION_METRICS_ONLY_REQUEST_ID,
+                        finished=True,
+                        metrics=metrics,
+                    )
+                )
         except Exception as e:
             logger.exception("Diffusion request %s failed: %s", request_id, e)
             status_code, error_type = client_error_metadata(e)
@@ -167,6 +198,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 status_code=status_code,
                 error_type=error_type,
             )
+            error_output.metrics.update(diffusion_exception_metrics(e))
             self._output_queue.put_nowait(error_output)
         finally:
             self._tasks.pop(request_id, None)
@@ -181,9 +213,8 @@ class InlineStageDiffusionClient(StageClientBase):
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         for rid in request_ids:
-            task = self._tasks.pop(rid, None)
-            if task:
-                task.cancel()
+            # Keep the consumer alive until the engine emits its terminal
+            # abort output. That path carries the refreshed scheduler gauge.
             self._engine.abort(rid)
 
     async def submit_interaction_async(
@@ -212,6 +243,11 @@ class InlineStageDiffusionClient(StageClientBase):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
+        # Playback only updates condition-protected host state. A worker RPC
+        # may occupy the single executor thread for a whole GPU chunk.
+        if method in ("update_streaming_playback", "track_streaming_interaction", "release_streaming_output"):
+            return getattr(self._engine, method)(*args, **(kwargs or {}))
+
         loop = asyncio.get_running_loop()
 
         if method == "profile":
@@ -221,9 +257,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 profile_prefix = f"stage_{self.stage_id}_rep_{self.replica_id}_diffusion_{int(time.time())}"
             return await loop.run_in_executor(
                 self._executor,
-                self._engine.profile,
-                is_start,
-                profile_prefix,
+                partial(self._engine.profile, is_start, profile_prefix, **(kwargs or {})),
             )
 
         kwargs = kwargs or {}

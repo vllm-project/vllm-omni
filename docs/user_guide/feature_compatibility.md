@@ -154,6 +154,59 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
   --ring 2
 ```
 
+### MixFusion (Mixed-Resolution Step Batching)
+
+Best for: **Serving Qwen-Image with concurrent requests at different resolutions**
+
+MixFusion packs mixed-resolution requests into a single denoise step batch
+(ragged latents) instead of splitting them into separate resolution groups,
+raising throughput when traffic mixes resolutions.
+
+```bash
+# Server-level enablement
+vllm serve Qwen/Qwen-Image --omni --port 8091 \
+  --enable-mixfusion \
+  --mixfusion-min-chunk-tokens 256 \
+  --mixfusion-max-chunks 128
+```
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--enable-mixfusion` / `--no-enable-mixfusion` | off | Let the scheduler pack mixed-resolution requests into one step batch |
+| `--mixfusion-min-chunk-tokens` | 256 | Minimum packed-chunk token count below which a candidate is not packed |
+| `--mixfusion-max-chunks` | 128 | Maximum number of chunks in one packed forward |
+
+MixFusion requires a pipeline that declares `supports_mixfusion` (currently
+Qwen-Image only). On any other pipeline, server-level `--enable-mixfusion`
+fails at startup; a request-level `extra_args={"enable_mixfusion": True}` is a
+safe no-op and requests keep batching by resolution.
+
+MixFusion only mixes resolutions in step execution. When server-level
+`--enable-mixfusion` is set, step execution is enabled automatically (a
+warning is logged if it was off), so the command above works without
+`--step-execution`. Request-level `extra_args` in request mode remain a no-op.
+
+Constraints on the packed path:
+
+- **Model configuration**: the loaded model must expose a packing plan and
+  a request-layout declaration. SP, CFG parallel and conflicting forward
+  hooks keep requests on ordinary dense scheduling; the engine reports the
+  reason at initialization.
+- **Request inputs**: currently Qwen-Image text-to-image requests are eligible.
+  Other inputs keep the ordinary pipeline's support and compatibility limits.
+- **Chunk policy**: the scheduler checks the full candidate batch. Requests
+  that cannot join it remain waiting; a request that cannot meet the limits
+  alone uses dense execution. Dense batches retain resolution constraints.
+- **CFG**: sequential true-CFG is supported; CFG parallel is not packed.
+- **Attention backend**: native multi-document varlen is optional. Dense
+  backends use attention-only buckets (equal image lengths with text masks,
+  or exact joint lengths without masks). Mixed-resolution scheduling remains
+  enabled, including on NPU; there is no varlen-kernel speedup on this path.
+- **Runtime validation**: the worker builds a layout for the scheduler's
+  selected batch using actual prepared tensors. Chunk size is recomputed when
+  the layout changes, including removal of requests that fail preparation.
+  Unexpected token-count or runtime-capability changes fail explicitly rather than
+  silently splitting the denoise batch.
 
 ## Limitations
 
@@ -165,7 +218,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 
 - **Tensor Parallelism — Text Encoder Not Sharded**: TP currently only shards the DiT blocks. Each TP rank retains a **full copy of the text encoder weights**, leading to significant GPU memory overhead proportional to TP degree. Tracked in [Issue #771](https://github.com/vllm-project/vllm-omni/issues/771).
 
-- **CPU Offloading — Two Modes Are Mutually Exclusive**: Model-level offload (`enable_cpu_offload`) and layerwise offload (`enable_layerwise_offload`) cannot be used simultaneously. If both are set, layerwise takes priority and model-level is silently ignored.
+- **CPU Offloading — Strategies Are Mutually Exclusive**: Distributed layerwise, layerwise, and model-level offload should not be enabled together. Selection priority is distributed layerwise, then layerwise, then model-level.
 
 - **CPU Offloading — VAE stays on GPU**: Both offloading strategies keep the VAE on GPU at all times. For high-resolution generation, VAE decode can still cause OOM. Mitigate by combining with `vae_use_tiling=True` or VAE Patch Parallelism.
 
@@ -174,10 +227,10 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 ### Configuration Constraints
 
 - **GPU Count Must Match Parallel Degrees**: Total GPU count must satisfy:
+  ```text
+  total_gpus = ulysses_degree × ring_degree × allgather_degree × cfg_parallel_size × tensor_parallel_size
   ```
-  total_gpus = ulysses_degree × ring_degree × cfg_parallel_size × tensor_parallel_size
-  ```
-  Any mismatch will cause a configuration error at startup.
+  Any mismatch will cause a configuration error at startup. `allgather_degree > 1` may be combined with `ulysses_degree > 1`, but not with `ring_degree > 1`.
 
 - **VAE Patch Parallel Size ≤ DiT Process Group Size**: `vae_patch_parallel_size` reuses the DiT process group and cannot exceed it. Larger values are automatically clamped with a warning.
 
@@ -190,6 +243,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 **Symptoms:** Adding more GPUs doesn't improve speed proportionally
 
 **Solutions:**
+
 1. Check GPU communication bandwidth (use `nvidia-smi topo -m`)
 2. Reduce parallelism degree if communication overhead is high
 3. For very long sequences, prefer Ring-Attention over Ulysses-SP
@@ -200,6 +254,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 **Symptoms:** OOM errors when combining methods
 
 **Solutions:**
+
 1. Enable Tensor Parallelism to shard weights
 2. Reduce resolution or batch size
 3. Combine with memory efficient methods, such as cpu offloading
@@ -209,6 +264,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 **Symptoms:** Errors about invalid parallel configuration
 
 **Solutions:**
+
 1. Verify total GPU count matches: `ulysses × ring × cfg × tp`
 2. Check model supports all enabled methods
 3. Ensure divisibility constraints (e.g., Z-Image TP=1 or 2 only)
