@@ -388,12 +388,6 @@ class OmniDiffusionSamplingParams:
     streaming_output_ack: bool = False
 
     def __post_init__(self) -> None:
-        if isinstance(self.lora_request, dict):
-            self.lora_request = LoRARequest(**self.lora_request)
-        elif isinstance(self.lora_request, list):
-            self.lora_request = [
-                LoRARequest(**request) if isinstance(request, dict) else request for request in self.lora_request
-            ]
         buffer = self.streaming_buffer_seconds
         if buffer is not None and (
             isinstance(buffer, bool)
@@ -498,6 +492,13 @@ class OmniDiffusionSamplingParams:
             params["lora_request"] = lora_request
             if lora_scale is not None:
                 params["lora_scale"] = lora_scale
+        configured_lora = params.get("lora_request")
+        if isinstance(configured_lora, dict):
+            params["lora_request"] = LoRARequest(**configured_lora)
+        elif isinstance(configured_lora, list):
+            params["lora_request"] = [
+                LoRARequest(**request) if isinstance(request, dict) else request for request in configured_lora
+            ]
         return cls(**params)
 
     @classmethod
@@ -513,7 +514,7 @@ class OmniDiffusionSamplingParams:
             ]
         elif lora_request is not None and not isinstance(lora_request, (dict, LoRARequest)):
             params["lora_request"] = msgspec.convert(lora_request, LoRARequest)
-        return cls(**params)
+        return cls.from_config(params)
 
 
 # Request schedule fields that extra_args may carry, with the parser for each.

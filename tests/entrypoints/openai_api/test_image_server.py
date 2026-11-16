@@ -2825,7 +2825,7 @@ def image_client_with_cli_defaults(test_client: TestClient) -> TestClient:
         },
     )
     test_client.app.state.engine_client.default_sampling_params_list = [
-        OmniDiffusionSamplingParams(**config.stage_by_id(0).model_config.default_sampling_params)
+        OmniDiffusionSamplingParams.from_config(config.stage_by_id(0).model_config.default_sampling_params)
     ]
     return test_client
 
@@ -2977,7 +2977,7 @@ def test_image_default_loras_inherit_replace_and_disable(test_client: TestClient
             )
         },
     )
-    defaults = OmniDiffusionSamplingParams(**config.stage_by_id(0).model_config.default_sampling_params)
+    defaults = OmniDiffusionSamplingParams.from_config(config.stage_by_id(0).model_config.default_sampling_params)
     engine.default_sampling_params_list = [defaults]
     for lora, expected_names, expected_scales in (
         (None, ["default"], [0.7]),

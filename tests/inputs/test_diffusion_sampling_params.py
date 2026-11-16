@@ -190,7 +190,7 @@ def test_lora_defaults_normalize_config_dicts(stacked: bool) -> None:
     ]
     raw = configured if stacked else configured[0]
     for params in (
-        OmniDiffusionSamplingParams(lora_request=raw),
+        OmniDiffusionSamplingParams.from_config({"lora_request": raw}),
         OmniDiffusionSamplingParams.from_dict({"lora_request": raw}),
     ):
         requests = params.lora_request if stacked else [params.lora_request]

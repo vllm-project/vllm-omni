@@ -1682,9 +1682,8 @@ async def test_video_abort_passes_deadline_to_rpc_waiter(mocker: MockerFixture):
 
 
 def test_streaming_video_lora_override_preserves_defaults() -> None:
-    defaults = OmniDiffusionSamplingParams(
-        lora_request={"lora_name": "default", "lora_int_id": 1, "lora_path": "/models/default"},
-        lora_scale=0.7,
+    defaults = OmniDiffusionSamplingParams.from_config(
+        {"lora": {"name": "default", "local_path": "/models/default", "int_id": 1, "scale": 0.7}}
     )
     inherited = defaults.clone()
     OmniStreamingVideoOutputHandler._apply_lora(None, inherited)

@@ -4489,7 +4489,9 @@ def test_video_default_loras_inherit_replace_disable_and_isolate(
         {"lora_name": f"default-{index}", "lora_int_id": index + 1, "lora_path": f"/models/default-{index}"}
         for index in range(adapter_count)
     ]
-    defaults = OmniDiffusionSamplingParams(lora_request=configured, lora_scale=[0.6, 0.4][:adapter_count])
+    defaults = OmniDiffusionSamplingParams.from_config(
+        {"lora_request": configured, "lora_scale": [0.6, 0.4][:adapter_count]}
+    )
     engine.default_sampling_params_list = [defaults]
     for lora, expected_names, expected_scales in (
         (None, [item["lora_name"] for item in configured], [0.6, 0.4][:adapter_count]),

@@ -1156,9 +1156,11 @@ def test_multistage_diffusion_preserves_each_stage_defaults(
 def test_multistage_chat_default_loras_are_request_local(
     mock_engine_client, mocker: MockerFixture, disable: bool
 ) -> None:
-    default = OmniDiffusionSamplingParams(
-        lora_request=[{"lora_name": "default", "lora_int_id": 1, "lora_path": "/models/default"}],
-        lora_scale=[0.7],
+    default = OmniDiffusionSamplingParams.from_config(
+        {
+            "lora_request": [{"lora_name": "default", "lora_int_id": 1, "lora_path": "/models/default"}],
+            "lora_scale": [0.7],
+        }
     )
     engine = SimpleNamespace(
         stage_configs=[SimpleNamespace(stage_type="diffusion", is_comprehension=False)],
@@ -1195,9 +1197,8 @@ def test_invalid_explicit_lora_never_generates_with_defaults(
 ) -> None:
     from vllm_omni.errors import OmniClientError
 
-    default = OmniDiffusionSamplingParams(
-        lora_request={"lora_name": "default", "lora_int_id": 1, "lora_path": "/models/default"},
-        lora_scale=0.7,
+    default = OmniDiffusionSamplingParams.from_config(
+        {"lora": {"name": "default", "local_path": "/models/default", "int_id": 1, "scale": 0.7}}
     )
     engine = SimpleNamespace(
         stage_configs=[SimpleNamespace(stage_type="diffusion", is_comprehension=False)],
