@@ -160,7 +160,6 @@ _PIPELINE_STAGES = [
     "indextts2_talker",
     "kimi_audio_ar",
     "kimi_audio_decoder",
-    "kokoro",
     "latent_generator",
     "lfm3_code2wav",
     "lfm3_temporal",

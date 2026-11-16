@@ -861,12 +861,17 @@ class DuplexSessionRunner:
             if session.unanswered_user_items() > previous_user_items:
                 self.memory.note_user_item(command.payload(), str(command.item["id"]))
         elif isinstance(command, DeleteItem):
+            deleted_user_source = bool(session.user_source_ids_for_items((command.item_id,)))
             control = resolve_delete_item(projector, command)
             self._emit_events(control.events)
             for payload in control.payloads:
                 await self.control.on_turn_signal(payload)
             if control.payloads:
                 self.memory.forget_user_item(command.item_id)
+                if deleted_user_source and not session.user_source_ids_for_items((command.item_id,)):
+                    session.release_input_bytes(
+                        self.plugin.on_history_item_deleted(state=self.model_state, item_id=command.item_id)
+                    )
         elif isinstance(command, TruncateItem):
             control = resolve_truncate_item(
                 projector, command, has_audio=self.session.history_item_has_audio(command.item_id)
@@ -1614,6 +1619,7 @@ class DuplexSessionRunner:
         on_append_accepted: Callable[[float], None] | None = None,
         before_append: Callable[[], bool] | None = None,
         input_audio_parts: dict[str, dict[str, object] | None] | None = None,
+        unanswered_source_ids: tuple[int, ...] = (),
     ) -> asyncio.Task[bool]:
         session = self.session
         model_state = self.model_state
@@ -1673,6 +1679,20 @@ class DuplexSessionRunner:
                 for segment in segments
                 if isinstance(segment, dict) and isinstance(segment.get("item_id"), str)
             }
+        if final:
+            # Automatic speech commits need the same retry eligibility as an
+            # explicit response.create, even without a new text-item counter.
+            item_ids = {input_item_id} if isinstance(input_item_id, str) else set()
+            if isinstance(segments, list):
+                item_ids.update(
+                    segment["item_id"]
+                    for segment in segments
+                    if isinstance(segment, dict) and isinstance(segment.get("item_id"), str)
+                )
+            if item_ids:
+                unanswered_source_ids = tuple(
+                    dict.fromkeys((*unanswered_source_ids, *session.user_source_ids_for_items(item_ids)))
+                )
         attempt = AppendAttempt(
             ctx=self.ctx,
             out=self.out,
@@ -1689,6 +1709,7 @@ class DuplexSessionRunner:
             owns_request=final or precreate_response,
             input_audio_part=session.input_audio_part(input_item_id) if isinstance(input_item_id, str) else None,
             input_audio_parts=input_audio_parts,
+            unanswered_source_ids=unanswered_source_ids,
             on_append_accepted=on_append_accepted,
             on_append_prepared=self.memory.preempt_for_submission if interactive else None,
             before_append=before_append,
@@ -2376,9 +2397,9 @@ class DuplexSessionRunner:
         commit has its own prefixes, or when that retained payload is a VISION
         unit the model replays separately. Merging either of those into the
         terminal would reorder or collapse separate units. A single-terminal
-        model leaves a retained camera observation in place, so the newer
-        commit replaces it and a promotion queued for the old payload no
-        longer matches. A vision-only terminal still merges into retained
+        model coalesces retained camera frames into the newer terminal, so a
+        promotion queued for the old payload no longer matches. A vision-only
+        terminal still merges into retained
         speech, which keeps that speech's transcript owner and accumulates
         the frames. Returns False if the model state cannot hold prefixes;
         the caller then rolls the commit back.
@@ -2577,6 +2598,7 @@ class DuplexSessionRunner:
             if operation_id is None:
                 operation_id = uuid.uuid4().hex
                 model_state.committed_audio_operation_id = operation_id
+            unanswered_source_ids = session.pending_user_source_ids()
             session.reset_unanswered_user_items()
             await self._start_append(
                 committed_payload,
@@ -2584,11 +2606,18 @@ class DuplexSessionRunner:
                 precreate_response=True,
                 operation_id=operation_id,
                 retained_committed_payload=committed_payload,
+                unanswered_source_ids=unanswered_source_ids,
             )
             return
         if session.unanswered_user_items() and session.capabilities.supports_text_only_turn:
+            unanswered_source_ids = session.pending_user_source_ids()
             session.reset_unanswered_user_items()
-            await self._start_append({"type": "conversation"}, final=True, precreate_response=True)
+            await self._start_append(
+                {"type": "conversation"},
+                final=True,
+                precreate_response=True,
+                unanswered_source_ids=unanswered_source_ids,
+            )
             return
         if session.capabilities.supports_text_only_turn and self.plugin.has_pending_tool_followup(
             session.runtime_config

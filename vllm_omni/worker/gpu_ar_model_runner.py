@@ -1237,7 +1237,10 @@ class GPUARModelRunner(
                 flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
-                    self.flush_full_payload_outputs(flush_ids)
+                    self.flush_full_payload_outputs(
+                        flush_ids,
+                        finished_req_output_token_ids=getattr(scheduler_output, "finished_req_output_token_ids", None),
+                    )
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -1526,8 +1529,11 @@ class GPUARModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
+                extract_aux = getattr(self.model, "extract_aux_hidden_states", None)
+                if callable(extract_aux):
+                    hidden_states, aux_hidden_states = extract_aux(model_output)
+                else:
+                    hidden_states, aux_hidden_states = model_output
             else:
                 # Common case.
                 hidden_states = model_output
@@ -1969,11 +1975,32 @@ class GPUARModelRunner(
         )
         return inter_stage_outputs, multimodal_outputs
 
+    def _supports_speculative_payload(self) -> bool:
+        """Check both the speculative method and the model payload contract.
+
+        Preparation is method-neutral, but only DFlash's committed-token
+        semantics have been integrated so far. Other methods must opt in
+        here after their token and embedding contracts are validated.
+        """
+        spec_config = self.speculative_config
+        return (
+            spec_config is not None
+            and spec_config.use_dflash()
+            and self._runner_model_omni_flag("supports_speculative_payload")
+        )
+
     def _should_use_async_omni_output(self) -> bool:
         if not self.use_async_scheduling:
             return False
         if self.speculative_config is not None:
-            return False
+            if not (
+                self._supports_speculative_payload()
+                and self._async_chunk
+                and self.omni_prefix_cache is None
+                and not self._runner_model_omni_flag("has_postprocess")
+                and not self._should_accumulate_full_payload_output()
+            ):
+                return False
 
         model_config = getattr(self, "model_config", None)
         if model_config is None:
@@ -2119,11 +2146,16 @@ class GPUARModelRunner(
         postprocess_already_applied: bool = False,
         prefix_cache_step_id: int | None = None,
         restored_mm: dict[str, dict[str, torch.Tensor]] | None = None,
+        payload_routing: tuple[str, list[str]] | None = None,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
 
-        engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        engine_output_type, downstream_req_ids = (
+            payload_routing
+            if payload_routing is not None
+            else self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        )
         downstream_req_ids, sparse_mm_index, audio_sparse_output = resolve_sparse_mm_routing(
             engine_output_type=engine_output_type,
             req_ids_output_copy=req_ids_output_copy,
@@ -2252,6 +2284,9 @@ class GPUARModelRunner(
                         scheduled_seq_len=scheduled_seq_len,
                         restored_mm=restored_mm,
                     )
+                    finalize_payload = getattr(self.model, "finalize_pooler_payload", None)
+                    if callable(finalize_payload):
+                        payload = finalize_payload(payload, multimodal_outputs=multimodal_outputs, idx=idx)
                     pooler_output.append(flatten_payload(payload))
 
         pooler_inter: Sequence[dict[str, object] | None] | None
@@ -2367,6 +2402,25 @@ class GPUARModelRunner(
             talker_multiframe.neutralize_kstep_min_tokens(self.input_batch.sampling_metadata.logitsprocs)
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        # Model-owned preparation runs before drafting can reuse target input
+        # buffers. Its tensors travel through the ordinary Omni snapshot.
+        if self._supports_speculative_payload():
+            multimodal_outputs = self.model.prepare_speculative_multimodal_outputs(
+                multimodal_outputs=multimodal_outputs,
+                req_ids=self.input_batch.req_ids,
+                speculative_request_ids={
+                    rid for rid, tokens in scheduler_output.scheduled_spec_decode_tokens.items() if tokens
+                },
+                invalid_req_indices=np.flatnonzero(self.discard_request_mask.np[: self.input_batch.num_reqs]).tolist(),
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                input_token_ids=self.input_ids.gpu[: scheduler_output.total_num_scheduled_tokens],
+                input_positions=self.positions[: scheduler_output.total_num_scheduled_tokens],
+                query_start_loc=self._get_query_start_loc_cpu(snapshot=False),
+                prompt_lens=[len(self.requests[rid].prompt_token_ids or []) for rid in self.input_batch.req_ids],
+                vocab_size=self.input_batch.vocab_size,
+                consumed_input_span=self._should_use_async_omni_output(),
+            )
 
         # Commit conditional RNG before bookkeeping can roll back discarded draws.
         finalize_sampling = getattr(self.model, "finalize_deferred_sampling", None)
@@ -2572,6 +2626,11 @@ class GPUARModelRunner(
         # after a later step has already restored this request again, and it
         # would then consume the wrong step's prefix.
         restored_mm_snapshot = self._take_restored_mm(req_ids_output_snapshot)
+        # Invalid samples include unfinished chunked prefills; their prompt
+        # rows must still travel downstream. Freeze routing without filtering.
+        payload_routing_snapshot = (
+            self._resolve_pooler_payload_req_ids(req_ids_output_snapshot) if use_async_omni_output else None
+        )
 
         def output_builder() -> OmniModelRunnerOutput:
             if output_tensor_snapshot.async_payload is not None:
@@ -2604,6 +2663,7 @@ class GPUARModelRunner(
                     postprocess_already_applied=omni_postprocess_already_applied,
                     prefix_cache_step_id=prefix_cache_step_id,
                     restored_mm=restored_mm_snapshot,
+                    payload_routing=payload_routing_snapshot,
                 )
             output.omni_connector_output = omni_connector_output
             if sampling_feedback is not None:

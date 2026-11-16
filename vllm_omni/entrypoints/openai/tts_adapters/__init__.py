@@ -117,7 +117,6 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     higgs_audio_v3,
     indextts2,
     kimi_audio,
-    kokoro,
     lfm3_omni,
     ming3_audio_tts,
     ming3_tts,

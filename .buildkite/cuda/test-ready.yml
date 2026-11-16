@@ -85,11 +85,14 @@ steps:
 
       - label: "Diffusion · Distributed Test · 2-GPU"
         timeout_in_minutes: 65
-        source_file_dependencies: diffusion_distributed_attention
+        source_file_dependencies:
+          - diffusion_distributed_attention
+          - ar_diffusion_kv
         commands:
           - pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
           - pytest -sv tests/diffusion/attention/test_ulysses_uaa.py -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
           - pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
+          - pytest -sv tests/diffusion/ar_diffusion/test_noisy_kv_transport_cuda.py -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
         mirror_hardwares: l4_2
 
       - label: "Diffusion · Distributed & Attention Test · 4-GPU"
