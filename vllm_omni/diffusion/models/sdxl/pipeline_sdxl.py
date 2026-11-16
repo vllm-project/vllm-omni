@@ -124,6 +124,9 @@ class StableDiffusionXLPipeline(
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.tokenizer_max_length = 77
         self.default_sample_size = 128  # 1024 / 8
+        # diffusers' StableDiffusionXLPipeline defaults guidance_scale to 5.0,
+        # so an omitted guidance_scale must resolve to the same value here.
+        self.default_guidance_scale = 5.0
         self.output_type = self.od_config.output_type
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -331,7 +334,14 @@ class StableDiffusionXLPipeline(
         generator = req.collate_request_generators(num_images_per_prompt, generator)
         latents = req.collate_request_tensors("latents", latents)
 
-        self._guidance_scale = common_sampling_params.guidance_scale
+        # An omitted guidance_scale must fall back to the model default
+        # (diffusers uses 5.0) instead of the 1.0 placeholder, otherwise CFG
+        # is silently disabled for every request that leaves the field unset.
+        self._guidance_scale = (
+            common_sampling_params.guidance_scale
+            if common_sampling_params.guidance_scale_provided
+            else self.default_guidance_scale
+        )
         self._current_timestep = None
         self._interrupt = False
 
