@@ -208,7 +208,6 @@ def payload_transport(connector):
     transport.requests = {}
     yield transport
     transport._pending_save_reqs.clear()
-    transport.shutdown_omni_connectors()
 
 
 @pytest.mark.parametrize("repeat_finished_ids", [False, True])

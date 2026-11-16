@@ -388,9 +388,9 @@ class _OmniConnectorRuntimeMixin:
         ``send_full_payload_outputs`` keys under the INTERNAL id. To cover
         both modes (and forward compat with id-rename scenarios) we attempt
         cleanup against both keys; the entry that doesn't exist for the
-        active mode is a no-op pop.  Only the key that actually has pending
-        saves is added to ``_deferred_send_cleanup`` so the bg save's
-        decrement path drains it without leaving orphans.
+        active mode is a no-op pop. Keys with queued saves or full-payload
+        results awaiting admission defer send-side cleanup until the
+        background sender consumes their tasks.
         """
         # Force-flush any pending full-payload accumulator entry before
         # cleanup proceeds.  Without this, finished requests with no
