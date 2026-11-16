@@ -219,6 +219,25 @@ def _musa_marks(*, res: str, num_cards: int):
     ]
 
 
+def _mlu_marks(*, res: str, num_cards: int):
+    import pytest
+
+    _require_sku("mlu", res)
+    marks = [getattr(pytest.mark, res), pytest.mark.mlu, _cards_mark(num_cards)]
+    if num_cards == 1:
+        return marks
+    from vllm.platforms import current_platform
+
+    if current_platform.device_type != "mlu":
+        return marks
+    return marks + [
+        pytest.mark.skipif(
+            current_platform.device_count() < num_cards,
+            reason=f"Need at least {num_cards} MLUs to run the test.",
+        )
+    ]
+
+
 @lru_cache(maxsize=1)
 def _gpu_res_platforms() -> frozenset[str]:
     """Accelerator platforms tagged ``[hardware-platform] [gpu]`` (not the ``gpu`` mark)."""
@@ -293,6 +312,7 @@ def _marks_for_platform(platform: str, resource: SkuSpec, num_cards: int) -> lis
             "rocm": _rocm_marks,
             "xpu": _xpu_marks,
             "musa": _musa_marks,
+            "mlu": _mlu_marks,
             "npu": _npu_marks,
         }
         builder = builders.get(platform)
@@ -306,6 +326,11 @@ def _marks_for_platform(platform: str, resource: SkuSpec, num_cards: int) -> lis
 
 def _skipif_not_platform(platform: str) -> pytest.MarkDecorator:
     import pytest
+
+    if platform == "mlu":
+        from vllm.platforms import current_platform
+
+        return pytest.mark.skipif(current_platform.device_type != "mlu", reason="Requires mlu platform")
 
     from vllm_omni.platforms import current_omni_platform
 
