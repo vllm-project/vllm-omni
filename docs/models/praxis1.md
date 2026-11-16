@@ -17,42 +17,14 @@ Wan2.2 TI2V VAE and a Qwen3.5 text encoder.
 
 ## Usage
 
-Download a checkpoint directory and keep the companion weights beside it. The
-pipeline defaults to `Wan2.2_VAE.pth` and `text_encoder/` inside the checkpoint
-directory; `model_config.vae_weights` and `model_config.text_encoder` override
-the paths.
+This page is the client and deployment reference. The
+[recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Runway/Praxis-1.md)
+has the weight download, a deployment file, the offline and serving commands
+and the validation results.
 
-```text
-/path/to/praxis-1-droid/
-  config.json
-  model.safetensors.index.json
-  model-*.safetensors
-  Wan2.2_VAE.pth     # Wan-AI/Wan2.2-TI2V-5B
-  text_encoder/      # Qwen/Qwen3.5-2B snapshot
-```
-
-Pass the local directory to Omni with a deployment that selects the
-pipeline. A minimal deployment runs one stage on one GPU; the same file works
-for the DROID and the YAM checkpoint:
-
-```yaml
-# praxis1-deploy.yaml
-async_chunk: false
-dtype: bfloat16
-stages:
-  - stage_id: 0
-    devices: "0"
-    max_num_seqs: 1
-    enforce_eager: true
-    model_class_name: Praxis1Pipeline
-    model_config:
-      max_context_chunks: 1
-```
-
-```bash
-vllm serve /path/to/praxis-1-droid --omni --served-model-name praxis-1 \
-  --deploy-config praxis1-deploy.yaml --stage-init-timeout 1800
-```
+The pipeline loads a local checkpoint directory. It reads `Wan2.2_VAE.pth`
+and `text_encoder/` from inside that directory unless
+`model_config.vae_weights` and `model_config.text_encoder` point elsewhere.
 
 Offline requests pass `robot_obs` and a nonempty `session_id` in
 `OmniDiffusionSamplingParams.extra_args`; reuse the id for continuation,
@@ -106,6 +78,12 @@ predicted frames.
 
 ### Deployment settings
 
+The shipped deployments, `vllm_omni/deploy/praxis1.yaml` (DROID) and
+`vllm_omni/deploy/praxis1_yam.yaml` (YAM), select the pipeline on one GPU and
+carry the `policy_server_config` handshake that the robot-policy servers
+advertise to clients. The worker refuses a handshake that does not match the
+checkpoint.
+
 Set these under `model_config` in a copy of the deployment:
 
 | Setting | Default |
@@ -133,38 +111,11 @@ shared `Attention` layer. Block masks use 256-token blocks, which every
 FlexAttention tile configuration divides, so one code path serves Hopper and
 Blackwell GPUs. Routed experts run through vLLM's fused MoE kernels with the
 checkpoint's sigmoid-plus-bias routing. No GPU-specific numerical branches are
-used; see the validation notes below for what that implies.
+used; the recipe's
+[verification section](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Runway/Praxis-1.md#verification)
+shows what that implies.
 
 The text encoder uses the Transformers Qwen3.5 implementation with vLLM
 linear layers. Installing `flash-linear-attention` and `causal-conv1d` speeds up
 its gated delta-rule layers; without them Transformers falls back to PyTorch
 kernels. Prompt embeddings are cached per task string.
-
-## Validation
-
-The port is checked at three levels.
-
-1. **Oracle parity on random weights.** A tiny transformer built by both the
-   reference implementation and this port from the same random weights agrees
-   to about 1e-4 relative in float32 at every context depth, including the
-   block-sparse and dense attention paths.
-2. **Real weights, same inputs.** With the DROID checkpoint, text embeddings
-   are bitwise identical to the reference; the VAE latent and each transformer
-   block differ at bfloat16 rounding level (about 3e-3 relative). The sampler
-   is chaotic: two Euler steps with video guidance 4 amplify those rounding
-   differences to tens of millimetres on individual targets, and the reference
-   itself moves by a similar amount between two of its own builds (compiled
-   versus eager FlexAttention, with or without the FLA text kernels). Bitwise
-   parity with a specific reference build is therefore not a goal of this
-   integration.
-3. **Task success in simulation.** The reference repository's MuJoCo task
-   suites, driven unchanged against this server over its robot-policy
-   WebSocket API, are the qualification that matters. Results are recorded in
-   the recipe that accompanies the checkpoint-gated tests.
-
-Weight-free CPU and GPU tests cover the config contract, masks,
-rotary tables, the sampler, weight mapping, observation processing and the
-worker's session lifecycle.
-
-Validated locally on one H100 80 GB. B200, GB300 and RTX PRO 6000 run the same
-code path but have not been exercised for this port.
