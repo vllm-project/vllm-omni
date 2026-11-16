@@ -561,24 +561,39 @@ def test_dedicated_pool_runners_use_distinct_handles(monkeypatch):
     assert all(p is not global_pool for p in seen_pools), "dedicated runners must not touch the global pool"
 
 
-def test_dedicated_pool_missing_handle_warns_and_falls_back(monkeypatch):
+def test_dedicated_pool_missing_handle_stays_eager(monkeypatch):
     seen_pools, global_pool = _install_fake_npu(monkeypatch, with_pool_handle=False)
 
     import vllm_omni.platforms.npu.graph_tools as graph_tools_module
 
-    warnings = []
+    warned = []
     monkeypatch.setattr(
         graph_tools_module.logger,
-        "warning",
-        lambda *args, **kwargs: warnings.append(args),
+        "warning_once",
+        lambda *args, **kwargs: warned.append(args),
     )
 
-    runner = NPUExactGraphRunner(use_shared_pool=False, component_name="fallback-check")
-    runner.capture((torch.tensor([1.0]),), lambda value: (value + 1,))
+    runner = NPUExactGraphRunner(use_shared_pool=False, component_name="eager-check")
+    # Bypass the NPU-device eligibility check (CPU tensors here); the pool
+    # decision under test happens after eligibility.
+    runner._eligible = lambda inputs: True
+    outputs = runner.run("op", (torch.tensor([1.0]),), (), lambda value: (value + 1,))
 
-    assert seen_pools == [global_pool]
-    assert warnings, "the shared-pool fallback must be announced, not silent"
-    assert "graph_pool_handle" in str(warnings[0][0])
+    # No capture is attempted, the global pool is never touched, the request
+    # still gets its (eager) result, and the degradation is announced.
+    assert runner.stats["captures"] == 0
+    assert seen_pools == []
+    assert warned, "the eager degradation must be announced, not silent"
+    assert "graph_pool_handle" in str(warned[0][0])
+    assert outputs[0].item() == 2.0
+    # A direct capture() call past the run() guard must fail loudly instead
+    # of silently sharing the global pool.
+    try:
+        runner.capture((torch.tensor([1.0]),), lambda value: (value + 1,))
+    except RuntimeError as exc:
+        assert "graph_pool_handle" in str(exc)
+    else:
+        raise AssertionError("direct capture() without a pool handle must raise")
 
 
 def test_vae_npu_graph_runner_is_per_instance(monkeypatch):
