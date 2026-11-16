@@ -80,11 +80,10 @@ REQUEST_IDENTITY_EXTRA_ARGS = frozenset({"latent_cache_key"})
 # FLUX.2 Klein supports up to four reference images.
 FLUX2_KLEIN_MAX_INPUT_IMAGES = 4
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
-# Qwen-Image 2.1 image-conditioned generation caps condition images at 4.
-QWEN_IMAGE_21_MAX_INPUT_IMAGES = 4
+# Qwen-Image 2.1 supports up to 10 reference images for image-conditioned generation.
+QWEN_IMAGE_21_MAX_INPUT_IMAGES = 10
 # Upstream HunyuanImage-3.0 "Multi-Image Fusion" caps reference images at 3.
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
-JOY_IMAGE_EDIT_MAX_INPUT_IMAGES = 1
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 FLUX3_MAX_INPUT_IMAGES = 10
@@ -289,15 +288,6 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
             TEXT_TO_IMAGE,
             _image_edit_profile(BOOGU_IMAGE_MAX_INPUT_IMAGES),
             sources=("vllm_omni/diffusion/models/boogu_image/pipeline_boogu_image.py",),
-        ),
-    ),
-    "JoyImageEditPipeline": DiffusionModelMetadata(
-        supports_multimodal_inputs=True,
-        max_multimodal_image_inputs=JOY_IMAGE_EDIT_MAX_INPUT_IMAGES,
-        serving_capabilities=declare_capabilities(
-            replace(IMAGE_RESPONSE, required_inputs=("text", "image")),
-            _image_edit_profile(JOY_IMAGE_EDIT_MAX_INPUT_IMAGES),
-            sources=("vllm_omni/diffusion/models/joy_image/pipeline_joy_image_edit.py",),
         ),
     ),
     "MiniMaxH3Pipeline": DiffusionModelMetadata(

@@ -106,8 +106,8 @@ Apply `enum_normalization` to the supplied string and each enum candidate only
 for membership comparison; preserve the original request value. `strip_lower`
 removes surrounding whitespace before lowercasing. Unknown rules are unknown
 capability data, not permission to assume exact matching. Only string enums can
-declare this field. Qwen3-TTS language uses `title`; Kokoro and Gepard voices
-use `lower`; Audex and music placeholders use `strip_lower`. Empty placeholders
+declare this field. Qwen3-TTS language uses `title`; Gepard voices use `lower`;
+Audex and music placeholders use `strip_lower`. Empty placeholders
 are included only where the actual adapter accepts them. An accepted placeholder
 does not imply selectable voices.
 
@@ -235,7 +235,7 @@ promote the overall mode to `supported`. Missing role declarations stay unknown.
 | `chat` | Declared text/media requirements and response modalities are preserved. Unspecified optional inputs and reference counts stay unknown; an image output does not imply an image-edit input contract. |
 | `image_generation` | The image route accepts positive dimensions and output format; it has no image/mask/separate-reference mapping. Declared model limits cannot be widened by the route. |
 | `video_generation` | HTTP reference roles remain separate from the WebSocket's single-image input. Neither route maps native Wan `last_image`, so the optional offline last-frame role is excluded on these routes. MAGI-2 declares 125 frames, 12.5 fps, 10 seconds and its two native resolution modes. Joint audio output remains in `outputs`; optional audio remains in `constraints.optional_outputs`. |
-| `speech` | Each TTS adapter owns its accepted reference, voice and instruction facts beside its request builder. Loaded voice enums include validated aliases such as Kokoro's `default` only when its target exists. Qwen language enums reflect actual input validation; the generic default language list is not promoted for other adapters. |
+| `speech` | Each TTS adapter owns its accepted reference, voice and instruction facts beside its request builder. Qwen language enums reflect actual input validation; the generic default language list is not promoted for other adapters. |
 | `speech` music/caption profiles | MiniMax Music3/YuE2 require lyrics and style instructions, accept an empty or `default` voice placeholder, and exclude ordinary TTS reference controls. Audex TTA takes captions. MOSS variants separately expose reference cloning, sound-effect descriptions or voice-design instructions. |
 | `audio_generation` | The diffusion audio handler maps a text caption and optional negative prompt. It has no lyrics/instruction pair, voice or reference-media mapping. |
 
