@@ -224,10 +224,16 @@ PY
         pkill -f "VLLM::EngineCore" || true
         pkill -f "vllm_omni.*worker" || true
         sleep 5
-        ZE_AFFINITY_MASK="$1" python - <<PY || true
+        ZE_AFFINITY_MASK="$1" MASK="$1" python - <<PY || true
+import os
+
 import torch
+
 free, total = torch.xpu.mem_get_info()
-print(f"[card {torch.xpu.current_device()}] {free / 2**30:.2f} of {total / 2**30:.2f} GiB free")
+# The index inside the process is always 0 for a one-card mask, so report the
+# mask the stage ran under instead.
+mask = os.getenv("MASK", "?")
+print(f"[ZE_AFFINITY_MASK={mask}] {free / 2**30:.2f} of {total / 2**30:.2f} GiB free")
 PY
     }
 
