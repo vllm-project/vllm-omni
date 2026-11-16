@@ -196,7 +196,7 @@ stage 1 with the LAYA pooling judge. Serve
 
 - **Another pooling model:** add a pooling model class that returns one logit
   per option, and a format entry in
-  `vllm_omni/model_executor/stage_input_processors/response_judge.py` that
+  `vllm_omni/engine/duplex/response_judge.py` that
   builds its prompt and reads its decision.
 - **Another pipeline:** add a stage with `model_stage="response_judge"` right
   after the ASR stage. Build its input with `judge_input(...)`, and wrap the

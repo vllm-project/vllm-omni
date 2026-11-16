@@ -295,6 +295,7 @@ vllm_omni/
 │       ├── turn_detection.py        server-side VAD turn detector used by the session
 │       ├── audio.py                 compatibility re-export, via protocol/duplex
 │       ├── vad.py / intermediate.py
+│       ├── response_judge.py        post-ASR judge: does a committed turn need a reply
 │       └── session/                 one engine-resident session and everything that runs it
 │           ├── engine_session.py    DuplexEngineSession: ledgers, lease, fence, stage resources, append sequencing
 │           ├── runner.py            DuplexSessionRunner (per-session mailbox on the orchestrator loop)
