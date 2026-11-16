@@ -674,6 +674,46 @@ def test_step_runner_binds_schedule_around_mixfusion_driver(monkeypatch, fail):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_step_runner_dispatches_mixfusion_denoise_through_stage_operator(monkeypatch):
+    from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
+
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.vllm_config = None
+    runner.pipeline = _DenoiseOnlyStagePipeline()
+    driver = MixFusionDriver(runner.pipeline, transformer=Mock(), adapter=Mock())
+    driver.run = Mock(wraps=driver.run)
+    runner.pipeline.mixfusion_driver = driver
+    request = OmniDiffusionRequest(
+        request_id="mixfusion-stage-request",
+        prompt="test",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+    )
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "is_available", lambda: False)
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+
+    result = runner._execute_stepwise_core(scheduler_output, record_output_peak_memory=False)
+
+    driver.run.assert_called_once()
+    assert runner.pipeline.operators == [
+        DiffusionStageOperator.STEP_PREPARE,
+        DiffusionStageOperator.DENOISE_STEP,
+        DiffusionStageOperator.STEP_SCHEDULER,
+        DiffusionStageOperator.STEP_FINALIZE,
+    ]
+    output = result.get_request_output(request.request_id)
+    assert output.finished is True
+    assert torch.equal(output.result.custom_output["latents"], torch.ones(1, 1))
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_update_states_does_not_choose_packing_from_request_flag() -> None:
     runner = _make_runner(cache_backend=None, cache_backend_name=None)
     runner.pipeline.supports_mixfusion = True
