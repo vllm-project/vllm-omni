@@ -10,7 +10,6 @@ import torch
 from tests.helpers.mark import hardware_marks
 from tests.model_executor.models.test_zonos3_codec import small_config, spec
 from vllm_omni.model_executor.models.zonos3.codec import (
-    ZACCodecChunk,
     ZACConvNeXt,
     ZACDecoderNetwork,
     ZACMossLayer,
@@ -20,7 +19,6 @@ from vllm_omni.model_executor.models.zonos3.codec import (
     _packed_convnext,
     zac_packed_ring_attention,
 )
-from vllm_omni.model_executor.models.zonos3.cuda_graph_wrapper import ZACCodecGraphWrapper
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [
@@ -80,6 +78,7 @@ def test_packed_ring_kernel_capture_matches_cpu_reference(batch):
             oracle,
         )
         graph.replay()
+        assert result is not None
         torch.testing.assert_close(result.cpu(), expected, atol=2e-6, rtol=2e-5)
         torch.testing.assert_close(
             captured.keys[: batch * ring].cpu(), oracle.keys[: batch * ring], atol=2e-6, rtol=2e-5
@@ -119,35 +118,10 @@ def test_complete_packed_codec_graph_matches_same_eager_forward(batch):
         codes[:2, 4:] = -1
         expected = eager(codes, slots, offsets, final)
         graph.replay()
+        assert result is not None
         torch.testing.assert_close(result[0], expected[0], atol=1e-7, rtol=1e-6)
         torch.testing.assert_close(result[1], expected[1], atol=0, rtol=0)
         torch.testing.assert_close(result[2], expected[2], atol=0, rtol=0)
-
-
-@torch.inference_mode()
-def test_complete_packed_two_key_buckets_share_state():
-    torch.manual_seed(99)
-    network = ZACDecoderNetwork(small_config()).cuda().eval()
-    wrapper = ZACCodecGraphWrapper(network, 4, 5, [(b, t) for b in (1, 4) for t in (1, 8, 20)])
-    eager = ZACPackedCodec(network, 8, 5, 20)
-    wrapper.capture()
-    assert set(wrapper.buckets) == {(b, t) for b in (1, 4) for t in (1, 8, 20)}
-    for lengths, finished in (([1, 3, 0, 4], False), ([5], False), ([2, 1, 5, 3], False), ([0, 0, 0, 0], True)):
-        n = len(lengths)
-        slots = torch.arange(n, device="cuda")
-        valid = torch.tensor(lengths, device="cuda")
-        codes = torch.randint(0, 32, (sum(lengths), 10), device="cuda")
-        final = torch.full((n,), finished, device="cuda")
-        actual = wrapper(codes, slots, valid, final)
-        b = next(x for x in wrapper.batch_sizes if x >= n)
-        t = next(t for bb, t in wrapper.capture_keys if bb == b and t >= max(1, sum(lengths)))
-        bucket = wrapper.buckets[b, t]
-        expected = eager(bucket.codes, bucket.slots, bucket.offsets, bucket.final)
-        torch.testing.assert_close(actual[0], expected[0], atol=1e-7, rtol=1e-6)
-        torch.testing.assert_close(actual[1], expected[1][: n + 1], atol=0, rtol=0)
-        torch.testing.assert_close(actual[2], expected[2][:n], atol=0, rtol=0)
-        torch.testing.assert_close(wrapper.codec.state.frames[:4], eager.state.frames[:4], atol=0, rtol=0)
-        assert not wrapper.codec.state.frames[4:].any()
 
 
 @torch.inference_mode()
@@ -171,57 +145,6 @@ def test_segmented_conv_preserves_noncontiguous_packed_input():
     torch.testing.assert_close(history, expected_history, atol=0, rtol=0)
 
 
-@torch.inference_mode()
-def test_packed_model_state_graph_lifecycle_and_owned_pcm():
-    """ModelState routing/ownership against identical direct packed graph math."""
-    from tests.model_executor.models.test_zonos3_codec import graph_network, make_codec_state
-
-    network = graph_network("cuda")
-    manager = make_codec_state(network, 2, max_chunk=4, graph_batch_sizes=(1, 2), graph_frame_sizes=(1, 4))
-    reference = ZACCodecGraphWrapper(network, 2, 4, manager.model.graph.capture_keys)
-    reference.capture()
-    codes = torch.randint(0, 4096, (8, 10))
-    retained = []
-    skip = {"a": 4, "b": 0, "c": 4}
-
-    def check(chunks, slots, reset=()):
-        slots = torch.tensor(slots, dtype=torch.long, device="cuda")
-        if reset:
-            reference.codec.reset(torch.tensor(reset, dtype=torch.long, device="cuda"))
-        raw = torch.cat([c.codes for c in chunks])
-        if not raw.numel():
-            raw = torch.zeros(1, 10, dtype=torch.long)
-        expected, offsets, _ = reference(
-            raw.cuda(),
-            slots,
-            torch.tensor([len(c.codes) for c in chunks], device="cuda"),
-            torch.tensor([c.finished for c in chunks], device="cuda"),
-        )
-        boundaries = offsets.cpu().tolist()
-        expected = expected.clone()
-        actual = manager.decode(chunks)
-        for i, (c, out) in enumerate(zip(chunks, actual, strict=True)):
-            count = boundaries[i + 1] - boundaries[i]
-            crop = min(skip[c.request_id], count)
-            skip[c.request_id] -= crop
-            torch.testing.assert_close(
-                out.audio, expected[boundaries[i] + crop : boundaries[i + 1]], atol=1e-6, rtol=1e-4
-            )
-            retained.append((out.audio, out.audio.clone()))
-
-    check([ZACCodecChunk("a", 0, 0, codes[:2], skip_samples=4), ZACCodecChunk("b", 0, 0, codes[:1])], [0, 1], (0, 1))
-    manager.release("a")
-    check([ZACCodecChunk("b", 1, 1, codes[1:3]), ZACCodecChunk("c", 0, 0, codes[3:7], skip_samples=4)], [1, 0], (0,))
-    check([ZACCodecChunk("c", 1, 4, codes[:0], True), ZACCodecChunk("b", 2, 3, codes[3:4])], [0, 1])
-    check([ZACCodecChunk("b", 3, 4, codes[:0], True)], [1])
-    manager.release("b")
-    manager.release("c")
-    assert not manager.states and not manager._finished and len(manager._free) == 2
-    assert manager.model.graph.replay_count == 4 and manager.model.graph.eager_count == 0
-    for audio, snapshot in retained:
-        torch.testing.assert_close(audio, snapshot, atol=0, rtol=0)
-
-
 @pytest.mark.parametrize("batch", [1, 4, 32])
 @torch.inference_mode()
 def test_release_shape_synthesis_matches_whole_waveform(batch):
@@ -234,7 +157,7 @@ def test_release_shape_synthesis_matches_whole_waveform(batch):
     slots = torch.arange(batch, device="cuda")
     lengths = [240 - i % 5 * 16 for i in range(batch)]
     spectra = [[torch.randn(2 * length, n + 2, device="cuda") * 0.2 for n in config.n_ffts] for length in lengths]
-    parts = [[] for _ in lengths]
+    parts: list[list[torch.Tensor]] = [[] for _ in lengths]
     for step in range(3):
         chunk_lengths = lengths if step < 2 else [0] * batch
         offsets = torch.tensor([0, *torch.tensor(chunk_lengths).cumsum(0).tolist()], device="cuda")

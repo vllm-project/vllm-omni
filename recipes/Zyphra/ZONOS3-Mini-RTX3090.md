@@ -4,8 +4,8 @@
 
 - Vendor/model: Zyphra, [`Zyphra/ZONOS3-Mini`](https://huggingface.co/Zyphra/ZONOS3-Mini).
 - Task: text-to-speech through `POST /v1/audio/speech`.
-- Runtime: vLLM-Omni MRv2, AR → stateful ZAC decoder (`keep2_plain`).
-- Hardware: one NVIDIA GeForce RTX 3090, 24 GiB; both stages on GPU 0.
+- Runtime: vLLM-Omni MRv2, single-stage AR + stateful packed ZAC decoder (`keep2_plain`).
+- Hardware: one NVIDIA GeForce RTX 3090, 24 GiB; one worker on GPU 0.
 - Maintainer: vLLM-Omni contributors.
 
 ## Supported model contract
@@ -17,7 +17,7 @@
 | Provided profile | `vllm_omni/deploy/zonos3_mini.yaml`, 32 request slots, AR context 2048 tokens |
 | Precision | AR BF16; speaker encoder and Codec weights FP32 |
 | Execution | Piecewise AR prefill/mixed, FULL AR decode, model-owned Codec graphs |
-| Qualified scope | Single-GPU default-voice serving; 128 requests per concurrency at 1/4/8/16/32, with WER evaluation |
+| Qualification | Historical two-stage measurements below; single-stage validation is reported separately |
 | Voice cloning / other topologies | Not qualified by this recipe |
 
 For generic API fields, see the [Speech API](../../docs/serving/speech_api.md).
@@ -89,16 +89,27 @@ vllm serve "$ZONOS3_MODEL_PATH" \
   --port 8000
 ```
 
-The deploy sets Stage 0 KV cache to **128 MiB**. GDN recurrent/conv/window state
-is separately preallocated. Stage 1 `enforce_eager: false` enables complete Codec
-graphs; set it to `true` for eager execution of the same packed Codec core.
-Both paths consume packed RVQ and produce packed PCM. Graph keys contain only
-`(num_seqs_bucket, total_RVQ_tokens_bucket)`; per-request lengths and final flags
-are device inputs. Only the global token slab tail is padded. Buckets derive
-from `max_num_seqs` and connector chunk sizes, without a separate opt-in flag.
-The ring reserves room for the configured chunk/ramp and up to 30 silence-primer
-frames in the first chunk. Requests exceeding that per-request chunk bound are
-rejected before state changes; increase the shared connector chunk size if needed.
+The deploy reserves **128 MiB** for AR KV. GDN and Codec persistent state
+are separately preallocated. One native scheduler owns both AR and Codec slots;
+sampled delayed RVQ stays on the GPU, without an inter-stage connector.
+
+AR decode uses native FULL graphs and mixed/prefill uses PIECEWISE graphs.
+After sampling, the Codec stream updates the RVQ ring and tests chunk readiness
+and logical EOS for the whole batch. Device conditionals skip the complete
+packed Codec when nothing is ready and select a token-capacity bucket on GPU. Ready requests share one packed forward;
+inactive lanes use zero-length scratch slots. Remaining frames and synthesis
+tail are flushed once at logical EOS or the request length limit.
+
+The Codec graph has fixed capacity for each request-count bucket. Actual lengths,
+slots and final flags stay on device. PCM is copied into an owned step snapshot
+before replay can overwrite graph storage. The native output materializer waits
+for Codec completion, then copies only valid PCM before delivering logical tokens. Cancellation invalidates the original output lease,
+and slot reuse resets Codec state on its serial stream.
+
+The default per-request capacity is 31 RVQ frames, including silence priming on
+the first packet. Custom chunk settings must fit it; increase
+`hf_overrides.zonos3_codec_max_chunk` at startup for larger packets. This also
+increases graph workspace and padding cost.
 
 ## Decoder variants and launch adjustments
 
@@ -125,7 +136,7 @@ vllm serve "$ZONOS3_MODEL_PATH" \
   --served-model-name Zyphra/ZONOS3-Mini \
   --omni \
   --deploy-config vllm_omni/deploy/zonos3_mini.yaml \
-  --stage-overrides '{"1":{"hf_overrides":{"zonos3_decoder":"full_mr"}}}' \
+  --stage-overrides '{"0":{"hf_overrides":{"zonos3_decoder":"full_mr"}}}' \
   --port 8000
 ```
 
@@ -134,9 +145,12 @@ Selection happens at startup, not in the Speech API request. Returning to
 restarting. The larger network may need more device memory and capture time;
 the measured memory figures below apply only to `keep2_plain`.
 
-### Disable Codec graphs
+### Enforce eager execution
 
-To keep AR decode graphs but run the Codec eagerly, override **Stage 1 only**:
+Set Stage 0 `enforce_eager: true` to disable both AR and Codec graphs. Codec
+uses the same packed core, with zero-length scratch lanes for requests that are
+not ready. This avoids a host readiness check but still executes padding work;
+it does not promise that dummy lanes cost no compute.
 
 ```bash
 HF_HUB_OFFLINE=1 FLA_TILELANG=0 \
@@ -144,24 +158,9 @@ vllm serve "$ZONOS3_MODEL_PATH" \
   --served-model-name Zyphra/ZONOS3-Mini \
   --omni \
   --deploy-config vllm_omni/deploy/zonos3_mini.yaml \
-  --stage-overrides '{"1":{"enforce_eager":true}}' \
+  --stage-overrides '{"0":{"enforce_eager":true}}' \
   --port 8000
 ```
-
-The two overrides can be combined in one Stage 1 object:
-
-```json
-{"1":{"enforce_eager":true,"hf_overrides":{"zonos3_decoder":"full_mr"}}}
-```
-
-Do not apply a global `--enforce-eager` to this profile: Stage 0 currently requires
-FULL decode graphs. The provided `FULL_AND_PIECEWISE` configuration keeps decode
-in one FULL graph and splits mixed/prefill steps at Zonos3 GDN and global
-attention cores. GDN request metadata and recurrent updates execute outside the
-piecewise graphs; surrounding backbone operations compile and replay.
-To adjust Codec bucket shapes, edit connector
-`codec_chunk_frames` / `codec_chunk_ramp` and the Codec stage's `max_num_seqs` in
-a copy of the deploy YAML. The graph keys are derived from those values.
 
 ## Generate speech
 
@@ -244,7 +243,7 @@ WER separately for each concurrency. Warmup requests are excluded from the
 timed workload. ASR evaluation on the serving GPU is a separate phase; distinguish
 its memory usage from the server's steady-state and request-processing peaks.
 
-## Qualification evidence
+## Historical two-stage qualification evidence
 
 | Environment | Validated value |
 | --- | --- |
@@ -270,7 +269,7 @@ its memory usage from the server's steady-state and request-processing peaks.
 
 All 640 timed requests and their ASR evaluations succeeded, with no missing PCM.
 These measurements cover the default packed-only YAML, AR BF16 and Codec FP32,
-with both stages on the same GPU. They are one bounded measurement run, not a
+with both stages on the same GPU, before the single-stage migration. They are one bounded measurement run, not a
 statistical no-regression claim. Warmups and subsequent ASR evaluation are outside
 the timed serving workload. High-concurrency RTF exceeds 1, so successful request
 completion does not imply uninterrupted real-time playback. Graph replay was

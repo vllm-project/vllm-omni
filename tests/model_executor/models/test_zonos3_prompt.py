@@ -144,7 +144,7 @@ def test_zonos3_rejects_uploaded_audio_voice_without_reference_codec_encoder(tmp
     assert "unsupported reference-prefix encoder" in adapter.validate(request)
 
 
-def test_deployment_resolves_both_native_stages_with_release_parser(tmp_path):
+def test_deployment_resolves_single_native_stage_with_release_parser(tmp_path):
     (tmp_path / "params.json").write_text(json.dumps(release_params()))
     deploy = Path(__file__).resolve().parents[3] / "vllm_omni/deploy/zonos3_mini.yaml"
     resolved = resolve_omni_config(
@@ -155,9 +155,9 @@ def test_deployment_resolves_both_native_stages_with_release_parser(tmp_path):
         stage_overrides=None,
         strategy_config_path=None,
     )
-    assert len(resolved.stage_configs) == 2
-    ar, codec = resolved.stage_configs
-    for stage in (ar, codec):
+    assert len(resolved.stage_configs) == 1
+    (ar,) = resolved.stage_configs
+    for stage in (ar,):
         assert stage.load_config.config_format == "zonos3"
         assert stage.model_config.use_v2_model_runner
         assert stage.model_config.supports_native_mrv2_data_plane
@@ -168,10 +168,8 @@ def test_deployment_resolves_both_native_stages_with_release_parser(tmp_path):
     assert ar.cache_config.kv_cache_memory_bytes == 128 * 1024**2
     assert "FULL_AND_PIECEWISE" in str(ar.compilation_config)
     assert "vllm::zonos3_gdn_core" in str(ar.compilation_config)
-    assert codec.stage_pipeline_config.hf_config_name == "codec_config"
-    assert codec.stage_pipeline_config.retains_state_across_chunks
-    assert codec.model_config.enforce_eager is False
-    assert "zonos3_codec_graph_frame_sizes" not in (codec.runtime_config.additional_config or {})
+    assert ar.stage_pipeline_config.final_output
+    assert ar.stage_pipeline_config.final_output_type == "audio"
 
 
 def test_release_parser_roundtrip_and_conditioning_prompt_lengths(tmp_path):
@@ -186,7 +184,7 @@ def test_release_parser_roundtrip_and_conditioning_prompt_lengths(tmp_path):
     config = get_config(str(tmp_path), trust_remote_code=False, config_format="zonos3")
     restored = Zonos3Config.from_dict(config.to_dict())
     assert restored.zonos3_params == params
-    assert restored.vocab_size == 3 and restored.codec_config.architectures == ["Zonos3CodecModel"]
+    assert restored.vocab_size == 3 and not hasattr(restored, "codec_config")
     builder = Zonos3PromptBuilder(Zonos3Architecture.from_params(params), str(tmp_path), "lm/zonos3_mini")
     assert builder.canonical_language("Chinese") == "cmn"
     tokens = [2, *(byte + 192 for byte in "你好".encode()), 3]

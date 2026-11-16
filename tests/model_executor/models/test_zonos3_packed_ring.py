@@ -147,7 +147,7 @@ def test_complete_packed_pcm_matches_whole_audio(batch):
         sequence[:2, 4:] = -1
     expected = [whole_audio(network, sequence) for sequence in codes]
     progress = [0] * batch
-    outputs = [[] for _ in range(batch)]
+    outputs: list[list[torch.Tensor]] = [[] for _ in range(batch)]
     for step in range(16):
         lengths = [min((i + step) % 6, len(codes[i]) - progress[i]) for i in range(batch)]
         offsets = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()])
@@ -166,40 +166,3 @@ def test_complete_packed_pcm_matches_whole_audio(batch):
             progress[i] += n
     for actual, reference in zip(outputs, expected):
         torch.testing.assert_close(torch.cat(actual), reference, atol=2e-7, rtol=3e-4)
-
-
-@torch.inference_mode()
-def test_packed_model_state_lifecycle_crop_empty_final_cancel_reuse_and_ownership():
-    from tests.model_executor.models.test_zonos3_codec import make_codec_state
-    from vllm_omni.model_executor.models.zonos3.codec import ZACCodecChunk
-
-    torch.manual_seed(71)
-    network = ZACDecoderNetwork(small_config()).eval()
-    packed = make_codec_state(network, 2, max_chunk=4)
-    codes = torch.randint(0, network.config.codebook_size, (8, 10))
-    held = []
-    outputs = {"b": [], "c": []}
-
-    def decode(chunks):
-        result = packed.decode(chunks)
-        assert [r.request_id for r in result] == [c.request_id for c in chunks]
-        for out in result:
-            held.append((out.audio, out.audio.clone()))
-            if out.request_id in outputs:
-                outputs[out.request_id].append(out.audio)
-
-    decode([ZACCodecChunk("a", 0, 0, codes[:2], skip_samples=4), ZACCodecChunk("b", 0, 0, codes[:1])])
-    slot = packed.states["a"].slot
-    packed.release("a")
-    decode([ZACCodecChunk("c", 0, 0, codes[2:6]), ZACCodecChunk("b", 1, 1, codes[1:3])])
-    assert packed.states["c"].slot == slot
-    decode([ZACCodecChunk("c", 1, 4, codes[:0], True)])
-    decode([ZACCodecChunk("b", 2, 3, codes[:0], True)])
-    for name, data in (("b", codes[:3]), ("c", codes[2:6])):
-        torch.testing.assert_close(torch.cat(outputs[name]), whole_audio(network, data), atol=1e-6, rtol=1e-3)
-        packed.release(name)
-    assert not packed.states and not packed._finished and len(packed._free) == 2
-    final = packed.decode([ZACCodecChunk("a", 0, 0, codes[:2], True, 4)])[0]
-    torch.testing.assert_close(final.audio, whole_audio(network, codes[:2])[4:], atol=1e-6, rtol=1e-3)
-    for audio, snapshot in held:
-        torch.testing.assert_close(audio, snapshot, atol=0, rtol=0)

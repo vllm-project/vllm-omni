@@ -19,7 +19,7 @@ from vllm.v1.worker.gpu.states import RequestState
 from tests.model_executor.models.test_zonos3_modeling import make_cpu_lm, small_ar_config, valid_runtime
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.engine.serialization import serialize_additional_information
-from vllm_omni.model_executor.models.zonos3.model_state import Zonos3ARModelState
+from vllm_omni.model_executor.models.zonos3.model_state import Zonos3MiniModelState
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -42,6 +42,7 @@ def make_owner(capacity=4, device="cpu", dtype=torch.float32):
     config = valid_runtime()
     config.model_config = MagicMock(spec=ModelConfig)
     config.model_config.enable_prompt_embeds = False
+    config.model_config.enforce_eager = False
     config.model_config.uses_mrope = False
     config.model_config.get_inputs_embeds_size.return_value = architecture.dim
     config.model_config.max_model_len = 128
@@ -51,7 +52,7 @@ def make_owner(capacity=4, device="cpu", dtype=torch.float32):
         max_model_len=128, is_encoder_decoder=False, max_num_seqs=capacity, max_num_batched_tokens=max(32, capacity)
     )
     config.compilation_config.cudagraph_capture_sizes = [1, 2, 4]
-    state = Zonos3ARModelState(config, model, None, device)
+    state = Zonos3MiniModelState(config, model, None, device)
     native = Mock(spec=Sampler)
     native.sampling_states = SamplingStates(capacity, 3)
     native.add_request.side_effect = native.sampling_states.add_request
@@ -62,19 +63,6 @@ def make_owner(capacity=4, device="cpu", dtype=torch.float32):
 
     native.req_states.prefill_len = UvaBackedTensor(capacity, dtype=torch.int32)
     return state, native, native.req_states
-
-
-def materialize_codes(snapshot):
-    """Use the runner's real generic D2H/partition contract for model snapshots."""
-    from vllm_omni.data_entry_keys import unflatten_payload
-    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
-
-    cpu = snapshot.copy_to_cpu(lambda tensor: tensor.clone())
-    n = len(cpu["codes"]["audio"])
-    outputs, _ = OmniARModelRunner._build_async_chunk_outputs_from_mm(
-        cpu, np.arange(n + 1, dtype=np.int32), np.ones(n, dtype=np.int32), n, n
-    )
-    return [unflatten_payload(payload) for payload in outputs]
 
 
 def add(owner, req_id, slot, length):
@@ -270,34 +258,6 @@ def test_prompt_conditioning_survives_engine_core_metadata_serialization(owner):
     assert output.num_sampled.tolist() == [1]
     assert state._prompts["serialized"].embeddings.shape == (6, state.model.config.dim)
     assert bool(state.sampling_state.has_audio_prefix[0])
-
-
-@torch.inference_mode()
-def test_request_owned_codes_survive_mixed_prefill_partition_and_later_steps(owner):
-    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
-
-    state, native, requests = owner
-    add(owner, "partial", 0, 6)
-    add(owner, "complete", 1, 5)
-    data = batch(owner, [("partial", 0, 2, 0, True), ("complete", 1, 5, 0, True)])
-    inputs = state.prepare_inputs(data, requests)
-    state.run_preprocess(data, inputs, requests)
-    hidden = state.model(
-        inputs_embeds=inputs["inputs_embeds"], positions=data.positions, zonos3_batch=inputs["zonos3_batch"]
-    )
-    _, snapshot = state.postprocess_model_output(hidden, data, requests)
-    tokens = state.sample_determined_tokens(data, native)
-    assert tokens.num_sampled.tolist() == [0, 1]
-    cpu = snapshot.copy_to_cpu(lambda tensor: tensor.clone())
-    outputs, _ = OmniARModelRunner._build_async_chunk_outputs_from_mm(
-        cpu, data.query_start_loc_np, data.num_scheduled_tokens, 2, 7
-    )
-    assert outputs[0]["codes.audio"].shape == (1, 10)
-    assert outputs[0]["codes.audio"].eq(state.model.config.audio_pad_id).all()
-    assert outputs[1]["codes.audio"].shape == (1, 10)
-    saved = outputs[1]["codes.audio"].clone()
-    step(owner, batch(owner, [("partial", 0, 4, 2, True), ("complete", 1, 1, 5, False)]))
-    assert torch.equal(materialize_codes(snapshot)[1]["codes"]["audio"], saved)
 
 
 def test_native_startup_decode_warmup_can_run_before_full_graph_capture(owner, monkeypatch):

@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from vllm.sequence import IntermediateTensors
     from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 
-    from .model_state import Zonos3ARModelState
+    from .model_state import Zonos3MiniModelState
 
 CHUNK = 64
 HEADS = 4
@@ -583,7 +583,7 @@ def validate_zonos3_ar_runtime(vllm_config: VllmConfig) -> None:
         raise ValueError(
             "Zonos3 V1 requires prefix caching disabled: KV-only hits cannot restore GDN conv/recurrent state"
         )
-    if vllm_config.model_config.enforce_eager or vllm_config.compilation_config.cudagraph_mode not in (
+    if not vllm_config.model_config.enforce_eager and vllm_config.compilation_config.cudagraph_mode not in (
         CUDAGraphMode.FULL_DECODE_ONLY,
         CUDAGraphMode.FULL_AND_PIECEWISE,
     ):
@@ -729,7 +729,7 @@ class Zonos3ForCausalLM(nn.Module):
         # model.pth is the release's flat canonical state dict. Native
         # Attention adds runtime scale/cache buffers that are not checkpoint
         # weights; every actual parameter must still be present exactly once.
-        expected = set(dict(self.named_parameters()))
+        expected = {name for name, _ in self.named_parameters() if not name.startswith("codec.")}
         missing, unknown = expected - set(weights), set(weights) - expected
         if missing or unknown:
             raise ValueError(
@@ -766,10 +766,10 @@ class Zonos3ForCausalLM(nn.Module):
 
     def create_mrv2_model_state(
         self, vllm_config: VllmConfig, encoder_cache: EncoderCache | None, device: torch.device
-    ) -> Zonos3ARModelState:
-        from .model_state import Zonos3ARModelState
+    ) -> Zonos3MiniModelState:
+        from .model_state import Zonos3MiniModelState
 
-        return Zonos3ARModelState(vllm_config, self, encoder_cache, device)
+        return Zonos3MiniModelState(vllm_config, self, encoder_cache, device)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         # Logical placeholders carry length only. run_preprocess writes all
@@ -886,5 +886,11 @@ class Zonos3ForCausalLM(nn.Module):
                 self.vllm_config.scheduler_config.max_num_seqs
             ]
             self.prepare_cuda([size for size in buckets if size <= self.vllm_config.scheduler_config.max_num_seqs])
+        from .codec import Zonos3Codec
+
+        # Instantiate after strict AR loading: the release has separate checkpoints.
+        self.codec = Zonos3Codec(self.vllm_config).to(device=next(self.parameters()).device)
+        self.codec.load_release()
+        loaded.update(f"codec.{name}" for name, _ in self.codec.named_parameters())
         self._weights_loaded = True
         return loaded

@@ -65,24 +65,6 @@ class Zonos3Config(PretrainedConfig):
             is_encoder_decoder=False,
             **kwargs,
         )
-        # This stage has no language-model KV. Benign standard dimensions let
-        # native runner/task inspection handle its one placeholder per chunk.
-        self.codec_config = PretrainedConfig(
-            architectures=["Zonos3CodecModel"],
-            hidden_size=64,
-            intermediate_size=64,
-            num_hidden_layers=1,
-            num_attention_heads=1,
-            num_key_value_heads=1,
-            head_dim=64,
-            vocab_size=3,
-            max_position_embeddings=64,
-            bos_token_id=0,
-            eos_token_id=2,
-            pad_token_id=0,
-            tie_word_embeddings=False,
-            dtype="float32",
-        )
 
 
 AutoConfig.register("zonos3", Zonos3Config)

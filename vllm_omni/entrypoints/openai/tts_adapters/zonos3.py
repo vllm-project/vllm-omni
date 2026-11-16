@@ -61,13 +61,14 @@ class Zonos3TTSAdapter(ARTTSAdapter):
         model_config = ctx.server.model_config
         hf = model_config.hf_config
         self.architecture = Zonos3Architecture.from_params(hf.zonos3_params)
+        self.codec_max_chunk = int(getattr(hf, "zonos3_codec_max_chunk", 31))
         self.builder = Zonos3PromptBuilder(
             self.architecture, model_config.model, hf.zonos3_lm_subdir, model_config.revision
         )
 
     @classmethod
     def stage_serves_speech(cls, model_stage: str | None, all_stage_keys: frozenset[str]) -> bool:
-        return "zonos3_codec" in all_stage_keys
+        return model_stage == "zonos3_ar"
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         uploaded_voice = request.voice is not None and request.ref_audio is None
@@ -148,6 +149,12 @@ class Zonos3TTSAdapter(ARTTSAdapter):
                 raise ValueError("chunk_ramp must contain positive integer frame counts")
             if not isinstance(first_chunk_codebooks, int) or not 1 <= first_chunk_codebooks <= 10:
                 raise ValueError("first_chunk_codebooks must be in 1..10")
+            if (
+                len(chunk_ramp) > 31
+                or max((chunk_size, *chunk_ramp)) > self.codec_max_chunk
+                or frames + (chunk_ramp[0] if chunk_ramp else chunk_size) > self.codec_max_chunk
+            ):
+                raise ValueError("Codec chunk settings exceed zonos3_codec_max_chunk (including silence primer)")
         except (ValueError, TypeError) as error:
             return str(error)
         return self._validate_max_new_tokens(request)

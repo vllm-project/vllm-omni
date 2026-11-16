@@ -9,7 +9,7 @@ import torch
 
 from tests.helpers.mark import hardware_marks
 from tests.model_executor.models.test_zonos3_sampler import add_sampling, codes, make_state, run
-from vllm_omni.model_executor.models.zonos3.model_state import Zonos3ARModelState
+from vllm_omni.model_executor.models.zonos3.model_state import Zonos3MiniModelState
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [
@@ -40,7 +40,7 @@ def test_top_k_filters_every_codebook_with_single_and_reordered_requests(order):
     )
     slots = torch.tensor(order, device=device)
     logits = torch.arange(66, device=device, dtype=torch.float32).expand(len(order), 10, -1).clone()
-    probs = Zonos3ARModelState.probabilities(owner, logits, slots, 0)
+    probs = Zonos3MiniModelState.probabilities(owner, logits, slots, 0)
     assert torch.isfinite(probs).all()
     for row, slot in enumerate(order):
         expected = torch.arange(66, device=device) >= 65 - (5 if slot == 0 else 9)
@@ -111,7 +111,7 @@ def test_fused_rvq_draw_matches_native_filter_and_rng(width):
     )
     for _ in range(3):
         logits = torch.randn(batch, 10, vocab, device="cuda") * 4
-        probs = Zonos3ARModelState.probabilities(owner, logits, slots, width)
+        probs = Zonos3MiniModelState.probabilities(owner, logits, slots, width)
         position = state.position[slots, None] * 10 + state.columns
         expected = gumbel_sample(
             probs.log().view(-1, vocab),

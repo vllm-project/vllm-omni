@@ -6,6 +6,7 @@ import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -14,7 +15,7 @@ from vllm import SamplingParams
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
-from tests.model_executor.models.test_zonos3_model_state import make_owner, materialize_codes
+from tests.model_executor.models.test_zonos3_model_state import make_owner
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.model_executor.models.zonos3.model_state import Zonos3SamplingOptions
 from vllm_omni.model_executor.models.zonos3.sampling_state import CONTINUE, EOS
@@ -73,7 +74,17 @@ def greedy_params(**extra):
 
 def run(state, slots, hidden, seq_lens=None, prefill_len=1):
     batch, requests = make_batch(slots, seq_lens, prefill_len, hidden.device)
-    _, snapshot = state.postprocess_model_output(hidden, batch, requests)
+    accepted = []
+    original = state.sampling_state.accept
+
+    def accept(*args, **kwargs):
+        step = original(*args, **kwargs)
+        accepted.append(step.codes)
+        return step
+
+    with patch.object(state.sampling_state, "accept", side_effect=accept):
+        state.postprocess_model_output(hidden, batch, requests)
+    snapshot = accepted[0]
     # Exercise the existing runner shortcut. This sampler has no __call__, so
     # any accidental fallback to standard text sampling fails the test.
     runner = SimpleNamespace(model_state=state, sampler=object(), batch_sharder=None, pp_handler=None)
@@ -83,7 +94,7 @@ def run(state, slots, hidden, seq_lens=None, prefill_len=1):
 
 
 def codes(snapshot):
-    return torch.stack(snapshot["codes"]["audio"])[:, 0]
+    return snapshot
 
 
 @torch.inference_mode()
@@ -99,8 +110,6 @@ def test_parallel_codebooks_one_scheduler_token_and_feedback_contract():
     assert sampled.shape == (2, 10) and not (sampled == state.model.config.audio_pad_id).any()
     frame = torch.cat((sampled, torch.full((2, 1), state.model.config.text_vocab)), -1)
     torch.testing.assert_close(state.next_embeddings[[1, 0]], state.model.multi_embedder(frame))
-    materialized = materialize_codes(snapshot)
-    assert [p["codes"]["audio"].shape for p in materialized] == [(1, 10), (1, 10)]
 
 
 def test_rvq_top_k_is_not_clamped_to_three_logical_tokens():
@@ -121,7 +130,7 @@ def test_chunked_prefill_does_not_advance_physical_state_or_rng():
     output, first = run(state, [0], hidden, [2], prefill_len=5)
     assert output.num_sampled.item() == 0 and state.sampling_state.position[0].item() == 0
     assert torch.equal(
-        materialize_codes(first)[0]["codes"]["audio"],
+        codes(first)[:1],
         torch.full((1, 10), state.model.config.audio_pad_id, dtype=torch.int64),
     )
     _, actual = run(state, [0], hidden, [5], prefill_len=5)
@@ -151,7 +160,7 @@ def test_tail_drain_logical_eos_is_independent_and_absorbs_async_extra_step():
             assert codes(snapshot)[0].eq(c.audio_pad_id).all()
     assert state.sampling_state.position.tolist()[:2] == [11, 15]
     assert torch.equal(
-        materialize_codes(snapshot)[0]["codes"]["audio"],
+        codes(snapshot)[:1],
         torch.full((1, 10), c.audio_pad_id, dtype=torch.int64),
     )
 
@@ -222,6 +231,7 @@ def test_official_rvq_filter_probabilities_with_repetition_and_delayed_min_frame
     root = os.environ.get("ZONOS3_REFERENCE_ROOT")
     if not root:
         pytest.skip("Set ZONOS3_REFERENCE_ROOT for official RVQ sampling parity")
+    assert root is not None
     source = Path(root) / "model/src/zonos3/tts/sampler.py"
     import sys
     from types import ModuleType

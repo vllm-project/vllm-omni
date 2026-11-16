@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Complete incremental ZAC-1 Codec and native Stage-1 entry.
+"""Complete incremental ZAC-1 Codec embedded in the AR worker.
 
 Neural modules and persistent state precede release checkpoint loading,
-synthesis, slot management and the final Zonos3CodecModel entry class.
+synthesis and the release checkpoint module.
 CUDA capture/replay remains in cuda_graph_wrapper.py. Adapted from the
 Zyphra/ZONOS3-Mini release; see LICENSE.Zyphra.
 """
@@ -13,10 +13,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import Any, TypedDict, cast
 
 import torch
 from torch import nn
@@ -24,11 +24,7 @@ from torch.nn import functional as F
 from torchaudio.transforms import Resample
 from vllm.config import VllmConfig
 
-from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
-from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
-from vllm_omni.worker_v2.warmup import is_warmup_request
 
 
 class ZACTransformerSpec(TypedDict):
@@ -811,249 +807,33 @@ class ZACPackedCodec(nn.Module):
                 0, slots, 0
             )
 
-    def output_end(self, frames: int, final: bool) -> int:
-        """CPU-known PCM frontier; avoids reading device offsets to split output."""
-        s = self.synthesis
-        samples = frames * self.scale * s.ola.hop
-        if final:
-            return (samples * s.new + s.orig - 1) // s.orig
-        mixed = max(0, samples - s.ola.lookahead - s.half_fir)
-        return max(0, (mixed - s.width - s.orig) // s.orig + 1) * s.new
 
+class Zonos3Codec(nn.Module):
+    """Release decoder embedded in the AR worker; ModelState owns execution."""
 
-@dataclass(frozen=True)
-class ZACCodecChunk:
-    request_id: str
-    chunk_seq: int
-    frame_offset: int
-    codes: torch.Tensor
-    finished: bool = False
-    skip_samples: int = 0
-
-
-@dataclass(frozen=True)
-class ZACPCMOutput:
-    request_id: str
-    chunk_seq: int
-    audio: torch.Tensor
-    finished: bool
-
-
-if TYPE_CHECKING:
-    from vllm.sequence import IntermediateTensors
-    from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
-
-    from .model_state import Zonos3CodecModelState
-
-
-def _host_integer(value: object, field: str) -> int:
-    if isinstance(value, torch.Tensor):
-        if (
-            value.device.type != "cpu"
-            or value.numel() != 1
-            or value.dtype not in (torch.int32, torch.int64, torch.bool)
-        ):
-            raise ValueError(f"Zonos3 {field} must be a CPU integer scalar")
-        return int(value)
-    if not isinstance(value, int):
-        raise ValueError(f"Zonos3 {field} must be an integer")
-    return value
-
-
-class Zonos3CodecModel(nn.Module):
-    have_multimodal_outputs = True
-    has_preprocess = False
-    has_postprocess = False
-    requires_request_ids = True
-    requires_raw_input_tokens = True
-    enable_update_additional_information = True
-
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(self, vllm_config: VllmConfig) -> None:
         super().__init__()
-        del prefix
         self.vllm_config = vllm_config
-        model_config = vllm_config.model_config
-        variant = getattr(model_config.hf_config, "zonos3_decoder", "keep2_plain")
-        self.files = Zonos3CodecFiles.for_variant(variant)
+        config = vllm_config.model_config
+        self.files = Zonos3CodecFiles.for_variant(getattr(config.hf_config, "zonos3_decoder", "keep2_plain"))
         self.root = self.files.resolve(
-            model_config.model, vllm_config.load_config.download_dir, model_config.revision, with_weights=False
+            config.model, vllm_config.load_config.download_dir, config.revision, with_weights=False
         )
         self.release_config = self.files.read_config(self.root)
-        # The released codec stores FP32 weights; only transformer GEMMs use
-        # BF16 autocast. Never inherit the AR stage's default parameter dtype.
-        previous_dtype = torch.get_default_dtype()
+        previous = torch.get_default_dtype()
         try:
             torch.set_default_dtype(torch.float32)
             self.network = ZACDecoderNetwork(ZACDecoderConfig.from_release(self.release_config))
         finally:
-            torch.set_default_dtype(previous_dtype)
-        self.allow_patterns_overrides = [self.files.generator]
-        self.graph = None
-        self._weights_loaded = False
+            torch.set_default_dtype(previous)
 
-    def create_mrv2_model_state(
-        self, vllm_config: VllmConfig, encoder_cache: EncoderCache | None, device: torch.device
-    ) -> Zonos3CodecModelState:
-        from .model_state import Zonos3CodecModelState
-
-        return Zonos3CodecModelState(vllm_config, self, encoder_cache, device)
-
-    def _initialize_runtime(self) -> None:
-        from .cuda_graph_wrapper import ZACCodecGraphWrapper
-
-        if self.graph is None:
-            capacity = self.vllm_config.scheduler_config.max_num_seqs
-            connector = self.vllm_config.model_config.stage_connector_config
-            extra = connector.get("extra", connector) if isinstance(connector, dict) else connector.extra
-            chunk_size = extra.get("codec_chunk_frames", 15)
-            ramp = extra.get("codec_chunk_ramp", (1, 2, 4, 8, 15))
-            frames = tuple(sorted({1, chunk_size, *ramp}))
-            if any(type(size) is not int or size < 1 for size in frames):
-                raise ValueError("Zonos3 Codec chunk sizes must be positive integers")
-            # The first transport chunk can include up to 30 silence-primer
-            # frames. Ring capacity must cover them even without graph capture.
-            max_chunk = max(chunk_size, *ramp, (ramp[0] if ramp else chunk_size) + 30)
-            batches = tuple(1 << i for i in range((capacity - 1).bit_length())) + (capacity,)
-            if self.vllm_config.model_config.enforce_eager:
-                batches, frames = (), ()
-            self.graph = ZACCodecGraphWrapper(
-                self.network,
-                capacity,
-                max_chunk,
-                [(b, b * t) for b in batches for t in frames],
-            )
-            self.max_chunk = max_chunk
-            if batches and next(self.network.parameters()).device.type == "cuda":
-                self.graph.capture()
-
-    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: object = None) -> None:
-        """Declare the native generation task, as other forward-only codecs do.
-
-        OmniGenerationModelRunner consumes OmniOutput directly and never samples
-        logits. The method exists for upstream architecture/task inspection.
-        """
-        return None
-
-    def decode_packed(
-        self, codes: torch.Tensor, slots: torch.Tensor, lengths: list[int], final: list[bool]
-    ) -> torch.Tensor:
-        device = slots.device
-        audio, _, _ = self.graph(
-            to_device_nonblocking(codes, device),
-            slots,
-            index_to_device(lengths, device),
-            to_device_nonblocking(torch.tensor(final, device="cpu"), device),
-        )
-        return audio
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # Native task inspection requires the embedding interface even for a
-        # forward-only generation stage. Chunk placeholders have no learned
-        # meaning; actual neural inputs come exclusively from codes.audio.
-        width = self.vllm_config.model_config.get_inputs_embeds_size()
-        return torch.zeros((input_ids.shape[0], width), dtype=torch.float32, device=input_ids.device)
-
-    @torch.inference_mode()
-    def forward(
-        self,
-        input_ids: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        intermediate_tensors: IntermediateTensors | None = None,
-        *,
-        request_ids: list[str] | None = None,
-        model_intermediate_buffer: list[dict[str, Any]] | None = None,
-        runtime_additional_information: list[dict[str, Any]] | None = None,
-        seq_token_counts: list[int] | None = None,
-        sampling_metadata: object = None,
-        logits_index: torch.Tensor | None = None,
-        sampler: object = None,
-        codec_state: Zonos3CodecModelState | None = None,
-    ) -> OmniOutput:
-        del (
-            input_ids,
-            positions,
-            inputs_embeds,
-            intermediate_tensors,
-            seq_token_counts,
-            sampling_metadata,
-            logits_index,
-            sampler,
-        )
-        if not self._weights_loaded:
-            raise RuntimeError("Zonos3 Codec release weights have not been loaded")
-        if codec_state is None:
-            raise ValueError("Zonos3 Codec requires its native ModelState")
-        infos = model_intermediate_buffer if model_intermediate_buffer is not None else runtime_additional_information
-        if request_ids is None or infos is None or len(request_ids) != len(infos):
-            raise ValueError("Zonos3 Codec needs one native request ID and payload per scheduled row")
-        if len(request_ids) != len(set(request_ids)):
-            raise ValueError("Duplicate native codec request IDs")
-        pending: list[ZACCodecChunk] = []
-        indices: list[int] = []
-        bindings: list[tuple[str, str]] = []
-        for i, (internal_id, info) in enumerate(zip(request_ids, infos, strict=True)):
-            if is_warmup_request(internal_id):
-                continue
-            meta = info.get("meta")
-            if not isinstance(meta, Mapping) or not isinstance(meta.get("request_id"), str):
-                raise ValueError("Zonos3 Codec payload is missing its external request identity")
-            external_id = meta["request_id"]
-            if (
-                codec_state._internal_to_external.get(internal_id, external_id) != external_id
-                or codec_state._external_to_internal.get(external_id, internal_id) != internal_id
-            ):
-                raise ValueError("Zonos3 Codec request identity changed without lifecycle cleanup")
-            namespace = info.get("codes")
-            codes = namespace.get("audio") if isinstance(namespace, Mapping) else None
-            if not isinstance(codes, torch.Tensor):
-                raise ValueError("Zonos3 Codec payload must include CPU codes.audio, including on final flush")
-            finished = _host_integer(meta.get("finished"), "finished")
-            if finished not in (0, 1):
-                raise ValueError("Zonos3 Codec finished must be boolean")
-            pending.append(
-                ZACCodecChunk(
-                    request_id=external_id,
-                    chunk_seq=_host_integer(meta.get("chunk_seq"), "chunk_seq"),
-                    frame_offset=_host_integer(meta.get("num_processed_tokens"), "num_processed_tokens"),
-                    codes=codes,
-                    finished=bool(finished),
-                    skip_samples=_host_integer(meta.get("ref_context_size", 0), "ref_context_size") * 2940,
-                )
-            )
-            indices.append(i)
-            bindings.append((internal_id, external_id))
-        device = next(self.network.parameters()).device
-        audio = [torch.empty(0, device=device, dtype=torch.float32) for _ in request_ids]
-        if pending:
-            decoded = codec_state.decode(pending)
-            for i, output in zip(indices, decoded, strict=True):
-                audio[i] = output.audio
-            for internal_id, external_id in bindings:
-                codec_state._internal_to_external[internal_id] = external_id
-                codec_state._external_to_internal[external_id] = internal_id
-        payload = cast(
-            OmniPayload, {"model_outputs": audio, "sr": [torch.tensor(44100, dtype=torch.int32)] * len(audio)}
-        )
-        return OmniOutput(text_hidden_states=torch.empty((len(audio), 0), device=device), multimodal_outputs=payload)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
-        # Release .pt files contain nested state dictionaries rather than flat
-        # HF tensors. Resolve their exact paths and load strictly once; do not
-        # iterate the default loader's unrelated/nested weight iterator.
-        del weights
-        if self._weights_loaded:
-            raise RuntimeError("Zonos3 Codec release weights are already loaded")
+    def load_release(self) -> None:
         config = self.vllm_config
         self.root = self.files.resolve(
             config.model_config.model, config.load_config.download_dir, config.model_config.revision, with_weights=True
         )
         self.files.load(self.root, self.network, self.release_config)
         if next(self.network.parameters()).device.type == "cuda":
-            # Stage 1 has its own worker process. Set the reference's FP32
-            # arithmetic policy once at startup, rather than racing global
-            # backend switches across requests in the decode hot path.
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
-        self._weights_loaded = True
-        self._initialize_runtime()
+        self.eval().requires_grad_(False)

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Zonos3-Mini Speech API smoke with the default two-stage graph deployment."""
+"""Zonos3-Mini Speech API smoke with the default single-stage graph deployment."""
 
 import os
 
@@ -28,7 +28,7 @@ MODEL = os.environ.get("ZONOS3_MODEL_PATH", "Zyphra/ZONOS3-Mini")
     indirect=True,
 )
 def test_text_to_audio_001(omni_server, online_client) -> None:
-    """Exercise prompt IPC, sampling, transfer and Codec PCM with real weights.
+    """Exercise native prompt preparation, sampling and in-process Codec PCM with real weights.
 
     Zonos3's strict companion loaders do not support the core-model harness's
     dummy weights. Advanced mode also validates the synthesized spoken content.

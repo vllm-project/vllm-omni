@@ -2,36 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Packed Codec loading and native transport lifecycle against stateless oracles."""
 
-import hashlib
-import json
 import math
-from dataclasses import replace
-from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 import torch
 from torch.nn import functional as F
-from transformers import PretrainedConfig
-from vllm.config import LoadConfig, ModelConfig, SchedulerConfig, VllmConfig
 
-from vllm_omni.data_entry_keys import to_dict
-from vllm_omni.model_executor.models.zonos3 import codec as codec_checkpoint
 from vllm_omni.model_executor.models.zonos3.codec import (
-    ZACCodecChunk,
     ZACDecoderConfig,
     ZACDecoderNetwork,
     ZACMossLayer,
     ZACPatch,
     ZACTransformerSpec,
-    Zonos3CodecFiles,
-    Zonos3CodecModel,
 )
-from vllm_omni.model_executor.models.zonos3.model_state import Zonos3CodecModelState
-from vllm_omni.model_executor.stage_input_processors.zonos3 import Zonos3ChunkConfig, Zonos3RVQStageInputProcessor
-from vllm_omni.worker.scheduling_metadata_adapter import DefaultSchedulingMetadataAdapter
-from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -219,36 +203,6 @@ def test_release_config_selects_retained_stages_and_pruned_layer_indices():
 # ---------------------------------------------------------------- codec_lifecycle
 
 
-def bind_codec_state(model, capacity=None):
-    """Supply the native state argument without constructing unrelated runner buffers."""
-    state = object.__new__(Zonos3CodecModelState)
-    state.model = model
-    state.device = next(model.network.parameters()).device
-    state._mtp_state = SimpleNamespace(finish_audio=lambda ids: None)
-    state._initialize_codec_state(capacity or model.vllm_config.scheduler_config.max_num_seqs)
-
-    def supply_state(module, args, kwargs):
-        return args, {**kwargs, "codec_state": state}
-
-    model.register_forward_pre_hook(supply_state, with_kwargs=True)
-    return state
-
-
-def make_codec_state(network, capacity, *, max_chunk=31, graph_batch_sizes=(), graph_frame_sizes=()):
-    from vllm_omni.model_executor.models.zonos3.cuda_graph_wrapper import ZACCodecGraphWrapper
-
-    model = Zonos3CodecModel.__new__(Zonos3CodecModel)
-    torch.nn.Module.__init__(model)
-    model.network = network
-    model.max_chunk = max_chunk
-    model.graph = ZACCodecGraphWrapper(
-        network, capacity, max_chunk, [(b, b * t) for b in graph_batch_sizes for t in graph_frame_sizes]
-    )
-    if graph_batch_sizes and next(network.parameters()).device.type == "cuda":
-        model.graph.capture()
-    return bind_codec_state(model, capacity)
-
-
 def whole_audio(model, codes):
     branches = []
     for i, y in enumerate(whole_trunk(model, codes[None])):
@@ -266,50 +220,6 @@ def whole_audio(model, codes):
         )
     audio = F.conv1d(torch.stack(branches)[None], model.head.mixer.weight, padding=model.config.fir_kernel // 2)[0, 0]
     return model.to_external(audio)
-
-
-@torch.inference_mode()
-def test_metadata_and_code_validation_precede_state_mutation():
-    model = ZACDecoderNetwork(small_config()).eval()
-    manager = make_codec_state(model, 1)
-    chunk = ZACCodecChunk("a", 0, 0, torch.zeros((2, 10), dtype=torch.int64))
-    with pytest.raises(ValueError, match="at most one"):
-        manager.decode([chunk, chunk])
-    with pytest.raises(RuntimeError, match="No free"):
-        manager.decode([chunk, replace(chunk, request_id="b")])
-    assert not manager.states
-    manager.decode([chunk])
-    with pytest.raises(ValueError, match="Out-of-order"):
-        manager.decode([chunk])
-    assert manager.states["a"].frames == 2
-    malformed = replace(chunk, chunk_seq=1, frame_offset=2, codes=torch.full((1, 10), -1))
-    with pytest.raises(ValueError, match="Invalid ZAC code"):
-        manager.decode([malformed])
-    assert manager.states["a"].chunk_seq == 1
-
-
-@torch.inference_mode()
-def test_failed_neural_cohort_reclaims_slots_before_retry(monkeypatch):
-    model = ZACDecoderNetwork(small_config()).eval()
-    manager = make_codec_state(model, 2)
-    forward = model.forward_packed
-
-    def fail_after_state_update(*args):
-        forward(*args)
-        raise RuntimeError("injected neural failure")
-
-    chunks = [ZACCodecChunk(str(i), 0, 0, torch.zeros((4, 10), dtype=torch.int64)) for i in range(2)]
-    monkeypatch.setattr(model, "forward_packed", fail_after_state_update)
-    with pytest.raises(RuntimeError, match="injected neural failure"):
-        manager.decode(chunks)
-    assert not manager.states and len(manager._free) == 2
-    monkeypatch.setattr(model, "forward_packed", forward)
-    result = manager.decode([replace(chunk, finished=True) for chunk in chunks])
-    for row, chunk in zip(result, chunks, strict=True):
-        torch.testing.assert_close(row.audio, whole_audio(model, chunk.codes), atol=2e-7, rtol=3e-4)
-
-
-# ---------------------------------------------------------------- codec_model
 
 
 def release_config():
@@ -355,344 +265,30 @@ def release_config():
     }
 
 
-@pytest.fixture
-def checkpoint(tmp_path, monkeypatch):
-    torch.manual_seed(73)
-    files = Zonos3CodecFiles.for_variant("keep2_plain")
-    (tmp_path / files.config).parent.mkdir(parents=True)
-    config = release_config()
-    (tmp_path / files.config).write_text(json.dumps(config))
-    oracle = ZACDecoderNetwork(ZACDecoderConfig.from_release(config)).eval()
-    generator, trainable = {}, {}
-    for name, value in oracle.state_dict().items():
-        if name.startswith(("head.", "stages.")):
-            trainable[name] = value
-        if not name.startswith("head."):
-            generator[name.replace("stages.", "decoder.", 1) if name.startswith("stages.") else name] = value
-    torch.save(
-        {"step": 600000, "config": {"model": config["model"]}, "generator": generator}, tmp_path / files.generator
-    )
-    torch.save({"step": 50000, "trainable": trainable}, tmp_path / files.checkpoint)
-    with (tmp_path / files.generator).open("rb") as handle:
-        digest = hashlib.sha256(handle.read()).hexdigest()
-    # This fixture tests loading, not release-weight parity: only its generated
-    # tiny checkpoint is accepted, and production keeps the registry checksum.
-    monkeypatch.setattr(codec_checkpoint, "GENERATOR_SHA256", digest)
-    config = MagicMock(spec=VllmConfig)
-    config.model_config = MagicMock(spec=ModelConfig)
-    config.model_config.model = str(tmp_path)
-    config.model_config.revision = None
-    config.model_config.hf_config = PretrainedConfig(zonos3_decoder="keep2_plain")
-    config.model_config.enforce_eager = True
-    config.model_config.stage_connector_config = {
-        "extra": {"codec_chunk_frames": 15, "codec_chunk_ramp": [1, 2, 4, 8, 15]}
-    }
-    config.load_config = LoadConfig()
-    config.additional_config = {}
-    config.scheduler_config = SchedulerConfig(
-        max_model_len=16, is_encoder_decoder=False, max_num_seqs=8, max_num_batched_tokens=32
-    )
-    return config, oracle
-
-
-def payload(external_id, codes, seq, offset, finished=False):
-    return {
-        "codes": {"audio": codes},
-        "meta": {
-            "request_id": external_id,
-            "chunk_seq": seq,
-            "num_processed_tokens": offset,
-            "finished": torch.tensor(finished),
-        },
-    }
-
-
-@pytest.mark.parametrize("capacity, expected_batches", [(1, [1]), (3, [1, 2, 3])])
-@pytest.mark.parametrize("chunk_size, ramp", [(7, [1, 3, 7]), (5, [])])
-@pytest.mark.parametrize("enforce_eager", [True, False])
-def test_codec_graph_policy_uses_scheduler_and_connector(
-    checkpoint, capacity, expected_batches, chunk_size, ramp, enforce_eager
-):
-    config, _ = checkpoint
-    config.scheduler_config.max_num_seqs = capacity
-    config.model_config.enforce_eager = enforce_eager
-    config.model_config.stage_connector_config = {"extra": {"codec_chunk_frames": chunk_size, "codec_chunk_ramp": ramp}}
-    model = Zonos3CodecModel(vllm_config=config)
-    model._initialize_runtime()
-    assert model.graph.batch_sizes == ([capacity] if enforce_eager else expected_batches)
-    expected_keys = (
-        [] if enforce_eager else [(b, b * t) for b in expected_batches for t in sorted({1, chunk_size, *ramp})]
-    )
-    assert model.graph.capture_keys == sorted(expected_keys)
-    assert not model.graph.buckets  # CPU tests never pretend to capture CUDA.
-
-
-@pytest.mark.parametrize("termination", ["eos", "length", "length_before_frame", "cancel", "cancel_before_output"])
-@torch.inference_mode()
-def test_native_finalizer_transport_codec_lifecycle(checkpoint, termination):
-    """Real finalizer, output worker and producer feed the incremental Codec.
-
-    The transport backend records connector puts; neural execution uses the
-    synthetic release checkpoint rather than replacing the decoder with a mock.
-    """
-    from types import SimpleNamespace
-
-    from vllm import SamplingParams
-
-    from tests.model_executor.models.test_zonos3_model_state import materialize_codes
-    from tests.worker_v2.test_omni_data_plane import (
-        _make_plane,
-        _new_request,
-        _Output,
-        _start_save_thread,
-        _stop_save_thread,
-    )
-    from vllm_omni.model_executor.models.zonos3.model_state import Zonos3CodeSnapshot
-    from vllm_omni.model_executor.stage_input_processors.zonos3 import zonos3_rvq_async_chunk
-    from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
-
-    config, oracle = checkpoint
-    config.scheduler_config.max_num_seqs = 2
-    model = Zonos3CodecModel(vllm_config=config)
-    state = bind_codec_state(model)
-    model.load_weights(iter(()))
-    frames = torch.arange(200).reshape(20, 10)
-    cancelled = termination.startswith("cancel")
-    length = {"cancel_before_output": 0, "length_before_frame": 4, "eos": 15}.get(termination, 14)
-    rows = torch.full((length, 10), 4097, dtype=torch.int64)
-    for f in range(5 if termination == "eos" else 20):
-        for book in range(10):
-            if f + book < length:
-                rows[f + book, book] = frames[f, book]
-    if termination == "eos":
-        for book in range(10):
-            rows[5 + book, book] = 4096
-    sent = []
-
-    def put(**kwargs):
-        sent.append(kwargs["data"] if isinstance(kwargs["data"], dict) else to_dict(kwargs["data"]))
-        return True, 1, None
-
-    plane = _make_plane(False)
-    connector = SimpleNamespace(
-        put=put,
-        config={
-            "extra": {
-                "codebook_sizes": [4096] * 10,
-                "eoa_id": 4096,
-                "audio_pad_id": 4097,
-                "first_chunk_codebooks": 10,  # Full-codebook waveform oracle in this test.
-            }
-        },
-    )
-    _start_save_thread(plane, connector)
-    plane._custom_process_func = zonos3_rvq_async_chunk
-    plane._custom_process_batch_func = None
-    request = _new_request()
-    request.resumable = False
-    request.sampling_params = SamplingParams(
-        max_tokens=length if termination.startswith("length") else 100, stop_token_ids=[2]
-    )
-    plane.register_request(request)
-    plane._start_output_worker(max_pending_batches=2)
-    worker = NativeOutputWorker(capacity=2)
-    try:
-        for i, row in enumerate(rows):
-            end = termination == "eos" and i == length - 1
-            snapshot = Zonos3CodeSnapshot(row[None])
-            worker.submit(_Output(payload=materialize_codes(snapshot)[0], token=2 if end else 1), plane).get_output()
-        plane.drain_outputs()
-        # A speculative in-flight step after stop must not be published.
-        if not cancelled:
-            assert (
-                plane.complete_outputs(
-                    req_ids=["internal"],
-                    inter_stage_outputs=[{"codes": {"audio": torch.full((1, 10), -999)}}],
-                    sampled_token_ids=[[1]],
-                )
-                == 0
-            )
-            plane.request_terminal({"internal"})
-        else:
-            plane.abort_requests({"internal"})
-        assert plane.record.cleaned == ["internal"]
-        assert not plane.request_payload and not plane._native_requests
-        assert not plane._native_outputs_in_flight and not plane._native_terminal_pending
-        audio = []
-        for chunk in sent:
-            if cancelled and "codes" not in chunk:
-                # Cancellation is an engine lifecycle notification, not a
-                # fabricated final Codec frame or a synthesis flush.
-                assert chunk == {"meta": {"finished": torch.tensor(True)}}
-                state.on_requests_finished({"codec-internal"})
-                continue
-            result = model(request_ids=["codec-internal"], model_intermediate_buffer=[chunk])
-            audio.append(result.multimodal_outputs["model_outputs"][0])
-        if not cancelled:
-            assert [bool(chunk["meta"]["finished"]) for chunk in sent] == [False] * (len(sent) - 1) + [True]
-            assert [chunk["meta"]["chunk_seq"] for chunk in sent] == list(range(len(sent)))
-            waveform = torch.cat(audio)
-            expected_frames = 0 if termination == "length_before_frame" else 5
-            assert waveform.numel() == expected_frames * 2940
-            if expected_frames:
-                torch.testing.assert_close(
-                    waveform, whole_audio(oracle, frames[:expected_frames]), atol=5e-7, rtol=1e-3
-                )
-        else:
-            assert "codes" not in sent[-1]
-        assert not state.states and len(state._free) == config.scheduler_config.max_num_seqs
-        state.on_requests_finished({"codec-internal"})
-        assert not state._internal_to_external and not state._external_to_internal and not state._finished
-        # Reusing the same identities allocates clean state after cleanup.
-        model(request_ids=["codec-internal"], model_intermediate_buffer=[payload("external", frames[:1], 0, 0, True)])
-        state.on_requests_finished({"codec-internal"})
-    finally:
-        worker.close()
-        plane._stop_output_worker()
-        _stop_save_thread(plane)
-
-
-@pytest.mark.parametrize("concurrency", [1, 4, 8])
-@torch.inference_mode()
-def test_native_model_loading_pcm_materialization_and_identity_cleanup(checkpoint, concurrency):
-    config, oracle = checkpoint
-    model = Zonos3CodecModel(vllm_config=config)
-    state = bind_codec_state(model)
-    assert next(model.network.parameters()).dtype == torch.float32
-    with pytest.raises(RuntimeError, match="not been loaded"):
-        model(request_ids=[], model_intermediate_buffer=[])
-    model.load_weights(iter(()))
-    requests = [f"internal-{i}" for i in range(concurrency)]
-    codes = torch.randint(0, 4096, (concurrency, 5, 10))
-    projected_batch = []
-    handle = model.network.stages[0].input_proj.register_forward_pre_hook(
-        lambda _, args: projected_batch.append(args[0].shape[0])
-    )
-    try:
-        first = model(
-            request_ids=requests,
-            model_intermediate_buffer=[payload(f"external-{i}", codes[i, :2], 0, 0) for i in range(concurrency)],
-        )
-        last = model(
-            request_ids=requests,
-            model_intermediate_buffer=[payload(f"external-{i}", codes[i, 2:], 1, 2, True) for i in range(concurrency)],
-        )
-    finally:
-        handle.remove()
-    assert projected_batch == [2 * concurrency, 3 * concurrency]
-    a = OmniGenerationModelRunner._build_pooler_output(first, concurrency)
-    b = OmniGenerationModelRunner._build_pooler_output(last, concurrency)
-    for i in range(concurrency):
-        waveform = torch.cat((a[i]["model_outputs"], b[i]["model_outputs"]))
-        assert waveform.numel() == 5 * 2940
-        torch.testing.assert_close(waveform, whole_audio(oracle, codes[i]), atol=5e-7, rtol=1e-3)
-        assert int(b[i]["sr"]) == 44100
-    state.on_requests_finished(set(requests))
-    assert not state._internal_to_external and not state._external_to_internal
-    # Stable external identity can be reused only after native completion cleanup.
-    model(request_ids=[requests[0]], model_intermediate_buffer=[payload("external-0", codes[0], 0, 0, True)])
-
-
-@torch.inference_mode()
-def test_producer_delay_reconstruction_to_native_codec_model(checkpoint):
-    config, _ = checkpoint
-    model = Zonos3CodecModel(vllm_config=config)
-    bind_codec_state(model)
-    model.load_weights(iter(()))
-    processor = Zonos3RVQStageInputProcessor(
-        Zonos3ChunkConfig(
-            codebook_sizes=(4096,) * 10,
-            eoa_id=4096,
-            pad_id=4097,
-            chunk_size=3,
-            chunk_ramp=(1, 2),
-            first_chunk_codebooks=4,
-        )
-    )
-    frames = torch.randint(0, 4096, (8, 10))
-    delayed = torch.full((18, 10), 4097, dtype=torch.int64)
-    for f in range(8):
-        for cb in range(10):
-            delayed[f + cb, cb] = frames[f, cb]
-    for cb in range(10):
-        delayed[8 + cb, cb] = 4096
-    output = []
-    for step in range(19):
-        chunk = processor.push("external", delayed[step : step + 1] if step < 18 else None, finished=step == 18)
-        if chunk is None:
-            continue
-        transport_payload = to_dict(chunk)
-        update = DefaultSchedulingMetadataAdapter().extract(transport_payload, model_mode="generation")
-        assert update.prompt_token_ids == (0,)
-        result = model(request_ids=["internal"], model_intermediate_buffer=[transport_payload])
-        output.append(result.multimodal_outputs["model_outputs"][0])
-    assert torch.cat(output).numel() == 8 * 2940
-
-
-def test_checkpoint_integrity_and_native_preemption_rejection(checkpoint, monkeypatch):
-    config, _ = checkpoint
-    model = Zonos3CodecModel(vllm_config=config)
-    monkeypatch.setattr(codec_checkpoint, "GENERATOR_SHA256", "0" * 64)
-    with pytest.raises(ValueError, match="checksum mismatch"):
-        model.load_weights(iter(()))
-    assert not model._weights_loaded
-    state = object.__new__(Zonos3CodecModelState)
-    with pytest.raises(RuntimeError, match="does not support preemption"):
-        state.on_request_preempted("request", 7)
-
-
-@torch.inference_mode()
-def test_weight_loading_is_once_and_restores_ar_default_dtype(checkpoint):
-    config, _ = checkpoint
-    previous_dtype = torch.get_default_dtype()
-    try:
-        torch.set_default_dtype(torch.bfloat16)
-        model = Zonos3CodecModel(vllm_config=config)
-        assert torch.get_default_dtype() == torch.bfloat16
-        assert all(parameter.dtype == torch.float32 for parameter in model.network.parameters())
-    finally:
-        torch.set_default_dtype(previous_dtype)
-    model.load_weights(iter(()))
-    with pytest.raises(RuntimeError, match="already loaded"):
-        model.load_weights(iter(()))
-
-
-@torch.inference_mode()
-def test_producer_cancel_discards_codec_tail_without_affecting_other_batch_request(checkpoint):
-    from tests.model_executor.stage_input_processors.test_zonos3 import Manager, Request
-    from vllm_omni.model_executor.stage_input_processors.zonos3 import zonos3_rvq_async_chunk
-
-    config, oracle = checkpoint
-    model = Zonos3CodecModel(vllm_config=config)
-    state = bind_codec_state(model)
-    model.load_weights(iter(()))
-    codes = torch.randint(0, 4096, (6, 10))
-    model(request_ids=["native-a"], model_intermediate_buffer=[payload("a", codes, 0, 0)])
-    manager = Manager()
-    assert zonos3_rvq_async_chunk(manager, None, Request("a", aborted=True), True) is None
-    state.on_requests_finished({"native-a"})
-    calls = []
-    handle = model.network.stages[0].input_proj.register_forward_pre_hook(
-        lambda _, args: calls.append(args[0].shape[0])
-    )
-    try:
-        output = model(
-            request_ids=["native-b"],
-            model_intermediate_buffer=[payload("b", codes, 0, 0, True)],
-        )
-    finally:
-        handle.remove()
-    assert calls == [len(codes)]  # cancelled request does not run a neural forward
-    torch.testing.assert_close(
-        output.multimodal_outputs["model_outputs"][0], whole_audio(oracle, codes), atol=5e-7, rtol=1e-3
-    )
-    assert "a" not in state.states
-    assert "native-a" not in state._internal_to_external
-
-
-# ---------------------------------------------------------------- codec_graph
-
-
 def graph_network(device="cpu"):
     torch.manual_seed(73)
     return ZACDecoderNetwork(ZACDecoderConfig.from_release(release_config())).to(device).eval()
+
+
+def write_codec_release(root, monkeypatch):
+    """A complete paired release, retaining the real strict checkpoint loader."""
+    import hashlib
+    import json
+
+    from vllm_omni.model_executor.models.zonos3 import codec
+
+    config = release_config()
+    network = ZACDecoderNetwork(ZACDecoderConfig.from_release(config))
+    files = codec.Zonos3CodecFiles.for_variant("keep2_plain")
+    for relative in (files.config, files.generator, files.checkpoint):
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+    (root / files.config).write_text(json.dumps(config))
+    generator, trainable = {}, {}
+    for key, value in network.state_dict().items():
+        if key.startswith(("head.", *(f"stages.{i}." for i in network.config.trainable_stages))):
+            trainable[key] = value
+        if not key.startswith("head."):
+            generator[key.replace("stages.", "decoder.", 1)] = value
+    torch.save({"step": 600000, "config": config, "generator": generator}, root / files.generator)
+    torch.save({"step": 50000, "trainable": trainable}, root / files.checkpoint)
+    monkeypatch.setattr(codec, "GENERATOR_SHA256", hashlib.sha256((root / files.generator).read_bytes()).hexdigest())

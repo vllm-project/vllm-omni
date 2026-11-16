@@ -41,7 +41,7 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm_omni.model_executor.models.registry import OmniModelRegistry
 from vllm_omni.model_executor.models.zonos3 import modeling_zonos3_mini
 from vllm_omni.model_executor.models.zonos3.ar_config import Zonos3Architecture
-from vllm_omni.model_executor.models.zonos3.model_state import Zonos3ARModelState
+from vllm_omni.model_executor.models.zonos3.model_state import Zonos3MiniModelState
 from vllm_omni.model_executor.models.zonos3.modeling_zonos3_mini import (
     FullAttnResWorkspace,
     MultiEmbedding,
@@ -284,8 +284,7 @@ def test_native_full_decode_mode_is_accepted_before_backend_construction(mode):
     config.compilation_config.cudagraph_mode = mode
     validate_zonos3_ar_runtime(config)
     config.model_config.enforce_eager = True
-    with pytest.raises(ValueError, match="requires FULL_DECODE_ONLY"):
-        validate_zonos3_ar_runtime(config)
+    validate_zonos3_ar_runtime(config)
 
 
 @pytest.mark.parametrize(
@@ -691,12 +690,18 @@ def test_release_checkpoint_native_model_and_parallel_codebook_sampling(tmp_path
     torch.manual_seed(17)
     weights = {name: torch.randn_like(parameter) * 0.1 for name, parameter in model.named_parameters()}
     torch.save(weights, tmp_path / "model.pth")
+    from tests.model_executor.models.test_zonos3_codec import write_codec_release
+
+    write_codec_release(tmp_path, monkeypatch)
     loaded = model.load_weights(DefaultModelLoader(config.load_config).get_all_weights(config.model_config, model))
-    assert loaded == set(weights)
+    assert loaded == set(weights) | {f"codec.{name}" for name, _ in model.codec.named_parameters()}
     with pytest.raises(RuntimeError, match="already loaded"):
         model.load_weights(iter(()))
+    # The CUDA integration test covers the attached decoder. Keep this tiny
+    # vocabulary fixture scoped to native AR loading and sampling.
+    del model.codec
     state = init_omni_model_state(config, model, None, torch.device("cpu"))
-    assert isinstance(state, Zonos3ARModelState)
+    assert isinstance(state, Zonos3MiniModelState)
     base = Mock(spec=Sampler)
     base.sampling_states = SamplingStates(4, 3)
     base.add_request.side_effect = base.sampling_states.add_request
@@ -722,4 +727,5 @@ def test_release_checkpoint_native_model_and_parallel_codebook_sampling(tmp_path
     finally:
         hook.remove()
     assert result.num_sampled.tolist() == [1]
-    assert snapshot.copy_to_cpu(lambda tensor: tensor.clone())["codes"]["audio"][0].shape == (1, 10)
+    assert snapshot == {"zonos3_audio": True}
+    assert state.sampling_state.next_codes[0].shape == (10,)
