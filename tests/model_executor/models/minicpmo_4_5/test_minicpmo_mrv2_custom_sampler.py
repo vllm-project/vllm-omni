@@ -79,3 +79,38 @@ def test_duplex_k0_draft_method_raises(fake_sampler):
     talker = _talker("duplex", 0)
     with pytest.raises(NotImplementedError):
         MiniCPMO45OmniTTSForConditionalGeneration.mrv2_custom_sampler(talker, fake_sampler)
+
+
+def test_thinker_ngram_verifies_with_underlying_sampler(monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode import rejection_sampler
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2_sampling import MiniCPMO45DuplexSampler
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
+
+    spec = SimpleNamespace(method="ngram")
+    model = SimpleNamespace(
+        model_stage="llm",
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                model_stage="llm",
+                session_mode="duplex",
+                architecture="MiniCPMO45OmniForConditionalGeneration",
+                use_v2_model_runner=True,
+            ),
+            device_config=SimpleNamespace(device_type="npu"),
+            speculative_config=spec,
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            parallel_config=SimpleNamespace(
+                pipeline_parallel_size=1, prefill_context_parallel_size=1, decode_context_parallel_size=1
+            ),
+            kv_transfer_config=None,
+        ),
+    )
+    device = object()
+    base_sampler = SimpleNamespace(req_states=SimpleNamespace(draft_tokens=SimpleNamespace(device=device)))
+    monkeypatch.setattr(rejection_sampler, "RejectionSampler", lambda *args: args)
+
+    sampler, verifier = MiniCPMO45OmniForConditionalGeneration.mrv2_custom_sampler(model, base_sampler)
+
+    assert isinstance(sampler, MiniCPMO45DuplexSampler)
+    assert verifier == (base_sampler, spec, device)

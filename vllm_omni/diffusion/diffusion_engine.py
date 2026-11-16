@@ -1581,6 +1581,7 @@ class DiffusionEngine:
                             describe(async_output_id) if describe else "unavailable",
                         )
                         raise
+                output._wait_device_ready()
                 finished = output.finished
                 yield output
                 with self._cv:
@@ -1792,9 +1793,11 @@ class DiffusionEngine:
                 guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
                 extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
-                # Warm up the base attention only: service ranges are sized for real
-                # requests, not for the fixed short warm-up sequence.
+                # Warm up the base attention only. Service step ranges are sized for real requests, not for the
+                # fixed short warm-up sequence, and a service sigma window that covers the first step's sigma
+                # would select its profile on the warm-up step.
                 attention_schedule=(),
+                attention_sigma_schedule=(),
             ),
         )
 
