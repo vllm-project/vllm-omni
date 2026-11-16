@@ -221,3 +221,59 @@ def diffusion2decoder(
     decoder_prompt["multi_modal_data"] = None
     decoder_prompt.pop("model_intermediate_buffer", None)
     return decoder_prompt
+
+
+def _diffusion2modality_decoder(
+    source_outputs: list[Any],
+    prompt: Any = None,
+    *,
+    modality: str,
+) -> dict[str, Any] | None:
+    """Build an isolated VAE prompt for one fan-out branch."""
+    if not source_outputs:
+        return None
+    if len(source_outputs) != 1:
+        raise RuntimeError(f"MiniMax H3 {modality} decoder requires exactly one DiT source")
+    source = source_outputs[0]
+    if not source.finished:
+        return None
+    decoder_prompt = _original_prompt(prompt)
+    expected_request_id = _global_request_id(decoder_prompt)
+    if expected_request_id is not None and source.request_id != expected_request_id:
+        raise RuntimeError("MiniMax H3 DiT request ID does not match the decoder request")
+    latents = source.latents
+    metadata = (source.multimodal_output or {}).get("metadata", {})
+    options = metadata.get("minimax_h3_decode")
+    if not isinstance(latents, Mapping) or not isinstance(options, Mapping):
+        raise RuntimeError("MiniMax H3 DiT returned no decoder latent payload")
+    latent_key = "video" if modality == "video" else "audio"
+    if latent_key not in latents:
+        raise RuntimeError(f"MiniMax H3 DiT returned no {modality} latent")
+    payload = {**options, f"{modality}_latents": latents[latent_key]}
+    additional_information: dict[str, Any] = {"minimax_h3_decode": payload}
+    if expected_request_id is not None:
+        additional_information["global_request_id"] = expected_request_id
+    decoder_prompt["additional_information"] = additional_information
+    decoder_prompt["multi_modal_data"] = None
+    decoder_prompt.pop("model_intermediate_buffer", None)
+    return decoder_prompt
+
+
+def diffusion2video_decoder(
+    source_outputs: list[Any],
+    prompt: Any = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
+) -> dict[str, Any] | None:
+    del requires_multimodal_data, streaming_context
+    return _diffusion2modality_decoder(source_outputs, prompt, modality="video")
+
+
+def diffusion2audio_decoder(
+    source_outputs: list[Any],
+    prompt: Any = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
+) -> dict[str, Any] | None:
+    del requires_multimodal_data, streaming_context
+    return _diffusion2modality_decoder(source_outputs, prompt, modality="audio")

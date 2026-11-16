@@ -32,12 +32,13 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackEncoder,
 )
 from vllm_omni.engine.stage_client import StageClientBase
-from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.stage_latent_transport import StageLatentTransport
+    from vllm_omni.engine.stage_init_utils import StageMetadata
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt, OmniPromptType
 
 logger = init_logger(__name__)
@@ -81,6 +82,7 @@ class StageDiffusionClient(StageClientBase):
     stage_type: str = "diffusion"
     replica_id: int = 0
     is_comprehension: bool = False
+    _latent_transport: StageLatentTransport | None = None
 
     def __init__(
         self,
@@ -132,6 +134,11 @@ class StageDiffusionClient(StageClientBase):
         self._tasks: dict[str, asyncio.Task] = {}
         self._shutting_down = False
         self._engine_dead: bool = False
+        self._latent_transport = None
+        if self.input_payload_selector in {"video", "audio"} and self.result_aggregator == "minimax_h3_av":
+            from vllm_omni.diffusion.stage_latent_transport import StageLatentTransport
+
+            self._latent_transport = StageLatentTransport(self.stage_id, self.input_payload_selector)
 
         if self._proc_manager is not None:
             self._start_proc_monitor()
@@ -155,6 +162,15 @@ class StageDiffusionClient(StageClientBase):
         self.requires_multimodal_data = getattr(metadata, "requires_multimodal_data", False)
         self.custom_process_input_func = getattr(metadata, "custom_process_input_func", None)
         self.engine_input_source = getattr(metadata, "engine_input_source", [])
+        self.fanout_targets = getattr(metadata, "fanout_targets", [])
+        self.input_payload_selector = getattr(metadata, "input_payload_selector", None)
+        self.result_aggregator = getattr(metadata, "result_aggregator", None)
+        runtime = getattr(metadata, "runtime_cfg", None)
+        self.parallel_decode_timeout_s = (
+            runtime.get("parallel_decode_timeout_s")
+            if isinstance(runtime, dict)
+            else getattr(runtime, "parallel_decode_timeout_s", None)
+        ) or 120.0
 
     def _connect_transport(self, request_address: str, response_address: str) -> None:
         # Expose the ZMQ addresses on the instance so callers (e.g.
@@ -236,7 +252,10 @@ class StageDiffusionClient(StageClientBase):
             msg_type = msg.get("type")
 
             if msg_type == "result":
-                self._output_queue.put_nowait(msg["output"])
+                output = msg["output"]
+                if output.finished and self._latent_transport is not None:
+                    output.metrics.update(self._latent_transport.release(output.request_id))
+                self._output_queue.put_nowait(output)
             elif msg_type == "metrics":
                 self._output_queue.put_nowait(
                     OmniRequestOutput(
@@ -269,6 +288,8 @@ class StageDiffusionClient(StageClientBase):
                 # Route request errors as error outputs so the Orchestrator
                 # sees the request complete (instead of hanging forever).
                 if req_id is not None:
+                    if self._latent_transport is not None:
+                        self._latent_transport.release(req_id)
                     error_output = OmniRequestOutput.from_error(
                         req_id,
                         error_msg,
@@ -350,8 +371,10 @@ class StageDiffusionClient(StageClientBase):
             self.replica_id,
             request_id,
         )
-        self._send_request(
-            self._encoder.encode(
+        if self._latent_transport is not None:
+            prompt = self._latent_transport.pack(request_id, prompt)
+        try:
+            data = self._encoder.encode(
                 {
                     "type": "add_request",
                     "request_id": request_id,
@@ -362,7 +385,30 @@ class StageDiffusionClient(StageClientBase):
                     "payload_sender_info": payload_sender_info,
                 }
             )
-        )
+            if self._latent_transport is not None:
+                await self._send_request_async(data)
+            else:
+                self._send_request(data)
+        except BaseException:
+            if self._latent_transport is not None:
+                self._latent_transport.release(request_id)
+            raise
+
+    async def _send_request_async(self, data: bytes) -> None:
+        # Opt-in fan-out must yield while a peer has no queue space, allowing
+        # the sibling submission and request deadline to make progress.
+        while True:
+            if self._engine_dead or (self._proc_manager is not None and not self._proc_manager.proc.is_alive()):
+                self._engine_dead = True
+                raise EngineDeadError()
+            try:
+                self._request_socket.send(data, flags=zmq.NOBLOCK)
+                return
+            except zmq.Again:
+                await asyncio.sleep(0.01)
+
+    async def wait_for_requests_idle_async(self, request_ids: list[str], timeout: float) -> None:
+        await self.collective_rpc_async("drain_requests", timeout=timeout, args=(request_ids,))
 
     def _send_request(self, data: bytes) -> None:
         # The subprocess can die before _engine_dead is set, and a blocking send to it never returns.
@@ -407,6 +453,9 @@ class StageDiffusionClient(StageClientBase):
             return None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
+        if self._latent_transport is not None:
+            for request_id in request_ids:
+                self._latent_transport.release(request_id)
         if self._engine_dead:
             return
         try:
@@ -462,18 +511,20 @@ class StageDiffusionClient(StageClientBase):
 
         kwargs = kwargs or {}
         rpc_id = uuid.uuid4().hex
-        self._send_request(
-            self._encoder.encode(
-                {
-                    "type": "collective_rpc",
-                    "rpc_id": rpc_id,
-                    "method": method,
-                    "timeout": timeout,
-                    "args": list(args),
-                    "kwargs": kwargs,
-                }
-            )
+        rpc_data = self._encoder.encode(
+            {
+                "type": "collective_rpc",
+                "rpc_id": rpc_id,
+                "method": method,
+                "timeout": timeout,
+                "args": list(args),
+                "kwargs": kwargs,
+            }
         )
+        if self._latent_transport is not None:
+            await self._send_request_async(rpc_data)
+        else:
+            self._send_request(rpc_data)
         self._pending_rpcs.add(rpc_id)
 
         deadline = time.monotonic() + timeout if timeout else None
@@ -523,6 +574,20 @@ class StageDiffusionClient(StageClientBase):
             )
 
     def shutdown(self) -> None:
+        shutdown_requested = self._request_shutdown()
+        self._shutdown_process(shutdown_requested)
+        self._close_sockets()
+
+    async def shutdown_async(self) -> None:
+        # Keep ZMQ socket operations on their owning event loop. Only process
+        # joins move to a thread, allowing other stages to stop concurrently.
+        shutdown_requested = self._request_shutdown()
+        await asyncio.to_thread(self._shutdown_process, shutdown_requested)
+        self._close_sockets()
+
+    def _request_shutdown(self) -> bool:
+        if self._latent_transport is not None:
+            self._latent_transport.close()
         self._shutting_down = True
         shutdown_requested = False
         try:
@@ -532,21 +597,23 @@ class StageDiffusionClient(StageClientBase):
         except Exception:
             pass
 
+        return shutdown_requested
+
+    def _shutdown_process(self, shutdown_requested: bool) -> None:
         if self._proc_manager is not None and self._proc_manager.proc.is_alive():
-            if self._proc_manager.distributed_executor_backend == "ray":
-                # Let the subprocess kill its remote actors before terminating it.
-                stopped = shutdown_requested and self._proc_manager.wait_for_shutdown(timeout=10.0)
-                if not stopped:
-                    logger.warning(
-                        "Stage-%d Ray diffusion subprocess did not stop within %.1fs; "
-                        "falling back to signal-based shutdown",
-                        self.stage_id,
-                        10.0,
-                    )
-                    self._proc_manager.shutdown(timeout=10.0)
-            else:
+            # Both MP workers and Ray actors need their owner's normal close
+            # path. A signal can interrupt that path after it marks itself
+            # closed, leaving queues or workers unreleased. Allow the worker
+            # grace period (15s) plus process teardown before escalating.
+            stopped = shutdown_requested and self._proc_manager.wait_for_shutdown(timeout=20.0)
+            if not stopped:
+                logger.warning(
+                    "Stage-%d diffusion subprocess did not stop gracefully; falling back to signal-based shutdown",
+                    self.stage_id,
+                )
                 self._proc_manager.shutdown(timeout=10.0)
 
+    def _close_sockets(self) -> None:
         self._request_socket.close(linger=0)
         self._response_socket.close(linger=0)
         self._zmq_ctx.term()

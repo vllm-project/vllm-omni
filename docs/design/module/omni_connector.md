@@ -44,6 +44,11 @@ ownership, and completion semantics.
 **Rule:** Connections, buffers, handles, and background work MUST be released on
 normal completion, cancellation, failure, and shutdown.
 
+AR model runners stop initialized payload transport before the upstream runner
+releases model storage. This joins connector background threads and invokes
+the connector's close operation, including cleanup of unread sender-owned SHM
+segments. This lifecycle is shared by the GPU and NPU AR runner paths.
+
 ## Safe-change guide
 
 Test setup, transfer, synchronization, timeout, cancellation, failure, and
