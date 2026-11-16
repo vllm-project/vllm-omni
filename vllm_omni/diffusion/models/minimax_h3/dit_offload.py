@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import sys
 from pathlib import Path
 
@@ -15,6 +13,7 @@ from vllm_omni.diffusion.offloader.base import OffloadBackend, OffloadConfig
 from vllm_omni.diffusion.offloader.file_backed_offload import FileBackedBlockOffloader
 
 from .minimax_h3_transformer import _reorder_grouped_qkv_to_qkv
+from .offload_manifest import make_tensor_entry, read_weight_sources
 
 
 class MiniMaxH3DiTOffloader(FileBackedBlockOffloader, OffloadBackend):
@@ -29,63 +28,15 @@ class MiniMaxH3DiTOffloader(FileBackedBlockOffloader, OffloadBackend):
         OffloadBackend.__init__(self, OffloadConfig.from_od_config(model.od_config), device)
         self.model = model
         root = Path(root)
-        index_path = next(root.glob("*.safetensors.index.json"))
-        weight_map = json.loads(index_path.read_text(encoding="utf-8"))["weight_map"]
-        sources, shards = {}, []
-        for filename in sorted(set(weight_map.values())):
-            path = root / filename
-            with path.open("rb") as handle:
-                header_size = int.from_bytes(handle.read(8), "little")
-                header_bytes = handle.read(header_size)
-            header = json.loads(header_bytes)
-            file_bytes = path.stat().st_size
-            shards.append(
-                dict(
-                    shard=filename,
-                    header_bytes=8 + header_size,
-                    header_sha256=hashlib.sha256(header_bytes).hexdigest(),
-                    file_bytes=file_bytes,
-                )
-            )
-            for name, source in header.items():
-                if name == "__metadata__" or weight_map.get(name) != filename:
-                    continue
-                start, end = source["data_offsets"]
-                if not 0 <= start <= end <= file_bytes - 8 - header_size:
-                    raise ValueError(f"Invalid DiT tensor byte range: {name}")
-                sources[name] = dict(
-                    source_name=name,
-                    shard=filename,
-                    file_offset=8 + header_size + start,
-                    bytes=end - start,
-                    shape=source["shape"],
-                    dtype=source["dtype"],
-                    concat_offset=0,
-                )
-
+        sources, shards = read_weight_sources(root)
         blocks = [dict(parameters=[], bytes=0) for _ in model.blocks]
         resident = []
         tensors = dict(model.named_parameters())
         buffers = dict(model.named_buffers())
         tensors.update(buffers)
-        dtypes = {"BF16": torch.bfloat16, "F32": torch.float32}
         for name, tensor in tensors.items():
             source = sources[name]
-            if (
-                not tensor.is_meta
-                or list(tensor.shape) != source["shape"]
-                or tensor.dtype != dtypes[source["dtype"]]
-                or source["bytes"] != tensor.numel() * tensor.element_size()
-            ):
-                raise ValueError(f"DiT checkpoint does not match meta tensor: {name}")
-            entry = dict(
-                runtime_name=name,
-                shape=list(tensor.shape),
-                dtype=source["dtype"],
-                bytes=source["bytes"],
-                sources=[source],
-                buffer=name in buffers,
-            )
+            entry = make_tensor_entry(name, tensor, [source], buffer=name in buffers)
             parent, _, local_name = name.rpartition(".")
             if name.startswith("blocks."):
                 if tensor.dtype != torch.bfloat16:
