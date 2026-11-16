@@ -25,14 +25,20 @@ no-op at its default value.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    import numpy as np
 
 logger = init_logger(__name__)
 
 VOCAB_SIZE = 6562
 HISTORY_WINDOW = 16
+# Same cutoff vLLM's V1 sampler uses to treat a row as greedy.
+_SAMPLING_EPS = 1e-5
 
 # Engine steps 6a+7b run as one Triton kernel on NPU (adopted 2026-10-17 after a
 # 200-case bit-exact verification). Two independent controls:
@@ -202,9 +208,88 @@ try:  # Triton is NPU-only; other backends keep the eager prologue.
         gids = tl.load(idx_ptr + offs, mask=cand, other=0)
         tl.store(out_ptr + gids, v, mask=keep)
 
+    @triton.jit
+    def _validate_argmax(probabilities, ratios, output, valid, n: tl.constexpr, block: tl.constexpr):
+        offsets = tl.arange(0, block)
+        p = tl.load(probabilities + offsets, offsets < n, other=0.0)
+        r = tl.load(ratios + offsets, offsets < n, other=-float("inf"))
+        finite_nonnegative = (p >= 0.0) & (p < float("inf"))
+        legal = (tl.sum(finite_nonnegative.to(tl.int32), 0) == block) & (tl.sum(p, 0) > 0.0)
+        token = tl.argmax(r, 0, tie_break_left=True)
+        tl.store(output, token.to(tl.int64))
+        tl.store(valid, legal)
+
     _HAS_TRITON = True
 except Exception:  # pragma: no cover - triton missing/CPU
     _HAS_TRITON = False
+
+
+def _sample_cuda(probabilities: torch.Tensor, generator: torch.Generator | None) -> torch.Tensor:
+    if (
+        _HAS_TRITON
+        and probabilities.is_cuda
+        and probabilities.dtype == torch.float32
+        and probabilities.ndim == 2
+        and probabilities.shape[0] == 1
+        and probabilities.is_contiguous()
+        and 0 < probabilities.shape[1] <= 8192
+    ):
+        noise = torch.empty_like(probabilities).exponential_(1, generator=generator)
+        ratios = probabilities / noise
+        output = torch.empty(1, dtype=torch.long, device=probabilities.device)
+        valid = torch.empty(1, dtype=torch.bool, device=probabilities.device)
+        width = probabilities.shape[1]
+        _validate_argmax[(1,)](probabilities, ratios, output, valid, width, triton.next_power_of_2(width))
+        torch._assert_async(valid, "probability tensor contains inf, nan or a negative value, or has zero mass")
+        return output
+    return torch.multinomial(probabilities, 1, generator=generator).reshape(1)
+
+
+def draw_v1_codec_ids(
+    processed_logits: torch.Tensor,
+    *,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+    temperature: torch.Tensor,
+    host_temperature: np.ndarray,
+    generators: dict[int, torch.Generator],
+    has_topp_only_rows: bool = True,
+    use_fp64_gumbel: bool = False,
+) -> torch.Tensor:
+    """Return one codec id per row, matching V1 ``Sampler.sample``.
+
+    MRv2 normally uses a different Triton Gumbel stream. Reuse V1's
+    exponential draws so a seed produces the same codec sequence.
+
+    ``temperature`` is one value per row, on the same device as
+    ``processed_logits``; ``host_temperature`` holds the same values on the
+    host, so branch decisions never read the device. An all-greedy batch
+    returns the argmax and does not touch ``generators``. A mixed batch draws
+    every row, then restores the argmax on greedy rows, which is the order V1
+    uses.
+    """
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+
+    from vllm_omni.utils.seeded_exponential import categorical_sample as random_sample
+
+    if processed_logits.ndim != 2:
+        raise ValueError(f"codec logits must be 2D, got {tuple(processed_logits.shape)}")
+    num_rows = processed_logits.shape[0]
+    if temperature.shape[0] != num_rows or host_temperature.shape[0] != num_rows:
+        raise ValueError(
+            f"temperature rows {temperature.shape[0]}/{host_temperature.shape[0]} != logit rows {num_rows}"
+        )
+    host_greedy = host_temperature < _SAMPLING_EPS
+    # Skipping the draw on an all-greedy step keeps the generator aligned with
+    # V1, which returns before random_sample in that case.
+    if host_greedy.all():
+        return processed_logits.argmax(dim=-1)
+    filtered = apply_top_k_top_p(processed_logits.clone(), top_k, top_p, has_topp_only_rows=has_topp_only_rows)
+    sampled = random_sample(filtered.softmax(dim=-1, dtype=torch.float32), generators, use_fp64_gumbel)
+    if host_greedy.any():
+        greedy = temperature.reshape(-1) < _SAMPLING_EPS
+        sampled = torch.where(greedy, processed_logits.argmax(dim=-1), sampled)
+    return sampled
 
 
 @dataclass(frozen=True)
@@ -464,12 +549,8 @@ class TalkerCudaKStepState:
         for row, (config, generator) in enumerate(zip(sampling, generators)):
             temperature = config[0]
             scores = filtered[row]
-            if temperature and scores.is_cuda and _HAS_TRITON:
-                from .talker_cuda_sample import sample
-
-                token = sample(scores.softmax(-1), generator)
-            elif temperature:
-                token = torch.multinomial(scores.softmax(-1), 1, generator=generator).reshape(1)
+            if temperature:
+                token = _sample_cuda(scores.softmax(-1), generator)
             else:
                 token = scores.argmax(dim=-1)
             sampled.append(token)

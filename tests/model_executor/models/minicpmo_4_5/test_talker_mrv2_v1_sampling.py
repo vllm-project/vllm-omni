@@ -12,7 +12,7 @@ import torch
 from vllm.v1.sample.ops import topk_topp_sampler
 from vllm.v1.worker.gpu.sample.states import SamplingStates
 
-from vllm_omni.model_executor.models.minicpmo_4_5.talker_mrv2_sampling import draw_v1_codec_ids
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import draw_v1_codec_ids
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -198,7 +198,6 @@ def test_partial_prefill_preserves_seeded_streams_with_upstream_sampling_states(
     from vllm.v1.worker.gpu.sample.sampler import Sampler as Mrv2Sampler
 
     from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni_tts as tts
-    from vllm_omni.model_executor.models.minicpmo_4_5 import talker_mrv2_sampling as draw
 
     base = Mrv2Sampler.__new__(Mrv2Sampler)
     base.sampling_states = _sampling_states([1.0, 1.0], top_k, top_p)
@@ -233,7 +232,7 @@ def test_partial_prefill_preserves_seeded_streams_with_upstream_sampling_states(
         return (seq_lens >= prefill[mapping]).to(torch.int32), torch.zeros_like(ones)
 
     mocker.patch.object(tts, "get_num_sampled_and_rejected", side_effect=counts)
-    filtering = mocker.spy(draw, "apply_top_k_top_p")
+    filtering = mocker.spy(topk_topp_sampler, "apply_top_k_top_p")
     expected_topp_only = any(k >= _VOCAB and p < 1.0 for k, p in zip(top_k, top_p))
     logits = torch.linspace(-1, 1, _VOCAB).repeat(2, 1)
     # Two discarded chunks, final prefill, then decode: only the decode row

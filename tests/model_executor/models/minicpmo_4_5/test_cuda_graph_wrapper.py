@@ -255,7 +255,7 @@ def test_lazy_capture_limit_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch)
     wrapper.decode_fn.assert_called_once_with(speech_feat, cache_source)
     assert result is wrapper.decode_fn.return_value
     # The fallback is counted under the padded capture key it would have used.
-    assert wrapper.eager_fallback_counts() == {(1, 9, 0): 1}
+    assert wrapper._eager_fallbacks == {(1, 9, 0): 1}
 
 
 def test_eager_fallbacks_are_counted_by_shape(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -263,16 +263,16 @@ def test_eager_fallbacks_are_counted_by_shape(monkeypatch: pytest.MonkeyPatch) -
 
     The exact-shape capture config is empirical (the merged backlog width has
     no derivable cap), so the counts -- one WARNING on a shape's first miss,
-    ``eager_fallback_counts()`` afterwards -- are what makes a width outgrowing
+    followed by periodic INFO summaries -- are what makes a width outgrowing
     the config visible instead of the miss silently repeating every call.
     """
     wrapper = _fake_wrapper(monkeypatch)
     # A width outside the buckets falls back eagerly (width padding disabled).
     wrapper.replay(torch.randn(1, 80, 11), torch.zeros(1, 1, 0))
-    assert wrapper.eager_fallback_counts() == {(1, 11, 0): 1}
+    assert wrapper._eager_fallbacks == {(1, 11, 0): 1}
     # An unsupported batch size is counted under its own shape key.
     wrapper.replay(torch.randn(16, 80, 7), torch.zeros(16, 1, 0))
-    assert wrapper.eager_fallback_counts() == {(1, 11, 0): 1, (16, 7, 0): 1}
+    assert wrapper._eager_fallbacks == {(1, 11, 0): 1, (16, 7, 0): 1}
     # The counters accumulate; nothing was captured for either miss.
     wrapper._capture.assert_not_called()
 
@@ -314,7 +314,7 @@ def test_padded_replay_fallback_is_counted_under_the_request_width(
     wrapper.lazy_graph_count = wrapper.max_lazy_graphs  # force the lazy-limit fallback
     wrapper.replay(torch.randn(1, 80, 11), torch.zeros(1, 1, 0))
     wrapper._capture.assert_not_called()
-    assert wrapper.eager_fallback_counts() == {(1, 11, 0): 1}
+    assert wrapper._eager_fallbacks == {(1, 11, 0): 1}
 
 
 def test_multibatch_serial_replay_with_batch1_graph(monkeypatch: pytest.MonkeyPatch) -> None:

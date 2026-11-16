@@ -55,6 +55,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     TalkerCodecSampleResult,
     TalkerCudaKStepState,
     codec_sample_result,
+    draw_v1_codec_ids,
     greedy_codec_sample,
     make_device_state,
     prepare_codec_logits,
@@ -68,7 +69,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
     CONTINUE_TOKEN_ID,
     talker_kstep_frames,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.talker_mrv2_sampling import draw_v1_codec_ids
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking

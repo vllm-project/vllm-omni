@@ -1848,13 +1848,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         bad_token_ids = getattr(tokenizer, "bad_token_ids", []) if tokenizer is not None else []
         return MiniCPMO45DuplexPolicy.native_forbidden_token_ids(token_ids, bad_token_ids=bad_token_ids)
 
-    def _minicpmo45_native_special_token_ids(self, token_ids: dict[str, int]) -> set[int]:
-        tokenizer = self._minicpmo45_tokenizer()
-        return MiniCPMO45DuplexPolicy.native_special_token_ids(
-            token_ids,
-            tokenizer_special_ids=getattr(tokenizer, "all_special_ids", []) if tokenizer is not None else [],
-        )
-
     @staticmethod
     def _sampling_metadata_value(
         sampling_metadata: SamplingMetadata,
