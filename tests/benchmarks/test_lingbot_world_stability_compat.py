@@ -92,7 +92,9 @@ def test_upstream_stability_script_keeps_legacy_cli_and_result(tmp_path: Path, f
                 "--flow-shift",
                 "5.0",
                 cwd=ROOT,
+                # ROCm torch imports require the parent process's dynamic loader paths.
                 env={
+                    **{key: os.environ[key] for key in ("LD_LIBRARY_PATH", "LD_PRELOAD") if key in os.environ},
                     "PATH": os.environ["PATH"],
                     "PYTHONPATH": str(ROOT),
                     "PYTHONDONTWRITEBYTECODE": "1",

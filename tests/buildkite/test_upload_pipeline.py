@@ -55,19 +55,9 @@ def _render(changed_files: list[str]) -> str:
 
 
 @pytest.mark.parametrize("pytest_exit", [0, 1, 124])
-@pytest.mark.parametrize("lane", ["cuda-duplex", "npu-a3-perf"])
-def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_path, monkeypatch, pytest_exit, lane):
-    path = CUDA_READY_YAML if lane == "cuda-duplex" else Path(".buildkite/npu/test-npu-nightly.yml")
-    doc = yaml.safe_load(path.read_text())
-    step = next(
-        step
-        for step in _leaf_steps(doc["steps"])
-        if (
-            step.get("label") == "Omni · MiniCPM-o 4.5 Duplex Test"
-            if lane == "cuda-duplex"
-            else step.get("key") == "nightly-omni-performance-minicpmo-4-5-npu-a3-2card"
-        )
-    )
+def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_path, monkeypatch, pytest_exit):
+    doc = yaml.safe_load(CUDA_READY_YAML.read_text())
+    step = next(step for step in _leaf_steps(doc["steps"]) if step.get("label") == "Omni · MiniCPM-o 4.5 Duplex Test")
     # Build 19334 runs the workload under /bin/sh. Exercise that entrypoint,
     # without starting a real server or loading model weights.
     calls_path = tmp_path / "pytest-call.json"
@@ -86,7 +76,7 @@ def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_pa
     monkeypatch.setenv("PYTEST_CALLS", str(calls_path))
     monkeypatch.setenv("PYTEST_EXIT", str(pytest_exit))
     result = subprocess.run(
-        ["/bin/sh", "-e", "-c", "\n".join(step["commands"]).replace("$$", "$")],
+        ["/bin/sh", "-e", "-c", "\n".join(step["commands"])],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -94,16 +84,10 @@ def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_pa
     )
     assert result.returncode == pytest_exit, result.stderr
     args = json.loads(calls_path.read_text())
-    if lane == "cuda-duplex":
-        assert "tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py" in args
-        assert args[args.index("-m") + 1] == "(core_model or advanced_model) and cuda"
-        assert "pytest-stderr" in result.stderr
-    else:
-        assert "tests/dfx/perf/scripts/run_benchmark.py" in args
-        assert args[args.index("-m") + 1] == "full_model and omni and npu and A3 and cards_2"
-        log = tmp_path / "tests/dfx/perf/results/minicpmo-4-5-a3-2card/pytest.log"
-        assert "pytest-stderr" in log.read_text()
+    assert "tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py" in args
+    assert args[args.index("-m") + 1] == "(core_model or advanced_model) and cuda"
     assert "pytest-stdout" in result.stdout
+    assert "pytest-stderr" in result.stderr
 
 
 def test_bootstrap_if_injected_by_step_key() -> None:
@@ -1007,25 +991,23 @@ def test_audex_cosyvoice_qwen3_weekly_pr_validation_is_focused(monkeypatch: pyte
     assert label not in _surviving_labels(doc, ["docs/source/index.md"], pipeline_path=pipeline_path)
 
 
-def test_gepard_kokoro_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gepard_weekly_pr_validation_is_focused(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MIRROR_HW", raising=False)
     pipeline_path = Path(".buildkite/cuda/test-weekly.yml")
     doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
     expected_dependencies = {
         "TTS · Gepard-1.0 · L4": "tts_gepard_weekly",
-        "TTS · Kokoro-82M · L4": "tts_kokoro_weekly",
     }
     for label, dependency in expected_dependencies.items():
         matching_steps = [step for step in _iter_steps(doc) if step.get("label") == label]
         assert len(matching_steps) == 1
         assert matching_steps[0]["source_file_dependencies"] == dependency
 
-    group = next(step for step in doc["steps"] if "Gepard and Kokoro Weekly" in step.get("group", ""))
+    group = next(step for step in doc["steps"] if "Gepard Weekly" in step.get("group", ""))
     assert group["if"] == ('build.env("NON_CRITICAL") == "1" || build.pull_request.labels includes "weekly-test"')
 
     changed_files = {
         "tests/e2e/online_serving/test_gepard_tts.py": "TTS · Gepard-1.0 · L4",
-        "tests/e2e/offline_inference/test_kokoro.py": "TTS · Kokoro-82M · L4",
     }
     for changed_file, label in changed_files.items():
         assert label in _surviving_labels(doc, [changed_file], pipeline_path=pipeline_path)
@@ -1512,9 +1494,6 @@ def test_qwen_image_21_accuracy_model_dependencies(
         ("vllm_omni/benchmarks/realtime_video/evaluators.lock.json", {"performance", "accuracy"}),
         ("vllm_omni/benchmarks/serve.py", {"performance", "accuracy"}),
         ("vllm_omni/benchmarks/patch/patch.py", {"performance", "accuracy"}),
-        ("vllm_omni/benchmarks/metrics/collectors.py", {"performance", "accuracy"}),
-        ("vllm_omni/metrics/definitions.py", {"performance", "accuracy"}),
-        ("vllm_omni/diffusion/offloader/sequential_backend.py", {"performance", "accuracy"}),
         ("vllm_omni/entrypoints/cli/benchmark/cli_args.py", {"performance", "accuracy"}),
         ("tests/dfx/perf/tests/test_lingbot_world_realtime.json", {"performance"}),
         ("tests/e2e/accuracy/lingbot_world/test_precision.py", {"accuracy"}),

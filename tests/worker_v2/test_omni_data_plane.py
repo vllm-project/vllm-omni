@@ -1011,12 +1011,24 @@ def test_release_reclaims_segments_no_downstream_stage_consumed(plane):
         connector.close()
 
 
-def test_native_perf_tags_survive_deferred_cohort_wire_and_shared_payload(raw_plane):
+@pytest.mark.parametrize("typed_payload", [False, True])
+def test_native_perf_tags_survive_deferred_cohort_wire_and_shared_payload(raw_plane, typed_payload):
+    """Frozen tags survive dict and native Struct builders without shared-state mutation."""
+    from vllm_omni.data_entry_keys import CodesStruct, OmniPayloadStruct
     from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _MiniCPMO45MetaStruct
     from vllm_omni.worker.scheduling_metadata_adapter import DefaultSchedulingMetadataAdapter
     from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
-    shared = {"codes": {"audio": [1, 2]}, "meta": {"duplex_turn_id": "turn", "duplex_epoch": 3}}
+    shared = (
+        OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor([1, 2])),
+            meta=_MiniCPMO45MetaStruct(duplex_turn_id=7, duplex_epoch=3),
+        )
+        if typed_payload
+        else {"codes": {"audio": [1, 2]}, "meta": {"duplex_turn_id": 7, "duplex_epoch": 3}}
+    )
+    shared_meta = shared.meta if typed_payload else shared["meta"]
     first, second = {"duplex": {"perf_chunk": [3, 7]}}, {"duplex": {"perf_chunk": [4, 2]}}
     req_ids = ["first", "second", "unmeasured"]
     for req_id in req_ids:
@@ -1076,10 +1088,15 @@ def test_native_perf_tags_survive_deferred_cohort_wire_and_shared_payload(raw_pl
         update = adapter.extract(received, model_mode="generation")
         if req_id in expected:
             assert update.duplex_perf_chunk == expected[req_id]
-            assert payload is not shared and payload["meta"] is not shared["meta"]
+            assert payload is not shared and payload["meta"] is not shared_meta
         else:
             assert update is not None and update.duplex_perf_chunk is None
             assert payload is shared
-        assert received["meta"]["duplex_turn_id"] == "turn"
+        assert received["meta"]["duplex_turn_id"] == 7
         assert received["meta"]["duplex_epoch"] == 3
-    assert shared == {"codes": {"audio": [1, 2]}, "meta": {"duplex_turn_id": "turn", "duplex_epoch": 3}}
+    if typed_payload:
+        assert shared.meta.duplex_perf_chunk is None
+        assert shared.meta.duplex_turn_id == 7 and shared.meta.duplex_epoch == 3
+        torch.testing.assert_close(shared.codes.audio, torch.tensor([1, 2]))
+    else:
+        assert shared == {"codes": {"audio": [1, 2]}, "meta": {"duplex_turn_id": 7, "duplex_epoch": 3}}

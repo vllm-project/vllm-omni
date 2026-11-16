@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MOSS-TTS-Nano pipeline topology (frozen).
 
 Single-stage AR TTS: text -> speech waveform in one pass. The 0.1B AR LM
@@ -24,6 +24,7 @@ MOSS_TTS_NANO_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=0,
             model_stage="moss_tts_nano",
+            supports_native_mrv2_data_plane=True,
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             final_output=True,
