@@ -177,13 +177,18 @@ def test_built_weekly_image_uploads_only_validated_sglang_workloads(comparison_r
             assert "git -C /tmp apply" not in job["command"]
             prompts = 3 if key in {"perf-sglang-cosmos3-t2i", "perf-sglang-minimax-h3"} else 10
             assert f".completed == {prompts}" in job["command"]
-        assert container["image"] == environment["image_reference"]
+        assert container["image"] == (
+            "936637512419.dkr.ecr.us-west-2.amazonaws.com/"
+            "vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo@" + digest
+        )
         assert job["depends_on"] == "image-build-sglang-omni"
         assert "commands" not in job
         assert "artifact download" in job["command"]
         assert job["env"]["COMPARISON_SGLANG_OMNI_REVISION"] == "b" * 40
         assert job["env"]["COMPARISON_SGLANG_REVISION"] == "0.5.23"
     assert ".completed == 32" in jobs["perf-sglang-minicpm-o"]["command"]
+    # Rendering the private pull URI does not rewrite the published source lock.
+    assert json.loads((tmp_path / "environment.json").read_text()) == environment
 
 
 @pytest.mark.parametrize(

@@ -228,7 +228,10 @@ def cosmos_performance_job(benchmark: dict) -> dict:
 def weekly_job(job: dict, environment: dict) -> None:
     """Attach every weekly job to the same immutable build and recorded versions."""
     container = next(iter(job["plugins"][0].values()))["podSpec"]["containers"][0]
-    container["image"] = environment["image_reference"]
+    # GPU agents pull through the private ECR cache used by the template.
+    # Keep the public source reference in the lock and pin the same digest here.
+    repository = container["image"].split("@", 1)[0].rsplit(":", 1)[0]
+    container["image"] = repository + "@" + environment["image_digest"]
     job.update(
         depends_on="image-build-sglang-omni",
         concurrency=2,
