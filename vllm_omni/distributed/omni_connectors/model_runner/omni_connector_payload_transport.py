@@ -1720,26 +1720,22 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         return bool(is_finished()) if callable(is_finished) else False
 
     def _publish_chunk_cohort(self, entries: list[tuple[Any, Any]], *, wait_for_delivery: bool) -> int:
-        # A request's last chunk must carry its finish marker even when the
-        # processor has nothing left to send (e.g. its frames ended exactly on
-        # a chunk boundary), as the V1 chunk adapter guarantees; otherwise the
-        # receiver waits for input until its deadline.
-        entries = [
-            (request, payload if payload is not None else self._finish_marker_payload())
-            for request, payload in entries
-            if payload is not None or self._request_is_finished(request)
-        ]
         emitted = 0
         completions: list[Any] = []
         for request, payload in entries:
-            chunk = getattr(request, "duplex_perf_chunk", None)
-            if chunk is not None:
+            if payload is None:
+                if not self._request_is_finished(request):
+                    continue
+                # A terminal request still needs a finish marker so its
+                # receiver stops waiting when the processor has no data left.
+                payload = self._finish_marker_payload()
+            elif (chunk := getattr(request, "duplex_perf_chunk", None)) is not None:
                 # Reuse the wire key read by the downstream scheduler. The
                 # model's payload may still be shared with another consumer.
                 if isinstance(payload, OmniPayloadStruct):
                     meta = replace_struct(payload.meta or MetaStruct(), duplex_perf_chunk=list(chunk))
                     payload = replace_struct(payload, meta=meta)
-                else:
+                elif isinstance(payload, dict):
                     payload = {**payload, "meta": {**(payload.get("meta") or {}), "duplex_perf_chunk": list(chunk)}}
             if self._return_stage_payload(request.req_id, request.additional_information, payload):
                 continue

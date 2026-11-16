@@ -959,6 +959,23 @@ def test_terminal_without_processor_payload_still_sends_finish_marker(raw_plane,
     assert payload["meta"]["finished"].item() is True
 
 
+def test_terminal_marker_without_payload_has_no_duplex_chunk(raw_plane, monkeypatch):
+    enqueued = []
+
+    def enqueue(request, payload, **_kwargs):
+        enqueued.append(payload)
+        return True, None
+
+    monkeypatch.setattr(raw_plane, "_enqueue_chunk_payload", enqueue)
+    request = _new_request()
+    request.is_finished = lambda: True
+    request.duplex_perf_chunk = (0, 1)
+    assert raw_plane._publish_chunk_cohort([(request, None)], wait_for_delivery=False) == 1
+    [payload] = enqueued
+    assert payload["meta"]["finished"].item() is True
+    assert "duplex_perf_chunk" not in payload["meta"]
+
+
 def test_payload_builders_see_stage_model_config(monkeypatch):
     # Producer-side builders (Qwen3-Omni's Thinker reads
     # hf_config.talker_config.accept_hidden_layer) resolve the stage config
