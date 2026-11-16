@@ -25,6 +25,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import pytest
@@ -34,6 +35,9 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 
 from tests.e2e.accuracy.helpers import reset_artifact_dir, write_accuracy_result
 from tests.helpers.mark import hardware_test
+
+if TYPE_CHECKING:
+    from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
 
 OFFICIAL_REPOSITORY = "https://github.com/Lightricks/LTX-2.git"
 LTX25_OFFICIAL_REVISION = "7954dcb0d986bdc36ef272564a9789ade07fcc65"
@@ -149,6 +153,34 @@ def test_ltx_reference_runner_unwraps_audio_only_output() -> None:
 
     assert actual_audio is audio
     assert sample_rate == 48_000
+
+
+def test_ltx_reference_runner_resolves_gemma4_rope_layer_config() -> None:
+    from .run_ltx25_reference import _gemma4_rope_config_for_layer
+
+    @dataclass(frozen=True)
+    class LayerConfig:
+        head_dim: int
+
+    class Config:
+        is_heterogeneous = True
+        per_layer_config = {
+            "sliding_attention": LayerConfig(head_dim=256),
+            "full_attention": LayerConfig(head_dim=512),
+        }
+
+        @property
+        def head_dim(self) -> int:
+            raise AssertionError("heterogeneous global head_dim must not be read")
+
+    config = Config()
+    resolved = _gemma4_rope_config_for_layer(
+        cast("Gemma4UnifiedTextConfig", config),
+        "sliding_attention",
+    )
+
+    assert resolved is config.per_layer_config["sliding_attention"]
+    assert resolved.head_dim == 256
 
 
 def test_connector_weight_index_is_authoritative(tmp_path: Path) -> None:
