@@ -158,7 +158,6 @@ _PIPELINE_STAGES = [
     "indextts2_5_talker",
     "indextts2_s2mel_decoder",
     "indextts2_talker",
-    "kokoro",
     "latent_generator",
     "lfm3_code2wav",
     "lfm3_temporal",
