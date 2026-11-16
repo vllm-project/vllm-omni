@@ -27,6 +27,7 @@ th {
 | `BailingMoeV3AudioForConditionalGeneration` + `BailingTalker2` | Ming-3.0-audio-flash (ASR, speech QA and spoken answers) | `inclusionAI/Ming-3.0-audio-flash` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/inclusionAI/Ming-3.0-audio-flash.md) |
 | `BagelForConditionalGeneration` | BAGEL (DiT-only) | `ByteDance-Seed/BAGEL-7B-MoT` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `InternVLAA1Pipeline` | InternVLA-A1 | `InternRobotics/InternVLA-A1-3B` | ✅︎ | ✅︎ | | | — |
+| `Praxis1Pipeline` | Praxis-1 DROID / YAM (native robot policy) | `runwayml/praxis-1-droid`, `runwayml/praxis-1-yam` (local checkpoint directory) | ✅︎ | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Runway/Praxis-1.md) · [Model guide](praxis1.md) |
 | `Alpamayo2SuperPolicy` + `Alpamayo2SuperPipeline` | Alpamayo 2 Super | `nvidia/Alpamayo2-Super` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/Alpamayo2-Super-H200.md) |
 | `Gr00tN1d7Pipeline` | GR00T N1.7 | `nvidia/GR00T-N1.7-3B` | ✅︎ | | | ✅︎ | — |
 | `HunyuanImage3ForCausalMM` | HunyuanImage3.0 (DiT-only) | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
@@ -65,7 +66,7 @@ th {
 | `LTX2TwoStagePipeline` | LTX-2.5 Full/SFT two-stage T2V and I2V | `Lightricks/LTX-2.5-Diffusers` + `Lightricks/LTX-2.5` LoRA | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.5.md) |
 | `LTX2DistilledOneStagePipeline` | LTX-2.5 merged-distilled one-stage T2V and I2V | `Lightricks/LTX-2.5-Diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.5.md) |
 | `LTX2DistilledTwoStagePipeline` | LTX-2.5 merged-distilled two-stage T2V and I2V | `Lightricks/LTX-2.5-Diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.5.md) |
-| `LingBotVideoPipeline` | LingBot-Video dense and MoE T2I, T2V, TI2V | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | ✅︎ | | | ✅︎ | — |
+| `LingBotVideoPipeline` | LingBot-Video dense and MoE T2I, T2V, TI2V | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Robbyant/LingBot-Video.md) |
 | `SanaVideoPipeline` | SANA-Video-2B T2V (native 480p/720p; Diffusers adapter validated at both resolutions) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers`, `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/SANA-Video-2B.md) |
 | `SanaImageToVideoPipeline` | SANA-Video-2B I2V (native and Diffusers adapter validated at 480p/720p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers`, `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/SANA-Video-2B.md) |
 | `SeedVR2Pipeline` | [SeedVR2 3B](seedvr2.md) video restoration | `ByteDance-Seed/SeedVR2-3B` | ✅︎ | | ✅︎ | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ByteDance/SeedVR2-RTX-5090.md) |
@@ -139,6 +140,7 @@ th {
 | `CovoAudioForConditionalGeneration` | Covo-Audio-Chat | `tencent/Covo-Audio-Chat` | ✅︎ | | | ✅︎ | — |
 | `MiniCPMO45OmniForConditionalGeneration` | MiniCPM-o 4.5 | `openbmb/MiniCPM-o-4_5` | ✅︎ | | ✅︎ | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/OpenBMB/MiniCPM-o-4_5.md) |
 | `PersonaPlexTalkerForConditionalGeneration` | PersonaPlex (full duplex, 24 kHz speech in/out over `/v1/realtime?duplex=1`) | `nvidia/personaplex-7b-v1` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/PersonaPlex.md) |
+| `HaruForConditionalGeneration` | Haru-4B (full duplex, 24 kHz speech in/out over `/v1/realtime?duplex=1`) | `higurashi-ai/Haru-4B` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/higurashi-ai/Haru-4B-H200.md) |
 | `ErnieImagePipeline` | ERNIE-Image | `baidu/ERNIE-Image`, `baidu/ERNIE-Image-Turbo` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `GepardTalkerForConditionalGeneration` | Gepard-1.0 | `nineninesix/gepard-1.0` | ✅︎ | | | ✅︎ | — |
 | `HiDreamO1ImagePipeline` | HiDream-O1-Image | `HiDream-ai/HiDream-O1-Image` | ✅︎ | | | | — |

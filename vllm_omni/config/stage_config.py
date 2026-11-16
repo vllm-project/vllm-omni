@@ -124,6 +124,7 @@ def build_stage_runtime_overrides(
         internal_keys = (internal_blacklist_keys() | SHARED_FIELDS) - deploy_runtime_override_keys()
 
     result: dict[str, Any] = {}
+    stage_overrides: dict[str, Any] = {}
 
     for key, value in cli_overrides.items():
         if value is None or key in internal_keys:
@@ -134,11 +135,13 @@ def build_stage_runtime_overrides(
             override_stage_id = int(match.group(1))
             param_name = match.group(2)
             if override_stage_id == stage_id and param_name not in internal_keys:
-                result[param_name] = value
+                stage_overrides[param_name] = value
             continue
 
         result[key] = value
 
+    # Stage-scoped inputs take precedence regardless of their insertion order.
+    result.update(stage_overrides)
     return result
 
 
@@ -683,6 +686,10 @@ class StageDeployConfig:
     dlo_host_registration_limit_gib: float | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
+    # Mixed-resolution batch packing (MixFusion) server-level defaults.
+    enable_mixfusion: bool | None = None
+    mixfusion_min_chunk_tokens: int | None = None
+    mixfusion_max_chunks: int | None = None
 
     # Modality/service constraints consumed outside the core engine config.
     max_generated_image_size: int | None = None
@@ -1253,7 +1260,7 @@ def _apply_platform_overrides(
                 if key in _DEEP_MERGE_KEYS and isinstance(val, dict):
                     base_val = getattr(base, key, None)
                     if isinstance(base_val, dict):
-                        setattr(base, key, {**base_val, **val})
+                        setattr(base, key, _get_recursively_merged_dict(base_val, val))
                         continue
                 setattr(base, key, val)
             else:
