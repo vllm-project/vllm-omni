@@ -12,6 +12,11 @@ import numpy as np
 
 from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.plugin import DefaultDuplexModelSessionState, DuplexDataPlane, DuplexDataPlaneContext
+from vllm_omni.engine.duplex.visual_memory import (
+    EncodedVisualImage,
+    VisualMemory,
+    VisualMemorySource,
+)
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action, ParsedAction, parse_action
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation import (
     DELEGATION_TOOL_NAME,
@@ -21,10 +26,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import Jo
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     RECENT_MESSAGES,
     SUMMARY_CHUNK_MESSAGES,
-    EncodedVisualImage,
     JoyAISummaryMemory,
-    JoyAIVisualMemory,
-    VisualMemorySource,
 )
 
 
@@ -66,7 +68,7 @@ class JoyAISessionState(DefaultDuplexModelSessionState):
     conversation_images: tuple[str, ...] = ()
     last_response_text: str = ""
     memory: JoyAISummaryMemory = field(default_factory=JoyAISummaryMemory)
-    visual_memory: JoyAIVisualMemory = field(default_factory=JoyAIVisualMemory)
+    visual_memory: VisualMemory = field(default_factory=VisualMemory)
     visual_source: VisualMemorySource | None = None
     observations: list[WorkingObservation] = field(default_factory=list)
     queries: list[QueryReference] = field(default_factory=list)
@@ -111,6 +113,7 @@ class Observation:
     delegation_tools: bool = False
     chunk_id: str | None = None
     text_sent: bool = False
+    audio_sent: bool = False
     call_sent: bool = False
     response_text: str = ""
     query_reference: QueryReference | None = None
@@ -248,6 +251,9 @@ class JoyAIDataPlane(DuplexDataPlane):
                         event["end_of_turn"] = True
                         if observation.state is not None:
                             observation.state.last_response_text = action.text
+                # A turn that ends at JoyAI never reaches the Talker, so nothing feeds the
+                # Code2Wav request async-chunk prewarmed at submit; abort it.
+                event["abort_data_plane_request"] = event["end_of_turn"]
                 yield event
             elif stage_id == self.audio_stage_id:
                 completion = next(iter(output.outputs or ()), None)
@@ -269,13 +275,17 @@ class JoyAIDataPlane(DuplexDataPlane):
                     for chunk in chunks
                 ]
                 samples = np.concatenate(arrays) if arrays else np.empty(0, dtype=np.float32)
-                if output.finished and not samples.size:
+                # Streamed (DELTA) outputs carry only new samples; the final one may be empty.
+                observation.audio_sent |= bool(samples.size)
+                if output.finished and not observation.audio_sent:
                     event.update(
                         error_code="missing_audio", error="JoyAI Code2Wav completed without audio", end_of_turn=True
                     )
                     yield event
                     continue
-                if output.finished and samples.size and observation.state is not None:
+                if not output.finished and not samples.size:
+                    continue
+                if output.finished and observation.state is not None:
                     observation.state.last_response_text = observation.response_text
                 event.update(
                     audio_data=self.encode_audio(samples, rate, context.response_format, context.speed)
@@ -322,6 +332,8 @@ class JoyAIDataPlane(DuplexDataPlane):
             # when its audio never completed, e.g. a cancel between projection
             # and the first Code2Wav output.
             text_requires_complete_audio=audio,
+            # A note that ends the turn here skips the Talker: free the prewarmed Code2Wav request.
+            abort_data_plane_request=not audio,
         )
         arguments = delegation_arguments(action)
         observation.call_sent = True
@@ -336,6 +348,7 @@ class JoyAIDataPlane(DuplexDataPlane):
                     model_context_text="",
                     end_of_turn=True,
                     text_requires_complete_audio=False,
+                    abort_data_plane_request=True,
                 )
             yield note_event
             return
@@ -358,5 +371,7 @@ class JoyAIDataPlane(DuplexDataPlane):
             model_context_text="",
             end_of_turn=True,
             text_requires_complete_audio=False,
+            # No note means no Talker: free the prewarmed Code2Wav request.
+            abort_data_plane_request=True,
         )
         yield terminal_event

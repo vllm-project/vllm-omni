@@ -12,6 +12,8 @@ import numpy as np
 import pytest
 import torch
 
+from tests.model_executor.models.minicpmo_4_5.helpers import stage0_vision_runtime as _stage0_vision_runtime
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
@@ -1022,57 +1024,28 @@ def test_minicpmo_stage0_window_uses_accepted_output_not_async_sampler_history(p
     assert 41 not in result["input_token_ids"]
 
 
-def _stage0_vision_runtime():
-    import torch
-
+@pytest.mark.parametrize("pending_terminator", [None, 3, 99])
+def test_minicpmo_stage0_without_window_reconciles_accepted_terminator(pending_terminator):
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
-        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
     )
 
-    class _StageModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed = torch.nn.Embedding(256, 2)
-
-        def get_input_embeddings(self):
-            return self.embed
-
-        def get_audio_hidden_states(self, _data):
-            return [torch.tensor([[0.5, 0.5]], dtype=torch.float32)]
-
-    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
-    runtime.stage_model = _StageModel()
-    runtime.thinker = runtime.stage_model
-    runtime.tokenizer = SimpleNamespace(
-        unk_token_id=0,
-        convert_tokens_to_ids=lambda token: {
-            "<unit>": 1,
-            "</unit>": 2,
-            "<|listen|>": 3,
-            "<|speak|>": 4,
-            "<|tts_bos|>": 5,
-            "<|tts_eos|>": 6,
-            "<|tts_pad|>": 7,
-            "<|chunk_eos|>": 8,
-            "<|chunk_tts_eos|>": 9,
-            "<|turn_eos|>": 10,
-            "<|audio|>": 11,
-            "<image>": 12,
-            "</image>": 13,
-            "<slice>": 14,
-            "</slice>": 15,
-        }.get(token, 0),
-        encode=lambda text, add_special_tokens=False: [201, 5],
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-no-window", window_enabled=False)
+    runtime._stage_prefill_embeddings_only(state, None, video_frames=[object()], seq=1)
+    # Emulate a late async sample overwriting the accepted listen boundary.
+    state.pending_terminator_token = pending_terminator
+    result = runtime._stage_prefill_embeddings_only(
+        state,
+        None,
+        video_frames=[object()],
+        seq=2,
+        stage0_window={"completed_token_ids": [], "completed_terminator_token_id": 3},
     )
-    runtime.processor = SimpleNamespace(get_streaming_chunk_size=lambda: 4)
-    runtime.device = "cpu"
-    runtime._init_token_ids()
-    # One 2-row block per frame keeps the expected token_ids readable; the real
-    # resampler emits VISION_EMBEDS_PER_FRAME rows per slice.
-    runtime._stage_vision_embeddings = lambda frames: [
-        [torch.full((2, 2), float(index), dtype=torch.float32)] for index in range(len(frames))
-    ]
-    return runtime
+    assert result["input_token_ids"][:3] == [3, 2, 1]  # listen, </unit>, <unit>
+    assert result["stage0_window_replaced"] is False
+    assert state.pending_terminator_token is None
+    assert not state.window_units
 
 
 def _minicpmo_seeded_silence_sampling_case(initial_user_text: str | None, *, force_listen_count: int = 0):
@@ -2785,6 +2758,7 @@ def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
 
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.model_stage = "llm"
+    model.max_speak_chars_per_chunk = 28
     model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
     vocab_size = 151723
     candidate = 202
@@ -2803,8 +2777,13 @@ def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
 
     sampled = model.sample(logits, sampling_metadata)
 
-    assert MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK == 28
+    assert MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK == 0
+    assert model.max_speak_chars_per_chunk == 28
     assert sampled is not None
+    # Keep the complete token that reaches the soft character target.
+    assert sampled.sampled_token_ids.tolist() == [[candidate]]
+    sampling_metadata.output_token_ids[0].append(candidate)
+    sampled = model.sample(logits, sampling_metadata)
     assert sampled.sampled_token_ids.tolist() == [[151718]]
 
 

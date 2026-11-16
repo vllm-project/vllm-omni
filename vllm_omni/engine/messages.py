@@ -49,11 +49,14 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
     request_artifact_dirs: list[str] | None = None
+    trace_headers: dict[str, str] | None = None
     # Stage ID to provide the output of current request for use in external routing.
     # Only set when that stage has a next stage; otherwise it's a normal request.
     yield_stage_id: int | None = None
     entry_stage_id: int = 0
     lora_request: LoRARequest | None = None
+    requested_replica_id: int | None = None
+    cfg_companion_ids: dict[str, str] | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
@@ -148,6 +151,7 @@ class NextStageInputMessage(EngineQueueMessage, kw_only=True):
     prompt: OmniPromptType
     # Currently, sampling params are set by the stage 0 call & carried to every later call
     sampling_params_list: list[OmniSamplingParams]
+    requested_replica_id: int | None = None
 
     def ensure_valid(self, stage_types: Sequence[str | None]) -> None:
         """Raise ValueError if this input can't be submitted to its receiver stage correctly.

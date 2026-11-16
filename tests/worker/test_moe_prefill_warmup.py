@@ -107,11 +107,13 @@ def test_warmup_can_be_disabled(moe_detection, monkeypatch, value):
     assert worker.model_runner.calls == []
 
 
-def test_warmup_skips_v2_model_runner(moe_detection):
+def test_warmup_runs_on_v2_model_runner(moe_detection):
     worker = _worker(_moe_model(), use_v2=True)
 
-    assert warm_up_moe_prefill_kernels(worker) == []
-    assert worker.model_runner.calls == []
+    sizes = warm_up_moe_prefill_kernels(worker)
+
+    assert sizes == moe_prefill_warmup_sizes(8, 32768)
+    assert worker.model_runner.calls == [(size, {"skip_eplb": True, "remove_lora": False}) for size in sizes]
 
 
 class _FakeMoERunner:
@@ -121,7 +123,7 @@ class _FakeMoERunner:
 @pytest.fixture
 def fake_fused_moe_module(monkeypatch):
     module = ModuleType("vllm.model_executor.layers.fused_moe")
-    module.MoERunner = _FakeMoERunner
+    setattr(module, "MoERunner", _FakeMoERunner)
     monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.fused_moe", module)
 
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CausVid Wan single-stage diffusion topology (Noisy KV).
+"""CausVid Wan single-stage diffusion topology (Noisy PP).
 
 Diffusion implementation: ``vllm_omni.diffusion.models.causvid_wan``.
 """

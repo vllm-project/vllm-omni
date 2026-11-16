@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+from vllm_omni.diffusion.distributed.noisy_pipeline_parallel.noisy_pp_plan import (
     CellPlan,
     CellSchedule,
     Inflight,
@@ -15,6 +15,7 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     build_cell_plan,
     union_wait_ready,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.lifecycle import KVCacheLifecycle
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
     NoisyKVCache,
@@ -98,6 +99,153 @@ def test_reset_all_releases_versions():
     assert not cache.pool.has(key)
     assert cache.pool.has_free
     assert all(len(stack) == cache.capacity for stack in cache.pool.free)
+
+
+class _TransportSpy:
+    """Transport callbacks that record their order while the pool is still holding."""
+
+    def __init__(self, pool, key) -> None:
+        self._pool = pool
+        self._key = key
+        self.events: list[str] = []
+
+    def wait_sends(self) -> None:
+        assert self._pool.has(self._key)
+        self.events.append("send complete")
+
+    def discard(self, version) -> None:
+        assert version == self._key
+        assert self._pool.has(self._key)
+        self.events.append("receive complete")
+
+
+class _FailingWaitSends:
+    """Transport wait that always fails, so the retry path keeps its storage."""
+
+    def __call__(self) -> None:
+        raise RuntimeError("transport failure")
+
+
+def _history_plan() -> CellPlan:
+    return build_cell_plan(
+        CellSchedule(
+            chunks=2,
+            num_denoise_steps=2,
+            step_replicas=3,
+            layer_groups=2,
+            ordering=Ordering.LATEST_KV,
+            kv_history_chunks=6,
+        )
+    )
+
+
+def test_finish_request_preserves_only_retained_history():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    lifecycle: KVCacheLifecycle[str] = state
+    plan = _history_plan()
+    state.begin_request("A", plan, chunk_tokens=4)
+    history = ("A", 0, 0, 0)
+    temporary = ("A", 1, 0, 0)
+    other = ("B", 0, 0, 0)
+    for key in (history, temporary, other):
+        cache.pool.alloc(key)
+    state.retain_history("A", [(0, 0, 0)])
+    lifecycle.finish_request("A")
+    lifecycle.finish_request("A")
+    assert cache.pool.has(history)
+    assert not cache.pool.has(temporary)
+    assert cache.pool.has(other)
+    # Mainline continuation reuses retained history through an explicitly bound plan.
+    state.begin_request("A", plan, chunk_tokens=4)
+    assert cache.pool.has(history)
+    lifecycle.finish_request("A")
+    lifecycle.release_history("A")
+    lifecycle.release_history("A")
+    assert not cache.pool.has(history)
+    assert cache.pool.has(other)
+    state.begin_request("A", plan, chunk_tokens=4)
+
+
+def test_retained_history_survives_last_use_eviction():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    plan = _history_plan()
+    state.begin_request("A", plan, chunk_tokens=4)
+    version, last = next(iter(plan.last_use(0).items()))
+    key = ("A", *version)
+    cache.pool.alloc(key)
+    state.retain_history("A", [version])
+    state.evict(last)
+    assert cache.pool.has(key)
+    with pytest.raises(RuntimeError, match="Finish"):
+        state.release_history("A")
+    state.end_request("A", retain=())
+    assert not cache.pool.has(key)
+
+
+def test_retain_history_validation_is_atomic():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    plan = _history_plan()
+    with pytest.raises(ValueError, match="no active request"):
+        state.retain_history("A", [])
+    state.begin_request("A", plan, chunk_tokens=4)
+    key = ("A", 0, 0, 0)
+    cache.pool.alloc(key)
+    with pytest.raises(ValueError, match="nonresident"):
+        state.retain_history("A", [(0, 0, 0), (1, 0, 0)])
+    state.finish_request("A")
+    assert not cache.pool.has(key)
+
+
+def test_reset_all_releases_finished_request_history():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    plan = _history_plan()
+    state.begin_request("A", plan, chunk_tokens=4)
+    key = ("A", 0, 0, 0)
+    cache.pool.alloc(key)
+    state.retain_history("A", [(0, 0, 0)])
+    state.finish_request("A")
+    state.reset_all()
+    assert not cache.pool.has(key)
+    state.begin_request("A", plan, chunk_tokens=4)
+
+
+def test_history_release_waits_for_transport_before_pool_reuse(monkeypatch):
+    cache = _cache()
+    state = NoisyKVState(cache)
+    state.begin_request("A", _history_plan(), chunk_tokens=4)
+    key = ("A", 0, 0, 0)
+    cache.pool.alloc(key)
+    state.retain_history("A", [(0, 0, 0)])
+    state.finish_request("A")
+    recorder = _TransportSpy(cache.pool, key)
+
+    monkeypatch.setattr(cache.transport, "wait_sends", recorder.wait_sends)
+    monkeypatch.setattr(cache.transport, "discard", recorder.discard)
+    state.release_history("A")
+    assert recorder.events == ["send complete", "receive complete"]
+    assert not cache.pool.has(key)
+
+
+def test_history_release_failure_keeps_storage_for_retry(monkeypatch):
+    cache = _cache()
+    state = NoisyKVState(cache)
+    state.begin_request("A", _history_plan(), chunk_tokens=4)
+    key = ("A", 0, 0, 0)
+    cache.pool.alloc(key)
+    state.retain_history("A", [(0, 0, 0)])
+    state.finish_request("A")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cache.transport, "wait_sends", _FailingWaitSends())
+        with pytest.raises(RuntimeError, match="transport failure"):
+            state.release_history("A")
+    assert cache.pool.has(key)
+    state.release_history("A")
+    assert not cache.pool.has(key)
 
 
 def test_per_layer_free_stacks_do_not_share_slots():
@@ -354,3 +502,65 @@ def test_same_step_sink_cache_lifetime_and_attention_window(history):
     for state in states:
         state.end_request("A")
         assert state.resident_versions == 0
+
+
+@pytest.mark.parametrize("groups", [1, 2, 4])
+def test_same_step_all_live_history_versions_fit_capacity(groups):
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=24,
+            num_denoise_steps=4,
+            step_replicas=4,
+            layer_groups=groups,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=18,
+            blocks=2 * groups,
+        )
+    )
+    spec = ARDiffusionNoisyKVSpec(
+        num_layers=2,
+        num_kv_heads=1,
+        head_size=4,
+        block_size=4,
+        max_chunk_tokens=4,
+        max_history_chunks=18,
+    )
+    states = []
+    for rank in range(plan.world):
+        cache = NoisyKVCache(
+            spec,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            layer_groups=groups,
+            max_batch_size=2,
+            step_replicas=4,
+            layer_offset=2 * (rank % groups),
+        )
+        state = NoisyKVState(cache)
+        state.bind_rank(rank, None)
+        for req in ("A", "B"):
+            state.begin_request(req, plan, chunk_tokens=4)
+        states.append(state)
+    peaks = {rank: [0] * spec.num_layers for rank in range(plan.world)}
+    for tick in range(plan.num_ticks):
+        for rank, state in enumerate(states):
+            task = plan.task(tick, rank)
+            if task is not None:
+                contexts = state.prepare(tuple((req, task) for req in ("A", "B")))
+                assert all(context[0].seq_len == (len(plan.sources(task, rank)) + 1) * 4 for context in contexts)
+        for transfer in plan.transfers(tick):
+            for req in ("A", "B"):
+                key = (req, *transfer.version)
+                source = states[transfer.src].cache.pool
+                target = states[transfer.dst].cache.pool
+                target.alloc(key)
+                target.copy_into(key, source.tensor_dict(key, 1))
+        for rank, state in enumerate(states):
+            for layer in range(spec.num_layers):
+                live = state.cache.capacity - len(state.cache.pool.free[layer])
+                peaks[rank][layer] = max(peaks[rank][layer], live)
+                assert live <= state.cache.capacity
+            state.evict(tick)
+    for rank, state in enumerate(states):
+        assert not state.cache.pool.keys
+        assert all(peak > 0 for peak in peaks[rank])

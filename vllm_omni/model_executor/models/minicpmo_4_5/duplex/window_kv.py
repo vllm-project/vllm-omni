@@ -64,10 +64,13 @@ positive block size. The conversion below reads that size back off the spec the
 parent produced, so the kernel's choice -- not this module's -- is the one the
 chunk arithmetic uses.
 
-Nothing here has been executed: it needs an engine, a checkpoint and a GPU. The
-arithmetic it delegates to is CPU-covered by
+The arithmetic it delegates to is CPU-covered by
 ``tests/model_executor/models/minicpmo_4_5/duplex/test_window_plan.py``, which
 also checks the RoPE identity behind :func:`rotate_cached_keys` numerically.
+``tests/worker_v2/test_minicpmo_duplex_block_table.py`` exercises MRv2's actual
+GPU block-table gather across the allocation bound and after compaction. The
+spec disables ordinary sliding-window masking: that bound sizes admission,
+but does not authorize the worker to hide the manager's retained pages.
 
 Wiring, in the order the pieces get used
 ----------------------------------------
@@ -272,6 +275,18 @@ class MiniCPMO45DuplexWindowSpec(ChunkWindowSpec):
     trim entry point is never reachable.
     """
 
+    @property
+    def num_retained_tokens(self) -> int:
+        """Disable MRv2's ordinary sliding-window block-table masking.
+
+        Zero tells BlockTables to preserve the manager's complete table. Our
+        sliding_window is an admission bound, not an attention mask: only the
+        duplex manager may remove history, retaining sink pages and reanchoring
+        the remaining positions. Sessions with windowing off can also exceed
+        that bound. Masking their leading blocks silently loses live context.
+        """
+        return 0
+
 
 def duplex_window_spec(geometry: DuplexWindowGeometry, layer_spec: SlidingWindowSpec) -> MiniCPMO45DuplexWindowSpec:
     """Re-express a layer's sliding-window spec as the duplex one.
@@ -417,14 +432,35 @@ def rotate_keys(keys: torch.Tensor, delta: int, inv_freq: torch.Tensor) -> torch
     return torch.cat([k1 * cos + k2 * sin, k2 * cos - k1 * sin], dim=-1)
 
 
+def flattened_key_cache_view(
+    key: torch.Tensor,
+    block_size: int | None,
+    head_dim: int | None,
+    rotary_dim: int,
+) -> torch.Tensor:
+    """Return a storage-sharing view or reject an unsupported flattened layout."""
+    if head_dim is None or head_dim <= 0 or head_dim != rotary_dim:
+        raise ValueError("flattened key cache requires explicit head_dim and full rotary")
+    if block_size is None or key.shape[1] != block_size or key.shape[2] % head_dim:
+        raise ValueError(f"unsupported flattened key cache shape {tuple(key.shape)}")
+    try:
+        return key.view(key.shape[0], block_size, -1, head_dim)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"cannot view flattened key cache in place: shape={tuple(key.shape)}, "
+            f"stride={key.stride()}, head_dim={head_dim}"
+        ) from exc
+
+
 def rotate_cached_keys(
-    k_pool: torch.Tensor,
+    k_pool: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
     *,
     block_ids: list[int],
     positions: torch.Tensor,
     plan: PositionReanchor,
     inv_freq: torch.Tensor,
     block_size: int | None = None,
+    head_dim: int | None = None,
 ) -> int:
     """Re-RoPE the retained tail where it stands; return the rows touched.
 
@@ -442,6 +478,18 @@ def rotate_cached_keys(
     """
     if positions.numel() == 0:
         return 0
+
+    # Ascend keeps K and V in separate tensors. Operate on the original K
+    # storage only; stacking the pair would rotate a copy and leave KV stale.
+    if isinstance(k_pool, (tuple, list)):
+        if len(k_pool) != 2:
+            raise ValueError("split KV cache must contain exactly K and V")
+        k_pool = k_pool[0]
+
+    # Ascend's standard paged layout can flatten heads into the last axis:
+    # (num_blocks, block_size, num_kv_heads * head_dim).
+    if k_pool.dim() == 3:
+        k_pool = flattened_key_cache_view(k_pool, block_size, head_dim, inv_freq.numel() * 2)
 
     if k_pool.dim() == 5:
         if k_pool.shape[0] == 2:
@@ -752,6 +800,14 @@ class MiniCPMO45DuplexWorkerHelper:
     """Worker-side KV cache rotation and position metadata helper for MiniCPM-o 4.5 duplex."""
 
     @classmethod
+    def get_reanchor_parameters(cls, runner: Any) -> tuple[int, int | None, torch.Tensor]:
+        """Resolve the same cache geometry for startup validation and rotation."""
+        block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
+        model_config = getattr(runner, "model_config", None)
+        head_dim = model_config.get_head_size() if model_config is not None else None
+        return block_size, head_dim, cls.get_rope_inv_freq(runner)
+
+    @classmethod
     def get_rope_inv_freq(cls, runner: Any) -> torch.Tensor:
         inv_freq = getattr(runner, "_duplex_inv_freq", None)
         if inv_freq is None:
@@ -904,9 +960,8 @@ class MiniCPMO45DuplexWorkerHelper:
                 assert_uniform_position_shift(positions, plan.moved_from)
 
             if positions.numel() > 0 and hasattr(runner, "kv_caches") and runner.kv_caches:
-                inv_freq = cls.get_rope_inv_freq(runner)
+                block_size, head_dim, inv_freq = cls.get_reanchor_parameters(runner)
                 kv_groups = getattr(runner, "kv_cache_group_ids", None)
-                block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
                 # Layers share their KV group's table; on MRv2 each lookup is a device read.
                 group_block_ids: dict[int, list[int]] = {}
                 for layer_idx, kv_cache in enumerate(runner.kv_caches):
@@ -922,6 +977,7 @@ class MiniCPMO45DuplexWorkerHelper:
                         plan=plan,
                         inv_freq=inv_freq,
                         block_size=block_size,
+                        head_dim=head_dim,
                     )
 
             # Evict worker-held unit history so state.window_units remains bounded

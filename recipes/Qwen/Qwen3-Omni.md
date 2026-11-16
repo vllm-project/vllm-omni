@@ -42,6 +42,9 @@ Notes:
 - `--omni` is required.
 - The default deploy config `vllm_omni/deploy/qwen3_omni_moe.yaml` is loaded
   automatically by model registry.
+- CUDA uses model runner v2. NPU, XPU, ROCm and MUSA stay on v1. Set
+  `model_runner: v1` in an overlay to opt out on CUDA. The Thinker prefix
+  cache stays off with this default.
 - `async_chunk` is enabled by default in this deploy config.
 - Platform deltas under `platforms:` (NPU/ROCm/XPU) are merged automatically on
   matching runtimes.

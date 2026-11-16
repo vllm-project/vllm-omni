@@ -292,31 +292,39 @@ class VoxCPM2ModelState(OmniModelState):
         return self.next_embed.index_select(0, indices)
 
     def decode_patch(self, slots, rows_valid, patch):
+        # Keep the decode input in the VAE's configured dtype: the VAE's
+        # weights live in _vae_dtype after the deployment-dtype cast, so an
+        # fp32 patch here would bypass the dtype contract (hard error on
+        # NPU, silent promotion elsewhere). PCM returns on the fp32 boundary.
+        vae_dtype = self.model._vae_dtype
         if getattr(self, "incremental_vae", False):
             valid = rows_valid & self.active_slots.index_select(0, slots)
             sr_cond = self.model._get_vae_decode_sr_cond(patch.device)
             pcm = incremental_vae_decode(
                 self.model.tts.audio_vae,
-                patch.float().transpose(1, 2),
+                patch.to(vae_dtype).transpose(1, 2),
                 self.vae_feature_cache,
                 slots,
                 valid,
                 len(self.slots) + 1,
                 sr_cond,
             )
-            return pcm.reshape(len(slots), -1), valid
+            return pcm.reshape(len(slots), -1).float(), valid
         lengths = self.latent_context_lengths.index_select(0, slots)
         context = self.latent_context.index_select(0, slots)
+        # Pack against the fp32 context (pack_patch_context torch.where's the
+        # context against this patch — a bf16 patch there raises under
+        # --dtype bfloat16); cast only the tensor that enters audio_vae.decode.
         inputs, tail, next_lengths = pack_patch_context(context, lengths, patch.float())
         sr_cond = self.model._get_vae_decode_sr_cond(inputs.device)
-        decoded = self.model.tts.audio_vae.decode(inputs, sr_cond=sr_cond).reshape(len(slots), -1)
+        decoded = self.model.tts.audio_vae.decode(inputs.to(vae_dtype), sr_cond=sr_cond).reshape(len(slots), -1)
         samples = self.model._patch_size * int(self.model.tts.audio_vae.decode_chunk_size)
         offsets = lengths[:, None] * int(self.model.tts.audio_vae.decode_chunk_size)
         pcm = decoded.gather(1, offsets + torch.arange(samples, device=decoded.device)[None, :])
         valid = rows_valid & self.active_slots.index_select(0, slots)
         self.latent_context.index_copy_(0, slots, torch.where(valid[:, None, None], tail, context))
         self.latent_context_lengths.index_copy_(0, slots, torch.where(valid, next_lengths, lengths))
-        return pcm, valid
+        return pcm.float(), valid
 
     def commit_patch(self, slots, valid, next_embed, patch, stop_logits):
         embeds = self.next_embed.index_select(0, slots)
@@ -791,6 +799,15 @@ class VoxCPM2ModelState(OmniModelState):
                 for cache in self.vae_feature_cache.values():
                     cache[req_index].zero_()
             fresh = VoxCPM2RequestState(request_id="")
+            # An in-flight stop-mask D2H may still be writing into this
+            # state's pinned buffer (the talker retains only the GPU source,
+            # not the pinned pages). Synchronize before the fresh-dataclass
+            # copy clears pending_stop_mask_cpu/event, or the side-stream DMA
+            # lands in freed pages on an abort between precompute and
+            # compute_logits.
+            event = getattr(state, "pending_stop_mask_event", None)
+            if event is not None:
+                event.synchronize()
             for field in dataclasses.fields(state):
                 setattr(state, field.name, getattr(fresh, field.name))
         super().remove_request(req_index_or_id)
