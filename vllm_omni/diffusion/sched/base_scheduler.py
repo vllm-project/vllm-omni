@@ -19,7 +19,9 @@ from vllm_omni.config.stage_config import resolve_diffusion_stage_role
 from vllm_omni.diffusion.attention.schedule import (
     InvalidAttentionScheduleError,
     resolve_request_attention_schedule,
+    resolve_request_attention_sigma_schedule,
     stage_runs_denoising,
+    validate_request_attention_schedules,
 )
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -49,6 +51,7 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import per_sample_kv_count
 from vllm_omni.inputs.data import absorb_attention_schedule_extra_args
+from vllm_omni.lora.utils import build_lora_batch_key
 
 logger = init_logger(__name__)
 
@@ -60,8 +63,9 @@ BatchSamplingParamsKey = StepBatchSamplingParamsKey | RequestBatchSamplingParams
 _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in fields(StepBatchSamplingParamsKey)) - {
     "attention_schedule",
     "attention_schedule_explicit",
+    "attention_sigma_schedule",
     "condition_key",
-    "lora_int_id",
+    "lora_key",
     "use_step_execution",
     "mixfusion_key",
 }
@@ -186,7 +190,8 @@ class BaseScheduler(ABC):
             absorb_attention_schedule_extra_args(request.sampling_params)
             if not self._runs_denoising:
                 request.sampling_params.attention_schedule = None
-            resolve_request_attention_schedule(
+                request.sampling_params.attention_sigma_schedule = None
+            validate_request_attention_schedules(
                 request.sampling_params,
                 getattr(self.od_config, "diffusion_attention_schedule", None),
             )
@@ -797,8 +802,11 @@ class BaseScheduler(ABC):
                 sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
             ),
             attention_schedule_explicit=sampling.attention_schedule is not None,
+            attention_sigma_schedule=resolve_request_attention_sigma_schedule(
+                sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
+            ),
             condition_key=getattr(request, "batch_compatibility_key", None),
-            lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
+            lora_key=build_lora_batch_key(lora_request, getattr(sampling, "lora_scale", None)),
             use_step_execution=getattr(request, "use_step_execution", True),
             **relaxed_key,
         )

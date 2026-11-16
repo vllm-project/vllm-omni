@@ -16,6 +16,7 @@ import math
 import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
+from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -29,10 +30,14 @@ from vllm_omni.config.stage_config import resolve_diffusion_stage_role
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
+    AttentionSigmaSchedule,
     batch_attention_schedule,
+    batch_attention_sigma_schedule,
     require_attention_schedule_pipeline,
     resolve_batch_attention_schedule,
+    resolve_batch_attention_sigma_schedule,
     resolve_request_attention_schedule,
+    resolve_request_attention_sigma_schedule,
     stage_runs_denoising,
 )
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
@@ -51,6 +56,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionMetadata,
     DiffusionPagedAttentionRow,
 )
+from vllm_omni.diffusion.distributed.member_batch import BatchMember, ExecutionBatch
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank
 from vllm_omni.diffusion.forward_context import bind_attention_schedule, set_forward_context
 from vllm_omni.diffusion.graph import warn_if_denoise_graph_unsupported
@@ -170,13 +176,43 @@ def _normalize_pipeline_outputs(
     return outputs
 
 
+def _abort_stepwise_prep(
+    state_cache: dict[str, Any],
+    state: Any,
+    error_outputs: list[Any],
+    per_req_exc: BaseException | None,
+) -> None:
+    """Drop a stepwise request whose preparation failed, recording why.
+
+    Called on every DiT rank so a peer failure cannot leave one rank out of the
+    following collective.
+    """
+    state_cache.pop(state.request_id, None)
+    if per_req_exc is None:
+        per_req_exc = RuntimeError(f"Stepwise preparation failed on another DiT rank for {state.request_id}")
+    logger.error(
+        "Stepwise request preparation failed for %s: %s",
+        state.request_id,
+        per_req_exc,
+        exc_info=isinstance(per_req_exc, Exception),
+    )
+    error_outputs.append(
+        RunnerOutput(
+            request_id=state.request_id,
+            step_index=state.step_index,
+            finished=True,
+            result=DiffusionOutput.from_exception(per_req_exc),
+        )
+    )
+
+
 def _attention_schedule_scope(
-    schedule: AttentionSchedule, *, from_request: bool = False
+    schedule: AttentionSchedule, sigma_schedule: AttentionSigmaSchedule, *, from_request: bool = False
 ) -> AbstractContextManager[Any]:
-    """Bind a non-empty schedule; an unscheduled batch leaves the forward context untouched."""
-    if not schedule:
+    """Bind non-empty step ranges or sigma windows; an unscheduled batch leaves the forward context untouched."""
+    if not schedule and not sigma_schedule:
         return nullcontext()
-    return bind_attention_schedule(schedule, from_request=from_request)
+    return bind_attention_schedule(schedule, sigma_schedule, from_request=from_request)
 
 
 class DiffusionModelRunner(DiffusionStagePayloadMixin):
@@ -377,11 +413,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         load_device = "cpu" if offload_enabled(self.od_config) else str(self.device)
 
-        def get_memory_context() -> AbstractContextManager[Any]:
-            if memory_pool_context_fn is not None:
-                return memory_pool_context_fn("weights")
-            return nullcontext()
-
+        # Built inline: ``load_class_methods`` executes this method with a
+        # whitelisted namespace, so module-level helpers are not reachable here.
+        get_memory_context = (
+            partial(memory_pool_context_fn, "weights") if memory_pool_context_fn is not None else nullcontext
+        )
         # Load model within forward context
         weight_sharing_backend = None
         if shared_group is not None:
@@ -885,9 +921,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 raise ValueError("Cannot execute model with empty prompt")
         if require_request_batch_support and not getattr(self.pipeline, "supports_request_batch", False):
             raise RuntimeError(f"{type(self.pipeline).__name__} does not support request-batch forward.")
-        attention_schedule = resolve_batch_attention_schedule(
-            [req.sampling_params for req in reqs], getattr(od_config, "diffusion_attention_schedule", None)
-        )
+        service = getattr(od_config, "diffusion_attention_schedule", None)
+        sampling_params = [req.sampling_params for req in reqs]
+        attention_schedule = resolve_batch_attention_schedule(sampling_params, service)
+        sigma_schedule = resolve_batch_attention_sigma_schedule(sampling_params, service)
 
         # Use no_grad() for HSDP compatibility, inference_mode() otherwise for
         # better perf. HSDP2's fully_shard pre-forward hooks need tensor version
@@ -973,6 +1010,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # against the sequence; an inherited default is not.
                 _attention_schedule_scope(
                     attention_schedule,
+                    sigma_schedule,
                     from_request=any(req.sampling_params.attention_schedule is not None for req in reqs),
                 ),
             ):
@@ -1259,6 +1297,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     attention_schedule=resolve_request_attention_schedule(
                         sched_new_req.req.sampling_params, getattr(self.od_config, "diffusion_attention_schedule", None)
                     ),
+                    attention_sigma_schedule=resolve_request_attention_sigma_schedule(
+                        sched_new_req.req.sampling_params, getattr(self.od_config, "diffusion_attention_schedule", None)
+                    ),
                 )
                 if (
                     sched_new_req.diffusion_kv_metadata is not None
@@ -1314,26 +1355,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # ``clear_pipeline_stage_durations`` on one rank would skip the
                 # all-reduce here while every peer proceeds into it, and the
                 # peers then hang on the NCCL collective until timeout.
-                def _abort_prep_failure(per_req_exc: BaseException | None) -> None:
-                    self.state_cache.pop(state.request_id, None)
-                    if per_req_exc is None:
-                        per_req_exc = RuntimeError(
-                            f"Stepwise preparation failed on another DiT rank for {state.request_id}"
-                        )
-                    logger.error(
-                        "Stepwise request preparation failed for %s: %s",
-                        state.request_id,
-                        per_req_exc,
-                        exc_info=isinstance(per_req_exc, Exception),
-                    )
-                    error_outputs.append(
-                        RunnerOutput(
-                            request_id=state.request_id,
-                            step_index=state.step_index,
-                            finished=True,
-                            result=DiffusionOutput.from_exception(per_req_exc),
-                        )
-                    )
+                _abort_prep_failure = partial(
+                    _abort_stepwise_prep,
+                    self.state_cache,
+                    state,
+                    error_outputs,
+                )
 
                 per_req_exc: BaseException | None = None
                 try:
@@ -1540,6 +1567,23 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 self.remove_diffusion_kv_requests(installed_request_ids)
             raise
 
+    def _step_execution_batch(self, states: Sequence[StepRequestState]) -> ExecutionBatch:
+        """Describe independent step members before packing model-specific tensors."""
+        members = []
+        for state in states:
+            if state.latents is None:
+                raise RuntimeError(f"Stepwise request {state.request_id} has no latent state.")
+            members.append(
+                BatchMember(
+                    request_id=state.request_id,
+                    position=(state.chunk_index, state.step_in_chunk, state.step_index),
+                    inputs=state,
+                    kv_view=None,
+                    rows=int(state.latents.shape[0]),
+                )
+            )
+        return ExecutionBatch(tuple(members))
+
     def _execute_stepwise_core(
         self,
         scheduler_output: DiffusionSchedulerOutput,
@@ -1557,6 +1601,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             had_active_states = bool(self.state_cache)
             states, new_request_ids = self._update_states(scheduler_output)
             attention_schedule = batch_attention_schedule(state.attention_schedule for state in states)
+            sigma_schedule = batch_attention_sigma_schedule(state.attention_sigma_schedule for state in states)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if (
                 record_output_peak_memory
@@ -1583,7 +1628,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
                 clear_pipeline_stage_durations(pipeline)
-                with _attention_schedule_scope(attention_schedule):
+                execution_batch = self._step_execution_batch(states)
+                input_batch.execution_batch = execution_batch
+                with _attention_schedule_scope(attention_schedule, sigma_schedule):
                     driver = getattr(pipeline, "mixfusion_driver", None)
                     if getattr(input_batch, "use_mixfusion", False) and driver is None:
                         raise RuntimeError("Scheduler requested MixFusion without an installed driver")
@@ -1619,11 +1666,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                         )
 
                 else:
-                    offset = 0
+                    member_outputs = (
+                        execution_batch.split_rows(noise_pred)
+                        if noise_pred is not None and not isinstance(noise_pred, list)
+                        else None
+                    )
                     for req_idx, req in enumerate(states):
                         if req.latents is None:
                             raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
-                        row_num = req.latents.shape[0]
                         try:
                             if sample_results is not None:
                                 error = sample_results[req.request_id]
@@ -1634,7 +1684,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                     req_noise_pred = noise_pred[req_idx] if noise_pred is not None else None
                                 else:
                                     req_noise_pred = (
-                                        noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                                        member_outputs[req.request_id] if member_outputs is not None else None
                                     )
                                 pipeline.step_scheduler(req, req_noise_pred)
                             if self.od_config.streaming_output:
@@ -1686,9 +1736,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                     streaming_next_media_duration=streaming_next_media_duration,
                                 )
                             )
-                            offset = offset + row_num
                         except Exception as per_req_exc:
-                            offset = offset + row_num
                             self.state_cache.pop(req.request_id, None)
                             logger.error(
                                 "Stepwise per-request error for %s: %s",
@@ -1711,12 +1759,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             raise ValueError(
                                 f"Stepwise noise_pred list has {len(noise_pred)} entries, expected {expected}."
                             )
-                    elif noise_pred is not None and offset != noise_pred.shape[0]:
-                        raise ValueError(
-                            f"Stepwise noise_pred consumed {offset} rows, "
-                            f"but batched noise_pred has {noise_pred.shape[0]} rows."
-                        )
-
+                    # Tensor rows are validated by ``split_rows`` above.
                 if is_primary and record_output_peak_memory:
                     batch_peak_memory_mb = self._sample_peak_memory_mb()
                     states_by_id = {state.request_id: state for state in states}
