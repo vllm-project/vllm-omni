@@ -1571,8 +1571,9 @@ class TestDeployConfigLoading:
         assert stages[1].yaml_engine_args["async_scheduling"] is False
         assert "Async" in (stages[0].scheduler_cls or "")
         assert "Async" not in (stages[1].scheduler_cls or "")
-        assert stages[1].yaml_engine_args["speculative_config"]["num_speculative_tokens"] == 7
-        assert [stage.devices for stage in deploy.stages] == ["0", "0", "0"]
+        assert stages[1].yaml_engine_args["speculative_config"]["num_speculative_tokens"] == 15
+        assert [stage.devices for stage in deploy.stages] == ["0", "0", "0,0"]
+        assert deploy.stages[2].num_replicas == 2
         assert deploy.stages[1].enforce_eager is False
         assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 4096
         assert stages[1].yaml_extras["default_sampling_params"]["min_tokens"] == 50
@@ -1642,8 +1643,8 @@ class TestDeployConfigLoading:
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
         [
-            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", "0", "1,2", "0", 2),
-            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", "0", "1,2,3", "0", 3),
+            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", "0", "1,2", "0,0", 2),
+            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", "0", "1,2,3", "0,0", 3),
             ("minicpmo_4_5_8x4090_stage1_replicas.yaml", "0,1,2,3", "4,5,6,7", "5", 4),
         ],
     )
