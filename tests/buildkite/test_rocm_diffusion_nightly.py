@@ -19,6 +19,7 @@ RUNNER = Path(".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh")
     ("overrides", "expected_status", "executes_tests"),
     [
         ({}, 0, True),
+        ({"ROCM_DIFFUSION_RUN_LEVEL": "core_model"}, 0, True),
         ({"COLLECTED": "0"}, 1, False),
         ({"COLLECTED": "4"}, 1, False),
         ({"COLLECTION_STATUS": "2"}, 2, False),
@@ -35,6 +36,7 @@ RUNNER = Path(".buildkite/amd/scripts/run-rocm-diffusion-nightly.sh")
     ],
     ids=[
         "pass",
+        "core-model-run-level",
         "empty-collection",
         "missing-case",
         "collection-error",
@@ -118,6 +120,7 @@ def test_nightly_runner_fails_closed(
         "TIMEOUT_STATUS": "0",
         "LEAK": "0",
         "PS_FAILURE": "0",
+        "ROCM_DIFFUSION_RUN_LEVEL": "full_model",
         **overrides,
     }
     result = subprocess.run(
@@ -140,7 +143,7 @@ def test_nightly_runner_fails_closed(
     assert result.returncode == expected_status, result.stdout + result.stderr
     assert (tmp_path / "executed").exists() == executes_tests
     args = (tmp_path / "pytest-args").read_text()
-    assert "--run-level\nfull_model\n" in args
+    assert f"--run-level\n{env['ROCM_DIFFUSION_RUN_LEVEL']}\n" in args
     assert "--shard-id\n0\n--num-shards\n1\n" in args
     inventory = (tmp_path / "artifacts/nightly-test/runtime-inventory.txt").read_text()
     assert "buildkite_commit=fixture-buildkite-commit" in inventory

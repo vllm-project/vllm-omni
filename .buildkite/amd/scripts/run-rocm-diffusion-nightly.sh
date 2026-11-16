@@ -10,10 +10,12 @@ expected_tests=${2:?expected test count required}
 run_timeout=${3:?pytest timeout required}
 artifact_name=${4:?artifact directory name required}
 shift 4
+run_level=${ROCM_DIFFUSION_RUN_LEVEL:-full_model}
 [[ "$expected_gpus" =~ ^[1-9][0-9]*$ ]]
 [[ "$expected_tests" =~ ^[1-9][0-9]*$ ]]
 [[ "$run_timeout" =~ ^[1-9][0-9]*m$ ]]
 [[ "$artifact_name" =~ ^[a-z0-9-]+$ ]]
+[[ "$run_level" == core_model || "$run_level" == full_model ]]
 (( $# > 0 ))
 artifact_dir="${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/${artifact_name}"
 mkdir -p "$artifact_dir"
@@ -61,7 +63,7 @@ trap check_cleanup EXIT
         printf 'checkout_head=%s\n' "$(git rev-parse HEAD)"
     fi
     printf 'pytest_arg=%s\n' "$@"
-    echo "expected_tests=$expected_tests run_level=full_model timeout=$run_timeout"
+    echo "expected_tests=$expected_tests run_level=$run_level timeout=$run_timeout"
     rocminfo
     python3 - "$expected_gpus" <<'PY'
 import sys
@@ -85,7 +87,7 @@ baseline_ready=1
 
 pytest_args=(
     "$@"
-    --run-level full_model --shard-id 0 --num-shards 1
+    --run-level "$run_level" --shard-id 0 --num-shards 1
 )
 timeout --signal=TERM --kill-after=1m 10m \
     bash .buildkite/amd/scripts/assert-pytest-collection.sh "$expected_tests" "${pytest_args[@]}" \

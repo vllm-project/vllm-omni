@@ -460,6 +460,7 @@ source_file_dependencies:
 
   # Tiny-model diffusion jobs (shared across many model trees under models/).
   diffusion_tiny_model:
+    - .buildkite/amd/scripts/run-rocm-diffusion-nightly.sh
     - tests/model_tests/diffusion/
     - vllm_omni/diffusion/models/
 
