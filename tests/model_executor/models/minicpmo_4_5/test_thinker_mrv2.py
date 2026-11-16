@@ -30,12 +30,18 @@ def test_cuda_turn_inherits_mrv2_talker_kstep(monkeypatch):
     assert config.session_mode == "turn"
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [True, True, True]
-    assert stages[0].yaml_engine_args["enable_prefix_caching"] is True
+    assert stages[0].yaml_engine_args["enable_prefix_caching"] is False
+    assert stages[0].yaml_engine_args["speculative_config"] == {
+        "method": "ngram",
+        "num_speculative_tokens": 7,
+        "prompt_lookup_min": 1,
+        "prompt_lookup_max": 4,
+    }
     talker = stages[1]
     assert talker.yaml_engine_args["attention_backend"] == "FLASH_ATTN"
     assert talker.yaml_engine_args["speculative_config"] == {
         "method": "ngram",
-        "num_speculative_tokens": 7,
+        "num_speculative_tokens": 15,
         "prompt_lookup_min": 1,
         "prompt_lookup_max": 1,
     }
