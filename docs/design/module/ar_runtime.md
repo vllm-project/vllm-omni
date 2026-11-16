@@ -43,12 +43,14 @@ waiting for that lookup, and a lookup past its deadline is a miss.
 A failed receive uses the explicitly configured `recompute` policy;
 the upstream `fail` default still terminates requests for other configurations.
 Restored captures are merged before output publication and consumed once per
-request attempt. External loads do not populate the worker's local prefix-cache
-slots, so local prefix caching remains disabled with this backend. See
+request attempt. With local prefix caching enabled, successful external loads
+populate the matching local CPU capture slots before receive completion. The
+local prefix-cache rewrite then assembles local, externally promoted, and fresh
+rows once; the Mooncake rewrite stages only newly computed prompt rows. See
 [KV offload configuration](../../configuration/kv_offload.md#mooncake-kv-and-hidden-state-caching-experimental)
 for configuration, scope, and validation limits, and the
 [Mooncake KV/HS cache design](../feature/mooncake_kv_hs_cache.md) for its
-lifecycle and the deferred two-level mode.
+lifecycle and the two-level mode.
 
 MRv2 preserves the auxiliary output tree when capturing PIECEWISE CUDA graphs,
 because their replay returns that tree directly to model postprocessing.

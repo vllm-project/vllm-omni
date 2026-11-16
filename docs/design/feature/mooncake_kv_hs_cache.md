@@ -28,17 +28,17 @@ turns.
 **Multimodal identity.** Block hashes include each media item's identifier.
 vLLM derives that identifier from the item's content unless both the
 multimodal processor cache (`mm_processor_cache_gb: 0`) and local prefix
-caching are disabled; it then uses a per-process request counter. This
-backend always disables local prefix caching, and a counter repeats after a
-restart while the Store keeps its objects, so a restarted server could reuse
-another request's audio or image prefix. The connector rejects
-`mm_processor_cache_gb: 0`.
+caching are disabled; it then uses a per-process request counter. A counter
+repeats after a restart while the Store keeps its objects, so a
+restarted server could reuse another request's audio or image prefix. The
+connector rejects `mm_processor_cache_gb: 0` when local prefix caching is off.
+With local prefix caching on, vLLM still computes content hashes.
 
-**Cache mode.** The backend is a Mooncake-only external cache. Selecting it
-rejects local Thinker prefix caching, so every reused prefix is restored from
-Mooncake. It is not a two-level cache; the
-[deferred two-level design](#deferred-two-level-cache-cooperation) records what
-that mode requires. Online connector reset is unsupported.
+**Cache modes.** With `mooncake_config`, an explicit
+`enable_prefix_caching: true` selects local-first two-level caching. False or
+unset retains the external-only default. Without `mooncake_config`, the
+existing local-cache behavior is unchanged. Online connector reset remains
+unsupported.
 
 In this page, **HS** means the two Thinker captures that Talker reads for
 prompt positions: the input embeddings and the hidden states of
@@ -99,7 +99,8 @@ generated tokens, which the lookup also covers, but restored HS covers prompt
 rows only; the generated positions are recomputed.
 
 A lookup that exceeds `load_timeout_seconds` is treated as a miss. That request
-computes its whole prompt without another lookup. The native client
+computes the uncached prompt suffix without another external lookup, retaining
+any local hit. The native client
 sends lookups one at a time over one socket, so later requests are also misses,
 without a lookup, until the stalled reply returns. The connector detects that
 reply by queueing a marker job behind the pending lookups, which is valid only
@@ -181,10 +182,11 @@ a failed-key count.
 | --- | --- | --- | --- | --- |
 | `lookup_wait` | Scheduler | Prefix lookup, as the request waited for it | 1 / 1 if not answered | `ok`, `timeout`, `skipped` (stall guard) |
 | `joint_lookup` | Worker rank 0 | Joint lookup | Blocks with KV / those without usable HS | `ok`, `partial_failure`, `error` |
-| `joint_load` | Worker | Load attempt, from submission to outcome | Blocks / blocks left to recompute | `ok`, `hs_error`, `kv_error`, `timeout`, `rejected`, `cancelled` |
+| `joint_load` | Worker | Load attempt, from submission to outcome | Blocks / blocks left to recompute | `ok`, `hs_error`, `kv_error`, `timeout`, `rejected`, `promotion_error`, `cancelled` |
 | `hs_get` | Worker | HS prefix read and validation | HS objects and records | `ok`, `error`, `cancelled` |
 | `hs_put` | Worker | Save job's HS object writes | Blocks / blocks not written | `ok`, `partial_failure`, `cancelled`, `skipped` |
 | `hs_commit` | Worker | Save job's completion records | Blocks / blocks never published | `ok`, `partial_failure`, `cancelled` |
+| `prefix_tokens` | Worker | Hit source on the first output step; computed prompt rows per step | Tokens / 0 | `local`, `external`, `recomputed` |
 
 An `hs_put` record is `skipped` when a full save queue or staging budget turns
 blocks away, or when an earlier save of the same request attempt failed and
@@ -202,13 +204,11 @@ size. vLLM's external prefix-cache counters
 lookup hits when the scheduler admits them, before the load succeeds or
 fails, so they overstate reuse when loads fail.
 
-**Known gap.** Omni schedulers emit `SchedulerStats` at most once per second
-(`OmniSchedulerMixin.make_stats`). A step that emits none discards the
-connector records passed to it, so `/metrics` undercounts every Mooncake
-operation: native and Omni, worker and scheduler role alike. In a
-three-request diagnostic run, all 26 records reached the scheduler and 4 were
-exported. Until records from skipped steps are carried into the next emission,
-treat these counts as lower bounds.
+Omni schedulers emit `SchedulerStats` at most once per second. Connector
+records from intervening steps accumulate until the next emission, so native
+and Omni operations are not lost to this throttle. With statistics disabled,
+records are not retained. A server stopped before its next emission may still
+have unexported records.
 
 ## Concurrency and resource limits
 
@@ -233,6 +233,8 @@ can delay other saves but never a load.
 | KV load error | Native connector | Failed receive, recompute, lookup bypass |
 | HS missing, truncated, mismatched, or late | HS read and validation | Failed receive after KV drains, recompute, lookup bypass |
 | HS read not admitted | Slot or memory budget | Same as a failed read |
+| Promotion rows fail validation before writing | Local pool | Failed receive, recompute, lookup bypass |
+| Local pool writer or occupancy invariant fails | Local pool/controller | Fatal worker error, preserving the local-cache failure contract |
 | HS write or read-back failure | Save worker | No completion record; response unchanged |
 | KV object never written for a saved block | Save deadline | No completion record |
 | Invalid fresh capture | Runner rewrite | Error for that request only |
@@ -242,68 +244,74 @@ unrelated requests' saves miss the deadline even when their HS workers are free.
 `load_timeout_seconds` sets the KV-readiness deadline; cache population
 remains best effort.
 
-## Deferred two-level cache cooperation
+## Two-level cache cooperation
 
-M1 does not combine Mooncake with local Thinker prefix caching. Combining the
-two is outside M1 and is tracked in
-[feature issue #10335](https://github.com/vllm-project/vllm-omni/issues/10335),
-using the design and acceptance criteria below.
+[Feature issue #10335](https://github.com/vllm-project/vllm-omni/issues/10335)
+extends M1 with local-first reuse. The initial validation scope is Qwen3-Omni
+turn serving on CUDA, MRv2, unquantized Thinker TP=1.
 
-**Current limitation.** Local prefix hits and external loads both advance
-`num_computed_tokens`. A local hit finds its Thinker rows in
-`PrefixBlockPool`, the [local stage-output cache](prefix_caching.md) indexed by
-KV block slot. External loads do not fill that pool, and the runner cannot tell
-which source produced a computed token. vLLM also caches externally loaded
-blocks locally when prefix caching is enabled, so a later local hit on such a
-block would find no Thinker rows.
+**Lookup order.** vLLM finds the local GPU prefix first. A full local hit
+bypasses the Store. For a partial local hit, the connector sends only the
+remaining chained block hashes through the native lookup channel and translates
+its suffix-relative result back to absolute token boundaries. Local blocks
+need not still exist in Mooncake. A changed local boundary invalidates the
+previous lookup result. Combined-mode external hits are capped at
+`floor((prompt_length - 1) / block_size) * block_size`, matching the native
+local cache. A block-aligned prompt therefore recomputes its final block
+instead of replaying a single token with an unaligned local-pool boundary.
+External-only mode retains its existing final-token replay behavior.
 
-**Intended design.**
+**Ownership and promotion.** Each attempt carries explicit local and external
+token counts. HS reads begin at the local boundary. After native KV and HS
+validation succeed, the worker synchronously promotes the suffix captures into
+the existing `PrefixBlockPool` at the loaded KV block slots. Promotion uses the
+pool's ordinary write queue and occupancy claims, preserving delayed readers
+of a previous slot tenant. Receive completion is withheld until promotion
+finishes. Pending decode writes are flushed before promotion. A subsequent local
+hit can therefore use both previously local and newly promoted blocks.
 
-- **Lookup order.** Local GPU prefix first. Mooncake is queried only beyond the
-  block-aligned local hit; vLLM already passes that boundary to
-  `get_num_new_matched_tokens`, and the native load spec carries both
-  boundaries.
-- **Hit accounting.** Report local, externally restored, and recomputed tokens
-  separately, per request and in aggregate. A failed external load counts its
-  tokens as recomputed.
-- **KV/HS ownership and row assembly.** For a local hit of `L` tokens and an
-  external hit of `E` tokens, rows `[0, L)` come from the local pool, rows
-  `[L, L + E)` from Mooncake (read from block `L / block_size`), and later rows
-  from computation. The runner must receive `L` and `E` for the attempt rather
-  than infer them from `num_computed_tokens`.
-- **Promotion and writes.** A block loaded from Mooncake may serve a later
-  local hit only after its HS rows are written to the local pool at the same
-  block slot; otherwise it must not be cached locally. Mooncake writes stay
-  limited to blocks computed by the request.
-- **Eviction.** GPU eviction drops a local block and its pool rows together.
-  Mooncake evicts independently; readers keep validating, so a missing
-  external object is a miss or a failed load.
-- **Memory budgets.** Report GPU KV, the local pool (which scales with the GPU
-  block count), Mooncake staging (`max_hs_bytes`), and Store usage separately.
-- **Failure fallback.** A failed external load discards only the external
-  rows. M1 reports failures per request, so vLLM recomputes from token 0 and
-  the retry may hit the local cache again; block-level reporting would keep
-  the local prefix instead. Local rows must match whichever range remains.
-- **Cancellation and reset.** M1 attempt fencing covers the external part;
-  local hits have no asynchronous state. A local reset clears GPU blocks and
-  the local pool. External reset stays unsupported until it can fence HS
-  writes and clear only its own namespace.
+**Row assembly.** In two-level mode, the existing local prefix-cache rewrite
+assembles `[0, L + E)` and fresh rows exactly once, including preemption
+trimming. The Mooncake rewrite stages only freshly computed
+prompt blocks and does not prepend the external suffix again. The local pool
+stores the two captures used by the Qwen3 Thinker-to-Talker processor: input
+embeddings and the selected hidden layer. Generic final text hidden states stay
+on the fresh-step path, as in external-only mode. Local-only configurations
+retain their existing policy.
 
-**Follow-up acceptance criteria.**
+**Writes and accounting.** Native KV and HS writes skip the reused prefix.
+`prefix_tokens` operation records use token counts as `num_keys`, with statuses
+`local`, `external`, and `recomputed`. External counts require a successful
+load and a subsequent output step; failed receives contribute through their
+retry's computation instead. `request_cache_stats` exposes the current attempt's
+source counts to worker-side diagnostics. The standard external-cache lookup
+counter still counts admitted hits before transfer validation.
 
-1. Restored embeddings, hidden states, packed Talker inputs, generated tokens,
-   and audio match cache-off baselines (exactly, or within tolerances derived
-   from baseline repeats) for local-only, external-only, and mixed hits, and
-   for a later local hit on a block promoted from Mooncake.
-2. A failed external read in a mixed hit leaves local rows intact and
-   produces the same outputs as the cache-off baseline.
-3. Per-request accounting distinguishes local, external, and recomputed tokens.
-4. The matched comparison from RFC #9908 section 4: caching off, local prefix
-   caching only, and the two-level mode, with the M1 Mooncake-only mode
-   reported separately. Workloads cover serial and concurrent requests and
-   working sets that fit and exceed the GPU cache and Mooncake capacity.
-   Report TTFT, first-audio latency, RTF, throughput, and memory over repeated
-   runs.
+**Eviction and failure.** GPU KV slot ownership governs local pool reuse;
+slot claims replace stale rows when slots are reassigned. Store eviction is
+independent: missing or invalid external data triggers recomputation. Attempt
+fencing discards late reads after cancellation/preemption. Whole-request
+receive failure follows vLLM's recompute policy; the retry may hit the valid
+local prefix again. Failed external reads never promote partial rows or
+invalidate unrelated local pool entries.
+Promotion validation errors before writing also recompute. An internal local
+pool writer or occupancy failure remains fatal: recomputation cannot safely
+repair a pool whose published KV identities no longer have reliable rows.
+
+**Memory and reset.** Report GPU KV, the local CPU pool, transfer/staging
+(`max_hs_bytes`), and Store usage separately. The pool scales with GPU block
+count and is outside the staging budget. A local reset invalidates GPU prefix
+identities, making old pool slots unreachable until reassigned; physical pool
+allocations remain reusable. External reset remains unsupported.
+
+**Validation requirements.** Compare cache-off, local-only, external-only, and
+two-level configurations with identical model/runtime pins, workloads and
+sampling. Confirm local, external, mixed, and promoted-then-local hit sources.
+Check Thinker captures, packed Talker inputs, tokens and audio against independent
+cache-off repeats, including changed media and failed loads. Timing runs must
+exclude tensor dumps and save barriers, cover resident and eviction/revisit
+workloads at serial/concurrent load, and report repeated-run variability.
+No universal performance improvement is assumed.
 
 ## Validation
 
