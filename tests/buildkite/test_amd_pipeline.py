@@ -2188,6 +2188,65 @@ def test_bagel_offline_weekly_executes_junit_guard_before_exit(
     )
 
 
+_COSMOS3_WEEKLY_NODES = (
+    "test_text_to_image_001",
+    "test_video_generation_modes_001",
+)
+
+
+def test_cosmos3_weekly_covers_all_rocm_generation_modes() -> None:
+    def flatten_paths(items: list) -> set[str]:
+        paths: set[str] = set()
+        for item in items:
+            if isinstance(item, list):
+                paths.update(flatten_paths(item))
+            else:
+                paths.add(item)
+        return paths
+
+    step = _find_step("Cosmos3 generation modes · 1-GPU", AMD_WEEKLY_PIPELINE)
+    command = "\n".join(step["commands"])
+    dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 240
+    assert step["source_file_dependencies"] == [
+        "diffusion_cosmos3_function",
+        ".buildkite/amd/scripts/run-rocm-full-model-nightly.sh",
+        "tests/helpers/",
+    ]
+    assert step["artifact_paths"] == ["artifacts/rocm-cosmos3-weekly/**/*"]
+    assert "retry" not in step
+    assert "ROCM_E2E_LEVEL_MARKER=slow" in command
+    assert "ROCM_E2E_RUN_LEVEL=full_model" in command
+    assert "ROCM_E2E_TIMEOUT_MINUTES=210" in command
+
+    tokens = split(next(item for item in step["commands"] if "run-rocm-full-model-nightly.sh" in item))
+    runner_index = tokens.index(".buildkite/amd/scripts/run-rocm-full-model-nightly.sh")
+    assert tokens[runner_index + 1 :] == [
+        "tests/e2e/online_serving/test_cosmos3.py",
+        "2",
+        "diffusion",
+        "rocm-cosmos3-weekly",
+    ]
+
+    dependency_paths = flatten_paths(dependencies["diffusion_cosmos3_function"])
+    assert {
+        "tests/e2e/online_serving/test_cosmos3.py",
+        "vllm_omni/diffusion/models/cosmos3/",
+        "vllm_omni/model_extras/cosmos3.py",
+    } <= dependency_paths
+
+    source = Path("tests/e2e/online_serving/test_cosmos3.py").read_text(encoding="utf-8")
+    assert 'SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})' in source
+    assert source.count("def test_") == len(_COSMOS3_WEEKLY_NODES)
+    for node in _COSMOS3_WEEKLY_NODES:
+        assert f"def {node}" in source
+
+
 _DRAMA3_WEEKLY_CORE_NODE = "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
 _DRAMA3_WEEKLY_ADVANCED_NODES = (
     _DRAMA3_WEEKLY_CORE_NODE,
@@ -5978,10 +6037,12 @@ def test_minicpmo_rocm_v1_duplex_ready_executes_junit_guard_before_exit(
     )
 
 
-def test_weekly_existing_jobs_stay_blocking_while_drama3_burns_in() -> None:
+def test_weekly_existing_jobs_stay_blocking_while_new_coverage_burns_in() -> None:
     weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
     steps = [step for group in weekly["steps"] for step in group["steps"]]
 
-    assert len(steps) == 38
-    assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == (_DRAMA3_WEEKLY_BURNIN_LABELS)
-    assert all(step["grade"] == "Blocking" for step in steps if step["label"] not in _DRAMA3_WEEKLY_BURNIN_LABELS)
+    burnin_labels = _DRAMA3_WEEKLY_BURNIN_LABELS | {"Cosmos3 generation modes · 1-GPU"}
+
+    assert len(steps) == 39
+    assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == burnin_labels
+    assert all(step["grade"] == "Blocking" for step in steps if step["label"] not in burnin_labels)
