@@ -106,7 +106,7 @@ run; preserve old artifacts before refreshing the suite's output directory.
 Use the matching maintained lane and its resource budget:
 
 - Nightly image accuracy runs under **Diffusion X2I(&A&T)**. Current examples
-  include Qwen-Image, JoyAI-Image-Edit, and HunyuanImage3-DIT.
+  include Qwen-Image and HunyuanImage3-DIT.
 - Nightly video accuracy runs under **Diffusion X2V**. Current examples include
   Wan2.2 I2V, MiniMax H3 I2VA/Ref2VA, and HunyuanVideo-1.5.
 - Weekly carries expensive or non-critical cases. Current examples include
@@ -350,7 +350,7 @@ calibration-only or inactive CI case.
 For a later change, rerun only the affected checks:
 
 | Change | Minimum follow-up |
-|---|---|
+| --- | --- |
 | Skill/documentation only | Format and link checks; no accuracy rerun |
 | Model-directory move only | Migration checks above; reuse numerical evidence if the effective execution contract is unchanged |
 | CI routing/markers/artifact paths only | Collection/rendering, dependency selection and retention checks; reuse numerical evidence if the execution contract is unchanged |

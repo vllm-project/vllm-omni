@@ -27,19 +27,43 @@ committed audio remains associated with its history item even when that item
 is no longer last. Prompt preparation snapshots the selected inputs; later
 items do not modify an already prepared request.
 
-The duplex adapter retains its existing budgets: at most four audio payloads
-(including the current input), an 8 MiB encoded-audio history budget (keeping
-at least the newest payload), and at most eight prompt images. The recent
-16-message window is rounded outwards to a complete turn. If any audio in an
-older turn is no longer retained, the entire turn's model context, including
-its images/text and assistant replies, is omitted. Images from that turn are
-therefore **not** permanent session-wide model context. These limits differ
-from the demo's one image-bearing turn and five audio-bearing turns; the
-shared rule is grouping before pruning, rather than copying its UI budgets.
+When `history_policy` is omitted, the duplex adapter uses `full_history`. Every
+request includes the effective original Session history and retained input audio
+and images. It does not discard old turns or substitute transcripts for their
+media. Playback acknowledgement, interruption handling and explicit deletion
+still determine which source records are effective.
 
-Grouping and pruning affect only the model-input view. They do not merge or
-delete the source conversation items exposed to clients, and do not change
-playback acknowledgement or interruption handling.
+!!! note "Qwen default history policy changed"
+    The default changes from `recent` to `full_history`. Existing deployments
+    that need the previous automatic clipping must explicitly configure `recent`.
+    Full history can reach the deployment's token or media limits sooner.
+
+The complete request must fit the deployed model's token and media limits,
+including reserved output tokens. The engine validates its processed input and
+reuses those media features for inference. Overflow returns the recoverable
+`input_capacity_exceeded` error and preserves history; clients can delete source
+items and retry. It does not silently switch to a smaller history window. Original
+input audio remains retained while its source items exist, so session storage can
+grow with the conversation. Session input-admission limits also remain in effect.
+
+To restore the previous clipping behavior, select `recent` in a deployment overlay:
+
+```yaml
+duplex_session:
+  model_custom_options:
+    history_policy: recent
+```
+
+`recent` retains the legacy 16-message window, rounded outwards to a complete
+history group, at most four audio payloads including current input, and an 8 MiB
+encoded-audio cache budget that keeps at least its newest payload. Its renderer
+also limits prompts to eight images. Evicted audio can cause its whole group to
+leave model input when no text view is available. These transformations affect
+only the model-input view and do not delete client-addressable source items.
+
+For budget-based clipping or incremental compression, explicitly select
+`bounded_recent` or `incremental`. Configuration, policy hooks and resource
+behavior are described in [Qwen history policies](../design/fullduplex.md#experimental-qwen-history-policy).
 
 ### Qwen3-Omni voice selection
 
@@ -287,13 +311,16 @@ default.
 
 ## Qwen3-Omni L1 history views
 
-The deployment setting `duplex_session.context_keep_media_turns` opts the
-Qwen3-Omni Thinker (stage 0) into L1 history views. Its default, `null`, preserves
-the existing prompt construction. Set a nonnegative integer in the deployment
-configuration, for example:
+With explicit `history_policy: recent`, the deployment setting
+`duplex_session.context_keep_media_turns` opts the Qwen3-Omni Thinker (stage 0)
+into L1 history views. Its default, `null`, leaves that view disabled.
+`full_history` always uses original sources and does not enable L1 media removal.
+Set both fields to use the legacy policy with a media-dropped view:
 
 ```yaml
 duplex_session:
+  model_custom_options:
+    history_policy: recent
   context_keep_media_turns: 2
 ```
 
