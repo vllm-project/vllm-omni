@@ -11,6 +11,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
@@ -401,146 +402,168 @@ def _decode_source_image_file(path: str | os.PathLike[str]) -> PIL.Image.Image:
         source_image.close()
 
 
+def _preprocess_lingbot_request(
+    request: OmniDiffusionRequest,
+    *,
+    configured_action_root: str | None,
+    stepwise: bool,
+) -> OmniDiffusionRequest:
+    """Materialize request-local files once before dispatching GPU workers."""
+    prompt = request.prompt
+    if not isinstance(prompt, dict):
+        raise ValueError("LingBot World requires a prompt mapping containing multi_modal_data.image.")
+    multi_modal_data = prompt.get("multi_modal_data") or {}
+    additional_information = prompt.get("additional_information") or {}
+    if not isinstance(multi_modal_data, dict):
+        raise ValueError("prompt.multi_modal_data must be a mapping containing image.")
+    if not isinstance(additional_information, dict):
+        raise ValueError("prompt.additional_information must be a mapping.")
+    if "action_path" in additional_information:
+        raise ValueError(
+            "prompt.additional_information.action_path is not supported; use sampling_params.extra_args.action_path."
+        )
+
+    image = multi_modal_data.get("image")
+    if isinstance(image, list):
+        raise ValueError("LingBot World requires one image and does not accept an image list.")
+    if image is None:
+        raise ValueError("LingBot World requires exactly one image in multi_modal_data.image.")
+    if isinstance(image, (str, os.PathLike)):
+        image = _load_source_image(image)
+    elif isinstance(image, PIL.Image.Image):
+        image = _decode_source_image(image)
+    elif not isinstance(image, torch.Tensor):
+        raise ValueError("multi_modal_data.image must be a PIL image, tensor, or file path.")
+
+    extra_args = getattr(request.sampling_params, "extra_args", None) or {}
+    if not isinstance(extra_args, dict):
+        raise ValueError("sampling_params.extra_args must be a mapping.")
+    tick = ARDiffusionTickRequest.from_extra_args(extra_args)
+    if tick is not None:
+        camera_controls = [control for control in tick.controls if control.track == "camera"]
+        if len(camera_controls) != 1:
+            raise ValueError("LingBot realtime ticks require exactly one camera control.")
+        camera_control = camera_controls[0]
+        if camera_control.schema == LINGBOT_CAMERA_TRAJECTORY_SCHEMA:
+            camera_data = camera_control.data
+            try:
+                poses = torch.as_tensor(camera_data["poses"], dtype=torch.float32)
+                intrinsics = torch.as_tensor(
+                    camera_data["intrinsics"],
+                    dtype=torch.float32,
+                )
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("lingbot.camera_trajectory.v1 requires numeric poses and intrinsics fields.") from None
+            if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+                raise ValueError("camera control poses must have shape [frames, 4, 4].")
+            if intrinsics.ndim != 2 or intrinsics.shape[1:] != (4,):
+                raise ValueError("camera control intrinsics must have shape [frames, 4].")
+            if poses.shape[0] != intrinsics.shape[0] or poses.shape[0] == 0:
+                raise ValueError("camera control poses and intrinsics must contain the same positive number of frames.")
+            if not torch.isfinite(poses).all() or not torch.isfinite(intrinsics).all():
+                raise ValueError("camera control values must all be finite.")
+            trajectory = CameraTrajectory(
+                poses=poses,
+                intrinsics=intrinsics,
+            )
+            camera_actions = None
+        elif camera_control.schema == LINGBOT_CAMERA_ACTION_SCHEMA:
+            trajectory = None
+            camera_actions = parse_lingbot_camera_action_frames(
+                camera_control.data,
+                expected_frames=3,
+            )
+        else:
+            raise ValueError(
+                "LingBot realtime camera controls require schema "
+                "'lingbot.camera_trajectory.v1' or 'lingbot.camera_actions.v1'."
+            )
+        camera_action_script = None
+    elif extra_args.get("camera_action_script") is not None:
+        if extra_args.get("action_path"):
+            raise ValueError("camera_action_script cannot be combined with action_path.")
+        camera_action_script = parse_lingbot_camera_action_script(
+            extra_args.get("camera_action_script"),
+            frames_per_chunk=3,
+        )
+        trajectory = None
+        camera_actions = None
+    else:
+        action_path = extra_args.get("action_path")
+        if action_path is None or action_path == "":
+            # Stepwise / streaming sessions may omit a request-scoped camera
+            # script and instead drive motion via mid-generation camera
+            # interaction (idle hold until the first camera event).
+            if stepwise:
+                trajectory = None
+                camera_actions = None
+                camera_action_script = None
+            else:
+                raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
+        else:
+            if not isinstance(action_path, (str, os.PathLike)) or not str(action_path):
+                raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
+            if not configured_action_root:
+                raise ValueError(
+                    "sampling_params.extra_args.action_path requires a trusted action root configured by "
+                    f"model_config.lingbot_action_root or {_ACTION_ROOT_ENV}."
+                )
+            action_directory = resolve_trusted_action_directory(
+                action_path,
+                configured_action_root,
+            )
+            try:
+                trajectory = load_camera_trajectory(action_directory)
+            except OSError:
+                raise ValueError(
+                    "Unable to load camera trajectory from action_path; expected poses.npy and intrinsics.npy."
+                ) from None
+            camera_actions = None
+            camera_action_script = None
+
+    updated_prompt = dict(prompt)
+    updated_multi_modal_data = dict(multi_modal_data)
+    updated_multi_modal_data["image"] = image
+    updated_prompt["multi_modal_data"] = updated_multi_modal_data
+    request.prompt = updated_prompt
+    request.sampling_params.extra_args = {
+        **extra_args,
+        _PREPROCESSED_CAMERA_KEY: trajectory,
+        _PREPROCESSED_CAMERA_ACTIONS_KEY: camera_actions,
+        _PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY: camera_action_script,
+    }
+    return request
+
+
 def get_lingbot_world_pre_process_func(
     od_config: OmniDiffusionConfig,
 ) -> Callable[[OmniDiffusionRequest], OmniDiffusionRequest]:
-    """Materialize request-local files once before dispatching GPU workers."""
-
+    """Resolve the trusted action root once, then bind the request helper."""
     model_config = getattr(od_config, "model_config", None) or {}
     configured_action_root = model_config.get("lingbot_action_root") or os.environ.get(_ACTION_ROOT_ENV)
+    stepwise = bool(getattr(od_config, "step_execution", False) or getattr(od_config, "streaming_output", False))
+    return partial(
+        _preprocess_lingbot_request,
+        configured_action_root=configured_action_root,
+        stepwise=stepwise,
+    )
 
-    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        prompt = request.prompt
-        if not isinstance(prompt, dict):
-            raise ValueError("LingBot World requires a prompt mapping containing multi_modal_data.image.")
-        multi_modal_data = prompt.get("multi_modal_data") or {}
-        additional_information = prompt.get("additional_information") or {}
-        if not isinstance(multi_modal_data, dict):
-            raise ValueError("prompt.multi_modal_data must be a mapping containing image.")
-        if not isinstance(additional_information, dict):
-            raise ValueError("prompt.additional_information must be a mapping.")
-        if "action_path" in additional_information:
-            raise ValueError(
-                "prompt.additional_information.action_path is not supported; use "
-                "sampling_params.extra_args.action_path."
-            )
 
-        image = multi_modal_data.get("image")
-        if isinstance(image, list):
-            raise ValueError("LingBot World requires one image and does not accept an image list.")
-        if image is None:
-            raise ValueError("LingBot World requires exactly one image in multi_modal_data.image.")
-        if isinstance(image, (str, os.PathLike)):
-            image = _load_source_image(image)
-        elif isinstance(image, PIL.Image.Image):
-            image = _decode_source_image(image)
-        elif not isinstance(image, torch.Tensor):
-            raise ValueError("multi_modal_data.image must be a PIL image, tensor, or file path.")
+def _project_text_layer_kv(
+    blocks: Iterable[Any],
+    projected_text: torch.Tensor,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """Yield per-block cross-attention K/V for one projected prompt.
 
-        extra_args = getattr(request.sampling_params, "extra_args", None) or {}
-        if not isinstance(extra_args, dict):
-            raise ValueError("sampling_params.extra_args must be a mapping.")
-        tick = ARDiffusionTickRequest.from_extra_args(extra_args)
-        if tick is not None:
-            camera_controls = [control for control in tick.controls if control.track == "camera"]
-            if len(camera_controls) != 1:
-                raise ValueError("LingBot realtime ticks require exactly one camera control.")
-            camera_control = camera_controls[0]
-            if camera_control.schema == LINGBOT_CAMERA_TRAJECTORY_SCHEMA:
-                camera_data = camera_control.data
-                try:
-                    poses = torch.as_tensor(camera_data["poses"], dtype=torch.float32)
-                    intrinsics = torch.as_tensor(
-                        camera_data["intrinsics"],
-                        dtype=torch.float32,
-                    )
-                except (KeyError, TypeError, ValueError):
-                    raise ValueError(
-                        "lingbot.camera_trajectory.v1 requires numeric poses and intrinsics fields."
-                    ) from None
-                if poses.ndim != 3 or poses.shape[1:] != (4, 4):
-                    raise ValueError("camera control poses must have shape [frames, 4, 4].")
-                if intrinsics.ndim != 2 or intrinsics.shape[1:] != (4,):
-                    raise ValueError("camera control intrinsics must have shape [frames, 4].")
-                if poses.shape[0] != intrinsics.shape[0] or poses.shape[0] == 0:
-                    raise ValueError(
-                        "camera control poses and intrinsics must contain the same positive number of frames."
-                    )
-                if not torch.isfinite(poses).all() or not torch.isfinite(intrinsics).all():
-                    raise ValueError("camera control values must all be finite.")
-                trajectory = CameraTrajectory(
-                    poses=poses,
-                    intrinsics=intrinsics,
-                )
-                camera_actions = None
-            elif camera_control.schema == LINGBOT_CAMERA_ACTION_SCHEMA:
-                trajectory = None
-                camera_actions = parse_lingbot_camera_action_frames(
-                    camera_control.data,
-                    expected_frames=3,
-                )
-            else:
-                raise ValueError(
-                    "LingBot realtime camera controls require schema "
-                    "'lingbot.camera_trajectory.v1' or 'lingbot.camera_actions.v1'."
-                )
-            camera_action_script = None
-        elif extra_args.get("camera_action_script") is not None:
-            if extra_args.get("action_path"):
-                raise ValueError("camera_action_script cannot be combined with action_path.")
-            camera_action_script = parse_lingbot_camera_action_script(
-                extra_args.get("camera_action_script"),
-                frames_per_chunk=3,
-            )
-            trajectory = None
-            camera_actions = None
-        else:
-            action_path = extra_args.get("action_path")
-            if action_path is None or action_path == "":
-                # Stepwise / streaming sessions may omit a request-scoped camera
-                # script and instead drive motion via mid-generation camera
-                # interaction (idle hold until the first camera event).
-                if getattr(od_config, "step_execution", False) or getattr(od_config, "streaming_output", False):
-                    trajectory = None
-                    camera_actions = None
-                    camera_action_script = None
-                else:
-                    raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
-            else:
-                if not isinstance(action_path, (str, os.PathLike)) or not str(action_path):
-                    raise ValueError("action_path is required in sampling_params.extra_args.action_path.")
-                if not configured_action_root:
-                    raise ValueError(
-                        "sampling_params.extra_args.action_path requires a trusted action root configured by "
-                        f"model_config.lingbot_action_root or {_ACTION_ROOT_ENV}."
-                    )
-                action_directory = resolve_trusted_action_directory(
-                    action_path,
-                    configured_action_root,
-                )
-                try:
-                    trajectory = load_camera_trajectory(action_directory)
-                except OSError:
-                    raise ValueError(
-                        "Unable to load camera trajectory from action_path; expected poses.npy and intrinsics.npy."
-                    ) from None
-                camera_actions = None
-                camera_action_script = None
-
-        updated_prompt = dict(prompt)
-        updated_multi_modal_data = dict(multi_modal_data)
-        updated_multi_modal_data["image"] = image
-        updated_prompt["multi_modal_data"] = updated_multi_modal_data
-        request.prompt = updated_prompt
-        request.sampling_params.extra_args = {
-            **extra_args,
-            _PREPROCESSED_CAMERA_KEY: trajectory,
-            _PREPROCESSED_CAMERA_ACTIONS_KEY: camera_actions,
-            _PREPROCESSED_CAMERA_ACTION_SCRIPT_KEY: camera_action_script,
-        }
-        return request
-
-    return pre_process_func
+    A generator on purpose: publishing one layer at a time keeps the text-cache
+    build from materializing every layer's K/V at once.
+    """
+    for block in blocks:
+        cross_attention = block.cross_attn
+        shape = (cross_attention.num_local_heads, cross_attention.head_dim)
+        key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(2, shape)
+        value = cross_attention.v(projected_text).unflatten(2, shape)
+        yield key, value
 
 
 def _fold_camera_embedding(
@@ -552,29 +575,32 @@ def _fold_camera_embedding(
     return folded.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
 
 
+def _postprocess_lingbot_video(
+    video: torch.Tensor,
+    output_type: str = "np",
+    sampling_params: Any | None = None,
+    *,
+    video_processor: Any,
+) -> Any:
+    """Wrap the decoded video in the pipeline payload envelope."""
+    if isinstance(video, dict) and isinstance(video.get("payload"), dict):
+        return video
+    if sampling_params is not None:
+        output_type = getattr(sampling_params, "output_type", None) or output_type
+    if output_type == "latent":
+        return video
+    return {
+        "payload": {"video": video_processor.postprocess_video(video, output_type=output_type)},
+        "metadata": {},
+    }
+
+
 def get_lingbot_world_post_process_func(od_config: OmniDiffusionConfig) -> Callable[..., Any]:
     del od_config
     from diffusers.video_processor import VideoProcessor
 
     video_processor = VideoProcessor(vae_scale_factor=8)
-
-    def post_process_func(
-        video: torch.Tensor,
-        output_type: str = "np",
-        sampling_params: Any | None = None,
-    ) -> Any:
-        if isinstance(video, dict) and isinstance(video.get("payload"), dict):
-            return video
-        if sampling_params is not None:
-            output_type = getattr(sampling_params, "output_type", None) or output_type
-        if output_type == "latent":
-            return video
-        return {
-            "payload": {"video": video_processor.postprocess_video(video, output_type=output_type)},
-            "metadata": {},
-        }
-
-    return post_process_func
+    return partial(_postprocess_lingbot_video, video_processor=video_processor)
 
 
 class LingBotWorldCausalDMDPipeline(
@@ -1408,15 +1434,7 @@ class LingBotWorldCausalDMDPipeline(
             ticket = scope.begin_build(identity)
             projected_text = self.transformer.text_embedding(prompt_embeds)
 
-            def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-                for block in self.transformer.blocks:
-                    cross_attention = block.cross_attn
-                    shape = (cross_attention.num_local_heads, cross_attention.head_dim)
-                    key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(2, shape)
-                    value = cross_attention.v(projected_text).unflatten(2, shape)
-                    yield key, value
-
-            scope.publish(ticket, layer_kv())
+            scope.publish(ticket, _project_text_layer_kv(self.transformer.blocks, projected_text))
             layers = scope.lookup(identity)
             assert layers is not None
         return [
@@ -2188,11 +2206,17 @@ class LingBotWorldCausalDMDPipeline(
         states: Sequence[StepRequestState] | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | None:
-        del input_batch, kwargs
+        del kwargs
         if states is None or len(states) != 1:
             raise ValueError("LingBot step execution supports a single request, not a batched request.")
         self._require_bound_ar_state()
         state = states[0]
+        members = getattr(input_batch, "execution_batch", None)
+        if members is not None:
+            if members.request_ids != (state.request_id,):
+                raise ValueError("LingBot compute members do not match the scheduled request")
+            if members.kv_views != (self._ar_diffusion_kv_state,):
+                raise ValueError("LingBot compute member is bound to a different KV backend")
         extra = state.extra
         latents = state.latents
         if latents is None:
@@ -2202,13 +2226,14 @@ class LingBotWorldCausalDMDPipeline(
             raise RuntimeError("LingBot step execution requires a current timestep before denoise_step.")
         schedule = extra["schedule"]
         step_in_chunk = state.step_in_chunk
+        ar_context = self._ar_block_context(extra["ar_cross_attention"])
         return self._dmd_blocks.probe_step(
             current_latents=latents,
             condition=extra["condition"],
             camera=extra["camera"],
             prompt_embeds=cast(torch.Tensor, state.prompt_embeds),
             cache=None,
-            ar=self._ar_block_context(extra["ar_cross_attention"]),
+            ar=ar_context,
             start_frame=int(extra["start_frame"]),
             timestep_value=float(schedule[step_in_chunk][0]),
             step_index=step_in_chunk,

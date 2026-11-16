@@ -91,7 +91,7 @@ def test_capture_disabled_keeps_original_intermediate_schema(monkeypatch):
 )
 @pytest.mark.parametrize("staged", [False, True])
 def test_factory_declares_only_captures_from_earlier_ranks(monkeypatch, start, expected, staged):
-    thinker_config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=8))
+    thinker_config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=8), image_token_id=5)
     config = SimpleNamespace(
         thinker_config=thinker_config,
         talker_config=SimpleNamespace(accept_hidden_layer=24),

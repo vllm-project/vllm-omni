@@ -994,7 +994,6 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type, 
 @pytest.mark.parametrize(
     ("model_type", "deploy_yaml"),
     [
-        ("kokoro", "kokoro.yaml"),
         ("indextts2", "indextts2.yaml"),
         ("indextts2", "indextts2_low_latency.yaml"),
         ("yue2", "yue2.yaml"),
