@@ -470,6 +470,9 @@ The adapters lower this object to each backend's native session shape. A
 top-level value in `--extra-body` overrides its same-named nested sampling
 value. Both adapters default `force_listen_count` to zero, so model response
 eligibility starts at the same input unit even when the object is omitted.
+For SGLang, only the common sampling fields may use the top-level shorthand;
+put backend-specific settings under `sglang`, and the adapter rejects sampling
+fields that the server does not list in its negotiated capabilities.
 Every sample metadata file records the requested sampling configuration; the
 SGLang adapter also records the configuration echoed by `session.updated` and
 the server's supported sampling fields.

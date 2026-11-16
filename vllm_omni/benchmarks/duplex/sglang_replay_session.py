@@ -34,6 +34,13 @@ from vllm_omni.experimental.fullduplex.client import (
 )
 
 _HANDSHAKE_TIMEOUT_S = 60.0
+_COMMON_SAMPLING_PARAMETERS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "repetition_penalty",
+    "force_listen_count",
+)
 
 
 class _RealtimeClient(Protocol):
@@ -108,7 +115,15 @@ def _sglang_extension(ref_audio: str | None, extra_body: dict[str, object] | Non
     if not isinstance(top_level_sampling, Mapping):
         raise ValueError("extra_body.sampling must be an object")
     sampling.update(top_level_sampling)
-    sampling.update(options)
+    for key in _COMMON_SAMPLING_PARAMETERS:
+        if key in options:
+            sampling[key] = options.pop(key)
+    if options:
+        unsupported = ", ".join(sorted(options))
+        raise ValueError(
+            f"Unsupported top-level extra_body keys for SGLang replay: {unsupported}. "
+            "Put backend-specific settings under extra_body.sglang."
+        )
     # vLLM's native replay client uses zero forced-listen turns. Match that
     # default while preserving an explicit benchmark override.
     sampling.setdefault("force_listen_count", 0)
@@ -154,7 +169,7 @@ class SGLangReplaySession:
 
         def arrived() -> bool:
             for received in self.events.events[from_index:]:
-                if received.get("type") == "error":
+                if received.get("type") == "error" and event_id in _related_event_ids(received):
                     return True
                 if received.get("type") == response_type and event_id in _related_event_ids(received):
                     return True
@@ -166,7 +181,7 @@ class SGLangReplaySession:
             raise TimeoutError(f"Timed out waiting for {response_type}")
         await wait_for(arrived, timeout_s=remaining_s, label=response_type)
         for received in self.events.events[from_index:]:
-            if received.get("type") == "error":
+            if received.get("type") == "error" and event_id in _related_event_ids(received):
                 raise ConnectionError(_error_message(received))
             if received.get("type") == response_type and event_id in _related_event_ids(received):
                 return received
@@ -235,12 +250,21 @@ class SGLangReplaySession:
         effective_sampling = effective_extension.get("sampling") if isinstance(effective_extension, Mapping) else None
         requested_sampling = extension.get("sampling")
         supported_sampling = granted.get("sampling_parameters")
+        if not isinstance(supported_sampling, list) or not all(
+            isinstance(parameter, str) for parameter in supported_sampling
+        ):
+            raise ValueError("SGLang session did not report supported sampling_parameters")
+        requested_keys = set(requested_sampling) if isinstance(requested_sampling, Mapping) else set()
+        unsupported_sampling = requested_keys.difference(supported_sampling)
+        if unsupported_sampling:
+            unsupported = ", ".join(sorted(unsupported_sampling))
+            raise ValueError(f"SGLang session does not support requested sampling parameters: {unsupported}")
         self.session_configuration = {
             "backend": "sglang",
             "requested_sampling": dict(requested_sampling) if isinstance(requested_sampling, Mapping) else {},
             "effective_sampling": dict(effective_sampling) if isinstance(effective_sampling, Mapping) else {},
             "sampling_source": "server_echo",
-            "supported_sampling_parameters": list(supported_sampling) if isinstance(supported_sampling, list) else [],
+            "supported_sampling_parameters": list(supported_sampling),
         }
 
     def prepare_input(self, pcm: bytes, frames: tuple[tuple[float, bytes], ...]) -> bytes:
@@ -295,15 +319,12 @@ class SGLangReplaySession:
                 await asyncio.sleep(max(0.0, started_at + audio_end_ms / 1000 - time.monotonic()))
 
     async def finish_input(self, *, timeout_s: float) -> ReplayDrainResult:
-        try:
-            await self._send_and_wait(
-                {"type": "sglang.input_audio.end", "event_id": f"evt_{uuid4().hex}"},
-                response_type="sglang.input_audio.drained",
-                timeout_s=timeout_s,
-            )
-        except TimeoutError as exc:
+        deadline = time.monotonic() + timeout_s
+
+        def timeout_result(message: str) -> ReplayDrainResult:
             return ReplayDrainResult(
-                drain_timeout=str(exc) or "SGLang input drain timed out",
+                input_committed=True,
+                drain_timeout=message,
                 drain_timeout_state={
                     "response_ids": list(self.events.response_ids),
                     "unfinished_response_ids": [
@@ -313,10 +334,32 @@ class SGLangReplaySession:
                     ],
                 },
             )
-        return ReplayDrainResult(
-            response_done=all(self.events.response_is_done(response_id) for response_id in self.events.response_ids),
-            input_committed=True,
-        )
+
+        try:
+            await self._send_and_wait(
+                {"type": "sglang.input_audio.end", "event_id": f"evt_{uuid4().hex}"},
+                response_type="sglang.input_audio.drained",
+                timeout_s=timeout_s,
+            )
+        except TimeoutError as exc:
+            result = timeout_result(str(exc) or "SGLang input drain timed out")
+            result.input_committed = False
+            return result
+
+        def responses_finished() -> bool:
+            self._client.raise_if_reader_stopped()
+            response_ids = self.events.response_ids
+            return bool(response_ids) and all(self.events.response_is_done(response_id) for response_id in response_ids)
+
+        if not responses_finished():
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                return timeout_result("Timed out waiting for response.done after SGLang input drain")
+            try:
+                await wait_for(responses_finished, timeout_s=remaining_s, label="response.done")
+            except TimeoutError as exc:
+                return timeout_result(str(exc) or "Timed out waiting for response.done after SGLang input drain")
+        return ReplayDrainResult(response_done=True, input_committed=True)
 
     async def acknowledge_playback(self) -> None:
         # SGLang's native protocol does not require playback acknowledgements.

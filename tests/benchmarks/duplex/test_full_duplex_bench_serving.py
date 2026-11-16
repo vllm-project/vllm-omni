@@ -158,10 +158,12 @@ def test_v15_serving_selection_preserves_complete_pairs(tmp_path: Path):
     assert args.max_concurrency == 1
 
 
-def test_sglang_backend_is_accepted_for_full_duplex_bench(tmp_path: Path):
+def test_sglang_backend_is_registered_and_accepted_for_full_duplex_bench(tmp_path: Path):
     args = _args(tmp_path, "--backend", "sglang-realtime-duplex")
     preprocess_serve_args(args)
     assert args.backend == "sglang-realtime-duplex"
+    assert patch.ASYNC_REQUEST_FUNCS[args.backend] is patch.async_request_sglang_realtime_duplex
+    assert args.backend in patch.OPENAI_COMPATIBLE_BACKENDS
 
 
 def test_sglang_backend_rejects_server_vad(tmp_path: Path):

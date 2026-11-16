@@ -798,7 +798,8 @@ class _VLLMReplaySession:
             auto_response=not self._server_turns,
             turn_detection=session_turn_detection(turn_detection),
         )
-        requested_sampling = {**normalized_options, "force_listen_count": 0}
+        requested_sampling = dict(normalized_options)
+        requested_sampling.setdefault("force_listen_count", 0)
         if temperature is not None:
             requested_sampling["temperature"] = float(temperature)
         self.session_configuration = {

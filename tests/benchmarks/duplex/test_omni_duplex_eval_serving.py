@@ -512,8 +512,8 @@ async def test_vllm_session_normalizes_shared_sampling_options():
         ref_audio=None,
         instructions=None,
         extra_body={
-            "sampling": {"temperature": 0.7, "top_p": 0.8, "force_listen_count": 2},
-            "force_listen_count": 0,
+            "sampling": {"temperature": 0.7, "top_p": 0.8, "force_listen_count": 0},
+            "force_listen_count": 2,
             "sglang": {"tail_policy": "pad"},
         },
         turn_detection="none",
@@ -523,12 +523,31 @@ async def test_vllm_session_normalizes_shared_sampling_options():
     model, configured = client.configured
     assert model == "served-model"
     assert configured["temperature"] == 0.7
-    assert configured["extra_body"] == {"top_p": 0.8, "force_listen_count": 0}
+    assert configured["extra_body"] == {"top_p": 0.8, "force_listen_count": 2}
     assert session.session_configuration == {
         "backend": "vllm",
-        "requested_sampling": {"top_p": 0.8, "force_listen_count": 0, "temperature": 0.7},
+        "requested_sampling": {"top_p": 0.8, "force_listen_count": 2, "temperature": 0.7},
         "sampling_source": "client_request",
     }
+
+
+@pytest.mark.asyncio
+async def test_vllm_client_preserves_explicit_force_listen_count(monkeypatch):
+    client = runner.RealtimeDuplexClient("ws://example.test/v1/realtime")
+    client.events.add({"type": "session.created", "session": {"capabilities": {}}})
+    sent = []
+
+    async def send(event):
+        sent.append(event)
+
+    monkeypatch.setattr(client, "send", send)
+    await client.configure(
+        "served-model",
+        extra_body={"force_listen_count": 2},
+        timeout_s=0.1,
+    )
+
+    assert sent[0]["session"]["extra_body"]["force_listen_count"] == 2
 
 
 @pytest.mark.asyncio

@@ -347,7 +347,8 @@ class RealtimeDuplexClient:
     ) -> None:
         session_extra_body = dict(extra_body or {})
         session_extra_body.pop("native_duplex", None)
-        session_extra_body.update(auto_response=auto_response, force_listen_count=0)
+        session_extra_body["auto_response"] = auto_response
+        session_extra_body.setdefault("force_listen_count", 0)
         session: dict[str, object] = {
             "model": model,
             "modalities": ["audio", "text"],

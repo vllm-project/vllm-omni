@@ -267,6 +267,9 @@ def add_full_duplex_bench_cli_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--fdb-instructions",
         help="Session system prompt. Defaults to the native-duplex prompt; pass '' to use the server default.",
+    )
+
+
 def add_duplex_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add shared duplex workload and metric options."""
     group = parser.add_argument_group("Duplex Benchmark Options")

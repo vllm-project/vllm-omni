@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 
 import pybase64 as base64
@@ -23,11 +24,20 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
 
 
 class _FakeRealtimeClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        finish_mode: str = "normal",
+        supported_sampling: list[str] | None = None,
+        uncorrelated_update_error: bool = False,
+    ) -> None:
         self.events = RealtimeEventCollector()
         self.sent: list[dict[str, object]] = []
         self.media_clock_ms: list[int] = []
         self._received_at_s = 0.0
+        self.finish_mode = finish_mode
+        self.supported_sampling = supported_sampling or ["temperature", "force_listen_count"]
+        self.uncorrelated_update_error = uncorrelated_update_error
         self.events.add(
             {"type": "session.created", "session": {"id": "session-1"}},
             received_at_s=self._next_time(),
@@ -51,6 +61,14 @@ class _FakeRealtimeClient:
             assert isinstance(requested_session, Mapping)
             requested_extension = requested_session.get("sglang", {})
             assert isinstance(requested_extension, Mapping)
+            if self.uncorrelated_update_error:
+                self._add(
+                    {
+                        "type": "error",
+                        "event_id": "unrelated-event",
+                        "error": {"message": "unrelated asynchronous failure"},
+                    }
+                )
             self._add(
                 {
                     "type": "session.updated",
@@ -68,13 +86,16 @@ class _FakeRealtimeClient:
                                 "native_unit_ms": 1000,
                                 "input_audio_format": {"type": "audio/pcm", "rate": 16000},
                                 "output_audio_format": {"type": "audio/pcm", "rate": 16000},
-                                "sampling_parameters": ["temperature", "force_listen_count"],
+                                "sampling_parameters": self.supported_sampling,
                             },
                         },
                     },
                 }
             )
         elif event_type == "sglang.input_audio.end":
+            if self.finish_mode == "no_response":
+                self._add({"type": "sglang.input_audio.drained", "client_event_id": event_id})
+                return
             response_id = "response-1"
             audio = base64.b64encode(bytes(3200)).decode("ascii")
             origin = {
@@ -116,19 +137,23 @@ class _FakeRealtimeClient:
                 },
                 increment=0.25,
             )
-            self._add(
-                {
-                    "type": "response.done",
-                    "response": {"id": response_id, "status": "completed"},
-                    "response_request_metrics": {
-                        "source": "server_monotonic_request_start",
-                        "measurement_origin": origin,
-                        "ttft_ms": 12.5,
-                        "ttfp_ms": 34.5,
-                    },
-                }
-            )
-            self._add({"type": "sglang.input_audio.drained", "client_event_id": event_id})
+            done: dict[str, object] = {
+                "type": "response.done",
+                "response": {"id": response_id, "status": "completed"},
+                "response_request_metrics": {
+                    "source": "server_monotonic_request_start",
+                    "measurement_origin": origin,
+                    "ttft_ms": 12.5,
+                    "ttfp_ms": 34.5,
+                },
+            }
+            if self.finish_mode == "normal":
+                self._add(done)
+                self._add({"type": "sglang.input_audio.drained", "client_event_id": event_id})
+            else:
+                self._add({"type": "sglang.input_audio.drained", "client_event_id": event_id})
+                if self.finish_mode == "drained_before_done":
+                    asyncio.get_running_loop().call_later(0.01, lambda: self._add(done))
         elif event_type == "session.close":
             self._add({"type": "session.closed", "client_event_id": event_id})
 
@@ -235,3 +260,129 @@ async def test_sglang_session_rejects_server_vad():
             extra_body=None,
             turn_detection="server_vad",
         )
+
+
+@pytest.mark.asyncio
+async def test_sglang_session_preserves_explicit_force_listen_count():
+    client = _FakeRealtimeClient()
+    session = SGLangReplaySession(client)
+
+    await session.configure(
+        "served-model",
+        ref_audio=None,
+        instructions=None,
+        extra_body={"sampling": {"force_listen_count": 2}},
+        turn_detection="none",
+    )
+
+    extension = _session_payload(client)["sglang"]
+    assert isinstance(extension, Mapping)
+    assert extension["sampling"] == {"force_listen_count": 2}
+    assert session.session_configuration["requested_sampling"] == {"force_listen_count": 2}
+
+
+@pytest.mark.asyncio
+async def test_sglang_session_rejects_unknown_top_level_extra_body():
+    client = _FakeRealtimeClient()
+    session = SGLangReplaySession(client)
+
+    with pytest.raises(ValueError, match="Unsupported top-level extra_body keys.*mystery_option"):
+        await session.configure(
+            "served-model",
+            ref_audio=None,
+            instructions=None,
+            extra_body={"mystery_option": True},
+            turn_detection="none",
+        )
+    assert not any(event["type"] == "session.update" for event in client.sent)
+
+
+@pytest.mark.asyncio
+async def test_sglang_session_rejects_sampling_not_granted_by_server():
+    session = SGLangReplaySession(_FakeRealtimeClient(supported_sampling=["force_listen_count"]))
+
+    with pytest.raises(ValueError, match="does not support requested sampling parameters: top_p"):
+        await session.configure(
+            "served-model",
+            ref_audio=None,
+            instructions=None,
+            extra_body={"top_p": 0.8},
+            turn_detection="none",
+        )
+
+
+@pytest.mark.asyncio
+async def test_sglang_command_wait_ignores_uncorrelated_error():
+    client = _FakeRealtimeClient(uncorrelated_update_error=True)
+    session = SGLangReplaySession(client)
+
+    await session.configure(
+        "served-model",
+        ref_audio=None,
+        instructions=None,
+        extra_body=None,
+        turn_detection="none",
+    )
+
+    assert session.session_configuration["backend"] == "sglang"
+    assert client.events.count("error") == 1
+
+
+@pytest.mark.asyncio
+async def test_sglang_finish_waits_for_response_done_after_drained():
+    client = _FakeRealtimeClient(finish_mode="drained_before_done")
+    session = SGLangReplaySession(client)
+    await session.configure(
+        "served-model",
+        ref_audio=None,
+        instructions=None,
+        extra_body=None,
+        turn_detection="none",
+    )
+
+    drain = await session.finish_input(timeout_s=1.0)
+
+    assert drain.input_committed and drain.response_done
+    assert drain.drain_timeout is None
+    assert client.events.count("response.done") == 1
+
+
+@pytest.mark.asyncio
+async def test_sglang_finish_reports_unfinished_response_after_drained():
+    client = _FakeRealtimeClient(finish_mode="drained_without_done")
+    session = SGLangReplaySession(client)
+    await session.configure(
+        "served-model",
+        ref_audio=None,
+        instructions=None,
+        extra_body=None,
+        turn_detection="none",
+    )
+
+    drain = await session.finish_input(timeout_s=0.05)
+
+    assert drain.input_committed and not drain.response_done
+    assert drain.drain_timeout is not None
+    assert drain.drain_timeout_state == {
+        "response_ids": ["response-1"],
+        "unfinished_response_ids": ["response-1"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_sglang_finish_times_out_when_no_response_was_created():
+    client = _FakeRealtimeClient(finish_mode="no_response")
+    session = SGLangReplaySession(client)
+    await session.configure(
+        "served-model",
+        ref_audio=None,
+        instructions=None,
+        extra_body=None,
+        turn_detection="none",
+    )
+
+    drain = await session.finish_input(timeout_s=0.05)
+
+    assert drain.input_committed and not drain.response_done
+    assert drain.drain_timeout is not None
+    assert drain.drain_timeout_state == {"response_ids": [], "unfinished_response_ids": []}
