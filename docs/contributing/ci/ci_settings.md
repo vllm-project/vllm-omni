@@ -183,6 +183,15 @@ Canonical layout (prefer these paths for new changes):
 
     **Rendering:** [`test-template-amd-omni.j2`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/test-template-amd-omni.j2) wraps data steps with `amd-build` image build and `amd_<agent_pool>` queues. Do **not** hand-edit generated `pipeline.yaml`.
 
+    **Image-builder isolation:** each invocation of `build-ci-image.sh` creates a
+    job-specific Docker Buildx builder and passes its name explicitly to dependency
+    export and image-push commands. It never changes the selected builder in shared
+    Docker client configuration. An exit trap removes only the builder it created,
+    with bounded, best-effort cleanup that preserves the build's exit status.
+    Registry cache keys, image tags, publication concurrency, and downstream test
+    dependencies remain controlled by the existing script and pipeline. Builder
+    isolation does not serialize writes to a shared registry cache reference.
+
     **Hardware in YAML:** `agent_pool` (for example `mi325_1`) plus `mirror_hardwares: [amdproduction]` (array—Buildkite template filter, not the CUDA/NPU uploader preset mechanism).
 
     **READY/MERGE CPU timing:** the three **Model Executor** shards and **Other Test** use
