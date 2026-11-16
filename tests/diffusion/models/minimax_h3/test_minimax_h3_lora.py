@@ -30,11 +30,17 @@ _TINY_TARGET_DIMS = {
     "ff.net.0.proj": (2, 4),
     "ff.net.2": (2, 2),
 }
+_TINY_ADALN_TARGET_DIMS = {
+    "adaln_proj.linear": (2, 6),
+    "norm_out.linear": (2, 4),
+}
+_V1_2_EIGHT_STEP = "minimax_h3_fl2v_turbo_8step_v1.2_768p_bf16.safetensors"
 
 
 @pytest.fixture(autouse=True)
 def _use_tiny_h3_dimensions(monkeypatch):
     monkeypatch.setattr(lora_module, "_TURBO_TARGET_DIMS", _TINY_TARGET_DIMS)
+    monkeypatch.setattr(lora_module, "_TURBO_ADALN_TARGET_DIMS", _TINY_ADALN_TARGET_DIMS)
 
 
 def _request(path) -> LoRARequest:
@@ -52,10 +58,31 @@ def _write_tiny_turbo(
     key_format: str = "minimax-h3-diffusers",
     omit_target: str | None = None,
     shape_overrides: dict[str, tuple[int, int]] | None = None,
+    target_alpha: float | None = None,
+    adaln_rank: int | None = None,
+    adaln_alpha: float | None = None,
+    omit_alpha: str | None = None,
 ) -> None:
+    """Write a tiny Turbo artifact.
+
+    ``target_alpha`` adds the per-target scalar alphas and ``adaln_rank`` the 51
+    AdaLN pairs; together they give the ``8step_v1.2`` layout.
+    """
     rank = 128
     tensors = {}
     overrides = shape_overrides or {}
+    if adaln_rank is not None:
+        for target in sorted(lora_module._TURBO_EXPECTED_ADALN_RAW_TARGETS):
+            if target == omit_target:
+                continue
+            suffix = "norm_out.linear" if target == "norm_out.linear" else "adaln_proj.linear"
+            input_dim, output_dim = _TINY_ADALN_TARGET_DIMS[suffix]
+            a_name = f"{target}.lora_A.default.weight"
+            b_name = f"{target}.lora_B.default.weight"
+            tensors[a_name] = torch.ones(overrides.get(a_name, (adaln_rank, input_dim)))
+            tensors[b_name] = torch.ones(overrides.get(b_name, (output_dim, adaln_rank)))
+            if adaln_alpha is not None and target != omit_alpha:
+                tensors[f"{target}.alpha"] = torch.tensor(float(adaln_alpha))
     target_suffixes = (
         "attn.to_q",
         "attn.to_k",
@@ -90,6 +117,8 @@ def _write_tiny_turbo(
                         )
                 else:
                     tensors[b_name] = torch.ones(overrides.get(b_name, (output_dim, rank)))
+                if target_alpha is not None and target != omit_alpha:
+                    tensors[f"{target}.alpha"] = torch.tensor(float(target_alpha))
     metadata = {"key_format": key_format}
     if alpha is not None:
         metadata["alpha"] = alpha
@@ -602,3 +631,234 @@ def test_h3_finds_turbo_in_composition(turbo_scale):
     sampling.lora_request.reverse()
     sampling.lora_scale.reverse()
     assert pipeline._active_turbo_spec(sampling) is (spec if turbo_scale else None)
+
+
+def _load_v1_2(tmp_path, **kwargs):
+    path = tmp_path / _V1_2_EIGHT_STEP
+    _write_tiny_turbo(path, **{"target_alpha": 128.0, "adaln_rank": 16, "adaln_alpha": 16.0, **kwargs})
+    return load_minimax_h3_turbo_lora(
+        partition="fl2va",
+        lora_request=_request(path),
+        lora_path=path,
+        dtype=torch.float32,
+    )
+
+
+def test_h3_turbo_loads_the_eight_step_v1_2_layout(tmp_path):
+    """``8step_v1.2`` adds per-target alphas and 51 lower-rank AdaLN pairs."""
+    import regex as re
+
+    loaded = _load_v1_2(tmp_path)
+
+    assert loaded is not None
+    lora_model, peft_helper, spec = loaded
+    assert spec.denoise_steps == 8
+    assert spec.alpha == 128
+    assert peft_helper.r == 128
+    assert len(lora_model.loras) == 312 + 51
+    # The AdaLN pairs keep their own rank and scaling; the others keep theirs.
+    for name in ("blocks.0.adaln_proj.linear", "blocks.49.adaln_proj.linear", "final_layer.adaln_proj.linear"):
+        weights = lora_model.get_lora(name)
+        assert (weights.rank, weights.lora_alpha, weights.scaling) == (16, 16.0, 1.0)
+        assert weights.lora_a.shape[0] == 16
+        assert weights.lora_b.shape[1] == 16
+    assert lora_model.get_lora("final_layer.adaln_proj.linear").lora_b.shape[0] == 4
+    to_q = lora_model.get_lora("blocks.0.attn.to_q")
+    assert (to_q.rank, to_q.scaling) == (128, 1.0)
+
+    pattern = peft_helper.target_modules
+    assert re.search(pattern, "transformer.blocks.7.adaln_proj.linear")
+    assert re.search(pattern, "transformer.final_layer.adaln_proj.linear")
+    assert re.search(pattern, "transformer.blocks.7.attn.to_q")
+    assert re.search(pattern, "transformer.token_refiner.blocks.0.mlp.fc2")
+    # Anchored on both ends, and the token refiner has no AdaLN pair.
+    assert re.search(pattern, "transformer.token_refiner.blocks.0.adaln_proj.linear") is None
+    assert re.search(pattern, "transformer.blocks.7.adaln_proj.linear.base_layer") is None
+    assert re.search(pattern, "transformer.blocks.7.attn.to_q.base_layer") is None
+    assert re.search(pattern, "transformer.controlnet.blocks.0.adaln_proj.linear") is None
+
+
+def test_h3_turbo_eight_step_v1_2_runs_at_the_base_flow_shift():
+    """LightX2V's reference configs run this 768p artifact at shift 12, not 6."""
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    spec = _spec(_V1_2_EIGHT_STEP)
+    assert spec.video_shift == 12.0
+    assert spec.audio_shift == 3.0
+    # The other 768p artifacts keep the rule their name implies.
+    assert _spec("minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors").video_shift == 6.0
+    assert _spec("minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors").video_shift == 6.0
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    pipeline.default_video_shift = 12.0
+    pipeline.default_audio_shift = 3.0
+    pipeline._validate_turbo_sampling(
+        SimpleNamespace(num_inference_steps=8, extra_args={"flow_shift": 12.0, "audio_flow_shift": 3.0}),
+        spec,
+    )
+    pipeline._validate_turbo_sampling(SimpleNamespace(num_inference_steps=8, extra_args={}), spec)
+    with pytest.raises(OmniClientError, match="requires flow_shift=12"):
+        pipeline._validate_turbo_sampling(
+            SimpleNamespace(num_inference_steps=8, extra_args={"flow_shift": 6.0, "audio_flow_shift": 3.0}),
+            spec,
+        )
+
+
+def test_h3_turbo_artifacts_without_adaln_pairs_leave_the_projections_unwrapped(tmp_path):
+    import regex as re
+
+    path = tmp_path / "minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors"
+    _write_tiny_turbo(path, alpha="8")
+    loaded = load_minimax_h3_turbo_lora(
+        partition="fl2va",
+        lora_request=_request(path),
+        lora_path=path,
+        dtype=torch.float32,
+    )
+
+    assert loaded is not None
+    lora_model, peft_helper, _ = loaded
+    assert len(lora_model.loras) == 312
+    assert peft_helper.target_modules == lora_module._TURBO_TARGET_PATTERN
+    assert re.search(peft_helper.target_modules, "transformer.blocks.7.adaln_proj.linear") is None
+    assert re.search(peft_helper.target_modules, "transformer.final_layer.adaln_proj.linear") is None
+
+
+def test_h3_turbo_adaln_pairs_scale_by_their_own_alpha_and_rank(tmp_path):
+    """The manager folds each module's scaling into B, so it must be per module."""
+    path = tmp_path / _V1_2_EIGHT_STEP
+    _write_tiny_turbo(path, alpha="64", target_alpha=64.0, adaln_rank=4, adaln_alpha=2.0)
+
+    class _Pipeline:
+        def _load_diffusion_lora_adapter(self, **kwargs):
+            lora_model, peft_helper, _spec_unused = load_minimax_h3_turbo_lora(partition="fl2va", **kwargs)
+            return lora_model, peft_helper
+
+    manager = object.__new__(DiffusionLoRAManager)
+    manager.pipeline = _Pipeline()
+    manager.dtype = torch.float32
+    manager.lora_application = "runtime"
+    manager._expected_lora_modules = {"to_q", "fc1", "linear"}
+
+    lora_model, peft_helper = manager._load_adapter(_request(path))
+
+    assert peft_helper.lora_alpha == 64
+    adaln = lora_model.get_lora("blocks.3.adaln_proj.linear")
+    assert adaln.rank == 4
+    torch.testing.assert_close(adaln.lora_b, torch.full((6, 4), 2.0 / 4))
+    final = lora_model.get_lora("final_layer.adaln_proj.linear")
+    torch.testing.assert_close(final.lora_b, torch.full((4, 4), 2.0 / 4))
+    torch.testing.assert_close(lora_model.get_lora("blocks.3.attn.to_q").lora_b, torch.full((3, 128), 64.0 / 128))
+
+
+def test_h3_turbo_per_target_alpha_stands_in_for_missing_metadata(tmp_path):
+    loaded = _load_v1_2(tmp_path, alpha=None, target_alpha=32.0)
+
+    assert loaded is not None
+    lora_model, peft_helper, spec = loaded
+    assert spec.alpha == 32
+    assert peft_helper.lora_alpha == 32
+    assert lora_model.get_lora("blocks.0.attn.to_q").scaling == 32 / 128
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"omit_target": "transformer_blocks.49.adaln_proj.linear"}, "target set does not match"),
+        ({"omit_target": "norm_out.linear"}, "target set does not match"),
+        ({"target_alpha": None, "adaln_alpha": None}, "need per-target alpha tensors"),
+        ({"omit_alpha": "transformer_blocks.3.attn.to_q"}, "per-target alphas do not match"),
+        ({"omit_alpha": "norm_out.linear"}, "per-target alphas do not match"),
+        ({"alpha": "8"}, "in its metadata"),
+        ({"adaln_alpha": 0.0}, "must be a positive number"),
+        (
+            {"shape_overrides": {"transformer_blocks.0.adaln_proj.linear.lora_B.default.weight": (6, 8)}},
+            "disagree on their rank",
+        ),
+        (
+            {"shape_overrides": {"transformer_blocks.0.adaln_proj.linear.lora_A.default.weight": (16, 3)}},
+            "invalid global shape",
+        ),
+        (
+            {"shape_overrides": {"norm_out.linear.lora_B.default.weight": (6, 16)}},
+            "invalid global shape",
+        ),
+        (
+            # Above the rank the manager's buffers are sized for.
+            {"adaln_rank": 256, "adaln_alpha": 256.0},
+            "invalid global shape",
+        ),
+    ],
+)
+def test_h3_turbo_rejects_inconsistent_adaln_and_alpha_tensors(tmp_path, kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        _load_v1_2(tmp_path, **kwargs)
+
+
+def test_h3_turbo_rejects_alpha_tensors_that_differ_across_the_rank_128_pairs(tmp_path):
+    path = tmp_path / _V1_2_EIGHT_STEP
+    _write_tiny_turbo(path, target_alpha=128.0, adaln_rank=16, adaln_alpha=16.0)
+    from safetensors.torch import load_file
+
+    tensors = load_file(str(path))
+    tensors["transformer_blocks.5.ff.net.2.alpha"] = torch.tensor(8.0)
+    save_file(tensors, str(path), metadata={"key_format": "minimax-h3-diffusers", "alpha": "128"})
+
+    with pytest.raises(ValueError, match="must share one alpha"):
+        load_minimax_h3_turbo_lora(
+            partition="fl2va",
+            lora_request=_request(path),
+            lora_path=path,
+            dtype=torch.float32,
+        )
+
+
+@pytest.mark.parametrize("with_adaln", [False, True])
+def test_h3_turbo_binds_the_adaln_projections_only_for_artifacts_that_carry_them(monkeypatch, with_adaln):
+    from vllm.lora.layers import BaseLayerWithLoRA
+    from vllm.lora.peft_helper import PEFTHelper
+
+    from vllm_omni.lora import manager as manager_module
+
+    class _StubLoRALayer(BaseLayerWithLoRA):
+        def __init__(self, base_layer):
+            super().__init__()
+            self.base_layer = base_layer
+
+    def _block() -> torch.nn.Module:
+        block = torch.nn.Module()
+        block.attn = torch.nn.Module()
+        block.attn.out_proj = torch.nn.Linear(2, 2)
+        block.mlp = torch.nn.Module()
+        block.mlp.fc2 = torch.nn.Linear(2, 2)
+        block.adaln_proj = torch.nn.Module()
+        block.adaln_proj.linear = torch.nn.Linear(2, 2)
+        return block
+
+    transformer = torch.nn.Module()
+    transformer.blocks = torch.nn.ModuleList([_block() for _ in range(50)])
+    transformer.final_layer = torch.nn.Module()
+    transformer.final_layer.adaln_proj = torch.nn.Module()
+    transformer.final_layer.adaln_proj.linear = torch.nn.Linear(2, 2)
+    pipeline = torch.nn.Module()
+    pipeline.transformer = transformer
+
+    monkeypatch.setattr(manager_module, "from_layer", lambda *, layer, **_: _StubLoRALayer(layer))
+
+    manager = object.__new__(DiffusionLoRAManager)
+    manager.pipeline = pipeline
+    manager.dtype = torch.float32
+    manager.max_cached_adapters = 1
+    manager._lora_modules = {}
+    manager._max_lora_rank = 128
+    manager._resident_lora_device = None
+
+    pattern = lora_module._TURBO_ADALN_TARGET_PATTERN if with_adaln else lora_module._TURBO_TARGET_PATTERN
+    manager._replace_layers_with_lora(PEFTHelper.from_dict({"r": 128, "lora_alpha": 128, "target_modules": pattern}))
+
+    adaln = {name for name in manager._lora_modules if name.endswith("adaln_proj.linear")}
+    expected = {f"transformer.blocks.{index}.adaln_proj.linear" for index in range(50)}
+    expected.add("transformer.final_layer.adaln_proj.linear")
+    assert adaln == (expected if with_adaln else set())
+    assert "transformer.blocks.0.attn.out_proj" in manager._lora_modules
+    assert "transformer.blocks.49.mlp.fc2" in manager._lora_modules
