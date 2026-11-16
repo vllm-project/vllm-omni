@@ -33,7 +33,6 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.attention.backends.utils.fa import is_flash_attn_available
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import (
     reinit_rotary_inv_freq,
@@ -163,7 +162,7 @@ def _pick(info: dict, key: str, default):
 
 def _configure_attention_implementation(lm: nn.Module, device: torch.device) -> None:
     if device.type == "cuda":
-        if is_flash_attn_available():
+        if current_omni_platform.supports_standalone_flash_attn():
             lm._set_attention_implementation("flash_attention_2")
             logger.info("MOSS-TTS-Nano using flash_attention_2")
         else:

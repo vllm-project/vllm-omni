@@ -77,6 +77,13 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         return is_flash_attn_installed()
 
     @classmethod
+    def supports_standalone_flash_attn(cls) -> bool:
+        """Follow vLLM's ViT backend rule."""
+        from vllm.platforms.rocm import flash_attn_triton_available, on_cdna
+
+        return super().supports_standalone_flash_attn() and (on_cdna() or flash_attn_triton_available())
+
+    @classmethod
     def apply_diffusion_model_patches(cls, model: nn.Module, od_config: "OmniDiffusionConfig") -> None:
         from vllm_omni.platforms.rocm.patch.worker.patch_groupnorm import apply_aiter_groupnorm
 

@@ -207,6 +207,15 @@ class OmniPlatform(Platform):
         return False
 
     @classmethod
+    def supports_standalone_flash_attn(cls) -> bool:
+        """Whether the ``flash_attn`` package imports and can run on this platform."""
+        try:
+            import flash_attn  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    @classmethod
     def get_diffusion_worker_cls(cls) -> str:
         """Get the diffusion worker class path for this platform.
 

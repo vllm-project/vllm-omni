@@ -89,8 +89,8 @@ from vllm.multimodal.processing.processor import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import is_list_of
 
-from vllm_omni.diffusion.attention.backends.utils.fa import is_flash_attn_available
 from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.component_config import (
     ComponentQuantizationConfig,
     resolve_encoder_quant_config,
@@ -1050,7 +1050,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
 
         # force "use_flash_attention_2=True" to audio tower to align
         # the results.
-        if is_flash_attn_available():
+        if current_omni_platform.supports_standalone_flash_attn():
             audio_config = thinker_config.audio_config
             audio_config._attn_implementation_autoset = True
             audio_config._attn_implementation = "flash_attention_2"
