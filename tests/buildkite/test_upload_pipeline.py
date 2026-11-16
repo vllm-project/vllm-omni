@@ -1490,6 +1490,7 @@ def test_qwen_image_21_accuracy_model_dependencies(
     assert any(selector in command for command in step["commands"])
     assert "tests/e2e/accuracy/artifacts/qwen_image_21/**/*" in step["artifact_paths"]
 
+
 @pytest.mark.parametrize(
     "changed_path,expected_group",
     [
@@ -1507,7 +1508,8 @@ def test_mammoth_fp8_routes_shared_image_changes_to_cpu(
     labels = {
         step["label"]: step["source_file_dependencies"]
         for step in _iter_steps(doc)
-        if step.get("source_file_dependencies") in (
+        if step.get("source_file_dependencies")
+        in (
             "omni_mammoth_moda2_image_contract",
             "omni_mammoth_moda2_fp8",
         )
