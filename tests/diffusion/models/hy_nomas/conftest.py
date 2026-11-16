@@ -23,7 +23,7 @@ def single_rank_parallel(monkeypatch):
         lambda *_args, **_kwargs: default_unquantized_gemm,
     )
     assign_ephemeral_master_port()
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
-    initialize_model_parallel()
+    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://", backend="gloo")
+    initialize_model_parallel(backend="gloo")
     yield
     cleanup_dist_env_and_memory()
