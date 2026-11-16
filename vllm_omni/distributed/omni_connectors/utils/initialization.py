@@ -46,11 +46,23 @@ ORCHESTRATOR_PORT_OFFSET = 200
 ConnectorPurpose = Literal["request_forwarding", "kv_transfer", "orchestrator"]
 
 
+def _is_auto_host(value: object) -> bool:
+    return value is None or str(value).strip().lower() in {"", "auto", "0.0.0.0", "*", "::"}
+
+
 def _resolve_local_host() -> str:
-    """Return this process's IP for same-host headless connector fallback."""
+    """Return the routed local address used by the NIXL handshake producer."""
     import socket
 
-    return socket.gethostbyname(socket.gethostname())
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))
+            return str(probe.getsockname()[0])
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
 
 
 def compute_connector_zmq_port(
@@ -116,17 +128,20 @@ def resolve_connector_spec(
         )
     if role == "receiver":
         sender_host = extra.get("sender_host")
-        if sender_host is None or str(sender_host).lower() in {
-            "auto",
-            "0.0.0.0",
-            "*",
-            "::",
-        }:
+        host = extra.get("host")
+        if not _is_auto_host(sender_host):
+            # Preserve an explicit producer address exactly as configured.
+            pass
+        elif not _is_auto_host(host):
+            # Legacy concrete-host fallback: host is also the producer address.
+            sender_host = host
+        else:
             # `host: auto` is this worker's bind address, not the producer's.
-            # Same-host/headless mode needs the local address; remote
-            # deployments must set sender_host explicitly.
+            # Same-host/headless mode needs the routed local address; remote
+            # deployments must set sender_host explicitly. An explicit
+            # `sender_host: auto` is normalized here as well.
             sender_host = _resolve_local_host()
-        extra.setdefault("sender_host", sender_host)
+        extra["sender_host"] = sender_host
         extra.setdefault("sender_zmq_port", resolved_port)
         extra.pop("zmq_port", None)
         outgoing = extra.get("outgoing")
