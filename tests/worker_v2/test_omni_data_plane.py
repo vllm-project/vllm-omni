@@ -240,7 +240,8 @@ def test_resumable_output_keeps_scheduler_owned_segment_boundary(plane):
     assert len(plane.record.batches) == 3
 
 
-def test_native_resumable_publishes_only_scheduler_commits(plane):
+@pytest.mark.parametrize("reserve_output", [True, False])
+def test_native_resumable_publishes_only_scheduler_commits(plane, reserve_output):
     from vllm_omni.core.sched.output import OmniChunkCommit
 
     plane._native_resumable = True
@@ -249,7 +250,8 @@ def test_native_resumable_publishes_only_scheduler_commits(plane):
     plane.register_request(_new_request())
 
     for sampled in (21, 22):
-        plane.reserve_outputs(["internal"])
+        if reserve_output:
+            plane.reserve_outputs(["internal"])
         output = OmniModelRunnerOutput(
             req_ids=["internal"],
             req_id_to_index={"internal": 0},
@@ -271,6 +273,11 @@ def test_native_resumable_publishes_only_scheduler_commits(plane):
     assert "external" not in plane._ramp_chunk_count
     assert "internal" not in plane._native_outputs_in_flight
     assert len(plane.record.batches) == 1
+
+    assert plane.request_terminal({"internal"}) == 1
+    [(terminal, terminal_payload)] = plane.record.batches[-1]
+    assert terminal.is_finished()
+    assert terminal_payload is None
 
 
 def test_full_payload_qwen_builder_receives_complete_codec(raw_plane, monkeypatch):

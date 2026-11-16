@@ -361,11 +361,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 if not pending:
                     raise RuntimeError(f"Missing resumable output for {commit.request_id}")
                 payload = pending.popleft()
-                in_flight = self._native_outputs_in_flight[commit.request_id] - 1
-                if in_flight:
-                    self._native_outputs_in_flight[commit.request_id] = in_flight
-                else:
-                    self._native_outputs_in_flight.pop(commit.request_id, None)
+                self._release_output_reservation(commit.request_id)
                 if commit.discard:
                     continue
                 state.accept_tokens(commit.token_ids)
@@ -389,6 +385,14 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             for req_id in dict.fromkeys(req_ids):
                 if req_id in self._native_requests:
                     self._native_outputs_in_flight[req_id] += 1
+
+    def _release_output_reservation(self, req_id: str) -> None:
+        """Release one output hold while the caller holds the native output lock."""
+        in_flight = self._native_outputs_in_flight.get(req_id, 0)
+        if in_flight > 1:
+            self._native_outputs_in_flight[req_id] = in_flight - 1
+        elif in_flight == 1:
+            self._native_outputs_in_flight.pop(req_id, None)
 
     def _ready_terminal_requests(self) -> set[str]:
         return {
@@ -486,11 +490,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         with self._native_output_lock:
             self._cleanup_finished_entries(finished_req_ids)
             for req_id in dict.fromkeys(req_ids):
-                in_flight = self._native_outputs_in_flight.get(req_id, 0)
-                if in_flight > 1:
-                    self._native_outputs_in_flight[req_id] = in_flight - 1
-                elif in_flight == 1:
-                    self._native_outputs_in_flight.pop(req_id, None)
+                self._release_output_reservation(req_id)
             return emitted + self._emit_ready_terminals()
 
     def register_receivers(self, handles: list[Any]) -> None:

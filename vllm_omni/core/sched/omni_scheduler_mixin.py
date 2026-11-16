@@ -603,8 +603,8 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         stage_recv_req_ids.intersection_update(live_request_ids)
         if getattr(self, "_native_resumable", False) and input_coordinator.receives_chunks:
             for req_id, update in list(request_metadata.items()):
-                request = self.requests[req_id]
-                if not request.resumable:
+                request = self.requests.get(req_id)
+                if request is None or not request.resumable:
                     continue
                 waiting_for_prompt = (
                     getattr(request, "_omni_waiting_native_prompt", False) or request.num_computed_tokens == 0
@@ -636,11 +636,12 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         if model_mode == "ar" and getattr(self, "_native_resumable", False):
             # A codec may reach EOS before the upstream segment marker
             # arrives. Only a new prompt can wake its next decode.
-            chunk_ready_req_ids.difference_update(
+            chunk_ready_req_ids = {
                 req_id
-                for req_id in chunk_ready_req_ids.copy()
-                if getattr(self.requests[req_id], "_omni_waiting_native_prompt", False)
-            )
+                for req_id in chunk_ready_req_ids
+                if (request := self.requests.get(req_id)) is not None
+                and not getattr(request, "_omni_waiting_native_prompt", False)
+            }
         if request_metadata:
             input_coordinator.update_request_metadata(
                 self.requests,

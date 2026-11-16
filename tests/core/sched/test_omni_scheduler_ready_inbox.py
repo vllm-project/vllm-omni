@@ -17,13 +17,18 @@ from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_ready_inbox_coalesces_live_events_and_drops_cancelled(mocker):
+@pytest.mark.parametrize("native_resumable", [False, True])
+def test_ready_inbox_coalesces_live_events_and_drops_cancelled(mocker, native_resumable):
     scheduler = OmniSchedulerMixin()
-    scheduler.requests, scheduler.waiting, scheduler.running = {"r": object()}, [], []
+    scheduler.requests, scheduler.waiting, scheduler.running = {"r": SimpleNamespace(resumable=False)}, [], []
+    scheduler._native_resumable = native_resumable
     scheduler.kv_holding_waiting = []
     scheduler._is_blocked_waiting_status = OmniARScheduler._is_blocked_waiting_status
     coordinator = SimpleNamespace(
-        _async_chunk=True, update_request_metadata=mocker.Mock(), process_pending_chunks=mocker.Mock()
+        _async_chunk=True,
+        receives_chunks=True,
+        update_request_metadata=mocker.Mock(),
+        process_pending_chunks=mocker.Mock(),
     )
     scheduler.input_coordinator = coordinator
     scheduler._outputs_awaiting_stage_payload = {}
