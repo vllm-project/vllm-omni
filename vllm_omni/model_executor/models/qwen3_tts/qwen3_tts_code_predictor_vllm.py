@@ -40,14 +40,15 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         extra = CodePredictorWrapper._stage_connector_extra_config(vllm_config)
         if not current_omni_platform.is_npu():
             return extra
-        # Model-local NPU defaults: do not change Qwen3-Omni or CUDA defaults.
+        # Keep the NPU optimization profile opt-in until paired audio quality
+        # is qualified. Do not change Qwen3-Omni or CUDA defaults.
         # Explicit connector/stage options, including false, remain authoritative.
         return {
             "code_predictor_fused_sampling": False,
-            "code_predictor_frame_graph": True,
-            "code_predictor_kv_cache": extra.get("code_predictor_frame_graph", True),
+            "code_predictor_frame_graph": False,
+            "code_predictor_kv_cache": extra.get("code_predictor_frame_graph", False),
             "code_predictor_npu_native_gqa": False,
-            "code_predictor_npu_fused_swiglu": True,
+            "code_predictor_npu_fused_swiglu": False,
             **extra,
         }
 

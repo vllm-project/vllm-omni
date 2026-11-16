@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Resolve NPU defaults without changing other platforms or explicit opt-outs."""
+"""Keep NPU optimizations opt-in and preserve explicit option precedence."""
 
 from types import SimpleNamespace
 
@@ -15,29 +15,31 @@ from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-PREDICTOR_DEFAULTS = {
-    "code_predictor_fused_sampling": False,
-    "code_predictor_frame_graph": True,
-    "code_predictor_kv_cache": True,
-    "code_predictor_npu_native_gqa": False,
-    "code_predictor_npu_fused_swiglu": True,
-}
-PREDICTOR_OPTIONS = tuple(PREDICTOR_DEFAULTS)
+PREDICTOR_OPTIONS = (
+    "code_predictor_fused_sampling",
+    "code_predictor_frame_graph",
+    "code_predictor_kv_cache",
+    "code_predictor_npu_native_gqa",
+    "code_predictor_npu_fused_swiglu",
+)
 
 
-@pytest.mark.parametrize("platform", ["npu", "cuda", "rocm", "xpu"])
-def test_resolved_defaults_are_npu_only(monkeypatch, platform):
+@pytest.mark.parametrize("platform", ["npu", "cuda", "rocm", "xpu", "musa"])
+def test_resolved_defaults_keep_optimizations_opt_in(monkeypatch, platform):
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: platform == "npu")
     deploy = _apply_platform_overrides(load_deploy_config(get_deploy_config_path("qwen3_tts.yaml")), platform=platform)
+    assert deploy.model_runner == ("v2" if platform == "cuda" else "v1")
+    if platform == "npu":
+        for stage in deploy.stages:
+            assert stage.compilation_config is not None
+            assert stage.compilation_config["cudagraph_mode"] == "PIECEWISE"
     connector = deploy.connectors["connector_of_shared_memory"]
     config = SimpleNamespace(
         model_config=SimpleNamespace(stage_connector_config=connector),
         additional_config=deploy.stages[0].engine_extras.get("additional_config", {}),
     )
     options = Predictor._stage_connector_extra_config(config)
-    assert all(
-        options.get(key, False) is (enabled and platform == "npu") for key, enabled in PREDICTOR_DEFAULTS.items()
-    )
+    assert all(options.get(key, False) is False for key in PREDICTOR_OPTIONS)
     # Defaults belong to the model/loader. A YAML copy could mask a change
     # to those defaults and give custom deployments different behavior.
     npu_options = {
@@ -50,29 +52,28 @@ def test_resolved_defaults_are_npu_only(monkeypatch, platform):
         assert npu_options.isdisjoint(stage.engine_extras.get("additional_config", {}))
 
 
-@pytest.mark.parametrize("source", ["implicit", "additional", "connector", "opt_in"])
-def test_npu_predictor_defaults_preserve_explicit_opt_out(monkeypatch, source):
+@pytest.mark.parametrize("source", ["implicit", "additional", "connector", "connector_opt_in"])
+def test_npu_predictor_defaults_preserve_explicit_overrides(monkeypatch, source):
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
     config = SimpleNamespace(model_config=SimpleNamespace(stage_connector_config={"extra": {}}), additional_config={})
     if source == "additional":
-        config.additional_config = dict.fromkeys(PREDICTOR_OPTIONS, False)
+        config.additional_config = dict.fromkeys(PREDICTOR_OPTIONS, True)
     elif source == "connector":
         config.additional_config = dict.fromkeys(PREDICTOR_OPTIONS, True)
         config.model_config.stage_connector_config["extra"] = dict.fromkeys(PREDICTOR_OPTIONS, False)
-    elif source == "opt_in":
-        config.additional_config = dict.fromkeys(PREDICTOR_OPTIONS, True)
+    elif source == "connector_opt_in":
+        config.additional_config = dict.fromkeys(PREDICTOR_OPTIONS, False)
+        config.model_config.stage_connector_config["extra"] = dict.fromkeys(PREDICTOR_OPTIONS, True)
     options = Predictor._stage_connector_extra_config(config)
-    assert all(
-        options[key] is (source == "opt_in" or (enabled and source == "implicit"))
-        for key, enabled in PREDICTOR_DEFAULTS.items()
-    )
+    assert all(options[key] is (source in ("additional", "connector_opt_in")) for key in PREDICTOR_OPTIONS)
 
 
-def test_disabling_frame_graph_disables_implicit_npu_kv(monkeypatch):
+@pytest.mark.parametrize("frame_graph", [False, True])
+def test_frame_graph_opt_in_controls_implicit_npu_kv(monkeypatch, frame_graph):
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
     config = SimpleNamespace(
-        model_config=SimpleNamespace(stage_connector_config={"extra": {"code_predictor_frame_graph": False}}),
+        model_config=SimpleNamespace(stage_connector_config={"extra": {"code_predictor_frame_graph": frame_graph}}),
         additional_config={},
     )
     options = Predictor._stage_connector_extra_config(config)
-    assert options["code_predictor_kv_cache"] is False
+    assert options["code_predictor_kv_cache"] is frame_graph

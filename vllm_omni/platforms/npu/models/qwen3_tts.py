@@ -84,9 +84,14 @@ def _patched_load_weights(self, weights):
     additional = getattr(self.vllm_config, "additional_config", None)
     if isinstance(additional, dict):
         extra = {**additional, **extra}
-    incremental = extra.get("npu_incremental_codec", True)
+    incremental = extra.get("npu_incremental_codec", False)
     if not isinstance(incremental, bool):
         raise ValueError("npu_incremental_codec must be a boolean")
+    if incremental and self.vllm_config.model_config.enforce_eager:
+        # Arena construction prewarms NPU graphs. Honor the stage-wide graph
+        # opt-out before construction, including explicit incremental opt-ins.
+        logger.info("Skipping NPU incremental Codec because enforce_eager is set; using the stateless decoder")
+        incremental = False
     if incremental:
         from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec
 

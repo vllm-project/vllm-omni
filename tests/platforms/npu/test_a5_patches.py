@@ -17,6 +17,7 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -263,3 +264,52 @@ def test_qwen3_tts_code2wav_patch_skips_fractal_z_conv_cast_on_a5(
     # On A5 convs keep the contiguous ND layout: no FRACTAL_Z cast is issued.
     assert conv_weights == []
     assert model.decoder.cache_precompute_calls == 1
+
+
+@pytest.mark.parametrize(
+    "additional,connector,eager,enabled",
+    [
+        ({}, {}, False, False),
+        ({"npu_incremental_codec": True}, {}, False, True),
+        ({"npu_incremental_codec": False}, {"npu_incremental_codec": True}, False, True),
+        ({"npu_incremental_codec": True}, {"npu_incremental_codec": False}, False, False),
+        ({"npu_incremental_codec": True}, {}, True, False),
+        ({}, {"npu_incremental_codec": True}, True, False),
+    ],
+    ids=["default", "stage-opt-in", "connector-opt-in", "connector-opt-out", "eager-stage", "eager-connector"],
+)
+def test_qwen3_tts_incremental_loader_gates(monkeypatch, additional, connector, eager, enabled):
+    module, _, _ = _load_qwen3_tts_code2wav_patch(monkeypatch, a5=False)
+    incremental = Mock()
+    _install_fake_module(
+        monkeypatch,
+        "vllm_omni.platforms.npu.layers.incremental_codec",
+        NPUIncrementalCodec=incremental,
+    )
+    decoder = torch.nn.Linear(2, 2)
+    previous = Mock()
+    decoder._npu_incremental = previous
+    model = SimpleNamespace(
+        decoder=decoder,
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(stage_connector_config={"extra": connector}, enforce_eager=eager),
+            additional_config=additional,
+            device_config=SimpleNamespace(device="cpu"),
+            scheduler_config=SimpleNamespace(max_num_seqs=4),
+        ),
+    )
+
+    def load_weights(self, weights):
+        previous.close.assert_called_once_with()
+        assert self.decoder._npu_incremental is None
+        return {"loaded"}
+
+    monkeypatch.setattr(module, "_original_load_weights", load_weights)
+    monkeypatch.setattr(module, "_prepare_npu_decoder_weights", lambda _: None)
+    assert module._patched_load_weights(model, []) == {"loaded"}
+    if enabled:
+        incremental.assert_called_once_with(decoder, slots=4, max_batch=1, chunk_frames=25)
+        assert decoder._npu_incremental is incremental.return_value
+    else:
+        incremental.assert_not_called()
+        assert decoder._npu_incremental is None

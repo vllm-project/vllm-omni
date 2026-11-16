@@ -124,39 +124,6 @@ def test_incremental_attention_does_not_change_stateless_backend(monkeypatch):
         arena.close()
 
 
-@pytest.mark.parametrize("source", ["implicit", "additional", "connector"])
-def test_loader_defaults_and_explicit_opt_out(monkeypatch, source):
-    pytest.importorskip("torch_npu")
-    from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
-    from vllm_omni.platforms.npu.layers import incremental_codec
-    from vllm_omni.platforms.npu.models import qwen3_tts
-
-    decoder = _make_decoder()
-    model = SimpleNamespace(
-        decoder=decoder,
-        vllm_config=SimpleNamespace(
-            model_config=SimpleNamespace(
-                stage_connector_config={"extra": {"npu_incremental_codec": False} if source == "connector" else {}}
-            ),
-            # Connector opt-outs override explicit stage opt-ins.
-            additional_config={"npu_incremental_codec": source == "connector"} if source != "implicit" else {},
-            device_config=SimpleNamespace(device="cpu"),
-            scheduler_config=SimpleNamespace(max_num_seqs=4),
-        ),
-    )
-    monkeypatch.setattr(qwen3_tts, "_original_load_weights", lambda *_: {"loaded"})
-    monkeypatch.setattr(qwen3_tts, "_prepare_npu_decoder_weights", lambda _: None)
-    incremental = Mock()
-    monkeypatch.setattr(incremental_codec, "NPUIncrementalCodec", incremental)
-    assert qwen3_tts._patched_load_weights(model, []) == {"loaded"}
-    if source == "implicit":
-        incremental.assert_called_once_with(decoder, slots=4, max_batch=1, chunk_frames=25)
-        assert decoder._npu_incremental is incremental.return_value
-    else:
-        incremental.assert_not_called()
-        assert decoder._npu_incremental is None
-
-
 @torch.inference_mode()
 @pytest.mark.parametrize("max_batch", [1, 2])
 def test_all_tail_lengths_match_eager_state(monkeypatch, max_batch):
