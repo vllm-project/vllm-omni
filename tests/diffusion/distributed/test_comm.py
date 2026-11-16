@@ -516,3 +516,189 @@ def test_fused_qkv_all_to_all_matches_three_4d_exchanges_cpu(world_size: int) ->
         nprocs=world_size,
         device_kind="cpu",
     )
+
+
+def _packed_test_inputs(
+    shape: tuple[int, int, int, int], rank: int, device: torch.device, dtype: torch.dtype, layout: str
+) -> tuple[torch.Tensor, ...]:
+    batch, tokens, heads, width = shape
+    values = torch.arange(batch * tokens * heads * width * 3, dtype=torch.int32).reshape(*shape, 3)
+    if dtype == torch.int32:
+        values = values + (rank + 1) * 1000000
+    else:
+        # Bounded, exactly representable values retain rank/coordinate tags in
+        # low precision without rounding every coordinate to the same value.
+        values = (values % 47 + rank * 64).to(dtype)
+    if layout == "row_strided":
+        storage = torch.empty((batch, 2 * tokens, heads, width, 3), dtype=dtype, device=device)
+        storage[:, ::2].copy_(values)
+        return tuple(storage[:, ::2, :, :, index] for index in range(3))
+    if layout == "projection":
+        storage = values.permute(0, 1, 2, 4, 3).contiguous().to(device)
+        return tuple(storage[..., index, :] for index in range(3))
+    storage = values.to(device)
+    if layout == "interleaved":
+        return tuple(storage[..., index] for index in range(3))
+    return tuple(storage[..., index].contiguous() for index in range(3))
+
+
+def _check_packed_strategy(group, device: torch.device) -> None:
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+    from vllm_omni.diffusion.attention.parallel import ulysses
+    from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
+
+    qkv = _packed_test_inputs((2, 11, 8, 4), group.ulysses_rank, device, torch.bfloat16, "projection")
+    for joint in (None, "front", "rear"):
+        outputs, strategies, metadata = [], [], []
+        for enabled in (False, True):
+            strategy = UlyssesParallelAttention(group, 2, 1, False)
+            # Exercise the portable layout on CPU/Gloo and GPU collectives.
+            # Public platform selection is checked separately without a group.
+            strategy._rocm_packed_qkv = enabled
+            strategies.append(strategy)
+            if joint is None:
+                mask = torch.ones((2, 11 * group.ulysses_world_size), device=device, dtype=torch.bool)
+                mask[:, -3:] = False
+                md = AttentionMetadata(attn_mask=mask, extra={"sentinel": "unchanged"})
+            else:
+                joint_q = torch.arange(2 * 3 * 8 * 4, device=device, dtype=torch.float32).reshape(2, 3, 8, 4)
+                joint_q = joint_q.to(torch.bfloat16)
+                md = AttentionMetadata(
+                    joint_query=joint_q,
+                    joint_key=joint_q + 1,
+                    joint_value=joint_q + 2,
+                    joint_strategy=joint,
+                    extra={"sentinel": "unchanged"},
+                )
+            metadata.append(md)
+            outputs.append(strategy.pre_attention(*qkv, md))
+        assert outputs[0][4].use_packed_qkv is False
+        assert outputs[1][4].use_packed_qkv is True
+        for slot in range(3):
+            assert torch.equal(outputs[0][slot], outputs[1][slot])
+        assert metadata[0].extra == metadata[1].extra
+        if joint is None:
+            assert torch.equal(metadata[0].attn_mask, metadata[1].attn_mask)
+        restored = [strategy.post_attention(out[0], out[4]) for strategy, out in zip(strategies, outputs)]
+        assert torch.equal(restored[0], restored[1])
+
+    # Opting in must preserve the existing gate, GQA, and variable-size UAA
+    # routes, including their actual process-group exchanges.
+    for case in ("gate", "gqa", "uaa"):
+        inputs = (qkv[0], qkv[1][:, :, :4], qkv[2][:, :, :4]) if case == "gqa" else qkv
+        outputs, gates, restored = [], [], []
+        with pytest.MonkeyPatch.context() as patch:
+            mode = "advanced_uaa" if case == "uaa" else "strict"
+            patch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: mode)
+            for enabled in (False, True):
+                strategy = UlyssesParallelAttention(group, 2, 1, False)
+                strategy._rocm_packed_qkv = enabled
+                md = AttentionMetadata(extra={"gate_compress": inputs[0].clone()}) if case == "gate" else None
+                out = strategy.pre_attention(*inputs, md)
+                assert out[4].use_packed_qkv is False
+                assert out[4].use_uaa is (case == "uaa")
+                outputs.append(out)
+                restored.append(strategy.post_attention(out[0], out[4]))
+                if md is not None:
+                    gates.append(md.extra["gate_compress"])
+        for slot in range(3):
+            assert torch.equal(outputs[0][slot], outputs[1][slot])
+        assert torch.equal(restored[0], restored[1])
+        if gates:
+            assert torch.equal(gates[0], gates[1])
+
+
+def _run_packed_qkv(local_rank: int, world_size: int, device_kind: DeviceKind, master_port: int) -> None:
+    from vllm_omni.diffusion.distributed.comm import all_to_all_4D
+    from vllm_omni.diffusion.distributed.packed_qkv import packed_output_all_to_all, packed_qkv_all_to_all
+
+    device = _worker_device(local_rank, device_kind)
+    if device_kind == "cuda":
+        current_omni_platform.set_device(device)
+    _init_worker(local_rank, world_size, master_port, device_kind)
+    initialize_model_parallel(ulysses_degree=world_size)
+    group = get_sp_group().ulysses_group
+    cases = [
+        ((1, 7, 8, 5), torch.int32, "contiguous"),
+        ((2, 11, 8, 7), torch.int32, "row_strided"),
+        ((1, 13, 56, 16), torch.bfloat16, "projection"),
+        ((2, 17, 56, 16), torch.bfloat16, "interleaved"),
+        ((2, 19, 56, 16), torch.float16, "row_strided"),
+    ]
+    if device_kind == "cuda":
+        cases.append(((1, 1032, 56, 128), torch.bfloat16, "projection"))
+    try:
+        with torch.inference_mode():
+            for shape, dtype, layout in cases:
+                qkv = _packed_test_inputs(shape, local_rank, device, dtype, layout)
+                expected = tuple(all_to_all_4D(t, group=group) for t in qkv)
+                original_collective = torch.distributed.all_to_all_single
+                calls = []
+
+                def counted(*args, **kwargs):
+                    calls.append(1)
+                    return original_collective(*args, **kwargs)
+
+                with pytest.MonkeyPatch.context() as patch:
+                    patch.setattr(torch.distributed, "all_to_all_single", counted)
+                    actual = packed_qkv_all_to_all(group, *qkv)
+                    assert len(calls) == 1
+                    reverse = packed_output_all_to_all(group, actual[0])
+                    assert len(calls) == 2
+                for tensor, reference, producer in zip(actual, expected, qkv):
+                    assert tensor.is_contiguous()
+                    assert tensor.dtype == producer.dtype
+                    assert torch.equal(tensor, reference)
+                    # Independent oracle: rank-ordered sequence concatenation
+                    # of each producer's destination head slice.
+                    gathered = [torch.empty_like(producer) for _ in range(world_size)]
+                    torch.distributed.all_gather(gathered, producer.contiguous(), group=group)
+                    heads = shape[2] // world_size
+                    oracle = torch.cat(
+                        [t[:, :, local_rank * heads : (local_rank + 1) * heads] for t in gathered], dim=1
+                    )
+                    assert torch.equal(tensor, oracle)
+                assert reverse.is_contiguous()
+                assert torch.equal(reverse, qkv[0])
+                assert torch.equal(reverse, all_to_all_4D(expected[0], 1, 2, group=group))
+                padded = torch.empty(
+                    (shape[0], actual[0].shape[1] + 3, actual[0].shape[2], shape[3]), dtype=dtype, device=device
+                )
+                sliced = padded[:, 1:-2]
+                sliced.copy_(actual[0])
+                assert torch.equal(packed_output_all_to_all(group, sliced), reverse)
+                saved = tuple(t.clone() for t in actual)
+                packed_qkv_all_to_all(group, *(t + 1 for t in qkv))
+                for tensor, reference in zip(actual, saved):
+                    assert torch.equal(tensor, reference)
+            _check_packed_strategy(get_sp_group(), device)
+    finally:
+        destroy_distributed_env()
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_packed_qkv_layout_and_strategy_cpu(world_size: int) -> None:
+    start_collective_workers(
+        _run_packed_qkv,
+        args=(world_size, "cpu", get_open_port()),
+        nprocs=world_size,
+        device_kind="cpu",
+    )
+
+
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@pytest.mark.parametrize("world_size", [pytest.param(2, marks=_L4_TWO_GPU), pytest.param(4, marks=_L4_FOUR_GPU)])
+def test_packed_qkv_layout_and_strategy_gpu(world_size: int) -> None:
+    _require_gpus(world_size)
+    start_collective_workers(
+        _run_packed_qkv,
+        args=(world_size, "cuda", get_open_port()),
+        nprocs=world_size,
+        device_kind="cuda",
+    )
