@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 
 from tests.helpers.mark import hardware_marks
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
-from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import BatchedToken2Wav
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.dit_fused import (
     blocks_forward_chunk_fused,
     dit_modulation,
     supports_fused_body,
@@ -126,7 +126,7 @@ def test_fp16_fused_body_matches_fp16_ragged_body(monkeypatch):
         return blocks_forward_chunk_fused(*args, **kwargs)
 
     monkeypatch.setattr(
-        "vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav.blocks_forward_chunk_fused",
+        "vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav.blocks_forward_chunk_fused",
         fused,
     )
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):

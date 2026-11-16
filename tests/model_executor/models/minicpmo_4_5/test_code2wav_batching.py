@@ -13,15 +13,15 @@ import pytest
 import torch
 import torch.nn as nn
 
-import vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav as batched_token2wav_module
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+import vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav as batched_token2wav_module
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
     BatchedToken2Wav,
     PromptFeatures,
     _token2wav_sdpa_context,
     plan_token2wav_encode_slices,
     relpos_encode_token_budget,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
     AttSlotPool,
     WholeEulerExecutionArena,
     _pack_att_cache,
@@ -1023,7 +1023,7 @@ from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import (
     _FakeToken2Wav,
     _enable_fake_ragged_kernel,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import BatchedToken2Wav
 import vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav as npu_patch
 
 
@@ -2609,7 +2609,7 @@ def test_decode_replays_encoder_graph_in_capture_autocast(monkeypatch, ragged, a
 
 @pytest.mark.parametrize("graph_hit", [True, False])
 def test_cfm_padding_mask_is_deferred_until_graph_fallback(monkeypatch, graph_hit):
-    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import _build_capture_mask
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import _build_capture_mask
 
     adapter = BatchedToken2Wav(_FakeToken2Wav())
     adapter._cfm_graph_bucket_frames = 4

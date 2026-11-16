@@ -100,7 +100,7 @@ import torch
 from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import (
     _FakeToken2Wav,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import BatchedToken2Wav
 import vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav as npu_patch
 
 

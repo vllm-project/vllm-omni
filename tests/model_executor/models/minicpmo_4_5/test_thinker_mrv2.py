@@ -54,7 +54,7 @@ def _model(mocker, *, v2=True, session="turn", async_chunk=False, speculative_co
     thinker = torch.nn.Module()
     thinker.make_empty_intermediate_tensors = lambda: None
     mocker.patch.object(omni, "init_vllm_registered_model", return_value=thinker)
-    mocker.patch("vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat.patch_minicpmo_remote_config")
+    mocker.patch("vllm_omni.model_executor.models.minicpmo_4_5.config.patch_minicpmo_remote_config")
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(),

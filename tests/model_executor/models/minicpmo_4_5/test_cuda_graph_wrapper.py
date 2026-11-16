@@ -12,14 +12,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.platforms import current_platform
 
-import vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper as wrapper_module
+import vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs as wrapper_module
 from tests.helpers.cudnn import ieee_cudnn_fp32
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     HiFTGenerator,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav, _trim_streaming_cache
-from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
+    BatchedToken2Wav,
+    _trim_streaming_cache,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
     CFMGraphWrapper,
     HiFTGraphWrapper,
     WholeEulerCFMGraphWrapper,
@@ -509,7 +512,7 @@ def test_importing_wrapper_does_not_resolve_platform() -> None:
     """Importing this module must not build the OmniPlatform singleton.
 
     The NPU platform's ``__init__`` patches Code2Wav, which imports
-    ``batched_token2wav`` -> ``cuda_graph_wrapper``. Resolving
+    ``code2wav.batched_token2wav`` -> ``code2wav.graphs``. Resolving
     ``current_omni_platform`` at module scope re-enters
     ``platforms.__getattr__`` while the singleton is still under construction
     and the import graph deadlocks. The module reaches for nothing on
@@ -519,7 +522,7 @@ def test_importing_wrapper_does_not_resolve_platform() -> None:
 
     import vllm_omni.platforms as platforms_module
 
-    name = "vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper"
+    name = "vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs"
     importlib.import_module(name)
     saved = platforms_module._current_omni_platform
     try:
@@ -2297,7 +2300,7 @@ def test_whole_euler_query_bucket_keeps_current_first_cache_layout(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_whole_euler_skipped_when_trt_stepper_configured() -> None:
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
         BatchedToken2Wav,
     )
 
@@ -2358,7 +2361,7 @@ def test_whole_euler_skipped_when_trt_stepper_configured() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_whole_euler_disabled_via_serving_config() -> None:
-    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
         BatchedToken2Wav,
     )
 
@@ -2825,7 +2828,7 @@ def test_whole_euler_groups_are_acquired_again_after_a_flush() -> None:
 
 @pytest.mark.parametrize("fail", [False, True])
 def test_vocoder_restores_tf32_policy(fail, monkeypatch):
-    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav_watchdog import Code2WavWatchdog
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.watchdog import Code2WavWatchdog
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
     from vllm_omni.platforms import current_omni_platform
 

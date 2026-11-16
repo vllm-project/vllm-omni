@@ -26,16 +26,16 @@ from vllm.logger import init_logger
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.device_copy import to_device_nonblocking
 
-from .batched_token2wav import (
+from .code2wav.batched_token2wav import (
     BatchedToken2Wav,
     BatchedToken2WavState,
     PromptFeatures,
     row_offset_signature,
     state_shape_signature,
 )
-from .code2wav_watchdog import Code2WavWatchdog
-from .config_flags import read_bool_flag, resolve_token2wav_trt_config
-from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
+from .code2wav.graphs import ResidentAttCache, _format_memory_delta, _memory_snapshot
+from .code2wav.watchdog import Code2WavWatchdog
+from .config import read_bool_flag, resolve_token2wav_trt_config
 
 if TYPE_CHECKING:
     from vllm_omni.core.sched.output import OmniRequestPrewarm
@@ -1831,7 +1831,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         # that package's hard-coded `.cuda()` calls, and auto-applies the
         # Ascend fixes (HiFT linear downsample, DiT mask expand, MATH SDPA)
         # on NPU.
-        from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
+        from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
             MiniCPMO45Token2wav as Token2wav,
         )
         from vllm_omni.platforms import current_omni_platform

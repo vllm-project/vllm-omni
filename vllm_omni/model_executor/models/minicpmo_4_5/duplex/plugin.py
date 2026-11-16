@@ -18,6 +18,7 @@ from base64 import b64decode
 from binascii import Error as BinasciiError
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -36,6 +37,7 @@ from vllm_omni.engine.duplex.contracts import (
 )
 from vllm_omni.engine.duplex.intermediate import build_duplex_append_prompt
 from vllm_omni.engine.duplex.plugin import (
+    DefaultDuplexModelSessionState,
     DuplexModelPlugin,
     DuplexRuntimeConfigError,
     EncodeAudio,
@@ -55,12 +57,10 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import (
     MiniCPMO45DataPlaneContext,
     MiniCPMO45DataPlaneSession,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import MiniCPMO45PcmAppendBuffer
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
     MiniCPMO45DuplexPolicy,
     MiniCPMO45DuplexWindowConfig,
-)
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.session import (
-    MiniCPMO45ServingSessionState,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     load_default_prompt_audio,
@@ -69,6 +69,18 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
     from vllm.config import ModelConfig
+
+
+@dataclass(slots=True)
+class MiniCPMO45ServingSessionState(DefaultDuplexModelSessionState):
+    """Mutable model-owned state of one MiniCPM duplex session (owned by the session runner).
+
+    The runner-facing flag contract lives on ``DefaultDuplexModelSessionState``;
+    MiniCPM-o only binds its ~1 s PCM unit buffer.
+    """
+
+    audio_buffer: MiniCPMO45PcmAppendBuffer = field(default_factory=MiniCPMO45PcmAppendBuffer)
+
 
 _DUPLEX_CHUNK_SAMPLES = 16000
 _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
@@ -416,8 +428,8 @@ def _stage0_stop_token_ids(tokenizer: PreTrainedTokenizerBase | None) -> list[in
         "chunk_tts_eos_token_id",
         "listen_token_id",
     )
-    for field in stop_token_fields:
-        token = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS[field]
+    for field_name in stop_token_fields:
+        token = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS[field_name]
         token_id = _convert_token_to_id(tokenizer, token)
         if token_id is not None and token_id not in out:
             out.append(token_id)

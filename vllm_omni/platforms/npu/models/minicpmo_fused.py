@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.dit_fused import (
     _GATE_CONV,
     _GATE_MLP,
     _GATE_MSA,

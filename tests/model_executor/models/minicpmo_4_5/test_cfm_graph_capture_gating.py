@@ -12,7 +12,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
     CFMGraphWrapper,
     _format_memory_delta,
     _memory_snapshot,

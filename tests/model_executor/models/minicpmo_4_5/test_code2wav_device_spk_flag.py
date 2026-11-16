@@ -23,9 +23,7 @@ import torch
 from vllm_omni.model_executor.models.minicpmo_4_5 import (
     minicpmo_4_5_code2wav as code2wav_module,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5 import (
-    minicpmo_4_5_token2wav as token2wav_module,
-)
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav import token2wav as token2wav_module
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
 )
@@ -403,14 +401,14 @@ def test_speaker_graph_flag_reaches_selected_backend(tmp_path, monkeypatch, valu
 @pytest.mark.parametrize("selection", ["torch", "cpu", "trt-env", "trt-config", "trt-speaker"])
 def test_reference_graphs_respect_selected_backend(tmp_path, monkeypatch, mocker, platform, selection):
     from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_torch import CampplusTorch
-    from vllm_omni.model_executor.models.minicpmo_4_5 import s3_cuda_graph, speaker_cuda_graph
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav import reference_audio_graph
     from vllm_omni.model_executor.models.step_audio2 import step_audio2_dit_trt
 
     _force_platform(monkeypatch, platform)
     monkeypatch.setenv("MINICPMO_TOKEN2WAV_TRT", "1" if selection == "trt-env" else "0")
     mocker.patch.object(step_audio2_dit_trt, "build_dit_trt_stepper", return_value=object())
-    speaker_wrapper = mocker.patch.object(speaker_cuda_graph, "SpeakerCudaGraph")
-    s3_wrapper = mocker.patch.object(s3_cuda_graph, "S3CudaGraph")
+    speaker_wrapper = mocker.patch.object(reference_audio_graph, "SpeakerCudaGraph")
+    s3_wrapper = mocker.patch.object(reference_audio_graph, "S3CudaGraph")
     original_init = _FakeToken2Wav.__init__
     device = torch.device("cuda" if platform == "cuda" else "privateuseone")
 

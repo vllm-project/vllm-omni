@@ -14,11 +14,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
     _cfm_pad_frames,
     _zero_padded_frames,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
     WholeEulerCFMGraphWrapper,
     _att_keep_ranges,
     _build_capture_mask,
@@ -307,7 +307,7 @@ def test_zero_padded_cnn_cache_uniform_blocks_use_one_write():
 
 @pytest.mark.parametrize("max_graphs", [15, 32])
 def test_precapture_covers_final_chunk_without_displacing_steady_graphs(monkeypatch, max_graphs):
-    from vllm_omni.model_executor.models.minicpmo_4_5 import cuda_graph_wrapper as graph_module
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav import graphs as graph_module
 
     captured = []
     stats = {"captures": 0}
@@ -348,7 +348,7 @@ def test_precapture_covers_final_chunk_without_displacing_steady_graphs(monkeypa
 
 @pytest.mark.parametrize("width,valid", [(0, 0), (3, 2), (8, 8)])
 def test_uniform_capture_mask_cache_reuses_only_key_storage(width, valid):
-    cache = {}
+    cache: dict[tuple[int, int, int, int, int, torch.device], torch.Tensor] = {}
     args = dict(
         attn_mask=None,
         query_cap=8,
@@ -376,7 +376,7 @@ def test_uniform_capture_mask_cache_reuses_only_key_storage(width, valid):
 
 
 def test_capture_key_mask_cache_is_bounded_and_excludes_dynamic_masks():
-    cache = {}
+    cache: dict[tuple[int, int, int, int, int, torch.device], torch.Tensor] = {}
     args = dict(batch_size=1, query_cap=4, mel_width=3, mel_frames=2, device=torch.device("cpu"), key_masks=cache)
     first = _build_capture_mask(attn_mask=None, offset=0, **args)
     retained = first.clone()
@@ -394,7 +394,7 @@ def test_capture_key_mask_cache_is_bounded_and_excludes_dynamic_masks():
 
 @pytest.mark.parametrize("device_type", ["cuda", "npu", "cpu"])
 def test_graph_memory_telemetry_uses_device_allocator(monkeypatch, mocker, device_type):
-    from vllm_omni.model_executor.models.minicpmo_4_5 import cuda_graph_wrapper as graph_module
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav import graphs as graph_module
 
     device = SimpleNamespace(type=device_type)
     api = mocker.Mock()
@@ -416,7 +416,7 @@ def test_graph_memory_telemetry_uses_device_allocator(monkeypatch, mocker, devic
 
 
 def test_npu_precapture_stops_after_graph_exceeds_memory_budget(monkeypatch, mocker):
-    from vllm_omni.model_executor.models.minicpmo_4_5 import cuda_graph_wrapper as graph_module
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav import graphs as graph_module
 
     api = mocker.Mock()
     api.memory_allocated.return_value = 0

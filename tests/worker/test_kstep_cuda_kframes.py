@@ -137,19 +137,3 @@ def test_applies_skips_a_stage_without_multi_frame_support():
     assert talker_multiframe.applies(model, {}) == 0
 
 
-def test_kstep_frame_rows_picks_the_row_the_loop_samples():
-    """The per-frame projection must gather ``end - 1`` of each span.
-
-    The sampling loop reads ``hidden[end - 1 : end]``, so projecting ``start``
-    instead would silently score the wrong row once a span is wider than one.
-    """
-    import torch
-
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-        kstep_frame_rows,
-    )
-
-    # One-row spans (what the K-frame loop passes per frame).
-    assert kstep_frame_rows([(0, 1), (1, 2), (2, 3)], torch.device("cpu")).tolist() == [0, 1, 2]
-    # Wider spans (a step that scheduled several positions per request).
-    assert kstep_frame_rows([(0, 8), (8, 16)], torch.device("cpu")).tolist() == [7, 15]

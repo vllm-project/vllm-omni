@@ -7,7 +7,7 @@ import logging
 
 import pytest
 
-from vllm_omni.model_executor.models.minicpmo_4_5.code2wav_stats import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.stats import (
     CODE2WAV_STATS_ENV,
     Code2WavSolveStats,
 )

@@ -23,7 +23,7 @@ import math
 import os
 import warnings
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from functools import partial
 from typing import Annotated, Any, Literal, TypeAlias
 
@@ -52,7 +52,7 @@ from transformers.image_utils import (
 )
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
-from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, ModelOutput
+from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.whisper.modeling_whisper import ACT2FN
 
@@ -911,33 +911,6 @@ def lecun_normal_(tensor):
 
 def default_flax_embed_init(tensor):
     variance_scaling_(tensor, mode="fan_in", distribution="normal")
-
-
-@dataclass
-# Copied from transformers.models.clip.modeling_clip.CLIPVisionModelOutput with CLIP->Siglip
-class SiglipVisionModelOutput(ModelOutput):
-    """
-    Base class for vision model's outputs that also contains image embeddings of the pooling of the last hidden states.
-    Args:
-        image_embeds (`torch.FloatTensor` of shape `(batch_size, output_dim)` *optional* returned when model is initialized with `with_projection=True`):
-            The image embeddings obtained by applying the projection layer to the pooler_output.
-        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
-            Sequence of hidden-states at the output of the last layer of the model.
-        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
-            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
-            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
-            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
-            sequence_length)`.
-            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
-            heads.
-    """
-
-    image_embeds: torch.FloatTensor | None = None
-    last_hidden_state: torch.FloatTensor = None
-    hidden_states: tuple[torch.FloatTensor] | None = None
-    attentions: tuple[torch.FloatTensor] | None = None
 
 
 class SiglipVisionEmbeddings(nn.Module):
@@ -3274,59 +3247,6 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         )
 
 
-class MiniCPMOOmniImageFeatureInputs(TensorSchema):
-    """
-    Dimensions:
-        - ni: Number of images
-        - nq: Number of queries (from resampler)
-        - embed_dim: Embedding dimension
-    """
-
-    type: Literal["image_features"]
-    image_embeds: Annotated[
-        torch.Tensor | list[torch.Tensor],
-        TensorShape("ni", "nq", "embed_dim"),
-    ]
-
-
-def _minicpmo_omni_llm_field_config(hf_inputs: Mapping[str, torch.Tensor]):
-    """Create field config for MiniCPM-o thinker multimodal inputs."""
-    # For MiniCPM-o, pixel_values come preprocessed from image processor
-    # tgt_sizes indicates the size of each image after patch embedding
-    pixel_values = hf_inputs.get("pixel_values")
-    tgt_sizes = hf_inputs.get("tgt_sizes")
-
-    # Handle empty case - return empty tensor configs like qwen2.5
-    if pixel_values is None or tgt_sizes is None or (isinstance(pixel_values, list) and len(pixel_values) == 0):
-        # Return empty configs with empty tensors
-        return dict(
-            pixel_values=MultiModalFieldConfig.flat_from_sizes("image", torch.empty((0,), dtype=torch.long)),
-            tgt_sizes=MultiModalFieldConfig.batched("image"),
-            image_embeds=MultiModalFieldConfig.flat_from_sizes("image", torch.empty((0,), dtype=torch.long)),
-        )
-
-    # Calculate number of images and slices per image
-    if isinstance(pixel_values, list):
-        num_images = len(pixel_values)
-        # Calculate number of slices per image (each image can have multiple slices)
-        pixel_value_sizes = torch.tensor(
-            [len(pv) if isinstance(pv, list) else 1 for pv in pixel_values], dtype=torch.long
-        )
-    else:
-        num_images = 1
-        pixel_value_sizes = torch.tensor([1], dtype=torch.long)
-
-    # query_num is the output size from resampler
-    query_num = hf_inputs.get("query_num", 64)
-    image_grid_sizes = torch.full((num_images,), query_num, dtype=torch.long)
-
-    return dict(
-        pixel_values=MultiModalFieldConfig.flat_from_sizes("image", pixel_value_sizes),
-        tgt_sizes=MultiModalFieldConfig.batched("image"),
-        image_embeds=MultiModalFieldConfig.flat_from_sizes("image", image_grid_sizes),
-    )
-
-
 def get_version_by_config(config: PretrainedConfig) -> tuple[int, ...]:
     version_float = getattr(config, "version", None)
 
@@ -4319,7 +4239,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         else:
             text_config = Qwen2Config.from_dict(config_dict)
             llm_arch = "Qwen2ForCausalLM"
-        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat import (
+        from vllm_omni.model_executor.models.minicpmo_4_5.config import (
             patch_minicpmo_remote_config,
         )
 
@@ -4382,146 +4302,6 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
     def get_language_model(self) -> torch.nn.Module:
         return self.llm
-
-    def _process_image_input(self, image_input: dict[str, torch.Tensor]) -> list[torch.Tensor]:
-        """Process image input through vision encoder and resampler.
-
-        Args:
-            image_input: Dict containing:
-                - pixel_values: List of preprocessed image tensors or tensor
-                - tgt_sizes: Target sizes for each image after patch embedding
-
-        Returns:
-            List of image embeddings (one per image)
-        """
-        if self.vpm is None or self.resampler is None:
-            return []
-
-        pixel_values_list = image_input.get("pixel_values")
-        tgt_sizes = image_input.get("tgt_sizes")
-
-        if pixel_values_list is None or tgt_sizes is None:
-            return []
-
-        # Normalize input format
-        if not isinstance(pixel_values_list, list):
-            pixel_values_list = [pixel_values_list]
-        if not isinstance(tgt_sizes, list | torch.Tensor):
-            tgt_sizes = [tgt_sizes] if tgt_sizes is not None else []
-
-        # Convert to tensors if needed
-        if isinstance(tgt_sizes, list):
-            tgt_sizes = torch.vstack(
-                [torch.tensor(ts) if not isinstance(ts, torch.Tensor) else ts for ts in tgt_sizes]
-            ).type(torch.int32)
-
-        dtype = self.llm.model.embed_tokens.weight.dtype
-        device = self.llm.model.embed_tokens.weight.device
-
-        # Process all images
-        all_pixel_values = []
-        img_cnt = []
-        for pixel_values in pixel_values_list:
-            if isinstance(pixel_values, list):
-                img_cnt.append(len(pixel_values))
-                all_pixel_values.extend(
-                    [pv.flatten(end_dim=1).permute(1, 0) if pv.ndim > 2 else pv for pv in pixel_values]
-                )
-            else:
-                img_cnt.append(1)
-                if pixel_values.ndim > 2:
-                    all_pixel_values.append(pixel_values.flatten(end_dim=1).permute(1, 0))
-                else:
-                    all_pixel_values.append(pixel_values)
-
-        if not all_pixel_values:
-            return []
-
-        # Stack and reshape pixel values
-        tgt_sizes = (
-            [ts for ts in tgt_sizes if isinstance(ts, torch.Tensor)] if isinstance(tgt_sizes, list) else tgt_sizes
-        )
-        if isinstance(tgt_sizes, list):
-            tgt_sizes = torch.vstack(tgt_sizes).type(torch.int32)
-
-        max_patches = torch.max(tgt_sizes[:, 0] * tgt_sizes[:, 1])
-
-        all_pixel_values = torch.nn.utils.rnn.pad_sequence(all_pixel_values, batch_first=True, padding_value=0.0)
-        B, L, _ = all_pixel_values.shape
-        all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
-
-        # Create patch attention mask
-        patch_attn_mask = torch.zeros((B, 1, max_patches), dtype=torch.bool, device=device)
-        for i in range(B):
-            patch_attn_mask[i, 0, : tgt_sizes[i][0] * tgt_sizes[i][1]] = True
-
-        # Process through vision encoder with batching
-        all_pixel_values = all_pixel_values.type(dtype)
-        vision_batch_size = self.config.vision_batch_size
-
-        if B > vision_batch_size:
-            vision_embeddings = []
-            for i in range(0, B, vision_batch_size):
-                start_idx = i
-                end_idx = min(i + vision_batch_size, B)
-                tmp_emb = self.vpm(
-                    all_pixel_values[start_idx:end_idx],
-                    patch_attention_mask=patch_attn_mask[start_idx:end_idx],
-                    tgt_sizes=tgt_sizes[start_idx:end_idx],
-                ).last_hidden_state
-                vision_embeddings.append(tmp_emb)
-            vision_embedding = torch.cat(vision_embeddings, dim=0)
-        else:
-            vision_embedding = self.vpm(
-                all_pixel_values,
-                patch_attention_mask=patch_attn_mask,
-                tgt_sizes=tgt_sizes,
-            ).last_hidden_state
-
-        # Apply resampler
-        image_embeds = self.resampler(vision_embedding, tgt_sizes)  # (B, query_num, embed_dim)
-
-        # Split back into per-image embeddings
-        image_embeddings = []
-        start = 0
-        for cnt in img_cnt:
-            if cnt > 0:
-                image_embeddings.append(image_embeds[start : start + cnt])
-                start += cnt
-            else:
-                image_embeddings.append([])
-
-        return image_embeddings
-
-    # def _parse_and_validate_vision_input(
-    #     self,
-    #     modality: str,
-    #     **kwargs: object,
-    # ) -> MiniCPMVImageInputs | None:
-    #     pixel_values = kwargs.pop("pixel_values", None)
-    #     image_embeds = kwargs.pop("image_embeds", None)
-    #
-    #     if pixel_values is None and image_embeds is None:
-    #         return None
-    #
-    #     if image_embeds is not None:
-    #         return MiniCPMVImageEmbeddingInputs(
-    #             type="image_embeds",
-    #             image_embeds=image_embeds,
-    #         )
-    #
-    #     tgt_sizes = kwargs.pop("tgt_sizes")
-    #
-    #     num_slices_flat = torch.tensor([len(ps) for ps in pixel_values])
-    #     pixel_values_flat = flatten_bn(pixel_values)
-    #     tgt_sizes_flat = flatten_bn(tgt_sizes, concat=True)
-    #
-    #     return MiniCPMVImagePixelInputs(
-    #         type="pixel_values",
-    #         pixel_values=pixel_values_flat,
-    #         tgt_sizes=tgt_sizes_flat,
-    #         num_slices=num_slices_flat,
-    #     )
 
     def _parse_and_validate_vision_input(
         self,
