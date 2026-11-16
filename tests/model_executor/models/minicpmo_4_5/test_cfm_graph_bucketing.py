@@ -32,14 +32,38 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_shared_prompt_attention_cache_is_bit_exact_and_range_copyable():
-    prompt = torch.arange(2 * 2 * 2 * 1 * 5 * 4, dtype=torch.float32).reshape(2, 2, 2, 1, 5, 4)
-    delta = torch.arange(2 * 2 * 2 * 1 * 3 * 4, dtype=torch.float32).reshape(2, 2, 2, 1, 3, 4) + 1000
-    shared = SharedPromptAttCache(prompt, delta)
-    torch.testing.assert_close(shared.materialize(), torch.cat((prompt, delta), dim=4), rtol=0, atol=0)
+    prefix = torch.arange(2 * 2 * 2 * 2 * 1 * 3 * 4, dtype=torch.float32).reshape(2, 2, 2, 2, 1, 3, 4) + 1000
+    prompt = torch.arange(2 * 2 * 2 * 2 * 1 * 5 * 4, dtype=torch.float32).reshape(2, 2, 2, 2, 1, 5, 4)
+    shared = SharedPromptAttCache(prefix, prompt)
+    assert shared.ndim == 7
+    assert shared.shape == (2, 2, 2, 2, 1, 8, 4)
+    torch.testing.assert_close(shared.materialize(), torch.cat((prefix, prompt), dim=5), rtol=0, atol=0)
     copied = torch.empty_like(shared.materialize())
     shared.copy_range_to(copied[..., :4, :], 0, 4)
     shared.copy_range_to(copied[..., 4:, :], 4, 4)
     torch.testing.assert_close(copied, shared.materialize(), rtol=0, atol=0)
+
+    with pytest.raises(ValueError, match="7-D"):
+        SharedPromptAttCache(torch.zeros(2, 2, 2, 1, 3, 4), torch.zeros(2, 2, 2, 1, 5, 4))
+
+
+def test_whole_euler_plan_groups_handles_grid_without_singleton(monkeypatch):
+    block0 = SimpleNamespace(
+        conv=SimpleNamespace(in_channels=2, out_channels=2, block=[None, SimpleNamespace(causal_padding=(4, 0))]),
+        attn=SimpleNamespace(num_heads=2, head_dim=4),
+    )
+    estimator = SimpleNamespace(blocks=[block0], parameters=lambda: iter((torch.empty(0),)))
+
+    monkeypatch.setenv("VLLM_OMNI_CFM_GRAPH_GRID", "16")
+    wrapper_16 = WholeEulerCFMGraphWrapper(estimator=estimator, micro_batch_size=32, pad_max_rows=2)
+    assert wrapper_16._graph_batches() == [16]
+    assert wrapper_16._plan_groups(1) == [(16, 1)]
+    assert wrapper_16._plan_groups(17) == [(16, 16), (16, 1)]
+
+    monkeypatch.setenv("VLLM_OMNI_CFM_GRAPH_GRID", "4")
+    wrapper_4 = WholeEulerCFMGraphWrapper(estimator=estimator, micro_batch_size=4, pad_max_rows=1)
+    assert wrapper_4._graph_batches() == [4]
+    assert wrapper_4._plan_groups(1) == [(4, 1)]
 
 
 def test_whole_euler_arena_rows_from_graph_grid_and_env(monkeypatch):
@@ -49,7 +73,7 @@ def test_whole_euler_arena_rows_from_graph_grid_and_env(monkeypatch):
         conv=SimpleNamespace(in_channels=2, out_channels=2, block=[None, SimpleNamespace(causal_padding=(4, 0))]),
         attn=SimpleNamespace(num_heads=2, head_dim=4),
     )
-    estimator = SimpleNamespace(blocks=[block0], parameters=lambda: iter(()))
+    estimator = SimpleNamespace(blocks=[block0], parameters=lambda: iter((torch.empty(0),)))
     wrapper = WholeEulerCFMGraphWrapper(
         estimator=estimator,
         micro_batch_size=32,
@@ -479,3 +503,236 @@ def test_npu_precapture_stops_after_graph_exceeds_memory_budget(monkeypatch, moc
     wrapper._entry = entry
     assert wrapper.precapture(offsets=[50, 100, 150], steady=150, channels=4, spk_dim=4, max_graph_bytes=1024) == 1
     assert api.memory_reserved.call_count == 2
+
+
+def _make_history_preserving_token2wav(prompt_len: int = 10):
+    import torch.nn as nn
+
+    class _HistoryEncoder(nn.Module):
+        def forward_chunk(self, xs, last_chunk=False, cnn_cache=None, att_cache=None):
+            del last_chunk, cnn_cache
+            batch, length, _ = xs.shape
+            old_length = 0 if att_cache is None else att_cache.shape[3]
+            output = xs[:, : max(1, length - 1)]
+            cnn = xs[:, :1, :].transpose(1, 2).contiguous()
+            cur = output.unsqueeze(0).unsqueeze(2).expand(1, batch, 1, output.shape[1], 1)
+            att = cur if att_cache is None else torch.cat((cur, att_cache), dim=3)
+            assert att.shape[3] == old_length + output.shape[1]
+            return output, cnn, att
+
+    class _HistoryEstimator(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.in_proj = True
+            conv1 = SimpleNamespace(causal_padding=(1, 0))
+            self.blocks = [
+                SimpleNamespace(
+                    conv=SimpleNamespace(in_channels=1, out_channels=1, block=[None, conv1]),
+                    attn=SimpleNamespace(num_heads=1, head_dim=1),
+                )
+            ]
+            self.register_buffer("att_cache_buffer", torch.ones(1), persistent=False)
+            self.register_buffer("cnn_cache_buffer", torch.ones(1), persistent=False)
+
+        def t_embedder(self, time):
+            return time[:, None]
+
+        def blocks_forward_chunk(self, inputs, time, mask, cnn_cache, att_cache, cnn_out, att_out):
+            del time, cnn_cache
+            batch_2x, _, frames = inputs.shape
+            x_feat = inputs[:, :1, :].reshape(1, batch_2x, 1, frames, 1)
+            new_kv = torch.cat((x_feat, x_feat + 0.5), dim=-1)
+            if isinstance(att_cache, torch.Tensor):
+                att_out[:, :, :, :frames].copy_(new_kv)
+                att_out[:, :, :, frames:].copy_(att_cache)
+            else:
+                att_out.copy_(new_kv)
+            kv_sum = (att_out * 0.05).mean(dim=(0, 2, 3, 4)).reshape(batch_2x, 1, 1)
+            if mask is not None:
+                kv_sum = kv_sum * mask.to(inputs.dtype).mean(dim=(1, 2)).reshape(batch_2x, 1, 1)
+            cnn_out.copy_(inputs[:, :1, :1].reshape(1, batch_2x, 1, 1).expand_as(cnn_out))
+            return inputs[:, 1:2] + kv_sum
+
+    class _HistoryDecoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.estimator = _HistoryEstimator()
+            self.inference_cfg_rate = 0.7
+            self.register_buffer("rand_noise", torch.zeros(1, 1, 512), persistent=False)
+
+    class _HistoryFlow(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = _HistoryEncoder()
+            self.encoder_proj = nn.Identity()
+            self.decoder = _HistoryDecoder()
+            self.spk_embed_affine_layer = nn.Identity()
+
+        def input_embedding(self, tokens):
+            return tokens.to(torch.float32).unsqueeze(-1)
+
+    class _HistoryHiFT(nn.Module):
+        def inference(self, mel, source):
+            del source
+            speech = mel[:, 0].repeat_interleave(2, dim=1)
+            return speech, speech[:, None]
+
+    class _HistoryToken2Wav:
+        def __init__(self):
+            self.flow = _HistoryFlow()
+            self.hift = _HistoryHiFT()
+            self.float16 = False
+            self.n_timesteps = 2
+            self.mel_cache_len = 1
+            self.source_cache_len = 2
+            self.speech_window = torch.hamming_window(4, periodic=False)
+            self._prompt_len = prompt_len
+
+        def _prepare_prompt(self, prompt_wav):
+            seed = float(sum(ord(ch) for ch in str(prompt_wav)) % 7 + 1)
+            # _create_initial_states appends 3 lookahead tokens and _HistoryEncoder trims 1 frame.
+            tok_len = max(1, self._prompt_len - 2)
+            tokens = torch.arange(tok_len, dtype=torch.long).unsqueeze(0) + int(seed)
+            mels = torch.arange(self._prompt_len, dtype=torch.float32).reshape(1, self._prompt_len, 1) * 0.1 + seed
+            return (
+                tokens,
+                torch.tensor([tok_len], dtype=torch.int32),
+                torch.full((1, 1), seed),
+                mels,
+                torch.tensor([self._prompt_len], dtype=torch.int32),
+            )
+
+    return _HistoryToken2Wav()
+
+
+def test_batched_token2wav_prompt_att_sharing_matches_unshared_across_trims(monkeypatch, caplog):
+    import logging
+
+    from vllm_omni.model_executor.models.minicpmo_4_5 import batched_token2wav as btw_mod
+    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+        BatchedToken2Wav,
+        _trim_streaming_cache,
+    )
+
+    # Set trim suffix < prompt_len (6 < 10) so multi-chunk decoding crosses
+    # prompt_len + _CACHE_TRIM_SUFFIX and exercises _att_keep_ranges eviction.
+    monkeypatch.setattr(btw_mod, "_CACHE_TRIM_SUFFIX", 6)
+
+    unshared = BatchedToken2Wav(_make_history_preserving_token2wav(prompt_len=10))
+    shared = BatchedToken2Wav(
+        _make_history_preserving_token2wav(prompt_len=10),
+        cfm_graph_config={"prompt_att_sharing": True},
+    )
+
+    feat_u = unshared.prepare_prompt("voice-a", "/fake/a.wav")
+    feat_s = shared.prepare_prompt("voice-a", "/fake/a.wav")
+
+    states_u = unshared.setup_batch(feat_u, 2)
+    states_s = shared.setup_batch(feat_s, 2)
+    # Initial states share the raw setup cache before any chunk runs.
+    prompt_suffix = shared._prompt_att_caches[feat_s.cache_key]
+    assert prompt_suffix.shape[5] == 6
+    assert torch.equal(prompt_suffix, states_s[0].flow_cache["estimator_att_cache"][..., -6:, :])
+
+    with caplog.at_level(logging.INFO, logger=btw_mod.logger.name):
+        for step in range(4):
+            toks = torch.full((2, 5), 10 + step * 3, dtype=torch.long)
+            toks[1] += 1
+            aud_u, states_u = unshared.decode_batch(toks, feat_u, states_u, last_chunk=(step == 3))
+            aud_s, states_s = shared.decode_batch(toks, feat_s, states_s, last_chunk=(step == 3))
+            for row in range(2):
+                torch.testing.assert_close(aud_s[row], aud_u[row], rtol=0, atol=0)
+                att_s = states_s[row].flow_cache["estimator_att_cache"]
+                assert isinstance(att_s, SharedPromptAttCache)
+                assert att_s.prompt.data_ptr() == prompt_suffix.data_ptr()
+                torch.testing.assert_close(
+                    att_s.materialize(),
+                    states_u[row].flow_cache["estimator_att_cache"],
+                    rtol=0,
+                    atol=0,
+                )
+
+    assert any("CFM prompt attention suffix verified bit-exact" in rec.message for rec in caplog.records)
+    assert any(rec.levelname == "INFO" and "prompt=voice-a" in rec.message for rec in caplog.records)
+    assert states_s[0].flow_cache["estimator_att_cache"].prefix.data_ptr() != (
+        states_s[1].flow_cache["estimator_att_cache"].prefix.data_ptr()
+    )
+    # _trim_streaming_cache keeps SharedPromptAttCache valid when trimming further.
+    extra_trimmed = _trim_streaming_cache(states_s[0].flow_cache["estimator_att_cache"], 4)
+    assert isinstance(extra_trimmed, SharedPromptAttCache)
+    assert extra_trimmed.shape[5] == 10
+
+    # Inject a corrupted prompt suffix on chunk 2+ to confirm per-call validation
+    # catches mismatches even after initial verification succeeded.
+    corrupted = states_s[0].flow_cache["estimator_att_cache"].materialize()
+    corrupted[..., -1:, :] += 9.0
+    rejected_rows = shared._share_prompt_att_rows(feat_s.cache_key, prompt_suffix, [corrupted])
+    assert isinstance(rejected_rows[0], torch.Tensor)
+    assert feat_s.cache_key in shared._prompt_att_rejected
+    assert any("CFM prompt attention suffix differs" in rec.message for rec in caplog.records)
+
+
+def test_decode_ragged_batch_shares_prompt_suffix_single_and_mixed_voices(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5 import batched_token2wav as btw_mod
+    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+        _pack_att_cache,
+        _packed_att_buffer,
+        _unpack_att_cache,
+    )
+
+    monkeypatch.setattr(btw_mod, "_CACHE_TRIM_SUFFIX", 6)
+
+    def _mock_ragged_body(estimator, x, time_emb, mask, old_cnn, old_att, cnn_out, att_out, valid_lengths):
+        del valid_lengths
+        packed_out = _packed_att_buffer(att_out)
+        out = estimator.blocks_forward_chunk(x, time_emb, mask, old_cnn, _pack_att_cache(old_att), cnn_out, packed_out)
+        _unpack_att_cache(packed_out, att_out)
+        return out
+
+    # Single-voice ragged batch
+    unshared = BatchedToken2Wav(_make_history_preserving_token2wav(prompt_len=8))
+    shared = BatchedToken2Wav(
+        _make_history_preserving_token2wav(prompt_len=8),
+        cfm_graph_config={"prompt_att_sharing": True},
+    )
+    monkeypatch.setattr(unshared, "_ragged_body", _mock_ragged_body)
+    monkeypatch.setattr(shared, "_ragged_body", _mock_ragged_body)
+    feat_u = unshared.prepare_prompt("voice-r", "/fake/r.wav")
+    feat_s = shared.prepare_prompt("voice-r", "/fake/r.wav")
+    states_u = unshared.setup_batch(feat_u, 2)
+    states_s = shared.setup_batch(feat_s, 2)
+    ragged_toks = [torch.tensor([11, 12, 13]), torch.tensor([21, 22, 23, 24])]
+    aud_u, next_u = unshared.decode_ragged_batch(ragged_toks, feat_u, states_u, last_chunks=[False, True])
+    aud_s, next_s = shared.decode_ragged_batch(ragged_toks, feat_s, states_s, last_chunks=[False, True])
+    for row in range(2):
+        torch.testing.assert_close(aud_s[row], aud_u[row], rtol=0, atol=0)
+        att_s = next_s[row].flow_cache["estimator_att_cache"]
+        assert isinstance(att_s, SharedPromptAttCache)
+        assert att_s.prompt.data_ptr() == shared._prompt_att_caches[feat_s.cache_key].data_ptr()
+        torch.testing.assert_close(att_s.materialize(), next_u[row].flow_cache["estimator_att_cache"], rtol=0, atol=0)
+
+    # Mixed-voice ragged batch via setup_prompts + list[PromptFeatures]
+    feat_u_pair = [
+        unshared.prepare_prompt("voice-m1", "/fake/m1.wav"),
+        unshared.prepare_prompt("voice-m2", "/fake/m2.wav"),
+    ]
+    feat_s_pair = [
+        shared.prepare_prompt("voice-m1", "/fake/m1.wav"),
+        shared.prepare_prompt("voice-m2", "/fake/m2.wav"),
+    ]
+    mixed_u = unshared.setup_prompts(feat_u_pair, max_batch=2)
+    mixed_s = shared.setup_prompts(feat_s_pair, max_batch=2)
+    m_aud_u, m_next_u = unshared.decode_ragged_batch(ragged_toks, feat_u_pair, mixed_u, last_chunks=[False, False])
+    m_aud_s, m_next_s = shared.decode_ragged_batch(ragged_toks, feat_s_pair, mixed_s, last_chunks=[False, False])
+    for row, feat in enumerate(feat_s_pair):
+        torch.testing.assert_close(m_aud_s[row], m_aud_u[row], rtol=0, atol=0)
+        att_s = m_next_s[row].flow_cache["estimator_att_cache"]
+        assert isinstance(att_s, SharedPromptAttCache)
+        assert att_s.prompt.data_ptr() == shared._prompt_att_caches[feat.cache_key].data_ptr()
+        torch.testing.assert_close(att_s.materialize(), m_next_u[row].flow_cache["estimator_att_cache"], rtol=0, atol=0)
+
+    # can_merge_state_shapes accepts mixed SharedPromptAttCache and Tensor rows
+    monkeypatch.setattr(shared, "_whole_euler_ragged_active", lambda: True)
+    mixed_states = [m_next_s[0], mixed_s[1]]
+    assert shared.can_merge_state_shapes(mixed_states, [3, 4]) is True

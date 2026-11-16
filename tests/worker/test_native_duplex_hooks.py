@@ -2884,7 +2884,10 @@ def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
     runtime._decode_ref_audio_from_session_config = lambda _config: np.array([0.1, -0.1], dtype=np.float32)
     runtime._encode_text = lambda text: token_map[text]
     runtime._embed_token = lambda token_id: torch.full((1, 2), float(token_id))
-    runtime._stage_ref_audio_embeddings = lambda ref_audio, state=None: torch.tensor([[10.0, 11.0], [12.0, 13.0]])
+    runtime._stage_ref_audio_embeddings = lambda ref_audio, state=None: (
+        torch.tensor([[10.0, 11.0], [12.0, 13.0]]),
+        False,
+    )
 
     state = _MiniCPMO45Stage0SessionState(session_id="sid-ref")
     runtime._prepare_session_context(state, {"instructions": "Use speech.", "extra_body": {"ref_audio_data": "x"}})

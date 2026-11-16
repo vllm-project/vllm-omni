@@ -1252,28 +1252,44 @@ class ResidentAttCache:
 
 
 class SharedPromptAttCache:
-    """A request attention cache split into an immutable prompt prefix and a request-owned delta tail.
+    """A request attention cache split into a request-owned prefix and an immutable prompt suffix.
 
-    Holds ``(prompt, delta)`` without joining them into a full tensor.
-    Logical shape is ``(n_t, depth, 2, heads, prompt_frames + delta_frames, width)``.
+    Holds ``(prefix, prompt)`` without joining them into a full tensor.
+    Logical shape is ``(n_t, depth, 2, 2, heads, prefix_frames + prompt_frames, head_dim)``
+    matching the per-request split K/V estimator cache layout (frame axis ``5``).
     """
 
-    __slots__ = ("prompt", "delta")
+    __slots__ = ("prefix", "prompt")
 
-    def __init__(self, prompt: torch.Tensor, delta: torch.Tensor) -> None:
+    def __init__(self, prefix: torch.Tensor, prompt: torch.Tensor) -> None:
+        if prefix.ndim != 7 or prompt.ndim != 7:
+            raise ValueError(
+                f"SharedPromptAttCache expects 7-D (n_t, depth, 2, 2, heads, frames, head_dim) tensors, "
+                f"got {tuple(prefix.shape)} and {tuple(prompt.shape)}"
+            )
+        if prefix.shape[:5] != prompt.shape[:5] or prefix.shape[6] != prompt.shape[6]:
+            raise ValueError(
+                f"SharedPromptAttCache shape mismatch between prefix {tuple(prefix.shape)} "
+                f"and prompt {tuple(prompt.shape)}"
+            )
+        self.prefix = prefix
         self.prompt = prompt
-        self.delta = delta
+
+    @property
+    def ndim(self) -> int:
+        return 7
 
     @property
     def shape(self) -> torch.Size:
         return torch.Size(
             (
-                self.prompt.shape[0],
-                self.prompt.shape[1],
-                self.prompt.shape[2],
-                self.prompt.shape[3],
-                self.prompt.shape[4] + self.delta.shape[4],
-                self.prompt.shape[5],
+                self.prefix.shape[0],
+                self.prefix.shape[1],
+                self.prefix.shape[2],
+                self.prefix.shape[3],
+                self.prefix.shape[4],
+                self.prefix.shape[5] + self.prompt.shape[5],
+                self.prefix.shape[6],
             )
         )
 
@@ -1287,28 +1303,28 @@ class SharedPromptAttCache:
 
     def data_ptr(self) -> int:
         """Expose a stable pointer for cache-owner accounting without a full materialization."""
-        return self.delta.data_ptr() if self.delta.numel() > 0 else id(self)
+        return self.prefix.data_ptr() if self.prefix.numel() > 0 else id(self)
 
     def copy_range_to(self, dst: torch.Tensor, start: int, length: int) -> None:
-        """Copy a logical frame range into ``dst`` without joining prompt and tail."""
+        """Copy a logical frame range into ``dst`` without joining prefix and prompt."""
         start, length = int(start), int(length)
-        if start < 0 or length < 0 or start + length > int(self.shape[4]):
+        if start < 0 or length < 0 or start + length > int(self.shape[5]):
             raise ValueError(f"attention-cache range ({start}, {length}) is outside {tuple(self.shape)}")
-        prompt_len = int(self.prompt.shape[4])
+        prefix_len = int(self.prefix.shape[5])
         position = 0
-        if start < prompt_len:
-            count = min(length, prompt_len - start)
-            dst[..., position : position + count, :].copy_(self.prompt[..., start : start + count, :])
+        if start < prefix_len:
+            count = min(length, prefix_len - start)
+            dst[..., position : position + count, :].copy_(self.prefix[..., start : start + count, :])
             position += count
             start += count
             length -= count
         if length:
-            delta_start = start - prompt_len
-            dst[..., position : position + length, :].copy_(self.delta[..., delta_start : delta_start + length, :])
+            prompt_start = start - prefix_len
+            dst[..., position : position + length, :].copy_(self.prompt[..., prompt_start : prompt_start + length, :])
 
     def materialize(self) -> torch.Tensor:
         """Materialize the logical cache for eager or unsupported graph paths."""
-        return torch.cat((self.prompt, self.delta), dim=4)
+        return torch.cat((self.prefix, self.prompt), dim=5)
 
 
 def _copy_att_cache_range(dst: torch.Tensor, src, start: int, length: int) -> None:
@@ -1659,7 +1675,7 @@ class WholeEulerCFMGraphWrapper:
         graph's replay costs well over its share of a larger one, so a padded
         row is cheaper than a further replay.
         """
-        sizes = self._graph_batches()
+        sizes = sorted(self._graph_batches())
         largest = max(sizes)
         groups: list[tuple[int, int]] = []
         remainder = batch_size
@@ -1671,7 +1687,13 @@ class WholeEulerCFMGraphWrapper:
             if up - remainder <= self.pad_max_rows:
                 groups.append((up, remainder))
                 break
-            down = max(size for size in sizes if size <= remainder)
+            down_candidates = [size for size in sizes if size <= remainder]
+            if not down_candidates:
+                # Configured grids without a singleton tier (e.g. VLLM_OMNI_CFM_GRAPH_GRID=16)
+                # must still handle batches smaller than the minimum tier (such as setup_batch).
+                groups.append((up, remainder))
+                break
+            down = max(down_candidates)
             groups.append((down, down))
             remainder -= down
         return groups
@@ -2076,7 +2098,11 @@ class WholeEulerCFMGraphWrapper:
             return None
         handles: list[ResidentAttCache] = []
         for row, needs in zip(att_rows, adopt, strict=True):
-            handle = pool.adopt(row.materialize() if isinstance(row, ResidentAttCache) else row) if needs else row
+            handle = (
+                pool.adopt(row.materialize() if isinstance(row, (ResidentAttCache, SharedPromptAttCache)) else row)
+                if needs
+                else row
+            )
             assert handle is not None
             handles.append(handle)
 
@@ -2395,8 +2421,9 @@ class WholeEulerCFMGraphWrapper:
         if mixed_offsets and x.device.type != "cuda" and not (x.device.type == "npu" and self.npu_mixed_history):
             return None
         if att_rows is not None:
-            # A refused slot replay can leave resident rows; the arena path reads tensors.
-            att_rows = _materialize_att_rows(att_rows)
+            # A refused slot replay can leave resident rows; the arena path reads
+            # tensors or copies SharedPromptAttCache piecewise via copy_range_to.
+            att_rows = [row.materialize() if isinstance(row, ResidentAttCache) else row for row in att_rows]
         offset_cap = _capture_offset(offset, self.offset_bucket_frames, sum(att_keep) if att_keep is not None else 0)
         mask_cap = _build_capture_mask(
             attn_mask=attn_mask,
@@ -2505,7 +2532,11 @@ class WholeEulerCFMGraphWrapper:
                     # The row's old cache was copied into the arena by ``fill``.
                     old = att_rows[start + row] if att_rows is not None else None
                     request = None
-                    if old is not None and old.dtype == self.att_cache_dtype and owners[old.data_ptr()] == 1:
+                    if (
+                        isinstance(old, torch.Tensor)
+                        and old.dtype == self.att_cache_dtype
+                        and owners[old.data_ptr()] == 1
+                    ):
                         request = _resized_frame_view(old, shape[5])
                     if request is None:
                         # Room for the steady length, so the cache grows into it in place.
