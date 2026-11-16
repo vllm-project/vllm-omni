@@ -104,6 +104,10 @@ chunked prefill disabled. Existing two-call ABC/semantic clients and external
 scores remain supported; pipeline, architecture and HTTP endpoint names stay
 `yue2`, `Yue2ForCausalLM` and `/v1/audio/speech`.
 
+The deploy YAML explicitly selects `model_runner: v1`. Selecting V2 raises
+an error before backbone initialization. A V2-only runtime requires a YuE2
+runner migration; changing the YAML to V2 does not provide compatibility.
+
 ### Acoustic batching and memory
 
 Set `hf_overrides.yue2_nar_batch_size: 2` in `yue2.yaml` to batch up to two

@@ -5,6 +5,7 @@
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm.config import ModelConfig, ParallelConfig, SchedulerConfig, VllmConfig
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.engine import FinishReason
@@ -29,6 +30,20 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.request import OmniRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_v2_is_rejected_before_backbone_initialization(mocker):
+    config = mocker.Mock(
+        spec=VllmConfig,
+        parallel_config=mocker.Mock(spec=ParallelConfig, tensor_parallel_size=1, pipeline_parallel_size=1),
+        scheduler_config=mocker.Mock(spec=SchedulerConfig, async_scheduling=False),
+        model_config=mocker.Mock(spec=ModelConfig, use_v2_model_runner=True),
+        speculative_config=None,
+    )
+    initialize = mocker.patch("vllm_omni.model_executor.models.yue2.runtime.Yue2Backbone.__init__", return_value=None)
+    with pytest.raises(ValueError, match="YuE2 requires model runner v1 without speculative decoding"):
+        Yue2ForCausalLM(vllm_config=config)
+    initialize.assert_not_called()
 
 
 def test_acoustic_detachment_is_only_visible_to_runner_bookkeeping(monkeypatch):
@@ -102,6 +117,7 @@ def test_detach_and_delayed_completion_with_coalesced_tokens(mocker, outcome):
     _bind_request_lifecycle(scheduler, update_request=lambda r, tokens: (tokens, False))
     del scheduler._update_request_with_output
     scheduler.max_model_len = 4096
+    scheduler.num_spec_tokens = 0
     scheduler._pause_state = PauseState.UNPAUSED
     scheduler.num_waiting_for_streaming_input = 0
     scheduler._hold_payloadless_outputs = True

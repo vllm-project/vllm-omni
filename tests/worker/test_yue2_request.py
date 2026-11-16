@@ -261,6 +261,7 @@ def test_existing_model_and_pipeline_names_resolve_to_unified_path():
     assert getattr(import_module(module), name) is Yue2Scheduler
     deploy = yaml.safe_load((Path(__file__).parents[2] / "vllm_omni/deploy/yue2.yaml").read_text())
     assert deploy["pipeline"] == "yue2"
+    assert deploy["model_runner"] == "v1"
     module, name = deploy["stages"][0]["worker_cls"].rsplit(".", 1)
     worker = getattr(import_module(module), name)
     from vllm_omni.model_executor.models.yue2.runtime import Yue2ModelRunner
