@@ -384,6 +384,11 @@ class Qwen2_5OmniForConditionalGeneration(
             return talker_hidden
 
         if self.model_stage == "code2wav":
+            # Non-async stage prompts contain only scheduling slots. The
+            # worker connector owns the actual codec ids and requested voice.
+            buffers = kwargs.get("model_intermediate_buffer") or ()
+            info = buffers[0] if buffers else None
+            codec_ids = info.get("codes", {}).get("audio") if isinstance(info, dict) else None
             code = (
                 input_ids
                 if input_ids is not None
@@ -393,6 +398,8 @@ class Qwen2_5OmniForConditionalGeneration(
                     device=inputs_embeds.device,
                 )
             )
+            if codec_ids is not None:
+                code = torch.as_tensor(codec_ids, dtype=torch.long, device=code.device).reshape(-1)
 
             if code.numel() and code[-1] == TALKER_CODEC_EOS_TOKEN_ID:
                 code = code[:-1]
@@ -400,8 +407,6 @@ class Qwen2_5OmniForConditionalGeneration(
                 code = code[1:]
 
             # Code2Wav decodes one request per forward (its deploy uses max_num_seqs=1).
-            buffers = kwargs.get("model_intermediate_buffer") or ()
-            info = buffers[0] if buffers else None
             speaker = resolve_speaker(info.get("speaker") if isinstance(info, dict) else None)
             audio_tensor = self.generate_audio(code, speaker) if code.numel() else torch.zeros(0, device=code.device)
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": audio_tensor})

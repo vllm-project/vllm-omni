@@ -924,6 +924,67 @@ def test_payload_builders_see_stage_model_config(monkeypatch):
     assert _get_accept_hidden_layer_index(plane) == 24
 
 
+def test_qwen25_full_payload_stages_create_native_data_plane(monkeypatch):
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import QWEN2_5_OMNI_PIPELINE
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    def cpu_init(self, config, device):
+        self.vllm_config, self.model_config, self.device = config, config.model_config, device
+
+    # Only native GPU allocation is substituted. Runner selection, the
+    # topology's capability gate and payload-builder loading remain real.
+    monkeypatch.setattr(GPUModelRunner, "__init__", cpu_init)
+    for stage in QWEN2_5_OMNI_PIPELINE.stages:
+        model_config = SimpleNamespace(
+            stage_id=stage.stage_id,
+            model_stage=stage.model_stage,
+            async_chunk=False,
+            supports_native_mrv2_data_plane=stage.supports_native_mrv2_data_plane,
+            requires_full_payload_input=stage.requires_full_payload_input,
+            custom_process_next_stage_input_func=stage.custom_process_next_stage_input_func,
+        )
+        config = SimpleNamespace(
+            model_config=model_config,
+            parallel_config=SimpleNamespace(pipeline_parallel_size=1, prefill_context_parallel_size=1),
+        )
+        runner = OmniGPUModelRunner(config, torch.device("cpu"))
+        plane = runner._omni_data_plane
+        assert plane is not None, f"stage {stage.stage_id} has no full-payload owner"
+        try:
+            assert plane._can_send is (stage.stage_id < 2)
+        finally:
+            plane.close()
+
+
+def test_nonreply_tp_rank_releases_terminal_without_materializing_output(plane, monkeypatch):
+    from vllm.v1.executor import multiproc_executor
+
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniAsyncOutput
+
+    plane._local_rank = 1
+    request = _new_request()
+    request.resumable = False
+    plane.register_request(request)
+    plane.reserve_outputs([request.req_id])
+
+    # Native995 consumes AsyncModelRunnerOutput only on the replying TP0.
+    # An uninitialized output would fail if TP1 tried to materialize it.
+    deferred = object.__new__(OmniAsyncOutput)
+    worker = object.__new__(multiproc_executor.WorkerProc)
+    worker.worker = SimpleNamespace(sample_tokens=lambda: deferred)
+    worker.rank, worker.use_async_scheduling, worker.worker_response_mq = 1, False, None
+    monkeypatch.setattr(multiproc_executor, "get_watch_dog", lambda: SimpleNamespace(feed=lambda: None))
+    worker._execute_worker_rpc(("sample_tokens", (), {}, 0))
+    plane.request_terminal({request.req_id})
+
+    assert not plane._native_outputs_in_flight
+    assert not plane._native_terminal_pending
+    assert not plane._native_requests
+    assert plane.record.cleaned == [request.req_id]
+
+
 @pytest.mark.parametrize("factory", ["from_base", "from_request"])
 def test_native_request_preserves_streaming_flag_and_reference_audio(plane, factory):
     from vllm.v1.core.sched.output import NewRequestData
