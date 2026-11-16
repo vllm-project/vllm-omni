@@ -31,7 +31,11 @@ class DiffusionStagePayloadMixin(OmniConnectorModelRunnerMixin):
 
     od_config: OmniDiffusionConfig
     device: torch.device
-    _target_device: torch.device | None
+
+    @property
+    def _target_device(self) -> torch.device | None:
+        """Device chosen by the runner for incoming stage payloads."""
+        raise NotImplementedError
 
     _STAGE_PAYLOAD_HANDLE_KEY = "_stage_payload_transfer"
 

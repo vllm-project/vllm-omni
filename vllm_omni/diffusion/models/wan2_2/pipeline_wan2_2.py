@@ -727,6 +727,24 @@ class Wan22Pipeline(
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
+        runtime = getattr(self, "_aligncache_runtime", None)
+        if runtime is not None:
+            # forward() may rebuild the scheduler from request extra_args after admission.
+            if self._sample_solver != "unipc":
+                raise ValueError("align_cache: Wan requires the native UniPC sampler")
+            runtime.bind_schedule(
+                self,
+                timesteps,
+                latents,
+                prompt_embeds,
+                negative_prompt_embeds,
+                guidance_low,
+                guidance_high,
+                boundary_timestep,
+                dtype,
+                latent_condition,
+                first_frame_mask,
+            )
         # Checks a bound attention schedule against the actual sequence (3 steps for DMD) and returns its
         # length; None without a schedule, so unscheduled runs publish no total.
         total_steps = begin_scheduled_denoise(len(timesteps))
@@ -812,13 +830,19 @@ class Wan22Pipeline(
                 else:
                     negative_kwargs = None
 
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_true_cfg,
-                    true_cfg_scale=current_guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=False,
-                )
+                if runtime is None:
+                    noise_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=do_true_cfg,
+                        true_cfg_scale=current_guidance_scale,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                    )
+
+                else:
+                    noise_pred = runtime.predict_noise(
+                        self, step_idx, t, current_guidance_scale, positive_kwargs, negative_kwargs
+                    )
 
                 if self.is_dmd:
                     pred_clean = self.scheduler.predict_clean(noise_pred, latents, t).to(noise_pred.dtype)
@@ -1633,6 +1657,9 @@ class Wan22Pipeline(
             # By name: the graph keys on primitive values, and each expert gets its own graph.
             component = "transformer_2" if current_model is self.transformer_2 else "transformer"
             return self._denoise_graph_runner(component=component, **kwargs)
+        runtime = getattr(self, "_aligncache_runtime", None)
+        if runtime is not None:
+            runtime.record_forward(current_model)
         result = current_model(**kwargs)
         return result if isinstance(result, IntermediateTensors) else result[0]
 

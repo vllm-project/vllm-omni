@@ -336,6 +336,7 @@ def minimax_h3_denoise_loop(
     update_progress: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
     sampler: str = "euler",
+    aligncache_runtime: Any | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -368,6 +369,19 @@ def minimax_h3_denoise_loop(
     if audio_edit is not None:
         audio_edit = audio_edit.to(device=device, dtype=torch.float32)
 
+    if aligncache_runtime is not None:
+        if (
+            sampler != "euler"
+            or positive.locked_audio_rows is not None
+            or keyframe_cond_rows is not None
+            or audio_ref_rows is not None
+            or video_edit is not None
+            or audio_edit is not None
+            or not bool(update.all())
+            or not bool(audio_update.all())
+        ):
+            raise ValueError("align_cache: MiniMax-H3 currently requires pure T2VA Euler without reference/edit rows")
+        aligncache_runtime.bind([sigmas_video, sigmas_audio], (id(model), id(positive)))
     # Each call denoises one sequence and publishes its steps from 0 with its
     # own num_steps. forward() runs one call per output seed and per
     # continuation window, all with the main num_steps, and with latent_refine
@@ -411,7 +425,7 @@ def minimax_h3_denoise_loop(
     try:
         with torch.inference_mode():
             sampler_object(sampler).sample(
-                MiniMaxH3ModelBatch({state: adapter}),
+                MiniMaxH3ModelBatch({state: adapter}, aligncache_runtime=aligncache_runtime),
                 [state],
                 callback=write_back_and_update_progress,
                 step_context=step_context,

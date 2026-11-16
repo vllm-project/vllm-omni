@@ -1052,7 +1052,7 @@ def test_generic_diffusion_deploy_survives_typed_resolution(
 
 
 def test_default_stage_config_preserves_pre_sharded_hsdp_weight_load() -> None:
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"hsdp_weight_load_strategy": "pre_sharded"})[0]
+    stage_cfg = StageConfigFactory.create_default_diffusion({"hsdp_weight_load_strategy": "pre_sharded"})[0]
 
     assert stage_cfg["engine_args"]["hsdp_weight_load_strategy"] == "pre_sharded"
 
@@ -1079,3 +1079,33 @@ def test_removed_hsdp_loading_strategies_are_rejected(strategy):
 
     with pytest.raises(ValueError, match="hsdp_weight_load_strategy"):
         OmniDiffusionConfig(hsdp_weight_load_strategy=strategy)
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        "wan21_reference_v1",
+        "wan22_t2v_reference_v1",
+        "wan22_i2v_reference_v1",
+        "wan22_ti2v_reference_v1",
+        "qwen21_reference_v1",
+        "minimax_h3_reference_v1",
+    ],
+)
+def test_aligncache_namespace_survives_default_diffusion_stage(profile):
+    from vllm_omni.diffusion.cache.aligncache.config import AlignCacheConfig
+
+    namespace = {"align_cache": {"profile": profile, "mode": "trace", "warmup_steps": 3}}
+    stage = StageConfigFactory.create_default_diffusion({"cache_backend": "align_cache", "cache_config": namespace})[0]
+    terminal = _terminal_config(stage)
+    resolved = AlignCacheConfig.parse(terminal.cache_config)
+    assert terminal.cache_backend == "align_cache"
+    assert resolved.profile == profile
+    assert resolved.mode == "trace"
+    assert resolved.warmup_steps == 3
+
+
+@pytest.mark.parametrize("value", ["{", "[]", "true", '"nested"'])
+def test_aligncache_engine_does_not_downgrade_invalid_json(value):
+    with pytest.raises(ValueError, match="cache_config"):
+        StageConfigFactory.create_default_diffusion({"cache_backend": "align_cache", "cache_config": value})

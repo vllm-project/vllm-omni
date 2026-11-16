@@ -36,6 +36,11 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
     if cache_backend is None or cache_backend == "none":
         return None
 
+    if cache_backend == "align_cache":
+        from vllm_omni.diffusion.cache.aligncache.backend import AlignCacheBackend
+
+        return AlignCacheBackend(cache_config)
+
     if isinstance(cache_config, dict):
         cache_config = DiffusionCacheConfig.from_dict(cache_config)
 
@@ -52,5 +57,5 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
     else:
         raise ValueError(
             f"Unsupported cache backend: {cache_backend}. "
-            "Supported: 'cache_dit', 'tea_cache', 'mag_cache', 'sea_cache', 'step_cache'"
+            "Supported: 'cache_dit', 'tea_cache', 'mag_cache', 'sea_cache', 'step_cache', 'align_cache'"
         )

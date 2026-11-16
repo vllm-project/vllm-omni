@@ -420,10 +420,15 @@ class TestDrainAsyncOutputs:
         proc.worker = MagicMock()
 
         call_order: list[str] = []
+
+        def drain(*args, **kwargs):
+            call_order.append("drain")
+            return True
+
         mocker.patch.object(
             proc,
             "drain_async_outputs",
-            side_effect=lambda *a, **kw: call_order.append("drain") or True,
+            side_effect=drain,
         )
         proc.worker.execute_method.side_effect = lambda *a, **kw: call_order.append("sleep")
 
@@ -528,10 +533,15 @@ class TestSynchronizeDeviceBarrier:
         proc = _make_worker_proc(step_execution=False)
         proc.worker = MagicMock()
         call_order: list = []
+
+        def drain(**kwargs):
+            call_order.append(("drain", kwargs))
+            return True
+
         mocker.patch.object(
             proc,
             "drain_async_outputs",
-            side_effect=lambda **kw: call_order.append(("drain", kw)) or True,
+            side_effect=drain,
         )
         proc.worker.execute_method.side_effect = lambda *a, **kw: call_order.append(("sync", a, kw))
 
@@ -593,3 +603,18 @@ class TestSynchronizeDeviceBarrier:
             proc._async_output_queue.put(None)
             loop_thread.join(timeout=2.0)
             barrier_thread.join(timeout=2.0)
+
+
+def test_missing_async_queue_does_not_publish_or_count_output(mocker):
+    from vllm_omni.diffusion.worker import diffusion_worker as worker_module
+
+    proc = _make_worker_proc()
+    proc._async_output_queue = None
+    event = mocker.patch.object(worker_module.current_omni_platform, "record_device_event")
+
+    with pytest.raises(AssertionError, match="Async output queue"):
+        proc._return_result(DiffusionOutput(output="test"))
+
+    assert proc._async_output_pending == 0
+    event.assert_not_called()
+    proc.result_mq.enqueue.assert_not_called()

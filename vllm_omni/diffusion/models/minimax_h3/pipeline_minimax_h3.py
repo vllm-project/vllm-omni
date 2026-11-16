@@ -2414,6 +2414,7 @@ class MiniMaxH3Pipeline(
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     sampler=inputs["sampler"],
                     model=transformer,
+                    aligncache_runtime=getattr(self, "_aligncache_runtime", None),
                     positive=branch,
                     initial_video_rows=inputs["video_rows"],
                     initial_audio_rows=inputs["audio_rows"],
@@ -3446,6 +3447,8 @@ class MiniMaxH3Pipeline(
                 "refine pass is a second denoise sequence with its own step count; send attention_schedule=[] "
                 "or latent_refine=false"
             )
+        if getattr(self, "_aligncache_runtime", None) is not None and quality_plan.cache_dit is not None:
+            raise OmniClientError("align_cache: H3 cannot combine AlignCache with request-level Cache-DiT")
         self._cache_dit_runtime.prepare(quality_plan.cache_dit)
         upscale_target = self._resolve_latent_upscale(
             extra, latent_h=conditioning.height // 16, latent_w=conditioning.width // 16
@@ -3880,6 +3883,17 @@ class MiniMaxH3Pipeline(
             request.sampling_params,
         )
         check_request_cancellation()
+        if getattr(self, "_aligncache_runtime", None) is not None:
+            if (
+                context["task"] != "t2va"
+                or context.get("latent_refine") is not None
+                or context.get("latent_upscale") is not None
+                or context.get("continuation") is not None
+                or context.get("latent_continuation") is not None
+                or context.get("control_rows") is not None
+                or context["num_outputs"] != 1
+            ):
+                raise ValueError("align_cache: H3 requires one pure T2VA pass without refine/upscale/continuation")
         denoise_kwargs = self._denoise_kwargs(context)
         num_outputs = context["num_outputs"]
         upscale_target = context.get("latent_upscale")

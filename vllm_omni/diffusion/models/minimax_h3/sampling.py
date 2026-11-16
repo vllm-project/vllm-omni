@@ -18,6 +18,8 @@ from .latent_mask import MiniMaxH3LatentEdit
 from .scheduling_minimax_h3_euler_ancestral import minimax_h3_rf_v_to_x0
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.cache.aligncache.flow import FlowRuntime
+
     from .denoise_loop import MiniMaxH3DenoiseBranch
 
 logger = init_logger(__name__)
@@ -104,7 +106,16 @@ class MiniMaxH3Model:
 class MiniMaxH3ModelBatch:
     """Callable x0 model; pack compatible evaluations without advancing samplers."""
 
-    def __init__(self, models: dict[SamplingState, MiniMaxH3Model], packed_supported: Callable = lambda _: False):
+    def __init__(
+        self,
+        models: dict[SamplingState, MiniMaxH3Model],
+        packed_supported: Callable = lambda _: False,
+        *,
+        aligncache_runtime: FlowRuntime | None = None,
+    ):
+        if aligncache_runtime is not None and len(models) != 1:
+            raise ValueError("align_cache: H3 requires one sampling state")
+        self.aligncache_runtime = aligncache_runtime
         self.models = models
         self.packed_supported = packed_supported
 
@@ -212,7 +223,20 @@ class MiniMaxH3ModelBatch:
             reference_kv_state = kwargs.get("reference_kv_state")
             if reference_kv_state is not None:
                 reference_kv_state.begin_step(evaluations[0].state.step_index, sigma=float(evaluations[0].sigmas[0]))
-            video, audio = models[0].transformer(**kwargs)
+            if self.aligncache_runtime is None:
+                video, audio = models[0].transformer(**kwargs)
+            else:
+
+                def exact(count):
+                    count()
+                    return models[0].transformer(**kwargs)
+
+                video, audio = self.aligncache_runtime.evaluate(
+                    evaluations[0].state.step_index,
+                    (kwargs["video_rows"], kwargs["audio_rows"]),
+                    (id(models[0].transformer), id(models[0].branch)),
+                    exact,
+                )
             if reference_kv_state is not None:
                 reference_kv_state.end_step()
             check_request_cancellation()
