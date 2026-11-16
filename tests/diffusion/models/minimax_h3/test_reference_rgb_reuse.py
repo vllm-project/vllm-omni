@@ -268,15 +268,12 @@ def test_transcode_sidecar_matches_prepared_video_pixels(
     rgb = reference_video.load_prepared_rgb_frames(
         {"rgb_path": rgb_path, "frame_count": expected_count, "width": 32, "height": 32}
     )
-    try:
-        decoded = reference_video._decode_video_frames_ffmpeg(prepared, frame_count=expected_count, width=32, height=32)
-        np.testing.assert_array_equal(rgb, decoded)
-        sidecar_sample = reference_video.sample_reference_video_frames(prepared, decoded_frames=rgb)
-        decoded_sample = reference_video.sample_reference_video_frames(prepared, decoded_frames=decoded)
-        np.testing.assert_array_equal(sidecar_sample["frames"], decoded_sample["frames"])
-        assert sidecar_sample["block_timestamps"] == decoded_sample["block_timestamps"]
-        np.testing.assert_array_equal(
-            encoder_processing._frames_to_tensor(rgb).numpy(), encoder_processing._frames_to_tensor(decoded).numpy()
-        )
-    finally:
-        del rgb
+    decoded = reference_video._decode_video_frames_ffmpeg(prepared, frame_count=expected_count, width=32, height=32)
+    np.testing.assert_array_equal(rgb, decoded)
+    sidecar_sample = reference_video.sample_reference_video_frames(prepared, decoded_frames=rgb)
+    decoded_sample = reference_video.sample_reference_video_frames(prepared, decoded_frames=decoded)
+    np.testing.assert_array_equal(sidecar_sample["frames"], decoded_sample["frames"])
+    assert sidecar_sample["block_timestamps"] == decoded_sample["block_timestamps"]
+    np.testing.assert_array_equal(
+        encoder_processing._frames_to_tensor(rgb).numpy(), encoder_processing._frames_to_tensor(decoded).numpy()
+    )
