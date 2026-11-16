@@ -959,6 +959,18 @@ def test_terminal_without_processor_payload_still_sends_finish_marker(raw_plane,
     assert payload["meta"]["finished"].item() is True
 
 
+@pytest.mark.parametrize("finished", [False, True])
+def test_duplex_perf_metadata_does_not_schedule_model_work(plane, finished):
+    plane._model_mode = "generation"
+    payload = {"meta": {"duplex_perf_chunk": [2, 7], "finished": finished}}
+
+    assert not plane._payload_is_consumable(payload)
+    metadata = plane._extract_scheduling_metadata_update(payload)
+    assert metadata is not None
+    assert metadata.duplex_perf_chunk == (2, 7)
+    assert metadata.input_terminal is finished
+
+
 def test_terminal_marker_without_payload_has_no_duplex_chunk(raw_plane, monkeypatch):
     enqueued = []
 
