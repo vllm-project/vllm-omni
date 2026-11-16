@@ -3059,6 +3059,28 @@ class TestBaseConfigInheritance:
         assert [stage.yaml_runtime["devices"] for stage in stages] == expected_devices
         assert stages[1].yaml_engine_args["gpu_memory_utilization"] == talker_memory
 
+    @pytest.mark.parametrize("platform", ["cuda", "xpu"])
+    def test_qwen2_5_omni_1card_overlay_colocates_every_stage(self, monkeypatch, platform):
+        """The single-card overlay only tests colocation while the merge keeps all three stages together.
+
+        The base deploy's own ``platforms.xpu`` section moves Code2Wav to
+        device 1, so the overlay re-pins the devices. If that re-pin ever stops
+        winning the merge, the single-card lane would spread over three cards
+        instead of failing, and would silently stop covering colocation.
+        """
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
+        deploy = load_deploy_config(get_deploy_config_path("ci/qwen2_5_omni_1card.yaml"))
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen2_5_omni"), deploy)
+
+        assert [stage.yaml_runtime["devices"] for stage in stages] == ["0", "0", "0"]
+        assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [0.45, 0.25, 0.15]
+        if platform == "xpu":
+            # The talker's native sampler workaround comes from the base
+            # platforms section and must survive the overlay.
+            assert stages[1].yaml_runtime["env"]["VLLM_XPU_USE_SAMPLER_KERNEL"] == "0"
+
     def test_minicpmo_overlays_inherit_talker_sampling_params(self):
         """Overlays must keep the base Talker codec Sampler knobs."""
         for filename in (
