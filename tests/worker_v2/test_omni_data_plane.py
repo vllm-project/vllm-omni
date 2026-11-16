@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
 
@@ -16,6 +16,7 @@ from vllm import SamplingParams
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
+from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker_v2.delivery import DeliveryCancelledError, DeliveryState, OmniDeliveryManager
 from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
@@ -54,6 +55,7 @@ def _bare_plane(*, delivery_timeout_s=1.0, shutdown_timeout_s=1.0):
         _native_terminal_pending=set(),
         _deferred_shm_releases=set(),
         _async_chunk=True,
+        _can_send=True,
         _pending_full_payload_send={},
         _put_req_chunk=defaultdict(int),
         _ramp_chunk_count=defaultdict(int),
@@ -326,8 +328,10 @@ class _Output:
             assert self.gate.wait(timeout=3)
         if self.error is not None:
             raise self.error
-        return SimpleNamespace(
+        return OmniModelRunnerOutput(
             req_ids=[self.rid],
+            req_id_to_index={self.rid: 0},
+            prompt_logprobs_dict={},
             inter_stage_outputs=[self.payload] if self.payload is not None else None,
             sampled_token_ids=[[self.token]],
         )
@@ -589,10 +593,9 @@ def test_native_worker_fifo_thread_affinity_and_signals():
         calls.append(("signals", threading.get_ident()))
         return "ready"
 
-    plane = SimpleNamespace(
-        enqueue_outputs=lambda **kw: calls.append(("publish", kw["req_ids"], threading.get_ident())),
-        get_omni_connector_output=get_signals,
-    )
+    plane = _bare_plane()
+    plane.enqueue_outputs = lambda **kw: calls.append(("publish", kw["req_ids"], threading.get_ident()))
+    plane.get_omni_connector_output = get_signals
     worker = NativeOutputWorker(2)
     try:
         a = worker.submit(_Output("a", gate=gate, payload={"v": 1}), plane)
@@ -614,7 +617,9 @@ def test_native_worker_fifo_thread_affinity_and_signals():
 def test_native_worker_capacity_error_cache_and_tp_gates():
     from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
-    plane = SimpleNamespace(enqueue_outputs=lambda **kw: None, get_omni_connector_output=lambda: None)
+    plane = _bare_plane()
+    plane.enqueue_outputs = lambda **kw: None
+    plane.get_omni_connector_output = lambda: None
     worker, gate = NativeOutputWorker(1), threading.Event()
     try:
         first = worker.submit(_Output("a", gate=gate), plane)
@@ -639,6 +644,179 @@ def test_native_worker_capacity_error_cache_and_tp_gates():
     assert OmniGPUModelRunner._uses_native_output_materializer(runner) is False  # TP>1 keeps TP consumers
     runner.vllm_config.parallel_config.tensor_parallel_size = 1
     assert OmniGPUModelRunner._uses_native_output_materializer(runner) is True
+
+
+@pytest.mark.parametrize(
+    "publication,can_send",
+    [
+        ("worker", True),
+        ("worker", False),
+        ("inline", True),
+        ("inline", False),
+        ("direct", True),
+        ("direct", False),
+        ("legacy", False),
+    ],
+)
+@pytest.mark.parametrize("pooler_kind", ["alias", "shallow_copy", "independent"])
+def test_native_publication_omits_only_transported_pooler_payload(
+    plane, monkeypatch, publication, can_send, pooler_kind
+):
+    from vllm.v1.request import Request
+
+    from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    plane._async_chunk = False
+    plane._can_send = can_send
+    plane._full_payload_replace_keys_cached = frozenset()
+    plane._start_output_worker(max_pending_batches=2)
+    plane.register_request(_new_request())
+    plane.reserve_outputs(["internal"])
+    hidden = torch.arange(12).reshape(3, 4)
+    payloads = [{"hidden": hidden}]
+    pooler = {
+        "alias": payloads,
+        "shallow_copy": list(payloads),
+        "independent": [{"embedding": torch.ones(1, 4)}],
+    }[pooler_kind]
+    client = [{"audio": torch.tensor([0.25])}]
+    output = OmniModelRunnerOutput(
+        req_ids=["internal"],
+        req_id_to_index={"internal": 0},
+        sampled_token_ids=[[21]],
+        prompt_logprobs_dict={},
+        pooler_output=pooler,
+        inter_stage_outputs=payloads,
+        multimodal_outputs=client,
+        sampled_token_ids_materialized=True,
+    )
+    if publication == "worker":
+        source = _Output()
+        monkeypatch.setattr(source, "get_output", lambda: output)
+        worker = NativeOutputWorker(1)
+        try:
+            result = worker.submit(source, plane).get_output()
+        finally:
+            worker.close()
+    elif publication == "direct":
+        plane.publish_output(output)
+        result = output
+    else:
+        runner = object.__new__(OmniGPUModelRunner)
+        runner._omni_data_plane = None if publication == "legacy" else plane
+        result = runner._finalize_native_data_plane_output(output)
+
+    assert result is output
+    assert result.sampled_token_ids == [[21]]
+    assert result.multimodal_outputs is client
+    if publication != "legacy":
+        plane.drain_outputs()
+        plane.request_terminal({"internal"})
+        assert result.inter_stage_outputs is None
+        if can_send:
+            [(snapshot, delivered)] = plane.record.batches[0]
+            assert snapshot.is_finished()
+            torch.testing.assert_close(delivered["hidden"], hidden)
+    else:
+        assert result.inter_stage_outputs is payloads
+
+    # Exercise the scheduler's real serialization boundary: transported tensors
+    # must not become a second bytes payload alongside the first text token.
+    request = Request("internal", [10, 11], SamplingParams(max_tokens=4), pooling_params=None)
+    scheduler = object.__new__(OmniSchedulerMixin)
+    engine_output = scheduler._make_omni_engine_output(
+        request,
+        new_token_ids=result.sampled_token_ids[0],
+        pooling_output=result.pooler_output[0] if result.pooler_output else None,
+        multimodal_output=result.multimodal_outputs[0],
+    )
+    omitted = publication != "legacy" and can_send and pooler_kind == "alias"
+    assert (engine_output.pooling_output_payload is None) == omitted
+    if not omitted:
+        assert result.pooler_output is pooler
+    assert engine_output.new_token_ids == [21]
+    assert engine_output.multimodal_output is client[0]
+
+
+@pytest.mark.parametrize("publication", ["worker", "inline"])
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_native_publication_retains_queued_mixed_batch(plane, monkeypatch, publication, async_chunk):
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    plane._async_chunk = async_chunk
+    plane._can_send = True
+    plane._full_payload_replace_keys_cached = frozenset()
+    entered, release = threading.Event(), threading.Event()
+    gate_result: Future[bool] = Future()
+    complete_outputs = plane.complete_outputs
+
+    def delayed_complete(**kwargs):
+        entered.set()
+        gate_result.set_result(release.wait(timeout=5))
+        return complete_outputs(**kwargs)
+
+    monkeypatch.setattr(plane, "complete_outputs", delayed_complete)
+    plane._start_output_worker(max_pending_batches=2)
+    req_ids = ["first", "no-payload", "last"]
+    for req_id in req_ids:
+        plane.register_request(_new_request(req_id, f"external-{req_id}"))
+    plane.reserve_outputs(req_ids)
+    first, last = torch.arange(6).reshape(2, 3), torch.arange(9, 12).reshape(1, 3)
+    payloads = [{"hidden": first}, None, {"hidden": last}]
+    tokens = [[21], [22], [23]]
+    output = OmniModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
+        sampled_token_ids=tokens,
+        prompt_logprobs_dict={},
+        pooler_output=None if async_chunk else payloads,
+        inter_stage_outputs=payloads,
+        sampled_token_ids_materialized=True,
+    )
+    del payloads
+    worker = None
+    try:
+        if publication == "worker":
+            source = _Output()
+            monkeypatch.setattr(source, "get_output", lambda: output)
+            worker = NativeOutputWorker(1)
+            result = worker.submit(source, plane).get_output()
+        else:
+            runner = object.__new__(OmniGPUModelRunner)
+            runner._omni_data_plane = plane
+            result = runner._finalize_native_data_plane_output(output)
+
+        assert entered.wait(timeout=5)
+        # Publication has returned before transport consumes the payload. Only
+        # the model output's aliases are cleared; the queued batch owns its data.
+        assert not gate_result.done(), "Consumer gate completed before publication returned"
+        # The recording send_chunks fake runs inside complete_outputs, which
+        # has not been called yet because it is behind the release event.
+        assert not plane.record.batches
+        assert result.inter_stage_outputs is None and result.pooler_output is None
+        assert result.req_ids == req_ids and result.sampled_token_ids == tokens
+    finally:
+        release.set()
+        if worker is not None:
+            worker.close()
+
+    plane.drain_outputs()
+    assert gate_result.result(timeout=10), "Consumer timed out waiting for the publication check"
+    plane.request_terminal(set(req_ids))
+    delivered = {
+        request.req_id: (request, payload)
+        for batch in plane.record.batches
+        for request, payload in batch
+        if payload is not None
+    }
+    assert set(delivered) == {"first", "last"}
+    for req_id, expected, token in [("first", first, 21), ("last", last, 23)]:
+        request, payload = delivered[req_id]
+        torch.testing.assert_close(payload["hidden"], expected)
+        assert request.output_token_ids == [token]
+        assert request.is_finished() == (not async_chunk)
+    assert sorted(plane.record.cleaned) == sorted(req_ids)
 
 
 def test_abort_before_first_chunk_cleans_receiver_state():
