@@ -13,18 +13,18 @@ import pytest
 import torch
 import torch.nn as nn
 
-import vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav as batched_token2wav_module
-from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
+import vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav as token2wav_module
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
+    AttSlotPool,
+    WholeEulerExecutionArena,
+    _pack_att_cache,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
     BatchedToken2Wav,
     PromptFeatures,
     _token2wav_sdpa_context,
     plan_token2wav_encode_slices,
     relpos_encode_token_budget,
-)
-from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
-    AttSlotPool,
-    WholeEulerExecutionArena,
-    _pack_att_cache,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
@@ -1017,13 +1017,19 @@ def test_ragged_diffusion_batches_eight_rows_and_preserves_exact_results():
 
 def test_npu_patch_preserves_ragged_estimator_contract():
     script = r"""
+import sys
+
 import torch
+
+# Model import and NPU patching must work without loading vocoder assets.
+core_module = "vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav"
+sys.modules[core_module] = None
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import BatchedToken2Wav
 
 from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import (
     _FakeToken2Wav,
     _enable_fake_ragged_kernel,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import BatchedToken2Wav
 import vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav as npu_patch
 
 
@@ -1033,6 +1039,7 @@ class _FailGraphRunner:
 
 
 npu_patch.apply_minicpmo_4_5_code2wav_patch()
+del sys.modules[core_module]
 adapter = BatchedToken2Wav(_FakeToken2Wav())
 _enable_fake_ragged_kernel(adapter)
 prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
@@ -1069,7 +1076,7 @@ def test_decode_cfm_enters_platform_sdpa_context(monkeypatch):
         entered.append("exit")
 
     monkeypatch.setattr(
-        batched_token2wav_module,
+        token2wav_module,
         "_token2wav_sdpa_context",
         lambda _device: recording_context(),
     )
@@ -2224,7 +2231,7 @@ def _padded_decode_adapter(bucket_frames: int) -> tuple[BatchedToken2Wav, int, i
 def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disable_during_setup, grouped):
     adapter, _, _ = _padded_decode_adapter(bucket_frames=16)
     adapter.flow.decoder.rand_noise = torch.randn(1, 1, 400)
-    prompt = batched_token2wav_module.PromptFeatures(
+    prompt = token2wav_module.PromptFeatures(
         cache_key=("voice", "voice.wav"),
         # The fake encoder consumes one of the three appended lookahead tokens.
         speech_tokens=torch.full((1, 298), 5, dtype=torch.long),

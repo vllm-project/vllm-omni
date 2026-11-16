@@ -6,7 +6,7 @@ import threading
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import BatchedToken2Wav
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import BatchedToken2Wav
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

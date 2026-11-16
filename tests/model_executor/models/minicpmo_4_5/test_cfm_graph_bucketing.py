@@ -14,10 +14,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
-    _cfm_pad_frames,
-    _zero_padded_frames,
-)
 from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
     WholeEulerCFMGraphWrapper,
     _att_keep_ranges,
@@ -25,6 +21,10 @@ from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
     _capture_query_width,
     _whole_euler_att_segments,
     _zero_padded_cnn_cache,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
+    _cfm_pad_frames,
+    _zero_padded_frames,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import _config, _forward, _info, _model
-from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
     BatchedToken2WavState,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav, _WorkItem
@@ -367,7 +367,7 @@ def test_epoch_policy_is_preserved(cross_turn):
 
 def _prepared_rows():
     _, core, _ = _candidate()
-    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import BatchedToken2Wav
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import BatchedToken2Wav
 
     # A standalone CPU adapter avoids the fake graph while creating fixtures.
     backend = BatchedToken2Wav(core)
