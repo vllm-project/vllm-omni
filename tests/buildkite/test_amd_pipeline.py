@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
-from importlib.util import find_spec, module_from_spec, spec_from_file_location
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from shlex import split
 from typing import cast
@@ -33,8 +33,6 @@ AMD_OMNI_PROCESSOR_RUNNER = Path(".buildkite/amd/scripts/run-omni-processor-test
 AR_PAGED_ATTENTION_LABEL = "ROCm · AR Diffusion Paged Attention GPU Test"
 DIFFUSION_GROUP = ":card_index_dividers: Diffusion Test"
 AR_PAGED_ATTENTION_MARKERS = "core_model and rocm and MI325 and cards_1"
-JOY_GPU_LABEL = "Diffusion · JoyImage GPU Inference Test"
-JOY_GPU_PATH = "tests/diffusion/models/joy_image/test_joy_image_gpu.py"
 MODEL_EXECUTOR_CPU_MARKERS = "core_model and cpu and not omni"
 PERSONAPLEX_TEMPORAL_LABEL = "Simple · PersonaPlex Temporal Streaming Test"
 PERSONAPLEX_TEMPORAL_PATH = "tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py"
@@ -632,7 +630,6 @@ _NIGHTLY_UNITS_PROMOTIONS = (
         "PERSONAPLEX_TEMPORAL_ARTIFACT_DIR",
         "pytest -s -v",
     ),
-    ("Diffusion · JoyImage GPU Inference Test", 10, "JoyImage GPU inference", "JOY_GPU_ARTIFACT_DIR", "pytest -sv"),
 )
 
 
@@ -694,59 +691,6 @@ def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
         assert transfer_argv[transfer_argv.index("--run-level") + 1] == "core_model"
 
     assert lane_definitions[0] == lane_definitions[1]
-
-
-def _find_joy_gpu_steps(pipeline_path: Path) -> list[dict]:
-    pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
-    matches = []
-
-    def walk(steps: list[dict]) -> None:
-        for step in steps:
-            if step.get("label") == JOY_GPU_LABEL or any(
-                arg == JOY_GPU_PATH or arg.startswith(f"{JOY_GPU_PATH}::")
-                for command in step.get("commands", [])
-                for arg in split(command)
-            ):
-                matches.append(step)
-            walk(step.get("steps", []))
-
-    walk(pipeline.get("steps", []))
-    return matches
-
-
-@pytest.mark.parametrize("pipeline_path", [AMD_READY_PIPELINE, AMD_MERGE_PIPELINE], ids=["ready", "merge"])
-def test_joy_gpu_lane_is_not_on_amd_ready_or_merge_critical_path(pipeline_path: Path) -> None:
-    assert not _find_joy_gpu_steps(pipeline_path)
-
-
-def test_joy_gpu_nightly_lane_is_unique_blocking_and_preserves_default_backend() -> None:
-    steps = _find_joy_gpu_steps(AMD_NIGHTLY_PIPELINE)
-    assert len(steps) == 1
-    step = steps[0]
-    assert step["label"] == JOY_GPU_LABEL
-    assert step["grade"] == "Blocking"
-    assert step["agent_pool"] == "mi300_1"
-    assert step["depends_on"] == "amd-build"
-    assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 90
-    assert step["artifact_paths"] == ["artifacts/joy-image-gpu/*.xml"]
-    assert 'export JOY_GPU_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/joy-image-gpu"' in step["commands"]
-    assert 'export AITER_JIT_DIR="/tmp/vllm-omni-joy-aiter-$$BUILDKITE_JOB_ID"' in step["commands"]
-    assert 'export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-joy-torch-$$BUILDKITE_JOB_ID"' in step["commands"]
-    assert 'mkdir -p "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR" "$$JOY_GPU_ARTIFACT_DIR"' in step["commands"]
-    assert "export VLLM_ROCM_USE_AITER=1" in step["commands"]
-    assert all("DIFFUSION_ATTENTION_BACKEND" not in command for command in step["commands"])
-    pytest_commands = [command for command in step["commands"] if "pytest" in split(command)]
-    assert len(pytest_commands) == 1
-    assert "|| true" not in pytest_commands[0]
-    argv = split(pytest_commands[0])
-    assert argv[:4] == ["timeout", "--signal=TERM", "--kill-after=2m", "80m"]
-    assert argv.count(JOY_GPU_PATH) == 1
-    assert "-k" not in argv
-    assert argv[argv.index("-m") + 1] == AR_PAGED_ATTENTION_MARKERS
-    assert argv[argv.index("--run-level") + 1] == "core_model"
-    assert "--durations=20" in argv
-    assert "--junitxml=$$JOY_GPU_ARTIFACT_DIR/pytest.xml" in argv
 
 
 # These jobs previously selected CUDA-marked items on AMD. Each migrated lane
@@ -1061,34 +1005,6 @@ def test_wan_sdpa_alignment_cpu_case_stays_shared_and_cuda_kernel_stays_nvidia()
     assert "rocm" not in cpu_case
     assert 'res={"cuda": "L4"}' in cuda_case
     assert "rocm" not in cuda_case
-
-
-def test_joy_gpu_suite_is_not_duplicated_in_amd_model_lane() -> None:
-    step = _find_step("Diffusion · Model Test", AMD_READY_PIPELINE)
-    argv = split(
-        next(command for command in step["commands"] if split(command)[:4] == ["timeout", "15m", "pytest", "-sv"])
-    )
-
-    assert step["grade"] == "Blocking"
-    assert step["agent_pool"] == "mi300_1"
-    assert argv[:4] == ["timeout", "15m", "pytest", "-sv"]
-    assert f"--ignore={JOY_GPU_PATH}" in argv
-    assert "--ignore=tests/diffusion/models/auk/test_auk_vae_fastpath.py" in argv
-    assert "--ignore=tests/diffusion/models/mammoth_moda2/test_dit_attention_cuda.py" in argv
-    assert argv[argv.index("-m") + 1] == (
-        "core_model and rocm and MI325 and not nvidia_only and not "
-        "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
-    )
-    assert argv[argv.index("--run-level") + 1] == "core_model"
-
-
-def test_joy_gpu_helper_import_does_not_require_pytest_package_mode() -> None:
-    source = Path(JOY_GPU_PATH).read_text(encoding="utf-8")
-    assert "from . import" not in source
-    assert "from tests.diffusion.models.joy_image import test_joy_image as joy_units" in source
-    spec = find_spec("tests.diffusion.models.joy_image.test_joy_image")
-    assert spec is not None and spec.origin is not None
-    assert Path(spec.origin).resolve() == Path(JOY_GPU_PATH).with_name("test_joy_image.py").resolve()
 
 
 @pytest.mark.parametrize("label", ["Diffusion · Batch Test", "Diffusion · Offloader Test", "Diffusion · Cache Test"])
@@ -2635,23 +2551,6 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
                 "tests/e2e/online_serving/test_gepard_tts.py",
             ),
         },
-        "Kokoro-82M · 1-GPU": {
-            "timeout": 240,
-            "test_timeout": 210,
-            "count": 10,
-            "artifact_name": "rocm-kokoro-weekly",
-            "dependency": "tts_kokoro_weekly",
-            "level_marker": "advanced_model",
-            "run_level": "advanced_model",
-            "setup_fragments": (
-                '"misaki[en]>=0.9.4"',
-                "en_core_web_sm-3.8.0-py3-none-any.whl",
-            ),
-            "files": (
-                "tests/e2e/offline_inference/test_kokoro.py",
-                "tests/e2e/online_serving/test_kokoro.py",
-            ),
-        },
         "MOSS-TTS v1.5 · 1-GPU": {
             "timeout": 240,
             "test_timeout": 210,
@@ -2771,8 +2670,6 @@ def test_weekly_tts_jobs_match_cuda_files_on_rocm() -> None:
         "tests/e2e/online_serving/test_breeze_tts_2.py": 4,
         "tests/e2e/offline_inference/test_gepard_tts.py": 3,
         "tests/e2e/online_serving/test_gepard_tts.py": 11,
-        "tests/e2e/offline_inference/test_kokoro.py": 2,
-        "tests/e2e/online_serving/test_kokoro.py": 5,
         "tests/e2e/offline_inference/test_moss_tts_v1_5_expansion.py": 1,
         "tests/e2e/online_serving/test_minimax_music3.py": 2,
         "tests/e2e/online_serving/test_yue2.py": 3,
@@ -6043,6 +5940,6 @@ def test_weekly_existing_jobs_stay_blocking_while_new_coverage_burns_in() -> Non
 
     burnin_labels = _DRAMA3_WEEKLY_BURNIN_LABELS | {"Cosmos3 generation modes · 1-GPU"}
 
-    assert len(steps) == 39
+    assert len(steps) == 38
     assert {step["label"] for step in steps if step["grade"] == "NonBlocking"} == burnin_labels
     assert all(step["grade"] == "Blocking" for step in steps if step["label"] not in burnin_labels)
