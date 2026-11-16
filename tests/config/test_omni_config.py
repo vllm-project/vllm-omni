@@ -408,10 +408,14 @@ def test_from_pipeline_config_preserves_current_pipeline_config_object():
 )
 @pytest.mark.parametrize("cli_prefix", [None, "", "stage_0_"], ids=["defaults", "global-cli", "stage-cli"])
 def test_minicpmo_cuda_duplex_profile_isolated_from_turn_defaults(filename, cli_prefix, monkeypatch, tmp_path):
+    from vllm.platforms import current_platform as host_platform
+
     from vllm_omni import platforms
     from vllm_omni.engine.arg_utils import OmniEngineArgs
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
     from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
+
+    host_is_npu = host_platform.device_type == "npu"
 
     # Select CUDA before resolving a fresh deploy; the production merge applies its overlay once.
     monkeypatch.setattr(platforms.current_omni_platform, "device_name", "cuda")
@@ -431,22 +435,19 @@ def test_minicpmo_cuda_duplex_profile_isolated_from_turn_defaults(filename, cli_
     # EngineArgs resolves model paths during construction. Keep this config-only
     # test local instead of attempting to download a fictitious Hub repository.
     args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(0), model=str(tmp_path))
-    # Stage config already contains typed vLLM configs. Their construction can
-    # normalize CUDA-only passes for the real host, independently of the Omni
-    # deployment-platform selection mocked above.
-    if cli_prefix is not None:
-        from vllm.config import CompilationConfig
-
-        requested = CompilationConfig(pass_config={"enable_qk_norm_rope_fusion": True})
-        expected_fusion = requested.pass_config.enable_qk_norm_rope_fusion
-        assert args["compilation_config"].pass_config.enable_qk_norm_rope_fusion == expected_fusion
     resolved = OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, args))
 
     if cli_prefix is not None:
         assert resolved.kernel_config.ir_op_priority.rms_norm == ["vllm_c", "native"]
         assert resolved.kernel_config.ir_op_priority.fused_add_rms_norm == ["vllm_c", "native"]
         assert resolved.compilation_config.custom_ops == ["none", "+rotary_embedding"]
-        assert resolved.compilation_config.pass_config.enable_qk_norm_rope_fusion == expected_fusion
+        # All other CLI checks above must pass before marking this host limit.
+        if host_is_npu and resolved.compilation_config.pass_config.enable_qk_norm_rope_fusion is not True:
+            pytest.xfail(
+                "Ascend host normalizes the CUDA-only QK norm/RoPE fusion flag despite the mocked Omni platform"
+            )
+        assert args["compilation_config"].pass_config.enable_qk_norm_rope_fusion is True
+        assert resolved.compilation_config.pass_config.enable_qk_norm_rope_fusion is True
     elif filename == "minicpmo_4_5.yaml":
         assert resolved.kernel_config.ir_op_priority.rms_norm == ["native"]
         assert resolved.kernel_config.ir_op_priority.fused_add_rms_norm == ["native"]
