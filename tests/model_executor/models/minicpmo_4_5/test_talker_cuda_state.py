@@ -521,7 +521,6 @@ def test_model_binding_fuses_native_duplex_rows_with_step_metadata():
     """
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
         MiniCPMO45OmniTTSForConditionalGeneration,
-        _native_duplex_meta_outputs,
     )
 
     model = _binding_model()
@@ -538,12 +537,12 @@ def test_model_binding_fuses_native_duplex_rows_with_step_metadata():
     output = MiniCPMO45OmniTTSForConditionalGeneration.commit_cuda_kstep(model, hidden)
 
     meta = output.multimodal_outputs["meta"]
-    expected = _native_duplex_meta_outputs(infos)
-    for key, values in expected.items():
-        assert [v.tolist() for v in meta[key]] == [v.tolist() for v in values], key
+    assert [v.item() for v in meta["native_duplex"]] == [True, True]
     assert [v.item() for v in meta["duplex_epoch"]] == [1, 0]
+    assert [v.item() for v in meta["duplex_turn_id"]] == [3, 0]
     assert [v.item() for v in meta["streaming_condition_seq"]] == [5, 2]
-    assert bytes(meta["llm_output_text_utf8"][1].tolist()).decode("utf-8") == "\u4f60\u597d"
+    assert [bytes(v.tolist()).decode("utf-8") for v in meta["llm_output_text_utf8"]] == ["hi", "\u4f60\u597d"]
+    assert [v.item() for v in meta["turn_end"]] == [False, False]
     assert [d.flatten().tolist() for d in output.multimodal_outputs["codes"]["audio"]] == [[3, 5], [4, 6]]
 
 
