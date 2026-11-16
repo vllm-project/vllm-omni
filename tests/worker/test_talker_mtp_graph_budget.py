@@ -260,7 +260,7 @@ def _make_v2_runner(monkeypatch, device_memory, *, decoder_size, mtp_size):
     runner = object.__new__(OmniV2Runner)
     runner._staged_writes = StagedWrites()
     runner._exclude_full_graph = False
-    runner._model_returns_tuple = False
+    runner._model_has_structured_output = False
     events: list = []
 
     def capture_decoder(self, *, profile_only=False):
