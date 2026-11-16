@@ -26,14 +26,14 @@ from vllm.logger import init_logger
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.device_copy import to_device_nonblocking
 
-from .code2wav.batched_token2wav import (
+from .code2wav.graphs import ResidentAttCache, _format_memory_delta, _memory_snapshot
+from .code2wav.token2wav import (
     BatchedToken2Wav,
     BatchedToken2WavState,
     PromptFeatures,
     row_offset_signature,
     state_shape_signature,
 )
-from .code2wav.graphs import ResidentAttCache, _format_memory_delta, _memory_snapshot
 from .code2wav.watchdog import Code2WavWatchdog
 from .config import read_bool_flag, resolve_token2wav_trt_config
 

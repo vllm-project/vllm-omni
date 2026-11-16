@@ -203,9 +203,10 @@ def test_invalid_value_is_rejected_off_device_too(tmp_path, monkeypatch):
 def test_cuda_speaker_backend_preserves_lazy_model_loading(tmp_path, monkeypatch, use_trt):
     """The facade can select torch on CUDA while other callers retain TRT."""
     from vllm_omni.model_executor.models.cosyvoice3 import speaker_embedding_torch
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import StepAudio2Token2WavCore
 
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
-    core = token2wav_module.StepAudio2Token2WavCore(str(tmp_path), device="cuda")
+    core = StepAudio2Token2WavCore(str(tmp_path), device="cuda")
     calls = []
     speaker = object()
 
@@ -605,7 +606,9 @@ def test_cpu_reference_speaker_is_ignored_off_cuda(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("cpu_reference", [False, True])
 def test_facade_forwards_speaker_reference_policy(mocker, cpu_reference):
-    core = mocker.Mock(spec=token2wav_module.StepAudio2Token2WavCore)
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import StepAudio2Token2WavCore
+
+    core = mocker.Mock(spec=StepAudio2Token2WavCore)
     facade = token2wav_module.MiniCPMO45Token2wav.__new__(token2wav_module.MiniCPMO45Token2wav)
     facade._core = core
     facade.enable_trt_spk_embedding(cpu_reference=cpu_reference)

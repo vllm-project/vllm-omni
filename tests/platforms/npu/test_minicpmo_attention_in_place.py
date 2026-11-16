@@ -8,7 +8,7 @@ import torch
 pytest.importorskip("torch_npu")
 
 from tests.helpers.mark import hardware_marks
-from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import BatchedToken2Wav
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import BatchedToken2Wav
 from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import prepare_code2wav_graph_runtime
 from vllm_omni.platforms.npu.models.step_audio2_token2wav import npu_token2wav_sdpa_context
 
@@ -118,7 +118,7 @@ def test_packed_qkv_tracks_weight_and_bias_loads(inference):
 @pytest.mark.parametrize("affine", [False, True])
 @torch.inference_mode()
 def test_gated_residual_norm_replay(affine):
-    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import _gated_residual_norm
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import _gated_residual_norm
 
     prepare_code2wav_graph_runtime()
     norm = torch.nn.LayerNorm(512, eps=1e-6, elementwise_affine=affine).npu().eval()

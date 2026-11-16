@@ -28,7 +28,7 @@ from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import (
     _runtime_ref_info,
 )
 from vllm_omni.core.sched.output import OmniRequestPrewarm
-from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import BatchedToken2Wav
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import BatchedToken2Wav
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
 from vllm_omni.platforms import current_omni_platform
 

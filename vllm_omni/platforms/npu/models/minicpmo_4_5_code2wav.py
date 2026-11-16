@@ -446,7 +446,7 @@ def apply_minicpmo_4_5_code2wav_patch() -> None:
     if _PATCHED:
         return
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
         BatchedToken2Wav,
     )
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (

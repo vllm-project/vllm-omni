@@ -13,7 +13,7 @@ import torch.nn as nn
 pytest.importorskip("vllm_ascend")
 
 from tests.helpers.mark import hardware_marks
-from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
     BatchedToken2Wav,
 )
 from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
@@ -516,8 +516,8 @@ def test_fused_body_npugraph_matches_its_eager_path_with_inference_weights():
 def test_encoder_tail_and_prompt_replay_after_shared_precapture(rows):
     from cosyvoice2.transformer.upsample_encoder_v2 import UpsampleConformerEncoderV2
 
-    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import _undecorate_dynamo
     from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.flow_encoder_graph import FlowEncoderGraphs
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import _undecorate_dynamo
 
     prepare_code2wav_graph_runtime()
     backend = BatchedToken2Wav.__new__(BatchedToken2Wav)

@@ -18,14 +18,14 @@ from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     HiFTGenerator,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
-    BatchedToken2Wav,
-    _trim_streaming_cache,
-)
 from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.graphs import (
     CFMGraphWrapper,
     HiFTGraphWrapper,
     WholeEulerCFMGraphWrapper,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
+    BatchedToken2Wav,
+    _trim_streaming_cache,
 )
 
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)]
@@ -512,7 +512,7 @@ def test_importing_wrapper_does_not_resolve_platform() -> None:
     """Importing this module must not build the OmniPlatform singleton.
 
     The NPU platform's ``__init__`` patches Code2Wav, which imports
-    ``code2wav.batched_token2wav`` -> ``code2wav.graphs``. Resolving
+    ``code2wav.token2wav`` -> ``code2wav.graphs``. Resolving
     ``current_omni_platform`` at module scope re-enters
     ``platforms.__getattr__`` while the singleton is still under construction
     and the import graph deadlocks. The module reaches for nothing on
@@ -2300,7 +2300,7 @@ def test_whole_euler_query_bucket_keeps_current_first_cache_layout(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_whole_euler_skipped_when_trt_stepper_configured() -> None:
-    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
         BatchedToken2Wav,
     )
 
@@ -2361,7 +2361,7 @@ def test_whole_euler_skipped_when_trt_stepper_configured() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_whole_euler_disabled_via_serving_config() -> None:
-    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.batched_token2wav import (
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav.token2wav import (
         BatchedToken2Wav,
     )
 
