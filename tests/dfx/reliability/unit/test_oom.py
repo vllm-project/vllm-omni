@@ -22,6 +22,49 @@ from tests.dfx.reliability.unit._loader import RELIABILITY_ROOT, exec_ast_nodes
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_minicpm_fault_images_are_independent_and_preflight_stays_small(capsys):
+    path = RELIABILITY_ROOT / "test_minicpmo_4_5.py"
+    runtime = RELIABILITY_ROOT.parents[1] / "helpers" / "runtime.py"
+    nodes = [
+        n
+        for n in ast.parse(path.read_text(encoding="utf-8")).body
+        if isinstance(n, ast.FunctionDef) and n.name in {"_system_prompt", "_audio_request", "_oom_request"}
+    ]
+    images = []
+
+    def image(width, height, *, seed, force_regenerate):
+        assert force_regenerate  # The shared dimension cache otherwise repeats the same image.
+        images.append((width, height, seed))
+        return {"base64": f"independent-image-{seed}"}
+
+    env: dict[str, Any] = {
+        "Any": Any,
+        "generate_synthetic_image": image,
+        "generate_synthetic_audio": lambda *args: {"base64": "audio"},
+    }
+    message_nodes = [
+        n
+        for n in ast.parse(runtime.read_text(encoding="utf-8")).body
+        if isinstance(n, ast.FunctionDef) and n.name == "dummy_messages_from_mix_data"
+    ]
+    exec_ast_nodes(message_nodes, runtime, env)
+    exec_ast_nodes(nodes, path, env)
+    preflight = env["_audio_request"]("model")
+    assert images == []
+    fault = env["_oom_request"]("model")
+    content = fault["messages"][-1]["content"]
+    urls = [item["image_url"]["url"] for item in content if item["type"] == "image_url"]
+    assert 1 < len(urls) <= 64
+    assert len(set(urls)) == len(urls) == len(images)
+    assert not any(item["type"] == "video_url" for item in content)
+    assert any(item["type"] == "audio_url" for item in content)
+    assert fault["modalities"] == preflight["modalities"] == ["text", "audio"]
+    assert not any(item["type"] == "image_url" for item in preflight["messages"][-1]["content"])
+    output = capsys.readouterr().out
+    assert f"images={len(urls)}" in output
+    assert "independent-image-" not in output
+
+
 @pytest.fixture
 def qwen_oom():
     # Execute the real free functions without importing GPU/platform modules or

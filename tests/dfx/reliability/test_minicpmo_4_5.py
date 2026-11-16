@@ -34,7 +34,7 @@ from tests.dfx.reliability.scenarios import (
     ServeRootCrashAtLaunch,
 )
 from tests.helpers.mark import hardware_marks
-from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image
 from tests.helpers.runtime import dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -86,21 +86,32 @@ def _assert_text_200(client: Any, model: str) -> None:
 
 
 def _oom_request(model: str) -> dict[str, Any]:
-    """Use fresh vision/audio inputs and a larger prefill than the small preflight.
+    """Use independent images and audio rather than a sampled video.
 
     Media generation runs before sidecar allocation. Do not warm up this body:
     repeating the preflight can reuse allocator pools without triggering OOM.
     """
     request = _audio_request(model)
+    image_count = 16
+    width, height = 1280, 720
+    images = [
+        f"data:image/jpeg;base64,{generate_synthetic_image(width, height, seed=i, force_regenerate=True)['base64']}"
+        for i in range(image_count)
+    ]
     request["messages"] = dummy_messages_from_mix_data(
         system_prompt=_system_prompt(),
-        image_data_url=f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}",
-        video_data_url=f"data:video/mp4;base64,{generate_synthetic_video(1280, 720, 64)['base64']}",
+        image_data_url=images,
         audio_data_url=f"data:audio/wav;base64,{generate_synthetic_audio(20, 1)['base64']}",
-        content_text=("Describe the image and video, and summarize the audio. " * 128)
-        + "Answer in one short sentence.",
+        content_text=("Compare all the images, and summarize the audio. " * 128) + "Answer in one short sentence.",
     )
     request["max_tokens"] = 128
+    # Input dimensions are not the processor's final crop/token counts. Stay
+    # below the deployment's 64-image limit; GPU runs must establish actual OOM.
+    print(
+        f"[oom-under-load] MiniCPM fault payload: images={image_count}, image_size={width}x{height}, "
+        "audio_seconds=20, max_tokens=128; media prepared before pressure",
+        flush=True,
+    )
     return request
 
 
