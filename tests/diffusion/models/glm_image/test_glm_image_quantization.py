@@ -9,6 +9,7 @@ quantization configs for W4A16/AutoRound quantization support.
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.utils.network_utils import get_file_store_init_method
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
@@ -32,7 +33,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture(scope="function", autouse=True)
-def _init_distributed(tmp_path):
+def _init_distributed():
     """Initialize the minimal distributed environment required by
     ReplicatedLinear (tensor-parallel group must exist)."""
     from vllm.distributed.parallel_state import (
@@ -41,18 +42,44 @@ def _init_distributed(tmp_path):
         initialize_model_parallel,
     )
 
-    # A fresh file per test avoids the free-port probe/bind race in env://.
+    # A fresh file store per test avoids the free-port probe/bind race in env://.
     init_distributed_environment(
         world_size=1,
         rank=0,
         local_rank=0,
-        distributed_init_method=(tmp_path / "rendezvous").as_uri(),
+        distributed_init_method=get_file_store_init_method(),
     )
     try:
         initialize_model_parallel()
         yield
     finally:
         cleanup_dist_env_and_memory()
+
+
+def test_distributed_fixture_uses_file_rendezvous(mocker: MockerFixture):
+    get_file_store_init_method_mock = mocker.patch(
+        f"{__name__}.get_file_store_init_method",
+        return_value="file:///tmp/glm-image-rendezvous",
+    )
+    init_distributed_environment = mocker.patch("vllm.distributed.parallel_state.init_distributed_environment")
+    initialize_model_parallel = mocker.patch("vllm.distributed.parallel_state.initialize_model_parallel")
+    cleanup_dist_env_and_memory = mocker.patch("vllm.distributed.parallel_state.cleanup_dist_env_and_memory")
+
+    fixture = _init_distributed.__wrapped__()
+    next(fixture)
+    try:
+        get_file_store_init_method_mock.assert_called_once_with()
+        init_distributed_environment.assert_called_once_with(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method="file:///tmp/glm-image-rendezvous",
+        )
+        initialize_model_parallel.assert_called_once_with()
+    finally:
+        fixture.close()
+
+    cleanup_dist_env_and_memory.assert_called_once_with()
 
 
 @pytest.fixture(scope="function", autouse=True)
