@@ -479,11 +479,9 @@ steps:
         mirror_hardwares: h100_2
         artifact_paths:
           - "tests/e2e/accuracy/results/result_acc_*.json"
-          - "tests/e2e/accuracy/results/lingbot_world/cuda/**/*.json"
-          - "tests/e2e/accuracy/results/lingbot_world/cuda/**/*.log"
-          - "tests/e2e/accuracy/results/lingbot_world/cuda/**/*.npz"
-          - "tests/e2e/accuracy/results/lingbot_world/cuda/candidate/**/*.mp4"
+          - "tests/e2e/accuracy/results/lingbot_world/cuda/**/*"
         commands:
+          - export ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/results
           - pytest -sv tests/e2e/accuracy/lingbot_world/test_precision.py tests/e2e/accuracy/lingbot_world/test_wbench.py tests/e2e/accuracy/lingbot_world/test_vbench.py --lingbot-profile=tests/e2e/accuracy/lingbot_world/configs/cuda.json --lingbot-output=tests/e2e/accuracy/results/lingbot_world/cuda --run-level full_model
 
   - group: ":card_index_dividers: Diffusion Test"

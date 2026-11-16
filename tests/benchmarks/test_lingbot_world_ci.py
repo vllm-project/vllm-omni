@@ -248,6 +248,7 @@ def evaluator_repository(root: Path):
     evaluator_lock.parent.mkdir(parents=True)
     evaluator_lock.write_text('{"repositories": {}, "files": {}}')
     (directory / "opencv_provider.py").write_text("# canonical provider policy\n")
+    (directory / "prepare.py").write_text("# evaluator provisioning\n")
     (root / "requirements").mkdir()
     (root / "requirements/video-quality.txt").write_text("example==1\n")
 
@@ -290,6 +291,63 @@ def test_evaluator_cache_isolated_by_code_weights_and_dependencies(tmp_path: Pat
         "# changed canonical provider policy\n"
     )
     assert evaluator_cache_key(tmp_path) != initial
+    (tmp_path / "tests/e2e/accuracy/lingbot_world/opencv_provider.py").write_text("# canonical provider policy\n")
+    assert evaluator_cache_key(tmp_path) == initial
+    (tmp_path / "tests/e2e/accuracy/lingbot_world/prepare.py").write_text("# changed evaluator provisioning\n")
+    assert evaluator_cache_key(tmp_path) != initial
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("valid", [False, True])
+def test_evaluator_asset_staging_preserves_other_writers_and_rejects_corruption(tmp_path, monkeypatch, cached, valid):
+    from io import BytesIO
+
+    from tests.e2e.accuracy.lingbot_world import prepare
+
+    repository = tmp_path / "repository"
+    evaluator_repository(repository)
+    relative = "wbench/weights/model.bin"
+    expected = b"pinned asset"
+    payload = expected if valid else b"corrupted asset"
+    lock = repository / "vllm_omni/benchmarks/realtime_video/evaluators.lock.json"
+    lock.write_text(
+        json.dumps(
+            {
+                "repositories": {},
+                "files": {relative: hashlib.sha256(expected).hexdigest()},
+                "urls": {relative: "https://example.invalid/model.bin"},
+            }
+        )
+    )
+    monkeypatch.setattr(prepare, "ROOT", repository)
+    root = tmp_path / "evaluator"
+    destination = root / relative
+    destination.parent.mkdir(parents=True)
+    foreign_partial = destination.with_name(destination.name + ".partial")
+    foreign_partial.write_bytes(b"another writer owns this download")
+    # Reach the asset stage without invoking any environment provisioning.
+    (root / "environment-ready").write_text(prepare.evaluator_cache_key(repository) + "\n")
+
+    def stop_after_assets(*args):
+        raise RuntimeError("asset stage completed")
+
+    monkeypatch.setattr(prepare, "verify_environment", stop_after_assets)
+    if cached:
+        cache = tmp_path / "shared-cache"
+        source = cache / relative
+        source.parent.mkdir(parents=True)
+        source.write_bytes(payload)
+        monkeypatch.setenv("LINGBOT_EVALUATOR_CACHE", str(cache))
+    else:
+        monkeypatch.delenv("LINGBOT_EVALUATOR_CACHE", raising=False)
+        monkeypatch.setattr(prepare.urllib.request, "urlopen", lambda *args, **kwargs: BytesIO(payload))
+    error = RuntimeError if valid else RegressionError
+    message = "asset stage completed" if valid else "Downloaded asset checksum mismatch"
+    with pytest.raises(error, match=message):
+        prepare.prepare_evaluators(root)
+    assert foreign_partial.read_bytes() == b"another writer owns this download"
+    assert destination.read_bytes() == expected if valid else not destination.exists()
+    assert not list(destination.parent.glob(f".{destination.name}-*"))
 
 
 def test_ready_evaluator_is_never_resynced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

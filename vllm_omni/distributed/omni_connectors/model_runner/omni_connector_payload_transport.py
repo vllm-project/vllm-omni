@@ -1726,6 +1726,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         emitted = 0
         completions: list[Any] = []
         for request, payload in entries:
+            # Read only the tag frozen with this output, not a request buffer
+            # that may already describe the next chunk. Builders can reuse
+            # payloads, so keep request-specific metadata off shared objects.
+            perf_chunk = getattr(request, "_omni_duplex_perf_chunk", None)
+            if perf_chunk is not None:
+                payload = {**payload, "meta": {**(payload.get("meta") or {}), "duplex_perf_chunk": list(perf_chunk)}}
             enqueued, completion = self._enqueue_chunk_payload(request, payload, wait_for_delivery=wait_for_delivery)
             if enqueued:
                 emitted += 1

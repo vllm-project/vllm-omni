@@ -85,7 +85,10 @@ def test_three_scorers_use_shared_frontend_and_keep_independent_verdicts(measure
     assert not reports["wbench"]["passed"]
     assert reports["vbench"]["passed"] and reports["precision"]["passed"]
     assert reports["precision"]["comparison_status"] == "finite_only"
-    assert reports["vbench"]["comparison_status"] == reports["wbench"]["comparison_status"] == "score_floor"
+    assert reports["vbench"]["comparison_status"] == "score_floor"
+    assert reports["wbench"]["comparison_status"] == "unavailable"
+    assert reports["wbench"]["floor_violations"] == []
+    assert not any("Score below floor" in error for error in reports["wbench"]["errors"])
     assert reports["precision"]["measurements"]["replay"]["tensors"]["output/decoded"]["mean"] == 1.0
     assert "no stored reference tensors" in capsys.readouterr().out
     files = list((tmp_path / "accuracy-results").glob("result_acc_*.json"))

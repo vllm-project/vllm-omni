@@ -111,7 +111,8 @@ artifacts; VBench staging symlinks do not produce duplicate video uploads. On CU
 against per-platform floors derived from recorded CI runs. Numerical precision
 has no stored reference tensors: it checks a complete, finite replay and does
 not compute tensor error, PSNR or SSIM. Generation and evaluator errors always
-fail. No performance verdict depends on accuracy results.
+fail and leave score-floor comparison unavailable instead of inventing low
+scores. No performance verdict depends on accuracy results.
 
 CUDA generation uses two H100 GPUs and SP=2. NPU uses its existing four-device A2
 profile, followed by CUDA evaluation; result metadata distinguishes generation

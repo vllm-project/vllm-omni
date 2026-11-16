@@ -96,6 +96,7 @@ import json
 import math
 import pathlib
 import sys
+import tempfile
 import traceback
 
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
@@ -167,41 +168,41 @@ try:
                     raise ValueError("WBench metric failures: " + strict_json(failures))
                 scores = {dim: raw["metrics"][dim]["score"] for dim in manifest["dimensions"]}
             else:
-                stage = root / ("video_" + str(index))
-                stage.mkdir()
-                staged = stage / ("rollout-0" + pathlib.Path(video).suffix.lower())
-                staged.symlink_to(video)
-                output = root / ("raw_" + str(index))
-                output.mkdir()
-                evaluator = Evaluator(torch.device("cuda"), str(repo / "vbench/VBench_full_info.json"), str(output))
-                kwargs = {"imaging_quality_preprocessing_mode": "longer"}
-                evaluator.evaluate(
-                    str(stage), "result", dimension_list=manifest["dimensions"], local=True,
-                    mode=manifest["mode"], **kwargs,
-                )
-                raw = json.loads((output / "result_eval_results.json").read_text())
-                strict_json(raw)
-                if set(raw) != set(manifest["dimensions"]):
-                    raise ValueError("Unexpected dimension coverage in VBench output")
-                if any(not isinstance(value, list) or len(value) < 2 or not value[1] for value in raw.values()):
-                    raise ValueError("Missing per-video detail in VBench output")
-                expected = {staged.resolve()}
-                for dimension, value in raw.items():
-                    covered = []
-                    if not isinstance(value[1], list):
-                        raise ValueError("Unexpected VBench per-video result format")
-                    for row in value[1]:
-                        path = pathlib.Path(row["video_path"]).resolve()
-                        score = row["video_results"]
-                        if not isinstance(score, (float, int)) or not math.isfinite(score):
-                            raise ValueError("Invalid VBench per-video score")
-                        matches = [clip for clip in expected if path == clip or clip in path.parents]
-                        if len(matches) != 1:
-                            raise ValueError("VBench returned detail for an unexpected video or clip")
-                        covered.append(matches[0])
-                    if len(covered) != len(expected) or set(covered) != expected:
-                        raise ValueError("VBench skipped or duplicated a video or clip")
-                scores = {dim: raw[dim][0] for dim in manifest["dimensions"]}
+                with tempfile.TemporaryDirectory(prefix="vbench-video-") as stage_dir:
+                    stage = pathlib.Path(stage_dir)
+                    staged = stage / ("rollout-0" + pathlib.Path(video).suffix.lower())
+                    staged.symlink_to(video)
+                    output = root / ("raw_" + str(index))
+                    output.mkdir()
+                    evaluator = Evaluator(torch.device("cuda"), str(repo / "vbench/VBench_full_info.json"), str(output))
+                    kwargs = {"imaging_quality_preprocessing_mode": "longer"}
+                    evaluator.evaluate(
+                        str(stage), "result", dimension_list=manifest["dimensions"], local=True,
+                        mode=manifest["mode"], **kwargs,
+                    )
+                    raw = json.loads((output / "result_eval_results.json").read_text())
+                    strict_json(raw)
+                    if set(raw) != set(manifest["dimensions"]):
+                        raise ValueError("Unexpected dimension coverage in VBench output")
+                    if any(not isinstance(value, list) or len(value) < 2 or not value[1] for value in raw.values()):
+                        raise ValueError("Missing per-video detail in VBench output")
+                    expected = {staged.resolve()}
+                    for dimension, value in raw.items():
+                        covered = []
+                        if not isinstance(value[1], list):
+                            raise ValueError("Unexpected VBench per-video result format")
+                        for row in value[1]:
+                            path = pathlib.Path(row["video_path"]).resolve()
+                            score = row["video_results"]
+                            if not isinstance(score, (float, int)) or not math.isfinite(score):
+                                raise ValueError("Invalid VBench per-video score")
+                            matches = [clip for clip in expected if path == clip or clip in path.parents]
+                            if len(matches) != 1:
+                                raise ValueError("VBench returned detail for an unexpected video or clip")
+                            covered.append(matches[0])
+                        if len(covered) != len(expected) or set(covered) != expected:
+                            raise ValueError("VBench skipped or duplicated a video or clip")
+                    scores = {dim: raw[dim][0] for dim in manifest["dimensions"]}
             result["scores"][label] = scores
         except Exception as exc:
             traceback.print_exc()

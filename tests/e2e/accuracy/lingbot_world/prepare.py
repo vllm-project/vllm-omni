@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -135,6 +136,7 @@ def evaluator_cache_key(root: Path = ROOT) -> str:
         root / "vllm_omni/benchmarks/realtime_video/evaluators.lock.json",
         root / "requirements/video-quality.txt",
         root / "tests/e2e/accuracy/lingbot_world/opencv_provider.py",
+        root / "tests/e2e/accuracy/lingbot_world/prepare.py",
     )
     return hashlib.sha256(b"\0".join(path.read_bytes() for path in files)).hexdigest()[:16]
 
@@ -202,19 +204,19 @@ def _prepare_evaluators(root: Path) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not destination.exists():
             cached = Path(cached_weights) / relative if cached_weights else None
-            if cached is not None and cached.is_file():
-                shutil.copyfile(cached, destination)
-            else:
-                # Write atomically; an interrupted download must not poison a
-                # shared cache or pass a later preflight.
-                partial = destination.with_name(destination.name + ".partial")
-                with (
-                    urllib.request.urlopen(lock["urls"][relative], timeout=300) as response,
-                    partial.open("wb") as handle,
-                ):
-                    shutil.copyfileobj(response, handle)
+            # A private staging path cannot truncate or unlink another job's
+            # unfinished download, even when its lock lives on another host.
+            with tempfile.TemporaryDirectory(prefix=f".{destination.name}-", dir=destination.parent) as temporary:
+                partial = Path(temporary) / destination.name
+                if cached is not None and cached.is_file():
+                    shutil.copyfile(cached, partial)
+                else:
+                    with (
+                        urllib.request.urlopen(lock["urls"][relative], timeout=300) as response,
+                        partial.open("wb") as handle,
+                    ):
+                        shutil.copyfileobj(response, handle)
                 if sha256(partial) != digest:
-                    partial.unlink()
                     raise RegressionError(f"Downloaded asset checksum mismatch: {relative}")
                 partial.replace(destination)
         if sha256(destination) != digest:

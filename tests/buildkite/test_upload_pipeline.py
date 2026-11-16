@@ -55,9 +55,19 @@ def _render(changed_files: list[str]) -> str:
 
 
 @pytest.mark.parametrize("pytest_exit", [0, 1, 124])
-def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_path, monkeypatch, pytest_exit):
-    doc = yaml.safe_load(CUDA_READY_YAML.read_text())
-    step = next(step for step in _leaf_steps(doc["steps"]) if step.get("label") == "Omni · MiniCPM-o 4.5 Duplex Test")
+@pytest.mark.parametrize("lane", ["cuda-duplex", "npu-a3-perf"])
+def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_path, monkeypatch, pytest_exit, lane):
+    path = CUDA_READY_YAML if lane == "cuda-duplex" else Path(".buildkite/npu/test-npu-nightly.yml")
+    doc = yaml.safe_load(path.read_text())
+    step = next(
+        step
+        for step in _leaf_steps(doc["steps"])
+        if (
+            step.get("label") == "Omni · MiniCPM-o 4.5 Duplex Test"
+            if lane == "cuda-duplex"
+            else step.get("key") == "nightly-omni-performance-minicpmo-4-5-npu-a3-2card"
+        )
+    )
     # Build 19334 runs the workload under /bin/sh. Exercise that entrypoint,
     # without starting a real server or loading model weights.
     calls_path = tmp_path / "pytest-call.json"
@@ -76,7 +86,7 @@ def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_pa
     monkeypatch.setenv("PYTEST_CALLS", str(calls_path))
     monkeypatch.setenv("PYTEST_EXIT", str(pytest_exit))
     result = subprocess.run(
-        ["/bin/sh", "-e", "-c", "\n".join(step["commands"])],
+        ["/bin/sh", "-e", "-c", "\n".join(step["commands"]).replace("$$", "$")],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -84,10 +94,16 @@ def test_minicpmo_duplex_command_runs_from_sh_and_preserves_pytest_status(tmp_pa
     )
     assert result.returncode == pytest_exit, result.stderr
     args = json.loads(calls_path.read_text())
-    assert "tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py" in args
-    assert args[args.index("-m") + 1] == "(core_model or advanced_model) and cuda"
+    if lane == "cuda-duplex":
+        assert "tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py" in args
+        assert args[args.index("-m") + 1] == "(core_model or advanced_model) and cuda"
+        assert "pytest-stderr" in result.stderr
+    else:
+        assert "tests/dfx/perf/scripts/run_benchmark.py" in args
+        assert args[args.index("-m") + 1] == "full_model and omni and npu and A3 and cards_2"
+        log = tmp_path / "tests/dfx/perf/results/minicpmo-4-5-a3-2card/pytest.log"
+        assert "pytest-stderr" in log.read_text()
     assert "pytest-stdout" in result.stdout
-    assert "pytest-stderr" in result.stderr
 
 
 def test_bootstrap_if_injected_by_step_key() -> None:
@@ -447,10 +463,10 @@ def test_mirror_hardwares_inferred_skips_unmatched_chip(
 
 
 def test_mirror_hardwares_inferred_missing_preset_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
-    with pytest.raises(ValueError, match="has no preset 'b200_8'"):
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    with pytest.raises(ValueError, match="has no preset 'h100_8'"):
         _expand_mirror_hardwares(
-            {"label": "B200 8-gpu", "commands": ['pytest -sv tests/e2e -m "B200 and cards_8"']},
+            {"label": "H100 8-gpu", "commands": ['pytest -sv tests/e2e -m "H100 and cards_8"']},
         )
 
 
@@ -1496,6 +1512,9 @@ def test_qwen_image_21_accuracy_model_dependencies(
         ("vllm_omni/benchmarks/realtime_video/evaluators.lock.json", {"performance", "accuracy"}),
         ("vllm_omni/benchmarks/serve.py", {"performance", "accuracy"}),
         ("vllm_omni/benchmarks/patch/patch.py", {"performance", "accuracy"}),
+        ("vllm_omni/benchmarks/metrics/collectors.py", {"performance", "accuracy"}),
+        ("vllm_omni/metrics/definitions.py", {"performance", "accuracy"}),
+        ("vllm_omni/diffusion/offloader/sequential_backend.py", {"performance", "accuracy"}),
         ("vllm_omni/entrypoints/cli/benchmark/cli_args.py", {"performance", "accuracy"}),
         ("tests/dfx/perf/tests/test_lingbot_world_realtime.json", {"performance"}),
         ("tests/e2e/accuracy/lingbot_world/test_precision.py", {"accuracy"}),
@@ -1597,6 +1616,8 @@ def test_lingbot_accuracy_uploads_preserve_original_inputs_and_diagnostics_witho
         output / "results/bench-precision.json",
         output / "vbench/vbench/native/inputs.json",
         output / "vbench/vbench/native/evaluator.log",
+        output / "vbench/vbench/native/scores.csv",
+        output / "wbench/wbench/native/diagnostics.txt",
         output / "vbench/vbench/native/raw_0/result_eval_results.json",
     }
     capture = output if platform == "cuda" else results / "lingbot_world/npu-capture"
@@ -1609,16 +1630,12 @@ def test_lingbot_accuracy_uploads_preserve_original_inputs_and_diagnostics_witho
         destination = tmp_path / artifact
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(b"preserved diagnostic or original input")
-    staged = output / "vbench/vbench/native/video_0/rollout-0.mp4"
-    (tmp_path / staged).parent.mkdir(parents=True)
-    (tmp_path / staged).symlink_to(tmp_path / capture / "candidate/case/rollout.mp4")
 
     def uploaded(job):
         return {file.relative_to(tmp_path) for pattern in job["artifact_paths"] for file in tmp_path.glob(pattern)}
 
     artifacts = uploaded(accuracy)
     assert expected <= artifacts
-    assert staged not in artifacts
     assert all(str(artifact).startswith("tests/e2e/accuracy/") for artifact in artifacts)
     if platform == "cuda":
         assert captured <= artifacts
@@ -1647,12 +1664,13 @@ def test_lingbot_recording_commands_preserve_independent_checks_and_failure_stat
             "import json, os, sys\n"
             "from pathlib import Path\n"
             "with open(os.environ['LINGBOT_COMMAND_CALLS'], 'a') as output:\n"
-            "    output.write(json.dumps({'tool': Path(sys.argv[0]).name, 'args': sys.argv[1:]}) + '\\n')\n"
+            "    output.write(json.dumps({'tool': Path(sys.argv[0]).name, 'args': sys.argv[1:], 'result_dir': os.environ.get('ACC_BENCH_RESULT_DIR')}) + '\\n')\n"
             f"sys.exit({exit_code})\n"
         )
         executable.chmod(0o755)
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("LINGBOT_COMMAND_CALLS", str(calls_path))
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(tmp_path / "inherited-results"))
     result = subprocess.run(
         ["/bin/sh", "-e", "-c", "\n".join(job["commands"])],
         cwd=tmp_path,
@@ -1664,6 +1682,7 @@ def test_lingbot_recording_commands_preserve_independent_checks_and_failure_stat
     calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
     pytest_args = calls[-1]["args"]
     assert calls[-1]["tool"] == "pytest"
+    assert calls[-1]["result_dir"] == "tests/e2e/accuracy/results"
     for name in ("precision", "wbench", "vbench"):
         assert f"tests/e2e/accuracy/lingbot_world/test_{name}.py" in pytest_args
     assert not any("baseline" in arg or "reference" in arg for arg in pytest_args)

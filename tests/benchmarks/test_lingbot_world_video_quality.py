@@ -126,13 +126,12 @@ def test_quality_adapter_does_not_reuse_stale_outputs(evaluator_inputs: dict, mo
     assert first["raw_result"] != second["raw_result"]
 
 
-@pytest.mark.parametrize("suite", ["vbench"])
 def test_quality_adapter_rejects_non_mp4_vbench_input(
-    evaluator_inputs: dict, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, suite: str
+    evaluator_inputs: dict, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     video = tmp_path / "video.avi"
     video.write_bytes(b"mock video")
-    evaluator_inputs.update(suite=suite, videos={"reference": video})
+    evaluator_inputs.update(suite="vbench", videos={"reference": video})
     calls = _worker_output(monkeypatch, {})
     result = quality.evaluate_video_quality(**evaluator_inputs)
     assert result["status"] == "failed"
@@ -166,15 +165,13 @@ def test_quality_adapter_reports_timeout(evaluator_inputs: dict, monkeypatch: py
     assert "TimeoutExpired" in result["errors"][0]
 
 
-@pytest.mark.parametrize("suite", ["vbench"])
 @pytest.mark.parametrize("wrong_identity", [False, True])
-def test_worker_checks_native_vbench_video_identity(tmp_path: Path, suite: str, wrong_identity: bool) -> None:
+def test_worker_checks_native_vbench_video_identity(tmp_path: Path, wrong_identity: bool) -> None:
     repo, run_dir = tmp_path / "repo", tmp_path / "run"
     repo.mkdir()
     run_dir.mkdir()
     (repo / "torch.py").write_text("def device(value): return value\n")
-    for package in ("vbench", "vbench2_beta_long"):
-        (repo / package).mkdir()
+    (repo / "vbench").mkdir()
     (repo / "vbench" / "__init__.py").write_text(
         "import json\nfrom pathlib import Path\n"
         "class VBench:\n"
@@ -193,7 +190,6 @@ def test_worker_checks_native_vbench_video_identity(tmp_path: Path, suite: str, 
         "        raw = {dim: row for dim in dimension_list}\n"
         "        (self.output / (name + '_eval_results.json')).write_text(json.dumps(raw))\n"
     )
-    (repo / "vbench2_beta_long" / "__init__.py").write_text("from vbench import VBench as VBenchLong\n")
     videos = {}
     for label in ("reference", "candidate"):
         path = tmp_path / (label + ".mp4")
@@ -205,7 +201,7 @@ def test_worker_checks_native_vbench_video_identity(tmp_path: Path, suite: str, 
             {
                 "repo": str(repo),
                 "run_dir": str(run_dir),
-                "suite": suite,
+                "suite": "vbench",
                 "mode": "custom_input",
                 "dimensions": ["subject_consistency"],
                 "videos": videos,
@@ -221,6 +217,8 @@ def test_worker_checks_native_vbench_video_identity(tmp_path: Path, suite: str, 
     )
     assert result.returncode == 0, result.stderr
     raw = json.loads((run_dir / "worker_result.json").read_text())
+    assert not list(run_dir.glob("video_*"))
+    assert all(Path(video).is_file() for video in videos.values())
     if wrong_identity:
         assert raw["scores"] == {}
         assert len(raw["errors"]) == 2
@@ -245,6 +243,7 @@ def test_worker_rejects_hps_nonfinite_details_and_records_flow_backend(
 ) -> None:
     pytest.importorskip("numpy")
     repo = evaluator_inputs["repo"]
+    (repo / "datasets.py").write_text("# Fake evaluator does not load any datasets.\n")
     for directory in ("src", "src/metrics", "src/metrics/video_quality"):
         (repo / directory).mkdir(exist_ok=True)
         (repo / directory / "__init__.py").write_text("")

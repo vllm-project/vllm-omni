@@ -428,6 +428,9 @@ source_file_dependencies:
     - vllm_omni/benchmarks/realtime_video/
     - vllm_omni/benchmarks/serve.py
     - vllm_omni/benchmarks/patch/patch.py
+    - vllm_omni/benchmarks/metrics/
+    - vllm_omni/metrics/
+    - vllm_omni/diffusion/offloader/
     - vllm_omni/entrypoints/cli/benchmark/cli_args.py
     - vllm_omni/entrypoints/cli/benchmark/serve.py
     - tests/benchmarks/test_realtime_video_serve.py
@@ -457,6 +460,9 @@ source_file_dependencies:
     - vllm_omni/benchmarks/realtime_video/
     - vllm_omni/benchmarks/serve.py
     - vllm_omni/benchmarks/patch/patch.py
+    - vllm_omni/benchmarks/metrics/
+    - vllm_omni/metrics/
+    - vllm_omni/diffusion/offloader/
     - vllm_omni/entrypoints/cli/benchmark/cli_args.py
     - vllm_omni/entrypoints/cli/benchmark/serve.py
     - tests/benchmarks/test_realtime_video_serve.py

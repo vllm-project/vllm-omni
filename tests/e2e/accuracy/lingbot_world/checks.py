@@ -93,6 +93,8 @@ def run_accuracy(settings, data, suite):
     # bench_serve returns a fresh report, so the status is set after measurement.
     report["comparison_status"] = "finite_only" if suite == "precision" else "score_floor"
     if floors:
+        report["floor_violations"] = []
+    if floors and report["passed"]:
         report["floor_violations"] = [
             f"{name}: {metrics.get(name)!r} < {floor}"
             for name, floor in floors.items()
@@ -102,6 +104,8 @@ def run_accuracy(settings, data, suite):
         if report["floor_violations"]:
             report["passed"] = False
             report["errors"].extend(f"Score below floor: {row}" for row in report["floor_violations"])
+    elif floors:
+        report["comparison_status"] = "unavailable"
     write_json(settings["output"] / f"{suite}.json", report)
     helpers.write_accuracy_result(
         model_id=read_json(ROOT / "tests/e2e/accuracy/lingbot_world/assets.lock.json")["model_id"],
@@ -121,7 +125,9 @@ def run_accuracy(settings, data, suite):
             "measurement_report": report,
         },
     )
-    if floors:
+    if floors and report["comparison_status"] == "unavailable":
+        print(f"LingBot {suite}: measurement failed; score floors were not evaluated", flush=True)
+    elif floors:
         violations = report["floor_violations"]
         print(
             f"LingBot {suite}: {report['status']}; {len(violations)} of {len(floors)} score floors failed", flush=True

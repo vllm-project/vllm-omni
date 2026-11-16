@@ -35,6 +35,9 @@ rollout for each of the three existing image/prompt/camera cases. Each case has
 an excluded eight-chunk warmup. It runs one fixed-input VAE replay separately.
 There is no official source checkout, live reference server, or repeated
 reference/candidate campaign in routine CI.
+`--realtime-video-warmup-num-chunks` sets the separate warmup rollout length;
+`--realtime-video-warmup-chunks` excludes the initial attention-window chunks
+from steady-cadence statistics in a measured rollout.
 
 Each test checks its own authenticated inputs, prints real measurements as JSON,
 and writes `result_acc_*.json` (with the floors under `baseline`) before
@@ -101,46 +104,24 @@ and native per-video scores. Capture artifacts include `generation.json`,
 workload and allocation provenance. On CUDA, capture and scoring share the
 output directory. NPU capture is uploaded separately under
 `tests/e2e/accuracy/results/lingbot_world/npu-capture` and downloaded by the
-evaluation step. NPU capture files are uploaded recursively. Evaluation uploads include JSON
-reports and logs, with CUDA also retaining the numerical NPZ and original
-`candidate/<case>/rollout.mp4` videos. VBench stages symlinks to those videos
-under `video_*/rollout-0.mp4`; these staging copies are not uploaded again. The
-original videos, evaluator input manifests, logs and native score details
-remain available for baseline work and debugging.
-
-Existing uploads were checked in CUDA [build 19659](https://buildkite.com/vllm/vllm-omni/builds/19659)
-and NPU [build 11510](https://buildkite.com/vllm/vllm-omni-npu-ci/builds/11510),
-both at `b0e2faeb7fa37f90b14764fc8817d93f1f887540`. They contain nonempty
-performance JSON, all three accuracy results, numerical NPZ and video/scoring
-artifacts. This confirms uploads for that historical revision; it does not
-validate later revisions on native hardware.
-
-The historical CUDA accuracy job uploaded 46 files for the three test suites:
-
-| Files | Count | Purpose |
-| --- | --- | --- |
-| Capture and provenance | 14 | NPZ, three original videos, per-case serving/benchmark JSON, generation/model/allocation/cleanup records |
-| Standard accuracy records | 3 | Shared result format, measured metrics, score floors and final verdicts |
-| Serving benchmark results | 3 | `vllm bench` result envelope and unmodified measurements |
-| Suite verdict reports | 3 | Per-suite measurements with the applied accuracy verdict |
-| Native measurements and diagnostics | 20 | Numerical measurement report, semantic reports/raw scores, evaluator inputs/logs/worker output and native per-video details |
-| VBench staging video copies | 3 | Symlinks to original capture videos, now excluded from uploads |
-
-The retained JSON formats serve existing CLI, accuracy and evaluator consumers;
-they are kept together with the original tensors/videos and provenance. For
-that same successful three-case workload the new upload selection would keep
-43 files. This is an audit of the historical manifest, not a fixed artifact
-count: partial captures, evaluator failures or additional native diagnostics
-can change the count. Historical NPU outputs split the same 46-file inventory
-into 14 capture files and 32 evaluator/result files; the updated evaluator
-upload similarly excludes its three staged video copies, and standard records
-move to the shared accuracy results directory.
+evaluation step. NPU capture and evaluation outputs are uploaded recursively, preserving native
+JSON, logs and any other evaluator diagnostics. The CUDA output also retains
+the numerical NPZ and original `candidate/<case>/rollout.mp4` videos. VBench
+stages its input symlinks in a temporary directory that is removed after each
+evaluation, so the upload tree contains no duplicate staging videos. Input
+manifests retain the original video paths. Both CI scoring jobs explicitly set
+`ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/results` to match their standard-result
+upload path; local runs may override the shared result destination.
 
 Normal measurement or score-floor failures retain their reports before the
 pytest assertion, and partial capture retains available inputs and its
 manifest. Early setup failure or host termination can prevent complete output.
 Score floors come only from reviewed CI measurements; new results are never
 auto-promoted to a baseline.
+Evaluator setup or measurement failures remain failures with
+`comparison_status: unavailable`; they are not reported as measured scores
+below the floors. Shared evaluator assets are checked before atomic publication
+from a private staging directory; existing corrupt assets still fail validation.
 
 Partial capture preserves its manifest and available artifacts. The three
 tests inspect their own required inputs even after a producer failure. A local
@@ -166,3 +147,8 @@ These accuracy and performance workflows add no stability or weekly lane.
 Existing DFX stability cases keep
 `benchmarks/lingbot_world/benchmark_lingbot_world_realtime.py` and their deploy
 config paths. This compatibility entry delegates to the shared serving benchmark.
+
+For PR builds the NPU LingBot lanes require both `nightly-test` and `npu-test`;
+the latter is a separate opt-in for the four-A2 capture and CUDA scoring cost.
+The deprecated nightly email distribution is not extended by this PR; the
+performance JSON remains available through the existing artifacts/dashboard.
