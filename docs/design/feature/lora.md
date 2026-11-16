@@ -92,7 +92,7 @@ the [Diffusion LoRA guide](../../user_guide/diffusion/lora.md) for formats,
 supported pipelines and checkpoint name mapping
 ([#8001](https://github.com/vllm-project/vllm-omni/issues/8001)).
 
-Diffusion stage `default_sampling_params` owns the default adapter group and strengths. `OmniDiffusionSamplingParams` normalizes configured dictionaries into `LoRARequest` objects. Serving starts from a request-local copy: omission inherits the group, an explicit object or non-empty list replaces it, and `[]` clears it without changing later requests. The existing worker and manager own adapter loading and activation; fixed and fused adapter policies remain separate. Configuration and request examples are in the [LoRA guide](../../user_guide/diffusion/lora.md#online-inference).
+Diffusion stage `default_sampling_params` owns the default adapter group and strengths. `OmniDiffusionSamplingParams.from_config` normalizes the public `lora` object or array through the same parser as HTTP requests before constructing internal sampling parameters. Existing internal fields remain accepted, but mixing them with `lora` is rejected. Serving starts from a request-local copy: omission inherits the group, an explicit object or non-empty list replaces it, and `[]` clears it without changing later requests. The existing worker and manager own adapter loading and activation; fixed and fused adapter policies remain separate. Configuration and request examples are in the [LoRA guide](../../user_guide/diffusion/lora.md#online-inference).
 
 ## Not supported
 

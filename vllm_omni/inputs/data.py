@@ -22,6 +22,7 @@ from vllm_omni.diffusion.attention.schedule import (
     parse_attention_schedule,
     parse_attention_sigma_schedule,
 )
+from vllm_omni.lora.parsing import parse_lora_requests
 from vllm_omni.lora.request import LoRARequest
 
 DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
@@ -485,6 +486,19 @@ class OmniDiffusionSamplingParams:
             "Diffusion stage requires OmniDiffusionSamplingParams or vllm.SamplingParams, "
             f"got {type(params).__name__!r}."
         )
+
+    @classmethod
+    def from_config(cls, params: dict[str, Any]) -> "OmniDiffusionSamplingParams":
+        """Normalize deployment defaults using the public LoRA request format."""
+        params = params.copy()
+        if "lora" in params:
+            if "lora_request" in params or "lora_scale" in params:
+                raise ValueError("Configure lora without lora_request or lora_scale")
+            lora_request, lora_scale = parse_lora_requests(params.pop("lora"))
+            params["lora_request"] = lora_request
+            if lora_scale is not None:
+                params["lora_scale"] = lora_scale
+        return cls(**params)
 
     @classmethod
     def from_dict(cls, params: dict[str, Any]) -> "OmniDiffusionSamplingParams":

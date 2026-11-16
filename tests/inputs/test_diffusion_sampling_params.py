@@ -197,3 +197,15 @@ def test_lora_defaults_normalize_config_dicts(stacked: bool) -> None:
         assert all(isinstance(request, LoRARequest) for request in requests)
         assert [request.lora_name for request in requests] == (["first", "second"] if stacked else ["first"])
     assert isinstance(configured[0], dict)
+
+
+@pytest.mark.parametrize("lora", [{"name": "missing-path"}, [None], "invalid"])
+def test_public_lora_defaults_reject_malformed_input(lora: object) -> None:
+    with pytest.raises(ValueError):
+        OmniDiffusionSamplingParams.from_config({"lora": lora})
+
+
+@pytest.mark.parametrize("field", ["lora_request", "lora_scale"])
+def test_public_lora_defaults_reject_mixed_formats(field: str) -> None:
+    with pytest.raises(ValueError, match="Configure lora without"):
+        OmniDiffusionSamplingParams.from_config({"lora": [], field: []})

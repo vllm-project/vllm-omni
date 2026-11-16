@@ -255,7 +255,7 @@ For PEFT serving, configure sampling settings, adapters and strengths once in th
 
 ```bash
 vllm serve MODEL --omni --lora-backend peft --max-cpu-loras 2 \
-  --default-sampling-params '{"0":{"num_inference_steps":50,"guidance_scale":4.0,"lora_request":[{"lora_name":"style","lora_int_id":1,"lora_path":"/models/style.safetensors"},{"lora_name":"character","lora_int_id":2,"lora_path":"/models/character.safetensors"}],"lora_scale":[0.8,0.6]}}'
+  --default-sampling-params '{"0":{"num_inference_steps":50,"guidance_scale":4.0,"lora":[{"name":"style","local_path":"/models/style.safetensors","scale":0.8},{"name":"character","local_path":"/models/character.safetensors","scale":0.6}]}}'
 ```
 
 Alternatively, store the same defaults in a deploy YAML, for example `lora-defaults.yaml` for a single diffusion stage:
@@ -267,14 +267,13 @@ stages:
     default_sampling_params:
       num_inference_steps: 50
       guidance_scale: 4.0
-      lora_request:
-        - lora_name: style
-          lora_int_id: 1
-          lora_path: /models/style.safetensors
-        - lora_name: character
-          lora_int_id: 2
-          lora_path: /models/character.safetensors
-      lora_scale: [0.8, 0.6]
+      lora:
+        - name: style
+          local_path: /models/style.safetensors
+          scale: 0.8
+        - name: character
+          local_path: /models/character.safetensors
+          scale: 0.6
 ```
 
 ```bash
@@ -284,7 +283,7 @@ vllm serve MODEL --omni --deploy-config lora-defaults.yaml \
 
 For an existing multi-stage deploy file, add `default_sampling_params` to its diffusion stage using that stage's actual `stage_id`; preserve the other stage settings. YAML places the defaults directly under the stage, while `--default-sampling-params` wraps them in a mapping keyed by stage ID. Explicit request fields override CLI defaults, which override YAML defaults.
 
-Choose sampling values and adapters compatible with the selected model. A single default uses one `lora_request` object and scalar `lora_scale`; a stack uses parallel lists. These internal configuration fields differ from the HTTP fields below. Adapter paths must be readable by the server.
+Choose sampling values and adapters compatible with the selected model. Deployment defaults and HTTP requests use the same `lora` object or array, with each adapter's strength in `scale` (default `1.0`). Adapter paths must be readable by the server.
 
 On an image-capable deployment, this request inherits the sampling settings, both adapters and their strengths:
 
