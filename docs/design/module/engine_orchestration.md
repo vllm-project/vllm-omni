@@ -137,6 +137,13 @@ physical EngineCore abort succeeds.
 Changes that cross into stage runtime or public error behavior require review
 from that contract's owners.
 
+Multimodal cache-miss feedback invalidates only the reported hashes in the
+owning sender cache before request error delivery. Downstream caches are
+updated under the preprocessing lock; stage 0 feedback crosses to the frontend
+and is applied while draining outputs, including cancelled requests. Ordinary
+request failures retain retryable classification; duplex session termination
+keeps its existing semantics.
+
 ## Promotion gate
 
 - Reconcile current names and boundaries after #5441 merges, closes, or is

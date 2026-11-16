@@ -36,6 +36,9 @@ class _AdmissionGate:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         del exc_type, exc, tb
 
+    def attach_event_collector(self, collector: object) -> None:
+        del collector
+
     async def events(self):  # the collector's consume loop ends at once
         return
         yield  # pragma: no cover

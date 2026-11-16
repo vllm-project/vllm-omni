@@ -73,6 +73,11 @@ This experimental mode stores the final noisy probe's KV rather than clean
 `x0` KV, so generated outputs can differ. The four denoising steps, chunk
 boundaries, and paged-context finalization remain the same.
 
+## NPU host lengths
+
+LingBot paged attention on NPU uses the valid query and KV lengths already
+available to the forward, avoiding per-layer device reads.
+
 ## Experimental Ascend SP8 output paths
 
 Two independent, default-disabled options are available for the eight-rank

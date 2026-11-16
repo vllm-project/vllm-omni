@@ -272,8 +272,11 @@ class OpenPIWebSocketSession:
             raise ModuleNotFoundError("GR00T OpenPI test dependencies are missing: websockets") from exc
         try:
             from openpi_client import msgpack_numpy
-        except ImportError as exc:  # pragma: no cover - optional e2e dependency
-            raise ModuleNotFoundError("GR00T OpenPI test dependencies are missing: openpi-client") from exc
+        except ImportError:
+            # Prefer the real library when it is installed. Otherwise use the
+            # standalone OpenPI codec. Do not call connection._pack/_unpack here:
+            # that round-trip accepts a wrong wire format.
+            from tests.helpers import openpi_msgpack as msgpack_numpy
         return websockets_client, msgpack_numpy
 
     def __init__(
@@ -623,7 +626,10 @@ class OnlineOmniClient:
         err_code: int | tuple[int, ...] | list[int] | None = None,
         err_message: str | tuple[str, ...] | list[str] | None = None,
     ) -> list[HttpResponse]:
-        """POST ``/v1/chat/completions`` with ``json`` or ``raw_body`` (malformed-body / contract tests)."""
+        """POST ``/v1/chat/completions`` with ``json`` or ``raw_body`` (malformed-body / contract tests).
+
+        With no ``err_code`` and no ``err_message``, the response must be HTTP 200.
+        """
         cfg = _merge_http_expectation_kwargs(
             request_config,
             err_code=err_code,
@@ -631,11 +637,19 @@ class OnlineOmniClient:
         )
         r = self._post_json_endpoint("/v1/chat/completions", cfg, default_timeout=120.0)
         resp = self._http_response_from_requests(r)
-        assert_http_error(
-            resp,
-            err_code=cfg.get("err_code"),
-            err_message=cfg.get("err_message"),
-        )
+        expected_code = cfg.get("err_code")
+        expected_message = cfg.get("err_message")
+        if expected_code is None and expected_message is None:
+            assert resp.status_code == 200, (
+                "POST /v1/chat/completions expected HTTP 200 when no error expectation is set, "
+                f"got {resp.status_code}: {resp.error_message!r}"
+            )
+        else:
+            assert_http_error(
+                resp,
+                err_code=expected_code,
+                err_message=expected_message,
+            )
         return [resp]
 
     def send_batched_chat_completions_http_request(
@@ -1496,13 +1510,18 @@ class OnlineOmniClient:
 
         return result
 
-    def send_audio_speech_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def send_audio_speech_request(
+        self, request_config: dict[str, Any] | list[dict[str, Any]], request_num: int = 1
+    ) -> list[OmniResponse]:
         """
         Call the /v1/audio/speech endpoint using the same configuration-dict
         style as send_omni_request, but via the OpenAI Python client's
         audio.speech APIs.
 
-        Expected keys in request_config:
+        A list sends distinct requests concurrently and validates each response
+        against its own configuration. Results retain input order.
+
+        Expected keys in each request configuration:
           - model: model name/path (required)
           - input: text to synthesize (required)
           - response_format: audio format such as "wav" or "pcm" (optional)
@@ -1518,6 +1537,15 @@ class OnlineOmniClient:
         For negative / contract checks (expected 4xx), use
         :meth:`send_audio_speech_http_request` with ``err_code`` / ``err_message``.
         """
+        if isinstance(request_config, list):
+            if not request_config:
+                raise ValueError("request_config list must not be empty")
+            if request_num != 1:
+                raise ValueError("request_num is not supported when request_config is a list")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(request_config)) as executor:
+                config_futures = [executor.submit(self.send_audio_speech_request, config) for config in request_config]
+                return [config_future.result()[0] for config_future in config_futures]
+
         timeout = float(request_config.get("timeout", 120.0))
 
         model = request_config["model"]

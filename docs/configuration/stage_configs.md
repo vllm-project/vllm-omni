@@ -5,6 +5,8 @@ In vLLM-Omni, a model's `PipelineConfig` defines its fixed stage topology, while
 !!! note
     Default deploy config YAMLs (for example, `vllm_omni/deploy/qwen2_5_omni.yaml`, `vllm_omni/deploy/qwen3_omni_moe.yaml`, and `vllm_omni/deploy/qwen3_tts.yaml`) are bundled and loaded automatically when `--deploy-config` is omitted. The resolved pipeline selects its default through `default_deploy_config_name`.
 
+For diffusion sampling, explicit request fields override `--default-sampling-params`, which overrides deploy YAML defaults. CLI values are merged by stage ID, and `extra_args` is merged by key. Invalid CLI JSON fails startup; model-owned sampling constraints still apply.
+
 ## Pipeline configuration
 
 `PipelineConfig` and its `StagePipelineConfig` entries are Python definitions
@@ -103,7 +105,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | `connectors` | dict | optional | `null` | Named connector specs (`{name, extra}`). Referenced by each stage's `input_connectors` / `output_connectors`. See [Connector schema](#connector-schema). |
 | `edges` | list | optional | `null` | Explicit edge list for the KV transfer graph. Auto-derived from stage inputs if omitted. |
 | `stages` | list | optional | `[]` | Per-stage runtime overrides matched by `stage_id`. Pipeline stages are still created from `PipelineConfig` when this list is empty. |
-| `platforms` | dict | optional | `null` | Keyed by `npu` / `rocm` / `xpu`, each contains a `stages:` list with per-platform overrides applied on top of the CUDA defaults. |
+| `platforms` | dict | optional | `null` | Keyed by platform (`cuda`, `npu`, `rocm`, `xpu`, etc.). Per-platform `stages:` and named `connectors:` overrides are applied on top of the shared defaults. |
 | `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only` / `qwen3_omni_moe_thinker_only`). |
 | `trust_remote_code` | bool \| null | optional | `null` | **Pipeline-wide.** Trust HF remote code on model load; applies to every stage when specified. |
 | `distributed_executor_backend` | str \| null | optional | `null` | **Pipeline-wide.** Distributed executor backend forwarded to vLLM (`"mp"`, `"ray"`, `"external_launcher"`). If omitted, vLLM auto-selects backend from runtime topology. |
@@ -413,6 +415,14 @@ stages:
     input_connectors:  {from_stage_0: shm}
 ```
 
+`platforms.<platform>.connectors` deep-merges named connector definitions,
+including `extra`, through each `base_config` inheritance level and then onto
+the shared connectors. A partial platform override retains the other inherited
+platform values. This applies both to deploy
+resolution and to the connector spec passed to workers. Unspecified keys retain
+their shared values; other platforms retain the shared connector. To override a
+platform-specific value in a user overlay, use the same platform block.
+
 ### CLI flags
 
 | Flag | Description |
@@ -482,6 +492,37 @@ From highest to lowest:
 3. Platform section (`platforms.npu.stages`, etc.) on top of the base `stages:`
 4. Overlay YAML (via `base_config:`) on top of the base YAML
 5. Parser defaults
+
+### vLLM LoRA on LLM stages
+
+AR and generation stage entries accept vLLM's LoRA engine options, such as
+`enable_lora`, `max_lora_rank`, `max_loras`, `max_cpu_loras`,
+`lora_target_modules`, and `fully_sharded_loras`. As in vLLM, the other options
+take effect only on a stage that also sets `enable_lora: true`.
+
+```yaml
+stages:
+  - stage_id: 0
+    enable_lora: true
+    max_lora_rank: 64
+```
+
+The equivalent CLI and Python forms are
+`--stage-overrides '{"0": {"enable_lora": true, "max_lora_rank": 64}}'` and
+`Omni(model, stage_overrides={"0": {"enable_lora": True, "max_lora_rank": 64}})`.
+
+- Top-level `--enable-lora` (or `enable_lora=True`) works only on single-stage
+  pipelines. Multi-stage pipelines reject global vLLM LoRA options and must use
+  stage-scoped keys, including in the stage-based / `--headless` CLI, where each
+  process resolves the whole pipeline.
+- `AsyncOmni.generate(..., lora_request=...)` applies the adapter on stage 0.
+- Diffusion stages reject `enable_lora` and configure LoRA through `lora_path`,
+  `lora_scale`, and `lora_backend` instead; see [Diffusion LoRA](../user_guide/diffusion/lora.md).
+- `max_cpu_loras` sizes the CPU LoRA cache of whichever stage type receives it.
+  A global value on a pipeline with a diffusion stage sizes only the diffusion
+  cache; set an LLM stage's value with a stage-scoped key.
+
+The design is described in [LoRA](../design/feature/lora.md).
 
 ### Worked override example
 
@@ -573,27 +614,51 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 ## Qwen3-TTS with Model Runner V2
 
-Qwen3-TTS runs the native CUDA Model Runner V2 pipeline by default on vLLM
-0.29.0. MRV2 is an experimental feature for this model: the bundled default
-profile selects it on CUDA only, and its scheduler and delivery paths are
-still being qualified. Set `model_runner: v1` in a copy of the deploy config
-to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on NPU, XPU,
-ROCm and MUSA. Select one of these deployment profiles:
+Qwen3-TTS selects Model Runner V2 by default on CUDA and NPU. MRV2 remains
+experimental for this model; its scheduler and delivery paths are still being
+qualified. Set `model_runner: v1` in a copy of the deploy config
+to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on XPU,
+ROCm and MUSA. On NPU, the V2 Talker uses `FULL_AND_PIECEWISE`; Code2Wav
+retains `PIECEWISE`. If opting out to V1 on NPU, set both `model_runner: v1`
+and stage 0 to `PIECEWISE` in the NPU platform section of the copied
+configuration. The NPU Talker rejects
+V1 with full decode graphs before loading weights; use `PIECEWISE`, `NONE` or
+eager execution for V1. Select one of these
+deployment profiles:
 
 | Profile | Runner | Code2Wav graph batches | Intended use |
 | --- | --- | --- | --- |
-| `qwen3_tts.yaml` | V2 (default) | Existing defaults | Shipped default; experimental |
-| `qwen3_tts_mrv2.yaml` | V2 | B1 | Explicit MRV2 profile (same runner selection as the default) |
+| `qwen3_tts.yaml` | V2 on CUDA/NPU; V1 on XPU/ROCm/MUSA | B1 | Shipped default; experimental |
 | `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
 | `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
 | `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` | V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
 | `qwen3_tts_high_concurrency.yaml` | V1 | Existing defaults | V1 high-concurrency control |
 | `qwen3_tts_fused_single_gpu.yaml` | V2 | N/A (in-Talker decoder) | Opt-in single-stage CUDA pipeline on one GPU |
 
+The former `qwen3_tts_mrv2.yaml` profile has been removed. Use
+`qwen3_tts.yaml` instead: their resolved settings were identical on CUDA,
+XPU, ROCm and MUSA. On NPU, the former profile selected V1 with `PIECEWISE`
+Talker graphs, while the default selects V2 with `FULL_AND_PIECEWISE`.
+To retain that NPU V1 behavior, use a custom overlay:
+
+```yaml
+# qwen3_tts_npu_v1.yaml; replace base_config with your installed file's path.
+base_config: /absolute/path/to/vllm_omni/deploy/qwen3_tts.yaml
+platforms:
+  npu:
+    model_runner: v1
+    stages:
+      - stage_id: 0
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+```
+
+Relative `base_config` paths resolve from the overlay's directory.
+
 ```bash
-# MRV2 is the default; pass a copy with `model_runner: v1` to force V1.
+# Use the overlay above to retain V1 on NPU.
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
-  --deploy-config /path/to/qwen3_tts_v1.yaml
+  --deploy-config /path/to/qwen3_tts_npu_v1.yaml
 ```
 
 The V2 profiles bound Talker prefill to 512 tokens per step and select the
@@ -601,7 +666,7 @@ Talker AR runner and the Code2Wav generation
 runner together. Native inter-stage delivery carries codec payloads directly;
 request-owned snapshots preserve buffers through asynchronous completion and
 CUDA graph reuse. Terminal completion waits for upstream stage metrics before
-releasing request state. Platform sections retain V1 on NPU, XPU, ROCm and MUSA;
+releasing request state. Platform sections retain V1 on XPU, ROCm and MUSA;
 this change does not qualify MRV2 on those backends or enable other model families.
 Selecting V2 for a stage without `supports_native_mrv2_data_plane` emits a warning
 when pipeline and deployment settings are merged. That stage retains the legacy
@@ -681,8 +746,8 @@ the shared worker does not select Qwen's context length or codebook layout.
 
 ### Qwen3-TTS first-frame delivery and rollback
 
-The standard `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`,
-`qwen3_tts_mrv2.yaml` and `qwen3_tts_high_concurrency_mrv2.yaml` profiles
+The standard `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`
+and `qwen3_tts_high_concurrency_mrv2.yaml` profiles
 enable the `talker_first_audio` connector option, as does the experimental
 two-stage `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile.
 This changes the default CUDA MRV2 streaming path:
@@ -758,10 +823,13 @@ It is disabled by default. The experimental
 alongside cached residual prediction, fused sampling, time-major codec
 convolutions, first-frame delivery, and larger graph batches.
 
-The runtime requires `nvidia-cuda-mps-control` on `PATH` and one explicit CUDA
-GPU per local EngineCore stage, with `parallel_stage_init: false`.
-Use numeric GPU ordinals for stage placement and visibility so initialization
-locks identify the physical GPU before MPS remaps it. It starts a private MPS daemon for each selected
+A missing `nvidia-cuda-mps-control` binary, an MPS daemon that fails to start
+or answer `get_server_list` (including an unreachable operator-managed
+`CUDA_MPS_PIPE_DIRECTORY`), a stage that is not one numeric
+CUDA GPU, `parallel_stage_init`, or a diffusion/remote stage disables MPS for
+that configuration and continues. Use numeric GPU ordinals for stage placement
+and visibility so initialization locks identify the physical GPU before MPS
+remaps it. When MPS does start, it uses a private daemon for each selected
 GPU and stops its own daemon after the stages exit. If
 `CUDA_MPS_PIPE_DIRECTORY` already names an operator-managed daemon, the runtime
 reuses it without stopping it. Diffusion and remote stages are unsupported.
@@ -807,6 +875,18 @@ capacities, capture sizes, KV budget and `platforms.cuda.cuda_mps`. The
 pipeline no longer changes configuration based on a GPU-memory or MPS probe.
 
 Other platforms use V1 in the same file; NPU keeps its codec graph override.
+On Ascend NPU, `moss_tts_local_npu_mrv2.yaml` is an opt-in profile that runs the
+Talker (Stage0) and codec (Stage1) on MRV2. The Talker builds Ascend attention
+metadata, and the codec inherits the NPU streaming graph settings from
+`moss_tts_local.yaml`. The Stage0
+first-frame direct decode is off on NPU because it needs CUDA-only kernels, so
+Stage1 delivers every chunk:
+
+```bash
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
+  --deploy-config vllm_omni/deploy/moss_tts_local_npu_mrv2.yaml
+```
+
 The 2/3-NPU files retain their distinct multi-device topology. These changes
 do not enable MRV2 for MOSS Delay, Realtime or Nano. Local 1.5 emits 48 kHz
 stereo; benchmark raw PCM with `VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000` and

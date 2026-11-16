@@ -1,11 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for the unified quantization framework."""
 
 import pytest
 from torch import nn
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def test_serialized_per_channel_fp8_reuses_upstream_kernel_and_limits_scope():
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config, resolve
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8DynamicTokenSym, kFp8StaticTokenSym
+
+    from vllm_omni.quantization import build_quant_config
+
+    metadata = {
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "weight_scheme": "per_channel",
+        "activation_scheme": "dynamic_per_token",
+        "quantized_modules": r"blocks\.\d+\.proj\.weight",
+    }
+    config = build_quant_config(metadata)
+    assert isinstance(config, ModelOptFp8Config)
+    spec, _, _ = resolve(config.quant_method, config, "blocks.0.proj")
+    assert spec.weight == kFp8StaticTokenSym
+    assert spec.activation == kFp8DynamicTokenSym
+    assert config.is_checkpoint_fp8_serialized
+    assert config.get_name() == "fp8"
+    assert not config.is_layer_excluded("blocks.0.proj")
+    assert config.is_layer_excluded("blocks.0.norm")
+    assert config.is_layer_excluded("text_encoder.proj")
+    with pytest.raises(ValueError, match="activation_scheme"):
+        build_quant_config(metadata | {"activation_scheme": "static"})
 
 
 def test_build_quant_config_fp8():
@@ -219,19 +246,19 @@ def test_component_config_with_default():
     assert config.resolve("vae.encoder") is None
 
 
-def test_integration_string():
+def test_integration_string(tmp_path):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-    config = OmniDiffusionConfig(model="test", quantization_config="fp8")
+    config = OmniDiffusionConfig(model=str(tmp_path), quantization_config="fp8")
     assert config.quantization_config is not None
     assert config.quantization_config.get_name() == "fp8"
 
 
-def test_integration_dict():
+def test_integration_dict(tmp_path):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
     config = OmniDiffusionConfig(
-        model="test",
+        model=str(tmp_path),
         quantization_config={"method": "fp8", "is_checkpoint_fp8_serialized": True, "activation_scheme": "static"},
     )
     assert config.quantization_config is not None
@@ -239,20 +266,20 @@ def test_integration_dict():
     assert config.quantization_config.activation_scheme == "static"
 
 
-def test_integration_no_quant():
+def test_integration_no_quant(tmp_path):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-    config = OmniDiffusionConfig(model="test")
+    config = OmniDiffusionConfig(model=str(tmp_path))
     assert config.quantization_config is None
 
 
-def test_integration_per_component():
+def test_integration_per_component(tmp_path):
     """OmniDiffusionConfig with per-component quantization dict."""
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.quantization import ComponentQuantizationConfig
 
     config = OmniDiffusionConfig(
-        model="test",
+        model=str(tmp_path),
         quantization_config={
             "transformer": {"method": "fp8"},
             "vae": None,

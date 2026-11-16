@@ -14,7 +14,7 @@ This runner separates two concepts:
 A config JSON file may be passed via --test-config-file. If omitted, every ``*.json`` under
 ``tests/dfx/perf/tests/`` is loaded and pytest ``-m`` filters by each case's ``mark``:
   pytest run_diffusion_benchmark.py -m "diffusion"
-  pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+  pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_bagel_vllm_omni.json
 
 Optional JSON field ``mark`` is applied as pytest marks on that case via
 ``pytest.param`` (e.g. ``"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 1}}, "full_model", "diffusion"]``).
@@ -860,6 +860,7 @@ def run_benchmark(
         "stage_durations_p50": metrics.get("stage_durations_p50"),
         "stage_durations_p99": metrics.get("stage_durations_p99"),
         "commit_sha": _get_branchpoint_commit_sha(),
+        "branch": os.environ.get("BUILDKITE_BRANCH", ""),
         "build_id": os.environ.get("BUILDKITE_BUILD_ID", ""),
         "build_url": os.environ.get("BUILDKITE_BUILD_URL", ""),
         "source_file": source_file,
