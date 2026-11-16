@@ -79,7 +79,12 @@ def _runner_assisted_batch_descriptor(
 
 
 def _needs_capture_tensor_unwrap(model: Any) -> bool:
-    return bool(getattr(model, "_returns_tuple", False) or getattr(model, "have_multimodal_outputs", False))
+    if getattr(model, "_returns_tuple", False):
+        return True
+    # Some models build multimodal outputs from the live batch after replay.
+    return bool(getattr(model, "have_multimodal_outputs", False)) and (
+        getattr(model, "mrv2_forward_returns_tensor", False) is not True
+    )
 
 
 def _supports_full_graph_aux_outputs(model: Any) -> bool:
