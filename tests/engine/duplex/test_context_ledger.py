@@ -433,3 +433,96 @@ def test_l1_node_for_returns_only_valid_l1(session):
     ledger.refresh(session.history_snapshot())
 
     assert ledger.l1_node_for(snapshot.source_ids[0]) is None
+
+
+def test_rolling_summary_flattens_transitive_sources_and_retires_old_nodes(session):
+    for index in range(3):
+        session.register_history_item(str(index), _user(f"source {index}"))
+    snapshot, ledger = session.history_snapshot(), session.context_ledger
+    l1 = _l1(ledger, snapshot, 0)
+    first = _summary(ledger, snapshot, l1)
+    second = ledger.replace_summary(
+        snapshot,
+        sources=source_refs(snapshot, snapshot.source_ids[1]),
+        replaces=(first.node_id,),
+        message={"content": "first two"},
+    )
+    third = ledger.replace_summary(
+        snapshot,
+        sources=source_refs(snapshot, snapshot.source_ids[2]),
+        replaces=(second.node_id,),
+        message={"content": "all three"},
+    )
+    assert not third.parents
+    assert set(third.sources) == set(source_refs(snapshot, *snapshot.source_ids))
+    assert ledger.nodes() == (l1, third)
+    session.register_history_item("0", _user("corrected earliest source"))
+    assert ledger.refresh(session.history_snapshot()) == (l1.node_id, third.node_id)
+    assert ledger.nodes() == ()
+
+
+@pytest.mark.parametrize("invalid", ["old_revision", "missing_replacement", "l1_replacement", "bad_message"])
+def test_rejected_replacement_is_atomic(session, invalid):
+    session.register_history_item("one", _user("first"))
+    snapshot, ledger = session.history_snapshot(), session.context_ledger
+    l1 = _l1(ledger, snapshot, 0)
+    first = _summary(ledger, snapshot, l1)
+    message: Mapping[str, object] = {"content": "new summary"}
+    replaces = (first.node_id,)
+    if invalid == "old_revision":
+        session.register_history_item("one", _user("changed"))
+        snapshot = session.history_snapshot()
+    elif invalid == "missing_replacement":
+        replaces = (999,)
+    elif invalid == "l1_replacement":
+        replaces = (l1.node_id,)
+    else:
+
+        class BrokenMessage(Mapping):
+            def __iter__(self):
+                raise ValueError("cannot copy message")
+
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, key):
+                raise ValueError("cannot copy message")
+
+        message = BrokenMessage()
+    before = ledger.nodes()
+    with pytest.raises(ValueError):
+        ledger.replace_summary(snapshot, replaces=replaces, message=message)
+    assert ledger.nodes() == before
+    # A failed admission must not consume a node ID.
+    fresh = ledger.replace_summary(
+        snapshot, sources=source_refs(snapshot, *snapshot.source_ids), message={"content": "fresh"}
+    )
+    assert fresh.node_id == first.node_id + 1
+
+
+def test_remove_cascades_and_summary_replacement_preserves_independent_l1(session):
+    session.register_history_item("one", _user("first"))
+    snapshot, ledger = session.history_snapshot(), session.context_ledger
+    l1 = _l1(ledger, snapshot, 0)
+    first = _summary(ledger, snapshot, l1)
+    descendant = _summary(ledger, snapshot, first)
+    independent = _summary(ledger, snapshot, source_index=0)
+    replacement = ledger.replace_summary(snapshot, replaces=(first.node_id,), message={"content": "replacement"})
+    assert not ledger.valid(first.node_id) and not ledger.valid(descendant.node_id)
+    assert ledger.nodes() == (l1, independent, replacement)
+    assert ledger.remove(l1.node_id) == (l1.node_id,)
+    assert ledger.l1_node_for(snapshot.source_ids[0]) is None
+    assert ledger.remove(replacement.node_id, 123456) == (replacement.node_id,)
+    assert ledger.remove(replacement.node_id) == ()
+
+
+def test_remove_newest_l1_restores_older_revision_lookup(session):
+    session.register_history_item("one", _user("old"))
+    before, ledger = session.history_snapshot(), session.context_ledger
+    old = _l1(ledger, before, 0)
+    session.register_history_item("one", _user("new"))
+    new = _l1(ledger, session.history_snapshot(), 0)
+    assert ledger.remove(new.node_id) == (new.node_id,)
+    assert ledger.l1_node_for(before.source_ids[0]) == old
+    with pytest.raises(DuplexContextNodeRejectedError, match="source_already_has"):
+        _l1(ledger, before, 0)

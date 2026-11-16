@@ -28,6 +28,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
 from vllm_omni.platforms import current_omni_platform
@@ -173,6 +174,7 @@ class CodePredictorAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         assert self.num_heads % self.num_kv_heads == 0
         self.is_gqa = self.num_kv_heads != self.num_heads
+        self.use_npu_native_gqa = False
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.head_dim = getattr(
             config,
@@ -234,6 +236,20 @@ class CodePredictorAttention(nn.Module):
         bsz: int,
         seq_len: int,
     ) -> torch.Tensor:
+        if self.use_npu_native_gqa and q.dtype in (torch.bfloat16, torch.float16):
+            # The inference operator consumes grouped K/V directly. Keep the
+            # existing expanded-head implementation as the default/reference.
+            return torch_npu.npu_fused_infer_attention_score(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="BNSD",
+                atten_mask=self._fusion_causal_mask[:seq_len, :seq_len].contiguous(),
+                scale=float(self.scaling),
+                sparse_mode=0,
+            )[0]
         q_f, k_f, v_f = q, k, v
         if self.is_gqa:
             k_f = (
@@ -343,13 +359,48 @@ class CodePredictorAttention(nn.Module):
         v = v_raw.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = position_embeddings
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-        q = (q * cos) + (_rotate_half(q) * sin)
-        k = (k * cos) + (_rotate_half(k) * sin)
-        k_cache.index_copy_(2, write_positions, k.to(k_cache.dtype))
-        v_cache.index_copy_(2, write_positions, v.to(v_cache.dtype))
-        if getattr(self, "use_short_kv_attention", False):
+        if current_omni_platform.is_npu() and HAS_TRITON and q.dtype in (torch.bfloat16, torch.float16):
+            from vllm_omni.platforms.npu.layers.predictor_rope_cache import rope_cache
+
+            q = rope_cache(q, k, v, cos, sin, write_positions, k_cache, v_cache)
+        else:
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
+            q = (q * cos) + (_rotate_half(q) * sin)
+            k = (k * cos) + (_rotate_half(k) * sin)
+            k_cache.index_copy_(2, write_positions, k.to(k_cache.dtype))
+            v_cache.index_copy_(2, write_positions, v.to(v_cache.dtype))
+        if current_omni_platform.is_npu() and self.use_npu_native_gqa and q.dtype in (torch.bfloat16, torch.float16):
+            # The cache has fixed capacity; masked future slots are never read.
+            attn_out = torch_npu.npu_fused_infer_attention_score(
+                q.contiguous(),
+                k_cache,
+                v_cache,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="BNSD",
+                atten_mask=~key_mask,
+                scale=float(self.scaling),
+                sparse_mode=0,
+            )[0]
+        elif current_omni_platform.is_npu():
+            k_full, v_full = k_cache, v_cache
+            if self.is_gqa:
+                k_full = k_full.repeat_interleave(self.num_queries_per_kv, dim=1)
+                v_full = v_full.repeat_interleave(self.num_queries_per_kv, dim=1)
+            attn_out = torch_npu.npu_fusion_attention(
+                q.contiguous(),
+                k_full.contiguous(),
+                v_full.contiguous(),
+                self.num_heads,
+                "BNSD",
+                atten_mask=(~key_mask).contiguous(),
+                scale=float(self.scaling),
+                keep_prob=1.0,
+                sparse_mode=0,
+                sync=True,
+            )[0]
+        elif getattr(self, "use_short_kv_attention", False):
             from .short_kv_attention import short_kv_attention
 
             attn_out = short_kv_attention(q, k_cache, v_cache, write_positions, self.scaling)
@@ -381,6 +432,7 @@ class CodePredictorMLP(nn.Module):
         # separate gate/up linears. See the module-level HF-numerics note for
         # the GPU bit-level drift caveat.
         self._intermediate_size = int(config.intermediate_size)
+        self.use_npu_fused_swiglu = False
         self.gate_up_proj = nn.Linear(
             config.hidden_size,
             2 * config.intermediate_size,
@@ -390,6 +442,8 @@ class CodePredictorMLP(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(hidden_states)
+        if self.use_npu_fused_swiglu and gate_up.device.type == "npu" and gate_up.dtype == torch.bfloat16:
+            return self.down_proj(torch_npu.npu_swiglu(gate_up, dim=-1))
         gate, up = gate_up.split([self._intermediate_size, self._intermediate_size], dim=-1)
         return self.down_proj(F.silu(gate) * up)
 
@@ -795,6 +849,17 @@ class CodePredictorWrapper(nn.Module):
         self._fused_sampling_enabled = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_fused_sampling"))
         prefix_graphs_requested = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_prefix_graphs"))
         is_npu = current_omni_platform.is_npu()
+        native_gqa = prefix_graph_cfg.get("code_predictor_npu_native_gqa", False)
+        if not isinstance(native_gqa, bool):
+            raise ValueError("code_predictor_npu_native_gqa must be a boolean")
+        fused_swiglu = prefix_graph_cfg.get("code_predictor_npu_fused_swiglu", False)
+        if not isinstance(fused_swiglu, bool):
+            raise ValueError("code_predictor_npu_fused_swiglu must be a boolean")
+        for layer in self.model.layers:
+            layer.self_attn.use_npu_native_gqa = is_npu and native_gqa
+            layer.mlp.use_npu_fused_swiglu = is_npu and fused_swiglu
+        if is_npu and (native_gqa or fused_swiglu):
+            logger.info("code_predictor NPU native GQA=%s, fused SwiGLU=%s", native_gqa, fused_swiglu)
         # MRv2 captures the whole Talker MTP call. It can therefore capture
         # shorter compiled re-prefill forwards without nesting predictor-owned
         # CUDA graphs inside the outer graph.
