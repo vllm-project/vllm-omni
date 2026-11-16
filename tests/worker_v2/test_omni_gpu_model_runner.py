@@ -536,6 +536,25 @@ def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
     assert runner._exclude_full_graph is exclude_full
 
 
+@pytest.mark.parametrize("model_name", ["slow_ar", "omni"])
+def test_fish_capture_contract_preserves_full_graph(model_name):
+    from vllm_omni.model_executor.models.fish_omni.fish_omni_model import FishOmniForConditionalGeneration
+    from vllm_omni.model_executor.models.fish_speech.fish_speech_slow_ar import FishSpeechSlowARForConditionalGeneration
+
+    model_cls = {"slow_ar": FishSpeechSlowARForConditionalGeneration, "omni": FishOmniForConditionalGeneration}[model_name]
+    model = model_cls.__new__(model_cls)
+    torch.nn.Module.__init__(model)
+    # Slow AR sets this in its weight-loading constructor.
+    model.have_multimodal_outputs = True
+    runner = _make_runner()
+    runner.model = model
+
+    runner._configure_cudagraph_output_contract()
+
+    assert not runner._model_has_structured_output
+    assert not runner._exclude_full_graph
+
+
 def _aux_output(num_tokens):
     hidden = torch.arange(num_tokens * 2, dtype=torch.float32).reshape(num_tokens, 2)
     return hidden, {"hidden_states": {"layers": {0: hidden + 1, 24: hidden + 2}}}

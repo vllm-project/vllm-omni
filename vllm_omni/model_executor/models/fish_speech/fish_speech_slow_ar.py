@@ -183,6 +183,8 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
 
     # Postprocess only stores the last hidden for the V1 next-step MTP.
     eager_frames_need_postprocess = False
+    # Codec outputs are assembled after the backbone forward.
+    mrv2_forward_returns_tensor: bool = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
