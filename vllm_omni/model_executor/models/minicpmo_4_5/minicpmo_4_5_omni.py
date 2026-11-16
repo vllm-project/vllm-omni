@@ -1045,6 +1045,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             self.model_stage == "tts" or (self.model_stage == "llm" and not self._returns_aux_hidden_states)
         )
 
+    @property
+    def mrv2_forward_returns_native_aux(self) -> bool:
+        # Target layers belong to the native drafter, not Omni's auxiliary slot.
+        return self._use_v2_model_runner and self.model_stage == "llm" and self._returns_aux_hidden_states
+
     def make_omni_output_mrv2(self, model_outputs, *, input_batch, req_states, model_intermediate_buffer):
         """Attach the Thinker row identities used by the llm2tts bridge."""
         if self.model_stage != "llm":

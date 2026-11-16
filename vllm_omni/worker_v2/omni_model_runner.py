@@ -83,6 +83,9 @@ def _runner_assisted_batch_descriptor(
 def _needs_capture_tensor_unwrap(model: Any) -> bool:
     if getattr(model, "_returns_tuple", False):
         return True
+    # Native drafters own their (hidden states, target layers) tuple.
+    if getattr(model, "mrv2_forward_returns_native_aux", False) is True:
+        return False
     # Some models build multimodal outputs from the live batch after replay.
     return bool(getattr(model, "have_multimodal_outputs", False)) and (
         getattr(model, "mrv2_forward_returns_tensor", False) is not True

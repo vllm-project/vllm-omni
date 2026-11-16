@@ -656,7 +656,7 @@ def test_aux_hidden_state_contract_uses_tuple_slot_not_structured_output():
 @pytest.mark.parametrize("stage,declared", [("thinker", False), ("custom_ar", True)])
 def test_capture_contract_uses_model_declaration(stage, declared):
     runner = _make_runner()
-    runner.model = SimpleNamespace(model_stage=stage, _returns_tuple=declared)
+    runner.model = SimpleNamespace(model_stage=stage, _returns_tuple=declared, mrv2_forward_returns_native_aux=True)
     runner._configure_cudagraph_output_contract()
     assert runner._model_has_structured_output is declared
     assert runner._exclude_full_graph is declared
@@ -665,7 +665,7 @@ def test_capture_contract_uses_model_declaration(stage, declared):
 
 @pytest.mark.parametrize(
     ("stage", "use_mrv2", "returns_aux", "exclude_full"),
-    [("llm", True, False, False), ("tts", True, False, False), ("llm", True, True, True), ("llm", False, False, True)],
+    [("llm", True, False, False), ("tts", True, False, False), ("llm", True, True, False), ("llm", False, False, True)],
 )
 def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
@@ -678,6 +678,8 @@ def test_minicpmo_capture_contract(stage, use_mrv2, returns_aux, exclude_full):
     model._use_v2_model_runner = use_mrv2
     model._returns_aux_hidden_states = returns_aux
     model.have_multimodal_outputs = True
+    assert model.mrv2_forward_returns_tensor is (use_mrv2 and (stage == "tts" or not returns_aux))
+    assert model.mrv2_forward_returns_native_aux is (use_mrv2 and stage == "llm" and returns_aux)
 
     runner = _make_runner()
     runner.model = model
