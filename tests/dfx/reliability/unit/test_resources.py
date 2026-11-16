@@ -964,3 +964,23 @@ def test_tree_crash_preserves_trackers_and_keeps_them_in_snapshot():
     module.make_server_tree_kill_fault_injector()(server)
     assert killed == [(10, 9), (12, 9), (15, 9)]
     assert server.reliability_fault_snapshot["tree_pids"] == [10, 11, 12, 13, 14, 15]
+
+
+def test_minicpm_fault_cli_pins_single_replica_without_changing_replica_suite():
+    import json
+
+    source = RELIABILITY_ROOT / "test_minicpmo_4_5.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    model = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MiniCPMO45")
+    scenarios = next(
+        n.value
+        for n in model.body
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "scenarios" for t in n.targets)
+    )
+    namespace: dict[str, Any] = {"_MODEL": "model", "_NATIVE_CHAT_TEMPLATE": "template"}
+    cases = eval(compile(ast.Expression(scenarios), str(source), "eval"), namespace)
+    args = cases[0]["server_params"]["server_args"]
+    overrides = json.loads(args[args.index("--stage-overrides") + 1])
+    assert overrides == {str(stage): {"num_replicas": 1, "devices": "0"} for stage in range(3)}
+    replica = (RELIABILITY_ROOT / "test_minicpmo_4_5_replica.py").read_text(encoding="utf-8")
+    assert "--stage-overrides" not in replica

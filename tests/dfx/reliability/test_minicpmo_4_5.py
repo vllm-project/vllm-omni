@@ -118,6 +118,11 @@ class MiniCPMO45(FaultModel):
                 "server_args": [
                     "--trust-remote-code",
                     "--async-chunk",
+                    # Keep single-replica fault semantics despite production defaults.
+                    "--stage-overrides",
+                    '{"0":{"num_replicas":1,"devices":"0"},'
+                    '"1":{"num_replicas":1,"devices":"0"},'
+                    '"2":{"num_replicas":1,"devices":"0"}}',
                     "--chat-template",
                     str(_NATIVE_CHAT_TEMPLATE),
                     "--chat-template-content-format",
