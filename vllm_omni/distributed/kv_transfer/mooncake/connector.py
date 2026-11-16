@@ -51,6 +51,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     KVConnectorTransferResults,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector import MooncakeStoreConnector
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     MooncakeLookupResult,
@@ -445,7 +446,7 @@ class OmniMooncakeStoreConnector(MooncakeStoreConnector):
         spec.tail_key_boundaries = tuple(replace(boundary, num_tokens=limit) for boundary in spec.tail_key_boundaries)
         return limit - num_computed_tokens, load_async
 
-    def get_kv_connector_stats(self) -> MooncakeStoreConnectorStats | None:
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
         if self.connector_worker is not None:
             return super().get_kv_connector_stats()
         # The scheduler role has no native telemetry; it reports lookup waits.

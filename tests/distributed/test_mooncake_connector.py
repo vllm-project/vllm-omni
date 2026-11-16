@@ -138,6 +138,22 @@ class SchedulerSeam:
 
 
 @dataclass
+class ClockSeam:
+    """Stands in for the connector module's `time`; sleeping advances the clock."""
+
+    now: float = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def perf_counter(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@dataclass
 class PlatformSeam:
     cuda: bool
 
@@ -644,28 +660,22 @@ def test_slow_hs_write_preserves_kv_readiness_budget(connector, monkeypatch, kv_
     key = hs_key(connector.namespace, attempt.hashes[0])
     if kv_ready:
         store.objects["kv:" + attempt.hashes[0].hex()] = b"kv"
-    now = 0.0
+    clock = ClockSeam()
     put = store.put
 
     def slow_put(name, payload):
-        nonlocal now
         if name == key:
-            now += 2
+            clock.now += 2
         return put(name, payload)
 
-    def sleep(seconds):
-        nonlocal now
-        now += seconds
-
     monkeypatch.setattr(store, "put", slow_put)
-    clock = SimpleNamespace(monotonic=lambda: now, perf_counter=lambda: now, sleep=sleep)
     monkeypatch.setattr(connector_module, "time", clock)
     monkeypatch.setattr(connector_module, "_KV_POLL_SECONDS", 1)
     saved = connector._save_hs(PendingSave(attempt, [(0, 4, captures(0, 4))], 0))
 
     assert saved is kv_ready
     assert (key + ":ready" in store.objects) is kv_ready
-    assert now == (2 if kv_ready else 3)
+    assert clock.now == (2 if kv_ready else 3)
 
 
 def test_failed_save_cannot_publish_completion(connector):
