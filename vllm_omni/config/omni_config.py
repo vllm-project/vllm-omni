@@ -377,6 +377,7 @@ def _stage_cli_overrides(
     *,
     execution_type: StageExecutionType | None = None,
     stage_scoped_lora: bool = False,
+    stage_deploy: StageDeployConfig | None = None,
 ) -> dict[str, Any]:
     if execution_type == StageExecutionType.DIFFUSION:
         stage_override_pattern = re.compile(r"^stage_\d+_")
@@ -384,6 +385,18 @@ def _stage_cli_overrides(
             name: _copy_value(value) for name, value in cli_overrides.items() if stage_override_pattern.match(name)
         }
         global_inputs = {name: _copy_value(value) for name, value in cli_overrides.items() if name not in stage_scoped}
+        # Ingress normalization drops malformed cache JSON with a warning, so
+        # check it first against the preset, which may come from deploy.
+        from vllm_omni.diffusion.low_vram import reject_malformed_cache_config
+
+        reject_malformed_cache_config(
+            _first_defined(
+                stage_scoped.get(f"stage_{stage_id}_low_vram_preset"),
+                global_inputs.get("low_vram_preset"),
+                getattr(stage_deploy, "low_vram_preset", None),
+            ),
+            _first_defined(stage_scoped.get(f"stage_{stage_id}_cache_config"), global_inputs.get("cache_config")),
+        )
         cli_overrides = {
             **normalize_and_validate_diffusion_engine_ingress_kwargs(
                 global_inputs,
@@ -1026,11 +1039,15 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             normalize_omni_diffusion_kwargs,
             validate_omni_diffusion_kwargs,
         )
+        from vllm_omni.diffusion.low_vram import expand_low_vram_preset
         from vllm_omni.diffusion.offloader.config import parse_diffusion_offload_config
 
         valid_fields = frozenset(f.name for f in fields(cast(Any, cls)))
         normalized = normalize_omni_diffusion_kwargs(kwargs)
         validate_omni_diffusion_kwargs(normalized, valid_fields)
+        # Built from merged deploy/CLI stage values, so preset defaults fill
+        # only settings that no source provided.
+        normalized = expand_low_vram_preset(normalized)
         # Validate before stage construction while retaining the raw mapping
         # needed by dataclass/config serialization across process boundaries.
         parse_diffusion_offload_config(normalized.get("diffusion_offload_config"))
@@ -1578,6 +1595,7 @@ def extract_diffusion_stage_config_kwargs(
         normalize_omni_diffusion_kwargs,
         validate_omni_diffusion_kwargs,
     )
+    from vllm_omni.diffusion.low_vram import expand_low_vram_preset
 
     shared_only_fields = sorted(_DIFFUSION_SHARED_ONLY_ENGINE_FIELDS.intersection(kwargs))
     if shared_only_fields:
@@ -1614,6 +1632,9 @@ def extract_diffusion_stage_config_kwargs(
         diffusion_fields | fields_owned_elsewhere,
         stage_id=stage_id,
     )
+    # Input here is the merged stage payload; expanding earlier (on a single
+    # source) would turn preset defaults into overrides of other sources.
+    normalized = expand_low_vram_preset(normalized)
     return {name: _copy_value(value) for name, value in normalized.items() if name in diffusion_fields}
 
 
@@ -2580,6 +2601,7 @@ class VllmOmniConfig:
                         cli_overrides,
                         execution_type=topology.execution_type,
                         stage_scoped_lora=len(pipeline_cfg.stages) > 1,
+                        stage_deploy=deploy_by_id.get(topology.stage_id),
                     ),
                 ),
                 model=model,

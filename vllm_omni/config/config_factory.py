@@ -39,6 +39,7 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import get_diffusion_output_type
+from vllm_omni.diffusion.low_vram import reject_malformed_cache_config
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
 logger = init_logger(__name__)
@@ -767,6 +768,12 @@ class StageConfigFactory:
             merged_parallel.pop("world_size", None)
             kwargs = {**kwargs, "parallel_config": merged_parallel}
 
+        # Normalization below sees only CLI input and drops malformed cache JSON;
+        # a deploy-enabled low-VRAM preset must reject it instead.
+        reject_malformed_cache_config(
+            kwargs.get("low_vram_preset") or stage_deploy.low_vram_preset,
+            kwargs.get("cache_config"),
+        )
         engine_overrides, parallel_config, default_sampling_params, final_output_type = (
             cls._normalize_default_diffusion(kwargs)
         )

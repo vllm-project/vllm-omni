@@ -98,11 +98,16 @@ Diffusion keeps its existing engine-field ownership and projection surface.
 Shared Python inheritance must not be treated as evidence that an LLM-only
 parallel input is effective for a diffusion stage.
 
-The opt-in diffusion `low_vram_preset` remains unexpanded at ingress so that
-deploy and CLI sources can merge without manufactured overrides. Terminal
-normalization and the diffusion projection expand its unset fields through
-`diffusion/low_vram.py`. Structured stage construction checks the single-GPU
-and sleep restrictions; terminal configuration revalidates the composed
+The opt-in diffusion `low_vram_preset` is never expanded by shared kwargs
+normalization, because some callers (for example the generic diffusion
+factory) normalize CLI input before deploy and CLI sources merge. Only merged
+stage payloads expand its unset fields through `diffusion/low_vram.py`:
+`extract_diffusion_stage_config_kwargs`, the diffusion projection, and
+`OmniDiffusionConfig.__post_init__`. Normalization drops malformed cache JSON
+with a warning, so ingress checks it first against the preset from either
+source. Structured stage construction checks the single-GPU and sleep
+restrictions, and headless launch rechecks `--omni-dp-size-local`, which is
+applied after validation. Terminal configuration revalidates the composed
 settings. Architecture discovery also checks the preset's supported pipeline
 and cache combinations. See the [user guide](../../configuration/low_vram.md).
 

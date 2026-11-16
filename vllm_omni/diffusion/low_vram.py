@@ -73,10 +73,8 @@ def expand_low_vram_preset(kwargs: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("low_vram_preset supports cache_backend='none' or 'tea_cache'")
     cache_config = result.get("cache_config")
     if isinstance(cache_config, str):
-        try:
-            cache_config = json.loads(cache_config)
-        except json.JSONDecodeError as exc:
-            raise ValueError("low_vram_preset requires valid cache_config JSON") from exc
+        reject_malformed_cache_config(preset, cache_config)
+        cache_config = json.loads(cache_config)
         if not isinstance(cache_config, dict):
             raise ValueError("low_vram_preset requires cache_config to be a JSON object")
         result["cache_config"] = cache_config
@@ -89,6 +87,21 @@ def expand_low_vram_preset(kwargs: Mapping[str, Any]) -> dict[str, Any]:
 
     validate_low_vram_pipeline(result.get("model_class_name"))
     return result
+
+
+def reject_malformed_cache_config(preset: str | None, cache_config: Any) -> None:
+    """Fail on malformed cache JSON when the preset is in effect.
+
+    Plain normalization drops malformed cache JSON with a warning. Call this
+    where raw CLI input and the deploy stage are both visible, so the preset can
+    reject the input even when the two settings come from different sources.
+    """
+    if preset is None or not isinstance(cache_config, str):
+        return
+    try:
+        json.loads(cache_config)
+    except json.JSONDecodeError as exc:
+        raise ValueError("low_vram_preset requires valid cache_config JSON") from exc
 
 
 def validate_low_vram_pipeline(model_class_name: str | None) -> None:
