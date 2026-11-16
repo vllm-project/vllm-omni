@@ -14,6 +14,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS
 from vllm_omni.diffusion.models.hunyuan_image3.request_layout import (
     extract_hunyuan_ar_token_ids,
+    hunyuan_sequence_template,
     prepare_hunyuan_layout,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -307,6 +308,45 @@ def test_bridge_copies_original_ids_and_layout_planner_consumes_them(wrapper):
     worker = _layout(wrapper, prompt_ids, generated)
     assert torch.equal(prepared.tokenizer_output.tokens, worker.tokens)
     assert prepared.tokenizer_output.think_recaption_end_pos == worker.think_recaption_end_pos
+
+
+def test_ar_prefix_uses_instruct_when_generation_config_omits_the_template(wrapper):
+    prompt_ids = _prompt_ids(wrapper)
+    generated = [
+        wrapper.tokenizer.convert_tokens_to_ids("a"),
+        wrapper.tokenizer.convert_tokens_to_ids("bc"),
+        wrapper.end_think_token_id,
+    ]
+    source = _AROutput(
+        prompt_token_ids=prompt_ids,
+        outputs=[_ARCompletion(cumulative_token_ids=generated, text="abc")],
+    )
+    prompt = ar2diffusion([source], prompt={"prompt": "draw"})
+    request = OmniDiffusionRequest(
+        prompt=prompt,
+        kv_transfer_params={"num_transfer_tokens": len(prompt_ids) + len(generated) - 1},
+        request_id="ar-token-default-template",
+        sampling_params=OmniDiffusionSamplingParams(
+            height=32, width=32, guidance_scale=1.0, guidance_scale_provided=True, extra_args={}
+        ),
+    )
+    prepared = prepare_hunyuan_layout(
+        request,
+        tokenizer_wrapper=wrapper,
+        image_processor=_ImageProcessor(_image_info()),
+        generation_config=GenerationConfig(drop_think=False),
+        image_base_size=1024,
+    )
+    worker = _layout(wrapper, prompt_ids, generated)
+    assert torch.equal(prepared.tokenizer_output.tokens, worker.tokens)
+
+
+def test_sequence_template_stays_on_generation_config_without_ar_ids():
+    generation_config = GenerationConfig()
+    assert hunyuan_sequence_template(generation_config, None) == "pretrain"
+    generation_config.sequence_template = "instruct"
+    assert hunyuan_sequence_template(generation_config, None) == "instruct"
+    assert hunyuan_sequence_template(generation_config, [([1], [2])]) == "instruct"
 
 
 def test_text_only_requests_keep_legacy_path_and_partial_metadata_is_rejected():

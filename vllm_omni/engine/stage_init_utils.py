@@ -1985,21 +1985,46 @@ def release_device_locks(lock_fds: list[int]) -> None:
             pass
 
 
-def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> Any:
+def load_omni_transfer_config_for_model(
+    model: str,
+    config_path: str | None,
+    platform: str | None = None,
+) -> Any:
     """Load omni transfer config from the resolver-selected deploy config.
 
     Resolves ``base_config`` inheritance (CI overlay → base deploy YAML) so
     that connectors defined in the base config are visible to the transfer
-    config parser.
+    config parser. The parser reads top-level ``stages``, so connector refs
+    already applied to the deploy stages by ``_apply_platform_overrides`` are
+    copied back first.
     """
     from vllm_omni.distributed.omni_connectors import load_omni_transfer_config
 
     try:
         if config_path is None:
             return None
-        from vllm_omni.config.stage_config import resolve_deploy_yaml
+        from vllm_omni.config.stage_config import (
+            _apply_platform_overrides,
+            load_deploy_config,
+            resolve_deploy_yaml,
+        )
 
         resolved_dict = resolve_deploy_yaml(config_path)
+        deploy = _apply_platform_overrides(load_deploy_config(config_path), platform)
+        by_id = {stage.stage_id: stage for stage in deploy.stages}
+        for stage in resolved_dict.get("stages") or []:
+            if not isinstance(stage, dict):
+                continue
+            stage_id = stage.get("stage_id")
+            if not isinstance(stage_id, int):
+                continue
+            overridden = by_id.get(stage_id)
+            if overridden is None:
+                continue
+            if overridden.output_connectors:
+                stage["output_connectors"] = dict(overridden.output_connectors)
+            if overridden.input_connectors:
+                stage["input_connectors"] = dict(overridden.input_connectors)
         return load_omni_transfer_config(config_dict=resolved_dict)
     except Exception as e:
         logger.warning("[stage_init] Failed to load transfer config: %s", e)

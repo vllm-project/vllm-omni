@@ -149,6 +149,22 @@ def extract_hunyuan_ar_token_ids(
     return result if any(item is not None for item in result) else None
 
 
+def hunyuan_sequence_template(
+    generation_config: Any,
+    ar_token_ids: list[tuple[list[int], list[int]] | None] | None,
+) -> str:
+    """Template whose prefix matches the AR tokens being reused.
+
+    The AR stage frames its prefill with Instruct role markers
+    (``prompt_utils.build_prompt_tokens``). HunyuanImage-3.0 does not set
+    ``sequence_template``, so the DiT fallback of ``pretrain`` drops those
+    markers and the reused prefix no longer matches.
+    """
+    if ar_token_ids is not None and any(item is not None for item in ar_token_ids):
+        return "instruct"
+    return getattr(generation_config, "sequence_template", "pretrain")
+
+
 def extract_hunyuan_prompt_inputs(
     prompts: list[Any],
     extra_args: dict[str, Any],
@@ -303,6 +319,7 @@ def prepare_hunyuan_layout(
     if use_meanflow:
         image_info_kwargs["add_timestep_r_token"] = True
     generated_image_info = image_processor.build_image_info((height, width), **image_info_kwargs)
+    ar_token_ids = extract_hunyuan_ar_token_ids([request.prompt])
     result = tokenizer_wrapper.apply_chat_template(
         batch_prompt=prompt,
         mode="gen_image",
@@ -310,12 +327,12 @@ def prepare_hunyuan_layout(
         batch_cond_image_info=batch_cond_image_info,
         batch_system_prompt=[system_prompt],
         batch_cot_text=cot_text,
-        batch_ar_token_ids=extract_hunyuan_ar_token_ids([request.prompt]),
+        batch_ar_token_ids=ar_token_ids,
         validate_ar_kv_prefix=request.kv_transfer_params is not None,
         max_length=None,
         bot_task=tokenizer_bot_task,
         image_base_size=image_base_size,
-        sequence_template=getattr(generation_config, "sequence_template", "pretrain"),
+        sequence_template=hunyuan_sequence_template(generation_config, ar_token_ids),
         cfg_factor=hunyuan_cfg_factor(generated_image_info, guidance_scale),
         drop_think=getattr(generation_config, "drop_think", False),
     )
