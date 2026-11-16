@@ -360,6 +360,8 @@ def set_death_signal(sig: int) -> None:
     would otherwise become an orphan under ``init``. Detect that race and
     self-signal with ``sig`` instead of silently continuing unprotected.
 
+    An initial parent PID of 1 is treated as orphaned. Reparenting to a
+    non-init subreaper before the first PID check cannot be detected here.
     Non-Linux platforms are a no-op. ``prctl`` failures are logged; if the
     parent is already gone when arming fails, this process still self-signals.
     """
@@ -370,7 +372,7 @@ def set_death_signal(sig: int) -> None:
         if platform.system() != "Linux":
             return
 
-        # PR_SET_PDEATHSIG == 1. Capture the spawn parent before arming so a
+        # PR_SET_PDEATHSIG == 1. Capture the current parent before arming so a
         # mid-call death still looks like a parent change afterward.
         parent = os.getppid()
         if parent <= 1:
