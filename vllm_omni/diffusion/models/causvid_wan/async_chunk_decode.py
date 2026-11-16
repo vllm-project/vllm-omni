@@ -13,24 +13,18 @@ import queue
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import timedelta
 from typing import Any
 
 import torch
 import torch.distributed as dist
+from vllm.logger import init_logger
 
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 
-_DECODE_DRAIN_TIMEOUT_S = 5.0
+logger = init_logger(__name__)
 
-
-def _drain_latent_work(work: Any) -> None:
-    """Do not reuse a transport whose cancelled latent transfer cannot drain."""
-    try:
-        if work.wait(timeout=timedelta(seconds=_DECODE_DRAIN_TIMEOUT_S)) is False:
-            raise TimeoutError("Latent transfer did not complete")
-    except Exception as exc:
-        raise SystemExit("Cancelled latent transport did not drain; stop the Worker") from exc
+# Bound for cancel() waiting on the latent sender after posting the stop sentinel.
+_SENDER_CANCEL_JOIN_TIMEOUT_S = 5.0
 
 
 def _rescale_latents(vae: Any, latent: torch.Tensor) -> torch.Tensor:
@@ -69,6 +63,7 @@ class AsyncStreamDecodeJob:
 
     on_finished: Callable[[int, torch.Tensor], None] | None
     join: Callable[[], torch.Tensor | None]
+    _send_works: list = field(default_factory=list)
     _cancel: Callable[[], None] | None = None
     # Client streaming: chunks were handed to ``on_chunk`` and are not accumulated.
     streams_to_client: bool = False
@@ -136,8 +131,9 @@ def start_async_chunk_decode(
     if pp_rank == source_rank:
         send_q: queue.Queue = queue.Queue()
         stop = object()
-        cancelled = threading.Event()
-        send_errors: list[Exception] = []
+        sent_count = [0]
+        send_lock = threading.Lock()
+        sender_cancelled = threading.Event()
 
         def _sender() -> None:
             while True:
@@ -145,16 +141,17 @@ def start_async_chunk_decode(
                 if item is stop:
                     break
                 _chunk, host, event = item
-                try:
-                    if event is not None:
-                        event.synchronize()
-                    if cancelled.is_set():
-                        continue
-                    work = dist.isend(host, dst=owner, group=stream_group, tag=decode_tag)
+                if event is not None:
+                    event.synchronize()
+                # Cancel may have timed out while we were stuck on the copy
+                # event; never isend a late real latent after cancel abandons
+                # the stream group (filler path only runs once sender exits).
+                if sender_cancelled.is_set():
+                    continue
+                work = dist.isend(host, dst=owner, group=stream_group, tag=decode_tag)
+                with send_lock:
                     send_works.append((host, work))
-                except Exception as exc:
-                    send_errors.append(exc)
-                    return
+                    sent_count[0] += 1
 
         sender_thread = threading.Thread(target=_sender, name="causvid-latent-send", daemon=True)
         sender_thread.start()
@@ -163,35 +160,44 @@ def start_async_chunk_decode(
             host, event = _async_host_copy(latent, shape=latent_shape, dtype=dtype)
             send_q.put((chunk, host, event))
 
+        def _fill_remaining_sends() -> None:
+            """Complete the owner's posted irecvs after a mid-request cancel."""
+            with send_lock:
+                already = sent_count[0]
+            for _ in range(max(0, n_chunks - already)):
+                filler = torch.zeros(latent_shape, device="cpu", dtype=dtype)
+                work = dist.isend(filler, dst=owner, group=stream_group, tag=decode_tag)
+                with send_lock:
+                    send_works.append((filler, work))
+                    sent_count[0] += 1
+                work.wait()
+
         def join() -> torch.Tensor | None:
             send_q.put(stop)
             sender_thread.join()
-            if send_errors:
-                raise SystemExit("Latent sender failed; stop the Worker") from send_errors[0]
             for _host, work in send_works:
                 work.wait()
             return None
 
         def cancel() -> None:
-            cancelled.set()
+            sender_cancelled.set()
             send_q.put(stop)
-            sender_thread.join(timeout=_DECODE_DRAIN_TIMEOUT_S)
-            if sender_thread.is_alive() or send_errors:
-                raise SystemExit("Latent sender did not stop cleanly; stop the Worker")
-            # Complete this member's posted receives; the owner discards fillers
-            # while cancelling. The sender has exited, so the count is stable.
-            for _host, work in send_works:
-                _drain_latent_work(work)
-            if len(send_works) < n_chunks:
-                filler = torch.zeros(latent_shape, device="cpu", dtype=dtype)
-                for _ in range(n_chunks - len(send_works)):
-                    try:
-                        work = dist.isend(filler, dst=owner, group=stream_group, tag=decode_tag)
-                    except Exception as exc:
-                        raise SystemExit("Cancelled latent send failed; stop the Worker") from exc
-                    _drain_latent_work(work)
+            sender_thread.join(timeout=_SENDER_CANCEL_JOIN_TIMEOUT_S)
+            if sender_thread.is_alive():
+                # Do not fill: a stuck sender that later wakes could isend a
+                # real latent after fillers and re-pollute the stream group.
+                # Caller must stop/rebuild workers and the stream process group.
+                raise RuntimeError(
+                    "async_chunk_decode cancel: latent sender did not stop within "
+                    f"{_SENDER_CANCEL_JOIN_TIMEOUT_S:.1f}s; stream group may be "
+                    "unusable until workers are rebuilt "
+                    f"(session_id={session_id!r})"
+                )
+            # Owner posted ``n_chunks`` irecvs up front; fill any gap so the
+            # next request cannot match a leftover receive on this stream group.
+            _fill_remaining_sends()
 
-        return AsyncStreamDecodeJob(on_finished=on_finished, join=join, _cancel=cancel)
+        return AsyncStreamDecodeJob(on_finished=on_finished, join=join, _send_works=send_works, _cancel=cancel)
 
     if pp_rank == 0:
         if vae is None or decoder is None:
@@ -208,11 +214,13 @@ def start_async_chunk_decode(
             state = decoder.new_decode_state(session_id)
             try:
                 for chunk_index, (buf, work) in enumerate(zip(buffers, recv_works)):
-                    if cancelled.is_set():
-                        break
+                    # Always wait: posted irecvs must complete or the next
+                    # request's isend can match a stale receive and hang.
                     work.wait()
                     if cancelled.is_set():
-                        continue
+                        for leftover in recv_works[chunk_index + 1 :]:
+                            leftover.wait()
+                        break
                     scaled = _rescale_latents(vae, buf)
                     pixels = decoder.decode_chunk(scaled, state).clamp(-1, 1)
                     _record_decoded_chunk(
@@ -242,13 +250,12 @@ def start_async_chunk_decode(
 
         def cancel() -> None:
             cancelled.set()
-            # Posted irecvs cannot be aborted; daemon thread may still block.
-            # Prefer not combining async_chunk_decode with mid-request Engine abort.
-            # (Later commit restores fill/drain; keep decode_tag path intact.)
-            thread.join(timeout=0.1)
+            # Producer cancel fills remaining isends; wait for the consumer to
+            # drain every posted irecv so the stream group is reusable.
+            thread.join(timeout=30.0)
             if thread.is_alive():
                 logger.warning(
-                    "async_chunk_decode cancel: consumer still alive after 0.1s join "
+                    "async_chunk_decode cancel: consumer still alive after 30s drain "
                     "(posted irecv may be stuck); session_id=%s",
                     session_id,
                 )
@@ -256,6 +263,7 @@ def start_async_chunk_decode(
         return AsyncStreamDecodeJob(
             on_finished=None,
             join=join,
+            _send_works=send_works,
             _cancel=cancel,
             streams_to_client=on_chunk is not None,
             _emitted=emitted,
@@ -264,7 +272,7 @@ def start_async_chunk_decode(
     def join() -> torch.Tensor | None:
         return None
 
-    return AsyncStreamDecodeJob(on_finished=None, join=join)
+    return AsyncStreamDecodeJob(on_finished=None, join=join, _send_works=send_works)
 
 
 def _record_decoded_chunk(
@@ -354,9 +362,7 @@ def _start_local(
 
     def cancel() -> None:
         latent_q.put(stop)
-        thread.join(timeout=_DECODE_DRAIN_TIMEOUT_S)
-        if thread.is_alive():
-            raise SystemExit("Local latent decoder did not stop; stop the Worker")
+        thread.join(timeout=_SENDER_CANCEL_JOIN_TIMEOUT_S)
 
     return AsyncStreamDecodeJob(
         on_finished=on_finished,
