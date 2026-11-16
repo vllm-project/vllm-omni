@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Generate raw LTX video and audio outputs with the official or Omni runtime."""
 
@@ -259,7 +259,7 @@ def _unwrap_omni_output(output: Any) -> tuple[Any, Any, int]:
     if isinstance(frames, OmniRequestOutput):
         multimodal_output = frames.multimodal_output or {}
         audio = multimodal_output.get("audio")
-        audio_sample_rate = multimodal_output.get("audio_sample_rate")
+        audio_sample_rate = multimodal_output.get("sr", multimodal_output.get("audio_sample_rate"))
         if not frames.images:
             raise ValueError("No video frames found in OmniRequestOutput")
         frames = frames.images

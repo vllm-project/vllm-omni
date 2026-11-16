@@ -486,6 +486,25 @@ class OpenAIFullDuplexConnection:
         rate = getattr(audio_format, "rate", SAMPLE_RATE_HZ)
         return format_type in ("audio/pcm", "pcm16") and rate == SAMPLE_RATE_HZ
 
+    def _audio_format_rate_hz(self, audio_format: Any) -> int:
+        """Rate negotiated for a session audio format.
+
+        Bare-string formats carry no rate; pcm16 support is 24kHz-only (see
+        ``_is_pcm16_24khz_format``), so the module constant is the fallback.
+        """
+        rate = getattr(audio_format, "rate", None)
+        return int(rate) if isinstance(rate, (int, float)) and rate > 0 else SAMPLE_RATE_HZ
+
+    def _input_audio_rate_hz(self) -> int:
+        """Input PCM rate negotiated for this session (see the default config)."""
+        audio_input = getattr(getattr(self.session.config.audio, "input", None), "format", None)
+        return self._audio_format_rate_hz(audio_input)
+
+    def _output_audio_rate_hz(self) -> int:
+        """Output PCM rate negotiated for this session (see the default config)."""
+        audio_output = getattr(getattr(self.session.config.audio, "output", None), "format", None)
+        return self._audio_format_rate_hz(audio_output)
+
     @staticmethod
     def _reject_mcp(
         config: types.RealtimeSessionCreateRequest | types.RealtimeResponseCreateParams,
@@ -537,7 +556,7 @@ class OpenAIFullDuplexConnection:
                     detector.process,
                     event.audio,
                     fmt="pcm16",
-                    sample_rate_hz=SAMPLE_RATE_HZ,
+                    sample_rate_hz=self._input_audio_rate_hz(),
                 )
             except SemanticVADUnavailableError as exc:
                 self._turn_detector = None
@@ -634,13 +653,13 @@ class OpenAIFullDuplexConnection:
             raise ValueError("PCM audio data must contain complete 16-bit samples")
         return decoded
 
-    @staticmethod
-    def _pcm16_wav_b64(audio: bytes) -> str:
+    def _pcm16_wav_b64(self, audio: bytes) -> str:
+        # The buffered audio arrived at the session's negotiated input rate.
         with io.BytesIO() as buffer:
             with wave.open(buffer, "wb") as wav:
                 wav.setnchannels(1)
                 wav.setsampwidth(BYTES_PER_SAMPLE_PCM16)
-                wav.setframerate(SAMPLE_RATE_HZ)
+                wav.setframerate(self._input_audio_rate_hz())
                 wav.writeframes(audio)
             return base64.b64encode(buffer.getvalue()).decode("ascii")
 
@@ -1336,9 +1355,12 @@ class OpenAIFullDuplexConnection:
                     if audio_chunks:
                         sample_rate = audio_chunk_sample_rate(output)
                         if audio_resampler is None:
+                            # Model rate → the session's negotiated output
+                            # format rate (24000 pcm16 today, but sourced
+                            # from the session config, not a module constant).
                             audio_resampler = StreamingAudioResampler(
                                 sample_rate,
-                                SAMPLE_RATE_HZ,
+                                self._output_audio_rate_hz(),
                             )
                         for chunk in audio_chunks:
                             stretched = self._stretch_audio_delta(chunk, output_speed)
@@ -1552,7 +1574,9 @@ class OpenAIFullDuplexConnection:
             else:
                 s.replace_item(history_item)
                 if item_obj.id:
-                    s.item_duration_ms[item_obj.id] = total_audio_samples / SAMPLE_RATE_HZ * 1000
+                    # total_audio_samples counts post-resample chunks, so the
+                    # divisor is the negotiated output rate.
+                    s.item_duration_ms[item_obj.id] = total_audio_samples / self._output_audio_rate_hz() * 1000
                     # Skip storing for tool-call responses: full_token_ids is
                     # the raw thinker stream (tool-call tags included), but
                     # this item's transcript/text is tool-parser-stripped,

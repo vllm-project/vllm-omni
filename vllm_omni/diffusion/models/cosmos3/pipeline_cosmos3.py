@@ -921,41 +921,50 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
             return processed_video
         if isinstance(audio, torch.Tensor):
             audio = audio.detach().cpu()
-        result = {
-            "video": processed_video,
-            "audio": audio,
-            "fps": _resolve_output_fps(sampling_params),
-        }
+        fps = _resolve_output_fps(sampling_params)
+        audio_metadata: dict[str, object] = {}
         if audio_sample_rate is not None:
-            result["audio_sample_rate"] = int(audio_sample_rate)
+            audio_metadata["sample_rate"] = int(audio_sample_rate)
+        base_metadata: dict[str, object] = {
+            "video": {"fps": fps},
+            "audio": audio_metadata,
+        }
         if pending_action is not None:
             return {
                 "payload": {
-                    "video": result["video"],
-                    "audio": result["audio"],
+                    "video": processed_video,
+                    "audio": audio,
                     "actions": pending_action,
                 },
                 "metadata": {
                     **pending_action_metadata,
-                    "video": {"fps": result["fps"]},
-                    "audio": {"sample_rate": result.get("audio_sample_rate")},
+                    **base_metadata,
                 },
             }
         if envelope_public_metadata:
+            envelope_video_metadata = envelope_public_metadata.get("video")
             return {
                 "payload": {
-                    "video": result["video"],
-                    "audio": result["audio"],
+                    "video": processed_video,
+                    "audio": audio,
                 },
                 "metadata": {
                     **envelope_public_metadata,
-                    "video": {"fps": result["fps"], **envelope_public_metadata.get("video", {})}
-                    if isinstance(envelope_public_metadata.get("video"), dict)
-                    else {"fps": result["fps"]},
-                    "audio": {"sample_rate": result.get("audio_sample_rate")},
+                    "video": (
+                        {"fps": fps, **envelope_video_metadata}
+                        if isinstance(envelope_video_metadata, dict)
+                        else {"fps": fps}
+                    ),
+                    "audio": audio_metadata,
                 },
             }
-        return result
+        return {
+            "payload": {
+                "video": processed_video,
+                "audio": audio,
+            },
+            "metadata": base_metadata,
+        }
 
     return post_process_func
 

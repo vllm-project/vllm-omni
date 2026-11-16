@@ -121,7 +121,7 @@ def test_ltx_reference_runner_unwraps_flattened_pipeline_output() -> None:
     output = OmniRequestOutput(
         stage_id=0,
         images=[frame],
-        _multimodal_output={"audio": audio, "audio_sample_rate": 48_000},
+        _multimodal_output={"audio": audio, "sr": 48_000},
     )
 
     frames, actual_audio, sample_rate = _unwrap_omni_output(output)
@@ -142,7 +142,7 @@ def test_ltx_reference_runner_unwraps_audio_only_output() -> None:
     output = OmniRequestOutput(
         stage_id=0,
         final_output_type="audio",
-        _multimodal_output={"audio": audio, "audio_sample_rate": 48_000},
+        _multimodal_output={"audio": audio, "sr": 48_000},
     )
 
     actual_audio, sample_rate = _unwrap_omni_audio_output([output])

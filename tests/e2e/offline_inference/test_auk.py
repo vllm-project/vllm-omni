@@ -77,7 +77,9 @@ def _audio_from_output(output) -> tuple[np.ndarray, int]:
     if hasattr(audio, "detach"):
         audio = audio.detach().cpu().float().numpy()
     audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-    sr = mm.get("audio_sample_rate", SAMPLE_RATE)
+    # The formatter emits the canonical key; fail loudly if the label disappears
+    # rather than silently falling back to the expected rate.
+    sr = mm["sr"]
     if isinstance(sr, list) and sr:
         sr = sr[-1]
     if hasattr(sr, "item"):

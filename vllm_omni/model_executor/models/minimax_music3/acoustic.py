@@ -30,6 +30,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.sample_rate import SAMPLE_RATE_KEY, make_sample_rate_tensors
 
 from .chunking import ChunkWindow, chunk_windows, crop_sample_bounds, overlap_mel_length
 from .constants import (
@@ -151,6 +152,10 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
 
         self._states: dict[str, _RequestState] = {}
         self._loaded = False
+        # The vocoder's output rate; instance attribute so tests (and any
+        # future checkpoint-varying source) can pin it independently of the
+        # module constant.
+        self._output_sample_rate = OUTPUT_SAMPLE_RATE
 
     @staticmethod
     def _configure_backends() -> None:
@@ -438,7 +443,6 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
         num_reqs = len(seq_token_counts) if seq_token_counts is not None else len(infos)
 
         audios: list[Tensor] = []
-        sr_tensor = torch.tensor(OUTPUT_SAMPLE_RATE, dtype=torch.int32)
         for index in range(num_reqs):
             info = infos[index] if index < len(infos) else {}
             info = info if isinstance(info, dict) else {}
@@ -459,5 +463,10 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": [sr_tensor] * num_reqs},
+            multimodal_outputs={
+                "model_outputs": audios,
+                # The vocoder emits at the model constants' output rate; the
+                # checkpoint ships no rate field to read instead.
+                SAMPLE_RATE_KEY: make_sample_rate_tensors(self._output_sample_rate, num_reqs),
+            },
         )

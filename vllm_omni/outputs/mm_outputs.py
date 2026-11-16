@@ -23,6 +23,7 @@ from vllm_omni.outputs.output_modality import (
     get_accumulation_strategy,
 )
 from vllm_omni.outputs.utils import _is_tensor_list, _to_cpu
+from vllm_omni.sample_rate import ALL_SAMPLE_RATE_KEYS
 
 logger = init_logger(__name__)
 
@@ -30,18 +31,18 @@ logger = init_logger(__name__)
 # latest completion flag) may arrive as 0-d torch.Tensors. from_dict routes
 # all tensors into .tensors, so relocate these keys to .metadata before
 # consolidation to preserve the latest value without attempting torch.cat.
+# The sample-rate spellings come from vllm_omni.sample_rate so the alias
+# list lives in exactly one place.
 _METADATA_TENSOR_KEYS: frozenset[str] = frozenset(
-    {
-        "sr",
-        "sample_rate",
-        "audio_sample_rate",
+    (
+        *ALL_SAMPLE_RATE_KEYS,
         "meta.finished",
         # Speculative span controls describe the latest step, not content
         # rows. committed_token_count is not a request-wide token total.
         "meta.decode_span",
         "meta.consumed_input_span",
         "meta.committed_token_count",
-    }
+    )
 )
 
 

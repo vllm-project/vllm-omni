@@ -571,13 +571,15 @@ def _unwrap_omni_output(output: Any) -> tuple[Any, Any, int]:
     if isinstance(frames, OmniRequestOutput):
         multimodal_output = frames.multimodal_output or {}
         audio = multimodal_output.get("audio")
-        audio_sample_rate = multimodal_output.get("audio_sample_rate")
+        audio_sample_rate = multimodal_output.get("sr", multimodal_output.get("audio_sample_rate"))
         nested_output = getattr(frames, "request_output", None)
         if frames.is_pipeline_output and isinstance(nested_output, OmniRequestOutput):
             frames = nested_output
             multimodal_output = frames.multimodal_output or {}
             audio = multimodal_output.get("audio", audio)
-            audio_sample_rate = multimodal_output.get("audio_sample_rate", audio_sample_rate)
+            audio_sample_rate = multimodal_output.get(
+                "sr", multimodal_output.get("audio_sample_rate", audio_sample_rate)
+            )
         if isinstance(frames, OmniRequestOutput):
             if not frames.images:
                 raise ValueError("No video frames found in OmniRequestOutput")
@@ -608,7 +610,7 @@ def _unwrap_omni_audio_output(output: Any) -> tuple[Any, int]:
         result = nested_output
     multimodal_output = result.multimodal_output or {}
     audio = multimodal_output.get("audio")
-    audio_sample_rate = multimodal_output.get("audio_sample_rate")
+    audio_sample_rate = multimodal_output.get("sr", multimodal_output.get("audio_sample_rate"))
     if audio is None or audio_sample_rate is None:
         raise ValueError("Omni output did not contain audio and audio_sample_rate")
     return audio, int(audio_sample_rate)

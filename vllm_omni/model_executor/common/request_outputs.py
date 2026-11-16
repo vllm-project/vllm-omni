@@ -16,6 +16,8 @@ from typing import Any, cast
 
 import numpy as np
 
+from vllm_omni.sample_rate import coerce_sample_rate, get_sampling_rate_or_none
+
 
 def unwrap_request_output(output: object) -> tuple[object, object | None]:
     """Return ``(request_output, first_completion)`` for a stage output or a wrapper around one."""
@@ -145,16 +147,22 @@ def slice_audio_delta(audio: object | None, offset: int) -> object | None:
     return np.asarray(audio, dtype=np.float32).reshape(-1)[offset:]
 
 
-def sample_rate_hz(multimodal: Mapping[str, object], *, default: int) -> int:
-    value = multimodal.get("sr", multimodal.get("sample_rate_hz", default))
-    if isinstance(value, list) and value:
-        value = value[0]
-    if hasattr(value, "item"):
-        try:
-            value = value.item()
-        except (RuntimeError, TypeError, ValueError):
-            value = default
-    return int(value) if isinstance(value, int | float) and value > 0 else default
+def sample_rate_hz(multimodal: Mapping[str, object]) -> int | None:
+    """The sample rate a duplex model output advertises, or ``None`` when it carries none.
+
+    Reads the canonical key (and its legacy spellings) through the shared
+    strict reader, then the duplex wire spelling ``sample_rate_hz``.
+    ``None`` is the legal answer for zero-audio sparse steps; a caller about
+    to encode actual samples must treat ``None`` as a producer bug (raise,
+    do not substitute a default). A present-but-invalid rate raises
+    :class:`InvalidSampleRateError` here.
+    """
+    rate = get_sampling_rate_or_none(multimodal)
+    if rate is None:
+        # The duplex wire spelling is a distinct protocol namespace, so it is
+        # accepted here (not in ALL_SAMPLE_RATE_KEYS) for outputs that carry it.
+        rate = coerce_sample_rate(multimodal.get("sample_rate_hz"))
+    return rate
 
 
 __all__ = [

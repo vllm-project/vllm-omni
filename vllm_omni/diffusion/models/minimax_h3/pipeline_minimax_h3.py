@@ -436,27 +436,22 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     else:
         encoded_videos = None
     if encoded_videos is not None:
-        result = {
-            "video": encoded_videos,
-            "audio": [None] * len(encoded_videos),
-            "audio_sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE,
-            "fps": MINIMAX_H3_FPS,
-        }
+        video_metadata: dict[str, object] = {"fps": MINIMAX_H3_FPS}
         if frame_counts is not None:
-            if not valid_frame_counts(frame_counts, len(encoded_videos)):
+            if valid_frame_counts(frame_counts, len(encoded_videos)):
+                video_metadata["frame_counts"] = frame_counts
+            else:
                 logger.warning("Ignoring invalid encoded frame counts; falling back to MP4 metadata inspection")
-                return result
-            return {
-                "payload": {
-                    "video": encoded_videos,
-                    "audio": [None] * len(encoded_videos),
-                },
-                "metadata": {
-                    "video": {"fps": MINIMAX_H3_FPS, "frame_counts": frame_counts},
-                    "audio": {"sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE},
-                },
-            }
-        return result
+        return {
+            "payload": {
+                "video": encoded_videos,
+                "audio": [None] * len(encoded_videos),
+            },
+            "metadata": {
+                "video": video_metadata,
+                "audio": {"sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE},
+            },
+        }
     if video.dtype != torch.uint8 or video.ndim != 5 or video.shape[-1] not in (3, 4):
         # Float or channel-first frames would reach the muxer as a black or
         # banded video rather than as an error.
@@ -470,10 +465,14 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
         audio = audio.detach().float().cpu().numpy()
         video = [sample for sample in video]
     return {
-        "video": video,
-        "audio": audio,
-        "audio_sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE,
-        "fps": MINIMAX_H3_FPS,
+        "payload": {
+            "video": video,
+            "audio": audio,
+        },
+        "metadata": {
+            "video": {"fps": MINIMAX_H3_FPS},
+            "audio": {"sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE},
+        },
     }
 
 

@@ -35,6 +35,7 @@ from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
     DuplexRuntimeConfigError,
 )
+from vllm_omni.model_executor.common.request_outputs import sample_rate_hz
 from vllm_omni.model_executor.models.qwen3_omni.duplex.history_policy import (
     DEFAULT_HISTORY_POLICY,
     RECENT_MESSAGE_WINDOW,
@@ -49,6 +50,7 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
     ThinkerToolCursor,
     chat_template_tools,
 )
+from vllm_omni.sample_rate import MissingSampleRateError
 from vllm_omni.utils.speakers import (
     get_supported_speakers_from_hf_config,
     validate_requested_speaker,
@@ -248,13 +250,14 @@ class QwenDataPlane(DuplexDataPlane):
             audio = mm.get("audio")
             encoded = None
             duration_ms = 0
-            rate = mm.get("sr", mm.get("sample_rate", mm.get("sample_rate_hz", 24000)))
-            if isinstance(rate, (list, tuple)):
-                rate = next((value for value in rate if value is not None), 24000)
-            rate = int(rate)
-            if rate <= 0:
-                raise ValueError("Invalid output audio sample rate")
+            rate = sample_rate_hz(mm)
             if audio is not None and "audio" in context.get("modalities", ()):
+                if rate is None:
+                    # Zero-audio sparse steps legally carry no rate; audio without one is a producer bug.
+                    raise MissingSampleRateError(
+                        "Qwen3-Omni duplex audio carried no sample rate; the model must emit 'sr' on its "
+                        "multimodal output"
+                    )
                 chunks = audio if isinstance(audio, (list, tuple)) else [audio]
                 arrays = [
                     np.asarray(

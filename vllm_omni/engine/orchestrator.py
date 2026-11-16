@@ -151,7 +151,7 @@ def _build_terminal_empty_output(
     request_id: str,
     *,
     final_output_type: str | None,
-    audio_sample_rate: int = 24000,
+    audio_sample_rate: int,
 ) -> RequestOutput:
     """Build a terminal empty output when no downstream stage input exists."""
     completion = CompletionOutput(

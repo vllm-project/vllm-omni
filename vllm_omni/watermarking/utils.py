@@ -60,10 +60,10 @@ def watermark_payload(
     data = payload.get(modality_key)
     if data is None or isinstance(data, list) and not data:
         return
-    metadata: Mapping[str, object] = payload
-    if modality == OutputModalityNames.AUDIO and payload.get("sr") is None:
-        metadata = {"sr": payload.get("audio_sample_rate")}
-    result = watermark_media(request_id, modality, watermarker, data, metadata)
+    # The payload itself is the metadata source; legacy sample-rate spellings
+    # resolve inside the watermarker via get_sampling_rate with a deprecation
+    # warning (previously a one-off rename bridge lived here).
+    result = watermark_media(request_id, modality, watermarker, data, payload)
     if not isinstance(payload, MultimodalPayload):
         payload[modality_key] = result
     elif modality_key not in payload.tensors:

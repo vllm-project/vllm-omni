@@ -163,7 +163,7 @@ def _generate_joint_output(omni, config: QualityTestConfig):
     multimodal = getattr(first, "multimodal_output", None)
     if not multimodal or "audio" not in multimodal:
         raise ValueError("Could not extract audio from H3 output")
-    sample_rate = int(multimodal.get("audio_sample_rate", 0))
+    sample_rate = int(multimodal.get("sr", 0))
     peak_mem = worker_peak_memory_mb / 1024 if worker_peak_memory_mb > 0 else main_process_peak_mem
     return video, _canonical_audio(multimodal["audio"]), sample_rate, peak_mem
 

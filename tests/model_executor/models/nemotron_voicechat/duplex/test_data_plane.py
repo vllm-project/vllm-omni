@@ -13,6 +13,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.duplex.data_plane import
     NemotronVoiceChatDataPlaneContext,
     NemotronVoiceChatDataPlaneSession,
 )
+from vllm_omni.sample_rate import MissingSampleRateError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -67,6 +68,20 @@ def test_function_channel_projects_completed_call_without_ending_speech() -> Non
     for function_token in (20, 98, 21):
         bad_events.extend(projector.project_output(_stage0_output(function_token=function_token)))
     assert any(event.get("error_code") == "nemotron_function_call_parse_error" for event in bad_events)
+
+
+def test_audio_without_a_rate_fails_loudly() -> None:
+    projector = _projector()
+    audio = SimpleNamespace(
+        stage_id=2,
+        request_output=SimpleNamespace(
+            request_id="req-0",
+            outputs=[SimpleNamespace(multimodal_output={"model_outputs": [np.ones(1764, dtype=np.float32)]})],
+        ),
+    )
+
+    with pytest.raises(MissingSampleRateError, match="must emit 'sr'"):
+        list(projector.project_output(audio))
 
 
 def test_new_epoch_request_does_not_inherit_partial_function_or_frame_state() -> None:

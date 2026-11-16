@@ -53,6 +53,12 @@ from vllm_omni.outputs.output_metadata import (
     DiffusionPayloadValue,
     valid_frame_counts,
 )
+from vllm_omni.sample_rate import (
+    MissingSampleRateError,
+    coerce_sample_rate,
+    find_sample_rate,
+    get_sampling_rate_or_none,
+)
 
 logger = init_logger(__name__)
 
@@ -135,7 +141,9 @@ class VideoGenerationArtifacts:
     videos: list[DiffusionPayloadValue]
     audios: list[DiffusionPayloadValue | None]
     actions: list[VideoAction | None]
-    audio_sample_rate: int
+    # None for video-only results; guaranteed non-None whenever any audio
+    # is present (``_run_and_extract`` raises instead of defaulting).
+    audio_sample_rate: int | None
     output_fps: float
     stage_durations: dict[str, float]
     peak_memory_mb: float
@@ -609,6 +617,15 @@ class OmniOpenAIServingVideo:
         audios = self._extract_audio_outputs(result, expected_count=len(videos))
         actions = self._extract_action_outputs(result, expected_count=len(videos))
         audio_sample_rate = self._resolve_audio_sample_rate(result)
+        if audio_sample_rate is None and any(audio is not None for audio in audios):
+            # Post-normalization every audio-emitting model advertises its
+            # rate on the payload (or its config carries one); audio without
+            # a rate is a producer bug that must surface, not fall back to
+            # 24000 and mislabel every encoded response.
+            raise MissingSampleRateError(
+                "video generation produced audio without a sample rate; the model must emit "
+                "'sr' on its multimodal output or configure one (e.g. on the vocoder)"
+            )
         model_fps = self._resolve_fps(result)
         output_fps_base = (vp.fps if fps_provided else None) or model_fps or vp.fps or 24
         output_fps = output_fps_base * self._resolve_video_fps_multiplier(result)
@@ -928,18 +945,20 @@ class OmniOpenAIServingVideo:
 
         return [audio] + [None] * max(expected_count - 1, 0)
 
-    def _resolve_audio_sample_rate(self, result: object) -> int:
+    def _resolve_audio_sample_rate(self, result: object) -> int | None:
+        """Resolve the payload rate first, then the model config.
+
+        Returns ``None`` when neither carries a rate (video-only results);
+        ``_run_and_extract`` turns that into a loud failure whenever audio
+        was actually produced, instead of the old silent 24000 default.
+        """
         result_sample_rate = self._extract_audio_sample_rate_from_result(result)
         if result_sample_rate is not None:
             return result_sample_rate
 
         model_config = getattr(self._engine_client, "model_config", None)
         hf_config = getattr(model_config, "hf_config", None)
-        config_sample_rate = self._extract_audio_sample_rate_from_config(hf_config)
-        if config_sample_rate is not None:
-            return config_sample_rate
-
-        return 24000
+        return self._extract_audio_sample_rate_from_config(hf_config)
 
     @classmethod
     def _extract_action_outputs(cls, result: object, expected_count: int) -> list[VideoAction | None]:
@@ -1108,82 +1127,57 @@ class OmniOpenAIServingVideo:
 
     @classmethod
     def _extract_audio_sample_rate_from_result(cls, result: object) -> int | None:
-        multimodal_output = getattr(result, "multimodal_output", None)
-        if isinstance(multimodal_output, Mapping):
-            sample_rate = cls._coerce_audio_sample_rate(
-                multimodal_output.get("audio_sample_rate")
-                or multimodal_output.get("sample_rate")
-                or multimodal_output.get("sampling_rate")
-                or multimodal_output.get("sr")
-            )
-            if sample_rate is not None:
-                return sample_rate
+        # The shared reader resolves the canonical key plus legacy spellings;
+        # _extract_multimodal_output already normalizes every payload shape
+        # (attr / dict / ``_multimodal_output``) this used to probe by hand.
+        return get_sampling_rate_or_none(cls._extract_multimodal_output(result))
 
-        request_output = result
-        if isinstance(request_output, dict):
-            multimodal_output = request_output.get("multimodal_output") or {}
-            if isinstance(multimodal_output, Mapping):
-                return cls._coerce_audio_sample_rate(
-                    multimodal_output.get("audio_sample_rate")
-                    or multimodal_output.get("sample_rate")
-                    or multimodal_output.get("sampling_rate")
-                    or multimodal_output.get("sr")
-                )
-        elif hasattr(request_output, "multimodal_output"):
-            multimodal_output = getattr(request_output, "multimodal_output", None)
-            if isinstance(multimodal_output, Mapping):
-                return cls._coerce_audio_sample_rate(
-                    multimodal_output.get("audio_sample_rate")
-                    or multimodal_output.get("sample_rate")
-                    or multimodal_output.get("sampling_rate")
-                    or multimodal_output.get("sr")
-                )
+    @classmethod
+    def _find_config_sample_rate(cls, config: object) -> int | None:
+        """Probe one config level: the Wan vocoder spelling, then shared keys.
 
-        return None
+        ``output_sampling_rate`` is not part of the shared key set
+        (``find_sample_rate`` covers the ``sample_rate``-family names only),
+        so it keeps an explicit probe ahead of the shared lookup.
+        """
+        if config is None:
+            return None
+        if isinstance(config, dict):
+            raw_value = config.get("output_sampling_rate")
+        else:
+            raw_value = getattr(config, "output_sampling_rate", None)
+        sample_rate = coerce_sample_rate(raw_value)
+        if sample_rate is not None:
+            return sample_rate
+        return find_sample_rate(config)
 
     @classmethod
     def _extract_audio_sample_rate_from_config(cls, config: object) -> int | None:
         if config is None:
             return None
 
-        for attr_name in ("output_sampling_rate", "audio_sample_rate", "sample_rate", "sampling_rate"):
-            raw_value = config.get(attr_name) if isinstance(config, dict) else getattr(config, attr_name, None)
-            sample_rate = cls._coerce_audio_sample_rate(raw_value)
-            if sample_rate is not None:
-                return sample_rate
-
+        # find_sample_rate deliberately does not recurse into components;
+        # the vocoder/audio_vae walk stays explicit here.
+        sources: list[object] = [config]
         for component_name in ("vocoder", "audio_vae"):
             component = (
                 config.get(component_name) if isinstance(config, dict) else getattr(config, component_name, None)
             )
             if component is None:
                 continue
-
-            sample_rate = cls._extract_audio_sample_rate_from_config(component)
-            if sample_rate is not None:
-                return sample_rate
-
+            sources.append(component)
             component_config = (
                 component.get("config") if isinstance(component, dict) else getattr(component, "config", None)
             )
-            sample_rate = cls._extract_audio_sample_rate_from_config(component_config)
+            if component_config is not None:
+                sources.append(component_config)
+
+        for source in sources:
+            sample_rate = cls._find_config_sample_rate(source)
             if sample_rate is not None:
                 return sample_rate
 
         return None
-
-    @staticmethod
-    def _coerce_audio_sample_rate(value: object) -> int | None:
-        if value is None:
-            return None
-
-        try:
-            sample_rate = value.item() if hasattr(value, "item") else value
-            sample_rate = int(sample_rate)
-        except (TypeError, ValueError):
-            return None
-
-        return sample_rate if sample_rate > 0 else None
 
     @staticmethod
     def _extract_stage_durations(result: object) -> dict[str, float]:

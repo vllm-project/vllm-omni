@@ -17,6 +17,7 @@ import pytest
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.data_plane import (
     MiniCPMO45DataPlaneSession,
 )
+from vllm_omni.sample_rate import MissingSampleRateError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -76,3 +77,24 @@ def test_close_stream_releases_the_cursor_for_the_next_stream() -> None:
     assert _sliced_len(session, 48000) == 48000
     session.close_stream(REQUEST_ID)
     assert _sliced_len(session, 24000) == 24000
+
+
+def test_audio_without_a_rate_fails_loudly() -> None:
+    # Samples that ship without 'sr' are a producer bug; the projection must
+    # not fall back to a default rate.
+    with pytest.raises(MissingSampleRateError, match="must emit 'sr'"):
+        list(
+            _session()._encode_audio_chunks_with_duration(
+                {"model_outputs": _snapshot(8)}, request_id=REQUEST_ID, response_format="wav", speed=None
+            )
+        )
+
+
+def test_zero_audio_output_without_a_rate_stays_legal() -> None:
+    # A sparse step with neither audio nor rate encodes nothing and raises nothing.
+    assert (
+        list(
+            _session()._encode_audio_chunks_with_duration({}, request_id=REQUEST_ID, response_format="wav", speed=None)
+        )
+        == []
+    )
