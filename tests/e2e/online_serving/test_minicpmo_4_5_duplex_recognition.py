@@ -16,7 +16,7 @@ from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import SERVER_PARAMS, 
 from tests.e2e.online_serving.helpers.minicpmo_duplex_recognition import evaluate_session, load_manifest, unpack_inputs
 from tests.helpers.mark import hardware_test
 
-pytestmark = [pytest.mark.omni, pytest.mark.full_model]
+pytestmark = [pytest.mark.omni, pytest.mark.core_model]
 
 
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
@@ -59,10 +59,15 @@ def test_duplex_long_video_scene_recognition(omni_server, tmp_path: Path, monkey
         timeout_s=90,
         chunk_ms=200,
         no_realtime_pacing=False,
-        tail_silence_s=8,
+        # Keep one 200 ms residual after the eight whole silent model units.
+        # The final commit can then answer from retained input instead of
+        # falling back to response.create after every unit was consumed. This
+        # gives a sampled mid-sentence final scene one bounded completion
+        # opportunity without weakening the 12-scene accuracy oracle.
+        tail_silence_s=8.2,
         # Native duplex lets the model keep listening instead of answering the
         # last scene. Asking for one response on the final commit makes that
-        # answer a session contract instead of a ~25% nightly coin flip; the
+        # answer a session contract instead of a ~25% CI coin flip; the
         # scene-coverage assertion below still judges what the model said.
         final_create_response=True,
         require_audio=True,
@@ -77,4 +82,5 @@ def test_duplex_long_video_scene_recognition(omni_server, tmp_path: Path, monkey
     (output / "recognition.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     assert result["ok"], result
     assert result["video_frames_sent"] == 180, result
+    assert result["post_commit"]["input_had_residual_model_unit"] is True, result
     assert report["passed"], report

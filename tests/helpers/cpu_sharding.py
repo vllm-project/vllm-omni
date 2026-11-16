@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Deterministic module partitions for opt-in model-executor CPU qualification."""
+"""Deterministic, coverage-preserving module partitions for AMD CPU suites."""
 
 import hashlib
 import json
@@ -11,12 +11,34 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+SUITE_MARKERS = {
+    "model-executor": "core_model and cpu and not omni",
+    "other": "core_model and cpu",
+    "diffusion": "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
+}
+
+
+def in_suite(nodeid: str, suite: str) -> bool:
+    module, separator, _ = nodeid.partition("::")
+    if not separator or not module.endswith(".py"):
+        return False
+    if suite == "model-executor":
+        return module.startswith("tests/model_executor/")
+    if suite == "diffusion":
+        return module.startswith("tests/diffusion/")
+    if suite == "other":
+        return module.startswith("tests/") and not module.startswith(
+            ("tests/model_executor/", "tests/diffusion/", "tests/engine/", "tests/entrypoints/")
+        )
+    raise ValueError(f"Unknown CPU suite: {suite}")
+
 
 @dataclass(frozen=True)
 class TimingProfile:
     node_seconds: dict[str, float]
     sha256: str
     sources: list[dict[str, str]]
+    suite: str = "model-executor"
 
 
 @dataclass(frozen=True)
@@ -53,6 +75,9 @@ def load_profile(path: Path) -> TimingProfile:
         raise ValueError("CPU shard profile must have schema_version 1")
     weights = data.get("node_seconds")
     sources = data.get("sources")
+    suite = data.get("suite", "model-executor")
+    if not isinstance(suite, str) or suite not in SUITE_MARKERS:
+        raise ValueError("Unknown CPU timing profile suite")
     if not isinstance(weights, dict) or not isinstance(sources, list):
         raise ValueError("CPU shard profile requires node_seconds and sources")
     for source in sources:
@@ -64,11 +89,11 @@ def load_profile(path: Path) -> TimingProfile:
         raise ValueError("Nonempty timing weights require source provenance")
     durations = {}
     for nodeid, duration in weights.items():
-        if not nodeid.startswith("tests/model_executor/") or "::" not in nodeid:
-            raise ValueError(f"Timing node is outside tests/model_executor: {nodeid}")
+        if not in_suite(nodeid, suite):
+            raise ValueError(f"Timing node is outside {suite}: {nodeid}")
         durations[nodeid] = duration_seconds(duration)
     provenance = [{key: source[key] for key in ("build_url", "commit")} for source in sources]
-    return TimingProfile(durations, hashlib.sha256(raw).hexdigest(), provenance)
+    return TimingProfile(durations, hashlib.sha256(raw).hexdigest(), provenance, suite)
 
 
 def build_plan(nodeids: list[str], profile: TimingProfile, shard_count: int) -> ShardPlan:
@@ -80,8 +105,8 @@ def build_plan(nodeids: list[str], profile: TimingProfile, shard_count: int) -> 
     groups: dict[str, list[str]] = defaultdict(list)
     for nodeid in sorted(nodeids):
         module, separator, _ = nodeid.partition("::")
-        if not separator or not module.startswith("tests/model_executor/"):
-            raise ValueError(f"CPU partition only supports tests/model_executor: {nodeid}")
+        if not separator or not in_suite(nodeid, profile.suite):
+            raise ValueError(f"CPU partition node is outside {profile.suite}: {nodeid}")
         groups[module].append(nodeid)
     live_weights = [profile.node_seconds[node] for node in nodeids if node in profile.node_seconds]
     positive_weights = [weight for weight in live_weights if weight > 0]

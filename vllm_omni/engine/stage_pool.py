@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from copy import copy
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.config.watermarking import ALGORITHM_KEY, WatermarkConfig
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_full_payload_input_coordinator
 from vllm_omni.data_entry_keys import flatten_payload
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import PER_SAMPLE_KV_CONFIG_KEY, per_sample_kv_request_id
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
     OmniCoordClientForHub,
@@ -29,7 +31,13 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, PayloadSenderInfo
+from vllm_omni.engine import (
+    AdditionalInformationEntry,
+    AdditionalInformationPayload,
+    OmniEngineCoreOutput,
+    OmniEngineCoreOutputs,
+    PayloadSenderInfo,
+)
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     DiffusionSubmitKwargs,
@@ -38,6 +46,7 @@ from vllm_omni.engine.stage_client import (
     StagePoolLLMClient,
 )
 from vllm_omni.errors import OmniClientError
+from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics import (
     count_audio_frames,
@@ -50,6 +59,7 @@ from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import (
     coerce_positive_int_scalar,
     iter_mm_outputs,
+    iter_request_output_items,
 )
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.watermarking import WATERMARKER_REGISTRY, Watermarker
@@ -59,6 +69,91 @@ if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 logger = init_logger(__name__)
+
+#: Upper bound on remembered session -> replica bindings, evicting the least
+#: recently routed one. Evicting a binding only costs the session its stickiness:
+#: the next request is served cold on some replica, never failed.
+MAX_SESSION_BINDINGS = 4096
+#: Upper bound on remembered *lost* sessions. A lost-session record only exists to
+#: reject a continuation whose history is gone (``allow_cold=False``) instead of
+#: silently restarting it cold, so retiring the oldest record degrades that
+#: rejection into a cold start rather than failing a live request. Without a
+#: bound, sessions that are never continued would accumulate for the pool's
+#: lifetime: they leave the live map when their replica dies and nothing else
+#: retires them.
+MAX_STALE_SESSIONS = 4096
+#: Upper bound on remembered lost-session *ids* (no owner). This outlives
+#: ``_stale_sessions`` so an aged-out id is still recognised as a lost session and
+#: its continuation is still refused; without it the id would look brand new and
+#: the fail-closed submit path would silently start it cold.
+MAX_RETIRED_SESSIONS = 65536
+
+
+def _session_fields(params: object) -> tuple[str | None, bool]:
+    """Return session identity and reset from typed ticks or legacy fields."""
+    extra = getattr(params, "extra_args", None)
+    if not isinstance(extra, dict):
+        return None, False
+    tick = ARDiffusionTickRequest.from_extra_args(extra)
+    if tick is not None:
+        return tick.session_id, tick.reset
+    value = extra.get("session_id")
+    return (str(value) if value else None), bool(extra.get("reset", False))
+
+
+def session_reset_requested(params: object) -> bool:
+    """Whether the request asks to restart the session encoded in its params."""
+    return _session_fields(params)[1]
+
+
+def session_chunk_base_of(params: object) -> int:
+    """Chunk the request continues from (0 for a fresh session).
+
+    A non-zero base is the request's own statement that it is a continuation:
+    it expects the pool to still hold that session's history. That claim can be
+    checked even when the session's loss record has aged out, so the fail-closed
+    submit path does not depend solely on how much the pool remembers.
+    """
+    extra = getattr(params, "extra_args", None)
+    if not isinstance(extra, dict):
+        return 0
+    tick = ARDiffusionTickRequest.from_extra_args(extra)
+    if tick is not None:
+        return int(tick.chunk_index)
+    return max(0, int(extra.get("chunk_base", 0) or 0))
+
+
+def _remember_stale_session(stale: dict[str, int], retired: OrderedDict, session_id: str, replica_id: int) -> None:
+    """Record a lost-session holder, keeping the memory bound and the rejection.
+
+    ``stale`` keeps the full record (owner included) for the recent window, so a
+    continuation is refused with a precise reason. Retiring an owner from it must
+    not also retire the *fact* that this id once existed: without that, an
+    aged-out id looks brand new, ``allow_cold=False`` returns instead of raising,
+    and the non-reset submit path picks a fresh replica -- silently converting a
+    fail-closed continuation into a cold start.
+
+    ``retired`` therefore keeps only the ids, in the same bounded window, so the
+    rejection survives while the owner detail does not.
+    """
+    stale.pop(session_id, None)
+    stale[session_id] = replica_id
+    retired.pop(session_id, None)
+    retired[session_id] = None
+    while len(stale) > MAX_STALE_SESSIONS:
+        stale.pop(next(iter(stale)), None)
+    while len(retired) > MAX_RETIRED_SESSIONS:
+        retired.popitem(last=False)
+
+
+def session_id_of(params: object) -> str | None:
+    """Session identity a request carries, if any.
+
+    A session's KV lives on one replica, so its follow-up requests have to reach
+    that replica. The identity travels in the sampling params' ``extra_args``
+    because that is what the model-facing layers already read.
+    """
+    return _session_fields(params)[0]
 
 
 class StageUnavailableError(RuntimeError):
@@ -81,6 +176,20 @@ class _ReplicaMetrics:
     batch_seq: int = 0
     agg_total_tokens: int = 0
     agg_total_gen_time_ms: float = 0.0
+
+
+def _set_sample_global_request_id(request: Any, sample_request_id: str) -> None:
+    """Give one sample of an ``n > 1`` request its own ``global_request_id``.
+
+    The AR runners send a finished request's KV under its ``global_request_id``,
+    so each sample's KV arrives under its own key. The request's other
+    additional information is shared, not copied.
+    """
+    if not hasattr(request, "additional_information"):
+        return  # a plain EngineCoreRequest: the runner keys its KV by the engine request id
+    entries = dict(request.additional_information.entries) if request.additional_information else {}
+    entries["global_request_id"] = AdditionalInformationEntry(list_data=[sample_request_id])
+    request.additional_information = AdditionalInformationPayload(entries=entries)
 
 
 class StagePool:
@@ -138,6 +247,12 @@ class StagePool:
     # Only these EngineCore helpers may skip collective_rpc_async. A generic
     # ``{method}_async`` on AsyncMPClient must not silently drop timeout.
     _CACHE_RESET_METHODS = frozenset({"reset_prefix_cache", "reset_encoder_cache", "reset_mm_cache"})
+    # Helpers whose argument is a typed object instead of a scalar. They cannot
+    # ride the generic ``collective_rpc`` path: the msgpack codec decodes a
+    # nested dataclass (``LoRARequest``) back as a plain list, so the worker
+    # fails on ``lora_request.lora_int_id``. Each one is dispatched through its
+    # typed ``{method}_async`` client helper instead.
+    _TYPED_ARG_ASYNC_METHODS = frozenset({"add_lora"})
     _ENGINE_CORE_CONTROL_ASYNC_METHODS = frozenset(
         {
             "pause_scheduler",
@@ -187,6 +302,16 @@ class StagePool:
         self._watermark_lock = asyncio.Lock()
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
+        # Session -> replica. Round-robin would scatter a session's follow-up
+        # requests across replicas that do not hold its state. This pool is the
+        # single owner of the binding: the ordered map carries the live holder
+        # (insertion order is the LRU), and ``_stale_sessions`` records sessions
+        # that lost their holder so a cold restart stays visible.
+        self._session_bindings: dict[str, int] = {}
+        self._stale_sessions: dict[str, int] = {}
+        # Ids whose owner record has aged out of ``_stale_sessions``. Ordering is
+        # the same LRU, the value carries no state.
+        self._retired_sessions: OrderedDict[str, None] = OrderedDict()
         # The orchestrator records caller-selected replicas before admission,
         # but they are not active affinities until submission. Keeping the
         # intent separate prevents membership cleanup from reporting a
@@ -247,6 +372,12 @@ class StagePool:
     def stage_type(self) -> str | None:
         client = self.stage_client
         return None if client is None else client.stage_type
+
+    @property
+    def per_sample_kv(self) -> bool:
+        """Whether each sample of an ``n > 1`` request sends its own KV (``omni_kv_config["per_sample_kv"]``)."""
+        omni_kv_config = getattr(getattr(self._stage_vllm_config, "model_config", None), "omni_kv_config", None)
+        return isinstance(omni_kv_config, dict) and bool(omni_kv_config.get(PER_SAMPLE_KV_CONFIG_KEY))
 
     @property
     def final_output(self) -> bool:
@@ -404,6 +535,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         """Return a replica id for ``request_id``.
 
@@ -416,7 +548,13 @@ class StagePool:
         :meth:`select_replica_id`.
         """
         if self._hub is None or self._lb is None:
-            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
+
+        # 0. Sticky by session: its history lives on exactly one replica.
+        if session_id is not None:
+            holder = self._session_holder(session_id)
+            if holder is not None:
+                return self._sync_session_route(request_id, holder)
 
         # 1. Sticky: previously bound and still serviceable?
         bound_addr = self._affinity.get(request_id)
@@ -446,6 +584,8 @@ class StagePool:
                 lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
                 replica_info, replica_id = candidates[lb_idx]
                 self._affinity[request_id] = replica_info.input_addr
+                if session_id is not None:
+                    self._bind_session(session_id, replica_id)
                 return replica_id
 
             now = _time.monotonic()
@@ -461,6 +601,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int | None:
         """Synchronously pick and bind a replica before request preprocessing.
 
@@ -475,10 +616,27 @@ class StagePool:
         requested_replica_id = self._requested_replica_ids.get(request_id)
         if requested_replica_id is not None:
             self._validate_requested_replica(requested_replica_id)
+            if session_id is not None:
+                # A caller pin and a session binding are two statements about where
+                # the state lives. Reconcile them instead of keeping two ledgers: a
+                # pin that contradicts the holder is refused, otherwise the pin
+                # becomes the session's replica.
+                holder = self.session_replica_id(session_id, allow_cold=False)
+                if holder is not None and holder != requested_replica_id:
+                    raise StageUnavailableError(
+                        f"stage {self.stage_id} request {request_id!r} pinned replica {requested_replica_id}, "
+                        f"but session {session_id!r} is held by replica {holder}"
+                    )
+                self._bind_session(session_id, requested_replica_id)
             return requested_replica_id
 
+        if session_id is not None:
+            holder = self._session_holder(session_id)
+            if holder is not None:
+                return self._sync_session_route(request_id, holder)
+
         if self._hub is None or self._lb is None:
-            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
 
         bound_addr = self._affinity.get(request_id)
         if bound_addr is not None:
@@ -495,14 +653,17 @@ class StagePool:
                     self._affinity[request_id] = parent_addr
                     return replica_id
 
-        task = task or Task(request_id=request_id)
+        selection_task = task if task is not None else Task(request_id=request_id)
         candidates = self._collect_serviceable_replicas()
         if not candidates:
             return None
 
-        lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
+        lb_idx = self._lb.select(selection_task, [rep for rep, _ in candidates])
         replica_info, replica_id = candidates[lb_idx]
         self._affinity[request_id] = replica_info.input_addr
+        if session_id is not None:
+            self._bind_session(session_id, replica_id)
+            return self._sync_session_route(request_id, replica_id)
         return replica_id
 
     def _collect_serviceable_replicas(self) -> list[tuple[ReplicaInfo, int]]:
@@ -775,6 +936,13 @@ class StagePool:
         released_request_ids = list(dict.fromkeys(released_request_ids))
         for request_id in released_request_ids:
             self.release_binding(request_id)
+        # Sessions that lived here lost their history with the replica. Recording
+        # that lets a follow-up be told apart from a fresh start instead of
+        # silently continuing cold.
+        for session_id, bound_replica_id in list(self._session_bindings.items()):
+            if bound_replica_id == replica_id:
+                self._session_bindings.pop(session_id, None)
+                _remember_stale_session(self._stale_sessions, self._retired_sessions, session_id, bound_replica_id)
         return released_request_ids
 
     def mark_replica_unavailable(self, replica_id: int) -> list[str]:
@@ -790,13 +958,130 @@ class StagePool:
     def available_replica_ids(self) -> list[int]:
         return [replica_id for replica_id in range(self.num_replicas) if self.is_replica_available(replica_id)]
 
+    # ---- Session affinity ----
+
+    def _bind_session(self, session_id: str, replica_id: int) -> None:
+        """Record a session -> replica binding, evicting the oldest when full.
+
+        The caller has already decided the move is allowed (a pin, a cold
+        restart, or the session's first request), so this only records the
+        answer; a contradicting move is not repaired here.
+        """
+        previous = self._session_bindings.get(session_id)
+        if previous is not None and previous != replica_id:
+            # An explicit move (a caller pinning the request elsewhere, or a cold
+            # restart after eviction): the old holder no longer serves this session.
+            logger.warning(
+                "stage %s session %s moves to replica %d despite a previous binding",
+                self.stage_id,
+                session_id,
+                replica_id,
+            )
+        self._session_bindings.pop(session_id, None)
+        self._session_bindings[session_id] = replica_id
+        while len(self._session_bindings) > MAX_SESSION_BINDINGS:
+            evicted = next(iter(self._session_bindings))
+            self._session_bindings.pop(evicted, None)
+            # This id was live, so it holds no loss record to retire. Keep the
+            # defensive clears: a rebind while the id is still in either ledger
+            # must not carry a stale verdict into the new binding.
+            self._stale_sessions.pop(evicted, None)
+            self._retired_sessions.pop(evicted, None)
+
+    def session_replica_id(self, session_id: str, *, allow_cold: bool = True) -> int | None:
+        """Replica that holds *session_id*, if it is still serviceable.
+
+        A holder that is gone cannot serve the session, so the loss is recorded
+        and this returns ``None`` for the caller to select a replica again --
+        which means the continuation starts cold. Pass ``allow_cold=False`` to
+        refuse it instead of silently losing the session's history.
+        """
+        replica_id = self._session_bindings.get(session_id)
+        if replica_id is None:
+            if not allow_cold and (session_id in self._stale_sessions or session_id in self._retired_sessions):
+                raise StageUnavailableError(
+                    f"stage {self.stage_id} session {session_id!r} lost its replica; "
+                    "the continuation cannot be served from its history"
+                )
+            return None
+        input_addr = self._input_addr_for_replica(replica_id)
+        if self.is_replica_available(replica_id) and (
+            not self.is_distributed
+            or (input_addr is not None and self._serviceable_replica_id_for_addr(input_addr) == replica_id)
+        ):
+            return replica_id
+        if not allow_cold:
+            raise StageUnavailableError(
+                f"stage {self.stage_id} session {session_id!r} is bound to replica {replica_id}, "
+                "which is not live; the continuation cannot be served from its history"
+            )
+        # Cold restart: the binding is void and the history it held is unreachable.
+        self._session_bindings.pop(session_id, None)
+        _remember_stale_session(self._stale_sessions, self._retired_sessions, session_id, replica_id)
+        return None
+
+    def _session_holder(self, session_id: str) -> int | None:
+        """Routing lookup: the holder, refreshed so an active session is evicted last."""
+        replica_id = self.session_replica_id(session_id)
+        if replica_id is not None:
+            self._bind_session(session_id, replica_id)
+        return replica_id
+
+    def _sync_session_route(self, request_id: str, replica_id: int) -> int:
+        """Record the route to a session holder for *request_id*.
+
+        Abort routing and mid-request interactions look a request up through
+        ``get_bound_replica_id`` (then ``_affinity`` for a later pick), so a session
+        hit that recorded neither would leave abort with no binding and let an
+        interaction or retry load-balance onto another replica.
+        """
+        self._request_bindings[request_id] = replica_id
+        input_addr = self._input_addr_for_replica(replica_id)
+        if input_addr is not None:
+            self._affinity[request_id] = input_addr
+        else:
+            self._affinity.pop(request_id, None)
+        return replica_id
+
+    def _input_addr_for_replica(self, replica_id: int) -> str | None:
+        """Registered input address of ``replica_id`` once a head-side client is attached."""
+        return self._replica_id_to_addr.get(replica_id)
+
+    def bind_session_replica(self, session_id: str, replica_id: int) -> int:
+        """Record the replica that now holds *session_id*."""
+        if not self.is_replica_available(replica_id):
+            raise StageUnavailableError(
+                f"stage {self.stage_id} replica {replica_id} cannot hold session {session_id!r}"
+            )
+        self._bind_session(session_id, replica_id)
+        return replica_id
+
+    def release_session(self, session_id: str) -> int | None:
+        """Forget a session binding (the session closed, reset, or moved)."""
+        self._stale_sessions.pop(session_id, None)
+        self._retired_sessions.pop(session_id, None)
+        return self._session_bindings.pop(session_id, None)
+
+    def is_session_stale(self, session_id: str) -> bool:
+        """Whether *session_id* lost a replica, so a continuation restarts cold."""
+        return session_id in self._stale_sessions or session_id in self._retired_sessions
+
+    def session_binding_count(self) -> int:
+        return len(self._session_bindings)
+
     def select_replica_id(
         self,
         request_id: str,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         """Pick a replica id for *request_id* and cache the choice (legacy path)."""
+        if session_id is not None:
+            # A session's history lives on one replica; the follow-up must reach it.
+            holder = self._session_holder(session_id)
+            if holder is not None:
+                return self._sync_session_route(request_id, holder)
         cached = self.get_bound_replica_id(request_id)
         if cached is not None and self.clients[cached] is not None and self.is_replica_available(cached):
             return cached
@@ -824,6 +1109,8 @@ class StagePool:
                 self._next_replica_id = (self._next_replica_id + 1) % len(live)
 
         self._request_bindings[request_id] = chosen
+        if session_id is not None:
+            self._bind_session(session_id, chosen)
         return chosen
 
     def _llm_client(self, replica_id: int) -> StagePoolLLMClient:
@@ -863,7 +1150,7 @@ class StagePool:
             (
                 str(reason)
                 for request_output in reversed(request_outputs)
-                for completion in reversed(getattr(request_output, "outputs", []) or [])
+                for completion in reversed(iter_request_output_items(request_output))
                 if (reason := getattr(completion, "finish_reason", None)) is not None
             ),
             None,
@@ -1130,7 +1417,7 @@ class StagePool:
         if final_output_type is None:
             final_output_type = getattr(self.stage_client, "final_output_type", None)
         if final_output_type == "text":
-            return any(bool(getattr(output, "text", "")) for output in getattr(request_output, "outputs", None) or [])
+            return any(bool(getattr(output, "text", "")) for output in iter_request_output_items(request_output))
 
         if getattr(request_output, "images", None):
             return True
@@ -1144,8 +1431,10 @@ class StagePool:
         for mm_output in iter_mm_outputs(request_output):
             if isinstance(mm_output, Mapping) and any(self._is_non_empty_value(value) for value in mm_output.values()):
                 return True
-        for output in getattr(request_output, "outputs", None) or []:
+        for output in iter_request_output_items(request_output):
             if getattr(output, "text", None):
+                return True
+            if self._is_non_empty_value(getattr(output, "data", None)):
                 return True
             token_ids = getattr(output, "token_ids", None)
             if self._is_non_empty_value(token_ids):
@@ -1271,15 +1560,45 @@ class StagePool:
             payload_sender_info = getattr(request, "payload_sender_info", None)
             if payload_sender_info is not None:
                 submit_kwargs.setdefault("payload_sender_info", payload_sender_info)
+            # A reset is executed on the current holder so its worker releases KV and grants.
+            session_id = session_id_of(params)
+            resetting = session_id is not None and session_reset_requested(params)
+            holder = self.session_replica_id(session_id, allow_cold=resetting) if session_id is not None else None
+            explicit_replica_id = requested_replica_id if requested_replica_id is not None else pinned_replica_id
+            # A continuation states its own chunk base. If the request continues
+            # from a non-zero chunk but this pool has no live holder for the
+            # session, its history is unreachable -- refuse it unless the caller
+            # asked for an explicit reset. This check does not depend on how many
+            # loss records the pool still remembers, so ageing one out cannot
+            # silently turn the continuation into a cold start.
+            if session_id is not None and holder is None and not resetting and session_chunk_base_of(params) > 0:
+                raise StageUnavailableError(
+                    f"stage {self.stage_id} session {session_id!r} continues from chunk "
+                    f"{session_chunk_base_of(params)} but this pool holds no replica for it; "
+                    "the continuation cannot be served from its history"
+                )
+            if holder is not None and explicit_replica_id is not None and holder != explicit_replica_id:
+                raise StageUnavailableError(
+                    f"stage {self.stage_id} request {request_id!r} pinned replica {explicit_replica_id}, "
+                    f"but session {session_id!r} is held by replica {holder}"
+                )
             if requested_replica_id is not None:
                 replica_id = self.bind_requested_replica(request_id, requested_replica_id)
             elif pinned_replica_id is not None:
                 replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
+            elif resetting and holder is not None:
+                replica_id = self.select_replica_id(request_id, session_id=session_id)
             else:
                 replica_id = await self._pick_or_select(
                     request_id,
                     affinity_request_id=affinity_request_id,
+                    session_id=session_id,
                 )
+
+            if session_id is not None:
+                # One ledger: whatever replica this request runs on becomes the
+                # session's holder (an explicit pin included).
+                self._bind_session(session_id, replica_id)
             if req_state.trace is not None:
                 req_state.trace.start_stage(self.stage_id, replica_id, self.stage_type)
             client = self._diffusion_client(replica_id)
@@ -1321,6 +1640,8 @@ class StagePool:
                 child_request = copy(request)
                 child_request.request_id = child_request_id
                 child_request.sampling_params = child_params
+                if self.per_sample_kv:
+                    _set_sample_global_request_id(child_request, per_sample_kv_request_id(request_id, index))
                 engine_requests.append(child_request)
         added: list[str] = []
         try:
@@ -1466,11 +1787,12 @@ class StagePool:
         request_id: str,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         """Bridge to ``pick`` in distributed mode or ``select_replica_id`` legacy."""
         if self.is_distributed:
-            return await self.pick(request_id, affinity_request_id=affinity_request_id)
-        return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return await self.pick(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
+        return self.select_replica_id(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
 
     # ---- Stage-local polling ----
 
@@ -1800,11 +2122,23 @@ class StagePool:
         EngineCore control methods (``pause_scheduler``, ``resume_scheduler``,
         ``sleep``, ``wake_up``) propagate worker exceptions. Capability probes
         and other RPCs still return ``{"supported": False, "error": ...}``.
+        Typed-argument helpers (``add_lora``) use their client helper and report
+        a plain ``bool`` like the diffusion subprocess path. They never return an
+        error dict: ``AsyncOmni._coerce_stage_bool`` reduces a non-empty dict to
+        ``True``, so a failed load would otherwise be reported as success.
         """
         args = tuple(args or ())
         kwargs = dict(kwargs or {})
         client = self.clients[replica_id]
         if client is None:
+            if method in self._TYPED_ARG_ASYNC_METHODS:
+                logger.warning(
+                    "[StagePool] stage=%s replica=%s is not attached; %s reported as failed",
+                    self.stage_id,
+                    replica_id,
+                    method,
+                )
+                return False
             return {
                 "supported": False,
                 "error": f"stage {self.stage_id} replica {replica_id} is not attached",
@@ -1819,6 +2153,29 @@ class StagePool:
                     return await result
                 if method in self._CACHE_RESET_METHODS or method == "release_kv_cache_memory":
                     return {"supported": False, "error": f"EngineCore helper {method}_async is unavailable"}
+
+            if self.stage_type != "diffusion" and method in self._TYPED_ARG_ASYNC_METHODS:
+                # ``add_lora`` carries a LoRARequest dataclass; msgpack turns it
+                # into a list on the generic path and the worker then raises
+                # ``'list' object has no attribute 'lora_int_id'``.
+                # These helpers report a plain bool like the diffusion path, so
+                # every failure returns False: an error dict would be reduced to
+                # True by ``AsyncOmni._coerce_stage_bool`` and report a load
+                # that never happened.
+                client_method = getattr(client, f"{method}_async", None)
+                if not callable(client_method):
+                    logger.warning(
+                        "[StagePool] stage=%s replica=%s does not expose %s_async; %s reported as failed",
+                        self.stage_id,
+                        replica_id,
+                        method,
+                        method,
+                    )
+                    return False
+                result = client_method(*args, **kwargs)
+                if timeout is not None:
+                    return await asyncio.wait_for(result, timeout=timeout)
+                return await result
 
             return await client.collective_rpc_async(
                 method=method,
@@ -1835,6 +2192,10 @@ class StagePool:
             )
             if method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS and method not in self._CACHE_RESET_METHODS:
                 raise
+            if method in self._TYPED_ARG_ASYNC_METHODS:
+                # Same bool contract as above; the reason is in the log line
+                # emitted just above this branch.
+                return False
             if isinstance(exc, TimeoutError):
                 error = f"{type(exc).__name__}: {method} timed out after {timeout}s"
             else:
