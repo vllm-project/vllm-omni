@@ -3533,13 +3533,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     self._get_diffusion_extra_body_params(),
                     extra_body,
                 )
-                if isinstance(lora_body, (dict, list)):
+                if lora_body is not None:
                     try:
                         lora_reqs, lora_scales = parse_lora_requests(lora_body)
                         default_stage_params.lora_request = lora_reqs
                         default_stage_params.lora_scale = lora_scales
-                    except Exception as e:  # pragma: no cover - safeguard
-                        logger.warning("Failed to parse LoRA request: %s", e)
+                    except (TypeError, ValueError) as exc:
+                        raise OmniClientError(str(exc)) from exc
             elif stage_type == "llm" and idx > 0 and is_image_generation_stage(stage_cfg):
                 if num_outputs_per_prompt is not None and num_outputs_per_prompt > 1:
                     raise ValueError(
@@ -3616,13 +3616,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             sigmas=extra_body.get("sigmas"),
         )
 
-        if isinstance(lora_body, (dict, list)):
+        if lora_body is not None:
             try:
                 lora_reqs, lora_scales = parse_lora_requests(lora_body)
                 gen_params.lora_request = lora_reqs
                 gen_params.lora_scale = lora_scales
-            except Exception as e:  # pragma: no cover - safeguard
-                logger.warning("Failed to parse LoRA request: %s", e)
+            except (TypeError, ValueError) as exc:
+                return self._create_error_response(str(exc), status_code=400)
 
         gen_prompt: OmniTextPrompt = OmniTextPrompt(
             prompt=prompt,
@@ -4030,13 +4030,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     gen_params.resolution = resolution
 
                 # Parse per-request LoRA.
-                if isinstance(lora_body, (dict, list)):
+                if lora_body is not None:
                     try:
                         lora_reqs, lora_scales = parse_lora_requests(lora_body)
                         gen_params.lora_request = lora_reqs
                         gen_params.lora_scale = lora_scales
-                    except Exception as exc:  # pragma: no cover - safeguard
-                        logger.warning("Failed to parse LoRA request: %s", exc)
+                    except (TypeError, ValueError) as exc:
+                        return self._create_error_response(str(exc), status_code=400)
 
                 if reference_videos:
                     gen_params.extra_args["video_path"] = reference_videos[0]

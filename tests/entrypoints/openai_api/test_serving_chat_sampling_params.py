@@ -1176,3 +1176,59 @@ def test_multistage_chat_default_loras_are_request_local(
     assert params[0].lora_scale == ([] if disable else [0.7])
     assert default.lora_request[0].lora_name == "default"
     assert default.lora_scale == [0.7]
+
+
+@pytest.mark.parametrize(
+    "lora",
+    [
+        {"name": "other"},
+        [{"name": "other"}],
+        "invalid",
+        [None],
+        {"name": "other", "path": "/models/other", "scale": "bad"},
+    ],
+    ids=["missing-path", "list-missing-path", "wrong-type", "null-item", "invalid-scale"],
+)
+@pytest.mark.parametrize("path", ["chat", "image", "multistage"])
+def test_invalid_explicit_lora_never_generates_with_defaults(
+    mock_engine_client, mocker: MockerFixture, lora: Any, path: str
+) -> None:
+    from vllm_omni.errors import OmniClientError
+
+    default = OmniDiffusionSamplingParams(
+        lora_request={"lora_name": "default", "lora_int_id": 1, "lora_path": "/models/default"},
+        lora_scale=0.7,
+    )
+    engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="diffusion", is_comprehension=False)],
+        default_sampling_params_list=[default],
+        generate=mocker.Mock(),
+    )
+    server = build_serving_chat(engine_client=mock_engine_client)
+    server._diffusion_engine = engine
+    server._diffusion_model_name = "test"
+    server._diffusion_mode = True
+    server._diffusion_extra_body_params = frozenset()
+    mocker.patch.object(server, "_extract_diffusion_prompt_and_media", return_value=("cat", [], [], []))
+    mocker.patch.object(server, "_resolve_multistage_model_class_name", return_value=None)
+
+    if path == "multistage":
+        with pytest.raises(OmniClientError, match="Invalid|could not convert") as error:
+            server._build_multistage_generation_inputs(
+                engine=engine,
+                prompt="cat",
+                extra_body={"lora": lora},
+                reference_images=[],
+                gen_params=default.clone(),
+            )
+        assert error.value.status_code == 400
+    else:
+        if path == "chat":
+            request = ChatCompletionRequest(model="test", messages=[], modalities=["image"], lora=lora)
+            result = asyncio.run(server._create_chat_completion(request))
+        else:
+            result = asyncio.run(server.generate_diffusion_images(prompt="cat", extra_body={"lora": lora}))
+        assert result.error.code == 400
+    engine.generate.assert_not_called()
+    assert default.lora_request.lora_name == "default"
+    assert default.lora_scale == 0.7

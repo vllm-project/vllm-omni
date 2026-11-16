@@ -149,7 +149,9 @@ Image, video, streaming-video and diffusion-chat handlers preserve the
 presence of the HTTP `lora` field. Omission inherits the diffusion stage's
 default adapter group; an object or non-empty list replaces it, while an
 explicit empty list clears the request-local adapters and strengths. Empty
-lists must not be treated as absent by truthiness checks. Configured adapter
+lists must not be treated as absent by truthiness checks. Malformed explicit
+overrides fail with HTTP 400 before generation rather than falling back to
+the deployment defaults. Configured adapter
 dictionaries are normalized by `OmniDiffusionSamplingParams`; worker-side
 loading remains owned by the diffusion runtime. See the
 [LoRA contract](../feature/lora.md#deployment-default-request-adapters).

@@ -183,6 +183,8 @@ Image, video and diffusion chat requests use the following override rules:
 | Provide a `lora` object or non-empty list | Replace the entire default adapter group; request strengths default to 1.0. |
 | Provide `lora: []` | Disable deployment-default request adapters for this request. |
 
+Malformed explicit LoRA overrides return HTTP 400 before generation; they do not fall back to deployment defaults.
+
 For multipart endpoints, send the JSON string `[]` in the `lora` form field. For chat, put `lora` in `extra_body`. Each request receives its own copy of the stage defaults, so overrides do not affect later requests. This does not unload adapters fused into the base weights or override a pipeline's fixed adapter policy.
 
 ##### Request examples
