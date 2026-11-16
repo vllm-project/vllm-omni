@@ -1225,11 +1225,11 @@ full and windowed latents.
 
 ## Request-scoped sampler
 
-H3 supports `euler` (the default), `res_multistep`, `heun`, and `dpmpp_2m`. Select the sampler per
-request; it applies to both video and audio, using their separate sigma schedules.
-For the HTTP examples above, set `num_inference_steps=20` and add
-`"sampler":"res_multistep"` to the existing `extra_params` object. For example,
-the T2VA fields become:
+H3 supports `euler` (the default), `res_multistep`, `heun`, and `dpmpp_2m`.
+Select the sampler per request; it applies to both video and audio, using their
+separate sigma schedules. For the HTTP examples above, set
+`num_inference_steps=20` and add `"sampler":"res_multistep"` to the existing
+`extra_params` object. For example, the T2VA fields become:
 
 ```bash
 -F 'num_inference_steps=20' \
