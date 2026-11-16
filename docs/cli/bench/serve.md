@@ -986,6 +986,88 @@ H100 nightly runs with this configuration, a follow-up can set a separate baseli
 measurements. Results from before the capture-pacing fix could understate VAD latency by up to one 200 ms chunk and must
 not be used as the corrected workload's performance reference.
 
+### Continuous visual-session QA (OVO-Bench / Video-MME)
+
+`ovo-bench` and `videomme-streaming` replay local videos into one persistent
+Realtime session per question. They use a session that accepts video without
+mandatory audio, such as JoyAI. Frames arrive at 1 FPS by default; each
+observation finishes before the next is submitted. Pacing lag remains visible
+when inference takes longer than the input interval.
+
+Use the official [OVO annotations](https://github.com/JoeLeelyf/OVO-Bench/tree/main/data)
+and source videos, or the official
+[Video-MME parquet and videos](https://huggingface.co/datasets/lmms-lab/Video-MME).
+`--dataset-path` accepts a Hub ID, a local dataset directory, or an annotation
+file with `--long-video-media-root`. Hub sources use the Hugging Face cache;
+Video-MME reuses the existing Video-MME downloader and extraction layout.
+OVO downloads its pinned official annotations and source-video tar parts,
+then extracts them once under a file lock. Set `HF_HOME` to choose the cache
+and `HF_HUB_OFFLINE=1` to reuse a fully populated cache without downloading.
+All media is local during inference. OVO resolves each annotation's `video`
+relative to the media root. Video-MME resolves `<videoID>.mp4` in flat or
+nested video directories. `--long-video-annotation-sha256` pins the annotation file; each
+result also records the source video's SHA256.
+
+```bash
+vllm bench serve --omni \
+  --model jdopensource/JoyAI-VL-Interaction-Preview --trust-remote-code \
+  --backend openai-realtime-duplex --endpoint /v1/realtime \
+  --base-url http://127.0.0.1:8000 \
+  --dataset-name ovo-bench --dataset-path /data/OVO-Bench/ovo_bench_new.json \
+  --long-video-media-root /data/OVO-Bench/src_videos \
+  --long-video-ids 37 316 511 --long-video-fps 1 --long-video-max-edge 336 \
+  --num-prompts 0 --disable-shuffle --max-concurrency 1 \
+  --num-warmups 0 --ready-check-timeout-sec 0 --omni-request-timeout-s 3600 --save-result
+```
+
+For Video-MME, select `--dataset-name videomme-streaming`, point
+`--dataset-path` at its parquet, and choose question IDs such as `322-2`.
+OVO stops at the annotated `realtime` timestamp and supports its nine MCQ
+subtasks. Its forward-responding tasks require their own temporal protocol.
+Video-MME plays the full video. The question is then sent together with the
+last sampled frame. Every question starts a fresh session. This is an adapted,
+visual-only streaming QA protocol, with text answers and no subtitles or
+soundtrack; compare scores only under matching conditions.
+
+The saved benchmark JSON includes `long_video_qa`, shared duplex metrics and
+per-question results. Shared server timing fields remain unmeasured when the
+server supplies no timing snapshots for text-only observations.
+The standard serve-bench TTFT statistics aggregate each session's mean of
+available response timings, including per-frame observation responses.
+Use the saved `long_video_query_ttft_ms` and `long_video_query_completion_ms`
+distributions for final-question latency; their per-question values are
+`query_ttft_ms` and `query_completion_ms`.
+`query_ttft_ms` and `query_completion_ms` start when the
+question is submitted; session elapsed time includes real-time playback.
+`pacing_max_lag_s` reports accumulated observation delay.
+`--omni-request-timeout-s` bounds the entire replay, including preparation;
+`--long-video-timeout-s` bounds each observation and question. Audio RTF is
+unmeasured in this text-output protocol. Answers must contain one option
+letter; failed requests and invalid answers count as wrong.
+
+The optional local regression runs the same command through DFX:
+
+```bash
+pytest tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_joyai_long_video_qa.json -m local_model
+```
+
+The JSON uses Hub IDs; local mirrors can be supplied through `dataset_path`.
+CLI default concurrency is 1, matching OmniInteract and Omni-DuplexEval.
+The local regression sets the client concurrency cap and server session capacity
+to 8. Its fixed subsets contain 3 OVO and 6 Video-MME questions, so their
+actual peak concurrency is bounded by those sample counts.
+Each run gets a fresh `run-*` directory containing `accuracy.json` and
+`<dataset>/<index>-<question-id>/result.json`, `events.json`, and a `.done` or
+`.failed.json` marker. Events retain response and commit diagnostics, including
+partial traces for failed sessions. The visual-only protocol produces text.
+Performance records go to `tests/dfx/perf/results/`; the same run writes the
+standard accuracy envelope, including `Hardware`, to
+`tests/e2e/accuracy/long_video_qa/results/`. The fixed questions report scores
+and check complete replay and valid answers. A held-out accuracy floor will be
+calibrated after expanding the sample set. Lifecycle fault-injection tests
+remain separately runnable from this accuracy comparison.
+
 ### Video-MME Benchmark
 
 Video-MME (`--dataset-name videomme`) scores multiple-choice video QA. Default packing is

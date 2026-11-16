@@ -780,6 +780,19 @@ def run_benchmark(
         }
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(persisted, f, ensure_ascii=False, indent=2)
+    if dataset_name in {"ovo-bench", "videomme-streaming"}:
+        from tests.e2e.accuracy.long_video_qa.validation import write_accuracy_result
+
+        accuracy_path = write_accuracy_result(
+            result,
+            args=args,
+            num_prompts=num_prompt,
+            returncode=returncode,
+            test_name=test_name,
+            name=benchmark_params_name,
+            when=started_at,
+        )
+        print(f"Accuracy result saved to {accuracy_path}")
     if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:
         from tests.e2e.accuracy.helpers import (
             _DUPLEX_EVAL_DEFAULT_ACC_DIR,

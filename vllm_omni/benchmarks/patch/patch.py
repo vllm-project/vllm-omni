@@ -78,6 +78,12 @@ from vllm_omni.benchmarks.data_modules.videomme_dataset import (
     VideoMMESampleRequest,
     resolve_videomme_local_root,
 )
+from vllm_omni.benchmarks.duplex.long_video_serving import (
+    attach_long_video,
+    finalize_long_video,
+    get_long_video_samples,
+    request_long_video,
+)
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_serving import (
     OmniDuplexEvalSampleRequest,
     attach_duplex_eval,
@@ -737,6 +743,9 @@ def get_samples(args, tokenizer, **kwargs):
             requests.append(request)
         args.num_prompts = len(requests)
         return requests
+
+    if args.dataset_name in {"ovo-bench", "videomme-streaming"}:
+        return get_long_video_samples(args)
 
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
     is_daily_omni = args.dataset_name == "daily-omni" or (
@@ -3493,6 +3502,16 @@ async def async_request_openai_realtime_duplex(
     from vllm_omni.clients.duplex import summarize_session_request_metrics, wait_for_condition
 
     del session
+    if getattr(request_func_input, "long_video_sample", None) is not None:
+        headers = _get_headers()
+        _update_headers_common(headers, request_func_input)
+        return await request_long_video(
+            request_func_input,
+            MixRequestFuncOutput(),
+            headers=headers,
+            pbar=pbar,
+            total_timeout_s=_omni_request_timeout_s(),
+        )
     if getattr(request_func_input, "omniinteract_case", None) is not None:
         return await _async_request_omniinteract(request_func_input, pbar=pbar)
     if getattr(request_func_input, "duplex_eval_sample", None) is not None:
@@ -3950,6 +3969,7 @@ async def benchmark(
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
     _attach_omniinteract_to_request_func_input(input_requests[0], test_input)
     attach_duplex_eval(input_requests[0], test_input)
+    attach_long_video(input_requests[0], test_input)
 
     if ready_check_timeout_sec > 0:
         test_output = await wait_for_endpoint(
@@ -4119,6 +4139,7 @@ async def benchmark(
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         _attach_omniinteract_to_request_func_input(request, request_func_input)
         attach_duplex_eval(request, request_func_input)
+        attach_long_video(request, request_func_input)
         request_func_inputs.append(request_func_input)
         tasks.append(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
@@ -4146,6 +4167,7 @@ async def benchmark(
     # Upstream's result "date" is populated only after this function returns.
     benchmark_end_time = datetime.now().isoformat()
 
+    long_video_summary = await asyncio.to_thread(finalize_long_video, input_requests, outputs)
     duplex_eval_summary = await asyncio.to_thread(finalize_duplex_eval, input_requests, outputs)
     if duplex_eval_summary is not None:
         duplex_eval_summary.update(_duplex_retry_tally(outputs))
@@ -4331,6 +4353,22 @@ async def benchmark(
             summary = distribution_summary(values, digits=digits)
             if summary is not None:
                 result[result_key] = summary
+    if long_video_summary is not None:
+        result["long_video_qa"] = long_video_summary
+        print(
+            "\nVisual-session QA accuracy: "
+            f"{long_video_summary['correct']}/{long_video_summary['samples']} "
+            f"({long_video_summary['accuracy']:.2%})"
+        )
+        for key, label in (
+            ("query_ttft_ms", "Question-to-first-text (ms)"),
+            ("query_completion_ms", "Question-to-completion (ms)"),
+            ("pacing_max_lag_s", "Per-session max pacing lag (s)"),
+        ):
+            values = [row[key] for row in long_video_summary["items"] if row.get(key) is not None]
+            if values:
+                result[f"long_video_{key}"] = distribution_summary(values, digits=3)
+                print(f"Mean {label}: {sum(values) / len(values):.3f}")
     if omniinteract_summary is not None:
         result["omniinteract"] = omniinteract_summary
     if duplex_eval_summary is not None:
