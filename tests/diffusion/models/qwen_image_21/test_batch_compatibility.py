@@ -171,7 +171,7 @@ def test_preprocess_preserves_reference_images(preprocess, monkeypatch, num_imag
     assert len(info["prompt_image"]) == num_images
     assert len(info["vae_images"]) == num_images
     assert info["input_image_sizes"] == [(64, 64)] * num_images
-    assert processed.batch_compatibility_key == ("qwen_image_21", ((64, 64),) * num_images)
+    assert processed.batch_compatibility_key == ("qwen_image_21", ((64, 64),) * num_images, None, False)
     for color, prompt_image, vae_image in zip(colors, info["prompt_image"], info["vae_images"]):
         assert prompt_image.getpixel((0, 0)) == color
         assert vae_image.shape == (1, 4, 1, 64, 64)
