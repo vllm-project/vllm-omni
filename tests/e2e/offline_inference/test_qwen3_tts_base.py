@@ -63,7 +63,7 @@ tts_server_params = [
         marks=hardware_marks(res={"rocm": "MI325"}, num_cards=1),
     ),
     pytest.param(
-        (MODEL, get_deploy_config_path("qwen3_tts_mrv2.yaml")),
+        (MODEL, get_deploy_config_path("qwen3_tts.yaml")),
         id="async_chunk_mrv2",
         marks=pytest.mark.skipif(not current_platform.is_cuda(), reason="MRV2 validation is CUDA-only"),
     ),
