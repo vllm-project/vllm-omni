@@ -762,7 +762,11 @@ class Attention(nn.Module):
         return getattr(get_forward_context(), "paged_kv_adapter", None)
 
     def is_paged_kv_active(self) -> bool:
-        """Select paged model semantics, including the pre-allocation profile."""
+        """Return whether this layer selects paged model semantics.
+
+        This includes the pre-allocation memory profile, when no Worker
+        adapter exists. A true result does not imply an adapter is available.
+        """
 
         return self.paged_kv_cache_role is not None and (
             self._active_paged_kv_adapter() is not None or self._is_paged_kv_memory_profile()

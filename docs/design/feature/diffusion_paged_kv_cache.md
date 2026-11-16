@@ -202,6 +202,15 @@ request token count. When omitted, the normal utilization path sizes the pool
 after subtracting profiled non-KV memory. Reserved pool memory can exceed the
 live payload because it also reflects capacity and fragmentation.
 
+The empty-KV profile is an estimate, not an upper bound on request memory.
+It omits paged-path temporaries such as contiguous Q/K/V copies, piecewise
+output concatenation, and backend workspaces. These allocations depend on
+input shape, parallel topology, and backend; a measured error at one resolution
+does not bound another. Validate first-request and steady-state peaks at the
+intended maximum shape, including device memory outside PyTorch, and leave
+headroom when selecting utilization or a fixed KV-pool budget. This is
+especially relevant when HunyuanImage3 skips warmup or stages share a device.
+
 ### Logical layout
 
 Each sequence has a stable prefix and a changing target:

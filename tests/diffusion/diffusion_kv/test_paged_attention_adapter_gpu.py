@@ -122,7 +122,6 @@ def _native_adapter(num_rows: int = 1):
         )
         block_tables = BlockTables(
             block_sizes=[_BLOCK_SIZE],
-            kernel_block_sizes=kernel_block_sizes,
             max_num_reqs=num_rows,
             max_num_batched_tokens=32 * num_rows,
             max_num_blocks_per_group=[2],
