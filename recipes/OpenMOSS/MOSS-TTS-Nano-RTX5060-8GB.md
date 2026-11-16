@@ -19,7 +19,10 @@ when something else needs the rest. The measured peak did not change.
 
 | Task | Input | Output | Profile |
 | --- | --- | --- | --- |
-| Text-to-speech | one text prompt | 48 kHz WAV | `moss_tts_nano_8gb.yaml` |
+| Text-to-speech | one text prompt and one reference audio (`ref_audio`) | 48 kHz WAV | `moss_tts_nano_8gb.yaml` |
+
+Voice cloning only: `ref_audio` is required, and there are no built-in voice
+presets. See the [speech API contract](../../docs/serving/speech_api.md).
 
 Requests must stay serial. The model and its audio tokenizer keep process-wide
 RNG and streaming decode state, so concurrent generation corrupts audio.
@@ -50,13 +53,44 @@ RNG and streaming decode state, so concurrent generation corrupts audio.
 
 ```bash
 vllm serve OpenMOSS-Team/MOSS-TTS-Nano-100M --omni \
-  --deploy-config vllm_omni/deploy/moss_tts_nano_8gb.yaml --port 8091
+  --deploy-config vllm_omni/deploy/moss_tts_nano_8gb.yaml --port 8091 \
+  --allowed-local-media-path /path/to/assets
+```
+
+`--allowed-local-media-path` is required for a `file://` reference audio; a
+request that sends one without it fails with HTTP 500. The qualified run used
+`zh_1.wav` from the model repository's `assets/audio/`. It is a FLAC bitstream
+despite the extension, so convert it to PCM WAV first:
+
+```bash
+ffmpeg -i zh_1.wav -ar 44100 -ac 1 -c:a pcm_s16le zh_1.pcm.wav
 ```
 
 ## Verification
 
 Send one speech request and check the WAV is 48 kHz and not silent. The
-qualified run used three fixed prompts and seed 42.
+qualified run used three fixed prompts and seed 42:
+
+```bash
+curl http://127.0.0.1:8091/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "OpenMOSS-Team/MOSS-TTS-Nano-100M",
+    "input": "The quick brown fox jumps over the lazy dog.",
+    "ref_audio": "file:///path/to/assets/zh_1.pcm.wav",
+    "response_format": "wav",
+    "seed": 42,
+    "watermarking": false,
+    "stream": false
+  }' \
+  --output out.wav
+```
+
+The three prompts, in order:
+
+1. `The quick brown fox jumps over the lazy dog.`
+2. `今天天气很好，我们去公园散步吧。`
+3. `Please read this sentence in a calm, steady voice.`
 
 ## Notes
 

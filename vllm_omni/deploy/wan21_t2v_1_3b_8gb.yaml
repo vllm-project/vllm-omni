@@ -19,3 +19,8 @@ stages:
       seed: 42
       num_inference_steps: 20
       guidance_scale: 6.0
+      # A request without these falls back to 480x832x1, and 832x480 OOMs.
+      height: 368
+      width: 640
+      num_frames: 17
+      fps: 16

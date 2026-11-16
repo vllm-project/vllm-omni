@@ -19,11 +19,16 @@ it and the DiT block by block. 832×480 does not fit at any step count tried.
 
 | Task | Input | Output | Profile |
 | --- | --- | --- | --- |
-| Text-to-video | one prompt | 640×368, 81 frames (5 s at 16 fps), 40 steps | `wan21_t2v_1_3b_8gb.yaml` |
+| Text-to-video | one prompt | 640×368, 17 frames (16 fps), 20 steps | `wan21_t2v_1_3b_8gb.yaml`, the profile default |
+| Text-to-video | one prompt | 640×368, 81 frames (5 s at 16 fps), 40 steps | same profile, request overrides frames and steps |
 | Text-to-video | one prompt | 768×432, 33 frames (2 s at 16 fps), 40 steps | same profile, request overrides the size |
 
-The profile's own default is 20 steps. The 40-step ceiling below was measured
-with the same offload config and the step count set per request.
+Requests that omit `size` or `num_frames` do not get a safe default from the
+engine: `effective_wan_dimensions` falls back to 480×832, and 832×480 OOMs at
+every step count tried (the frame count stays at the `1` sentinel). The profile
+pins `height: 368`, `width: 640`, `num_frames: 17` and `fps: 16` in
+`default_sampling_params`, so a bare request is the measured 640×368×17 cell.
+Any larger geometry must pass `size` and `num_frames` explicitly.
 
 ## References
 
@@ -59,8 +64,15 @@ explicitly because the checkpoint name does not select it.
 
 ## Verification
 
-Send one text-to-video request at 640×368 and confirm the returned mp4 is
-640×368. The qualified runs used guidance 6.0, flow shift 8.0 and seed 42.
+Send one text-to-video request and confirm the returned mp4 is 640×368 with 17
+frames. The qualified runs used guidance 6.0, flow shift 8.0 and seed 42.
+
+```bash
+curl -sS -X POST http://127.0.0.1:8091/v1/videos/sync \
+  -F "prompt=A corgi in a tiny raincoat walks through a puddle, soft daylight, camera slowly pans right." \
+  -F "seed=42" \
+  --output out.mp4
+```
 
 ## Notes
 
