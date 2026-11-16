@@ -254,6 +254,9 @@ class OmniStreamingSpeechHandler:
                     config = new_config
                     splitter = SpeechTextSplitter(config.split_granularity)
 
+                elif msg_type == "session.ping":
+                    await websocket.send_json({"type": "session.pong"})
+
                 elif config is None:
                     await self._send_error(
                         websocket,
@@ -335,8 +338,6 @@ class OmniStreamingSpeechHandler:
                     sentence_index = 0
                     utterance_open = False
 
-                elif msg_type == "session.ping":
-                    await websocket.send_json({"type": "session.pong"})
                 elif msg_type == "session.close":
                     await self._cleanup_commitment_utterance(commitment)
                     commitment = None

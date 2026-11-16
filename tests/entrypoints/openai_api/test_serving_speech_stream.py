@@ -1850,19 +1850,22 @@ class TestStreamingSpeechWebSocket:
         speech_service.engine_client.abort.assert_awaited_once_with("req-abort")
         assert websocket.send_json.await_count == 2
 
-    def test_ping_echoes_pong_response(self, mocker: MockerFixture):
+    @pytest.mark.parametrize(("configure_session"), [(True, False)])
+    def test_ping_echoes_pong_response(self, mocker: MockerFixture, configure_session):
+        # Server should respond to ping message despite the state of the session config
         app, _ = _build_test_app(mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json(
-                    {
-                        "type": "session.config",
-                        "voice": "Vivian",
-                        "stream_audio": True,
-                        "response_format": "pcm",
-                    }
-                )
+                if configure_session:
+                    ws.send_json(
+                        {
+                            "type": "session.config",
+                            "voice": "Vivian",
+                            "stream_audio": True,
+                            "response_format": "pcm",
+                        }
+                    )
 
                 ws.send_json({"type": "session.ping"})
                 pong_response = ws.receive_json()
