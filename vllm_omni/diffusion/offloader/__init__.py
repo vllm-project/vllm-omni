@@ -84,6 +84,7 @@ def get_offload_backend(
     od_config: OmniDiffusionConfig,
     device: torch.device | None = None,
     host_weight_plan: HostWeightPlan | None = None,
+    file_backed_backend: OffloadBackend | None = None,
 ) -> OffloadBackend | None:
     """Create appropriate offload backend based on configuration.
 
@@ -92,6 +93,8 @@ def get_offload_backend(
         device: Target device (auto-detected if None)
         host_weight_plan: Exact loader-produced backing plan, if ordinary
             weight materialization was skipped.
+        file_backed_backend: Pipeline-prepared backend whose manifests cover
+            the skipped file-backed weights.
 
     Returns:
         OffloadBackend instance or None if offloading disabled
@@ -112,6 +115,11 @@ def get_offload_backend(
     # Return None if no offloading requested
     if config.strategy == OffloadStrategy.NONE:
         return None
+
+    if config.strategy == OffloadStrategy.FILE_BACKED:
+        if file_backed_backend is None:
+            raise RuntimeError("File-backed offload requires a backend prepared by the pipeline during loading")
+        return file_backed_backend
 
     # Validate platform (CUDA required for now)
     if not current_omni_platform.supports_cpu_offload() or current_omni_platform.get_device_count() < 1:
@@ -174,6 +182,7 @@ def enable_offload_backend(
                 od_config,
                 device=device,
                 host_weight_plan=state.host_weight_plan if state is not None else None,
+                file_backed_backend=getattr(model, "file_backed_offload_backend", None),
             )
             if backend is not None:
                 logger.info("Enabling offloader backend: %s", backend.__class__.__name__)

@@ -889,7 +889,16 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
                 host_weight_plan = self.host_weight_plan
 
-                if host_weight_plan is not None:
+                if resolved_offload.strategy is OffloadStrategy.FILE_BACKED:
+                    source_prefixes, planned_weights = model.prepare_file_backed_offload()
+                    logger.info(
+                        "File-backed offload: skipping ordinary materialization for %s", sorted(source_prefixes)
+                    )
+                    ordinary_sources = tuple(
+                        source for source in weight_sources if source.prefix not in source_prefixes
+                    )
+                    self.load_weights(model, sources=ordinary_sources, planned_weights=planned_weights)
+                elif host_weight_plan is not None:
                     logger.info(
                         "DLO host-weight plan active (%s, %s): skipping ordinary materialization for %s",
                         "AllGather" if dit_uses_allgather and dlo_group_size > 1 else "rank-local",
