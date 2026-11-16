@@ -903,8 +903,9 @@ class MiniCPMO45Stage0DuplexRuntime:
             return
         if ids[-2] not in speech_terminators or self.listen_token_id < 0:
             return
-        if self.turn_eos_token_id >= 0 and self.turn_eos_token_id in ids:
-            # The model had already ended its turn in this unit; keep its tokens.
+        if self.turn_eos_token_id >= 0 and len(ids) >= 3 and ids[-3] == self.turn_eos_token_id:
+            # Only the final generated token decides whether the turn stayed ended;
+            # text after an earlier turn_eos reopens it.
             return
         unit.token_ids = [*ids[:-2], self.listen_token_id, ids[-1]]
         unit.embeds = [*unit.embeds[:-2], self._embed_token(self.listen_token_id), unit.embeds[-1]]

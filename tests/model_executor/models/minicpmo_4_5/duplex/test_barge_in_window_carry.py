@@ -482,6 +482,24 @@ def test_worker_drops_carried_units_no_plan_places() -> None:
     assert [len(unit.token_ids) for unit in state.window_units] == [9]
 
 
+@pytest.mark.parametrize("terminator", [CHUNK_EOS, CHUNK_TTS_EOS])
+def test_worker_closes_a_carried_unit_that_reopened_after_turn_eos(terminator: int) -> None:
+    helper = _worker()
+    helper.listen_token_id, helper.unit_end_token_id = LISTEN, UNIT_END
+    helper.chunk_eos_token_id, helper.chunk_tts_eos_token_id = CHUNK_EOS, CHUNK_TTS_EOS
+    helper.turn_eos_token_id = TURN_EOS
+    # Later speech reopens the turn even though this unit contains an earlier turn_eos.
+    spoke_again = [200, TURN_EOS, 151706, 202, terminator, UNIT_END]
+    state = _state(carried_window_units=[_unit_of(spoke_again)])
+    plan = {"replace": True, "mode": "basic", "drop_units": 0, "carried_units": 1, "replacement_prompt_len": 9}
+
+    embeds, token_ids = helper._window_replacement_parts(state, plan)
+
+    assert token_ids == [1, 2, 3, 200, TURN_EOS, 151706, 202, LISTEN, UNIT_END]
+    assert len(embeds) == len(token_ids) == 9
+    assert float(embeds[-2][0, 0]) == float(LISTEN)
+
+
 def test_worker_places_the_newest_units_when_it_kept_more() -> None:
     helper = _worker()
     state = _state(carried_window_units=[_unit(100, 4), _unit(200, 5), _unit(300, 6)], window_units=[_unit(400, 9)])
