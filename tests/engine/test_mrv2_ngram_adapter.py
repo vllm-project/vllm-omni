@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.worker_v2.ngram_adapter import is_npu_thinker_ngram, scheduler_ngram_factory, use_scheduler_ngram
+from vllm_omni.worker_v2.ngram_adapter import is_thinker_ngram, scheduler_ngram_factory, use_scheduler_ngram
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -52,7 +52,7 @@ def test_ascend_mrv1_thinker_keeps_worker_drafts_with_duplex_guard(thinker_confi
     thinker_config.model_config.use_v2_model_runner = False
     thinker_config.speculative_config.method = method
 
-    assert is_npu_thinker_ngram(thinker_config)
+    assert is_thinker_ngram(thinker_config)
     assert not use_scheduler_ngram(thinker_config)
     worker_speculator = object()
     assert scheduler_ngram_factory(lambda *_: worker_speculator)(thinker_config) is worker_speculator
@@ -63,3 +63,19 @@ def test_ascend_mrv2_thinker_rejects_ngram_gpu(thinker_config):
 
     with pytest.raises(ValueError, match="ngram_gpu on Ascend requires model_runner: v1"):
         use_scheduler_ngram(thinker_config)
+
+
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+@pytest.mark.parametrize("model_stage", ["llm", "tts"])
+def test_ngram_duplex_guard_is_thinker_only_on_both_platforms(thinker_config, device_type, model_stage):
+    thinker_config.device_config.device_type = device_type
+    thinker_config.model_config.model_stage = model_stage
+
+    assert is_thinker_ngram(thinker_config) is (model_stage == "llm")
+    assert use_scheduler_ngram(thinker_config) is (model_stage == "llm" and device_type == "npu")
+
+
+def test_cuda_ngram_keeps_worker_owned_proposals(thinker_config):
+    thinker_config.device_config.device_type = "cuda"
+    worker_speculator = object()
+    assert scheduler_ngram_factory(lambda *_: worker_speculator)(thinker_config) is worker_speculator
