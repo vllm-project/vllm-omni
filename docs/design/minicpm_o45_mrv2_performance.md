@@ -237,8 +237,10 @@ For a single-frame control, override CUDA stage 1 with
 
 Mixed prefill and decode steps use the single-frame codec path. A K-step batch
 replays a CUDA graph when its sampling settings are supported, and falls back
-to the same per-frame attention view for other settings. The connector receives
-only valid codec frames, including the final short batch at EOS.
+to the same per-frame attention view for other settings. Native duplex decode
+steps take the graph too and report their duplex step metadata from the
+commit; a duplex turn-end condition drains on the per-frame path. The connector
+receives only valid codec frames, including the final short batch at EOS.
 
 The profile enables CUDA MPS for the colocated stages. CUDA Graphs are captured
 on demand for the batch sizes seen by the Talker. To prewarm a newly started
