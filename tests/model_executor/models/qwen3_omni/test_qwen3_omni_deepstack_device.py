@@ -46,6 +46,9 @@ def test_deepstack_buffers_use_execution_device(mocker, vision_limit, num_tokens
         device_config=DeviceConfig(device="cpu"),
         scheduler_config=mocker.Mock(spec=SchedulerConfig, max_num_batched_tokens=4),
         quant_config=None,
+        # Disabled-feature default. A spec Mock otherwise returns a truthy
+        # child mock, and _mark_tower_model then requires a PP group.
+        use_v2_model_runner=False,
     )
     vllm_config.with_hf_config.return_value = vllm_config
 

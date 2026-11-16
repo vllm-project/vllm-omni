@@ -13,7 +13,7 @@ from contextlib import suppress
 from typing import Any
 
 import pytest
-from fastapi import WebSocketDisconnect
+from fastapi import FastAPI, WebSocketDisconnect
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
@@ -39,6 +39,7 @@ _DISCONNECT = object()
 
 class FakeWebSocket:
     def __init__(self, query: dict[str, str] | None = None) -> None:
+        self.app = FastAPI()
         self.query_params = dict(query or {})
         self.sent: list[dict[str, Any]] = []
         self.accepted = False
@@ -263,6 +264,38 @@ async def _open(
 # --------------------------------------------------------------------------- #
 # Handshake and commands                                                      #
 # --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route_name", ["realtime_websocket", "duplex_websocket"])
+async def test_transport_accepts_before_warmup_but_session_open_waits(route_name: str) -> None:
+    from vllm_omni.entrypoints.openai import api_server
+
+    accepted = asyncio.Event()
+
+    class HandshakeSocket(FakeWebSocket):
+        async def accept(self) -> None:
+            await super().accept()
+            accepted.set()
+
+    omni = FakeOmni()
+    ws = HandshakeSocket({"duplex": "1", "autostart": "0"})
+    warmup_done = asyncio.Event()
+    ws.app.state.duplex_warmup_done = warmup_done
+    ws.app.state.openai_serving_duplex = _handler(omni)
+    ws.feed(_session_update())
+    task = asyncio.create_task(getattr(api_server, route_name)(ws))
+    try:
+        await asyncio.wait_for(accepted.wait(), timeout=1.0)
+        assert not omni.handles
+        assert not ws.sent
+        warmup_done.set()
+        await ws.wait_for("session.created")
+        assert len(omni.handles) == 1
+    finally:
+        warmup_done.set()
+        ws.disconnect()
+        await asyncio.wait_for(task, timeout=2.0)
 
 
 @pytest.mark.asyncio

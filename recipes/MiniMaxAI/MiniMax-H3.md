@@ -622,16 +622,18 @@ Select the device with `HIP_VISIBLE_DEVICES` (not `CUDA_VISIBLE_DEVICES`), drop 
 CUDA-only `FLASHINFER_DISABLE_VERSION_CHECK`, and install without the `[fa4]` extra
 (FA4 is CUDA-only). The VAE uses AITER GroupNorm on ROCm.
 
-Install (ROCm wheel + source vLLM-Omni):
+For this source checkout, build the frozen vLLM 0.33.0 ROCm runtime from
+source using the repository Dockerfile, from the Omni repository root:
 
 ```bash
-pip install "vllm==0.26.0+rocm723" \
-  --extra-index-url https://wheels.vllm.ai/rocm/0.26.0/rocm723
-VLLM_OMNI_TARGET_DEVICE=rocm pip install -e . --no-build-isolation
+docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm:v033-source .
 ```
 
-Prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. All tasks work out of the box:
-the image bundles TorchCodec (for image+audio Ref2VA) and `ffmpeg` (for
+See the [ROCm installation guide](../../docs/getting_started/installation/gpu/rocm.inc.md)
+for source/runtime details. Container and native H3 validation on ROCm remain
+pending for this checkout; an older ROCm wheel cannot provide its 0.33 APIs.
+
+Historical prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. That image bundles TorchCodec (for image+audio Ref2VA) and `ffmpeg` (for
 video-reference Ref2VA).
 
 ### ROCm single GPU
@@ -1561,7 +1563,7 @@ The two `ref2v` rows are not served by this FL2VA command. Start a
 already send `audio_flow_shift=3.0`.
 
 For FL2VA, change `task` and add `input_reference` as shown above. This
-integration is dynamic-only and does not support prefusion or LoRA composition. DLO is
+integration is dynamic-only and does not support prefusion. DLO is
 supported by keeping the request-switchable LoRA A/B buffers resident on the
 accelerator while DLO streams only the base blocks; budget for this additional
 fixed HBM usage. Model-level and standard layerwise offload remain unsupported.
@@ -1727,6 +1729,14 @@ H3 replayed the same way. Software: Ubuntu 22.04, driver 580.178.04, Python
 
 See [FastH3 Omni — Ref2VA](../FastVideo/FastH3-Omni.md) in the
 [FastH3 section](../FastVideo/README.md) for reference-conditioned generation.
+
+### ComfyUI-style LoRA adapters
+
+Use `--lora-backend peft` to load ComfyUI-style single-file A/B LoRA adapters using the native H3 parameter layout. Provide a server-local `.safetensors` path in the request's `lora` object.
+
+Use a `lora` array to combine multiple adapters, each with its own `scale`. These adapters can also be combined with the supported Turbo LoRA. Start with `scale=1.0` and adjust it to control adapter strength.
+
+Select a specific file when a directory contains multiple adapters. General Diffusers checkpoint conversion is not supported.
 
 ## Key parameters
 
@@ -2018,6 +2028,9 @@ memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
   own resolution and its own truncated schedule, and the step contract carries
   one schedule per request, so step execution rejects it. `latent_upscale`
   without `latent_refine` works in both modes.
+- Non-empty attention step ranges reject `latent_refine` in request mode too;
+  disable them (`attention_schedule=[]`) or refinement (`latent_refine=false`).
+  Sigma windows work with `latent_refine`.
 - Large refine layouts can abort workers with `CUDA error: an illegal memory
   access was encountered`. On B300, observed video token counts of 54,144 per
   rank complete while 108,288 and 109,360 abort. The preflight limit of 65,536

@@ -207,7 +207,8 @@ def _http_judge(limit: int = 4, *, overflow_message: str = OVERFLOW) -> Iterator
             payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             assert self.path == "/v1/chat/completions"
             assert payload["model"] == "fixture-judge"
-            assert payload["max_tokens"] == 1200
+            expected_max_tokens = 800 if payload["messages"][0]["role"] == "system" else 1200
+            assert payload["max_tokens"] == expected_max_tokens
             parts = payload["messages"][-1]["content"]
             images = [part for part in parts if part["type"] == "image_url"]
             for part in images:
@@ -366,7 +367,7 @@ def test_upstream_video_fallback_keeps_frame_reduction_opt_in(
         assert result["content"]["frame_count"] == 4
         assert result["content"]["frame_budget_retries"] == 2
         trace = [json.loads(line) for line in score_path.with_suffix(".judge.jsonl").read_text().splitlines()]
-        assert trace == [{"raw_response": '{"content_score": 1}'}]
+        assert trace == [{"raw_response": '{"content_score": 1}', "error": None}]
 
 
 def test_recovered_response_retains_schema_trace_and_old_score_quarantine(
@@ -399,11 +400,12 @@ def test_recovered_response_retains_schema_trace_and_old_score_quarantine(
 
 @pytest.mark.parametrize("route", ["temporal", "content", "video-fallback"])
 @pytest.mark.parametrize("overflow_on_correction", [False, True])
+@pytest.mark.parametrize("original_count", [16, 40])
 def test_frame_reduction_composes_with_format_correction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, overflow_on_correction: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, overflow_on_correction: bool, original_count: int
 ) -> None:
     sample, response_path, score_path = _sample_inputs(tmp_path, monkeypatch, with_sentence=route == "temporal")
-    original = [bytes([i]) for i in range(16)]
+    original = [bytes([i]) for i in range(original_count)]
     monkeypatch.setattr(eval_mod, "_extract_frames", lambda *args, **kwargs: original)
     calls = []
     prose = "The person moves."
@@ -436,7 +438,13 @@ def test_frame_reduction_composes_with_format_correction(
         judge_video_mode="video_url" if route == "video-fallback" else "frame-sample",
         judge_frame_overflow="reduce",
     )
-    expected_counts = [16, 8, 8, 4] if overflow_on_correction else [16, 8, 8]
+    expected_counts = [original_count]
+    while expected_counts[-1] > 8:
+        expected_counts.append((expected_counts[-1] + 1) // 2)
+    correction_index = len(expected_counts)
+    expected_counts.append(expected_counts[-1])
+    if overflow_on_correction:
+        expected_counts.append((expected_counts[-1] + 1) // 2)
     assert [len(frames) for _, frames, _ in calls] == expected_counts
     for prompt, frames, followup in calls:
         assert prompt == calls[0][0]
@@ -444,16 +452,18 @@ def test_frame_reduction_composes_with_format_correction(
         if followup is not None:
             assert followup[0] == prose
             assert "score" in followup[1]
-    assert all(followup is None for _, _, followup in calls[:2])
-    assert all(followup == calls[2][2] for _, _, followup in calls[2:])
+    assert all(followup is None for _, _, followup in calls[:correction_index])
+    assert all(followup == calls[correction_index][2] for _, _, followup in calls[correction_index:])
     row = result["temporal"]["sentences"][0] if route == "temporal" else result["content"]
-    assert row["frame_count_initial"] == 16
+    assert row["frame_count_initial"] == original_count
     assert row["frame_count"] == expected_counts[-1]
-    assert row["frame_budget_retries"] == (2 if overflow_on_correction else 1)
+    assert row["frame_budget_retries"] == len(expected_counts) - 2
     if route == "video-fallback":
         assert row["judge_input_fallback"] == "frame-sample"
     trace = [json.loads(line) for line in score_path.with_suffix(".judge.jsonl").read_text().splitlines()]
-    assert trace[0] == {"raw_response": prose}
+    assert trace[0]["raw_response"] == prose
+    assert trace[0]["error"]
+    assert trace[0]["error"] in calls[correction_index][2][1]
     assert trace[1]["judge_retry"] is True
 
 

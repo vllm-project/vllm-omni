@@ -267,9 +267,9 @@ def _mixed_quant_config(algorithms):
     )
 
 
-@pytest.mark.parametrize("algorithms", [("FP8",), ("NVFP4",)])
+@pytest.mark.parametrize("algorithms", [("FP8",), ("NVFP4",), ("FP8", "NVFP4")])
 @pytest.mark.parametrize("override", [False, True])
-def test_mixed_modelopt_policy_supports_homogeneous_native_format(algorithms, override) -> None:
+def test_mixed_modelopt_policy_supports_native_formats(algorithms, override) -> None:
     od_config = _checkpoint_od_config(
         _mixed_quant_config(algorithms),
         policy=None if override else _policy(),
@@ -279,17 +279,6 @@ def test_mixed_modelopt_policy_supports_homogeneous_native_format(algorithms, ov
         Cosmos3MixedPrecisionConfig(),
         "additional_config" if override else "checkpoint",
     )
-
-
-@pytest.mark.parametrize("override", [False, True])
-def test_mixed_modelopt_policy_rejects_heterogeneous_formats(override) -> None:
-    od_config = _checkpoint_od_config(
-        _mixed_quant_config(("FP8", "NVFP4")),
-        policy=None if override else _policy(),
-        additional_config={"cosmos3_mixed_precision": {}} if override else None,
-    )
-    with pytest.raises(ValueError, match="does not support mixing FP8 and NVFP4"):
-        resolve_mixed_precision_config(od_config)
 
 
 @pytest.mark.parametrize("algorithm", ["MXFP8", "W4A16_NVFP4", "UNKNOWN"])
@@ -315,8 +304,9 @@ def test_mixed_modelopt_policy_rejects_malformed_layer(entry) -> None:
         ("NVFP4", "nvfp4_config", "is_checkpoint_nvfp4_serialized"),
     ],
 )
-def test_mixed_modelopt_policy_validates_selected_subconfig(algorithm, subconfig, flag) -> None:
-    config = _mixed_quant_config((algorithm,))
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_mixed_modelopt_policy_validates_selected_subconfig(algorithm, subconfig, flag, hybrid) -> None:
+    config = _mixed_quant_config(("FP8", "NVFP4") if hybrid else (algorithm,))
     setattr(getattr(config, subconfig), flag, False)
     with pytest.raises(ValueError, match="serialized ModelOpt"):
         read_checkpoint_policy(_checkpoint_od_config(config, policy=_policy()))
@@ -792,6 +782,48 @@ def test_reset_clears_generation_state() -> None:
     assert runtime.use_high_precision("generation")
     runtime.reset()
     assert not runtime.use_high_precision("generation")
+
+
+def test_install_hybrid_uses_real_modelopt_strategies(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    from vllm.config.quantization import QuantSpec
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization.modelopt import CkptCtx, ModelOptLinearMethod
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8StaticTensorSym,
+        kNvfp4Dynamic,
+        kNvfp4Static,
+    )
+
+    # Real methods/specs and registry, without hardware-dependent kernel
+    # initialization. The CPU FP8 kernels require AMX, unavailable on ARM64;
+    # this portable CPU test covers installation, not native execution.
+    specs = (
+        QuantSpec(weight=kFp8StaticTensorSym, activation=kFp8StaticTensorSym),
+        QuantSpec(weight=kNvfp4Static, activation=kNvfp4Dynamic),
+    )
+    methods = [ModelOptLinearMethod(spec, CkptCtx()) for spec in specs]
+    linears = [LinearBase(16, 16, prefix=f"gen_layers.{index}", disable_tp=True) for index in range(2)]
+    for layer, method in zip(linears, methods):
+        layer.quant_method = method
+    transformer = torch.nn.Module()
+    transformer.gen_layers = torch.nn.ModuleList(linears)
+    runtime = Cosmos3MixedPrecisionRuntime(Cosmos3MixedPrecisionConfig(reasoner="native"))
+    log_info = Mock()
+    monkeypatch.setattr(runtime_impl.logger, "info", log_info)
+
+    runtime.install(transformer)
+
+    for layer, base_method, strategy_type in zip(linears, methods, (Fp8W8A8W8A16Strategy, Nvfp4W4A4W4A16Strategy)):
+        wrapper = layer.quant_method
+        assert isinstance(wrapper, Cosmos3MixedPrecisionLinearMethod)
+        assert wrapper.base_method is base_method
+        assert isinstance(wrapper.strategy, strategy_type)
+        assert wrapper.strategy in runtime_impl._STRATEGIES
+        assert wrapper.runtime is runtime
+        assert wrapper.path == "generation"
+    log_info.assert_called_once_with("Cosmos3 mixed precision wrapped linears: fp8=%d, nvfp4=%d", 1, 1)
 
 
 def test_install_discovers_generation_and_opt_in_reasoner(monkeypatch) -> None:

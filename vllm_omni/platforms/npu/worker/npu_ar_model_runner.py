@@ -42,7 +42,7 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 # yapf: disable
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, global_stream
-from vllm_ascend.worker.model_runner_v1 import graph_capture
+from vllm_ascend.worker.v1.model_runner import graph_capture
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
@@ -132,7 +132,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
-        self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
+        self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
+        self.inputs_embeds = self._make_buffer(
+            self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
+        )
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
@@ -157,10 +160,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         ~0.6 ms more than a one-query one. Without the multi-frame loop engaged
         (``narrow_replay_enabled`` false) this is a no-op, so the wide capture
         path stays exactly as before."""
-        from vllm_omni.platforms.npu.worker import talker_multiframe
+        from vllm_omni.platforms.npu.worker import talker_narrow_replay
 
         saved = int(getattr(self, "uniform_decode_query_len", 1) or 1)
-        if saved <= 1 or not talker_multiframe.narrow_replay_enabled(self):
+        if saved <= 1 or not talker_narrow_replay.narrow_replay_enabled(self):
             yield
             return
         logger.info("[minicpmo] the Talker's decode graphs are one query row wide, not %d", saved)
@@ -233,7 +236,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         (vllm-ascend ``NPUModelRunner.propose_draft_token_ids``); the upstream
         GPU signature has ``scheduler_output`` first instead.
         """
-        from vllm_omni.platforms.npu.worker import talker_multiframe
+        from vllm_omni.worker import talker_multiframe
 
         frames = talker_multiframe.drafts_this_step(self)
         if frames > 1:
@@ -581,7 +584,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
-                    self.flush_full_payload_outputs(flush_ids)
+                    self.flush_full_payload_outputs(
+                        flush_ids,
+                        finished_req_output_token_ids=getattr(scheduler_output, "finished_req_output_token_ids", None),
+                    )
 
         # Exactly once per real scheduler_output, before _update_states.
         self._prefix_cache_step_begin(scheduler_output)
@@ -1139,7 +1145,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if supports_multi_frame_decode(self.model) and int(
                 getattr(self, "num_spec_tokens", 0) or 0
             ) > 0:
-                from vllm_omni.platforms.npu.worker import talker_multiframe
+                from vllm_omni.worker import talker_multiframe
 
                 talker_multiframe.neutralize_kstep_min_tokens(
                     self.input_batch.sampling_metadata.logitsprocs

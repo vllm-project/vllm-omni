@@ -23,13 +23,11 @@ from __future__ import annotations
 import uuid
 from contextlib import ExitStack
 from dataclasses import asdict
-from functools import lru_cache
 
 import numpy as np
 import pytest
 import torch
 from torch.multiprocessing.reductions import reduce_tensor
-from transformers import AutoTokenizer
 from vllm.distributed.weight_transfer.ipc_engine import IPCWeightTransferUpdateInfo
 
 from tests.helpers.mark import hardware_test
@@ -38,48 +36,9 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 MODEL = "tiny-random/Qwen-Image"
-TOKENIZER_MODEL = "Qwen/Qwen2-1.5B-Instruct"
 # Same handshake payload IPCTrainerWeightTransferEngine.trainer_init ships
 # (ipc_engine.py): the only worker-side wire param is ``packed``.
 IPC_INIT_INFO = {"packed": False}
-
-
-def normalize_token_ids(tokenized_output) -> list[int]:
-    """Normalize tokenizer outputs into a flat list[int]."""
-    token_ids = tokenized_output
-    if isinstance(tokenized_output, dict):
-        if "input_ids" in tokenized_output:
-            token_ids = tokenized_output["input_ids"]
-    elif hasattr(tokenized_output, "input_ids"):
-        token_ids = tokenized_output.input_ids
-
-    if hasattr(token_ids, "tolist"):
-        token_ids = token_ids.tolist()
-
-    if isinstance(token_ids, tuple):
-        token_ids = list(token_ids)
-
-    if isinstance(token_ids, list) and len(token_ids) == 1 and isinstance(token_ids[0], (list, tuple)):
-        token_ids = list(token_ids[0])
-
-    if not isinstance(token_ids, list):
-        raise TypeError(f"token_ids must be list-like, got {type(token_ids).__name__}")
-
-    normalized_ids = []
-    for token_id in token_ids:
-        if hasattr(token_id, "item"):
-            token_id = token_id.item()
-        normalized_ids.append(int(token_id))
-    return normalized_ids
-
-
-@lru_cache(maxsize=1)
-def _tokenize_prompt(text: str) -> list[int]:
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_MODEL, trust_remote_code=True)
-    messages = [{"role": "user", "content": text}]
-    token_ids = normalize_token_ids(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False))
-    assert token_ids, "Tokenized prompt is empty"
-    return token_ids
 
 
 def _sampling_params(seed: int = 42) -> OmniDiffusionSamplingParams:
@@ -99,12 +58,11 @@ async def _generate_once(
     request_id: str,
     sampling_params: OmniDiffusionSamplingParams,
 ) -> OmniRequestOutput:
-    prompt_ids = _tokenize_prompt(prompt)
-    prompt_dict = {"prompt_ids": prompt_ids}
-
     last_output = None
+    # The pipeline tokenizes text itself; pre-tokenized ids are rejected at
+    # engine admission for in-tree diffusion pipelines.
     async for output in engine.generate(
-        prompt=prompt_dict,
+        prompt={"prompt": prompt},
         request_id=request_id,
         sampling_params_list=[sampling_params],
         output_modalities=["image"],
@@ -154,9 +112,11 @@ def _ipc_handle_exporter(request_q, response_q) -> None:
     dtype_names: list[str] = []
     shapes: list[list[int]] = []
     ipc_handles: list[dict[str, tuple]] = []
+    exported_weights: list[torch.Tensor] = []
 
     for name, cpu_tensor in tensors:
         weight = cpu_tensor.to("cuda").contiguous()
+        exported_weights.append(weight)
         names.append(name)
         dtype_names.append(str(weight.dtype).split(".")[-1])
         shapes.append(list(weight.shape))
@@ -170,8 +130,9 @@ def _ipc_handle_exporter(request_q, response_q) -> None:
         ipc_handles=ipc_handles,
     )
     response_q.put(asdict(update_info))
-    # Block until the caller releases us; exiting would free the IPC storages.
+    # Keep every source storage alive until the receiver has imported it.
     request_q.get()
+    del exported_weights
 
 
 def _spawn_ipc_exporter(source_tensors: list[tuple[str, torch.Tensor]]):
