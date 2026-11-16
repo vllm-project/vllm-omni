@@ -48,8 +48,8 @@ REQUEST_IDENTITY_EXTRA_ARGS = frozenset({"latent_cache_key"})
 # FLUX.2 Klein supports up to four reference images.
 FLUX2_KLEIN_MAX_INPUT_IMAGES = 4
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
-# Qwen-Image 2.1 image-conditioned generation caps condition images at 4.
-QWEN_IMAGE_21_MAX_INPUT_IMAGES = 4
+# Qwen-Image 2.1 supports up to 10 reference images for image-conditioned generation.
+QWEN_IMAGE_21_MAX_INPUT_IMAGES = 10
 # Upstream HunyuanImage-3.0 "Multi-Image Fusion" caps reference images at 3.
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
 JOY_IMAGE_EDIT_MAX_INPUT_IMAGES = 1
