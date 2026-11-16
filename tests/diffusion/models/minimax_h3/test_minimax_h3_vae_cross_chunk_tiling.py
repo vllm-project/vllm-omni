@@ -3,7 +3,9 @@
 
 """CPU scheduling tests for the MiniMax-H3 cross-chunk tile decoder."""
 
+import importlib.util
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -178,6 +180,67 @@ def test_original_checkpoint_does_not_need_a_private_component_marker():
     adapter = _FakeAdapter()
     del adapter.model._h3_component_group_supported
     assert reshape_module._supported(adapter.model, torch.zeros(1, 1, 4, 4, 4))
+
+
+def test_native_stacked_batches_keep_their_original_path():
+    adapter = _FakeAdapter()
+    adapter.model.stack_tiling = True
+    assert not reshape_module._supported(adapter.model, torch.zeros(1, 1, 4, 4, 4))
+
+
+class _BatchSensitiveProjection(nn.Linear):
+    def __init__(self):
+        super().__init__(1, 1)
+        self.calls: list[int] = []
+
+    def forward(self, value):
+        self.calls.append(value.shape[0])
+        # Reproduce a backend whose batched GEMM rounds differently.
+        return value + (0.25 if value.shape[0] > 1 else 0.0)
+
+
+@pytest.mark.parametrize("batch", [3, 4])
+def test_ffn_projection_keeps_reference_batch_and_restores_forward(batch):
+    projection = _BatchSensitiveProjection()
+    model = types.SimpleNamespace(
+        decoder=types.SimpleNamespace(
+            transformer_blocks=[types.SimpleNamespace(ff=types.SimpleNamespace(w1=projection))]
+        )
+    )
+    value = torch.arange(batch, dtype=torch.float32).reshape(batch, 1, 1)
+    assert not torch.equal(projection(value), value)
+    projection.calls.clear()
+    with reshape_module._reference_ffn_projection_batches(model, 1):
+        result = projection(value)
+    assert torch.equal(result, value)
+    assert projection.calls == [1] * batch
+    assert "forward" not in projection.__dict__
+    assert not torch.equal(projection(value), value)
+
+
+def test_ffn_projection_restores_forward_on_failure():
+    projection = _BatchSensitiveProjection()
+    model = types.SimpleNamespace(
+        decoder=types.SimpleNamespace(
+            transformer_blocks=[types.SimpleNamespace(ff=types.SimpleNamespace(w1=projection))]
+        )
+    )
+    with pytest.raises(RuntimeError, match="consumer failed"):
+        with reshape_module._reference_ffn_projection_batches(model, 1):
+            raise RuntimeError("consumer failed")
+    assert "forward" not in projection.__dict__
+
+
+def test_precision_comparator_checks_float_bits_including_signed_zero():
+    path = Path(__file__).resolve().parents[4] / "benchmarks/diffusion/minimax_h3_vae_precision.py"
+    spec = importlib.util.spec_from_file_location("h3_precision_benchmark", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    result = getattr(module, "compare")(torch.tensor([-0.0]), torch.tensor([0.0]))
+    assert result["different_values"] == 0
+    assert result["different_bytes"] > 0
+    assert result["bit_exact"] is False
 
 
 def _gather_worker(rank, rendezvous):
