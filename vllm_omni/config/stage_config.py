@@ -1067,7 +1067,7 @@ def _merge_platforms(
     base: dict[str, Any] | None,
     overlay: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Deep-merge two ``platforms:`` blocks per-platform, per-stage_id."""
+    """Merge platform blocks by stage ID and named connector definition."""
     if not base and not overlay:
         return None
     base = base or {}
@@ -1078,6 +1078,9 @@ def _merge_platforms(
         op = overlay.get(plat) or {}
         merged_plat = {**bp, **{k: v for k, v in op.items() if k != "stages"}}
         merged_plat["stages"] = _merge_stage_lists(bp.get("stages"), op.get("stages"))
+        connectors = _merge_connectors(bp.get("connectors"), op.get("connectors"))
+        if connectors is not None:
+            merged_plat["connectors"] = connectors
         merged[plat] = merged_plat
     return merged
 
@@ -1211,6 +1214,8 @@ def _apply_platform_overrides(
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
     platform_section = (deploy.platforms or {}).get(platform) if platform is not None else None
+    if platform_section is not None and "connectors" in platform_section:
+        deploy.connectors = _merge_connectors(deploy.connectors, platform_section["connectors"])
     if platform_section is not None and "cuda_mps" in platform_section:
         cuda_mps = platform_section["cuda_mps"]
         if not isinstance(cuda_mps, bool):

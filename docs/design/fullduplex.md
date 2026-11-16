@@ -510,6 +510,12 @@ for queue updates and the final validity check before delivery.
   resumable responses also defer video-only commits. If response creation is
   disabled on the commit, a later explicit `response.create` must drain the
   held prefixes before submitting the terminal payload.
+- **Coalesced camera commits.** Single-terminal models such as JoyAI combine
+  frames from retained camera commits in capture order. The newest commit
+  owns the response while earlier committed frames remain available to model
+  memory. Retained frames continue to consume the pending-input byte budget
+  until submission or cleanup. Before commit, the model's frame buffer applies
+  its sampling policy, such as retaining only the latest camera frame.
 - **Cancel is atomic at the session.** `CancelResponse` / `BargeIn` advance
   the epoch, cancel tracked append tasks, abort the owned stage bindings
   through the stage port and emit the cancelled terminal events before

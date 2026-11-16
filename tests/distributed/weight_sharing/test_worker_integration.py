@@ -239,6 +239,7 @@ def test_loader_handles_are_reused_and_detached_before_release(weight_sharing, m
             current_omni_platform=mocker.Mock(current_device=lambda: 0),
             gc=mocker.Mock(),
             get_process_gpu_memory=lambda device: None,
+            _flashinfer_autotune_wanted=mocker.Mock(return_value=False),
             DiffusionLoRAManager=RetainingManager,
             LoRABackend=SimpleNamespace(PEFT="peft"),
         ),
