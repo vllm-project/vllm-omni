@@ -156,10 +156,10 @@ class ConversationHistory:
     # Every non-placeholder insertion must call _track_history_message;
     # removing one must call _forget_history_message. Placeholders are untracked.
     sources: dict[int, HistorySource] = field(default_factory=dict)
-    #: User items added by ``conversation.item.create`` that no response has
-    #: answered yet. A turn can start from these alone, the way the Realtime
-    #: protocol allows, without any audio having been committed.
-    unanswered_user_items: int = 0
+    # Notifications without a history source (for example initial_user_text).
+    unbound_user_items: int = 0
+    # New and capacity-rejected inputs share the same source-scoped readiness.
+    unanswered_user_source_ids: set[int] = field(default_factory=set)
     item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
     history_item_placeholders: dict[str, dict[str, object]] = field(default_factory=dict)
     item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
@@ -569,11 +569,14 @@ class DuplexEngineSession:
             if not changed:
                 return
             source.revision += 1
+        if message.get("role") != "user":
+            self._conversation.unanswered_user_source_ids.discard(source.source_id)
         self._conversation.revision += 1
 
     def _forget_history_message(self, message: dict[str, object]) -> None:
         if id(message) in self._conversation.sources:
-            self._history_source(message)
+            source = self._history_source(message)
+            self._conversation.unanswered_user_source_ids.discard(source.source_id)
             del self._conversation.sources[id(message)]
             self._conversation.revision += 1
 
@@ -784,9 +787,9 @@ class DuplexEngineSession:
         if (
             candidate.initial_user_text
             and candidate.initial_user_text != previous.initial_user_text
-            and self._conversation.unanswered_user_items > 0
+            and self._conversation.unbound_user_items > 0
         ):
-            self._conversation.unanswered_user_items -= 1
+            self._conversation.unbound_user_items -= 1
         self.config = previous
         if self.config_generation > 0:
             self.config_generation -= 1
@@ -866,17 +869,48 @@ class DuplexEngineSession:
         self._conversation.messages.append(message)
         self._track_history_message(message)
 
-    def notify_new_user_item(self) -> None:
-        """Record a user item that a later ``response.create`` may answer."""
-        self._conversation.unanswered_user_items += 1
+    def notify_new_user_item(self, message: dict[str, object] | None = None) -> None:
+        """Mark an owned user message or an unbound seed ready for a response."""
+        if message is None:
+            self._conversation.unbound_user_items += 1
+        else:
+            self._conversation.unanswered_user_source_ids.add(self._history_source(message).source_id)
+
+    def user_source_ids_for_items(self, item_ids: Iterable[str]) -> tuple[int, ...]:
+        """Resolve current user item identities without copying a history snapshot."""
+        return tuple(
+            self._history_source(message).source_id
+            for item_id in item_ids
+            if (message := self._conversation.item_ids.get(item_id)) is not None and message.get("role") == "user"
+        )
+
+    def pending_user_source_ids(self) -> tuple[int, ...]:
+        """Capture exact input eligibility before an asynchronous response attempt."""
+        return tuple(sorted(self._conversation.unanswered_user_source_ids))
+
+    def restore_unanswered_user_sources(self, source_ids: tuple[int, ...]) -> None:
+        """Rearm still-effective rejected input without consuming new arrivals.
+
+        Corrections/transcripts keep the source identity; deletion/recreation
+        removes it. Repeated compensation is idempotent.
+        """
+        live = {
+            self._history_source(message).source_id
+            for message in self._visible_history_messages()
+            if message.get("role") == "user"
+        }
+        pending = self._conversation.unanswered_user_source_ids
+        pending.intersection_update(live)
+        pending.update(source_id for source_id in source_ids if source_id in live)
 
     def unanswered_user_items(self) -> int:
-        """How many user items are waiting for a response."""
-        return self._conversation.unanswered_user_items
+        """Count unbound seeds and effective user sources awaiting a response."""
+        return self._conversation.unbound_user_items + len(self._conversation.unanswered_user_source_ids)
 
     def reset_unanswered_user_items(self) -> None:
         """A turn has started: the pending items are now its input."""
-        self._conversation.unanswered_user_items = 0
+        self._conversation.unbound_user_items = 0
+        self._conversation.unanswered_user_source_ids.clear()
 
     @property
     def pending_input_bytes(self) -> int:
