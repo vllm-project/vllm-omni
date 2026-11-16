@@ -203,12 +203,13 @@ class OmniPlatform(Platform):
 
     @classmethod
     def has_flash_attn_package(cls) -> bool:
-        """Check if a Flash Attention package is available and usable on this platform."""
+        """Whether a FlashAttention implementation (vLLM's or a standalone package) is
+        available for the diffusion FLASH_ATTN backend."""
         return False
 
     @classmethod
     def supports_standalone_flash_attn(cls) -> bool:
-        """Whether the ``flash_attn`` package imports and can run on this platform."""
+        """Whether the standalone ``flash_attn`` package imports and can run on this GPU."""
         try:
             import flash_attn  # noqa: F401
         except ImportError:
