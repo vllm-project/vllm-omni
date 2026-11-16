@@ -430,6 +430,144 @@ class TestDistributedLayerwiseOffloadHook:
                 atol=0,
             )
 
+    @pytest.mark.parametrize("mode", ["cast", "reactor"])
+    def test_int8_nz_upload_and_double_buffer(self, patched_offload_runtime, mocker, mode):
+        from vllm_omni.quantization import npu_int8_weight_nz as nz
+
+        block = nn.Module()
+        block.weight = nn.Parameter(torch.arange(512).to(torch.int8).reshape(16, 32), requires_grad=False)
+        block.padded_weight = nn.Parameter(torch.arange(561).to(torch.int8).reshape(17, 33), requires_grad=False)
+        block.weight_scale = nn.Parameter(torch.arange(33, dtype=torch.float32), requires_grad=False)
+        expected = {name: tensor.detach().clone() for name, tensor in block.named_parameters()}
+        mocker.patch.object(nz, "get_weight_nz_mode", return_value=mode)
+        mocker.patch.object(nz, "int8_weight_names", return_value={"weight", "padded_weight"})
+        mocker.patch.object(nz, "check_reactor_support")
+        events = []
+        converted = []
+
+        def cast(weight):
+            events.append("cast")
+            result = weight.clone()
+            result.npu_format = 29
+            converted.append(result)
+            return result
+
+        def view(buffer, offset, shape):
+            physical = buffer[offset : offset + nz.nz_storage_numel(shape)]
+            result = nz.unpack_nz_weight(physical, shape)
+            result.npu_format = 29
+            converted.append(result)
+            return result
+
+        cast_op = mocker.patch.object(nz, "cast_weight_to_nz", side_effect=cast)
+        view_op = mocker.patch.object(nz, "nz_view", side_effect=view)
+        bind = mocker.spy(dist_backend_module, "set_tensor_storage")
+        hook = DistributedLayerwiseOffloadHook(
+            block, torch.device("cpu"), dp_group=None, dp_size=1, rank=0, pin_memory=False
+        )
+        hook.initialize_hook(nn.Module())
+        metadata = hook.metadata[torch.int8]
+        assert [meta["offset"] for meta in metadata] == [0, 512]
+        assert [meta["numel"] for meta in metadata] == ([512, 2048] if mode == "reactor" else [512, 561])
+        assert all(meta["weight_nz"] == mode for meta in metadata)
+        assert "weight_nz" not in hook.metadata[torch.float32][0]
+
+        def make_event():
+            event = mocker.Mock()
+            event.record.side_effect = lambda _stream: events.append(event)
+            return event
+
+        mocker.patch.object(dist_backend_module.current_omni_platform, "Event", side_effect=make_event)
+        compute = mocker.Mock(wraps=DummyStream())
+        mocker.patch.object(dist_backend_module.current_omni_platform, "current_stream", return_value=compute)
+        buffers = [slot[torch.int8] for slot in hook.gpu_buffers]
+        assert buffers[0].data_ptr() != buffers[1].data_ptr()
+        for slot in (0, 1, 0):
+            events.clear()
+            converted.clear()
+            bind.reset_mock()
+            view_op.reset_mock()
+            hook.prefetch_layer(slot, non_blocking=False)
+            for name, tensor in block.named_parameters():
+                assert torch.equal(tensor, expected[name])
+            for call, result in zip(bind.call_args_list[:2], converted, strict=True):
+                assert call.args[1] is result
+                assert result.npu_format == 29
+                assert call.args[0].data_ptr() == result.data_ptr()
+            if mode == "reactor":
+                cast_op.assert_not_called()
+                assert view_op.call_count == 2
+                for call, meta in zip(view_op.call_args_list, metadata, strict=True):
+                    assert call.args[0] is buffers[slot]
+                    assert call.args[1:] == (meta["offset"], meta["shape"])
+                    physical = buffers[slot][meta["offset"] : meta["offset"] + meta["numel"]]
+                    assert torch.equal(physical, nz.pack_nz_weight(expected[meta["name"]]))
+            else:
+                view_op.assert_not_called()
+                assert events.count("cast") == 2
+                assert events[-1] is hook.ready_events[slot]
+                hook.ready_events[slot].record.assert_called_once_with(hook.copy_stream)
+            hook._wait_for_weights(slot)
+            compute.wait_event.assert_called_with(hook.ready_events[slot])
+
+    @pytest.mark.parametrize("dp_size", [1, 2])
+    def test_int8_nz_restore_and_reenable(self, patched_offload_runtime, mocker, dp_size):
+        from vllm_omni.quantization import npu_int8_weight_nz as nz
+
+        expected = torch.arange(561).to(torch.int8).reshape(17, 33)
+        scale = torch.arange(33, dtype=torch.float32)
+        blocks = []
+        for _ in range(dp_size):
+            block = nn.Module()
+            block.weight = nn.Parameter(expected.clone(), requires_grad=False)
+            block.weight_scale = nn.Parameter(scale.clone(), requires_grad=False)
+            blocks.append(block)
+        mocker.patch.object(nz, "get_weight_nz_mode", return_value="reactor")
+        mocker.patch.object(nz, "int8_weight_names", return_value={"weight"})
+        mocker.patch.object(nz, "check_reactor_support")
+        mocker.patch.object(
+            nz,
+            "nz_view",
+            side_effect=lambda buffer, offset, shape: nz.unpack_nz_weight(
+                buffer[offset : offset + nz.nz_storage_numel(shape)], shape
+            ),
+        )
+        cast_op = mocker.patch.object(nz, "cast_weight_to_nz")
+        previous_shards = None
+        for _ in range(2):
+            hooks = []
+            for rank, block in enumerate(blocks):
+                hook = DistributedLayerwiseOffloadHook(
+                    block,
+                    torch.device("cpu"),
+                    dp_group=object() if dp_size > 1 else None,
+                    dp_size=dp_size,
+                    rank=rank,
+                    pin_memory=False,
+                )
+                hook.initialize_hook(nn.Module())
+                hook.gpu_shard_buffers = [
+                    {dtype: torch.empty_like(shard) for dtype, shard in hook.cpu_shards.items()} for _ in range(2)
+                ]
+                hooks.append(hook)
+
+            def allgather(output, local_shard, *, group):
+                del group
+                output.copy_(torch.cat([hook.cpu_shards[local_shard.dtype] for hook in hooks]))
+
+            mocker.patch.object(torch.distributed, "all_gather_into_tensor", side_effect=allgather)
+            shards = [hook.cpu_shards[torch.int8].clone() for hook in hooks]
+            if previous_shards is not None:
+                assert all(torch.equal(before, after) for before, after in zip(previous_shards, shards, strict=True))
+            previous_shards = shards
+            for hook, block in zip(hooks, blocks, strict=True):
+                hook.prefetch_layer(1, non_blocking=False)
+                hook.restore_next_block_to_cpu()
+                assert block.weight.device.type == "cpu"
+                assert torch.equal(block.weight, expected)
+                assert torch.equal(block.weight_scale, scale)
+        cast_op.assert_not_called()
+
     def test_allgather_reconstructs_online_mxfp8_weight_and_scale(
         self,
         patched_offload_runtime,
