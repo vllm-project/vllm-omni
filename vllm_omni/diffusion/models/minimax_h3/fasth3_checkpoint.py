@@ -181,6 +181,10 @@ class FastH3CheckpointSpec:
             raise ValueError(
                 f"{self.name} pins VSA sparsity={self.vsa_sparsity}; remove the fixed fastvideo_vsa_topk override"
             )
+        if attention.fastvideo_vsa_sparsity is not None:
+            raise ValueError(
+                f"{self.name} pins VSA sparsity={self.vsa_sparsity}; remove the fastvideo_vsa_sparsity override"
+            )
         parallel = od_config.parallel_config
         if parallel.ring_degree != 1 or parallel.allgather_degree != 1:
             raise ValueError(f"{self.name} supports local attention or pure Ulysses sequence parallelism")
@@ -189,6 +193,11 @@ class FastH3CheckpointSpec:
             if spec.fastvideo_vsa_topk is not None:
                 raise ValueError(
                     f"{self.name} pins VSA sparsity={self.vsa_sparsity}; remove the fixed fastvideo_vsa_topk "
+                    f"override from attention schedule profile {name!r}"
+                )
+            if spec.fastvideo_vsa_sparsity is not None:
+                raise ValueError(
+                    f"{self.name} pins VSA sparsity={self.vsa_sparsity}; remove the fastvideo_vsa_sparsity "
                     f"override from attention schedule profile {name!r}"
                 )
         check_scheduled_vsa_providers(od_config, name=self.name, tile_size=self.vsa_tile_size)

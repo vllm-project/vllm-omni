@@ -153,6 +153,7 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
     """Apply release-specific H3 routing after parallel attention dispatch."""
 
     _supports_tile64_provider = True
+    _supports_sparsity_ratio = True
 
     def _forward_h3(
         self,
@@ -186,6 +187,10 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
 
         block_size = attn_metadata.extra.get("vsa_h3_tile_size", 64)
         sparsity = attn_metadata.extra.get("vsa_h3_sparsity")
+        if sparsity is None and block_size == 64:
+            # An adapter pins no policy in its checkpoint, so the deployment may
+            # configure a ratio. A checkpoint-pinned sparsity always wins.
+            sparsity = self.sparsity
         if block_size == 128:
             if attn_metadata.extra.get("vsa_h3_ref_policy") != "p2_multi_region":
                 raise ValueError("FastH3 Omni tile 128 requires p2_multi_region routing")

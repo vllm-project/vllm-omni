@@ -163,6 +163,61 @@ def test_v2_uses_trained_sparsity_instead_of_legacy_fixed_topk(monkeypatch, topk
     assert output.shape == query.shape and torch.isfinite(output).all()
 
 
+@pytest.mark.parametrize(
+    ("video_shape", "kept"),
+    [((8, 8, 8), 1), ((40, 8, 8), 4), ((80, 8, 8), 8)],
+    ids=["8_tiles", "40_tiles", "80_tiles"],
+)
+def test_adapter_sparsity_ratio_scales_the_kept_tiles_with_the_request_shape(monkeypatch, video_shape, kept):
+    calls: dict[str, Any] = {}
+    _fake_block_sparse_kernel(monkeypatch, calls)
+    seq_len = 5 + math.prod(video_shape)
+    query = torch.randn(1, seq_len, 2, 8, dtype=torch.bfloat16)
+
+    # No checkpoint-pinned policy in the metadata: this is the adapter path.
+    output = _h3_impl(sparsity=0.9).forward_cuda(query, query, query, _h3_metadata((5,), video_shape))
+
+    mask = calls["block_map"]
+    assert mask[..., :1].all() and mask[..., :1, :].all(), "prefix queries and keys stay dense"
+    assert (mask[..., 1:, 1:].sum(-1) == kept).all()  # ceil(10% of the video tiles)
+    assert output.shape == query.shape and torch.isfinite(output).all()
+
+
+def test_adapter_fixed_topk_is_unchanged_without_a_sparsity_ratio(monkeypatch):
+    calls: dict[str, Any] = {}
+    _fake_block_sparse_kernel(monkeypatch, calls)
+    query = torch.randn(1, 5 + 40 * 8 * 8, 2, 8, dtype=torch.bfloat16)
+
+    _h3_impl(topk=2).forward_cuda(query, query, query, _h3_metadata((5,), (40, 8, 8)))
+
+    assert (calls["block_map"][..., 1:, 1:].sum(-1) == 2).all()
+
+
+def test_checkpoint_pinned_sparsity_wins_over_a_configured_ratio(monkeypatch):
+    calls: dict[str, Any] = {}
+    _fake_block_sparse_kernel(monkeypatch, calls)
+    metadata = _h3_metadata((5,), (40, 8, 8))
+    metadata.extra.update(vsa_h3_tile_size=64, vsa_h3_sparsity=0.8)
+    query = torch.randn(1, 5 + 40 * 8 * 8, 2, 8, dtype=torch.bfloat16)
+
+    _h3_impl(sparsity=0.9).forward_cuda(query, query, query, metadata)
+
+    assert (calls["block_map"][..., 1:, 1:].sum(-1) == 8).all()  # ceil(20% of forty video tiles)
+
+
+@pytest.mark.parametrize("sparsity", [0.0, 1.0, -0.1])
+def test_h3_rejects_an_out_of_range_sparsity_ratio_at_construction(sparsity):
+    with pytest.raises(ValueError, match="sparsity must be in"):
+        _h3_impl(sparsity=sparsity)
+
+
+def test_shared_vsa_route_rejects_a_sparsity_ratio():
+    from vllm_omni.diffusion.attention.backends.fastvideo_vsa import FastVideoVSAImpl
+
+    with pytest.raises(ValueError, match="only the MiniMax-H3 route"):
+        FastVideoVSAImpl(num_heads=2, head_size=8, softmax_scale=8**-0.5, backend_kwargs={"sparsity": 0.9})
+
+
 @pytest.mark.parametrize("failure", ["missing-layout", "unequal-lengths", "kernel"])
 def test_v2_never_replaces_trained_sparse_attention_with_dense(monkeypatch, failure):
     impl = _h3_impl(fallback_on_error=True)

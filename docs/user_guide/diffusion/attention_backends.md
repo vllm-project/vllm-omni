@@ -114,6 +114,7 @@ Backend-specific typed blocks are documented with their consumers:
 - `sparge`: [SPARGE Attention](attention_backends/sparge.md#configuration).
 - `block_sparse`: [RainFusion](attention_backends/rainfusion.md#configuration).
 - `fastvideo_vsa_topk`: [FastVideo VSA](attention_backends/fastvideo_vsa.md#choose-top-k).
+- `fastvideo_vsa_sparsity`: [FastVideo VSA](attention_backends/fastvideo_vsa.md#keep-a-ratio-instead-of-a-count-on-the-four-step-adapter).
 
 ## Platform defaults
 

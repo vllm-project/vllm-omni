@@ -273,6 +273,17 @@ def test_v2_serving_contract_reads_a_per_role_fixed_topk_override():
         spec.check_serving_contract(partition="fl2va", od_config=config)
 
 
+def test_v2_serving_contract_rejects_a_sparsity_ratio_override():
+    spec = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
+    config = OmniDiffusionConfig(
+        diffusion_attention_config=AttentionConfig(
+            default=AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_sparsity=0.9)
+        ),
+    )
+    with pytest.raises(ValueError, match="remove the fastvideo_vsa_sparsity override"):
+        spec.check_serving_contract(partition="fl2va", od_config=config)
+
+
 def _scheduled(profile: AttentionConfig) -> OmniDiffusionConfig:
     """A valid V2 baseline with one schedule profile, ``sparse``."""
     return OmniDiffusionConfig(
@@ -292,6 +303,13 @@ def _scheduled(profile: AttentionConfig) -> OmniDiffusionConfig:
 def test_v2_serving_contract_rejects_a_scheduled_fixed_topk_on_the_dit_role(profile):
     spec = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
     with pytest.raises(ValueError, match="fixed fastvideo_vsa_topk override from attention schedule profile 'sparse'"):
+        spec.check_serving_contract(partition="fl2va", od_config=_scheduled(profile))
+
+
+def test_v2_serving_contract_rejects_a_scheduled_sparsity_ratio_on_the_dit_role():
+    spec = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
+    profile = AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_sparsity=0.9))
+    with pytest.raises(ValueError, match="fastvideo_vsa_sparsity override from attention schedule profile 'sparse'"):
         spec.check_serving_contract(partition="fl2va", od_config=_scheduled(profile))
 
 

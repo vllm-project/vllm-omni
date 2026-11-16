@@ -2386,6 +2386,9 @@ class AttentionSpec:
     sparge: SpargeAttnSpec | None = None
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
+    # Fraction of video blocks each query drops; the kept count then follows the
+    # request shape instead of staying at a fixed top-k.
+    fastvideo_vsa_sparsity: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str):
@@ -2419,6 +2422,18 @@ class AttentionSpec:
                 raise ValueError("fastvideo_vsa_topk is only supported by the FASTVIDEO_VSA backend.")
             if self.fastvideo_vsa_topk <= 0:
                 raise ValueError("fastvideo_vsa_topk must be positive.")
+        if self.fastvideo_vsa_sparsity is not None:
+            if self.backend.upper() != "FASTVIDEO_VSA":
+                raise ValueError("fastvideo_vsa_sparsity is only supported by the FASTVIDEO_VSA backend.")
+            sparsity = self.fastvideo_vsa_sparsity
+            if isinstance(sparsity, bool) or not isinstance(sparsity, (int, float)) or not 0.0 < sparsity < 1.0:
+                raise ValueError(f"fastvideo_vsa_sparsity must be a number in (0, 1), got {sparsity!r}.")
+            if self.fastvideo_vsa_topk is not None:
+                raise ValueError(
+                    "fastvideo_vsa_sparsity and fastvideo_vsa_topk are mutually exclusive: "
+                    "the ratio derives the kept block count from the request shape."
+                )
+            self.fastvideo_vsa_sparsity = float(sparsity)
         if self.sparge is not None and self.backend.upper() != "SPARGE_ATTN":
             raise ValueError(
                 f"sparge is only supported by the SPARGE_ATTN backend, but backend={self.backend!r}. "
@@ -2472,6 +2487,8 @@ class AttentionSpec:
                 kw["quant"] = quant_kw
         if self.fastvideo_vsa_topk is not None:
             kw["topk"] = self.fastvideo_vsa_topk
+        if self.fastvideo_vsa_sparsity is not None:
+            kw["sparsity"] = self.fastvideo_vsa_sparsity
         if self.sparge is not None:
             sp = self.sparge
             kw["sparge_topk"] = sp.topk
@@ -2566,6 +2583,7 @@ class AttentionConfig:
             "fastvideo_vsa_topk",
             "fastvideo_vsa_provider",
             "fastvideo_vsa_precision",
+            "fastvideo_vsa_sparsity",
             "sparge",
             "block_sparse",
         }

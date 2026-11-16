@@ -152,6 +152,9 @@ class FastVideoVSABackend(AttentionBackend):
 
 class FastVideoVSAImpl(AttentionImpl):
     _supports_tile64_provider = False
+    # Only routes that build their own block map can derive the kept count from
+    # a ratio; the shared Wan route hands a fixed top-k to the kernel.
+    _supports_sparsity_ratio = False
 
     def __init__(
         self,
@@ -193,6 +196,14 @@ class FastVideoVSAImpl(AttentionImpl):
         self.topk = int(backend_kwargs.get("topk", 64))
         if self.topk <= 0:
             raise ValueError("VSA topk must be positive")
+        sparsity = backend_kwargs.get("sparsity")
+        if sparsity is not None:
+            if not self._supports_sparsity_ratio:
+                raise ValueError("VSA sparsity is a ratio only the MiniMax-H3 route implements; set topk instead")
+            sparsity = float(sparsity)
+            if not 0.0 < sparsity < 1.0:
+                raise ValueError(f"VSA sparsity must be in (0, 1), got {sparsity}")
+        self.sparsity: float | None = sparsity
         self.block_size = self._parse_block_size(backend_kwargs.get("block_size", (4, 8, 8)))
         self.block_elements = self.block_size[0] * self.block_size[1] * self.block_size[2]
         self.min_seq_len = int(backend_kwargs.get("min_seq_len", self.block_elements * 2))
