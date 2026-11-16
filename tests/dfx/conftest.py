@@ -80,15 +80,20 @@ def assert_baseline_within_tolerance(
     """Fail when any metric in the current hardware bucket is more than ``tolerance`` worse.
 
     ``baseline`` is the sweep-resolved hardware-nested map
-    (``{"H100": {"request_throughput": 1.2}}``). An empty baseline skips
-    comparison. Missing or unmatched hardware logs a warning and skips comparison.
+    (``{"H100": {"request_throughput": 1.2}}``). Missing or empty baselines
+    and missing or unmatched hardware log a warning and skip comparison.
     """
-    if not isinstance(baseline, dict) or not baseline:
-        print(f"[baseline-check] SKIP hardware={hardware}: no baseline configured", flush=True)
-        return
-    if not isinstance(hardware, str) or not hardware or hardware not in baseline:
-        message = f"No matching baseline for hardware {hardware!r}; available hardware: {list(baseline)}"
+    if (
+        not isinstance(baseline, dict)
+        or not baseline
+        or not isinstance(hardware, str)
+        or not hardware
+        or hardware not in baseline
+    ):
+        available = list(baseline) if isinstance(baseline, dict) else []
+        message = f"No matching baseline for hardware {hardware!r}; available hardware: {available}"
         logging.getLogger(__name__).warning("[baseline-check] SKIP: %s", message)
+        print(f"[baseline-check] WARNING SKIP: {message}", flush=True)
         return
     bucket = baseline[hardware]
     if not isinstance(bucket, dict) or not bucket:
