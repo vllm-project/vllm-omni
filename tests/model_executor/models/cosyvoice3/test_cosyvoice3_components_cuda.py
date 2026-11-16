@@ -9,6 +9,13 @@ import torch
 import torch.nn as nn
 
 from tests.helpers.mark import hardware_test
+from tests.model_executor.models.cosyvoice3.test_cosyvoice3_hift_stream_batch import (
+    ATOL,
+    RTOL,
+    _run,
+    _voiced_model,
+)
+from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3_code2wav
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [
@@ -219,3 +226,24 @@ def test_causal_hift_f0_predictor_cuda_parity_and_fallback(monkeypatch):
     # Fallback output should match within numerical tolerance
     torch.testing.assert_close(s_final, s_fallback, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(wav_final, wav_fallback, atol=1e-2, rtol=1e-2)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@torch.inference_mode()
+def test_batched_streaming_hift_with_f0_on_cpu(monkeypatch):
+    """With COSYVOICE3_F0_ON_CPU=1 the F0 predictor stays on the CPU while HiFT
+    runs on CUDA; batched streaming HiFT must still match per-request HiFT."""
+    monkeypatch.setenv("COSYVOICE3_F0_ON_CPU", "1")
+    monkeypatch.setattr(cosyvoice3_code2wav, "cosyvoice3_packed_streaming_enabled", lambda: True)
+    model = _voiced_model(64).to("cuda")
+    model.hift.f0_predictor.to("cpu")
+    expected = _run(model, batched=False, device="cuda")
+    assert next(model.hift.f0_predictor.parameters()).device.type == "cpu"
+
+    monkeypatch.setattr(cosyvoice3_code2wav, "cosyvoice3_hift_batch_enabled", lambda: True)
+    actual = _run(model, batched=True, device="cuda")
+    for stream_expected, stream_actual in zip(expected, actual):
+        assert len(stream_expected) == len(stream_actual)
+        for want, got in zip(stream_expected, stream_actual):
+            assert got.device.type == "cuda"
+            torch.testing.assert_close(got, want, atol=ATOL, rtol=RTOL)

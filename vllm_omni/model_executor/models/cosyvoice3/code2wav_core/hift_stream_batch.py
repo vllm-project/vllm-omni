@@ -127,8 +127,12 @@ class StreamingHiFTBatcher:
         lefts = [width - frames if layout == "right" else 0 for frames in widths]
         for row, window in enumerate(windows):
             mel[row, :, lefts[row] : lefts[row] + widths[row]] = window.mel[0]
+        # COSYVOICE3_F0_ON_CPU=1 keeps the predictor on the CPU: run F0 there
+        # and bring it back, as CausalHiFTGenerator.inference does.
+        f0_device = next(self.hift.f0_predictor.parameters()).device
         with _tf32_disabled():
-            f0 = self.hift.f0_predictor(mel.float(), finalize=True).to(mel.dtype)
+            f0 = self.hift.f0_predictor(mel.float().to(f0_device), finalize=True)
+        f0 = f0.to(device=device, dtype=mel.dtype)
         margins = [window.margin for window in windows] + [0] * (rows - len(windows))
         # Frame of each row's decoded window start within the batch.
         origins = [0] * rows

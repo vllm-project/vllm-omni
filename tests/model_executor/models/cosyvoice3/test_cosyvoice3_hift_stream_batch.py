@@ -43,9 +43,9 @@ def _stream_chunks(seed: int, first: int, hop: int, hops: int) -> list[torch.Ten
     return [mel[:, :, start:end] for start, end in zip(bounds, bounds[1:])]
 
 
-def _run(model, batched: bool) -> list[list[torch.Tensor]]:
+def _run(model, batched: bool, device: str = "cpu") -> list[list[torch.Tensor]]:
     """Step every live stream once per step; the last hop of each is final."""
-    chunks = [_stream_chunks(seed, *spec[:3]) for seed, spec in enumerate(STREAMS)]
+    chunks = [[chunk.to(device) for chunk in _stream_chunks(seed, *spec[:3])] for seed, spec in enumerate(STREAMS)]
     states: list = [None] * len(STREAMS)
     emitted: list[list[torch.Tensor]] = [[] for _ in STREAMS]
     hop_of = [0] * len(STREAMS)
