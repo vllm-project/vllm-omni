@@ -2,19 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """JoyAI long-session lifecycle acceptance on real model stages.
 
-The continuous test runs one twelve-minute cycle by default. For an optional
-one-hour soak through the same server fixture, save this plugin as
-``/tmp/joyai_soak.py``::
+The continuous test runs one twelve-minute cycle by default. Set
+JOYAI_SOAK_CYCLES to a positive integer to select more cycles. For a one-hour
+soak, run from the repository root with the model assets available::
 
-    from functools import partial
-
-    def pytest_runtest_setup(item):
-        if item.originalname == "test_twelve_minute_observation_cancel_resume_and_readmission":
-            item.module.run_continuous = partial(item.module.run_continuous, cycles=5)
-
-Then run from the repository root with the model assets available::
-
-    PYTHONPATH=/tmp:. python -m pytest -p joyai_soak -o addopts='' \
+    JOYAI_SOAK_CYCLES=5 PYTHONPATH=. python -m pytest -o addopts='' \
         --run-level=advanced_model -m local_model -k twelve_minute \
         tests/e2e/online_serving/test_joyai_vl_interaction_expansion.py
 
@@ -25,6 +17,7 @@ share one session; close and fresh-session admission are checked at the end.
 import asyncio
 import io
 import json
+import os
 import time
 from contextlib import AsyncExitStack
 
@@ -38,6 +31,14 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.clients.duplex import DuplexClient, EventCollector, ReconnectPolicy, SessionConfig
 
 pytestmark = [pytest.mark.local_model, pytest.mark.omni]
+
+# Validate at collection, before starting the model server fixture.
+try:
+    SOAK_CYCLES = int(os.environ.get("JOYAI_SOAK_CYCLES", "1"))
+except ValueError as exc:
+    raise pytest.UsageError("JOYAI_SOAK_CYCLES must be a positive integer") from exc
+if SOAK_CYCLES < 1:
+    raise pytest.UsageError("JOYAI_SOAK_CYCLES must be a positive integer")
 
 CONFIG = SessionConfig(
     auto_response=False,
@@ -473,5 +474,6 @@ def test_twelve_minute_observation_cancel_resume_and_readmission(omni_server, tm
             f"ws://{omni_server.host}:{omni_server.port}/v1/realtime?duplex=1",
             omni_server.model,
             tmp_path,
+            cycles=SOAK_CYCLES,
         )
     )
