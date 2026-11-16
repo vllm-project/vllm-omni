@@ -1404,9 +1404,7 @@ class OmniDiffusionConfig:
 
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
-    diffusion_batching_config: DiffusionBatchingConfig | dict[str, Any] = field(
-        default_factory=DiffusionBatchingConfig
-    )
+    diffusion_batching_config: DiffusionBatchingConfig | dict[str, Any] = field(default_factory=DiffusionBatchingConfig)
 
     # Native vLLM KV-cache sizing inputs used only by paged_scheduler mode.
     # These mirror the structured stage cache/scheduler config until all

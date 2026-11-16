@@ -129,8 +129,8 @@ def test_saturation_disabled_when_zero():
 
 def test_choose_max_throughput():
     points = [
-        _point(1, 5.0),   # thr 0.2
-        _point(2, 8.0),   # thr 0.25
+        _point(1, 5.0),  # thr 0.2
+        _point(2, 8.0),  # thr 0.25
         _point(4, 14.0),  # thr ~0.286  <- winner
         _point(8, 40.0),  # thr 0.2
     ]
@@ -148,7 +148,7 @@ def test_choose_tie_takes_smaller():
 
 def test_choose_filters_budget_exceeded():
     points = [
-        _point(2, 8.0),   # thr 0.25 within 10ms
+        _point(2, 8.0),  # thr 0.25 within 10ms
         _point(4, 30.0),  # exceeds 10ms -> filtered; thr would be higher
     ]
     b, analysis = choose_sweet_spot_batch(points, max_step_ms=10.0, min_marginal_gain=0.05)
@@ -243,14 +243,10 @@ def test_cache_load_missing_and_corrupt(tmp_path):
 
 def test_cache_load_rejects_wrong_version_and_bad_bstar(tmp_path):
     key = "deadbeef"
-    (tmp_path / f"{key}.json").write_text(
-        '{"format_version": 999, "b_star": 24}', encoding="utf-8"
-    )
+    (tmp_path / f"{key}.json").write_text('{"format_version": 999, "b_star": 24}', encoding="utf-8")
     assert load_cached_profile(str(tmp_path), key) is None
 
-    (tmp_path / f"{key}.json").write_text(
-        '{"format_version": 1, "b_star": 0}', encoding="utf-8"
-    )
+    (tmp_path / f"{key}.json").write_text('{"format_version": 1, "b_star": 0}', encoding="utf-8")
     assert load_cached_profile(str(tmp_path), key) is None
 
 

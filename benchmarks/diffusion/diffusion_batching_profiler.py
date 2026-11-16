@@ -79,9 +79,7 @@ def _piecewise_fit(
     min_segment_points = max(2, min_segment_points)
     if len(points) < min_segment_points * 2:
         raise ValueError(
-            "Need at least "
-            f"{min_segment_points * 2} profiled batch sizes for piecewise fitting, "
-            f"got {len(points)}."
+            f"Need at least {min_segment_points * 2} profiled batch sizes for piecewise fitting, got {len(points)}."
         )
 
     best_fit: dict[str, float | int] | None = None
@@ -128,10 +126,7 @@ def choose_sweet_spot_batch(
 
     ref_units = reference_compute_units or min(by_units)
     if ref_units not in by_units:
-        raise ValueError(
-            f"reference_compute_units={ref_units} not found in logs; "
-            f"available values: {sorted(by_units)}"
-        )
+        raise ValueError(f"reference_compute_units={ref_units} not found in logs; available values: {sorted(by_units)}")
 
     points: list[tuple[int, float]] = []
     for batch_size, values in by_units[ref_units].items():
@@ -191,10 +186,7 @@ def main() -> None:
         "--reference-compute-units",
         type=int,
         default=None,
-        help=(
-            "Compute units for the profiled 512x512 reference request. "
-            "Defaults to the smallest value in logs."
-        ),
+        help=("Compute units for the profiled 512x512 reference request. Defaults to the smallest value in logs."),
     )
     parser.add_argument(
         "--min-samples-per-batch",

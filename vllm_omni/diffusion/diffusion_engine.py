@@ -2243,8 +2243,7 @@ class DiffusionEngine:
         min_gain = float(batching_config.warmup_profile_min_marginal_gain)
 
         cache_dir = os.path.expanduser(
-            getattr(batching_config, "warmup_profile_cache_dir", None)
-            or "~/.cache/vllm_omni/warmup_batch_profile"
+            getattr(batching_config, "warmup_profile_cache_dir", None) or "~/.cache/vllm_omni/warmup_batch_profile"
         )
         # Parallel layout changes how one request is sharded across ranks,
         # hence the per-step cost of a batch and the sweet-spot B*. Without
@@ -2316,17 +2315,13 @@ class DiffusionEngine:
                     )
 
                 self.collective_rpc("start_warmup_batch_profile", unique_reply_rank=0, exec_all_ranks=True)
-                requests = [
-                    self._make_warmup_profile_request(i, ref_h, ref_w, num_steps) for i in range(batch)
-                ]
+                requests = [self._make_warmup_profile_request(i, ref_h, ref_w, num_steps) for i in range(batch)]
                 warmup_request_ids.extend(req.request_id for req in requests)
                 outputs = self._add_requests_and_wait(requests)
                 for output in outputs:
                     if output.error:
                         raise RuntimeError(f"Warmup profile request failed: {output.error}")
-                records = self.collective_rpc(
-                    "collect_warmup_batch_profile", unique_reply_rank=0, exec_all_ranks=True
-                )
+                records = self.collective_rpc("collect_warmup_batch_profile", unique_reply_rank=0, exec_all_ranks=True)
                 records = records or []
                 agg = aggregate_step_records(records, discard_steps)
                 if not agg:
@@ -2406,9 +2401,7 @@ class DiffusionEngine:
             # in _running/_waiting with popped state poisons every later
             # schedule() call (KeyError) and kills server startup.
             try:
-                residual = [
-                    rid for rid in warmup_request_ids if self.scheduler.get_request_state(rid) is not None
-                ]
+                residual = [rid for rid in warmup_request_ids if self.scheduler.get_request_state(rid) is not None]
                 if residual:
                     logger.warning("Cleaning up %s residual warmup request(s): %s", len(residual), residual)
                     self.scheduler.finish_requests(residual, DiffusionRequestStatus.FINISHED_ABORTED)
