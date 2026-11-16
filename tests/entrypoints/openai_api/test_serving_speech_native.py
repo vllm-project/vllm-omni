@@ -15,6 +15,10 @@ import numpy as np
 import pytest
 from fastapi import FastAPI, WebSocket
 from starlette.testclient import TestClient
+from tokenizers import AddedToken, Regex, Tokenizer, decoders, normalizers, pre_tokenizers
+from tokenizers.models import BPE
+from transformers import PreTrainedTokenizerFast
+from transformers.models.qwen2.tokenization_qwen2 import PRETOKENIZE_REGEX
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.entrypoints.openai import serving_speech_stream as stream_module
@@ -23,6 +27,7 @@ from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
+    IncrementalInputNotReadyError,
     PreparedRequest,
     SpeechServingContext,
     TextCommitmentCapabilities,
@@ -32,6 +37,8 @@ from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
     Qwen3TTSAdapter,
 )
 from vllm_omni.model_executor.models.qwen3_tts.input_stream import Qwen3TTSTextInput
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import build_assistant_text
+from vllm_omni.model_executor.models.qwen3_tts.streaming_tokenizer import Qwen3TTSStreamingTokenizerSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -71,7 +78,7 @@ def native_app(text_tokenizer, mocker):
     mocker.patch.object(
         server,
         "_count_usage_text_tokens",
-        side_effect=lambda text: len(text_tokenizer.encode(text, add_special_tokens=False)),
+        side_effect=lambda text: len(server._tts_tokenizer.encode(text, add_special_tokens=False)),
     )
     server._check_model = mocker.AsyncMock(return_value=None)
     params = SamplingParams(max_tokens=1024)
@@ -119,7 +126,7 @@ def native_app(text_tokenizer, mocker):
                     kwargs["sampling_params_list"][0].max_tokens - 1,
                     engine.model_config.max_model_len - len(kwargs["prompt"]["prompt_token_ids"]) - 1,
                 ),
-                len(text_tokenizer),
+                len(server._tts_tokenizer),
                 final=stream["final"],
             )
             queue: asyncio.Queue[object] = asyncio.Queue()
@@ -156,6 +163,24 @@ def native_app(text_tokenizer, mocker):
     server.engine_client = engine
     server.model_config = engine.model_config
     server._adapter = Qwen3TTSAdapter(SpeechServingContext(server=server, engine_client=engine))
+    spec = mocker.Mock(footer_ids=[0] * 5)
+
+    def create_encoder():
+        encoder = mocker.Mock()
+        encoder.spec = spec
+        encoder.feed.side_effect = lambda text, *, final=False: (
+            [0, 0, 0] + server._tts_tokenizer.encode(text[len("<|im_start|>assistant\n") :], add_special_tokens=False)
+            if text.startswith("<|im_start|>assistant\n")
+            else server._tts_tokenizer.encode(text, add_special_tokens=False)
+        )
+        encoder.copy.side_effect = create_encoder
+        return encoder
+
+    spec.create_stream.side_effect = create_encoder
+    compile_spec = mocker.patch(
+        "vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts.Qwen3TTSStreamingTokenizerSpec",
+        return_value=spec,
+    )
     mocker.patch.object(server._adapter, "_estimate_prompt_len_async", new=mocker.AsyncMock(return_value=10))
     handler = OmniStreamingSpeechHandler(server)
     app = FastAPI()
@@ -164,7 +189,49 @@ def native_app(text_tokenizer, mocker):
     async def endpoint(websocket: WebSocket):
         await handler.handle_session(websocket)
 
-    return SimpleNamespace(app=app, server=server, engine=engine, handler=handler)
+    return SimpleNamespace(app=app, server=server, engine=engine, handler=handler, compile_spec=compile_spec)
+
+
+@pytest.fixture
+def streaming_native_app(native_app, mocker):
+    """Use real HF encoding with a small, in-memory Qwen-compatible vocabulary."""
+    byte_level = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+    vocab = {token: index for index, token in enumerate(sorted(byte_level.alphabet()))}
+    merges = []
+    for text in ("assistant", "Get", " the", " trust", " now", "自动驾驶", "系统", "正在", "运行"):
+        encoded = byte_level.pre_tokenize_str(text)[0][0]
+        left = encoded[0]
+        for right in encoded[1:]:
+            if left + right not in vocab:
+                merges.append((left, right))
+                vocab[left + right] = len(vocab)
+            left += right
+    backend = Tokenizer(BPE(vocab=vocab, merges=merges))
+    backend.decoder = decoders.ByteLevel()
+    backend.normalizer = normalizers.NFC()
+    backend.pre_tokenizer = pre_tokenizers.Sequence(
+        [pre_tokenizers.Split(Regex(PRETOKENIZE_REGEX), behavior="isolated"), byte_level]
+    )
+    backend.add_special_tokens(
+        [AddedToken(content, normalized=False, special=True) for content in ("<|im_start|>", "<|im_end|>")]
+    )
+    native_app.server._tts_tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
+    native_app.compile_spec.side_effect = Qwen3TTSStreamingTokenizerSpec
+    native_app.waiting = threading.Event()
+    native_app.candidates = []
+    prepare = native_app.server._prepare_speech_generation
+
+    async def prepare_input(request, **kwargs):
+        native_app.candidates.append((request.input, kwargs["input_complete"]))
+        try:
+            return await prepare(request, **kwargs)
+        except IncrementalInputNotReadyError:
+            native_app.waiting.set()
+            raise
+
+    mocker.patch.object(native_app.server, "_prepare_speech_generation", side_effect=prepare_input)
+    native_app.input_factory = mocker.spy(native_app.server._adapter, "create_incremental_input")
+    return native_app
 
 
 def _finish_utterance(ws):
@@ -614,6 +681,125 @@ def test_native_empty_audio_is_not_a_success(native_app):
         assert ws.receive_json()["type"] == "audio.start"
         assert ws.receive_json()["error"]
         assert ws.receive_json()["type"] == "session.done"
+
+
+def test_incremental_waits_for_stable_tokens_and_retries_the_complete_candidate(streaming_native_app):
+    app = streaming_native_app
+    with TestClient(app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
+        ws.send_json(_NATIVE_CONFIG)
+        ws.send_json({"type": "input.text", "text": "自"})
+        assert app.waiting.wait(3)
+        assert not app.engine.submissions
+        app.waiting.clear()
+        ws.send_json({"type": "input.text", "text": "动"})
+        assert app.waiting.wait(3)
+        ws.send_json(_NATIVE_CONFIG)
+        assert "utterance" in ws.receive_json()["message"]
+        assert not app.engine.submissions
+        ws.send_json({"type": "input.text", "text": "驾驶系统正在运行"})
+        assert ws.receive_json()["type"] == "audio.start"
+        assert ws.receive_bytes()
+        ws.send_json({"type": "input.text", "text": "继续说话"})
+        ws.send_json({"type": "input.done"})
+        events, _ = _finish_utterance(ws)
+        assert not any(event["type"] == "error" or event.get("error") for event in events)
+    assert app.candidates == [("自", False), ("自动", False), ("自动驾驶系统正在运行", False)]
+    app.input_factory.assert_awaited_once()
+    assert len(app.engine.submissions) == 1
+    initial = app.engine.submissions[0]["prompt"]["additional_information"]["input_stream"]
+    delivered = initial["token_ids"] + [token for _, tokens, _ in app.engine.appends for token in tokens]
+    expected = app.server._tts_tokenizer.encode(
+        build_assistant_text("自动驾驶系统正在运行继续说话"), add_special_tokens=False
+    )[3:-5]
+    assert delivered == expected
+    assert sum(final for _, _, final in app.engine.appends) == 1
+
+
+def test_incremental_word_delivery_matches_the_complete_model_encoding(streaming_native_app):
+    app = streaming_native_app
+    words = ["Get ", "the ", "trust ", "now."]
+    with TestClient(app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
+        ws.send_json(_NATIVE_CONFIG)
+        ws.send_json({"type": "input.text", "text": words[0]})
+        for word in words[1:]:
+            ws.send_json({"type": "input.text", "text": word})
+        ws.send_json({"type": "input.done"})
+        events, audio = _finish_utterance(ws)
+        assert audio
+        assert not any(event["type"] == "error" or event.get("error") for event in events)
+    assert len(app.engine.submissions) == 1
+    initial = app.engine.submissions[0]["prompt"]["additional_information"]["input_stream"]
+    delivered = initial["token_ids"] + [token for _, tokens, _ in app.engine.appends for token in tokens]
+    expected = app.server._tts_tokenizer.encode(build_assistant_text("".join(words)), add_special_tokens=False)[3:-5]
+    assert delivered == expected
+    assert int(initial["final"]) + sum(final for _, _, final in app.engine.appends) == 1
+
+
+def test_incremental_eof_flushes_an_unbuilt_input_and_allows_connection_reuse(streaming_native_app):
+    app = streaming_native_app
+    with TestClient(app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
+        ws.send_json(_NATIVE_CONFIG)
+        ws.send_json({"type": "input.text", "text": "自"})
+        assert app.waiting.wait(3)
+        assert not app.engine.submissions
+        ws.send_json({"type": "input.done"})
+        events, audio = _finish_utterance(ws)
+        assert audio
+        assert not events[-2]["error"]
+        assert events[-1]["utterance_index"] == 0
+        assert app.candidates == [("自", False), ("自", True)]
+        initial = app.engine.submissions[0]["prompt"]["additional_information"]["input_stream"]
+        assert initial == {
+            "token_ids": app.server._tts_tokenizer.encode(build_assistant_text("自"), add_special_tokens=False)[3:-5],
+            "final": True,
+        }
+        assert not app.engine.appends
+        ws.send_json({"type": "input.text", "text": "自动驾驶系统正在运行"})
+        ws.send_json({"type": "input.done"})
+        events, _ = _finish_utterance(ws)
+        assert not any(event["type"] == "error" or event.get("error") for event in events)
+        assert events[-1]["utterance_index"] == 1
+    assert len(app.engine.submissions) == app.input_factory.await_count == 2
+    app.compile_spec.assert_called_once()
+    assert not app.engine.active and not app.engine.cancelled
+
+
+@pytest.mark.parametrize("close", [False, True])
+def test_incremental_disconnect_while_tokenizer_waits_does_not_submit(streaming_native_app, mocker, close):
+    app = streaming_native_app
+    cleanup = mocker.spy(app.handler, "_cleanup_incremental_utterance")
+    with TestClient(app.app) as client:
+        with client.websocket_connect("/v1/audio/speech/stream") as ws:
+            ws.send_json(_NATIVE_CONFIG)
+            ws.send_json({"type": "input.text", "text": "自"})
+            assert app.waiting.wait(3)
+            if close:
+                ws.send_json({"type": "session.close"})
+                assert ws.receive()["type"] == "websocket.close"
+    states = [call.args[0] for call in cleanup.call_args_list if call.args[0] is not None]
+    assert states and all(state.worker.done() for state in states)
+    assert not app.engine.submissions and not app.engine.appends
+
+
+def test_incremental_tokenizer_wait_does_not_start_the_generation_deadline(streaming_native_app, monkeypatch):
+    app = streaming_native_app
+    monkeypatch.setattr(stream_module, "_MAX_INCREMENTAL_UTTERANCE_SECONDS", 0.1)
+    with TestClient(app.app) as client, client.websocket_connect("/v1/audio/speech/stream") as ws:
+        ws.send_json(_NATIVE_CONFIG)
+        ws.send_json({"type": "input.text", "text": "自"})
+        assert app.waiting.wait(3)
+        client.portal.call(asyncio.sleep, 0.15)
+        ws.send_json(_NATIVE_CONFIG)
+        assert "utterance" in ws.receive_json()["message"]
+        assert not app.engine.submissions
+        ws.send_json({"type": "input.text", "text": "动驾驶系统正在运行"})
+        assert ws.receive_json()["type"] == "audio.start"
+        assert ws.receive_bytes()
+        ws.send_json({"type": "input.done"})
+        events, _ = _finish_utterance(ws)
+        assert not any(event["type"] == "error" or event.get("error") for event in events)
+    assert len(app.engine.submissions) == 1
+    assert not app.engine.cancelled
 
 
 def test_incremental_commitment_starts_before_a_sentence_boundary(native_app, text_tokenizer):

@@ -190,12 +190,39 @@ class PreparedRequest:
     output_policy: OutputPolicy = field(default_factory=OutputPolicy)
 
 
+class IncrementalInputNotReadyError(Exception):
+    """Recoverable initial-input wait, not an invalid request or engine error."""
+
+
 class IncrementalTTSInput(Protocol):
     """Model-owned input conversion for one ordinary TTS request.
 
     Each call receives released frontend text, not token IDs or a batch of
     requests. The handler owns submission, output consumption, cancellation, and
-    EOF. An empty final append closes text input without ending generation.
+    EOF. Calls on an instance must be serialized.
+
+    Input conversion must preserve the complete-input model encoding regardless
+    of source chunking or delivery batching. Already submitted input is never
+    revised; EOF flushes the remaining encoding exactly once.
+
+    Before the first successful build, the caller accumulates initial text.
+    ``build`` receives the entire candidate, returning a request or raising
+    ``IncrementalInputNotReadyError`` if more input is required. This signal
+    neither submits a request nor consumes caller-owned input; retry with the
+    complete candidate, not only the newly arrived suffix. Implementations may
+    cache speculative encoding to avoid reprocessing an unchanged prefix.
+
+    EOF cannot require more input: ``build(final=True)`` either returns a
+    complete initial request or raises an actual input/construction error.
+    Catch only ``IncrementalInputNotReadyError`` as a normal wait. Other build
+    failures terminate the utterance; discard the instance rather than retrying.
+    A successful build is performed exactly once per instance.
+
+    After a successful build, ``append`` consumes each text delta exactly once.
+    It may buffer text without submitting an engine update. An empty final
+    append flushes pending text and closes input without ending generation.
+    Append/delivery failures terminate the utterance; do not retry a delta
+    whose engine delivery may already have occurred.
     """
 
     async def build(self, text: str, *, final: bool) -> PreparedRequest: ...
@@ -482,6 +509,7 @@ class DiffusionTTSAdapter(TTSModelAdapter):
 __all__ = [
     "ARTTSAdapter",
     "DiffusionTTSAdapter",
+    "IncrementalInputNotReadyError",
     "IncrementalTTSInput",
     "OutputPolicy",
     "PreparedRequest",

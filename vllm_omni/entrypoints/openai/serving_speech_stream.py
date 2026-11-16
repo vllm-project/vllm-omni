@@ -85,7 +85,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.speech_text_splitter import SpeechTextSplitter
 from vllm_omni.entrypoints.openai.speech_usage import SpeechOutputTokenCounter
-from vllm_omni.entrypoints.openai.tts_adapters.base import IncrementalTTSInput
+from vllm_omni.entrypoints.openai.tts_adapters.base import IncrementalInputNotReadyError, IncrementalTTSInput
 from vllm_omni.model_executor.stage_input_processors.streaming_text_frontend import (
     StreamingTextFrontend,
     StreamingTextFrontendConfig,
@@ -636,7 +636,12 @@ class OmniStreamingSpeechHandler:
         return usage_acc.stage0_finish_reason
 
     async def _run_incremental_utterance(
-        self, websocket: WebSocket, state: _IncrementalUtterance, initial_text: str, final: bool
+        self,
+        websocket: WebSocket,
+        state: _IncrementalUtterance,
+        initial_text: str,
+        final: bool,
+        ready: asyncio.Future[None],
     ) -> None:
         if not initial_text.strip():
             return
@@ -644,17 +649,26 @@ class OmniStreamingSpeechHandler:
         assert adapter is not None
         request = self._incremental_request(state.config, initial_text)
         model_input = await adapter.create_incremental_input(request)
-        state.request_id = f"speech-stream-{random_uuid()}"
+        request_id = f"speech-stream-{random_uuid()}"
         submitted = asyncio.get_running_loop().create_future()
-        request_id, generator, tts_params = await self._speech_service._prepare_speech_generation(
-            request,
-            request_id=state.request_id,
-            arrival_time=time.time(),
-            incremental_input=model_input,
-            input_complete=final,
-            submitted=submitted,
-        )
+        while True:
+            try:
+                request_id, generator, tts_params = await self._speech_service._prepare_speech_generation(
+                    request,
+                    request_id=request_id,
+                    arrival_time=time.time(),
+                    incremental_input=model_input,
+                    input_complete=final,
+                    submitted=submitted,
+                )
+                break
+            except IncrementalInputNotReadyError:
+                if final:
+                    raise
+                text, final = await self._take_incremental_input(state)
+                request.input += text
         state.request_id = request_id
+        ready.set_result(None)
         async with aclosing(generator):
             producer = asyncio.create_task(self._incremental_input_pump(state, model_input, submitted, final))
             consumer = asyncio.create_task(self._incremental_audio_worker(websocket, state, generator, tts_params))
@@ -681,13 +695,19 @@ class OmniStreamingSpeechHandler:
     async def _incremental_worker(
         self, websocket: WebSocket, state: _IncrementalUtterance, initial_text: str, final: bool
     ) -> None:
-        operation = asyncio.create_task(self._run_incremental_utterance(websocket, state, initial_text, final))
+        ready = asyncio.get_running_loop().create_future()
+        operation = asyncio.create_task(self._run_incremental_utterance(websocket, state, initial_text, final, ready))
         try:
             done, _ = await asyncio.wait(
-                (operation, state.failure),
-                timeout=_MAX_INCREMENTAL_UTTERANCE_SECONDS,
+                (operation, state.failure, ready),
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if ready in done:
+                done, _ = await asyncio.wait(
+                    (operation, state.failure),
+                    timeout=_MAX_INCREMENTAL_UTTERANCE_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
             if state.failure in done:
                 raise state.failure.result()
             if not done:
@@ -703,6 +723,8 @@ class OmniStreamingSpeechHandler:
                 websocket, state, RuntimeError(f"Incremental generation failed: {message}")
             )
         finally:
+            if not ready.done():
+                ready.cancel()
             if not operation.done():
                 operation.cancel()
             await asyncio.gather(operation, return_exceptions=True)

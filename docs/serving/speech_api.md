@@ -356,12 +356,24 @@ The separate `model_input_mode` selects complete or incremental model input;
 incremental input uses the commitment frontend and keeps one request alive for
 the utterance.
 
+In incremental mode, the adapter buffers any tokenizer-unstable suffix after
+frontend commitment. It submits the initial engine request only when stable text
+tokens are available, or flushes the remaining text at `input.done`. Subsequent
+releases may also be buffered without sending an engine update. The delivered
+token IDs match encoding the complete model text, regardless of text packet
+boundaries or delivery batching. Empty or whitespace-only utterances do not
+submit an engine request.
+
 The incremental-input scheduler enforces a fixed 10-second conditioning-starvation
 timeout that request payloads cannot override. It starts when the model cannot
 execute its next step because the required text conditioning is unavailable,
 not at every WebSocket message gap. The commitment frontend may still be
 withholding text during this wait. Normal model drain after text EOF is not
 subject to this timeout.
+
+Before the initial request is ready, the normal session idle timeout applies.
+The total generation deadline starts after initial input construction succeeds,
+including the time spent waiting for engine admission.
 
 !!! important
     Commitment mode is not a general sentence detector. Its strong-terminator
