@@ -301,8 +301,10 @@ class VDNCheckpoint:
         if any(int(getattr(parallel, key, 1) or 1) != 1 for key in ("ulysses_degree", "ring_degree")):
             raise ValueError("VDN-H3 does not support sequence parallelism; use --tensor-parallel-size")
         if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
-            # Its host-weight plan installs the DiT without load_weights(), where the fusion lives.
-            raise ValueError("VDN-H3 is fused while the weights stream in; use a non-distributed offload mode")
+            # DLO may stream the fused tensors, but the loader must materialize
+            # them through load_weights() first. The host-weight planner rejects
+            # a direct-mmap plan for load-time fusion (``lora_is_fused``).
+            logger.info("VDN-H3: DLO will use the ordinary fused loader before streaming blocks")
 
     def check_request(self, sampling: OmniDiffusionSamplingParams, task: str) -> None:
         if task not in VDN_TASKS:

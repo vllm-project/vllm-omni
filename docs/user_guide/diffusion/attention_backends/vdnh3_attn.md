@@ -17,7 +17,7 @@ window is summarized rather than computed exactly.
 
 | Model / checkpoint | Required adapter | Tasks | Steps | Parallelism |
 | --- | --- | --- | --- | --- |
-| `MiniMaxAI/MiniMax-H3` (FL2VA partition) | [`OpenVDN/vdn-minimax-h3`](https://huggingface.co/OpenVDN/vdn-minimax-h3) (`stage-dmd-step-250`) | T2VA, FL2VA | 8 | Tensor parallelism |
+| `MiniMaxAI/MiniMax-H3` (FL2VA partition) | [`OpenVDN/vdn-minimax-h3`](https://huggingface.co/OpenVDN/vdn-minimax-h3) (`stage-dmd-step-250`) | T2VA, FL2VA | 8 | Tensor parallelism; rank-local DLO |
 
 ## Quick start
 
@@ -102,6 +102,12 @@ Because the adapters are fused into the weights, requests cannot attach
 another LoRA. `VDNH3_ATTN` and the VDN checkpoint must be selected together:
 another backend would run the hybrid weights as dense attention, so a mismatch
 is rejected at startup.
+
+DLO is supported with rank-local weight transfer. Add
+`--enable-distributed-layerwise-offload --dlo-no-use-allgather` to the serve
+command. The loader runs VDN-H3's ordinary fused path first, then DLO streams
+the resulting TP-local blocks; direct-checkpoint mmap is intentionally skipped
+so the adapter merge cannot be bypassed.
 
 ## Performance
 

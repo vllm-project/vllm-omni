@@ -87,7 +87,9 @@ accepted only when preflight proves all of the following:
 
 - every required DiT parameter and persistent buffer has exactly one source;
 - runtime names, checkpoint keys, shapes, and dtypes match;
-- the runtime topology is TP1 without HSDP or online quantization; and
+- the runtime topology is TP1 without HSDP or online quantization;
+- the model does not require a load-time weight transformation (for example,
+  fused LoRA adapters such as VDN-H3); and
 - every custom loader operation is represented by a loader-owned checkpoint
   adapter.
 

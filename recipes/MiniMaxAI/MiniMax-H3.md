@@ -1703,8 +1703,10 @@ the linear branch's output projection.
 
 `VDNH3_ATTN` and the checkpoint must be selected together, and the server must
 use `--task-type fl2va`. VDN-H3 scales with tensor parallelism only: `--usp`
-and `--ring` are rejected. Distributed layerwise offload is rejected because it
-installs the DiT without the load-time fusion. The startup log confirms the
+and `--ring` are rejected. DLO is supported with rank-local weight transfer:
+the loader runs VDN-H3's ordinary fused loader first, then DLO streams the
+resulting TP-local blocks. Add `--enable-distributed-layerwise-offload
+--dlo-no-use-allgather` to the serve command. The startup log confirms the
 fusion:
 
 ```text
