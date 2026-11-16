@@ -1270,6 +1270,12 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         cudagraph_stats: CUDAGraphStat | None,
         perf_stats: PerfStats | None,
     ) -> None:
+        # Connector records are drained every engine step, but scheduler
+        # statistics are emitted at most once a second. Retain records until
+        # that emission instead of dropping transfers from throttled steps.
+        pending = getattr(self, "_pending_kv_connector_stats", None)
+        if pending is not None:
+            kv_connector_stats = pending.aggregate(kv_connector_stats) if kv_connector_stats is not None else pending
         stats = self.make_stats(
             spec_decoding_stats,
             kv_connector_stats,
@@ -1277,7 +1283,11 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             perf_stats,
         )
         if stats is None:
+            self._pending_kv_connector_stats = (
+                kv_connector_stats if kv_connector_stats is not None and self.log_stats else None
+            )
             return
+        self._pending_kv_connector_stats = None
         if (output := next(iter(engine_core_outputs.values()), None)) is None:
             engine_core_outputs[0] = output = EngineCoreOutputs()
         output.scheduler_stats = stats
