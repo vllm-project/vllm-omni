@@ -119,6 +119,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
 
     def _configure_cudagraph_output_contract(self) -> None:
         """Select the CUDA graph output contract declared by the model."""
+        self._model_returns_tuple = bool(getattr(self.model, "_returns_tuple", False))
         self._model_has_structured_output = _needs_capture_tensor_unwrap(self.model)
         # FULL replay returns what capture stored: the hidden states and, for a
         # declared tuple model, its auxiliary pytree flattened to leaves.
@@ -126,6 +127,18 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         self._aux_output_spec = None
         self._exclude_full_graph = (self._model_has_structured_output and not self._full_graph_aux_outputs) or hasattr(
             self.model, "_last_captured_layers"
+        )
+
+    def _aux_hidden_state_contract_conflicts(self) -> bool:
+        """Whether a target-hidden-layer drafter conflicts with the model output.
+
+        ``_returns_tuple`` is the forward's tuple-output slot contract. A model
+        that only sets ``have_multimodal_outputs`` returns ``OmniOutput`` and
+        keeps its auxiliary state separately, so it is not a conflict.
+        """
+        return bool(
+            self.use_aux_hidden_state_outputs
+            and (self._model_returns_tuple or hasattr(self.model, "_last_captured_layers"))
         )
 
     def _split_fullgraph_output(self, replayed: Any) -> tuple[Any, Any]:
@@ -413,9 +426,7 @@ class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
         self._last_aux_output = None
         self._last_multimodal_outputs = None
         self._configure_cudagraph_output_contract()
-        if self.use_aux_hidden_state_outputs and (
-            self._model_has_structured_output or hasattr(self.model, "_last_captured_layers")
-        ):
+        if self._aux_hidden_state_contract_conflicts():
             # Both would use the forward's tuple output slot.
             raise NotImplementedError(
                 f"{type(self.model).__name__} returns its own auxiliary output; a drafter that "
