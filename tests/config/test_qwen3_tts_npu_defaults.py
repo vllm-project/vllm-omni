@@ -87,10 +87,19 @@ def test_frame_graph_opt_in_controls_implicit_npu_kv(monkeypatch, frame_graph):
     assert options["code_predictor_kv_cache"] is frame_graph
 
 
-def test_explicit_mrv2_profile_keeps_valid_npu_v1_fallback():
-    deploy = _apply_platform_overrides(
-        load_deploy_config(get_deploy_config_path("qwen3_tts_mrv2.yaml")), platform="npu"
+def test_custom_npu_v1_overlay_overrides_default_runner_and_full_graphs(tmp_path):
+    overlay = tmp_path / "qwen3_tts_npu_v1.yaml"
+    overlay.write_text(
+        f"base_config: {get_deploy_config_path('qwen3_tts.yaml')}\n"
+        "platforms:\n"
+        "  npu:\n"
+        "    model_runner: v1\n"
+        "    stages:\n"
+        "      - stage_id: 0\n"
+        "        compilation_config:\n"
+        "          cudagraph_mode: PIECEWISE\n"
     )
+    deploy = _apply_platform_overrides(load_deploy_config(overlay), platform="npu")
     assert deploy.model_runner == "v1"
     talker = next(stage for stage in deploy.stages if stage.stage_id == 0)
     assert talker.enforce_eager is False

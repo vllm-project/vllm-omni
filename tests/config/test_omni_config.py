@@ -1332,9 +1332,6 @@ def test_qwen3_tts_default_profile_is_experimental_mrv2_with_v1_platform_fallbac
     for platform in ("xpu", "rocm", "musa"):
         assert _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform).model_runner == "v1"
 
-    # The explicit MRV2 profile resolves to the same runner selection.
-    assert load_deploy_config(_DEPLOY_DIR / "qwen3_tts_mrv2.yaml").model_runner == "v2"
-
 
 def test_qwen3_tts_mrv2_retunes_do_not_change_default_mrv1_profile():
     default = resolve_deploy_yaml(_DEPLOY_DIR / "qwen3_tts_high_concurrency.yaml")
